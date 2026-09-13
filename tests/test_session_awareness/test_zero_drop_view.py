@@ -138,8 +138,26 @@ async def test_every_part_obeys_the_denominator_rule_or_declares_an_exemption(db
     """
     view = await V.build_view(db, now=datetime.now(UTC))
 
-    for name in ("items_by_store", "owner_pending"):
-        part = view[name]
+    # The exemption is the escape hatch this rule hands out, so the test has to
+    # police the hatch too — otherwise adding `denominator_exempt` to a part is
+    # a one-line way to make this test pass with every count bare, and the
+    # docstring's claim that `owner_pending` is "the only one" is a sentence
+    # nothing can falsify.
+    exempt = sorted(
+        n for n, p in view.items() if isinstance(p, dict) and p.get("denominator_exempt")
+    )
+    assert exempt == ["owner_pending"], (
+        f"exactly ONE declared exemption is expected; found {exempt}. A new one "
+        "is a decision to argue for, not a default to inherit."
+    )
+
+    # Universe DERIVED from the payload, never a literal beside it: a sixth part
+    # added later must be checked by construction rather than remembered. (The
+    # tab-registry test in this same change makes precisely this argument about
+    # itself; it did not cross the file boundary.)
+    for name, part in view.items():
+        if not isinstance(part, dict) or name in ("gaps", "pr_pipeline", "roadmap"):
+            continue
         if part.get("denominator_exempt"):
             continue
         for child, value in part.items():
@@ -161,6 +179,18 @@ async def test_the_follow_up_numerator_is_the_STORE_S_open_set_not_just_pending(
     added later is included rather than silently dropped.
     """
     from genesis.db.crud import follow_ups as fu
+
+    # The docstring above says the numerator is "derived from the store's own
+    # _VALID_STATUS minus the terminal state, so a status added later is
+    # included rather than silently dropped". That was a claim with nothing
+    # behind it: the constant is a hand-written tuple, so a new status would be
+    # silently EXCLUDED — the exact under-count it was written to prevent.
+    # This is the assertion that makes the sentence true.
+    assert set(V.FOLLOW_UP_OPEN_STATUSES) == fu._VALID_STATUS - {"completed"}, (
+        "FOLLOW_UP_OPEN_STATUSES has drifted from the store's own vocabulary; a "
+        "status added to _VALID_STATUS is otherwise dropped from the count in "
+        "silence"
+    )
 
     for i, status in enumerate(("pending", "in_progress", "failed", "blocked", "completed")):
         await fu.create(
@@ -388,3 +418,40 @@ async def test_the_roadmap_names_what_the_board_does_NOT_cover(db, pulse_home):
     assert any("Beads" in item for item in roadmap["not_covered"]), (
         "the item-level carve-out is a deliberate boundary and must be visible"
     )
+
+
+async def test_a_FUTURE_dated_pr_cache_WITHHOLDS_its_count(db, pulse_home):
+    """The mirror of the stale case, and the half that was silent.
+
+    A negative age is never greater than the TTL, so a cache whose
+    `computed_at` is in the FUTURE sailed through the freshness gate and this
+    part reported a live count off a snapshot that cannot be current. It is
+    reachable from clock skew, a restored backup or a hand-edited file — and a
+    future-dated record is the SIGNATURE of a wedged writer, so the one state
+    where the count deserves least trust was the state that skipped the check.
+
+    The detector fixed exactly this on its own run record; the family did not
+    get swept one module out. The tolerance is IMPORTED rather than redefined,
+    because two constants for one physical fact drift with nothing watching.
+    """
+    from genesis.session_awareness.zero_drop import FUTURE_SKEW_TOLERANCE
+
+    now = datetime.now(UTC)
+    ahead = (now + timedelta(days=30)).isoformat()
+    pulse_home({"version": 1, "computed_at": ahead, "prs": [{"number": 1}], "limit_hit": False})
+
+    part = (await V.build_view(db, now=now))["pr_pipeline"]
+
+    assert part["status"] == V.STATUS_STALE, f"a future cache must not read as live: {part}"
+    assert "open_prs" not in part, "the COUNT is the thing to withhold"
+    assert "FUTURE" in part["verdict"]
+    assert part["age_seconds"] < 0, "the negative age is the evidence, and it is rendered"
+
+    # The tolerance is real, not a strict rejection: a record written moments
+    # ago can sit a hair ahead of `now` through ordinary drift, and withholding
+    # on that would be a false positive on the FRESHEST possible data.
+    near = (now + FUTURE_SKEW_TOLERANCE / 2).isoformat()
+    pulse_home({"version": 1, "computed_at": near, "prs": [{"number": 1}], "limit_hit": False})
+
+    ok = (await V.build_view(db, now=now))["pr_pipeline"]
+    assert ok["status"] == V.STATUS_OK, f"drift inside the tolerance is not a wedged writer: {ok}"

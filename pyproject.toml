@@ -13,7 +13,43 @@ dependencies = [
     "litellm==1.78.7",  # pinned — 1.82.7/1.82.8 contain malware. Its open advisories are all
                        # proxy-server / JWT / OIDC / UI vulns (see the ci.yml dependency-audit
                        # ignore-list); not reachable — Genesis uses acompletion/completion_cost only.
-    "qdrant-client",
+    "qdrant-client>=1.15,<1.16",  # MUST track the SERVER. scripts/install.sh DEFAULTS to installing
+                                  # Qdrant 1.14.0 when none is present (QDRANT_VERSION is overridable,
+                                  # and an existing server of any version is left alone) — so this is
+                                  # a hard client bound against a soft server default.
+                                  # Qdrant's rule (qdrant_client/common/version_check.py) is same
+                                  # major, |minor difference| <= 1: a 1.14 server admits a 1.13-1.15
+                                  # client. The CEILING follows from that rule. The FLOOR is 1.15
+                                  # because it is the newest admitted release and so carries the most
+                                  # fixes — widening it to >=1.13 would change nothing in practice,
+                                  # since resolution takes the highest satisfying version either way.
+                                  # Left unpinned this resolved to whatever was latest (1.17.1 here,
+                                  # 1.19.0 available) and every client start logged an incompatibility
+                                  # warning. The drift is not cosmetic: the 1.16 line DROPPED
+                                  # QdrantClient.search() (VERIFIED: present 1.15.1, absent 1.16.0),
+                                  # which memory/health.py still called. Genesis's whole API surface
+                                  # (query_points/scroll/retrieve/upsert/set_payload/payload indexes;
+                                  # no sparse or named vectors) predates 1.14, so this costs nothing.
+                                  # BUMP BOTH TOGETHER or not at all — locked by
+                                  # tests/test_scripts/test_dependency_pins.py, which re-derives the
+                                  # coupling from this line AND install.sh rather than trusting it.
+                                  #
+                                  # KNOWN LIMIT, stated rather than hidden: this bound tracks the
+                                  # SHIPPED DEFAULT server, and install.sh does not force that server
+                                  # on anyone — QDRANT_VERSION is overridable, QDRANT_URL may point at
+                                  # a remote of any version, and an already-running server is left
+                                  # alone. An install deliberately on a NEWER server gets a client
+                                  # that is now too old, and a later `pip install -e .` will pull it
+                                  # back down. That is a real cost and it is the reason this comment
+                                  # exists: if you run a non-default server, move BOTH this specifier
+                                  # and QDRANT_VERSION to match it (the test above will tell you when
+                                  # the pair is wrong). Such an install is not made WORSE by the pin —
+                                  # unpinned it would resolve to the newest release (1.19.0 today),
+                                  # which is further from a 1.17 server than 1.15 is — but it does
+                                  # lose the ability to just install a matching client by hand.
+                                  # The deeper problem is that the right client depends on the server
+                                  # version, which is unknown at dependency-resolution time; a static
+                                  # bound is the best instrument available here, not a complete one.
     "pyyaml",
     "httpx",
     "diskcache>=5.6",
@@ -32,6 +68,26 @@ dependencies = [
     "curl_cffi>=0.15.0",  # curl_cffi backend for Scrapling's AsyncFetcher
     "networkx>=3.0",  # In-memory graph for memory_links traversal + algorithms
     "wyoming>=1.5",  # Wyoming protocol for HA voice satellite STT/TTS integration
+    "falkordb>=1.7.1,<2",  # Graph-engine client for the memory graph. CORE, like
+                           # qdrant-client above: the graph engine is part of the memory
+                           # architecture, not an optional add-on. `config/graphstore.yaml`
+                           # defaulting to networkx is a STAGED CUTOVER, not optionality.
+                           # Its own pin is redis<9,>=8.0.0, so the line below is not an
+                           # independent choice — declaring falkordb mandates redis 8.
+    "redis>=8,<9",  # Was UNDECLARED and purely transitive (fastmcp -> pydocket -> redis>=5,
+                    # no upper bound). Pinned explicitly now that first-party code depends
+                    # on it: observability/health.py's engine probe is the first in-tree
+                    # importer (there were zero before this change).
+                    #
+                    # MEASURED 2026-09-07, isolated venv, control flipping. Genesis
+                    # configures no redis URL and never uses docket, so the surface is the
+                    # IMPORT chain, not a connection. Under fastmcp 2.14.6 + pydocket
+                    # 0.25.0: redis 8.1.0 + fakeredis 2.37.1 import, FastMCP instantiates
+                    # and registers tools, docket._redis loads, fakeredis async round-trips,
+                    # and redis.asyncio's unix-socket client behaves. The same probe passes
+                    # on 7.4.0/2.34.1 and FAILS when asked to assert 8.x against 7.4.0, so
+                    # it is measuring the version it names. The whole graph-engine path
+                    # (12.4s full projection, concurrent-reader swap) also ran on 8.1.0.
     # Transitive deps pinned to secure floors (audit #638) so a clean/cached install can't resolve a vulnerable version
     "urllib3>=2.7.0",  # via qdrant-client/requests — CVE-2026-44431/44432 (auth-header leak, decompression DoS)
     "idna>=3.15",  # via httpx/requests — CVE-2026-45409 (quadratic-processing DoS)

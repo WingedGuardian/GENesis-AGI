@@ -43,6 +43,7 @@ count of one install (~150 refs), so there is no unbounded growth to GC.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import uuid
@@ -140,6 +141,31 @@ async def apply_sweep(
     """
     ts = now or _now()
     held = set(held or ())
+    # The docstring below promises "no half-applied middle state — one commit at
+    # the end", and before this that was true only when nothing raised. The
+    # writes here are many statements with ONE commit, so a failure partway left
+    # them PENDING on a connection the worker goes on using: the next class's
+    # reconcile, the alert write, or the always-runs heartbeat commit would
+    # flush the failed class's partial updates — while `degraded[cls]` reported
+    # that class as not applied (Codex P2, PR #1794). A frozen class that
+    # silently half-applied is the precise failure this whole subsystem exists
+    # to prevent, arriving through the caller's own error handling.
+    #
+    # A SAVEPOINT rather than a rollback at the call site, so the guarantee
+    # belongs to the function that makes it rather than to every caller
+    # remembering. The name is uniquely generated so a nested or concurrent
+    # sweep cannot release someone else's.
+    #
+    # PRECONDITION, stated because the commit below is this function's: do not
+    # call this inside a caller-owned transaction. When the savepoint is
+    # outermost, RELEASE commits and the `db.commit()` at the end is a no-op;
+    # nested inside someone else's transaction that commit would become THEIRS,
+    # committing work they had not finished.
+    #
+    # VERIFIED under aiosqlite: SAVEPOINT opens its own transaction without
+    # colliding with sqlite3's implicit BEGIN, and after ROLLBACK TO the later
+    # unrelated commit flushed only its own row.
+    savepoint = f"zd_sweep_{uuid.uuid4().hex}"
     counts = dict.fromkeys(
         (
             "new",
@@ -154,6 +180,68 @@ async def apply_sweep(
         0,
     )
 
+    await db.execute(f"SAVEPOINT {savepoint}")
+    try:
+        return await _apply_sweep_locked(
+            db,
+            class_=class_,
+            present=present,
+            run_id=run_id,
+            ts=ts,
+            escalation_k=escalation_k,
+            held=held,
+            counts=counts,
+            savepoint=savepoint,
+        )
+    except BaseException:
+        # Discard ONLY this class's partial writes.
+        #
+        # The recovery path can fail too, and blanket-suppressing that was this
+        # fix reproducing the defect it was written for. If `ROLLBACK TO`
+        # raises, `RELEASE` never runs, the savepoint stays on the stack and the
+        # transaction stays open carrying this class's half-finished rows. The
+        # caller then reconciles the NEXT class on the same connection, whose
+        # savepoint is now NESTED — so its RELEASE commits nothing, and its
+        # `db.commit()` issues a real COMMIT that flushes BOTH classes, while
+        # the run record reports this one as not applied. Exactly the state the
+        # savepoint exists to prevent, reached through its own error handling.
+        #
+        # So: log it (an unwind failure that leaves no trace anywhere is the
+        # report-authored-nowhere problem in its purest form), then fall back to
+        # a full rollback. A full rollback is SAFE here, contrary to what the
+        # note above this function used to claim: every sibling class ends with
+        # RELEASE + commit, so its work is already durable and the only
+        # uncommitted rows on this connection are ours.
+        try:
+            await db.execute(f"ROLLBACK TO {savepoint}")
+            await db.execute(f"RELEASE {savepoint}")
+        except Exception:
+            logger.error(
+                "zero_drop apply_sweep could not unwind savepoint %s for class %s — "
+                "falling back to a full rollback; this connection's uncommitted "
+                "writes are being discarded",
+                savepoint,
+                class_,
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                await db.rollback()
+        raise
+
+
+async def _apply_sweep_locked(
+    db: aiosqlite.Connection,
+    *,
+    class_: str,
+    present: list[dict],
+    run_id: str,
+    ts: str,
+    escalation_k: int,
+    held: set,
+    counts: dict,
+    savepoint: str,
+) -> dict:
+    """The body of :func:`apply_sweep`, inside its savepoint. Never called directly."""
     cursor = await db.execute(
         "SELECT * FROM zero_drop_findings WHERE class = ?",
         (class_,),
@@ -286,6 +374,7 @@ async def apply_sweep(
         )
         counts["resolved"] += 1
 
+    await db.execute(f"RELEASE {savepoint}")
     await db.commit()
     return counts
 
@@ -311,13 +400,44 @@ async def ack(
     row = await get(db, class_=class_, branch=branch)
     if row is None or row["status"] == "resolved":
         return None
-    await db.execute(
+    # CONDITIONAL on the state that was read, not just on the id. This runs from
+    # an MCP tool while a DETACHED sweep may be reconciling the same row on
+    # another connection: between the read above and this write the sweep can
+    # resolve the finding, or advance its tip. An unconditional `WHERE id = ?`
+    # would then acknowledge a stale row — resurrecting a resolved condition, or
+    # suppressing work that has CHANGED since the operator looked at it, against
+    # a tip that is no longer current (Codex P2, PR #1794). Both directions end
+    # with the board hiding something, which is the one thing it may not do.
+    #
+    # `tip_sha` is compared with `IS NOT DISTINCT FROM` semantics spelled out
+    # longhand, because it is nullable for a dirty worktree and `= NULL` is
+    # never true in SQL — the bug this guard would otherwise introduce.
+    cursor = await db.execute(
         """UPDATE zero_drop_findings
               SET status = 'acked', ack_reason = ?, acked_at = ?, acked_tip_sha = ?,
                   updated_at = ?
-            WHERE id = ?""",
-        (reason, ts, row["tip_sha"], ts, row["id"]),
+            WHERE id = ?
+              AND status = ?
+              AND (tip_sha IS ? OR tip_sha = ?)""",
+        (reason, ts, row["tip_sha"], ts, row["id"], row["status"], row["tip_sha"], row["tip_sha"]),
     )
+    if cursor.rowcount == 0:
+        # The row moved under us. Treated as NOT FOUND rather than retried: the
+        # operator acknowledged a condition as they saw it, and what is there now
+        # is a different condition that deserves its own look.
+        #
+        # COMMIT, not rollback — and this was a defect in the fix that added
+        # this branch (cross-model review). Unlike the worker, which owns a
+        # short-lived connection, `ack` is reached from an MCP tool running on
+        # the SERVER'S shared `SerializedConnection`. That proxy serializes per
+        # METHOD and its own docstring blesses interleaving at method boundaries
+        # on the grounds that "commit() flushes all pending work" — which makes
+        # `rollback()` the unsafe mirror, because it would discard all pending
+        # work too, including another subsystem's. A zero-row UPDATE has nothing
+        # of its own worth discarding, so committing ends the implicit
+        # transaction just as well and takes nobody else's writes with it.
+        await db.commit()
+        return None
     await db.commit()
     return await get(db, class_=class_, branch=branch)
 

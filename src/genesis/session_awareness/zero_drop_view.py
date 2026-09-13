@@ -44,6 +44,11 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
+# Imported, not redefined: the detector already owns "how far ahead of now is
+# still plausible clock skew", and a second copy of that number would drift
+# from the first without anything noticing.
+from genesis.session_awareness.zero_drop import FUTURE_SKEW_TOLERANCE
+
 logger = logging.getLogger(__name__)
 
 # A part that could not be read. Callers render this rather than a zero — the
@@ -146,6 +151,22 @@ def _pr_pipeline(*, now: datetime) -> dict:
 
     cfg = pulse_cfg.load_config()
     ttl_s = max(86400, pulse_cfg.knob_int(cfg, "min_interval_minutes") * 60 * 2)
+    # A FUTURE `computed_at` is the same defect the detector already fixed on
+    # its own record, arriving one module out: a negative age is never greater
+    # than the TTL, so the freshness gate passes and this part reports a live
+    # count off a cache that cannot be current. It is reachable from clock
+    # skew, a restored backup, or a hand-edited file — and a future-dated
+    # record is the SIGNATURE of a wedged writer, so the one state where the
+    # count is least trustworthy is the state that skipped the check.
+    # Tolerance is imported rather than redefined: two constants for one
+    # physical fact drift, and the detector already owns this one.
+    if age_s < -FUTURE_SKEW_TOLERANCE.total_seconds():
+        return {
+            "status": STATUS_STALE,
+            "computed_at": data.get("computed_at"),
+            "age_seconds": age_s,
+            "verdict": "cache computed_at is in the FUTURE — count withheld",
+        }
     if age_s > ttl_s:
         # A count is withheld ON PURPOSE. Rendering the stale number beside the
         # age would still be read as a count by anyone skimming.

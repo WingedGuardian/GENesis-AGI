@@ -111,3 +111,39 @@ def test_the_limit_parameter_is_clamped_rather_than_trusted(client, query, expec
         client.get(f"/api/genesis/zero-drop{query}")
 
     assert seen["limit"] == expected
+
+
+def test_the_dashboard_renders_the_SAFE_identity_not_the_ack_key():
+    """The API splits the identity into three fields so this cannot be got
+    wrong, and the first consumer got it wrong anyway.
+
+    `zero_drop_status` emits `branch` (the VERBATIM ack key, which must
+    round-trip unsanitised), `branch_display` (neutralised, safe to put in
+    front of a person) and `identity_unrenderable` (the two differ).
+    `git check-ref-format` accepts bidi overrides and zero-width characters, so
+    a ref name can RENDER as something other than the key an operator is
+    acknowledging. `x-text` is not the defence — it stops HTML injection, and
+    this is not an injection problem.
+
+    This is a source-level assertion because there is no browser in the suite;
+    it is worth having anyway, since it fails the moment someone reverts to the
+    shorter field name, which is the whole failure mode.
+    """
+    import pathlib
+
+    tpl = (
+        pathlib.Path(__file__).resolve().parents[2]
+        / "src/genesis/dashboard/templates/partials/tabs/zero_drop.html"
+    ).read_text()
+
+    assert 'x-text="f.branch_display || f.branch"' in tpl, (
+        "the finding row must render the NEUTRALISED identity"
+    )
+    assert "f.identity_unrenderable" in tpl, (
+        "and must TELL the reader when what they see is not the ack key"
+    )
+    # The bare field in a text position is the regression to catch. It stays
+    # legal as an x-for :key, which is never rendered.
+    assert 'x-text="f.branch"' not in tpl, (
+        "rendering the verbatim ack key is the defect this test exists for"
+    )

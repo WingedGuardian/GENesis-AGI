@@ -25,6 +25,13 @@ exists to prevent, so verdicts are now ordered by EVIDENCE STRENGTH:
 
 1. **SHA proof.** ``headRefOid == tip`` means the PR contained exactly this
    commit. MEASURED: 119 of 123 merged-covered branches match exactly.
+   PR history is therefore indexed BOTH ways — by head-ref name and by head
+   SHA — because a name-only lookup gates tier 1 behind tier 5: a branch
+   renamed (or checked out locally under another name) matches no historical
+   ``headRefName``, so the exact-SHA evidence never reached the classifier at
+   all. MEASURED 2026-09-12 over 251 refs / 1775 PRs: 4 of 26 ``flagged_no_pr``
+   rows (15%) were that blind spot, each one a local branch sitting at the
+   exact head of a real PR — one open, two merged, one closed.
 2. **Ancestry.** The tip is reachable from the PR's head, so everything local
    was in the PR. Costs one local ``merge-base`` and needs no clocks.
 3. **Push state.** ``ls-remote`` gives the remote's tip SHA. If the local tip
@@ -52,7 +59,9 @@ the judgement instead of a rule nobody can see.
 
 from __future__ import annotations
 
+import hashlib
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 # The alert's row grammar, defused. Git ref names may legally contain `|` and
@@ -112,6 +121,56 @@ CLASS_DIRTY = "dirty_worktree"
 # never collide with a real branch identity.
 DETACHED_KEY_PREFIX = "@detached:"
 
+# ...and the same ':' separates a branch from a DIGEST OF its path when ONE
+# branch is checked out in several worktrees at once (`git worktree add
+# --force`). A bare branch identity can therefore never be mistaken for a
+# discriminated one, and a discriminated one can never be mistaken for a
+# detached key: that would need a branch literally named "@detached" sharing a
+# path with a detached worktree, and a single path is either detached or on a
+# branch, never both.
+DUPLICATE_KEY_SEP = ":"
+
+# ...and once more for an identity that cannot be emitted as itself at all. A
+# worktree PATH may contain anything, and a BRANCH name may legally contain a
+# bidi override or a zero-width space (MEASURED on git 2.43 — check-ref-format
+# bans control characters and says nothing about the Cf category), so the
+# natural identity is sometimes a value that cannot safely be a key OR be shown
+# to a reader. It becomes an opaque digest rather than being thrown away.
+OPAQUE_KEY_PREFIX = "@opaque:"
+
+
+def _path_digest(path: str) -> str:
+    """A worktree path rendered as something that is always safe to be a key.
+
+    The path itself is NOT used, and the reason is a false suppression this
+    very discriminator introduced before it was caught. A worktree path may
+    legally contain a newline — this subsystem's own worktree parser was
+    redesigned around exactly that — and an identity carrying a control or
+    invisible character cannot be stored as a key and emitted verbatim to a
+    model. Splicing a raw path into a branch-keyed identity therefore produced a
+    value the classifier had to refuse, and a refused worktree landed in neither
+    ``present`` nor ``held``, so ``apply_sweep`` resolved a live finding about
+    uncommitted work.
+
+    That refusal is GONE — ``worktree_identity`` now derives an opaque key for
+    any unsafe identity rather than dropping it (see ``OPAQUE_KEY_PREFIX``), so
+    this digest is no longer what stands between a duplicated worktree and a
+    resolved row. It is kept because it is still the right key: stable, opaque
+    and collision-resistant, so the duplicate case never DEPENDS on the safety
+    net. Stated in the past tense on purpose — describing a quarantine that no
+    longer exists is how the next reader trusts a guarantee nothing provides
+    (cross-model review).
+
+    The readable value is not lost — the finding row carries ``worktree_path``,
+    and every surface renders THAT through ``neutralise``.
+
+    The digest is FULL, never shortened. A key is the one thing that must not
+    be truncated: two paths colliding on a prefix would silently transfer one
+    worktree's acknowledgement to another worktree's work, which is the same
+    rule ``dirty_state_key`` states for the same reason.
+    """
+    return hashlib.sha256(path.encode()).hexdigest()
+
 
 def _parse_iso(value: str | None) -> datetime | None:
     """Parse a timestamp to an AWARE datetime, or None.
@@ -137,6 +196,39 @@ def _parse_iso(value: str | None) -> datetime | None:
 # A local branch's relationship to the remote ref of the same name. This is
 # evidence tier 3 and it is computed from SHAs, so it does not depend on PR
 # names or on any clock.
+# How far ahead of the clock a timestamp may legitimately sit. Not a guess at
+# how wrong a clock can be — it is the skew between the clock that WROTE the
+# value and the one reading it. Git commit dates come from this machine, mtimes
+# come from this filesystem, and `mergedAt` comes from GitHub, so seconds of NTP
+# and network drift are normal and minutes are not. Generous enough that a
+# commit made moments ago is never mistaken for a corrupt one, tight enough that
+# nothing hides behind it for long.
+FUTURE_SKEW_TOLERANCE = timedelta(minutes=5)
+
+
+def not_future(parsed: datetime | None, now: datetime) -> datetime | None:
+    """*parsed*, or None when it sits implausibly far ahead of *now*.
+
+    Git accepts a future commit date, a restored snapshot or a backwards clock
+    step produces future mtimes, and a hand-repaired run record can carry
+    anything. Every age gate in this subsystem asks "is this NEWER than the
+    cutoff", so a future timestamp answers YES forever — and the two gates that
+    ask it HOLD their subject, which means neither reported nor resolved, for as
+    long as the wrong timestamp stands. A tip dated 2031 is not stranded work
+    that resolves itself in five years; it is stranded work nobody is told about
+    (Codex P2, PR #1794).
+
+    Returning None rather than a clamped value is what keeps this from inventing
+    a state: None is already what an UNPARSEABLE timestamp yields, and every
+    caller already handles it — `classify_branches` judges such a branch "on its
+    merits rather than excused", which FLAGS, and flagging is the direction a
+    detector is allowed to be wrong in.
+    """
+    if parsed is None:
+        return None
+    return None if parsed - now > FUTURE_SKEW_TOLERANCE else parsed
+
+
 PUSH_EXACT = "exact"  # local tip IS the remote tip: nothing is local-only
 PUSH_BEHIND = "behind"  # remote has moved on; every local commit is pushed
 PUSH_DIVERGED = "diverged"  # PROVEN local-only commits (non-merge, so real work)
@@ -144,35 +236,109 @@ PUSH_ABSENT = "absent"  # no remote branch of this name (never pushed, or delete
 PUSH_UNKNOWN = "unknown"  # differs, but ancestry was unanswerable
 
 
-def index_prs_by_head(prs: list[dict], *, owner: str | None = None) -> tuple[dict, int]:
-    """Group PR records by ``headRefName``. Returns ``(index, ignored_forks)``.
+@dataclass(frozen=True)
+class PrIndex:
+    """PR history addressed BOTH ways — by head-ref name and by head SHA.
 
-    Rows without a head-ref name are dropped. When *owner* is given, PRs whose
-    head branch lives in a DIFFERENT account are excluded from the join and
-    counted: a contributor's fork branch named ``patch-1`` says nothing about a
-    local ``patch-1``, and head-ref name reuse is already MEASURED at 35 of
-    1586 names here. Excluding them is cheap insurance — MEASURED 2026-09-06,
-    9 of 1665 PRs come from forks and none currently collides with a local
-    branch name, so this closes a real hole at zero present cost.
+    Two maps rather than one because they are different tiers of evidence and
+    the module's whole design is that the stronger one must not sit behind the
+    weaker. ``by_name`` is the indexing convenience (tier 5); ``by_head_sha``
+    is SHA proof (tier 1), and a branch RENAMED after its PR merged matches
+    only through it — the historical ``headRefName`` is gone, but
+    ``headRefOid`` is immutable and still equals the local tip.
+
+    ``for_branch`` is the only supported lookup, and that is deliberate. A
+    caller reaching into ``by_name`` directly is the mechanism this class
+    exists to retire: the SHA index would then be something every call site
+    had to REMEMBER to consult, which is a convention, and a convention is
+    what a reviewer finds one missing instance of at a time.
+    """
+
+    by_name: dict[str, list[dict]]
+    by_head_sha: dict[str, list[dict]]
+
+    def for_branch(self, branch: str | None, tip_sha: str | None = None) -> list[dict]:
+        """Every PR row that could speak to this branch, name rows first.
+
+        Name rows keep their listing order and lead, so a branch that was never
+        renamed sees exactly the sequence it saw before the SHA index existed —
+        the union can only ADD evidence, never reorder what was already there.
+
+        Deduplicated by object identity rather than by ``number``: both maps are
+        built in a single pass over one list and therefore hold the SAME dict
+        objects, and every one of them is kept alive by the maps themselves for
+        this index's whole lifetime, so ``id()`` cannot be recycled underneath
+        us. ``number`` would have been the obvious key and is the wrong one — it
+        is untrusted input and may be missing, in which case every unnumbered
+        row would collapse onto a single ``None``.
+        """
+        rows = list(self.by_name.get(branch, [])) if branch else []
+        if not tip_sha:
+            return rows
+        seen = {id(row) for row in rows}
+        rows.extend(row for row in self.by_head_sha.get(tip_sha, []) if id(row) not in seen)
+        return rows
+
+
+def index_prs_by_head(prs: list[dict], *, owner: str | None = None) -> tuple[PrIndex, int]:
+    """Index PR records by head-ref NAME and by head SHA. ``(index, ignored)``.
+
+    Rows without a head-ref name are dropped FROM THE NAME MAP but kept in the
+    SHA map — defence in depth rather than an observed case: the only
+    production producer (``repo_pulse_gh.list_all_prs``) already drops every row
+    lacking a non-empty string ``headRefName`` before the classifier sees it, so
+    no live sweep can currently reach that branch.
+
+    When *owner* is given, PRs whose head branch lives in a DIFFERENT account
+    are excluded from the join entirely and counted: a contributor's fork branch
+    named ``patch-1`` says nothing about a local ``patch-1``, and head-ref name
+    reuse is already
+    MEASURED at 35 of 1586 names here. Excluding them is cheap insurance —
+    MEASURED 2026-09-06, 9 of 1665 PRs come from forks and none currently
+    collides with a local branch name, so this closes a real hole at zero
+    present cost.
+
+    The fork filter governs BOTH maps, which is a choice worth stating because
+    the SHA map could defensibly keep forks: a fork PR whose ``headRefOid`` IS
+    our tip holds that exact commit, so it is genuine evidence rather than a
+    name coincidence. It is excluded anyway because including it would open a
+    new SUPPRESSION path on third-party data for a case nothing has yet
+    observed, and the wrong direction here is the silent one. Revisit with a
+    measurement, not with an argument.
+
+    "Governs both maps" describes the filter's REACH, not its strength: the
+    filter itself fails OPEN on an owner it cannot read. ``headRepositoryOwner``
+    is absent for a PR whose fork has been DELETED, which
+    ``repo_pulse_gh.list_all_prs`` records as ``None``, and a non-string owner
+    is kept rather than excluded — uniformly in both maps, and uncounted.
+    Pre-existing, unmeasured, and named here so the sentence above is not read
+    as a guarantee it does not make.
 
     ``owner=None`` keeps every PR, for a caller that could not resolve the
     repository owner. That is the safe direction: an over-broad join can only
     SUPPRESS, and a suppression here is visible in the stage counts, whereas
     dropping every PR would flag the entire branch list at once.
     """
-    index: dict[str, list[dict]] = {}
+    by_name: dict[str, list[dict]] = {}
+    by_head_sha: dict[str, list[dict]] = {}
     ignored = 0
     for pr in prs:
         head = pr.get("headRefName")
-        if not (isinstance(head, str) and head):
+        oid = pr.get("headRefOid")
+        named = isinstance(head, str) and bool(head)
+        shaed = isinstance(oid, str) and bool(oid)
+        if not (named or shaed):
             continue
         if owner is not None:
             pr_owner = pr.get("headRepositoryOwnerLogin")
             if isinstance(pr_owner, str) and pr_owner.lower() != owner.lower():
                 ignored += 1
                 continue
-        index.setdefault(head, []).append(pr)
-    return index, ignored
+        if named:
+            by_name.setdefault(head, []).append(pr)
+        if shaed:
+            by_head_sha.setdefault(oid, []).append(pr)
+    return PrIndex(by_name=by_name, by_head_sha=by_head_sha), ignored
 
 
 def pr_coverage(
@@ -261,7 +427,17 @@ def pr_coverage(
             # carry SHA proof, which outranks an open PR.
             # MEASURED 2026-09-06: 0 of 221 refs are ABSENT with an open PR, so
             # this tightening changes no current row.
-            if not proven_pushed:
+            #
+            # An exact head SHA settles the same question DIRECTLY and outranks
+            # push state, which is tier 3 evidence read off a ref of this NAME.
+            # `headRefOid` is the commit GitHub holds as this PR's head, so an
+            # exact match proves the tip is on the server whatever a same-named
+            # remote ref does or does not say — and under a RENAME there is no
+            # such ref to consult, which is exactly when this row arrived by SHA
+            # rather than by name. Not gated on HOW the row was found: the
+            # evidence is identical either way, and gating on provenance would
+            # be the name-as-identity mistake one level up.
+            if not (proven_pushed or (head and head == tip_sha)):
                 open_not_covering = {"pr": pr.get("number"), "url": pr.get("url")}
                 continue
             return "open", {"pr": pr.get("number"), "url": pr.get("url")}
@@ -382,17 +558,30 @@ def _closed_verdict(
     suppressed, and one that flags takes a single acknowledgement that never
     expires, because a dead branch never moves.
     """
+    # Positive containment is scanned for across EVERY row before any negative
+    # verdict is chosen. Head-ref names are reused — MEASURED 35 of 1586 names
+    # here, one carrying 7 PRs — so a branch can carry several unrelated closed
+    # PRs, and the listing order is not evidence about anything. Returning on
+    # the first disproven row let one stale PR override SHA proof sitting in
+    # another, which files a stranded finding for work a closed PR provably did
+    # contain (Codex P2, PR #1794). The first disproven row is still what gets
+    # REPORTED; it just no longer gets to decide.
     unanswerable = False
+    disproven: dict | None = None
     for pr in closed_rows:
         verdict = contains(pr.get("headRefOid"))
         if verdict is True:
             return "closed", {"pr": pr.get("number"), "proof": "head_oid_or_ancestor"}
         if verdict is False:
-            return "closed_local_only", {
-                "pr": pr.get("number"),
-                "proof": "not_an_ancestor_of_the_closed_head",
-            }
+            if disproven is None:
+                disproven = {
+                    "pr": pr.get("number"),
+                    "proof": "not_an_ancestor_of_the_closed_head",
+                }
+            continue
         unanswerable = True
+    if disproven is not None:
+        return "closed_local_only", disproven
 
     # Same verdict, DIFFERENT evidence, and the difference is the point: one of
     # these is proven and the other is merely unrefuted. `local_only` implies
@@ -489,6 +678,35 @@ def classify_branches(
     )
     stages["refs_total"] = len(branches)
 
+    # Holding is TWO facts, and until now only the first was recorded.
+    #
+    # The first is "do not resolve this row" — every hold site had that right.
+    # The second is "this run did not MEASURE this branch", and that one is the
+    # detector's own blindness signal: the run record has exactly one field
+    # saying so (`degraded`, which drives `blind`, the alarm and `status`). A
+    # hold that never reaches it lets a sweep which measured NOTHING publish
+    # `status: ok`, `coverage: all classes swept`, `blind: false` — `frozen`
+    # derives from which CLASSES were applied, and a fully-held sweep still
+    # applies both. That is the stale confident zero this subsystem exists to
+    # prevent, reached with no leg reporting an error.
+    #
+    # So holding goes through here and the second fact is a REQUIRED argument.
+    # A future hold site cannot forget it the way three existing ones did,
+    # because there is no spelling of this call that omits it — the same
+    # argument `_git()` makes for `--no-optional-locks`.
+    #
+    # `measured=True` is not a formality: an age-gated branch was looked at and
+    # deliberately not reported, which is a JUDGEMENT, not a blind spot. Wiring
+    # it to `degraded` would make the alarm permanent furniture on any repo
+    # with recent work — the failure mode that ruins an alarm's meaning.
+    unmeasured: dict[str, int] = {}
+
+    def _hold(name: str, stage: str, *, measured: bool) -> None:
+        stages[stage] += 1
+        held.add(name)
+        if not measured:
+            unmeasured[stage] = unmeasured.get(stage, 0) + 1
+
     # Every `continue` below is one of two KINDS, and conflating them is the
     # bug this classifier keeps almost making:
     #   "the condition genuinely ended"  -> absent from `present`, so the
@@ -505,21 +723,21 @@ def classify_branches(
             # measure it — so it is held, not resolved. (Missed on the first
             # pass, which held age-gated branches and let this one through: the
             # identical mistake one branch over.)
-            stages["ahead_unknown"] += 1
-            held.add(branch)
+            _hold(branch, "ahead_unknown", measured=False)
             continue
         if ahead <= 0:
             # Genuinely no longer ahead of the base: the condition ended.
             stages["not_ahead"] += 1
             continue
-        tip_date = _parse_iso(row.get("tip_date"))
+        tip_date = not_future(_parse_iso(row.get("tip_date")), now)
         if tip_date is not None and tip_date > cutoff:
             # Work in flight right now is not stranded work. An UNDATED tip
-            # (unparseable) is judged on its merits rather than excused.
+            # (unparseable, or dated implausibly far AHEAD — git accepts a
+            # future commit date, and this gate would then read "too new"
+            # forever) is judged on its merits rather than excused.
             # HELD, not absent: a branch under the age gate is one we looked at
             # and chose not to report, so it must not resolve an existing row.
-            stages["too_young"] += 1
-            held.add(branch)
+            _hold(branch, "too_young", measured=True)
             continue
 
         push_state = push_states.get(branch, PUSH_UNKNOWN)
@@ -528,12 +746,11 @@ def classify_branches(
             # unanswerable, so we cannot tell "ahead" from "behind". HELD for
             # the same reason ahead_unknown is: a guess in either direction is
             # a claim we cannot support, and the wrong one is silent.
-            stages["push_unknown"] += 1
-            held.add(branch)
+            _hold(branch, "push_unknown", measured=False)
             continue
 
         verdict, evidence = pr_coverage(
-            index.get(branch, []),
+            index.for_branch(branch, row.get("tip_sha")),
             tip_date=tip_date,
             tip_sha=row.get("tip_sha"),
             push_state=push_state,
@@ -592,6 +809,11 @@ def classify_branches(
         "stages": stages,
         "held": held,
         "ignored_forks": ignored_forks,
+        # META, outside the terminal sum: a stage -> count map of the branches
+        # this run FAILED TO MEASURE (never the ones it judged). The caller
+        # folds it into `degraded`, which is what makes the blindness alarm and
+        # the coverage line tell the truth about a partial sweep.
+        "unmeasured": unmeasured,
     }
 
 
@@ -612,8 +834,6 @@ def dirty_state_key(entries: list[tuple[str, str]], newest: datetime | None) -> 
     that must never be shortened, since two states colliding on a prefix would
     silently transfer one worktree's acknowledgement to another's work.
     """
-    import hashlib
-
     payload = "\n".join(sorted(f"{xy}\t{path}" for xy, path in entries))
     payload += f"\n@{newest.isoformat() if newest else 'undated'}"
     return hashlib.sha256(payload.encode()).hexdigest()
@@ -646,18 +866,67 @@ def _safe_identity(value: str | None) -> bool:
 def worktree_identity(observation: dict) -> str:
     """The stable identity of a worktree finding.
 
-    The branch name when there is one — a worktree is one-to-one with its
-    branch, and the path can change while the work does not. A DETACHED
+    The branch name when there is one — a worktree is USUALLY one-to-one with
+    its branch, and the path can change while the work does not. A DETACHED
     worktree has no branch, so it keys on its path behind a prefix containing
     ':', which git forbids in a ref name, so the two spaces cannot collide.
 
-    Shared rather than inlined because the HOLD set and the finding row must
-    agree on it exactly: an identity computed one way in one place and another
-    way in the other would hold a key nothing matches, silently restoring the
-    resolve-on-absence behaviour the hold exists to prevent.
+    "Usually" is where this went wrong. ``git worktree add --force`` checks out
+    a branch that is ALREADY checked out elsewhere, so two worktrees can carry
+    the same branch and different uncommitted work — and they then collapse
+    onto one ``(class, branch)`` key, where ``apply_sweep`` keeps the first
+    sighting and the second can never be acknowledged or tracked separately
+    (Codex P2, PR #1794). Such a worktree therefore takes a discriminator,
+    behind the same ':' that makes the detached key collision-proof — a DIGEST
+    of the path rather than the path, for the reason ``_path_digest`` states.
+
+    The discriminator is CONDITIONAL, and that is load-bearing rather than
+    tidy: the identity IS the ack key, so applying it unconditionally would
+    change every existing worktree identity at once and silently expire every
+    acknowledgement ever written. MEASURED 2026-09-12: 0 of 165 worktrees on
+    this install share a branch, so the conditional form is a no-op here by
+    construction and only starts acting when the ambiguity it answers actually
+    exists.
+
+    Being conditional has its own cost, which is smaller than the unconditional
+    one but is not zero and is stated rather than left to be discovered: at the
+    TRANSITION — a branch becoming duplicated, or stopping — the identity
+    changes shape, so the old row is absent from ``present``, ``apply_sweep``
+    resolves it and its acknowledgement goes with it. The work stays visible (a
+    new row opens immediately), so the direction is safe, but that run publishes
+    a ``resolved`` for a condition that did not end.
+
+    ``branch_duplicated`` is stamped by ``list_worktrees`` over the FULL
+    listing, not derived here from whatever subset a caller holds. That matters
+    because the callers hold different subsets — the worker's HOLD path sees
+    every registration including prunable ones, while ``classify_worktrees``
+    sees only the ones it could read — and two populations would disagree about
+    which branches are duplicated, producing a hold key that matches no finding.
+    An identity computed one way in one place and another way in the other holds
+    a key nothing matches, silently restoring the resolve-on-absence behaviour
+    the hold exists to prevent.
     """
     branch = observation.get("branch")
-    return branch or f"{DETACHED_KEY_PREFIX}{observation['path']}"
+    if not branch:
+        natural = f"{DETACHED_KEY_PREFIX}{observation['path']}"
+    elif observation.get("branch_duplicated"):
+        natural = f"{branch}{DUPLICATE_KEY_SEP}{_path_digest(observation['path'])}"
+    else:
+        natural = branch
+    if _safe_identity(natural):
+        return natural
+    # DERIVED, not refused. An identity that cannot round-trip safely used to be
+    # QUARANTINED — counted, then dropped into neither `present` nor `held`, so
+    # `apply_sweep` resolved it and the uncommitted work it named left the board
+    # silently (Codex P2, PR #1794). Refusing to make a key is only correct when
+    # the alternative is a key that lies; a digest is neither.
+    #
+    # Collision-resistant and stable, so an acknowledgement granted against it
+    # holds, and prefixed with the same forbidden ':' that keeps every other
+    # derived identity unrepresentable as a ref name. The human-readable form is
+    # not lost: the finding carries `worktree_path`, which every surface renders
+    # through `neutralise`.
+    return f"{OPAQUE_KEY_PREFIX}{_path_digest(natural)}"
 
 
 def classify_worktrees(observations: list[dict], *, now: datetime, min_age_hours: int = 6) -> dict:
@@ -673,28 +942,33 @@ def classify_worktrees(observations: list[dict], *, now: datetime, min_age_hours
     cutoff = now - timedelta(hours=min_age_hours)
     findings: list[dict] = []
     held: set[str] = set()
-    stages = dict.fromkeys(
-        ("worktrees_total", "clean", "too_young", "quarantined_identity", "flagged_dirty"), 0
-    )
+    opaque_identities = 0
+    stages = dict.fromkeys(("worktrees_total", "clean", "too_young", "flagged_dirty"), 0)
     stages["worktrees_total"] = len(observations)
 
     for obs in observations:
-        if not _safe_identity(worktree_identity(obs)):
-            # The identity is the ACK KEY and it round-trips verbatim through
-            # the MCP surface, so it is the one field that cannot be sanitised
-            # without merging two identities onto one key. A detached worktree
-            # keys on its PATH, and a path — unlike a git ref name — may
-            # contain newlines and escape sequences. Refusing such a value is
-            # the resolution: it never becomes a key, so the key stays safe to
-            # emit whole, and the refusal is COUNTED rather than silent.
-            # MEASURED 2026-09-06: 0 of 161 worktrees here.
-            stages["quarantined_identity"] += 1
-            continue
+        identity = worktree_identity(obs)
+        if identity.startswith(OPAQUE_KEY_PREFIX):
+            # COUNTED, not dropped — and that is the correction. The identity is
+            # the ACK KEY and round-trips verbatim through the MCP surface, so
+            # it cannot be sanitised without merging two identities onto one
+            # key; the previous resolution was to refuse it, which meant the
+            # worktree entered neither `present` nor `held` and `apply_sweep`
+            # RESOLVED it. `worktree_identity` now derives an opaque key
+            # instead, so the row survives and this is a META count of how many
+            # identities had to be made opaque. It is deliberately NOT one of
+            # the terminal stages any more: the worktree still lands in exactly
+            # one of clean/too_young/flagged_dirty, so those still sum to the
+            # denominator. MEASURED 2026-09-06: 0 of 161 worktrees here.
+            opaque_identities += 1
         entries = obs.get("entries") or []
         if not entries:
             stages["clean"] += 1
             continue
-        newest = obs.get("newest_mtime")
+        # Same future-proofing as the branch gate: a restored snapshot or a
+        # backwards clock step yields a future mtime, which would hold this
+        # worktree out of the board for as long as the date stands.
+        newest = not_future(obs.get("newest_mtime"), now)
         if newest is not None and newest > cutoff:
             # HELD, not absent — and this is the case that made the distinction
             # matter. One edit inside a worktree moves newest_mtime, so an
@@ -721,4 +995,12 @@ def classify_worktrees(observations: list[dict], *, now: datetime, min_age_hours
             }
         )
 
-    return {"findings": findings, "stages": stages, "held": held}
+    return {
+        "findings": findings,
+        "stages": stages,
+        "held": held,
+        # META, outside the terminal sum — like `ignored_forks` on the branch
+        # side. Putting it in `stages` would break the invariant that the
+        # terminal counts add up to `worktrees_total`.
+        "opaque_identities": opaque_identities,
+    }

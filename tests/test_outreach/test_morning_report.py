@@ -195,22 +195,27 @@ async def test_format_health_cost_line_grounded(db, mock_health, mock_drafter):
     real numbers only — no projection, no daily figure, no spike alarm, no
     provider breakdown. Cost is observability, not control."""
     gen = MorningReportGenerator(mock_health, db, mock_drafter)
-    section = gen._format_health({
-        "cost": {
-            "daily_usd": 0.14,
-            "monthly_usd": 3.79,
-            "budget_status": "UNDER_LIMIT",
-            "budget_monthly_limit": 30.0,
-            "budget_pct_used": 12.6,  # renders as "13%" via :.0f rounding (pins the format)
-            "forecast_monthly_usd": 622.0,  # projection — must NOT appear
-            "cost_by_provider": [{"provider": "x", "month_usd": 2.0}],
-        },
-        "queues": {}, "infrastructure": {}, "surplus": {},
-        "awareness": {}, "cc_sessions": {},
-    })
+    section = gen._format_health(
+        {
+            "cost": {
+                "daily_usd": 0.14,
+                "monthly_usd": 3.79,
+                "budget_status": "UNDER_LIMIT",
+                "budget_monthly_limit": 30.0,
+                "budget_pct_used": 12.6,  # renders as "13%" via :.0f rounding (pins the format)
+                "forecast_monthly_usd": 622.0,  # projection — must NOT appear
+                "cost_by_provider": [{"provider": "x", "month_usd": 2.0}],
+            },
+            "queues": {},
+            "infrastructure": {},
+            "surplus": {},
+            "awareness": {},
+            "cc_sessions": {},
+        }
+    )
     assert "Spend: $3.79 MTD" in section
     assert "13% of $30 cap" in section  # 12.6% → "13%" (.0f); pins the rendered format
-    assert "622" not in section            # no projection leaked
+    assert "622" not in section  # no projection leaked
     assert "today" not in section.lower()  # MTD only — no daily figure
     assert "Top cost drivers" not in section
 
@@ -252,11 +257,16 @@ async def test_observation_insights_demotes_aged(db, mock_health, mock_drafter):
 async def test_format_health_cost_line_without_budget(db, mock_health, mock_drafter):
     """When no budget cap is configured, fall back to a bare MTD spend line."""
     gen = MorningReportGenerator(mock_health, db, mock_drafter)
-    section = gen._format_health({
-        "cost": {"monthly_usd": 3.79, "budget_status": "unknown"},
-        "queues": {}, "infrastructure": {}, "surplus": {},
-        "awareness": {}, "cc_sessions": {},
-    })
+    section = gen._format_health(
+        {
+            "cost": {"monthly_usd": 3.79, "budget_status": "unknown"},
+            "queues": {},
+            "infrastructure": {},
+            "surplus": {},
+            "awareness": {},
+            "cc_sessions": {},
+        }
+    )
     assert "Spend: $3.79 MTD" in section
     assert "cap" not in section.lower()
 
@@ -268,8 +278,7 @@ async def test_context_includes_session_topics(db, mock_health, mock_drafter):
         "INSERT INTO cc_sessions (id, session_type, model, effort, status, "
         "started_at, last_activity_at, topic) VALUES (?, ?, ?, ?, ?, "
         "datetime('now', '-2 hours'), datetime('now', '-1 hour'), ?)",
-        ("s1", "foreground", "opus", "high", "completed",
-         "Working on memory supersession chain"),
+        ("s1", "foreground", "opus", "high", "completed", "Working on memory supersession chain"),
     )
     await db.commit()
 
@@ -312,8 +321,16 @@ async def test_follow_up_summary_includes_age(db):
     await db.execute(
         "INSERT INTO follow_ups (id, source, content, strategy, status, "
         "priority, domain, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        ("fu1", "foreground_session", "Decide on the migration approach",
-         "user_input_needed", "pending", "medium", "user_world", created),
+        (
+            "fu1",
+            "foreground_session",
+            "Decide on the migration approach",
+            "user_input_needed",
+            "pending",
+            "medium",
+            "user_world",
+            created,
+        ),
     )
     await db.commit()
 
@@ -332,8 +349,14 @@ async def test_background_sessions_excluded_from_topics(db, mock_health, mock_dr
         "INSERT INTO cc_sessions (id, session_type, model, effort, status, "
         "started_at, last_activity_at, topic) VALUES (?, ?, ?, ?, ?, "
         "datetime('now', '-2 hours'), datetime('now', '-1 hour'), ?)",
-        ("bg1", "background_reflection", "sonnet", "medium", "completed",
-         "Internal reflection cycle"),
+        (
+            "bg1",
+            "background_reflection",
+            "sonnet",
+            "medium",
+            "completed",
+            "Internal reflection cycle",
+        ),
     )
     await db.commit()
 
@@ -353,7 +376,10 @@ async def test_event_bus_emits_on_section_failure(db, mock_health, mock_drafter)
 
     # Use real health so _assemble_context reaches the failing DB sections
     mock_health.snapshot.return_value = {
-        "cost": {}, "queues": {}, "infrastructure": {}, "surplus": {},
+        "cost": {},
+        "queues": {},
+        "infrastructure": {},
+        "surplus": {},
     }
 
     gen = MorningReportGenerator(mock_health, broken_db, mock_drafter, event_bus=event_bus)
@@ -452,12 +478,17 @@ async def test_eval_quality_section_appears_in_assembled_context(db, mock_health
 
 def test_summarize_ci_rollup():
     assert _mr_mod._summarize_ci_rollup([]) == "no checks"
-    assert _mr_mod._summarize_ci_rollup(
-        [{"conclusion": "SUCCESS"}, {"state": "SUCCESS"}]) == "passing"
-    assert _mr_mod._summarize_ci_rollup(
-        [{"conclusion": "SUCCESS"}, {"status": "IN_PROGRESS"}]) == "pending"
-    assert _mr_mod._summarize_ci_rollup(
-        [{"conclusion": "SUCCESS"}, {"conclusion": "FAILURE"}]) == "failing"
+    assert (
+        _mr_mod._summarize_ci_rollup([{"conclusion": "SUCCESS"}, {"state": "SUCCESS"}]) == "passing"
+    )
+    assert (
+        _mr_mod._summarize_ci_rollup([{"conclusion": "SUCCESS"}, {"status": "IN_PROGRESS"}])
+        == "pending"
+    )
+    assert (
+        _mr_mod._summarize_ci_rollup([{"conclusion": "SUCCESS"}, {"conclusion": "FAILURE"}])
+        == "failing"
+    )
 
 
 def test_format_build_calibration():
@@ -481,14 +512,27 @@ async def test_build_lane_section_none_when_empty(db, mock_health, mock_drafter)
 async def test_build_lane_section_renders(db, mock_health, mock_drafter, monkeypatch):
     from genesis.db.crud import build_candidates as bc
 
-    await bc.create(db, id="c1", item_key="k1", item_title="Dad-joke skill",
-                    source_file="New Genesis Capabilities.md", verdict="build")
-    await bc.update(db, "c1", outcome="pr_opened",
-                    pr_url="https://github.com/o/r/pull/42", branch="task/c1")
+    await bc.create(
+        db,
+        id="c1",
+        item_key="k1",
+        item_title="Dad-joke skill",
+        source_file="New Genesis Capabilities.md",
+        verdict="build",
+    )
+    await bc.update(
+        db, "c1", outcome="pr_opened", pr_url="https://github.com/o/r/pull/42", branch="task/c1"
+    )
     await bc.record_user_decision(db, "c1", user_decision="approved")
-    await bc.create(db, id="c2", item_key="k2", item_title="Rewrite the kernel",
-                    source_file="New Genesis Capabilities.md",
-                    verdict="dont_build", verdict_reason="brain-not-body scope")
+    await bc.create(
+        db,
+        id="c2",
+        item_key="k2",
+        item_title="Rewrite the kernel",
+        source_file="New Genesis Capabilities.md",
+        verdict="dont_build",
+        verdict_reason="brain-not-body scope",
+    )
 
     async def fake_ci(url, *, actions_degraded=None):
         return "passing"
@@ -575,7 +619,8 @@ def _components(*entries):
 async def test_github_actions_degraded_component_scoped(monkeypatch):
     # Operational Actions → not degraded.
     monkeypatch.setattr(
-        _mr_mod.httpx, "AsyncClient",
+        _mr_mod.httpx,
+        "AsyncClient",
         lambda **kw: _FakeStatusClient(
             payload=_components({"name": "Actions", "status": "operational"}),
         ),
@@ -584,7 +629,8 @@ async def test_github_actions_degraded_component_scoped(monkeypatch):
 
     # Degraded Actions → degraded.
     monkeypatch.setattr(
-        _mr_mod.httpx, "AsyncClient",
+        _mr_mod.httpx,
+        "AsyncClient",
         lambda **kw: _FakeStatusClient(
             payload=_components({"name": "Actions", "status": "major_outage"}),
         ),
@@ -593,7 +639,8 @@ async def test_github_actions_degraded_component_scoped(monkeypatch):
 
     # Scheduled maintenance stalls CI for infra reasons too (Codex P2).
     monkeypatch.setattr(
-        _mr_mod.httpx, "AsyncClient",
+        _mr_mod.httpx,
+        "AsyncClient",
         lambda **kw: _FakeStatusClient(
             payload=_components({"name": "Actions", "status": "under_maintenance"}),
         ),
@@ -603,7 +650,8 @@ async def test_github_actions_degraded_component_scoped(monkeypatch):
     # An UNRELATED component's outage must NOT trip the Actions preflight
     # (the aggregate-indicator approach did — Codex P2).
     monkeypatch.setattr(
-        _mr_mod.httpx, "AsyncClient",
+        _mr_mod.httpx,
+        "AsyncClient",
         lambda **kw: _FakeStatusClient(
             payload=_components(
                 {"name": "Packages", "status": "major_outage"},
@@ -619,13 +667,15 @@ async def test_github_actions_degraded_fails_open(monkeypatch):
     # Unreachable / malformed status page must NOT report degraded — never mask
     # a real CI failure as an infra outage.
     monkeypatch.setattr(
-        _mr_mod.httpx, "AsyncClient",
+        _mr_mod.httpx,
+        "AsyncClient",
         lambda **kw: _FakeStatusClient(exc=RuntimeError("boom")),
     )
     assert await _mr_mod._github_actions_degraded() is False
 
     monkeypatch.setattr(
-        _mr_mod.httpx, "AsyncClient",
+        _mr_mod.httpx,
+        "AsyncClient",
         lambda **kw: _FakeStatusClient(payload={}),  # no 'components' key
     )
     assert await _mr_mod._github_actions_degraded() is False
@@ -634,7 +684,8 @@ async def test_github_actions_degraded_fails_open(monkeypatch):
     # the allowlist rejects them (Codex P2: `true`/`1` must not read as degraded).
     for bad in (True, 1, {"level": "major"}, "weird_new_state", None):
         monkeypatch.setattr(
-            _mr_mod.httpx, "AsyncClient",
+            _mr_mod.httpx,
+            "AsyncClient",
             lambda _bad=bad, **kw: _FakeStatusClient(
                 payload=_components({"name": "Actions", "status": _bad}),
             ),
@@ -643,7 +694,8 @@ async def test_github_actions_degraded_fails_open(monkeypatch):
 
     # Actions component absent entirely → cannot confirm → fail open.
     monkeypatch.setattr(
-        _mr_mod.httpx, "AsyncClient",
+        _mr_mod.httpx,
+        "AsyncClient",
         lambda **kw: _FakeStatusClient(
             payload=_components({"name": "Packages", "status": "operational"}),
         ),
@@ -731,9 +783,14 @@ async def _insert_finding(db, id_: str, content: str = "inbox batch finding"):
     from genesis.db.crud import message_queue as mq_crud
 
     await mq_crud.create(
-        db, id=id_, source="cc_background", target="cc_foreground",
-        message_type="finding", content=content,
-        created_at="2026-03-12T06:00:00+00:00", priority="low",
+        db,
+        id=id_,
+        source="cc_background",
+        target="cc_foreground",
+        message_type="finding",
+        content=content,
+        created_at="2026-03-12T06:00:00+00:00",
+        priority="low",
     )
 
 
@@ -758,9 +815,7 @@ async def test_mq_finding_closed_after_confirm_delivery(db, mock_health, mock_dr
 
 
 @pytest.mark.asyncio
-async def test_mq_finding_stays_pending_when_delivery_unconfirmed(
-    db, mock_health, mock_drafter
-):
+async def test_mq_finding_stays_pending_when_delivery_unconfirmed(db, mock_health, mock_drafter):
     # Delivery failed → confirm_delivery never called → finding re-appears
     # in the next report instead of being silently closed.
     await _insert_finding(db, "f2")
@@ -773,9 +828,7 @@ async def test_mq_finding_stays_pending_when_delivery_unconfirmed(
 
 
 @pytest.mark.asyncio
-async def test_untitled_mq_rows_not_rendered_and_not_closed(
-    db, mock_health, mock_drafter
-):
+async def test_untitled_mq_rows_not_rendered_and_not_closed(db, mock_health, mock_drafter):
     # "Untitled" rows are filtered from the report, so closing them would
     # mark items responded that were never shown.
     await _insert_finding(db, "f3", content="Untitled batch artifact")
@@ -788,9 +841,7 @@ async def test_untitled_mq_rows_not_rendered_and_not_closed(
 
 
 @pytest.mark.asyncio
-async def test_mq_ids_replaced_not_accumulated_across_generates(
-    db, mock_health, mock_drafter
-):
+async def test_mq_ids_replaced_not_accumulated_across_generates(db, mock_health, mock_drafter):
     await _insert_finding(db, "f4")
     gen = MorningReportGenerator(mock_health, db, mock_drafter)
     await gen.generate()
@@ -805,8 +856,12 @@ async def test_checkpoint_question_rows_never_closed(db, mock_health, mock_draft
     from genesis.db.crud import message_queue as mq_crud
 
     await mq_crud.create(
-        db, id="q1", source="cc_background", target="user",
-        message_type="question", content="Need a decision on X",
+        db,
+        id="q1",
+        source="cc_background",
+        target="user",
+        message_type="question",
+        content="Need a decision on X",
         created_at="2026-03-12T06:00:00+00:00",
     )
     gen = MorningReportGenerator(mock_health, db, mock_drafter)
@@ -824,13 +879,22 @@ async def test_activity_summary_scopes_goals_by_origin(db, mock_health, mock_dra
     from genesis.db.crud import user_goals
 
     await user_goals.create(
-        db, title="User career goal", category="career", priority="high",
+        db,
+        title="User career goal",
+        category="career",
+        priority="high",
     )
     await user_goals.create(
-        db, title="Ego ops goal", category="project", origin="genesis_ego",
+        db,
+        title="Ego ops goal",
+        category="project",
+        origin="genesis_ego",
     )
     paused = await user_goals.create(
-        db, title="Paused ego goal", category="other", origin="genesis_ego",
+        db,
+        title="Paused ego goal",
+        category="other",
+        origin="genesis_ego",
     )
     await user_goals.update(db, paused, status="paused")
 
@@ -879,7 +943,10 @@ async def test_ground_truth_totals_precede_truncated_lists(db, mock_health, mock
 
     for i in range(7):
         await ego_crud.create_proposal(
-            db, id=f"gt-{i}", action_type="t", content=f"proposal {i}",
+            db,
+            id=f"gt-{i}",
+            action_type="t",
+            content=f"proposal {i}",
         )
     gen = MorningReportGenerator(mock_health, db, mock_drafter)
     context = await gen._assemble_context()
@@ -1047,3 +1114,42 @@ async def test_ground_truth_stranded_work_line_emits_NO_branch_names(
     assert "Stranded work (zero-drop)" in ground_truth
     assert "SECRET-BRANCH-NAME" not in ground_truth
     assert "private/path" not in ground_truth
+
+
+async def test_the_stranded_line_SURVIVES_the_whole_store_part_failing(
+    db, mock_health, mock_drafter, monkeypatch, tmp_path
+):
+    """The one line in this section whose own comment forbids silence.
+
+    `items_by_store` is itself guarded, so when that part fails it IS
+    `{"status": "unavailable", ...}` and carries no `stranded_work` child at
+    all. The old form read `view["items_by_store"].get("stranded_work", {})`,
+    got `{}`, found `.get("status")` was None rather than UNAVAILABLE, took the
+    happy branch, raised KeyError on `stranded["open"]`, and had it swallowed
+    by the section's outer handler. The line VANISHED — in precisely the state
+    it exists to announce, and a reader who sees no stranded-work line
+    concludes there is no stranded work.
+
+    The guard existed one level up and not one level down. Testing for OK
+    rather than for UNAVAILABLE is what makes the check total: it also catches
+    STALE and DEGRADED, which the old comparison waved through into a
+    real-looking count beside "freshness unknown".
+    """
+    from genesis.session_awareness import zero_drop_view as V
+
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "home"))
+
+    async def _store_is_down(*a, **kw):
+        raise RuntimeError("container down")
+
+    monkeypatch.setattr(V, "_items_by_store", _store_is_down)
+
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    ground_truth = await gen._ground_truth_section()
+
+    assert "Stranded work (zero-drop)" in ground_truth, (
+        "the line must be present even when the store cannot be read — its "
+        "absence is indistinguishable from a clean board"
+    )
+    assert "UNAVAILABLE" in ground_truth
+    assert "this is not a zero, it is an unread board" in ground_truth

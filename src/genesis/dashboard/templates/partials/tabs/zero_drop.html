@@ -112,7 +112,20 @@
                                 dirty_worktree:  'background:rgba(255,193,7,0.15); color:#ffc107'
                               }[f.class] || ''"
                               x-text="f.class"></span>
-                        <span style="margin-left:0.4rem; font-family:monospace;" x-text="f.branch"></span>
+                        <!-- `branch_display`, NEVER `branch`. The API emits three fields on
+                             purpose: `branch` is the verbatim ack key and must round-trip
+                             unsanitised, `branch_display` is the neutralised form safe to put
+                             in front of a person, and `identity_unrenderable` says the two
+                             differ. `git check-ref-format` accepts bidi overrides and
+                             zero-width characters, so a ref name can render as something
+                             other than the key an operator would be acknowledging. This is a
+                             rendering problem, not an injection one, so `x-text` is not the
+                             defence — choosing the right field is. -->
+                        <span style="margin-left:0.4rem; font-family:monospace;"
+                              x-text="f.branch_display || f.branch"></span>
+                        <span x-show="f.identity_unrenderable" style="color:#ff9800; font-size:0.6rem;"
+                              title="This name contains characters that do not render as themselves — what you see is not the acknowledgement key.">
+                          &#9888; name &ne; ack key</span>
                         <span style="color:var(--color-text-secondary);" x-text="' +' + f.ahead_count"></span>
                         <span x-show="f.escalated" style="color:#f44336; font-weight:700;"> ESCALATED</span>
                         <span x-show="f.status === 'acked'" style="color:var(--color-text-secondary);"

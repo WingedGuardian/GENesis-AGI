@@ -5,6 +5,16 @@ After=genesis-server.service
 [Service]
 Type=oneshot
 WorkingDirectory=__REPO_DIR__
+# NO `EnvironmentFile=secrets.env` here, deliberately, though the audit-store trim
+# below needs two variables that live in it. MEASURED on systemd 255: an
+# `EnvironmentFile=` overrides `Environment=` REGARDLESS of the order the directives
+# appear in — a throwaway unit with the file listed FIRST still had its
+# `Environment=PATH=` replaced by the file's. So loading secrets.env here would
+# silently discard the PATH pinned below on any install whose secrets.env sets one,
+# degrading the reaper exactly as that line's own comment warns. It would also hand
+# every provider key and the backup passphrase to a oneshot that runs `rm -rf`.
+# `scripts/disk_hygiene.sh` reads the two store knobs by name instead, where the
+# ordering is under our control.
 ExecStart=/bin/bash __REPO_DIR__/scripts/disk_hygiene.sh
 # Reaping ~dozens of worktrees (gh/git calls each) + a multi-GB rmtree can run
 # well past the 90s default TimeoutStartSec, which would SIGTERM mid-trash-move.

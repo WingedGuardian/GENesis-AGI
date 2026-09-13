@@ -739,6 +739,18 @@ async def test_update_blocked_still_works_untouched(db):
     assert any(r["id"] == fid for r in actionable)  # still visible
 
 
+# ── source_session on the MCP surface ────────────────────────────────────────
+
+
+async def _seed_charter(db, sid: str) -> None:
+    await db.execute(
+        "INSERT INTO session_charters (session_id, created_at, updated_at)"
+        " VALUES (?, datetime('now'), datetime('now'))",
+        (sid,),
+    )
+    await db.commit()
+
+
 # ─── external state: the surface follow_up proposals never had ───────────────
 #
 # A follow-up's issue link and its repo-pulse completion proposal both live
@@ -760,6 +772,87 @@ async def _seed_posted_issue(db, *, follow_up_id, number=101, repo="Owner/Repo")
     )
     await db.commit()
 
+
+async def test_source_session_prefix_resolves_to_the_full_id(db):
+    """The per-turn tag shows 8 chars; the stored row must carry the FULL id —
+    resolve_session_id's own contract says WRITE callers must never create rows
+    under a truncated id."""
+    full = "abcdef12-3456-7890-abcd-ef1234567890"
+    await _seed_charter(db, full)
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        res = await follow_up_tools._impl_follow_up_create(
+            content="work from a known session",
+            reason="provenance",
+            strategy="ego_judgment",
+            work_state="ready",
+            source_session="abcdef12",
+        )
+    assert res["source_session"] == full, res
+    row = await follow_ups.get_by_id(db, res["id"])
+    assert row["source_session"] == full
+
+
+async def test_an_unresolvable_prefix_stores_null_and_says_so(db):
+    """NULL over a truncated id — and the drop is REPORTED, not silent: the
+    create must not fail over provenance, but a swallowed drop teaches the
+    caller the prefix worked when it did not."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        res = await follow_up_tools._impl_follow_up_create(
+            content="work from an unknown prefix",
+            reason="provenance",
+            strategy="ego_judgment",
+            work_state="ready",
+            source_session="deadbeef",
+        )
+    assert res["source_session"] is None, res
+    assert "did not resolve" in res["message"], res["message"]
+    row = await follow_ups.get_by_id(db, res["id"])
+    assert row["source_session"] is None
+
+
+async def test_a_full_session_id_passes_through_unresolved(db):
+    """A >=32-char id needs no charter row to be stored — resolve passes it
+    through, so a session that has not chartered yet still gets provenance."""
+    full = "12345678-aaaa-bbbb-cccc-1234567890ab"
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        res = await follow_up_tools._impl_follow_up_create(
+            content="work from an unchartered session",
+            reason="provenance",
+            strategy="ego_judgment",
+            work_state="ready",
+            source_session=full,
+        )
+    assert res["source_session"] == full
+    row = await follow_ups.get_by_id(db, res["id"])
+    assert row["source_session"] == full
+
+
+async def test_a_long_but_malformed_id_is_stored_as_NULL(db):
+    """The gate is the id's SHAPE, not its length.
+
+    `resolve_session_id` returns a >= 32-char input unchanged — it never
+    consulted a store — so a length-only acceptance check meant a mistyped UUID
+    or a 32-char fragment of something else became durable provenance the
+    documented contract promised would be NULL (Codex P2, PR #1622). Each value
+    below is long enough to pass the old test.
+    """
+    for bad in (
+        "abcdef12-3456-7890-abcd-ef123456789g",  # one non-hex character
+        "abcdef1234567890abcdef1234567890",  # 32 chars, no hyphens
+        "not-a-session-id-but-definitely-long-enough",
+    ):
+        with patch.object(follow_up_tools, "_get_db", return_value=db):
+            res = await follow_up_tools._impl_follow_up_create(
+                content=f"work claiming provenance {bad}",
+                reason="provenance",
+                strategy="ego_judgment",
+                work_state="ready",
+                source_session=bad,
+            )
+        assert res["source_session"] is None, (bad, res)
+        assert "did not resolve" in res["message"], (bad, res["message"])
+        row = await follow_ups.get_by_id(db, res["id"])
+        assert row["source_session"] is None, bad
 
 async def _seed_proposal(db, *, item_id, pr_number=42):
     await db.execute(

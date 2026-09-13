@@ -623,3 +623,59 @@ async def test_ambient_recovery_failing_alerts_with_remedy(config, db):
     text = scheduler._pipeline.submit_raw.call_args[0][0]
     assert "auto-recovery exhausted" in text
     assert "ESPHome API" in text  # the recovery-failing remedy hint
+
+
+@pytest.mark.asyncio
+async def test_drain_does_not_send_a_row_cancelled_after_the_snapshot(config, db):
+    """A cancel landing between drain and send must stop the send.
+
+    `drain` takes a snapshot of up to 20 rows and the loop then sends them one at a
+    time, each costing an LLM draft plus an adapter round-trip — so the snapshot is
+    stale by seconds to minutes. That is exactly when someone cancels: they cancel
+    because the message is about to go out. Without a re-read, cancel() reports
+    "cancelled", the message ships anyway, and the row ends up recorded as BOTH
+    cancelled and delivered — a contradiction no reader can resolve.
+
+    Simulated by cancelling from inside the pipeline's submit, which runs at the
+    same point in the sequence a concurrent cancel would.
+    """
+    from genesis.db.crud import pending_outreach
+
+    first = await pending_outreach.enqueue(
+        db, message="first", category="notification", channel="telegram"
+    )
+    second = await pending_outreach.enqueue(
+        db, message="second — cancelled while the first is in flight",
+        category="notification", channel="telegram",
+    )
+
+    pipeline = _drain_pipeline(OutreachStatus.DELIVERED)
+    original = pipeline.submit
+
+    async def _submit_then_cancel_the_next(req):
+        # Runs while row 1 is being sent — the real window.
+        await pending_outreach.cancel(db, second)
+        return await original(req)
+
+    pipeline.submit = AsyncMock(side_effect=_submit_then_cancel_the_next)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    sent = [c[0][0].context for c in pipeline.submit.call_args_list]
+    assert any("first" in m for m in sent), "the uncancelled row must still send"
+    assert not any("cancelled while" in m for m in sent), (
+        "the row cancelled after the drain snapshot was still sent — cancel() told "
+        "the caller it was cancelled and the recipient got it anyway"
+    )
+
+    cur = await db.execute(
+        "SELECT delivered, cancelled_at FROM pending_outreach WHERE id = ?", (second,)
+    )
+    row = await cur.fetchone()
+    assert row["cancelled_at"] is not None
+    assert row["delivered"] == 0, (
+        "a cancelled row must not also be marked delivered — that is the "
+        "contradictory record this guard exists to prevent"
+    )
+    assert first  # the id is used only to distinguish the two rows

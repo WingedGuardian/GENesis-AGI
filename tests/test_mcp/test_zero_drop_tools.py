@@ -292,3 +292,64 @@ async def test_a_null_worktree_path_stays_null_rather_than_becoming_empty(db, la
 
     out = await _impl_zero_drop_status(db, now=datetime.now(UTC))
     assert out["findings"][0]["worktree_path"] is None
+
+
+async def test_a_BIDI_branch_identity_is_rendered_safely_and_flagged(db):
+    """Codex P2 :128 — untrusted repository text reached a model unescaped.
+
+    `check-ref-format` bans control characters, and this module concluded from
+    that a branch name could carry nothing deceptive. It says nothing about the
+    Cf (format) category: MEASURED 2026-09-13 on git 2.43, a branch named with
+    U+202E (right-to-left override), U+200B (zero-width space) or U+2066 (bidi
+    isolate) is LEGAL. Those render as nothing or reorder the text around them,
+    so the branch a reader SEES can differ from the key they acknowledge.
+
+    The key still round-trips byte for byte — neutralising it would merge two
+    identities onto one key, which is worse than the problem. So the response
+    carries all three: the verbatim key, a renderable display, and a flag.
+    """
+    from datetime import UTC, datetime
+
+    from genesis.db.crud import zero_drop as zd
+    from genesis.mcp.health.zero_drop_tools import _impl_zero_drop_status
+
+    hostile = "feat/a\u202eb\u200bc"
+    await zd.apply_sweep(
+        db, class_="unpushed_branch",
+        present=[{"branch": hostile, "tip_sha": "a" * 40}], run_id="r1",
+    )
+
+    out = await _impl_zero_drop_status(db, now=datetime.now(UTC))
+    row = next(f for f in out["findings"] if f["class"] == "unpushed_branch")
+
+    # The KEY is untouched — this is what zero_drop_ack matches on.
+    assert row["branch"] == hostile
+    # The DISPLAY has no invisible or reordering characters left in it.
+    assert "\u202e" not in row["branch_display"]
+    assert "\u200b" not in row["branch_display"]
+    assert row["branch_display"] == "feat/abc"
+    # And the difference is ANNOUNCED rather than left to be noticed.
+    assert row["identity_unrenderable"] is True
+
+    # The ack still works on the verbatim key, so nothing was traded away.
+    acked = await zd.ack(db, class_="unpushed_branch", branch=hostile, reason="test", now=None)
+    assert acked is not None
+
+
+async def test_an_ORDINARY_branch_is_not_flagged_as_unrenderable(db):
+    """The control, and the one that keeps the flag meaningful: a normal name
+    must render identically and carry no warning, or the flag is noise and
+    readers learn to ignore it."""
+    from datetime import UTC, datetime
+
+    from genesis.db.crud import zero_drop as zd
+    from genesis.mcp.health.zero_drop_tools import _impl_zero_drop_status
+
+    await zd.apply_sweep(
+        db, class_="unpushed_branch",
+        present=[{"branch": "feat/perfectly-ordinary", "tip_sha": "b" * 40}], run_id="r1",
+    )
+    out = await _impl_zero_drop_status(db, now=datetime.now(UTC))
+    row = next(f for f in out["findings"] if f["class"] == "unpushed_branch")
+    assert row["branch_display"] == row["branch"] == "feat/perfectly-ordinary"
+    assert row["identity_unrenderable"] is False

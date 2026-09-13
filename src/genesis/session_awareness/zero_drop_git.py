@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from collections.abc import Awaitable, Callable
 
@@ -77,8 +78,8 @@ def _is_sha(value: object) -> bool:
     return isinstance(value, str) and bool(_FULL_SHA.match(value))
 
 
-def _refuse_empty(kind: str, records) -> dict | None:
-    """Refuse an rc=0 result that parsed to NOTHING. Shared by all enumerators.
+def _refuse_empty(kind: str, records, *, raw: str) -> dict | None:
+    """Refuse output that PARSED to nothing. An empty OUTPUT is not that.
 
     An empty set does NOT fail neutrally, which is what makes this a
     correctness guard rather than tidiness. Each enumerator feeds a class that
@@ -88,24 +89,68 @@ def _refuse_empty(kind: str, records) -> dict | None:
     subsystem exists to prevent, arriving through the one door that looks like
     success.
 
-    And empty cannot be a true observation for any of them: a repository always
-    has at least one local branch, at least one branch on its remote, and at
-    least one worktree. "rc=0 and nothing parsed" therefore means the output was
-    not what we think it is — a format change, a wrong path, a truncated read —
-    and the honest response is to freeze the class.
+    But the first version of this guard could not tell the two rc=0 empties
+    apart, and they mean opposite things (Codex P2, PR #1794):
 
-    MEASURED 2026-09-06 before this existed: the guard was on ls-remote ONLY.
-    ``for-each-ref`` and ``worktree list`` both returned a clean empty set from
-    rc=0, and ``worktree list`` did so even for unparseable garbage.
+    * **rc=0, and git printed NOTHING.** A true observation of an empty set. An
+      unborn repository has no local refs; a newly created or fully cleared
+      remote answers ``ls-remote`` with no heads at all. MEASURED 2026-09-13 on
+      git 2.43: an empty bare repo gives ``ls-remote --heads`` rc=0 and stdout
+      of EXACTLY zero bytes, and an unborn repo gives ``for-each-ref
+      refs/heads`` the same — and ``--exit-code``, the OPTIONAL flag that turns
+      no-match into rc=2, is what this code would have to pass for emptiness to
+      be an error at all. Refusing these froze both branch classes forever on a
+      condition that never changes, and in the cleared-remote case every local
+      branch is precisely the unpushed work the detector exists to report.
+    * **rc=0, git printed SOMETHING, and none of it parsed.** The format changed
+      under us, or the read was truncated. Nothing here can be trusted and the
+      class freezes.
+
+    So the discriminator is the RAW output, not the record count. Passing the
+    parsed list alone is what made the two indistinguishable.
+
+    Tested on the raw string rather than ``raw.strip()``, and the measurement
+    above is why: an empty set is zero bytes, so WHITESPACE is not one — it is
+    output that parsed to nothing, and it belongs on the freezing side. Using
+    ``strip()`` would have quietly moved a whole class of unreadable output into
+    the permissive branch, which is the direction that resolves findings.
+
+    MEASURED 2026-09-06 before this existed at all: the guard was on ls-remote
+    ONLY. ``for-each-ref`` and ``worktree list`` both returned a clean empty set
+    from rc=0, and ``worktree list`` did so even for unparseable garbage.
+
+    Where it actually fires, stated because the obvious reading is wrong: each
+    enumerator counts unreadable lines itself and returns before reaching here,
+    so for a non-empty output that parsed to nothing it is the caller's
+    ``unparsed`` counter that freezes the class, not this. That makes this a
+    BACKSTOP for a parser that ever stops counting — worth keeping, worth not
+    mistaking for the primary guard.
     """
-    if not records:
-        return {"error": f"{kind} returned no records (rc=0) — refusing an empty set"}
-    return None
+    if records or not raw:
+        return None
+    return {
+        "error": (
+            f"{kind}: rc=0 with {len(raw)} bytes of output, none of which parsed "
+            "as a record — refusing a set we cannot read"
+        )
+    }
 
 
 # TAB-separated so a branch name containing a space survives the split; git ref
 # names cannot contain a TAB (check-ref-format forbids control characters).
-_REF_FORMAT = "%(refname:short)\t%(objectname)\t%(ahead-behind:{base})\t%(committerdate:iso-strict)"
+#
+# `lstrip=2`, not `:short`, and the difference is not cosmetic. `:short` emits
+# the shortest UNAMBIGUOUS name, so the moment a tag shares a branch's name it
+# emits `heads/foo` where the branch is `foo` (MEASURED on git 2.43). The remote
+# and the PR history both key on `foo`, so such a branch matches NEITHER the
+# ls-remote join nor the PR-name join and is reported as unpushed work with no
+# PR. Since this enumeration is scoped to `refs/heads`, the prefix is a known
+# constant: a fixed strip is exact where an abbreviation is context-sensitive.
+# The identity is also the ack key, so a name that changes shape when an
+# unrelated tag appears would expire a standing acknowledgement.
+_REF_FORMAT = (
+    "%(refname:lstrip=2)\t%(objectname)\t%(ahead-behind:{base})\t%(committerdate:iso-strict)"
+)
 
 # `base` is spliced into a git FORMAT STRING, where `%(...)` is a directive. It
 # arrives from `refs/remotes/origin/HEAD` — i.e. whatever the remote's default
@@ -144,6 +189,39 @@ def _git(root: str, *args: str) -> list[str]:
     return ["git", "--no-optional-locks", "-C", root, *args]
 
 
+# Git's repository-discovery environment OVERRIDES `-C`. `-C` is equivalent to
+# `cd`, and `GIT_DIR` takes precedence over discovery from the working
+# directory — so with one of these inherited, every argv `_git()` builds reads a
+# repository the caller never named, and the module docstring's claim that
+# addressing by `-C` cannot point the sweep at the wrong worktree is simply
+# false.
+#
+# That used to fail CLOSED: a mismatched GIT_DIR yielding zero refs hit
+# `_refuse_empty` and froze the branch classes, loudly. Since an rc=0 empty set
+# became a legitimate observation it fails OPEN instead — `{"branches": []}`
+# reconciles both branch classes against nothing and RESOLVES every open and
+# acked finding in them. Stripped in the runner rather than at each call site,
+# for the same reason `--no-optional-locks` lives in `_git()`: a guarantee every
+# caller must remember is a convention.
+_GIT_ENV_OVERRIDES = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    }
+)
+
+
+def scrubbed_git_env() -> dict[str, str]:
+    """The ambient environment with git's repo-discovery overrides removed."""
+    return {k: v for k, v in os.environ.items() if k not in _GIT_ENV_OVERRIDES}
+
+
 async def default_runner(argv: list[str], timeout: float) -> tuple[int, str, str]:
     """Run a git command, returning (rc, stdout, stderr). Never raises."""
     try:
@@ -151,6 +229,7 @@ async def default_runner(argv: list[str], timeout: float) -> tuple[int, str, str
             *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=scrubbed_git_env(),
         )
     except Exception as exc:  # git missing / not executable
         return 127, "", f"git spawn failed: {exc}"
@@ -221,7 +300,7 @@ async def list_local_branches(
         # COMPLETE candidate set, and a quietly-short one resolves findings for
         # branches that were simply never listed.
         return {"error": f"for-each-ref: {unparsed} unparseable ref line(s)"}
-    if err := _refuse_empty("for-each-ref", branches):
+    if err := _refuse_empty("for-each-ref", branches, raw=out):
         return err
     return {"branches": branches}
 
@@ -252,15 +331,31 @@ async def list_remote_heads(
     if rc != 0:
         return {"error": f"ls-remote failed (rc={rc}): {err.strip()[:300]}"}
     heads: dict[str, str] = {}
+    unparsed = 0
     for line in out.splitlines():
         sha, _, ref = line.partition("\t")
         if ref.startswith("refs/heads/") and _FULL_SHA.match(sha):
             heads[ref[len("refs/heads/") :]] = sha
+        elif line.strip() and not ref.startswith(("refs/tags/", "refs/pull/")):
+            # The third sibling, and the last one to get this. Its two peers
+            # have counted unreadable lines from the start; this one dropped
+            # them silently, so a PARTIAL parse — most lines unreadable, a few
+            # readable — left `heads` truthy, passed `_refuse_empty`, and was
+            # accepted as a COMPLETE remote listing. The dropped branches then
+            # read as absent from the remote, which forks their identity into
+            # the wrong class and RESOLVES their `pushed_no_pr` rows.
+            #
+            # Tags and pull refs are named rather than swept into the counter:
+            # `--heads` should exclude them, but a server that sends them anyway
+            # is not a format change and must not freeze the class.
+            unparsed += 1
+    if unparsed:
+        return {"error": f"ls-remote: {unparsed} unparseable ref line(s)"}
     # On top of the class-wide resolve that `_refuse_empty` describes, an empty
     # set fails a second way here: it reclassifies EVERY branch as never-pushed,
     # and class is part of a finding's identity, so it forks rows instead of
     # correcting them.
-    if err := _refuse_empty("ls-remote", heads):
+    if err := _refuse_empty("ls-remote", heads, raw=out):
         return err
     return {"heads": heads}
 
@@ -300,32 +395,148 @@ async def is_ancestor(
     return None
 
 
-async def count_non_merge_commits(
+async def count_unique_work_commits(
     root: str, exclude: str, include: str, *, runner: Runner | None = None
 ) -> int | None:
-    """Commits in *include* but not *exclude*, ignoring merges. None if unknown.
+    """Commits in *include* but not *exclude* that hold work existing nowhere
+    else. ``None`` if unknown.
 
-    The merge commits are excluded because they carry no unique work: a branch
-    whose only local-only commits are merges of the base branch has diverged by
-    ancestry while holding nothing that exists nowhere else, and flagging it
-    would be noise sitting on top of a real signal. A count of 0 therefore
-    means "diverged, but every distinct commit is already on the remote".
+    Routine catch-up merges are excluded, because a branch whose only local-only
+    commits are merges of the base has diverged by ancestry while holding
+    nothing unique, and flagging it would be noise on top of a real signal. A
+    count of 0 means "diverged, but every distinct change is already on the
+    remote", and the caller turns that into ``PUSH_BEHIND`` — i.e. SUPPRESSES
+    the finding. That is why what counts as "unique" has to be exactly right.
+
+    **A CONFLICT-RESOLVED merge is unique work, and excluding it UNDERCOUNTS.**
+    An earlier version ran ``rev-list --count --no-merges`` and its docstring
+    asserted that "merge commits carry no unique work". That is true of an
+    auto-merge and FALSE of a resolution: the resolved tree exists in neither
+    parent, so the change is real and lives only here (Codex P1, PR #1794).
+
+    **Scoped honestly against the report's stronger claim.** Codex described the
+    consequence as a SUPPRESSION — a branch whose only local-only commit is such
+    a merge counts 0, is labelled ``PUSH_BEHIND``, and vanishes. That specific
+    outcome could not be constructed: for the range to hold only a merge, BOTH
+    its parents must already be on the remote, and merging an already-merged
+    branch produces no conflict to resolve. Every range reachable here that
+    contains a resolved merge also contains the merged-in commits, so the
+    classification stays ``PUSH_DIVERGED``.
+    What IS reachable, and what this fix is for, is the COUNT: ``local_only``
+    is reported to a human as "commits that exist nowhere else", and it silently
+    understated that number by one per resolved merge. A wrong number under a
+    true classification is still a wrong number, and this subsystem's whole
+    claim is that its counts can be checked.
+
+    MEASURED on this repository when that was fixed: of 23 recent merge commits,
+    **3 (13%) carry a non-empty combined diff** — content present in neither
+    parent. Not a hypothetical, and more likely here than elsewhere because this
+    repo cannot rebase (a history-rewriting publish is hard-blocked), so
+    branches catch up by merging and every conflict resolved that way lands in a
+    merge commit.
+
+    The discriminator is git's own combined diff (``--cc``), which by
+    construction shows only hunks differing from EVERY parent. Empty combined
+    diff = the merge contributed nothing of its own; non-empty = it did.
     """
     if not (_is_sha(exclude) and _is_sha(include)):
-        logger.warning("zero_drop count_non_merge_commits refused a non-SHA argument")
+        logger.warning("zero_drop count_unique_work_commits refused a non-SHA argument")
         return None
     run = runner or default_runner
+    rng = f"{exclude}..{include}"
+
     rc, out, err = await run(
-        _git(root, "rev-list", "--count", "--no-merges", f"{exclude}..{include}"),
+        _git(root, "rev-list", "--count", "--no-merges", rng),
         ANCESTRY_TIMEOUT_S,
     )
     if rc != 0:
         logger.debug("zero_drop rev-list failed (rc=%s): %s", rc, err.strip()[:200])
         return None
     try:
-        return int(out.strip())
+        total = int(out.strip())
     except ValueError:
         return None
+
+    # NUL-separated records so a commit subject can never be confused for a
+    # diff line, and `%x00%H` so each record starts with its object name.
+    #
+    # `log.showSignature` is neutralised deliberately. The predicate below asks
+    # "is this record's body non-empty", so anything else git may print into
+    # that body is indistinguishable from merge content — and in a repository
+    # that signs its commits, this config makes git emit signature-verification
+    # lines for every commit shown. Left ambient, every signed merge would read
+    # as unique work. `-c` here rather than in `_git` because it is this one
+    # reader's requirement, not a property every git call in the module needs.
+    rc, out, err = await run(
+        _git(
+            root,
+            "-c",
+            "log.showSignature=false",
+            # `diff.context` is PINNED because the predicate below reads hunk
+            # GROUPING, and the context width is what decides where one hunk
+            # ends and the next begins. MEASURED on git 2.43 over this
+            # repository's 36 merges: the same command counts 6 / 7 / 8 merges
+            # as carrying unique work at context 0 / 3 / 10. One constructed
+            # merge makes the mechanism plain — two parents each adding a
+            # different line a line apart, the merge keeping BOTH: at context 3
+            # that is ONE hunk matching neither parent (shown, counted); at
+            # context 0 it splits into two hunks that each match one parent,
+            # both suppressed as uninteresting, and the merge vanishes.
+            # Git's default is 3; the value only has to be STABLE, not special.
+            # What must not happen is a repo-level or user-level setting
+            # silently retuning a number this detector publishes.
+            "-c",
+            "diff.context=3",
+            "log",
+            "--merges",
+            "--cc",
+            "--format=%x00%H",
+            rng,
+        ),
+        ANCESTRY_TIMEOUT_S,
+    )
+    if rc != 0:
+        # The merge leg is the half that PREVENTS a suppression, so failing it
+        # must not silently fall back to the old, wrong number. Unknown, not 0.
+        logger.debug("zero_drop merge-diff scan failed (rc=%s): %s", rc, err.strip()[:200])
+        return None
+
+    for record in out.split("\0")[1:]:
+        # Split at the FIRST NEWLINE rather than a fixed object-name width. The
+        # width is the repository's hash format — 40 hex for SHA-1, 64 for
+        # SHA-256 — so a hardcoded slice leaves object-name digits in the body
+        # of a SHA-256 repository, where they read as content.
+        _, _, body = record.partition("\n")
+        # `--cc` suppresses a hunk whose "contents in the parents have only two
+        # variants and the merge result picks one of them without modification"
+        # (git-diff-tree(1), verbatim). For a two-parent merge that is exactly
+        # "the result matched NEITHER parent here", so a non-empty body IS the
+        # definition of "this merge contributed something of its own".
+        #
+        # The property is HUNK-level, not LINE-level, and the difference is a
+        # trap worth naming because a reviewer fell into it. A merge that keeps
+        # BOTH parents' additions has a hunk matching neither parent — real
+        # content living only on this branch — while EVERY LINE in it came from
+        # one parent or the other, so no line carries a mark in both combined-
+        # diff columns. MEASURED on this repository: 5 of the 7 merges counted
+        # here are that shape. Testing the columns instead would silently stop
+        # counting them, which is the SUPPRESSING direction.
+        #
+        # The one shape this over-counts is an OCTOPUS merge, where "only two
+        # variants" can fail with three or more parents, so a hunk may be shown
+        # that does match one parent. Over-count is the safe direction for a
+        # detector and octopus merges are vanishingly rare here (0 of 36).
+        #
+        # Ask the question directly rather than inspecting the
+        # body's shape: the previous form scanned for a line starting `+` or
+        # `-` and therefore missed a hand-resolved BINARY conflict, whose
+        # entire combined diff is the line `Binary files differ` (MEASURED on
+        # git 2.43). The branch was then counted at zero and suppressed as
+        # PUSH_BEHIND — the false-clean this function exists to prevent,
+        # arriving through the one door the text-conflict fix left open.
+        if body.strip():
+            total += 1
+    return total
 
 
 async def list_worktrees(root: str, *, runner: Runner | None = None) -> dict:
@@ -344,13 +555,22 @@ async def list_worktrees(root: str, *, runner: Runner | None = None) -> dict:
     holds no uncommitted work; the caller skips it and counts it.
     """
     run = runner or default_runner
-    rc, out, err = await run(_git(root, "worktree", "list", "--porcelain"), REF_SWEEP_TIMEOUT_S)
+    # `-z` for the same reason `status` uses it: a worktree path may legally
+    # contain a NEWLINE, and the line-oriented porcelain would then split one
+    # record into two — yielding a truncated path that resolves to nothing and a
+    # phantom remainder. VERIFIED against git 2.43: `-z` NUL-TERMINATES each
+    # attribute and separates records with an empty field, so the branch tests
+    # below are unchanged and an empty field falls through all of them without
+    # counting as unparsed (Codex P2, PR #1794).
+    rc, out, err = await run(
+        _git(root, "worktree", "list", "--porcelain", "-z"), REF_SWEEP_TIMEOUT_S
+    )
     if rc != 0:
         return {"error": f"worktree list failed (rc={rc}): {err.strip()[:300]}"}
     worktrees: list[dict] = []
     current: dict = {}
     unparsed = 0
-    for line in out.splitlines():
+    for line in out.split("\0"):
         if line.startswith("worktree "):
             if current.get("path"):
                 worktrees.append(current)
@@ -378,8 +598,44 @@ async def list_worktrees(root: str, *, runner: Runner | None = None) -> dict:
         worktrees.append(current)
     if unparsed:
         return {"error": f"worktree list: {unparsed} unrecognised record line(s)"}
-    if err := _refuse_empty("worktree list", worktrees):
-        return err
+    if not worktrees:
+        # NOT `_refuse_empty`, and the difference is the whole point of that
+        # helper's split. For the two ref enumerators an empty OUTPUT is a true
+        # observation — an unborn repo, a cleared remote — so they accept it.
+        # Here it cannot be: `git worktree list` always names the main worktree
+        # of any repository it can read at all, so nothing parsed means the
+        # output is not what we think it is, whether it was empty or garbage.
+        # Stated locally rather than borrowed, because the reason is this
+        # command's, not the shared guard's.
+        return {
+            "error": (
+                "worktree list returned no records (rc=0) — the main worktree is "
+                "always listed, so an empty parse means the output is unreadable"
+            )
+        }
+    # Stamped HERE, over the whole listing, because it is a fact about the
+    # listing rather than a judgement about any one worktree — and because the
+    # two consumers see different subsets of it. `git worktree add --force`
+    # checks out a branch already checked out elsewhere, and the classifier
+    # keys a finding on the branch, so two such worktrees would collapse onto
+    # one identity and one of them could never be acknowledged. Computing the
+    # duplicate set at each consumer instead would let the worker's HOLD path
+    # (which sees prunable and unreadable worktrees) and the classifier (which
+    # does not) disagree about which branches are duplicated — a hold key that
+    # matches no finding, which fails silently in the resolve direction.
+    #
+    # The cost of one population, stated rather than left to be found: a
+    # PRUNABLE registration still counts, so a live worktree can be
+    # discriminated because of a sibling whose directory no longer exists, and
+    # un-discriminated again once that registration is pruned. Both transitions
+    # are visible ones — the row re-opens immediately — and the alternative,
+    # two populations that must agree, fails silently instead.
+    seen: dict[str, int] = {}
+    for wt in worktrees:
+        if wt["branch"]:
+            seen[wt["branch"]] = seen.get(wt["branch"], 0) + 1
+    for wt in worktrees:
+        wt["branch_duplicated"] = bool(wt["branch"]) and seen[wt["branch"]] > 1
     return {"worktrees": worktrees}
 
 
@@ -426,9 +682,29 @@ async def worktree_status(path: str, *, runner: Runner | None = None) -> dict:
     Untracked files count. An untracked source file IS stranded work — the
     exact shape of "I wrote it and never added it" — and this repo gitignores
     its build/temp output, so the noise floor is low.
+
+    **``--untracked-files=all`` is load-bearing, not a default made explicit.**
+    Under git's default (``normal``) an untracked DIRECTORY collapses to a
+    single ``?? dir/`` entry, so nothing about its contents reaches the caller.
+    The dirty-state key is derived from these entries, and an ack is keyed to
+    that state — so adding a whole new file inside an already-untracked
+    directory left the key BYTE-IDENTICAL and the acknowledgement went on
+    suppressing work it was never granted against (Codex P1, PR #1794).
+    DEMONSTRATED: with two files under an untracked `somedir/`, default mode
+    printed `?? somedir/` before and after editing a child AND adding a third
+    file; `-uall` listed each child and gained the new one.
+    It also makes the sentence above true — under the default, "an untracked
+    source file" inside a new directory was exactly what could NOT be seen.
+    Cost MEASURED across 14 real worktrees on this install: identical entry
+    counts either way (delta 0), because the build/temp output is gitignored. A
+    clone where it is not is bounded by ``STATUS_TIMEOUT_S``, and a timeout
+    degrades the class to HELD rather than clean.
     """
     run = runner or default_runner
-    rc, out, err = await run(_git(path, "status", "--porcelain", "-z"), STATUS_TIMEOUT_S)
+    rc, out, err = await run(
+        _git(path, "status", "--porcelain", "-z", "--untracked-files=all"),
+        STATUS_TIMEOUT_S,
+    )
     if rc != 0:
         return {"error": f"status failed (rc={rc}): {err.strip()[:200]}"}
     entries, unparsed = parse_status_z(out)
