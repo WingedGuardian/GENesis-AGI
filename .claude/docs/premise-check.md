@@ -136,6 +136,20 @@ the whole premise. Everything short of that stays in the gate and gets iterated
 on: a premise slightly off, needing modest rework a review session can carry in a
 round or two, is the ordinary case and is NOT a kick-back.
 
+**The evidence bar is TWO OR MORE independent signals**, the same bar the
+round-2 gate message states, because a doc that set a lower one would be the
+easier surface to read and would quietly undercut it. The signals: findings
+CONCENTRATING in one file or function; a finding landing on a line THIS change
+added in an earlier round; the diff GROWING across rounds instead of shrinking.
+One alone is an ordinary local defect wearing an architectural shape — findings
+concentrate in any large parser, and that on its own says nothing. **Short of
+two, the answer is the class-level audit, not a hand-back.**
+
+(That sentence exists because its absence was found by a reviewer, not by me: I
+fixed the one-signal wording in the gate's message and left this document — the
+one the message points at — still saying it. Second instance of a two-instance
+class, which is the defect shape this whole PR is otherwise about.)
+
 Two failure modes, and the second is worse than the first:
 
 1. Kicking back too much. The gate stops working with the author, and the goal is to

@@ -1236,6 +1236,30 @@ def test_mode_switch_states_the_evidence_bar_for_handing_back(repo, home):
     assert re.search(r"Short of two[,\s]+it is \(B\)", err), err
 
 
+def test_the_premise_check_DOC_states_the_same_two_signal_bar():
+    """The gate message and the doc it points at must set the SAME bar.
+
+    This is the lock on a two-instance class whose second instance a reviewer
+    found, not this suite: the message above was corrected to TWO OR MORE, and
+    `.claude/docs/premise-check.md` — the document that message directs the
+    reader to — was left stating the one-signal version. A doc that sets a lower
+    bar than the gate is the easier surface to read, so it wins in practice.
+
+    Asserted on the DOC rather than by diffing the two texts: they are written
+    for different readers and should not be byte-identical. What must not drift
+    is the bar itself and the fallback short of it.
+    """
+    doc = (
+        Path(__file__).resolve().parents[2] / ".claude" / "docs" / "premise-check.md"
+    ).read_text()
+    assert "TWO OR MORE" in doc, "the doc must state the same evidence bar as the gate message"
+    assert re.search(r"[Ss]hort of\s+two", doc), (
+        "the doc must state the fallback short of that bar, or a single signal "
+        "silently reads as sufficient for a hand-back"
+    )
+    assert "class-level audit" in doc, "…and name what that fallback IS"
+
+
 def test_escalation_cap_names_handing_back_FIRST(repo, home):
     """At the cap, option (a) must be hand-back — not another way to keep going.
 
