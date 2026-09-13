@@ -103,6 +103,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import hashlib
 import json
 import os
 import subprocess
@@ -255,8 +256,12 @@ _SUBMODULE_RECURSE_FALSE = frozenset({"false", "0", "no", "off"})
 # whether to add a block. Count the BROAD ones — a directory-scoped checkout is
 # recorded too (same verb class, worth seeing) and is not the incident:
 #   cat "${GENESIS_DISCARD_SNAPSHOT_DIR:-$HOME/.genesis/git_discard_snapshots}"/*.jsonl \
-#     | jq -r 'select(.tree_rewind and .broad) | .ts + " " + (.cwd // "unknown")' \
-#     | sort -u | wc -l
+#     | jq -r 'select(.tree_rewind and .broad) | .event' | sort -u | wc -l
+# Dedup on `event`, not ts+cwd: whole-second timestamps collapse two
+# different-source rewinds of one repo in the same second, and split one
+# command counted by both wirings across a second boundary — measured wrong in
+# both directions. `event` digests (source, cwd, command), so the two wirings
+# agree and distinct in-payload events differ.
 # The store is a DIRECTORY of one file per snapshot, not a single file. This recipe
 # named `~/.genesis/git_discard_snapshots.jsonl` until adversarial review measured
 # it: that path is the pre-existing legacy file which `_snapshot_dir` deliberately
@@ -382,17 +387,33 @@ def _snapshot_dir() -> str:
 
 def _segment_cwd(seg, payload: dict) -> str | None:
     """DELIBERATELY simple cwd model for the best-effort snapshot: the payload
-    cwd, adjusted by a leading ``git -C <dir>`` on this segment. No cd-chain
-    walking, no --git-dir modeling — a shape this misses yields a missed
-    snapshot (status quo), never a block (see DOCUMENTED RESIDUALS)."""
+    cwd, adjusted by the leading ``git -C <dir>`` options on this segment. No
+    cd-chain walking, no --git-dir modeling — a shape this misses yields a missed
+    snapshot (status quo), never a block (see DOCUMENTED RESIDUALS).
+
+    ALL leading ``-C`` operands are folded, composing left to right, because git
+    documents each subsequent relative ``-C`` as interpreted relative to the one
+    before it. The first version returned at the FIRST ``-C``, which was harmless
+    while the note carried no repo-specific sha — but once each rewind note began
+    advertising ITS OWN repo's snapshot, ``git -C outer -C inner checkout <c> -- .``
+    rewound outer/inner while the note offered OUTER's sha: a recovery command
+    that does not even resolve where the reader would run it, which is the exact
+    false-promise class the per-repo association was built to end (Codex P2,
+    round 2). MEASURED before: ``/base/outer``; after: ``/base/outer/inner``."""
     base = payload.get("cwd") or os.getcwd()
     argv = seg.argv
-    for i, tok in enumerate(argv[1:], start=1):
+    resolved = base
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
         if tok == "-C" and i + 1 < len(argv):
-            return os.path.normpath(os.path.join(base, argv[i + 1]))
+            resolved = os.path.normpath(os.path.join(resolved, argv[i + 1]))
+            i += 2
+            continue
         if not tok.startswith("-"):
-            break  # subcommand reached — no leading -C
-    return base
+            break  # subcommand reached — no more leading -C
+        i += 1
+    return resolved
 
 
 def _snapshot_worktree(cwd: str, timeout: float = _GIT_TIMEOUT_S) -> str | None:
@@ -722,13 +743,30 @@ def _rewind_verb_and_operands(argv: list[str]) -> tuple[str, list[str], list[str
     operands: list[str] = []
     options: list[str] = []
     j = i + 1
+    pathspec_mode = False
     while j < len(argv):
         tok = argv[j]
+        if pathspec_mode:
+            # After `--`, git reads EVERY token as a pathspec — including ones
+            # spelled like options. Without this, a file named `-b` after the
+            # separator read as branch-creation and suppressed the warning, and
+            # `git restore -- --source=old .` (an index restore of a file named
+            # `--source=old`) reported `old` as a rewind source — false evidence
+            # in the log whose purpose is deciding whether this becomes a block
+            # (Codex P2, round 2).
+            operands.append(tok)
+            j += 1
+            continue
+        if tok == "--":
+            pathspec_mode = True
+            operands.append(tok)
+            j += 1
+            continue
         if tok in with_arg:
             options.append(tok)
             j += 2  # the option AND its value
             continue
-        if tok.startswith("-") and tok != "-" and tok != "--":
+        if tok.startswith("-") and tok != "-":
             options.append(tok)
             j += 1
             continue
@@ -759,7 +797,20 @@ def _writes_the_worktree(argv: list[str], verb: str) -> bool:
     a missed one costs the silent reversion this guard was built for.
     """
     if verb == "read-tree":
+        # `-n/--dry-run` reports and changes nothing — MEASURED on git 2.43:
+        # `git read-tree -n -u --reset <old>` exits 0 with worktree AND index
+        # untouched, yet it warned and wrote `broad: true` recurrence evidence
+        # (Codex P2, round 2).
+        if {"-n", "--dry-run"} & set(argv):
+            return False
         return "-u" in argv
+    if verb in ("checkout", "restore") and {"-p", "--patch"} & set(argv):
+        # Patch mode is an INTERACTIVE hunk picker: nothing is written until a
+        # human selects hunks, and a session-driven Bash tool has no interactive
+        # stdin to select them with. The silent-revert shape this note hunts is
+        # precisely the non-interactive one, so warning here is only false
+        # recurrence evidence (Codex P2, round 2).
+        return False
     if verb == "restore":
         staged = {"-S", "--staged"} & set(argv)
         worktree = {"-W", "--worktree"} & set(argv)
@@ -810,6 +861,10 @@ def _rewind_source(argv: list[str], verb: str) -> str | None:
     """
     if verb == "restore":
         for i, tok in enumerate(argv):
+            if tok == "--":
+                # Everything after the separator is a pathspec, so a token
+                # spelled `--source=X` there is a FILENAME, not the option.
+                return None
             if tok.startswith("--source="):
                 return _as_commitish(tok.split("=", 1)[1])
             if tok in ("-s", "--source") and i + 1 < len(argv):
@@ -831,6 +886,16 @@ def _rewind_source(argv: list[str], verb: str) -> str | None:
         # to the VERB's options, never the whole argv: git's global `-C <dir>` shares
         # a spelling with switch's `-C`.
         return None
+    if verb == "read-tree":
+        # read-tree takes UP TO THREE trees and the RESULT content comes from the
+        # last one, so `HEAD` in first position is not the "put things back how
+        # they are" no-op it is for checkout. MEASURED on git 2.43: with a clean,
+        # refreshed index `git read-tree -m -u HEAD <old>` succeeds and rewinds
+        # the worktree to <old> — and a clean tree is the likeliest setting for
+        # the incident this note exists for. Reading the FIRST operand stopped at
+        # HEAD and stayed silent (Codex P2, round 2).
+        trees = [t for t in resolved[1] if t != "--"]
+        return _as_commitish(trees[-1]) if trees else None
     for tok in resolved[1]:
         if tok == "--":
             return None  # `git checkout -- .` — no source, a plain local discard
@@ -866,7 +931,16 @@ def _rewrites_whole_tree(argv: list[str], verb: str) -> bool:
     if not _writes_the_worktree(argv, verb):
         return False
     if verb == "read-tree":
-        return True  # no pathspec at all; `-u` already established the worktree write
+        # `--prefix <dir>/` reads the tree UNDER that subdirectory — MEASURED on
+        # git 2.43: `git read-tree --prefix=sub/new/ -u <old>` creates sub/new/
+        # and touches nothing else. Same verb class, worth a note, but recording
+        # it `broad: true` pollutes the very count meant to separate
+        # repository-wide incidents from directory-scoped work.
+        # Checked on argv directly: read-tree takes no pathspec, so there is no
+        # `--` section where this spelling could be a filename instead.
+        # (`-u` already established the worktree write; no pathspec exists here,
+        # so "broad" is the default and --prefix is the one scoping spelling.)
+        return not any(t == "--prefix" or t.startswith("--prefix=") for t in argv)
     # Scan every operand after the verb rather than only those following the
     # source token. Locating the source by VALUE (`argv.index(source)`) silently
     # fails for the attached spelling `--source=<sha>`, where the sha is not a
@@ -1164,12 +1238,27 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
         if (source, rewind_cwd) in logged_events:
             continue
         logged_events.add((source, rewind_cwd))
+        # `event` is the row's DEDUP identity, because ts+cwd was measured wrong
+        # in both directions (Codex P2, round 2): whole-second timestamps collapse
+        # two different-source rewinds of one repo landing in the same second,
+        # and split ONE command counted by both hook wirings across a second
+        # boundary. A digest of (source, cwd, command) is identical for the two
+        # wirings' processes — they read the same payload — and distinct for
+        # distinct in-payload events. A deliberate retry of the IDENTICAL command
+        # after reading the note also collapses into one event, which is the
+        # right answer for a count of intents. The command contributes only as a
+        # DIGEST: the metadata-only rule stands, a Bash payload can carry
+        # credentials, and sixteen hex of sha256 reverses to nothing.
+        event = hashlib.sha256(
+            f"{source}\x00{rewind_cwd or ''}\x00{cmd}".encode()
+        ).hexdigest()[:16]
         _write_log_row(
             {
                 "ts": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
                 "cwd": rewind_cwd,
                 "tree_rewind": True,
                 "broad": broad,
+                "event": event,
                 "snapshot": sha_by_cwd.get(rewind_cwd or ""),
             }
         )
@@ -1177,13 +1266,24 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
     # never a sha borrowed from another repo in the same compound. Only for
     # sources the author has not already acknowledged with the override.
     seen_rewinds: set[tuple[str, str | None]] = set()
+    warnings: list[str] = []
     for source, overridden, rewind_cwd, _broad in rewinds:
         if overridden or (source, rewind_cwd) in seen_rewinds:
             continue
         seen_rewinds.add((source, rewind_cwd))
-        notes.append(_tree_rewind_note(source, rewind_cwd, sha_by_cwd.get(rewind_cwd or "")))
+        warnings.append(_tree_rewind_note(source, rewind_cwd, sha_by_cwd.get(rewind_cwd or "")))
+    # WARNINGS GO FIRST, and this ordering is load-bearing, not presentation.
+    # `_fit_whole_notes` keeps a PREFIX, so whatever is appended last is what a
+    # tight budget drops — and rewind warnings were appended after the routine
+    # snapshot notes. MEASURED (Codex P1, round 2): 20 dirty repos + 3 rewinds
+    # kept 13 routine notes and ZERO rewind warnings — the model saw ordinary
+    # recovery furniture and never learned merged work was reverted, which is
+    # the pre-change failure this feature exists to end. Ordering also decides
+    # what an omission COSTS: a dropped snapshot note's content (cwd + sha) is
+    # in the snapshot log the remainder line points at; a dropped rewind
+    # warning is recorded nowhere else.
     if budget_hit:
-        notes.append(
+        warnings.append(
             "[git-discard-guard] NOTE: hit the ~"
             f"{_TOTAL_SNAPSHOT_BUDGET_S:.0f}s snapshot budget — one or more later "
             "repos in this compound were NOT snapshotted. Run a single git "
@@ -1199,12 +1299,12 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
         # and the wording it left on the live path implied repositories that cannot
         # exist. Defensive phrasing against an impossible state is not caution, it is
         # a false claim with a conditional in front of it.
-        notes.append(
+        warnings.append(
             f"[git-discard-guard] no recovery snapshot was recorded at all: this "
             f"command {blind.cause}, so the guard could not tell which "
             f"repositories it touches. To get the missing snapshots: {blind.hint}."
         )
-    return notes
+    return warnings + notes
 
 
 def _emit_additional_context(notes: list[str]) -> None:
@@ -1281,11 +1381,22 @@ def _fit_whole_notes(notes: list[str], budget: int) -> list[str]:
         "within the hook output cap — read the snapshot log for their recovery "
         f"shas: {where}"
     )
-    reserve = hook_output.emit_cost(remainder.format(n=len(notes)))
+    def _cost(text: str) -> int:
+        # The SERIALISED cost, not the raw one. The payload ships through
+        # `json.dumps`, where a quote or backslash becomes two characters and a
+        # control character six — MEASURED (Codex P2, round 2): a note whose cwd
+        # carried JSON metacharacters cost 1,461 raw and 1,895 serialised, so
+        # raw-cost selection approved "complete" notes the writer then cut
+        # mid-note, removing exactly the recovery sha this selector exists to
+        # protect. `json.dumps(text)[1:-1]` is the string's own wire form; +2
+        # charges the escaped "\n" that joins it to its neighbour.
+        return hook_output.emit_cost(json.dumps(text)[1:-1]) + 2
+
+    reserve = _cost(remainder.format(n=len(notes)))
     kept: list[str] = []
     used = 0
     for note in notes:
-        cost = hook_output.emit_cost(note)
+        cost = _cost(note)
         # Reserve room for the remainder line only while notes actually remain.
         floor = 0 if len(kept) + 1 == len(notes) else reserve
         if used + cost > budget - floor:

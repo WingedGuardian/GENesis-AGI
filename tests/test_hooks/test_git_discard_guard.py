@@ -1145,6 +1145,22 @@ _OLD = "0" * 40
         # `--reset` alone loads the INDEX; `-u` is what writes the worktree.
         ("read-tree index-only", f"git read-tree --reset {_OLD}", False),
         ("read-tree worktree", f"git read-tree --reset -u {_OLD}", True),
+        # `-n/--dry-run` reports and changes nothing — measured rc=0, worktree AND
+        # index untouched, yet it used to warn and write broad:true evidence.
+        ("read-tree dry-run", f"git read-tree -n -u --reset {_OLD}", False),
+        # `--prefix <dir>/` reads the tree UNDER that subdirectory — measured: it
+        # creates sub/new/ and touches nothing else. Scoped, so no whole-tree note.
+        ("read-tree scoped by --prefix", f"git read-tree --prefix=sub/new/ -u {_OLD}", False),
+        # read-tree's RESULT comes from its LAST tree, so HEAD in first position is
+        # not the harmless "put things back" it is for checkout — measured: with a
+        # clean refreshed index `-m -u HEAD <old>` succeeds and rewinds to <old>.
+        ("read-tree two-tree form", f"git read-tree -m -u HEAD {_OLD}", True),
+        # Interactive hunk-picking writes nothing until a human selects hunks, and
+        # a session-driven Bash tool has no interactive stdin to select them with.
+        ("checkout patch mode", f"git checkout -p {_OLD} -- .", False),
+        ("restore patch mode", f"git restore -p --source={_OLD} .", False),
+        # After `--` every token is a pathspec — `--source=old` there is a FILE.
+        ("restore of a file named --source=old", "git restore -- --source=old .", False),
         # `-S/--staged` restores the index; `-W/--worktree` is the default when
         # neither is given.
         ("restore staged-only", f"git restore --staged --source={_OLD} .", False),
@@ -1178,7 +1194,6 @@ def test_the_rewind_predicate_over_real_git_spellings(label, cmd, fires):
         # whole point of the note, so a confidently wrong name is worse than the
         # generic note it replaced.
         ("--index-output <file>", f"git read-tree --reset -u --index-output tmpidx {_OLD}"),
-        ("--prefix <dir>/", f"git read-tree --reset -u --prefix sub/ {_OLD}"),
         (
             "--exclude-per-directory <file>",
             f"git read-tree --reset -u --exclude-per-directory .gitignore {_OLD}",
@@ -1525,6 +1540,65 @@ def test_the_positive_control_an_intact_tree_allows_a_dry_run_clean(tmp_path):
     )
 
 
+def test_rewind_warnings_come_BEFORE_routine_snapshot_notes(
+    two_repos, snap_log, monkeypatch, capsys
+):
+    """Ordering is load-bearing, not presentation: the bound keeps a PREFIX.
+
+    Rewind warnings were appended after the routine snapshot notes, so a tight
+    budget kept the furniture and dropped the warnings — MEASURED (Codex P1,
+    round 2): 20 dirty repos + 3 rewinds kept 13 routine notes and ZERO rewind
+    warnings, recreating the pre-change failure where the model never learns
+    merged work was reverted. Ordering also decides what an omission costs: a
+    dropped snapshot note's content (cwd + sha) is in the snapshot log the
+    remainder line points at; a dropped rewind warning is recorded nowhere else.
+
+    Pinned at the emit level with two repos — the prefix-retention property is
+    already pinned separately, and prefix-retention plus warnings-first is what
+    closes the P1, so this does not need twenty repositories to prove it.
+    """
+    a, b, b_old = two_repos
+    cmd = f"git -C {a} checkout -- tracked.py && git -C {b} checkout {b_old} -- ."
+    monkeypatch.setattr(
+        _gd, "read_payload", lambda: {"tool_input": {"command": cmd}, "cwd": str(a.parent)}
+    )
+    assert _gd.main() == 0
+    ctx = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
+    first = ctx.splitlines()[0]
+    assert "WHOLE-TREE REWIND" in first, (
+        f"the rewind warning must be the FIRST note, not appended after the "
+        f"routine ones. First line was: {first[:120]!r}"
+    )
+    assert "snapshotted the worktree" in ctx, (
+        "control: the routine notes must still be there — ordering, not omission"
+    )
+
+
+def test_notes_are_sized_by_their_SERIALIZED_cost(capsys):
+    """The payload ships through json.dumps, so raw length under-counts.
+
+    A quote or backslash becomes two characters and a control character six —
+    MEASURED (Codex P2, round 2): a note whose cwd carried JSON metacharacters
+    cost 1,461 raw and 1,895 serialised, so raw-cost selection approved
+    "complete" notes the writer then cut mid-note, removing exactly the recovery
+    sha the whole-note selector exists to protect.
+    """
+    evil_cwd = "/" + '"\\\\' * 60 + "路径" * 30
+    note = _gd._tree_rewind_note("a" * 40, evil_cwd, "b" * 40)
+    out = _emit([note] * 12, capsys)
+    assert len(out) <= _gd.hook_output.HOOK_STDOUT_CAP
+    ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+    assert "cap]" not in ctx, (
+        "the writer's trim marker fired, so selection approved notes whose "
+        "serialised cost did not fit — a mid-note cut one layer down"
+    )
+    started = ctx.count("WHOLE-TREE REWIND")
+    finished = ctx.count("DELETED restored by the rewind.")
+    assert started == finished and started > 0, (
+        f"{started} notes started, {finished} finished — a metachar-heavy note was amputated"
+    )
+
+
 # ── the tripwire: recurrence must be COUNTABLE, not argued ───────────────────
 # The owner's decision (2026-09-06) was "loud note now, block if it recurs". That
 # only means something if recurrence can be measured, so every match writes a
@@ -1549,7 +1623,12 @@ def test_the_log_row_stays_metadata_only(repo, snap_log, monkeypatch, capsys):
     old = _git(repo, "rev-parse", "HEAD").strip()
     _rewind_ctx(f"git checkout {old} -- .", repo, monkeypatch, capsys)
     assert set(_snapshot_rows(snap_log)[-1]) == {"ts", "cwd", "sha"}
-    assert set(_rewind_rows(snap_log)[-1]) == {"ts", "cwd", "tree_rewind", "broad", "snapshot"}
+    row = _rewind_rows(snap_log)[-1]
+    assert set(row) == {"ts", "cwd", "tree_rewind", "broad", "event", "snapshot"}
+    assert re.fullmatch(r"[0-9a-f]{16}", row["event"]), (
+        "the event identity must be a DIGEST — sixteen hex reverses to nothing, "
+        "where any fragment of the command could carry a credential"
+    )
     assert old not in json.dumps(_rows(snap_log))
 
 
