@@ -1883,6 +1883,13 @@ verified: 788dd9a9 2026-09-06
   Each class reconciles inside its own SAVEPOINT, so a class that raises
   mid-DML cannot leave partial writes for the next commit on the shared
   connection to flush while the record reports that class as not applied.
+  Untrusted text reaching a MODEL: a branch identity is the ack key and is
+  emitted VERBATIM, paired with a neutralised `branch_display` and an
+  `identity_unrenderable` flag. `check-ref-format` bans control characters but
+  says nothing about the Cf category — MEASURED 2026-09-13 on git 2.43, a
+  branch name containing U+202E/U+200B/U+2066 is LEGAL — so the older
+  structural argument for emitting the key bare was false in the one direction
+  that mattered; neutralising the key itself would merge two identities.
   Surfaces: `zero_drop_status` (read-only, in the reflection allowlist —
   findings + counts + the detector's own freshness, because a stale board's
   zero is unverified rather than clean) and `zero_drop_ack(class_, branch,

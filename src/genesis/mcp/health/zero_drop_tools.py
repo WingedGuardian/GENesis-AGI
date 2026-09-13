@@ -81,13 +81,28 @@ async def _impl_zero_drop_status(db, *, now: datetime, limit: int | None = None)
     - ``branch`` is the ACK KEY. Callers pass it straight back to
       ``zero_drop_ack``, so it must round-trip byte for byte — neutralising it
       would merge two identities onto one key, which is a correctness bug worse
-      than the problem it addresses. It is safe to leave verbatim for a
-      structural reason rather than a hopeful one: git refuses to create a ref
-      name containing an ASCII control character, a space, or any of ``~^:?*[``
-      (check-ref-format), so a branch name cannot carry a newline or an escape
-      sequence. The detached-worktree identity (``@detached:<path>``) is the
-      exception the quarantine in ``classify_worktrees`` exists for — a path
-      with a control character never becomes an identity in the first place.
+      than the problem it addresses. It is therefore emitted VERBATIM, and
+      paired with ``branch_display``, which is not.
+
+      The structural argument this docstring used to make for emitting it bare
+      was FALSE, and false in the one direction that mattered. It said git
+      refuses a ref name containing a control character, a space or any of
+      ``~^:?*[`` — true — and concluded that a branch name therefore cannot
+      carry anything deceptive. It can. ``check-ref-format`` says nothing about
+      the Cf (format) category, and MEASURED 2026-09-13 on git 2.43 it ACCEPTS
+      a branch whose name contains U+202E (right-to-left override), U+200B
+      (zero-width space) or U+2066 (bidi isolate). Those render as nothing, or
+      reorder the text around them, so a crafted local ref could make the
+      branch a reader SEES differ from the key they are acknowledging — while
+      this module's own ``_safe_identity`` classifies exactly those characters
+      as unsafe (Codex P2, PR #1794).
+
+      Hence three fields rather than one: the verbatim key, a neutralised
+      ``branch_display`` safe to render, and ``identity_unrenderable`` so a
+      reader is TOLD when the two differ instead of having to notice. Not
+      quarantined the way a hostile worktree identity is — a quarantine there
+      refuses to create a key, whereas here the finding already exists and
+      dropping it would hide real stranded work to avoid an awkward name.
     - ``worktree_path`` and the ``degraded`` blob are DISPLAY, not keys.
       Nothing passes them back, and a filesystem path (unlike a ref name) may
       contain anything at all, so both are neutralised here.
@@ -124,7 +139,17 @@ async def _impl_zero_drop_status(db, *, now: datetime, limit: int | None = None)
         "findings": [
             {
                 "class": r["class"],
+                # VERBATIM: this is the value `zero_drop_ack` matches on.
                 "branch": r["branch"],
+                # SAFE TO RENDER, and never a key — `neutralise` deletes the
+                # invisible/reordering characters and defuses the row grammar,
+                # both of which merge identities if done to the key itself.
+                "branch_display": _neutralise(r["branch"]),
+                # Said out loud rather than left for a reader to spot. True
+                # means the name carries characters that do not render as
+                # themselves, so the display and the key are NOT interchangeable
+                # and only `branch` will be accepted by the ack.
+                "identity_unrenderable": _neutralise(r["branch"]) != r["branch"],
                 "status": r["status"],
                 "tip_sha": r["tip_sha"],
                 "ahead_count": r["ahead_count"],
