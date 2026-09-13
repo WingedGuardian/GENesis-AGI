@@ -36,8 +36,11 @@ FINDINGS the mark represents, and it is what decides whether the round counts:
   * ``--source external`` — a review by a non-ANTHROPIC MODEL found (or cleared) the round.
     EXTERNAL is judged by the reviewing MODEL, not the gateway: Anthropic Claude via any
     route (incl. an OpenRouter Claude route) is INTERNAL, and a Genesis internal model call
-    is never a reviewer. Approved external methods TODAY are Codex and Kimi (on .123) —
-    NOT OpenRouter. This is the only kind that counts, so it REQUIRES a review-outcome flag:
+    is never a reviewer. The approved methods are Codex plus whatever the install names
+    as its secondary reviewer — NOT OpenRouter, and never a Genesis internal model. Which
+    reviewer that is, if any, is install-local: it belongs in local config, not in a file
+    every clone receives.
+    This is the only kind that counts, so it REQUIRES a review-outcome flag:
     ``--defects`` (a new BLOCKER/SHOULD-FIX/P1/P2 → +1) or ``--clean`` (none → reset the
     streak, circuit-breaker reset-on-success).
 The ``--source`` value describes the review that produced the findings, NOT who typed

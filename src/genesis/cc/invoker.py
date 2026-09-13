@@ -48,10 +48,18 @@ logger = logging.getLogger(__name__)
 def set_oom_score_adj(pid: int, score: int = 500) -> None:
     """Set OOM score adjustment for a process.
 
-    Higher scores make the process more likely to be OOM-killed.
-    CC subprocesses get +500 so the kernel kills them before genesis-server
-    (-500) or qdrant. This is the container-side complement to the
-    host VM's cgroup OOM scoring.
+    Higher scores make the process more likely to be OOM-killed. CC subprocesses
+    get +500 so the kernel kills them before genesis-server or qdrant. This is
+    the container-side complement to the host VM's cgroup OOM scoring.
+
+    This docstring used to say genesis-server sits at ``-500``. It never did.
+    MEASURED 2026-09-08: the unit declared ``-500`` while the live process ran at
+    ``100``, because a user manager cannot lower oom_score_adj below the inherited
+    ``oom_score_adj_min`` of 0 without CAP_SYS_RESOURCE — the write fails silently.
+    The unit now declares an achievable ``100``. Only the direction this function
+    uses is actually available to us: RAISING needs no privilege, LOWERING is
+    always refused, so every rung of the kill order has to be built by pushing
+    sacrificial processes UP rather than protecting important ones DOWN.
     """
     try:
         Path(f"/proc/{pid}/oom_score_adj").write_text(str(score))

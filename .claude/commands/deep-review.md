@@ -11,8 +11,11 @@ whole loop — fix-churn and hand-rolled parsing drive the tail. See the Common 
 CLI parsing.)
 
 Note: `/deep-review` is the LOCAL pre-push adversarial pass (Claude-model reviewers). It does
-NOT replace the independent-model Codex review, which still runs on the PR and is required by the
-merge gate — the two are complementary (Codex catches cross-model blind spots). This command
+NOT replace the independent-model Codex review, which runs on the PR — automatically when the PR
+opens, and after any later push only when you comment `@codex review` (an
+owner-tunable setting that has flipped before — verify at the PR rather than
+trusting this sentence) — and is required by the
+merge gate. The two are complementary (Codex catches cross-model blind spots). This command
 clears the local commit review-depth gate; it does not certify the PR by itself.
 
 ## 1. Stage everything, then scope the FULL branch diff
@@ -38,8 +41,11 @@ which is exactly what lets Round-1 bugs through.
   ladder with per-finding `file:line` + confidence, completion status last.
 - **ALSO `genesis-security-reviewer`** when the diff touches auth, credentials/secrets,
   subprocess, SQL, path handling, external input (Telegram/dashboard/MCP), or hooks/gates.
-- Run them SEQUENTIALLY, never in parallel (standing rule — the second reviewer must see the
-  fixed code, and parallel doubles spend).
+- Run them SEQUENTIALLY, almost never in parallel on the same diff (standing rule — the second
+  reviewer must see the fixed code, and parallel doubles spend). Sequential means WAIT for a
+  running reviewer to finish; it never means killing one to start the next. The one
+  exception is an ORPHAN — its session gone, or wedged holding a slot — which is
+  ordinary cleanup once you have established that is what it is.
 
 Prime each reviewer with the RIGHT SHAPE (what a lint scan misses). Paste this into the prompt:
 
@@ -115,8 +121,9 @@ started, and neither of which the findings list will tell you about:
   (same-model) audit, so a plain `mark` is correct: it satisfies the commit review-depth gate and
   NEVER counts toward the cross-model escalation streak, whatever it found. No outcome flag is
   needed. (EXTERNAL is judged by the reviewing MODEL, not the gateway: only a non-Anthropic model —
-  Codex or Kimi on .123 (NOT OpenRouter, which is not an approved method today; and never a Genesis
-  internal model) — is marked `--source external --defects|--clean`; that alone moves the counter.)
+  Codex, or the install's configured secondary reviewer (`merge_gate.secondary_reviewer`);
+  NOT OpenRouter, and never a Genesis internal model — is marked
+  `--source external --defects|--clean`; that alone moves the counter.)
 - Run `mark` AFTER the final `git add` and BEFORE `git commit`. The evidence must be recent when
   you `mark` (its age is checked at mark time), so write-then-mark promptly. Once marked, an
   unchanged staged diff stays cleared by its diff-hash — if you restage or amend, re-mark.

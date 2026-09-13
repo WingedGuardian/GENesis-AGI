@@ -211,8 +211,8 @@ _UNWIRED_SHELL_BLOCKERS = {
 }
 
 
-def _settings_bash_hooks() -> tuple[list[Path], list[str], list[str]]:
-    """(python blockers, shell-script blockers, inline shell blockers).
+def _settings_bash_hooks() -> tuple[list[Path], list[str], list[str], list[Path]]:
+    """(python blockers, shell-script blockers, inline shell blockers, ALL python hooks).
 
     Reads ONLY the repo's own `.claude/settings.json` — deliberately. A test that
     consulted `~/.claude/settings.json` would pass or fail depending on the
@@ -220,11 +220,22 @@ def _settings_bash_hooks() -> tuple[list[Path], list[str], list[str]]:
     repo-shipped script wired only at user level (`bash_safety_hook.sh`) is
     invisible from here, which is exactly why `_UNWIRED_SHELL_BLOCKERS` names it
     by hand instead of deriving it.
+
+    The FOURTH element is unfiltered, and the distinction is load-bearing. The
+    first element keeps only hooks that can `return 2` / `sys.exit(2)`, which is
+    right for the refusal-note lock and WRONG for the ask-note lock: a hook that
+    emits only an `ask` and never a hard refusal would be filtered out by
+    construction, and that is precisely the hook most in need of the prompt note,
+    since it is all dialog. Measured today: 4 of 13 configured python Bash hooks
+    are excluded by the blocker filter, and none of them emits an ask — so the
+    hole is latent, not live. Inheriting the wrong filter is how it would stop
+    being latent without anything failing.
     """
     settings = json.loads((_REPO / ".claude" / "settings.json").read_text())
     scripts: list[Path] = []
     shell: list[str] = []
     inline: list[str] = []
+    all_python: list[Path] = []
     for entry in settings["hooks"]["PreToolUse"]:
         if entry.get("matcher") != "Bash":
             continue
@@ -232,7 +243,10 @@ def _settings_bash_hooks() -> tuple[list[Path], list[str], list[str]]:
             cmd = hook["command"]
             if m := re.search(r"genesis-hook\s+(\S+\.py)", cmd):
                 path = _REPO / "scripts" / m.group(1)
-                if path.exists() and re.search(r"return 2|sys\.exit\(2\)", path.read_text()):
+                if not path.exists():
+                    continue
+                all_python.append(path)
+                if re.search(r"return 2|sys\.exit\(2\)", path.read_text()):
                     scripts.append(path)
             elif m := re.search(r"\bbash\s+(\S+)\s*$", cmd):
                 # A `bash <script>` hook. The previous extractor matched neither
@@ -245,7 +259,7 @@ def _settings_bash_hooks() -> tuple[list[Path], list[str], list[str]]:
                         break
             elif "exit 2" in cmd:
                 inline.append("<inline bash -c in .claude/settings.json>")
-    return scripts, shell, inline
+    return scripts, shell, inline, all_python
 
 
 def _imports_helper(tree: ast.AST) -> bool:
@@ -280,7 +294,7 @@ def test_every_configured_python_bash_blocker_emits_the_note():
     one that warns without remembering prints nothing, since stdin is consumed
     once and the command can only be handed over where it is first read.
     """
-    scripts, _, _ = _settings_bash_hooks()
+    scripts, _, _, _ = _settings_bash_hooks()
     assert len(scripts) >= 9, (
         f"blocker walk went blind: found only {len(scripts)} configured python "
         "Bash blockers, so a green result here means nothing"
@@ -306,7 +320,7 @@ def test_every_unwired_shell_blocker_is_named_and_still_unwired():
     uncovered. And every NAMED entry must still lack the wiring — otherwise the
     record outlives the gap and pre-approves a regression nobody reviewed.
     """
-    _, shell, inline = _settings_bash_hooks()
+    _, shell, inline, _ = _settings_bash_hooks()
     exposed = set(shell) | set(inline)
     unnamed = exposed - set(_UNWIRED_SHELL_BLOCKERS)
     assert not unnamed, (
@@ -327,17 +341,36 @@ def test_every_unwired_shell_blocker_is_named_and_still_unwired():
 
 
 def test_every_guard_with_an_ask_path_wires_the_prompt_note():
-    """A prompt has not discarded anything yet, so it needs the other tense."""
-    ask_guards = [
-        _HOOKS / "git_push_guard.py",
-        _REPO / "scripts" / "review_enforcement_commit.py",
-    ]
-    missing = []
-    for path in ask_guards:
-        src = path.read_text()
-        assert '"permissionDecision": "ask"' in src, f"{path.name}: no ask path left"
-        if not _calls(ast.parse(src), "prompt_note"):
-            missing.append(path.name)
+    """A prompt has not discarded anything yet, so it needs the other tense.
+
+    DERIVED, not hardcoded — and that change was bought by this test firing. An
+    earlier version named git_push_guard and review_enforcement_commit directly
+    and asserted each still had an ask path. #1861 then deleted
+    `review_enforcement_commit._ask` outright (the blind-spot net now denies
+    instead of prompting), so the merge made that assertion false and the test
+    failed with "no ask path left". That was the tripwire working: it forced the
+    reconciliation instead of passing over a call to a function that no longer
+    existed.
+
+    The lesson is that the SET is not stable, so it must not be a literal. A
+    guard acquires or loses an ask path as policy changes; what must hold is the
+    conditional — IF a configured blocker can emit an ask, THEN it warns about
+    what declining costs. The floor keeps a walk that matches nothing from
+    reading as success.
+    """
+    # The UNFILTERED walk, deliberately — `scripts` keeps only hooks that can
+    # `return 2`, and a hook emitting ONLY an ask would be excluded by
+    # construction. That is the hook most in need of this note, since it is all
+    # dialog and never a hard refusal.
+    _, _, _, all_python = _settings_bash_hooks()
+    ask_guards = [p for p in all_python if '"permissionDecision": "ask"' in p.read_text()]
+    assert ask_guards, (
+        "no configured blocker emits an ask decision — either the walk is broken, "
+        "or the repo has moved away from ask verdicts entirely, in which case "
+        "prompt_note and _PROMPT_NOTE have no consumer and should be DELETED "
+        "rather than left as an unwired entry point"
+    )
+    missing = [p.name for p in ask_guards if not _calls(ast.parse(p.read_text()), "prompt_note")]
     assert not missing, missing
 
 
@@ -354,7 +387,7 @@ def test_each_guarded_import_has_a_stand_in(monkeypatch):
     """An unguarded import that fails aborts module load -> exit 1 -> CC reads a
     non-2 exit as NON-blocking -> the guarded command RUNS. Every consumer must
     therefore define the name in its except branch."""
-    scripts, _, _ = _settings_bash_hooks()
+    scripts, _, _, _ = _settings_bash_hooks()
     bad = []
     for path in scripts:
         src = path.read_text()
@@ -554,6 +587,31 @@ def test_live_an_exception_generated_refusal_still_carries_the_note(tmp_path):
     )
     assert proc.returncode == 2, (proc.returncode, proc.stderr[-400:])
     assert "ENTIRE command was discarded" in proc.stderr, proc.stderr[-600:]
+
+
+def test_live_a_refusal_from_the_extracted_gates_carries_the_note():
+    """Locks the one invariant an upstream refactor could have broken silently.
+
+    When `_main_with_note` was written, all 28 `return 2` sites were inside
+    `main`. Upstream then extracted them into `_run_merge_and_push_gates`, so
+    `main` now has ZERO of them and the wrapper's correctness rests entirely on
+    `main` returning the gate's own rc unchanged. Nothing asserted that: the
+    wrapper's other tests are string assertions over source, and the live
+    exception test exercises only the `except` branch.
+
+    This drives the real guard to a real refusal and asserts the note arrives —
+    so if a future refactor makes `main` swallow or translate the gate's code,
+    this fails instead of the note quietly vanishing from 28 sites at once.
+
+    The payload is deterministic and needs no network: requesting a Codex review
+    on an unresolvable PR target is refused by the identity check.
+    """
+    proc = _drive(
+        "scripts/hooks/git_push_guard.py",
+        'echo hi > /tmp/dw_probe && gh pr comment "$PR" --body "@codex review"',
+    )
+    assert proc.returncode == 2, (proc.returncode, proc.stdout[-300:], proc.stderr[-500:])
+    assert "ENTIRE command was discarded" in proc.stderr, proc.stderr[-700:]
 
 
 def test_live_the_ask_path_carries_the_prompt_note():
