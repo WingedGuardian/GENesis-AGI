@@ -188,18 +188,31 @@ def _pr_pipeline(*, now: datetime) -> dict:
     # belong to the previous repo — a plausible WRONG count rather than an
     # unavailable one, which is the worse of the two failures here.
     #
-    # Surfaced rather than VALIDATED against the live repository, deliberately.
-    # The cache stores `owner/name`, while the only live accessors are
-    # `env.github_user()` and `env.github_public_repo()` — and the user half is
-    # MEASURED EMPTY on this install, so a comparison would either be skipped
-    # or would mark a perfectly good cache unavailable forever. Rendering the
-    # scope lets a reader see the mismatch; asserting it would manufacture one.
+    # A count with NO scope is WITHHELD, not rendered with the scope omitted.
+    # Reporting `ok` with a number and a null repository leaves the reader a
+    # figure they cannot attribute, which is the same false-clean this part
+    # already refuses past the TTL and on future skew — the standard was
+    # applied to freshness and not to scope, and there is no reason for the
+    # two to differ.
+    #
+    # NOT validated against the LIVE repository, which is the stronger check
+    # and is unavailable here: the cache stores `owner/name`, while the live
+    # accessors expose the halves separately and `env.github_user()` is
+    # MEASURED EMPTY on this install — so an equality assertion would mark a
+    # perfectly good cache unavailable forever, converting a rare wrong count
+    # into a permanent false negative. Presence is checkable; identity is not.
+    #
+    # Consequence, stated rather than discovered: a cache written before the
+    # worker recorded `repo` reads `unavailable` until the next pulse refresh.
+    # That is the safe direction and it self-heals.
     repo = data.get("repo")
+    if not isinstance(repo, str) or not repo.strip():
+        return _unavailable("cache carries no repository scope — the count cannot be attributed")
     return {
         "status": STATUS_OK,
         "computed_at": data.get("computed_at"),
         "age_seconds": age_s,
-        "repo": repo if isinstance(repo, str) and repo else None,
+        "repo": repo,
         "open_prs": len(prs),
         # A capped fetch makes the count a FLOOR, not a measurement. Say which
         # one this is rather than leaving a reader to assume.
@@ -287,19 +300,31 @@ async def _items_by_store(db, *, gaps: dict | None = None) -> dict:
         # per-kind enumeration, and deliberately so: a fourth kind added later
         # is absorbed by a remainder and would be silently missed by a list of
         # kinds — which is the same shape as the bug this comment is about.
-        fu = await fu_crud.get_summary_counts(db, include_tabled=False)
-        # ONE statement for both totals. The first version of this asked twice
-        # and subtracted — and this connection is shared and releases its lock
-        # per database method, so a row deleted or reclassified between the two
-        # SELECTs produced a difference true at no instant, possibly NEGATIVE.
-        # That is the same autocommit-SELECT race fixed twenty lines above, in
-        # the same commit, reintroduced while fixing a different defect.
-        actionable_total, deferred = await fu_crud.get_actionable_and_deferred_totals(db)
+        # EVERY figure below comes from ONE read of this population, and that
+        # took three attempts to get right. Two separate reads were subtracted
+        # (a negative `deferred`); then the totals were unified but `by_status`
+        # was still read separately, so `unresolved` could exceed `total`. The
+        # connection is shared and releases its lock per database method, so
+        # any two SELECTs are two snapshots however close together they run —
+        # "they agree in practice" is not a property, it is a coincidence that
+        # holds until a sweep lands between them.
+        lanes = await fu_crud.get_lane_counts(db)
+        actionable = lanes[fu_crud.LANE_ACTIONABLE]
+        deferred = lanes[fu_crud.LANE_DEFERRED]
         out["follow_ups"] = {
-            "unresolved": sum(fu.get(s, 0) for s in FOLLOW_UP_OPEN_STATUSES),
-            "total": actionable_total,
-            "deferred": deferred,
-            "by_status": fu,
+            "unresolved": sum(actionable.get(s, 0) for s in FOLLOW_UP_OPEN_STATUSES),
+            "total": sum(actionable.values()),
+            # The deferred lane carries its OWN numerator and denominator. A
+            # previous version reported one scalar beside the actionable
+            # `total`, so the only denominator on screen belonged to the other
+            # population — the board read "212 of 348 (+322 deferred)", where
+            # 348 is not what 322 is out of. It also counted TERMINAL deferred
+            # rows as outstanding, which is reachable: nothing filters `kind`
+            # when a status is updated, so a tabled row can be completed and
+            # then sit in the remainder forever.
+            "deferred_open": sum(deferred.get(s, 0) for s in FOLLOW_UP_OPEN_STATUSES),
+            "deferred": sum(deferred.values()),
+            "by_status": actionable,
         }
     except Exception as exc:
         logger.warning("zero-drop view: follow-up counts failed", exc_info=True)

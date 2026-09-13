@@ -562,32 +562,57 @@ async def get_summary_counts(
     return {row[0]: row[1] for row in await cursor.fetchall()}
 
 
-async def get_actionable_and_deferred_totals(db: aiosqlite.Connection) -> tuple[int, int]:
-    """Row totals for the actionable lane and everything else, in ONE statement.
+LANE_ACTIONABLE = "actionable"
+LANE_DEFERRED = "deferred"
 
-    The caller needs both halves and they must agree. Asking twice —
-    ``get_summary_counts(include_tabled=False)`` then ``(include_tabled=True)``
-    and subtracting — reads two different snapshots: this connection is shared
-    and releases its lock per database method, so a row deleted or reclassified
-    between the two SELECTs yields a difference that was never true at any
-    instant, and can go NEGATIVE. A conditional aggregate cannot disagree with
-    itself.
 
-    Returns ``(actionable, deferred)`` where *actionable* is the ``follow_up``
-    kind — the lane work is dispatched from — and *deferred* is every other
-    kind (``tabled``, ``idea``, and anything added later). Deferred is computed
-    as the complement rather than by naming kinds, so a kind introduced next
-    year lands in it instead of vanishing from both halves.
+async def get_lane_counts(db: aiosqlite.Connection) -> dict[str, dict[str, int]]:
+    """Per-status counts for BOTH lanes of this store, from ONE statement.
+
+    Everything a caller needs to describe this store comes back together, and
+    that is the point rather than a convenience. A board assembled from several
+    reads of one population can publish figures that were never simultaneously
+    true: the connection is shared and releases its lock per database method,
+    so a row deleted or reclassified between two SELECTs yields arithmetic true
+    at no instant — ``unresolved > total``, or a negative remainder. A single
+    aggregate cannot disagree with itself.
+
+    Returns ``{lane: {status: count}}`` for exactly two lanes:
+    :data:`LANE_ACTIONABLE` (``kind = 'follow_up'`` — where work is dispatched
+    from) and :data:`LANE_DEFERRED` (every other kind). Both lanes are always
+    present, empty when they have no rows, so a caller never distinguishes
+    "no rows" from "key absent".
+
+    TWO LANES, EACH WITH ITS OWN STATUS MAP, and that shape is the fix rather
+    than an elaboration. An earlier version returned ONE status map with the
+    deferred rows folded in under a sentinel key: every caller then had to
+    strip that key before summing, the two lanes shared a single denominator
+    the second one did not belong to, and a deferred row in a terminal status
+    was silently counted as outstanding. Separate maps make the denominator of
+    each lane derivable from the lane itself, which is the property the surface
+    reading these numbers actually needs.
+
+    The deferred lane is a COMPLEMENT (``ELSE``) rather than an enumeration of
+    ``tabled``/``idea``: a kind added later lands in it automatically, where a
+    named list would drop those rows from both lanes — the exact under-count
+    this function exists to prevent. ``kind`` is NOT NULL with a CHECK
+    constraint (``db/schema/_tables.py``), so every row falls in exactly one
+    lane and none escapes both.
+
+    ``GROUP BY 1, 2`` uses ordinals deliberately. Grouping by an alias binds to
+    a real COLUMN of that name if one ever exists, which would collapse both
+    lanes into one group silently — verified on SQLite 3.45.1. Ordinals cannot
+    be shadowed.
     """
     cursor = await db.execute(
-        "SELECT "
-        "  SUM(CASE WHEN kind = 'follow_up' THEN 1 ELSE 0 END), "
-        "  SUM(CASE WHEN kind != 'follow_up' THEN 1 ELSE 0 END) "
-        "FROM follow_ups"
+        "SELECT CASE WHEN kind = 'follow_up' THEN ? ELSE ? END AS lane, "
+        "status, COUNT(*) FROM follow_ups GROUP BY 1, 2",
+        (LANE_ACTIONABLE, LANE_DEFERRED),
     )
-    row = await cursor.fetchone()
-    # SUM over zero rows is NULL, not 0.
-    return (row[0] or 0, row[1] or 0) if row else (0, 0)
+    lanes: dict[str, dict[str, int]] = {LANE_ACTIONABLE: {}, LANE_DEFERRED: {}}
+    for lane, status, count in await cursor.fetchall():
+        lanes[lane][status] = count
+    return lanes
 
 
 async def get_recent(

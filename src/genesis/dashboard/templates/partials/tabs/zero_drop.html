@@ -246,8 +246,18 @@
                                The backend gained this count and the renderer did
                                not, so the false zero was fixed in the data and
                                left in front of the reader. -->
+                          <!-- The deferred lane renders its OWN numerator and
+                               denominator. Showing a bare `+N deferred` beside
+                               the actionable total put two populations behind
+                               one denominator: "212 of 348 (+322 deferred)"
+                               invites the reading 322-of-348, which is false.
+                               Kept a scalar pair rather than an object —
+                               `x-text` on a dict renders [object Object], a
+                               consumer-side failure this panel has already
+                               hit once. -->
                           <span x-show="part.deferred" style="color:var(--color-text-secondary);"
-                                x-text="' (+' + part.deferred + ' deferred)'"></span>
+                                x-text="' (+' + part.deferred_open + ' open of '
+                                        + part.deferred + ' deferred)'"></span>
                         </span>
                       </template>
                     </div>

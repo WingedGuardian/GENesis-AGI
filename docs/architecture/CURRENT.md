@@ -1926,9 +1926,14 @@ verified: 788dd9a9 2026-09-06
   layer out), store counts (stranded work, ledger, follow-ups), owner-pending,
   and a roadmap naming what the board does NOT cover. Every count carries its
   denominator, each part degrades INDEPENDENTLY (an unreadable store cannot
-  blank the readable ones), and a source past its freshness bound WITHHOLDS its
-  count rather than rendering a stale one — the same false-clean rule the
-  detector applies to itself, one layer out. Both accounting surfaces
+  blank the readable ones), and a source past its freshness bound — or one that
+  cannot say WHICH repository it counted — WITHHOLDS its count rather than
+  rendering an unattributable or stale one; the same false-clean rule the
+  detector applies to itself, one layer out. Every figure describing one store
+  comes from ONE read of it, so two sections of a board cannot disagree about
+  the same population (`follow_ups.get_lane_counts` returns per-status
+  actionable counts and the deferred remainder together; the remainder is a
+  COMPLEMENT, so a `kind` added later is absorbed rather than dropped). Both accounting surfaces
   (`GET /api/genesis/zero-drop` + the Zero-Drop tab, and the morning report's
   Ground-Truth line) call that one assembler so they cannot disagree; the
   morning-report line is COUNTS ONLY, never a branch name, because that

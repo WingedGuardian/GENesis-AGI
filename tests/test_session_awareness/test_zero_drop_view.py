@@ -298,6 +298,7 @@ async def test_a_fresh_pr_cache_reports_its_count_AND_its_age(db, pulse_home):
         {
             "version": 1,
             "computed_at": (now - timedelta(hours=2)).isoformat(),
+            "repo": "acme/widgets",
             "prs": [{"number": 1}, {"number": 2}],
             "limit_hit": False,
         }
@@ -322,6 +323,7 @@ async def test_a_CAPPED_listing_is_reported_as_a_floor_not_a_total(db, pulse_hom
         {
             "version": 1,
             "computed_at": now.isoformat(),
+            "repo": "acme/widgets",
             "prs": [{"number": n} for n in range(50)],
             "limit_hit": True,
         }
@@ -451,7 +453,15 @@ async def test_a_FUTURE_dated_pr_cache_WITHHOLDS_its_count(db, pulse_home):
     # ago can sit a hair ahead of `now` through ordinary drift, and withholding
     # on that would be a false positive on the FRESHEST possible data.
     near = (now + FUTURE_SKEW_TOLERANCE / 2).isoformat()
-    pulse_home({"version": 1, "computed_at": near, "prs": [{"number": 1}], "limit_hit": False})
+    pulse_home(
+        {
+            "version": 1,
+            "computed_at": near,
+            "repo": "acme/widgets",
+            "prs": [{"number": 1}],
+            "limit_hit": False,
+        }
+    )
 
     ok = (await V.build_view(db, now=now))["pr_pipeline"]
     assert ok["status"] == V.STATUS_OK, f"drift inside the tolerance is not a wedged writer: {ok}"
@@ -532,55 +542,6 @@ async def test_DEFERRED_follow_ups_are_reported_not_silently_dropped(db, pulse_h
     )
 
 
-async def test_both_follow_up_totals_come_from_ONE_statement(db, pulse_home, monkeypatch):
-    """The race introduced while fixing a race, twenty lines apart.
-
-    The `deferred` remainder first asked `get_summary_counts` twice — once for
-    the actionable lane, once for everything — and subtracted. The connection
-    is shared and releases its lock per database method, so a row deleted or
-    reclassified between the two SELECTs yields a difference that was true at
-    no instant and can go NEGATIVE.
-
-    Driven by making a second call answer differently: if the view still
-    reports a coherent, non-negative pair, it is not taking the difference of
-    two snapshots.
-    """
-    from genesis.db.crud import follow_ups as fu_crud
-
-    for i in range(3):
-        await fu_crud.create(
-            db, id=f"act-{i}", content=f"a{i}", source="test", strategy="ego_judgment"
-        )
-    await fu_crud.create(
-        db,
-        id="cold",
-        content="someday",
-        source="test",
-        strategy="ego_judgment",
-        kind="tabled",
-    )
-    await db.commit()
-
-    real = fu_crud.get_summary_counts
-    calls = {"n": 0}
-
-    async def _shrinking(conn, **kw):
-        calls["n"] += 1
-        out = await real(conn, **kw)
-        if calls["n"] > 1:
-            # Rows vanishing underneath a second read.
-            return {}
-        return out
-
-    monkeypatch.setattr(fu_crud, "get_summary_counts", _shrinking)
-
-    part = (await V.build_view(db, now=datetime.now(UTC)))["items_by_store"]["follow_ups"]
-
-    assert part["deferred"] >= 0, f"a remainder of two snapshots can go negative: {part}"
-    assert part["total"] == 3, f"the actionable total must be its own read: {part}"
-    assert part["deferred"] == 1, f"and the deferred lane counted in the same read: {part}"
-
-
 async def test_the_pr_count_carries_the_repository_it_counted(db, pulse_home):
     """A count with no scope reads as correct for the wrong repository.
 
@@ -611,4 +572,139 @@ async def test_the_pr_count_carries_the_repository_it_counted(db, pulse_home):
     assert part["status"] == V.STATUS_OK
     assert part["repo"] == "someone/other-repo", (
         f"the count must carry the repository it belongs to: {part}"
+    )
+
+
+async def test_an_UNSCOPED_pr_cache_withholds_its_count(db, pulse_home):
+    """A count nobody can attribute is withheld, not rendered scope-less.
+
+    The cache records WHICH repository it listed. Reporting `ok` with a number
+    and no scope hands the reader a figure they cannot attribute — and a
+    retargeted remote or a renamed repository then renders a still-FRESH count
+    belonging to the previous repo, which reads as correct.
+
+    This is the standard the part already applies to freshness (past the TTL,
+    and on future skew, the count is withheld rather than shown beside a
+    caveat). It was simply never applied to scope. Both directions are pinned:
+    a missing field and a blank one, because `""` is the shape a truncated or
+    hand-edited cache produces.
+
+    NOT validated against the live repository, deliberately — presence is
+    checkable, identity is not: the cache stores `owner/name` while the live
+    accessors expose the halves separately and the owner half is empty on some
+    installs, so an equality assertion would convert a rare wrong count into a
+    permanent false negative.
+    """
+    now = datetime.now(UTC)
+    fresh = (now - timedelta(hours=1)).isoformat()
+
+    for label, record in (
+        ("missing", {"version": 1, "computed_at": fresh, "prs": [{"number": 1}]}),
+        ("blank", {"version": 1, "computed_at": fresh, "repo": "   ", "prs": [{"number": 1}]}),
+        ("wrong type", {"version": 1, "computed_at": fresh, "repo": 42, "prs": [{"number": 1}]}),
+    ):
+        pulse_home(record)
+        part = (await V.build_view(db, now=now))["pr_pipeline"]
+
+        assert part["status"] == V.STATUS_UNAVAILABLE, f"{label} scope must withhold: {part}"
+        assert "open_prs" not in part, f"{label}: the COUNT is the thing to withhold"
+        assert "scope" in part["reason"], f"{label}: the reason must name WHY"
+
+
+async def test_every_follow_up_figure_comes_from_ONE_read(db, pulse_home, monkeypatch):
+    """Two sections of one board cannot disagree about one population.
+
+    This took three attempts. Two separate reads were subtracted, which could
+    yield a NEGATIVE deferred count; then the totals were unified while
+    `by_status` was still read separately, so `unresolved` could exceed
+    `total`. The connection is shared and releases its lock per database
+    method, so any two SELECTs are two snapshots however close together they
+    run.
+
+    Driven by making a SECOND read of this store answer differently: if any
+    figure still came from its own query, the assembled part would be
+    internally inconsistent.
+    """
+    from genesis.db.crud import follow_ups as fu_crud
+
+    for i in range(3):
+        await fu_crud.create(
+            db, id=f"act-{i}", content=f"a{i}", source="test", strategy="ego_judgment"
+        )
+    await fu_crud.create(
+        db, id="cold", content="someday", source="test", strategy="ego_judgment", kind="tabled"
+    )
+    # A THIRD kind, and it is load-bearing rather than thoroughness. The
+    # remainder's whole claim is that a kind the code does not name is still
+    # counted — a fixture holding only `follow_up` and `tabled` cannot tell a
+    # COMPLEMENT from a hand-written list of those two, so it would pass
+    # against the very shape this is meant to forbid.
+    await fu_crud.create(
+        db,
+        id="notion",
+        content="someday-maybe",
+        source="test",
+        strategy="ego_judgment",
+        kind="idea",
+    )
+    await fu_crud.update_status(db, "act-2", "completed")
+    await db.commit()
+
+    # Assert the SECOND READ DOES NOT EXIST, rather than counting the first.
+    # An earlier version counted `get_lane_counts` calls — which stays at one
+    # when a separate `get_summary_counts` is ADDED beside it, so the test
+    # passed against the defect. And in a quiescent database two reads return
+    # identical data, so the coherence assertions below cannot see the split
+    # either. The only observable form of "one read" is that nothing else is
+    # called.
+    other = {"n": 0}
+    real_summary = fu_crud.get_summary_counts
+
+    async def _counted_summary(conn, **kw):
+        other["n"] += 1
+        return await real_summary(conn, **kw)
+
+    monkeypatch.setattr(fu_crud, "get_summary_counts", _counted_summary)
+
+    part = (await V.build_view(db, now=datetime.now(UTC)))["items_by_store"]["follow_ups"]
+
+    assert other["n"] == 0, (
+        "every figure must come from the single lane read — a second query "
+        f"against this population is the defect, saw {other['n']}"
+    )
+    assert part["total"] == 3, f"actionable rows only: {part}"
+    assert part["deferred"] == 2, f"BOTH non-actionable kinds are counted — tabled and idea: {part}"
+    assert part["unresolved"] == 2, f"completed is terminal: {part}"
+    assert part["unresolved"] <= part["total"], (
+        f"unresolved can never exceed total — that shape was reachable when "
+        f"by_status was read separately: {part}"
+    )
+    assert part["deferred"] >= 0, f"a subtracted remainder could go negative: {part}"
+    assert sum(part["by_status"].values()) == part["total"], (
+        f"by_status must add up to the same total it was read with: {part}"
+    )
+
+    # A TERMINAL row in the deferred lane is tracked but NOT outstanding. The
+    # previous shape counted every deferred row as outstanding regardless of
+    # status, and this is reachable rather than theoretical: neither
+    # `update_status` nor the MCP update path filters on `kind`, so a tabled
+    # row can be completed and would then have sat in the remainder forever.
+    await fu_crud.update_status(db, "cold", "completed")
+    await db.commit()
+
+    after = (await V.build_view(db, now=datetime.now(UTC)))["items_by_store"]["follow_ups"]
+    assert after["deferred"] == 2, f"still tracked in the lane: {after}"
+    assert after["deferred_open"] == 1, f"but a completed deferred row is not outstanding: {after}"
+    # The two lanes are separate POPULATIONS, each with its own numerator and
+    # denominator. An earlier shape folded deferred rows into one status map
+    # under a sentinel key, so every caller had to strip it before summing and
+    # the deferred count shared a denominator it did not belong to.
+    assert "by_status" in part and part["by_status"] == {"pending": 2, "completed": 1}, (
+        f"by_status is the ACTIONABLE lane only: {part}"
+    )
+    assert part["deferred_open"] == 2, (
+        f"the deferred lane reports its OWN numerator, not the actionable one: {part}"
+    )
+    assert part["deferred_open"] <= part["deferred"], (
+        f"and its numerator cannot exceed its own denominator: {part}"
     )

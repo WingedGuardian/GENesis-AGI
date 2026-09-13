@@ -267,7 +267,19 @@ def test_the_board_renders_the_deferred_lane_and_a_superseded_fetch_is_dropped()
         "the deferred lane must reach the SCREEN — counting it in the backend "
         "alone leaves `0 of 0` in front of the reader"
     )
-    assert "' (+' + part.deferred + ' deferred)'" in tpl, "and the count itself must render"
+    # The deferred lane renders its OWN numerator AND denominator. A bare
+    # `+N deferred` beside the actionable total put two populations behind one
+    # denominator — the board read "212 of 348 (+322 deferred)" on live data,
+    # where 348 is not what 322 is out of.
+    assert "part.deferred_open" in tpl, (
+        "the deferred lane needs its own numerator on screen, not just a total"
+    )
+    assert "' open of '" in tpl and "' deferred)'" in tpl, (
+        "...and its own denominator beside it, so neither figure borrows the actionable lane's"
+    )
+    assert "' (+' + part.deferred + ' deferred)'" not in tpl, (
+        "the bare scalar is the mixed-denominator defect"
+    )
     # BOTH halves, for both fields. A guard with a blanked body renders
     # nothing; a body with no guard renders `undefined`. Checking one and not
     # the other leaves the mutation that removes the other alive — which is
