@@ -210,6 +210,12 @@ try:
 except Exception:  # noqa: BLE001 — see the review_state guard's rationale (108-114)
     push_allowlist = None
 
+try:
+    import discarded_write  # noqa: E402 — scripts/hooks is on sys.path[0]
+except Exception:  # noqa: BLE001 — same rationale: an unguarded import failure would
+    # abort module load → exit 1 → CC reads non-2 as NON-blocking → the push RUNS.
+    discarded_write = None
+
 # Sentinel: the effective cwd cannot be confidently resolved (a cd into a
 # variable/command-substitution, a subshell, or a target nested at depth>0).
 # Callers MUST fail closed on it — block the merge, do not soften a force push.
@@ -7645,6 +7651,13 @@ def _ask(reason: str) -> int:
     """
     global _ASK_EMITTED
     _ASK_EMITTED = True
+    # Nothing is discarded YET here — the decision is still open — so this warns
+    # about what DECLINING costs, which is the thing a "block the push?" dialog
+    # otherwise hides.
+    if discarded_write is not None:
+        extra = discarded_write.prompt_note()
+        if extra:
+            reason = f"{reason}\n\n{extra}"
     print(
         json.dumps(
             {
@@ -7778,6 +7791,46 @@ def _pr_create_would_publish(argv: list[str]) -> bool:
         return True  # fail-safe → gate
 
 
+def _main_with_note() -> int:
+    """``main`` plus the discarded-command note on every refusal.
+
+    ``main`` delegates to ``_run_merge_and_push_gates``, which holds 28 separate
+    ``return 2`` sites (AST count) and has no ``_deny`` chokepoint, so wrapping the
+    entry point is the only way to cover them all without editing 28 places — and
+    without a 29th being added noteless tomorrow, which is the failure this shape
+    exists to make impossible. ``main`` returns that code unchanged, so the wrapper
+    sees every one of them.
+
+    That delegation is NEW: when this wrapper was written, the 28 sites were inside
+    ``main`` itself and this docstring counted them there. The gates were extracted
+    in the interval, which moved every site out of the function named here while
+    leaving the wrapper correct — so the sentence explaining WHY the wrapper exists
+    described a function with none of them. Pinned now by
+    ``test_live_a_refusal_from_the_extracted_gates_carries_the_note``, because the
+    invariant that extraction could have broken silently — ``main`` returning the
+    gate's own rc — was locked by nothing but this prose.
+
+    The note is emitted ONLY on a refusal; every other verdict is passed through
+    untouched, and the return value is never altered.
+    """
+    try:
+        rc = main()
+    except BaseException:
+        # An EXCEPTION is also a refusal here: `run_guard` converts it to exit 2,
+        # so the whole command is discarded just as deliberately as on a `return
+        # 2` — but the reader only sees "GUARD ERROR ... failing CLOSED" and is
+        # told nothing about the write two steps earlier. MEASURED: a crash
+        # injected after the command is remembered gave rc=2 with the note
+        # ABSENT. `finally` would run on the allow path too, so the note is
+        # emitted here, on the raising path only.
+        if discarded_write is not None:
+            discarded_write.warn()
+        raise
+    if rc == 2 and discarded_write is not None:
+        discarded_write.warn()
+    return rc
+
+
 def main() -> int:
     """Run the guard, then record any override sigils with the verdict they got.
 
@@ -7814,6 +7867,8 @@ def _run_merge_and_push_gates() -> int:
     try:
         payload = read_payload()
         cmd = field(payload, "command")
+        if discarded_write is not None:
+            discarded_write.remember(cmd)
         if not cmd:
             return 0
 
@@ -8910,4 +8965,4 @@ if __name__ == "__main__":
             )
             sys.exit(2)
         sys.exit(check_pr_report(sys.argv[2], repo=_repo))
-    run_guard(main, "git_push_guard")
+    run_guard(_main_with_note, "git_push_guard")

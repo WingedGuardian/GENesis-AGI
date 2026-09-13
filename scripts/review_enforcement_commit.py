@@ -32,6 +32,15 @@ from shell_parse import (  # noqa: E402
     split_segments,
 )
 
+try:  # noqa: E402
+    import discarded_write
+except Exception:  # noqa: BLE001 — GUARDED ON PURPOSE. An unguarded import that
+    # failed would abort this module's load → exit 1 → which CC reads as a
+    # NON-blocking error → the commit RUNS. A cosmetic note must never be able to
+    # fail this gate open. Sentinel + null-check is the house pattern
+    # (git_push_guard.py's push_allowlist).
+    discarded_write = None  # type: ignore[assignment]
+
 # Sentinel: the commit's effective cwd cannot be confidently resolved (a cd into
 # a variable/command-substitution, a subshell, or a commit nested at depth>0).
 # Fail closed on it — treat as main (block Rule 1) and do NOT take the docs skip.
@@ -640,6 +649,10 @@ def main() -> None:
     # Parse tool input
     payload = read_payload()
     command = field(payload, "command")
+    # Hand the command over ONCE, here, where it is already extracted: stdin is
+    # consumed by read_payload, so nothing further down can read it again.
+    if discarded_write is not None:
+        discarded_write.remember(command)
     if not _COMMIT_PATTERN.search(command):
         sys.exit(0)  # Not a commit, allow
 
@@ -1215,8 +1228,18 @@ def main() -> None:
 
 
 def _deny(message: str) -> None:
-    """Output denial message and block the tool via exit code 2."""
+    """Output denial message and block the tool via exit code 2.
+
+    Every refusal in this file funnels through here, so the discarded-command
+    note is emitted once, at the single chokepoint, rather than at its 14 call
+    sites. (It was 15 when this was written; the blind-spot net's own refusal was
+    removed upstream in the interval, which is the ordinary fate of a count kept
+    in prose — the load-bearing claim is "sole chokepoint", and that is checked:
+    this file has exactly one ``sys.exit(2)``, the one below.)
+    """
     print(message, file=sys.stderr)
+    if discarded_write is not None:
+        discarded_write.warn()
     sys.exit(2)
 
 
