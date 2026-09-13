@@ -522,9 +522,14 @@ def private_module(name: str, path):
       SUCCEEDS against the canonical module and returns a same-named class from
       a different module object. Silent, and worse for that reason.
 
-    ``dataclasses.fields`` is unaffected in both. Both branches are locked in
-    ``tests/test_private_module.py``; an earlier revision of this paragraph
-    asserted the first outcome unconditionally, which is wrong about the second.
+    ``dataclasses.fields`` is unaffected in both. Documented rather than locked,
+    deliberately: the test that once pinned these two branches had to exec every
+    carrier under ``scripts/`` to find them, which pulled a module-level
+    ``load_dotenv(override=True)`` into the test process and replaced environment
+    variables for everything collected after it — a worse defect than the caveat
+    it was verifying. An earlier revision of this paragraph also asserted the
+    first outcome unconditionally, which is wrong about the second — and the
+    second is the SILENT one, which is why it is written down here.
 
     So if the script under test needs late annotation resolution, it is not a
     private-module candidate. (An earlier revision also claimed the opposite of

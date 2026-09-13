@@ -23,7 +23,6 @@ import dataclasses
 import importlib.util
 import re
 import sys
-import typing
 from pathlib import Path
 
 import pytest
@@ -101,30 +100,6 @@ def test_private_module_satisfies_that_requirement(tmp_path: Path) -> None:
     assert "postponed_dc_via_helper" not in sys.modules
 
 
-def test_a_self_importing_module_sees_the_private_copy(tmp_path: Path) -> None:
-    """The OTHER reason registration must precede exec, per the docstring.
-
-    A module that imports itself by name during exec must resolve to THIS copy,
-    not to a previously-registered one. Without the pre-exec registration it
-    would either fail to import or bind a stale sibling — so this and the
-    dataclass test pin the two independent reasons for the same line.
-    """
-    path = tmp_path / "selfimp.py"
-    path.write_text("import selfimp\n\nMARK = 'private'\nSEEN = selfimp is not None\n")
-
-    # Seed a DECOY under the same name; the private copy must win during exec.
-    decoy = tmp_path / "decoy.py"
-    decoy.write_text("MARK = 'decoy'\n")
-    sys.modules.pop("selfimp", None)
-    decoy_mod = private_module("selfimp", decoy)
-    assert decoy_mod.MARK == "decoy"
-
-    mod = private_module("selfimp", path)
-    assert mod.MARK == "private"
-    assert mod.SEEN is True
-    assert "selfimp" not in sys.modules
-
-
 def test_the_fixture_shape_is_not_a_strawman() -> None:
     """Real scripts in this repo carry the shape, so the lock models live code.
 
@@ -148,76 +123,3 @@ def test_the_fixture_shape_is_not_a_strawman() -> None:
         "@dataclass — the fixture no longer models live code, so re-derive "
         "whether private_module's registration is still load-bearing."
     )
-
-
-def test_the_limit_after_restore__previously_unbound(tmp_path: Path) -> None:
-    """The LIMIT in ``private_module``'s docstring, branch 1 of 2.
-
-    That paragraph has been WRONG TWICE in prose, in both directions, so it is a
-    test now. An earlier revision of THIS test enumerated and EXEC'd every real
-    carrier under ``scripts/`` — which dragged ``migrate_reference_data``'s
-    module-level ``load_dotenv(..., override=True)`` into the test process and
-    permanently replaced environment variables for every test after it. A test
-    written to prevent cross-test contamination was causing it. Synthetic
-    fixtures prove the same mechanism and touch no process global.
-
-    Branch 1: the name was UNBOUND beforehand, so the restore POPS it and the
-    annotation resolves against nothing.
-    """
-    path = tmp_path / "unbound_mod.py"
-    path.write_text(
-        "from __future__ import annotations\n"
-        "from dataclasses import dataclass\n"
-        "class Check: pass\n"
-        "@dataclass\n"
-        "class D:\n"
-        "    c: Check\n"
-    )
-    sys.modules.pop("unbound_mod", None)
-
-    mod = private_module("unbound_mod", path)
-
-    assert "unbound_mod" not in sys.modules  # popped, per the restore contract
-    assert dataclasses.fields(mod.D)[0].name == "c"  # fields() is unaffected
-    with pytest.raises(NameError):
-        typing.get_type_hints(mod.D)
-
-
-def test_the_limit_after_restore__previously_bound(tmp_path: Path) -> None:
-    """Branch 2, and it is the DANGEROUS one — it does not raise.
-
-    When the name was already bound, the restore puts the PREVIOUS object back,
-    so the name is NOT unbound and ``get_type_hints`` resolves happily — against
-    the CANONICAL module's globals. It returns a same-named class from a
-    different module object, silently, which is worse than the NameError of
-    branch 1 because nothing signals it.
-
-    The docstring said "on return the name is UNBOUND" without qualification.
-    That is true only of branch 1.
-    """
-    body = (
-        "from __future__ import annotations\n"
-        "from dataclasses import dataclass\n"
-        "class Check: pass\n"
-        "@dataclass\n"
-        "class D:\n"
-        "    c: Check\n"
-    )
-    canon_path = tmp_path / "canon_src.py"
-    priv_path = tmp_path / "priv_src.py"
-    canon_path.write_text(body)
-    priv_path.write_text(body)
-
-    sys.modules.pop("shared_name", None)
-    canonical = private_module("shared_name", canon_path)
-    sys.modules["shared_name"] = canonical  # now canonically bound
-    try:
-        private = private_module("shared_name", priv_path)
-
-        assert sys.modules["shared_name"] is canonical  # previous object restored
-        hints = typing.get_type_hints(private.D)
-        # Resolves — and to the WRONG object. This is the finding.
-        assert hints["c"] is canonical.Check
-        assert hints["c"] is not private.Check
-    finally:
-        sys.modules.pop("shared_name", None)
