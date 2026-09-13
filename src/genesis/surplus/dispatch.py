@@ -145,8 +145,14 @@ async def _handle_failure(
             #      other failure emitter uses (`surplus/scheduler.py`,
             #      `runtime/_job_health.py`) — never hand-rolled, so the
             #      fingerprint identity basis stays single-sourced.
-            # Both axes are pinned by `tests/test_reflex/test_severity_seam.py`;
-            # the end-to-end path by `tests/test_reflex/test_task_failed_funnel.py`.
+            # BOTH axes are pinned by `tests/test_reflex/test_task_failed_funnel.py`,
+            # which drives this emit through a real bus into the real ingestor:
+            # lowering the severity fails it, and removing the `failure_details`
+            # spread fails it. It tests ARRIVAL rather than the shape of this
+            # call, which is why it replaced an AST scanner that graded the shape
+            # and passed an emitter that could raise and emit nothing at all.
+            # `tests/test_reflex/test_reflex_owned_inventory.py` guards the list
+            # of event types the reflex arc owns, not this emit.
             Subsystem.SURPLUS, Severity.ERROR,
             "task.failed",
             f"Surplus task {task.id} failed with exception",
