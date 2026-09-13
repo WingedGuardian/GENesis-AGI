@@ -88,12 +88,20 @@ class ReflexIngestor:
             # sets error_type IFF an exception caused the failure; a semantic,
             # reason-only failure carries error_reason and NO error_type and
             # belongs to a different lane (recorded by job_health / owned by the
-            # Sentinel), not the reflex arc. Both current emitters fire
-            # exception-only (task.failed always; job.failed's PR-2a funnel gates
-            # on `exc is not None`), so today this guard is defense-in-depth
-            # honoring the failure_details contract — without it, a future
-            # reason-only event would MANUFACTURE a bogus "UnknownError" signal,
-            # the opposite of surfacing a real problem.
+            # Sentinel), not the reflex arc. Both emitters now build their
+            # payload through that chokepoint (job.failed's PR-2a funnel gates
+            # on `exc is not None`; task.failed's executor-exception path in
+            # `surplus/dispatch.py` threads the exception into
+            # `failure_details(exc=…)`), so this guard is the lane router —
+            # without it, a reason-only event would MANUFACTURE a bogus
+            # "UnknownError" signal, the opposite of surfacing a real problem.
+            # HISTORY, kept as a warning: an earlier version of this comment
+            # asserted task.failed "always" fired exception-only while its
+            # payload in fact never carried error_type at all — every task.failed
+            # was silently dropped HERE, and the false invariant is why nobody
+            # looked. A claim about another file's emit belongs in a test, not a
+            # comment: `tests/test_reflex/test_severity_seam.py` now pins both
+            # admission axes for every reflex-owned emit site.
             error_type = details.get("error_type")
             # behavioral-lint: ignore no-hide-problems — lane-routing, not hiding
             # (see the contract note above; reason-only failures stay visible via

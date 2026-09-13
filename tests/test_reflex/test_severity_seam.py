@@ -149,3 +149,97 @@ def test_every_reflex_owned_event_is_emitted_at_or_above_the_subscriber_floor():
                 )
     assert checked >= 2, f"expected at least two emit sites to grade, graded {checked}"
     assert not offenders, "\n".join(offenders)
+
+
+def _payload_axis_sites(event_type: str) -> list[tuple[str, bool]]:
+    """Every emit site for *event_type*, graded on the PAYLOAD axis.
+
+    Returns ``(file, ok)`` per site: ``ok`` iff the call spreads
+    ``**failure_details(...)`` (the chokepoint that sets ``error_type`` from
+    the exception) or passes an explicit ``error_type=`` keyword. The
+    admission contract has TWO axes: severity ≥ the subscriber floor (test
+    above) and ``error_type`` present in the details — `reflex/ingest.py`
+    drops the event at ``if not error_type: return`` one branch after the
+    floor.
+
+    The event type is matched as a positional OR keyword string literal —
+    `emit_sync(..., event_type="task.failed", ...)` is the house pattern for
+    sync contexts, and a matcher reading only positional args graded 1 of the
+    3 live emit sites while reporting a clean pass (found by the pre-push
+    adversarial review of #1941, by gutting a payload the test then ignored).
+    Returning graded sites rather than offenders is the other half of that
+    fix: it lets the test assert the matcher SAW something per event type, so
+    matching nothing can never again read as passing.
+    """
+    sites: list[tuple[str, bool]] = []
+    for path in _SRC.rglob("*.py"):
+        try:
+            tree = ast.parse(path.read_text())
+        except SyntaxError:  # pragma: no cover - not our concern here
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            literals = [
+                a.value
+                for a in node.args
+                if isinstance(a, ast.Constant) and isinstance(a.value, str)
+            ]
+            kw_literals = [
+                kw.value.value
+                for kw in node.keywords
+                if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str)
+            ]
+            if event_type not in literals + kw_literals:
+                continue
+            # Only grade calls that look like emits (they carried a Severity —
+            # same discriminator _emitted_severities uses).
+            has_sev = any(
+                isinstance(a, ast.Attribute) and a.attr in _ORDER for a in node.args
+            ) or any(kw.arg in ("severity", "severity_str") for kw in node.keywords)
+            if not has_sev:
+                continue
+            ok = False
+            for kw in node.keywords:
+                if kw.arg == "error_type":
+                    ok = True
+                if kw.arg is None and isinstance(kw.value, ast.Call):
+                    f = kw.value.func
+                    name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+                    if name == "failure_details":
+                        ok = True
+            sites.append((str(path.relative_to(_SRC)), ok))
+    return sites
+
+
+def test_every_reflex_owned_emit_payload_can_pass_the_admission_gate():
+    """The SECOND axis of the admission contract, which #1941's first cut
+    missed: an emitter with the right severity and a bare payload cleared the
+    floor and was then dropped at the ingestor's ``error_type`` gate — the
+    seam test above stayed green while the real event still reached nothing.
+
+    VERIFY-RED (both watched): removing ``**failure_details(exc=exc)`` from
+    the task.failed emit in `surplus/dispatch.py` fails this test with the
+    file named; so does gutting the ``job.failed`` payload in
+    `runtime/_job_health.py` (the case the first matcher was blind to).
+    """
+    offenders: list[str] = []
+    for event_type in sorted(_reflex_owned_event_types()):
+        sites = _payload_axis_sites(event_type)
+        # Guard the guard: a matcher that saw no emit site for an owned event
+        # type is blind, not clean — the exact fail-open this test shipped
+        # with (0 job.failed sites graded read as a pass).
+        assert sites, (
+            f"payload axis graded NO emit site for {event_type!r} — either the "
+            "event is dead or this matcher no longer recognises how it is "
+            "emitted; both need a human, neither is a pass"
+        )
+        for where, ok in sites:
+            if not ok:
+                offenders.append(
+                    f"{where} emits {event_type!r} without routing its payload "
+                    "through failure_details (or an explicit error_type=) — the "
+                    "event clears the severity floor and is then dropped at "
+                    "reflex/ingest.py's admission gate, reaching NOTHING"
+                )
+    assert not offenders, "\n".join(offenders)
