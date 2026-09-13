@@ -562,6 +562,34 @@ async def get_summary_counts(
     return {row[0]: row[1] for row in await cursor.fetchall()}
 
 
+async def get_actionable_and_deferred_totals(db: aiosqlite.Connection) -> tuple[int, int]:
+    """Row totals for the actionable lane and everything else, in ONE statement.
+
+    The caller needs both halves and they must agree. Asking twice —
+    ``get_summary_counts(include_tabled=False)`` then ``(include_tabled=True)``
+    and subtracting — reads two different snapshots: this connection is shared
+    and releases its lock per database method, so a row deleted or reclassified
+    between the two SELECTs yields a difference that was never true at any
+    instant, and can go NEGATIVE. A conditional aggregate cannot disagree with
+    itself.
+
+    Returns ``(actionable, deferred)`` where *actionable* is the ``follow_up``
+    kind — the lane work is dispatched from — and *deferred* is every other
+    kind (``tabled``, ``idea``, and anything added later). Deferred is computed
+    as the complement rather than by naming kinds, so a kind introduced next
+    year lands in it instead of vanishing from both halves.
+    """
+    cursor = await db.execute(
+        "SELECT "
+        "  SUM(CASE WHEN kind = 'follow_up' THEN 1 ELSE 0 END), "
+        "  SUM(CASE WHEN kind != 'follow_up' THEN 1 ELSE 0 END) "
+        "FROM follow_ups"
+    )
+    row = await cursor.fetchone()
+    # SUM over zero rows is NULL, not 0.
+    return (row[0] or 0, row[1] or 0) if row else (0, 0)
+
+
 async def get_recent(
     db: aiosqlite.Connection,
     *,

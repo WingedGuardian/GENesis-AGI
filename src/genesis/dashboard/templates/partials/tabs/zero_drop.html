@@ -145,16 +145,23 @@
                              other than the key an operator would be acknowledging. This is a
                              rendering problem, not an injection one, so `x-text` is not the
                              defence — choosing the right field is. -->
-                        <!-- `?? '[unrenderable]'`, NOT `|| f.branch`. An earlier
-                             version of this line used `||`, which is falsy on the
-                             EMPTY STRING — and a branch name made entirely of bidi
-                             or zero-width characters neutralises to exactly that,
-                             so the fallback reintroduced the verbatim key this
-                             field exists to suppress, in the one case where it
-                             matters most. `??` distinguishes "missing" from
-                             "deliberately empty after sanitising". -->
+                        <!-- The FALLBACK TARGET was the bug, never the operator,
+                             and this line took two tries to get right.
+                             It began as `|| f.branch`: a branch made entirely of
+                             bidi or zero-width characters neutralises to the
+                             EMPTY STRING, which is falsy, so the fallback handed
+                             back the verbatim ack key in exactly the case this
+                             display field exists for.
+                             The first correction swapped `||` for `??`, which
+                             stopped the leak and introduced a new one — `??`
+                             falls back only on null/undefined, so an empty
+                             sanitised name rendered as a BLANK identity instead
+                             of a placeholder.
+                             `||` was right all along; only the target was wrong.
+                             Falsy is precisely the condition to handle here, and
+                             `''` is the value that matters. -->
                         <span style="margin-left:0.4rem; font-family:monospace;"
-                              x-text="f.branch_display ?? '[unrenderable]'"></span>
+                              x-text="f.branch_display || '[unrenderable]'"></span>
                         <span x-show="f.identity_unrenderable" style="color:#ff9800; font-size:0.6rem;"
                               title="This name contains characters that do not render as themselves — what you see is not the acknowledgement key.">
                           &#9888; name &ne; ack key</span>
@@ -195,6 +202,13 @@
               <div style="font-size:0.7rem; color:var(--color-text-secondary);"
                    x-show="$store.genesisDashboard.zeroDropView.pr_pipeline?.age_seconds != null"
                    x-text="'cache age: ' + Math.round($store.genesisDashboard.zeroDropView.pr_pipeline.age_seconds / 3600) + 'h'"></div>
+              <!-- WHICH repository this count belongs to. Without it the number
+                   is scope-less: a retargeted remote or a renamed repository
+                   leaves a still-fresh cache rendering a count for the previous
+                   repo, which reads as correct. -->
+              <div style="font-size:0.7rem; color:var(--color-text-secondary);"
+                   x-show="$store.genesisDashboard.zeroDropView.pr_pipeline?.repo"
+                   x-text="'repo: ' + $store.genesisDashboard.zeroDropView.pr_pipeline.repo"></div>
             </div>
 
             <!-- ── Items by store ──────────────────────────────────── -->
@@ -223,6 +237,17 @@
                         <span>
                           <strong x-text="part.open ?? part.unresolved"></strong>
                           <span x-text="' of ' + (part.tracked ?? part.total)"></span>
+                          <!-- Rows in a lane nobody dispatches from — tabled and
+                               idea follow-ups. They are deliberately OUTSIDE the
+                               numerator (consciously-not-doing work must not
+                               inflate what is outstanding) but they are tracked
+                               and they exist, so leaving them off the screen
+                               renders `0 of 0` for a store that is not empty.
+                               The backend gained this count and the renderer did
+                               not, so the false zero was fixed in the data and
+                               left in front of the reader. -->
+                          <span x-show="part.deferred" style="color:var(--color-text-secondary);"
+                                x-text="' (+' + part.deferred + ' deferred)'"></span>
                         </span>
                       </template>
                     </div>

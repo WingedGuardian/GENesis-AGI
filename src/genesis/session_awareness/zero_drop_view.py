@@ -182,10 +182,24 @@ def _pr_pipeline(*, now: datetime) -> dict:
         return _unavailable("cache has no readable pr list")
 
     limit_hit = bool(data.get("limit_hit"))
+    # The cache records WHICH repository it counted, and dropping that made the
+    # number scope-less: retarget the checkout's remote or rename the
+    # repository, and a still-fresh cache renders as "N open" for PRs that
+    # belong to the previous repo — a plausible WRONG count rather than an
+    # unavailable one, which is the worse of the two failures here.
+    #
+    # Surfaced rather than VALIDATED against the live repository, deliberately.
+    # The cache stores `owner/name`, while the only live accessors are
+    # `env.github_user()` and `env.github_public_repo()` — and the user half is
+    # MEASURED EMPTY on this install, so a comparison would either be skipped
+    # or would mark a perfectly good cache unavailable forever. Rendering the
+    # scope lets a reader see the mismatch; asserting it would manufacture one.
+    repo = data.get("repo")
     return {
         "status": STATUS_OK,
         "computed_at": data.get("computed_at"),
         "age_seconds": age_s,
+        "repo": repo if isinstance(repo, str) and repo else None,
         "open_prs": len(prs),
         # A capped fetch makes the count a FLOOR, not a measurement. Say which
         # one this is rather than leaving a reader to assume.
@@ -274,12 +288,17 @@ async def _items_by_store(db, *, gaps: dict | None = None) -> dict:
         # is absorbed by a remainder and would be silently missed by a list of
         # kinds — which is the same shape as the bug this comment is about.
         fu = await fu_crud.get_summary_counts(db, include_tabled=False)
-        fu_all = await fu_crud.get_summary_counts(db, include_tabled=True)
-        actionable_total = sum(fu.values())
+        # ONE statement for both totals. The first version of this asked twice
+        # and subtracted — and this connection is shared and releases its lock
+        # per database method, so a row deleted or reclassified between the two
+        # SELECTs produced a difference true at no instant, possibly NEGATIVE.
+        # That is the same autocommit-SELECT race fixed twenty lines above, in
+        # the same commit, reintroduced while fixing a different defect.
+        actionable_total, deferred = await fu_crud.get_actionable_and_deferred_totals(db)
         out["follow_ups"] = {
             "unresolved": sum(fu.get(s, 0) for s in FOLLOW_UP_OPEN_STATUSES),
             "total": actionable_total,
-            "deferred": sum(fu_all.values()) - actionable_total,
+            "deferred": deferred,
             "by_status": fu,
         }
     except Exception as exc:

@@ -574,11 +574,21 @@ class MorningReportGenerator:
             stranded = store.get("stranded_work") if isinstance(store, dict) else None
             gaps = view.get("gaps") or {}
 
+            # A BLIND detector passes every check above. A sweep whose GitHub
+            # leg failed is recent, its part status is `ok`, and its freshness
+            # verdict reads `fresh` — so the predicate accepted it and the line
+            # printed a numeric count followed by "detector fresh" while a whole
+            # class was frozen and uncounted. Fresh and complete are different
+            # claims, and only one of them was being checked.
+            detector = gaps.get("detector") if isinstance(gaps, dict) else None
+            blind = bool(detector.get("blind")) if isinstance(detector, dict) else False
+
             unreadable = (
                 not isinstance(stranded, dict)
                 or stranded.get("status", STATUS_OK) != STATUS_OK
                 or not {"open", "tracked", "acked"} <= stranded.keys()
                 or gaps.get("status", STATUS_OK) != STATUS_OK
+                or blind
             )
             if unreadable:
                 # DELIBERATELY departs from this section's convention of dropping
@@ -587,7 +597,16 @@ class MorningReportGenerator:
                 # whole subsystem exists to prevent — a reader who sees no
                 # stranded-work line concludes there is none.
                 reason = (
-                    (stranded or {}).get("reason")
+                    # Named FIRST: a blind detector is the case where every
+                    # other field looks healthy, so falling through to
+                    # "unknown" would tell the reader nothing about why a
+                    # recent, ok-status sweep is not being trusted.
+                    (
+                        f"detector blind — {', '.join(sorted((detector or {}).get('degraded', {})))}"
+                        if blind
+                        else None
+                    )
+                    or (stranded or {}).get("reason")
                     or (store or {}).get("reason")
                     or gaps.get("reason")
                     or "unknown"

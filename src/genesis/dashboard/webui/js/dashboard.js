@@ -375,6 +375,9 @@
         _workSessionsInterval: null,
         _observationsInterval: null,
         _zeroDropInterval: null,
+        // Monotonic request token — see fetchZeroDrop. Declared here rather
+        // than created on first use so it is visible as state.
+        _zeroDropFetchToken: 0,
         _cockpitInterval: null,
         _commsInterval: null,
         _tracesInterval: null,
@@ -1188,11 +1191,29 @@
 
         // ── Observations tab fetches ─────────────────────────────
         async fetchZeroDrop() {
+          // A monotonic token, because responses can land out of order. Two
+          // requests overlap whenever one outlives the 60s interval, or when a
+          // tab exit and re-entry fires a fresh one while the previous is still
+          // in flight. Without this the SLOWER, OLDER response wins simply by
+          // arriving last — and then stamps `lastSuccess` with the current
+          // time, so the stale board it just installed reads as
+          // transport-healthy and the stale banner never appears. A board whose
+          // whole claim is that its number is current cannot let arrival order
+          // decide which number that is.
+          const token = (this._zeroDropFetchToken = (this._zeroDropFetchToken || 0) + 1);
           this.startFetch("zeroDrop");
           try {
             const resp = await fetchApi("/api/genesis/zero-drop");
+            // Superseded while we were awaiting: a newer request has already
+            // finished. Drop this payload silently — it is not an error, and
+            // calling failFetch would mark a healthy transport as broken.
+            if (token !== this._zeroDropFetchToken) return;
             if (resp && resp.ok) {
-              this.zeroDropView = await resp.json();
+              const payload = await resp.json();
+              // Re-checked AFTER the second await: parsing the body is another
+              // suspension point, and the newer response can land during it.
+              if (token !== this._zeroDropFetchToken) return;
+              this.zeroDropView = payload;
               this.finishFetch("zeroDrop");
             } else {
               this.failFetch("zeroDrop", "Zero-drop endpoint returned an error");

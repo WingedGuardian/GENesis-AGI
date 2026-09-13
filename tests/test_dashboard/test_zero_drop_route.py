@@ -136,17 +136,26 @@ def test_the_dashboard_renders_the_SAFE_identity_not_the_ack_key():
         / "src/genesis/dashboard/templates/partials/tabs/zero_drop.html"
     ).read_text()
 
-    # `??`, not `||`. The first version of this fix used `||`, which is falsy on
-    # the EMPTY STRING — and a branch name consisting only of bidi or zero-width
-    # characters neutralises to exactly that, so the fallback handed back the
-    # verbatim key in the one case the field exists for. A reviewer caught it.
-    # `??` separates "field missing" from "deliberately empty after sanitising".
-    assert "f.branch_display ?? '[unrenderable]'" in tpl, (
-        "an EMPTY neutralised name must fall back to a placeholder, never to "
-        "the raw ack key — `||` would do the latter"
+    # This line has been wrong in BOTH directions, so both are pinned.
+    #
+    # `|| f.branch` leaked the verbatim ack key, because a branch made entirely
+    # of bidi or zero-width characters neutralises to `''`, which is falsy.
+    # The correction to that overshot: `?? '[unrenderable]'` stopped the leak
+    # but `??` falls back only on null/undefined, so the same branch rendered
+    # as a BLANK identity — no key, no placeholder, nothing.
+    #
+    # `|| '[unrenderable]'` is the form that handles both: falsy is exactly the
+    # condition, and `''` is exactly the value that matters. The operator was
+    # never the bug; the fallback TARGET was.
+    assert "f.branch_display || '[unrenderable]'" in tpl, (
+        "an empty sanitised name must render the PLACEHOLDER — not the raw ack "
+        "key (`|| f.branch`) and not nothing at all (`?? ...`)"
     )
     assert "f.branch_display || f.branch" not in tpl, (
-        "`||` falls through on an empty sanitised name and renders the raw key"
+        "falling back to the raw ack key is the original defect"
+    )
+    assert "f.branch_display ??" not in tpl, (
+        "`??` does not catch the empty string, which is the ONLY case this fallback exists for"
     )
     assert "f.identity_unrenderable" in tpl, (
         "and must TELL the reader when what they see is not the ack key"
@@ -226,4 +235,53 @@ def test_the_header_badge_carries_its_denominator_and_refuses_a_stale_count():
     assert "not a count" in header and "detector" in header, (
         "and must name the fault — the reader is told why, never left with a "
         "blank where a figure used to be"
+    )
+
+
+def test_the_board_renders_the_deferred_lane_and_a_superseded_fetch_is_dropped():
+    """Two renders whose absence recreated the defects they were fixed for.
+
+    The backend gained a `deferred` count so a store holding only tabled rows
+    would stop reporting `0 of 0` — and the renderer was never taught to show
+    it, so the false zero stayed on the screen. Fixing the data and leaving the
+    surface is not fixing the false zero.
+
+    Separately, every fetch response overwrote the panel with no check for a
+    newer in-flight request. A response outliving the 60s interval, or one
+    still in flight across a tab exit and re-entry, could land last and install
+    an OLDER board — then stamp `lastSuccess`, so the stale data read as
+    transport-healthy and the stale banner never fired.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    tpl = (root / "src/genesis/dashboard/templates/partials/tabs/zero_drop.html").read_text()
+    js = (root / "src/genesis/dashboard/webui/js/dashboard.js").read_text()
+
+    # Assert the GUARD, not the identifier. A bare `"part.deferred" in tpl`
+    # stays true when the element is hidden — the name still sits in the
+    # `x-text` — so it passes against a row nobody can see, which is precisely
+    # what it exists to catch. (This test was written that way first, in the
+    # same session as the note saying not to.)
+    assert 'x-show="part.deferred"' in tpl, (
+        "the deferred lane must reach the SCREEN — counting it in the backend "
+        "alone leaves `0 of 0` in front of the reader"
+    )
+    assert "' (+' + part.deferred + ' deferred)'" in tpl, "and the count itself must render"
+    # BOTH halves, for both fields. A guard with a blanked body renders
+    # nothing; a body with no guard renders `undefined`. Checking one and not
+    # the other leaves the mutation that removes the other alive — which is
+    # exactly what happened here on the first two attempts at this test.
+    assert 'x-show="$store.genesisDashboard.zeroDropView.pr_pipeline?.repo"' in tpl, (
+        "the repository scope needs its guard"
+    )
+    assert "'repo: ' + $store.genesisDashboard.zeroDropView.pr_pipeline.repo" in tpl, (
+        "...and the scope itself must actually be rendered — a count with no "
+        "repository reads as correct for the wrong one"
+    )
+
+    assert "_zeroDropFetchToken" in js, "fetches need a monotonic token"
+    assert js.count("token !== this._zeroDropFetchToken") >= 2, (
+        "the token must be re-checked AFTER the json() await too — parsing the "
+        "body is a second suspension point where a newer response can land"
     )

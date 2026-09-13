@@ -1153,3 +1153,45 @@ async def test_the_stranded_line_SURVIVES_the_whole_store_part_failing(
     )
     assert "UNAVAILABLE" in ground_truth
     assert "this is not a zero, it is an unread board" in ground_truth
+
+
+async def test_a_BLIND_detector_is_not_reported_as_a_fresh_count(
+    db, mock_health, mock_drafter, monkeypatch, tmp_path
+):
+    """Fresh and COMPLETE are different claims, and only one was checked.
+
+    A sweep whose GitHub leg failed is recent, its gaps part status is `ok`,
+    and its freshness verdict reads `fresh` — so the predicate accepted it and
+    the line printed a numeric count followed by "detector fresh" while a whole
+    class was frozen and uncounted. The reader is told the board is current and
+    not told it is partial.
+    """
+    from genesis.session_awareness import zero_drop_view as V
+
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "home"))
+
+    real = V._gaps
+
+    async def _blind_gaps(conn, *, now, findings_limit):
+        out = await real(conn, now=now, findings_limit=findings_limit)
+        out["detector"] = {
+            **(out.get("detector") or {}),
+            "blind": True,
+            "stale": False,
+            "verdict": "fresh",
+            "degraded": {"branches": "ls-remote failed"},
+        }
+        return out
+
+    monkeypatch.setattr(V, "_gaps", _blind_gaps)
+
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    ground_truth = await gen._ground_truth_section()
+
+    assert "Stranded work (zero-drop)" in ground_truth, "the line must still appear"
+    assert "detector fresh" not in ground_truth, (
+        "a blind detector must not be reported as a fresh count"
+    )
+    assert "UNAVAILABLE" in ground_truth and "blind" in ground_truth, (
+        f"and must name the fault rather than a number: {ground_truth}"
+    )
