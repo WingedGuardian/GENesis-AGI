@@ -646,6 +646,18 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
      (measured, this session) a path relative to a process whose cwd had moved to
      another worktree. The mutation applied, the run happened, the test is sound,
      and none of the other causes fits.
+     **A test module can manufacture this for everyone else**, which is the
+     variant that hides longest: loading a script under a SHARED `sys.modules`
+     name and not restoring it. pytest imports every test module at COLLECTION,
+     so the last registration wins for the session — a module collected earlier
+     keeps the object it bound while production code doing a call-time
+     `from <name> import …` resolves the newer one, and
+     `monkeypatch.setattr(<module>, …)` then patches nobody. It passes in a
+     single-file run and fails only in the full suite, in collection order, so it
+     reads as a bug in whichever test depended on the patch. MEASURED on main:
+     four such modules, across `review_state` and `review_scope` — both imported
+     at call time by the commit gate. Use `tests.conftest.private_module`, which
+     registers, execs and restores; never hand-roll the sequence.
   4. **The mutation was BEHAVIOURALLY NULL** — it applied and parses, so every
      postcondition below passes, but it changed no behaviour: swapped operands
      that commute, an edit inside a dead branch, a type annotation Python does

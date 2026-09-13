@@ -19,7 +19,6 @@ network, or gh auth (install-agnostic).
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import subprocess
 import sys
@@ -27,12 +26,15 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import private_module
+
 _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 _SCRIPT_PATH = _SCRIPTS / "review_scope.py"
-_spec = importlib.util.spec_from_file_location("review_scope", _SCRIPT_PATH)
-_rs = importlib.util.module_from_spec(_spec)
-sys.modules["review_scope"] = _rs
-_spec.loader.exec_module(_rs)
+# Via conftest so the SHARED name is restored afterwards. `review_scope` is
+# imported at CALL time by review_enforcement_commit and git_push_guard, so a
+# leaked private copy here defeats any monkeypatch of it elsewhere — the same
+# defect as the `review_state` leak, one name over.
+_rs = private_module("review_scope", _SCRIPT_PATH)
 
 
 # --------------------------------------------------------------------------- #

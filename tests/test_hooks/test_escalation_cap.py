@@ -57,6 +57,55 @@ def _stage(repo: Path, content: str) -> None:
     _git(repo, "add", "-A")
 
 
+def test_the_shared_review_state_name_is_not_hijacked():
+    """The premise every `monkeypatch.setattr(review_state, ...)` here rests on.
+
+    `review_enforcement_commit` imports `review_state` at CALL time, so a patch
+    applied in this file only reaches production code if this module's
+    `review_state` and `sys.modules["review_state"]` are the SAME object.
+
+    Other test modules load a private copy of that script under the shared name.
+    pytest imports every test module at COLLECTION, so the last registration
+    wins for the whole session: a module collected earlier keeps a reference to
+    the object it bound, while production resolves whatever is in `sys.modules`
+    now. The patch then lands on nobody and the real function runs — a failure
+    invisible in a single-file run and visible only in the full suite, in
+    collection order.
+
+    Asserting the premise directly means the next unrestored hijack fails HERE,
+    naming the cause, instead of surfacing as a bewildering assertion in an
+    unrelated test. `tests.conftest.private_module` is the supported way to load
+    a private copy without leaking the name.
+    """
+    assert sys.modules.get("review_state") is review_state, (
+        "sys.modules['review_state'] is not the module this file imported — "
+        "some test module loaded a private copy under the shared name and did "
+        "not restore it, so monkeypatching this module patches nothing that "
+        "production code will resolve. Load it via tests.conftest.private_module."
+    )
+
+
+def test_the_shared_review_scope_name_is_not_hijacked():
+    """The sibling lock, for the second name the commit gate imports at call time.
+
+    `review_scope` is resolved by a call-time import in five places, including
+    `review_enforcement_commit.classify_change_substantiality`. No test module
+    imports it canonically, so there is no identity to compare against — assert
+    instead that whatever holds the name came from the real script. A private
+    copy loaded from the same path is indistinguishable and harmless; a copy
+    left registered by a module that loaded something ELSE under that name is
+    what this catches.
+    """
+    mod = sys.modules.get("review_scope")
+    if mod is None:  # nothing registered it in this run — nothing to hijack
+        return
+    assert Path(mod.__file__) == _REPO_ROOT / "scripts" / "review_scope.py", (
+        f"sys.modules['review_scope'] was loaded from {mod.__file__}, not the "
+        "repository's scripts/review_scope.py — a test module registered "
+        "something else under the shared name. Use tests.conftest.private_module."
+    )
+
+
 # ── Counter unit tests (review_state) ─────────────────────────────────────
 
 

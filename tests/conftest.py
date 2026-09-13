@@ -482,6 +482,77 @@ def _guard_db_crud_not_mocked():
         )
 
 
+def private_module(name: str, path):
+    """Load ``path`` as a PRIVATE module without leaking ``name`` to everyone.
+
+    A test wanting its own instance of a script registers it in ``sys.modules``
+    before ``exec_module`` so that anything the module imports BY ITS OWN NAME
+    during exec resolves to THIS copy rather than a previously-registered one
+    (measured: a self-importing module sees the private instance). The trap is
+    leaving it registered afterwards.
+
+    The ``@dataclass`` rationale repeated elsewhere in this repo is WRONG and is
+    deliberately not repeated here: MEASURED on this venv (3.12.3), exec'ing a
+    module containing ``@dataclass`` and ``@dataclass(slots=True)`` WITHOUT
+    registering the name raises nothing — ``dataclasses`` falls back to empty
+    globals when ``cls.__module__`` is absent from ``sys.modules``.
+
+    MEASURED on this repository, and not hypothetical: three test modules each
+    did that for the name ``review_state``. pytest imports every test module at
+    COLLECTION, so the last registration won for the whole session. A module
+    collected earlier kept a reference to the object it bound, while production
+    code doing a call-time ``from review_state import ...`` resolved whatever
+    was in ``sys.modules`` by then — so ``monkeypatch.setattr(review_state, …)``
+    WOULD patch one object while the code under test resolves another, and the
+    patch would reach nobody. Stated in that mood deliberately: the identity
+    DIVERGENCE is measured on main, while no assertion currently in this tree is
+    affected (the in-process patches here happen to run against the same object,
+    and the gate's production paths in those tests go through ``subprocess``).
+    It is a live trap rather than a live breakage — the branch that first added
+    a test depending on such a patch hit it immediately. Reproduced against main: after the
+    first such module is collected, the two identities differ.
+
+    The failure is invisible in a single-file run and appears only in the full
+    suite, in collection order, which is where it reads as a bug in whichever
+    test happened to depend on the patch.
+
+    Restoring what was found keeps a private copy genuinely private. Prefer this
+    over hand-rolling the register/exec/restore sequence: call sites each
+    remembering to restore is a convention, and conventions are what this repo
+    keeps finding one broken instance of at a time.
+
+    LIMIT, measured, because the instruction to prefer this helper would
+    otherwise route you into it: on return the name is UNBOUND, so a class
+    defined in the loaded module can no longer resolve its own string
+    annotations. ``typing.get_type_hints`` — and anything built on it (pydantic,
+    ``inspect.signature(eval_str=True)``) — raises ``NameError``;
+    ``dataclasses.fields`` is unaffected. The leaking version happened to work
+    for those callers by accident. If the script under test needs late
+    annotation resolution, it is not a private-module candidate.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - real files always resolve
+        raise ImportError(f"cannot load {name} from {path}")
+    mod = importlib.util.module_from_spec(spec)
+    sentinel = object()
+    previous = sys.modules.get(name, sentinel)
+    sys.modules[name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        # Restore in BOTH directions: put back what was there, or remove the
+        # entry entirely if the name was previously unbound. Leaving our copy
+        # registered when nothing was there before is the same leak, one step
+        # removed — the next importer would silently get this private instance.
+        if previous is sentinel:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
+    return mod
+
+
 def require_access_denied(path) -> None:
     """Skip unless THIS process is actually stopped by ``path``'s mode bits.
 

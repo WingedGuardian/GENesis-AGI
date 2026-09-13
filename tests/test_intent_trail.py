@@ -2,22 +2,22 @@
 
 from __future__ import annotations
 
-import importlib
 import sqlite3
-import sys
 from pathlib import Path
 from unittest.mock import patch
+
+from tests.conftest import private_module
 
 # The hook script lives in scripts/, not a package — load it manually
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 _HOOK_PATH = _SCRIPTS_DIR / "proactive_memory_hook.py"
 
-# Load the module from file path
-_spec = importlib.util.spec_from_file_location("proactive_memory_hook", _HOOK_PATH)
-_mod = importlib.util.module_from_spec(_spec)
-# Prevent the hook from auto-running or importing heavy deps at load time
-sys.modules["proactive_memory_hook"] = _mod
-_spec.loader.exec_module(_mod)
+# Load the module from file path, without leaving the name registered for the
+# rest of the session — see tests.conftest. No production code imports this one
+# by bare name at call time, so it is not the exploitable shape `review_state`
+# was; converting it anyway keeps the invariant simple: no test module leaves a
+# shared sys.modules name pointing at its own private copy.
+_mod = private_module("proactive_memory_hook", _HOOK_PATH)
 
 _jaccard_similarity = _mod._jaccard_similarity
 _detect_pivot = _mod._detect_pivot
