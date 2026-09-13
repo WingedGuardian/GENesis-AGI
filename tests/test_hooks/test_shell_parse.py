@@ -122,6 +122,12 @@ class TestNesting:
     def test_bash_ce_bundle(self):
         assert any(s.exe == "echo" for s in sp.analyze("bash -ce 'echo hello'"))
 
+    def test_zsh_Gc_bundle_recurse(self):
+        assert any(
+            s.exe == "git" and sp.git_subcommand(s.argv) == "push"
+           for s in sp.analyze("zsh -Gc 'git push origin main'")
+        )
+
     def test_bash_cl_bundle(self):
         assert any(s.exe == "echo" for s in sp.analyze("bash -cl 'echo hello'"))
 
@@ -359,6 +365,13 @@ class TestCommandPositionStrip:
 
         assert sum(s.exe == "echo" for s in segments) == 2
 
+    def test_case_parenthesized_later_pattern_command(self):
+        assert self._detects(
+            "case b in a) : ;; (b) git push origin main ;; esac",
+            "git",
+            "push",
+        )
+
     def test_function_body_command(self):
         assert self._detects("f() { echo hello; }", "echo")
 
@@ -370,6 +383,27 @@ class TestCommandPositionStrip:
 
     def test_function_keyword_body_command(self):
         assert self._detects("function f { echo hello; }", "echo")
+
+    def test_function_keyword_if_body_command(self):
+        assert self._detects(
+            "function f if git push origin main; then :; fi",
+            "git",
+            "push",
+        )
+
+    def test_function_keyword_while_body_command(self):
+        assert self._detects(
+            "function f while git push origin main; do :; done",
+            "git",
+            "push",
+        )
+
+    def test_function_keyword_case_body_command(self):
+        assert self._detects(
+           "function f case x in x) git push origin main ;; esac",
+           "git",
+           "push",
+        )
 
     def test_coproc_command(self):
         assert self._detects("coproc echo hello", "echo")

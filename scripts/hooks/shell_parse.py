@@ -1306,7 +1306,7 @@ _C_BUNDLE_OPTIONS = {
     "dash": frozenset("abcefhilmnprstuvxCEIV"),
     "ash": frozenset("abcefhilmnprstuvx"),
     "ksh": frozenset("abcefhilmnprstuvx"),
-    "zsh": frozenset("abcefhilmnprstuvx"),
+    "zsh": frozenset("Gabcefhilmnprstuvx"),
 }
 
 
@@ -1360,12 +1360,24 @@ def _embedded_commands(argv: list[str]) -> list[str]:
     if argv[0].endswith(")") and len(argv) > 1:
         return [shlex.join(argv[1:])]
 
-    if argv[0] == "function" and len(argv) > 3:
-        try:
-            start = argv.index("{") + 1
-        except ValueError:
-            return []
-        return [shlex.join(argv[start:])]
+    if argv[0] == "function" and len(argv) > 2:
+        if (
+           re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", argv[1])
+           and argv[2] in {
+               "{",
+               "(",
+               "if",
+               "while",
+               "until",
+               "for",
+               "case",
+               "select",
+           }
+        ):
+           if argv[2] == "{":
+              return [shlex.join(argv[3:])]
+           return [shlex.join(argv[2:])]
+        return []
 
     if (
         (
@@ -1465,7 +1477,7 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
             if script:
                 nested.append(script)
 
-        nested.extend(_embedded_commands(argv))
+        nested.extend(_embedded_commands(_argv(seg.argv_src)))
         nested.extend(_substitutions(raw))
         if not nested:
             continue
