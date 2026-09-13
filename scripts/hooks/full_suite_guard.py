@@ -109,7 +109,11 @@ def _targets_specific_test(args: list[str]) -> bool:
         arg = args[i]
         if arg.startswith("-"):
             # a -k/-m selector (separate value, =form, or glued) narrows the run
-            if arg in ("-k", "-m") or arg.startswith(("-k", "-m", "--keyword")) or arg == "--pyargs":
+            if (
+                arg in ("-k", "-m")
+                or arg.startswith(("-k", "-m", "--keyword"))
+                or arg == "--pyargs"
+            ):
                 has_selector = True
             elif arg in _VALUE_FLAGS:
                 i += 2  # skip the flag AND its value
@@ -168,6 +172,23 @@ def _carried_pytest_args(seg: Segment) -> list[str] | None:
     --with pytest ruff check .` (a ruff run) and `uv --color always run --with
     pytest pytest tests/foo.py` (a correctly TARGETED run) both blocked.
 
+    SECOND KNOWN RESIDUAL, also safe direction, and it is the price of the
+    confidence rule below: once the walk meets an option it cannot size, it stops
+    claiming to know which bare word is the command and looks for a `pytest`
+    token among the rest. So `uvx --allow-insecure-host h echo pytest` — which
+    runs `echo` — is refused. That is the same over-read the docstring above
+    rejects for the CONFIDENT case, accepted here only because confidence is
+    gone: the alternative is committing to the flag's value and allowing the
+    whole-suite run this function exists to stop. It costs a refusal
+    `# full-suite-ok` clears.
+
+    It is narrower than it first looks, and the narrowing was MEASURED rather
+    than assumed — the first example written here was wrong and a test caught it.
+    The option must be unknown to BOTH this list and the resolver's `uvx` wrapper
+    spec. A flag only the resolver lacks (`--directory`) leaves the segment on
+    the carrier, but THIS walk still sizes it, stays confident, and reads `echo`
+    as the command exactly as before.
+
     KNOWN RESIDUAL, safe direction: the `run` walk skips only flags it knows, so a
     literal `run` reached as an unlisted flag's value still ends the walk —
     `uv pip install --target run pytest` over-blocks. It is an install into a
@@ -197,17 +218,28 @@ def _carried_pytest_args(seg: Segment) -> list[str] | None:
             i += 1
         else:
             return None
+    confident = True
     while i < len(argv):
         tok = argv[i]
         if tok in _RUN_CARRIER_VALUE_FLAGS and "=" not in tok:
             i += 2  # `--with pytest` names a DEPENDENCY, not the command being run
             continue
         if tok.startswith("-"):
+            # An option of unknown arity. From here the walk can no longer say
+            # WHICH bare word is the command, because the next one may be this
+            # flag's value — so it stops treating the first bare word as the
+            # answer. Committing to it is the fail-OPEN reading: MEASURED,
+            # `uvx --directory /tmp pytest` resolved `tmp`, concluded "not
+            # pytest" and exited 0 where `uvx pytest` exits 2.
+            confident = confident and "=" in tok
             i += 1
             continue
-        if _basename(tok).split("@", 1)[0] != "pytest":
-            return None
-        return argv[i + 1 :]  # uv permits `pytest@8.3.5`
+        if _basename(tok).split("@", 1)[0] != "pytest":  # uv permits `pytest@8.3.5`
+            if confident:
+                return None  # the command is known, and it is not pytest
+            i += 1  # unsure which token is the command — keep looking for one
+            continue
+        return argv[i + 1 :]
     return None
 
 

@@ -156,3 +156,93 @@ class TestGuardIntegration:
     def test_plain_forms_unchanged(self):
         assert self._guard_rc("pytest tests/") == 2
         assert self._guard_rc("pytest tests/test_x.py") == 0
+
+
+class TestUnlistedCarrierOptionDoesNotHideTheCommand:
+    """An option the wrapper table does not list must not become the answer.
+
+    The table of uv's value-taking options is an OPEN set — four missing entries
+    were reported on this PR alone. The failure it produced was fail-OPEN, not a
+    short list: `uvx --directory /tmp pytest` resolved its exe to ``tmp``, so the
+    guard concluded "not pytest" and allowed a whole-suite run that `uvx pytest`
+    blocks. The fix does not extend the table. It stops the walk at the first
+    option of unknown arity and leaves the segment ON the carrier, which is the
+    one state full_suite_guard can still recover a command from.
+    """
+
+    def test_an_unlisted_option_leaves_the_segment_on_the_carrier(self):
+        assert exes("uvx --directory /tmp pytest tests/") == ["uvx"]
+
+    def test_the_option_value_never_becomes_the_executable(self):
+        # The pre-fix reading, and the one that made the guard say "not pytest".
+        assert "tmp" not in exes("uvx --directory /tmp pytest tests/")
+
+    def test_a_listed_option_still_reveals_the_command(self):
+        # Guard the guard: stopping early must not blunt the reveal this PR is for.
+        assert exes("uvx --with foo pytest tests/") == ["pytest"]
+        assert exes("uvx pytest tests/") == ["pytest"]
+
+    def test_an_inline_value_is_not_ambiguous_and_still_reveals(self):
+        assert exes("uvx --directory=/tmp pytest tests/") == ["pytest"]
+
+    def test_the_run_family_is_untouched_by_this(self):
+        # `uv run` resolves past an unknown flag as before: leaving THAT opaque
+        # would hide a wrapped command from every gate keying on seg.exe, which
+        # is the direction the resolver promises never to take.
+        assert exes("uv run --unknown-flag pytest tests/") == ["pytest"]
+
+
+class TestHatchSelectorSequence:
+    """Hatch's matrix selectors come in both signs and may end with ``--``."""
+
+    def test_a_terminator_after_a_selector_is_not_the_command(self):
+        assert exes("hatch run +py=3.12 -- test:pytest tests/") == ["pytest"]
+
+    def test_an_excluding_selector_is_walked_past(self):
+        assert exes("hatch run +py=3.12 -py=3.9 test:pytest tests/") == ["pytest"]
+
+    def test_a_bare_env_qualified_command_is_unchanged(self):
+        assert exes("hatch run test:pytest tests/") == ["pytest"]
+
+
+class TestCarrierOptionGuardIntegration(TestGuardIntegration):
+    """The same shapes as verdicts, through the real guard."""
+
+    def test_unlisted_uvx_options_block_a_whole_suite_run(self):
+        assert self._guard_rc("uvx --directory /tmp pytest") == 2
+        assert self._guard_rc("uvx --env-file .env pytest") == 2
+        assert self._guard_rc("uvx --with-requirements reqs.txt pytest") == 2
+
+    def test_hatch_selector_sequences_block_a_whole_suite_run(self):
+        assert self._guard_rc("hatch run +py=3.12 -- test:pytest tests/") == 2
+        assert self._guard_rc("hatch run +py=3.12 -py=3.9 test:pytest tests/") == 2
+
+    def test_a_targeted_run_behind_an_unlisted_option_is_still_allowed(self):
+        assert self._guard_rc("uvx --directory /tmp pytest tests/test_x.py") == 0
+
+    def test_a_non_pytest_command_behind_an_unlisted_option_is_allowed(self):
+        # The over-block this fix must NOT cause: losing confidence in which
+        # token is the command may add a token read, never a blanket refusal.
+        assert self._guard_rc("uvx --directory /tmp ruff check .") == 0
+
+    def test_pytest_named_as_a_dependency_is_still_not_a_run(self):
+        assert self._guard_rc("uvx --with pytest ruff check .") == 0
+        assert self._guard_rc("uv pip install pytest") == 0
+
+    def test_the_over_read_is_confined_to_the_unconfident_walk(self):
+        """Pins the residual the guard's docstring declares, and its bounds.
+
+        Losing confidence means looking for a `pytest` token among the rest, so
+        `echo pytest` behind an option NEITHER list can size is refused — an
+        over-block `# full-suite-ok` clears. The two controls are the point: the
+        same shape behind an option the guard's own list knows, and with no
+        option at all, must still read `echo` as the command. If either flips,
+        the unconfident scan has escaped the case it was written for.
+        """
+        assert self._guard_rc("uvx --allow-insecure-host h echo pytest") == 2
+        assert self._guard_rc("uvx --directory /tmp echo pytest") == 0
+        assert self._guard_rc("uvx echo pytest") == 0
+
+    def test_an_option_unknown_to_both_lists_still_finds_the_run(self):
+        assert self._guard_rc("uvx --allow-insecure-host h pytest") == 2
+        assert self._guard_rc("uvx --allow-insecure-host h ruff check .") == 0

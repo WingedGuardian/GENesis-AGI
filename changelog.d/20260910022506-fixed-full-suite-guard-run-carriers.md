@@ -13,3 +13,14 @@
   the dependency it is. Replayed against 37,568 real commands from one install's
   history: one resolution changed, and it was a `poetry run python` the parser
   had been reading as `poetry` — the fix behaving, not a casualty.
+- **An unfamiliar option no longer lets a whole-suite run through that guard.**
+  These runners accept options before the command they carry, and some of those
+  options take a value of their own. The parser recognised a list of them, and
+  where an option was missing from that list its value could be mistaken for the
+  command being run — so the guard looked at the wrong word, concluded the run
+  was something else, and allowed it. Keeping such a list complete means tracking
+  another project's options as they change, which is not a thing this parser can
+  promise. It now stops at the first option it does not recognise and reports
+  what it is sure of — that the command is being carried by one of these runners —
+  which is enough for the guard to find the run. Commands that are not test runs
+  are unaffected, and a familiar option still resolves exactly as before.

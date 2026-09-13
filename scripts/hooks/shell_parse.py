@@ -1229,6 +1229,26 @@ def _basename(token: str) -> str:
     return token.rsplit("/", 1)[-1]
 
 
+def _is_hatch_selector(token: str) -> bool:
+    """True for a Hatch matrix selector — ``+py=3.12`` / ``-py=3.9``.
+
+    The ``=`` is load-bearing: it separates a selector from an ordinary short
+    option, whose value is a SEPARATE token this function must not walk past.
+
+    KNOWN RESIDUAL, and it is a fail-open: a Hatch option that takes its value
+    that way still ends the walk on the VALUE — MEASURED, ``hatch run -e prod
+    test:pytest`` resolves its exe to ``prod`` and full_suite_guard exits 0.
+    Closing it means modelling Hatch's option grammar, the open set this module
+    refuses to enumerate (see ``_RUN_CARRIER_VALUE_FLAGS``), and Hatch is not
+    installed here, so any table written now would be written from memory rather
+    than measured. The uv tool-runners get the opaque-carrier treatment instead
+    because full_suite_guard can recover THOSE; no such recovery exists for a
+    segment that has already resolved onto a value. Narrower than the behaviour
+    this PR replaces, where every ``hatch run`` was opaque and allowed.
+    """
+    return token[:1] in ("+", "-") and "=" in token[1:]
+
+
 def _hatch_revealed(
     argv: list[str], start: int, via_tool: bool, is_hatch: bool
 ) -> tuple[int, bool] | None:
@@ -1243,8 +1263,19 @@ def _hatch_revealed(
         return None
     if not is_hatch:
         return start, via_tool
-    while start < len(argv) and argv[start].startswith("+"):
+    # Hatch's matrix selectors come in BOTH signs — `+py=3.12` includes an
+    # environment, `-py=3.9` excludes one — and the sequence may be closed by
+    # the option terminator before the command: `hatch run +py=3.12 -- test:pytest`.
+    # Matching only `+` left both gaps. MEASURED on the pre-fix tree: that exact
+    # documented form resolved its exe to `--`, and full_suite_guard exited 0 on
+    # a whole-suite run. The `=` is what keeps this a closed set rather than a
+    # guess at Hatch's option grammar: a selector always carries one, while
+    # Hatch's own short options (`-e`, `-p`) never do and are left to the
+    # caller's generic flag walk.
+    while start < len(argv) and _is_hatch_selector(argv[start]):
         start += 1
+    if start < len(argv) and argv[start] == "--":
+        start += 1  # terminator AFTER the selectors, not only before them
     if start >= len(argv):
         return None
     env, separator, command = argv[start].partition(":")
@@ -1349,6 +1380,7 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
     i = 0
     open_parens = 0
     via_uv_tool = False  # reached the command through `uvx` / `uv tool run`
+    opaque = False  # a uv tool-runner met an option of unknown arity
     while i < len(argv):
         tok = argv[i]
         if tok.startswith("("):  # subshell opener, bare `( git` or glued `(git`
@@ -1376,6 +1408,13 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
             break
         if _basename(tok) == "uvx":
             via_uv_tool = True
+        # `uvx` is the one wrapper whose CALLER can recover an unresolved
+        # carrier: full_suite_guard keys its fallback scan on `exe == uvx`.
+        # That makes staying opaque a real option here and only here — for
+        # `env`/`timeout` an un-stripped segment is simply a hidden command,
+        # which is the direction this resolver promises never to take.
+        recoverable = _basename(tok) == "uvx"
+        wrapper_at = i
         argflags, positional = spec
         i += 1
         # consume the wrapper's own value-flags and leading positional args
@@ -1387,6 +1426,19 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
             if t.startswith("-"):
                 if t in argflags and "=" not in t:
                     i += 2  # flag + its separate value token
+                elif recoverable and "=" not in t:
+                    # An option this table does not list: its arity is unknown,
+                    # so the next bare word may be its VALUE rather than the
+                    # carried command. Resolving onto that value is the
+                    # fail-OPEN reading — MEASURED, `uvx --directory /tmp
+                    # pytest` resolved its exe to `tmp` and full_suite_guard
+                    # exited 0 where `uvx pytest` exits 2. Enumerating uv's
+                    # option grammar is the treadmill this module already
+                    # refused once (see _RUN_CARRIER_VALUE_FLAGS); instead the
+                    # walk STOPS and leaves the segment on `uvx`, where the
+                    # caller's carrier scan can still reach the command.
+                    opaque = True
+                    break
                 else:
                     i += 1
                 continue
@@ -1398,6 +1450,9 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
                 i += 1
                 continue
             break  # this bare word is the wrapped command
+        if opaque:
+            i = wrapper_at  # leave the segment ON the carrier — see above
+            break
     result = list(argv[i:])  # redirections are NOT stripped here (see docstring)
     if open_parens and result:
         # Peel matching trailing `)` closers off the operand(s) carrying the
