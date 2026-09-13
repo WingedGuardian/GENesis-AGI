@@ -24,6 +24,7 @@ _REVIEW_STATE = _REPO_ROOT / "scripts" / "review_state.py"
 
 sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 sys.path.insert(0, str(_REPO_ROOT / "scripts" / "hooks"))
+import review_scope  # noqa: E402
 import review_state  # noqa: E402
 
 
@@ -89,20 +90,29 @@ def test_the_shared_review_scope_name_is_not_hijacked():
     """The sibling lock, for the second name the commit gate imports at call time.
 
     `review_scope` is resolved by a call-time import in five places, including
-    `review_enforcement_commit.classify_change_substantiality`. No test module
-    imports it canonically, so there is no identity to compare against — assert
-    instead that whatever holds the name came from the real script. A private
-    copy loaded from the same path is indistinguishable and harmless; a copy
-    left registered by a module that loaded something ELSE under that name is
-    what this catches.
+    `review_enforcement_commit.classify_change_substantiality`, so the premise is
+    the same one the `review_state` lock above rests on: a patch applied to the
+    object THIS file holds only reaches production if it is the object
+    `sys.modules` hands the call-time import.
+
+    This file binds `review_scope` at module scope purely so that identity exists
+    to compare against — a canonical importer has to come from somewhere, and an
+    earlier revision of this lock concluded from its absence that PATH equality
+    was the best available check. It is not: two distinct module objects loaded
+    from the SAME path compare equal by path and differ by identity, so a private
+    copy left registered would pass a path assert while a `monkeypatch.setattr`
+    on the canonical object reached nobody. That is the exact divergence this
+    file exists to catch, and it is not hypothetical here —
+    `tests/test_scripts/test_check_review_depth.py` patches
+    `review_scope.classify_range_substantiality` against a call-time import at
+    `scripts/check_review_depth.py:60`.
     """
-    mod = sys.modules.get("review_scope")
-    if mod is None:  # nothing registered it in this run — nothing to hijack
-        return
-    assert Path(mod.__file__) == _REPO_ROOT / "scripts" / "review_scope.py", (
-        f"sys.modules['review_scope'] was loaded from {mod.__file__}, not the "
-        "repository's scripts/review_scope.py — a test module registered "
-        "something else under the shared name. Use tests.conftest.private_module."
+    assert sys.modules.get("review_scope") is review_scope, (
+        "sys.modules['review_scope'] is not the module this file imported — "
+        "some test module loaded a private copy under the shared name and did "
+        "not restore it. Same path is NOT sufficient: a same-path copy is a "
+        "different object, so patches land on one and production resolves the "
+        "other. Load it via tests.conftest.private_module."
     )
 
 

@@ -491,44 +491,42 @@ def private_module(name: str, path):
     (measured: a self-importing module sees the private instance). The trap is
     leaving it registered afterwards.
 
-    The ``@dataclass`` rationale repeated elsewhere in this repo is WRONG and is
-    deliberately not repeated here: MEASURED on this venv (3.12.3), exec'ing a
-    module containing ``@dataclass`` and ``@dataclass(slots=True)`` WITHOUT
-    registering the name raises nothing — ``dataclasses`` falls back to empty
-    globals when ``cls.__module__`` is absent from ``sys.modules``.
+    Registering BEFORE exec is also what lets a ``@dataclass`` decorate at all,
+    when the module carries ``from __future__ import annotations``:
+    ``dataclasses._is_type`` dereferences ``sys.modules.get(cls.__module__)``,
+    which is ``None`` for an unregistered module. Do not take that on trust from
+    this docstring — ``tests/test_private_module.py`` locks it, and deleting the
+    ``sys.modules[name] = mod`` line below fails there.
 
-    MEASURED on this repository, and not hypothetical: three test modules each
-    did that for the name ``review_state``. pytest imports every test module at
-    COLLECTION, so the last registration won for the whole session. A module
-    collected earlier kept a reference to the object it bound, while production
-    code doing a call-time ``from review_state import ...`` resolved whatever
-    was in ``sys.modules`` by then — so ``monkeypatch.setattr(review_state, …)``
-    WOULD patch one object while the code under test resolves another, and the
-    patch would reach nobody. Stated in that mood deliberately: the identity
-    DIVERGENCE is measured on main, while no assertion currently in this tree is
-    affected (the in-process patches here happen to run against the same object,
-    and the gate's production paths in those tests go through ``subprocess``).
-    It is a live trap rather than a live breakage — the branch that first added
-    a test depending on such a patch hit it immediately. Reproduced against main: after the
-    first such module is collected, the two identities differ.
+    Leaving the name registered is the leak this exists to prevent: pytest
+    imports every test module at COLLECTION, so the last registration wins for
+    the session, and a ``monkeypatch.setattr`` can then land on a different
+    object than a call-time ``from <name> import ...`` resolves. Two locks in
+    ``tests/test_hooks/test_escalation_cap.py`` assert exactly that for
+    ``review_state`` and ``review_scope``.
 
-    The failure is invisible in a single-file run and appears only in the full
-    suite, in collection order, which is where it reads as a bug in whichever
-    test happened to depend on the patch.
+    Prefer this over hand-rolling register/exec/restore: N call sites each
+    remembering to restore is a convention, and conventions break one instance
+    at a time.
 
-    Restoring what was found keeps a private copy genuinely private. Prefer this
-    over hand-rolling the register/exec/restore sequence: call sites each
-    remembering to restore is a convention, and conventions are what this repo
-    keeps finding one broken instance of at a time.
+    LIMIT, and it is real, because the instruction to prefer this helper routes
+    you into it. On return the name is UNBOUND, so a class defined in the loaded
+    module resolves its string annotations against a module that is no longer
+    registered. ``dataclasses.fields`` is unaffected; ``typing.get_type_hints``
+    — and anything built on it (pydantic, ``inspect.signature(eval_str=True)``)
+    — raises ``NameError`` whenever an annotation names a MODULE-LEVEL symbol
+    rather than a builtin or a generic. Today that is
+    ``disk_reclaim.CacheTarget`` (``path: Path``) and ``git_repair.Diagnosis``
+    (``checks: list[Check]``), whose test modules still hand-roll the sequence
+    and are the obvious next conversions — so this is the limit they will hit.
+    ``tests/test_private_module.py`` locks it: it enumerates the carriers and
+    fails if none of them raises.
 
-    LIMIT, measured, because the instruction to prefer this helper would
-    otherwise route you into it: on return the name is UNBOUND, so a class
-    defined in the loaded module can no longer resolve its own string
-    annotations. ``typing.get_type_hints`` — and anything built on it (pydantic,
-    ``inspect.signature(eval_str=True)``) — raises ``NameError``;
-    ``dataclasses.fields`` is unaffected. The leaking version happened to work
-    for those callers by accident. If the script under test needs late
-    annotation resolution, it is not a private-module candidate.
+    So if the script under test needs late annotation resolution, it is not a
+    private-module candidate. (An earlier revision claimed the opposite — "5/5,
+    no failures" — from four modules picked by hand for being easy to exec
+    rather than from the population. Recorded because the convenience sample IS
+    the failure mode, and it becomes invisible the moment it is a number.)
     """
     import importlib.util
 
