@@ -50,6 +50,32 @@ class LifecycleConfig:
 
 
 @dataclass
+class EndpointConfig:
+    """An endpoint is a MACHINE Genesis operates on, not a service it calls.
+
+    One instance per machine, declared in the install overlay. The fields are
+    deliberately per-machine rather than per-fleet: the archetype is cloned by
+    copying a YAML, not by subclassing.
+
+    ``machine_id`` is the stable identity and it must NOT be a hostname.
+    MEASURED 2026-09-08: two distinct Windows machines were observed reporting
+    the SAME ``COMPUTERNAME`` while differing in MachineGuid, BIOS serial, model
+    and GPU — so anything keyed on hostname merges them and one machine's state
+    silently overwrites the other's. Use a genuinely unique per-machine value
+    (Windows MachineGuid, a DMI UUID, or an operator-assigned label).
+
+    ``allowed_networks`` enforces reachability rather than assuming it: an
+    endpoint may be reachable only over an overlay network, or only over the
+    LAN, so "either-or" is a requirement rather than flexibility.
+    """
+
+    state_dir: str | None = None
+    mission_command: str | None = None
+    machine_id: str | None = None
+    allowed_networks: list[str] = field(default_factory=lambda: ["lan", "tailnet"])
+
+
+@dataclass
 class ProgramConfig:
     """Full configuration for an external program module.
 
@@ -76,6 +102,7 @@ class ProgramConfig:
     ipc: IPCConfig = field(default_factory=IPCConfig)
     health_check: HealthCheckConfig | None = None
     lifecycle: LifecycleConfig | None = None
+    endpoint: EndpointConfig | None = None
     research_profile: str | None = None
     enabled: bool = False
     # Typed field schema (source of truth for field metadata)
@@ -123,6 +150,16 @@ class ProgramConfig:
                 logs_cmd=lc_data.get("logs_cmd"),
             )
 
+        ep_data = data.get("endpoint")
+        endpoint = None
+        if ep_data:
+            endpoint = EndpointConfig(
+                state_dir=ep_data.get("state_dir"),
+                mission_command=ep_data.get("mission_command"),
+                machine_id=ep_data.get("machine_id"),
+                allowed_networks=ep_data.get("allowed_networks", ["lan", "tailnet"]),
+            )
+
         # Config fields: prefer new typed schema, fall back to legacy configurable dict
         raw_config_fields = data.get("config_fields", [])
         legacy_configurable = data.get("configurable", {})
@@ -156,6 +193,7 @@ class ProgramConfig:
             ipc=ipc,
             health_check=health_check,
             lifecycle=lifecycle,
+            endpoint=endpoint,
             research_profile=data.get("research_profile"),
             enabled=data.get("enabled", False),
             config_fields=config_fields,

@@ -212,13 +212,25 @@ def _load_native_module(data: dict, filename: str):
 
 
 def _load_external_module(data: dict, filename: str):
-    """Load an external program module via ExternalProgramAdapter."""
-    from genesis.modules.external.adapter import ExternalProgramAdapter
+    """Load an external program module via ExternalProgramAdapter or a subclass.
+
+    ``adapter:`` selects a specialised implementation and is OPTIONAL — omitting
+    it yields the plain ExternalProgramAdapter, which is what every existing
+    config does. Selection itself lives in ``modules/external/adapters.py``
+    because the MCP loader must make the identical choice.
+    """
+    from genesis.modules.external.adapters import build_adapter
     from genesis.modules.external.config import ProgramConfig
 
     config = ProgramConfig.from_dict(data)
-    adapter = ExternalProgramAdapter(config)
-    logger.info("External module '%s' loaded from %s", data["name"], filename)
+    adapter = build_adapter(data, filename, config)
+    if adapter is None:
+        return None
+
+    logger.info(
+        "External module '%s' loaded from %s (adapter=%s)",
+        data["name"], filename, data.get("adapter") or "external",
+    )
     return adapter
 
 

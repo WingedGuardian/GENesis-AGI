@@ -32,6 +32,15 @@ _MAX_TURNS_CEILING = 500
 # caller that bypasses config validation. (Parity with _MAX_TURNS_CEILING.)
 _MAX_TIMEOUT_CEILING = 3600
 
+# A health probe answers "is this reachable", so it gets a short FIXED budget
+# rather than borrowing the module's work timeout. This is what the old
+# hardcoded 30s was accidentally right about: wrong as a work timeout (it
+# silently overrode a module's configured `timeout:`) and correct as a health
+# one. Without the split, raising the work timeout to a legitimate 300s would
+# also let a hung health check stall the dashboard's module list for five
+# minutes, since it awaits check_health_cached serially per module.
+_HEALTH_PROBE_TIMEOUT = 30
+
 
 class IPCAdapter(Protocol):
     """Protocol for IPC communication with external programs."""
@@ -211,6 +220,26 @@ class SshIPCAdapter:
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", f"ConnectTimeout={self._ssh_connect_timeout}",
             "-o", "BatchMode=yes",
+            # ConnectTimeout bounds an UNREACHABLE host; these bound one that
+            # accepted the connection and then stopped answering (a machine that
+            # slept mid-session), which would otherwise ride TCP retransmit.
+            #
+            # Safe for a long-running remote command, which is the obvious worry
+            # since this path also carries `claude -p` sessions: keepalives
+            # measure SSH PROTOCOL liveness, and sshd answers them regardless of
+            # what the command is doing. MEASURED against a real endpoint — a
+            # 90-second SILENT remote command completed normally (exit 0, 91s
+            # elapsed) where a naive reading predicts a kill.
+            #
+            # 15s x 4 = ~60s, deliberately not tighter. The kill condition is
+            # consecutive UNANSWERED probes, i.e. the server host or the network
+            # being unreachable for that long — and this path also carries the
+            # live Career Ops `claude -p` runs, where a WiFi roam, a relay
+            # switch or a host paging under load was previously absorbed by TCP
+            # retransmit. A 15s budget would discard an expensive agentic run
+            # over a blip, reported only as "exited 255".
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=4",
         ]
         if self._ssh_key:
             cmd.extend(["-i", self._ssh_key])
@@ -280,7 +309,12 @@ class SshIPCAdapter:
         if method_upper == "CC":
             return await self._send_cc(data or {})
         if method_upper == "SHELL":
-            return await self._send_shell(path)
+            # `data["timeout_s"]` mirrors the CC path's existing contract, so a
+            # caller with its own budget (a health probe) is not forced to reach
+            # for the private method. Wrapping send() in asyncio.wait_for would
+            # be wrong: it cancels the coroutine and orphans the ssh subprocess
+            # that _send_shell's own TimeoutError branch is careful to kill().
+            return await self._send_shell(path, timeout_override=(data or {}).get("timeout_s"))
         return {"error": f"SSH adapter does not support method '{method}'. Use CC or SHELL."}
 
     async def _send_cc(self, data: dict) -> dict:
@@ -350,7 +384,7 @@ class SshIPCAdapter:
 
         return self._parse_cc_output(stdout)
 
-    async def _send_shell(self, command: str) -> dict:
+    async def _send_shell(self, command: str, timeout_override: float | None = None) -> dict:
         """Run a raw shell command on the remote machine.
 
         ``command`` is forwarded verbatim to the remote shell — this is the raw
@@ -358,6 +392,15 @@ class SshIPCAdapter:
         any interpolated/untrusted values before passing them here (see
         ``_build_remote_command`` and ``health_check`` for the quoting pattern).
         """
+        # Honour the module's configured timeout, clamped to the same adapter
+        # ceiling the CC path uses. This was a hardcoded 30s, which silently
+        # overrode config: a module declaring `timeout: 300` still had every
+        # SHELL operation killed at 30s, and the caller saw an ordinary timeout
+        # error with no hint that its own setting had been ignored.
+        # A health probe passes its own short budget rather than inheriting the
+        # work one — see _HEALTH_PROBE_TIMEOUT.
+        timeout_s = min(timeout_override or self._timeout, _MAX_TIMEOUT_CEILING)
+
         ssh_args = self._build_ssh_args(command)
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -367,7 +410,7 @@ class SshIPCAdapter:
             )
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 proc.communicate(),
-                timeout=30,
+                timeout=timeout_s,
             )
         except TimeoutError:
             try:
@@ -375,13 +418,25 @@ class SshIPCAdapter:
                 await proc.wait()
             except ProcessLookupError:
                 pass
-            return {"error": "SSH shell command timed out"}
+            # Name the duration: "timed out" with no number cannot distinguish a
+            # slow remote from a misconfigured budget.
+            return {"error": f"SSH shell command timed out after {timeout_s}s"}
         except OSError as exc:
             return {"error": f"SSH connection failed: {exc}"}
 
+        # A remote whose output is not UTF-8 must not raise out of the transport.
+        # MEASURED: a Windows endpoint returned console-codepage bytes and the
+        # bare .decode() raised UnicodeDecodeError straight through send(), past
+        # every error path here — a crash where every caller expects an error
+        # dict. Not hypothetical for existing SHELL callers.
+        #
+        # `replace` is right HERE and wrong for a payload: this is a diagnostic
+        # channel, so a lossy-but-readable string beats an exception. Anything
+        # that must survive byte-exact carries its own encoding — which is why
+        # the endpoint adapter base64s its payload in BOTH directions.
         return {
-            "output": stdout_bytes.decode().strip(),
-            "stderr": stderr_bytes.decode().strip() or None,
+            "output": stdout_bytes.decode("utf-8", errors="replace").strip(),
+            "stderr": stderr_bytes.decode("utf-8", errors="replace").strip() or None,
             "exit_code": proc.returncode,
         }
 
@@ -418,7 +473,8 @@ class SshIPCAdapter:
     async def health_check(self, endpoint: str, expected_status: int) -> bool:
         """Check remote connectivity by running a simple SSH command."""
         result = await self._send_shell(
-            f"{shlex.quote(self._remote_claude_path)} --version"
+            f"{shlex.quote(self._remote_claude_path)} --version",
+            timeout_override=_HEALTH_PROBE_TIMEOUT,
         )
         return result.get("exit_code") == 0
 
