@@ -1096,6 +1096,16 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         timer_name=$(basename "$template" .template)
         case "$timer_name" in
             genesis-backup.timer) continue ;;  # deliberate setup step — see note below
+            # External review dispatch is OPT-IN for the same reason backups are: it
+            # is rendered here so it is ready, and enabling it is a decision the
+            # operator makes. Three things make auto-enabling wrong. It needs a
+            # separately-installed orchestrator a fresh clone does not have. It spends
+            # Claude subscription window shared with every foreground session — one
+            # review measured ~3% of a 5-hour window. And it is an AUTONOMOUS
+            # capability: turning one on for someone by default is the operator's
+            # call, not the installer's.
+            #   systemctl --user enable --now genesis-external-review.timer
+            genesis-external-review.timer) continue ;;
         esac
         if [ -f "$SYSTEMD_USER_DIR/$timer_name" ]; then
             systemctl --user enable --now "$timer_name" 2>/dev/null && \
