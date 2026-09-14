@@ -20,6 +20,7 @@ identical, not coincidentally so.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -383,8 +384,17 @@ def test_the_attached_spelling_is_measured_too(marker_repo):
         "bare --exec-path ran the subcommand; the no-subcommand exemption is "
         "no longer true of this git"
     )
+    # The path comes from the git BEING TESTED, never a literal: a source-built
+    # git or a distro using /usr/libexec/git-core has no git-config under the
+    # hardcoded directory, so the probe would return False and this test would
+    # fail on a correct parser. Install-agnostic tests are a repo rule, and this
+    # assertion is about the parser, not about where git was installed.
+    exec_path = subprocess.run(
+        ["git", "--exec-path"], capture_output=True, text=True, timeout=30
+    ).stdout.strip()
+    assert exec_path, "git --exec-path reported nothing; the probe below would be vacuous"
     assert _runs_the_subcommand(
-        "--exec-path", marker_repo, attached_value="/usr/lib/git-core"
+        "--exec-path", marker_repo, attached_value=exec_path
     ), (
         "--exec-path=<path> did NOT run the subcommand on this git. If that is "
         "genuinely so here, the `not value_attached` qualifier in _verb_walk "
@@ -407,7 +417,18 @@ def test_every_global_gits_usage_advertises_is_classified():
     """
     import re
 
-    usage = subprocess.run(["git"], capture_output=True, text=True, timeout=30).stdout
+    # LC_ALL=C: the split sentinel below is English, and git's help text is
+    # translatable. Under a localized catalog the sentinel is absent, `head`
+    # becomes the WHOLE help output, and the footer's `git help -a` / `git help -g`
+    # examples get scraped as advertised globals — so the test fails on a
+    # localized box while the option table is perfectly correct.
+    usage = subprocess.run(
+        ["git"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "LC_ALL": "C", "LANGUAGE": "C"},
+    ).stdout
     head = usage[: usage.find("These are common")] if "These are common" in usage else usage
     assert head.strip(), "could not read git's usage line; the check would be vacuous"
 
@@ -422,3 +443,36 @@ def test_every_global_gits_usage_advertises_is_classified():
         "not resolve through the repository (see _runs_the_subcommand), then "
         "add it to the matching set."
     )
+
+
+def test_the_attached_only_terminal_globals_are_true_of_the_installed_git(marker_repo):
+    """`--list-cmds=<groups>` is terminal ATTACHED — the mirror of `--exec-path`.
+
+    Two option shapes that look alike and behave oppositely, which is why they
+    need separate sets rather than one `no_subcommand` field:
+
+        --exec-path        bare -> no subcommand   attached -> RUNS the subcommand
+        --list-cmds        bare -> REJECTED        attached -> no subcommand
+
+    A single bare-only exemption gets `--list-cmds=main` wrong in the
+    over-block direction: the closed world calls it unclassified and the push
+    guard refuses it. That is not hypothetical — the installed bash-completion
+    script invokes `__git --list-cmds=main,others,alias,nohelpers`, so the
+    spelling is in live use on this box.
+
+    It is invisible to the usage-line completeness check because `git -h` does
+    not advertise it, so this case exists precisely to cover what that sweep
+    cannot see. Raised by review, confirmed against the binary here.
+    """
+    assert not _runs_the_subcommand("--list-cmds", marker_repo, attached_value="main"), (
+        "git --list-cmds=main ran the subcommand on this git; if that is genuinely "
+        "so here, it is NOT a terminal option and must leave "
+        "_GIT_OPTS_NO_SUBCOMMAND_ATTACHED — otherwise a gated verb after it is allowed"
+    )
+    for option in sorted(sp._GIT_OPTS_NO_SUBCOMMAND_ATTACHED):
+        bare_runs = _runs_the_subcommand(option, marker_repo)
+        assert not bare_runs, (
+            f"{option} is listed as attached-only terminal, but its BARE form ran "
+            "the subcommand on this git — a gated verb after the bare spelling "
+            "would then be allowed. Re-derive its classification."
+        )

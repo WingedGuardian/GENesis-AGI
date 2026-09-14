@@ -291,6 +291,18 @@ _GIT_OPTS_VALUELESS = frozenset(
 # 17 of the 117 unknown-option occurrences in the command corpus. Without them
 # the commonest benign global on the box starts blocking. `-v` is here for the
 # same reason and behaves identically; it was missed by the first sweep.
+# ATTACHED-ONLY no-subcommand globals: `--list-cmds=<groups>` exits 0, prints the
+# command list, and does NOT run the subcommand — but the BARE spelling is
+# REJECTED (rc=129, "unknown option"). The exact mirror of `--exec-path`, which
+# is terminal bare and RUNS the subcommand when attached, so the two cannot
+# share one set.
+#
+# Absent from `git -h`, so the usage-line completeness test cannot see it — it
+# was found by review, not by the sweep. Not hypothetical: the installed
+# bash-completion script calls
+# `__git --list-cmds=main,others,alias,nohelpers`, so refusing it would refuse a
+# spelling the shell environment itself uses.
+_GIT_OPTS_NO_SUBCOMMAND_ATTACHED = frozenset({"--list-cmds"})
 _GIT_OPTS_NO_SUBCOMMAND = frozenset(
     {
         "--exec-path",
@@ -1367,6 +1379,7 @@ _ALL_BLIND_SPOTS = (
     _BLIND_OVER_NESTED,
     _BLIND_OVER_LONG,
     _BLIND_UNRESOLVED_VERB,
+    _BLIND_UNCLASSIFIED_OPTION,
 )
 
 
@@ -1897,7 +1910,12 @@ class _DispatcherSpec(NamedTuple):
     value_flags: frozenset[str]  # consume the FOLLOWING token as their value
     groups: frozenset[str]  # a group name; the next bare word is the verb
     valueless: frozenset[str] = frozenset()  # accepted, consume nothing
-    no_subcommand: frozenset[str] = frozenset()  # the subcommand never runs
+    no_subcommand: frozenset[str] = frozenset()  # BARE form runs no subcommand
+    # ATTACHED form runs no subcommand. A separate set because the two are
+    # mirror images and one field cannot hold both: MEASURED on git 2.43,
+    # `--exec-path` is terminal BARE and runs the subcommand when attached,
+    # while `--list-cmds=main` is terminal ATTACHED and is rejected bare.
+    no_subcommand_attached: frozenset[str] = frozenset()
     closed_world: bool = False  # an option in none of the above ⇒ verb unknown
     glued_value_shorts: frozenset[str] = frozenset()  # `-Rvalue` is one token
 
@@ -1919,6 +1937,7 @@ _VERB_DISPATCHERS: dict[str, _DispatcherSpec] = {
         groups=frozenset(),
         valueless=_GIT_OPTS_VALUELESS,
         no_subcommand=_GIT_OPTS_NO_SUBCOMMAND,
+        no_subcommand_attached=_GIT_OPTS_NO_SUBCOMMAND_ATTACHED,
         closed_world=True,
     ),
     "gh": _DispatcherSpec(
@@ -2264,6 +2283,9 @@ def _verb_walk(argv: list[str]) -> tuple[bool, str]:
             name, value_attached = _option_name(tok, spec)
             if not _word_is_literal(name) or _word_continues(tok):
                 return True, ""
+            if value_attached and name in spec.no_subcommand_attached:
+                # ATTACHED-only terminal (`--list-cmds=main`): nothing gated runs.
+                return False, ""
             if name in spec.no_subcommand and not value_attached:
                 # git handles it; no subcommand runs, so none is hidden.
                 #
