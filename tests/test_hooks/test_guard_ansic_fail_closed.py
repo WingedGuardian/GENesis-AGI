@@ -1791,3 +1791,71 @@ class TestVerbPositionReachesTheGuard:
             "the residual closed without this test being updated — that is "
             f"good news, but say so deliberately.\n{r.stdout}{r.stderr}"
         )
+
+
+# ── A git global option whose value the verb walk does not consume ────────────
+#
+# The walk that finds a git subcommand skips a KNOWN value-taking option plus
+# its value (`i += 2`) and every other `-`-prefixed token alone (`i += 1`). So
+# an option missing from the table is ASSUMED valueless, and if it really does
+# consume a value, that value lands in the verb slot: the walk reports it as the
+# subcommand, the real verb is never reached, and every gate keyed on the
+# subcommand stands down.
+#
+# This is not an exotic-quoting case — the command below is written out in full.
+# The option set was MEASURED against the installed git rather than read from
+# `git -h`, which omits `--attr-source` entirely while git accepts it.
+class TestGitGlobalOptionValueIsNotMistakenForTheVerb:
+    """A publish must stay gated when a global option precedes the verb."""
+
+    def test_a_listed_option_keeps_the_publish_gated(self, tmp_path, monkeypatch):
+        """CONTROL. `-c` is in the table, so its value is skipped correctly.
+
+        This is the cell that proves the fixture builds the hazard at all: if
+        this one does not gate, the variants below prove nothing, because an
+        un-gated control makes every verdict look the same.
+        """
+        cwd = _unpushed_repo(tmp_path, monkeypatch)
+        r = _run(_PUSH_GUARD, f"{GIT} -c user.name=x {PUSH} {FORCE} origin main", cwd=cwd)
+        assert _decision(r) in ("ask", "block"), (
+            "the control is not gated, so this class of test cannot measure "
+            f"anything.\n{r.stdout}{r.stderr}"
+        )
+
+    @pytest.mark.parametrize(
+        ("option", "value"),
+        [
+            ("--config-env", "user.name=HOME"),
+            ("--attr-source", "HEAD"),
+            ("--shallow-file", "/dev/null"),
+        ],
+    )
+    def test_an_unlisted_value_option_does_not_hide_the_publish(
+        self, option, value, tmp_path, monkeypatch
+    ):
+        """Each of these consumes its value on the installed git (MEASURED).
+
+        Absent from the value-flag table, the walk reads the VALUE as the
+        subcommand and the publish goes unseen.
+
+        What fails THIS test is removing an entry from
+        `git_push_guard._GIT_GLOBAL_VALUE_FLAGS` — the set this guard reads.
+        Removing it from the canonical set instead fails
+        `test_value_flag_consistency` for the three copies that still carry it.
+        Both matter: the first is the live bypass, the second is the drift that
+        produces it.
+
+        `--shallow-file` is here because it was MISSED by the first pass of this
+        very fix and found by review — the table was corrected for the two
+        options already suspected while a third sat unlisted. The derived test
+        in `test_value_flag_consistency` exists so the next one fails loudly
+        instead of waiting for a reviewer.
+        """
+        cwd = _unpushed_repo(tmp_path, monkeypatch)
+        cmd = f"{GIT} {option} {value} {PUSH} {FORCE} origin main"
+        r = _run(_PUSH_GUARD, cmd, cwd=cwd)
+        assert _decision(r) in ("ask", "block"), (
+            f"a force-publish preceded by `{option} <value>` was ALLOWED: the "
+            "option's value was taken for the subcommand, so the publish was "
+            f"never seen.\n{r.stdout}{r.stderr}"
+        )
