@@ -230,6 +230,70 @@ _GIT_OPTS_WITH_ARG = {
     "--attr-source",
     "--shallow-file",
 }
+# The other two halves of git's global-option world, so the walks below can tell
+# an option they KNOW is harmless from one they have simply never heard of.
+#
+# Both MEASURED against the installed binary with an oracle: for every candidate
+# the strings table yields, run it in front of a subcommand whose output only
+# the SUBCOMMAND can produce, and see whether that marker appears. Of 750
+# candidates: 8 consumers, 12 valueless, 4 that run no subcommand, 726 that git
+# rejects outright.
+#
+# THE ORACLE MUST NOT RESOLVE THROUGH THE REPOSITORY, and the first version of
+# it did. Reading the marker from the probe repo's own config makes the lookup
+# MISS for any global that changes repository or config resolution — the
+# subcommand ran, the marker is simply not where the probe looked — and that
+# scores the option as "git rejects it outright". `--bare` is exactly that
+# case: a plain valueless global, advertised in git's own usage line, scored as
+# rejected and left out of every set. The marker now lives in a file named by
+# absolute path (`config --file <abs> --get`), which no global redirects.
+# Found by adversarial review; the first sweep's counts were wrong by two.
+#
+# VALUELESS: git accepts it, consumes nothing, and the subcommand still runs. The
+# walk steps over the option alone.
+_GIT_OPTS_VALUELESS = frozenset(
+    {
+        "-P",
+        "-p",
+        "--bare",
+        "--paginate",
+        "--no-pager",
+        "--no-optional-locks",
+        "--no-replace-objects",
+        "--literal-pathspecs",
+        "--no-literal-pathspecs",
+        "--glob-pathspecs",
+        "--noglob-pathspecs",
+        "--icase-pathspecs",
+    }
+)
+# NO SUBCOMMAND: git handles the option itself and the subcommand never runs, so
+# there is no operation for a gate to miss. `--exec-path`, `--html-path`,
+# `--man-path` and `--info-path` print and exit 0. The other three are here for a
+# DIFFERENT measured reason and the difference is why they are not called
+# "terminal": `git --version config --get x` exits 129 with "unknown option
+# `get'" — git substitutes its own `version`/help operation and hands the rest to
+# THAT, so the real subcommand is equally unreachable while the exit status is a
+# failure rather than a clean print. Either way nothing gated runs, which is the
+# only property this set asserts.
+#
+# They need entries even though git rejects the command, because under the closed
+# world below an unlisted option is refused — and `--version`/`--help`/`-h` are
+# 17 of the 117 unknown-option occurrences in the command corpus. Without them
+# the commonest benign global on the box starts blocking. `-v` is here for the
+# same reason and behaves identically; it was missed by the first sweep.
+_GIT_OPTS_NO_SUBCOMMAND = frozenset(
+    {
+        "--exec-path",
+        "--html-path",
+        "--man-path",
+        "--info-path",
+        "--version",
+        "--help",
+        "-h",
+        "-v",
+    }
+)
 # git-commit short flags that consume the REST of their short-bundle as a value
 # (so -minitial is `-m initial`, not a bundle containing -n).
 _COMMIT_ARG_FLAGS = "mFCc"
@@ -1226,6 +1290,28 @@ _BLIND_UNRESOLVED_VERB = BlindSpot(
     ),
 )
 
+#: The SECOND cause that reaches the unresolved-verb predicate: every word is
+#: readable, and one of the options before the verb is not classifiable, so
+#: whether it consumes the next token — and therefore which word the verb is —
+#: is unknown. Same blindness, and a DIFFERENT remedy: there is nothing to
+#: "write out literally" here, so reusing the message above would name a rewrite
+#: the session has already performed. That is not a cosmetic difference on a
+#: hard block, where the message is the only route out.
+_BLIND_UNCLASSIFIED_OPTION = BlindSpot(
+    bounds_induced=False,  # no bound fired — same reasoning as the cause above
+    cause=(
+        "passes an option before the subcommand that this parser cannot classify, "
+        "so it cannot tell whether that option consumes the next word and cannot "
+        "establish which operation would run"
+    ),
+    hint=(
+        "drop the unrecognised option, or run the command without it and set what "
+        "it configures another way. If the option is legitimate and current, it "
+        "belongs in the option tables in shell_parse (with the classification "
+        "MEASURED against the installed binary, not read from help output)"
+    ),
+)
+
 #: THE OTHER HALF OF VERB POSITION IS DELIBERATELY NOT REPORTED, and the reason is
 #: measurement rather than oversight. When the PROGRAM ITSELF is built by the shell
 #: (``$PY x.py``, ``$SSH host …``), nothing about the segment is established — not
@@ -1368,7 +1454,18 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
         return [], _BLIND_OVER_NESTED
     if untokenizable(command):
         return segments, _BLIND_UNTOKENIZABLE
-    if any(_dispatcher_verb_unresolved(s) for s in segments):
+    hidden = [s for s in segments if _dispatcher_verb_unresolved(s)]
+    if hidden:
+        # Two causes reach one predicate, and they need DIFFERENT remedies. The
+        # expansion cause is answered by writing the subcommand out; telling a
+        # session that when its subcommand is ALREADY literal names a rewrite it
+        # cannot perform, which is the failure mode a refusal message has to
+        # avoid — the message is the only way out of a hard block. Recovered by
+        # re-deriving the cause here rather than by adding a field to
+        # :class:`BlindSpot`, which its own docstring rules out and for a
+        # measured reason: a field makes every consumer choose again, silently.
+        if any(_unclassified_global(s.argv) for s in hidden):
+            return segments, _BLIND_UNCLASSIFIED_OPTION
         return segments, _BLIND_UNRESOLVED_VERB
     return segments, None
 
@@ -1762,10 +1859,43 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
 #: column rather than assuming the columns are exhaustive.
 _EXPANSION_MARKS = ("$", "`")
 
+
+class _DispatcherSpec(NamedTuple):
+    """How one dispatcher's leading options behave, so a walk can find the verb.
+
+    ``closed_world`` is the load-bearing field. When it is True, an option in
+    NONE of the three sets leaves the verb UNESTABLISHED rather than assumed
+    harmless — the inversion that stops an unlisted value-consumer putting its
+    own VALUE in the verb slot. It is per-exe because the two dispatchers differ
+    in a way that was MEASURED rather than assumed:
+
+    * **git** — accepts options this module has never heard of, and 726 of the
+      750 candidates its own strings table yields are rejected while a handful
+      consume a value. Three such options (``--config-env``, ``--attr-source``,
+      ``--shallow-file``) each let a LITERAL force-publish past this guard
+      before they were listed. Closed world.
+    * **gh** — ``gh --bogus-flag x pr view 1`` exits 1 with "unknown flag" and
+      runs nothing, so an unlisted gh option cannot hide a verb; gh's parser
+      closes the open set for us. Open world, and making it closed would be pure
+      over-block with no hazard behind it.
+
+    ``glued_value_shorts`` is likewise measured, and the two disagree:
+    ``gh -Rcli/cli pr view 1`` exits 0, while ``git -C/tmp/x rev-parse`` and
+    ``git -cuser.name=x config`` both exit 129 with "unknown option". So gh's
+    ``-R`` carries an attached value and git's shorts do not.
+    """
+
+    value_flags: frozenset[str]  # consume the FOLLOWING token as their value
+    groups: frozenset[str]  # a group name; the next bare word is the verb
+    valueless: frozenset[str] = frozenset()  # accepted, consume nothing
+    no_subcommand: frozenset[str] = frozenset()  # the subcommand never runs
+    closed_world: bool = False  # an option in none of the above ⇒ verb unknown
+    glued_value_shorts: frozenset[str] = frozenset()  # `-Rvalue` is one token
+
+
 #: Programs whose FIRST WORDS choose the operation, so the verb is not argv[0].
-#: Per exe: (global options that consume the FOLLOWING token as a value, the
-#: first-words that dispatch a FURTHER verb). ``git push`` is one word; ``gh pr
-#: merge`` is two, because ``pr`` is a group rather than an operation.
+#: ``git push`` is one word; ``gh pr merge`` is two, because ``pr`` is a group
+#: rather than an operation. Field meanings are on :class:`_DispatcherSpec`.
 #:
 #: MIRRORS THE CONSUMERS — :func:`git_subcommand` and :func:`gh_pr_subcommand` —
 #: rather than modelling each CLI's grammar, and the difference is not cosmetic. A
@@ -1774,9 +1904,19 @@ _EXPANSION_MARKS = ("$", "`")
 #: flagged 1,830 ``gh api <endpoint>`` invocations, whose endpoint is an ARGUMENT
 #: that routinely interpolates an issue number or a sha. A verb rule that reads an
 #: argument is not a stricter verb rule, it is a different and wrong one.
-_VERB_DISPATCHERS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
-    "git": (frozenset(_GIT_OPTS_WITH_ARG), frozenset()),
-    "gh": (frozenset({"-R", "--repo"}), frozenset({"pr"})),
+_VERB_DISPATCHERS: dict[str, _DispatcherSpec] = {
+    "git": _DispatcherSpec(
+        value_flags=frozenset(_GIT_OPTS_WITH_ARG),
+        groups=frozenset(),
+        valueless=_GIT_OPTS_VALUELESS,
+        no_subcommand=_GIT_OPTS_NO_SUBCOMMAND,
+        closed_world=True,
+    ),
+    "gh": _DispatcherSpec(
+        value_flags=frozenset({"-R", "--repo"}),
+        groups=frozenset({"pr"}),
+        glued_value_shorts=frozenset({"-R"}),
+    ),
 }
 
 
@@ -2002,11 +2142,50 @@ def _word_continues(token: str) -> bool:
     return (saw_sub and depth > 0) or token.count("`") % 2 == 1
 
 
+def _option_name(tok: str, spec: _DispatcherSpec) -> tuple[str, bool]:
+    """Split an option token into its NAME and whether its value rides along.
+
+    Three spellings of the same option must answer the same, because they are
+    the same command to the program: ``--repo o/r``, ``--repo=o/r``, ``-Ro/r``.
+    Before this, the glued short form did not — ``_verb_unresolved`` split on
+    ``=`` only, so ``-R$REPO`` was tested WHOLE, read as an unreadable option
+    name, and flagged, while ``-R $REPO`` and ``--repo=$REPO`` passed. MEASURED
+    on the merged tree: True / False / False for one command written three ways.
+
+    The glued form is recognised only for shorts the spec LISTS, because
+    acceptance is per-program and was measured both ways: gh takes
+    ``-Rcli/cli``, git rejects ``-C/tmp/x`` and ``-cuser.name=x`` outright. A
+    blanket rule would read a value off a token git never accepts.
+    """
+    if "=" in tok:
+        return tok.split("=", 1)[0], True
+    if not tok.startswith("--") and len(tok) > 2 and tok[:2] in spec.glued_value_shorts:
+        return tok[:2], True
+    return tok, False
+
+
 def _verb_unresolved(argv: list[str]) -> bool:
     """Whether this argv's VERB — the words that decide WHICH operation runs —
-    carries a shell expansion, so the parse cannot establish what it is.
+    cannot be established by the parse.
 
-    Two positions qualify, and only these two:
+    TWO CAUSES, and they are not the same kind of fact. The first is a shell
+    expansion standing where a verb-deciding word should be: the text is not
+    there to read. The second is an option this module cannot CLASSIFY on a
+    dispatcher whose world is closed (:attr:`_DispatcherSpec.closed_world`) —
+    the text is perfectly readable, and the parse still cannot say which word is
+    the verb, because an unlisted option that consumes a value puts that VALUE
+    in the verb slot.
+
+    The second cause is the inversion this function exists to carry. Before it,
+    an unlisted ``-``-prefixed token was stepped over alone, so the walk
+    answered CONFIDENTLY and WRONGLY: ``git --future-opt somevalue push --force``
+    resolved its verb to ``somevalue``, every gate keyed on ``push`` stood down,
+    and nothing reported a difficulty. Three real options behaved exactly that
+    way on this guard. Now an unclassified option is reported here, the same way
+    an unreadable one is, and the callers that already refuse an unresolved verb
+    refuse it — failing closed and visibly instead of open and silently.
+
+    Two positions qualify for the expansion cause, and only these two:
 
     * the executable's BASENAME. Only the basename, because that is what
       :func:`_basename` reads and what a gate compares: ``$HOME/bin/git`` and
@@ -2028,14 +2207,37 @@ def _verb_unresolved(argv: list[str]) -> bool:
 
     Returns False for an empty argv — nothing executes, so there is no verb.
     """
+    return _verb_walk(argv)[0]
+
+
+def _unclassified_global(argv: list[str]) -> str:
+    """The option that made this argv's verb unestablished, or ``""``.
+
+    Distinguishes the two causes of :func:`_verb_unresolved` so a refusal can
+    name a remedy that applies. Both answers come out of ONE walk
+    (:func:`_verb_walk`) rather than a second copy of it — two walks of the same
+    grammar disagreeing is the defect class this change exists to close, so a
+    fresh walk written to REPORT on that class would be the first thing to
+    diverge from it.
+    """
+    return _verb_walk(argv)[1]
+
+
+def _verb_walk(argv: list[str]) -> tuple[bool, str]:
+    """``(verb is unestablished, the unclassifiable option that made it so)``.
+
+    The second element is ``""`` whenever the cause is an unreadable word
+    rather than an unrecognised option, so a caller can tell an expansion from
+    a classification gap without walking the argv again.
+    """
     if not argv:
-        return False
+        return False, ""
     if not _word_is_literal(_basename(argv[0])):
-        return True
+        return True, ""
     spec = _VERB_DISPATCHERS.get(_basename(argv[0]))
     if spec is None:
-        return False
-    value_flags, groups = spec
+        return False, ""
+    groups = spec.groups
     i = 1
     while i < len(argv):
         tok = argv[i]
@@ -2050,27 +2252,48 @@ def _verb_unresolved(argv: list[str]) -> bool:
             # An unreadable option NAME still returns True: it can expand to a
             # value-taking flag and consume the following word, which shifts what
             # lands in the verb slot.
-            if not _word_is_literal(tok.split("=", 1)[0]) or _word_continues(tok):
-                return True
-            if "=" not in tok and tok in value_flags:
+            name, value_attached = _option_name(tok, spec)
+            if not _word_is_literal(name) or _word_continues(tok):
+                return True, ""
+            if name in spec.no_subcommand and not value_attached:
+                # git handles it; no subcommand runs, so none is hidden.
+                #
+                # BARE ONLY, and the qualifier is the whole point. MEASURED with
+                # a marker only the subcommand can print: `git --exec-path
+                # config --get <marker>` does NOT run it, while
+                # `git --exec-path=<path> config --get <marker>` DOES — the
+                # attached form SETS the exec path and carries on. Treating the
+                # two alike would have let `git --exec-path=/x push --force`
+                # past this guard, which main refuses today; the corpus has no
+                # instance of the attached form, so only predicting the case
+                # found it. An attached spelling falls through to the closed
+                # world below and is refused — an over-block on a form nobody
+                # types, in the safe direction.
+                return False, ""
+            if not value_attached and name in spec.value_flags:
                 # The SEPARATE form: the value is the next token, skipped unread for
                 # the same reason an attached one is — UNLESS it is only the head of
                 # a split word, in which case skipping it lands the walk on that
                 # word's tail and every position after is wrong (:func:`_word_continues`).
                 if i + 1 < len(argv) and _word_continues(argv[i + 1]):
-                    return True
+                    return True, ""
                 i += 2
                 continue
+            if spec.closed_world and name not in spec.value_flags and name not in spec.valueless:
+                # THE INVERSION. Readable, and still unclassified — so whether it
+                # eats the next token is unknown, and so is which word the verb is.
+                return True, name
             i += 1
             continue
         if not _word_is_literal(tok):
-            return True  # the verb itself
+            return True, ""  # the verb itself
         if tok in groups:
             groups = frozenset()  # a group name: the NEXT bare word is the verb
             i += 1
             continue
-        return False  # the verb, read plainly
-    return False  # ran out of words before the verb was complete — nothing to hide
+        return False, ""  # the verb, read plainly
+    # Ran out of words before the verb was complete — nothing to hide.
+    return False, ""
 
 
 def _dispatcher_verb_unresolved(seg: Segment) -> bool:
@@ -2329,6 +2552,33 @@ def git_subcommand_index(argv: list[str]) -> int | None:
     The alternative was for the caller to repeat the option-skipping loop below.
     That is replica drift: two copies of one rule, diverging silently the next
     time the option table grows. One scan, one source of truth.
+
+    THIS WALK IS DELIBERATELY NOT CLOSED-WORLD, and the asymmetry with
+    :func:`_verb_unresolved` is the load-bearing decision in this change.
+
+    An earlier revision of it returned None for an option the module cannot
+    classify — the honest answer to "which word is the verb". It was WRONG to
+    ship, because None already means something else to every caller. Twenty-four
+    call sites across five guards read "not the subcommand I gate" as "not my
+    concern", so widening None widened the set of commands each guard ignores.
+    MEASURED on that revision, against the same guards on merged main:
+    ``git --bare worktree remove <path>`` went BLOCK -> allow in
+    worktree_cwd_guard, and ``commit_skips_hooks`` flipped True -> False for a
+    ``--no-verify`` behind any unclassified global — a fail-open introduced by a
+    change whose entire purpose is to close one.
+
+    So the inversion lives on :attr:`Segment.verb_unresolved`, which is a
+    channel whose only meaning is "cannot tell" and which the callers that fail
+    closed already consult. This function keeps main's best-effort answer: for
+    an unlisted consumer it can still name the option's VALUE as the verb, which
+    is the pre-existing residual, unchanged here and NOT closed by this change.
+    Closing it means teaching each guard to consult the blind spot, which is
+    per-guard work on five enforcement hooks and belongs in its own change.
+
+    Read together: ask :func:`_verb_unresolved` whether the verb can be trusted;
+    ask this for what it is. A caller that acts on the answer without asking the
+    first question is exactly as exposed as it was before this change — no more,
+    and for the push guard, which does ask, considerably less.
     """
     if not argv or _basename(argv[0]) != "git":
         return None
@@ -2367,7 +2617,7 @@ def gh_pr_subcommand(argv: list[str]) -> str | None:
     """
     if not argv or _basename(argv[0]) != "gh":
         return None
-    _VALUE_FLAGS = {"-R", "--repo"}
+    spec = _VERB_DISPATCHERS["gh"]
     for i, t in enumerate(argv[1:], 1):
         if t == "pr":
             skip_next = False
@@ -2375,7 +2625,14 @@ def gh_pr_subcommand(argv: list[str]) -> str | None:
                 if skip_next:
                     skip_next = False
                     continue
-                if u in _VALUE_FLAGS:
+                # Read the option table off the shared spec rather than a local
+                # set literal. No argv makes the two disagree today (checked the
+                # separated, attached and glued spellings, and both orderings of
+                # the group word), so this is drift insurance rather than a fix.
+                # But a second copy of one CLI option grammar is the shape that
+                # produced the defect this change is about, twenty lines above.
+                name, attached = _option_name(u, spec)
+                if not attached and name in spec.value_flags:
                     skip_next = True
                     continue
                 if not u.startswith("-"):
@@ -2390,19 +2647,9 @@ def commit_skips_hooks(argv: list[str]) -> bool:
     Parses real argv tokens, so a quoted ``'--no-verify'`` counts and an
     attached message ``-minitial`` does NOT (that is ``-m initial``).
     """
-    if git_subcommand(argv) != "commit":
+    i = git_subcommand_index(argv)
+    if i is None or argv[i] != "commit":
         return False
-    # Advance past git global options (+ their values) to the "commit" token.
-    i = 1
-    while i < len(argv):
-        t = argv[i]
-        if t in _GIT_OPTS_WITH_ARG:
-            i += 2
-            continue
-        if t.startswith("-"):
-            i += 1
-            continue
-        break  # argv[i] == "commit"
     i += 1  # move past "commit"
     while i < len(argv):
         tok = argv[i]

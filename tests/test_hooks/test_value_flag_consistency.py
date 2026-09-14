@@ -20,6 +20,8 @@ identical, not coincidentally so.
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -221,4 +223,173 @@ def test_the_table_covers_every_option_the_installed_git_consumes():
         "option's VALUE in the subcommand slot, so every guard keyed on the "
         "subcommand stops seeing the real operation. Add them to "
         "_CANONICAL_GIT_GLOBAL_VALUE_FLAGS and to all four copies it locks."
+    )
+
+
+_SUBCOMMAND_MARKER = "GENESIS_SUBCOMMAND_MARKER"
+
+
+@pytest.fixture(scope="module")
+def marker_repo(tmp_path_factory):
+    """One throwaway repo holding a config value only a SUBCOMMAND can print.
+
+    Module-scoped and built through ``tmp_path_factory`` on purpose. Both tests
+    below probe every member of their set, so a repo per probe would be 18 of
+    them per run — created under the ambient temp dir, never removed, on every
+    CI run and every local run. pytest owns this one and reaps it.
+    """
+    git = shutil.which("git")
+    if not git:  # pragma: no cover - environment dependent
+        pytest.skip("needs git to derive the classification")
+    repo = tmp_path_factory.mktemp("genesis-marker-repo")
+    subprocess.run([git, "init", "-q", str(repo)], check=True, timeout=30)
+    marker_file = repo / "probe.cfg"
+    marker_file.write_text(f"[genesis]\n\tmarker = {_SUBCOMMAND_MARKER}\n", encoding="utf-8")
+    return repo, marker_file
+
+
+def _runs_the_subcommand(option: str, marker_repo, *, attached_value: str = "") -> bool:
+    """Whether the installed git still runs a subcommand placed after *option*.
+
+    Two things about this probe are load-bearing, and the first version of it
+    got the second one wrong.
+
+    The marker is a config value rather than the version string, because the
+    obvious marker cannot answer this question: `git --version version` prints
+    "git version …" whether the subcommand ran or not, so it cannot tell the
+    two apart for the very options being asked about.
+
+    And the marker is read from a file named by ABSOLUTE PATH, never from the
+    repository's own config. A global that changes repository or config
+    resolution — `--bare`, `--git-dir=…` — makes a repo-relative lookup miss
+    while the subcommand runs perfectly well, and this probe cannot tell that
+    miss from "the option was rejected". That is not hypothetical: it is how
+    `--bare` came to be absent from every set while the sweep reported a tidy
+    750-candidate breakdown. An oracle that the thing being measured can
+    redirect is measuring something else.
+    """
+    repo, marker_file = marker_repo
+    spelling = f"{option}={attached_value}" if attached_value else option
+    p = subprocess.run(
+        ["git", spelling, "config", "--file", str(marker_file), "--get", "genesis.marker"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=str(repo),
+    )
+    return _SUBCOMMAND_MARKER in p.stdout
+
+
+def test_the_no_subcommand_exemption_is_true_of_the_installed_git(marker_repo):
+    """Each exempt option must really stop the subcommand running.
+
+    THIS IS A SAFETY ASSERTION, not a tidiness one, and it is the price of the
+    exemption. Because these options are exempt, a gated verb written after one
+    of them is ALLOWED — MEASURED as a deliberate change: all seven go BLOCK ->
+    ALLOW, on the ground that git never reaches the verb. If that ground ever
+    stops holding for one of them (a git release that keeps parsing, a
+    spelling that means something else), the exemption silently becomes a
+    bypass of every gate keyed on the subcommand.
+
+    So the claim is re-derived from the binary on every run rather than trusted
+    from a comment. Without this, the fix for a hand-maintained list that fails
+    open would have introduced a second hand-maintained list that fails open.
+
+    GUARD-THE-GUARD, and it is structural rather than an extra assertion: this
+    test and its sibling below demand OPPOSITE answers from the same helper —
+    every option here must NOT run the subcommand, every option there MUST.
+    MEASURED 7 False / 11 True. A helper stuck on either constant therefore
+    fails one of the two, which is what stops a derived test going quiet.
+    """
+    still_running = []
+    for option in sorted(sp._GIT_OPTS_NO_SUBCOMMAND):
+        if _runs_the_subcommand(option, marker_repo):
+            still_running.append(option)
+
+    assert not still_running, (
+        f"{still_running} are exempt from the closed world on the grounds that "
+        "no subcommand runs after them, but on THIS git the subcommand DID "
+        "run. A gated verb written after one of these is currently allowed, so "
+        "each of these is a live bypass. Remove it from "
+        "_GIT_OPTS_NO_SUBCOMMAND and classify it by what it actually does."
+    )
+
+
+def test_the_valueless_set_really_consumes_nothing(marker_repo):
+    """A valueless option that actually eats a value would hide the verb.
+
+    The mirror of the assertion above, in the other direction: the walk steps
+    over these ALONE, so if one of them consumed the following token, that
+    token is the verb slot again and we are back at the original defect. The
+    marker proves both halves at once — the subcommand ran, and it ran with no
+    value taken from it.
+    """
+    wrong = [
+        option
+        for option in sorted(sp._GIT_OPTS_VALUELESS)
+        if not _runs_the_subcommand(option, marker_repo)
+    ]
+    assert not wrong, (
+        f"{wrong} are listed as valueless, but on THIS git the subcommand did "
+        "not run after them bare — so either they consume a value (and the "
+        "walk is off by one, putting a VALUE in the verb slot) or git rejects "
+        "them. Re-derive the classification against the installed binary."
+    )
+
+
+def test_the_attached_spelling_is_measured_too(marker_repo):
+    """The exemption is BARE-only, and this is the axis that proves why.
+
+    `--exec-path` runs no subcommand; `--exec-path=<path>` sets the exec path
+    and RUNS one. The sets are keyed by option NAME, so nothing in them can
+    express that difference — the walk does, with a `not value_attached`
+    qualifier, and dropping that qualifier reopens the bypass.
+
+    The two tests above probe the bare spelling only, so neither of them can
+    see this. Without this case the file whose job is "re-derive from the
+    binary on every run" would grade a future edit to the sets with a probe
+    blind to the dangerous half.
+    """
+    assert not _runs_the_subcommand("--exec-path", marker_repo), (
+        "bare --exec-path ran the subcommand; the no-subcommand exemption is "
+        "no longer true of this git"
+    )
+    assert _runs_the_subcommand(
+        "--exec-path", marker_repo, attached_value="/usr/lib/git-core"
+    ), (
+        "--exec-path=<path> did NOT run the subcommand on this git. If that is "
+        "genuinely so here, the `not value_attached` qualifier in _verb_walk "
+        "is no longer load-bearing — but verify before relaxing it, because "
+        "relaxing it wrongly allows a publish this guard refuses."
+    )
+
+
+def test_every_global_gits_usage_advertises_is_classified():
+    """git's own usage line is a completeness check the strings sweep is not.
+
+    The sweep answers "what does this option DO"; it cannot answer "did I miss
+    one", because a sweep blind to a class scores that class as rejected and
+    reports a tidy total either way. This reads the list git itself advertises
+    and asserts the closed world has an answer for each — the check that would
+    have caught `--bare`, which the first sweep silently dropped.
+
+    Scoped to the globals git prints before its command list, so it stays a
+    dozen-odd options rather than an open-ended scrape.
+    """
+    import re
+
+    usage = subprocess.run(["git"], capture_output=True, text=True, timeout=30).stdout
+    head = usage[: usage.find("These are common")] if "These are common" in usage else usage
+    assert head.strip(), "could not read git's usage line; the check would be vacuous"
+
+    advertised = set(re.findall(r"(?<![\w-])(--?[a-zA-Z][\w-]*)", head))
+    known = sp._GIT_OPTS_WITH_ARG | sp._GIT_OPTS_VALUELESS | sp._GIT_OPTS_NO_SUBCOMMAND
+    unclassified = advertised - known
+
+    assert not unclassified, (
+        f"{sorted(unclassified)} are globals git ADVERTISES and the closed "
+        "world now refuses, so ordinary commands using them are blocked. "
+        "Classify each against the installed binary with an oracle that does "
+        "not resolve through the repository (see _runs_the_subcommand), then "
+        "add it to the matching set."
     )
