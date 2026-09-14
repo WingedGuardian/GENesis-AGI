@@ -1231,7 +1231,18 @@ class TestCheckInlineReviewFindings:
 
     # Every path this class anchors a finding on. Pinned as IN the PR's diff
     # by the autouse fixture below.
+    #
+    # THE LANE THIS LIST IMPLIES IS LOAD-BEARING, so it is declared rather than
+    # inherited. These tests assert the SCORE ARITHMETIC (two P2s = 1.0 blocks),
+    # which is only true at the critical threshold — and until the lane stopped
+    # consulting `_scope_tag`, this class reached `critical` BY ACCIDENT, because
+    # `src/genesis/router.py` matched the `*route*` name glob. That glob is gone
+    # (it also claimed the LLM router and the reflection output router), so the
+    # critical lane is now asserted on purpose via a migration path. Without this
+    # line the class silently drops to `standard` and the scoring tests stop
+    # testing what they name.
     _FINDING_PATHS = [
+        "src/genesis/db/migrations/0001_lane_anchor.py",
         "src/benign.py",
         "src/genesis/foo.py",
         "src/genesis/a.py",
@@ -4449,3 +4460,318 @@ class TestDetailsNestingFollowsHtml:
         segs = guard_module._cr_findings(body)
         assert len(segs) == 2, segs
         assert guard_module._cr_severity(segs[1])[0] == "major"
+
+
+class TestPerLaneThreshold:
+    """The blocking threshold varies by the CHANGE's consequence lane.
+
+    One global threshold either under-protects guards or over-blocks ordinary
+    features: MEASURED across this repo's review history, all 11 P1s ever raised
+    landed on guards / destructive paths / alerting / measurement, and ZERO on
+    ordinary features. `critical` keeps the historical 1.0; `standard` allows 2.0;
+    `light` allows 3.0.
+
+    THE ACCEPTANCE BAR for this change is the first two tests: the SAME two P2s
+    that block a hook-surface PR must no longer block an ordinary one. If that
+    pair does not reproduce, the change delivered nothing.
+    """
+
+    def _mock(self, guard_module, comments, rc=0):
+        return patch.object(
+            guard_module.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=rc,
+                stdout="\n".join(json.dumps(c) for c in comments), stderr="",
+            ),
+        )
+
+    def _codex(self, cid, body, path):
+        return {
+            "id": cid, "reply_to": None, "login": "chatgpt-codex-connector[bot]",
+            "type": "Bot", "body": body, "path": path,
+        }
+
+    def _files(self, monkeypatch, guard_module, *paths):
+        """Point the changed-files read at *paths*, and clear the memo.
+
+        The memo is keyed on the seam value too, but clearing is explicit here:
+        a stale entry would make this test assert against the previous case's
+        fixture, which is precisely the failure the key was widened to avoid.
+        """
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            "\n".join(json.dumps({"filename": p, "previous_filename": None}) for p in paths),
+        )
+        guard_module._reset_pr_files_cache()
+
+    # ── the acceptance bar ────────────────────────────────────────────────
+    def test_two_P2s_no_longer_block_an_ORDINARY_change(self, guard_module, monkeypatch):
+        """1.0 < 2.0 for a STANDARD change. This is the behaviour change."""
+        self._files(monkeypatch, guard_module, "src/genesis/memory/store.py")
+        with self._mock(guard_module, [
+            self._codex(1, _P2_BODY, "src/genesis/memory/store.py"),
+            self._codex(2, _P2_BODY, "src/genesis/memory/store.py"),
+        ]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block, "two P2s must no longer stop an ordinary change"
+
+    def test_the_same_two_P2s_STILL_block_a_hook_surface_change(self, guard_module, monkeypatch):
+        """Identical findings, critical lane: 1.0 >= 1.0 still blocks. The guard
+        that keeps the relaxation from reaching the surface it must not."""
+        self._files(monkeypatch, guard_module, "scripts/hooks/git_push_guard.py")
+        with self._mock(guard_module, [
+            self._codex(1, _P2_BODY, "scripts/hooks/git_push_guard.py"),
+            self._codex(2, _P2_BODY, "scripts/hooks/git_push_guard.py"),
+        ]):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block
+        assert "CRITICAL" in msg, "the verdict must name the lane it used"
+
+    # ── the floor is unchanged in every lane ──────────────────────────────
+    def test_a_P1_ALWAYS_blocks_regardless_of_lane(self, guard_module, monkeypatch):
+        """The always-fix floor. A P1 scores 1.0, which is UNDER the STANDARD
+        threshold of 2.0 — so without an explicit floor this would pass a gate
+        that has always stopped it.
+
+        That near-miss is the whole reason the floor is a rule: before the lanes
+        existed the single threshold was 1.0 and a P1 scores exactly 1.0, so the
+        floor held by ARITHMETIC. Nothing named it and nothing tested it, so
+        raising the ordinary threshold would have deleted it in silence.
+        """
+        self._files(monkeypatch, guard_module, "src/genesis/memory/store.py")
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, "src/genesis/memory/store.py")]):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block, "a P1 must block in every lane — severity floors, lane governs volume"
+        assert "always-fix floor" in msg
+        assert "STANDARD" in msg, "the message must still name the lane it evaluated"
+
+    def test_a_coderabbit_major_ALWAYS_blocks_regardless_of_lane(
+        self, guard_module, monkeypatch
+    ):
+        """Owner ruling: severity floors. A CodeRabbit Critical/Major is
+        floor-class alongside a Codex P1."""
+        self._files(monkeypatch, guard_module, "src/genesis/memory/store.py")
+        body = _cr_major("Do not swallow the write error")
+        with self._mock(guard_module, [{
+            "id": 9, "reply_to": None, "login": "coderabbitai[bot]", "type": "Bot",
+            "body": body, "path": "src/genesis/memory/store.py",
+        }]):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block, "a CodeRabbit Critical/Major must block in every lane"
+        assert "always-fix floor" in msg
+
+    def test_a_P1_plus_two_P2s_blocks_an_ordinary_change(self, guard_module, monkeypatch):
+        """2.0 >= 2.0 — the standard lane does still block."""
+        self._files(monkeypatch, guard_module, "src/genesis/memory/store.py")
+        with self._mock(guard_module, [
+            self._codex(1, _P1_BODY, "src/genesis/memory/store.py"),
+            self._codex(2, _P2_BODY, "src/genesis/memory/store.py"),
+            self._codex(3, _P2_BODY, "src/genesis/memory/store.py"),
+        ]):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block
+        assert "STANDARD" in msg
+
+    def test_unreadable_file_list_falls_back_to_CRITICAL(self, guard_module, monkeypatch):
+        """The lane RELAXES a threshold, so an unknown scope must relax nothing."""
+        monkeypatch.setenv("_TEST_GH_PR_FILES", "__error__")
+        guard_module._reset_pr_files_cache()
+        with self._mock(guard_module, [
+            self._codex(1, _P2_BODY, "src/genesis/memory/store.py"),
+            self._codex(2, _P2_BODY, "src/genesis/memory/store.py"),
+        ]):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block, "an unreadable scope must not buy a wider budget"
+        assert "CRITICAL" in msg
+
+    def test_the_LIGHT_lane_tolerates_five_P2s_and_blocks_on_six(
+        self, guard_module, monkeypatch
+    ):
+        """3.0 is only reachable at six P2s — the claim CLAUDE.md makes.
+
+        Anchored on a TEST file, not a doc path: a doc-path P2 is excluded from
+        the score entirely under `doc_findings: skip`, so a docs-anchored fixture
+        would pass vacuously while proving nothing about the threshold.
+
+        This gap was MEASURED before it was closed: mutating the light threshold
+        to 999.0 — so that no number of P2s could ever block a docs/test-only
+        change — left the whole gate suite green.
+        """
+        five = [self._codex(i, _P2_BODY, "tests/test_x.py") for i in range(1, 6)]
+        self._files(monkeypatch, guard_module, "tests/test_x.py")
+        with self._mock(guard_module, five):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert not block, f"5 P2s = 2.5 < 3.0 should not block a LIGHT change. {msg}"
+        self._files(monkeypatch, guard_module, "tests/test_x.py")
+        with self._mock(guard_module, [*five, self._codex(6, _P2_BODY, "tests/test_x.py")]):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block, "6 P2s = 3.0 >= 3.0 must block"
+        assert "LIGHT" in msg, msg
+
+    def test_a_passing_nonzero_score_says_so(self, guard_module, monkeypatch, capsys):
+        """The changelog headline: a merge that passes WITH findings outstanding
+        names the lane and threshold rather than reading as clean."""
+        self._files(monkeypatch, guard_module, "src/genesis/memory/store.py")
+        with self._mock(
+            guard_module,
+            [
+                self._codex(1, _P2_BODY, "src/genesis/memory/store.py"),
+                self._codex(2, _P2_BODY, "src/genesis/memory/store.py"),
+            ],
+        ):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+        assert "under the 2.0 threshold for a STANDARD change" in capsys.readouterr().err
+
+    def test_config_only_change_is_NOT_light(self, guard_module, monkeypatch):
+        """`config/desktop_takeover.yaml` arms desktop takeover; `pyproject.toml`
+        pins dependencies. Both reach `_category() == "docs-config"`, and the
+        first cut of the light lane handed them a 3.0 budget. Prose is light;
+        config is not."""
+        self._files(monkeypatch, guard_module, "config/desktop_takeover.yaml")
+        with self._mock(
+            guard_module,
+            [
+                self._codex(i, _P2_BODY, "config/desktop_takeover.yaml")
+                for i in range(1, 5)
+            ],
+        ):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block, "4 P2s = 2.0 must block a config change at the STANDARD threshold"
+        assert "STANDARD" in msg, msg
+
+    def test_the_memo_serves_repeat_reads(self, guard_module, monkeypatch):
+        """`_pr_changed_files` is asked by three call sites on one merge; the
+        pin-receipt gate already asks it before this one. Two reads must cost one
+        subprocess call."""
+        self._files(monkeypatch, guard_module, "src/genesis/memory/store.py")
+        monkeypatch.delenv("_TEST_GH_PR_FILES", raising=False)
+        guard_module._reset_pr_files_cache()
+        calls = []
+
+        def _fake(pr_num, repo=None):
+            calls.append(pr_num)
+            return ["src/genesis/memory/store.py"]
+
+        monkeypatch.setattr(guard_module, "_pr_changed_files_uncached", _fake)
+        a = guard_module._pr_changed_files("100")
+        b = guard_module._pr_changed_files("100")
+        assert a == b == ["src/genesis/memory/store.py"]
+        assert len(calls) == 1, f"expected one underlying read, got {len(calls)}"
+
+    def test_the_memo_is_dropped_when_a_head_is_established(self, guard_module, monkeypatch):
+        """The pin-receipt gate populates the memo BEFORE the freshness gate reads
+        the head. If a push lands in between, everything downstream — the lane and
+        the off-diff finding scoping — would otherwise judge the PREVIOUS head's
+        file set while `--match-head-commit` binds the new one.
+
+        `--match-head-commit` does not rescue this: it constrains the MERGE, it
+        does not make an already-fetched `pulls/N/files` response describe that
+        SHA. So establishing a head drops a memo bound to a different one.
+        """
+        monkeypatch.delenv("_TEST_GH_PR_FILES", raising=False)
+        guard_module._reset_pr_files_cache()
+        reads = []
+
+        def _fake(pr_num, repo=None):
+            reads.append(pr_num)
+            # Second read simulates the new head touching a different file.
+            return ["src/old.py"] if len(reads) == 1 else ["src/new.py"]
+
+        monkeypatch.setattr(guard_module, "_pr_changed_files_uncached", _fake)
+
+        assert guard_module._pr_changed_files("100") == ["src/old.py"]
+        guard_module._bind_pr_files_cache_head("a" * 40)
+        assert guard_module._pr_changed_files("100") == ["src/new.py"], (
+            "a memo populated before any head was known must not survive the "
+            "freshness gate establishing one"
+        )
+        assert len(reads) == 2
+
+        # Guard the guard: binding the SAME head again is not a reason to re-read,
+        # or the memo would buy nothing on the arm that actually uses it.
+        guard_module._bind_pr_files_cache_head("a" * 40)
+        assert guard_module._pr_changed_files("100") == ["src/new.py"]
+        assert len(reads) == 2, "re-binding an unchanged head must not invalidate"
+
+    def test_the_freshness_gate_is_what_binds_the_memo(self, guard_module, monkeypatch):
+        """The binding's whole design is its PLACEMENT, and placement was the one
+        property nothing tested.
+
+        MEASURED: with `_bind_pr_files_cache_head(head)` deleted from
+        `_check_codex_reviewed_head`, 463 tests in this file and
+        `test_review_scope.py` still passed — including the test directly above,
+        which calls the helper itself and so cannot see the call site go away.
+        A reviewer found that by mutation; the suite could not.
+
+        So this test drives the REAL gate and asserts the binding happened as a
+        side effect, which is the only form that fails when the wiring is removed.
+        """
+        monkeypatch.delenv("_TEST_GH_PR_FILES", raising=False)
+        guard_module._reset_pr_files_cache()
+        reads = []
+
+        def _fake(pr_num, repo=None):
+            reads.append(pr_num)
+            return ["src/old.py"] if len(reads) == 1 else ["src/new.py"]
+
+        monkeypatch.setattr(guard_module, "_pr_changed_files_uncached", _fake)
+        monkeypatch.setattr(guard_module, "_pr_head_sha", lambda *a, **k: "b" * 40)
+        monkeypatch.setattr(guard_module, "_latest_codex_reviewed_sha", lambda *a, **k: "b" * 40)
+
+        # The pin-receipt gate's read, before any head is known.
+        assert guard_module._pr_changed_files("100") == ["src/old.py"]
+        assert guard_module._PR_FILES_CACHE_HEAD is None
+
+        blocked, _msg, head = guard_module._check_codex_reviewed_head("100")
+        assert (blocked, head) == (False, "b" * 40)
+        assert guard_module._PR_FILES_CACHE_HEAD == "b" * 40, (
+            "the freshness gate must be what establishes the head — this fails if "
+            "the _bind_pr_files_cache_head call is removed from it, which is "
+            "precisely what no other test in this suite can detect"
+        )
+        # …and the downstream consumers therefore re-read.
+        assert guard_module._pr_changed_files("100") == ["src/new.py"]
+
+    def test_the_force_arm_DROPS_the_memo_rather_than_binding_it(
+        self, guard_module, monkeypatch
+    ):
+        """`# stale-review-override` returns before the binder, so it must DROP the
+        pin gate's cached file list instead of leaving it for the inline scan.
+
+        The first version of this change left the memo intact and argued the risk
+        was covered because a later head's files are a SUPERSET, so the lane could
+        only tighten. A reviewer refuted that: a force-push, or a commit that
+        deletes or renames a path, yields a list that is not a superset — and this
+        arm takes no `--match-head-commit` bind, so nothing downstream catches the
+        mismatch either. A finding on a file only the new head touches would be
+        discarded as off-diff.
+
+        Asserting the RE-READ, not just the absent bind: the earlier assertion
+        (`_PR_FILES_CACHE_HEAD is None`) passed both before and after the fix,
+        since the force arm never sets a head either way.
+        """
+        monkeypatch.delenv("_TEST_GH_PR_FILES", raising=False)
+        guard_module._reset_pr_files_cache()
+        reads = []
+
+        def _fake(pr_num, repo=None):
+            reads.append(pr_num)
+            return ["src/old.py"] if len(reads) == 1 else ["src/new.py"]
+
+        monkeypatch.setattr(guard_module, "_pr_changed_files_uncached", _fake)
+        monkeypatch.setattr(guard_module, "_hook_surface_override_check", lambda *a, **k: (False, ""))
+
+        # The pin-receipt gate's read, before the override arm runs.
+        assert guard_module._pr_changed_files("100") == ["src/old.py"]
+
+        blocked, _msg, head = guard_module._check_codex_reviewed_head("100", force=True)
+        assert (blocked, head) == (False, None), "the force arm still returns unbound"
+
+        # The inline scan downstream must NOT see the pre-override list.
+        assert guard_module._pr_changed_files("100") == ["src/new.py"], (
+            "the force arm must drop the memo so the finding scan re-reads — "
+            "leaving it is the superset assumption that a force-push breaks"
+        )
+        assert len(reads) == 2

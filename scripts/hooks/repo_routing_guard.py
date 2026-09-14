@@ -52,6 +52,12 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import field, read_payload  # noqa: E402
 
+try:  # noqa: E402
+    import discarded_write
+except Exception:  # noqa: BLE001 — GUARDED: an unguarded import failure would abort
+    # module load → exit 1 → CC reads non-2 as NON-blocking → the command RUNS.
+    discarded_write = None  # type: ignore[assignment]
+
 _OVERRIDE_RE = re.compile(r"#\s*repo-routing-override\b")
 
 
@@ -429,6 +435,8 @@ def main() -> int:
     """Entry point: parse hook input, classify staged files, block or advise."""
     try:
         cmd = field(read_payload(), "command")
+        if discarded_write is not None:
+            discarded_write.remember(cmd)
         if not cmd:
             return 0
         # Cheap pre-filter: skip clearly non-git commands. Do NOT match "git add"
@@ -535,6 +543,8 @@ def main() -> int:
                     f"could not be scoped and were NOT checked.)",
                     file=sys.stderr,
                 )
+            if discarded_write is not None:
+                discarded_write.warn()
             return 2
 
         notes: list[str] = []

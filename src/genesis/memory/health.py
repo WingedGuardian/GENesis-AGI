@@ -49,7 +49,16 @@ async def near_duplicate_stats(
 
     Uses sync Qdrant client calls wrapped in asyncio.to_thread to avoid
     blocking the event loop. Default sample_size is 20 to keep cost bounded
-    (~40 Qdrant calls: scroll + search per sample).
+    (at most ~40 Qdrant calls: one scroll per sample, plus a vector query for
+    each sample the scroll actually resolves).
+
+    NOTE: the scroll below looks memories up by a ``memory_id`` PAYLOAD key, and
+    most points do not carry one — MEASURED 2026-09-13 on a live store, 42,618
+    of 47,901 points (89%) lack it, so ~9 of every 10 samples resolve to nothing
+    and are skipped. The scan is therefore far cheaper, and far less thorough,
+    than the sample_size suggests. Tracked separately; not changed here, because
+    fixing the lookup is a behaviour change rather than part of migrating off a
+    removed client method.
     """
 
     try:
@@ -66,6 +75,12 @@ async def near_duplicate_stats(
 
     def _scan_duplicates() -> list[tuple[str, str, float]]:
         """Sync Qdrant work — runs in thread pool."""
+        # Imported here rather than at module scope: genesis.qdrant.collections
+        # pulls in qdrant_client at import time, and this module deliberately
+        # tolerates a minimal install without it (see the _QDRANT_ERRORS guard
+        # above). Same placement as memory/entity_resolution.py.
+        from genesis.qdrant import collections as qdrant_ops
+
         found: list[tuple[str, str, float]] = []
         for mem_id in sampled:
             results = qdrant_client.scroll(
@@ -78,16 +93,39 @@ async def near_duplicate_stats(
             if not points:
                 continue
             vector = points[0].vector
-            hits = qdrant_client.search(
-                collection_name=collection,
+            # Goes through the shared wrapper, which calls query_points. The raw
+            # client.search() this used to call was REMOVED in the qdrant-client
+            # 1.16 line, so the old form raised AttributeError on any client at
+            # or past it.
+            #
+            # Two deliberate arguments for why this is behaviour-preserving:
+            #
+            # 1. The wrapper takes no score_threshold. Results come back
+            #    score-descending, so "top 2, then filter >= t" returns the same
+            #    rows as "top 2 among rows >= t" — the server-side threshold only
+            #    trimmed rows the `>= threshold` comparison below already rejects.
+            # 2. include_deprecated=True is REQUIRED for parity, not incidental.
+            #    The wrapper defaults it False and then adds a must_not on
+            #    `deprecated=True` (qdrant/collections.py); the raw search() had
+            #    no such filter. Leaving the default would silently (a) hide a
+            #    duplicate whose neighbour is soft-deleted, and (b) break the
+            #    `limit=2, top hit is self` assumption when the SAMPLED memory is
+            #    itself deprecated — its own point would be filtered out, both
+            #    slots would be non-self, and one sample could emit two pairs.
+            #    Excluding deprecated memories here may well be desirable, but
+            #    that is a behaviour decision, not part of migrating off a
+            #    removed method.
+            hits = qdrant_ops.search(
+                qdrant_client,
+                collection=collection,
                 query_vector=vector,
                 limit=2,  # top hit is self
-                score_threshold=threshold,
+                include_deprecated=True,  # parity with the raw search() this replaced
             )
             for hit in hits:
-                hit_id = hit.payload.get("memory_id", str(hit.id))
-                if hit_id != mem_id and hit.score >= threshold:
-                    found.append((mem_id, hit_id, round(hit.score, 4)))
+                hit_id = (hit["payload"] or {}).get("memory_id", hit["id"])
+                if hit_id != mem_id and hit["score"] >= threshold:
+                    found.append((mem_id, hit_id, round(hit["score"], 4)))
         return found
 
     try:

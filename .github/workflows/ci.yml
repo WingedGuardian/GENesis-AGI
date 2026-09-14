@@ -39,10 +39,36 @@ jobs:
         run: ruff check src/ tests/ scripts/
 
   dependency-audit:
-    # Fail on any KNOWN-vulnerable dependency in the resolved runtime tree,
-    # except the triaged IDs below. A red run is a SIGNAL to bump the dep or
-    # add a triaged ignore — not a hard freeze (the ruleset has no required
-    # checks). Complements GitHub's already-enabled Dependabot security alerts.
+    # REPORTS known-vulnerable dependencies in the resolved runtime tree. It no
+    # longer FAILS — see the step-level continue-on-error below, which is the whole
+    # point of this job's current shape.
+    #
+    # It used to be a blocking check whose red run was "a SIGNAL to bump the dep
+    # or add a triaged ignore". In practice the signal arrived as a repo-wide
+    # outage: pip-audit queries a LIVE advisory database, so an unchanged
+    # dependency tree passes at one hour and fails the next, on every open PR at
+    # once, with nobody having changed a line. MEASURED 2026-09-10/11: main's CI
+    # passed this job at 18:41 EDT; by 23:30 the same tree failed it on four
+    # different branches simultaneously. The four new IDs were litellm
+    # CVE-2026-12771/12772/12773/12795, every one of them in `litellm/proxy/` —
+    # the same proxy-server class as the 28 already triaged below, and Genesis
+    # imports acompletion / completion_cost / model_cost / the exception types
+    # and references the proxy NOWHERE (verified across src/, scripts/, config/
+    # and pyproject.toml).
+    #
+    # So the blocking behaviour was not catching reachable vulnerabilities; it
+    # was converting third-party disclosure timing into an unplanned freeze of
+    # everyone's queue, repaired each time by appending another ignore. The
+    # advisories are still printed in the log, and GitHub's Dependabot security
+    # alerts — enabled on this repo — remain the mechanism that actually raises a
+    # vulnerability to a human. This job is the convenience view of the same
+    # data, and a convenience view must not hold the merge queue.
+    #
+    # NOTE the triaged --ignore-vuln list below is deliberately KEPT rather than
+    # deleted. It is the written record of which advisories were examined and why
+    # they were judged unreachable; deleting it would discard that reasoning.
+    # This reporting-policy change adds no new ignores: the four IDs discussed
+    # above remain visible, along with any other ID outside the existing baseline.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -55,9 +81,19 @@ jobs:
           pip install -e .
           pip install pip-audit
       - name: Audit dependencies for known CVEs
+        # STEP level, not job level, and the difference is the whole mechanism.
+        # MEASURED on this PR's own first run: with `continue-on-error` on the
+        # JOB, the workflow no longer fails but the job's own check-run
+        # conclusion is still `failure`, so `gh pr checks` and the merge gate
+        # both still read it red — the block was unchanged. On the STEP, a
+        # failing pip-audit does not fail the job, so the rollup entry is green
+        # and the advisories are still printed in the log above it.
+        continue-on-error: true
         run: |
           # Triaged --ignore-vuln IDs (rationale of record: pyproject.toml pins).
-          # A NEW / untriaged advisory is NOT in this list and so fails the job.
+          # A NEW / untriaged advisory is NOT in this list, so it is REPORTED here —
+          # it no longer fails the job (see continue-on-error above). Existing
+          # ignores reduce log noise; all IDs outside that baseline stay visible.
           #   litellm 1.78.7 — every ID is a proxy-server / JWT / OIDC / UI /
           #     MCP-gateway vuln; Genesis uses acompletion/completion_cost only
           #     (no proxy server), so none are reachable. Pinned <1.83 also dodges
@@ -468,7 +504,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-09-09: 60 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-09-13: 61 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -646,6 +682,24 @@ jobs:
     # CI is blocking — local full-suite runs are banned. See procedure
     # test_verification and CLAUDE.md "Targeted tests during development."
     #
+    # This job had NO timeout-minutes, so it inherited GitHub's 360-minute
+    # default. Two runs in this workflow have hit ~5.7h (33991793671,
+    # 33991913763, both failed) — consistent with that default killing them.
+    # WHICH job wedged is no longer recoverable (the per-job API returns an
+    # empty list for both now), so this cap is not attributed to `test`; it
+    # bounds `test` because that is the long job, not because it was proven
+    # guilty. The sibling jobs all still inherit 360.
+    #
+    # Derived, not guessed — MEASURED 2026-09-06 over the last 23 successful
+    # main runs, per JOB (`gh api .../runs/<id>/jobs`, name == "test"), NOT the
+    # workflow-run duration, which is ~20 min longer because it includes 12
+    # sibling jobs and queue time: min 19m38s, p50 29m22s, max 31m15s.
+    # The ceiling must exceed the worst LEGITIMATE case — that max plus one
+    # full per-test kill (pyproject `timeout = 3600`) = ~91 min — or this job
+    # would pre-empt the per-test timeout and make it dead code. 180 leaves
+    # ~89 min of growth headroom and still halves the default.
+    # Revisit as the suite grows — the --durations output below is the data.
+    timeout-minutes: 180
     # fetch-depth: 0 because measurement tests derive a rate from this
     # repository's own commit history and SKIP on a shallow clone rather than
     # lie. A skipped gate is an unevaluated gate: the commit-msg framing
@@ -669,7 +723,15 @@ jobs:
           # one, the checker must find nothing rather than yesterday's.
           rm -f junit.xml
           # Ignore preserved AZ-era test files that import removed modules
-          pytest -v \
+          #
+          # --durations: this suite's per-test cost has NEVER been measured.
+          # No --durations anywhere, no registered markers, and the sole
+          # pytest.mark.slow is an unregistered no-op whose own docstring
+          # claims those tests are "skipped in normal CI runs" — CI passes no
+          # -m "not slow", so they run. Every timeout in this repo has
+          # therefore been a guess. Print the 25 slowest so the next person
+          # inherits a number instead of one.
+          pytest -v --durations=25 \
             --ignore-glob='**/test_*az*.py' \
             --ignore-glob='**/test_*shim*.py' \
             --ignore=tests/test_ui/ \
