@@ -110,10 +110,20 @@ prune_mcp_spawn() {
 # (a run log is written once by a detached process and never appended to again).
 # Age first because it is the cheaper predicate and usually enough.
 prune_external_review_logs() {
-    local dir="${1:?}" max_bytes="${2:?}" total
+    local dir="${1:?}" max_bytes="${2:?}" total remaining
     [ -d "$dir" ] || return 0
 
-    find "$dir" -maxdepth 1 -type f -name '*.log' -mtime +30 -delete 2>/dev/null || true
+    # An ACTIVE log must never be unlinked. A detached orchestrator writes to its log
+    # for minutes; unlinking it loses the pathname while the bytes stay allocated
+    # until the child closes the descriptor, so the size bound is not even restored —
+    # the diagnostics are simply destroyed. Both reviewers found this independently.
+    # `-mmin +60` is the guard: a run is minutes, so an hour of silence means the
+    # writer is done. Note the ORDERING that makes this safe rather than hopeful —
+    # deletion is oldest-first, and an active log is by definition the newest, so the
+    # prune can only reach one after every completed log is already gone. That case
+    # is a single run whose own log exceeds the cap, and there the right answer is to
+    # stop and SAY SO rather than destroy a live transcript to hit a number.
+    find "$dir" -maxdepth 1 -type f -name '*.log' -mmin +60 -mtime +30 -delete 2>/dev/null || true
 
     total="$(find "$dir" -maxdepth 1 -type f -name '*.log' -printf '%s\n' 2>/dev/null \
         | awk '{s+=$1} END {print s+0}')"
@@ -121,13 +131,21 @@ prune_external_review_logs() {
 
     # Oldest first, deleting until the directory fits. `-printf` keeps mtime and path
     # on one line so the sort is numeric on a field we control rather than on a
-    # filename whose shape could change.
-    find "$dir" -maxdepth 1 -type f -name '*.log' -printf '%T@ %s %p\n' 2>/dev/null \
+    # filename whose shape could change. The subshell cannot export its running
+    # total back, so the remaining size is recomputed after the loop.
+    find "$dir" -maxdepth 1 -type f -name '*.log' -mmin +60 -printf '%T@ %s %p\n' 2>/dev/null \
         | sort -n \
         | while read -r _mtime size path; do
             [ "${total:-0}" -gt "$max_bytes" ] || break
             rm -f "$path" 2>/dev/null && total=$((total - size))
         done
+
+    remaining="$(find "$dir" -maxdepth 1 -type f -name '*.log' -printf '%s\n' 2>/dev/null \
+        | awk '{s+=$1} END {print s+0}')"
+    if [ "${remaining:-0}" -gt "$max_bytes" ] 2>/dev/null; then
+        echo "external-review logs still ${remaining}B over the ${max_bytes}B cap:" \
+             "the remainder is in-flight (modified within the hour) and was NOT deleted"
+    fi
     return 0
 }
 
@@ -307,6 +325,11 @@ main() {
     }
     _load_store_knob GENESIS_MERGE_OVERRIDE_DIR
     _load_store_knob GENESIS_DISCARD_SNAPSHOT_DIR
+    # The external-review store has its own knob, and this service does NOT inherit
+    # the review service's environment — so without loading it here, the runner
+    # writes to a custom directory while retention prunes the default one and the
+    # real store grows with no bound at all.
+    _load_store_knob GENESIS_EXTERNAL_REVIEW_DIR
     # One file per hook flush, so the oldest whole files are deleted past the byte
     # bound. This is the shape the ghost-export note above explains an age prune
     # cannot handle for an append-forever file. Retention lives here, never on the

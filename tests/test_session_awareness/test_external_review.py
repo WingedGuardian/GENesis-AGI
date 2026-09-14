@@ -337,18 +337,23 @@ class TestScanBudget:
             {
                 "repo view": (0, "o/r\n", ""),
                 "pr list": (0, json.dumps(prs), ""),
+                # live mode re-reads the head immediately before spawning
+                "pr view": (0, json.dumps(prs[0]), ""),
                 "comments": (0, "", ""),
             }
         )
-        captured = {}
-        monkeypatch.setattr(er, "record", lambda rows: captured.setdefault("rows", rows))
+        monkeypatch.setattr(er, "record", lambda rows: "/tmp/claim.jsonl")
         monkeypatch.setattr(er, "recent_dispatch_heads", lambda *a, **k: set())
-        # argv is malformed, so every dispatch FAILS rather than spawning.
-        cfg = _cfg(mode="live")
-        cfg["orchestrator"] = dict(cfg["orchestrator"], argv="not-a-list")
-        summary = er.scan(runner=runner, cfg=cfg)
+        # The SPAWN fails (not the config — a malformed template is now caught in
+        # preflight, which is a different defect). This isolates the budget property:
+        # an attempt that fails has still consumed a decision.
+        monkeypatch.setattr(
+            er, "dispatch", lambda *a, **k: (er.DECISION_FAILED, "spawn failed: boom")
+        )
+        summary = er.scan(runner=runner, cfg=_cfg(mode="live"))
         failed = [d for d in summary["decisions"] if d[1] == er.DECISION_FAILED]
         assert len(failed) == 1, "the budget must bind on ATTEMPTS, not on successes"
+        assert summary["failure"], "an infrastructure failure must be reported upward"
 
     def test_budget_is_a_hard_cap(self, monkeypatch):
         summary = self._scan_with(10, monkeypatch, budget=1)
@@ -490,12 +495,24 @@ class TestUnitTemplateContract:
             "directive; a comment mentioning it is not the setting"
         )
 
-    def test_timer_is_not_auto_enabled_by_bootstrap(self):
-        """Autonomous, subscription-spending review must be opt-in on every clone."""
+    @pytest.mark.parametrize("installer", ["bootstrap.sh", "install.sh"])
+    def test_timer_is_not_auto_enabled_by_any_installer(self, installer):
+        """Autonomous, subscription-spending review must be opt-in on every clone —
+        and the exclusion means nothing unless EVERY enable path carries it. There
+        are TWO installers; the first version of this change covered one. The first
+        version of this TEST would also have passed on a commented-out guard, since
+        a substring check matches a comment, so it asserts over executable lines."""
         from pathlib import Path
 
-        bootstrap = (Path(__file__).resolve().parents[2] / "scripts" / "bootstrap.sh").read_text()
-        assert "genesis-external-review.timer) continue ;;" in bootstrap
+        text = (Path(__file__).resolve().parents[2] / "scripts" / installer).read_text()
+        executable = [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        assert "genesis-external-review.timer) continue ;;" in executable, (
+            f"{installer} would auto-enable the timer"
+        )
 
 
 class TestRecentDispatchHeads:
@@ -604,6 +621,176 @@ class TestPrefilter:
         monkeypatch.setattr(er, "recent_dispatch_heads", lambda *a, **k: set())
         er.scan(runner=_runner, cfg=_cfg())
         assert calls == [], "a filtered PR must cost no comment read"
+
+
+def _live_runner(head=HEAD, number=7):
+    """A runner whose PR view and list both report one eligible, green PR."""
+    body = {
+        "number": number,
+        "headRefOid": head,
+        "isDraft": False,
+        "statusCheckRollup": [{"conclusion": "SUCCESS"}],
+    }
+    return _runner_returning(
+        {
+            "repo view": (0, "o/r\n", ""),
+            "pr list": (0, json.dumps([body]), ""),
+            "pr view": (0, json.dumps(body), ""),
+            "comments": (0, "", ""),
+        }
+    )
+
+
+class TestWorkOrderDispatch:
+    """The dispatch boundary must CARRY and PERSIST the decision that authorised it.
+
+    Four review findings shared this one generator: the head, the repo and the audit
+    record all stopped at the boundary, and the log was created without the store's
+    permissions. These pin the mechanism, not the four instances.
+    """
+
+    def test_argv_carries_repo_and_head(self):
+        block = dict(_cfg()["orchestrator"], argv=["{workflow}", "{repo}", "{pr}", "{head}"])
+        argv = er.build_argv(block, workflow=WORKFLOW, pr=42, repo="o/r", head=HEAD)
+        assert argv[1:] == [WORKFLOW, "o/r", "42", HEAD]
+
+    def test_claim_is_persisted_BEFORE_the_spawn(self, monkeypatch):
+        """VERIFY-RED ANCHOR: ordering is the property. A claim written after the
+        spawn means a failed write leaves a running review with no record of it."""
+        order = []
+        monkeypatch.setattr(er, "record", lambda rows: order.append("record") or "/tmp/x")
+        monkeypatch.setattr(
+            er,
+            "dispatch",
+            lambda *a, **k: (order.append("dispatch"), (er.DECISION_DISPATCHED, "ok"))[1],
+        )
+        monkeypatch.setattr(er, "recent_dispatch_heads", lambda *a, **k: set())
+        er.review_one(7, runner=_live_runner(), cfg=_cfg(mode="live"))
+        assert order[:2] == ["record", "dispatch"], f"claim must precede spawn, got {order}"
+
+    def test_unpersistable_claim_refuses_to_spend(self, monkeypatch):
+        """If the audit cannot be written, the dispatch does not happen — the trail
+        that stands in for the approval gate is not optional."""
+        monkeypatch.setattr(er, "record", lambda rows: None)  # write_batch failure
+        monkeypatch.setattr(er, "recent_dispatch_heads", lambda *a, **k: set())
+
+        def _explode(*a, **k):
+            raise AssertionError("must not spawn when the claim cannot be persisted")
+
+        monkeypatch.setattr(er, "dispatch", _explode)
+        summary = er.review_one(7, runner=_live_runner(), cfg=_cfg(mode="live"))
+        assert summary["dispatched"] == 0
+        assert "could not be persisted" in summary["decisions"][0][2]
+
+    def test_head_moving_between_checks_and_spawn_skips(self, monkeypatch):
+        """VERIFY-RED ANCHOR: every check was made for one commit; a push in the gap
+        would review code whose CI nobody has seen."""
+        listed = {
+            "number": 7,
+            "headRefOid": HEAD,
+            "isDraft": False,
+            "statusCheckRollup": [{"conclusion": "SUCCESS"}],
+        }
+        moved = dict(listed, headRefOid=OTHER_HEAD)
+        runner = _runner_returning(
+            {
+                "repo view": (0, "o/r\n", ""),
+                "pr list": (0, json.dumps([listed]), ""),
+                "pr view": (0, json.dumps(moved), ""),  # head moved before the spawn
+                "comments": (0, "", ""),
+            }
+        )
+        monkeypatch.setattr(er, "record", lambda rows: "/tmp/x")
+        monkeypatch.setattr(er, "recent_dispatch_heads", lambda *a, **k: set())
+
+        def _explode(*a, **k):
+            raise AssertionError("must not dispatch against a moved head")
+
+        monkeypatch.setattr(er, "dispatch", _explode)
+        summary = er.scan(runner=runner, cfg=_cfg(mode="live"))
+        assert summary["dispatched"] == 0
+        assert "head moved" in summary["decisions"][0][2]
+
+    def test_live_requires_workflow_in_the_template(self):
+        """The allowlist cannot bind a child that is never told which workflow."""
+        cfg = _cfg(mode="live")
+        cfg["orchestrator"] = dict(cfg["orchestrator"], argv=["run", "{pr}"])
+        assert "{workflow}" in er._preflight(cfg, "live")
+
+    def test_repo_override_requires_repo_in_the_template(self):
+        """A --repo override with no {repo} would review the same-numbered PR in the
+        working-directory repository instead of the selected one."""
+        cfg = _cfg(mode="live")
+        assert er._preflight(cfg, "live", repo_override="other/repo") is not None
+        assert er._preflight(cfg, "live", repo_override=None) is None
+
+    def test_run_log_is_owner_only(self, tmp_path, monkeypatch):
+        """The log holds a review agent's full transcript of a private repository."""
+        monkeypatch.setattr(er, "store_dir", lambda: str(tmp_path / "store"))
+        monkeypatch.setattr(er, "log_dir", lambda: str(tmp_path / "store" / "logs"))
+        monkeypatch.setattr(er, "orchestrator_binary", lambda cmd: "/bin/true")
+        monkeypatch.setattr(er.subprocess, "Popen", lambda *a, **k: None)
+        decision, _ = er.dispatch(
+            7, workflow=WORKFLOW, block=_cfg()["orchestrator"], repo="o/r", head=HEAD
+        )
+        assert decision == er.DECISION_DISPATCHED
+        logs = tmp_path / "store" / "logs"
+        assert oct(logs.stat().st_mode)[-3:] == "700"
+        written = list(logs.glob("*.log"))
+        assert written and oct(written[0].stat().st_mode)[-3:] == "600"
+
+
+class TestBoundaryUnknowns:
+    def test_non_object_audit_row_does_not_abort_the_scan(self, tmp_path, monkeypatch):
+        """Valid JSON of the WRONG SHAPE escaped the handler and killed the run."""
+        monkeypatch.setattr(er, "store_dir", lambda: str(tmp_path))
+        (tmp_path / "a.jsonl").write_text(
+            '[]\n"corrupt"\n' + json.dumps({"pr": 7, "head": HEAD, "decision": "dispatched"})
+        )
+        assert (7, HEAD) in er.recent_dispatch_heads()
+
+    def test_non_object_pr_entries_are_dropped(self):
+        runner = _runner_returning({"pr list": (0, json.dumps([{"number": 1}, "junk", 5]), "")})
+        rows = er.open_prs("o/r", runner)
+        assert rows == [{"number": 1}]
+
+    def test_pr_list_at_the_limit_is_reported_as_truncated(self, monkeypatch):
+        """A count EQUAL to the limit is a truncated read, not a complete one."""
+        prs = [
+            {"number": n, "headRefOid": HEAD, "isDraft": True, "statusCheckRollup": []}
+            for n in range(er._PR_LIST_LIMIT)
+        ]
+        runner = _runner_returning(
+            {"repo view": (0, "o/r\n", ""), "pr list": (0, json.dumps(prs), "")}
+        )
+        monkeypatch.setattr(er, "record", lambda rows: None)
+        monkeypatch.setattr(er, "recent_dispatch_heads", lambda *a, **k: set())
+        assert er.scan(runner=runner, cfg=_cfg())["truncated"] is True
+
+    def test_kill_switch_short_circuits_before_any_config_read(self, monkeypatch):
+        """VERIFY-RED ANCHOR: the emergency stop must work when config does not."""
+        monkeypatch.setenv(cfgmod.DISABLE_ENV, "1")
+
+        def _explode():
+            raise AssertionError("kill switch must be checked before load_config")
+
+        monkeypatch.setattr(cfgmod, "load_config", _explode)
+        assert er.scan()["mode"] == "off"
+        assert er.review_one(7)["mode"] == "off"
+
+    def test_infrastructure_failure_is_flagged_for_a_nonzero_exit(self, monkeypatch):
+        runner = _runner_returning({"repo view": (1, "", "gh auth expired")})
+        monkeypatch.setattr(er, "record", lambda rows: None)
+        assert er.scan(runner=runner, cfg=_cfg()).get("failure")
+
+    def test_a_quiet_scan_is_not_a_failure(self, monkeypatch):
+        """Nothing eligible is a SUCCESSFUL scan — the timer must not go red."""
+        runner = _runner_returning(
+            {"repo view": (0, "o/r\n", ""), "pr list": (0, json.dumps([]), "")}
+        )
+        monkeypatch.setattr(er, "record", lambda rows: None)
+        monkeypatch.setattr(er, "recent_dispatch_heads", lambda *a, **k: set())
+        assert "failure" not in er.scan(runner=runner, cfg=_cfg())
 
 
 class TestConfig:

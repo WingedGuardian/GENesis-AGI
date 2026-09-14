@@ -76,10 +76,23 @@ def main(argv: list[str] | None = None) -> int:
     detail = summary.get("detail")
     print(
         f"external-review: mode={mode} considered={summary.get('considered', 0)} "
-        f"dispatched={summary.get('dispatched', 0)}" + (f" — {detail}" if detail else "")
+        f"dispatched={summary.get('dispatched', 0)}"
+        + (" [PR list truncated]" if summary.get("truncated") else "")
+        + (f" — {detail}" if detail else "")
     )
     for number, decision, reason in summary.get("decisions", []):
         print(f"  PR #{number}: {decision} — {reason}")
+
+    # EXIT 0 MEANS "the runner ran", NOT "nothing went wrong". Disabled,
+    # unconfigured and nothing-eligible are all successful scans and must stay 0, or
+    # the timer's journal fills with red for the ordinary case. But an INFRASTRUCTURE
+    # failure — expired `gh` auth, an unreadable pull request, a misconfiguration, a
+    # dispatch that could not spawn — means the review lane is doing no work at all,
+    # and reporting that as success is how a dead lane stays invisible for days.
+    failure = summary.get("failure")
+    if failure:
+        print(f"external-review: FAILED — {failure}", file=sys.stderr)
+        return 1
     return 0
 
 

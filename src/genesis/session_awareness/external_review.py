@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import json
 import logging
 import os
@@ -68,6 +69,10 @@ logger = logging.getLogger(__name__)
 #: Where dispatch records land. Written through the shared hook-audit writer, which
 #: gives one file per flush, 0600, atomic publish, and never raises at the caller.
 _STORE_DIRNAME = "external_review_runs"
+
+#: How many open pull requests one listing asks for. A returned count EQUAL to this
+#: is a TRUNCATED read rather than a complete one, and callers report it as such.
+_PR_LIST_LIMIT = 100
 
 #: A dispatch is fire-and-forget: the workflow runs for minutes and its OUTCOME
 #: lands on the pull request as the orchestrator's own comment. These are the
@@ -110,14 +115,28 @@ def log_dir() -> str:
 
 
 def _default_runner(argv: Sequence[str], *, timeout: int = 60) -> tuple[int, str, str]:
-    """Run a command, returning ``(returncode, stdout, stderr)``. Never raises."""
+    """Run a command, returning ``(returncode, stdout, stderr)``. Never raises.
+
+    PINNED TO THE REPO ROOT, deliberately. ``gh`` resolves the repository from its
+    working directory when no ``--repo`` is given, and the dispatched child is
+    started in the repo root — so a runner inheriting an arbitrary cwd could read
+    one repository's pull requests and hand the number to a child looking at
+    another. Binding both ends to the same directory removes the mismatch by
+    construction rather than by remembering to pass ``--repo`` everywhere.
+    """
     try:
+        cwd: str | None
+        try:
+            cwd = str(_repo_root())
+        except Exception:  # noqa: BLE001 — an unresolvable root degrades to inherit
+            cwd = None
         proc = subprocess.run(  # noqa: S603 — fixed argv from callers, never a shell
             list(argv),
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
+            cwd=cwd,
         )
         return proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired:
@@ -230,12 +249,27 @@ def _repo_root() -> Path:
     return Path(repo_root())
 
 
-def build_argv(block: dict[str, Any], *, workflow: str, pr: int) -> list[str] | None:
+def build_argv(
+    block: dict[str, Any],
+    *,
+    workflow: str,
+    pr: int,
+    repo: str = "",
+    head: str = "",
+) -> list[str] | None:
     """The full argv for one dispatch, or ``None`` when the config cannot make one.
 
     ``argv`` is an install-local template because an orchestrator's command line is
-    its own business; ``{workflow}`` and ``{pr}`` are the only substitutions, and a
-    template naming neither is accepted (a tool may take the PR another way).
+    its own business. Four substitutions are offered — ``{workflow}``, ``{pr}``,
+    ``{repo}`` and ``{head}`` — and which of them an install MUST use is enforced in
+    :func:`_preflight`, not here, because the answer depends on how the runner was
+    invoked rather than on the template alone.
+
+    ``{head}`` exists so a dispatch can be bound to the exact commit the decision was
+    made about. Every check upstream — eligibility, CI, dedup, the audit row — is
+    computed for one ``headRefOid``; without passing it, the child resolves the PR
+    itself and can review a commit that was pushed after those checks passed, whose
+    CI nobody has seen.
     """
     exe = orchestrator_binary(str(block.get("command") or ""))
     if not exe:
@@ -244,7 +278,13 @@ def build_argv(block: dict[str, Any], *, workflow: str, pr: int) -> list[str] | 
     if not isinstance(template, list) or not all(isinstance(a, str) for a in template):
         logger.warning("external_review: orchestrator.argv must be a list of strings")
         return None
-    return [exe] + [a.replace("{workflow}", workflow).replace("{pr}", str(pr)) for a in template]
+    subs = {"{workflow}": workflow, "{pr}": str(pr), "{repo}": repo or "", "{head}": head or ""}
+    out = [exe]
+    for arg in template:
+        for token, value in subs.items():
+            arg = arg.replace(token, value)
+        out.append(arg)
+    return out
 
 
 def dispatch(
@@ -253,6 +293,8 @@ def dispatch(
     workflow: str,
     block: dict[str, Any],
     dry_run: bool = False,
+    repo: str = "",
+    head: str = "",
 ) -> tuple[str, str]:
     """Spawn the orchestrator for ``pr``. Returns ``(decision, detail)``.
 
@@ -275,19 +317,33 @@ def dispatch(
     if dry_run:
         return DECISION_DRY_RUN, f"would run {workflow} for PR #{pr}"
 
-    argv = build_argv(block, workflow=workflow, pr=pr)
+    argv = build_argv(block, workflow=workflow, pr=pr, repo=repo, head=head)
     if not argv:
         return DECISION_FAILED, "orchestrator not installed or not configured"
 
     # BOTH streams go to a per-run log, and neither is discarded. A detached run
     # reports its verdict nowhere else this process can see, and "no comment appeared
     # on the pull request" is the same observation for a crash, a refusal, and a run
-    # still in flight. Retention: file-age pruned by disk-hygiene (see log_dir).
+    # still in flight. Retention: pruned by disk-hygiene (see log_dir).
+    #
+    # OWNER-ONLY, and created that way rather than fixed afterwards. This file holds
+    # the full transcript of a review agent reading a private repository. A plain
+    # mkdir/open applies the process umask — 0755 dirs and a 0644 log under systemd —
+    # so on a multi-user host with a traversable home another user could read it. The
+    # sibling audit writer already creates its own files 0600; the parent directories
+    # it inherits are what this closes. os.open with an explicit mode applies the bits
+    # AT CREATE time, leaving no window where the file exists world-readable.
     try:
         logs = Path(log_dir())
-        logs.mkdir(parents=True, exist_ok=True)
+        logs.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for parent in (Path(store_dir()), logs):
+            # mkdir does not tighten a directory that already exists, and an earlier
+            # version of this code created both with the umask — so repair them.
+            with contextlib.suppress(OSError):
+                parent.chmod(0o700)
         run_log = logs / f"run-pr{pr}-{os.getpid()}.log"
-        log_fh = run_log.open("ab")
+        fd = os.open(run_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        log_fh = os.fdopen(fd, "ab")
     except Exception as exc:  # noqa: BLE001
         return DECISION_FAILED, f"could not open run log: {exc!r}"
 
@@ -395,6 +451,15 @@ def recent_dispatch_heads(within_s: int = DISPATCH_COOLOFF_S) -> set[tuple[int, 
                 if not line:
                     continue
                 row = json.loads(line)
+                # VALID JSON OF THE WRONG SHAPE is the case that escapes: `[]` or
+                # `"corrupt"` parses fine, and `.get` on it raises AttributeError,
+                # which is outside this handler and would abort the whole scheduled
+                # scan instead of degrading past one malformed row as documented.
+                if not isinstance(row, dict):
+                    logger.warning(
+                        "external_review: non-object audit row in %s — skipping", entry.name
+                    )
+                    continue
                 if row.get("decision") != DECISION_DISPATCHED:
                     continue
                 pr = row.get("pr")
@@ -449,7 +514,19 @@ def open_prs(repo: str, runner: Runner = _default_runner) -> list[dict[str, Any]
     except json.JSONDecodeError as exc:
         logger.warning("external_review: PR list unparseable (%r)", exc)
         return None
-    return parsed if isinstance(parsed, list) else None
+    if not isinstance(parsed, list):
+        return None
+    # Element shape is validated HERE rather than trusted downstream: a list whose
+    # members are not objects parses as valid JSON, and the first `.get` on one
+    # raises outside the caller's fail-safe boundary. Dropping non-objects keeps the
+    # unknown resolving toward considering fewer pull requests, never toward a crash.
+    rows = [row for row in parsed if isinstance(row, dict)]
+    if len(rows) != len(parsed):
+        logger.warning(
+            "external_review: %d non-object entries in the PR list were ignored",
+            len(parsed) - len(rows),
+        )
+    return rows
 
 
 def ci_is_green(pr: dict[str, Any]) -> bool | None:
@@ -612,9 +689,57 @@ def _consider(
         row["decision"] = DECISION_SKIPPED
         return row, DECISION_SKIPPED, reason
 
-    decision, detail = dispatch(number, workflow=workflow, block=block, dry_run=(mode == "dry_run"))
+    if mode == "dry_run":
+        decision, detail = dispatch(
+            number, workflow=workflow, block=block, dry_run=True, repo=slug, head=head
+        )
+        row["decision"] = decision
+        row["detail"] = detail
+        return row, decision, reason
+
+    # RE-READ THE HEAD IMMEDIATELY BEFORE SPENDING. Everything above was decided for
+    # the head the listing reported, and a push between that listing and this moment
+    # would leave the child reviewing a commit whose CI nobody has seen — while the
+    # audit suppresses only the OLD sha, so the next tick would dispatch the new one
+    # again with the first still running. Cheap: one call, only for a PR we are about
+    # to dispatch, so it is bounded by the budget rather than by the queue.
+    fresh = pr_detail(number, slug, runner)
+    if fresh is None:
+        row["decision"] = DECISION_SKIPPED
+        row["reason"] = "head could not be re-read immediately before dispatch"
+        return row, DECISION_SKIPPED, row["reason"]
+    fresh_head = str(fresh.get("headRefOid") or "").lower()
+    if fresh_head != head:
+        row["decision"] = DECISION_SKIPPED
+        row["reason"] = f"head moved to {fresh_head[:12]} after the checks — re-deciding next tick"
+        return row, DECISION_SKIPPED, row["reason"]
+
+    # CLAIM BEFORE SPENDING. The audit row is what suppresses a duplicate on the next
+    # tick, and writing it AFTER the spawn means a failed write leaves a running
+    # review with no record of it — so the same head is dispatched again an hour
+    # later, and the trail that stands in for the approval gate is missing exactly
+    # the event it exists to record. Persisting first makes the claim durable: if it
+    # cannot be written, we do not spend.
+    claim = dict(row)
+    claim["decision"] = DECISION_DISPATCHED
+    claim["intent"] = True
+    claim["detail"] = "intent recorded before dispatch"
+    if record([claim]) is None:
+        row["decision"] = DECISION_FAILED
+        row["reason"] = "audit claim could not be persisted — refusing to dispatch"
+        row["detail"] = row["reason"]
+        return row, DECISION_FAILED, row["reason"]
+
+    decision, detail = dispatch(
+        number, workflow=workflow, block=block, dry_run=False, repo=slug, head=head
+    )
     row["decision"] = decision
     row["detail"] = detail
+    # The claim above already recorded this attempt; tell the caller not to batch a
+    # second copy. A FAILED spawn still leaves the claim in place deliberately — we
+    # cannot be certain the child did not start, and the cooloff bounds the cost of
+    # being wrong in the conservative direction.
+    row["_claimed"] = True
     # Report the ELIGIBILITY reason, not the dispatch detail: "no report for head X"
     # is the fact an operator reads the log to learn, and "would run <workflow>"
     # restates the decision already in the column beside it. A FAILURE is the
@@ -622,7 +747,7 @@ def _consider(
     return row, decision, (detail if decision == DECISION_FAILED else reason)
 
 
-def _preflight(cfg: dict[str, Any], mode: str) -> str | None:
+def _preflight(cfg: dict[str, Any], mode: str, *, repo_override: str | None = None) -> str | None:
     """The reasons a scan should not start at all, checked once, up front.
 
     Returns a detail string to report, or ``None`` to proceed. Checking here rather
@@ -639,6 +764,22 @@ def _preflight(cfg: dict[str, Any], mode: str) -> str | None:
             # Without a marker there is no way to recognise an existing report, so
             # every tick would re-review every pull request. Refuse rather than spend.
             return "orchestrator.report_marker is unset — cannot detect existing reports"
+
+        template = block.get("argv")
+        joined = " ".join(template) if isinstance(template, list) else ""
+        # The allowlist decides WHICH workflow may run, but it only binds the child
+        # if the child is actually told. A template that never substitutes
+        # {workflow} leaves the executable free to pick its own default, so the
+        # closed set — the thing standing in for the approval gate — would be
+        # enforcing nothing. Refuse the configuration rather than record a weaker
+        # guarantee in the audit row.
+        if "{workflow}" not in joined:
+            return "orchestrator.argv must contain {workflow} — the allowlist cannot bind the child without it"
+        # A --repo override changes which repository supplies the pull requests. The
+        # child otherwise resolves the repository from its own working directory, so
+        # without {repo} it would review the same-numbered PR in the wrong place.
+        if repo_override and "{repo}" not in joined:
+            return "--repo was given but orchestrator.argv has no {repo} — the child cannot be pointed at it"
     return None
 
 
@@ -655,6 +796,19 @@ def review_one(
     a whole-queue scan would let the run dispatch a DIFFERENT pull request and simply
     not mention it — the flag would describe something other than what happened.
     """
+    # THE KILL SWITCH IS CHECKED FIRST, before any config read. Its whole promise is
+    # that it works when the configuration does not — a blocked or slow YAML path on
+    # a network mount would otherwise hang the timer despite an operator having set
+    # the emergency stop. The config docstring already promised this ordering; the
+    # code read the file first anyway.
+    if config.disabled_by_env():
+        return {
+            "mode": "off",
+            "dispatched": 0,
+            "considered": 0,
+            "decisions": [],
+            "detail": f"disabled ({config.DISABLE_ENV} is set)",
+        }
     cfg = config.load_config() if cfg is None else cfg
     mode = config.effective_mode(cfg)
     summary: dict[str, Any] = {"mode": mode, "dispatched": 0, "considered": 0, "decisions": []}
@@ -662,20 +816,26 @@ def review_one(
         summary["detail"] = "disabled (config mode=off or kill switch set)"
         return summary
 
-    blocked = _preflight(cfg, mode)
+    blocked = _preflight(cfg, mode, repo_override=repo)
     if blocked:
         summary["detail"] = blocked
+        # A misconfiguration is an INFRASTRUCTURE failure, not a quiet scan: under
+        # the timer it means the review lane does no work at all, and an exit 0
+        # would let systemd report every invocation as a success while nothing ran.
+        summary["failure"] = blocked
         return summary
 
     slug = repo or resolve_repo(runner)
     if not slug:
         summary["detail"] = "repo slug unresolved — not dispatching"
+        summary["failure"] = summary["detail"]
         return summary
     summary["repo"] = slug
 
     detail = pr_detail(pr, slug, runner)
     if detail is None:
         summary["detail"] = f"PR #{pr} unreadable — not dispatching"
+        summary["failure"] = summary["detail"]
         return summary
 
     # The budget binds HERE too. It is a cap on spend against a shared subscription,
@@ -698,7 +858,11 @@ def review_one(
     summary["decisions"].append((pr, decision, reason))
     if decision in (DECISION_DISPATCHED, DECISION_DRY_RUN):
         summary["dispatched"] = 1
-    record([row])
+    if decision == DECISION_FAILED:
+        summary["failure"] = reason
+    # A row already written as a pre-dispatch claim is not batched again.
+    if not row.pop("_claimed", False):
+        record([row])
     return summary
 
 
@@ -741,6 +905,19 @@ def scan(
     through, and a trail recording only the dispatches cannot show that the runner
     was being conservative rather than idle.
     """
+    # THE KILL SWITCH IS CHECKED FIRST, before any config read. Its whole promise is
+    # that it works when the configuration does not — a blocked or slow YAML path on
+    # a network mount would otherwise hang the timer despite an operator having set
+    # the emergency stop. The config docstring already promised this ordering; the
+    # code read the file first anyway.
+    if config.disabled_by_env():
+        return {
+            "mode": "off",
+            "dispatched": 0,
+            "considered": 0,
+            "decisions": [],
+            "detail": f"disabled ({config.DISABLE_ENV} is set)",
+        }
     cfg = config.load_config() if cfg is None else cfg
     mode = config.effective_mode(cfg)
     summary: dict[str, Any] = {"mode": mode, "dispatched": 0, "considered": 0, "decisions": []}
@@ -748,21 +925,37 @@ def scan(
         summary["detail"] = "disabled (config mode=off or kill switch set)"
         return summary
 
-    blocked = _preflight(cfg, mode)
+    blocked = _preflight(cfg, mode, repo_override=repo)
     if blocked:
         summary["detail"] = blocked
+        # A misconfiguration is an INFRASTRUCTURE failure, not a quiet scan: under
+        # the timer it means the review lane does no work at all, and an exit 0
+        # would let systemd report every invocation as a success while nothing ran.
+        summary["failure"] = blocked
         return summary
 
     slug = repo or resolve_repo(runner)
     if not slug:
         summary["detail"] = "repo slug unresolved — not dispatching"
+        summary["failure"] = summary["detail"]
         return summary
     summary["repo"] = slug
 
     prs = open_prs(slug, runner)
     if prs is None:
         summary["detail"] = "open-PR list unreadable — not dispatching"
+        summary["failure"] = summary["detail"]
         return summary
+    if len(prs) >= _PR_LIST_LIMIT:
+        # A result count EQUAL to the limit is a truncated read, not a complete one.
+        # Beyond this point the queue is simply invisible to the scan; the direction
+        # is safe (fewer candidates, never more) but silence about it is not, so it
+        # is reported rather than assumed away.
+        summary["truncated"] = True
+        logger.warning(
+            "external_review: open-PR list hit the %s limit — the queue may be truncated",
+            _PR_LIST_LIMIT,
+        )
 
     budget = config.max_dispatches_per_scan(cfg)
     recent = recent_dispatch_heads()
@@ -799,12 +992,17 @@ def scan(
         row, decision, reason = _consider(
             pr, slug=slug, mode=mode, cfg=cfg, runner=runner, recent=recent
         )
-        rows.append(row)
+        # A dispatched row was already persisted as a pre-dispatch claim; batching it
+        # again would double-count the attempt in the audit trail.
+        if not row.pop("_claimed", False):
+            rows.append(row)
         if decision != DECISION_SKIPPED:
             attempts += 1
         summary["decisions"].append((number, decision, reason))
         if decision in (DECISION_DISPATCHED, DECISION_DRY_RUN):
             summary["dispatched"] += 1
+        if decision == DECISION_FAILED:
+            summary.setdefault("failure", reason)
 
     record(compress_rows(rows))
     return summary
