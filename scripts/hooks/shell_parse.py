@@ -205,7 +205,31 @@ _NESTED = {"bash", "sh", "dash", "zsh", "ksh", "ash"}
 # structurally in _strip_wrappers, not via this set.
 _CMD_POSITION_WORDS = frozenset({"!", "if", "elif", "while", "until", "then", "do", "else", "{"})
 # git global options that consume the FOLLOWING token as their value.
-_GIT_OPTS_WITH_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"}
+#
+# MEASURED against the installed binary, NOT read from `git -h` — that usage
+# line omits `--attr-source` entirely while git accepts it and runs the
+# subcommand after it. A missing member is the FAIL-OPEN direction here: the
+# walks below skip an unlisted `-`-prefixed token alone, so the option's VALUE
+# lands in the verb slot and the real subcommand is never reached.
+#
+# `--super-prefix` is retained although git 2.43 rejects it — the set is
+# version-dependent, and an entry for an option a given git lacks is inert
+# because that git refuses the command outright.
+#
+# Four copies of this set exist (here, git_push_guard, review_enforcement_commit,
+# pre_push_privacy_review) and are locked identical by
+# tests/test_hooks/test_value_flag_consistency.py. Update all of them together.
+_GIT_OPTS_WITH_ARG = {
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--super-prefix",
+    "--config-env",
+    "--attr-source",
+    "--shallow-file",
+}
 # git-commit short flags that consume the REST of their short-bundle as a value
 # (so -minitial is `-m initial`, not a bundle containing -n).
 _COMMIT_ARG_FLAGS = "mFCc"
