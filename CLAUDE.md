@@ -188,6 +188,17 @@ Applies to every assertion — in conversation, and doubly in anything written t
   it.** When you have only the count, say "not found in K of N", never "absent". This
   failure is silent and confident: an under-read is indistinguishable from a clean result,
   so nothing prompts you to check.
+- **Do not set a limit you cannot justify — the failure starts at the WRITE end.** The
+  moment you pass `--limit 30` the answer is decided, and no later vigilance recovers it.
+  Default to **no limit** on an enumeration you will draw a count or an absence from; pass
+  one only when you can name the budget it protects, and then treat a saturated read
+  (`n >= limit`) as truncated without waiting to be reminded. **An UNFLAGGED listing may
+  already be capped by a tool default you never chose** — the absence of a limit in the
+  command is not evidence of a complete read, and that is the version of this you cannot
+  feel. A preview is exempt (`| head`, a top-N sample): that is a selection you are not
+  counting. The house pattern is `session_awareness/repo_pulse_gh.py`, which records
+  `limit_hit` and is loud rather than silent. Reporting your own limit back as a total
+  has happened.
 - **Evidence tiers.** Every stated fact is one of: **MEASURED** (number + denominator),
   **READ** (artifact + location, e.g. file:line / PR / live query), **INFERRED** (must be
   hedged out loud — "I think", "unverified, but"), or **ASSUMED** (say so). An unmarked
