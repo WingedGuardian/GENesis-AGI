@@ -473,46 +473,63 @@ def test_a_blind_spot_does_not_disarm_the_precise_scan(target, fake_home):
     )
 
 
-def test_an_untokenizable_parse_does_not_reach_the_precise_scan(fake_home):
-    """The fall-through above is for causes whose SEGMENTS ARE TRUSTWORTHY.
+# An `rm -rf` of a protected ancestor placed BEFORE a construct the tokenizer
+# cannot read. Bash runs the removal; the parse is unreadable, so the segments come
+# from the naive fallback — and here the fallback is RIGHT. Two spellings plus a
+# glob, because the substring fallback can see none of the three.
+_UNREADABLE_REAL_REMOVAL = [
+    r"""rm -rf $HOME/genesis; echo $'don\'t'""",
+    """rm -rf $HOME/genesis; echo 'oops""",
+    r"""rm -rf $HOME/gen*; echo $'don\'t'""",
+]
 
-    `untokenizable` is the one that is not: its segments come from the naive
-    fallback, which can INVENT a command outright. Bash reads the quoted string
-    below as ONE argument — printf prints it and nothing else runs — but the
-    tokenizer's model of quoting is narrower than the shell's here, so the parse
-    degrades to a naive split and emits an `rm -rf <protected dir>` segment that
-    was never a command.
 
-    The substring check does not match that ancestor spelling, so this was
-    correctly ALLOWED before the fall-through existed. Letting it through to the
-    precise scan refuses benign prose, which is an over-block introduced by the
-    very change that fixed the fail-open beside it. Deleting the
-    `untokenizable(cmd)` early return fails here.
+@pytest.mark.parametrize("cmd", _UNREADABLE_REAL_REMOVAL)
+def test_an_unreadable_parse_still_refuses_a_real_removal(cmd, fake_home):
+    """The fall-through must cover `untokenizable`, and THIS is why.
+
+    An unreadable parse makes the fallback segments unreliable in both directions.
+    When the segment is INVENTED the cost is a refused `printf`; when it is REAL —
+    as here, where bash genuinely runs the removal — an early return costs the
+    production database's parent directory, irreversibly.
+
+    The substring check cannot see an ancestor or a glob spelling, so it does not
+    catch any of these. Restoring an `untokenizable` early return fails here three
+    times, which is the whole argument for accepting the over-block beside it.
+    """
+    r = _run(cmd, fake_home)
+    assert r.returncode == 2, (
+        "a real rm of a protected ancestor was ALLOWED because the parse was "
+        "unreadable and the scan was skipped — the substring fallback cannot see "
+        f"this spelling.\n{r.stderr}"
+    )
+
+
+@pytest.mark.parametrize("cmd", _UNREADABLE_REAL_REMOVAL)
+def test_the_unreadable_removal_fixtures_really_are_unreadable(cmd, fake_home):
+    """Guard-the-guard. If these ever tokenized cleanly they would be caught by the
+    ordinary parsed path, and the test above would assert nothing about the
+    fall-through it exists to pin."""
+    assert shell_parse.untokenizable(cmd.replace("$HOME", "/home/x")), (
+        "fixture no longer produces an unreadable parse, so the test above "
+        "exercises the ordinary path instead of the fallback"
+    )
+
+
+def test_the_accepted_over_block_is_documented_not_accidental(fake_home):
+    """The price of the test above, pinned so it is a DECISION and not a surprise.
+
+    This command only prints text, and it is refused. That is the known cost of
+    letting the fall-through cover unreadable parses, and it is the cheap side of
+    the trade: rephrase the string. Pinned so that anyone who later makes this
+    ALLOW has to come here and read why it was not.
     """
     cmd = r"""printf %s $'don\'t; rm -rf $HOME/genesis; x'"""
     r = _run(cmd, fake_home)
-    assert r.returncode != 2, (
-        "a command that only PRINTS text was refused, because the naive "
-        "tokenization fallback invented an rm segment and the precise scan was "
-        f"allowed to read it.\n{r.stderr}"
-    )
-
-
-def test_the_untokenizable_fixture_really_is_untokenizable(fake_home):
-    """Guard-the-guard for the test above.
-
-    If that command ever tokenized cleanly, the test would pass via the ordinary
-    parsed path and assert nothing about the early return it exists to pin.
-    """
-    cmd = r"""printf %s $'don\'t; rm -rf $HOME/genesis; x'"""
-    assert shell_parse.untokenizable(cmd), (
-        "the fixture no longer defeats shlex, so the test above no longer "
-        "exercises the untokenizable early return"
-    )
-    segs, _blind = shell_parse.analyze_checked(cmd)
-    assert any(s.exe == "rm" for s in segs), (
-        "the fallback no longer invents an rm segment, so the test above would "
-        "pass even with the early return deleted"
+    assert r.returncode == 2, (
+        "the documented over-block no longer fires. If that was deliberate, the "
+        "three real-removal cases above must still pass — check them before "
+        f"updating this test.\n{r.stderr}"
     )
 
 

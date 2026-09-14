@@ -60,7 +60,7 @@ from fnmatch import fnmatch
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import brace_expand, read_payload, run_guard, tool_input  # noqa: E402
-from shell_parse import analyze_checked, untokenizable  # noqa: E402
+from shell_parse import analyze_checked  # noqa: E402
 
 try:  # noqa: E402
     import discarded_write
@@ -305,31 +305,38 @@ def main() -> int:
         if reason:
             return _block(reason)
 
-        # The fall-through is for causes whose SEGMENTS ARE TRUSTWORTHY, and
-        # `untokenizable` is the one that is not. The comment above said the scan
-        # "runs on segments that tokenized fine" — true of an unresolved verb, where
-        # the parse succeeded and one WORD of it is unreadable, and false of
-        # `untokenizable`, where the segments come from the naive fallback and can be
-        # INVENTED outright.
+        # THE FALL-THROUGH APPLIES TO `untokenizable` TOO, DELIBERATELY, AND THE
+        # OVER-BLOCK IT CAUSES IS THE PRICE. Both directions were measured, because
+        # each reviewer who looked at this saw only one of them.
         #
-        # MEASURED: a `printf` of a single quoted argument that happens to CONTAIN
-        # rm-shaped prose is one argument to bash — printf prints it and nothing runs
-        # — but the tokenizer's model of quoting is narrower than the shell's there,
-        # so the parse degrades to a naive split and emits a segment
-        # `rm -rf <the protected dir>` that was never a command. The substring check
-        # does not match that ancestor spelling, so before this branch existed the
-        # command was correctly ALLOWED; falling through handed the invented segment
-        # to the precise scan and refused benign prose. Restoring the early return
-        # for this one cause returns it to ALLOW while keeping the ancestor/glob fix
-        # for the unresolved-verb cause.
+        # An unreadable parse makes the fallback segments unreliable in BOTH
+        # directions, and the two costs are not comparable:
         #
-        # `untokenizable(cmd)` rather than a test on `blind.cause`: the BlindSpot
-        # contract forbids re-deriving policy from the cause string (a consumer
-        # comparing `kind != "untokenizable"` is the shape that failed OPEN twice and
-        # got the field deleted). This is the module's own public probe, and it is
-        # how `worktree_cwd_guard` spells the same distinction.
-        if untokenizable(cmd):
-            return 0
+        #   * segment INVENTED. A `printf` of one quoted argument that merely
+        #     CONTAINS rm-shaped prose runs nothing, yet the naive split emits an
+        #     `rm` segment naming a protected path. Falling through refuses it.
+        #     Cost: a refused `printf`, rephrase and move on.
+        #   * segment REAL. An `rm -rf` of a protected ancestor placed BEFORE the
+        #     construct the tokenizer cannot read — bash runs the removal. The
+        #     substring check cannot see an ancestor or a glob spelling, so an early
+        #     return here ALLOWS it. Cost: the production database's parent
+        #     directory, irreversibly.
+        #
+        # MEASURED, three constructed removals of that parent (two spellings plus a
+        # glob) against one benign `printf`:
+        #
+        #     with the early return   3 real removals ALLOWED, prose allowed
+        #     falling through         3 real removals BLOCKED, prose refused
+        #
+        # So this is not "scan or do not scan", it is which error to make when the
+        # command cannot be read, and for the guard standing in front of the
+        # database it is not close. The BOUNDS branch above already refuses outright
+        # on the same reasoning, and this module's docstring already says the
+        # fallback is weakest exactly where the command is most destructive.
+        #
+        # An earlier revision took the other side, having measured only the invented
+        # case. Recorded here because the shape recurs: a rate measured on one side
+        # of a trade-off reads as a clean result and is half a measurement.
 
     cwd = payload.get("cwd") if isinstance(payload, dict) else None
     for seg in segs:
