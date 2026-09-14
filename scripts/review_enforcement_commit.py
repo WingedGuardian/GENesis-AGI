@@ -755,24 +755,42 @@ _MODE_SWITCH_REMEDIES = [
 ]
 
 
+# Bound at the RENDER boundary, not only at the store. The store's bound covers the
+# recorder path; a hand-written round file does not go through it. Omission is
+# explicit and states the count — never a silent mid-value cut.
+_MAX_RENDERED_ANSWER = 2000
+
+
 def _quote_answer(text: str | None) -> str:
     """Render a user-typed answer inside a block message, safely and visibly.
 
-    The value arrives from the harness as free text (an "Other" answer) and is
-    replayed on EVERY subsequent block, into the model's instruction channel at the
-    moment that channel is most constrained. Unindented, a multi-line answer renders
-    at column 0 in the gate's own voice — MEASURED: an answer containing a blank line
-    followed by `NOTE: escalation-ack honored ...` is indistinguishable from the
-    gate's real `NOTE:` lines.
+    The value is replayed on EVERY subsequent block, into the model's instruction
+    channel at the moment that channel is most constrained. Unindented, a multi-line
+    answer renders at column 0 in the gate's own voice — MEASURED: an answer
+    containing a blank line followed by `NOTE: escalation-ack honored ...` is
+    indistinguishable from the gate's real `NOTE:` lines.
 
-    So every line is indented. The threat is low (the author is the user, not a
-    stranger) and this is not a sanitiser — it is the cheap structural fix that keeps
-    quoted text visibly quoted. Length is already bounded at the store.
+    DO NOT assume the user typed it. An earlier version of this docstring said "the
+    threat is low (the author is the user, not a stranger)", which is false: the
+    recorder is unauthenticated, so this string is agent-writable, and a stored
+    answer is then a standing slot in every later block message. Treat it as
+    untrusted text that happens to usually come from the user.
+
+    So: bound at the RENDER boundary rather than trusting the store's bound (a
+    hand-written file carries no bound at all), strip control characters so escape
+    sequences cannot repaint the surrounding message, and indent every line.
     """
     if not text:
         return "    <empty>"
     flattened = text.replace("\r\n", "\n").replace("\r", "\n")
-    return "\n".join("    " + line for line in flattened.split("\n"))
+    # Strip every C0/C1 control character except the newlines just normalised. An
+    # indent keeps text visually quoted for a human; it does nothing about an escape
+    # sequence that moves the cursor or recolours what follows.
+    cleaned = "".join(c if c == "\n" or c.isprintable() else " " for c in flattened)
+    if len(cleaned) > _MAX_RENDERED_ANSWER:
+        kept = cleaned[:_MAX_RENDERED_ANSWER]
+        cleaned = f"{kept}\n<rest of the recorded answer omitted: {len(cleaned) - len(kept)} chars>"
+    return "\n".join("    " + line for line in cleaned.split("\n"))
 
 
 def _remedy_by_key(remedies: list[dict], key: str | None) -> dict | None:
@@ -801,6 +819,7 @@ def _demand_refusal(
     sigil: str,
     *,
     present: bool = False,
+    gate: str = "",
 ) -> str | None:
     """Why this demand refuses to authorise the commit, or None if it authorises it.
 
@@ -830,9 +849,9 @@ def _demand_refusal(
     state = demand.get("state")
     if state == "live":
         return (
-            "A gate demand is LIVE and UNANSWERED on this branch. The sigil attests "
-            "that a fresh decision was made — but no answer from you has been "
-            "recorded, so nothing attests that you were ever asked. Ask the question: "
+            "A gate demand is LIVE and UNANSWERED on this branch. No answer is on record, "
+            "so as far as anything here can tell the question was never put to the "
+            "user. Ask it: "
             "make an AskUserQuestion call and the gate's own menu is appended to it "
             "automatically (you do not write those options, which is the point)."
         )
@@ -848,14 +867,30 @@ def _demand_refusal(
         return (
             "This demand's authorisation has already been SPENT. A decision "
             "authorises the commit it was made about, not the branch's remaining "
-            "life. Ask again for the next one."
+            "life.\n"
+            "Note asking again right now does nothing: a spent demand is not "
+            "re-offered. Commit WITHOUT the sigil first — that is what makes the gate "
+            "declare a fresh demand — and the menu is appended to your next ask."
         )
     remedy = _remedy_by_key(remedies, demand.get("answered_with"))
     if remedy is None:
+        # Check the TIER before blaming the data. A demand answered at the other tier
+        # is an ordinary sequence — cap answered, commit denied by a later rule, two
+        # rounds later the mode-switch tier reads the same demand — and calling that
+        # corruption sends the user to a recovery command for a healthy record. A
+        # gate crying corruption when nothing is corrupt costs exactly the trust this
+        # mechanism exists to build.
+        if demand.get("gate") != gate:
+            return (
+                "The answer on record was given for a DIFFERENT tier of this gate "
+                f"({demand.get('gate')}), so it does not authorise anything here. "
+                "Nothing is corrupt. Commit without the sigil once to let this tier "
+                "declare its own demand, then answer the menu it puts up."
+            )
         return (
             "The recorded answer names a remedy this gate no longer declares — the "
-            "remedy set changed under it. Clear it with "
-            "`python3 scripts/review_state.py retire-gate-demand` and ask again."
+            "remedy set changed under it. Re-open the question with "
+            "`python3 scripts/review_state.py retire-gate-demand` and answer again."
         )
     if not remedy["authorizes_commit"]:
         return (
@@ -1416,12 +1451,31 @@ def main() -> None:
                 + _merge_note(cwd)
             )
             return
-        # Acked. The sigil attests a fresh decision was MADE; the demand attests the
-        # USER made it. Both are required once this gate has actually blocked — that
-        # is the whole of the enforcement, and it is why a session that was never
-        # blocked (no demand) reaches the unconditional reset below exactly as before.
+        # Acked. WHAT THIS DOES AND DOES NOT PROVE, stated precisely because an
+        # earlier version of this comment claimed more than the code can deliver.
+        #
+        # The load-bearing property is the SUBSTITUTION, not the record: while a
+        # demand is live the user is shown the GATE's options, so a paraphrased or
+        # invented menu cannot reach them. That half is enforced by construction.
+        #
+        # The recorded answer is BOOKKEEPING that carries the choice back here. It is
+        # NOT an authenticated attestation and must not be described as one: this
+        # runs on a machine where the session has a shell, so the record can be
+        # written directly (MEASURED — piping a crafted payload into the recorder
+        # sets `answered`, with no ask and no user). That is true of every local gate
+        # here, including the round counter itself, and no local mechanism can close
+        # it. What the pair buys is that the CARELESS path — the one the founding
+        # incident actually took — now requires a deliberate act instead of happening
+        # by default.
+        #
+        # Both are required once this gate has actually blocked, and a session it
+        # never blocked (no demand) reaches the unconditional reset below as before.
         _refusal = _demand_refusal(
-            _cap_demand, _CAP_REMEDIES, "# escalation-ack", present=_cap_demand_present
+            _cap_demand,
+            _CAP_REMEDIES,
+            "# escalation-ack",
+            present=_cap_demand_present,
+            gate="escalation_cap",
         )
         if _refusal:
             _deny(
@@ -1537,12 +1591,17 @@ def main() -> None:
             )
             return
         # Acked at the mode-switch tier. Same contract as the cap: once this gate has
-        # blocked, the sigil attests the audit happened and the demand attests the
-        # user chose (B) rather than (A). Deliberately NO reset here either way — a
+        # blocked, the sigil records that the audit happened and the demand carries
+        # which option was chosen (see the cap tier's note on what that does and does
+        # not prove). Deliberately NO reset here either way — a
         # still-narrow fix must still reach the round-3 stop, which is why
         # `class_audit` declares `resets_streak: False`.
         _ms_refusal = _demand_refusal(
-            _ms_demand, _MODE_SWITCH_REMEDIES, "# audit-ack", present=_ms_demand_present
+            _ms_demand,
+            _MODE_SWITCH_REMEDIES,
+            "# audit-ack",
+            present=_ms_demand_present,
+            gate="mode_switch",
         )
         if _ms_refusal:
             _deny(
@@ -1555,8 +1614,13 @@ def main() -> None:
             )
             return
         if _ms_demand is not None:
-            with contextlib.suppress(Exception):
-                consume_gate_demand(cwd)
+            # Deferred to _allow(), exactly as the cap tier does. Consuming inline
+            # here spent the user's answer before the docs-only skip, the depth rule
+            # and the review-marker rule had run — so a commit any of them denied
+            # still burned it, and the user had to answer a question they had already
+            # answered. This tier's own comment said "Same contract as the cap" while
+            # doing the opposite, which is the instance-not-class shape in miniature.
+            spend_gate_demand = True  # noqa: F841 — read by the _allow() closure
 
     # Docs/config-only skip: a commit whose ENTIRE staged set is documentation
     # or config carries no code to review (adaptive-review "review level: None"),

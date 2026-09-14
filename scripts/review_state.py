@@ -738,7 +738,21 @@ def _load_round(cwd: str | None = None) -> dict:
                 # stamps last_source); an internal mark leaves it at 0. (Self-healing
                 # mechanism — obviates a one-time per-install data repair.)
                 if "round" in data and "last_source" not in data:
-                    return {}
+                    # The discard is about the COUNTER's provenance, so it must
+                    # discard the counter and nothing else. A gate demand is not a
+                    # counter — it records a decision the user was asked for, and its
+                    # trustworthiness has nothing to do with which reviewer produced
+                    # a round.
+                    #
+                    # Returning a bare {} here was a FULL DISARM reachable by deleting
+                    # ONE key. MEASURED: on a real capped state, removing `last_source`
+                    # made read_gate_demand AND gate_demand_present both report
+                    # nothing, and an acked commit went from exit 2 to exit 0 — past
+                    # the very split that exists so an unreadable demand cannot be
+                    # mistaken for an absent one, because this branch runs BEFORE
+                    # either reader sees the file.
+                    preserved = data.get(_GATE_DEMAND_KEY)
+                    return {_GATE_DEMAND_KEY: preserved} if isinstance(preserved, dict) else {}
                 if "round" in data:
                     data["round"] = _coerce_finite_int(data.get("round"))
                 return data
@@ -1220,6 +1234,7 @@ def read_gate_demand(cwd: str | None = None) -> dict | None:
         "gate": gate,
         "tier": demand.get("tier") if isinstance(demand.get("tier"), str) else "",
         "branch": demand.get("branch"),
+        "worktree": demand.get("worktree") if isinstance(demand.get("worktree"), str) else None,
         "question": question,
         "remedies": remedies,
         "state": status,
@@ -1265,6 +1280,58 @@ def gate_demand_present(cwd: str | None = None) -> bool:
     if branch == "unknown":
         return True
     return demand.get("branch") == branch
+
+
+def find_session_gate_demand(cwd: str | None = None) -> dict | None:
+    """The demand this SESSION should be asked about, wherever the gate keyed it.
+
+    THE CLASS THIS CLOSES, which a narrower fix missed. The commit gate keys a demand
+    under the COMMIT's effective directory — `git -C <dir>` and a trailing `cd` both
+    win over the session's own cwd (`_effective_diff_cwd`). A reader that COMPUTES a
+    key from the session cwd therefore looks in the wrong place whenever the session
+    sits in one worktree and commits into another, which is an ordinary shape here
+    because worktrees are mandated. MEASURED: session in wt1, `git -C wt2 commit`,
+    demand written under wt2 — the ask hook keyed on wt1 found nothing, so the menu
+    never rendered while the gate blocked every commit and told the session to ask.
+    A permanent wedge whose only exit was the kill switch.
+    (An earlier fix threaded the PAYLOAD cwd instead of the process cwd. That closed a
+    different axis — and in practice not even a live one, since Claude Code spawns
+    hooks with cwd == the project dir == the payload cwd — so it fixed the instance
+    and left the class. This is the class.)
+
+    So: look under this cwd first (the common case), then ENUMERATE. A candidate is
+    only accepted when its recorded branch still matches the branch of its recorded
+    worktree, which is what keeps a stale demand from another checkout out.
+    Ambiguity resolves to None rather than to a guess: appending the wrong gate's
+    menu would ask the user to decide something they are not being blocked on.
+    """
+    direct = read_gate_demand(cwd)
+    if direct is not None:
+        return direct
+    if gate_ack_disabled():
+        return None
+    candidates: list[dict] = []
+    try:
+        files = sorted(_ROUND_DIR.glob("*.json"))
+    except OSError:
+        return None
+    for path in files:
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        demand = data.get(_GATE_DEMAND_KEY)
+        if not isinstance(demand, dict):
+            continue
+        worktree = demand.get("worktree")
+        if not isinstance(worktree, str) or not worktree:
+            continue
+        found = read_gate_demand(worktree)
+        if found is not None:
+            candidates.append(found)
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _store_gate_demand(demand: dict, cwd: str | None = None) -> None:
@@ -1321,6 +1388,20 @@ def write_gate_demand(
         and existing.get("gate") == gate
         and existing.get("branch") == get_current_branch(cwd=cwd)
         and existing.get("state") != _DEMAND_CONSUMED
+        # ...and it must still be READABLE. Protecting an UNREADABLE demand from
+        # being overwritten made corruption permanent: the gate refused (correctly,
+        # since presence is separate from readability), pointed at
+        # `retire-gate-demand`, and retire resets only state/answered_with — never
+        # `question` or `remedies` — so the next block hit this idempotency check,
+        # no-op'd, and the loop never terminated. The kill switch was the only exit.
+        # MEASURED with `remedies` corrupted: refuse -> retire -> re-block -> still
+        # unreadable, forever.
+        #
+        # Self-healing instead: an unreadable demand is replaced by the gate's own
+        # current declaration. Note this cannot silently discard a decision — an
+        # unreadable demand has no legible answer to discard, which is exactly why
+        # it was wedging.
+        and read_gate_demand(cwd) is not None
     ):
         return
     _store_gate_demand(
@@ -1328,6 +1409,9 @@ def write_gate_demand(
             "gate": gate,
             "tier": tier,
             "branch": get_current_branch(cwd=cwd),
+            # Recorded so a reader can RE-KEY from the demand instead of computing a
+            # key from its own cwd -- see find_session_gate_demand.
+            "worktree": _worktree_root(cwd) if cwd else _worktree_root(os.getcwd()),
             "question": question,
             "remedies": valid,
             "state": _DEMAND_LIVE,

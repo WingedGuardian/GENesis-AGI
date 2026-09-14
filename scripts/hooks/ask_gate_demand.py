@@ -111,13 +111,16 @@ def _payload_cwd(payload: dict) -> str | None:
 def _demand_for_ask(cwd: str | None = None) -> dict | None:
     """The demand this hook should act on, or None. Never raises."""
     try:
-        from review_state import read_gate_demand
+        from review_state import find_session_gate_demand
     except Exception:
         # review_state unimportable (partially-synced worktree, syntax error) —
         # degrade to doing nothing rather than to refusing an ask.
         return None
     try:
-        demand = read_gate_demand(cwd)
+        # FIND the demand rather than computing its key. The commit gate keys it
+        # under the COMMIT's effective directory, which `git -C <dir>` moves away
+        # from the session's own — see find_session_gate_demand for the measurement.
+        demand = find_session_gate_demand(cwd)
     except Exception:
         return None
     if not isinstance(demand, dict):
@@ -233,7 +236,12 @@ def run_post() -> int:
     try:
         from review_state import record_gate_answer
 
-        record_gate_answer(question=demand["question"], label=label, cwd=cwd)
+        # Record against the demand's OWN worktree, not the session's. When the
+        # demand was found by enumeration (the `git -C <other-worktree>` case) those
+        # differ, and writing to the session's key would create a second, unread
+        # demand while the real one stayed unanswered — the wedge again, one layer out.
+        target = demand.get("worktree") or cwd
+        record_gate_answer(question=demand["question"], label=label, cwd=target)
     except Exception:
         return 0
     return 0
