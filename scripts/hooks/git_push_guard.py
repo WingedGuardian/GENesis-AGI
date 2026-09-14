@@ -159,11 +159,16 @@ from shell_parse import (  # noqa: E402
 
 # Mentions of a GATED operation, consulted ONLY on the un-parseable path where
 # analyze() has gone blind. Deliberately BROAD — both the gated verbs and the
-# destructive flags — because the outcome there is an approval PROMPT, not a
-# block: an over-match costs one confirmation, while an under-match silently
-# runs an unverified publish. (An earlier flag-only, hard-block version had to be
-# surgically precise, and precision is exactly what an unreliable parse cannot
-# deliver — every narrowing conjunct became a new way to starve the trigger.)
+# destructive flags.
+#
+# The breadth SURVIVES the 2026-09-08 ruling that made the outcome a DENY rather
+# than a prompt, and the reason has changed with it: an over-match now costs the
+# AGENT one rewrite that the deny message spells out, where it used to cost a
+# human one confirmation. An under-match still silently runs an unverified
+# publish. The asymmetry is intact, so do NOT narrow this — an earlier
+# flag-only, hard-block version had to be surgically precise, and precision is
+# exactly what an unreliable parse cannot deliver: every narrowing conjunct
+# became a new way to starve the trigger (measured).
 _GATED_MENTION = re.compile(
     r"(?:^|\s)(?:--force(?:-with-lease)?|--no-verify|--admin)(?:\s|=|$)|\b(?:push|merge)\b"
 )
@@ -184,6 +189,13 @@ _GATED_MENTION = re.compile(
 # nothing and would have measured 0 false positives by never firing at all.
 _GH_MENTION = re.compile(r"\bgh\b")
 _CREATE_MENTION = re.compile(r"\bcreate\b")
+
+#: The programs whose SUBCOMMAND this guard gates. Used on the blind path to ask
+#: whether a segment that resolved to one of them left its operation unreadable —
+#: the one blind-spot shape `_mentions_gated_op` structurally cannot see, because
+#: the operation's name is the missing part. Every gated op in this file is a
+#: subcommand of one of these two.
+_GATED_EXES = frozenset({"git", "gh"})
 
 
 def _mentions_gated_op(command: str) -> bool:
@@ -206,6 +218,12 @@ try:
 except Exception:  # noqa: BLE001 — see the review_state guard's rationale (108-114)
     push_allowlist = None
 
+try:
+    import discarded_write  # noqa: E402 — scripts/hooks is on sys.path[0]
+except Exception:  # noqa: BLE001 — same rationale: an unguarded import failure would
+    # abort module load → exit 1 → CC reads non-2 as NON-blocking → the push RUNS.
+    discarded_write = None
+
 # Sentinel: the effective cwd cannot be confidently resolved (a cd into a
 # variable/command-substitution, a subshell, or a target nested at depth>0).
 # Callers MUST fail closed on it — block the merge, do not soften a force push.
@@ -213,8 +231,23 @@ _CWD_UNKNOWN = object()
 
 # git global options that consume the FOLLOWING token as their value — used to
 # skip past `git -C <dir>` / `git -c KEY=VAL` when locating a push's positionals.
+# MEASURED against the installed binary, never `git -h` (which omits
+# `--attr-source` while git accepts it). A missing member is the fail-open
+# direction: the option's value is read as the subcommand, so a publish
+# preceded by it is never seen. Locked identical to the other three copies by
+# tests/test_hooks/test_value_flag_consistency.py.
 _GIT_GLOBAL_VALUE_FLAGS = frozenset(
-    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"}
+    {
+        "-C",
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--super-prefix",
+        "--config-env",
+        "--attr-source",
+        "--shallow-file",
+    }
 )
 
 
@@ -1043,12 +1076,29 @@ _CR_FINDING_SPLIT_RE = re.compile(r"^ {0,3}-{3,}\s*$", re.M)
 # path, so there is one score and one threshold to reason about.
 _CR_BLOCKING_WEIGHT = 1.0
 # Weighted review score for inline findings: a P1 is a full blocker (1.0), a P2
-# is half (0.5), so the gate blocks at any unresolved P1 OR >= 2 unresolved P2s.
+# is half (0.5). What that BUYS depends on the lane: see the per-lane thresholds
+# below. Two P2s block a `critical` change, four a `standard` one, six a `light`
+# one. The flat "any P1 OR >= 2 P2s" this line used to state is now true only in
+# the critical lane.
 # Doc-path and maintainer-replied (consciously-accepted) findings are excluded
 # from the score, exactly as for P1s. Fixed policy value that works on any clone —
 # deliberately not per-install configurable.
 _INLINE_P2_SCORE_WEIGHT = 0.5
-_INLINE_SCORE_BLOCK_THRESHOLD = 1.0
+# PER-LANE thresholds. The weights above are what a finding COSTS; these are what
+# a change can AFFORD before the merge stops, and they vary by how much it costs
+# to be wrong. MEASURED across this repo's review history: all 11 P1s ever raised
+# landed on guards / destructive paths / alerting / measurement, and ZERO on
+# ordinary features — so one global threshold either under-protects the first
+# group or over-blocks the second. `critical` keeps the historical 1.0 (any P1, or
+# two P2s); `standard` and `light` tolerate more before blocking, while the
+# always-fix floor (P1, leak/privacy, destructive) is a separate obligation this
+# score never governed.
+#
+# STILL "fixed policy values that work on any clone — deliberately not
+# per-install configurable", exactly as the note above says. Varying by LANE is a
+# property of the change; varying by INSTALL would be a property of the operator,
+# and only the second is what that sentence refuses. No config key is added.
+_INLINE_SCORE_BLOCK_THRESHOLDS = {"critical": 1.0, "standard": 2.0, "light": 3.0}
 _INLINE_REVIEW_BOTS = {
     "chatgpt-codex-connector[bot]",
     "github-advanced-security[bot]",
@@ -2154,8 +2204,11 @@ def _check_inline_review_findings(
 
 
     Returns (should_block, message). Each unresolved finding contributes to a review
-    score — P1 = 1.0, P2 = 0.5 — and the gate blocks when the score >= 1.0 (any P1, OR
-    >= 2 P2s). A finding is EXCLUDED from the score when its thread has a MAINTAINER
+    score — P1 = 1.0, P2 = 0.5 — and the gate blocks when the score reaches the
+    threshold FOR THIS PR'S LANE (`_INLINE_SCORE_BLOCK_THRESHOLDS`): critical 1.0,
+    standard 2.0, light 3.0. So two P2s stop a consequence surface, four ordinary
+    code, six prose-and-tests. A P1 blocks in EVERY lane via the always-fix floor,
+    before the score is consulted at all. A finding is EXCLUDED from the score when its thread has a MAINTAINER
     reply (engagement = consciously accepted), its path is documentation
     (``_is_doc_path``), or its path is OUTSIDE the PR's diff (issue #1728: a
     merge of main stamps base-branch findings onto the PR; scoring them makes
@@ -2609,7 +2662,9 @@ def _check_inline_review_findings(
         for title in doc_skipped_p2[:5]:
             print(f"  [doc P2] {title}", file=sys.stderr)
     # Weighted review score: P1 = 1.0 (full blocker), P2 = 0.5. Blocks at
-    # score >= threshold — any unresolved P1, OR >= 2 unresolved P2s. Doc-path
+    # score >= the LANE's threshold (critical 1.0 / standard 2.0 / light 3.0), so
+    # the P2 count that stops a merge is 2, 4 or 6 respectively. A P1 never
+    # reaches here — the always-fix floor above blocks it in every lane. Doc-path
     # and maintainer-replied findings were already excluded from p1/p2 above.
     # The REVIEW-BODY channel contributes NOTHING to this sum, at any severity.
     # It is surfaced and never scored — owner decision at the escalation cap,
@@ -2645,27 +2700,83 @@ def _check_inline_review_findings(
     if p2:
         print(
             f"WARNING: PR #{pr_num} has {len(p2)} inline [P2] review finding(s) "
-            f"(each adds {_INLINE_P2_SCORE_WEIGHT} to the review score; the gate "
-            f"blocks at score >= {_INLINE_SCORE_BLOCK_THRESHOLD:.0f}, i.e. any P1 "
-            f"or {int(_INLINE_SCORE_BLOCK_THRESHOLD / _INLINE_P2_SCORE_WEIGHT)}+ P2s):",
+            f"(each adds {_INLINE_P2_SCORE_WEIGHT} to the review score; the "
+            f"threshold depends on this change's LANE and is named in the "
+            f"verdict below):",
             file=sys.stderr,
         )
         for title in p2[:8]:
             print(f"  [P2] {title}", file=sys.stderr)
-    if score >= _INLINE_SCORE_BLOCK_THRESHOLD:
+    # The lane is resolved ONLY when there is a score to compare, so a PR with no
+    # blocking findings still pays nothing — the same laziness `_scope_cache`
+    # above was built for. `_pr_changed_files` is memoized, and the pin-receipt
+    # gate has already asked it on this merge, so in practice this costs no API
+    # call at all.
+    lane = _pr_lane(pr_num, repo=repo) if score > 0 else "critical"
+    threshold = _INLINE_SCORE_BLOCK_THRESHOLDS[lane]
+    # THE ALWAYS-FIX FLOOR, in every lane, before the score is consulted.
+    #
+    # Severity floors; the lane governs VOLUME. A P1 or a CodeRabbit
+    # Critical/Major stops any merge whatever its lane, and the per-lane
+    # threshold only decides how many P2s may accumulate first.
+    #
+    # This is a RULE now because it used to be an accident. Before the lanes
+    # existed the single threshold was 1.0 and a P1 scores exactly 1.0, so the
+    # floor held by arithmetic — nothing named it, and nothing tested it. Raising
+    # the ordinary threshold to 2.0 would therefore have deleted it silently:
+    # a lone P1 on ordinary code would have scored 1.0 < 2.0 and passed a gate
+    # that has always stopped it.
+    #
+    # WHAT THIS ENFORCES IS NARROWER THAN THE DOCTRINE IT SERVES, and the two
+    # must not be conflated. The genesis-development skill's always-fix floor is
+    # severity AND KIND — "a P1, a security defect, anything destructive or
+    # fail-open". This check can only see the severity LABEL a reviewer attached,
+    # so a CodeRabbit MINOR naming a fail-open scores 0.0 and passes here. The
+    # mechanical floor is the labelled subset; the rest still rests on somebody
+    # reading the report.
+    floor_hits = len(p1) + len(cr_block)
+    if floor_hits:
         listing = "\n".join(
             [f"  [P1] {t}" for t in p1[:5]]
-            + [f"  [P2] {t}" for t in p2[:5]]
             + [f"  [CodeRabbit Critical/Major] {t}" for t in cr_block[:5]]
         )
         return True, (
-            f"review score {score:.1f} >= {_INLINE_SCORE_BLOCK_THRESHOLD:.1f} blocks "
-            f"(P1=1.0, P2={_INLINE_P2_SCORE_WEIGHT}, CodeRabbit Critical/Major="
-            f"{_CR_BLOCKING_WEIGHT:.0f} each): {len(p1)} unresolved [P1] + "
-            f"{len(p2)} unresolved [P2] + {len(cr_block)} CodeRabbit "
-            f"Critical/Major finding(s), none maintainer-replied:\n{listing}\n"
+            f"always-fix floor: {len(p1)} unresolved [P1] + {len(cr_block)} "
+            f"CodeRabbit Critical/Major finding(s), none maintainer-replied "
+            f"(review score {score:.1f}). Severity blocks in EVERY lane (this "
+            f"change is {lane.upper()}); the per-lane score threshold "
+            f"({threshold:.1f} here) governs how many P2s may accumulate, never "
+            f"whether a P1 counts:\n{listing}\n"
             f"Fix and reply in-thread, or append '# review-override' "
             f"to the merge command to acknowledge and proceed."
+        )
+    if score >= threshold:
+        # P1s and CodeRabbit Critical/Majors cannot reach here — the floor above
+        # returned on any of them — so this branch is purely a P2 accumulation,
+        # and naming the other two terms would describe counts that are provably
+        # zero.
+        listing = "\n".join(f"  [P2] {t}" for t in p2[:8])
+        return True, (
+            f"review score {score:.1f} >= {threshold:.1f} blocks this "
+            f"{lane.upper()} change: {len(p2)} unresolved [P2] finding(s) at "
+            f"{_INLINE_P2_SCORE_WEIGHT} each, none maintainer-replied. (A P1 or a "
+            f"CodeRabbit Critical/Major would have blocked at the always-fix "
+            f"floor, whatever the lane.)\n{listing}\n"
+            f"Fix and reply in-thread, or append '# review-override' "
+            f"to the merge command to acknowledge and proceed."
+        )
+    if score > 0:
+        # Below the bar, but the findings are real and the lane is why they did
+        # not stop the merge. Say both, or an operator reading a passing gate
+        # cannot tell a low score from a wide budget.
+        print(
+            f"NOTE: PR #{pr_num} — review score {score:.1f} is under the "
+            f"{threshold:.1f} threshold for a {lane.upper()} change, so the "
+            f"findings above do not block. A CRITICAL change (enforcement hooks, "
+            f"CI config, API surfaces, migrations) blocks at "
+            f"{_INLINE_SCORE_BLOCK_THRESHOLDS['critical']:.1f}. Read them anyway: "
+            f"'not blocking' describes the gate, not the finding.",
+            file=sys.stderr,
         )
     # No unresolved P1 among what we read. If the read is INCOMPLETE (a later page
     # failed), a P1 could exist on an unread page — fail per _scan_unreadable rather
@@ -4030,7 +4141,101 @@ def _pr_changed_files(pr_num: str, repo: str | None = None) -> list[str] | None:
     3000 entries; at the cap a hook file may sit beyond it → None (the caller
     fails closed). Tests inject via ``_TEST_GH_PR_FILES`` (one JSON object per
     line: ``{filename, previous_filename}``; the literal ``__error__`` simulates
-    an API error)."""
+    an API error).
+
+    MEMOIZED per (pr, repo) for the life of the process. Three call sites ask this
+    question on a single merge — the pin-receipt gate, the lane, and the inline
+    findings' off-diff scoping — and the first of those runs unconditionally
+    before the other two, so without a cache one merge paid for the same
+    ``pulls/N/files`` read more than once. Cleared between tests by
+    ``_reset_pr_files_cache``.
+
+    THE MEMO IS BOUND TO A HEAD, via ``_bind_pr_files_cache_head``. An earlier
+    version of this docstring argued the answer "cannot change mid-hook, because a
+    merge is bound to one head by ``--match-head-commit``". That was wrong, and the
+    correction is worth keeping: ``--match-head-commit`` constrains the MERGE, it
+    does not make an already-fetched ``pulls/N/files`` response describe that SHA.
+    The pin-receipt gate populates this memo BEFORE the freshness gate reads the
+    head, so a push landing in between left the lane and the off-diff scoping
+    judging the previous head's file set while the merge bound the new one — the
+    findings on files only the new head touches discounted as off-diff, and the
+    lane computed from a diff nobody was merging.
+    """
+    cache_key = (pr_num, repo, os.environ.get("_TEST_GH_PR_FILES"))
+    if cache_key in _PR_FILES_CACHE:
+        return _PR_FILES_CACHE[cache_key]
+    value = _pr_changed_files_uncached(pr_num, repo)
+    _PR_FILES_CACHE[cache_key] = value
+    return value
+
+
+# Keyed on the test seam as well as (pr, repo). That slot is permanently None in
+# production and exists for pytest, which is a real smell — it was reviewed as one
+# and the suggested remedy MEASURED as unworkable, so the reasoning is recorded
+# rather than the conclusion.
+#
+# The remedy proposed was an autouse fixture in tests/test_hooks/conftest.py
+# clearing the memo around every test, with the key narrowed to (pr, repo). It
+# cannot reach the cache: each test file builds its OWN `git_push_guard` object
+# via `importlib.util.spec_from_file_location` + `exec_module`, which does NOT
+# register in `sys.modules` (verified: `"git_push_guard" in sys.modules` is False
+# after that sequence). conftest has no handle on a per-file `guard_module`
+# fixture, so the clear is a silent no-op — and with the seam gone from the key,
+# tests reusing PR "100" under different `_TEST_GH_PR_FILES` values started
+# reading each other's fixtures. That surfaced as 23 failures whose message was
+# the off-diff lock firing, not a cache complaint, which is exactly how long this
+# would have taken to diagnose later.
+#
+# So the seam stays in the key. Removing it needs the module loading to change
+# first, in every test file that builds one.
+_PR_FILES_CACHE: dict[tuple[str, str | None, str | None], list[str] | None] = {}
+
+
+#: The head ``_PR_FILES_CACHE``'s entries describe, or None before any head has been
+#: established. Not part of the key: the memo holds at most one head's answers at a
+#: time, and a key would let two heads' file sets coexist — which is the state this
+#: exists to make unrepresentable.
+_PR_FILES_CACHE_HEAD: str | None = None
+
+
+def _bind_pr_files_cache_head(head: str) -> None:
+    """Bind the changed-file memo to *head*, dropping it if it described another.
+
+    Called from the single point where a head becomes authoritative (the freshness
+    gate, once it has read ``headRefOid``), so no downstream consumer has to
+    remember to invalidate: establishing the head IS the invalidation. A consumer
+    added later inherits the property without knowing it exists, which a
+    "remember to call reset first" convention could not give it.
+
+    Costs one extra ``pulls/N/files`` read per merge in the ordinary case, because
+    the pin-receipt gate's pre-freshness entry is always dropped (it was populated
+    when no head was known). MEASURED at 421-481ms against the merge arm's 45s
+    budget — about 1% — which is the right trade for scoping findings against the
+    head actually being merged.
+
+    WHAT THIS BUYS IS A LOWER BOUND, NOT AN IDENTITY. ``pulls/N/files`` takes no
+    SHA — it answers for whatever the head is at read time — so binding
+    establishes that the file list was fetched AFTER this head was read, not that
+    it describes it. A push inside that window yields a NEWER head's list, which
+    can only add paths and therefore only tighten the lane, and the merge is
+    rejected by ``--match-head-commit`` regardless. The bound is worth having; the
+    identity is not available from the endpoint and is not claimed.
+    """
+    global _PR_FILES_CACHE_HEAD
+    if head != _PR_FILES_CACHE_HEAD:
+        _PR_FILES_CACHE.clear()
+        _PR_FILES_CACHE_HEAD = head
+
+
+def _reset_pr_files_cache() -> None:
+    """Drop the memo AND its head binding. For tests; a hook process never needs it."""
+    global _PR_FILES_CACHE_HEAD
+    _PR_FILES_CACHE.clear()
+    _PR_FILES_CACHE_HEAD = None
+
+
+def _pr_changed_files_uncached(pr_num: str, repo: str | None = None) -> list[str] | None:
+    """The real read. See :func:`_pr_changed_files` for the contract."""
     raw = os.environ.get("_TEST_GH_PR_FILES")
     if raw == "__error__":
         return None
@@ -4047,14 +4252,17 @@ def _pr_changed_files(pr_num: str, repo: str | None = None) -> list[str] | None:
                 ],
                 capture_output=True,
                 text=True,
-                # Merge-path timeout budget (see main()): THREE consumers —
+                # Merge-path timeout budget (see main()): FOUR consumers —
                 # the hook-surface override check (rare override path),
-                # _pin_blob_unchanged (rare pin path), and the inline-findings
-                # diff scoping (#1728), which is on the hot merge path but
-                # LAZY: it reads only when a candidate blocking finding exists,
-                # at most once per scan. _gh_timeout clamps this call to the
-                # remaining merge deadline, and a timeout degrades to None →
-                # the scoping caller scores everything (status quo) + a NOTE.
+                # _pin_blob_unchanged (rare pin path), the inline-findings
+                # diff scoping (#1728), and the review LANE. The last two are on
+                # the hot merge path but LAZY: each reads only when a candidate
+                # blocking finding exists, and the memo in _pr_changed_files
+                # means all four share ONE underlying read per merge.
+                # _gh_timeout clamps this call to the remaining merge deadline,
+                # and a timeout degrades to None → the scoping caller scores
+                # everything (status quo) + a NOTE, and the lane fails closed to
+                # `critical`.
                 timeout=_gh_timeout(8),
             )
             if result.returncode != 0:
@@ -4095,6 +4303,40 @@ def _pr_changed_files(pr_num: str, repo: str | None = None) -> list[str] | None:
         # 3000-entry endpoint cap a hook file may be hidden beyond it.
         return None
     return files
+
+
+def _pr_lane(pr_num: str, repo: str | None = None) -> str:
+    """The consequence lane of PR *pr_num*: ``"critical" | "standard" | "light"``.
+
+    Settles the hook surface HERE — this module owns that fence — and delegates
+    the rest to ``review_scope.classify_lane``, the same split
+    ``_classify_post_review_delta`` already uses for substantiality.
+
+    FAIL-CLOSED twice over. An unreadable file list (``None``) and an import
+    failure both yield ``"critical"``, the strictest lane, so a change nobody can
+    classify is never given the benefit of a wider budget. That direction matters
+    more here than for substantiality, because the lane RELAXES a threshold: the
+    safe default is the one that relaxes nothing.
+    """
+    files = _pr_changed_files(pr_num, repo=repo)
+    if files is None:
+        return "critical"
+    try:
+        # review_scope lives in scripts/ (parent of scripts/hooks/). Lazy import ON
+        # PURPOSE and de-duped sys.path insert — the same idiom as
+        # _classify_post_review_delta, so a missing sibling degrades THIS
+        # classification rather than crashing the guard's module load and dropping
+        # every push/merge protection.
+        _scripts_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _scripts_dir not in sys.path:
+            sys.path.insert(0, _scripts_dir)
+        from review_scope import classify_lane
+    except Exception:  # noqa: BLE001 - unclassifiable is treated as consequential
+        return "critical"
+    try:
+        return classify_lane(files, hook_surface=any(_is_hook_surface_path(f) for f in files))
+    except Exception:  # noqa: BLE001 - same direction: never relax on an error
+        return "critical"
 
 
 def _hook_surface_override_check(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
@@ -4667,6 +4909,24 @@ def _check_codex_reviewed_head(
         # see it"). Skipping evidence on a fresh review would let a hook-surface PR
         # RETARGETED to a non-default base merge with no base-bound review. A fresh
         # head-review is NOT a substitute for base-bound evidence here.
+        # The force arm returns WITHOUT establishing a head, so it never reaches
+        # the binder below — and the inline gate downstream keys on a DIFFERENT
+        # sigil (`# review-override`), so it still runs, against whatever file
+        # list the pin-receipt gate cached earlier.
+        #
+        # An earlier version of this change left that alone and argued the risk
+        # was covered because a later head's file list is a SUPERSET, so it could
+        # only tighten the lane. THAT IS FALSE, and a reviewer was right to say
+        # so: a force-push, or a commit that deletes or renames a path, produces a
+        # list that is not a superset. A finding on a file only the new head
+        # touches would then be discarded as off-diff, or a newly-critical change
+        # would keep the old wider threshold — and this arm takes no
+        # `--match-head-commit` bind, so nothing downstream catches it either.
+        #
+        # Dropping the memo is the whole fix: the consumers re-read, against the
+        # head that is actually current when they ask. It costs one
+        # `pulls/N/files` call on an override path that is rare by construction.
+        _reset_pr_files_cache()
         blocked, msg = _hook_surface_override_check(pr_num, repo=repo)
         if blocked:
             return True, msg, None
@@ -4683,6 +4943,19 @@ def _check_codex_reviewed_head(
             None,
         )
     head = head.strip().lower()
+    # This is the one place a head becomes authoritative on the NON-FORCED arm, so
+    # it is where the changed-file memo gets bound to it. The pin-receipt gate has
+    # already populated that memo against whatever the head was when IT asked; the
+    # lane and the off-diff finding scoping run after this point and must judge the
+    # head this gate verifies and `--match-head-commit` then binds.
+    #
+    # SCOPE: the `force` arm above returns before reaching here. It does NOT
+    # simply skip this — it DROPS the memo instead, so its consumers re-read.
+    # An earlier version left the memo intact there and justified it with "a
+    # later head's files are a superset, so the lane can only tighten"; that
+    # reasoning was wrong (a force-push or a delete/rename breaks it) and the
+    # correction lives at that arm.
+    _bind_pr_files_cache_head(head)
     reviewed = _latest_codex_reviewed_sha(pr_num, repo=repo)
     if reviewed == head:
         return False, "", head
@@ -7791,6 +8064,13 @@ def _ask(reason: str) -> int:
     """
     global _ASK_EMITTED
     _ASK_EMITTED = True
+    # Nothing is discarded YET here — the decision is still open — so this warns
+    # about what DECLINING costs, which is the thing a "block the push?" dialog
+    # otherwise hides.
+    if discarded_write is not None:
+        extra = discarded_write.prompt_note()
+        if extra:
+            reason = f"{reason}\n\n{extra}"
     print(
         json.dumps(
             {
@@ -7924,6 +8204,46 @@ def _pr_create_would_publish(argv: list[str]) -> bool:
         return True  # fail-safe → gate
 
 
+def _main_with_note() -> int:
+    """``main`` plus the discarded-command note on every refusal.
+
+    ``main`` delegates to ``_run_merge_and_push_gates``, which holds 28 separate
+    ``return 2`` sites (AST count) and has no ``_deny`` chokepoint, so wrapping the
+    entry point is the only way to cover them all without editing 28 places — and
+    without a 29th being added noteless tomorrow, which is the failure this shape
+    exists to make impossible. ``main`` returns that code unchanged, so the wrapper
+    sees every one of them.
+
+    That delegation is NEW: when this wrapper was written, the 28 sites were inside
+    ``main`` itself and this docstring counted them there. The gates were extracted
+    in the interval, which moved every site out of the function named here while
+    leaving the wrapper correct — so the sentence explaining WHY the wrapper exists
+    described a function with none of them. Pinned now by
+    ``test_live_a_refusal_from_the_extracted_gates_carries_the_note``, because the
+    invariant that extraction could have broken silently — ``main`` returning the
+    gate's own rc — was locked by nothing but this prose.
+
+    The note is emitted ONLY on a refusal; every other verdict is passed through
+    untouched, and the return value is never altered.
+    """
+    try:
+        rc = main()
+    except BaseException:
+        # An EXCEPTION is also a refusal here: `run_guard` converts it to exit 2,
+        # so the whole command is discarded just as deliberately as on a `return
+        # 2` — but the reader only sees "GUARD ERROR ... failing CLOSED" and is
+        # told nothing about the write two steps earlier. MEASURED: a crash
+        # injected after the command is remembered gave rc=2 with the note
+        # ABSENT. `finally` would run on the allow path too, so the note is
+        # emitted here, on the raising path only.
+        if discarded_write is not None:
+            discarded_write.warn()
+        raise
+    if rc == 2 and discarded_write is not None:
+        discarded_write.warn()
+    return rc
+
+
 def main() -> int:
     """Run the guard, then record any override sigils with the verdict they got.
 
@@ -7955,9 +8275,13 @@ def main() -> int:
 
 
 def _run_merge_and_push_gates() -> int:
+    # An armed refusal must survive the malformed-payload exception tail.
+    blind_spot_deny: str | None = None
     try:
         payload = read_payload()
         cmd = field(payload, "command")
+        if discarded_write is not None:
+            discarded_write.remember(cmd)
         if not cmd:
             return 0
 
@@ -7975,101 +8299,73 @@ def _run_merge_and_push_gates() -> int:
         create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
         merge_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"]
 
-        # ── Blind-spot net: unverifiable near a gated op → ask a human ──────
-        # analyze()/_argv degrade to a naive split SILENTLY, so an empty segment
-        # list is NOT evidence that no gated command is present: an ANSI-C
-        # `$'…\'…'` span, or an apostrophe in a here-doc body, is enough to drop
-        # a real, executing `git push --force` from the parse (reproduced on both
-        # guards). When the raw text names a gated op, the command will not
-        # tokenize, and the parse surfaced NO matching segment, the verdict is
-        # "unknown" — which earns a human decision, not a silent allow.
+        # ── Blind-spot net: unverifiable near a gated op → DENY ────────────
+        # Keep the broad raw-mention predicate: a failed parse cannot prove an
+        # operation absent. User ruling 2026-09-08: an ambiguous command costs
+        # the agent a rewrite, not the human an approval click. The only asks
+        # remain deliberate publishing. Current parser bounds still refuse.
+        # All FOUR parsed-operation exclusions matter: an already-published
+        # gh pr create must retain its normal allow path.
         #
-        # ASK rather than BLOCK is load-bearing. A refusal has to be surgically
-        # precise about which unparseable commands are real, and precision is
-        # exactly what an unreliable parse cannot deliver — every narrowing
-        # conjunct became a new way to starve the trigger, while over-blocking
-        # broke benign shapes. Asking inverts the costs: a false positive is one
-        # confirmation, a miss is the pre-existing status quo. That is what lets
-        # the predicate stay broad.
+        # `_mentions_gated_op` rests on an assumption that holds for every
+        # blind-spot cause but ONE: that the operation is still SPELLED in the
+        # raw text, and only the structure around it is unreadable. A segment
+        # resolving to git or gh with a verb the SHELL builds is the case where
+        # the unreadable part IS the operation's name — the text test is then
+        # asked about a word that is not there to find, and it answers "no gated
+        # op" with exactly the confidence it would have for a command that has
+        # none. Requiring it there would make this net's trigger depend on
+        # whoever wrote the command choosing to spell the operation out.
         #
-        # The reason is DEFERRED to the tail (like ask_reason / push_allow_reason
-        # above) so every hard block below — sqlite writes, --no-verify, the
-        # dispatched publish denies, the escalation cap — still takes precedence.
-        # Returning here would DOWNGRADE those to a prompt (measured).
-        # The segment check names ALL FOUR gated ops, not the three the first cut
-        # listed. `create_segs` is LOAD-BEARING — do not remove it.
+        # Read off the SEGMENT rather than off `blind`, deliberately: which
+        # programs are gated is this guard's question, and shell_parse keeps its
+        # BlindSpot to a single decision field for reasons its own class
+        # docstring measures. The exe test is what keeps the widening
+        # affordable — a segment whose PROGRAM is a variable is not established
+        # as git at all, and MEASURED over 129,179 real commands those are 1,845
+        # (interpreters and remote shells held in variables, plus prose) against
+        # 14 for the case this adds. Those 1,845 still reach this net through
+        # `_mentions_gated_op` whenever the operation is spelled, which is the
+        # honest split: an unreadable program naming a publish is worth
+        # refusing, an unreadable program naming nothing is a Tuesday.
+        hidden_gated_verb = any(s.verb_unresolved and s.exe in _GATED_EXES for s in segs)
+        # The two predicates are NOT suppressed by the same thing, and collapsing
+        # them into one `not (…parsed…)` guard was the defect.
         #
-        # An earlier version of this comment claimed the opposite: that it was
-        # symmetry only, and mutation-tested to change no verdict. That claim was
-        # WRONG, and wrong in the direction that invites deleting the conjunct.
-        # Its four cells varied parse state (interactive/dispatched x
-        # parsed-create x untokenizable) and held the GATE OUTCOME fixed, so they
-        # all assumed a create that was already gated. The axis that matters is
-        # whether the create is gated at all: for one the real gate ALLOWS (a
-        # branch already on the remote, so no publish risk), dropping this
-        # conjunct lets the net fire on an untokenizable-but-benign create and
-        # turns an allow into a prompt, or into a refusal when unattended.
+        # `_mentions_gated_op` reads the RAW TEXT, so a parsed gated segment
+        # EXPLAINS the mention — the ordinary gates own that operation and
+        # re-netting it would double-gate an already-published create. Its
+        # exclusion is right and stays.
         #
-        # A mutation test proves nothing about an axis its cells do not vary.
-        blind_spot_reason: str | None = None
-        if (
-            not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
-            and blind is not None
-            and _mentions_gated_op(cmd)
-        ):
-            if blind.bounds_induced:
-                # The DEPTH bound refuses outright, interactive or not, and the
-                # asymmetry between the two bounds is measured rather than felt.
-                # Across this install's history the deepest real nesting is 4
-                # against a bound of 5 — see the distribution recorded with
-                # `shell_parse.MAX_SUBSTITUTION_DEPTH`, which is the one place it
-                # is derived. Nothing legitimate reaches the bound, and a command
-                # that does is not a shape ordinary work produces. It is also the
-                # axis the decoy attacks use: a visible benign `git push` with a
-                # force push buried past the bound, which reaches an approval
-                # prompt describing the decoy. A human approving what looks like an
-                # ordinary push is not a gate on the operation actually hidden
-                # there. Length still asks — a long here-doc IS ordinary work.
-                print(
-                    f"BLOCKED: this command {blind.cause} and names a gated "
-                    "operation, so the guard cannot see every publish it would "
-                    "run. A command can carry a second, hidden one past the point "
-                    "the parser stops — approving the visible one would approve "
-                    f"that too.\nTo proceed: {blind.hint}.",
-                    file=sys.stderr,
-                )
-                return 2
-            if _is_dispatched():
-                # No human is present to answer a prompt, and an unverifiable
-                # gated command must not proceed unattended. Mirrors the
-                # dispatched deny legs on the push / pr-create asks below.
-                print(
-                    f"BLOCKED: this command {blind.cause} and names a gated "
-                    "operation. Autonomous sessions cannot proceed on an "
-                    "unverifiable command.\n"
-                    f"To proceed: {blind.hint}. If you are WRITING TEXT (a commit "
-                    "message, a plan, review notes) whose content merely mentions "
-                    "push or merge, use the Write tool instead of a here-doc. If "
-                    "you are RUNNING a git command, rewrite it in a "
-                    "directly-parseable form (plain quotes, or -F <file>).",
-                    file=sys.stderr,
-                )
-                # The advice above is load-bearing, not decoration. An
-                # unattended session cannot ask what it did wrong, so a refusal
-                # it cannot act on is a wall rather than a cost — which is the
-                # whole basis for refusing here at all. MEASURED: the dominant
-                # real shape that reaches this leg is prose-to-a-file, and the
-                # previous message's only suggestion ("rewrite it in a
-                # directly-parseable form") does not apply to it.
-                return 2
-            blind_spot_reason = (
-                f"This command {blind.cause} and mentions a gated operation "
-                "(push / merge / gh pr create / --force / --no-verify / --admin), "
-                "so the guard cannot verify what it would actually run. Approve "
-                f"only if you are sure. To avoid the prompt: {blind.hint}, or "
-                "rewrite it in a directly-parseable form (plain quotes, or "
-                "-F <file>)."
+        # `hidden_gated_verb` is a fact about a SPECIFIC segment, and a different
+        # segment parsing says nothing about it. Suppressing it that way let an
+        # unresolved publish ride a visible one: MEASURED on the merged tree,
+        # `git ${ACTION:-push} --force origin main && git push` on a published
+        # branch went BLOCK -> ASK interactively (dispatched stayed BLOCK), and
+        # the prompt it raised names the VISIBLE push — so a human approving it
+        # is told about the wrong command. The multiple-publish rejection is
+        # skipped too, since only one segment parses as a push.
+        if blind is not None and (
+            hidden_gated_verb
+            or (
+                not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
+                and _mentions_gated_op(cmd)
             )
+        ):
+            # Defer the syntax refusal so specific sqlite/no-verify blocks keep
+            # their sharper diagnostics. Bounds keep main's immediate refusal.
+            blind_spot_deny = (
+                f"BLOCKED: this command {blind.cause} and mentions a gated "
+                "operation, so the guard cannot verify what it would actually run.\n"
+                f"To proceed: {blind.hint}. If you are WRITING TEXT (a commit "
+                "message, a plan, review notes) whose content merely mentions "
+                "push or merge, use the Write tool instead of a here-doc. If "
+                "you are RUNNING a git command, rewrite it in a "
+                "directly-parseable form (plain quotes, or -F <file>)."
+            )
+            if blind.bounds_induced:
+                print(blind_spot_deny, file=sys.stderr)
+                return 2
 
         # Each git push / gh pr merge is a SEPARATE gated action. A single Bash
         # command carrying more than one would collapse into ONE ask/gate
@@ -8843,7 +9139,8 @@ def _run_merge_and_push_gates() -> int:
 
                 # Inline review comments (Codex P1/P2 badges) — separate
                 # endpoint, separate check. Weighted score: P1=1.0, P2=0.5;
-                # blocks at >= 1.0 (any P1, or 2+ unresolved P2s).
+                # blocks at the LANE's threshold (critical 1.0 / standard 2.0 /
+                # light 3.0), with any P1 blocking in every lane via the floor.
                 should_block, inline_msg = _check_inline_review_findings(
                     pr_num,
                     force=force_override,
@@ -8940,8 +9237,9 @@ def _run_merge_and_push_gates() -> int:
         # Reached only if no hard-block above returned. Dispatched sessions
         # were already denied inline; here, an interactive human session gets a
         # native approve/deny dialog for its push / PR-create.
-        if ask_reason is None and blind_spot_reason is not None:
-            ask_reason = blind_spot_reason
+        if blind_spot_deny is not None:
+            print(blind_spot_deny, file=sys.stderr)
+            return 2
         if ask_reason is not None:
             return _ask(ask_reason)
 
@@ -8964,6 +9262,9 @@ def _run_merge_and_push_gates() -> int:
             )
 
     except (json.JSONDecodeError, KeyError):
+        if blind_spot_deny is not None:
+            print(blind_spot_deny, file=sys.stderr)
+            return 2
         # A malformed/partial payload is a parse-ambiguity fail-open (matches the
         # sibling guards). Any OTHER exception is an orchestration BUG and must
         # NOT silently allow a push/merge — it propagates to run_guard(), which
@@ -9191,4 +9492,4 @@ if __name__ == "__main__":
             )
             sys.exit(2)
         sys.exit(check_pr_report(sys.argv[2], repo=_repo))
-    run_guard(main, "git_push_guard")
+    run_guard(_main_with_note, "git_push_guard")

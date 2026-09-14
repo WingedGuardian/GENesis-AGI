@@ -5,7 +5,7 @@
       Alpine.store("genesisDashboard", {
         // Tab state
         activeTab: "overview",
-        _tabInitialized: { overview: false, chat: false, internals: false, config: false, files: false, work: false, "follow-ups": false, observations: false, traces: false, autonomy: false, memory: false, knowledge: false, campaigns: false, references: false, calibration: false, backup: false },
+        _tabInitialized: { overview: false, chat: false, internals: false, config: false, files: false, work: false, "follow-ups": false, observations: false, traces: false, autonomy: false, memory: false, knowledge: false, campaigns: false, references: false, calibration: false, backup: false, sessions: false, "zero-drop": false },
         // ── Calibration tab state ──
         calibrationCells: [],
         calibrationSummary: null,
@@ -361,6 +361,7 @@
           campaigns: { state: "idle", lastSuccess: null, error: null },
           watchlist: { state: "idle", lastSuccess: null, error: null },
           knowledgeRecent: { state: "idle", lastSuccess: null, error: null },
+          zeroDrop: { state: "idle", lastSuccess: null, error: null },
         },
 
         // Polling interval IDs
@@ -380,9 +381,18 @@
         _tasksInterval: null,
         _workSessionsInterval: null,
         _observationsInterval: null,
+        _zeroDropInterval: null,
+        // Monotonic request token — see fetchZeroDrop. Declared here rather
+        // than created on first use so it is visible as state.
+        _zeroDropFetchToken: 0,
         _cockpitInterval: null,
         _commsInterval: null,
         _tracesInterval: null,
+
+        // Zero-drop accounting view — the whole five-part dict from one
+        // endpoint. `null` means NOT FETCHED, which the panel must render
+        // differently from a fetched-and-empty board.
+        zeroDropView: null,
 
         // Observations tab state
         observationsList: [],
@@ -441,6 +451,7 @@
           campaigns: ["_campaignsInterval"],
           backup:    [],
           sessions:  ["_ccSessionsTabInterval"],
+          "zero-drop": ["_zeroDropInterval"],
         },
 
         // ── Campaigns ──
@@ -523,7 +534,7 @@
 
         initTab() {
           const hash = location.hash.replace("#", "") || "overview";
-          const valid = ["overview", "chat", "internals", "config", "files", "work", "follow-ups", "observations", "traces", "autonomy", "memory", "knowledge", "campaigns", "references", "calibration", "backup", "sessions"];
+          const valid = ["overview", "chat", "internals", "config", "files", "work", "follow-ups", "observations", "traces", "autonomy", "memory", "knowledge", "campaigns", "references", "calibration", "backup", "sessions", "zero-drop"];
           this.activeTab = valid.includes(hash) ? hash : "overview";
           window.addEventListener("hashchange", () => {
             const h = location.hash.replace("#", "");
@@ -597,6 +608,22 @@
             case "follow-ups":
               if (first) { this.fetchCockpit(); this.fetchCockpitFilters(); }
               this._cockpitInterval = setInterval(() => this.fetchCockpit(), 30000);
+              break;
+            case "zero-drop":
+              // Fetches on EVERY entry, deliberately diverging from the
+              // `if (first)` its siblings use — do not "fix" this back to match
+              // them. `first` is false forever after the first visit, so on
+              // re-entry a sibling tab renders its retained payload until the
+              // next interval tick. For those tabs that is unremarkable. This
+              // one asserts that a number is current, and its stale banner is
+              // driven by FETCH state — so a re-entry that attempts no fetch
+              // leaves the state healthy and the banner silent while the board
+              // shows a figure up to a minute old. A board claiming a
+              // trustworthy zero cannot apply a weaker standard to itself than
+              // it applies to its sources. One extra request per tab click is
+              // the whole cost.
+              this.fetchZeroDrop();
+              this._zeroDropInterval = setInterval(() => this.fetchZeroDrop(), 60000);
               break;
             case "traces":
               if (first) { this.fetchSpansRecent(); }
@@ -1170,6 +1197,40 @@
         },
 
         // ── Observations tab fetches ─────────────────────────────
+        async fetchZeroDrop() {
+          // A monotonic token, because responses can land out of order. Two
+          // requests overlap whenever one outlives the 60s interval, or when a
+          // tab exit and re-entry fires a fresh one while the previous is still
+          // in flight. Without this the SLOWER, OLDER response wins simply by
+          // arriving last — and then stamps `lastSuccess` with the current
+          // time, so the stale board it just installed reads as
+          // transport-healthy and the stale banner never appears. A board whose
+          // whole claim is that its number is current cannot let arrival order
+          // decide which number that is.
+          const token = (this._zeroDropFetchToken = (this._zeroDropFetchToken || 0) + 1);
+          this.startFetch("zeroDrop");
+          try {
+            const resp = await fetchApi("/api/genesis/zero-drop");
+            // Superseded while we were awaiting: a newer request has already
+            // finished. Drop this payload silently — it is not an error, and
+            // calling failFetch would mark a healthy transport as broken.
+            if (token !== this._zeroDropFetchToken) return;
+            if (resp && resp.ok) {
+              const payload = await resp.json();
+              // Re-checked AFTER the second await: parsing the body is another
+              // suspension point, and the newer response can land during it.
+              if (token !== this._zeroDropFetchToken) return;
+              this.zeroDropView = payload;
+              this.finishFetch("zeroDrop");
+            } else {
+              this.failFetch("zeroDrop", "Zero-drop endpoint returned an error");
+            }
+          } catch (e) {
+            console.warn("Zero-drop fetch failed:", e);
+            this.failFetch("zeroDrop", "Failed to fetch the zero-drop view");
+          }
+        },
+
         async fetchObservations() {
           this.startFetch("observations");
           try {

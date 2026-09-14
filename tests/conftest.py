@@ -551,6 +551,85 @@ def _guard_db_crud_not_mocked():
         )
 
 
+def private_module(name: str, path):
+    """Load ``path`` as a PRIVATE module without leaking ``name`` to everyone.
+
+    A test wanting its own instance of a script registers it in ``sys.modules``
+    before ``exec_module`` so that anything the module imports BY ITS OWN NAME
+    during exec resolves to THIS copy rather than a previously-registered one
+    (measured: a self-importing module sees the private instance). The trap is
+    leaving it registered afterwards.
+
+    Registering BEFORE exec is also what lets a ``@dataclass`` decorate at all,
+    when the module carries ``from __future__ import annotations``:
+    ``dataclasses._is_type`` dereferences ``sys.modules.get(cls.__module__)``,
+    which is ``None`` for an unregistered module. Do not take that on trust from
+    this docstring — ``tests/test_private_module.py`` locks it, and deleting the
+    ``sys.modules[name] = mod`` line below fails there.
+
+    Leaving the name registered is the leak this exists to prevent: pytest
+    imports every test module at COLLECTION, so the last registration wins for
+    the session, and a ``monkeypatch.setattr`` can then land on a different
+    object than a call-time ``from <name> import ...`` resolves. Two locks in
+    ``tests/test_hooks/test_escalation_cap.py`` assert exactly that for
+    ``review_state`` and ``review_scope``.
+
+    Prefer this over hand-rolling register/exec/restore: N call sites each
+    remembering to restore is a convention, and conventions break one instance
+    at a time.
+
+    LIMIT, and it is real, because the instruction to prefer this helper routes
+    you into it. A class defined in the loaded module resolves its string
+    annotations against whatever ``sys.modules`` holds AFTER the restore, and the
+    restore has TWO branches with different — and differently dangerous —
+    outcomes for an annotation naming a module-level symbol:
+
+    * name previously UNBOUND -> the entry is popped, and
+      ``typing.get_type_hints`` (plus anything built on it: pydantic,
+      ``inspect.signature(eval_str=True)``) raises ``NameError``. Loud.
+    * name previously BOUND -> the PREVIOUS object is put back, so resolution
+      SUCCEEDS against the canonical module and returns a same-named class from
+      a different module object. Silent, and worse for that reason.
+
+    ``dataclasses.fields`` is unaffected in both. Documented rather than locked,
+    deliberately: the test that once pinned these two branches had to exec every
+    carrier under ``scripts/`` to find them, which pulled a module-level
+    ``load_dotenv(override=True)`` into the test process and replaced environment
+    variables for everything collected after it — a worse defect than the caveat
+    it was verifying. An earlier revision of this paragraph also asserted the
+    first outcome unconditionally, which is wrong about the second — and the
+    second is the SILENT one, which is why it is written down here.
+
+    So if the script under test needs late annotation resolution, it is not a
+    private-module candidate. (An earlier revision also claimed the opposite of
+    the limit entirely — "5/5, no failures" — from four modules picked by hand
+    for being easy to exec rather than from the population. Recorded because the
+    convenience sample IS the failure mode, and it becomes invisible the moment
+    it is written as a number.)
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - real files always resolve
+        raise ImportError(f"cannot load {name} from {path}")
+    mod = importlib.util.module_from_spec(spec)
+    sentinel = object()
+    previous = sys.modules.get(name, sentinel)
+    sys.modules[name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        # Restore in BOTH directions: put back what was there, or remove the
+        # entry entirely if the name was previously unbound. Leaving our copy
+        # registered when nothing was there before is the same leak, one step
+        # removed — the next importer would silently get this private instance.
+        if previous is sentinel:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
+    return mod
+
+
 def require_access_denied(path) -> None:
     """Skip unless THIS process is actually stopped by ``path``'s mode bits.
 

@@ -1,7 +1,8 @@
 {
     "env": {
         "DISABLE_AUTOUPDATER": "1",
-        "DISABLE_UPDATES": "1"
+        "DISABLE_UPDATES": "1",
+        "MCP_TIMEOUT": "120000"
     },
     "cleanupPeriodDays": 180,
     "attribution": {

@@ -116,6 +116,13 @@ _GIT_GLOBAL_VALUE_OPTS = (
     "--work-tree",
     "--namespace",
     "--super-prefix",
+    # MEASURED against the installed binary. `git -h` shows only ATTACHED forms
+    # and omits --attr-source and --shallow-file entirely, so the usage line
+    # cannot tell you a SEPARATED form is accepted — which is the property this
+    # tuple encodes. See test_value_flag_consistency for the derivation.
+    "--config-env",
+    "--attr-source",
+    "--shallow-file",
 )
 _PUSH_VALUE_FLAGS = ("-o", "--push-option", "--repo", "--receive-pack", "--exec")
 _MAX_LINES = 20
@@ -505,7 +512,7 @@ def _assignment_is_literal(text: str) -> bool:
     # Isolate the ASSIGNED EXPRESSION before testing for reference markers.
     #
     # Scanning the whole remainder of the line let any trailing text disarm the
-    # detector: `DATABASE_PASSWORD = "real-long-password"  # local config`
+    # detector: `DATABASE_PASSWORD = "real-long-password"  # local config`  # pragma: allowlist secret
     # contains "config", so the line was classified as an indirect reference and
     # skipped — on exactly the low-entropy class the module's own comment records
     # gitleaks as NOT covering. A comment must not be able to vouch for the code
