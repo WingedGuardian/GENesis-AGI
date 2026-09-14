@@ -252,6 +252,35 @@
             <div class="health-card-reason" x-text="$store.genesisDashboard.infrastructureSemantic().reason"></div>
           </div>
 
+          <!-- Worktrees — committed work in flight, and its countdown -->
+          <div class="health-card" style="cursor: pointer;"
+               x-init="$store.genesisDashboard.fetchWorktreeBoard()"
+               title="Git worktrees on disk. at-risk = unmerged and going cold; due = will be archived on the next reaper run. Nothing is ever deleted. Click for the full board."
+               @click="$store.genesisDashboard.worktreeModal.open = true; $store.genesisDashboard.fetchWorktreeBoard()">
+            <div class="health-card-header">
+              <div class="health-card-title">Worktrees <span style="font-size: 0.6rem; opacity: 0.5;">click for details</span></div>
+            </div>
+            <div class="health-card-value">
+              <template x-if="$store.genesisDashboard.worktreeModal.data?.available">
+                <div style="display: flex; gap: 0.5rem; align-items: baseline;"
+                     :style="`color: ${($store.genesisDashboard.worktreeModal.data.counts?.at_risk || 0) > 0 ? '#f0ad4e' : 'inherit'}`">
+                  <span title="Unmerged, idle, and not yet archived — the draining window">
+                    <span x-text="$store.genesisDashboard.worktreeModal.data.counts?.at_risk || 0"></span> at risk
+                  </span>
+                  <span style="opacity: 0.4;">/</span>
+                  <span title="Worktrees tracked in total">
+                    <span x-text="$store.genesisDashboard.worktreeModal.data.total || 0"></span> total
+                  </span>
+                </div>
+              </template>
+              <template x-if="!$store.genesisDashboard.worktreeModal.data?.available">
+                <div style="opacity: 0.5;">&mdash;</div>
+              </template>
+            </div>
+            <div class="health-card-detail"
+                 x-text="$store.genesisDashboard.worktreeModal.data?.available ? (($store.genesisDashboard.worktreeModal.data.due_for_archiving || 0) + ' due for archiving · board ' + $store.genesisDashboard.worktreeBoardAge()) : 'board not generated yet'"></div>
+          </div>
+
           <!-- CC Sessions -->
           <div class="health-card" style="cursor: pointer;"
                title="Active Claude Code sessions. live = slot-tagged claude processes (/proc); db = sessions marked active in the DB. Click for per-session detail."

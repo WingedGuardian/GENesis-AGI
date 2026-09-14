@@ -104,52 +104,134 @@ async def test_plan_cap(empty_db, empty_dirs):
     assert plan_section.count("- ") == 3
 
 
-async def test_worktrees_render_via_monkeypatch(empty_db, empty_dirs, monkeypatch):
+def _board(rows, *, age_h=1.0, isolate=None):
+    """Build a board cache payload with a controllable age."""
+    from datetime import UTC, datetime, timedelta
+
+    gen = (datetime.now(UTC) - timedelta(hours=age_h)).isoformat()
+    return {"generated_at": gen, "worktrees": rows}
+
+
+@pytest.fixture(autouse=True)
+def _isolate_at_risk_state(tmp_path, monkeypatch):
+    """Never read or write the operator's real at-risk state from a test.
+
+    ``_newly_at_risk`` PERSISTS what it saw, so without this a test run would
+    both consume and overwrite live session state — and the second test in a file
+    would see the first test's branches as "already seen".
+    """
+    monkeypatch.setattr(
+        open_loops, "_AT_RISK_SEEN", tmp_path / "at-risk-seen.json"
+    )
+    monkeypatch.setattr(open_loops, "_BOARD_CACHE", tmp_path / "absent-board.json")
+
+
+async def test_at_risk_branches_are_named(empty_db, empty_dirs, monkeypatch):
+    """The at-risk set is named individually — that is the whole point."""
     repo, plans = empty_dirs
-    monkeypatch.setattr(open_loops, "_list_worktrees", lambda root: [
-        {"path": str(repo / "wt-a"), "head": "1234567890abcdef", "branch": "feat/foo"},
-        {"path": str(repo / "wt-b"), "head": "abcdef1234567890"},  # detached (no branch)
-    ])
+    monkeypatch.setattr(open_loops, "_read_board", lambda: (
+        [
+            {"branch": "feat/foo", "state": "at_risk", "action": "none"},
+            {"branch": "", "path": "/x/wt-b", "state": "at_risk", "action": "none"},
+        ], 3.0,
+    ))
     block = await build_inflight_block(empty_db, repo_root=repo, plans_dir=plans)
-    assert "Live worktrees" in block
-    assert "feat/foo @ 12345678" in block
-    assert "wt-b @ abcdef12" in block  # detached → path basename
+    assert "Unlanded work at risk" in block
+    assert "feat/foo" in block
+    assert "wt-b" in block  # no branch (detached) → path basename
 
 
-async def test_worktree_cap_and_overflow(empty_db, empty_dirs, monkeypatch):
+async def test_merged_and_fresh_worktrees_are_invisible(empty_db, empty_dirs, monkeypatch):
+    """Nothing about merged or fresh work needs a human, so it is not shown.
+
+    This is the failure the redesign exists to fix: the old block listed every
+    worktree and overflowed to "(+183 more)", which is unreadable and therefore
+    unread.
+    """
     repo, plans = empty_dirs
-    many = [
-        {"path": str(repo / f"wt{i}"), "head": f"{i:040d}", "branch": f"b{i}"}
-        for i in range(12)
+    monkeypatch.setattr(open_loops, "_read_board", lambda: (
+        [
+            {"branch": "feat/landed", "state": "reap_merged", "action": "trash"},
+            {"branch": "feat/new", "state": "fresh", "action": "none"},
+        ], 1.0,
+    ))
+    block = await build_inflight_block(empty_db, repo_root=repo, plans_dir=plans)
+    assert "Unlanded work at risk" not in block
+    assert "feat/landed" not in block
+    assert "feat/new" not in block
+
+
+async def test_only_new_arrivals_are_named_the_rest_are_counted(
+    empty_db, empty_dirs, monkeypatch, tmp_path,
+):
+    """Second sighting of the same branch counts, but does not re-name it.
+
+    A list that is identical every session stops being read; the CHANGE is the
+    signal. Asserting the SECOND call is what proves the state round-trips —
+    asserting only the first would pass with persistence entirely broken.
+    """
+    repo, plans = empty_dirs
+    rows = [
+        {"branch": f"b{i}", "state": "at_risk", "action": "none"} for i in range(3)
     ]
-    monkeypatch.setattr(open_loops, "_list_worktrees", lambda root: many)
-    block = await build_inflight_block(empty_db, repo_root=repo, plans_dir=plans)
-    assert "(+4 more)" in block  # 12 - 8 cap
+    monkeypatch.setattr(open_loops, "_read_board", lambda: (rows, 1.0))
+
+    first = await build_inflight_block(empty_db, repo_root=repo, plans_dir=plans)
+    assert "3 newly at risk" in first
+    assert "b0" in first
+
+    second = await build_inflight_block(empty_db, repo_root=repo, plans_dir=plans)
+    assert "newly at risk" not in second, "an unchanged set must not re-announce"
+    assert "3 more aging" in second
 
 
-async def test_worktrees_ordered_by_git_activity(empty_db, empty_dirs, tmp_path, monkeypatch):
-    import os
-
+async def test_named_arrivals_are_capped_and_the_remainder_declared(
+    empty_db, empty_dirs, monkeypatch,
+):
+    """A burst of arrivals is bounded, and the overflow is STATED, not dropped."""
     repo, plans = empty_dirs
-
-    def make_wt(name, index_mtime, branch):
-        # A fake linked worktree: .git file points at a private gitdir whose
-        # index mtime is the activity signal we sort on.
-        wt = tmp_path / name
-        wt.mkdir()
-        gitdir = tmp_path / "gd" / name
-        gitdir.mkdir(parents=True)
-        (gitdir / "index").write_text("x")
-        os.utime(gitdir / "index", (index_mtime, index_mtime))
-        (wt / ".git").write_text(f"gitdir: {gitdir}\n")
-        return {"path": str(wt), "head": "0" * 40, "branch": branch}
-
-    old = make_wt("oldwt", 1_000.0, "feat/old")
-    new = make_wt("newwt", 9_000_000_000.0, "feat/new")
-    # Return in old-first order so a working sort must reorder them.
-    monkeypatch.setattr(open_loops, "_list_worktrees", lambda root: [old, new])
+    rows = [
+        {"branch": f"b{i}", "state": "at_risk", "action": "none"} for i in range(9)
+    ]
+    monkeypatch.setattr(open_loops, "_read_board", lambda: (rows, 1.0))
     block = await build_inflight_block(empty_db, repo_root=repo, plans_dir=plans)
-    assert block.index("feat/new") < block.index("feat/old")  # newer git activity first
+    assert "9 newly at risk" in block
+    assert "(+4 more new)" in block  # 9 - _MAX_NAMED_AT_RISK(5)
+
+
+async def test_stale_board_refuses_to_name_branches(empty_db, empty_dirs, monkeypatch):
+    """Past the staleness bound the cache describes a tree that has moved on.
+
+    Reporting its branch names as current would be a confident lie, so the block
+    says the board is stale and how to refresh it instead.
+    """
+    repo, plans = empty_dirs
+    monkeypatch.setattr(open_loops, "_read_board", lambda: (
+        [{"branch": "feat/ancient", "state": "at_risk", "action": "none"}], 200.0,
+    ))
+    block = await build_inflight_block(empty_db, repo_root=repo, plans_dir=plans)
+    assert "stale" in block
+    assert "feat/ancient" not in block
+    assert "--report-json" in block
+
+
+async def test_missing_board_says_nothing(empty_db, empty_dirs, monkeypatch):
+    """No cache is a real answer: emit nothing rather than guess or reassure."""
+    repo, plans = empty_dirs
+    monkeypatch.setattr(open_loops, "_read_board", lambda: ([], None))
+    block = await build_inflight_block(empty_db, repo_root=repo, plans_dir=plans)
+    assert "Unlanded work at risk" not in block
+
+
+async def test_read_board_survives_a_corrupt_cache(empty_db, empty_dirs, tmp_path, monkeypatch):
+    """A truncated or hand-edited cache degrades to "no board", never an exception."""
+    for payload in ("", "{", "null", "[]", '{"worktrees": "not-a-list"}',
+                    '{"worktrees": [], "generated_at": "not-a-date"}'):
+        cache = tmp_path / "board.json"
+        cache.write_text(payload)
+        monkeypatch.setattr(open_loops, "_BOARD_CACHE", cache)
+        rows, age = open_loops._read_board()
+        assert isinstance(rows, list), f"payload {payload!r} did not degrade cleanly"
 
 
 async def test_one_section_raises_others_still_render(empty_db, empty_dirs, monkeypatch):
@@ -162,7 +244,7 @@ async def test_one_section_raises_others_still_render(empty_db, empty_dirs, monk
     monkeypatch.setattr(open_loops, "_worktree_lines", boom)
     block = await build_inflight_block(empty_db, repo_root=repo, plans_dir=plans)
     assert "survivor task" in block  # tasks survive the worktree failure
-    assert "Live worktrees" not in block
+    assert "Unlanded work at risk" not in block
 
 
 async def test_truncation_hard_cap(empty_db, empty_dirs, monkeypatch):

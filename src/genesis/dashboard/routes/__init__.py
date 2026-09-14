@@ -52,6 +52,7 @@ from genesis.dashboard.routes import (
     vitals,
     voice,
     work,
+    worktrees,
     zero_drop,
 )
 
@@ -105,5 +106,6 @@ __all__ = [
     "vitals",
     "voice",
     "work",
+    "worktrees",
     "zero_drop",
 ]
