@@ -12,17 +12,19 @@
   anything about layout, so there was nothing for it to override. Nothing errored
   and nothing logged; it simply looked wrong, on every tab, for months.
 
-  Looking for other instances of the same leak found a third: the base stylesheet
-  also pins the page root to a fixed, non-scrolling viewport. Four pages undo
-  that, in four separate places — and the voice page does not, so it could not be
-  scrolled at all below the first screenful. Both neutralisations now live on the
+  Looking for other instances of the same leak found a third, and then a fourth.
+  The base stylesheet also pins the page root to a fixed, non-scrolling viewport.
+  Four pages undo that, in four separate places — the voice page did not, so it
+  could not be scrolled at all below the first screenful, and neither did the
+  login page, which is built as a string in Python rather than as a template and
+  had been overlooked twice for that reason. Both neutralisations now live on the
   stylesheet every page loads, rather than being copied per page, which is what
-  let one page be forgotten.
+  let two pages be forgotten.
 
-  Both are paired with a check over the stylesheets a page actually links: a
-  layout property the inherited sheet sets on a selector Genesis also lays out
-  must be answered by a Genesis sheet loading after it, and an answer that exists
-  on one page must exist on all of them. What that catches is stated with it —
-  it reads which declarations exist and in what order the sheets load, not which
-  one a browser would pick, and a leak onto a selector Genesis has never styled
-  is outside it. It would not have found the voice page on its own; a person did.
+  Nothing automatic guards this class yet. A check that reads the stylesheets a
+  page links was built alongside this fix and has been separated onto its own
+  branch: it found the original defect from the text alone, and it was also
+  found fail-open in four consecutive reviews, so it is not something to hold a
+  verified one-declaration fix behind. Worth saying plainly because the absence
+  is the status quo rather than a regression — the three instances above were
+  each found by a person looking at a page.

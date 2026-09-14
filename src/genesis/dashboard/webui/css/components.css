@@ -1,6 +1,6 @@
 /* Genesis shared UI components — built exclusively on tokens.css.
  *
- * Loaded by all five pages after tokens.css. New primitives only: names are
+ * Loaded by every page after tokens.css. New primitives only: names are
  * chosen not to collide with existing per-page classes (.status-chip,
  * .empty-state stay untouched until their call sites migrate).
  *
@@ -68,7 +68,7 @@
 }
 
 /* ── Panel: neutralise the inherited AZ layout ───────────────────────────
- * index.css (AZ, loaded first by all five pages) sets
+ * index.css (AZ, loaded first by every page) sets
  *   .panel { display: flex; height: 100%; overflow: auto; }
  * for AZ's side-by-side chat/settings panes. Genesis has no such panes — a
  * panel here is a header ABOVE a body — so the inherited flex laid the two out
@@ -84,21 +84,26 @@
  * never carried one selector over.
  *
  * It lives HERE rather than in dashboard.css because the voice page uses
- * `.panel` and links components.css but not dashboard.css. All five pages load
- * this file after index.css, so one declaration covers every page that can
- * carry the leak, including pages not written yet.
+ * `.panel` and links components.css but not dashboard.css. Every page loads
+ * this file after index.css, so one declaration covers all of them.
+ *
+ * "All of them" is exactly as wide as the set of pages that LINK this file, and
+ * a premise check found that set was smaller than assumed: the login page
+ * (auth.py `_LOGIN_HTML`, served as a Python string rather than a template)
+ * linked index.css and nothing else, so it carried the viewport lock live —
+ * MEASURED `html { overflow: hidden; position: fixed }`, scrolling unavailable.
+ * It links tokens + components now. The lesson is not "add a page to a list":
+ * it is that a shared answer only reaches a page that asks for it, so a NEW
+ * page is covered only once someone links this file from it.
  *
  * The dashboard's own `.panel` rule (dashboard.css) sets background, border and
  * overflow but never `display` — so the cascade had nothing to override with.
  * That is the whole mechanism.
  *
- * tests/test_dashboard/test_dashboard_css_isolation.py locks the CLASS from two
- * directions: per page, a layout property a vendor sheet declares on a selector
- * Genesis also LAYS OUT must be answered by a Genesis sheet loading after it;
- * across pages, an answer that exists anywhere must exist everywhere. Read its
- * docstring before trusting it — it compares declarations and load order, not
- * the cascade, and a leak onto a selector Genesis has never laid out is outside
- * both halves.
+ * Nothing automatic guards this class yet. A lint that does was built alongside
+ * this fix and split out to its own branch, because it kept being found
+ * fail-open while this one-declaration fix was already verified in a browser;
+ * it is not a reason to delay the fix and it is not a guarantee this file has.
  */
 .panel {
   display: block;

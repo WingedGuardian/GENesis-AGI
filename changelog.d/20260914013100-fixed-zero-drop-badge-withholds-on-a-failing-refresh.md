@@ -20,9 +20,13 @@
   That remembering has one visible side effect beyond the Zero-Drop tab, named
   here rather than left to be discovered: a panel that has never loaded
   successfully now shows the previous attempt's error text while it retries,
-  where it used to show nothing. Six panels can reach that state. It reads as an
+  where it used to show nothing. Ten panels can reach that state. It reads as an
   improvement — a panel that is failing says why — but it is a change, and it
   arrived as a consequence of the fix rather than as its goal.
+
+  The same correction was needed in a second place: the equivalent function for
+  modal panels cleared the failure too, and was missed the first time. Five
+  modal surfaces render that text.
 
   It also names every fault that holds at once — "detector blind + refresh
   failing" — rather than showing only the most severe. The previous wording

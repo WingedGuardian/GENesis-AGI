@@ -653,6 +653,19 @@ def test_a_failure_is_only_discarded_once_a_newer_request_has_SUCCEEDED():
         "token !== this._zeroDropFetchToken"
     ), "recorded only after the supersession check, never before"
 
+    # BOTH families. The first version of this fix landed on `startFetch` and
+    # left `startModalFetch` clearing the fault — the same defect one function
+    # over, on a surface that feeds five modal templates through
+    # `modalStatusDetail`. Two near-identical functions are exactly where a fix
+    # gets applied once, so they are asserted together rather than separately.
+    modal_start = _js_function_body(js, "startModalFetch(name) {")
+    assert "state.error = null" not in modal_start, (
+        "startModalFetch must not clear the fault either — a retry in flight "
+        "does not un-fail the attempt before it, in either family"
+    )
+    modal_finish = _js_function_body(js, "finishModalFetch(name) {")
+    assert "state.error = null" in modal_finish, "and a success is still what clears it"
+
     helper = _js_function_body(js, "_newerRequestSucceeded(token) {")
     assert "_zeroDropSucceededToken" in helper and ">" in helper, (
         "the helper compares against the last SUCCEEDED token"

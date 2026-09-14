@@ -3729,7 +3729,13 @@
           const state = this[name]?.fetch;
           if (!state) return;
           state.state = state.lastSuccess ? "refreshing" : "loading";
-          state.error = null;
+          // Same as `startFetch`, and it is here because the first version of
+          // that fix landed on one of the two parallel families. `state.error`
+          // is the record of the last COMPLETED attempt; a retry in flight does
+          // not un-fail it. Clearing it made every modal's failure text vanish
+          // for the duration of each retry — `fetchStatusDetail` renders it and
+          // `modalStatusDetail` feeds five modal templates. Only a success
+          // clears it (finishModalFetch).
         },
 
         finishModalFetch(name) {
