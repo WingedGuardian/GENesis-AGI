@@ -38,6 +38,9 @@
 #  13. Size trim of the hook audit stores (>5MB each) → scripts/prune_hook_audit_logs.py
 #      (merge-override + git-discard records, one file per flush — oldest whole
 #      files dropped; an age prune cannot bound an append-forever store)
+#  14. External-review runner stores: size trim of the dispatch rows (>5MB, same
+#      one-file-per-flush shape) and a 30d file-age prune of the run logs, which
+#      the size trim cannot see because it counts *.jsonl only
 #
 # Note: run under a hardened systemd sandbox (NoNewPrivileges, ProtectSystem=
 # strict), so disk_reclaim's --system (/var, sudo) path is intentionally NOT
@@ -99,6 +102,51 @@ prune_mcp_spawn() {
         esac
     done
     find "$dir" -maxdepth 1 -type f -name '.*' -mmin +60 -delete 2>/dev/null || true
+}
+
+# prune_external_review_logs DIR MAX_BYTES — bound the external-review run logs by
+# BOTH age and size. The shared trimmer handles `*.jsonl` only, so these need their
+# own pass; deleting whole old files is the one retention shape that is safe here
+# (a run log is written once by a detached process and never appended to again).
+# Age first because it is the cheaper predicate and usually enough.
+prune_external_review_logs() {
+    local dir="${1:?}" max_bytes="${2:?}" total remaining
+    [ -d "$dir" ] || return 0
+
+    # An ACTIVE log must never be unlinked. A detached orchestrator writes to its log
+    # for minutes; unlinking it loses the pathname while the bytes stay allocated
+    # until the child closes the descriptor, so the size bound is not even restored —
+    # the diagnostics are simply destroyed. Both reviewers found this independently.
+    # `-mmin +60` is the guard: a run is minutes, so an hour of silence means the
+    # writer is done. Note the ORDERING that makes this safe rather than hopeful —
+    # deletion is oldest-first, and an active log is by definition the newest, so the
+    # prune can only reach one after every completed log is already gone. That case
+    # is a single run whose own log exceeds the cap, and there the right answer is to
+    # stop and SAY SO rather than destroy a live transcript to hit a number.
+    find "$dir" -maxdepth 1 -type f -name '*.log' -mmin +60 -mtime +30 -delete 2>/dev/null || true
+
+    total="$(find "$dir" -maxdepth 1 -type f -name '*.log' -printf '%s\n' 2>/dev/null \
+        | awk '{s+=$1} END {print s+0}')"
+    [ "${total:-0}" -gt "$max_bytes" ] 2>/dev/null || return 0
+
+    # Oldest first, deleting until the directory fits. `-printf` keeps mtime and path
+    # on one line so the sort is numeric on a field we control rather than on a
+    # filename whose shape could change. The subshell cannot export its running
+    # total back, so the remaining size is recomputed after the loop.
+    find "$dir" -maxdepth 1 -type f -name '*.log' -mmin +60 -printf '%T@ %s %p\n' 2>/dev/null \
+        | sort -n \
+        | while read -r _mtime size path; do
+            [ "${total:-0}" -gt "$max_bytes" ] || break
+            rm -f "$path" 2>/dev/null && total=$((total - size))
+        done
+
+    remaining="$(find "$dir" -maxdepth 1 -type f -name '*.log' -printf '%s\n' 2>/dev/null \
+        | awk '{s+=$1} END {print s+0}')"
+    if [ "${remaining:-0}" -gt "$max_bytes" ] 2>/dev/null; then
+        echo "external-review logs still ${remaining}B over the ${max_bytes}B cap:" \
+             "the remainder is in-flight (modified within the hour) and was NOT deleted"
+    fi
+    return 0
 }
 
 main() {
@@ -277,12 +325,44 @@ main() {
     }
     _load_store_knob GENESIS_MERGE_OVERRIDE_DIR
     _load_store_knob GENESIS_DISCARD_SNAPSHOT_DIR
+    # The external-review store has its own knob, and this service does NOT inherit
+    # the review service's environment — so without loading it here, the runner
+    # writes to a custom directory while retention prunes the default one and the
+    # real store grows with no bound at all.
+    _load_store_knob GENESIS_EXTERNAL_REVIEW_DIR
     # One file per hook flush, so the oldest whole files are deleted past the byte
     # bound. This is the shape the ghost-export note above explains an age prune
     # cannot handle for an append-forever file. Retention lives here, never on the
     # hook path: a guard returning a security verdict must not also groom a store.
     "$VENV_PY" "$REPO_DIR/scripts/prune_hook_audit_logs.py" --max-bytes 5000000 \
         || echo "prune_hook_audit_logs exited $?"
+
+    # 14. The external-review runner's two stores, which need DIFFERENT retention.
+    #     The dispatch rows are JSONL, one file per flush, so they take the same
+    #     size trim as the hook stores above — passed explicitly because the runner
+    #     is not a hook and its store is not in audit_jsonl's STORES table. The run
+    #     LOGS are raw text, invisible to that trim (it counts `*.jsonl` only), so
+    #     they get a file-age prune instead. Ask the runner for the path rather than
+    #     hardcoding a second copy of it — the rule that was written at five call
+    #     sites elsewhere and was wrong at one of them.
+    #     The fallback is DELIBERATELY not a second copy of the path: if the runner
+    #     cannot tell us where its store is, we do not guess — guessing is how the
+    #     sibling pruner once trimmed an unrelated directory while the real store
+    #     grew unbounded. An empty answer simply skips this step, loudly.
+    _EXTREVIEW_STORE="$("$VENV_PY" "$REPO_DIR/scripts/external_review.py" --store-dir 2>/dev/null)" \
+        || _EXTREVIEW_STORE=""
+    if [ -z "$_EXTREVIEW_STORE" ]; then
+        echo "external-review store path unavailable — skipping its retention"
+    elif [ -d "$_EXTREVIEW_STORE" ]; then
+        "$VENV_PY" "$REPO_DIR/scripts/prune_hook_audit_logs.py" --max-bytes 5000000 \
+            "$_EXTREVIEW_STORE" || echo "prune_hook_audit_logs (external-review) exited $?"
+        # The run logs need BOTH bounds, and the shared trimmer cannot give them the
+        # size one: trim_dir_by_size counts `*.jsonl` ONLY, so a `.log` is invisible
+        # to it. Age alone does not bound bytes either — these are the full output of
+        # a multi-minute agent fleet, and a verbose orchestrator can put a lot on a
+        # small disk well inside 30 days. Age first, then oldest-first to a byte cap.
+        prune_external_review_logs "$_EXTREVIEW_STORE/logs" 200000000
+    fi
 
     echo "=== genesis-disk-hygiene done ==="
 }
