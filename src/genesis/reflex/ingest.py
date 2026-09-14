@@ -88,12 +88,33 @@ class ReflexIngestor:
             # sets error_type IFF an exception caused the failure; a semantic,
             # reason-only failure carries error_reason and NO error_type and
             # belongs to a different lane (recorded by job_health / owned by the
-            # Sentinel), not the reflex arc. Both current emitters fire
-            # exception-only (task.failed always; job.failed's PR-2a funnel gates
-            # on `exc is not None`), so today this guard is defense-in-depth
-            # honoring the failure_details contract — without it, a future
-            # reason-only event would MANUFACTURE a bogus "UnknownError" signal,
-            # the opposite of surfacing a real problem.
+            # Sentinel), not the reflex arc. Both emitters now build their
+            # payload through that chokepoint (job.failed's PR-2a funnel gates
+            # on `exc is not None`; task.failed's executor-exception path in
+            # `surplus/dispatch.py` threads the exception into
+            # `failure_details(exc=…)`), so this guard is the lane router —
+            # without it, a reason-only event would MANUFACTURE a bogus
+            # "UnknownError" signal, the opposite of surfacing a real problem.
+            # HISTORY, kept as a warning: an earlier version of this comment
+            # asserted task.failed "always" fired exception-only while its
+            # payload in fact never carried error_type at all — every task.failed
+            # was silently dropped HERE, and the false invariant is why nobody
+            # looked. A claim about another file's emit belongs in a test, not a
+            # comment. What pins the two emitters is a FUNNEL test each, driving
+            # the real producer into the real consumer:
+            # `tests/test_reflex/test_task_failed_funnel.py` and
+            # `tests/test_runtime/test_job_failure_funnel.py`.
+            #
+            # A THIRD emitter is NOT covered by either, and one admission form
+            # is therefore still a convention rather than a guarantee:
+            # `util/tasks.py` builds this payload by hand (and issue #1970 shows
+            # it can raise and emit nothing at all). Issue #1969's
+            # `emit_failure()` chokepoint is what makes the contract
+            # unconstructible instead of remembered — until it lands, a new
+            # emitter of an existing type is the gap. A scanner over every emit
+            # site was tried here and deleted: it graded that broken emitter as
+            # passing, because it checked the SHAPE of a call rather than
+            # whether an event arrives.
             error_type = details.get("error_type")
             # behavioral-lint: ignore no-hide-problems — lane-routing, not hiding
             # (see the contract note above; reason-only failures stay visible via

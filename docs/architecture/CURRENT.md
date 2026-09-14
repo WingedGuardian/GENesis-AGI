@@ -341,7 +341,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 51f9a358 2026-09-05
+verified: d0627c854 2026-09-11
 ```
 
 - **Roster peer availability is OBSERVATION, never a gate** (`cc/peer_availability.py`,
@@ -367,6 +367,16 @@ verified: 51f9a358 2026-09-05
   closed: per-field REPAIR of a foreign document (seven findings), and inferring
   whether credential discovery had succeeded from a config loader that degrades
   silently by design (two P1s).
+- **Research-profile direct sessions require the canonical `web-research` skill.**
+  Foreground research subagents preload the same skill through agent frontmatter;
+  autonomous blocker research injects it directly and requires the research MCP
+  profile. Ordinary autonomous steps assigned the legacy `research` skill use a
+  narrow compatibility adapter and receive the canonical method in their prompt,
+  including when an API provider has no filesystem tools. Both background research
+  paths derive the same recon boundary from the live tool registry: only
+  public-repository GitHub.com search and bounded source inspection remain. These
+  operations use a fixed unauthenticated API endpoint, never operator credentials;
+  UTF-8 file reads are limited to 8 MiB.
 - **Failover records availability only when a peer DEMONSTRABLY served** — a
   usable output, or answer text already streamed to the user. The degenerate
   empty non-error output (a silent cap) keeps its long-standing behaviour and is
@@ -909,7 +919,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: 788dd9a9 2026-09-06
+verified: d0627c854 2026-09-11
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -951,6 +961,12 @@ verified: 788dd9a9 2026-09-06
   than a drop, since dropping asserts absence. Pings immediately in `live`.
   `off`/`observe`/`live` lever + `notifications` reason-allowlist in
   `github_steward_config`.
+- **Research sessions can search and inspect public GitHub.com data through
+  read-only recon MCP operations.** The transport uses a fixed unauthenticated API
+  endpoint so operator-private repositories and viewer-specific fields are outside
+  its authority. Empty results remain distinct from API failure; tree and UTF-8
+  source reads are bounded, with file reads limited to 8 MiB and output truncation
+  reported explicitly.
 - **recon/career_outreach.py** (`CareerOutreachMonitor`) — the recon entry that
   not only pushes but ACTS: a daily surplus-cron ACTUATOR driving a configured
   external career-agent module (SSH CC dispatch, declared in the install's
@@ -1042,7 +1058,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: 50b79ffb 2026-09-01
+verified: d0627c854 2026-09-11
 ```
 
 - **channels/**: adapter framework. Telegram (`bridge.py` =
@@ -1734,6 +1750,222 @@ verified: 788dd9a9 2026-09-06
   a redaction pass first. Follow-ups ship `domain=None` (unclassified) because
   the sweep cannot tell a dropped user errand from a stale internal dev item —
   both shapes are really in the ledger.
+
+- **Zero-drop stranded-work detector** — **LIVE (findings store + sweep)**. The
+  reconciler behind the zero-drop rule: "what work has fallen through the
+  cracks?" is answered by ENUMERATION, never by a session that remembers.
+  Spawned beside the repo-pulse worker at SessionStart boundaries (never
+  clear; `GENESIS_ZERO_DROP_DISABLED=1` suppresses THAT spawn only — a
+  per-process variable cannot be a system-wide off switch, and one honoured on
+  every trigger would stop the heartbeat while the health manifest, unable to
+  read another process's env, went on expecting it: a permanent false overdue
+  alarm. Config `enabled: false` / `mode: off` is the real kill switch, and it
+  is what `_subsystem_enabled` reads) and once a day by
+  `disk_hygiene.sh` as the wall-clock floor, `scripts/zero_drop_worker.py`
+  detaches into `session_awareness/zero_drop_worker.py`: GLOBAL flock + 60-min
+  silent debounce under `~/.genesis/zero_drop/`. It is a SIBLING of the pulse
+  worker, deliberately not a lane inside it — the pulse holds ledger-absorb
+  authority, and a detector must not live in a process that can rewrite what it
+  observes. Its never-do list is a requirement: no push, fetch, PR open/close,
+  branch delete, unclaim, or write to ledger/follow-ups/tasks.
+  Sweep (`zero_drop_git.py`, read-only, injectable runner): ONE `for-each-ref`
+  with `%(ahead-behind:<base>)` (base read locally from
+  `refs/remotes/origin/HEAD`, validated with `is_safe_base_ref` and falling
+  back with a DISTINCT note — `%` and parens are LEGAL in a ref name, and an
+  unsafe base that reached the formatter froze the branch leg on every sweep
+  with no note at all), live `ls-remote`
+  for remote presence (never the fetch-stale remote mirror — class is part of
+  identity), the full `--state all` PR history (`repo_pulse_gh.list_all_prs`),
+  and `git status --porcelain -z` per worktree (`-z` because the default
+  porcelain C-quotes exactly the paths most likely to be somebody's untracked
+  work). MEASURED 2026-09-05: 209 refs + 1651 PRs + 161 worktrees in ~14s.
+  `_refuse_empty` distinguishes the two rc=0 empties, which mean opposite
+  things: NO BYTES is a true empty set (an unborn repo, a cleared remote —
+  MEASURED 2026-09-13 on git 2.43 as exactly 0 bytes, since `--exit-code` is
+  the optional flag that would make it an error), while output that PARSED to
+  nothing is a format change and freezes the class. Refusing both froze the
+  branch classes forever on a condition that never changes. `list_worktrees`
+  refuses either way, on its own reasoning: the main worktree is always
+  listed, so nothing parsed is always unreadable. All three enumerators now
+  COUNT lines they cannot read (ls-remote was the last to silently drop them,
+  so a partial parse read as a complete listing), and both subprocess runners
+  scrub git's repo-discovery environment — `GIT_DIR` and friends OVERRIDE
+  `-C`, so an inherited one would point the sweep at another repository, which
+  since the empty-set change reads as "no branches" and resolves the lot.
+  Classification (`zero_drop.py`, pure): this repo squash-merges, so every
+  merged branch reads permanently ahead — a naive ahead-count query was ~12%
+  precise (145 candidates, ~18 real). A head-ref-NAME PR join is what recovers
+  precision, but it is evidence about the PIPELINE, never proof the work
+  landed: verdicts are ordered by EVIDENCE STRENGTH, and a name never outranks
+  a SHA. (1) `headRefOid == tip` — the PR merged exactly this commit, MEASURED
+  2026-09-06 for 119 of 123 merged-covered branches. (2) ancestry — the tip is
+  reachable from the merged head (`is_ancestor`, local, three-valued: a missing
+  object is UNANSWERABLE, never False). (3) push state from `ls-remote`'s SHA —
+  matched by NAME first and, when that misses, against the set of remote head
+  SHAs, because a branch renamed locally (or a `pr<N>` review checkout) has its
+  tip on the server under another ref name and reading it as ABSENT assigned
+  `unpushed_branch`, i.e. "these commits exist only here", which was false —
+  MEASURED 2026-09-12: 2 of 251 local branches, both verified against the
+  remote by name;
+  tip == remote tip means nothing here is local-only, whatever the PRs say;
+  tip diverged (and not merely behind, merges excluded) means local-only
+  commits are PROVEN and NO PR on that ref can cover them. (4) the `mergedAt` /
+  `closedAt` time guards, demoted to confirming a tip already known pushed.
+  (5) the name join itself — indexing only, scoped to head refs in THIS repo so
+  a fork PR cannot cover a same-named local branch. PR history is indexed BOTH
+  ways (`PrIndex.by_name` + `.by_head_sha`, union via `for_branch`, name rows
+  leading): a name-ONLY lookup gated tier 1 behind tier 5, so a branch renamed
+  or checked out locally under another name matched no historical `headRefName`
+  and its exact-SHA evidence never reached the classifier. MEASURED 2026-09-12
+  over 251 refs / 1775 PRs: 4 of 26 `flagged_no_pr` rows (15%) were that blind
+  spot, each a local branch at the exact head of a real PR (1 open, 2 merged, 1
+  closed). An exact head SHA also stands in for push state on an OPEN PR — the
+  commit is demonstrably on the server — which is the only form of coverage a
+  renamed branch can have. Unresolvable coverage is
+  FLAGGED with the resolving command (`refs/pull/<n>/head`), never suppressed;
+  an unresolvable PUSH state is HELD (neither flagged nor resolved). MEASURED
+  2026-09-06 on 217 refs: the older name-join-as-proof suppressed 5 branches
+  holding commits that exist on no remote — 4 behind CLOSED PRs, 1 behind an
+  OPEN one. No prefix denylists by design — a backup branch is ACKED with a
+  reason instead, leaving a record rather than an invisible rule. Age gates:
+  12h on the branch tip, 6h on the newest DIRTY FILE (not the tip — an old tip
+  with a fresh edit is somebody typing). Every gate that HOLDS or DEBOUNCES
+  rejects an implausibly FUTURE timestamp first (`not_future`,
+  `FUTURE_SKEW_TOLERANCE` 5m): git accepts a future commit date and a restored
+  snapshot yields future mtimes, and a gate asking "is this newer than the
+  cutoff" then answers yes forever, holding the item off the board until wall
+  time catches up. A future value is read exactly like an UNPARSEABLE one, so it
+  is judged on its merits (which FLAGS) rather than excused; `_within_minutes`
+  and `_freshness` take the same guard, the latter because a negative age is
+  never `> STALE_AFTER_S` and so announced a wedged board as FRESH. The three
+  comparisons that fail toward flagging are deliberately untouched. Classes follow the COMMITS, not the
+  name: `unpushed_branch` (commits on no remote) | `pushed_no_pr` (safe, but in
+  no pipeline) | `dirty_worktree` (a detached worktree keys on
+  `@detached:<path>`, which no ref name can collide with; one branch checked
+  out in SEVERAL worktrees at once — `git worktree add --force` — takes a
+  `<branch>:<sha256(path)>` discriminator behind the same forbidden ':' (a
+  DIGEST, not the path: a path may hold a newline, and a raw one would route the
+  identity into the control-character quarantine, which lands in neither
+  `present` nor `held` and so RESOLVES a live finding — the readable path is
+  carried separately as `worktree_path`), stamped as
+  `branch_duplicated` by `list_worktrees` over the WHOLE listing so the worker's
+  hold path and the classifier cannot disagree about a key; CONDITIONAL because
+  the identity is the ack key and an unconditional suffix would expire every ack
+  ever written, MEASURED 2026-09-12: 0 of 165 worktrees duplicated here; an identity that
+  cannot round-trip safely — a path with a control character, or a BRANCH name
+  carrying a bidi/zero-width character, which check-ref-format PERMITS — is
+  DERIVED as `@opaque:<sha256>` rather than refused, and counted as the META
+  `opaque_identities`. Refusing it put the worktree in neither `present` nor
+  `held`, so `apply_sweep` resolved the uncommitted work it named; refusal is
+  only right when the alternative is a key that lies, and a digest is neither.)
+  A PRUNABLE worktree is HELD, not resolved: `prunable` means git could not
+  find the directory, which is UNREACHABLE and not necessarily gone — an
+  unmounted volume gives the byte-identical `gitdir file points to non-existent
+  location`, and the code already HELD the sibling condition (a failing `status`
+  call), so one unreachable path was held and the other resolved. Cost named
+  rather than hidden: a genuinely deleted worktree's row now needs an ack to
+  clear (a confirm-by-repetition refinement is filed, not built). Both branch
+  probe loops share the worktree leg's derived WALL-CLOCK deadline — a probe
+  COUNT cap bounds calls, not time, and the flock is held throughout while every
+  loser exits `lock_busy` silently.
+  Store: `zero_drop_findings` (migration 20260905215957, mirrored in
+  `_tables.py`; CRUD `db/crud/zero_drop.py`). Identity is `UNIQUE(class,
+  branch)` — never the SHA, which would fork the row on every commit and
+  disarm escalation. Lifecycle: present ⇒ `consecutive_runs`++ and escalate
+  ONCE at `escalation_k` (visibility only); absent ⇒ resolved; re-present ⇒ a
+  NEW episode (count restarts, `reopen_count`++). An ack is SHA-keyed
+  (`acked_tip_sha`) and expires the moment the branch moves.
+  Absence from a sweep means THREE different things and only one of them is
+  "gone": an age gate filtered it, a PR verdict covered it, or it genuinely
+  went away. The first is HELD — neither present nor absent, left exactly as
+  it is — because conflating them destroyed real state (MEASURED: one edit
+  inside an acknowledged worktree pushed it under the 6h gate for a single
+  sweep, resolving the row and discarding an acknowledgement the branch had
+  never invalidated). Unreadable worktrees are held the same way, per ITEM:
+  one bad worktree must not blind all 161.
+  **A degraded leg FREEZES its classes** — a failed/capped listing skips
+  reconciliation for that class entirely rather than resolving branches it
+  never looked at, and a degraded run is not a counted run. Per-leg stage
+  counts (namespaced — the legs share key names) go to `last_run.json` so
+  every suppression adds up to its denominator, and every published count
+  carries the coverage line naming which classes that run actually swept.
+  A FAILED sweep replaces the run record too (`_write_failure_record`, under
+  the same flock): the record is written at ONE place, the last statement, so
+  a raise used to leave the previous record intact — and when the cause was
+  IN that record (a timezone-naive `computed_at`, which parses and then raises
+  TypeError on the aware subtraction) every later sweep died at the same line
+  and wrote nothing, freezing the board until someone deleted the file by
+  hand. The failure record carries `degraded` (so `blind` reads True) and no
+  MEASUREMENT-shaped keys — but it DOES carry `coverage`/`frozen_classes`,
+  because omitting them is not neutral: the status tool reads
+  `frozen_classes or []`, so an omission renders as a positive claim that
+  nothing is frozen at the moment everything is. A `failed` prior debounces on
+  a short floor (`FAILED_RETRY_FLOOR_MINUTES`) rather than the full interval —
+  exempting it entirely was worse than the behaviour it replaced, since the
+  uncaught raise (an unreadable DB) happens AFTER both expensive legs run.
+  Each class reconciles inside its own SAVEPOINT, so a class that raises
+  mid-DML cannot leave partial writes for the next commit on the shared
+  connection to flush while the record reports that class as not applied.
+  Untrusted text reaching a MODEL: a branch identity is the ack key and is
+  emitted VERBATIM, paired with a neutralised `branch_display` and an
+  `identity_unrenderable` flag. `check-ref-format` bans control characters but
+  says nothing about the Cf category — MEASURED 2026-09-13 on git 2.43, a
+  branch name containing U+202E/U+200B/U+2066 is LEGAL — so the older
+  structural argument for emitting the key bare was false in the one direction
+  that mattered; neutralising the key itself would merge two identities.
+  Surfaces: `zero_drop_status` (read-only, in the reflection allowlist —
+  findings + counts + the detector's own freshness, because a stale board's
+  zero is unverified rather than clean) and `zero_drop_ack(class_, branch,
+  reason)`.
+  **The ACCOUNTING VIEW widens that answer past git without a second store**:
+  `session_awareness/zero_drop_view.py::build_view` DERIVES five parts on
+  demand — gaps (delegated whole to `_impl_zero_drop_status`, so the
+  neutralisation rules cannot drift), the open-PR pipeline (repo-pulse cache,
+  its `computed_at` age ALWAYS rendered and its count WITHHELD past the TTL —
+  a dead worker's snapshot presented as a number is the same false-clean one
+  layer out), store counts (stranded work, ledger, follow-ups), owner-pending,
+  and a roadmap naming what the board does NOT cover. Every count carries its
+  denominator, each part degrades INDEPENDENTLY (an unreadable store cannot
+  blank the readable ones), and a source past its freshness bound — or one that
+  cannot say WHICH repository it counted — WITHHOLDS its count rather than
+  rendering an unattributable or stale one; the same false-clean rule the
+  detector applies to itself, one layer out. Every figure describing one store
+  comes from ONE read of it, so two sections of a board cannot disagree about
+  the same population (`follow_ups.get_lane_counts` returns per-status
+  actionable counts and the deferred remainder together; the remainder is a
+  COMPLEMENT, so a `kind` added later is absorbed rather than dropped). Both accounting surfaces
+  (`GET /api/genesis/zero-drop` + the Zero-Drop tab, and the morning report's
+  Ground-Truth line) call that one assembler so they cannot disagree; the
+  morning-report line is COUNTS ONLY, never a branch name, because that
+  section's freedom from redaction work is exactly what its integers-only
+  discipline buys. `session_charters.ledger_counts_all` is the first
+  cross-session ledger count anywhere — a SUPERSET of the population
+  `ledger_escalation` acts on, which filters further by provenance.
+
+  The ack is the ONLY suppression path by design — there are no
+  prefix denylists — so it ships with the detector rather than after it.
+  Levers: settings domain `zero_drop` (off|observe|alert, default OBSERVE;
+  invalid degrades to observe, never a silent off — a dead detector answers
+  with a stale, confident zero). `alert` maintains ONE superseding observation
+  (follow-up-watchdog shape, created BEFORE the supersede so a failed write
+  cannot leave the board empty), auto-resolved when it comes clean; it is not
+  the default yet because `infrastructure_alert`'s 3-day TTL re-mints a stable
+  board's alert until episode-scoped dedup lands.
+  **Blindness has its own alarm, raised in every running mode**: a dead
+  detector is caught by the heartbeat, but a LIVE one with a permanently
+  failing leg (an expired `gh` token) keeps pulsing and keeps the board
+  frozen, so every health surface reads green while nothing new is ever
+  detected. That is the same stale, confident zero reached through the door
+  nobody guards.
+  Retention 45d RESOLVED-ONLY via `scripts/prune_zero_drop.py`
+  (disk-hygiene) — pruning an acked row would silently un-suppress it.
+  Telemetry: durable `events` heartbeat, subsystem `zero_drop`, registered in
+  `HEARTBEAT_EXPECTED` (3600s/48h — hourly on an active box, daily floor on an
+  idle one), in `_NO_BOOT_PULSE_SUBSYSTEMS` (a detached worker emits no
+  bootstrap pulse), in the `subsystem_stale` watch tuple (which is hardcoded,
+  NOT derived from `HEARTBEAT_EXPECTED` — registering only the former gives a
+  display row and no alarm) and in `_subsystem_enabled` (so turning the
+  detector off does not buy a permanent alarm).
 
 ## 10. Learning & evaluation
 
@@ -2455,6 +2687,10 @@ verified: 50b79ffb 2026-09-01
   `<!-- genesis:skills -->` block in `AGENTS.md` for Cursor/Codex/other
   runtimes — on-demand and committed (re-run when skills/MCP tools change;
   `update.sh` restores AGENTS.md to HEAD, so the block must live in the commit).
+  `web-research` is the shared method for foreground sessions, the
+  `genesis-researcher` subagent, and research-profile background sessions;
+  task risk and breadth select its depth. Tier-2 `research` resources resolve and
+  inject that delegated method before tool-less autonomous API dispatch.
 - **contribution/**: `python -m genesis contribute <sha>` — sanitize-then-PR
   upstream, pseudonymous. `sanitize.scan_diff()` is FAIL-CLOSED (8 scanners;
   any finding stops). Its forbidden-globs floor duplicates

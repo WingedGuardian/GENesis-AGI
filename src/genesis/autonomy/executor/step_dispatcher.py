@@ -16,6 +16,10 @@ from typing import Any
 
 from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
 from genesis.autonomy.executor import dispatch as _dispatch
+from genesis.autonomy.executor.resources import (
+    RequiredSkillUnavailableError,
+    load_step_resources,
+)
 from genesis.autonomy.executor.types import ResearchResult, StepResult, StepType
 
 logger = logging.getLogger(__name__)
@@ -157,9 +161,15 @@ class StepDispatcher:
         # Load assigned resources (skills, procedures) for this step
         resources: str | None = None
         try:
-            from genesis.autonomy.executor.resources import load_step_resources
-
             resources = await load_step_resources(self._db, step)
+        except RequiredSkillUnavailableError as exc:
+            logger.error("Step resource loading blocked: %s", exc)
+            return StepResult(
+                idx=step_idx,
+                status="failed",
+                result=str(exc),
+                blocker_description=str(exc),
+            )
         except Exception:
             logger.debug("Step resource loading failed", exc_info=True)
 

@@ -45,6 +45,12 @@ from shell_parse import (  # noqa: E402
     untokenizable,
 )
 
+try:  # noqa: E402
+    import discarded_write
+except Exception:  # noqa: BLE001 — GUARDED: an unguarded import failure would abort
+    # module load → exit 1 → CC reads non-2 as NON-blocking → the removal RUNS.
+    discarded_write = None  # type: ignore[assignment]
+
 # Kept ONLY for the untokenizable fallback below and as a cheap pre-gate — never
 # as the verdict. As the verdict it was quote-blind: it matched the phrase inside
 # a quoted grep pattern, a heredoc body or a commit message, and target
@@ -262,6 +268,8 @@ def _block_with_pids(target: str, pids: list[int]) -> int:
         "This would brick those sessions. Wait for them to finish or use the lifecycle manager.",
         file=sys.stderr,
     )
+    if discarded_write is not None:
+        discarded_write.warn()
     return 2
 
 
@@ -282,12 +290,22 @@ def _block_no_direct_removal(target: str) -> int:
         "python scripts/worktree_lifecycle.py --dry-run",
         file=sys.stderr,
     )
+    if discarded_write is not None:
+        discarded_write.warn()
     return 2
 
 
 def _handle_bash(data: dict) -> int:
     """Handle Bash tool — intercept `git worktree remove` commands."""
     cmd = data.get("command", "")
+    # ONLY the Bash path has a command to report on. The EnterWorktree /
+    # ExitWorktree tool paths carry an `action`, not a `command`, so their two
+    # refusal sites are deliberately left un-noted: there is no Bash call for a
+    # "the whole command was discarded" note to be about. `warn()` degrades to
+    # silence when nothing was remembered, so this is safe rather than merely
+    # untested.
+    if discarded_write is not None:
+        discarded_write.remember(cmd)
     if not cmd:
         return 0
 
@@ -326,7 +344,25 @@ def _handle_bash(data: dict) -> int:
     # that already fail closed here. The legacy regex extractor is the same
     # coarser reading the untokenizable case falls back to: weaker than the
     # parser, but it reads the raw text, so a bound cannot hide anything from it.
-    if untokenizable(cmd) or blind is not None:
+    # `blind.bounds_induced`, NOT `blind is not None`, and the comment above says
+    # why without meaning to: it justifies this fallback with "a BOUND stopped the
+    # parse — and `analyze_checked` then returns NO segments". That is the whole
+    # argument, and it is true of the BOUNDS causes only. A cause that leaves the
+    # segments COMPLETE — the parse succeeded, one word of it is unreadable — hands
+    # this branch a full segment list and then throws it away for a quote-blind
+    # regex over the raw text.
+    #
+    # MEASURED base-vs-branch when this read `blind is not None`: a `gh pr` whose
+    # verb was a variable, with a --body whose PROSE mentions removing a worktree,
+    # went ALLOW -> hard BLOCK. Writing a PR body about worktree removal is
+    # something sessions do constantly — this one's own body does it — and a hard
+    # block on prose is the worst direction available to this guard.
+    #
+    # `untokenizable` keeps the fallback unchanged: there the tokens really are
+    # unreliable. The parsed route below has its own carrier fallback for a removal
+    # the parser cannot see, so declining to degrade here is not the same as
+    # trusting the parse blindly.
+    if untokenizable(cmd) or (blind is not None and blind.bounds_induced):
         targets = _legacy_targets(cmd)
     else:
         targets = _extract_worktree_targets(segs)
@@ -384,6 +420,8 @@ def _handle_bash(data: dict) -> int:
                 "fail with 'Path does not exist').",
                 file=sys.stderr,
             )
+            if discarded_write is not None:
+                discarded_write.warn()
             return 2
 
         # Check 2: Cross-session — another process is using it

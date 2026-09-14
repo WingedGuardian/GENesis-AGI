@@ -55,6 +55,7 @@ _REFLECTION_READ_MCP: frozenset[str] = frozenset({
     "ego_goal_list", "experiment_status", "health_alerts", "health_errors", "health_status",
     "immunity_status", "inbox_digest", "infrastructure_profile", "j9_eval_status", "job_health",
     "loop_closure_status", "module_list", "provider_activity", "reflex_status",
+    "zero_drop_status",
     "session_charter", "settings_get", "settings_list",
     "subsystem_heartbeats", "task_detail", "task_list", "update_history_recent",
     "follow_up_list", "web_fetch", "web_search",
@@ -67,6 +68,11 @@ _REFLECTION_READ_MCP: frozenset[str] = frozenset({
 # The single sanctioned reflection write. The rest of reflection's observations
 # flow through the parsed `observations` output field (written server-side), not a tool.
 _REFLECTION_WRITE_MCP: frozenset[str] = frozenset({"observation_write"})
+
+_RESEARCH_RECON_READ_MCP: frozenset[str] = frozenset({
+    "recon_github_read",
+    "recon_github_search",
+})
 
 # The MCP servers a reflection session loads (mirrors _MCP_PROFILES["reflection"]).
 _REFLECTION_MCP_SERVERS: tuple[tuple[str, str], ...] = (
@@ -148,9 +154,9 @@ def render_mcp_servers(
 # Module-level constant (immutable intent), consistent with _READONLY_DISALLOWED.
 _MCP_PROFILES: dict[str, list[str]] = {
     "reflection": ["genesis-health", "genesis-memory"],
-    # research bg sessions: reflection servers + genesis-recon (the discovery
-    # engine — GitHub/model-intel/skill scanning). Full read+write recon; the
-    # research disallow list already omits _NO_RECON_WRITES.
+    # Research background sessions add genesis-recon for direct GitHub evidence.
+    # build_research_recon_disallowed() denies every recon operation except the
+    # read-only recon_github_read/search pair.
     "research": ["genesis-health", "genesis-memory", "genesis-recon"],
     "user_reflection": ["genesis-memory"],  # User ego: memory only, no health tools
     "sentinel": ["genesis-health", "genesis-memory", "genesis-outreach"],
@@ -163,6 +169,19 @@ _MCP_PROFILES: dict[str, list[str]] = {
 
 class SessionConfigBuilder:
     """Builds CC session configurations per type."""
+
+    def build_research_recon_disallowed(self) -> list[str]:
+        """Deny every recon tool except blocker research's read-only GitHub pair."""
+        try:
+            names = _registered_mcp_tool_names("genesis.mcp.recon_mcp")
+        except Exception:
+            logger.exception("Cannot enumerate recon tools; denying the server")
+            return ["mcp__genesis-recon__*"]
+        return [
+            f"mcp__genesis-recon__{name}"
+            for name in names
+            if name not in _RESEARCH_RECON_READ_MCP
+        ]
 
     def build_reflection_disallowed(self) -> list[str]:
         """Denylist that makes a reflection session read-only + observation-writing.
