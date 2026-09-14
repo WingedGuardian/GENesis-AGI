@@ -370,8 +370,22 @@ def _staged_files(cwd: str | None) -> list[str] | None:
 # pathspec, and `git add app.py && git commit` stages code in a prior segment.
 # The docs-only skip may fire ONLY for a "pure" bare commit that provably cannot
 # add or select content beyond the current --cached snapshot.
+# MEASURED against the installed binary, never `git -h` (which omits
+# `--attr-source` while git accepts it). Locked identical to the copies in
+# shell_parse / git_push_guard / pre_push_privacy_review by
+# tests/test_hooks/test_value_flag_consistency.py.
 _GIT_GLOBAL_VALUE_FLAGS = frozenset(
-    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"}
+    {
+        "-C",
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--super-prefix",
+        "--config-env",
+        "--attr-source",
+        "--shallow-file",
+    }
 )
 # git commit long flags that CONSUME a following value token (so the value is not
 # misread as a pathspec).

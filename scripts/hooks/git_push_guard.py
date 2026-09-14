@@ -230,8 +230,23 @@ _CWD_UNKNOWN = object()
 
 # git global options that consume the FOLLOWING token as their value — used to
 # skip past `git -C <dir>` / `git -c KEY=VAL` when locating a push's positionals.
+# MEASURED against the installed binary, never `git -h` (which omits
+# `--attr-source` while git accepts it). A missing member is the fail-open
+# direction: the option's value is read as the subcommand, so a publish
+# preceded by it is never seen. Locked identical to the other three copies by
+# tests/test_hooks/test_value_flag_consistency.py.
 _GIT_GLOBAL_VALUE_FLAGS = frozenset(
-    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"}
+    {
+        "-C",
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--super-prefix",
+        "--config-env",
+        "--attr-source",
+        "--shallow-file",
+    }
 )
 
 
