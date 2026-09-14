@@ -66,3 +66,77 @@
 @media (prefers-reduced-motion: reduce) {
   .gskeleton { animation: none; background: var(--s2); }
 }
+
+/* ── Panel: neutralise the inherited AZ layout ───────────────────────────
+ * index.css (AZ, loaded first by all five pages) sets
+ *   .panel { display: flex; height: 100%; overflow: auto; }
+ * for AZ's side-by-side chat/settings panes. Genesis has no such panes — a
+ * panel here is a header ABOVE a body — so the inherited flex laid the two out
+ * SIDE BY SIDE: every panel header became a narrow vertical gutter down the
+ * left of its panel, with the title floating level with the middle of the body
+ * rather than above it. MEASURED in a browser before this rule existed: the
+ * Zero-Drop header box was 261x882 px and System Health's 170x2501, inside
+ * panels ~1350 px wide.
+ *
+ * Nothing errored, nothing logged, and no test could see it — which is why it
+ * survived for months. dashboard.css already carried the same neutralisation
+ * for `html, body` (scrolling), written when someone hit THAT instance; it was
+ * never carried one selector over.
+ *
+ * It lives HERE rather than in dashboard.css because the voice page uses
+ * `.panel` and links components.css but not dashboard.css. All five pages load
+ * this file after index.css, so one declaration covers every page that can
+ * carry the leak, including pages not written yet.
+ *
+ * The dashboard's own `.panel` rule (dashboard.css) sets background, border and
+ * overflow but never `display` — so the cascade had nothing to override with.
+ * That is the whole mechanism.
+ *
+ * tests/test_dashboard/test_dashboard_css_isolation.py locks the CLASS from two
+ * directions: per page, a layout property a vendor sheet declares on a selector
+ * Genesis also LAYS OUT must be answered by a Genesis sheet loading after it;
+ * across pages, an answer that exists anywhere must exist everywhere. Read its
+ * docstring before trusting it — it compares declarations and load order, not
+ * the cascade, and a leak onto a selector Genesis has never laid out is outside
+ * both halves.
+ */
+.panel {
+  display: block;
+  height: auto;
+  /* `overflow` is the third property index.css sets on `.panel`, and it is
+   * stated here rather than left inherited. The value is the same one the
+   * vendor was already supplying (`auto`), so this changes nothing anywhere
+   * today — dashboard.css overrides it to `hidden` for the dashboard's own
+   * panels and loads later, and the other four pages already behaved as
+   * `auto`. What changes is that a Genesis default now EXISTS: a panel whose
+   * child overflows scrolls rather than clipping, by decision rather than by
+   * inheritance. `auto` is the safer of the two values in play — `hidden`
+   * silently removes content, which is how an action button on one dashboard
+   * panel ended up half unreachable. */
+  overflow: auto;
+}
+
+/* ── Page root: neutralise the inherited AZ viewport lock ────────────────
+ * index.css sets, for AZ's app-shell layout:
+ *   html, body { overflow: hidden; position: fixed; height: 100%; }
+ * A fixed, hidden-overflow body cannot scroll. Genesis pages are ordinary
+ * documents, so every one of them needs this undone.
+ *
+ * Four pages already undo it, in four separate places — dashboard.css and an
+ * inline <style> in the logs, errors and monitor templates, all with the same
+ * three !important declarations. The fifth, the voice page, does not, and
+ * MEASURED on a page carrying the same stylesheet set: disabling that inline
+ * block gives `overflow: hidden; position: fixed` and the document stops
+ * scrolling entirely. That is the same leak as `.panel` below, in its third
+ * instance, and copy-per-page is how the page that forgot went unnoticed.
+ *
+ * Declared here so every page that loads components.css is covered, including
+ * pages not written yet. The four existing copies are now redundant rather than
+ * wrong — identical values, so nothing changes on those pages.
+ */
+html,
+body {
+  overflow: auto !important;
+  position: static !important;
+  height: auto !important;
+}

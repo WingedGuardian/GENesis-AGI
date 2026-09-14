@@ -1220,6 +1220,13 @@
             }
           } catch (e) {
             console.warn("Zero-drop fetch failed:", e);
+            // Same superseded check as the two above, for the same reason and
+            // one it was missing: an OLDER request that throws after a newer one
+            // has already succeeded would otherwise mark a healthy transport as
+            // failing. That was cosmetic while nothing acted on it; now the
+            // header badge withholds its count on exactly this signal, so a
+            // spurious fault blanks a number that is in fact current.
+            if (token !== this._zeroDropFetchToken) return;
             this.failFetch("zeroDrop", "Failed to fetch the zero-drop view");
           }
         },
@@ -3619,7 +3626,11 @@
           const state = this.fetchState[name];
           if (!state) return;
           state.state = state.lastSuccess ? "refreshing" : "loading";
-          state.error = null;
+          // `error` is deliberately NOT cleared here: a retry in flight does not
+          // un-fail the attempt before it. Clearing it made the fault disappear
+          // for the whole duration of every attempt, which is how a panel that
+          // withholds a count on failure showed a confident one anyway — see
+          // `refreshFailing` below. Only a SUCCESS clears it (finishFetch).
         },
 
         finishFetch(name) {
@@ -3640,6 +3651,29 @@
         panelState(name) {
           const state = this.fetchState[name];
           return state ? state.state : "unknown";
+        },
+
+        // The PHASE a panel's transport is in right now. `refreshFailing` is the
+        // FAULT, which is a different question and the one a panel withholding a
+        // number needs to ask.
+        //
+        // `startFetch` moves the phase to "refreshing" for the entire duration
+        // of each attempt, so a panel gating on `panelState === 'stale'` shows
+        // its number again during every retry. Worse, the retry can outlive the
+        // poll interval: api.js backs off up to ~62s on consecutive 5xx while
+        // panels poll every 60s, so each in-flight request is superseded by the
+        // next before it returns — and a superseded non-throwing response
+        // returns early without calling `failFetch`. The phase then never leaves
+        // "refreshing" at all, and a sustained server-error outage renders as a
+        // confident count with no warning of any kind.
+        //
+        // The fault survives that because `startFetch` no longer erases it: the
+        // first failure records it and only a success clears it. `lastSuccess`
+        // distinguishes this from a panel that has never loaded, which is the
+        // `loading`/`error` case and has no board to mislabel.
+        refreshFailing(name) {
+          const state = this.fetchState[name];
+          return !!(state && state.error && state.lastSuccess);
         },
 
         panelStateColor(name) {

@@ -1933,7 +1933,17 @@ verified: 788dd9a9 2026-09-06
   comes from ONE read of it, so two sections of a board cannot disagree about
   the same population (`follow_ups.get_lane_counts` returns per-status
   actionable counts and the deferred remainder together; the remainder is a
-  COMPLEMENT, so a `kind` added later is absorbed rather than dropped). Both accounting surfaces
+  COMPLEMENT, so a `kind` added later is absorbed rather than dropped). The same
+  withholding rule reaches one axis further out, into the TAB's own TRANSPORT:
+  when a refresh starts failing after a board has loaded, the header badge drops
+  its number for a named warning rather than presenting the last board as
+  current, and it names every fault that holds at once instead of ranking them,
+  so fixing one does not hide the next. The predicate is the outstanding FAULT —
+  the last completed attempt failed and a board had loaded before it — never the
+  transport's current phase. A phase returns to "refreshing" for the duration of
+  every retry, and under a sustained server-error outage never leaves it,
+  because the client's backoff outlives the poll interval and each superseded
+  response returns before recording a failure. Both accounting surfaces
   (`GET /api/genesis/zero-drop` + the Zero-Drop tab, and the morning report's
   Ground-Truth line) call that one assembler so they cannot disagree; the
   morning-report line is COUNTS ONLY, never a branch name, because that

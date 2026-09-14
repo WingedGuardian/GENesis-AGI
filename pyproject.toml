@@ -104,6 +104,13 @@ test = [
     # which shells out to the venv's ruff — CI's test job installs only this
     # extra, so ruff must be here (the lint job installs its own copy).
     "ruff>=0.5",
+    # tests/test_dashboard/test_dashboard_css_isolation.py parses the stylesheets
+    # a page links, to catch a vendor layout rule Genesis never overrode. It is
+    # present transitively today (CairoSVG -> cssselect2 -> tinycss2) and named
+    # here because a guard that disappears when an unrelated dependency is
+    # dropped is not a guard. Regex CSS "parsing" is what it replaced: an audit
+    # constructed five live leaks that the regex version passed.
+    "tinycss2>=1.3",
 ]
 browser = [
     "playwright>=1.40",
