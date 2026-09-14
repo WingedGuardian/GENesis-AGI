@@ -153,6 +153,7 @@ def _installed_git_value_consuming_globals() -> set[str]:
     value — the marker still printing proves git ate the value and then ran the
     verb. Measured ~23s for ~750 candidates.
     """
+    import os
     import re
     import shutil
     import subprocess
@@ -170,10 +171,22 @@ def _installed_git_value_consuming_globals() -> set[str]:
 
     # Value shapes wide enough that each option TYPE has a valid candidate: a
     # path, a config assignment, a tree-ish, a git dir, a directory.
-    values = ("/tmp/x", "user.name=HOME", "HEAD", ".git", ".")
+    #
+    # The config assignment names an env var WE define in the child rather than
+    # borrowing an ambient one. `--config-env` resolves its value through the
+    # environment and is REJECTED when the named variable is unset, which is
+    # indistinguishable here from "this option takes no value" — so an ambient
+    # name would silently drop `--config-env` out of the measured set on any
+    # machine that does not export it, and the subset assertion would then pass
+    # vacuously for exactly the option class this test exists to catch. The
+    # guard-the-guard below checks `-C`/`-c` and would not notice.
+    probe_env = {**os.environ, "GENESIS_PROBE_VALUE": "probe"}
+    values = ("/tmp/x", "user.name=GENESIS_PROBE_VALUE", "HEAD", ".git", ".")
 
     def marker_ran(argv: list[str]) -> bool:
-        p = subprocess.run(["git", *argv], capture_output=True, text=True, timeout=30)
+        p = subprocess.run(
+            ["git", *argv], capture_output=True, text=True, timeout=30, env=probe_env
+        )
         return p.returncode == 0 and p.stdout.startswith("git version")
 
     consumers: set[str] = set()
