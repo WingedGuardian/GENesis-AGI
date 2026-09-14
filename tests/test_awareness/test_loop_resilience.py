@@ -252,7 +252,7 @@ async def test_retry_deferred_reflection_failure_resets_to_pending(db):
 
 # ── _resume_approved_reflections tests ───────────────────────────────────
 
-def _approval_loop(db, cc_bridge, approved_for):
+def _approval_loop(db, cc_bridge, approved_for, resolved_at="2026-03-24T03:00:00+00:00"):
     """Build an AwarenessLoop wired to a mock bridge whose approval gate
     reports the given ``policy_id`` → approval-request-id pairs as
     approved-but-unconsumed.
@@ -261,7 +261,12 @@ def _approval_loop(db, cc_bridge, approved_for):
 
     async def _find(*, subsystem, policy_id):
         rid = approved_for.get(policy_id)
-        return {"id": rid} if rid else None
+        if not rid:
+            return None
+        # The real query is `SELECT *`, so the row carries resolved_at. The
+        # fake used to return the id alone, which let the resume path read a
+        # column the production row always has.
+        return {"id": rid, "resolved_at": resolved_at}
 
     gate.find_recently_approved = AsyncMock(side_effect=_find)
     gate.mark_consumed = AsyncMock(return_value=True)
@@ -371,3 +376,140 @@ async def test_reflection_light_approval_resume_data_path(db):
     assert await ar_crud.find_approved_unconsumed(
         db, subsystem="reflection", policy_id="reflection_light",
     ) is None
+
+
+async def test_resume_log_names_the_tick_it_actually_runs_against(db, caplog):
+    """A resumed reflection runs against `self._last_tick_result` — the CURRENT
+    tick — not the one that raised the approval. That is a real gap between
+    what a person approved and what runs, and the log said neither, naming only
+    the approval id.
+
+    The originating tick is NOT recoverable: nothing writes it. The approval
+    context is built from a fixed key set and `_approval_key` has no tick input,
+    so the honest line names what IS known and says what is not.
+    """
+    import logging
+
+    cc_bridge = AsyncMock()
+    cc_bridge.reflect = AsyncMock(return_value=_MockReflectionResult(success=True))
+    from datetime import UTC, datetime, timedelta
+
+    two_hours_ago = (datetime.now(UTC) - timedelta(hours=2, seconds=1)).isoformat()
+    loop, _gate = _approval_loop(
+        db, cc_bridge, {"reflection_deep": "appr-deep-123456"},
+        resolved_at=two_hours_ago,
+    )
+
+    with caplog.at_level(logging.INFO, logger="genesis.awareness.loop"):
+        await loop._resume_approved_reflections()
+
+    line = next(
+        (r.getMessage() for r in caplog.records if "Resuming" in r.getMessage()), None
+    )
+    assert line is not None, [r.getMessage() for r in caplog.records]
+    assert "appr-dee" in line, line          # the approval, as before
+    assert "t-resume" in line, line          # the tick it RUNS against
+    # The FULL clause, not a prefix: asserting "requested it" alone still
+    # matched when the "which is not recorded" half was deleted, so the
+    # sentence could lose the thing it exists to say and stay green.
+    assert "NOT the tick that requested it, which is not recorded" in line, line
+    # The VALUE, not the literal: `"approved "` is part of the format string
+    # `"(approved %s)"`, so it matched even with the whole age computation
+    # replaced by a constant. The fixture pins resolved_at 2h before the frozen
+    # "now" this test sets, so the rendered age is checkable.
+    assert "(approved 2h00m ago)" in line, line
+
+
+async def test_resume_log_survives_a_row_without_a_resolved_timestamp(db, caplog):
+    """Never let a log line be the thing that breaks a resume. `resolved_at`
+    comes from the DB row; an unparseable or absent value degrades the age to
+    unknown rather than raising inside the dispatch path."""
+    import logging
+
+    cc_bridge = AsyncMock()
+    cc_bridge.reflect = AsyncMock(return_value=_MockReflectionResult(success=True))
+    loop, _gate = _approval_loop(
+        db, cc_bridge, {"reflection_light": "appr-light"}, resolved_at="not-a-timestamp"
+    )
+
+    with caplog.at_level(logging.INFO, logger="genesis.awareness.loop"):
+        await loop._resume_approved_reflections()
+
+    cc_bridge.reflect.assert_awaited_once()
+    assert any("Resuming" in r.getMessage() for r in caplog.records)
+
+
+async def test_resume_log_survives_a_row_with_no_resolved_column(db, caplog):
+    """The ABSENT case, not just the unparseable one.
+
+    A truthy-but-garbage timestamp exercises the parse branch; it never
+    reaches `if not resolved_at`. Making that branch raise left the suite
+    green, so the two inputs need separate tests.
+    """
+    import logging
+
+    cc_bridge = AsyncMock()
+    cc_bridge.reflect = AsyncMock(return_value=_MockReflectionResult(success=True))
+    loop, _gate = _approval_loop(
+        db, cc_bridge, {"reflection_light": "appr-light"}, resolved_at=None
+    )
+
+    with caplog.at_level(logging.INFO, logger="genesis.awareness.loop"):
+        await loop._resume_approved_reflections()
+
+    # NOT `assert_awaited_once(), "msg"` — that is a tuple expression and can
+    # never fail, which is how it read here until review caught it.
+    cc_bridge.reflect.assert_awaited_once()
+    line = next(r.getMessage() for r in caplog.records if "Resuming" in r.getMessage())
+    assert "age unknown" in line, line
+
+
+class TestApprovalAge:
+    """`_approval_age` sits between `mark_consumed` and `reflect()`.
+
+    By that point the approval is already consumed, so anything that raises
+    here loses a user-approved reflection and leaves only an error log. It must
+    therefore be TOTAL over every value the DB column can hold — and that
+    totality has to be tested directly, because reaching it through the log
+    line exercises almost none of it.
+    """
+
+    @staticmethod
+    def _ago(**kw):
+        from datetime import UTC, datetime, timedelta
+
+        return (datetime.now(UTC) - timedelta(**kw)).isoformat()
+
+    def test_minutes_under_an_hour(self):
+        from genesis.awareness.loop import _approval_age
+
+        assert _approval_age(self._ago(minutes=5, seconds=1)) == "5m ago"
+
+    def test_hours_and_minutes_are_zero_padded(self):
+        from genesis.awareness.loop import _approval_age
+
+        assert _approval_age(self._ago(hours=3, minutes=7, seconds=1)) == "3h07m ago"
+
+    def test_a_naive_timestamp_is_read_as_utc_and_does_not_raise(self):
+        """The branch that would actually RAISE. SQLite columns are text and
+        nothing guarantees an offset; subtracting a naive datetime from an
+        aware one is a TypeError, swallowed AFTER the approval was consumed."""
+        from datetime import UTC, datetime, timedelta
+
+        from genesis.awareness.loop import _approval_age
+
+        naive = (datetime.now(UTC) - timedelta(hours=1, seconds=1)).replace(tzinfo=None)
+        assert _approval_age(naive.isoformat()) == "1h00m ago"
+
+    def test_every_unusable_value_degrades_rather_than_raising(self):
+        from genesis.awareness.loop import _approval_age
+
+        for value in (None, "", "not-a-timestamp", 12345, [], {}):
+            assert _approval_age(value) == "age unknown", value
+
+    def test_a_future_timestamp_is_not_rendered_as_an_age(self):
+        """Clock skew between writer and reader is real; a negative age would
+        render as nonsense minutes."""
+        from genesis.awareness.loop import _approval_age
+
+        assert _approval_age(self._ago(hours=-1)) == "age unknown"

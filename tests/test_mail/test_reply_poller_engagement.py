@@ -331,8 +331,8 @@ async def test_e2e_reply_prediction_resolves_after_bridge(db):
         delivery_id="<sent-def@mx.google.com>",
     )
     # Mirror pipeline._deliver: write reply_received/positive_engagement predictions.
-    await ledger_writers.on_outreach_delivered(db, outreach_id=OUTREACH_ID, category="content")
-    await ledger_writers.on_outreach_delivered(db, outreach_id=other_id, category="content")
+    await ledger_writers.on_outreach_delivered(db, outreach_id=OUTREACH_ID, category="content", channel="email")
+    await ledger_writers.on_outreach_delivered(db, outreach_id=other_id, category="content", channel="email")
 
     # Bridge the reply on send A → engagement 'useful' / signal 'user_reply'.
     tracker = ThreadTracker(db)
@@ -597,7 +597,10 @@ async def test_marketing_reply_notifier_builds_brief_telegram_ping():
     assert len(pipe.calls) == 1
     text, request = pipe.calls[0]
     assert request.channel == "telegram"
-    assert request.category == OutreachCategory.NOTIFICATION
+    # MARKETING (not NOTIFICATION) so the reply-ping routes to the dedicated
+    # Marketing topic (delivery_routing.marketing=supergroup) rather than the DM
+    # that notification routes to.
+    assert request.category == OutreachCategory.MARKETING
     assert request.verbatim is True
     assert request.salience_score == 0.9
     assert "Cole &lt;cole@example.com&gt;" in text  # angle brackets HTML-escaped

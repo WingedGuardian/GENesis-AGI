@@ -163,11 +163,14 @@ async def test_no_unexpected_tables(db):
         "entities",
         "entity_mentions",
         "entity_links",  # entity layer (WS-H P2)
+        "entity_merge_journal",  # reversibility snapshot for applied merges (approval gate)
         "job_run_events",
         "alert_events",  # WS-2 sensor fabric (M9/M10)
         "memory_consistency_reports",
         "recall_probe_runs",  # memory integrity Phase 0 ("make silence loud")
         "memory_reconcile_runs",  # memory integrity Phase 1 (repair lane audit)
+        "pr_verifications",  # post-merge E2E obligation ledger (issue #1718)
+        "zero_drop_findings",  # stranded-work detector (one row per standing condition)
     }
     for table in tables:
         assert table in known, f"Unexpected table: {table}"

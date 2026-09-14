@@ -42,6 +42,7 @@ from urllib.request import pathname2url
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
 from hook_input import session_path  # noqa: E402
+from hook_output import BoundedStdout  # noqa: E402
 
 # Load secrets.env so USER_TIMEZONE and other env vars are available
 # before any genesis module imports (which may read os.environ at import time).
@@ -129,8 +130,7 @@ def _emit_temporal_context(session_id: str, now: datetime) -> None:
     if last_msg:
         parts.append(f"Last msg: {last_msg}")
 
-    print(f"[{' | '.join(parts)}]")
-    sys.stdout.flush()
+    _say(f"[{' | '.join(parts)}]")
 
 
 def _buffer_message(session_id: str, prompt: str, now: datetime) -> None:
@@ -168,12 +168,11 @@ def _buffer_message(session_id: str, prompt: str, now: datetime) -> None:
 def _check_shelve_hint(prompt: str) -> None:
     """Detect /shelve or /unshelve and emit a soft hint."""
     if _SHELVE_PATTERN.search(prompt):
-        print(
+        _say(
             "The user may be asking to bookmark this session. "
             "If that's their intent, use the bookmark_shelve or "
             "bookmark_unshelve MCP tool."
         )
-        sys.stdout.flush()
 
 
 def _ro_uri(db_path: Path) -> str:
@@ -190,17 +189,71 @@ def _ro_uri(db_path: Path) -> str:
     return f"file:{pathname2url(str(db_path))}?mode=ro"
 
 
-def _emit_charter_tag(session_id: str) -> None:
-    """One-line drift tag: [Charter: <mission|origin snippet> | open: N].
+# The tag runs on EVERY prompt, so it is bounded on three axes: rows shown,
+# characters per row, and total bytes. Generous enough that an ordinary ledger
+# renders whole; the caps exist so a pathological one cannot flood every turn.
+_TAG_MAX_ROWS = 8
+_TAG_ROW_CHARS = 140
+_TAG_MISSION_CHARS = 80
+# Sized so _TAG_MAX_ROWS rows still fit once ids render in FULL: worst case is
+# 8 x (32-hex id + 140 chars + a 32-hex escalation id) = 2,004 bytes MEASURED.
+# At the old 1,500 the trim would quietly drop rows the inventory promised to
+# list — the count-instead-of-inventory defect, reintroduced by its own cap.
+_TAG_MAX_BYTES = 2_200
 
-    Read-only stdlib sqlite3, mode=ro URI (WAL-aware — never immutable=1,
-    which misses un-checkpointed writes), 500ms connect / 300ms busy budget:
-    this runs on EVERY prompt and must never cost the user anything.
-    Omitted entirely when the session has no charter row yet (pre-first-
-    compaction — the origin is still in context), the DB/table is missing
-    (un-migrated install), or the DB is locked. open counts open+in_progress
-    ledger rows; "open: 0" IS shown for a chartered session — a clear ledger
-    is signal.
+
+# This hook writes to UserPromptSubmit, which IS a model-facing event: its
+# stdout is subject to the same 10,000-char persistence as SessionStart, and
+# above it the WHOLE turn's injection is filed behind a preview. Nothing here
+# was bounded in total before (per-emitter caps only), and this file grew by up
+# to _TAG_MAX_BYTES per prompt when the count became an inventory. One writer
+# for the whole hook, so the total cannot cross the cap however many emitters
+# fire in one turn.
+_OUT = BoundedStdout(label="urgent-alerts")
+
+
+def _say(text: str) -> None:
+    """Emit one model-facing line, bounded by the shared harness cap."""
+    _OUT.emit(text, block="urgent-alerts")
+
+
+def _escalation_dedup_key(ledger_id: str) -> str:
+    """`follow_ups.dedup_key` linking a ledger row to its escalation follow-up.
+
+    Inlined rather than imported: this hook is stdlib-only by design (a broken
+    venv must never wedge a prompt). `genesis.session_awareness.ledger_escalation_link`
+    owns the formula; `tests/test_scripts/test_urgent_alerts_charter_tag.py`
+    asserts THIS function equals the package one, so a change there that this
+    does not follow fails loudly instead of silently unlinking every row.
+    """
+    import hashlib
+
+    return hashlib.sha256(f"ledger_escalation|{ledger_id}".encode()).hexdigest()
+
+
+def _emit_charter_tag(session_id: str) -> None:
+    """Per-prompt ledger INVENTORY: the head line plus one line per open row.
+
+    This used to print a COUNT — `[Charter: <label> | open: N]`. A count is
+    indistinguishable from N items already handled, and that is not theoretical:
+    a session ran seven days with three founding agreements open behind exactly
+    that number while the model read past it every turn. The same
+    count-instead-of-inventory defect had just been fixed in the merge gate.
+    So every open row is NAMED here, with the id `session_ledger_update` needs.
+
+    The label degrades honestly too. With no mission set the old tag fell back to
+    the origin prompt's first 60 characters, which for a spoken prompt is a
+    half-formed clause that reads as noise — so after a compaction (when the
+    purpose IS knowable) it says the field is UNSET instead, and names the tool
+    that fills it.
+
+    Read-only stdlib sqlite3, mode=ro URI (WAL-aware — never immutable=1, which
+    misses un-checkpointed writes), 500ms connect / 300ms busy budget: this runs
+    on EVERY prompt and must never cost the user anything. Omitted entirely when
+    the session has no charter row yet (pre-first-compaction — the origin is
+    still in context), the DB/table is missing (un-migrated install), or the DB
+    is locked. "open: 0" IS shown for a chartered session — a clear ledger is
+    signal.
     """
     try:
         root = os.environ.get("GENESIS_REPO_ROOT", "")
@@ -211,33 +264,120 @@ def _emit_charter_tag(session_id: str) -> None:
         try:
             conn.execute("PRAGMA busy_timeout=300")
             row = conn.execute(
-                "SELECT mission, origin_prompt FROM session_charters"
+                "SELECT mission, origin_prompt, compaction_count FROM session_charters"
                 " WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
             if row is None:
                 return
+            rows = conn.execute(
+                # ORDER BY created_at, id — see the same query in
+                # genesis_session_context.py. `created_at` ties (rows added in
+                # the same second), and at the LIMIT a tie makes the rendered
+                # SUBSET arbitrary: the inventory can list a different set of
+                # rows on each prompt while the ledger has not changed. The id
+                # is unique, so it settles the order.
+                "SELECT id, text, status FROM session_ledger WHERE session_id = ?"
+                " AND status IN ('open','in_progress') ORDER BY created_at, id LIMIT ?",
+                (session_id, _TAG_MAX_ROWS),
+            ).fetchall()
             (open_n,) = conn.execute(
                 "SELECT COUNT(*) FROM session_ledger WHERE session_id = ?"
                 " AND status IN ('open','in_progress')",
                 (session_id,),
             ).fetchone()
+            escalations = {}
+            try:
+                # Own guard: an install without the follow_ups table (or without
+                # the dedup index) renders exactly as it did before.
+                keys = {_escalation_dedup_key(str(r[0])): str(r[0]) for r in rows}
+                if keys:
+                    placeholders = ",".join("?" * len(keys))
+                    for fid, dk in conn.execute(
+                        "SELECT id, dedup_key FROM follow_ups"  # noqa: S608
+                        # Interpolates only '?' placeholders; values are bound.
+                        f" WHERE dedup_key IN ({placeholders})",
+                        tuple(keys),
+                    ).fetchall():
+                        if keys.get(dk):
+                            escalations[keys[dk]] = str(fid)
+            except Exception:
+                escalations = {}
         finally:
             conn.close()
-        mission, origin = row
+        mission, origin, compactions = row[0], row[1], row[2] or 0
         label = (mission or "").strip()
+        first_line = next((ln for ln in (origin or "").strip().splitlines() if ln.strip()), "")
+        if not label and not first_line:
+            # A STUB row: the PreCompact hook creates the row and fills the
+            # origin later, so "no mission" here does not mean drift \u2014 it means
+            # there is no charter yet. Checked BEFORE the drift branch, which
+            # would otherwise nag about an unset mission on a charter that does
+            # not exist (caught by the omission-matrix test).
+            return
         if label:
-            label = label[:80] + ("…" if len(label) > 80 else "")
-        else:
-            first_line = next(
-                (ln for ln in (origin or "").strip().splitlines() if ln.strip()), ""
+            label = "mission: " + label[:_TAG_MISSION_CHARS] + (
+                "\u2026" if len(label) > _TAG_MISSION_CHARS else ""
             )
-            if not first_line:
-                return
-            snippet = first_line[:60] + ("…" if len(first_line) > 60 else "")
+        elif compactions >= 1:
+            label = (
+                f"mission: UNSET after {compactions} compactions"
+                " \u2014 session_charter_update"
+            )
+        else:
+            snippet = first_line[:60] + ("\u2026" if len(first_line) > 60 else "")
             label = f'origin: "{snippet}"'
-        print(f"[Charter: {label} | open: {open_n}]")
-        sys.stdout.flush()
+
+        head = f"[Ledger open: {open_n} | {label}]"
+        body_lines = []
+        for rid, text, status in rows:
+            mark = " [~]" if status == "in_progress" else ""
+            # Collapse whitespace at RENDER. `db/crud/session_charters._one_line`
+            # applies this on WRITE, which cannot reach rows already at rest: on
+            # an install upgraded across that change a legacy row still carries
+            # its embedded newline, and this tag emits one line PER ROW — so the
+            # row renders as two and the second reads as a genuine ledger row in
+            # Genesis's own voice. Inlined because this hook is stdlib-only by
+            # design; same formula as the write side and as the charter block's
+            # `_row_one_line`, pinned by a parity test.
+            body = " ".join(str(text or "").split())
+            if len(body) > _TAG_ROW_CHARS:
+                body = body[:_TAG_ROW_CHARS] + "\u2026"
+            link = ""
+            fid = escalations.get(str(rid))
+            if fid:
+                link = f" \u2192 escalated: follow_up {fid}"
+            # FULL ids, not an 8-char prefix. `session_ledger_update` passes its
+            # argument straight into `WHERE id = ?` with no prefix resolution,
+            # so a prefix shown here returns "No ledger item with id ..." \u2014 an
+            # inventory whose whole purpose is letting the next turn CLOSE a row
+            # must name something that tool accepts.
+            body_lines.append(f"- {rid}{mark} {body}{link}")
+
+        # Trim rows to fit the byte cap, then RECOMPUTE the overflow pointer for
+        # what actually rendered. A first version popped lines off the end, which
+        # ate the pointer FIRST and left a truncated list looking complete \u2014
+        # count-instead-of-inventory reintroduced by the very cap meant to keep
+        # the inventory affordable (MEASURED: 12 open rows rendered as 7, no
+        # pointer). The pointer is the one line that must survive: it is what
+        # says "this list is not all of it".
+        def _assemble(lines: list[str]) -> str:
+            shown = len(lines)
+            tail = (
+                [
+                    f"\u2026and {open_n - shown} more \u2014 see"
+                    f" ~/.genesis/sessions/{session_id}/charter.md"
+                ]
+                if open_n > shown
+                else []
+            )
+            return "\n".join([head, *lines, *tail])
+
+        tag = _assemble(body_lines)
+        while len(tag.encode("utf-8")) > _TAG_MAX_BYTES and body_lines:
+            body_lines.pop()
+            tag = _assemble(body_lines)
+        _say(tag)
     except Exception:
         return  # fail-open: a tag miss must never surface as an error
 
@@ -419,8 +559,7 @@ def _emit_staleness_nudge(session_id: str, now: datetime) -> None:
         # prompt — the absent-marker throttle path reads as "not throttled".
         if not _record_staleness_nudge(session_id, now):
             return
-        print(msg)
-        sys.stdout.flush()
+        _say(msg)
     except Exception:
         return  # fail-open: a nudge miss must never surface as an error
 
@@ -448,9 +587,9 @@ def main() -> None:
     # 1. Temporal context (always, even if no session_id)
     if session_id:
         _emit_temporal_context(session_id, now)
-        # 1b. Charter drift tag (chartered sessions only; fail-open)
+        # 1a. Charter drift tag (chartered sessions only; fail-open)
         _emit_charter_tag(session_id)
-        # 1c. MCP stale-code nudge (only when this session's MCP is behind the
+        # 1b. MCP stale-code nudge (only when this session's MCP is behind the
         # last deploy; throttled; fail-open)
         _emit_staleness_nudge(session_id, now)
 
@@ -461,6 +600,22 @@ def main() -> None:
     # 3. Shelve/unshelve hint
     if prompt:
         _check_shelve_hint(prompt)
+
+    # A cut here has no mirror to point at — this hook writes no per-part file —
+    # so the in-band marker degrades to "(no mirror)" and the tail is simply
+    # gone. Say so on stderr rather than losing it silently: silent truncation of
+    # model-facing output is the exact failure this module was written for, and a
+    # consumer that adopts the writer without adopting its mirror contract keeps
+    # only half the protection. Latent today (this hook's realistic total is a
+    # few KB), but the charter tag is now an inventory that grows with the
+    # ledger — the same direction that took SessionStart over the cliff.
+    # A durable mirror for this hook is tracked separately.
+    if _OUT.cut:
+        block, dropped = _OUT.cut
+        print(
+            f"[urgent_alerts] output CUT at {block!r} — {dropped} chars dropped with no mirror",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":

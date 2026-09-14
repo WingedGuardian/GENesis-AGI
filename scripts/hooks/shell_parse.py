@@ -32,6 +32,18 @@ at its own boundary — the parser degrades gracefully, each gate decides for
 itself what an unverifiable command means. Callers must probe the RAW command:
 normalizing text before a blind-spot probe can only ever delete the evidence
 the probe looks for.
+
+There is a SECOND blind spot, and it does not look like one, which is why it
+needed its own rule. ``untokenizable`` answers "did the parse fail". It cannot
+answer "did the parse succeed at the wrong thing" — and shlex, which implements
+no shell expansion at all, resolves a word that carries one into a token bash
+would never run. When such a word sits in VERB POSITION, the module returns a
+clean parse naming an operation nobody asked for, and every gate searching for a
+real operation finds none. :func:`_verb_unresolved` marks those segments, and
+:func:`analyze_checked` reports the half of them whose cost was measured and
+found affordable, so a verb the parser cannot ESTABLISH is treated as
+unestablished rather than as absent. The other half, and the number that decided
+it, are written out beside :data:`_BLIND_UNRESOLVED_VERB`.
 """
 
 from __future__ import annotations
@@ -101,8 +113,85 @@ _WRAPPER_SPEC = {
         },
         0,
     ),
+    # Tool-runner front-ends that take the wrapped command directly, with no
+    # subcommand between: `uvx pytest …`, `xvfb-run pytest …`.
+    "uvx": ({"--from", "--with", "--python", "-p", "--index", "--constraints"}, 0),
+    # Derived from the INSTALLED script's own `getopt` spec (`+ae:f:hn:lp:s:w:`)
+    # plus its case block, not from `--help` prose: an earlier reading of the help
+    # output picked `--server-num` out of a WRAPPED DESCRIPTION line and produced a
+    # false entry. `a`, `h` and `l` take no value; every other short option does,
+    # and each has a long spelling that was missing here. A missing entry is the
+    # fail-open direction for a wrapper — the option's VALUE resolves as the exe,
+    # so a guard keyed on the real command never fires.
+    "xvfb-run": (
+        {
+            "-n",
+            "--server-num",
+            "-s",
+            "--server-args",
+            "-f",
+            "--auth-file",
+            "-e",
+            "--error-file",
+            "-p",
+            "--xauth-protocol",
+            "-w",
+            "--wait",
+        },
+        0,
+    ),
 }
 _WRAPPERS = set(_WRAPPER_SPEC)
+# Package managers / task runners that carry a real command after a literal
+# `run` subcommand: `uv run pytest …`, `poetry run pytest …`.
+#
+# Gated on the subcommand LITERAL rather than modelled as a positional-consuming
+# _WRAPPER_SPEC entry, and that distinction is load-bearing for safety. A blanket
+# `("uv", (set(), 1))` would consume the first bare word of EVERY uv subcommand,
+# so `uv rm -rf /` would eat `rm` and resolve the exe past it — HIDING a command
+# the destructive gate catches today. Revealing a wrapped command is the
+# monotonic-safe direction this resolver promises; skipping past one is not.
+# A front-end invoked with any other subcommand (`uv pip install …`) is therefore
+# left resolving to the front-end itself, exactly as before.
+_RUN_CARRIERS = frozenset({"uv", "poetry", "hatch", "pdm", "pipenv", "rye"})
+# Value-consuming flags accepted BEFORE the wrapped command, on either the
+# front-end or its `run` subcommand.
+#
+# STILL non-exhaustive — but the claim that used to sit here, that an unlisted
+# `--flag value` "can only ADD a gate hit, never remove one", was FALSE and is
+# withdrawn. It holds only for a flag AFTER `run`. Before it, the flag's value
+# becomes the first bare word, `run` is never matched as the subcommand, and the
+# carrier stays OPAQUE — a fail-OPEN miss. MEASURED through the real
+# `full_suite_guard`: `uv --color always run pytest` and
+# `uv --cache-dir /tmp/c run pytest` both exited 0 (allowed) where `uv run pytest`
+# exits 2 (blocked).
+#
+# Enumerating uv's option grammar is not the fix — that is an open set, and each
+# missing entry is the next round's finding (this list reached four). The
+# residual is closed at the CALLER instead: `full_suite_guard` treats an
+# unresolved run-carrier as unresolved rather than allowed. This list only has to
+# keep the COMMON forms resolving so that fail-closed leg stays rare.
+#
+# `--isolated` was removed: it is BOOLEAN in `uv run`, so listing it here made
+# the parser eat the command word. MEASURED: `uv run --isolated pytest` resolved
+# its exe to `tests/` and the guard allowed it. A wrongly-listed flag is the more
+# dangerous direction of this list, because it mis-parses a COMMON form rather
+# than an exotic one.
+_RUN_CARRIER_VALUE_FLAGS = frozenset(
+    {
+        "--with",
+        "--with-requirements",
+        "--python",
+        "-p",
+        "--directory",
+        "-C",
+        "--project",
+        "--extra",
+        "--group",
+        "--index",
+        "--env-file",
+    }
+)
 # Interpreters that run a script string passed after -c; recurse into it.
 _NESTED = {"bash", "sh", "dash", "zsh", "ksh", "ash"}
 # Shell tokens that can front a SIMPLE COMMAND within a segment (after
@@ -116,7 +205,31 @@ _NESTED = {"bash", "sh", "dash", "zsh", "ksh", "ash"}
 # structurally in _strip_wrappers, not via this set.
 _CMD_POSITION_WORDS = frozenset({"!", "if", "elif", "while", "until", "then", "do", "else", "{"})
 # git global options that consume the FOLLOWING token as their value.
-_GIT_OPTS_WITH_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"}
+#
+# MEASURED against the installed binary, NOT read from `git -h` — that usage
+# line omits `--attr-source` entirely while git accepts it and runs the
+# subcommand after it. A missing member is the FAIL-OPEN direction here: the
+# walks below skip an unlisted `-`-prefixed token alone, so the option's VALUE
+# lands in the verb slot and the real subcommand is never reached.
+#
+# `--super-prefix` is retained although git 2.43 rejects it — the set is
+# version-dependent, and an entry for an option a given git lacks is inert
+# because that git refuses the command outright.
+#
+# Four copies of this set exist (here, git_push_guard, review_enforcement_commit,
+# pre_push_privacy_review) and are locked identical by
+# tests/test_hooks/test_value_flag_consistency.py. Update all of them together.
+_GIT_OPTS_WITH_ARG = {
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--super-prefix",
+    "--config-env",
+    "--attr-source",
+    "--shallow-file",
+}
 # git-commit short flags that consume the REST of their short-bundle as a value
 # (so -minitial is `-m initial`, not a bundle containing -n).
 _COMMIT_ARG_FLAGS = "mFCc"
@@ -134,6 +247,11 @@ class Segment:
     redirects: list[str] = field(
         default_factory=list
     )  # expansion redirect targets excised from argv
+    #: The words choosing WHICH operation this segment runs carry a shell
+    #: expansion, so ``exe``/``argv`` name something other than what bash runs.
+    #: See :func:`_verb_unresolved`. A guard must not read a False verdict off
+    #: this segment's verb; :func:`analyze_checked` reports it as a blind spot.
+    verb_unresolved: bool = False
 
 
 def _redirect_operator_len(command: str, i: int) -> int | None:
@@ -550,6 +668,13 @@ _KNOWN_SIGILS = (
     # missing declaration nor an unwarranted one can ship unnoticed.
     "merge-to-main-override",  # git_push_guard: local `git merge` onto main/master
     "full-suite-ok",  # full_suite_guard: run the whole pytest suite locally
+    # THIRD occurrence of the class the comment above describes, caught by that
+    # test rather than in review: the round-7 terminal shipped its sigil query
+    # without this line, and the terminal's own block message printed the losing
+    # token order. At streak>=3 AND lifetime>=7 — a reachable state, since the
+    # terminal does not reset the streak — `# final-round-accept escalation-ack`
+    # was refused while `# escalation-ack final-round-accept` passed.
+    "final-round-accept",  # review_enforcement_commit: the round-7 lifetime terminal
 )
 
 
@@ -613,9 +738,136 @@ def has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
     return _has_trailing_override(seg, sigil)
 
 
+def _ansi_c_spans(text: str) -> list[tuple[int, int, str, bool]]:
+    """Locate bash ANSI-C ``$'...'`` quoting spans in SHELL-WORD context.
+
+    Returns ``(start, end, content, has_escape)`` per span, where ``end`` is the
+    index past the closing ``'`` and ``content`` is the raw bytes between the
+    quotes. ``has_escape`` is True if the span contains a backslash escape.
+
+    Only spans OUTSIDE single- and double-quoted regions are ANSI-C: bash does
+    NOT treat ``$'...'`` as ANSI-C inside ``"..."`` (there it is a literal ``$``
+    followed by a quoted string), and everything inside ``'...'`` is literal.
+    Getting this dq/sq state right is what keeps the scan off heredoc-body and
+    quoted text. MEASURED to matter (author, 2026-09-04, over a corpus of 38,140
+    real Bash commands harvested from this install's CC transcripts): a naive
+    ``$'`` scan flagged 89, dq-awareness cut that to 45, and the residue is
+    almost entirely heredoc bodies. Heredoc bodies are NOT excluded here, and
+    saying so plainly matters: :func:`parse_segments` has no heredoc state, so a
+    body line is already segmented as a command TODAY — MEASURED on origin/main,
+    a ``cat <<'EOF'`` body line holding a plain gated git command resolves to a
+    ``('git', <verb>)`` segment and is over-blocked with or without this decode.
+    The decode makes the ANSI-C form CONSISTENT with that pre-existing plain-form
+    over-block; it does not create the class, and the direction is over-block,
+    never fail-open. Heredoc-awareness belongs in :func:`parse_segments` (where
+    it fixes both forms at once, and must distinguish a DATA receiver like
+    ``cat`` from an EXECUTING one like ``bash <<'EOF'``, whose body bash really
+    does run) — tracked separately, not bolted on here. The counts are provenance
+    for the design choice, not a runtime invariant; the invariant is the
+    dq/sq/backslash state machine below, which a security review verified against
+    bash's own rules.
+    """
+    spans: list[tuple[int, int, str, bool]] = []
+    i, n = 0, len(text)
+    in_sq = in_dq = False
+    while i < n:
+        c = text[i]
+        if in_sq:
+            if c == "'":
+                in_sq = False
+            i += 1
+            continue
+        if in_dq:
+            if c == "\\" and i + 1 < n:  # backslash escapes the next char in "..."
+                i += 2
+                continue
+            if c == '"':
+                in_dq = False
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:  # word-level escape, e.g. \$ — not an opener
+            i += 2
+            continue
+        if c == '"':
+            in_dq = True
+            i += 1
+            continue
+        if c == "$" and i + 1 < n and text[i + 1] == "'":
+            j = i + 2
+            content: list[str] = []
+            has_escape = False
+            while j < n and text[j] != "'":
+                if text[j] == "\\" and j + 1 < n:  # ANSI-C escape (incl. \' \\)
+                    has_escape = True
+                    content.append(text[j : j + 2])
+                    j += 2
+                    continue
+                content.append(text[j])
+                j += 1
+            if j >= n:
+                # UNTERMINATED ``$'...`` — bash rejects the whole command, so
+                # there is no "verb bash runs" to decode. Recording a span here
+                # would turn invalid syntax into valid argv
+                # (``--$'no-verify`` -> ``--no-verify``) and hand a hard policy
+                # verdict to a command that never runs. Leaving it untouched
+                # makes shlex fail, so :func:`untokenizable` routes the command
+                # to the caller's fail-closed/approval net, which is where an
+                # unparseable command belongs. Nothing after an unterminated
+                # opener can be a further span, so stop scanning.
+                break
+            end = j + 1
+            spans.append((i, end, "".join(content), has_escape))
+            i = end
+            continue
+        if c == "'":
+            in_sq = True
+            i += 1
+            continue
+        i += 1
+    return spans
+
+
+def _decode_escape_free_ansi_c(text: str) -> str:
+    """Rewrite ESCAPE-FREE ``$'...'`` spans to a plain-quoted literal of content.
+
+    shlex does not implement ANSI-C decoding: it strips the quotes from
+    ``$'push'`` but LEAVES the ``$``, yielding the token ``$push`` — one
+    character off from what bash runs (``push``). That is enough to hide a verb
+    (``git $'push'``) or a flag (``git commit --$'no-verify'``) from every gate
+    that reads the resolved subcommand/flag. Rewriting the span to what bash
+    would produce restores the parser's fidelity to the shell, so the ordinary
+    gate fires its ordinary verdict.
+
+    ONLY the escape-free case is rewritten, and deliberately so: a span with a
+    backslash (``$'\\x70...'`` hex, ``$'\\n'``) needs the full bash ANSI-C escape
+    grammar to decode, and a PARTIAL decoder is the exact "false confidence from
+    partial coverage" failure a sibling review flagged. Escape-bearing spans are
+    left untouched here and reported untrustworthy by :func:`untokenizable`, so
+    they route to the caller's fail-closed net rather than a guessed decode.
+    """
+    spans = _ansi_c_spans(text)
+    if not spans:
+        return text
+    out: list[str] = []
+    last = 0
+    for start, end, content, has_escape in spans:
+        out.append(text[last:start])
+        out.append(text[start:end] if has_escape else shlex.quote(content))
+        last = end
+    out.append(text[last:])
+    return "".join(out)
+
+
 def _argv(seg: str) -> list[str]:
-    """shlex argv of a comment-stripped segment; naive split on tokenizer error."""
-    core = _strip_trailing_comment(seg)
+    """shlex argv of a comment-stripped segment; naive split on tokenizer error.
+
+    ANSI-C ``$'...'`` spans are decoded to their bash value FIRST, so a verb or
+    flag hidden in one (``git $'push'``, ``--$'no-verify'``) resolves to the
+    token bash actually runs rather than the ``$``-prefixed token shlex leaves.
+    Decoding precedes comment-stripping so a ``#`` inside a decoded span is
+    re-quoted and cannot be mistaken for a trailing comment.
+    """
+    core = _strip_trailing_comment(_decode_escape_free_ansi_c(seg))
     try:
         return shlex.split(core)
     except ValueError:
@@ -658,6 +910,19 @@ def untokenizable(command: str) -> bool:
     MEASURED over 12,099 real commands: folding and not folding classify
     IDENTICALLY (339 un-tokenizable either way, zero commands differ), so the
     normalization bought nothing and is removed rather than documented.
+
+    ANSI-C ``$'...'`` is handled in the analyze path, NOT here. shlex SUCCEEDS on
+    ``$'push'`` but leaves the ``$`` (a token one char off from what bash runs),
+    so :func:`_decode_escape_free_ansi_c` rewrites the escape-free case to what
+    bash produces BEFORE tokenizing — the verb/flag then resolves normally and
+    the ordinary gate fires. This function is deliberately NOT broadened to flag
+    ANSI-C, because a benign ``$'...'`` in a MESSAGE argument
+    (``git commit -m $'l1\\nl2'``) is legitimate and flagging it would over-ask;
+    distinguishing verb-position from argument-position is exactly what the
+    per-segment analyze path can do and a whole-command probe cannot. The one
+    residual — a HEX-encoded verb (``$'\\x70\\x75\\x73\\x68'``), which the
+    escape-free decode does not touch — is tracked separately rather than closed
+    here with a message-hostile broadening.
     """
     try:
         shlex.split(command)
@@ -666,9 +931,555 @@ def untokenizable(command: str) -> bool:
         return True
 
 
+# WHY THIS MODULE HAS COST BOUNDS AT ALL
+#
+# Every guard is a hook registered with a wall clock (10s for the destructive and
+# protected-path guards, 60s for the push guard). The official hook contract is
+# explicit that a timed-out hook "doesn't block the tool call … don't count on a
+# stalled hook to act as a gate". A guard that runs out of clock does not refuse — it
+# PERMITS. So cost on this path is a correctness property, not a performance one.
+#
+# Cost has TWO independent axes and each needs its own bound, because neither
+# subsumes the other. MEASURED, this parser, on `echo` + a pad:
+#
+#     one long token   65K 0.30s | 250K 2.65s | 450K 9.14s   (0.46 -> 2.03 s/100K)
+#     many small tokens 65K 0.12s | 250K 0.48s | 450K 0.87s   (flat 0.19 s/100K)
+#
+# So cost is SUPERLINEAR in the length of a single token, and a 450K command with NO
+# nesting at all costs 9.14s against a 10s registration. That cost is spent in the
+# FIRST pass, before any recursion — which is why a budget checked between recursion
+# levels cannot bound it, and why an earlier draft that tried to was abandoned.
+
+#: The largest command this module will read. Bounds the unavoidable first pass.
+#:
+#: Calibrated against the TIGHTEST real path, which is not the one the individual
+#: guards are registered on. `bash_safety_hook.sh` is registered at **5 seconds** and
+#: delegates to `destructive_command_guard` AND `protected_paths_guard` SEQUENTIALLY,
+#: so two full parses of the same command share a 5s budget. Sizing against a single
+#: guard's 10s registration would have been calibrating against the loosest path and
+#: calling it a margin.
+#:
+#: THIS CAP AND :data:`MAX_SUBSTITUTION_DEPTH` ARE CHOSEN TOGETHER, and neither
+#: number means anything alone. The parser re-scans the remaining text at every level,
+#: so the worst case an attacker can force is a command at exactly this cap nested to
+#: exactly that bound — cost is length x levels. Measuring length at depth 0 and
+#: calling it the cost curve is the specific mistake that produced a 64 KiB cap here,
+#: which measured 0.86s at depth 0 and 5.46s at depth 8: OVER the 5s budget, i.e. the
+#: fail-open this module exists to close, reintroduced by its own fix.
+#:
+#: AND THE DIVISOR IS FIVE PARSES, NOT TWO. `bash_safety_hook.sh` delegates to THREE
+#: guards over the same command (destructive_command_guard, protected_paths_guard,
+#: git_discard_guard), and git_discard_guard reaches three consumers that each analyse
+#: it. An earlier revision of this comment claimed "two guards, two parses" and sized
+#: the cap against that; MEASURED end to end, the pair it chose ran 6.12s against a 5s
+#: registration. Two of those three duplicate parses are now memoised away
+#: (`git_discard_guard._parse_once`), because bounding the INPUT does not help if the
+#: same work is done three times.
+#:
+#: MEASURED end to end through the real hook — worst payload INSIDE both bounds (so
+#: nothing short-circuits), ALLOWED by every guard (so nothing exits early), and
+#: naming rm AND clean AND recurse so every delegation arm runs. Cap fixed at 48 KiB,
+#: which is the floor set by the longest real command:
+#:
+#:     depth 6   3.08s   62% of budget   1.6x margin
+#:     depth 5   2.67s   53%             1.9x margin   <- chosen
+#:     depth 4   2.52s   50%             2.0x margin
+#:
+#: THIS TABLE IS THE ONLY PLACE THESE FIGURES ARE DERIVED. Two other files and a test
+#: docstring used to restate the depth-5 row from memory, as 2.92s and 3.19s, so one
+#: measurement appeared with three values and nothing said which was current — they
+#: now point here instead. The reason a copy drifts is that the figure is
+#: load-dependent: re-measured 2026-09-08 through the same path on a box under heavy
+#: concurrent load, the depth-5 row came out at a 2.84s median over three runs with a
+#: 2.80-3.25s spread, which is the same decision and a different number. Treat the row
+#: as the scale at which the bound was chosen, and RE-MEASURE before quoting it as a
+#: current fact.
+#:
+#: Depth 4 buys almost no time for meaningfully less headroom, so 5 is the balance:
+#: 1.9x on the clock and 1.25x over the deepest nesting any real command reaches. That
+#: second ratio read 1.67x, from a corpus whose deepest command was 3; the re-derivation
+#: below finds one at 4, and a margin term is quoted against the DEEPEST observation
+#: available, never the friendliest. Nothing reaches 5 in either corpus, so the bound
+#: itself does not move — only the honesty of the margin does.
+#: The asymmetry decides which side to buy margin on — exceeding a bound fails CLOSED
+#: (a refusal), while exceeding the hook timeout fails OPEN (the command runs
+#: unchecked), so the clock is the side that must not be shaved.
+#:
+#: Headroom: over 45,956 distinct real Bash commands from this install's history the
+#: longest is 43,480 chars, so the cap is 1.13x that and fires on 0 of them. The cap
+#: CANNOT go lower without refusing real work, which is why depth carries the tuning.
+#:
+#: THAT MAXIMUM IS METHOD-UNRECORDED and is deliberately no longer labelled MEASURED.
+#: The re-derivation below, which DOES carry its method, finds a longest of 40,925 over
+#: a corpus 2.65x larger — and a superset harvested the same way cannot have a smaller
+#: maximum, so the two harvests are not the same population and 43,480 cannot be
+#: re-checked from anything written down. It is kept rather than replaced because it is
+#: the LARGER of the two, and every claim resting on it (the cap clears the longest real
+#: command; the fixtures assert `longest_real < cap`) is the more conservative for using
+#: it. The ratio is what the choice costs: 1.13x against 43,480, 1.20x against 40,925.
+#: Quote whichever you can defend, and never present the unrecorded one as measured.
+#:
+#: RE-DERIVED 2026-09-08 with the method stated, because a denominator whose method is
+#: not recorded cannot be checked — and this one could not be: two harvests taken in
+#: the same session left 45,956 and 45,358 side by side in these files with nothing to
+#: arbitrate them. Method: every `Bash` tool_use `input.command` in this install's CC
+#: transcripts (`~/.claude/projects` and `~/.genesis/background-sessions`, 11,298
+#: `.jsonl` files), deduplicated by exact string. That yields 121,927 distinct
+#: commands, longest 40,925 chars: 0 above this cap, 9 above the old 32,768 one, and a
+#: `Segment.depth` distribution of 91.4% / 7.9% / 0.7% / 16 commands / 1 command at
+#: depths 0-4. Exactly one command in the whole corpus trips a bound, and it is a probe
+#: typed while writing this note. So both bounds still fire on 0 real work at 2.65x the
+#: denominator they were chosen on.
+#:
+#: READ THAT AS A SECOND OPINION, NOT AS A CORRECTION, because the two are not nested:
+#: this harvest has 2.65x the COUNT and a SHORTER longest command (40,925 vs 43,480).
+#: A corpus that merely grew could not do that, so the harvests differ in what they
+#: admit, not only in when they were taken — which is the whole argument for recording
+#: a method beside a denominator. Neither number is wrong; they are different
+#: populations, and the cap sits above the longest command in BOTH.
+#:
+#: THIS CAP WAS 32,768 AND THAT WAS TOO SMALL — recorded because the mistake is
+#: instructive rather than embarrassing. It was sized against an earlier corpus of
+#: 20,514 commands whose longest was 14,682 chars, whence a claimed "2.2x headroom
+#: and 0 fires". The full corpus is 2.2x larger and contains three commands ABOVE
+#: 32,768 — all of them `cat > … <<EOF` here-docs writing review prose, a shape this
+#: very workflow generates and the earlier corpus had simply not accumulated yet. A
+#: cap is only as good as the corpus it was sized against, and a corpus keeps growing
+#: after you measure it. The length headroom here is deliberately modest (1.13x)
+#: because exceeding this bound ASKS rather than refuses — see _BLIND_OVER_LONG.
+MAX_COMMAND_CHARS = 49_152
+
+#: How deep :func:`analyze` will follow nested scripts and command substitutions.
+#:
+#: The second axis. The parser re-runs its whole scanner battery on near-identical
+#: text at every level, so a command inside the length cap still multiplies by its
+#: nesting depth — the cap alone leaves that unbounded, exactly as the depth bound
+#: alone leaves the first pass unbounded. MEASURED end to end against the real
+#: ``protected_paths_guard``, on a payload it genuinely refuses (a protected data
+#: directory) padded with a quoted string to 65,400 chars, under its 10s timeout:
+#:
+#:     depth   0  exit 2 refused   0.46s
+#:     depth  32  exit 2 refused   6.78s
+#:     depth  48  exit 2 refused   9.96s
+#:     depth 128  KILLED at 10s -> non-2 -> the tool call PROCEEDS
+#:
+#: With the bound the same payloads are flat at 2.0-2.1s and refused at every depth.
+#: (Padding SHAPE moves these by 3.4x, so a depth quoted without a length AND a shape
+#: is not a measurement.)
+#:
+#: 5 is chosen from data, not taste, and JOINTLY with :data:`MAX_COMMAND_CHARS` — see
+#: the cost table there, because cost is length x levels and neither limit can be set
+#: without the other. MEASURED over 45,956 distinct real commands, counting the depth
+#: ``analyze`` ACTUALLY recurses to (``Segment.depth``, so ``bash -c`` wrappers and
+#: substitutions both): 87.5% reach depth 0, 11.7% depth 1, 0.79% depth 2, and 7
+#: commands reach depth 3. Nothing reaches 5. Re-derived 2026-09-08 over the larger
+#: corpus recorded with :data:`MAX_COMMAND_CHARS`: 91.4% / 7.9% / 0.7%, 16 commands at
+#: depth 3 and ONE at depth 4. Still nothing at 5, which is the clause the bound rests
+#: on — but the deepest real command is 4 rather than 3, so quote the margin as 1.25x.
+#:
+#: This was 8, and came down twice: once when the cap went up, and again when the
+#: end-to-end budget turned out to carry FIVE parses rather than two. The cap cannot
+#: move (it is pinned above the longest real command), so this bound is the only
+#: tuning lever left — see the measured table in MAX_COMMAND_CHARS.
+#:
+#: Note the units — this bound counts ``Segment.depth``, NOT how deep a command looks,
+#: and the two differ per syntax because ``bash -c "$(…)"`` descends twice per level
+#: while a bare ``$(…)`` descends once. MEASURED at this bound, the first nesting
+#: level that reports over_nested:
+#:
+#:     bash -c "$(…)" x N   ->  N = 4
+#:     $(…) x N             ->  N = 6
+#:
+#: (An earlier revision of this comment asserted 3, which was simply wrong — measure
+#: it rather than deriving it from "twice per level", since the descent is not the
+#: only thing that consumes a level.) Compare the bound against the measured
+#: ``Segment.depth`` distribution above, never against an eyeballed nesting level.
+MAX_SUBSTITUTION_DEPTH = 5
+
+
+class BlindSpot(NamedTuple):
+    """A reason this module cannot see everything a command would execute.
+
+    ``cause`` is the phrase a guard drops into "this command <cause> and mentions
+    …"; ``hint`` is the way OUT, which differs per cause and is the half that makes
+    a refusal actionable rather than a wall. Guards supply their own op-specific
+    framing around both — what counts as gated is theirs to say, why the parse is
+    blind is ours.
+
+    THE POLICY LIVES HERE, NOT IN THE CONSUMERS. The one remaining DECISION field (of
+    the three fields below) is a verdict this module has already made, so a guard obeys
+    a single boolean instead of re-deriving one from a string:
+
+    ``bounds_induced`` — a BOUND stopped this parse, as opposed to the pre-existing
+    ``untokenizable`` case. "Blind" is not one thing: every guard's behaviour for an
+    untokenizable command was already settled before the bounds existed, so a guard
+    restoring what a bound took away must act on ``bounds_induced`` only. Widening to
+    all three causes is a new over-block wearing the costume of a regression fix, and
+    it was MEASURED as one: 209 of 1,367 real clean-mentioning commands and 161 of
+    3,222 pytest-mentioning ones.
+
+    THERE IS DELIBERATELY NO PER-AXIS SEVERITY FIELD. One existed briefly — a
+    ``refuse`` flag letting the length bound ask where the depth bound refused — and
+    removing it is the whole lesson of this design. It was wired into guards whose
+    only verdicts are BLOCK and ALLOW, where "don't refuse" does not mean "ask", it
+    means PERMIT: MEASURED, a real ``git clean -fd`` and a real
+    ``git checkout --recurse-submodules .``, each padded past the length cap, went
+    BLOCK -> ALLOW through both the guard and the shell hook — the first being the
+    operation that guard's own header calls unrecoverable.
+
+    That flag cost two review rounds and produced a fail-open in the very change meant
+    to close fail-opens, and its entire benefit was hypothetical: it protected a long
+    here-doc that MEASURES at 0 of 45,956 real commands. A distinction that no real
+    input exercises, which every one of six call sites must choose correctly, and
+    whose wrong choice is silent, is a defect generator rather than a feature. So the
+    module answers exactly ONE question, the same way for everyone: was this parse cut
+    short by a bound? A consumer that fails closed does so on that alone, and cannot
+    pick the wrong axis because there is no axis to pick.
+
+    THERE IS NO ``kind`` FIELD, deliberately. It was a string discriminator that
+    consumers compared as ``kind != "untokenizable"``, and that comparison silently
+    failed OPEN in two ways at once: it could not express "a bound fired AND
+    tokenization failed", and a consumer that forgot it kept the old behaviour with
+    no signal. Removing it makes every stale comparison an AttributeError at test
+    time — loud, at the one moment a silent fail-open is affordable to catch.
+
+    AND :data:`_BLIND_UNRESOLVED_VERB` DID NOT GET ONE EITHER. It looked as though
+    it needed a field: one guard must treat that cause differently, because its
+    engage-test is the operation's NAME in the raw text and this is the one cause
+    that removes the name. A field here would have made every consumer choose
+    again, silently, which is the generator this class already paid for once. The
+    fact lives on :attr:`Segment.verb_unresolved` instead, and the guard that needs
+    it reads that against its OWN list of gated programs. Which programs are gated
+    is the guard's to say; why the parse is blind is ours.
+    """
+
+    cause: str
+    hint: str
+    bounds_induced: bool
+
+
+_BLIND_UNTOKENIZABLE = BlindSpot(
+    bounds_induced=False,  # predates the bounds; guards' behaviour already settled
+    cause="cannot be parsed safely (e.g. ANSI-C $'...' quoting)",
+    hint=(
+        "an apostrophe in ordinary prose is what makes this unparseable, and "
+        "re-quoting the here-doc cannot fix that — write the text to a file instead"
+    ),
+)
+
+#: Deliberately does NOT name the depth, because there is no single true number to
+#: name. The bound counts `Segment.depth`, and how many of those a level costs depends
+#: on the syntax: MEASURED at the current bound, `bash -c "$(…)"` first trips at 4
+#: nesting levels and a bare `$(…)` at 6 — the same figures the MAX_SUBSTITUTION_DEPTH
+#: comment above records, which is the point of citing them in one place. (This said 5
+#: and 7 and was simply wrong: two comments quoting the same measurement disagreed, so
+#: a reader could not tell which was current. Re-measured through `analyze_checked` and
+#: `over_nested`, which agree.) Any figure in this message would still be wrong for one
+#: of the two shapes, and a reader can measure it — so describe the condition, not the
+#: count.
+_BLIND_OVER_NESTED = BlindSpot(
+    bounds_induced=True,
+    cause="nests scripts or command substitutions deeper than this parser follows",
+    hint=(
+        "flatten it — run the inner command as its own step, or write the text to a "
+        "file. The parser stops descending so a crafted command cannot stall the "
+        "guard past its timeout, and a guard killed by its timeout does not refuse"
+    ),
+)
+
+_BLIND_OVER_LONG = BlindSpot(
+    bounds_induced=True,
+    cause=f"is longer than the {MAX_COMMAND_CHARS} characters this parser reads",
+    hint=(
+        "split it into separate steps, or write the payload to a file and pass the "
+        "path. Nothing is parsed at all past this length — a prefix of a shell "
+        "command is not a partial answer, it is a wrong one"
+    ),
+)
+
+#: The parse SUCCEEDED and resolved a verb that is not the one bash runs. That is a
+#: different failure from the other three, and worse than any of them: the others
+#: leave the caller with nothing, this one leaves it with a confident wrong answer.
+#: A gate reading it sees "no gated operation" and cannot tell that reading apart
+#: from a command that genuinely has none.
+#:
+#: ``bounds_induced`` is False, and the reason is the same one it is False for
+#: :data:`_BLIND_UNTOKENIZABLE`: that flag means "a bound cut this parse short", and
+#: no bound fired here. The consumers that key on it exist to restore what a bound
+#: took away, so claiming a bound to reach them would be a hard block wearing the
+#: costume of a bounds regression — the exact substitution the ``refuse`` flag was
+#: removed for. Consumers that ask a broader question (``blind is not None``) net
+#: this cause as they net any other — which since the 2026-09-08 ruling is a
+#: REFUSAL, not a prompt. MEASURED post-merge over this PR's own 14 hidden-verb
+#: cases: block 14/14 interactive and 14/14 dispatched. An earlier revision of
+#: this line said "an ASK where a human is present", which was true of the net
+#: this branch was written against and false of the one it now lands on.
+_BLIND_UNRESOLVED_VERB = BlindSpot(
+    bounds_induced=False,
+    cause=(
+        "picks the operation it performs with a name the shell builds rather than "
+        "one written out, so the guard cannot establish which operation that is"
+    ),
+    hint=(
+        "write the subcommand out literally — a variable or a substitution belongs "
+        "in an argument, where it does not decide which operation runs"
+    ),
+)
+
+#: THE OTHER HALF OF VERB POSITION IS DELIBERATELY NOT REPORTED, and the reason is
+#: measurement rather than oversight. When the PROGRAM ITSELF is built by the shell
+#: (``$PY x.py``, ``$SSH host …``), nothing about the segment is established — not
+#: the operation, not even which executable performs it. :attr:`Segment.verb_unresolved`
+#: records it, because it is true; :func:`analyze_checked` stays quiet about it,
+#: because reporting it does not pay.
+#:
+#: MEASURED end to end — parse diff over 129,179 unique real commands harvested from
+#: this install's transcripts, then the actual guards run over every candidate in
+#: both trees, counting VERDICT changes rather than parse changes:
+#:
+#:     dispatcher verb unreadable   14 commands   13 push + 10 commit allow->refuse
+#:     program name unreadable   1,845 commands  203 push + 206 commit allow->refuse,
+#:                                                 5 path blocks, and ONE block->allow
+#:
+#: The last cell is the decisive one. `protected_paths_guard` answers a non-bounds
+#: blind spot by REPLACING its precise segment scan with a substring fallback that
+#: its own comment calls strictly weaker — so a newly-reported blind spot on a
+#: command it used to refuse turned that refusal into an allow. That is a defect in
+#: the guard rather than in this rule (any new non-bounds cause trips it, and it is
+#: filed separately), but it means reporting a cause with this volume moves verdicts
+#: in the fail-open direction, which is not a trade a security fix gets to make. The
+#: 200-odd extra prompts alone would also put the change an order of magnitude past
+#: the cost the narrow rule pays.
+#:
+#: The residual that leaves, stated so it is not mistaken for coverage: a command
+#: that names its program with a variable is read exactly as it is today, whether or
+#: not it spells the operation. Closing it needs a way to tell such a command apart
+#: from the 1,845 — an interpreter or a remote shell held in a variable is ordinary
+#: work here — which this rule does not have, and guessing at one is how a net
+#: becomes an outage.
+
+#: Every blind spot this module can report. Exported so a test can enforce the
+#: invariant `refuse ⟹ bounds_induced` over the WHOLE domain rather than over the
+#: examples a test author happened to think of.
+#:
+#: Deliberately NOT enforced here by an `assert` or an import-time raise. An assert
+#: vanishes under `python -O`, and a guard that raises during import exits non-zero —
+#: which the hook contract reads as NON-BLOCKING, so the invariant check would itself
+#: become a fail-open. The enforcement point for an invariant is a test, which fails
+#: loudly at the one moment nothing is at stake.
+_ALL_BLIND_SPOTS = (
+    _BLIND_UNTOKENIZABLE,
+    _BLIND_OVER_NESTED,
+    _BLIND_OVER_LONG,
+    _BLIND_UNRESOLVED_VERB,
+)
+
+
+def over_nested(command: str) -> bool:
+    """True when :func:`analyze` stopped descending before it ran out of command.
+
+    The companion to :func:`untokenizable`, and it exists for the identical reason:
+    ``analyze`` cannot otherwise report its own blind spot. A truncated parse and a
+    clean one are indistinguishable in its return value, so a caller that reads "no
+    gated segment found" as "no gated command present" fails OPEN — here by
+    concluding a deeply-buried ``rm`` is not there, when the parser simply stopped
+    looking.
+
+    Bounding the recursion WITHOUT this signal would trade one fail-open for a worse
+    one: today an over-deep command runs the guard out of clock, which is at least
+    loud; a silent cap would have it return a confident, wrong all-clear.
+
+    THE ANSWER COMES FROM THE PARSE ITSELF, never from a second opinion about it. An
+    earlier revision of this function was a hand-written depth counter that predicted
+    what ``analyze`` would do — and two shapes DEFEATED it, both measured: parens
+    inside a double-quoted string, and ``$(( … ))`` arithmetic, each of which
+    depressed the counter below the real depth while ``analyze`` truncated anyway. A
+    hidden ``rm -rf`` was then invisible to the parse AND unreported by the probe,
+    which is precisely the silent all-clear this signal exists to prevent. Two
+    parsers means two answers, and the gap between them is the vulnerability; see
+    :func:`_analyze_bounded`, which is the only thing that can answer this exactly.
+
+    Reports the DEPTH bound specifically. A command refused for LENGTH is a different
+    blind spot with a different remedy; ask :func:`analyze_checked` for either.
+    """
+    return _analyze_bounded(command)[1] == "depth"
+
+
+def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
+    """:func:`analyze`, plus the single question a guard must ask: am I blind here?
+
+    Returns ``(segments, blind_spot)``. ``blind_spot`` is None when neither of the
+    blind spots this module CAN detect fired, and otherwise says which did, in the two
+    halves a guard needs to write a message.
+
+    That is deliberately weaker than "the parse was complete", and the difference
+    matters because five guards now hang their fail-closed decision on it. MEASURED,
+    each returning no ``rm`` segment AND ``blind_spot`` None: ``eval "rm -rf …"``,
+    process substitution ``cat <(rm -rf …)``, and ``env -S 'rm -rf …'``. Those forms
+    are not parsed and cannot be reported — the module does not know it missed them.
+    Pre-existing, documented at :func:`_substitutions`, and not a promise this
+    function can make.
+
+    ONE call for every consumer that fails closed on an unreadable command — not one
+    call per probe. A blind spot discovered later is then wired in HERE, once, rather
+    than in each guard that has to remember it; "every call site must remember" is
+    the shape that has repeatedly shipped guards importing a probe they never
+    consult. It is also strictly CHEAPER than what the guards did before: one parse,
+    where they previously ran a separate tokenize probe and then parsed anyway.
+
+    A BOUNDED PARSE RETURNS NO SEGMENTS. Not the ones it managed to reach — none.
+    This is the single most load-bearing line in the module, so it gets the reason:
+    a partial segment list is "found something AND stopped looking", and every guard
+    here decides by SEARCHING that list, treating "not found" as "not present". A
+    partial list therefore turns a bound into a fail-open at an index the author of
+    the command chooses. MEASURED, base vs a version that returned partial segments:
+
+        git commit -m ok && <9-deep git commit --no-verify>   BLOCK -> ALLOW
+        git push origin feature && <9-deep git push +main>    BLOCK -> ask
+
+    Both are decoys — one visible benign operation filling the list so the not-found
+    branch, where the blind-spot net lives, is never reached. Returning nothing makes
+    "not found" trustworthy again, which is what every consumer already assumed, and
+    fixes both without a line of per-consumer logic. The length bound always worked
+    this way ("a prefix of a shell command is not a partial answer"); the depth bound
+    did not, and the whole defect class lived in that inconsistency.
+
+    Order is deliberate, and it is NOT the order this function first shipped with.
+    Both bounds outrank :func:`untokenizable`, because a consumer restoring what a
+    bound took away asks ``bounds_induced`` — so reporting the untokenizable cause for
+    a command that is ALSO over a bound hands that consumer the one answer it is
+    documented to ignore. MEASURED: appending a trailing ``# don't`` to a nested
+    command flipped three guards from BLOCK to ALLOW, because an apostrophe in a
+    comment is valid shell that shlex cannot tokenize. Reversing the order costs
+    2 of 45,956 real commands a reclassification and no change of verdict.
+
+    :data:`_BLIND_UNRESOLVED_VERB` is reported LAST, which means it is reported only
+    where this function previously returned None. That is a property worth stating
+    rather than a rank: every command that already had a blind spot keeps the exact
+    cause and hint it had, so the rule can only add net coverage and can never
+    reword or re-rank an existing refusal. It also makes the change measurable — the
+    flips it causes are exactly the commands moving from "clean parse" to "blind",
+    with nothing else shifting underneath them.
+    """
+    segments, reason = _analyze_bounded(command)
+    if reason == "length":
+        return [], _BLIND_OVER_LONG
+    if reason == "depth":
+        return [], _BLIND_OVER_NESTED
+    if untokenizable(command):
+        return segments, _BLIND_UNTOKENIZABLE
+    if any(_dispatcher_verb_unresolved(s) for s in segments):
+        return segments, _BLIND_UNRESOLVED_VERB
+    return segments, None
+
+
 def _basename(token: str) -> str:
     """Executable basename: /usr/bin/git → git, ./foo → foo."""
     return token.rsplit("/", 1)[-1]
+
+
+def _is_hatch_selector(token: str) -> bool:
+    """True for a Hatch matrix selector — ``+py=3.12`` / ``-py=3.9``.
+
+    The ``=`` is load-bearing: it separates a selector from an ordinary short
+    option, whose value is a SEPARATE token this function must not walk past.
+
+    KNOWN RESIDUAL, and it is a fail-open: a Hatch option that takes its value
+    that way still ends the walk on the VALUE — MEASURED, ``hatch run -e prod
+    test:pytest`` resolves its exe to ``prod`` and full_suite_guard exits 0.
+    Closing it means modelling Hatch's option grammar, the open set this module
+    refuses to enumerate (see ``_RUN_CARRIER_VALUE_FLAGS``), and Hatch is not
+    installed here, so any table written now would be written from memory rather
+    than measured. The uv tool-runners get the opaque-carrier treatment instead
+    because full_suite_guard can recover THOSE; no such recovery exists for a
+    segment that has already resolved onto a value. Narrower than the behaviour
+    this PR replaces, where every ``hatch run`` was opaque and allowed.
+    """
+    return token[:1] in ("+", "-") and "=" in token[1:]
+
+
+def _hatch_revealed(
+    argv: list[str], start: int, via_tool: bool, is_hatch: bool
+) -> tuple[int, bool] | None:
+    """Return Hatch's carried command, removing its optional ``ENV:`` prefix.
+
+    Hatch's first ``run`` argument may select an environment as
+    ``ENV:COMMAND``.  That selector is not part of the executable.  The
+    documented matrix selectors (``+name=value``) similarly precede the first
+    command argument and must not become the resolved executable.
+    """
+    if start >= len(argv):
+        return None
+    if not is_hatch:
+        return start, via_tool
+    # Hatch's matrix selectors come in BOTH signs — `+py=3.12` includes an
+    # environment, `-py=3.9` excludes one — and the sequence may be closed by
+    # the option terminator before the command: `hatch run +py=3.12 -- test:pytest`.
+    # Matching only `+` left both gaps. MEASURED on the pre-fix tree: that exact
+    # documented form resolved its exe to `--`, and full_suite_guard exited 0 on
+    # a whole-suite run. The `=` is what keeps this a closed set rather than a
+    # guess at Hatch's option grammar: a selector always carries one, while
+    # Hatch's own short options (`-e`, `-p`) never do and are left to the
+    # caller's generic flag walk.
+    while start < len(argv) and _is_hatch_selector(argv[start]):
+        start += 1
+    if start < len(argv) and argv[start] == "--":
+        start += 1  # terminator AFTER the selectors, not only before them
+    if start >= len(argv):
+        return None
+    env, separator, command = argv[start].partition(":")
+    if separator:
+        # Hatch defines the *first* colon as the environment separator.  Keep
+        # the remainder intact: it belongs to the command token.
+        argv[start] = command
+    return start, via_tool
+
+
+def _run_carrier_command_start(argv: list[str], i: int) -> tuple[int, bool] | None:
+    """``(index, via_tool_run)`` for a ``<front-end> run …`` invocation, else None.
+
+    ``argv[i]`` is the front-end (``uv``/``poetry``/…). Returns the index of the
+    first token of the WRAPPED command only when the front-end's first bare word
+    is the literal ``run``; any other subcommand (``uv pip install …``) returns
+    None so the front-end resolves as its own exe and NOTHING is skipped past.
+    That asymmetry is the safety property — see ``_RUN_CARRIERS``.
+
+    The second element reports whether the subcommand was ``tool run`` (the
+    ``uvx`` alias). The CALLER must not re-derive that from a fixed argv offset:
+    this function first consumes the front-end's own value flags, so
+    ``uv --directory /x tool run …`` puts ``tool run`` at argv[3:5], not argv[1:3].
+    """
+    j = i + 1
+    while j < len(argv):  # the front-end's own flags, ahead of its subcommand
+        t = argv[j]
+        if t == "--":
+            j += 1
+            break
+        if not t.startswith("-"):
+            break
+        j += 2 if (t in _RUN_CARRIER_VALUE_FLAGS and "=" not in t) else 1
+    # `uv tool run` is a documented ALIAS for `uvx` — "uvx is provided as a
+    # convenient alias for uv tool run, their behavior is identical" (uv help
+    # tool run). Requiring a bare `run` left that spelling opaque, so
+    # `uv tool run pytest` was allowed where `uvx pytest` was blocked. A literal
+    # two-token sequence, not a grammar: closed set, nothing to keep up with.
+    via_tool = False
+    if argv[j : j + 2] == ["tool", "run"]:
+        j += 2
+        via_tool = True
+    elif j < len(argv) and argv[j] == "run":
+        j += 1
+    else:
+        return None
+    is_hatch = _basename(argv[i]) == "hatch"
+    while j < len(argv):  # `run`'s own flags, ahead of the wrapped command
+        t = argv[j]
+        if t == "--":
+            return _hatch_revealed(argv, j + 1, via_tool, is_hatch)
+        if not t.startswith("-"):
+            return _hatch_revealed(argv, j, via_tool, is_hatch)
+        j += 2 if (t in _RUN_CARRIER_VALUE_FLAGS and "=" not in t) else 1
+    return None  # `uv run --flag` with no command after it
 
 
 def _strip_wrappers(argv: list[str]) -> list[str]:
@@ -717,6 +1528,8 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
         return []  # `((…))` arithmetic evaluation — no external command runs
     i = 0
     open_parens = 0
+    via_uv_tool = False  # reached the command through `uvx` / `uv tool run`
+    opaque = False  # a uv tool-runner met an option of unknown arity
     while i < len(argv):
         tok = argv[i]
         if tok.startswith("("):  # subshell opener, bare `( git` or glued `(git`
@@ -732,9 +1545,25 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
         if "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
             i += 1  # leading VAR=value assignment
             continue
+        if _basename(tok) in _RUN_CARRIERS:
+            found = _run_carrier_command_start(argv, i)
+            if found is None:
+                break  # not a `run` invocation — the front-end IS the command
+            i, tool_run = found
+            via_uv_tool = via_uv_tool or tool_run
+            continue
         spec = _WRAPPER_SPEC.get(_basename(tok))
         if spec is None:
             break
+        if _basename(tok) == "uvx":
+            via_uv_tool = True
+        # `uvx` is the one wrapper whose CALLER can recover an unresolved
+        # carrier: full_suite_guard keys its fallback scan on `exe == uvx`.
+        # That makes staying opaque a real option here and only here — for
+        # `env`/`timeout` an un-stripped segment is simply a hidden command,
+        # which is the direction this resolver promises never to take.
+        recoverable = _basename(tok) == "uvx"
+        wrapper_at = i
         argflags, positional = spec
         i += 1
         # consume the wrapper's own value-flags and leading positional args
@@ -746,6 +1575,19 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
             if t.startswith("-"):
                 if t in argflags and "=" not in t:
                     i += 2  # flag + its separate value token
+                elif recoverable and "=" not in t:
+                    # An option this table does not list: its arity is unknown,
+                    # so the next bare word may be its VALUE rather than the
+                    # carried command. Resolving onto that value is the
+                    # fail-OPEN reading — MEASURED, `uvx --directory /tmp
+                    # pytest` resolved its exe to `tmp` and full_suite_guard
+                    # exited 0 where `uvx pytest` exits 2. Enumerating uv's
+                    # option grammar is the treadmill this module already
+                    # refused once (see _RUN_CARRIER_VALUE_FLAGS); instead the
+                    # walk STOPS and leaves the segment on `uvx`, where the
+                    # caller's carrier scan can still reach the command.
+                    opaque = True
+                    break
                 else:
                     i += 1
                 continue
@@ -757,6 +1599,9 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
                 i += 1
                 continue
             break  # this bare word is the wrapped command
+        if opaque:
+            i = wrapper_at  # leave the segment ON the carrier — see above
+            break
     result = list(argv[i:])  # redirections are NOT stripped here (see docstring)
     if open_parens and result:
         # Peel matching trailing `)` closers off the operand(s) carrying the
@@ -777,7 +1622,469 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
                 remaining -= 1  # stay on j — the token may carry another glued `)`
             else:
                 j -= 1
+    # `uv tool run ruff@0.3.0` / `uvx pytest@8.3.5` — uv documents `<package>@<version>`
+    # as a supported command name, and it executes the named tool. Left as written,
+    # the exe resolves to `pytest@8.3.5`, which matches no gate looking for `pytest`:
+    # MEASURED, `uvx pytest@8.3.5` exited 0 from full_suite_guard where `uvx pytest`
+    # exits 2. Scoped to the uv tool-runners on purpose — this is uv's spelling, not
+    # a general one, and stripping an `@` suffix off every resolved command would be
+    # inventing syntax for tools that do not have it.
+    #
+    # Split the NAME, not the whole token. `result[0]` may be a path, and an `@` in
+    # a DIRECTORY is not a version suffix: MEASURED, `uvx /opt/homebrew/opt/
+    # python@3.12/bin/pytest` resolved its exe to `python`, and
+    # `uvx /nix/store/abc@1/bin/rm -rf …` to `abc` — the HIDE direction, in the one
+    # place this whole change exists to reveal. `python@3.12` is Homebrew's real keg
+    # layout, so that is a path shape, not a contrivance.
+    if via_uv_tool and result:
+        head, sep, name = result[0].rpartition("/")
+        if "@" in name:
+            result[0] = head + sep + name.split("@", 1)[0]
     return result
+
+
+#: Characters that make a shell WORD mean something other than what it spells.
+#: shlex implements quote removal and backslash escapes faithfully and implements
+#: NO expansion whatsoever, so a word carrying one of these tokenizes CLEANLY into
+#: a token that is not the word bash finally runs. That is the whole shape of the
+#: problem this module cannot otherwise see: :func:`untokenizable` answers "did the
+#: parse fail", and here the parse SUCCEEDS while resolving something else.
+#:
+#: An ALLOWLIST over SUBSTITUTION, deliberately, and scoped in that word because
+#: the scope is the part that keeps being overstated. These two characters open a
+#: substitution in bash's word grammar — parameter, command, arithmetic, and every
+#: quoting form layered over them — so a word free of both is a word shlex and bash
+#: agree on AS FAR AS SUBSTITUTION GOES. Enumerating spellings instead (which
+#: quoting form, which encoding) would be a denylist, and a denylist on a safety
+#: boundary is a treadmill whose every miss is a hole.
+#:
+#: THIS IS NOT THE COMPLETE SET OF WORD-GENERATING CONSTRUCTS, and saying otherwise
+#: is the specific mistake this file keeps repeating. #1686's docstring called a
+#: hex-encoded verb "the one residual" and was already wrong when written. An
+#: earlier revision of THIS comment claimed the two characters covered the class
+#: and was falsified in review by BRACE expansion, which generates words without
+#: either of them. A LATER revision then listed brace expansion as COVERED without
+#: qualification, and was falsified the same way: it is covered in VERB POSITION,
+#: and a brace group in an option's VALUE slot is a different, open case. Twice is
+#: a pattern, so the columns below name a POSITION as well as a construct.
+#:
+#:   COVERED  substitution        in verb position, via these two characters
+#:   COVERED  brace expansion     in verb position, via :func:`_has_brace_expansion`
+#:                                — ``{a,b}``, ``{a..b}``
+#:   LEFT     ANY expansion in a  A value-taking option's value is skipped unread
+#:            VALUE slot          (see :func:`_verb_unresolved`), in BOTH the split
+#:            (either option      (``-C <v>``) and attached (``--git-dir=<v>``)
+#:             form)              forms — they are one command to bash and answer
+#:                                the same here. So an expansion there can INJECT a
+#:                                verb the parse never sees, with argv intact.
+#:                                PRE-EXISTING and not
+#:                                made worse here: measured base-vs-branch, these
+#:                                shapes are ALLOW on both. Left because the price is
+#:                                the wrong shape — MEASURED over 129,179 real
+#:                                commands, flagging a non-literal value slot fires on
+#:                                711 of them (0.55%, 0.44% of invocations), against
+#:                                15 for everything this module currently moves. The
+#:                                dominant shape is ``git -C $WT`` on a worktree path,
+#:                                which is ordinary work here, so closing it would
+#:                                trade a 47x over-block for a residual nothing in the
+#:                                corpus exercises. `_word_continues` covers only the
+#:                                narrow sub-case where the value is the unterminated
+#:                                HEAD of a split word.
+#:                                RE-MEASURED from the GRAMMAR rather than the corpus
+#:                                after a corpus null result was wrong three times:
+#:                                384 generated cells over program x option form x
+#:                                construct x position, each evaluated under four
+#:                                environments so a slot that CAN move the verb is
+#:                                identified by watching it move rather than by
+#:                                argument. This slot moves; every other new refusal
+#:                                sits on a slot that also moves.
+#:   LEFT     tilde expansion     applies only at the start of a word and only up to
+#:                                the first ``/``, which is strictly ahead of the
+#:                                basename :func:`_basename` reads. ``~/venv/bin/python``
+#:                                is ``python`` under every value of HOME, so flagging
+#:                                it would cost the common shape and buy nothing.
+#:   LEFT     pathname expansion  (``*?[``) a REAL residual, not a safe one. A glob
+#:                                resolves against FILENAMES, so ``git pu*`` becomes a
+#:                                verb only if a file of that name already exists in the
+#:                                working directory, and otherwise stays the literal word
+#:                                git rejects. Closing it means flagging every ordinary
+#:                                ``ls *.py``-shaped word in verb position for a hazard
+#:                                that also needs a planted file.
+#:
+#:   LEFT     a QUOTED or        `shlex` removes quotes before this check runs, so
+#:            ESCAPED verb word  ``git '$ACTION'`` and ``git pu\\{s,s\\}h`` are
+#:                               flagged although bash leaves both literal
+#:                               (VERIFIED through an argv-printing shim). An
+#:                               over-block, so the direction is safe.
+#:                               PRICED before deciding: MEASURED over 69,259 real
+#:                               commands, 12 git/gh segments are flagged at all and
+#:                               exactly ONE is flagged on a quoted word — and that
+#:                               one is ``gh pr "$M" --help``, which the row below
+#:                               already covers. Closing it needs the RAW quoting to
+#:                               survive into this check, and neither cheap route is
+#:                               sound: an INDEX into the raw tokens does not survive
+#:                               :func:`_strip_wrappers`, and matching by VALUE fails
+#:                               OPEN — in ``git $ACTION '$ACTION'`` the quoted twin
+#:                               would clear the active one. A structural change to
+#:                               this pipeline is not worth 1 in 69,259; a fail-open
+#:                               shortcut is not worth anything.
+#:   LEFT     a TERMINAL mode    ``git --help <topic>``, ``git --html-path`` and
+#:            (help / path)      ``gh --help pr <verb>`` cannot run an operation, but
+#:                               the walk below treats every option as something to
+#:                               skip and reaches the non-literal word after them, so
+#:                               a help query on a shell-built topic is refused.
+#:                               An over-block, and the only one here whose closure
+#:                               would be an OPEN SET: it needs a list of every git
+#:                               and gh mode that consumes the remaining words as
+#:                               documentation, which grows whenever those tools do.
+#:                               This module has already paid for enumerating another
+#:                               project's CLI once (see _RUN_CARRIER_VALUE_FLAGS),
+#:                               and the price of the residual is one refused help
+#:                               command against a list nobody can finish.
+#:   LEFT     a NESTED shell     Brace rules here are BASH's, and they are applied to
+#:            that is not bash   every nested script regardless of the interpreter
+#:                               that will run it. MEASURED on this box, where
+#:                               ``/bin/sh`` is dash: ``pus{h..h}`` expands to
+#:                               ``push`` under bash and stays LITERAL under dash, so
+#:                               ``dash -c 'git pus{h..h} || echo fallback'`` has its
+#:                               git verb flagged unresolved and the compound refused,
+#:                               though dash hands git an invalid subcommand and the
+#:                               fallback is what actually runs. An over-block, so the
+#:                               direction is safe, and it is NOT closed here: doing
+#:                               so means propagating each nested interpreter's
+#:                               expansion semantics through the parse, a structural
+#:                               change to the path nine guards read that belongs in
+#:                               its own change rather than at the end of this one.
+#:                               UNPRICED — the rate is not measured, and this row
+#:                               does not claim it is rare.
+#:
+#: A construct absent from both columns is UNEXAMINED, not covered. Add it to a
+#: column rather than assuming the columns are exhaustive.
+_EXPANSION_MARKS = ("$", "`")
+
+#: Programs whose FIRST WORDS choose the operation, so the verb is not argv[0].
+#: Per exe: (global options that consume the FOLLOWING token as a value, the
+#: first-words that dispatch a FURTHER verb). ``git push`` is one word; ``gh pr
+#: merge`` is two, because ``pr`` is a group rather than an operation.
+#:
+#: MIRRORS THE CONSUMERS — :func:`git_subcommand` and :func:`gh_pr_subcommand` —
+#: rather than modelling each CLI's grammar, and the difference is not cosmetic. A
+#: generic "the verb is the first N bare words" rule reads one word too far for
+#: every gh command that is not ``gh pr``: MEASURED over 129,179 real commands, it
+#: flagged 1,830 ``gh api <endpoint>`` invocations, whose endpoint is an ARGUMENT
+#: that routinely interpolates an issue number or a sha. A verb rule that reads an
+#: argument is not a stricter verb rule, it is a different and wrong one.
+_VERB_DISPATCHERS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    "git": (frozenset(_GIT_OPTS_WITH_ARG), frozenset()),
+    "gh": (frozenset({"-R", "--repo"}), frozenset({"pr"})),
+}
+
+
+_BRACE_INT = re.compile(r"^[+-]?[0-9]+$")
+#: Bash's character-range domain, which is ASCII and NOT :meth:`str.isalpha`.
+#: See the comment at the end of :func:`_brace_range_expands`.
+_ASCII_ALPHA = re.compile(r"^[A-Za-z]$")
+
+
+def _brace_range_expands(token: str, starts: list[int], end: int) -> bool:
+    """Whether ``{`` + the parts at *starts* + ``}`` at *end* is a bash RANGE.
+
+    Grammar MEASURED against bash through an argv-printing shim rather than read
+    off a manual, because the two disagree in both directions:
+
+        expands   {a..c} {1..3} {3..1} {a..a} {01..03} {-2..0} {+1..3} {A..c}
+                  {z..x} {1..9..2} {a..e..2} {1..3..-1} {1..3..01} {1..2..0}
+        literal   {foo..bar} {ab..cd} {a..bb} {1..a} {a..1} {..} {1..} {..3}
+                  {1..2..}
+
+    So both endpoints are integers (sign and leading zeros allowed), OR both are
+    exactly one ALPHABETIC character — `{1..a}` is literal, so "both single
+    characters" is not the rule. An increment must itself be an integer, and
+    ZERO is not special: `{1..2..0}` expands.
+
+    Slices are taken only for a real range candidate, and sibling groups cover
+    disjoint spans, so the slicing across a whole token sums to its length.
+    """
+    if not 2 <= len(starts) <= 3:
+        return False
+    bounds = [*starts, end + 2]  # +2 so the last part's `..` trim is uniform
+    parts = [token[bounds[k] : bounds[k + 1] - 2] for k in range(len(starts))]
+    if len(parts) == 3 and not _BRACE_INT.match(parts[2]):
+        return False  # `{1..2..x}` and `{1..2..}` are literal to bash
+    lo, hi = parts[0], parts[1]
+    if _BRACE_INT.match(lo) and _BRACE_INT.match(hi):
+        return True
+    # ASCII, not :meth:`str.isalpha`. Python's is Unicode-wide and bash's character
+    # ranges are not: MEASURED, bash leaves ``{é..ê}``, ``{α..γ}`` and ``{é..é}``
+    # literal under both ``C`` and ``C.UTF-8``, while ``isalpha()`` called all three
+    # ranges. That over-reported an expansion, which routes a verb to the blind-spot
+    # net and refuses a command bash would have run unexpanded.
+    #
+    # ``_BRACE_INT`` needs no equivalent repair: ``[0-9]`` is a literal range and is
+    # already ASCII-only, so an Arabic-Indic digit falls through to here and is
+    # correctly rejected by the same test.
+    return len(lo) == 1 and len(hi) == 1 and _ASCII_ALPHA.match(lo) and _ASCII_ALPHA.match(hi)
+
+
+def _has_brace_expansion(token: str) -> bool:
+    """Whether *token* carries a bash BRACE EXPANSION — ``{a,b}`` or ``{a..b}``.
+
+    Brace expansion generates words with no substitution character anywhere, so it
+    is invisible to :data:`_EXPANSION_MARKS` and needed its own check. shlex keeps
+    the braces verbatim, which is one more way a token can tokenize cleanly into
+    something bash never runs.
+
+    A brace group expands only when its top level holds a COMMA or a ``..`` range —
+    ``{a}`` and ``{}`` are literal to bash, and treating them as expansion would
+    flag ordinary text. Nesting is tracked so the comma of an INNER group does not
+    make an outer literal group look expandable, matching bash, which expands
+    ``{{a,b}}`` via the inner group.
+
+    THE RANGE FORM IS WHY THIS IS A RULE AND NOT A FOOTNOTE. A comma list always
+    emits at least two words, so it lands an extra argument next to the verb and
+    corrupts the rest of argv — real, but self-limiting. A range with identical
+    endpoints emits exactly ONE word: ``pus{h..h}`` is a single ``push``, argv
+    intact. VERIFIED against bash itself through a shim that prints its own argv,
+    rather than reasoned about — the two forms look alike and behave differently,
+    and the difference is the whole severity of the case.
+
+    ONE LEFT-TO-RIGHT PASS, and that is a security property rather than a matter of
+    taste. The first version of this scan restarted an inner walk at every ``{``,
+    so a token of unterminated openers cost O(n^2): MEASURED on this function,
+    0.014s at 500 characters, 5.5s at 8,000, and 173s at
+    :data:`MAX_COMMAND_CHARS` — against guards registered with a 10-second wall
+    clock. The hook contract is explicit that a timed-out hook does not block the
+    tool call, so a guard that runs out of clock PERMITS, and this module feeds
+    nine of them: one crafted word would have disengaged the lot. A stack of
+    per-group flags answers the same question without ever re-reading a character,
+    because a ``{`` already passed can only ever be the group the next ``}``
+    closes.
+
+    The stack entry is that group's own "saw a top-level comma or range" flag, so
+    the innermost open group is the one a separator belongs to — which is exactly
+    the nesting rule above, expressed without a second traversal.
+    """
+    # FLAT containers, one set for the whole scan. Not a per-group object: the
+    # cost probe scans tens of thousands of unterminated `{`, and an object plus
+    # a list per opener is that many GC-tracked allocations — measured as a
+    # linearity failure even though the algorithm is linear. bytearrays are not
+    # GC-tracked at all.
+    comma = bytearray()
+    nested = bytearray()
+    base: list[int] = []
+    starts: list[int] = []
+    i, n = 0, len(token)
+    while i < n:
+        c = token[i]
+        if c == "{":
+            if comma:
+                nested[-1] = 1
+            comma.append(0)
+            nested.append(0)
+            base.append(len(starts))
+            starts.append(i + 1)
+        elif c == "}":
+            if comma:
+                had_comma = comma.pop()
+                had_nested = nested.pop()
+                first = base.pop()
+                if had_comma:
+                    return True  # this group expands, so the whole word does
+                # A nested group's braces sit inside this group's text, and no
+                # valid endpoint contains one — so a range cannot survive
+                # nesting. bash agrees: `{a..{b,c}}` expands through the INNER
+                # comma, which that group already reported, not through this `..`.
+                if not had_nested and _brace_range_expands(token, starts[first:], i):
+                    return True
+                del starts[first:]
+        elif comma:  # a separator belongs to the INNERMOST open group
+            if c == ",":
+                comma[-1] = 1
+            elif c == "." and i + 1 < n and token[i + 1] == ".":
+                starts.append(i + 2)
+                i += 1
+        i += 1
+    return False  # openers never closed — bash leaves them alone, so do we
+
+
+#: Longest verb-position WORD this module will read before giving up on it.
+#:
+#: A second line of defence, not the primary one: the scans this bounds are all
+#: linear now, and a linear pass over even a :data:`MAX_COMMAND_CHARS` word costs
+#: microseconds. It exists because the primary defence is "every scanner here stays
+#: linear", which is an invariant a future edit can break silently — and the way it
+#: broke once already was a nested loop that looked perfectly ordinary. A bound
+#: cannot be forgotten the way a complexity argument can.
+#:
+#: FAILS CLOSED, which is the whole point of putting it here rather than making it
+#: a truncation. An over-long word is one this module has declined to establish, and
+#: this PR's own principle is that a verb it cannot establish is unestablished
+#: rather than absent — so :func:`_word_is_literal` says "not literal" and the word
+#: routes to the blind-spot net. Truncating and judging the prefix would be the
+#: opposite: a confident answer about a word nobody read.
+#:
+#: DERIVED, not chosen. MEASURED over 129,179 real commands from this install's
+#: transcripts, the longest word ever reaching :func:`_word_is_literal` is 3,176
+#: characters (a line of prose inside a here-doc body, not a verb anyone typed);
+#: 481 words exceed 1,024. The cap sits above the observed maximum with headroom,
+#: so it costs zero flips on observed traffic — verified in the same two-stage
+#: measurement as the rest of this change.
+_MAX_VERB_WORD_CHARS = 4096
+
+
+def _word_is_literal(token: str) -> bool:
+    """Whether *token* means, to bash, exactly the characters it spells.
+
+    Covers the constructs named beside :data:`_EXPANSION_MARKS`, and only those.
+    Tilde and pathname expansion are deliberately out, with reasons recorded there.
+
+    An over-long word is NOT literal — see :data:`_MAX_VERB_WORD_CHARS`. That is
+    the fail-closed direction: this module declined to read the word, and declining
+    to read is not evidence that the word is harmless.
+    """
+    if len(token) > _MAX_VERB_WORD_CHARS:
+        return False
+    if any(mark in token for mark in _EXPANSION_MARKS):
+        return False
+    return not _has_brace_expansion(token)
+
+
+def _word_continues(token: str) -> bool:
+    """Whether *token* is only PART of a bash word, so the next tokens are its tail.
+
+    An UNQUOTED ``$( … )`` containing a space is ONE word to bash and SEVERAL tokens
+    to shlex, which splits on that space like any other. Every position after it is
+    then off by however many tokens the substitution contributed — so a walk that
+    counts positions is reading a different word than bash will.
+
+    This matters at exactly one place: the token a value-taking option consumes.
+    Everywhere else the walk already inspects the token itself, and a partial
+    substitution carries the ``$`` or the backtick that :func:`_word_is_literal`
+    catches. The consumed value is the one token skipped unread — and skipping the
+    HEAD of a split word leaves the walk pointing at that word's TAIL, which can be
+    an ordinary-looking literal with the real verb sitting behind it.
+
+    Detects an unterminated ``$(`` and an odd backtick count. Deliberately ignores
+    parentheses NOT opened by ``$`` — ``--format=%(refname)`` is data, and treating
+    its parens as syntax is how a rule like this starts flagging ordinary work.
+    MEASURED over 129,179 real commands: this adds ZERO flags on top of the verb
+    rule.
+
+    WHAT IT CLOSES, stated narrowly because a wider claim was wrong. It closes the
+    case where the skipped value is the unterminated HEAD of a split word — nothing
+    more. It does NOT close "the position-shift case" in general, which an earlier
+    revision of this docstring claimed: a value that is a plain ``$VAR`` or a brace
+    group is a single, terminated token, so neither test here fires, and the walk
+    skips it and runs out of words. A value that EXPANDS to several words then
+    injects a verb the parse never sees at all. That is the LEFT-column entry beside
+    :data:`_EXPANSION_MARKS`, it is PRE-EXISTING rather than introduced here, and the
+    711-command price of closing it is recorded there.
+
+    Zero added flags is therefore not evidence of coverage. It is what a narrow test
+    costs, and the two facts are easy to confuse — which is how the wider claim got
+    written next to the smaller number in the first place.
+    """
+    depth = 0
+    saw_sub = False
+    i, n = 0, len(token)
+    while i < n:
+        if token[i] == "$" and i + 1 < n and token[i + 1] == "(":
+            depth += 1
+            saw_sub = True
+            i += 2
+            continue
+        if depth:
+            if token[i] == "(":
+                depth += 1
+            elif token[i] == ")":
+                depth -= 1
+        i += 1
+    return (saw_sub and depth > 0) or token.count("`") % 2 == 1
+
+
+def _verb_unresolved(argv: list[str]) -> bool:
+    """Whether this argv's VERB — the words that decide WHICH operation runs —
+    carries a shell expansion, so the parse cannot establish what it is.
+
+    Two positions qualify, and only these two:
+
+    * the executable's BASENAME. Only the basename, because that is what
+      :func:`_basename` reads and what a gate compares: ``$HOME/bin/git`` and
+      ``~/venv/bin/python`` resolve to ``git`` and ``python`` no matter what the
+      leading component expands to, so flagging them would be a pure over-block
+      with no hazard behind it. ``/usr/bin/$X`` does NOT resolve, and is flagged.
+    * for a multi-verb dispatcher, the words that select the subcommand — plus any
+      option word passed on the way to it, because an unreadable option can shift
+      which word lands in the verb slot, and plus the VALUE of a value-taking
+      option when that value is only the head of a split word (see
+      :func:`_word_continues`), for the same reason one step removed.
+
+    An ARGUMENT is deliberately out of scope. ``git commit -m "$msg"``,
+    ``rm "$f"``, ``echo $PATH`` are ordinary work; a gate that asked about every
+    variable in every argument would be turned off within a week, and the failure
+    this closes is specifically that the OPERATION is unestablished while the
+    parse reports success. What an unresolved argument costs a path or flag gate
+    is a different question with a different answer, and is not answered here.
+
+    Returns False for an empty argv — nothing executes, so there is no verb.
+    """
+    if not argv:
+        return False
+    if not _word_is_literal(_basename(argv[0])):
+        return True
+    spec = _VERB_DISPATCHERS.get(_basename(argv[0]))
+    if spec is None:
+        return False
+    value_flags, groups = spec
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok.startswith("-"):
+            # AN OPTION. Only its NAME can decide where the verb sits, so only the
+            # NAME is read. An ATTACHED value (``--git-dir=<value>``) rides inside
+            # the same shlex token, and testing the whole token reads a VALUE as
+            # though it were a verb — which made an ordinary ``git --git-dir=$DIR
+            # status`` ask for approval while the identical SPLIT form did not. The
+            # two forms are the same command to bash, so they answer the same here.
+            #
+            # An unreadable option NAME still returns True: it can expand to a
+            # value-taking flag and consume the following word, which shifts what
+            # lands in the verb slot.
+            if not _word_is_literal(tok.split("=", 1)[0]) or _word_continues(tok):
+                return True
+            if "=" not in tok and tok in value_flags:
+                # The SEPARATE form: the value is the next token, skipped unread for
+                # the same reason an attached one is — UNLESS it is only the head of
+                # a split word, in which case skipping it lands the walk on that
+                # word's tail and every position after is wrong (:func:`_word_continues`).
+                if i + 1 < len(argv) and _word_continues(argv[i + 1]):
+                    return True
+                i += 2
+                continue
+            i += 1
+            continue
+        if not _word_is_literal(tok):
+            return True  # the verb itself
+        if tok in groups:
+            groups = frozenset()  # a group name: the NEXT bare word is the verb
+            i += 1
+            continue
+        return False  # the verb, read plainly
+    return False  # ran out of words before the verb was complete — nothing to hide
+
+
+def _dispatcher_verb_unresolved(seg: Segment) -> bool:
+    """The narrower half of :attr:`Segment.verb_unresolved`: the PROGRAM resolved,
+    and it is one whose first words select the operation — but those words did not.
+
+    This is the half a guard may act on WITHOUT first looking for the operation's
+    name in the raw text, because here that name is exactly what is missing. The
+    other half — the program itself unreadable — is recorded on the Segment and
+    deliberately NOT reported as a blind spot; the measurement that decided that,
+    and the residual it leaves, are written out beside
+    :data:`_BLIND_UNRESOLVED_VERB`.
+    """
+    return bool(seg.verb_unresolved and seg.argv and _basename(seg.argv[0]) in _VERB_DISPATCHERS)
 
 
 def analyze(command: str) -> list[Segment]:
@@ -787,8 +2094,59 @@ def analyze(command: str) -> list[Segment]:
     and env-assignments stripped), and whether a ``# review-override`` comment
     is bound to that segment. ``bash -c 'script'`` is recursed into so the inner
     commands are surfaced (the parent's override propagates to them).
+
+    The descent stops at :data:`MAX_SUBSTITUTION_DEPTH`, which is a SECURITY bound
+    rather than a performance one — see the constant. A DEPTH-truncated parse returns
+    the segments it DID resolve, so this signature and its result are unchanged for
+    every caller that does not care.
+
+    THE OTHER BOUND BEHAVES DIFFERENTLY, and this docstring used to omit it entirely
+    while asserting the depth bound's behaviour as if it were the whole story. Over
+    :data:`MAX_COMMAND_CHARS` this returns NO segments at all, silently — not a prefix,
+    not what it managed to reach, nothing. The two bounds are therefore NOT
+    interchangeable in any argument about what a caller sees, which is exactly the axis
+    the exemptions in ``_BARE_ANALYZE_ALLOWED`` reason on.
+
+    A caller that must not be BLIND wants :func:`analyze_checked`, which returns the
+    same segments plus WHY they might be incomplete, from the same single parse. That
+    exists for the reason :func:`untokenizable` does: this return value cannot
+    distinguish "found nothing" from "stopped looking", and a guard that conflates
+    the two fails OPEN.
     """
+    return _analyze_bounded(command)[0]
+
+
+def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], str | None]:
+    """:func:`analyze`, plus which bound (if any) stopped it short of the whole command.
+
+    Returns ``(segments, reason)`` where reason is None, ``"length"`` or ``"depth"``.
+    ``"depth"`` is reported only when there was something left to descend INTO and the
+    bound refused it — reaching the bound with nothing nested below is a complete
+    parse, not a truncated one.
+
+    Both facts come from ONE traversal, on purpose. Answering "did this truncate?"
+    with a separate pass means a second model of shell syntax, and any disagreement
+    between the two is a silent fail-open: the parse stops early, the predictor says
+    it did not, and a buried command is invisible to both. That is not hypothetical —
+    it is what the hand-written counter this replaced actually did, on two measured
+    shapes. One parse, one answer.
+
+    The length cap lives HERE rather than in :func:`analyze_checked` so that
+    :func:`analyze` is bounded too. Putting it only on the checked path would leave
+    every bare-``analyze`` caller paying the unbounded first pass — which is the same
+    "unmigrated consumer" hole the checked path exists to close.
+
+    ``_depth`` is internal bookkeeping; every caller passes a command and nothing else.
+    """
+    # Past the cap, parse NOTHING. Not a prefix: truncating a command mid-string flips
+    # the quoting state for everything after the cut, so a prefix parse is not a
+    # partial answer, it is a confidently wrong one — and the guards match on the
+    # resolved exe and argv. An empty list plus the reason is the honest result, and
+    # every consumer that must not be blind is already asking for the reason.
+    if _depth == 0 and len(command) > MAX_COMMAND_CHARS:
+        return [], "length"
     out: list[Segment] = []
+    truncated = False
     for seg in parse_segments(command):
         raw = seg.raw
         override = _has_trailing_override(raw)
@@ -797,7 +2155,14 @@ def analyze(command: str) -> list[Segment]:
         argv = _strip_wrappers(_argv(seg.argv_src))
         exe = _basename(argv[0]) if argv else ""
         out.append(
-            Segment(exe=exe, argv=argv, override=override, raw=raw, redirects=list(seg.redirects))
+            Segment(
+                exe=exe,
+                argv=argv,
+                override=override,
+                raw=raw,
+                redirects=list(seg.redirects),
+                verb_unresolved=_verb_unresolved(argv),
+            )
         )
         nested = []
         if exe in _NESTED:
@@ -807,8 +2172,22 @@ def analyze(command: str) -> list[Segment]:
         # $(...) / `...` bodies also execute — parsed from RAW, which STILL carries any
         # expansion redirect target, so a nested command stays visible to the guards.
         nested.extend(_substitutions(raw))
+        if not nested:
+            continue
+        # Past the bound, STOP DESCENDING — and SAY SO. Every scanner below runs
+        # again on near-identical text at each level (MEASURED: a character at the
+        # centre of a depth-48 command is scanned 293 times by six full-text
+        # scanners), so cost is length x depth and a guard runs out of clock. Depth 0
+        # is unaffected by construction, which is what keeps `[s.raw for s in
+        # analyze(cmd) if s.depth == 0] == split_segments(cmd)` byte-identical for
+        # the cwd consumers.
+        if _depth >= MAX_SUBSTITUTION_DEPTH:
+            truncated = True
+            continue
         for script in nested:
-            for inner in analyze(script):
+            inner_segs, inner_reason = _analyze_bounded(script, _depth=_depth + 1)
+            truncated = truncated or inner_reason == "depth"
+            for inner in inner_segs:
                 out.append(
                     Segment(
                         exe=inner.exe,
@@ -817,9 +2196,10 @@ def analyze(command: str) -> list[Segment]:
                         raw=inner.raw,
                         depth=inner.depth + 1,
                         redirects=inner.redirects,
+                        verb_unresolved=inner.verb_unresolved,
                     )
                 )
-    return out
+    return out, ("depth" if truncated else None)
 
 
 def is_pytest_invocation(seg: Segment) -> bool:
@@ -906,30 +2286,50 @@ def _substitutions(text: str) -> list[str]:
 def _nested_script(argv: list[str]) -> str:
     """The script string passed to an interpreter's ``-c``, else ''.
 
-    Handles a bare ``-c`` (script is the next token), a combined short bundle
-    where ``c`` is last (``-lc 'script'`` → next token), and an inline value
-    (``-c'script'`` → the rest of the token after ``c``).
+    For every interpreter in ``_NESTED`` the script is the NEXT argv token, and
+    where ``c`` sits inside a short bundle does not change that: ``-c 'script'``,
+    ``-lc 'script'`` and ``-ce 'script'`` all take it from the following token.
+
+    An earlier version read a bundle whose ``c`` was not last as an INLINE value
+    (``-ce`` → the script ``"e"``), which lost the real script entirely: the
+    parser then reported a segment whose executable was ``e``, and a guard keyed
+    on the nested command fell OPEN. Found by cross-model review, 2026-09-03.
+
+    MEASURED 2026-09-06 against the real interpreters, both directions:
+    ``bash -ce '<cmd>'`` and ``bash -cx '<cmd>'`` RUN ``<cmd>`` from the next
+    token, while the glued spelling that branch modelled is refused outright —
+    ``bash -c'<cmd>'`` prints "invalid option", ``sh``/``dash`` "Illegal option".
+    So the branch modelled a form none of these shells accepts and dropped one
+    they all do, and deleting it is strictly a widening.
     """
     for i, tok in enumerate(argv[1:], 1):
         if not tok.startswith("-") or tok.startswith("--"):
             continue
-        pos = tok.find("c")
-        if pos <= 0:
+        if "c" not in tok[1:]:
             continue
-        if pos == len(tok) - 1:  # 'c' is the last flag in the bundle
-            if i + 1 < len(argv):
-                return argv[i + 1]
-        else:  # inline script glued after the 'c'
-            return tok[pos + 1 :]
+        if i + 1 < len(argv):
+            return argv[i + 1]
     return ""
 
 
 # ── git-specific helpers ────────────────────────────────────────────────
 
 
-def git_subcommand(argv: list[str]) -> str | None:
-    """The git subcommand for an argv whose executable is git, skipping git
-    global options (including ``-c KEY=VAL`` / ``-C DIR`` which take a value)."""
+def git_subcommand_index(argv: list[str]) -> int | None:
+    """Index of the git subcommand token in ``argv``, or None.
+
+    Exposed alongside :func:`git_subcommand` because a caller that needs the
+    OPERANDS after the subcommand cannot recover this index on its own.
+    ``argv.index(name)`` returns the FIRST token equal to the name, and a global
+    option's operand may equal the subcommand's own name — ``git -C worktree worktree
+    remove /tmp/x`` selects the ``-C`` operand, so the operand list starts one
+    token early, the removal is not recognised, and the guard falls OPEN. Found
+    by cross-model review, 2026-09-03.
+
+    The alternative was for the caller to repeat the option-skipping loop below.
+    That is replica drift: two copies of one rule, diverging silently the next
+    time the option table grows. One scan, one source of truth.
+    """
     if not argv or _basename(argv[0]) != "git":
         return None
     i = 1
@@ -941,8 +2341,15 @@ def git_subcommand(argv: list[str]) -> str | None:
         if t.startswith("-"):
             i += 1
             continue
-        return t
+        return i
     return None
+
+
+def git_subcommand(argv: list[str]) -> str | None:
+    """The git subcommand for an argv whose executable is git, skipping git
+    global options (including ``-c KEY=VAL`` / ``-C DIR`` which take a value)."""
+    i = git_subcommand_index(argv)
+    return None if i is None else argv[i]
 
 
 def gh_pr_subcommand(argv: list[str]) -> str | None:

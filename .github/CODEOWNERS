@@ -1,0 +1,86 @@
+# Code owners for the enforcement surface.
+#
+# WHAT THIS DOES, AND WHAT IT DOES NOT. A CODEOWNERS entry only requests a
+# review from the named owner. It BLOCKS a merge solely when a ruleset turns on
+# `require_code_owner_review`, which this repo deliberately does not: the sole
+# maintainer cannot approve their own pull request, so requiring it would make
+# every self-authored change unmergeable without an admin bypass — which is the
+# same bypass the checks ruleset exists to stop relying on. Read these lines as
+# routing and as an inventory, never as a gate.
+#
+# WHY IT IS STILL WORTH HAVING. A contributor's pull request touching any path
+# below now automatically requests the maintainer's review instead of depending
+# on someone noticing, and the file states — in the repository, where a reader
+# looks — which paths are enforcement surface. Enable `require_code_owner_review`
+# the day a second maintainer exists; nothing else needs to change.
+#
+# THE LIST BELOW IS A MIRROR, NOT A SOURCE. The authoritative definition of the
+# enforcement-hook surface is `_HOOK_SURFACE_PREFIXES` + `_HOOK_SURFACE_FILES`
+# in scripts/hooks/git_push_guard.py, kept exhaustive by
+# tests/test_hooks/test_git_push_guard_hook_surface.py, which parses
+# .claude/settings.json and fails CI when a wired hook falls outside the fence.
+# GitHub cannot read a Python constant, so this file restates it in glob form —
+# and a restatement can drift. Three directory prefixes below, then the 27 named
+# files enumerated one by one — which is what the constant is. An earlier version
+# of this comment claimed the whole thing was written as prefixes so it would
+# keep matching when a new hook lands; that is true of the directories and false
+# of the files, and it describes a safety property this file does not have.
+# Two things actually cover a 28th hook: the `*` backstop below, and the test
+# named above, which reads the constant from the guard's AST and fails when this
+# list falls behind it. Over-matching costs a review request nobody needed;
+# under-matching costs the notification entirely.
+
+# ON A FORK OR A SEPARATE INSTALL, RE-POINT THE HANDLE BELOW. GitHub requires
+# a code owner to have write access, so an upstream handle in someone else's
+# repository is INERT — no review is requested and nothing breaks or warns. The
+# file cannot be generated out of this problem either: GitHub only reads a
+# TRACKED `.github/CODEOWNERS`, so the handle has to be committed by whoever
+# owns the repository. Change it in one place, here, and the entries below
+# follow. (Reviewed as a deliberate exception to the rule against committing
+# install-specific values, 2026-09-09: the value cannot live in generated
+# config and still function, and its failure mode elsewhere is silence rather
+# than breakage.)
+
+# Everything, as the backstop — a single-maintainer repo has one owner, so the
+# specific entries below exist to DOCUMENT the surface rather than to change
+# who is asked.
+*                                   @WingedGuardian
+
+# ── Enforcement hooks (mirrors _HOOK_SURFACE_PREFIXES) ──────────────────────
+/scripts/hooks/                     @WingedGuardian
+/.claude/hooks/                     @WingedGuardian
+/config/behavioral_rules/           @WingedGuardian
+
+# ── Named hook-surface files (mirrors _HOOK_SURFACE_FILES, all 27) ─────────
+/.claude/settings.json              @WingedGuardian
+/config/protected_paths.yaml        @WingedGuardian
+/config/repo_topology.yaml          @WingedGuardian
+/scripts/bash_safety_hook.sh        @WingedGuardian
+/scripts/behavioral_linter.py       @WingedGuardian
+/scripts/check_stale_pending.py     @WingedGuardian
+/scripts/content_safety_hook.py     @WingedGuardian
+/scripts/contribution_offer_hook.py @WingedGuardian
+/scripts/edit_failure_sensor.py     @WingedGuardian
+/scripts/file_context_hook.py       @WingedGuardian
+/scripts/file_modification_audit_hook.py @WingedGuardian
+/scripts/genesis_precompact.py      @WingedGuardian
+/scripts/genesis_session_context.py @WingedGuardian
+/scripts/genesis_session_end.py     @WingedGuardian
+/scripts/genesis_stop_hook.py       @WingedGuardian
+/scripts/genesis_urgent_alerts.py   @WingedGuardian
+/scripts/plan_bookmark_hook.py      @WingedGuardian
+/scripts/pretool_check.py           @WingedGuardian
+/scripts/proactive_memory_hook.py   @WingedGuardian
+/scripts/procedure_advisor.py       @WingedGuardian
+/scripts/review_enforcement_commit.py @WingedGuardian
+/scripts/review_enforcement_prompt.py @WingedGuardian
+/scripts/review_invalidate_on_commit.py @WingedGuardian
+/scripts/review_scope.py            @WingedGuardian
+/scripts/review_state.py            @WingedGuardian
+/scripts/surface_open_prs.py        @WingedGuardian
+/scripts/surface_pr_updates.py      @WingedGuardian
+
+# ── CI and repository configuration ─────────────────────────────────────────
+# Not hook surface, but it decides what runs and what binds: a change here can
+# disable a required check as surely as editing the gate can.
+/.github/                           @WingedGuardian

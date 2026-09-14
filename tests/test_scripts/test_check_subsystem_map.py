@@ -204,7 +204,9 @@ def test_staleness_warns_past_threshold(monkeypatch):
     def fake_git(args: list[str]) -> str | None:
         if args[:2] == ["rev-parse", "--is-shallow-repository"]:
             return "false"
-        if args[0] == "merge-base":
+        if args[:2] == ["rev-parse", "--verify"]:
+            return None  # no default ref here — the ancestry check stays out of it
+        if args[0] in ("cat-file", "merge-base"):
             return ""
         if args[0] == "rev-list":
             return "999"
@@ -222,7 +224,9 @@ def test_staleness_quiet_under_threshold(monkeypatch):
     def fake_git(args: list[str]) -> str | None:
         if args[:2] == ["rev-parse", "--is-shallow-repository"]:
             return "false"
-        if args[0] == "merge-base":
+        if args[:2] == ["rev-parse", "--verify"]:
+            return None  # no default ref here — the ancestry check stays out of it
+        if args[0] in ("cat-file", "merge-base"):
             return ""
         if args[0] == "rev-list":
             return "3"
@@ -250,8 +254,21 @@ def test_staleness_unresolvable_stamp_warns_and_keeps_checking(monkeypatch):
     def fake_git(args: list[str]) -> str | None:
         if args[:2] == ["rev-parse", "--is-shallow-repository"]:
             return "false"
-        if args[0] == "merge-base":
-            return None if bad in args else ""  # sha is a distinct element of the git args
+        if args[:2] == ["rev-parse", "--verify"]:
+            # MERGE: the resolved implementation resolves a DEFAULT REF once
+            # before the loop, so the ancestry check can ask "would squash-merge
+            # discard this stamp?" rather than "is it an ancestor of HEAD?" —
+            # HEAD cannot answer that, because a feature-branch commit is always
+            # an ancestor of its own HEAD. This stub is taught that call rather
+            # than the assertion being loosened: returning None keeps the
+            # ancestry branch out of THIS test, which is about the post-mortem.
+            return None
+        if args[0] in ("cat-file", "merge-base"):
+            # SUBSTRING, not element equality: `cat-file` is passed the sha with
+            # a `^{commit}` suffix, so the sha is not a distinct element of argv
+            # the way it is for `merge-base`. Matching on equality here silently
+            # made every stamp resolvable and the test asserted nothing.
+            return None if any(bad in a for a in args) else ""
         if args[0] == "rev-list":
             return "999"
         raise AssertionError(f"unexpected git call: {args}")
@@ -275,24 +292,99 @@ def test_staleness_degrades_on_shallow_history(monkeypatch):
     assert csm.check_staleness(entries, threshold=20) is None
 
 
-def test_staleness_all_stamps_unresolvable_warns_never_blanket_none(monkeypatch):
-    # Every stamp unresolvable → one warning per entry, never a blanket None that
-    # would mask real staleness for the whole file. (A shallow clone is the only
-    # genuine None case — see test_staleness_degrades_on_shallow_history.)
+MAP_ORPHAN_STAMP = """# Genesis — Current Architecture
+
+## Orphan
+
+```yaml subsystem-map
+entry: orphan-stamped
+modules: [memory]
+verified: dead1234 2026-07-01
+```
+
+## Live
+
+```yaml subsystem-map
+entry: live-stamped
+modules: [db]
+verified: 9037d45b 2026-07-07
+```
+"""
+
+
+def test_one_unresolvable_stamp_does_not_abandon_the_whole_pass(monkeypatch):
+    """An orphan stamp is ONE entry's problem; every other entry still counts.
+
+    This used to `return None` on the FIRST sha it could not resolve, which
+    abandoned staleness for the entire file while `main()` went on printing
+    CLEAN — a check reporting success while checking nothing.
+
+    MEASURED on this repo 2026-08-31: two orphan stamps (feature-branch commits
+    discarded by squash-merge) silenced the warning for all 14 entries, hiding
+    four genuinely stale ones, and the skip message blamed shallow history /
+    fetch-depth — which CI already sets correctly, so it sent the reader after
+    a cause that did not exist.
+    """
+    entries, _ = csm.parse_map(MAP_ORPHAN_STAMP)
+
+    def fake_git(args: list[str]) -> str | None:
+        if args[:2] == ["rev-parse", "--is-shallow-repository"]:
+            return "false"
+        if args[:2] == ["rev-parse", "--verify"]:
+            return None  # no default ref here — the ancestry check stays out of it
+        if args[0] == "cat-file":
+            return None if any("dead1234" in a for a in args) else ""
+        if args[0] == "rev-list":
+            return "999"
+        raise AssertionError(f"unexpected git call: {args}")
+
+    monkeypatch.setattr(csm, "_git", fake_git)
+    warnings = csm.check_staleness(entries, threshold=20)
+
+    assert warnings is not None, "one unresolvable stamp must not abandon the pass"
+    assert len(warnings) == 2, warnings
+    assert any("orphan-stamped" in w and "not a commit" in w for w in warnings), warnings
+    assert any("live-stamped" in w and "999 commits" in w for w in warnings), warnings
+
+
+def test_an_unknown_sha_is_reported_and_never_counted(monkeypatch):
+    """An unresolvable stamp yields no number — and does not abandon the pass.
+
+    This asserted `is None` (the WHOLE pass abandoned) until 2026-08-31. That
+    was broader than its own rationale: "cannot count honestly" is true of the
+    entry whose sha is missing, not of every other entry in the file. Held as
+    written it let two orphan stamps take staleness reporting off the air for
+    all 14 entries while the run still printed CLEAN.
+
+    The guarantee it existed to protect is unchanged and asserted more strictly
+    here: the fake RAISES on `rev-list`, so any attempt to invent a count for an
+    unresolvable sha fails the test rather than merely being unasserted.
+
+    Merge note: origin/main added the same test independently, as
+    `test_staleness_all_stamps_unresolvable_warns_never_blanket_none`. Kept as
+    one test under this name; its point is folded in — every stamp unresolvable
+    yields one warning PER ENTRY, never a blanket None that would mask real
+    staleness for the whole file. A shallow clone remains the only genuine None
+    case (see test_staleness_degrades_on_shallow_history).
+    """
     entries, _ = csm.parse_map(MAP_TWO_ENTRIES)
 
     def fake_git(args: list[str]) -> str | None:
         if args[:2] == ["rev-parse", "--is-shallow-repository"]:
             return "false"
-        if args[0] == "merge-base":
+        if args[:2] == ["rev-parse", "--verify"]:
+            return None  # no default ref here — the ancestry check stays out of it
+        if args[0] in ("cat-file", "merge-base"):
             return None  # sha not present locally
-        raise AssertionError(f"unexpected git call: {args}")
+        raise AssertionError(f"must not count commits for an unresolvable sha: {args}")
 
     monkeypatch.setattr(csm, "_git", fake_git)
     warnings = csm.check_staleness(entries, threshold=20)
-    assert warnings is not None
-    assert len(warnings) == 2
-    assert all("unresolvable" in w for w in warnings)
+    assert warnings is not None, "one unresolvable stamp must not abandon the pass"
+    assert len(warnings) == 2, warnings
+    # Assertion messages carried through from this side; the substring matches the
+    # wording the resolved implementation actually emits.
+    assert all("CANNOT be counted" in w for w in warnings), warnings
 
 
 # --- main (integration over a synthetic repo) ---
@@ -332,3 +424,79 @@ def test_main_missing_map_file_exits_one(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(csm, "SRC_ROOT", src)
     assert csm.main() == 1
     assert "::error::" in capsys.readouterr().out
+
+
+MAP_BRANCH_STAMP = """# Genesis — Current Architecture
+
+## Branch stamped
+
+```yaml subsystem-map
+entry: branch-stamped
+modules: [memory]
+verified: 82f84f0a 2026-08-31
+```
+"""
+
+
+def test_a_stamp_that_will_not_survive_squash_merge_is_caught_before_it_lands(monkeypatch):
+    """The PRE-mortem. The unresolvable-stamp check is a post-mortem by nature.
+
+    A stamp naming a FEATURE-BRANCH commit resolves perfectly while the PR is
+    open and dies the moment that PR is squash-merged, becoming the unresolvable
+    stamp this file's other test covers. Catching it only afterwards means the
+    staleness signal is already down.
+
+    MEASURED 2026-08-31: two stamps on main were already dead this way
+    (0e65071c, fbcf8ee4), and a THIRD was live on an open PR — `82f84f0a`,
+    which `git merge-base --is-ancestor 82f84f0a origin/main` rejects — and
+    would have landed within hours of the fix for the first two.
+
+    Why a mechanical check rather than the prose rule in CURRENT.md's header:
+    on that PR an adversarial reviewer RECOMMENDED the branch sha, reasoning
+    correctly about ancestry AT REVIEW TIME while nobody was reasoning about
+    what survives the merge. The recurrence path runs through careful people,
+    so it needs something that does not depend on remembering.
+    """
+    entries, _ = csm.parse_map(MAP_BRANCH_STAMP)
+
+    def fake_git(args: list[str]) -> str | None:
+        if args[:2] == ["rev-parse", "--is-shallow-repository"]:
+            return "false"
+        if args[:2] == ["rev-parse", "--verify"]:
+            return "abc"  # origin/main resolves
+        if args[0] == "cat-file":
+            return ""  # the stamp EXISTS locally — this is the whole trap
+        if args[:2] == ["merge-base", "--is-ancestor"]:
+            return None  # …but it is not an ancestor of the default branch
+        raise AssertionError(f"must not count staleness from a doomed stamp: {args}")
+
+    monkeypatch.setattr(csm, "_git", fake_git)
+    warnings = csm.check_staleness(entries, threshold=20)
+
+    assert len(warnings) == 1, warnings
+    assert "not an ancestor" in warnings[0]
+    assert "squash-merge" in warnings[0].lower()
+
+
+def test_ancestry_is_not_checked_when_the_default_ref_is_unknown(monkeypatch):
+    """Fail QUIET, not loud, when there is nothing to compare against.
+
+    A clone with no `origin/main` (a fork, a mirror, a detached CI checkout)
+    must not have every entry reported as doomed — the check would be measuring
+    the absence of a ref, not the stamp.
+    """
+    entries, _ = csm.parse_map(MAP_BRANCH_STAMP)
+
+    def fake_git(args: list[str]) -> str | None:
+        if args[:2] == ["rev-parse", "--is-shallow-repository"]:
+            return "false"
+        if args[:2] == ["rev-parse", "--verify"]:
+            return None  # no origin/main, no origin/master
+        if args[0] == "cat-file":
+            return ""
+        if args[0] == "rev-list":
+            return "0"
+        raise AssertionError(f"ancestry must not be probed without a ref: {args}")
+
+    monkeypatch.setattr(csm, "_git", fake_git)
+    assert csm.check_staleness(entries, threshold=20) == []

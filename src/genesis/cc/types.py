@@ -508,7 +508,7 @@ class CCOutput:
     downgraded: bool = False
     via_proxy: bool = False
     # The roster model NAME selected at the chokepoint (genesis.cc.roster) — e.g.
-    # "claude" (native) or "glm-5.2". Ground truth for what we ROUTED to (set from
+    # "claude" (native) or a configured peer. Ground truth for what we ROUTED to (set from
     # apply_active), independent of the provider's self-reported model_used, which
     # may be a variant string or empty. Used for resume-endpoint persistence.
     roster_model: str = ""
@@ -519,6 +519,20 @@ class CCOutput:
     # user and/or a cc.bg_truncated observability event — so the silent-death
     # class (2026-07-20 deep-research) can never recur unremarked.
     bg_truncated: bool = False
+    # Tool names the RUNTIME observed, in first-seen order, from the stream's
+    # `tool_use` events. Out-of-band by construction: the model's own text
+    # cannot write this, whereas scraping tool names out of `text` cannot tell
+    # a tool that RAN from one the response merely talked about.
+    #
+    # THREE states, and the third is why this is not a plain tuple:
+    #   None -> no runtime report at all (a non-streaming `run()`, or a
+    #           hand-built CCOutput). Consumers fall back to whatever they can
+    #           derive, and must NOT read this as "no tools ran".
+    #   ()   -> the runtime watched the stream and saw no tool_use event.
+    #   (…,) -> the tools it saw.
+    # Collapsing the first two into () made "no report" indistinguishable from
+    # "reported zero", which turned an absence of evidence into a claim.
+    tools_used: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -531,6 +545,31 @@ class StreamEvent:
     tool_input: dict | None = None
     session_id: str | None = None
     raw: dict | None = None
+
+    #: Block types ``from_raw`` recognizes, in the order it tests them. Named so
+    #: a caller can ask "how many blocks would this line have produced?" without
+    #: re-implementing the extraction — see ``recognized_blocks``.
+    _RECOGNIZED_BLOCKS = ("thinking", "text", "tool_use")
+
+    @staticmethod
+    def recognized_blocks(raw: dict) -> int:
+        """How many blocks on an ``assistant`` line ``from_raw`` could have used.
+
+        ``from_raw`` returns on the FIRST recognized block, so anything past the
+        first is dropped. This counts the RECOGNIZED ones specifically: a line
+        carrying an unrecognized block (``redacted_thinking``, a future type)
+        alongside one recognized block loses nothing, and a canary that counted
+        raw length would cry wolf on it. Lives here, next to the loop it mirrors,
+        so the two cannot drift apart.
+        """
+        blocks = raw.get("message", {}).get("content", [])
+        if not isinstance(blocks, list):
+            return 0
+        return sum(
+            1
+            for b in blocks
+            if isinstance(b, dict) and b.get("type") in StreamEvent._RECOGNIZED_BLOCKS
+        )
 
     @classmethod
     def from_raw(cls, raw: dict) -> StreamEvent:

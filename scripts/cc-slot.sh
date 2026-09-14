@@ -45,6 +45,7 @@ fi
 
 MODE_ARG="$1"
 shift
+
 # Extra claude args exist only in manual mode (SSH RemoteCommand passes %n only).
 CLAUDE_EXTRA_ARGS=("$@")
 
@@ -377,15 +378,68 @@ fi
 # the gate/fallback message above carries the cap itself.
 echo "→ Slot ${SLOT} (session: ${SESSION_NAME}, live: ${existing})" >&2
 
-# Redirect CC temp to dedicated directory (keeps /tmp clean)
-export TMPDIR="$HOME/.genesis/cc-tmp"
-mkdir -p "$TMPDIR"
-chmod 700 "$TMPDIR"
+# Redirect CC temp to a dedicated directory (keeps /tmp clean).
+#
+# CREATING a directory does not make it USABLE: `mkdir -p` returns SUCCESS for
+# one that already exists, including a root-owned one left by an earlier sudo
+# run. The old form also ran `mkdir`/`chmod` UNGUARDED under `set -euo pipefail`,
+# so a failing chmod killed the whole door — and since this value is now pinned
+# into the session with `-e TMPDIR=` below, an unusable path would be propagated
+# to every slot rather than staying local to this script. So each candidate must
+# be created AND writable before it is accepted, in a loop no future candidate
+# can be added without. ~/tmp is a DEGRADED fallback (disk_hygiene.sh prunes it
+# at 7 days), never an equal one.
+# UNSET, never TMPDIR="". Blanking an ALREADY-EXPORTED variable keeps the
+# export attribute, so the child would receive a literal `TMPDIR=` — and this
+# script ends in `exec tmux`, which STARTS the server when none is running, so
+# an empty value would be inherited by that server and (per the MEASURED note
+# at the exec below) by every slot created on it afterwards. That would defeat
+# the conditional `-e` pin further down via the ambient environment, on this
+# very path, and make the "system default" message a lie.
+unset TMPDIR CLAUDE_CODE_TMPDIR
+# TWIN: the in-tmux wrapper in scripts/bootstrap.sh carries this same
+# loop. It must be self-contained inside ~/.bashrc, so it cannot call
+# this one — keep the two in sync by hand, as with the other
+# deliberately-duplicated pairs in this repo.
+for _cand in "$HOME/.genesis/cc-tmp" "$HOME/tmp"; do
+    mkdir -p "$_cand" 2>/dev/null || continue
+    [ -w "$_cand" ] || continue
+    # A directory we cannot make PRIVATE is not a usable candidate: `-w` alone
+    # passes on a group/world-writable directory owned by SOMEONE ELSE, where
+    # `chmod` then fails — and swallowing that would put CC session temp state
+    # where other users can read it. So a failed chmod rejects the candidate.
+    # ACCEPTED RESIDUAL: the tests come before the repair, so a directory we DO
+    # own whose mode already lacks u+w (only reachable under a pathological
+    # umask like 077-and-worse at creation time) is rejected rather than
+    # repaired, and stays rejected. Deliberate: ordering the repair first would
+    # make the rejection path unreachable for any directory this user owns,
+    # which is exactly the path the security case needs to keep.
+    chmod 700 "$_cand" 2>/dev/null || continue
+    TMPDIR="$_cand"
+    break
+done
+unset _cand
+if [ -n "${TMPDIR:-}" ]; then
+    export TMPDIR
+    [ "$TMPDIR" = "$HOME/.genesis/cc-tmp" ] \
+        || echo "cc-slot: ${HOME}/.genesis/cc-tmp is unusable — using ${TMPDIR} instead." >&2
+else
+    # Make the message TRUE: leave BOTH names genuinely unset so CC resolves the
+    # system default, rather than an exported empty string.
+    unset TMPDIR CLAUDE_CODE_TMPDIR
+    echo "cc-slot: no usable temp dir (${HOME}/.genesis/cc-tmp or ${HOME}/tmp) —" >&2
+    echo "cc-slot: leaving CC on the system default (check disk space/permissions)." >&2
+fi
 
 # Move CC's Bash sandbox off volatile /tmp onto persistent disk.
 # CC uses CLAUDE_CODE_TMPDIR for its sandbox root (/claude-<uid>/<cwd>/).
 # Without this, intermittent ENOENT failures on /tmp break the Bash tool.
-export CLAUDE_CODE_TMPDIR="$HOME/.genesis/cc-tmp"
+# Same resolved directory as TMPDIR above — never a second, unchecked path, and
+# left UNSET (not empty) when there is none, for the same export-attribute
+# reason documented at the loop.
+if [ -n "${TMPDIR:-}" ]; then
+    export CLAUDE_CODE_TMPDIR="$TMPDIR"
+fi
 
 # Permission mode for this interactive dev console. Default: auto — auto-approves
 # common ops but still prompts on deny/ask rules, which the operator answers in
@@ -485,9 +539,49 @@ fi
 # python path, home-anchored token file), and if the repo is gone that python is too
 # → the read silently no-ops before cd fails. Do NOT move it after the `&&`
 # (test_cd_guard_skips_claude_on_bad_cd).
+#
+# The two extra `-e` pins below are each a MEASURED gap, not a guess. `tmux
+# new-session` builds a new session's env from the tmux SERVER's environment,
+# updated by the client only for `update-environment` vars (SSH_*, DISPLAY, …).
+# MEASURED on tmux 3.4, a new session on a server someone else started:
+#   TMPDIR                 -> SERVER's value  (gap: pin it, or CC temp lands on
+#                             the ambient/foreign dir, often /tmp this repo avoids)
+#   GENESIS_CC_SLOT_OAUTH  -> SERVER's value  (gap: pin the RESOLVED lever so a
+#                             hand-relaunch via the in-tmux bashrc wrapper honours
+#                             the operator's always/off, not the default conditional)
+#   PATH                   -> CLIENT's value  (NO gap: the door's PATH already
+#                             propagates, so it is deliberately NOT pinned here.
+#                             Do not "helpfully" add it — measured unnecessary.)
+# CLAUDE_CODE_TMPDIR was already pinned for the same server-env reason.
+# LANG stays LAST — a doors test parses the create line from its final -e.
+#
+# The temp pins are built as an ARRAY because they are conditional: when no
+# usable temp dir was found above, pinning `TMPDIR=` would push an EMPTY value
+# into the session, which is worse than not pinning it (CC would resolve an
+# empty TMPDIR rather than fall back to the system default).
+_TMPDIR_PIN=()
+_TMPDIR_UNSET=""
+if [ -n "${TMPDIR:-}" ]; then
+    _TMPDIR_PIN=(-e "CLAUDE_CODE_TMPDIR=$CLAUDE_CODE_TMPDIR" -e "TMPDIR=$TMPDIR")
+else
+    # OMITTING the pins is not the same as having no value. A new session takes
+    # its environment from the tmux SERVER (the inheritance measured above), so
+    # with no pin the pane silently gets whatever that server holds — including a
+    # stale `~/.genesis/cc-tmp` that we just rejected as unusable. The only way
+    # to actually leave CC on the system default is to unset both names INSIDE
+    # the pane. Joined with `&&`, not `;`, so a failed `cd` still skips claude
+    # (test_cd_guard_skips_claude_on_bad_cd); `unset` cannot fail, so it never
+    # blocks the launch. With these two branches the pane's temp environment is
+    # explicitly determined in BOTH directions — there is no third case.
+    # (Referenced as ${_TMPDIR_UNSET:-} below: the launch line is extracted
+    # and evaluated under `set -u` by the oauth tests, where a bare
+    # ${_TMPDIR_UNSET} would be unbound.)
+    _TMPDIR_UNSET="unset TMPDIR CLAUDE_CODE_TMPDIR && "
+fi
 exec tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
     -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \
-    -e "CLAUDE_CODE_TMPDIR=$CLAUDE_CODE_TMPDIR" \
+    "${_TMPDIR_PIN[@]}" \
+    -e "GENESIS_CC_SLOT_OAUTH=${_slot_oauth_mode}" \
     -e "LANG=$LANG" \
-    "${_OAUTH_SRC}cd ${GENESIS_ROOT} && claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${GENESIS_ROOT}/scripts/cc_exit_capture.sh ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"
+    "${_OAUTH_SRC}cd ${GENESIS_ROOT} && ${_TMPDIR_UNSET:-}claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${GENESIS_ROOT}/scripts/cc_exit_capture.sh ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"

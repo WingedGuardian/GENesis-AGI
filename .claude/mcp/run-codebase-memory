@@ -17,10 +17,25 @@
 # Install the tool first:
 #   curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui
 
-BINARY="${CODEBASE_MEMORY_MCP_BIN:-${HOME}/.local/bin/codebase-memory-mcp}"
+# Locate the binary WITHOUT depending on $HOME: some MCP clients
+# spawn servers with a scrubbed environment (no HOME/USER/XDG_RUNTIME_DIR),
+# where ${HOME}/.local/bin/... would collapse to /.local/bin/... and fail the
+# -x check below (the client then reports a bare "write EPIPE"). Resolution
+# order: explicit override, then the $HOME-based default, then PATH lookup
+# (even scrubbed clients typically keep ~/.local/bin on PATH). Such clients
+# also lack a reachable systemd user manager, so they take the ulimit
+# fallback below instead of the cgroup cap.
+BINARY="${CODEBASE_MEMORY_MCP_BIN:-}"
+if [[ -z "$BINARY" ]]; then
+    if [[ -n "${HOME:-}" && -x "${HOME}/.local/bin/codebase-memory-mcp" ]]; then
+        BINARY="${HOME}/.local/bin/codebase-memory-mcp"
+    elif command -v codebase-memory-mcp >/dev/null 2>&1; then
+        BINARY="$(command -v codebase-memory-mcp)"
+    fi
+fi
 MEM_MAX="${CODEBASE_MEMORY_MCP_MEMORY_MAX:-2G}"
 
-if [[ ! -x "$BINARY" ]]; then
+if [[ -z "$BINARY" || ! -x "$BINARY" ]]; then
     printf 'codebase-memory-mcp not installed.\n' >&2
     printf 'Install: curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui\n' >&2
     exit 1

@@ -403,3 +403,160 @@ async def test_full_health_report_no_qdrant(empty_db):
     assert "growth" in report
     assert report["duplicates"] is None
     assert report["distribution"]["total"] == 1
+
+
+class _ModernQdrantClient:
+    """A Qdrant client honouring the qdrant-client >= 1.16 contract.
+
+    The 1.16 line REMOVED ``QdrantClient.search``; ``query_points`` is the
+    replacement. This fake therefore exposes ``scroll`` + ``query_points`` and
+    deliberately has **no** ``search`` attribute, so any code still reaching for
+    the retired method raises ``AttributeError`` here exactly as it would
+    against a real modern client.
+
+    Returns the REAL ``Record`` / ``ScoredPoint`` / ``QueryResponse`` models so
+    the fake cannot drift from the shapes the production wrapper reads.
+
+    SCOPE — read before trusting a green here. This fake is faithful about the
+    API surface and the return models. It is NOT faithful about the payload: it
+    returns a point carrying ``memory_id`` for EVERY requested id, and on a real
+    store most points do not have that key (MEASURED 2026-09-13: 42,618 of
+    47,901, i.e. 89%, lack it), so the production scroll resolves nothing for
+    ~9 of every 10 samples. These tests therefore cover the removed-method
+    migration and the filter semantics around it — NOT the lookup, which is a
+    separate pre-existing defect tracked on its own.
+    """
+
+    def __init__(self, vector: list[float], neighbours: list[tuple[str, float]]):
+        self._vector = vector
+        self._neighbours = neighbours
+        self.query_points_calls = 0
+        self.last_query_filter = None
+
+    def scroll(self, collection_name, *, scroll_filter=None, limit=1, with_vectors=False):
+        from qdrant_client.http.models import Record
+
+        mem_id = scroll_filter["must"][0]["match"]["value"]
+        rec = Record(
+            id=mem_id,
+            payload={"memory_id": mem_id},
+            vector=self._vector if with_vectors else None,
+        )
+        return ([rec], None)
+
+    def query_points(self, collection_name, *, query=None, limit=10, **kwargs):
+        from qdrant_client.http.models import QueryResponse, ScoredPoint
+
+        self.query_points_calls += 1
+        # Captured so a test can assert on the filter the REAL wrapper built.
+        self.last_query_filter = kwargs.get("query_filter")
+        return QueryResponse(
+            points=[
+                ScoredPoint(id=mid, version=1, score=score, payload={"memory_id": mid}, vector=None)
+                for mid, score in self._neighbours[:limit]
+            ]
+        )
+
+
+@pytest.mark.asyncio()
+async def test_near_duplicate_stats_uses_modern_query_api(empty_db):
+    """near_duplicate_stats must work against a client with no ``search``.
+
+    Verify-RED: before the fix this fails — ``near_duplicate_stats`` called the
+    retired ``qdrant_client.search``, the broad ``except Exception`` turned the
+    resulting ``AttributeError`` into ``{"error": "Unexpected: ..."}``, and the
+    duplicate went unreported. The assertion below distinguishes the two: a
+    success path returns pairs and NO ``error`` key.
+    """
+    from genesis.memory.health import near_duplicate_stats
+
+    db = empty_db
+    await db.execute(
+        "INSERT INTO memory_metadata (memory_id, created_at) VALUES (?, ?)",
+        ("m1", _ts()),
+    )
+    await db.commit()
+
+    client = _ModernQdrantClient(
+        vector=[0.1] * 1024,
+        # m1 is its own top hit; m2 is a genuine near-duplicate above threshold.
+        neighbours=[("m1", 1.0), ("m2", 0.97)],
+    )
+
+    # Guard the guard: the fake really must lack the retired method, or this
+    # test would pass for the wrong reason against unfixed code.
+    assert not hasattr(client, "search")
+
+    result = await near_duplicate_stats(db, client, threshold=0.95)
+
+    assert "error" not in result, f"near_duplicate_stats degraded to an error: {result}"
+    assert result["total_sampled"] == 1
+    assert result["near_duplicates_found"] == 1
+    assert result["pairs"] == [("m1", "m2", 0.97)]
+    assert client.query_points_calls == 1
+
+
+@pytest.mark.asyncio()
+async def test_near_duplicate_stats_ignores_hits_below_threshold(empty_db):
+    """A neighbour under *threshold* is not a duplicate.
+
+    ``qdrant_ops.search`` takes no ``score_threshold``, so the Python-side
+    ``>= threshold`` filter is now the only thing enforcing it. This pins that
+    it still does — otherwise dropping the server-side threshold would silently
+    widen what counts as a duplicate.
+    """
+    from genesis.memory.health import near_duplicate_stats
+
+    db = empty_db
+    await db.execute(
+        "INSERT INTO memory_metadata (memory_id, created_at) VALUES (?, ?)",
+        ("m1", _ts()),
+    )
+    await db.commit()
+
+    client = _ModernQdrantClient(
+        vector=[0.1] * 1024,
+        neighbours=[("m1", 1.0), ("m2", 0.80)],  # 0.80 < 0.95
+    )
+
+    result = await near_duplicate_stats(db, client, threshold=0.95)
+
+    assert "error" not in result
+    assert result["near_duplicates_found"] == 0
+    assert result["pairs"] == []
+
+
+@pytest.mark.asyncio()
+async def test_near_duplicate_stats_does_not_filter_out_deprecated(empty_db):
+    """The scan must NOT inherit the wrapper's default deprecated-exclusion.
+
+    ``qdrant_ops.search`` defaults ``include_deprecated=False`` and then adds a
+    ``must_not`` on ``deprecated=True``. The raw ``client.search()`` this
+    migrated off had no such filter, so taking the default would be a silent
+    behaviour change: it hides a duplicate whose neighbour is soft-deleted, and
+    — worse — when the SAMPLED memory is itself deprecated its own point is
+    excluded from its own neighbour search, so ``limit=2, top hit is self`` stops
+    holding and one sample can emit two pairs.
+
+    This asserts on the filter the REAL wrapper constructed, so removing
+    ``include_deprecated=True`` from the call site turns it red.
+    """
+    from genesis.memory.health import near_duplicate_stats
+
+    db = empty_db
+    await db.execute(
+        "INSERT INTO memory_metadata (memory_id, created_at) VALUES (?, ?)",
+        ("m1", _ts()),
+    )
+    await db.commit()
+
+    client = _ModernQdrantClient(vector=[0.1] * 1024, neighbours=[("m1", 1.0)])
+    await near_duplicate_stats(db, client, threshold=0.95)
+
+    assert client.query_points_calls == 1, "the wrapper never reached query_points"
+    must_not = getattr(client.last_query_filter, "must_not", None) or []
+    deprecated_keys = [c for c in must_not if getattr(c, "key", None) == "deprecated"]
+    assert not deprecated_keys, (
+        "near_duplicate_stats inherited the wrapper's deprecated-exclusion; "
+        f"pass include_deprecated=True for parity. must_not={must_not!r}"
+    )

@@ -1336,3 +1336,51 @@ class TestShieldDrainRecheck:
         )
         assert report["shield_members_skipped"] == 0
         assert report["would_merge"] == 1
+
+
+class TestSynthesisWingVocabulary:
+    """An invalid wing from the model must not beat the cluster's own wing.
+
+    `dict.get(key, default)` falls back only when the key is ABSENT, so a model
+    emitting `"wing": "architecture"` won over `default_wing`. MemoryStore then
+    drops the invalid value and re-classifies from CONTENT, whose terminal
+    fallback is ("general", "uncategorized") — the exact pile the WING_AUDIT
+    surplus task exists to drain. The write-path guard would have fed the
+    backlog it was added to protect.
+    """
+
+    def test_invalid_wing_falls_back_to_the_cluster_wing(self):
+        from genesis.memory.dream_cycle import _parse_synthesis_response
+
+        response = json.dumps(
+            {"content": "merged", "wing": "architecture", "room": "whatever"}
+        )
+        result = _parse_synthesis_response(response, "memory", "retrieval")
+        assert result["wing"] == "memory", result["wing"]
+
+    def test_valid_wing_from_the_model_is_kept(self):
+        from genesis.memory.dream_cycle import _parse_synthesis_response
+
+        response = json.dumps({"content": "merged", "wing": "learning"})
+        result = _parse_synthesis_response(response, "memory", "retrieval")
+        assert result["wing"] == "learning"
+
+    def test_missing_wing_still_falls_back(self):
+        from genesis.memory.dream_cycle import _parse_synthesis_response
+
+        result = _parse_synthesis_response(
+            json.dumps({"content": "merged"}), "memory", "retrieval"
+        )
+        assert result["wing"] == "memory"
+
+    def test_prompt_enumerates_the_controlled_vocabulary(self):
+        """LLM-first: the guard is a backstop, the prompt is the root cause.
+        A schema line reading "<wing>" invites a plausible invention."""
+        from genesis.memory.dream_cycle import _build_synthesis_prompt
+        from genesis.memory.taxonomy import WINGS
+
+        cluster = [{"id": "m1", "payload": {"content": "a"}}]
+        prompt = _build_synthesis_prompt(cluster, "memory", "retrieval")
+        for wing in sorted(WINGS):
+            assert wing in prompt, f"{wing} missing from the synthesis prompt"
+        assert '"<wing>"' not in prompt

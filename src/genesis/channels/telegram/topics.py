@@ -48,6 +48,9 @@ DEFAULT_CATEGORIES: dict[str, str] = {
     "approvals": "Approvals",
     # Content pipeline drafts awaiting user review before external publishing.
     "content_review": "Content Review",
+    # Marketing campaign updates (tick digest / reply pings) — its own topic so
+    # they don't share the Morning Reports topic that generic digests use.
+    "marketing": "Marketing",
 }
 
 
@@ -313,6 +316,9 @@ class TopicManager:
             # scoped — they don't mix with general alerts.
             "approval": "approvals",
             "content": "content_review",
+            # Marketing campaign updates get their OWN topic — NOT the shared
+            # "morning_report" that generic 'digest' messages route to.
+            "marketing": "marketing",
         }
         topic = mapping.get(outreach_category)
         if topic is None:
