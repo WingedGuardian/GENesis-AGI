@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Substitute the gate's own question into an ask, and record the user's answer.
+"""Substitute the gate's own question into an ask.
 
 THE PROBLEM THIS SOLVES. On 2026-08-31 the escalation cap printed three remedies.
 The relay to the user dropped the first, invented a fourth, and added "ship as-is"
@@ -13,12 +13,18 @@ mismatch. Four external review rounds, 16 findings, 7 P1, and the largest class
 SET of words the agent chooses. Open sets do not converge; every named fix ships
 the next round's gap. The premise was rejected.
 
-WHAT THIS DOES INSTEAD. While a demand is live, the PreToolUse half APPENDS the
-gate's own question — carrying the gate's own remedy labels — to whatever the
-agent asked. The agent never authors those options, so it cannot drop, reword,
-negate or pad them. The matching class does not get defended better; it stops
-existing. The PostToolUse half then reads the chosen label out of the harness's
-own structured result and records it against the demand.
+WHAT THIS DOES INSTEAD. When the gate has recorded a menu, this hook APPENDS the
+gate's own question — carrying the gate's own remedy labels — to whatever the agent
+asked. The agent never authors those options, so it cannot drop, reword, negate or
+pad them. The matching class does not get defended better; it stops existing.
+
+AND THAT IS ALL IT DOES. The user's answer is not recorded and no gate reads one
+back. An earlier revision of this work had a PostToolUse recorder and a commit gate
+that honoured the recorded choice; four reviewers produced roughly twenty findings
+against that half and zero against this one, and the record was forgeable in
+principle by anything that can write the round file. So the authorisation path is
+gone rather than defended, and every way this marker can be lost degrades to "the
+menu does not appear this time" — the pre-change status quo, not a bypass.
 
 MEASURED (CC 2.1.246, live in a real session, re-confirmed 2026-09-13):
   * ``updatedInput`` under ``hookSpecificOutput`` rewrites an ``AskUserQuestion``
@@ -28,10 +34,6 @@ MEASURED (CC 2.1.246, live in a real session, re-confirmed 2026-09-13):
     breaks the call into "user did not answer" WITHOUT the user acting — a false
     negative that nearly killed the design. Never emit that field here; a test
     pins its absence.
-  * ``PostToolUse`` ``tool_response`` is ``{annotations, answers, questions}``,
-    where ``answers`` maps the FULL question text to the chosen label (verified
-    byte-exact, 0 characters lost at length 131). So the recorder needs no prose
-    parsing and no transcript walk.
   * Exactly ONE PreToolUse invocation per call, so an unconditional append cannot
     compound.
 The docs carry no version contract for ``updatedInput``, so re-probe on a pin bump
@@ -46,8 +48,8 @@ FAIL DIRECTION — OPEN, on purpose, and against the house default. A guard that
 refuse a question could leave a session unable to ask the user ANYTHING, including
 how to unwedge it. Its failure would cost more than its miss, so any internal error
 here exits 0 silently and this hook is deliberately NOT wrapped in ``run_guard``.
-The enforcement that matters is fail-CLOSED and lives in the commit gate: with no
-recorded answer, the commit stays blocked.
+Failing open is also cheap here in a way it usually is not: nothing downstream
+authorises on this output, so a miss costs a menu rather than a gate.
 """
 
 from __future__ import annotations
@@ -67,7 +69,30 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # live and the next ask gets the append.
 _MAX_QUESTIONS = 4
 
-_HEADER = "Gate decision"
+# The OPTIONS axis has a hard MINIMUM as well as a maximum, and that asymmetry is
+# why the count is bounded at all. MEASURED in the installed CC 2.1.246 binary:
+# `options:Me(J7o()).min(2).max(4)`, alongside the steer CC returns when it is
+# violated -- "This call included a question with fewer than 2 options, so it was
+# rejected and the person never saw it ... Do not retry this call."
+#
+# So an out-of-range option count is NOT a shorter menu. It is a REJECTED CALL that
+# takes the agent's own questions down with it and tells the agent not to retry --
+# the session loses its ability to ask the user anything, which is the one outcome
+# this hook's fail-direction note says it must never cause.
+#
+# THE COUNT IS BOUNDED AT THE READ, NOT HERE (`review_state._MIN_REMEDIES` /
+# `_MAX_REMEDIES`), and this comment is the pointer rather than a second check. A
+# duplicate guard here was written first and the verify-RED sweep found it VACUOUS:
+# nothing can reach it, because `read_gate_demand` refuses the same counts one layer
+# up, so disabling it left the test green. An unreachable guard is a convention
+# wearing a lock's clothes. What stays below is the UNIQUENESS check, which IS
+# reachable -- `_valid_remedy` validates entries one at a time and cannot see a
+# collision between two of them.
+
+# AskUserQuestion describes `header` as "Very short label ... (max 12 chars)" in
+# CC 2.1.246. It is `z.string()` with no `.max()`, so an over-long value does not
+# reject the call — it renders clipped. "Gate decision" is 13.
+_HEADER = "Gate"
 
 # THE KILL SWITCH IS NOT CHECKED HERE, and that is deliberate. It lives in
 # `review_state.gate_ack_disabled`, where `read_gate_demand` consults it and reports
@@ -137,11 +162,11 @@ def _demand_for_ask(cwd: str | None = None, session_id: str | None = None) -> di
         return None
     if not isinstance(demand, dict):
         return None
-    # LIVE: never answered. UNRECOGNISED: answered with something that mapped to no
-    # declared remedy, so asking again is exactly right — the user gets the real
-    # menu instead of another block telling them they were never asked.
-    if demand.get("state") not in ("live", "unrecognised"):
-        return None
+    # No state to filter on: a recorded menu is either readable, in which case the
+    # user should see it, or it is not, in which case the reader already returned
+    # None. An earlier revision gated on a LIVE/ANSWERED/CONSUMED state machine
+    # because the commit gate read the answer back; nothing reads one now, so the
+    # state machine went with it.
     return demand
 
 
@@ -171,7 +196,10 @@ def run_pre() -> int:
         }
         for remedy in demand["remedies"]
     ]
-    if not options:
+    # Checked BEFORE building the canonical question, so a menu that cannot be
+    # rendered never reaches the payload. Duplicates come only from a corrupt or
+    # hand-edited marker, and the next block rewrites it from the canonical set.
+    if len({o["label"] for o in options}) != len(options):
         return 0
 
     canonical = {
@@ -225,46 +253,13 @@ def run_pre() -> int:
     return 0
 
 
-def run_post() -> int:
-    payload = _read_payload()
-    if payload.get("tool_name") != "AskUserQuestion":
-        return 0
-    cwd = _payload_cwd(payload)
-    demand = _demand_for_ask(cwd, _payload_session(payload))
-    if not demand:
-        return 0
-    response = payload.get("tool_response")
-    if not isinstance(response, dict):
-        return 0
-    answers = response.get("answers")
-    if not isinstance(answers, dict):
-        return 0
-    # Exact containment of the QUESTION the gate itself wrote. Both sides of the
-    # match are gate-authored strings — a closed set, which is what makes this
-    # matching sound where #1863's matching over agent-authored text was not.
-    label = answers.get(demand["question"])
-    if not isinstance(label, str):
-        return 0
-    try:
-        from review_state import record_gate_answer
-
-        # Record against the demand's OWN worktree, not the session's. When the
-        # demand was found by enumeration (the `git -C <other-worktree>` case) those
-        # differ, and writing to the session's key would create a second, unread
-        # demand while the real one stayed unanswered — the wedge again, one layer out.
-        target = demand.get("worktree") or cwd
-        record_gate_answer(question=demand["question"], label=label, cwd=target)
-    except Exception:
-        return 0
-    return 0
-
-
 def main(argv: list[str]) -> int:
+    # `--pre` is kept as an explicit mode rather than dropped for having one member:
+    # the hook is wired by name in .claude/settings.json, and a hook invoked with a
+    # mode it does not understand must do nothing rather than guess.
     mode = argv[1] if len(argv) > 1 else ""
     if mode == "--pre":
         return run_pre()
-    if mode == "--post":
-        return run_post()
     return 0
 
 

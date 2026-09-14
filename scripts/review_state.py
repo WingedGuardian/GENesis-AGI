@@ -54,6 +54,7 @@ external marks.)
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
 import json
 import math
@@ -106,8 +107,26 @@ _MAX_EVIDENCE_AGE_SECONDS = 1800  # 30 minutes
 _GSTACK_ANALYTICS = Path.home() / ".gstack" / "analytics" / "skill-usage.jsonl"
 
 
+@functools.lru_cache(maxsize=64)
 def _worktree_root(cwd: str | None = None) -> str:
     """Absolute worktree root used to key per-worktree state.
+
+    MEMOIZED, and the reason is a TIMEOUT BUDGET rather than speed. Every consumer of
+    this module is a short-lived, single-shot hook process, so an in-process cache
+    cannot go stale: the worktree root of a given directory does not change inside one
+    `git commit` decision. Uncached, a single `write_gate_demand` call resolved the
+    same root THREE times -- MEASURED: 3x `rev-parse --show-toplevel` plus one
+    `branch --show-current`, four subprocesses at `timeout=5` each, 20s of worst-case
+    wall clock, inside a hook whose configured timeout is 10s
+    (`.claude/settings.json`, PreToolUse/Bash). A hook killed on the wall clock does
+    not exit 2, and a review gate that does not exit 2 has ALLOWED the commit. The
+    practical cost on a healthy git is ~10ms per call and the rate at which git is
+    slow enough here is UNMEASURED -- but the direction of that failure is permissive
+    and the cache is free, which is the whole argument.
+
+    Deliberately NOT applied to `get_current_branch`: a branch genuinely can change
+    inside one process, and a test in this repo checks out another branch and re-reads.
+    Same-looking call, opposite cache-safety.
 
     Primary: ``git rev-parse --show-toplevel``. Fallback — git missing or timed out,
     LIKELIEST under the concurrent load this keying exists to survive: walk up from
@@ -746,11 +765,11 @@ def _load_round(cwd: str | None = None) -> dict:
                     #
                     # Returning a bare {} here was a FULL DISARM reachable by deleting
                     # ONE key. MEASURED: on a real capped state, removing `last_source`
-                    # made read_gate_demand AND gate_demand_present both report
-                    # nothing, and an acked commit went from exit 2 to exit 0 — past
-                    # the very split that exists so an unreadable demand cannot be
-                    # mistaken for an absent one, because this branch runs BEFORE
-                    # either reader sees the file.
+                    # made `read_gate_demand` report nothing, and an acked commit
+                    # went from exit 2 to exit 0. The exit-code half of that no longer
+                    # applies — nothing authorises on the marker now — but the discard
+                    # still runs BEFORE the reader sees the file, so a bare {} would
+                    # still take the recorded menu with it.
                     preserved = data.get(_GATE_DEMAND_KEY)
                     return {_GATE_DEMAND_KEY: preserved} if isinstance(preserved, dict) else {}
                 if "round" in data:
@@ -815,8 +834,10 @@ def _write_round(state: dict, cwd: str | None = None, *, preserve_demand: bool =
     WHAT THIS DOES NOT CLOSE, stated because the paragraph below would otherwise read
     as "the traffic is now safe": every demand write is a read-modify-write over the
     whole file, so a concurrent counter bump can still LOSE its increment to a
-    recorder write. ``os.replace`` makes each write all-or-nothing; it does not
-    SERIALISE two of them. The round file is keyed per worktree and normally has a
+    menu write. ``os.replace`` makes each write all-or-nothing; it does not
+    SERIALISE two of them. The DIRECTION of that loss is worth naming rather than
+    left as neutral debt: a lost increment restores a LOWER round, so the escalation
+    cap silently un-fires. Permissive. The round file is keyed per worktree and normally has a
     single session writing it, so this is honest debt rather than an active defect —
     but it is debt, not a closed hole.
 
@@ -1037,11 +1058,12 @@ def reset_review_round(cwd: str | None = None) -> None:
     state = _load_round(cwd)
     lifetime = _coerce_finite_int(state.get("lifetime", 0)) if state else 0
     branch = state.get("branch") if state else None
-    # A gate demand lives on this same file and is NOT a counter — it records a
-    # decision the user was asked for. Resetting the streak must never destroy it:
-    # the ack that triggers this reset is itself granted BECAUSE a remedy was
-    # chosen, so dropping the record here would erase the evidence that authorised
-    # the very commit being allowed.
+    # The recorded MENU lives on this same file and is not a counter. Resetting the
+    # streak must not destroy it, because the reset and the retirement answer
+    # different questions: the streak resets when the ack is seen, the menu retires
+    # when a commit is actually ALLOWED (see `retire_gate_demand`, called from the
+    # gate's `_allow`). A commit can be acked here and still denied by four later
+    # rules, and in that window the user has not finished with the menu.
     demand = state.get(_GATE_DEMAND_KEY) if isinstance(state, dict) else None
     if not lifetime or not branch:
         # Nothing worth carrying — keep the original delete so a stale/foreign
@@ -1070,79 +1092,62 @@ def reset_review_round(cwd: str | None = None) -> None:
     )
 
 
-# ─── Gate demands: the gate's own question, carried as DATA ──────────────────
+# ─── The gate's menu, carried as DATA to the ask hook ────────────────────────
 #
 # THE FOUNDING INCIDENT (2026-08-31). The escalation cap printed three remedies.
 # The relay to the user DROPPED the first, INVENTED a fourth, and added "ship
-# as-is" — the one outcome the cap exists to prevent. The gate had said the right
-# thing; the agent relaying it had not.
+# as-is" -- the one outcome the cap exists to prevent. The gate said the right
+# thing; the agent relaying it did not.
 #
-# PR #1863 attacked that by VALIDATING the agent's AskUserQuestion options against
-# a declared set. Four review rounds, 16 findings, 7 P1 — the largest class being
-# "matching agent-authored option text", a coverage rule over an OPEN SET of words
-# the agent chooses. Open sets do not converge; each named fix ships the next
-# round's gap. Premise rejected.
+# WHAT THIS IS. When a tier blocks, it records its own question and its own remedy
+# labels here. A PreToolUse hook reads that and SUBSTITUTES the gate's question
+# into the session's next AskUserQuestion call, so the user chooses from the gate's
+# words rather than the agent's retelling of them. That is the whole mechanism.
 #
-# THIS IS THE INVERSION. The gate declares its remedies as DATA here; a PreToolUse
-# hook APPENDS the gate's own question to whatever the agent asked, so the agent
-# never authors those options and cannot drop, reword, negate or pad them. A
-# PostToolUse recorder reads the user's chosen label out of the harness's own
-# structured result and records it against the demand. The largest finding class
-# dies structurally rather than by being defended better.
+# WHAT THIS IS NOT, and the scoping is the load-bearing part. This marker is
+# WRITE-ONLY from the gate's perspective: the commit gate never reads it back, and
+# nothing here authorises anything. The acknowledgement sigils keep exactly the
+# meaning they had before.
 #
-# WHAT IS DELIBERATELY NOT HERE, because #1863 proved both wrong:
-#   * No matching against agent-authored option text, in any form.
-#   * No transcript reading. The transcript records a tool call AS THE AGENT
-#     EMITTED IT — substitution is applied afterwards — so a transcript-read
-#     verification reads exactly the untrusted values it is trying to check.
+# That boundary was chosen on measurement, not taste. An earlier revision of this
+# work also RECORDED the user's answer and made the commit gate honour it. Four
+# reviewers produced roughly twenty findings against that half and ZERO against
+# this one, concentrated in two generators that kept regrowing: "a demand that
+# cannot be read looks absent, and absent means allow" (four instances, the last
+# one inside the resolver written to make the class unconstructible), and "a
+# one-shot spent before the commit is actually allowed" (three). Twice the
+# enforcement code recreated the founding incident itself. The attestation was
+# also forgeable in principle by anything that can write this file, which is true
+# of every local gate here and cannot be closed locally.
 #
-# Stored on the EXISTING per-worktree round file rather than in a new store (the
-# New-Store Gate): it is already per-worktree and per-branch, which is exactly the
-# demand's scope. That choice is what makes `_write_round` atomic above.
+# So the authorisation path is GONE rather than defended. With no reader on it,
+# every way this marker can be lost or corrupted degrades to "the menu does not
+# appear this time", which is the pre-change status quo -- not a bypass.
 _GATE_DEMAND_KEY = "gate_demand"
 
-# Demand lifecycle. A demand is created by a BLOCK and dies with the branch.
-_DEMAND_LIVE = "live"  # written by a block, not yet answered
-_DEMAND_ANSWERED = "answered"  # the user chose a DECLARED remedy
-_DEMAND_UNRECOGNISED = "unrecognised"  # an answer arrived, matched no remedy
-_DEMAND_CONSUMED = "consumed"  # one authorised commit has been spent
-_DEMAND_STATES = frozenset({_DEMAND_LIVE, _DEMAND_ANSWERED, _DEMAND_UNRECOGNISED, _DEMAND_CONSUMED})
-
-# A free-text ("Other") answer is REJECTED above this length rather than cut. The
-# bound is a resource guard on a file the commit gate reads on every commit, and it
-# is derived from the protocol rather than from a corpus: AskUserQuestion free text
-# is human-typed into a terminal prompt, so 4096 characters is far above any real
-# answer and far below anything that matters to a per-commit read. Over it, the
-# answer is recorded as UNRECOGNISED with an explicit marker saying so — never
-# silently truncated, because a half-quoted answer read back to the user looks like
-# the gate misunderstood them.
-_MAX_ANSWER_TEXT = 4096
-# Same shape, on the declaring side: a gate declaring an implausible number of
-# remedies is a bug in the gate, not a menu to render. Both shipped tiers declare
-# 4 and 2.
-_MAX_REMEDIES = 12
-
-
-# Kill switch. An env var for a one-off, and a marker FILE for a durable disable.
-# A marker rather than a YAML config on purpose: both readers are stdlib-only, so
-# neither can parse YAML, and a file whose mere existence is the signal has nothing
-# to be malformed.
+# A menu is a thing a human reads and chooses from, and here it is rendered by
+# AskUserQuestion, whose schema bounds a question's options at 2..4 -- MEASURED in
+# the CC 2.1.246 binary (`options:Me(J7o()).min(2).max(4)`). Outside that range the
+# menu cannot be shown AT ALL: CC rejects the whole call and tells the agent not to
+# retry, taking the agent's own questions with it.
 #
-# It lives HERE, in the module both the hook and the commit gate already import,
-# rather than in either one of them — two copies of a kill switch is replica drift
-# on the one control that has to work when everything else does not.
-#
-# It disables ENFORCEMENT, not just the append. Disabling only the append would
-# leave a live demand unsatisfiable and wedge the gate, which is the opposite of a
-# recovery tool. Honest caveat: anything that can write this file can disable the
-# mechanism, including the agent it constrains. It is a recovery tool, never
-# insulation.
+# So the bound is the renderer's, not a taste judgement, and a set outside it is
+# REFUSED rather than trimmed to fit -- trimming would silently drop remedies, which
+# is the founding incident. Enforced on the read as well as the write because a
+# hand-edited round file never passes through the writer. The ask hook carries the
+# same two numbers and a test pins that the two agree.
+_MIN_REMEDIES = 2
+_MAX_REMEDIES = 4
+
+# Kill switch: an env var for a one-off, a marker FILE for a durable disable. A
+# marker rather than YAML because both readers are stdlib-only and a file whose
+# mere existence is the signal has nothing to be malformed.
 _GATE_ACK_DISABLED_ENV = "GENESIS_GATE_ACK_DISABLED"
 _GATE_ACK_DISABLED_MARKER = ".genesis/config/gate_ack_disabled"
 
 
 def gate_ack_disabled() -> bool:
-    """True when the operator has turned gate-demand enforcement off. Never raises."""
+    """True when the operator has turned the menu substitution off. Never raises."""
     if os.environ.get(_GATE_ACK_DISABLED_ENV, "").strip() not in ("", "0", "false", "False"):
         return True
     try:
@@ -1152,19 +1157,7 @@ def gate_ack_disabled() -> bool:
 
 
 def _valid_remedy(entry: object) -> dict | None:
-    """Return a normalised remedy dict, or None if ``entry`` is malformed.
-
-    Validates by TYPE at the single read boundary and SKIPS anything malformed, so
-    no persisted value can raise into a gate. ``key`` is required to be a ``str``
-    because callers compare and render it; nothing here uses it AS a dict key, and an
-    earlier version of this docstring cited that as the reason — a true fact about
-    #1863 and a false claim about this code.
-
-    ``required_action`` is NULLABLE by contract, not by accident — a TERMINAL remedy
-    (hand back, shelve) exits with NO action, and one flat non-null field per demand
-    would declare something false about it. Contract requirement from the peer
-    session holding #1971, independently validated here.
-    """
+    """A normalised remedy, or None if ``entry`` is malformed."""
     if not isinstance(entry, dict):
         return None
     key = entry.get("key")
@@ -1173,177 +1166,102 @@ def _valid_remedy(entry: object) -> dict | None:
         return None
     if not isinstance(label, str) or not label:
         return None
-    authorizes = entry.get("authorizes_commit")
-    resets = entry.get("resets_streak")
-    if not isinstance(authorizes, bool) or not isinstance(resets, bool):
-        return None
-    action = entry.get("required_action")
-    if action is not None and not isinstance(action, str):
-        return None
     description = entry.get("description")
     return {
         "key": key,
         "label": label,
         "description": description if isinstance(description, str) else "",
-        "authorizes_commit": authorizes,
-        "resets_streak": resets,
-        "required_action": action,
     }
 
 
-# The three outcomes of trying to resolve a demand. They are DISTINCT on purpose:
-# only ABSENT may lead the commit gate to allow, and ABSENT means one thing only —
-# no demand key in the file at all.
-_DEMAND_ABSENT = "absent"
-_DEMAND_UNREADABLE = "unreadable"
-_DEMAND_USABLE = "usable"
+def retire_gate_demand(cwd: str | None = None) -> None:
+    """Drop the recorded menu once its decision has been acted on. Never raises.
 
+    WHY THIS EXISTS. Without it the menu never retires: a session that hit the cap,
+    chose a remedy, acked and LANDED the commit still gets the gate's question
+    appended to every later ask for the branch's life -- a decided question, asked
+    again, whose answer goes nowhere. An agent that reads the user's second answer as
+    a fresh instruction is the founding incident's cousin. MEASURED before this
+    existed: the menu was still appended after the ack AND after the commit landed.
 
-def _resolve_gate_demand(cwd: str | None = None) -> tuple[str, dict | None]:
-    """THE single decision point for "is there a demand, and can I use it?".
+    WHY A SPEND IS SAFE HERE, when removing one was the whole point of the narrowing.
+    The findings that killed the authorisation path were about spending a PERMISSION:
+    a failed spend bricked a branch, a wrong spend was a bypass. This spends a
+    DISPLAY record, and it fails benignly in BOTH directions -- a failed retire shows
+    the menu again, a spurious retire restores the pre-change ask. Neither is a
+    permission, which is exactly why that objection does not transfer.
 
-    ROBUST BY CONSTRUCTION, and that phrasing is the point rather than decoration.
-    The generator behind more findings in this change than any other was "absent
-    means ALLOW": `read_gate_demand` returned a bare None for many unrelated reasons,
-    the commit gate read None as nothing-to-enforce, and every validation added later
-    became one more way to disarm the gate. Three separate reviews found three
-    separate axes of it — a corrupt `remedies` list, the legacy counter discard, and
-    a branch recorded as "unknown" while git was down — and each was patched at its
-    own axis. A fourth axis was always constructible, because the judgement lived in
-    two functions that each re-derived it.
-
-    So it lives HERE, once, and the SHAPE enforces the property. ABSENT is returned
-    for exactly three conditions, and each is an intentional "this gate has nothing
-    to say here" rather than a failure to read something: the kill switch is armed,
-    there is no demand key at all, or the demand belongs to a DIFFERENT branch. They
-    are all decided in the first half, before any field of the demand is inspected.
-
-    Past that point — the VALIDATION half, below the marker comment — every exit is
-    UNREADABLE. That is the invariant, and it is the one worth having: a validation
-    added next year lands there by construction and can only refuse-and-name-the-exit,
-    never allow. `test_no_validation_failure_can_make_a_demand_look_ABSENT` holds it
-    by corrupting each field in turn rather than by trusting this paragraph.
-
-    (An earlier draft of this docstring claimed "exactly ONE ABSENT return". That was
-    false — there are three — and the useful property was never the count.)
-
-    Never raises.
+    Uses ``_write_round``'s ``preserve_demand=False`` escape hatch, which the
+    chokepoint documents and which this is the only caller of, by design.
     """
-    if gate_ack_disabled():
-        # The recovery path, and the ONE deliberate exception to the rule above. An
-        # operator who disarms the mechanism must get the pre-demand behaviour
-        # wholesale; reporting "present" here would leave the switch unable to
-        # unwedge anything, which is the opposite of a recovery tool.
-        return _DEMAND_ABSENT, None
-
-    state = _load_round(cwd)
-    demand = state.get(_GATE_DEMAND_KEY) if isinstance(state, dict) else None
-    if not isinstance(demand, dict):
-        return _DEMAND_ABSENT, None
-
-    # ── Past this line every exit is UNREADABLE. Do not add an ABSENT return. ──
-
-    branch = demand.get("branch")
-    if not isinstance(branch, str) or branch in ("", "unknown"):
-        # Declared while git could not answer (`get_current_branch` returns the
-        # literal "unknown" on a timeout or OSError). It cannot be attributed to a
-        # branch, so it is not usable — but it is emphatically still THERE.
-        return _DEMAND_UNREADABLE, None
-    current = get_current_branch(cwd=cwd)
-    if current == "unknown":
-        return _DEMAND_UNREADABLE, None
-    if branch != current:
-        # A demand belonging to a DIFFERENT branch is the one case that is genuinely
-        # nothing to do with here — a new change starts fresh, and an answer about a
-        # design that no longer exists must not authorise a commit on the next one.
-        return _DEMAND_ABSENT, None
-
-    status = demand.get("state")
-    gate = demand.get("gate")
-    question = demand.get("question")
-    if status not in _DEMAND_STATES:
-        return _DEMAND_UNREADABLE, None
-    if not isinstance(gate, str) or not gate:
-        return _DEMAND_UNREADABLE, None
-    if not isinstance(question, str) or not question:
-        return _DEMAND_UNREADABLE, None
-
-    raw = demand.get("remedies")
-    remedies = [r for r in (_valid_remedy(e) for e in raw) if r] if isinstance(raw, list) else []
-    if not remedies:
-        # No INTELLIGIBLE remedy means nothing the user could choose, so it cannot be
-        # answered. Refusing is right; the demand self-heals when the gate re-declares.
-        return _DEMAND_UNREADABLE, None
-
-    answered_with = demand.get("answered_with")
-    answer_text = demand.get("answer_text")
-    worktree = demand.get("worktree")
-    return _DEMAND_USABLE, {
-        "gate": gate,
-        "tier": demand.get("tier") if isinstance(demand.get("tier"), str) else "",
-        "branch": branch,
-        "worktree": worktree if isinstance(worktree, str) else None,
-        "question": question,
-        "remedies": remedies,
-        "state": status,
-        "answered_with": answered_with if isinstance(answered_with, str) else None,
-        "answer_text": answer_text if isinstance(answer_text, str) else None,
-        "declared_at": _coerce_finite_int(demand.get("declared_at"), 0),
-    }
+    try:
+        state = {k: v for k, v in _load_round(cwd).items() if k != _GATE_DEMAND_KEY}
+        _write_round(state, cwd, preserve_demand=False)
+    except Exception:  # noqa: BLE001 -- retiring a menu must never break a caller.
+        return
 
 
 def read_gate_demand(cwd: str | None = None) -> dict | None:
-    """The USABLE gate demand for the current branch, or None. Never raises.
+    """The gate's recorded menu for this branch, or None. Never raises.
 
-    None here means "not usable" and deliberately does NOT distinguish absent from
-    unreadable — callers that need that distinction ask `gate_demand_present`, and
-    both derive from the same resolution so they cannot disagree.
+    ALL OR NOTHING on the remedy list, and that is the one validation rule here
+    worth stating. An earlier version SKIPPED a malformed entry and returned the
+    survivors -- which meant a single damaged remedy silently shortened the menu,
+    and if the damaged one happened to be HAND IT BACK the user would be shown
+    every option except the one the gate names first. That is the founding incident
+    reproduced by the mechanism built to prevent it. One bad entry now makes the
+    whole marker unreadable, so the next block simply rewrites it from the gate's
+    own canonical set.
 
-    Remedy ORDER is preserved exactly as declared. Nothing normalises to a dict or a
-    set: the cap tier's first option is hand-back, a test pins that position, and a
-    session takes the menu in the order the gate prints it.
+    Returning None costs a menu, never a permission: nothing downstream authorises
+    on this.
     """
-    _, demand = _resolve_gate_demand(cwd)
-    return demand
+    if gate_ack_disabled():
+        return None
+    state = _load_round(cwd)
+    demand = state.get(_GATE_DEMAND_KEY) if isinstance(state, dict) else None
+    if not isinstance(demand, dict):
+        return None
+    if demand.get("branch") != get_current_branch(cwd=cwd):
+        return None
+    question = demand.get("question")
+    if not isinstance(question, str) or not question:
+        return None
+    raw = demand.get("remedies")
+    if not isinstance(raw, list) or not raw:
+        return None
+    if not _MIN_REMEDIES <= len(raw) <= _MAX_REMEDIES:
+        return None
+    remedies = [_valid_remedy(e) for e in raw]
+    if any(r is None for r in remedies):
+        return None
+    worktree = demand.get("worktree")
+    session = demand.get("session_id")
+    return {
+        "gate": demand.get("gate") if isinstance(demand.get("gate"), str) else "",
+        "tier": demand.get("tier") if isinstance(demand.get("tier"), str) else "",
+        "branch": demand.get("branch"),
+        "worktree": worktree if isinstance(worktree, str) else None,
+        "session_id": session if isinstance(session, str) else None,
+        "question": question,
+        "remedies": remedies,
+    }
 
 
-def gate_demand_present(cwd: str | None = None) -> bool:
-    """True when a demand is RECORDED for this branch, readable or not. Never raises.
+def find_session_gate_demand(cwd: str | None = None, session_id: str | None = None) -> dict | None:
+    """The menu recorded for THIS session, wherever the gate keyed it. Never raises.
 
-    This is what stops "cannot read it" collapsing into "nothing to enforce". Derived
-    from the same resolution as `read_gate_demand`, so the two cannot drift apart —
-    which they could when each re-implemented the branch logic.
-    """
-    outcome, _ = _resolve_gate_demand(cwd)
-    return outcome != _DEMAND_ABSENT
+    The gate keys its marker under the COMMIT's effective directory -- `git -C <dir>`
+    and a trailing `cd` both win over the session's own cwd -- so a reader that
+    computes a key from where it is standing looks in the wrong place whenever a
+    session in one worktree commits into another. That is ordinary here, because
+    worktrees are mandated.
 
-
-def find_session_gate_demand(
-    cwd: str | None = None, session_id: str | None = None
-) -> dict | None:
-    """The demand THIS SESSION was blocked on, or None. Never raises.
-
-    THE ASSOCIATION IS RECORDED, NOT INFERRED, and that is the whole design here.
-    The commit gate keys a demand under the COMMIT's effective directory --
-    `git -C <dir>` and a trailing `cd` both win over the session's own cwd -- so a
-    reader that COMPUTES a key from where it happens to be standing looks in the
-    wrong place whenever the session sits in one worktree and commits into another.
-    That is an ordinary shape here, because worktrees are mandated.
-
-    TWO EARLIER SHAPES WERE WRONG, both recorded so neither comes back:
-      * Computing the key from the hook's PROCESS cwd. Missed the case entirely.
-      * Computing it from the PAYLOAD cwd, then enumerating every demand in the
-        round directory and taking the only candidate. That closed the wedge and
-        opened something worse: the round directory is GLOBAL, so an unrelated
-        session in worktree A could be shown worktree B's menu, and the recorder
-        would write A's answer onto B -- potentially authorising B's commit. It also
-        re-wedged as soon as a second demand existed anywhere, since "the only
-        candidate" stopped being true.
-
-    So the gate records WHICH SESSION it blocked, and this matches that. No
-    directory arithmetic, no sole-candidate guess, no global inference. A session
-    with no id, or one that matches nothing, gets its own worktree's demand or
-    nothing at all -- never someone else's.
+    Two earlier shapes were wrong and are recorded so neither returns: computing the
+    key from the hook's PROCESS cwd (missed the case), and computing it from the
+    PAYLOAD cwd then taking the only candidate in the round directory (that
+    directory is global, so one session could be shown another's menu). The gate
+    records WHICH SESSION it blocked; this matches that, and nothing is inferred.
     """
     direct = read_gate_demand(cwd)
     if direct is not None:
@@ -1362,15 +1280,10 @@ def find_session_gate_demand(
         if not isinstance(data, dict):
             continue
         demand = data.get(_GATE_DEMAND_KEY)
-        if not isinstance(demand, dict):
-            continue
-        if demand.get("session_id") != session_id:
+        if not isinstance(demand, dict) or demand.get("session_id") != session_id:
             continue
         worktree = demand.get("worktree")
         if not isinstance(worktree, str) or not worktree:
-            # No recorded root means it cannot be re-keyed. Still found by the direct
-            # read above when the session IS in its worktree, so this degrades to the
-            # pre-enumeration behaviour rather than losing anything.
             continue
         found = read_gate_demand(worktree)
         if found is not None:
@@ -1378,13 +1291,12 @@ def find_session_gate_demand(
     return None
 
 
-def _store_gate_demand(demand: dict, cwd: str | None = None) -> None:
-    """Persist ``demand`` onto the round file without disturbing the counters."""
-    state = _load_round(cwd)
-    if not isinstance(state, dict):
-        state = {}
-    state[_GATE_DEMAND_KEY] = demand
-    _write_round(state, cwd)
+# The demand write runs INSIDE the block path of a hook with a 10s wall-clock
+# timeout, before the exit(2) that IS the refusal. Nothing it does may be able to
+# delay that exit, so its own git read gets a budget far below the hook's and
+# degrades to the "unknown" branch on expiry -- which makes the marker unreadable,
+# which costs a menu and never a gate.
+_GATE_DEMAND_GIT_TIMEOUT = 1.0
 
 
 def write_gate_demand(
@@ -1395,196 +1307,65 @@ def write_gate_demand(
     remedies: list[dict],
     cwd: str | None = None,
     session_id: str | None = None,
+    branch: str | None = None,
+    worktree: str | None = None,
 ) -> None:
-    """Declare a gate's remedy set as data, at the moment the gate BLOCKS.
+    """Record the gate's own menu at the moment the gate BLOCKS. Never raises.
 
-    Called from the block path, never speculatively. That is the whole enforcement
-    scope: a demand exists only once this gate has ACTUALLY refused a commit, which
-    is exactly the founding incident's shape. A session that was never blocked has
-    nothing to relay, so its sigil keeps its old meaning and every existing sigil
-    test is untouched. (The separate, PRE-EXISTING hole — appending the sigil before
-    ever being blocked — is out of scope here and filed as an issue; closing it would
-    rewrite ~11 existing tests inside a lane with a hard stop at 2 review rounds,
-    which is the over-scope shape that killed #1863.)
-
-    IDEMPOTENT on re-block: an existing demand for the SAME gate on this branch is
-    left alone unless it is spent. Clobbering it would erase a recorded answer every
-    time the gate re-printed its menu — the user would answer, the next blocked
-    commit would rewrite the demand, and the answer would be gone.
+    Always overwrites a menu it ACCEPTS: there is no lifecycle to preserve and no
+    answer to protect, so the newest block's canonical set simply wins -- which is
+    also what repairs a marker some earlier write left unreadable. A set it REFUSES
+    (malformed, or outside the renderable range) writes nothing and leaves the
+    previous marker for the next block to replace. Stated precisely because "always
+    overwrites" is what a reader relies on when reasoning about repair.
     """
-    valid = [r for r in (_valid_remedy(e) for e in remedies) if r]
-    if not valid or len(valid) > _MAX_REMEDIES:
-        # Refuse to write an unanswerable or implausible demand. The gate still
-        # blocks — it simply does not gain a demand it could never satisfy.
+    valid = [_valid_remedy(e) for e in remedies]
+    if not _MIN_REMEDIES <= len(valid) <= _MAX_REMEDIES:
         return
-    if gate_ack_disabled():
-        # Disarmed: do not record a demand at all. The tier still blocks on its own
-        # rules; it simply does not accrue a demand nobody can satisfy.
+    if any(r is None for r in valid) or gate_ack_disabled():
         return
-    # Idempotency reads the RAW key, not `read_gate_demand`. Going through the
-    # filtered read meant that while the kill switch was armed the check saw None and
-    # a block CLOBBERED an ANSWERED demand back to LIVE (MEASURED: answered/narrow ->
-    # one disarmed block -> live/None), so an operator who disarmed and re-armed made
-    # the user answer all over again — and the "IDEMPOTENT on re-block" promise below
-    # was simply false in that window.
-    existing = _load_round(cwd).get(_GATE_DEMAND_KEY)
-    if (
-        isinstance(existing, dict)
-        and existing.get("gate") == gate
-        and existing.get("branch") == get_current_branch(cwd=cwd)
-        and existing.get("state") != _DEMAND_CONSUMED
-        # ...and it must still be READABLE. Protecting an UNREADABLE demand from
-        # being overwritten made corruption permanent: the gate refused (correctly,
-        # since presence is separate from readability), pointed at
-        # `retire-gate-demand`, and retire resets only state/answered_with — never
-        # `question` or `remedies` — so the next block hit this idempotency check,
-        # no-op'd, and the loop never terminated. The kill switch was the only exit.
-        # MEASURED with `remedies` corrupted: refuse -> retire -> re-block -> still
-        # unreadable, forever.
-        #
-        # Self-healing instead: an unreadable demand is replaced by the gate's own
-        # current declaration. Note this cannot silently discard a decision — an
-        # unreadable demand has no legible answer to discard, which is exactly why
-        # it was wedging.
-        and read_gate_demand(cwd) is not None
-    ):
-        return
-    _store_gate_demand(
-        {
-            "gate": gate,
-            "tier": tier,
-            "branch": get_current_branch(cwd=cwd),
-            # Recorded so a reader can RE-KEY from the demand instead of computing a
-            # key from its own cwd -- see find_session_gate_demand.
-            "worktree": _worktree_root(cwd) if cwd else _worktree_root(os.getcwd()),
-            # THE SESSION THAT WAS BLOCKED. This is the association that makes the
-            # ask hook's lookup exact instead of inferred: the gate knows which
-            # session it just refused, and the hook knows which session it is
-            # serving, so neither has to guess from a directory.
-            "session_id": session_id if isinstance(session_id, str) and session_id else None,
-            "question": question,
-            "remedies": valid,
-            "state": _DEMAND_LIVE,
-            "answered_with": None,
-            "answer_text": None,
-            "declared_at": int(time.time()),
-        },
-        cwd,
-    )
-
-
-def record_gate_answer(*, question: str, label: str, cwd: str | None = None) -> str | None:
-    """Record the user's answer to the gate's OWN question. Never raises.
-
-    Returns the matched remedy key, ``"unrecognised"``, or None if nothing was
-    recorded at all.
-
-    Matching is exact containment of the QUESTION+LABEL PAIR, and both strings were
-    written by the gate itself — a closed set, so this is not the open-set matching
-    that failed. The pair rather than the bare label is deliberate: the agent knows
-    our labels from the block message and could author its OWN question reusing
-    them under a misleading description, so the gate's actual question must be the
-    one that was answered.
-
-    A non-matching answer ("Other", free text) records UNRECOGNISED rather than
-    nothing. It still authorises no commit — but the next block can then say an
-    answer arrived and quote it back, instead of telling someone who just answered
-    that they were never asked.
-    """
-    demand = read_gate_demand(cwd)
-    if not demand or demand["state"] in (_DEMAND_ANSWERED, _DEMAND_CONSUMED):
-        # First answer wins. A later ask must not silently re-decide a demand the
-        # user has already settled.
-        return None
-    if demand["question"] != question:
-        return None
-    stored = _load_round(cwd).get(_GATE_DEMAND_KEY)
-    if not isinstance(stored, dict):
-        return None
-    for remedy in demand["remedies"]:
-        if remedy["label"] == label:
-            stored["state"] = _DEMAND_ANSWERED
-            stored["answered_with"] = remedy["key"]
-            stored["answer_text"] = label
-            _store_gate_demand(stored, cwd)
-            return remedy["key"]
-    stored["state"] = _DEMAND_UNRECOGNISED
-    stored["answered_with"] = None
-    stored["answer_text"] = (
-        label
-        if isinstance(label, str) and len(label) <= _MAX_ANSWER_TEXT
-        else "<answer rejected: longer than the gate stores>"
-    )
-    _store_gate_demand(stored, cwd)
-    return _DEMAND_UNRECOGNISED
-
-
-def consume_gate_demand(cwd: str | None = None) -> None:
-    """Spend an ANSWERED demand's single authorisation. Never raises.
-
-    One-shot by design: the answer authorises THE commit that was blocked, not the
-    branch's remaining life. The gate re-demands on the next block.
-    """
-    stored = _load_round(cwd).get(_GATE_DEMAND_KEY)
-    if not isinstance(stored, dict) or stored.get("state") != _DEMAND_ANSWERED:
-        return
-    stored["state"] = _DEMAND_CONSUMED
-    _store_gate_demand(stored, cwd)
-
-
-def retire_gate_demand(cwd: str | None = None) -> bool:
-    """Drop the current demand so the gate can ask again. Returns True if one went.
-
-    The documented exit from a TERMINAL answer. Choosing hand-back or shelve blocks
-    the branch permanently and that is the point — but a decision made on one day's
-    understanding must not be unappealable, so this is the deliberate re-ask: the
-    demand is dropped, the gate re-demands on its next block, and the user chooses
-    again with the menu in front of them.
-
-    Deliberately an OPERATOR command and not an automatic path. It is reachable by
-    anything that can write this file, which is the same honest caveat the kill
-    switch carries: this is a RECOVERY tool, not insulation. What it cannot do is
-    happen silently — it drops the recorded answer, so the next block prints the
-    full menu again rather than quietly proceeding.
-    """
     state = _load_round(cwd)
-    demand = state.get(_GATE_DEMAND_KEY) if isinstance(state, dict) else None
-    if not isinstance(demand, dict):
-        return False
-    # BRANCH-SCOPED, because its reader is. Popping unconditionally meant running
-    # this on one branch destroyed another branch's live demand while
-    # `gate-demand` on that same branch correctly reported none — read and write
-    # disagreeing about scope, with a success message asserting an effect on the
-    # wrong branch.
-    if demand.get("branch") != get_current_branch(cwd=cwd):
-        return False
-    # RESET, never DELETE. Deleting was a complete bypass and the worst kind: the
-    # block message advertises this command as the appeal route from a TERMINAL
-    # choice, so the gate itself handed the agent the override. MEASURED —
-    # hand-back answered, acked commit refused (2), retire, SAME acked commit -> 0.
-    # The CLI even printed "until then nothing is authorised" while authorising it.
-    #
-    # Resetting to LIVE delivers exactly what the docstring promises — the gate puts
-    # the full menu up again — while the commit stays blocked until a NEW answer
-    # lands. An appeal re-opens the question; it does not decide it.
-    demand["state"] = _DEMAND_LIVE
-    demand["answered_with"] = None
-    demand["answer_text"] = None
-    state[_GATE_DEMAND_KEY] = demand
-    # `preserve_demand=False` because this call IS the deliberate write of the
-    # demand key (see the chokepoint note in `_write_round`).
-    _write_round(state, cwd, preserve_demand=False)
-    return True
+    if not isinstance(state, dict):
+        state = {}
+    state[_GATE_DEMAND_KEY] = {
+        "gate": gate,
+        "tier": tier,
+        # Take what the caller already resolved; ask only when it did not, and
+        # then on a budget this path can afford.
+        "branch": (
+            branch
+            if isinstance(branch, str) and branch
+            else get_current_branch(cwd=cwd, timeout=_GATE_DEMAND_GIT_TIMEOUT)
+        ),
+        # Recorded so a reader can RE-KEY from the marker rather than computing a
+        # key from its own cwd, and so the ask hook can match the session the gate
+        # actually blocked. See find_session_gate_demand.
+        "worktree": (
+            worktree
+            if isinstance(worktree, str) and worktree
+            else (_worktree_root(cwd) if cwd else _worktree_root(os.getcwd()))
+        ),
+        "session_id": session_id if isinstance(session_id, str) and session_id else None,
+        "question": question,
+        "remedies": valid,
+    }
+    _write_round(state, cwd)
 
 
-def get_current_branch(cwd: str | None = None) -> str:
-    """Get current git branch name."""
+def get_current_branch(cwd: str | None = None, *, timeout: float = 5) -> str:
+    """Get current git branch name. Returns "unknown" rather than raising.
+
+    `timeout` is a parameter because not every caller can afford the same wait. A
+    caller on a path where a slow answer is worse than no answer passes a short one
+    and takes the "unknown" fallback -- see `write_gate_demand`, which runs inside a
+    10s hook and must not be able to delay the refusal that hook exists to deliver.
+    """
     try:
         result = subprocess.run(
             ["git", "branch", "--show-current"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=timeout,
             cwd=cwd,
         )
         return result.stdout.strip() or "unknown"
@@ -1595,8 +1376,7 @@ def get_current_branch(cwd: str | None = None) -> str:
 def main() -> None:
     if len(sys.argv) < 2:
         print(
-            "Usage: review_state.py "
-            "[status|mark|diff-hash|evidence-path|gate-demand|retire-gate-demand]",
+            "Usage: review_state.py [status|mark|diff-hash|evidence-path|gate-demand]",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1604,38 +1384,28 @@ def main() -> None:
     cmd = sys.argv[1]
 
     if cmd == "gate-demand":
+        # Read-only inspector. Shows the menu the ask hook will substitute; nothing
+        # here authorises anything, so there is no state to report beyond the menu.
         demand = read_gate_demand()
         if not demand:
-            print("no gate demand on this branch")
+            print("no gate menu recorded for this branch")
+            # Name the cause rather than leaving a bare negative. The gate keys the
+            # marker under the COMMIT's effective directory, so in the `git -C <other
+            # worktree>` configuration this repo mandates, running this from the
+            # session's own directory reports nothing while the ask hook finds and
+            # substitutes one. The hook re-keys from the marker; this inspector
+            # cannot, because it has no session id to match on.
+            print(
+                "(keyed to the commit's worktree — run this from the directory the "
+                "blocked commit targeted if that is not here)",
+                file=sys.stderr,
+            )
             return
         print(f"gate:     {demand['gate']} ({demand['tier']})")
-        print(f"state:    {demand['state']}")
         print(f"question: {demand['question']}")
-        if demand["answered_with"]:
-            print(f"answered: {demand['answered_with']}")
-        elif demand["answer_text"]:
-            print(f"answered: <no declared remedy matched> {demand['answer_text']}")
-        print("remedies (declaration order):")
+        print("remedies (declaration order — the order the gate prints them):")
         for remedy in demand["remedies"]:
-            authorises = "authorises a commit" if remedy["authorizes_commit"] else "TERMINAL"
-            action = remedy["required_action"] or "no action"
-            print(f"  - {remedy['label']}  [{authorises}; {action}]")
-        return
-
-    if cmd == "retire-gate-demand":
-        # The documented re-ask. Choosing a TERMINAL remedy blocks the branch and
-        # that is the point — but a decision made on one day's understanding must
-        # not be unappealable, so this drops the demand and the gate puts the full
-        # menu in front of the user again on its next block.
-        if retire_gate_demand():
-            print(
-                "gate demand re-opened. Any recorded answer has been cleared and the "
-                "demand is LIVE again, so the gate will put its full menu in front of "
-                "you on the next ask. The commit stays BLOCKED until a new answer is "
-                "recorded — re-opening the question does not decide it."
-            )
-        else:
-            print("no gate demand on this branch — nothing to re-open")
+            print(f"  - {remedy['label']}")
         return
 
     if cmd == "status":

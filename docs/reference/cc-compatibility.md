@@ -711,18 +711,17 @@ When a new CC version is released, run through this:
    safety guard a real payload, so it catches a changed hook payload shape that
    would otherwise silently disable the guards (see the hook input contract
    under "Actively Used" above).
-8. **Re-probe the `AskUserQuestion` rewrite path.** The gate-demand substitution
-   (`scripts/hooks/ask_gate_demand.py`) rests on three properties the docs give no
-   version contract for: `updatedInput` rewrites an `AskUserQuestion` call; it works
-   ONLY without a `permissionDecision` field; and PostToolUse `tool_response.answers`
-   maps question text to the chosen label. Wire the pre/post hook pair on
-   `AskUserQuestion`, make one real ask, and confirm an appended question renders and
-   its answer comes back. See the measured section under Known Issues.
-   **Failure here is QUIET, which is why it is a checklist item**: if the append stops
-   rendering, no demand is ever answered, and every capped branch simply stays blocked
-   with a message saying nobody was asked. That is fail-CLOSED and recoverable
-   (`GENESIS_GATE_ACK_DISABLED=1`, or `~/.genesis/config/gate_ack_disabled`), but
-   nothing announces it.
+8. **Re-probe the `AskUserQuestion` rewrite path.** The gate-menu substitution
+   (`scripts/hooks/ask_gate_demand.py`) rests on two properties the docs give no
+   version contract for: `updatedInput` rewrites an `AskUserQuestion` call, and it
+   works ONLY without a `permissionDecision` field. Wire the hook on
+   `AskUserQuestion`, make one real ask, and confirm the appended question renders.
+   See the measured section under Known Issues.
+   **Failure here is QUIET, which is why it is a checklist item** — and quiet in the
+   direction that does NOT announce itself: the session simply relays the gate's
+   options in its own words again, which is the pre-2026-09 behaviour and the exact
+   thing this mechanism exists to stop. Nothing blocks and nothing errors. There is
+   no gate to catch it, because by design no gate reads this marker back.
 9. **Update this document** with findings.
 
 ---
@@ -1185,12 +1184,22 @@ Variant A's failure is the dangerous one: it is a false NEGATIVE that looks like
 user declining. A test pins the field's absence
 (`tests/test_hooks/test_gate_demand.py::test_the_hook_NEVER_emits_a_permissionDecision`).
 
-**The answer comes back STRUCTURED**, so nothing needs to parse prose. PostToolUse
-`tool_response` is `{annotations, answers, questions}`, where `answers` maps the FULL
-question text to the chosen label. MEASURED byte-exact: a 131-character question came
-back at 131 characters, `sent in tool_response["answers"]` → `True`, **0 characters
-lost**. A free-text ("Other") answer lands in the same position as a clicked label, so
-a consumer must fail CLOSED on anything it does not recognise.
+**The answer comes back STRUCTURED.** PostToolUse `tool_response` is
+`{annotations, answers, questions}`, where `answers` maps the FULL question text to
+the chosen label. MEASURED byte-exact: a 131-character question came back at 131
+characters, `sent in tool_response["answers"]` → `True`, **0 characters lost**. A
+free-text ("Other") answer lands in the same position as a clicked label, so any
+consumer of this must fail CLOSED on anything it does not recognise.
+
+NOTHING IN GENESIS READS THIS TODAY, and the reason is worth recording next to the
+measurement rather than somewhere a future reader will not find it. A first version
+of the gate-menu work recorded the user's answer here and had the commit gate honour
+it. Four reviewers produced roughly twenty findings against that half and zero against
+the substitution half; the record was also forgeable in principle by anything that can
+write the round file, which is true of every local gate here. The authorisation path
+was removed rather than defended. The measurement stays because it is a true fact
+about CC that the next person to want a structured answer should not have to re-derive
+— not because anything depends on it.
 
 Two more measured properties:
 - **Exactly ONE PreToolUse invocation per call** — there is no re-validation pass, so
@@ -1204,10 +1213,31 @@ THE AGENT EMITTED IT — substitution is applied afterwards — so a transcript-
 "verification" of what was presented reads exactly the untrusted values it is trying
 to check. PR #1863 built that and it is why this note exists.
 
+**The OPTIONS axis has a hard MINIMUM as well as a maximum**, which the questions
+axis does not, and that asymmetry is easy to miss. Read from the 2.1.246 binary:
+`options:Me(J7o()).min(2).max(4)` against `questions:Me(mnr()).min(1).max(4)`. The
+steer CC returns on violation names the consequence: *"This call included a question
+with fewer than 2 options, so it was rejected and the person never saw it... Do not
+retry this call."* So an out-of-range option count is not a shorter menu — the WHOLE
+call is rejected, taking the caller's other questions with it, and the model is told
+not to retry. Anything rewriting `updatedInput` for this tool must bound the option
+count itself, since the rewrite bypasses whatever the model would have produced.
+`header` is described as max 12 characters but is a bare `z.string()` with no `.max()`
+— over-long renders clipped rather than rejecting.
+
 **No version contract.** The official docs describe `updatedInput` on PreToolUse but
 say nothing about the `permissionDecision` asymmetry, transcript faithfulness, or when
 the field was introduced. Re-probe on every pin bump — the CC Update Evaluation
 Checklist carries the step.
+
+**There is at least one code path that STRIPS `updatedInput` outright.** A hook-output
+sanitiser in the 2.1.246 bundle records the field as *dropped* on the PreToolUse
+branch and returns only `permissionDecision`/`additionalContext`. UNVERIFIED which
+contexts use it — it sits in a separately bundled module and no probe here reached it;
+remote or cloud sessions are a guess and nothing more. Recorded because it is the
+shape that would make a substitution vanish silently in an environment nobody
+re-probed, which is exactly the quiet failure the checklist step exists for. Do not
+treat this as established behaviour in either direction.
 
 MEASUREMENT NOTE worth keeping: the first read of the returned `answers` printed the
 keys through a `repr(k[:95])` slice and they LOOKED truncated by CC. The truncation

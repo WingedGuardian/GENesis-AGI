@@ -262,7 +262,9 @@ def test_defect_bearing_streak_still_reaches_cap_after_clean(repo, _isolate_roun
 # ── Gate integration tests (review_enforcement_commit, subprocess) ────────
 
 
-def _run_hook(command: str, repo: Path, home: Path) -> subprocess.CompletedProcess:
+def _run_hook(
+    command: str, repo: Path, home: Path, *, extra_env: dict | None = None
+) -> subprocess.CompletedProcess:
     payload = json.dumps(
         {
             "hook_event_name": "PreToolUse",
@@ -272,44 +274,15 @@ def _run_hook(command: str, repo: Path, home: Path) -> subprocess.CompletedProce
         }
     )
     env = {**os.environ, "HOME": str(home)}
+    # Decided PER TEST, never inherited. This suite runs inside dispatched sessions
+    # too, and GENESIS_CC_SESSION=1 is set in every one of them — so without this
+    # pop, a background run silently exercised the no-human branch of every cap test
+    # while a foreground run exercised the other, and nothing could tell the two
+    # apart because no test asserted the note's ABSENCE.
+    env.pop("GENESIS_CC_SESSION", None)
+    env.update(extra_env or {})
     return subprocess.run(
         [sys.executable, str(_HOOK)],
-        input=payload,
-        cwd=str(repo),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-
-
-def _answer_demand(repo: Path, home: Path, label: str) -> subprocess.CompletedProcess:
-    """Answer the live gate demand by driving the REAL PostToolUse recorder hook.
-
-    Once this gate has BLOCKED, `# escalation-ack` / `# audit-ack` no longer clear it
-    on their own: an answer from the user has to be on record, because the sigil
-    attests that a fresh decision was MADE and only the recorded answer attests that
-    the USER made it. (A session this gate never blocked has no demand, so the sigil
-    keeps its old meaning — which is why the other tests here are untouched.)
-
-    Deliberately drives `ask_gate_demand.py --post` with a real AskUserQuestion
-    payload rather than calling `review_state.record_gate_answer` in-process. Two
-    reasons: an in-process write would land in the REAL ~/.genesis instead of the test
-    HOME, and a hand-written intermediate would let the hook and the gate disagree
-    about the payload shape without any test noticing.
-    """
-    question = _gate_demand_question(repo, home)
-    payload = json.dumps(
-        {
-            "hook_event_name": "PostToolUse",
-            "tool_name": "AskUserQuestion",
-            "tool_response": {"answers": {question: label}},
-            "session_id": "test",
-        }
-    )
-    env = {**os.environ, "HOME": str(home)}
-    return subprocess.run(
-        [sys.executable, str(_ASK_HOOK), "--post"],
         input=payload,
         cwd=str(repo),
         env=env,
@@ -578,11 +551,7 @@ def test_docs_only_commit_still_blocked_at_cap(repo, home):
     res = _run_hook('git commit -m "docs"', repo, home)
     assert res.returncode == 2, res.stdout + res.stderr
     assert "escalation cap" in res.stderr
-    # ...and an ack lets the docs commit through — once the user's choice is on
-    # record. That block declared a demand, so from here the sigil alone no longer
-    # clears it: the sigil attests a fresh decision was MADE, the recorded answer
-    # attests the USER made it.
-    _answer_demand(repo, home, "REDESIGN robust-by-construction")
+    # ...and an ack lets the docs commit through.
     res2 = _run_hook('git commit -m "docs"  # escalation-ack', repo, home)
     assert res2.returncode == 0, res2.stderr
 
@@ -872,10 +841,6 @@ def test_acceptance_bar_incident_replay(repo, home):
     assert (
         "mode-switch" in res_blocked.stderr and "escalation cap reached" not in res_blocked.stderr
     )
-    # The mode-switch block declared its own demand, so the audit-ack now needs the
-    # user's choice on record too: (B) is "the premise holds — fix the CLASS", which
-    # is exactly what this replay says happened.
-    _answer_demand(repo, home, "(B) The premise holds — fix the CLASS, not the instance")
     res_ok = _run_hook('git commit -m "wip"  # audit-ack', repo, home)
     assert res_ok.returncode == 0, res_ok.stdout + res_ok.stderr
 
@@ -1162,10 +1127,6 @@ def test_a_denied_command_does_not_spend_the_acceptance(repo, home):
     denied = _run_hook('git commit -m "accept"  # final-round-accept', repo, home)
     assert denied.returncode == 2, denied.stdout + denied.stderr
     assert "already used" not in denied.stderr.lower()
-    # That denial came from the escalation cap, so it declared a demand. Record the
-    # user's choice before the co-required form, or the cap refuses the ack for the
-    # separate reason that nobody was ever asked.
-    _answer_demand(repo, home, "NARROW the scope")
     # The acceptance must still be available to the co-required form.
     ok = _run_hook('git commit -m "accept"  # final-round-accept escalation-ack', repo, home)
     assert ok.returncode == 0, ok.stdout + ok.stderr
@@ -1244,9 +1205,6 @@ def test_below_final_round_the_normal_cycle_still_applies(repo, home):
     without = _run_hook('git commit -m "wip"', repo, home)
     assert without.returncode == 2, "control: the escalation cap must be blocking here"
     assert "escalation cap" in without.stderr.lower()
-    # The control block above declared a demand, so the ordinary cycle now runs
-    # block -> the user is asked -> ack, rather than block -> ack.
-    _answer_demand(repo, home, "NARROW the scope")
     res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
     assert res.returncode == 0, res.stdout + res.stderr
 
@@ -1480,13 +1438,16 @@ def test_both_tiers_route_the_fork_to_evidence_not_feel(repo, home):
     )
 
 
-# ─── Gate demands: the substitution contract, at the gate ────────────────────
+# ─── The recorded menu, end to end ──────────────────────────────────────────
 #
-# These are the locks for the ENFORCEMENT itself. The four tests above that call
-# `_answer_demand` would pass whether or not the gate checks the demand — they
-# answer it either way — so without these, deleting `_demand_refusal` would leave
-# the whole suite green. That gap was found while planning the verify-RED sweep,
-# which is exactly what that sweep is for.
+# What this feature is, in two properties: the gate RECORDS its own menu when it
+# blocks, and the ask hook SUBSTITUTES that menu into the session's next question.
+# Both halves are driven here as real subprocesses, because the seam between them
+# is the whole mechanism and a unit test on either side alone cannot see it.
+#
+# What is deliberately NOT here: any test that a recorded ANSWER changes what this
+# gate does. Nothing reads one. The sigils mean exactly what they meant before,
+# which is why every other test in this file is untouched.
 
 
 def test_a_cap_block_declares_its_remedy_set(repo, home):
@@ -1499,83 +1460,211 @@ def test_a_cap_block_declares_its_remedy_set(repo, home):
     assert "escalation cap" in question.lower()
 
 
-def test_a_bare_ack_is_REFUSED_once_the_gate_has_actually_blocked(repo, home):
-    """THE ENFORCEMENT LOCK, and the founding incident in one test.
+def _menu_question(repo, home) -> str | None:
+    """The gate question the ask hook would substitute right now, or None.
 
-    The gate blocked and printed its remedies; the sigil attests that a fresh
-    decision was MADE. Only a recorded answer attests that the USER made it. On
-    2026-08-31 the relay dropped the first option, invented a fourth and added
-    "ship as-is" — and a bare ack would have landed that.
+    Drives the REAL hook as a subprocess rather than reading the round file: the
+    thing under test is what the USER would be shown, and a file read would pass
+    with the hook and the store disagreeing about the payload shape.
+    """
+    res = subprocess.run(
+        [sys.executable, str(_ASK_HOOK), "--pre"],
+        input=json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "AskUserQuestion",
+                "session_id": "test",
+                "cwd": str(repo),
+                "tool_input": {
+                    "questions": [
+                        {
+                            "question": "an unrelated later question",
+                            "header": "h",
+                            "multiSelect": False,
+                            "options": [
+                                {"label": "a", "description": ""},
+                                {"label": "b", "description": ""},
+                            ],
+                        }
+                    ]
+                },
+            }
+        ),
+        cwd=str(repo),
+        env={**os.environ, "HOME": str(home)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if not res.stdout:
+        return None
+    qs = json.loads(res.stdout)["hookSpecificOutput"]["updatedInput"]["questions"]
+    return qs[-1]["question"]
+
+
+def test_a_FOREGROUND_session_is_NOT_told_that_nobody_is_present(repo, home):
+    """The control for the background test, and the suite cannot discriminate without
+    it: every assertion about `_no_human_note` was positive, so flipping
+    `_background_session` to fire ALWAYS would have told every foreground session
+    nobody was there and left the whole file green."""
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    res = _run_hook('git commit -m "wip"', repo, home)
+    assert res.returncode == 2
+    assert "NO HUMAN IS PRESENT" not in res.stderr
+
+
+def test_the_recorded_menu_is_SUBSTITUTED_into_the_next_ask(repo, home):
+    """THE FOUNDING INCIDENT, end to end, on the real gate and the real hook.
+
+    2026-08-31: the cap printed three remedies and the relay to the user dropped the
+    first, invented a fourth, and added "ship as-is" — the one outcome the cap exists
+    to prevent. Here the agent asks a question of its own with options it wrote
+    itself, and what the user is shown carries the GATE's question and the GATE's
+    options, in the gate's order, with hand-back first.
+
+    Both processes are real: the gate writes the menu at the moment it denies, and
+    `ask_gate_demand.py --pre` reads it back out of the same round file. A unit test
+    on either side would pass with the two disagreeing about the payload shape.
     """
     _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    blocked = _run_hook('git commit -m "wip"', repo, home)
-    assert blocked.returncode == 2, "control: the cap must block here"
-    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
-    assert res.returncode == 2, res.stdout + res.stderr
-    assert "not enough on its own" in res.stderr
-    assert "LIVE and UNANSWERED" in res.stderr
+    assert _run_hook('git commit -m "wip"', repo, home).returncode == 2
+
+    agent_authored = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "AskUserQuestion",
+        "session_id": "test",
+        "cwd": str(repo),
+        "tool_input": {
+            "questions": [
+                {
+                    "question": "How should we proceed?",
+                    "header": "Next",
+                    "multiSelect": False,
+                    "options": [
+                        {"label": "split the PR", "description": "agent-invented"},
+                        {"label": "ship as-is", "description": "the outcome the cap forbids"},
+                    ],
+                }
+            ]
+        },
+    }
+    res = subprocess.run(
+        [sys.executable, str(_ASK_HOOK), "--pre"],
+        input=json.dumps(agent_authored),
+        cwd=str(repo),
+        env={**os.environ, "HOME": str(home)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert res.stdout, res.stderr
+    out = json.loads(res.stdout)["hookSpecificOutput"]
+    assert out["hookEventName"] == "PreToolUse"
+    assert "permissionDecision" not in out, (
+        "MEASURED: adding it breaks the call into 'user did not answer' without the user acting"
+    )
+    questions = out["updatedInput"]["questions"]
+    assert questions[0]["question"] == "How should we proceed?", (
+        "the agent's own question survives — this appends, it does not censor"
+    )
+    gate_q = questions[-1]
+    assert "escalation cap" in gate_q["question"].lower()
+    labels = [o["label"] for o in gate_q["options"]]
+    assert labels[0] == "HAND IT BACK", "hand-back FIRST is the pinned contract"
+    assert labels == [r["label"] for r in _cap_remedies()], (
+        "every declared remedy, in declaration order, none dropped"
+    )
+    assert "ship as-is" not in labels
 
 
-def test_a_session_the_gate_never_blocked_keeps_the_old_sigil_meaning(repo, home):
-    """The scope limit, stated as a test. No block -> no demand -> the sigil works
-    exactly as before. This is what keeps the change off ~11 other tests, and it
-    is also the PRE-EXISTING hole (a preemptive sigil is never demanded) that is
-    deliberately out of scope here and filed as an issue."""
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
-    assert res.returncode == 0, res.stdout + res.stderr
+def test_the_menu_RETIRES_once_the_commit_it_was_about_goes_through(repo, home):
+    """A decided question must stop being asked.
 
-
-def test_a_TERMINAL_choice_refuses_the_commit_even_with_the_sigil(repo, home):
-    """Choosing hand-back blocks the branch, and the sigil cannot override it.
-    That is the decision working, not a malfunction."""
+    MEASURED before this was fixed: after the ack AND after the commit landed, the
+    gate's question was still appended to every later ask for the branch's life. The
+    user was re-presented a decision they had already made, and whatever they picked
+    went nowhere -- an agent reading that second answer as a fresh instruction is the
+    founding incident's cousin.
+    """
     _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
     assert _run_hook('git commit -m "wip"', repo, home).returncode == 2
-    _answer_demand(repo, home, "HAND IT BACK")
-    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
-    assert res.returncode == 2, res.stdout + res.stderr
-    assert "TERMINAL remedy" in res.stderr
-    assert "retire-gate-demand" in res.stderr, "the documented re-ask must be named"
+    assert _menu_question(repo, home) is not None, "precondition: the block records a menu"
+
+    acked = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
+    assert acked.returncode == 0, acked.stdout + acked.stderr
+    assert _menu_question(repo, home) is None, (
+        "the commit was allowed, so the decision has been acted on"
+    )
 
 
-def test_an_UNRECOGNISED_answer_is_quoted_back_not_ignored(repo, home):
-    """The operator answered. Telling them they were never asked would read as the
-    gate being broken, which is why free text records a state instead of nothing."""
+def test_a_DENIED_commit_does_not_retire_the_menu(repo, home):
+    """Guard the guard, and the reason the retire lives at the ALLOW rather than at
+    the ack. A commit can carry the sigil and still be denied by a later rule; the
+    user has not finished with the menu until something actually goes through."""
     _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
     assert _run_hook('git commit -m "wip"', repo, home).returncode == 2
-    _answer_demand(repo, home, "narrow it but keep the tests")
-    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
-    assert res.returncode == 2, res.stdout + res.stderr
-    assert "narrow it but keep the tests" in res.stderr, "the answer must be quoted back"
+    assert _menu_question(repo, home) is not None
+    # Acked, but denied by the unwaivable hook-bypass rule that runs after the tier.
+    denied = _run_hook('git commit -m "wip" --no-verify  # escalation-ack', repo, home)
+    assert denied.returncode == 2, denied.stdout + denied.stderr
+    assert _menu_question(repo, home) is not None, "a denied commit must not spend it"
 
 
-def test_an_answer_authorises_exactly_ONE_commit(repo, home):
-    """One-shot: the decision authorises the commit it was made about, not the
-    branch's remaining life."""
+def test_the_kill_switch_stops_the_substitution_and_nothing_else(repo, home):
+    """The operator lever. Armed, the gate blocks exactly as it did before this
+    feature existed and the ask is passed through untouched — which is the whole
+    fallback story for every way this marker can fail."""
+    env_off = {"GENESIS_GATE_ACK_DISABLED": "1"}
     _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    assert _run_hook('git commit -m "wip"', repo, home).returncode == 2
-    _answer_demand(repo, home, "NARROW the scope")
-    first = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
-    assert first.returncode == 0, first.stdout + first.stderr
-    _git(repo, "commit", "-qm", "wip")
-    # Drive the streak back to the cap; the spent demand must not authorise again.
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    assert _run_hook('git commit -m "again"', repo, home).returncode == 2
-    again = _run_hook('git commit -m "again"  # escalation-ack', repo, home)
-    assert again.returncode == 2, again.stdout + again.stderr
+    blocked = _run_hook('git commit -m "wip"', repo, home, extra_env=env_off)
+    assert blocked.returncode == 2, "the cap still blocks"
+    ask = subprocess.run(
+        [sys.executable, str(_ASK_HOOK), "--pre"],
+        input=json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "AskUserQuestion",
+                "session_id": "test",
+                "cwd": str(repo),
+                "tool_input": {
+                    "questions": [
+                        {
+                            "question": "anything",
+                            "header": "h",
+                            "multiSelect": False,
+                            "options": [{"label": "x", "description": ""}],
+                        }
+                    ]
+                },
+            }
+        ),
+        cwd=str(repo),
+        env={**os.environ, "HOME": str(home), **env_off},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert ask.stdout == "", "the ask is untouched while the switch is armed"
+    # ...and the sigil clears the block as it always did: the switch costs the menu,
+    # never the gate.
+    acked = _run_hook('git commit -m "wip"  # escalation-ack', repo, home, extra_env=env_off)
+    assert acked.returncode == 0, acked.stdout + acked.stderr
 
 
-def test_the_mode_switch_tier_enforces_the_same_contract(repo, home):
-    """Both tiers, per the owner's decision — one declaration API, two data sets."""
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 1)
-    blocked = _run_hook('git commit -m "wip"', repo, home)
-    assert blocked.returncode == 2 and "mode-switch" in blocked.stderr
-    bare = _run_hook('git commit -m "wip"  # audit-ack', repo, home)
-    assert bare.returncode == 2, bare.stdout + bare.stderr
-    assert "not enough on its own" in bare.stderr
-    _answer_demand(repo, home, "(B) The premise holds — fix the CLASS, not the instance")
-    ok = _run_hook('git commit -m "wip"  # audit-ack', repo, home)
-    assert ok.returncode == 0, ok.stdout + ok.stderr
+def _cap_remedies():
+    """The gate's own declared cap remedies, imported rather than retyped."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_gate_for_remedies", _REPO_ROOT / "scripts" / "review_enforcement_commit.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["_gate_for_remedies"] = mod
+    try:
+        spec.loader.exec_module(mod)
+        return list(mod._CAP_REMEDIES)
+    finally:
+        sys.modules.pop("_gate_for_remedies", None)
 
 
 def test_a_background_session_is_told_how_to_EXIT_not_just_that_it_is_stuck(repo, home):
@@ -1607,76 +1696,3 @@ def test_a_background_session_is_told_how_to_EXIT_not_just_that_it_is_stuck(repo
     assert "NO HUMAN IS PRESENT" in res.stderr
     assert "needs-architecture-session" in res.stderr
     assert "ready" in res.stderr and "follow-up" in res.stderr
-
-
-def test_the_kill_switch_restores_the_pre_demand_behaviour(repo, home):
-    """A RECOVERY tool for a wedged gate. It disables ENFORCEMENT, not just the
-    append — disabling only the append would leave the demand unsatisfiable, which
-    is the opposite of a recovery tool."""
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    assert _run_hook('git commit -m "wip"', repo, home).returncode == 2
-    blocked = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
-    assert blocked.returncode == 2, "control: without the switch the ack is refused"
-    marker = home / ".genesis" / "config" / "gate_ack_disabled"
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text("")
-    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
-    assert res.returncode == 0, res.stdout + res.stderr
-
-
-def test_a_TERMINAL_choice_survives_a_clean_review(repo, home):
-    """A stop that lapses on the next clean review is not a stop.
-
-    The demand used to be consulted only INSIDE `round_n >= <tier>`. A later
-    `mark --source external --clean` resets the streak to 0 while the answered
-    demand is (correctly) preserved, so the next attempt skipped both demand checks
-    and proceeded -- the explicit hand-back quietly stopped meaning anything.
-
-    Checked through the REAL gate rather than the helper, because the whole point is
-    which branch of the gate runs.
-    """
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    assert _run_hook('git commit -m "w"', repo, home).returncode == 2, "control: cap blocks"
-    _answer_demand(repo, home, "HAND IT BACK")
-
-    # A clean external review resets the streak to zero...
-    _stage(repo, "after = 1\n")
-    clean = _mark(repo, home, clean=True)
-    assert clean.returncode == 0 and "streak reset" in clean.stdout
-
-    # ...and the terminal decision must still bind.
-    res = _run_hook('git commit -m "w"', repo, home)
-    assert res.returncode == 2, res.stdout + res.stderr
-    assert "TERMINAL remedy" in res.stderr
-    assert "retire-gate-demand" in res.stderr, "the documented re-ask must be named"
-
-
-def test_re_opening_a_terminal_choice_lifts_the_standing_block(repo, home):
-    """Guard the guard. If nothing could lift it the branch would be bricked, and
-    the test above would pass for the wrong reason."""
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    assert _run_hook('git commit -m "w"', repo, home).returncode == 2
-    _answer_demand(repo, home, "SHELVE it")
-    assert _run_hook('git commit -m "w"', repo, home).returncode == 2
-    subprocess.run(
-        [sys.executable, str(_REVIEW_STATE), "retire-gate-demand"],
-        cwd=str(repo),
-        env={**os.environ, "HOME": str(home)},
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    res = _run_hook('git commit -m "w"', repo, home)
-    assert "TERMINAL remedy" not in res.stderr, "re-opening must lift the standing block"
-
-
-def test_an_AUTHORISING_choice_does_not_create_a_standing_block(repo, home):
-    """The standing check must fire only on TERMINAL remedies. If it fired on any
-    answered demand it would block every branch that had ever been through the cap."""
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    assert _run_hook('git commit -m "w"', repo, home).returncode == 2
-    _answer_demand(repo, home, "NARROW the scope")
-    _stage(repo, "after = 1\n")
-    assert _mark(repo, home, clean=True).returncode == 0
-    res = _run_hook('git commit -m "w"', repo, home)
-    assert res.returncode == 0, res.stdout + res.stderr
