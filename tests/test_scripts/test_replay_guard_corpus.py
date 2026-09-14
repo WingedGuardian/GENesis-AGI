@@ -252,7 +252,7 @@ def test_the_pool_asks_for_fork_explicitly(cache, rgc, monkeypatch):
         spawns_process=True,
         safety=rgc.replay_safe("a test double; it touches nothing"),
     ):
-        rgc.replay("fake", [("echo hi", "/tmp")] * 4, show=0, jobs=4)
+        rgc.replay("fake", [("echo hi", "/tmp")] * 4, jobs=4)
 
     assert "fork" in asked, (
         "replay() did not request the fork start method — a spawn/forkserver "
@@ -279,7 +279,7 @@ def test_the_substitution_notice_is_actually_printed(cache, rgc, capsys, jobs):
         spawns_process=jobs > 1,
         safety=rgc.replay_safe("a test double; it touches nothing"),
     ):
-        rgc.replay("fake", corpus, show=0, jobs=jobs)
+        rgc.replay("fake", corpus, jobs=jobs)
 
     out = capsys.readouterr().out
     assert "replayed from the repo root" in out, f"no substitution notice (jobs={jobs})"
@@ -308,7 +308,7 @@ def test_a_guard_that_only_crashes_cannot_report_a_clean_rate(cache, rgc, capsys
         spawns_process=jobs > 1,
         safety=rgc.replay_safe("a test double; it only raises"),
     ):
-        rgc.replay("boom", corpus, show=0, jobs=jobs)
+        rgc.replay("boom", corpus, jobs=jobs)
 
     out = capsys.readouterr().out
     assert "RAISED" in out, f"a fully broken guard reported silently (jobs={jobs})"
@@ -624,7 +624,7 @@ def test_replay_refuses_an_unsafe_guard_even_when_called_directly(rgc):
         ),
         pytest.raises(RuntimeError, match="not replay-safe"),
     ):
-        rgc.replay("nope", [("echo hi", "/tmp")], show=0, jobs=1)
+        rgc.replay("nope", [("echo hi", "/tmp")], jobs=1)
 
 
 def test_a_declared_unsafe_guard_is_refused_before_the_corpus_is_built(rgc, monkeypatch, capsys):
@@ -665,7 +665,7 @@ def test_an_in_process_guard_that_crashes_is_disclosed_not_scored(rgc, capsys):
             safety=rgc.replay_safe("a test double"),
         ),
     ):
-        rgc.replay("crashy", corpus, show=0, jobs=1)
+        rgc.replay("crashy", corpus, jobs=1)
 
     out = capsys.readouterr().out
     assert "RAISED" in out, "a guard that crashed on EVERY row reported silently"
@@ -720,7 +720,7 @@ def test_a_timed_out_guard_is_disclosed_and_still_counted(rgc, capsys, jobs):
     with fake_guard(
         rgc, "hang", hang, spawns_process=jobs > 1, safety=rgc.replay_safe("a test double")
     ):
-        rgc.replay("hang", corpus, show=0, jobs=jobs)
+        rgc.replay("hang", corpus, jobs=jobs)
 
     out = capsys.readouterr().out
     assert "TIMED OUT" in out, f"a guard that never answered was silent (jobs={jobs})"
@@ -991,16 +991,6 @@ def test_one_malformed_transcript_record_does_not_abort_the_whole_walk(rgc, monk
     assert rgc._extract_commands() == [("echo ok", "/tmp")]
 
 
-def test_a_blocked_sample_carries_the_directory_that_decided_it(rgc, capsys):
-    """For both in-process guards the cwd DECIDES the verdict, so two
-    identical-looking commands can be classified differently. A sample printed
-    without it cannot be reproduced or argued with."""
-    with fake_guard(rgc, "always", lambda c, w: True, safety=rgc.replay_safe("a test double")):
-        rgc.replay("always", [("echo hi", "/some/recorded/dir")], show=5, jobs=1)
-
-    out = capsys.readouterr().out
-    assert "/some/recorded/dir" in out, "the sample dropped the cwd that decided it"
-
 
 def test_a_run_with_no_valid_measurement_exits_2(rgc, monkeypatch, capsys):
     """A guard that crashed on every row still prints a number, and main()
@@ -1025,26 +1015,13 @@ def test_a_run_with_no_valid_measurement_exits_2(rgc, monkeypatch, capsys):
     assert "no valid measurement" in err
 
 
-def test_a_negative_show_count_is_refused(rgc, monkeypatch):
-    """`blocked[:-1]` prints every blocked command except the last. These are
-    verbatim command lines that demonstrably contain secrets passed in argv, so
-    a slipped minus sign is a corpus dump to a terminal or a captured log."""
-    monkeypatch.setattr(
-        sys, "argv", ["replay_guard_corpus.py", "--guard", "protected_paths", "--show", "-1"]
-    )
-
-    with pytest.raises(SystemExit) as excinfo:
-        rgc.main()
-
-    assert excinfo.value.code == 2
-
 
 # ── round 2: findings from the adversarial audit of this session's fixes ──────
 
 
 @pytest.mark.parametrize("jobs", ["0", "-4"])
 def test_a_jobs_count_below_one_is_refused(rgc, monkeypatch, jobs):
-    """The validation --show and --limit already had, and --jobs did not.
+    """The validation --limit already had, and --jobs did not.
 
     `jobs > 1` is the pool test, so 0 or a negative silently takes the SERIAL
     path. On a shell guard that turns a ~14-minute pooled run into hours, with no
@@ -1074,33 +1051,6 @@ def test_rebuild_with_list_says_it_is_doing_nothing(rgc, monkeypatch, capsys):
 
     assert "--rebuild has no effect with --list" in capsys.readouterr().err
 
-
-def test_the_blocked_sample_comes_from_the_outcome_not_the_index(rgc, capsys):
-    """The pooled path must not recover its samples by position.
-
-    It used to do `blocked.append(corpus[i - 1])`, which is correct ONLY because
-    `imap` preserves order. A later switch to `imap_unordered` for speed would
-    silently attribute every printed sample to the wrong command — and the
-    samples are exactly what a human reads to turn a rate into a verdict, so the
-    corruption would land in the one output that gets pasted into a PR.
-
-    Pinned by making the guard block exactly ONE known row out of several.
-    """
-    corpus = [("echo alpha", "/tmp"), ("echo BLOCKME", "/tmp"), ("echo omega", "/tmp")]
-    with fake_guard(
-        rgc,
-        "picky",
-        lambda c, w: "BLOCKME" in c,
-        safety=rgc.replay_safe("a test double"),
-    ):
-        result = rgc.replay("picky", corpus, show=5, jobs=1)
-
-    out = capsys.readouterr().out
-    assert result.blocked == 1
-    assert "echo BLOCKME" in out, f"the sample did not name the blocked command: {out}"
-    assert "echo alpha" not in out and "echo omega" not in out, (
-        f"the sample named a command that was never blocked: {out}"
-    )
 
 
 def test_importing_the_module_survives_a_settings_file_with_no_inline_blob(tmp_path):
@@ -1176,7 +1126,7 @@ def test_a_guard_that_exits_in_a_pool_worker_does_not_hang_the_run(cache, rgc, c
         spawns_process=True,
         safety=rgc.replay_safe("a test double"),
     ):
-        result = rgc.replay("exiter", corpus, show=0, jobs=4)
+        result = rgc.replay("exiter", corpus, jobs=4)
 
     out = capsys.readouterr().out
     assert result.valid is False, "a run where every row exited reported as valid"
@@ -1203,7 +1153,7 @@ def test_a_guards_resource_is_resolved_in_the_parent_before_the_fan_out(cache, r
         safety=rgc.replay_safe("a test double"),
         prepare=lambda: calls.append(1),
     ):
-        rgc.replay("prepared", [("echo hi", "/tmp")] * 8, show=0, jobs=4)
+        rgc.replay("prepared", [("echo hi", "/tmp")] * 8, jobs=4)
 
     assert calls == [1], f"prepare ran {len(calls)} times, expected exactly once"
 
@@ -1230,7 +1180,7 @@ def test_an_unreadable_cache_does_not_also_blame_the_v1_format(cache, rgc, capsy
 def test_limit_zero_is_refused_rather_than_meaning_no_limit(rgc, monkeypatch):
     """`--limit 0` was falsy, so it ran the WHOLE corpus.
 
-    Meanwhile `--show 0` means "show none". An operator smoke-testing the
+    An operator smoke-testing the
     empty-corpus refusal with `--limit 0` got a full multi-minute run and no
     message. The default is None now, so omitted and zero are different things.
     """
@@ -1242,3 +1192,51 @@ def test_limit_zero_is_refused_rather_than_meaning_no_limit(rgc, monkeypatch):
         rgc.main()
 
     assert excinfo.value.code == 2
+
+
+# ── round 3: the guard must come from THIS checkout ───────────────────────────
+
+
+def test_the_guard_is_loaded_from_this_checkout_not_the_import_cache(rgc, monkeypatch):
+    """`__import__(name)` returns whatever a host process imported first.
+
+    That is the failure mode with the worst timing: `replay()` is a supported API
+    and worktree-based guard development is the reason to call it, so a process
+    that already imported `protected_paths_guard` from ANOTHER checkout gets that
+    module back and the harness reports a rate for the changed guard while having
+    measured the unchanged one. Nothing downstream can tell.
+
+    Pins the load path, not the absence of a bug: a decoy under the BARE name must
+    be ignored in favour of the file adjacent to this harness.
+    """
+    decoy = types.SimpleNamespace(main=lambda: 0, read_payload=lambda: None)
+    decoy.__file__ = "/somewhere/else/protected_paths_guard.py"
+    monkeypatch.setitem(sys.modules, "protected_paths_guard", decoy)
+
+    mod = rgc._load_guard_from_this_checkout("protected_paths_guard")
+
+    assert mod is not decoy, "the decoy in sys.modules was returned"
+    assert Path(mod.__file__).resolve() == (rgc._HOOKS / "protected_paths_guard.py").resolve()
+
+
+def test_a_dependency_from_another_checkout_is_refused_not_worked_around(rgc, monkeypatch):
+    """Loading the TARGET by path is not sufficient on its own.
+
+    The guards import their dependencies by bare name (`from hook_input import
+    read_payload`), which resolves through sys.path — so a foreign `hook_input`
+    would still be bound even with the target loaded correctly. Refusing is the
+    only honest option: the resulting number would be of the wrong code, and
+    unlike a crash or a timeout it cannot be disclosed afterwards because nothing
+    downstream can detect it.
+    """
+    foreign = types.ModuleType("hook_input")
+    foreign.__file__ = "/another/checkout/scripts/hooks/hook_input.py"
+    monkeypatch.setitem(sys.modules, "hook_input", foreign)
+
+    with pytest.raises(SystemExit) as excinfo:
+        rgc._load_guard_from_this_checkout("protected_paths_guard")
+
+    assert "hook_input" in str(excinfo.value)
+    assert "another/checkout" in str(excinfo.value), (
+        "the refusal did not name where the foreign module came from"
+    )

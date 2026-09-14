@@ -28,7 +28,7 @@ is why it is a script now.
 
     python3 scripts/replay_guard_corpus.py --list
     python3 scripts/replay_guard_corpus.py --guard protected_paths
-    python3 scripts/replay_guard_corpus.py --all --show 20
+    python3 scripts/replay_guard_corpus.py --all
     python3 scripts/replay_guard_corpus.py --rebuild --all
 
 WHAT THE NUMBER DOES AND DOES NOT MEAN
@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import functools
+import importlib.util
 import io
 import json
 import os
@@ -72,6 +73,12 @@ _CACHE = Path.home() / ".genesis" / "output" / "guard-corpus.jsonl"
 _TRANSCRIPTS = Path.home() / ".claude" / "projects"
 
 _GUARD_TIMEOUT_S = 15
+
+# The bare names the replayable guards import from _HOOKS. Enumerated rather than
+# discovered: this list is what `_load_guard_from_this_checkout` refuses on, so a
+# name missing here is a silent hole, and a name that is wrong here is a loud
+# refusal. Kept in step with the guards' own import lines.
+_GUARD_BARE_DEPS = ("hook_input", "shell_parse")
 
 
 # ── corpus ───────────────────────────────────────────────────────────────────
@@ -313,7 +320,7 @@ def _run_python_guard(module_name: str, cmd: str, cwd: str) -> bool:
     """
     mod = _run_python_guard._loaded.get(module_name)  # type: ignore[attr-defined]
     if mod is None:
-        mod = __import__(module_name)
+        mod = _load_guard_from_this_checkout(module_name)
         _run_python_guard._loaded[module_name] = mod  # type: ignore[attr-defined]
     here = _effective_cwd(cwd)
     payload = _payload(cmd, here)
@@ -391,6 +398,59 @@ def _run_python_guard(module_name: str, cmd: str, cwd: str) -> bool:
                 delattr(mod, "read_payload")
         with contextlib.suppress(OSError):
             os.chdir(prior)
+
+
+def _load_guard_from_this_checkout(module_name: str):
+    """Load a guard from THIS harness's hooks directory, or refuse.
+
+    `__import__(module_name)` returns whatever is already in `sys.modules` under
+    that bare name. A host process that imported `protected_paths_guard` — or one
+    of its bare-named dependencies — from ANOTHER checkout first therefore gets
+    that module back, and the harness reports a rate for the changed guard while
+    having measured the unchanged one. The scenario is not exotic: `replay()` is a
+    supported API and worktree-based guard development is the reason to call it,
+    so the wrong answer arrives exactly when the answer matters most, silently.
+
+    Two halves, because loading the target by path is not sufficient on its own:
+    the guards import their dependencies by BARE NAME (`from hook_input import
+    read_payload`), which resolves through `sys.path` and would still pick up a
+    foreign entry. So a pre-existing dependency from outside this checkout is a
+    REFUSAL rather than something to work around — a measurement of the wrong
+    code is the failure this whole file exists to prevent, and it cannot be
+    disclosed after the fact because nothing downstream can tell.
+    """
+    path = _HOOKS / f"{module_name}.py"
+    if not path.is_file():
+        raise SystemExit(f"guard module not found in this checkout: {path}")
+
+    for dep in _GUARD_BARE_DEPS:
+        existing = sys.modules.get(dep)
+        if existing is None:
+            continue
+        dep_file = getattr(existing, "__file__", None)
+        if dep_file is None or Path(dep_file).resolve().parent != _HOOKS:
+            raise SystemExit(
+                f"REFUSED: '{dep}' is already imported from {dep_file!r}, which is "
+                f"not this harness's {_HOOKS}. The guards import it by bare name, "
+                "so replaying now would measure another checkout's code and report "
+                "the number as this one's. Run the harness in a process that has "
+                "not already imported the hook modules."
+            )
+
+    spec = importlib.util.spec_from_file_location(f"_rgc_{module_name}", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"could not load a module spec for {path}")
+    mod = importlib.util.module_from_spec(spec)
+    # Registered under a HARNESS-PRIVATE name, never the bare one: claiming the
+    # bare name would make this harness the thing that poisons a host process's
+    # import cache for everyone else.
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+
+    loaded = getattr(mod, "__file__", None)
+    if loaded is None or Path(loaded).resolve() != path.resolve():
+        raise SystemExit(f"loaded {module_name} from {loaded!r}, expected {path}")
+    return mod
 
 
 _run_python_guard._loaded = {}  # type: ignore[attr-defined]
@@ -769,7 +829,7 @@ def _probe(args: tuple[str, str, str]) -> Outcome:
         return Outcome(True, bool(_SUBSTITUTED_CWD["n"]), True, False, row)
 
 
-def replay(guard: str, corpus: list[tuple[str, str]], show: int, jobs: int) -> Result:
+def replay(guard: str, corpus: list[tuple[str, str]], jobs: int) -> Result:
     """Replay the corpus through one guard.
 
     The two guard shapes have different costs, so they get different strategies.
@@ -870,15 +930,25 @@ def replay(guard: str, corpus: list[tuple[str, str]], show: int, jobs: int) -> R
         # With the rate, not in --list only. The number is what gets pasted into
         # a PR body, so anything qualifying it has to travel alongside it.
         print(f"    caveat: {safety.caveat}")
-    for cmd, cwd in blocked[:show]:
-        # WITH the directory. For protected_paths and worktree_cwd the cwd is
-        # what DECIDES the verdict — two identical-looking commands can be
-        # classified differently — so a sample without it cannot be reproduced
-        # or argued with.
-        flat = " ".join(cmd.split())
-        print(f"    [{cwd or '<unrecorded>'}] {flat[:150]}")
-    if show and len(blocked) > show:
-        print(f"    … and {len(blocked) - show} more")
+    # NO SAMPLE OUTPUT. `--show` printed the first N blocked commands, and it is
+    # LIFTED OUT of this PR rather than patched, because two independent review
+    # findings landed on those nine lines and both were about the same thing: the
+    # printed sample not being what was actually measured.
+    #
+    #   * it promised VERBATIM and delivered `" ".join(cmd.split())[:150]`, which
+    #     collapses significant whitespace and drops the tail — possibly the very
+    #     token that caused the block;
+    #   * it labelled the row with the RECORDED cwd while `_effective_cwd()` had
+    #     classified it from the repo root, and 27% of rows are substituted, so a
+    #     reader could attribute a cwd-dependent verdict to a directory that was
+    #     never used.
+    #
+    # Both are fixable, neither is fixable in nine lines, and the surface prints
+    # real command lines that demonstrably contain secrets passed in argv — so it
+    # gets its own change with its own review rather than riding along here — see
+    # issue #2007, which records what a correct version owes. The
+    # blocked ROWS are still accumulated (that is where the count comes from, and
+    # it is what a differential mode would diff); only the printing is gone.
     if substituted:
         print(
             f"    note: {substituted}/{n} replayed from the repo root because the "
@@ -926,14 +996,6 @@ def main() -> int:
     mode.add_argument("--list", action="store_true")
     ap.add_argument("--rebuild", action="store_true", help="re-extract the corpus")
     ap.add_argument(
-        "--show",
-        type=int,
-        default=0,
-        help="print N blocked commands VERBATIM. Off by default: these are real\n"
-        "command lines and demonstrably contain secrets passed in argv, so the\n"
-        "output must never be pasted into a PR body or an issue.",
-    )
-    ap.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -948,15 +1010,6 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    if args.show < 0:
-        # blocked[:-1] prints every blocked command except the last. These are
-        # verbatim command lines that demonstrably contain secrets passed in
-        # argv, so a slipped minus sign is a corpus dump to a terminal or a
-        # captured log, not a formatting quirk.
-        ap.error(
-            "--show must be >= 0; a negative count would print nearly every "
-            "blocked command, and those are real command lines"
-        )
     if args.limit is not None and args.limit < 1:
         # `--limit 0` used to mean NO LIMIT, because 0 is falsy and the slice was
         # guarded by `if args.limit`. Meanwhile `--show 0` means "show none". An
@@ -1054,7 +1107,7 @@ def main() -> int:
 
     invalid: list[str] = []
     for name in names:
-        if not replay(name, corpus, args.show, args.jobs).valid:
+        if not replay(name, corpus, args.jobs).valid:
             invalid.append(name)
 
     if refused:
