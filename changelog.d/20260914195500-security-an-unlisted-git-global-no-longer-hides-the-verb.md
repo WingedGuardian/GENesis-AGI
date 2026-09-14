@@ -1,5 +1,3 @@
-### Fixed
-
 - **An unlisted git global option no longer hides the subcommand from the push
   guard.** Verb discovery walks a git command's leading options to find the
   subcommand, and stepped over any option it did not recognise as consuming a
@@ -42,8 +40,8 @@
   because a help query runs no subcommand.
 
 - **A deliberate relaxation, and the check that keeps it honest.** A gated verb
-  written after one of the options that run no subcommand (`git --exec-path
-  <publish>` and siblings) was refused and is now allowed, because git never
+  written after one of the options that run no subcommand — `--exec-path` and
+  its siblings — was refused and is now allowed, because git never
   reaches the verb. That is a false block removed, but it makes several allow
   decisions depend on a classification — so both new sets are re-derived from
   the installed binary on every CI run, and the checks fail if an exempt option
