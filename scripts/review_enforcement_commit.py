@@ -14,6 +14,7 @@ Exit codes:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import subprocess
@@ -645,6 +646,285 @@ def _merge_note(cwd: str | None) -> str:
     )
 
 
+# ─── Remedy sets, declared as DATA ───────────────────────────────────────────
+#
+# The founding incident (2026-08-31): this gate printed three remedies, and the
+# relay to the user dropped the first, invented a fourth, and added "ship as-is"
+# — the outcome the cap exists to prevent. The remedies below are the SAME set the
+# block messages print, in the SAME order, carried as data so a PreToolUse hook can
+# put the gate's own question in front of the user instead of the agent's paraphrase
+# of it (scripts/hooks/ask_gate_demand.py).
+#
+# ORDER IS A CONTRACT, not presentation. Hand-back is first at both tiers because a
+# session takes the menu in the order the gate prints it, and a menu whose first
+# entry preserves the change reads as "try harder" at exactly the moment that is the
+# wrong instruction. `test_escalation_cap_names_handing_back_FIRST` pins the prose
+# side; a lock in tests/test_hooks/ pins that this data agrees with it. Nothing may
+# normalise these to a dict or a set.
+#
+# `required_action` is PER-REMEDY and NULLABLE by contract: a TERMINAL remedy's exit
+# is NO action, and one flat field per demand would declare something false about it.
+# `resets_streak` is the class-B lifecycle edge #1863 kept rediscovering —
+# `authorizes_commit=False` says the blocked commit does not proceed and says nothing
+# about the COUNTER. If "narrow" did not reset it, the narrowed rework could never
+# come back through the gate; if reset were unconditional, "shelve" would reset a
+# counter for work that is meant to stop.
+_CAP_DEMAND_QUESTION = (
+    "The review escalation cap fired: three consecutive EXTERNAL review rounds each "
+    "surfaced NEW defects. This is a decision only you can make — how should this "
+    "change proceed?"
+)
+_CAP_REMEDIES = [
+    {
+        "key": "hand_back",
+        "label": "HAND IT BACK",
+        "description": (
+            "Stop reviewing. Three rounds each finding something NEW after a "
+            "class-level audit is the strongest evidence available that the PREMISE "
+            "is wrong, and no further round can fix that. Terminal: no commit."
+        ),
+        "authorizes_commit": False,
+        "resets_streak": False,
+        "required_action": None,
+    },
+    {
+        "key": "redesign",
+        "label": "REDESIGN robust-by-construction",
+        "description": (
+            "The premise holds but the shape does not. Make the defect class "
+            "unconstructible rather than tested-for, and come back with a clean streak."
+        ),
+        "authorizes_commit": True,
+        "resets_streak": True,
+        "required_action": "# escalation-ack",
+    },
+    {
+        "key": "narrow",
+        "label": "NARROW the scope",
+        "description": (
+            "Keep only the part that is converging and drop the rest. The narrowed "
+            "rework returns through the gate with a clean streak."
+        ),
+        "authorizes_commit": True,
+        "resets_streak": True,
+        "required_action": "# escalation-ack",
+    },
+    {
+        "key": "shelve",
+        "label": "SHELVE it",
+        "description": (
+            "Stop here and keep the understanding the rounds bought. Terminal: no "
+            "commit, and the streak is NOT reset — this work is meant to stop."
+        ),
+        "authorizes_commit": False,
+        "resets_streak": False,
+        "required_action": None,
+    },
+]
+
+_MODE_SWITCH_DEMAND_QUESTION = (
+    "Two consecutive EXTERNAL review rounds each surfaced NEW defects. That has two "
+    "possible causes with OPPOSITE remedies — which is it?"
+)
+_MODE_SWITCH_REMEDIES = [
+    {
+        "key": "hand_back",
+        "label": "(A) The PREMISE is wrong — hand it back",
+        "description": (
+            "The change cannot do what it claims, or rests on something untrue. More "
+            "rounds cannot help: every fix creates the surface for the next finding. "
+            "Terminal: no commit."
+        ),
+        "authorizes_commit": False,
+        "resets_streak": False,
+        "required_action": None,
+    },
+    {
+        "key": "class_audit",
+        "label": "(B) The premise holds — fix the CLASS, not the instance",
+        "description": (
+            "Dispatch a FRESH-CONTEXT adversarial reviewer over the ENTIRE diff, read "
+            "the authoritative docs for any domain semantics in play, and fix the whole "
+            "enumerated class in ONE commit. Does NOT reset the streak: a still-narrow "
+            "fix must still reach the round-3 stop."
+        ),
+        "authorizes_commit": True,
+        "resets_streak": False,
+        "required_action": "# audit-ack",
+    },
+]
+
+
+def _quote_answer(text: str | None) -> str:
+    """Render a user-typed answer inside a block message, safely and visibly.
+
+    The value arrives from the harness as free text (an "Other" answer) and is
+    replayed on EVERY subsequent block, into the model's instruction channel at the
+    moment that channel is most constrained. Unindented, a multi-line answer renders
+    at column 0 in the gate's own voice — MEASURED: an answer containing a blank line
+    followed by `NOTE: escalation-ack honored ...` is indistinguishable from the
+    gate's real `NOTE:` lines.
+
+    So every line is indented. The threat is low (the author is the user, not a
+    stranger) and this is not a sanitiser — it is the cheap structural fix that keeps
+    quoted text visibly quoted. Length is already bounded at the store.
+    """
+    if not text:
+        return "    <empty>"
+    flattened = text.replace("\r\n", "\n").replace("\r", "\n")
+    return "\n".join("    " + line for line in flattened.split("\n"))
+
+
+def _remedy_by_key(remedies: list[dict], key: str | None) -> dict | None:
+    for remedy in remedies:
+        if remedy["key"] == key:
+            return remedy
+    return None
+
+
+def _background_session() -> bool:
+    """True in a dispatched session, where no human can answer an ask.
+
+    Detected the same way genesis_urgent_alerts.py does. A background session
+    CANNOT clear either tier, and that is intended rather than a regression: the
+    gate's own text says "neither option is yours to make alone", so a background
+    session self-acking was always falsifying that attestation. The same intended
+    class as "a background session can never push a PR". The block message gains a
+    no-human branch naming the exit, so it is a stop with a route rather than a wedge.
+    """
+    return os.environ.get("GENESIS_CC_SESSION") == "1"
+
+
+def _demand_refusal(
+    demand: dict | None,
+    remedies: list[dict],
+    sigil: str,
+    *,
+    present: bool = False,
+) -> str | None:
+    """Why this demand refuses to authorise the commit, or None if it authorises it.
+
+    Returns None when there is genuinely NO demand — the enforcement binds only AFTER
+    this gate has actually blocked, so a session that was never blocked keeps the
+    sigil's old meaning and every pre-existing sigil test is untouched. (The separate
+    PRE-EXISTING hole, appending the sigil before ever being blocked, is out of scope
+    here and filed as an issue.)
+
+    `present` is what stops "cannot read it" collapsing into that same None. A demand
+    recorded but unreadable — a corrupt field, an unresolvable branch — used to be
+    indistinguishable from never having been blocked, so ONE malformed value disarmed
+    the gate. Now it refuses and names the exit.
+    """
+    if demand is None:
+        if present:
+            return (
+                "A gate demand IS recorded on this branch but cannot be read — the "
+                "round file is corrupt, was hand-edited, or the branch could not be "
+                "resolved. This gate will not treat an unreadable demand as no "
+                "demand, because one malformed field would then disarm it.\n"
+                "Re-open the question deliberately with `python3 "
+                "scripts/review_state.py retire-gate-demand`, then answer the menu "
+                "the gate puts up on its next ask."
+            )
+        return None
+    state = demand.get("state")
+    if state == "live":
+        return (
+            "A gate demand is LIVE and UNANSWERED on this branch. The sigil attests "
+            "that a fresh decision was made — but no answer from you has been "
+            "recorded, so nothing attests that you were ever asked. Ask the question: "
+            "make an AskUserQuestion call and the gate's own menu is appended to it "
+            "automatically (you do not write those options, which is the point)."
+        )
+    if state == "unrecognised":
+        return (
+            "An answer WAS recorded, but it matched none of the declared remedies, so "
+            "it authorises nothing. What came back was:\n"
+            f"{_quote_answer(demand.get('answer_text'))}\n"
+            "Ask again and choose one of the declared options, or clear the demand "
+            "deliberately with `python3 scripts/review_state.py retire-gate-demand`."
+        )
+    if state == "consumed":
+        return (
+            "This demand's authorisation has already been SPENT. A decision "
+            "authorises the commit it was made about, not the branch's remaining "
+            "life. Ask again for the next one."
+        )
+    remedy = _remedy_by_key(remedies, demand.get("answered_with"))
+    if remedy is None:
+        return (
+            "The recorded answer names a remedy this gate no longer declares — the "
+            "remedy set changed under it. Clear it with "
+            "`python3 scripts/review_state.py retire-gate-demand` and ask again."
+        )
+    if not remedy["authorizes_commit"]:
+        return (
+            f"You chose: {remedy['label']}\n"
+            "That is a TERMINAL remedy — it does not authorise a commit, and "
+            f"`{sigil}` cannot override it. That is the decision working, not a "
+            "malfunction. Hand the branch off with the evidence.\n"
+            "If you have genuinely changed your mind, the documented re-ask is "
+            "`python3 scripts/review_state.py retire-gate-demand`, which drops the "
+            "answer and makes the gate put the full menu in front of you again."
+        )
+    return None
+
+
+def _no_human_note(sigil: str) -> str:
+    """The exit for a session that cannot be asked. Empty when a human is present.
+
+    Deliberately computed INDEPENDENTLY of the demand's state and appended to every
+    tier message. An earlier revision only emitted it when there was no demand at
+    all, which is exactly backwards — a dispatched session is most stuck when a
+    demand DOES exist and it cannot answer it. Caught by the founding-incident E2E,
+    not by a unit test, because the two conditions only meet on the live path.
+    """
+    if not _background_session():
+        return ""
+    return (
+        "\n\nNO HUMAN IS PRESENT (this is a dispatched session). You cannot be asked, "
+        "and you must not answer on the user's behalf — that attestation is the whole "
+        "point of this gate. Take the hand-back option: apply the "
+        "`needs-architecture-session` label, open a `ready` follow-up naming this "
+        f"branch and the decision it awaits, and stop. Do not append `{sigil}`."
+    )
+
+
+def _demand_status_note(demand: dict | None, sigil: str) -> str:
+    """The demand's state, appended to a block message. Never a diagnosis."""
+    state = demand.get("state") if demand else None
+    if demand is None:
+        body = (
+            "\n\nTHIS BLOCK HAS RECORDED A DEMAND. From here the sigil alone no longer "
+            "clears it: an answer from the user has to be on record. Make an "
+            "AskUserQuestion call and the gate's own question — with these exact "
+            "options — is appended to it automatically. You do not author them."
+        )
+    elif state == "live":
+        body = (
+            "\n\nA DEMAND IS ALREADY LIVE on this branch and is still unanswered. Ask "
+            "the question; the menu above is appended to your next AskUserQuestion "
+            "call automatically."
+        )
+    elif state == "unrecognised":
+        body = (
+            "\n\nAN ANSWER WAS RECORDED but matched none of the declared remedies, so "
+            "it authorises nothing. What came back was:\n"
+            f"{_quote_answer(demand.get('answer_text'))}\n"
+            "Ask again and choose a declared option."
+        )
+    elif state == "answered":
+        body = (
+            "\n\nAN ANSWER IS ON RECORD for this branch "
+            f"({demand.get('answered_with')}). If it authorises a commit, append "
+            f"`{sigil}`; if it is terminal, it does not, and that is the decision "
+            "working. `python3 scripts/review_state.py gate-demand` shows it."
+        )
+    else:
+        body = ""
+    return body + _no_human_note(sigil)
+
+
 def main() -> None:
     # Parse tool input
     payload = read_payload()
@@ -758,6 +1038,46 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(0)
+
+    # The gate-demand layer imports SEPARATELY, and that separation is the point.
+    # Folded into the import above, its failure would take the handler's exit — which
+    # disables the WHOLE gate: the main-branch rule, the review-marker requirement,
+    # the round caps, all of it. Previously only an absent or broken review_state
+    # could reach that; adding these names would have let a merely OLDER one do it
+    # too, and `genesis-hook` resolves scripts from the MAIN worktree while
+    # GENESIS_HOOK_DEV_LOCAL=1 splits the two trees, so version skew between the gate
+    # and review_state is a real configuration rather than a hypothetical.
+    #
+    # Degrading to "no demand layer" is the PRE-PR behaviour, so skew costs the
+    # feature and nothing else. Everything downstream already treats a missing demand
+    # as "this gate never blocked you", which is exactly right when the demand layer
+    # is not there at all.
+    try:
+        from review_state import (
+            consume_gate_demand,
+            gate_demand_present,
+            read_gate_demand,
+            write_gate_demand,
+        )
+    except Exception:  # noqa: BLE001 — an older/partial review_state, not a broken one.
+        print(
+            "NOTE (review_enforcement_commit): review_state has no gate-demand API — "
+            "the escalation tiers fall back to sigil-only acknowledgement. Every other "
+            "rule in this gate is unaffected.",
+            file=sys.stderr,
+        )
+
+        def read_gate_demand(_cwd=None):  # type: ignore[misc]
+            return None
+
+        def gate_demand_present(_cwd=None):  # type: ignore[misc]
+            return False
+
+        def write_gate_demand(**_kwargs):  # type: ignore[misc]
+            return None
+
+        def consume_gate_demand(_cwd=None):  # type: ignore[misc]
+            return None
 
     # Rule 1: Block commits on main. Fail closed when the cwd is ambiguous — we
     # cannot prove the commit is NOT landing on main, so treat it as such. The two
@@ -930,11 +1250,23 @@ def main() -> None:
     # this file's own comment calls reachable): all four sigil combinations
     # returned exit 2, including the one the block message itself prints.
     spend_final_accept = False
+    # Same reasoning, same placement, for the gate demand's one-shot authorisation.
+    # Consuming it inside the tier that honours it burned the answer on a commit that
+    # four LATER rules (depth, review-marker, branch) could still deny — and since the
+    # cap also resets the streak on that path, the cap would not re-fire either, so
+    # the user's recorded decision simply vanished. The repo already asserts this
+    # property for the sibling sigil
+    # (test_escalation_cap.py::test_a_denied_command_does_not_spend_the_acceptance);
+    # this makes the demand obey the same rule.
+    spend_gate_demand = False
 
     def _allow() -> None:
         """Exit 0, spending the acceptance only if one was actually honoured."""
         if spend_final_accept:
             consume_final_accept(cwd=cwd)
+        if spend_gate_demand:
+            with contextlib.suppress(Exception):
+                consume_gate_demand(cwd)
         sys.exit(0)
 
     # Rule 3a: the FINAL-ROUND terminal. Checked BEFORE the consecutive cap below,
@@ -1016,7 +1348,33 @@ def main() -> None:
         acked = bool(commit_segs) and all(
             has_trailing_override(s.raw, sigil="escalation-ack") for s in commit_segs
         )
+        # Read BEFORE declaring, so the message can report the state that was already
+        # there (an unanswered demand, an unmappable answer) instead of the one this
+        # call is about to write.
+        try:
+            _cap_demand = read_gate_demand(cwd)
+            # Read PRESENCE separately. `read_gate_demand` returning None conflates
+            # "nothing recorded" with "recorded but unreadable", and the gate reads
+            # None as allow — so without this a single corrupt field disarms it.
+            _cap_demand_present = gate_demand_present(cwd)
+        except Exception:  # noqa: BLE001 — a demand read must never break the gate.
+            _cap_demand = None
+            # A read that RAISED is the strongest "cannot tell" there is: refuse.
+            _cap_demand_present = True
         if not acked:
+            # Declare the remedy set as data at the moment the gate refuses. This is
+            # the ONLY place a cap demand is created: enforcement binds after a real
+            # block, never speculatively.
+            # Declaring is best-effort; the deny is not. A failed declaration costs a
+            # demand, never the block.
+            with contextlib.suppress(Exception):
+                write_gate_demand(
+                    gate="escalation_cap",
+                    tier="cap",
+                    question=_CAP_DEMAND_QUESTION,
+                    remedies=_CAP_REMEDIES,
+                    cwd=cwd,
+                )
             _deny(
                 f"BLOCKED: review escalation cap reached — {round_n} consecutive "
                 f"EXTERNAL cross-model review rounds each surfaced NEW defects (cap "
@@ -1053,15 +1411,47 @@ def main() -> None:
                 "streak — landing the work and erasing the evidence that stopped it. "
                 "Hand the branch off with the premise-check writeup instead. The streak "
                 "is per-branch, so whoever picks up the SAME branch inherits it: say so "
-                "in the handoff." + _merge_note(cwd)
+                "in the handoff."
+                + _demand_status_note(_cap_demand, "# escalation-ack")
+                + _merge_note(cwd)
             )
             return
-        # Acked = a fresh decision to continue → reset the round budget so the next
-        # stop is a fresh cap away, not per-commit friction for the branch's whole
-        # life. Reset stands even if a later rule blocks THIS commit: the
-        # acknowledgment was made, and erring toward less friction only happens
-        # AFTER a conscious ack.
-        reset_review_round(cwd=cwd)
+        # Acked. The sigil attests a fresh decision was MADE; the demand attests the
+        # USER made it. Both are required once this gate has actually blocked — that
+        # is the whole of the enforcement, and it is why a session that was never
+        # blocked (no demand) reaches the unconditional reset below exactly as before.
+        _refusal = _demand_refusal(
+            _cap_demand, _CAP_REMEDIES, "# escalation-ack", present=_cap_demand_present
+        )
+        if _refusal:
+            _deny(
+                "BLOCKED: the escalation-ack is not enough on its own here.\n\n"
+                f"{_refusal}\n\n"
+                "The gate's remedies, in the order it declares them:\n"
+                + "\n".join(f"  - {r['label']}" for r in _CAP_REMEDIES)
+                + _no_human_note("# escalation-ack")
+                + _merge_note(cwd)
+            )
+            return
+        # An ANSWERED demand authorises exactly one commit. Mark it to be spent AT THE
+        # ALLOW, not here: later rules can still deny this command, and spending a
+        # one-shot on a commit that never ran loses the user's decision outright.
+        _cap_remedy = (
+            _remedy_by_key(_CAP_REMEDIES, _cap_demand.get("answered_with")) if _cap_demand else None
+        )
+        if _cap_demand is not None:
+            spend_gate_demand = True  # noqa: F841 — read by the _allow() closure
+        # Reset the round budget so the next stop is a fresh cap away, not per-commit
+        # friction for the branch's whole life. Reset stands even if a later rule
+        # blocks THIS commit: the acknowledgment was made, and erring toward less
+        # friction only happens AFTER a conscious ack.
+        #
+        # WITH a demand, the chosen remedy decides — `resets_streak` is declared per
+        # remedy for the class-B reason in the data block above. Without one (this
+        # gate never blocked, so the sigil keeps its old meaning) the reset is
+        # unconditional, exactly as before.
+        if _cap_remedy is None or _cap_remedy["resets_streak"]:
+            reset_review_round(cwd=cwd)
     elif round_n == ESCALATION_ROUND_CAP - 1:
         # Tier 1 — MODE-SWITCH, one round BEFORE the hard stop. Two consecutive
         # defect-bearing rounds is the signature of fixing the INSTANCE a reviewer
@@ -1078,7 +1468,21 @@ def main() -> None:
         acked = bool(commit_segs) and all(
             has_trailing_override(s.raw, sigil="audit-ack") for s in commit_segs
         )
+        try:
+            _ms_demand = read_gate_demand(cwd)
+            _ms_demand_present = gate_demand_present(cwd)
+        except Exception:  # noqa: BLE001 — a demand read must never break the gate.
+            _ms_demand = None
+            _ms_demand_present = True
         if not acked:
+            with contextlib.suppress(Exception):
+                write_gate_demand(
+                    gate="mode_switch",
+                    tier="round2",
+                    question=_MODE_SWITCH_DEMAND_QUESTION,
+                    remedies=_MODE_SWITCH_REMEDIES,
+                    cwd=cwd,
+                )
             _deny(
                 f"BLOCKED (mode-switch): {round_n} consecutive EXTERNAL cross-model "
                 f"review rounds each surfaced NEW defects (cap {ESCALATION_ROUND_CAP}; "
@@ -1127,9 +1531,32 @@ def main() -> None:
                 "ATTESTS that the class-level audit happened — appending it because "
                 "you want to land something is falsifying it. Hand the branch off "
                 "with the evidence instead. (The streak is per-branch, so a builder "
-                "picking up the SAME branch inherits it: say so in the handoff.)" + _merge_note(cwd)
+                "picking up the SAME branch inherits it: say so in the handoff.)"
+                + _demand_status_note(_ms_demand, "# audit-ack")
+                + _merge_note(cwd)
             )
             return
+        # Acked at the mode-switch tier. Same contract as the cap: once this gate has
+        # blocked, the sigil attests the audit happened and the demand attests the
+        # user chose (B) rather than (A). Deliberately NO reset here either way — a
+        # still-narrow fix must still reach the round-3 stop, which is why
+        # `class_audit` declares `resets_streak: False`.
+        _ms_refusal = _demand_refusal(
+            _ms_demand, _MODE_SWITCH_REMEDIES, "# audit-ack", present=_ms_demand_present
+        )
+        if _ms_refusal:
+            _deny(
+                "BLOCKED: the audit-ack is not enough on its own here.\n\n"
+                f"{_ms_refusal}\n\n"
+                "The gate's options, in the order it declares them:\n"
+                + "\n".join(f"  - {r['label']}" for r in _MODE_SWITCH_REMEDIES)
+                + _no_human_note("# audit-ack")
+                + _merge_note(cwd)
+            )
+            return
+        if _ms_demand is not None:
+            with contextlib.suppress(Exception):
+                consume_gate_demand(cwd)
 
     # Docs/config-only skip: a commit whose ENTIRE staged set is documentation
     # or config carries no code to review (adaptive-review "review level: None"),

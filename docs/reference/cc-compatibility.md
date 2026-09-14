@@ -711,7 +711,19 @@ When a new CC version is released, run through this:
    safety guard a real payload, so it catches a changed hook payload shape that
    would otherwise silently disable the guards (see the hook input contract
    under "Actively Used" above).
-8. **Update this document** with findings.
+8. **Re-probe the `AskUserQuestion` rewrite path.** The gate-demand substitution
+   (`scripts/hooks/ask_gate_demand.py`) rests on three properties the docs give no
+   version contract for: `updatedInput` rewrites an `AskUserQuestion` call; it works
+   ONLY without a `permissionDecision` field; and PostToolUse `tool_response.answers`
+   maps question text to the chosen label. Wire the pre/post hook pair on
+   `AskUserQuestion`, make one real ask, and confirm an appended question renders and
+   its answer comes back. See the measured section under Known Issues.
+   **Failure here is QUIET, which is why it is a checklist item**: if the append stops
+   rendering, no demand is ever answered, and every capped branch simply stays blocked
+   with a message saying nobody was asked. That is fail-CLOSED and recoverable
+   (`GENESIS_GATE_ACK_DISABLED=1`, or `~/.genesis/config/gate_ack_disabled`), but
+   nothing announces it.
+9. **Update this document** with findings.
 
 ---
 
@@ -1154,6 +1166,53 @@ size, not the cap; (2) a Bash TOOL result probe does not transfer to hooks
 typed turn writes no transcript, and "newest transcript" mis-attributes a
 concurrent session's — identify your own transcript by before/after set
 difference and send a real turn.
+
+### A PreToolUse hook can REWRITE an `AskUserQuestion` call — variant B only (measured 2.1.246, 2026-09-13)
+
+A PreToolUse hook returning `updatedInput` under `hookSpecificOutput` rewrites the
+tool input before the tool runs. It works on `AskUserQuestion`, which is what lets a
+gate put its OWN question in front of the user instead of the agent's paraphrase of
+it (`scripts/hooks/ask_gate_demand.py`).
+
+**The asymmetry is the whole finding, and it is undocumented upstream.**
+
+| variant | shape | result |
+|---|---|---|
+| **B — the only one that works** | `{"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {...}}}` | the rewritten questions render; the user answers normally |
+| A — looks more correct, is not | the same plus `"permissionDecision": "allow"` | the call returns **"user did not answer"** WITHOUT the user acting |
+
+Variant A's failure is the dangerous one: it is a false NEGATIVE that looks like the
+user declining. A test pins the field's absence
+(`tests/test_hooks/test_gate_demand.py::test_the_hook_NEVER_emits_a_permissionDecision`).
+
+**The answer comes back STRUCTURED**, so nothing needs to parse prose. PostToolUse
+`tool_response` is `{annotations, answers, questions}`, where `answers` maps the FULL
+question text to the chosen label. MEASURED byte-exact: a 131-character question came
+back at 131 characters, `sent in tool_response["answers"]` → `True`, **0 characters
+lost**. A free-text ("Other") answer lands in the same position as a clicked label, so
+a consumer must fail CLOSED on anything it does not recognise.
+
+Two more measured properties:
+- **Exactly ONE PreToolUse invocation per call** — there is no re-validation pass, so
+  an unconditional append cannot compound.
+- `AskUserQuestion`'s maximum is **4 questions**. A call already at the limit must be
+  passed through unmodified; refusing it would let a hook wedge a session's ability to
+  ask anything.
+
+**The transcript is NOT a record of what the user saw.** It stores the tool call AS
+THE AGENT EMITTED IT — substitution is applied afterwards — so a transcript-read
+"verification" of what was presented reads exactly the untrusted values it is trying
+to check. PR #1863 built that and it is why this note exists.
+
+**No version contract.** The official docs describe `updatedInput` on PreToolUse but
+say nothing about the `permissionDecision` asymmetry, transcript faithfulness, or when
+the field was introduced. Re-probe on every pin bump — the CC Update Evaluation
+Checklist carries the step.
+
+MEASUREMENT NOTE worth keeping: the first read of the returned `answers` printed the
+keys through a `repr(k[:95])` slice and they LOOKED truncated by CC. The truncation
+was the reader's own. Re-measuring the raw lengths is what established the 0-char
+result — never reason from where truncated output stops, including your own.
 
 ### Bypass/auto mode tells the agent to edit via Bash — safe for reads, NOT for writes (measured 2.1.246, 2026-09-05)
 

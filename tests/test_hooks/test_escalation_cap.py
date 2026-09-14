@@ -22,6 +22,7 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HOOK = _REPO_ROOT / "scripts" / "review_enforcement_commit.py"
 _REVIEW_STATE = _REPO_ROOT / "scripts" / "review_state.py"
+_ASK_HOOK = _REPO_ROOT / "scripts" / "hooks" / "ask_gate_demand.py"
 
 sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 sys.path.insert(0, str(_REPO_ROOT / "scripts" / "hooks"))
@@ -282,6 +283,72 @@ def _run_hook(command: str, repo: Path, home: Path) -> subprocess.CompletedProce
     )
 
 
+def _answer_demand(repo: Path, home: Path, label: str) -> subprocess.CompletedProcess:
+    """Answer the live gate demand by driving the REAL PostToolUse recorder hook.
+
+    Once this gate has BLOCKED, `# escalation-ack` / `# audit-ack` no longer clear it
+    on their own: an answer from the user has to be on record, because the sigil
+    attests that a fresh decision was MADE and only the recorded answer attests that
+    the USER made it. (A session this gate never blocked has no demand, so the sigil
+    keeps its old meaning — which is why the other tests here are untouched.)
+
+    Deliberately drives `ask_gate_demand.py --post` with a real AskUserQuestion
+    payload rather than calling `review_state.record_gate_answer` in-process. Two
+    reasons: an in-process write would land in the REAL ~/.genesis instead of the test
+    HOME, and a hand-written intermediate would let the hook and the gate disagree
+    about the payload shape without any test noticing.
+    """
+    question = _gate_demand_question(repo, home)
+    payload = json.dumps(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "AskUserQuestion",
+            "tool_response": {"answers": {question: label}},
+            "session_id": "test",
+        }
+    )
+    env = {**os.environ, "HOME": str(home)}
+    return subprocess.run(
+        [sys.executable, str(_ASK_HOOK), "--post"],
+        input=payload,
+        cwd=str(repo),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def _gate_demand_question(repo: Path, home: Path) -> str:
+    """The question the gate actually declared, read back out of the round file.
+
+    Read rather than hardcoded: a test that retypes the question would keep passing
+    after the gate's wording changed, and the match is by exact containment.
+    """
+    env = {**os.environ, "HOME": str(home)}
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, json; sys.path.insert(0, sys.argv[1]);"
+            "import review_state as rs;"
+            "d = rs.read_gate_demand(sys.argv[2]);"
+            "print(json.dumps(d['question'] if d else None))",
+            str(_REPO_ROOT / "scripts"),
+            str(repo),
+        ],
+        cwd=str(repo),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    question = json.loads(out.stdout)
+    assert question, "no gate demand was declared — the block did not record one"
+    return question
+
+
 def _mark(
     repo: Path, home: Path, *, clean: bool = False, source: str = "external"
 ) -> subprocess.CompletedProcess:
@@ -511,7 +578,11 @@ def test_docs_only_commit_still_blocked_at_cap(repo, home):
     res = _run_hook('git commit -m "docs"', repo, home)
     assert res.returncode == 2, res.stdout + res.stderr
     assert "escalation cap" in res.stderr
-    # ...and an ack lets the docs commit through.
+    # ...and an ack lets the docs commit through — once the user's choice is on
+    # record. That block declared a demand, so from here the sigil alone no longer
+    # clears it: the sigil attests a fresh decision was MADE, the recorded answer
+    # attests the USER made it.
+    _answer_demand(repo, home, "REDESIGN robust-by-construction")
     res2 = _run_hook('git commit -m "docs"  # escalation-ack', repo, home)
     assert res2.returncode == 0, res2.stderr
 
@@ -801,6 +872,10 @@ def test_acceptance_bar_incident_replay(repo, home):
     assert (
         "mode-switch" in res_blocked.stderr and "escalation cap reached" not in res_blocked.stderr
     )
+    # The mode-switch block declared its own demand, so the audit-ack now needs the
+    # user's choice on record too: (B) is "the premise holds — fix the CLASS", which
+    # is exactly what this replay says happened.
+    _answer_demand(repo, home, "(B) The premise holds — fix the CLASS, not the instance")
     res_ok = _run_hook('git commit -m "wip"  # audit-ack', repo, home)
     assert res_ok.returncode == 0, res_ok.stdout + res_ok.stderr
 
@@ -1087,6 +1162,10 @@ def test_a_denied_command_does_not_spend_the_acceptance(repo, home):
     denied = _run_hook('git commit -m "accept"  # final-round-accept', repo, home)
     assert denied.returncode == 2, denied.stdout + denied.stderr
     assert "already used" not in denied.stderr.lower()
+    # That denial came from the escalation cap, so it declared a demand. Record the
+    # user's choice before the co-required form, or the cap refuses the ack for the
+    # separate reason that nobody was ever asked.
+    _answer_demand(repo, home, "NARROW the scope")
     # The acceptance must still be available to the co-required form.
     ok = _run_hook('git commit -m "accept"  # final-round-accept escalation-ack', repo, home)
     assert ok.returncode == 0, ok.stdout + ok.stderr
@@ -1165,6 +1244,9 @@ def test_below_final_round_the_normal_cycle_still_applies(repo, home):
     without = _run_hook('git commit -m "wip"', repo, home)
     assert without.returncode == 2, "control: the escalation cap must be blocking here"
     assert "escalation cap" in without.stderr.lower()
+    # The control block above declared a demand, so the ordinary cycle now runs
+    # block -> the user is asked -> ack, rather than block -> ack.
+    _answer_demand(repo, home, "NARROW the scope")
     res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
     assert res.returncode == 0, res.stdout + res.stderr
 
@@ -1396,3 +1478,147 @@ def test_both_tiers_route_the_fork_to_evidence_not_feel(repo, home):
     assert (_REPO_ROOT / ".claude" / "docs" / "premise-check.md").is_file(), (
         "both gate tiers cite .claude/docs/premise-check.md — it is missing"
     )
+
+
+# ─── Gate demands: the substitution contract, at the gate ────────────────────
+#
+# These are the locks for the ENFORCEMENT itself. The four tests above that call
+# `_answer_demand` would pass whether or not the gate checks the demand — they
+# answer it either way — so without these, deleting `_demand_refusal` would leave
+# the whole suite green. That gap was found while planning the verify-RED sweep,
+# which is exactly what that sweep is for.
+
+
+def test_a_cap_block_declares_its_remedy_set(repo, home):
+    """The block is the ONLY place a cap demand is created. Enforcement binds
+    after a real refusal, never speculatively."""
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    res = _run_hook('git commit -m "wip"', repo, home)
+    assert res.returncode == 2
+    question = _gate_demand_question(repo, home)  # asserts a demand exists
+    assert "escalation cap" in question.lower()
+
+
+def test_a_bare_ack_is_REFUSED_once_the_gate_has_actually_blocked(repo, home):
+    """THE ENFORCEMENT LOCK, and the founding incident in one test.
+
+    The gate blocked and printed its remedies; the sigil attests that a fresh
+    decision was MADE. Only a recorded answer attests that the USER made it. On
+    2026-08-31 the relay dropped the first option, invented a fourth and added
+    "ship as-is" — and a bare ack would have landed that.
+    """
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    blocked = _run_hook('git commit -m "wip"', repo, home)
+    assert blocked.returncode == 2, "control: the cap must block here"
+    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "not enough on its own" in res.stderr
+    assert "LIVE and UNANSWERED" in res.stderr
+
+
+def test_a_session_the_gate_never_blocked_keeps_the_old_sigil_meaning(repo, home):
+    """The scope limit, stated as a test. No block -> no demand -> the sigil works
+    exactly as before. This is what keeps the change off ~11 other tests, and it
+    is also the PRE-EXISTING hole (a preemptive sigil is never demanded) that is
+    deliberately out of scope here and filed as an issue."""
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_a_TERMINAL_choice_refuses_the_commit_even_with_the_sigil(repo, home):
+    """Choosing hand-back blocks the branch, and the sigil cannot override it.
+    That is the decision working, not a malfunction."""
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    assert _run_hook('git commit -m "wip"', repo, home).returncode == 2
+    _answer_demand(repo, home, "HAND IT BACK")
+    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "TERMINAL remedy" in res.stderr
+    assert "retire-gate-demand" in res.stderr, "the documented re-ask must be named"
+
+
+def test_an_UNRECOGNISED_answer_is_quoted_back_not_ignored(repo, home):
+    """The operator answered. Telling them they were never asked would read as the
+    gate being broken, which is why free text records a state instead of nothing."""
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    assert _run_hook('git commit -m "wip"', repo, home).returncode == 2
+    _answer_demand(repo, home, "narrow it but keep the tests")
+    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "narrow it but keep the tests" in res.stderr, "the answer must be quoted back"
+
+
+def test_an_answer_authorises_exactly_ONE_commit(repo, home):
+    """One-shot: the decision authorises the commit it was made about, not the
+    branch's remaining life."""
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    assert _run_hook('git commit -m "wip"', repo, home).returncode == 2
+    _answer_demand(repo, home, "NARROW the scope")
+    first = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
+    assert first.returncode == 0, first.stdout + first.stderr
+    _git(repo, "commit", "-qm", "wip")
+    # Drive the streak back to the cap; the spent demand must not authorise again.
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    assert _run_hook('git commit -m "again"', repo, home).returncode == 2
+    again = _run_hook('git commit -m "again"  # escalation-ack', repo, home)
+    assert again.returncode == 2, again.stdout + again.stderr
+
+
+def test_the_mode_switch_tier_enforces_the_same_contract(repo, home):
+    """Both tiers, per the owner's decision — one declaration API, two data sets."""
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 1)
+    blocked = _run_hook('git commit -m "wip"', repo, home)
+    assert blocked.returncode == 2 and "mode-switch" in blocked.stderr
+    bare = _run_hook('git commit -m "wip"  # audit-ack', repo, home)
+    assert bare.returncode == 2, bare.stdout + bare.stderr
+    assert "not enough on its own" in bare.stderr
+    _answer_demand(repo, home, "(B) The premise holds — fix the CLASS, not the instance")
+    ok = _run_hook('git commit -m "wip"  # audit-ack', repo, home)
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+
+
+def test_a_background_session_is_told_how_to_EXIT_not_just_that_it_is_stuck(repo, home):
+    """A dispatched session cannot be asked, so it cannot clear either tier — the
+    gate's own text already says the decision is not the session's to make alone.
+    That is a deliberate capability reduction, so the block must name the exit
+    (hand back: label + a `ready` follow-up) rather than leaving it to grind.
+    """
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    payload = json.dumps(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": 'git commit -m "wip"'},
+            "session_id": "test",
+        }
+    )
+    env = {**os.environ, "HOME": str(home), "GENESIS_CC_SESSION": "1"}
+    res = subprocess.run(
+        [sys.executable, str(_HOOK)],
+        input=payload,
+        cwd=str(repo),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert res.returncode == 2
+    assert "NO HUMAN IS PRESENT" in res.stderr
+    assert "needs-architecture-session" in res.stderr
+    assert "ready" in res.stderr and "follow-up" in res.stderr
+
+
+def test_the_kill_switch_restores_the_pre_demand_behaviour(repo, home):
+    """A RECOVERY tool for a wedged gate. It disables ENFORCEMENT, not just the
+    append — disabling only the append would leave the demand unsatisfiable, which
+    is the opposite of a recovery tool."""
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    assert _run_hook('git commit -m "wip"', repo, home).returncode == 2
+    blocked = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
+    assert blocked.returncode == 2, "control: without the switch the ack is refused"
+    marker = home / ".genesis" / "config" / "gate_ack_disabled"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("")
+    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
