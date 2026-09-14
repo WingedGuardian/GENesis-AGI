@@ -2174,6 +2174,86 @@ def _fetch_comments_paged(
     return acc, False
 
 
+#: A single file holding at least this share of a round's scored findings is
+#: reported as CONCENTRATED. Not a threshold anything blocks on — it only decides
+#: whether the report adds the mechanism note, so being approximately right is
+#: enough and no value here can change a verdict.
+_CONCENTRATION_SHARE = 0.5
+
+#: …and below this many findings the share is noise (2 of 3 is 67% and means
+#: nothing). Concentration is a claim about a distribution; a distribution needs
+#: enough points to have a shape.
+_CONCENTRATION_MIN_FINDINGS = 4
+
+
+def _findings_distribution(scored_at: list[tuple[str, str]]) -> str:
+    """Where this round's findings LAND, as a report — never a verdict.
+
+    WHY THE GATE PRINTS THIS AT ALL, including on round one. A list of findings
+    reads as a work queue, so the default response is to answer them one by one;
+    the same findings arranged BY FILE can show something a list cannot — that
+    several of them share one seam and may therefore share one cause. That is
+    information the gate already holds (every finding is parsed with its path, to
+    diff-scope it) and used to discard. Printing it costs nothing and puts the
+    evidence in front of whoever is deciding what to do about the round.
+
+    DELIBERATELY NOT A VERDICT, and the distinction is the whole design. This
+    function states counts and, when one file dominates, names what that MIGHT
+    mean. It never concludes the approach is wrong — one round rarely carries
+    that, and a gate that cried "premise!" at every round would be tuned out
+    within a week, which would cost more than it bought. What it does instead is
+    grant permission explicitly, because the failure this exists for is not that
+    sessions cannot see concentration; it is that answering the findings feels
+    like the whole job and stepping back feels like exceeding the brief.
+
+    Origin, stated because it is the acceptance case: a change whose round-one
+    findings were 8-of-11 in one file, three of them on code written to answer an
+    earlier round, was about to be answered as eleven separate patches. One
+    question from a human — are the premises right? — turned it into a single
+    mechanism change, using facts that were already on the table.
+    """
+    if not scored_at:
+        return ""
+
+    by_file: dict[str, list[str]] = {}
+    for severity, path in scored_at:
+        by_file.setdefault(path or "(no path)", []).append(severity)
+
+    total = len(scored_at)
+    ranked = sorted(by_file.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    lines = [
+        f"DISTRIBUTION: {total} scored finding(s) across {len(by_file)} file(s) —"
+        f" read as a class before answering as a list:"
+    ]
+    for path, sevs in ranked[:6]:
+        share = 100.0 * len(sevs) / total
+        mix = ", ".join(f"{sevs.count(s)} {s}" for s in ("P1", "P2", "CR") if sevs.count(s))
+        lines.append(f"    {len(sevs):>2} ({share:4.0f}%)  {path}  [{mix}]")
+    if len(ranked) > 6:
+        lines.append(f"    … and {len(ranked) - 6} more file(s)")
+
+    top_path, top_sevs = ranked[0]
+    concentrated = (
+        total >= _CONCENTRATION_MIN_FINDINGS
+        and len(top_sevs) / total >= _CONCENTRATION_SHARE
+    )
+    if concentrated:
+        lines.append(
+            f"  NOTE: {100.0 * len(top_sevs) / total:.0f}% of this round's findings are in ONE "
+            f"file ({top_path}). Findings that concentrate on a single seam — or that land on "
+            "code added to answer an EARLIER round — are a mechanism signal: they often share "
+            "one cause, and fixing the cause retires them together while fixing them "
+            "individually tends to produce the next round's findings."
+        )
+    lines.append(
+        "  Deciding this round is a CLASS rather than a list is part of answering it, not a "
+        "detour from it — and concluding the approach itself is wrong is a legitimate verdict "
+        "that needs nobody's permission. One round is a lead, not a proof: say what THIS "
+        "round's evidence supports, and no more. Method: .claude/docs/premise-check.md"
+    )
+    return "\n".join(lines)
+
+
 def _check_inline_review_findings(
     pr_num: str,
     *,
@@ -2261,6 +2341,11 @@ def _check_inline_review_findings(
     }
     p1: list[str] = []
     p2: list[str] = []
+    # (severity, path) for every finding that SCORES, kept alongside the title
+    # lists so the distribution below can be computed without a second fetch.
+    # The off-diff lists already carry (title, path) tuples for the same reason;
+    # this is that shape applied to the findings that actually count.
+    scored_at: list[tuple[str, str]] = []
     doc_skipped: list[str] = []  # P1s on doc paths — surfaced, never blocking
     doc_skipped_p2: list[str] = []  # P2s on doc paths — surfaced, excluded from score
     cr_block: list[str] = []  # CodeRabbit Critical/Major — 1.0 each
@@ -2368,6 +2453,7 @@ def _check_inline_review_findings(
                     cr_doc_skipped.append(_coderabbit_title(seg))
                     continue
                 cr_block.append(_coderabbit_title(seg))
+                scored_at.append(("CR", c.get("path") or ""))
             continue
         if _INLINE_P1_RE.search(body):
             if c.get("id") in replied_to:
@@ -2387,6 +2473,7 @@ def _check_inline_review_findings(
                 doc_skipped.append(_inline_title(body))
                 continue
             p1.append(_inline_title(body))
+            scored_at.append(("P1", c.get("path") or ""))
         elif _INLINE_P2_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — maintainer consciously accepted the P2
@@ -2402,6 +2489,7 @@ def _check_inline_review_findings(
                 doc_skipped_p2.append(_inline_title(body))
                 continue
             p2.append(_inline_title(body))
+            scored_at.append(("P2", c.get("path") or ""))
         else:
             # The silent-drop CLASS, not just its CodeRabbit instance. A comment
             # that reached this loop was authored by a Bot or an allowlisted review
@@ -2706,6 +2794,14 @@ def _check_inline_review_findings(
         )
         for title in p2[:8]:
             print(f"  [P2] {title}", file=sys.stderr)
+    # Printed with the findings themselves, not with the verdict, because this is
+    # for whoever is deciding what to do about them — and that decision is made
+    # while reading the list, before any threshold is consulted. Emitted on EVERY
+    # round including the first: one round is a lead rather than a proof, but a
+    # lead nobody is shown is a lead nobody follows.
+    distribution = _findings_distribution(scored_at)
+    if distribution:
+        print(distribution, file=sys.stderr)
     # The lane is resolved ONLY when there is a score to compare, so a PR with no
     # blocking findings still pays nothing — the same laziness `_scope_cache`
     # above was built for. `_pr_changed_files` is memoized, and the pin-receipt
