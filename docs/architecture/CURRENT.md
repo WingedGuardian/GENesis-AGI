@@ -1940,10 +1940,8 @@ verified: 788dd9a9 2026-09-06
   current, and it names every fault that holds at once instead of ranking them,
   so fixing one does not hide the next. The predicate is the outstanding FAULT —
   the last completed attempt failed and a board had loaded before it — never the
-  transport's current phase. A phase returns to "refreshing" for the duration of
-  every retry, and under a sustained server-error outage never leaves it,
-  because the client's backoff outlives the poll interval and each superseded
-  response returns before recording a failure. Both accounting surfaces
+  transport's current phase, which returns to "refreshing" for the duration of
+  every retry. Both accounting surfaces
   (`GET /api/genesis/zero-drop` + the Zero-Drop tab, and the morning report's
   Ground-Truth line) call that one assembler so they cannot disagree; the
   morning-report line is COUNTS ONLY, never a branch name, because that

@@ -17,6 +17,13 @@
   with no warning of any kind, indefinitely. A failure is now remembered until a
   request actually succeeds.
 
+  That remembering has one visible side effect beyond the Zero-Drop tab, named
+  here rather than left to be discovered: a panel that has never loaded
+  successfully now shows the previous attempt's error text while it retries,
+  where it used to show nothing. Six panels can reach that state. It reads as an
+  improvement — a panel that is failing says why — but it is a change, and it
+  arrived as a consequence of the fix rather than as its goal.
+
   It also names every fault that holds at once — "detector blind + refresh
   failing" — rather than showing only the most severe. The previous wording
   picked one, so anyone who fixed the fault they were shown would have seen the

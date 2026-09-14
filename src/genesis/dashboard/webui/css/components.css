@@ -103,7 +103,8 @@
 .panel {
   display: block;
   height: auto;
-  /* `overflow` is the third property index.css sets on `.panel`, and it is
+  /* `overflow` is the third LAYOUT property index.css sets on `.panel` (it
+   * also sets `scroll-behavior`), and it is
    * stated here rather than left inherited. The value is the same one the
    * vendor was already supplying (`auto`), so this changes nothing anywhere
    * today — dashboard.css overrides it to `hidden` for the dashboard's own
@@ -127,7 +128,7 @@
  * three !important declarations. The fifth, the voice page, does not, and
  * MEASURED on a page carrying the same stylesheet set: disabling that inline
  * block gives `overflow: hidden; position: fixed` and the document stops
- * scrolling entirely. That is the same leak as `.panel` below, in its third
+ * scrolling entirely. That is the same leak as `.panel` above, in its third
  * instance, and copy-per-page is how the page that forgot went unnoticed.
  *
  * Declared here so every page that loads components.css is covered, including

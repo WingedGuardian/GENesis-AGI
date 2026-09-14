@@ -278,9 +278,22 @@ def test_the_board_renders_the_deferred_lane_and_a_superseded_fetch_is_dropped()
     )
 
     assert "_zeroDropFetchToken" in js, "fetches need a monotonic token"
-    assert js.count("token !== this._zeroDropFetchToken") >= 2, (
-        "the token must be re-checked AFTER the json() await too — parsing the "
-        "body is a second suspension point where a newer response can land"
+    # Originally "at least two checks", which pinned the shape rather than the
+    # property: the point was never the COUNT, it was that the last check sits
+    # after the FINAL suspension point. `json()` is that point — a newer
+    # response can land while the body is being parsed — so the check must come
+    # between it and the assignment. Stated that way it survives a restructure
+    # that legitimately drops a redundant earlier check, and still fails if the
+    # remaining one drifts to the wrong side of the await.
+    body = js[js.index("async fetchZeroDrop() {") : js.index("async fetchObservations() {")]
+    parse, guard, install = (
+        body.index("await resp.json()"),
+        body.index("token !== this._zeroDropFetchToken"),
+        body.index("this.zeroDropView = payload"),
+    )
+    assert parse < guard < install, (
+        "the supersession check must sit AFTER the json() await and BEFORE the "
+        "payload is installed, or an older board can overwrite a newer one"
     )
 
 
@@ -398,6 +411,19 @@ def test_the_badge_withholds_its_number_when_the_REFRESH_is_failing_too():
     assert "refresh failing" in warning_body, (
         "naming the fault is the point: a reader who sees a warning with no "
         "cause cannot tell a broken detector from a broken fetch"
+    )
+
+    # The BANNER in the body must use the same predicate as the chips above it.
+    # It had no assertion at all: an audit reverted it to the phase and the whole
+    # suite stayed green, which is the round-1 defect exactly — badge withholds,
+    # banner vanishes for the duration of every retry, and the two disagree
+    # precisely when the reader needs them to agree. The comment beside it says
+    # they must match; nothing checked that they did.
+    tpl = _zero_drop_template()
+    banner = tpl.split("Refresh is FAILING")[0].rsplit('<template x-if="', 1)[1].split('">')[0]
+    assert banner == "$store.genesisDashboard.refreshFailing('zeroDrop')", (
+        f"the failing-refresh banner must gate on the same fault as the badge, "
+        f"not on the transport phase — got {banner!r}"
     )
 
     # SHAPE, not just presence. An audit inverted both chips without removing a
@@ -568,32 +594,232 @@ def test_a_retry_in_flight_does_not_erase_the_fault_it_is_retrying():
     )
 
 
-def test_a_superseded_THROWN_request_cannot_mark_a_healthy_transport_as_failing():
-    """The token check guarded two of the three exits, and the third now matters.
+def test_a_failure_is_only_discarded_once_a_newer_request_has_SUCCEEDED():
+    """Started is not succeeded, and the gap between them is a poll interval.
 
-    `fetchZeroDrop` re-checks its token after the fetch and after `json()`, with
-    a comment explaining that calling `failFetch` on a superseded response would
-    mark a healthy transport broken. The `catch` had no such check. That was
-    cosmetic while nothing acted on the flag; the header badge now withholds its
-    count on exactly this signal, so an older request throwing after a newer one
-    succeeded would blank a number that is in fact current — and, since the fault
-    now persists across retries, it would stay blanked until the next success.
+    A first pass guarded the `catch` with the same started-based token check the
+    install path uses. An external review showed that reintroduces, on the other
+    path, the defect the badge change exists to prevent: a request that fails
+    SLOWLY — a hung connection, or `fetchApi`'s shared backoff sitting near its
+    60-62s ceiling — returns after the 60s poll has already begun the next one,
+    sees a newer token, and discards a real failure. The next does the same to
+    the one after it. Nothing reaches `failFetch`, the fault is never recorded,
+    and the badge shows an arbitrarily old count for the whole outage.
+
+    The suppression has exactly one legitimate job — an older request failing
+    after a newer one has already installed a board must not mark a healthy
+    transport broken — and a completed SUCCESS is what that job keys on.
+
+    The INSTALL path still keys on the started-token, deliberately: there the
+    question is which of two boards belongs on screen, and the newer request
+    should win whether or not it has finished yet.
     """
     import pathlib
 
     js = (
         pathlib.Path(__file__).resolve().parents[2] / "src/genesis/dashboard/webui/js/dashboard.js"
     ).read_text()
-    body = js[js.index("async fetchZeroDrop() {") : js.index("async fetchObservations() {")]
+    # fetchZeroDrop's OWN body. Slicing to the next `async` method would swallow
+    # the `_newerRequestSucceeded` helper that sits between them, so the call
+    # count would include the definition and read 3 where 2 is the contract.
+    body = _js_function_body(js, "async fetchZeroDrop() {")
 
-    assert body.count("token !== this._zeroDropFetchToken") >= 3, (
-        "all three exits — after the fetch, after json(), and in the catch — "
-        "must drop a superseded response"
+    assert body.count("_newerRequestSucceeded(token)") == 2, (
+        "both failure exits — the non-ok branch and the catch — must gate their "
+        "failFetch on a newer request having SUCCEEDED"
     )
     catch = body[body.index("} catch (e) {") :]
-    assert "token !== this._zeroDropFetchToken" in catch, (
-        "the catch is the exit that was missing the check"
+    assert "_newerRequestSucceeded(token)" in catch, (
+        "the catch is the exit an external review found swallowing failures"
     )
-    assert catch.index("token !== this._zeroDropFetchToken") < catch.index("failFetch"), (
+    assert catch.index("_newerRequestSucceeded(token)") < catch.index("failFetch"), (
         "and it must come BEFORE failFetch, or it guards nothing"
+    )
+    # The started-token check must not guard a failure path any more.
+    non_ok = body[body.index("} else if") : body.index("} catch (e) {")]
+    for exit_ in (non_ok, catch):
+        assert "token !== this._zeroDropFetchToken" not in exit_, (
+            "a merely-STARTED newer request is not grounds to discard a failure"
+        )
+
+    ok_branch = body[body.index("if (resp && resp.ok)") : body.index("} else if")]
+    assert "token !== this._zeroDropFetchToken" in ok_branch, (
+        "an older payload must still lose to a newer request"
+    )
+    assert "this._zeroDropSucceededToken = token" in ok_branch, (
+        "and the success must be RECORDED, or the failure exits have nothing to ask"
+    )
+    assert ok_branch.index("this._zeroDropSucceededToken = token") > ok_branch.index(
+        "token !== this._zeroDropFetchToken"
+    ), "recorded only after the supersession check, never before"
+
+    helper = _js_function_body(js, "_newerRequestSucceeded(token) {")
+    assert "_zeroDropSucceededToken" in helper and ">" in helper, (
+        "the helper compares against the last SUCCEEDED token"
+    )
+    assert "_zeroDropFetchToken" not in helper, (
+        "reading the started-token here would restore the defect verbatim"
+    )
+
+
+def _js_body_only(js: str, signature: str) -> str:
+    """The inside of one store method, for execution rather than inspection."""
+    start = js.index(signature) + len(signature)
+    return js[start : js.index("\n        },", start)]
+
+
+def test_the_transport_fault_BEHAVES_correctly_across_overlapping_requests():
+    """Executed, not grepped — because every grep here survived the mutations.
+
+    An adversarial audit extracted these same methods into node and showed that
+    five separate operator mutations left the whole Python suite green while
+    inverting the behaviour: dropping the `!` on both failure exits, comparing
+    the succeeded-token against `0` instead of `token`, and two spellings of
+    clearing `state.error` in `startFetch`. Substring and index assertions pin
+    the SHAPE of the fix; they cannot see polarity, and polarity is the entire
+    content of this change.
+
+    So the real methods are lifted out of dashboard.js and run against an
+    injected `fetchApi` whose outcome each scenario controls. A rewrite that
+    keeps every token and loses the property fails here.
+
+    The property under test, in one line: `refreshFailing('zeroDrop')` is true
+    exactly when the last COMPLETED attempt failed and a board had loaded before
+    it — never merely because a newer attempt has STARTED.
+    """
+    import json
+    import pathlib
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; the source assertions above still apply")
+
+    js = (
+        pathlib.Path(__file__).resolve().parents[2] / "src/genesis/dashboard/webui/js/dashboard.js"
+    ).read_text()
+    methods = {
+        "startFetch": _js_body_only(js, "startFetch(name) {"),
+        "finishFetch": _js_body_only(js, "finishFetch(name) {"),
+        "failFetch": _js_body_only(js, "failFetch(name, message) {"),
+        "panelState": _js_body_only(js, "panelState(name) {"),
+        "refreshFailing": _js_body_only(js, "refreshFailing(name) {"),
+        "_newerRequestSucceeded": _js_body_only(js, "_newerRequestSucceeded(token) {"),
+        "fetchZeroDrop": _js_body_only(js, "async fetchZeroDrop() {"),
+    }
+
+    # Each scenario is a SCRIPT of interleaved steps, because the interleaving
+    # IS the subject. "start" begins a request; "ok:i" / "err:i" / "throw:i"
+    # resolve the i-th started request as a board, a 500, or a network error.
+    # A first version launched every request up front and every one of them was
+    # superseded before it could install anything, so no scenario ever reached a
+    # success — the harness measured a state the app cannot be in.
+    scenarios = [
+        {
+            "name": "a clean fetch leaves no fault",
+            "steps": ["start", "ok:0"],
+            "refreshFailing": False,
+        },
+        {
+            "name": "one failure after a good board is a fault",
+            "steps": ["start", "ok:0", "start", "err:1"],
+            "refreshFailing": True,
+        },
+        {
+            "name": "a retry IN FLIGHT does not clear the fault it is retrying",
+            "steps": ["start", "ok:0", "start", "err:1", "start"],
+            "refreshFailing": True,
+        },
+        {
+            "name": "a success clears it",
+            "steps": ["start", "ok:0", "start", "err:1", "start", "ok:2"],
+            "refreshFailing": False,
+        },
+        {
+            "name": "SUSTAINED OUTAGE: every failure overtaken before it returns",
+            "steps": ["start", "ok:0", "start", "start", "throw:1", "start", "throw:2", "throw:3"],
+            "refreshFailing": True,
+        },
+        {
+            "name": "same, with 500s rather than throws",
+            "steps": ["start", "ok:0", "start", "start", "err:1", "start", "err:2", "err:3"],
+            "refreshFailing": True,
+        },
+        {
+            "name": "an older failure landing after a newer SUCCESS is discarded",
+            "steps": ["start", "ok:0", "start", "start", "ok:2", "throw:1"],
+            "refreshFailing": False,
+        },
+        {
+            "name": "an older BOARD landing after a newer one does not overwrite it",
+            "steps": ["start", "ok:0", "start", "start", "ok:2", "ok:1"],
+            "refreshFailing": False,
+            "board": "board-2",
+        },
+    ]
+
+    script = (
+        "const M = " + json.dumps(methods) + ";\n"
+        "function makeStore(fetchApi) {\n"
+        "  const self = {\n"
+        "    zeroDropView: null,\n"
+        "    fetchState: { zeroDrop: { state: 'idle', error: null, lastSuccess: null } },\n"
+        "  };\n"
+        "  self.startFetch = new Function('name', M.startFetch);\n"
+        "  self.finishFetch = new Function('name', M.finishFetch);\n"
+        "  self.failFetch = new Function('name', 'message', M.failFetch);\n"
+        "  self.panelState = new Function('name', M.panelState);\n"
+        "  self.refreshFailing = new Function('name', M.refreshFailing);\n"
+        "  self._newerRequestSucceeded = new Function('token', M._newerRequestSucceeded);\n"
+        "  self.fetchZeroDrop = new Function('fetchApi', 'console',\n"
+        "    'return async function () {' + M.fetchZeroDrop + '\\n};')(fetchApi, console);\n"
+        "  return self;\n"
+        "}\n"
+        "const tick = () => new Promise((r) => setImmediate(r));\n"
+        "async function run(sc) {\n"
+        "  const gate = [];\n"
+        "  const flying = [];\n"
+        "  const store = makeStore(() => new Promise((res, rej) => gate.push({ res, rej })));\n"
+        "  for (const step of sc.steps) {\n"
+        "    if (step === 'start') {\n"
+        "      flying.push(store.fetchZeroDrop.call(store));\n"
+        "    } else {\n"
+        "      const [kind, idx] = step.split(':');\n"
+        "      const g = gate[Number(idx)];\n"
+        "      if (kind === 'ok') g.res({ ok: true, json: async () => 'board-' + idx });\n"
+        "      else if (kind === 'err') g.res({ ok: false, status: 500 });\n"
+        "      else g.rej(new Error('network'));\n"
+        "    }\n"
+        "    await tick();\n"
+        "    await tick();\n"
+        "  }\n"
+        "  await tick();\n"
+        "  return store;\n"
+        "}\n"
+        "(async () => {\n"
+        "  const cases = " + json.dumps(scenarios) + ";\n"
+        "  let bad = 0;\n"
+        "  for (const sc of cases) {\n"
+        "    const store = await run(sc);\n"
+        "    const got = store.refreshFailing.call(store, 'zeroDrop');\n"
+        "    if (got !== sc.refreshFailing) {\n"
+        "      bad++;\n"
+        "      console.log('MISMATCH refreshFailing: ' + sc.name + ' -> ' + got +\n"
+        "        ' want ' + sc.refreshFailing + ' state=' + JSON.stringify(store.fetchState.zeroDrop));\n"
+        "    }\n"
+        "    if (sc.board !== undefined && store.zeroDropView !== sc.board) {\n"
+        "      bad++;\n"
+        "      console.log('MISMATCH board: ' + sc.name + ' -> ' + store.zeroDropView +\n"
+        "        ' want ' + sc.board);\n"
+        "    }\n"
+        "  }\n"
+        "  console.log(bad === 0 ? 'OK' : 'FAIL ' + bad);\n"
+        "})();\n"
+    )
+
+    r = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, f"node failed: {r.stderr[:1200]}"
+    assert r.stdout.strip().endswith("OK"), (
+        "the fetch state machine disagreed with the expected transport faults:\n" + r.stdout
     )

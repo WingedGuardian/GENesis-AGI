@@ -378,6 +378,12 @@
         // Monotonic request token — see fetchZeroDrop. Declared here rather
         // than created on first use so it is visible as state.
         _zeroDropFetchToken: 0,
+        // The token of the last request that actually INSTALLED a board. A
+        // failure is discardable only against this one, never against the
+        // started-token above — see `_newerRequestSucceeded`. Declared beside
+        // its sibling for the same reason, and because a key created on first
+        // use is invisible to the member scan in test_webui_js_integrity.
+        _zeroDropSucceededToken: 0,
         _cockpitInterval: null,
         _commsInterval: null,
         _tracesInterval: null,
@@ -728,7 +734,13 @@
         cleanup() {
           if (this._healthInterval) clearInterval(this._healthInterval);
           if (this._backupInterval) clearInterval(this._backupInterval);
-          for (const tab of ["overview", "chat", "internals", "config", "work", "observations", "traces", "autonomy"]) {
+          // Every tab in the registry, not a hand-kept list beside it. The
+          // literal here named eight of the sixteen, so half the panels — this
+          // one included — kept polling through cleanup. It costs nothing on
+          // `beforeunload`, where the page is being torn down anyway, but the
+          // list is a second place to remember a tab and this panel is the
+          // proof it gets forgotten.
+          for (const tab of Object.keys(this._TAB_INTERVALS)) {
             this._stopTabIntervals(tab);
           }
           // Terminal runs in its own window — no cleanup needed here
@@ -1204,31 +1216,46 @@
           this.startFetch("zeroDrop");
           try {
             const resp = await fetchApi("/api/genesis/zero-drop");
-            // Superseded while we were awaiting: a newer request has already
-            // finished. Drop this payload silently — it is not an error, and
-            // calling failFetch would mark a healthy transport as broken.
-            if (token !== this._zeroDropFetchToken) return;
             if (resp && resp.ok) {
               const payload = await resp.json();
-              // Re-checked AFTER the second await: parsing the body is another
-              // suspension point, and the newer response can land during it.
+              // Superseded: a NEWER request exists, so its result should win.
+              // Installing this older payload would let arrival order decide
+              // which board is on screen, and `finishFetch` would then stamp
+              // `lastSuccess` with now — so the older board would read as
+              // current. Dropping it costs one poll interval of staleness.
               if (token !== this._zeroDropFetchToken) return;
               this.zeroDropView = payload;
+              this._zeroDropSucceededToken = token;
               this.finishFetch("zeroDrop");
-            } else {
+            } else if (!this._newerRequestSucceeded(token)) {
               this.failFetch("zeroDrop", "Zero-drop endpoint returned an error");
             }
           } catch (e) {
             console.warn("Zero-drop fetch failed:", e);
-            // Same superseded check as the two above, for the same reason and
-            // one it was missing: an OLDER request that throws after a newer one
-            // has already succeeded would otherwise mark a healthy transport as
-            // failing. That was cosmetic while nothing acted on it; now the
-            // header badge withholds its count on exactly this signal, so a
-            // spurious fault blanks a number that is in fact current.
-            if (token !== this._zeroDropFetchToken) return;
-            this.failFetch("zeroDrop", "Failed to fetch the zero-drop view");
+            if (!this._newerRequestSucceeded(token)) {
+              this.failFetch("zeroDrop", "Failed to fetch the zero-drop view");
+            }
           }
+        },
+
+        // A FAILURE is only discardable once a newer request has actually
+        // produced a board — never merely because one has STARTED.
+        //
+        // The two are a poll interval apart and the difference is the whole
+        // defect. `_zeroDropFetchToken` increments when a request begins, so
+        // suppressing on it means: request A fails slowly (a hung connection,
+        // or `fetchApi`'s shared backoff sitting near its 60-62s ceiling), the
+        // 60s poll has already started request B, A returns here, sees a newer
+        // token and discards a real failure. B then does the same to C. Nothing
+        // ever reaches `failFetch`, `refreshFailing` stays false, and the badge
+        // shows an arbitrarily old count for the whole outage — which is
+        // precisely the failure the badge was changed to prevent.
+        //
+        // Keyed on a completed success instead, the suppression still does its
+        // one legitimate job: an older request that fails after a newer one has
+        // already installed a board must not mark a healthy transport broken.
+        _newerRequestSucceeded(token) {
+          return (this._zeroDropSucceededToken || 0) > token;
         },
 
         async fetchObservations() {

@@ -61,15 +61,40 @@ wins. Specificity is now compared as well: an answer must load later AND be at
 least as specific. That was the last of the seven to fall, and it fell to a
 mutation rather than to reading.
 
+Comparing specificity then produced a hole of its own, and the shape is worth
+keeping because it is easy to repeat: the first version scored every selector on
+ONE bound and called erring high "the safe direction". It is safe on one side
+only. A vendor rule scored too high is a false alarm someone reads; an ANSWER
+scored too high is silence — the guard accepts an answer the browser will not
+apply. The vendor side is now scored HIGH and the answer side LOW.
+
+Declaring that asymmetry did not deliver it. A second audit constructed five
+selectors whose LOW bound sat ABOVE the true CSS value, two of which accepted a
+live leak end to end: a namespace prefix counted as a second element
+(``svg|a``); an escaped character splitting one class name into two
+(``.foo\\.bar``) or reading as a pseudo-class (``.md\\:flex``); a pseudo-class
+inside an attribute VALUE (``[title=":hover"]``); and — needing no exotic CSS at
+all — a selector GROUP scored at its strongest member on the answer side, where
+``#app .panel, .panel`` answers at plain ``.panel`` for every panel outside
+``#app``. All five are closed and each is a row in the table below. The lesson
+is the one the earlier holes taught in a different costume: a stated safety
+property is a claim to be attacked, not a design that holds because it was
+written down.
+
 SCOPE, stated rather than implied. This compares what is DECLARED, in what order
-the sheets load, and a rough specificity per rule. It does not compute the
-cascade. The specificity is approximate — ``:is()``/``:where()`` argument lists,
-``:not()`` contents and attribute operators are counted as written rather than
-resolved, deliberately erring HIGH so a rule is never scored weaker than it is.
-Shorthands are not expanded (``flex`` is not read as implying
+the sheets load, and a bounded specificity per rule. It does not compute the
+cascade: within those bounds a functional pseudo-class is dropped rather than
+resolved, shorthands are not expanded (``flex`` is not read as implying
 ``flex-direction``), and inline ``<style>`` blocks in a template are invisible.
 It is a lint against one specific failure — a vendor layout declaration with no
 Genesis answer — not a model of CSS.
+
+And the bound is exact only for the selector shapes below it. Five over-counts
+were found by construction rather than by reading; a sixth shape nobody has
+written yet could over-count again, in the silent direction. Treat the
+parametrised table as the shapes CHECKED, never as a proof about selectors in
+general — which is the same distinction the corpus-versus-constructible one
+makes everywhere else in this repository.
 
 Two gaps worth naming, because a guard is read as covering what it does not say
 it misses. The per-page test only fires where Genesis has ALREADY staked a layout
@@ -165,6 +190,40 @@ def _linked_stylesheets(template: Path) -> list[str]:
     return parser.hrefs
 
 
+def _strip_parens(text: str) -> str:
+    """Remove every parenthesised group, innermost first, including nesting."""
+    while True:
+        stripped = re.sub(r"\([^()]*\)", "", text)
+        if stripped == text:
+            return text
+        text = stripped
+
+
+def _selector_groups(prelude: list) -> list[str]:
+    """Split a selector list on TOP-LEVEL commas only.
+
+    `raw.split(",")` looks equivalent and is not: a comma inside a functional
+    pseudo-class is an argument separator, not a selector separator, so
+    `.panel:is(.a, .b)` split into `.panel:is(.a` and `.b)` — two nonsense
+    selectors, one of which registered a spurious `.b` key while `.panel` was
+    scored from a truncated string with its bounds collapsed. Found by a test
+    written for something else; reading never would have, because the string
+    split is the obvious thing and looks right.
+
+    tinycss2 already hands back a token list in which the arguments of `:is(...)`
+    live INSIDE a function block, so a top-level comma is the only kind visible
+    here. Having parsed the stylesheet, this is the half that was still being
+    pattern-matched.
+    """
+    groups: list[list] = [[]]
+    for token in prelude:
+        if token.type == "literal" and token.value == ",":
+            groups.append([])
+        else:
+            groups[-1].append(token)
+    return [s for s in (tinycss2.serialize(g).strip() for g in groups) if s]
+
+
 def _selector_keys(prelude: list) -> set[str]:
     """Approximate which elements a selector can match, as a set of keys.
 
@@ -192,12 +251,20 @@ def _selector_keys(prelude: list) -> set[str]:
     BENIGN entry and a stated reason; one that errs toward silence cannot be
     noticed at all.
     """
-    text = tinycss2.serialize(prelude).strip()
     keys: set[str] = set()
-    for selector in text.split(","):
-        selector = selector.strip()
-        if not selector:
-            continue
+    for selector in _selector_groups(prelude):
+        # Drop the ARGUMENTS of every functional pseudo-class before looking for
+        # the last compound. They contain whitespace and combinators of their
+        # own, so `.panel:is(.a, .b)` split on whitespace yields `.b)` as the
+        # "last compound" and the rule registers under `.b` while `.panel` — the
+        # thing it actually targets — gets no key at all. The arguments never
+        # change WHAT a compound matches, only how narrowly, so removing them is
+        # exactly right for a key.
+        selector = _strip_parens(selector)
+        # Escapes, for the same reason as in `_specificity`: `.foo\.bar` is one
+        # class named `foo.bar`, and splitting it would register an ANSWER under
+        # `.foo` — a key it does not match, which reads as a clear.
+        selector = re.sub(r"\\.", "", selector)
         # Last compound: everything after the final combinator or whitespace.
         last = re.split(r"[\s>+~]+", selector)[-1]
         # Drop pseudo-classes/elements — they narrow, they do not re-target.
@@ -211,32 +278,74 @@ def _selector_keys(prelude: list) -> set[str]:
     return keys
 
 
-def _specificity(selector: str, important: bool) -> tuple[int, int, int, int]:
-    """A rough CSS specificity, with `!important` sorting above everything.
+# Pseudo-classes whose specificity is NOT their own: `:where()` contributes
+# nothing at all, and `:is()`/`:not()`/`:has()` contribute the specificity of
+# their most specific argument rather than one class each.
+_FUNCTIONAL_PSEUDO = re.compile(
+    r":(?:where|is|not|has|matches|-moz-any|-webkit-any)\([^)]*\)", re.I
+)
 
-    Rough on purpose and in the safe direction: `:is()`/`:where()` argument
-    lists, `:not()` contents and attribute operators are counted as written
-    rather than resolved, so a selector is never scored LOWER than it really is.
-    A vendor rule scored too high produces a false alarm someone reads; one
-    scored too low produces silence nobody reads.
 
-    Without this the guard compared only load ORDER, and an audit walked
+def _specificity(selector: str, important: bool, *, bound: str) -> tuple[int, int, int, int]:
+    """A bounded CSS specificity, with `!important` sorting above everything.
+
+    TWO bounds, because "err high" is only safe on one side and an earlier
+    version of this function claimed it was safe on both. A vendor rule scored
+    too high produces a false alarm someone reads; an ANSWER scored too high
+    produces silence — the guard accepts an answer the browser will not apply.
+    So the vendor side is scored HIGH and the answer side LOW, and every
+    imprecision below becomes a false alarm rather than a false clear.
+
+    What is imprecise: `:where()` contributes ZERO specificity in CSS, argument
+    included, and `:is()`/`:not()`/`:has()` contribute the specificity of their
+    most specific argument. Counting them as written — which the single-bound
+    version did — over-scores both. Under `bound="low"` the whole functional
+    pseudo-class is dropped; under `bound="high"` it is counted as written.
+    Genesis stylesheets already use `:not()` on the answer side
+    (`buttons.css`: `.btn-icon:hover:not(:disabled)`), so this is not
+    hypothetical.
+
+    Attribute operators are likewise counted as written, in both bounds, since
+    an attribute selector is one class either way.
+
+    Without any of this the guard compared only load ORDER, and an audit walked
     straight through it: `body .panel { display: flex }` added to the vendor
     sheet is more specific than a Genesis `.panel`, so it wins despite loading
     first — and the check passed, because the property was "answered later".
     """
+    if bound == "low":
+        selector = _FUNCTIONAL_PSEUDO.sub(" ", selector)
+    else:
+        # `:where()` is zero in BOTH bounds — that is exact, not an estimate.
+        selector = re.sub(r":where\([^)]*\)", " ", selector, flags=re.I)
+
+    # Three normalisations, each because the LOW bound was measured OVER the
+    # true value without them — which is the one direction that turns a bound
+    # into a false clear rather than a false alarm.
+    #
+    # Escapes: `.foo\.bar` is ONE class whose name contains a dot, and
+    # `.md\:flex` is one class, not a class plus a pseudo-class. Dropping the
+    # backslash AND the character it escapes stops either starting a new token.
+    selector = re.sub(r"\\.", "", selector)
+    # Attribute selectors are one class each, and their INTERIOR must not be
+    # scanned: `[title=":hover"]` scored an extra pseudo-class for a string.
+    attributes = len(re.findall(r"\[[^\]]*\]", selector))
+    selector = re.sub(r"\[[^\]]*\]", " ", selector)
+    # A namespace prefix is not an element: `svg|a` is one element, not two.
+    selector = re.sub(r"(?:[A-Za-z0-9_-]+|\*)?\|", " ", selector)
+
     ids = len(re.findall(r"#[A-Za-z0-9_-]+", selector))
-    classes = len(re.findall(r"\.[A-Za-z0-9_-]+|\[[^\]]*\]", selector))
+    classes = attributes + len(re.findall(r"\.[A-Za-z0-9_-]+", selector))
     # Pseudo-CLASSES count with classes; pseudo-ELEMENTS (::) count with elements.
     pseudo_el = len(re.findall(r"::[A-Za-z-]+", selector))
     classes += len(re.findall(r"(?<!:):[A-Za-z-]+(?:\([^)]*\))?", selector))
-    stripped = re.sub(r"::?[A-Za-z-]+(?:\([^)]*\))?|\[[^\]]*\]|[.#][A-Za-z0-9_-]+", " ", selector)
+    stripped = re.sub(r"::?[A-Za-z-]+(?:\([^)]*\))?|[.#][A-Za-z0-9_-]+", " ", selector)
     elements = len(re.findall(r"(?<![\w-])[A-Za-z][A-Za-z0-9-]*", stripped))
     return (1 if important else 0, ids, classes, elements + pseudo_el)
 
 
 def _declarations(css: str) -> dict[str, dict[str, tuple[bool, tuple, tuple]]]:
-    """selector key -> {property: (declared_at_top_level, best_top_spec, best_spec)}.
+    """selector key -> {property: (declared_at_top_level, answer_spec, leak_spec)}.
 
     Three facts per declaration, each earned by a hole:
 
@@ -245,9 +354,14 @@ def _declarations(css: str) -> dict[str, dict[str, tuple[bool, tuple, tuple]]]:
       inside `@media` is NOT an answer, because it does not apply at every
       width. The regex version counted both the same way and so handed the
       answer side a hiding place while its docstring claimed to close one.
-    * BEST TOP SPEC — the strongest specificity Genesis answers at, top level.
-    * BEST SPEC — the strongest the sheet declares at all, used for the vendor
-      side, where a media-scoped rule still wins at the widths it applies to.
+    * ANSWER SPEC — the strongest specificity Genesis answers at, top level,
+      scored at the LOW bound. Read when this sheet is the answer.
+    * LEAK SPEC — the strongest the sheet declares at all, scored at the HIGH
+      bound. Read when this sheet is the vendor, where a media-scoped rule
+      still wins at the widths it applies to.
+
+    The two bounds are not decoration: see `_specificity`. Scoring an answer
+    high is how a guard accepts an answer the browser will not apply.
     """
     out: dict[str, dict[str, tuple[bool, tuple, tuple]]] = {}
     zero = (0, 0, 0, 0)
@@ -262,26 +376,35 @@ def _declarations(css: str) -> dict[str, dict[str, tuple[bool, tuple, tuple]]]:
                 ]
                 if not decls:
                     continue
-                raw = tinycss2.serialize(node.prelude).strip()
+                groups = _selector_groups(node.prelude)
                 for key in _selector_keys(node.prelude):
                     bucket = out.setdefault(key, {})
                     for d in decls:
                         # Score each comma-separated selector that produced this
                         # key and keep the strongest; a group is only as strong
                         # as its strongest member for the elements it matches.
-                        spec = max(
-                            (
-                                _specificity(s, d.important)
-                                for s in raw.split(",")
-                                if key in _selector_keys(tinycss2.parse_component_value_list(s))
-                            ),
-                            default=_specificity(raw, d.important),
-                        )
-                        was_top, top_spec, any_spec = bucket.get(d.lower_name, (False, zero, zero))
+                        matching = [
+                            s
+                            for s in groups
+                            if key in _selector_keys(tinycss2.parse_component_value_list(s))
+                        ] or groups
+                        # MIN for the answer, MAX for the leak, and the
+                        # asymmetry is the point. A group like
+                        # `#app .panel, .panel` answers at its WEAKEST member for
+                        # any `.panel` outside `#app`, so scoring it at the
+                        # strongest accepted it against a vendor rule that beats
+                        # the member actually applying. The same group as a
+                        # VENDOR rule leaks if ANY member wins, so there the
+                        # strongest is right. Taking the max on both sides read
+                        # as symmetric and was backwards on one of them — this
+                        # is ordinary CSS, no escapes or namespaces required.
+                        low = min(_specificity(s, d.important, bound="low") for s in matching)
+                        high = max(_specificity(s, d.important, bound="high") for s in matching)
+                        was_top, ans_spec, leak_spec = bucket.get(d.lower_name, (False, zero, zero))
                         bucket[d.lower_name] = (
                             was_top or top_level,
-                            max(top_spec, spec) if top_level else top_spec,
-                            max(any_spec, spec),
+                            max(ans_spec, low) if top_level else ans_spec,
+                            max(leak_spec, high),
                         )
             elif node.type == "at-rule" and node.content is not None:
                 # @media / @supports wrap ordinary rules; @keyframes wraps step
@@ -515,4 +638,135 @@ def test_a_vendor_rule_answered_on_one_page_is_answered_on_every_page():
         + "\n  ".join(sorted(set(gaps)))
         + "\n\nMove the answer to a stylesheet every affected page loads "
         "(css/components.css) rather than answering it per page."
+    )
+
+
+@pytest.mark.parametrize(
+    ("selector", "low", "high"),
+    [
+        # Plain selectors: both bounds agree, because nothing is being estimated.
+        ("body .panel", (0, 0, 1, 1), (0, 0, 1, 1)),
+        (".panel", (0, 0, 1, 0), (0, 0, 1, 0)),
+        ("#x .panel", (0, 1, 1, 0), (0, 1, 1, 0)),
+        # `:where()` contributes ZERO, argument included — exact in BOTH bounds.
+        (":where(body) .panel", (0, 0, 1, 0), (0, 0, 1, 0)),
+        (".panel:where(.a.b.c)", (0, 0, 1, 0), (0, 0, 1, 0)),
+        # `:is()`/`:not()`/`:has()` are estimated, so the bounds separate — and
+        # they BRACKET the true value rather than merely differing. CSS scores
+        # `.btn:not(:disabled)` at 2 classes and `.panel:is(.wide)` at 2; the
+        # low bound sits at 1 for both, the high at 2 and 3. Measured against
+        # the function rather than predicted: a first version of this table
+        # guessed 3 for the `:not()` case, on the assumption that the inner
+        # pseudo-class would be counted twice. It is not — the outer match
+        # consumes it.
+        (".btn:not(:disabled)", (0, 0, 1, 0), (0, 0, 2, 0)),
+        (".panel:is(.wide)", (0, 0, 1, 0), (0, 0, 3, 0)),
+        # Pseudo-ELEMENTS count as elements, and `::` must not read as two `:`.
+        ("a::before", (0, 0, 0, 2), (0, 0, 0, 2)),
+        # The one shape a Genesis sheet already uses, on the ANSWER side.
+        (".btn-icon:hover:not(:disabled)", (0, 0, 2, 0), (0, 0, 3, 0)),
+        # Four constructions where the LOW bound used to sit ABOVE the true CSS
+        # value — the one direction that turns a bound into a false CLEAR. Each
+        # is written with its true specificity in the comment; each was found by
+        # an adversarial audit rather than by reading, and two of them produced
+        # an end-to-end acceptance of a live leak.
+        ("svg|a", (0, 0, 0, 1), (0, 0, 0, 1)),  # true (0,0,1): prefix is not an element
+        (".foo\\.bar", (0, 0, 1, 0), (0, 0, 1, 0)),  # true (0,1,0): ONE escaped class name
+        (".md\\:flex", (0, 0, 1, 0), (0, 0, 1, 0)),  # true (0,1,0): not a pseudo-class
+        ('.panel[title=":hover"]', (0, 0, 2, 0), (0, 0, 2, 0)),  # true (0,2,0): value not scanned
+    ],
+)
+def test_specificity_is_bounded_and_where_is_exactly_zero(selector, low, high):
+    """The bounds must separate where the estimate is, and agree where it is not.
+
+    `:where(body) .panel` is the case that matters and the one an external review
+    named: CSS scores it identically to a bare `.panel`, so it must NOT satisfy a
+    vendor `body .panel`. The single-bound version scored it HIGHER than
+    `body .panel` and therefore accepted it as an answer — silence, in the one
+    direction where silence is the failure.
+    """
+    assert _specificity(selector, False, bound="low") == low
+    assert _specificity(selector, False, bound="high") == high
+    assert _specificity(selector, False, bound="low") <= _specificity(
+        selector, False, bound="high"
+    ), "the low bound must never exceed the high one"
+
+
+def test_a_where_wrapped_answer_does_not_satisfy_a_more_specific_vendor_rule():
+    """The guard's own arithmetic, exercised end to end on constructed sheets.
+
+    Asserting `_specificity` alone would leave the comparison unpinned: the
+    function could be right and the caller could still read the wrong bound from
+    each side, which is precisely the mistake the two bounds exist to prevent.
+    """
+    vendor = _declarations("body .panel { display: flex; }")
+    weak = _declarations(":where(body) .panel { display: block; }")
+    strong = _declarations("body .panel { display: block; }")
+
+    leak = vendor[".panel"]["display"][2]  # HIGH bound — the vendor side
+    assert weak[".panel"]["display"][1] < leak, (
+        "a `:where()`-wrapped answer is no more specific than a bare class and "
+        "must not be accepted against a descendant vendor selector"
+    )
+    assert strong[".panel"]["display"][1] >= leak, (
+        "an equally specific answer must still be accepted, or the guard is "
+        "merely noisy rather than correct"
+    )
+
+
+def test_an_answer_inflated_only_by_a_functional_pseudo_is_not_accepted():
+    """Where the estimate is uncertain, the answer loses. On purpose.
+
+    `:where()` is exact in both bounds, so the `:where()` test above cannot
+    exercise the asymmetry — scoring the answer on the HIGH bound leaves it
+    green, which a mutation showed. `:is()`/`:not()`/`:has()` are the estimated
+    family, and this is what the two bounds actually buy: an answer whose
+    specificity comes from an estimate is not accepted against a vendor rule of
+    the SAME written form.
+
+    The cost is stated rather than hidden: two identical selectors are reported
+    as unanswered. That is a false alarm, and a false alarm is the price of
+    never issuing a false clear on a value neither side can compute exactly.
+    Silence a real one with a BENIGN entry and a reason.
+    """
+    vendor = _declarations(".panel:is(.a, .b) { display: flex; }")
+    answer = _declarations(".panel:is(.a, .b) { display: block; }")
+
+    leak = vendor[".panel"]["display"][2]
+    assert answer[".panel"]["display"][1] < leak, (
+        "an answer scored on the estimate's HIGH bound would be accepted here, "
+        "which is the guard trusting a number it cannot compute"
+    )
+    # And the bounds must genuinely differ for this family, or the test above is
+    # asserting nothing about the estimate.
+    assert _specificity(".panel:is(.a, .b)", False, bound="low") < _specificity(
+        ".panel:is(.a, .b)", False, bound="high"
+    ), "the estimated family must separate the bounds, or there is no estimate"
+
+
+def test_a_selector_GROUP_answers_at_its_weakest_member_and_leaks_at_its_strongest():
+    """The asymmetry that reads as symmetric, and needs no exotic CSS at all.
+
+    `#app .panel, .panel { display: block }` answers at `#app .panel` for any
+    panel inside `#app` and at plain `.panel` everywhere else. A vendor
+    `body .panel` beats the second member, so the answer does not cover every
+    element the leak reaches — but scoring the group at its STRONGEST member
+    accepted it. The same group as a VENDOR rule leaks if ANY member wins, so
+    there the strongest IS right. Taking the max on both sides looked even-handed
+    and was backwards on one of them.
+    """
+    group = "#app .panel, .panel { display: %s; }"
+    answer = _declarations(group % "block")[".panel"]["display"][1]
+    leak = _declarations(group % "flex")[".panel"]["display"][2]
+    vendor = _declarations("body .panel { display: flex; }")[".panel"]["display"][2]
+
+    assert answer == _specificity(".panel", False, bound="low"), (
+        "an answer group is only as strong as its WEAKEST matching member"
+    )
+    assert leak == _specificity("#app .panel", False, bound="high"), (
+        "a vendor group leaks at its STRONGEST matching member"
+    )
+    assert answer < vendor, (
+        "so this group does not answer `body .panel` — which is what scoring it "
+        "at the strongest member wrongly concluded"
     )
