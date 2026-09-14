@@ -181,6 +181,14 @@ _BRACE_LITERAL = [
     "{..3}", "{1..2..x}", "{1..2..}", "{a}", "{}", "plain", "{unclosed", "a{b}c",
 ]
 
+#: Bash's character ranges are ASCII; Python's ``str.isalpha`` is Unicode-wide.
+#: Graded against bash under both ``C`` and ``C.UTF-8`` — it leaves every one of
+#: these literal, while the first implementation called all of them ranges and
+#: refused the command. Kept as its own list rather than folded into
+#: ``_BRACE_LITERAL`` so that deleting the ASCII test fails a test whose NAME says
+#: what broke.
+_BRACE_NON_ASCII = ["{é..ê}", "{α..γ}", "{é..é}", "{à..ÿ}", "{Α..Ω}"]
+
 
 @pytest.mark.parametrize("word", _BRACE_EXPANDS)
 def test_a_word_bash_expands_is_reported(word):
@@ -195,6 +203,18 @@ def test_a_word_bash_leaves_literal_is_not_reported(word):
     """The over-block this closes: any top-level `..` used to count as a range,
     so `git {foo..bar}` — which bash passes through untouched — was routed to the
     blind-spot net and refused."""
+    assert sp._has_brace_expansion(word) is False, word
+
+
+@pytest.mark.parametrize("word", _BRACE_NON_ASCII)
+def test_a_non_ascii_range_is_not_a_bash_range(word):
+    """`str.isalpha` is Unicode-wide and bash's character ranges are not.
+
+    MEASURED: bash leaves each of these literal under both `C` and `C.UTF-8`, so
+    reporting them as expansions routes an ordinary verb to the blind-spot net and
+    refuses a command bash would have run unexpanded. Replacing `_ASCII_ALPHA` with
+    `str.isalpha` fails every case here.
+    """
     assert sp._has_brace_expansion(word) is False, word
 
 

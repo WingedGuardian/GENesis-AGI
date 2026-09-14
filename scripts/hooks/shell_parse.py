@@ -116,7 +116,30 @@ _WRAPPER_SPEC = {
     # Tool-runner front-ends that take the wrapped command directly, with no
     # subcommand between: `uvx pytest …`, `xvfb-run pytest …`.
     "uvx": ({"--from", "--with", "--python", "-p", "--index", "--constraints"}, 0),
-    "xvfb-run": ({"-n", "--server-num", "-s", "--server-args", "-f", "--auth-file", "-e"}, 0),
+    # Derived from the INSTALLED script's own `getopt` spec (`+ae:f:hn:lp:s:w:`)
+    # plus its case block, not from `--help` prose: an earlier reading of the help
+    # output picked `--server-num` out of a WRAPPED DESCRIPTION line and produced a
+    # false entry. `a`, `h` and `l` take no value; every other short option does,
+    # and each has a long spelling that was missing here. A missing entry is the
+    # fail-open direction for a wrapper — the option's VALUE resolves as the exe,
+    # so a guard keyed on the real command never fires.
+    "xvfb-run": (
+        {
+            "-n",
+            "--server-num",
+            "-s",
+            "--server-args",
+            "-f",
+            "--auth-file",
+            "-e",
+            "--error-file",
+            "-p",
+            "--xauth-protocol",
+            "-w",
+            "--wait",
+        },
+        0,
+    ),
 }
 _WRAPPERS = set(_WRAPPER_SPEC)
 # Package managers / task runners that carry a real command after a literal
@@ -1694,6 +1717,22 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
 #:                               project's CLI once (see _RUN_CARRIER_VALUE_FLAGS),
 #:                               and the price of the residual is one refused help
 #:                               command against a list nobody can finish.
+#:   LEFT     a NESTED shell     Brace rules here are BASH's, and they are applied to
+#:            that is not bash   every nested script regardless of the interpreter
+#:                               that will run it. MEASURED on this box, where
+#:                               ``/bin/sh`` is dash: ``pus{h..h}`` expands to
+#:                               ``push`` under bash and stays LITERAL under dash, so
+#:                               ``dash -c 'git pus{h..h} || echo fallback'`` has its
+#:                               git verb flagged unresolved and the compound refused,
+#:                               though dash hands git an invalid subcommand and the
+#:                               fallback is what actually runs. An over-block, so the
+#:                               direction is safe, and it is NOT closed here: doing
+#:                               so means propagating each nested interpreter's
+#:                               expansion semantics through the parse, a structural
+#:                               change to the path nine guards read that belongs in
+#:                               its own change rather than at the end of this one.
+#:                               UNPRICED — the rate is not measured, and this row
+#:                               does not claim it is rare.
 #:
 #: A construct absent from both columns is UNEXAMINED, not covered. Add it to a
 #: column rather than assuming the columns are exhaustive.
@@ -1718,6 +1757,9 @@ _VERB_DISPATCHERS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
 
 
 _BRACE_INT = re.compile(r"^[+-]?[0-9]+$")
+#: Bash's character-range domain, which is ASCII and NOT :meth:`str.isalpha`.
+#: See the comment at the end of :func:`_brace_range_expands`.
+_ASCII_ALPHA = re.compile(r"^[A-Za-z]$")
 
 
 def _brace_range_expands(token: str, starts: list[int], end: int) -> bool:
@@ -1748,7 +1790,16 @@ def _brace_range_expands(token: str, starts: list[int], end: int) -> bool:
     lo, hi = parts[0], parts[1]
     if _BRACE_INT.match(lo) and _BRACE_INT.match(hi):
         return True
-    return len(lo) == 1 and len(hi) == 1 and lo.isalpha() and hi.isalpha()
+    # ASCII, not :meth:`str.isalpha`. Python's is Unicode-wide and bash's character
+    # ranges are not: MEASURED, bash leaves ``{é..ê}``, ``{α..γ}`` and ``{é..é}``
+    # literal under both ``C`` and ``C.UTF-8``, while ``isalpha()`` called all three
+    # ranges. That over-reported an expansion, which routes a verb to the blind-spot
+    # net and refuses a command bash would have run unexpanded.
+    #
+    # ``_BRACE_INT`` needs no equivalent repair: ``[0-9]`` is a literal range and is
+    # already ASCII-only, so an Arabic-Indic digit falls through to here and is
+    # correctly rejected by the same test.
+    return len(lo) == 1 and len(hi) == 1 and _ASCII_ALPHA.match(lo) and _ASCII_ALPHA.match(hi)
 
 
 def _has_brace_expansion(token: str) -> bool:

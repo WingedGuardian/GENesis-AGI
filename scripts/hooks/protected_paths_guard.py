@@ -60,7 +60,7 @@ from fnmatch import fnmatch
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import brace_expand, read_payload, run_guard, tool_input  # noqa: E402
-from shell_parse import analyze_checked  # noqa: E402
+from shell_parse import analyze_checked, untokenizable  # noqa: E402
 
 try:  # noqa: E402
     import discarded_write
@@ -304,6 +304,32 @@ def main() -> int:
         reason = _legacy_substring_block(cmd, dirs, f"that {blind.cause}. To proceed: {blind.hint}")
         if reason:
             return _block(reason)
+
+        # The fall-through is for causes whose SEGMENTS ARE TRUSTWORTHY, and
+        # `untokenizable` is the one that is not. The comment above said the scan
+        # "runs on segments that tokenized fine" — true of an unresolved verb, where
+        # the parse succeeded and one WORD of it is unreadable, and false of
+        # `untokenizable`, where the segments come from the naive fallback and can be
+        # INVENTED outright.
+        #
+        # MEASURED: a `printf` of a single quoted argument that happens to CONTAIN
+        # rm-shaped prose is one argument to bash — printf prints it and nothing runs
+        # — but the tokenizer's model of quoting is narrower than the shell's there,
+        # so the parse degrades to a naive split and emits a segment
+        # `rm -rf <the protected dir>` that was never a command. The substring check
+        # does not match that ancestor spelling, so before this branch existed the
+        # command was correctly ALLOWED; falling through handed the invented segment
+        # to the precise scan and refused benign prose. Restoring the early return
+        # for this one cause returns it to ALLOW while keeping the ancestor/glob fix
+        # for the unresolved-verb cause.
+        #
+        # `untokenizable(cmd)` rather than a test on `blind.cause`: the BlindSpot
+        # contract forbids re-deriving policy from the cause string (a consumer
+        # comparing `kind != "untokenizable"` is the shape that failed OPEN twice and
+        # got the field deleted). This is the module's own public probe, and it is
+        # how `worktree_cwd_guard` spells the same distinction.
+        if untokenizable(cmd):
+            return 0
 
     cwd = payload.get("cwd") if isinstance(payload, dict) else None
     for seg in segs:

@@ -473,6 +473,49 @@ def test_a_blind_spot_does_not_disarm_the_precise_scan(target, fake_home):
     )
 
 
+def test_an_untokenizable_parse_does_not_reach_the_precise_scan(fake_home):
+    """The fall-through above is for causes whose SEGMENTS ARE TRUSTWORTHY.
+
+    `untokenizable` is the one that is not: its segments come from the naive
+    fallback, which can INVENT a command outright. Bash reads the quoted string
+    below as ONE argument — printf prints it and nothing else runs — but the
+    tokenizer's model of quoting is narrower than the shell's here, so the parse
+    degrades to a naive split and emits an `rm -rf <protected dir>` segment that
+    was never a command.
+
+    The substring check does not match that ancestor spelling, so this was
+    correctly ALLOWED before the fall-through existed. Letting it through to the
+    precise scan refuses benign prose, which is an over-block introduced by the
+    very change that fixed the fail-open beside it. Deleting the
+    `untokenizable(cmd)` early return fails here.
+    """
+    cmd = r"""printf %s $'don\'t; rm -rf $HOME/genesis; x'"""
+    r = _run(cmd, fake_home)
+    assert r.returncode != 2, (
+        "a command that only PRINTS text was refused, because the naive "
+        "tokenization fallback invented an rm segment and the precise scan was "
+        f"allowed to read it.\n{r.stderr}"
+    )
+
+
+def test_the_untokenizable_fixture_really_is_untokenizable(fake_home):
+    """Guard-the-guard for the test above.
+
+    If that command ever tokenized cleanly, the test would pass via the ordinary
+    parsed path and assert nothing about the early return it exists to pin.
+    """
+    cmd = r"""printf %s $'don\'t; rm -rf $HOME/genesis; x'"""
+    assert shell_parse.untokenizable(cmd), (
+        "the fixture no longer defeats shlex, so the test above no longer "
+        "exercises the untokenizable early return"
+    )
+    segs, _blind = shell_parse.analyze_checked(cmd)
+    assert any(s.exe == "rm" for s in segs), (
+        "the fallback no longer invents an rm segment, so the test above would "
+        "pass even with the early return deleted"
+    )
+
+
 def test_the_blinding_prefix_really_blinds(fake_home):
     """The other half of the control: prove the prefix does what it claims.
 
