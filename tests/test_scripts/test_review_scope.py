@@ -868,6 +868,32 @@ def test_the_extractor_sees_every_invocation_form():
     )
 
 
+def test_trust_boundaries_are_never_relaxed_below_todays_bar():
+    """Approval and outbound-action gates must not get a wider finding budget.
+
+    This lane RELAXES thresholds, and main runs a flat 1.0 — so every file blocks
+    at two unresolved P2s today. Anything this change moves to `standard` gets
+    FOUR. For `autonomy/approval_gate.py`, `email_gate.py` and `cli_policy.py`
+    that is a live weakening of review on the autonomous-CLI approval gate, which
+    is a standing non-negotiable in this repo. MEASURED before the fix: all five
+    named modules classified `standard`.
+
+    Pinned as a FLOOR, not a preference. A future edit that widens the budget on
+    these fails here, which is the point — a lane that quietly relaxes a
+    sovereignty gate is a downgrade wearing a refactor.
+    """
+    for path in (
+        "src/genesis/autonomy/approval_gate.py",
+        "src/genesis/autonomy/email_gate.py",
+        "src/genesis/autonomy/cli_policy.py",
+        "src/genesis/autonomy/approval.py",
+        "src/genesis/autonomy/dispatch_gate.py",
+    ):
+        assert _rs.classify_lane([path], hook_surface=False) == "critical", (
+            f"{path} is a trust boundary; the lane must not widen its budget"
+        )
+
+
 def test_a_fixture_corpus_is_light_even_when_it_looks_like_source():
     """Sample programs the eval harness loads as DATA are not consequence surfaces.
 
@@ -931,6 +957,10 @@ def test_the_explicit_rules_FULLY_EXPLAIN_the_critical_set():
             return True
         base = os.path.basename(path)
         if base in _rs._LANE_CRITICAL_BASENAMES:
+            return True
+        if base in _rs._LANE_CRITICAL_TRUST_BASENAMES or base.endswith(
+            _rs._LANE_CRITICAL_BASENAME_SUFFIXES
+        ):
             return True
         return base.endswith(_rs._LANE_CRITICAL_BASENAME_EXTS) and base.startswith(
             _rs._LANE_CRITICAL_BASENAME_PREFIXES

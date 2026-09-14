@@ -686,7 +686,6 @@ _LANE_CRITICAL_PREFIXES = (
     "src/genesis/db/migrations/",  # schema
     "src/genesis/db/data_migrations/",  # data; MISSED by the inherited glob
     "src/genesis/dashboard/routes/",  # HTTP surface
-    "src/genesis/hosting/",  # HTTP servers: /genesis/login, /v1/chat/completions
     "scripts/ci/",  # implementations behind required checks — see below
 )
 
@@ -744,6 +743,15 @@ _LANE_CRITICAL_BASENAMES = frozenset(
         "_blueprint.py",
         # Required-check implementation that matches no prefix below.
         "assemble_changelog.py",
+        # HTTP servers under `hosting/`. Named individually rather than fencing
+        # the subtree: only 3 of its 17 tracked files define routes, and the
+        # broad prefix put CSS, SVG assets, `types.py` and lifecycle adapters in
+        # the strictest lane. The list cannot go stale unnoticed —
+        # `test_every_route_defining_module_is_critical` enumerates route
+        # definitions across the tracked tree and fails if one is uncovered.
+        "standalone.py",
+        "completions.py",
+        "overlay.py",
     }
 )
 
@@ -760,6 +768,25 @@ _LANE_CRITICAL_BASENAMES = frozenset(
 #: this a boundary rather than the `*route*` shape that matched the LLM router.
 _LANE_CRITICAL_BASENAME_PREFIXES = ("api_", "auth_", "check_")
 _LANE_CRITICAL_BASENAME_EXTS = (".py", ".sh")
+
+#: TRUST BOUNDARIES — approval and outbound-action gates. Without this the lane
+#: RELAXES review on `autonomy/approval_gate.py`, `email_gate.py` and
+#: `cli_policy.py` from two unresolved P2s to four, because nothing else here
+#: matches them. That is the one direction this change must never move: the
+#: autonomous-CLI approval gate is a standing non-negotiable, and a lane that
+#: quietly widens its finding budget is a downgrade wearing a refactor.
+#:
+#: The asymmetry that decides the shape, and it is why a `_gate.py` suffix is
+#: acceptable here where a name pattern was rejected for HTTP surfaces: main runs
+#: a FLAT 1.0 threshold, so every file blocks at two P2s today. Over-matching
+#: therefore costs NOTHING relative to the status quo — it only withholds a
+#: relaxation — while under-matching is a live weakening. MEASURED: the rule takes
+#: 15 tracked modules, of which 4 (`version_gate`, `validation_gate`,
+#: `question_gate`, `rate_gate`) are flow-control rather than authorization. Those
+#: four keep today's bar; they are not made stricter than main, and saying that
+#: plainly is the point — this is a deliberate over-match, not an unnoticed one.
+_LANE_CRITICAL_BASENAME_SUFFIXES = ("_gate.py",)
+_LANE_CRITICAL_TRUST_BASENAMES = frozenset({"approval.py", "cli_policy.py"})
 
 #: Prose. `.txt` is NOT prose on its own — `requirements.txt` and
 #: `config/az-pip-constraints.txt` are dependency pins — so it counts only on a
@@ -821,6 +848,10 @@ def _is_lane_critical_path(path: str) -> bool:
         return True
     base = os.path.basename(path)
     if base in _LANE_CRITICAL_BASENAMES:
+        return True
+    if base in _LANE_CRITICAL_TRUST_BASENAMES or base.endswith(
+        _LANE_CRITICAL_BASENAME_SUFFIXES
+    ):
         return True
     return base.endswith(_LANE_CRITICAL_BASENAME_EXTS) and base.startswith(
         _LANE_CRITICAL_BASENAME_PREFIXES
