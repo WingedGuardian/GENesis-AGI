@@ -970,23 +970,8 @@ def test_the_hook_resolves_the_SESSION_directory_from_the_payload(repo, tmp_path
 #   * the deferred one-shot consume was fixed at the cap tier and not the round-2 tier
 
 
-def test_the_demand_is_found_when_the_COMMIT_targets_another_worktree(repo, tmp_path):
-    """The commit gate keys a demand under the COMMIT's effective directory, which
-    `git -C <dir>` moves away from the session's own. A reader that COMPUTES a key
-    from the session cwd looks in the wrong place.
-
-    MEASURED before the fix: session in wt1, `git -C wt2 commit`, demand written
-    under wt2 -- the hook keyed on wt1 found nothing, so the menu never rendered
-    while the gate blocked every commit and told the session to ask. Permanent wedge.
-
-    An earlier fix threaded the PAYLOAD cwd instead of the process cwd. That is a
-    different axis and not even a live one, since Claude Code spawns hooks with
-    cwd == project dir == payload cwd. Instance, not class.
-    """
-    home = tmp_path / "home"
-    home.mkdir()
-    session_dir = tmp_path / "other_worktree"
-    session_dir.mkdir()
+def _declare_for_session(repo, home, sid, question=None):
+    """Declare a demand as the GATE does: keyed to a worktree, bound to a session."""
     subprocess.run(
         [
             sys.executable,
@@ -996,20 +981,25 @@ def test_the_demand_is_found_when_the_COMMIT_targets_another_worktree(repo, tmp_
             "import review_state as rs;"
             "rs._ROUND_DIR = pathlib.Path(os.environ['HOME'])/'.genesis'/'review_rounds';"
             "rs.write_gate_demand(gate='g', tier='cap', question=sys.argv[2],"
-            " remedies=json.loads(sys.argv[3]), cwd=sys.argv[4])",
+            " remedies=json.loads(sys.argv[3]), cwd=sys.argv[4], session_id=sys.argv[5])",
             str(_REPO_ROOT / "scripts"),
-            Q,
+            question or Q,
             json.dumps(REMEDIES),
-            str(repo),  # the demand is keyed under `repo`
+            str(repo),
+            sid,
         ],
         check=True,
         capture_output=True,
         cwd=str(repo),
         env={"PATH": "/usr/bin:/bin", "HOME": str(home)},
     )
+
+
+def _ask_as(session_dir, home, sid):
     payload = _ask()
-    payload["cwd"] = str(session_dir)  # ...while the SESSION sits elsewhere entirely
-    res = subprocess.run(
+    payload["cwd"] = str(session_dir)
+    payload["session_id"] = sid
+    return subprocess.run(
         [sys.executable, str(_ASK_HOOK), "--pre"],
         input=json.dumps(payload),
         cwd=str(session_dir),
@@ -1018,63 +1008,79 @@ def test_the_demand_is_found_when_the_COMMIT_targets_another_worktree(repo, tmp_
         text=True,
         timeout=30,
     )
-    assert res.stdout != "", "the demand must be FOUND, not computed from the session cwd"
+
+
+def test_the_demand_is_found_when_the_COMMIT_targets_another_worktree(repo, tmp_path):
+    """The gate keys a demand under the COMMIT's effective directory, which
+    `git -C <dir>` moves away from the session's own. The association is RECORDED --
+    the gate knows which session it blocked -- so the lookup is exact rather than
+    derived from where the hook happens to be standing.
+
+    Two earlier shapes were wrong and are pinned against here: computing the key from
+    the hook's PROCESS cwd (missed the case), and computing it from the PAYLOAD cwd
+    then taking the only candidate in the round directory (closed the wedge, opened a
+    cross-session leak -- see the next test).
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    session_dir = tmp_path / "other_worktree"
+    session_dir.mkdir()
+    _declare_for_session(repo, home, "session-A")  # demand keyed under `repo`
+    res = _ask_as(session_dir, home, "session-A")  # ...session sits elsewhere
+    assert res.stdout != "", "the session's own demand must be found"
     qs = json.loads(res.stdout)["hookSpecificOutput"]["updatedInput"]["questions"]
     assert qs[-1]["question"] == Q
 
 
-def test_an_ambiguous_enumeration_appends_NOTHING(repo, tmp_path):
-    """Guard the guard on the test above. Enumeration must not guess: appending the
-    wrong gate's menu asks the user to decide something they are not blocked on."""
+def test_a_session_is_NEVER_shown_another_sessions_demand(repo, tmp_path):
+    """The defect the previous shape introduced, now unrepresentable.
+
+    Enumerating the round directory and returning the sole candidate meant an
+    unrelated session in worktree A could be shown worktree B's menu -- and the
+    recorder would write A's answer onto B, potentially authorising B's work. The
+    round directory is global; "the only candidate" was never a statement about who
+    was asking.
+    """
     home = tmp_path / "home"
     home.mkdir()
-    second = tmp_path / "second_repo"
-    second.mkdir()
-    subprocess.run(["git", "init", "-b", "feature-x", str(second)], check=True, capture_output=True)
+    session_dir = tmp_path / "unrelated"
+    session_dir.mkdir()
+    _declare_for_session(repo, home, "session-A")
+    assert _ask_as(session_dir, home, "session-B").stdout == "", (
+        "session B must not receive session A's decision"
+    )
+    # ...and the control: A still gets its own, so the assertion above is not
+    # passing merely because nothing is ever found.
+    assert _ask_as(session_dir, home, "session-A").stdout != ""
+
+
+def test_a_second_demand_elsewhere_does_not_re_wedge_the_lookup(repo, tmp_path):
+    """The sole-candidate shape also re-wedged as soon as a second demand existed
+    anywhere, since the disambiguator was "there is only one". Matching on the
+    recorded session has no such dependency on what other worktrees are doing."""
+    home = tmp_path / "home"
+    home.mkdir()
+    other = tmp_path / "second_repo"
+    other.mkdir()
+    subprocess.run(["git", "init", "-b", "feature-x", str(other)], check=True, capture_output=True)
     for k, v in (("user.email", "t@t"), ("user.name", "t")):
-        subprocess.run(["git", "-C", str(second), "config", k, v], check=True)
-    (second / "s.txt").write_text("s\n")
-    subprocess.run(["git", "-C", str(second), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(other), "config", k, v], check=True)
+    (other / "s.txt").write_text("s\n")
+    subprocess.run(["git", "-C", str(other), "add", "-A"], check=True, capture_output=True)
     subprocess.run(
-        ["git", "-C", str(second), "commit", "-m", "s", "--no-verify"],
+        ["git", "-C", str(other), "commit", "-m", "s", "--no-verify"],
         check=True,
         capture_output=True,
     )
-    for target in (repo, second):
-        subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                "import sys, json, os, pathlib;"
-                "sys.path.insert(0, sys.argv[1]);"
-                "import review_state as rs;"
-                "rs._ROUND_DIR = pathlib.Path(os.environ['HOME'])/'.genesis'/'review_rounds';"
-                "rs.write_gate_demand(gate='g', tier='cap', question=sys.argv[2],"
-                " remedies=json.loads(sys.argv[3]), cwd=sys.argv[4])",
-                str(_REPO_ROOT / "scripts"),
-                Q,
-                json.dumps(REMEDIES),
-                str(target),
-            ],
-            check=True,
-            capture_output=True,
-            cwd=str(target),
-            env={"PATH": "/usr/bin:/bin", "HOME": str(home)},
-        )
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    payload = _ask()
-    payload["cwd"] = str(elsewhere)
-    res = subprocess.run(
-        [sys.executable, str(_ASK_HOOK), "--pre"],
-        input=json.dumps(payload),
-        cwd=str(elsewhere),
-        env={"PATH": "/usr/bin:/bin", "HOME": str(home)},
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert res.stdout == "", "two candidate demands must resolve to NONE, never to a guess"
+    _declare_for_session(repo, home, "session-A")
+    _declare_for_session(other, home, "session-C")  # an unrelated second demand
+
+    session_dir = tmp_path / "elsewhere"
+    session_dir.mkdir()
+    res = _ask_as(session_dir, home, "session-A")
+    assert res.stdout != "", "a second demand elsewhere must not hide A's own"
+    qs = json.loads(res.stdout)["hookSpecificOutput"]["updatedInput"]["questions"]
+    assert qs[-1]["question"] == Q
 
 
 def test_the_legacy_counter_discard_does_not_take_the_demand_with_it(repo, rounds):

@@ -88,6 +88,18 @@ def _read_payload() -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _payload_session(payload: dict) -> str | None:
+    """The session this hook is serving, from the payload.
+
+    This is the half of the association the gate cannot know and the hook can. The
+    gate records WHICH session it blocked; this reports which session is asking. The
+    two match exactly, or nothing happens — which is what replaced a global scan that
+    could hand one session another session's decision.
+    """
+    sid = payload.get("session_id")
+    return sid if isinstance(sid, str) and sid else None
+
+
 def _payload_cwd(payload: dict) -> str | None:
     """The SESSION's directory, from the payload — never this process's cwd.
 
@@ -108,7 +120,7 @@ def _payload_cwd(payload: dict) -> str | None:
     return cwd if isinstance(cwd, str) and cwd else None
 
 
-def _demand_for_ask(cwd: str | None = None) -> dict | None:
+def _demand_for_ask(cwd: str | None = None, session_id: str | None = None) -> dict | None:
     """The demand this hook should act on, or None. Never raises."""
     try:
         from review_state import find_session_gate_demand
@@ -120,7 +132,7 @@ def _demand_for_ask(cwd: str | None = None) -> dict | None:
         # FIND the demand rather than computing its key. The commit gate keys it
         # under the COMMIT's effective directory, which `git -C <dir>` moves away
         # from the session's own — see find_session_gate_demand for the measurement.
-        demand = find_session_gate_demand(cwd)
+        demand = find_session_gate_demand(cwd, session_id)
     except Exception:
         return None
     if not isinstance(demand, dict):
@@ -148,7 +160,7 @@ def run_pre() -> int:
     # a forged gate question would have been waved through untouched, when replacing
     # it in place keeps the count identical and fixes the forgery. Only a genuine
     # APPEND can overflow.
-    demand = _demand_for_ask(_payload_cwd(payload))
+    demand = _demand_for_ask(_payload_cwd(payload), _payload_session(payload))
     if not demand:
         return 0
 
@@ -218,7 +230,7 @@ def run_post() -> int:
     if payload.get("tool_name") != "AskUserQuestion":
         return 0
     cwd = _payload_cwd(payload)
-    demand = _demand_for_ask(cwd)
+    demand = _demand_for_ask(cwd, _payload_session(payload))
     if not demand:
         return 0
     response = payload.get("tool_response")

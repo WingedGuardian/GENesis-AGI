@@ -793,6 +793,15 @@ def _quote_answer(text: str | None) -> str:
     return "\n".join("    " + line for line in cleaned.split("\n"))
 
 
+# Demand gate -> its declared remedy set. Registered in one place so a tier added
+# later cannot be silently invisible to the standing-terminal check.
+_REMEDY_SETS: dict[str, list[dict]] = {
+    "escalation_cap": _CAP_REMEDIES,
+    "mode_switch": _MODE_SWITCH_REMEDIES,
+}
+_DEMAND_ANSWERED_STATE = "answered"
+
+
 def _remedy_by_key(remedies: list[dict], key: str | None) -> dict | None:
     for remedy in remedies:
         if remedy["key"] == key:
@@ -911,16 +920,13 @@ def _demand_refusal(
             "remedy set changed under it. Re-open the question with "
             "`python3 scripts/review_state.py retire-gate-demand` and answer again."
         )
-    if not remedy["authorizes_commit"]:
-        return (
-            f"You chose: {remedy['label']}\n"
-            "That is a TERMINAL remedy — it does not authorise a commit, and "
-            f"`{sigil}` cannot override it. That is the decision working, not a "
-            "malfunction. Hand the branch off with the evidence.\n"
-            "If you have genuinely changed your mind, the documented re-ask is "
-            "`python3 scripts/review_state.py retire-gate-demand`, which drops the "
-            "answer and makes the gate put the full menu in front of you again."
-        )
+    # NO TERMINAL CHECK HERE. It lives in the standing check that runs BEFORE both
+    # tiers, which covers every path this one could -- a terminal answer denies long
+    # before any tier is evaluated. Keeping a copy here made that lock VACUOUS: a
+    # verify-RED mutation of either layer left the other enforcing the property, so
+    # neither was pinned. One layer, one lock; this is the third time that shape has
+    # appeared in this change, and each time the fix was deleting the duplicate
+    # rather than mutating both.
     return None
 
 
@@ -1323,6 +1329,50 @@ def main() -> None:
                 consume_gate_demand(cwd)
         sys.exit(0)
 
+    # Rule 3-pre: A TERMINAL CHOICE BINDS, WHATEVER THE COUNTER SAYS.
+    #
+    # Checked here, OUTSIDE both tier branches, because the demand used to be
+    # consulted only inside `round_n >= ...`. A later `mark --source external
+    # --clean` resets the streak to 0 while the answered demand is (correctly)
+    # preserved, so the next attempt skipped both demand checks and proceeded -- and
+    # the explicit hand-back or shelve quietly stopped meaning anything. A stop that
+    # lapses on the next clean review is not a stop.
+    #
+    # Deliberately WIDER than the two tiers, which is a real behaviour change and was
+    # an owner decision: work no tier would otherwise stop can now be refused. The
+    # exit is the documented re-ask, named in the message.
+    _terminal = None
+    try:
+        _standing = read_gate_demand(cwd)
+        if _standing and _standing.get("state") == _DEMAND_ANSWERED_STATE:
+            _set = _REMEDY_SETS.get(_standing.get("gate"))
+            if _set is not None:
+                _chosen = _remedy_by_key(_set, _standing.get("answered_with"))
+                if _chosen is not None and not _chosen["authorizes_commit"]:
+                    _terminal = _chosen
+    except Exception:  # noqa: BLE001 -- a demand read must never break the gate.
+        _terminal = None
+    if _terminal is not None:
+        _deny(
+            f"BLOCKED: you chose {_terminal['label']} for this branch.\n\n"
+            "That is a TERMINAL remedy. It authorises nothing here, and no sigil "
+            "overrides it. This is the decision working, not a malfunction, and it "
+            "holds regardless of the round counter: a clean review afterwards resets "
+            "the streak but does not un-make the choice.\n"
+            "If you have genuinely changed your mind, re-open the question with "
+            "`python3 scripts/review_state.py retire-gate-demand` -- the gate then "
+            "puts its full menu in front of you again, and nothing is authorised "
+            "until a new answer is recorded."
+            # A dispatched session cannot re-open it meaningfully either, so it gets
+            # the hand-back exit rather than a command it should not be running. This
+            # check fires BEFORE both tiers, so without this the no-human guidance
+            # was unreachable once a terminal answer existed -- caught by the
+            # founding-incident replay, not by a unit test.
+            + _no_human_note("# escalation-ack")
+            + _merge_note(cwd)
+        )
+        return
+
     # Rule 3a: the FINAL-ROUND terminal. Checked BEFORE the consecutive cap below,
     # and that ordering is the entire point — at the terminal the round counter has
     # typically just been reset by an earlier '# escalation-ack', so the cap would
@@ -1428,6 +1478,7 @@ def main() -> None:
                     question=_CAP_DEMAND_QUESTION,
                     remedies=_CAP_REMEDIES,
                     cwd=cwd,
+                    session_id=field(payload, "session_id"),
                 )
             _deny(
                 f"BLOCKED: review escalation cap reached — {round_n} consecutive "
@@ -1555,6 +1606,7 @@ def main() -> None:
                     question=_MODE_SWITCH_DEMAND_QUESTION,
                     remedies=_MODE_SWITCH_REMEDIES,
                     cwd=cwd,
+                    session_id=field(payload, "session_id"),
                 )
             _deny(
                 f"BLOCKED (mode-switch): {round_n} consecutive EXTERNAL cross-model "

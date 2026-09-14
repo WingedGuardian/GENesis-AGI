@@ -1622,3 +1622,61 @@ def test_the_kill_switch_restores_the_pre_demand_behaviour(repo, home):
     marker.write_text("")
     res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
     assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_a_TERMINAL_choice_survives_a_clean_review(repo, home):
+    """A stop that lapses on the next clean review is not a stop.
+
+    The demand used to be consulted only INSIDE `round_n >= <tier>`. A later
+    `mark --source external --clean` resets the streak to 0 while the answered
+    demand is (correctly) preserved, so the next attempt skipped both demand checks
+    and proceeded -- the explicit hand-back quietly stopped meaning anything.
+
+    Checked through the REAL gate rather than the helper, because the whole point is
+    which branch of the gate runs.
+    """
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    assert _run_hook('git commit -m "w"', repo, home).returncode == 2, "control: cap blocks"
+    _answer_demand(repo, home, "HAND IT BACK")
+
+    # A clean external review resets the streak to zero...
+    _stage(repo, "after = 1\n")
+    clean = _mark(repo, home, clean=True)
+    assert clean.returncode == 0 and "streak reset" in clean.stdout
+
+    # ...and the terminal decision must still bind.
+    res = _run_hook('git commit -m "w"', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "TERMINAL remedy" in res.stderr
+    assert "retire-gate-demand" in res.stderr, "the documented re-ask must be named"
+
+
+def test_re_opening_a_terminal_choice_lifts_the_standing_block(repo, home):
+    """Guard the guard. If nothing could lift it the branch would be bricked, and
+    the test above would pass for the wrong reason."""
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    assert _run_hook('git commit -m "w"', repo, home).returncode == 2
+    _answer_demand(repo, home, "SHELVE it")
+    assert _run_hook('git commit -m "w"', repo, home).returncode == 2
+    subprocess.run(
+        [sys.executable, str(_REVIEW_STATE), "retire-gate-demand"],
+        cwd=str(repo),
+        env={**os.environ, "HOME": str(home)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    res = _run_hook('git commit -m "w"', repo, home)
+    assert "TERMINAL remedy" not in res.stderr, "re-opening must lift the standing block"
+
+
+def test_an_AUTHORISING_choice_does_not_create_a_standing_block(repo, home):
+    """The standing check must fire only on TERMINAL remedies. If it fired on any
+    answered demand it would block every branch that had ever been through the cap."""
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    assert _run_hook('git commit -m "w"', repo, home).returncode == 2
+    _answer_demand(repo, home, "NARROW the scope")
+    _stage(repo, "after = 1\n")
+    assert _mark(repo, home, clean=True).returncode == 0
+    res = _run_hook('git commit -m "w"', repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr

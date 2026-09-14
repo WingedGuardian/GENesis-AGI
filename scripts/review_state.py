@@ -1318,35 +1318,38 @@ def gate_demand_present(cwd: str | None = None) -> bool:
     return outcome != _DEMAND_ABSENT
 
 
-def find_session_gate_demand(cwd: str | None = None) -> dict | None:
-    """The demand this SESSION should be asked about, wherever the gate keyed it.
+def find_session_gate_demand(
+    cwd: str | None = None, session_id: str | None = None
+) -> dict | None:
+    """The demand THIS SESSION was blocked on, or None. Never raises.
 
-    THE CLASS THIS CLOSES, which a narrower fix missed. The commit gate keys a demand
-    under the COMMIT's effective directory — `git -C <dir>` and a trailing `cd` both
-    win over the session's own cwd (`_effective_diff_cwd`). A reader that COMPUTES a
-    key from the session cwd therefore looks in the wrong place whenever the session
-    sits in one worktree and commits into another, which is an ordinary shape here
-    because worktrees are mandated. MEASURED: session in wt1, `git -C wt2 commit`,
-    demand written under wt2 — the ask hook keyed on wt1 found nothing, so the menu
-    never rendered while the gate blocked every commit and told the session to ask.
-    A permanent wedge whose only exit was the kill switch.
-    (An earlier fix threaded the PAYLOAD cwd instead of the process cwd. That closed a
-    different axis — and in practice not even a live one, since Claude Code spawns
-    hooks with cwd == the project dir == the payload cwd — so it fixed the instance
-    and left the class. This is the class.)
+    THE ASSOCIATION IS RECORDED, NOT INFERRED, and that is the whole design here.
+    The commit gate keys a demand under the COMMIT's effective directory --
+    `git -C <dir>` and a trailing `cd` both win over the session's own cwd -- so a
+    reader that COMPUTES a key from where it happens to be standing looks in the
+    wrong place whenever the session sits in one worktree and commits into another.
+    That is an ordinary shape here, because worktrees are mandated.
 
-    So: look under this cwd first (the common case), then ENUMERATE. A candidate is
-    only accepted when its recorded branch still matches the branch of its recorded
-    worktree, which is what keeps a stale demand from another checkout out.
-    Ambiguity resolves to None rather than to a guess: appending the wrong gate's
-    menu would ask the user to decide something they are not being blocked on.
+    TWO EARLIER SHAPES WERE WRONG, both recorded so neither comes back:
+      * Computing the key from the hook's PROCESS cwd. Missed the case entirely.
+      * Computing it from the PAYLOAD cwd, then enumerating every demand in the
+        round directory and taking the only candidate. That closed the wedge and
+        opened something worse: the round directory is GLOBAL, so an unrelated
+        session in worktree A could be shown worktree B's menu, and the recorder
+        would write A's answer onto B -- potentially authorising B's commit. It also
+        re-wedged as soon as a second demand existed anywhere, since "the only
+        candidate" stopped being true.
+
+    So the gate records WHICH SESSION it blocked, and this matches that. No
+    directory arithmetic, no sole-candidate guess, no global inference. A session
+    with no id, or one that matches nothing, gets its own worktree's demand or
+    nothing at all -- never someone else's.
     """
     direct = read_gate_demand(cwd)
     if direct is not None:
         return direct
-    if gate_ack_disabled():
+    if not session_id or gate_ack_disabled():
         return None
-    candidates: list[dict] = []
     try:
         files = sorted(_ROUND_DIR.glob("*.json"))
     except OSError:
@@ -1361,18 +1364,18 @@ def find_session_gate_demand(cwd: str | None = None) -> dict | None:
         demand = data.get(_GATE_DEMAND_KEY)
         if not isinstance(demand, dict):
             continue
+        if demand.get("session_id") != session_id:
+            continue
         worktree = demand.get("worktree")
         if not isinstance(worktree, str) or not worktree:
-            # A demand with no recorded root cannot be re-keyed, so it is not
-            # enumerable. It is still found by the direct read above whenever the
-            # session IS in its worktree, so this degrades to the pre-enumeration
-            # behaviour rather than losing anything. Only reachable across a version
-            # downgrade, since every demand this code writes records its root.
+            # No recorded root means it cannot be re-keyed. Still found by the direct
+            # read above when the session IS in its worktree, so this degrades to the
+            # pre-enumeration behaviour rather than losing anything.
             continue
         found = read_gate_demand(worktree)
         if found is not None:
-            candidates.append(found)
-    return candidates[0] if len(candidates) == 1 else None
+            return found
+    return None
 
 
 def _store_gate_demand(demand: dict, cwd: str | None = None) -> None:
@@ -1391,6 +1394,7 @@ def write_gate_demand(
     question: str,
     remedies: list[dict],
     cwd: str | None = None,
+    session_id: str | None = None,
 ) -> None:
     """Declare a gate's remedy set as data, at the moment the gate BLOCKS.
 
@@ -1453,6 +1457,11 @@ def write_gate_demand(
             # Recorded so a reader can RE-KEY from the demand instead of computing a
             # key from its own cwd -- see find_session_gate_demand.
             "worktree": _worktree_root(cwd) if cwd else _worktree_root(os.getcwd()),
+            # THE SESSION THAT WAS BLOCKED. This is the association that makes the
+            # ask hook's lookup exact instead of inferred: the gate knows which
+            # session it just refused, and the hook knows which session it is
+            # serving, so neither has to guess from a directory.
+            "session_id": session_id if isinstance(session_id, str) and session_id else None,
             "question": question,
             "remedies": valid,
             "state": _DEMAND_LIVE,
