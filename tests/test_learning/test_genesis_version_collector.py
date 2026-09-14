@@ -198,6 +198,87 @@ class TestUpstreamCheck:
             f"Expected ERROR log, got: {[r.message for r in caplog.records]}"
 
     @pytest.mark.asyncio
+    async def test_a_failed_upstream_check_is_not_reported_as_up_to_date(
+        self, collector, db,
+    ) -> None:
+        """A failed check must be a FAILED reading, never the up-to-date baseline.
+
+        The sibling test above pins that the failure is LOGGED. Logging is not
+        the contract that matters to a consumer: `collect()` used to catch, log,
+        and then fall through to the explicit "0.0=up to date" return with
+        failed=False, so an unknown state reached the caller wearing the same
+        grammar as a successful measurement. That is the defect class this
+        collector was rewritten to remove, one layer out from the count itself.
+        """
+        await db.execute(
+            "INSERT INTO observations (id, source, type, content, priority, created_at) "
+            "VALUES ('a', 'genesis_version', 'genesis_version_baseline', "
+            "?, 'low', '2026-04-01T00:00:00Z')",
+            (json.dumps({"version": "abc123"}),),
+        )
+        await db.commit()
+
+        async def raising_upstream(self):
+            raise RuntimeError("git rev-list --count HEAD..origin/main failed")
+
+        with _mock_head("abc123"), _mock_failure_file_check(), \
+             patch.object(GenesisVersionCollector, "_check_upstream", raising_upstream):
+            reading = await collector.collect()
+
+        assert reading.failed is True, (
+            "a failed upstream check was reported as a successful reading; "
+            "consumers cannot distinguish it from a measured 'up to date'"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_measured_zero_resolves_a_stale_update_alert(
+        self, collector, db,
+    ) -> None:
+        """Zero commits behind must clear a pending alert, not just skip.
+
+        Reachable only since the count stopped coercing with max(behind, 1):
+        if the upstream target is rewritten or rolled back after an observation
+        was stored, HEAD never moves, so the resolve on the HEAD-change path
+        never fires. Without a resolve here the dashboard keeps serving the
+        dead target indefinitely despite a successful zero measurement.
+        """
+        await db.execute(
+            "INSERT INTO observations (id, source, type, content, priority, created_at) "
+            "VALUES ('a', 'genesis_version', 'genesis_version_baseline', "
+            "?, 'low', '2026-04-01T00:00:00Z')",
+            (json.dumps({"version": "same111"}),),
+        )
+        await db.execute(
+            "INSERT INTO observations (id, source, type, content, priority, created_at) "
+            "VALUES ('b', 'genesis_version', 'genesis_update_available', "
+            "?, 'medium', '2026-04-01T00:00:00Z')",
+            (json.dumps({
+                "current_commit": "same111",
+                "target_commit": "gone999",
+                "commits_behind": 4,
+            }),),
+        )
+        await db.commit()
+
+        async def zero_upstream(self):
+            return 0, ""
+
+        # HEAD deliberately UNCHANGED, so the HEAD-change resolve cannot fire
+        # and only the measured-zero path can clear the alert.
+        with _mock_head("same111"), _mock_failure_file_check(), \
+             patch.object(GenesisVersionCollector, "_check_upstream", zero_upstream):
+            await collector.collect()
+
+        cursor = await db.execute(
+            "SELECT resolved FROM observations WHERE id = 'b'",
+        )
+        row = await cursor.fetchone()
+        assert row["resolved"] == 1, (
+            "a measured zero left the stale update_available observation "
+            "unresolved; the dashboard would keep claiming an update forever"
+        )
+
+    @pytest.mark.asyncio
     async def test_throttle_skips_fetch_within_interval(self, collector, db) -> None:
         """After a fetch, subsequent collect() calls within interval skip."""
         from datetime import UTC, datetime

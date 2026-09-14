@@ -180,6 +180,18 @@ class GenesisVersionCollector:
                 behind, summary = await self._check_upstream()
                 self._last_fetch_at = now
 
+                if behind == 0:
+                    # A MEASURED zero must clear a stale alert. Before this
+                    # method stopped coercing with max(behind, 1), zero was
+                    # unreachable here, so nothing downstream was written for
+                    # it. Now that a genuine zero can arrive, an upstream ref
+                    # that was rewritten or rolled back after an observation
+                    # was stored would otherwise leave the dashboard claiming
+                    # an update forever: HEAD never changes, so the resolve on
+                    # the HEAD-change path never fires, and update_status keeps
+                    # serving the unresolved target.
+                    await self._resolve_pending_update_available(current_head)
+
                 if behind > 0:
                     stored = await self._store_update_available(
                         current_head, behind, summary,
@@ -194,6 +206,19 @@ class GenesisVersionCollector:
             except Exception:
                 logger.error("Upstream check failed", exc_info=True)
                 self._last_fetch_at = now  # Don't retry immediately on failure
+                # A FAILED check is not "up to date". Falling through to the
+                # 0.0 return below would report an unknown state as the
+                # explicit baseline "0.0=up to date" with failed=False — the
+                # same defect class this method was rewritten to remove, since
+                # it is false about the reader while wearing verified grammar.
+                # Same shape as the HEAD-read failure above.
+                return SignalReading(
+                    name=self.signal_name,
+                    value=0.0,
+                    source="genesis_version",
+                    collected_at=now_iso,
+                    failed=True,
+                )
 
         return SignalReading(
             name=self.signal_name, value=0.0,
@@ -298,9 +323,14 @@ class GenesisVersionCollector:
                 # Honour the docstring above rather than substituting a 1. A
                 # fabricated distance is the same defect as the tag-span one
                 # this method was rewritten to fix: it is false about the
-                # reader while wearing verified grammar. The caller logs and
-                # skips the cycle, so the cost of raising is one quiet cycle,
-                # against a notification that names a number nobody counted.
+                # reader while wearing verified grammar.
+                # An earlier revision of this comment said "the caller logs and
+                # skips the cycle". It did not: collect() caught this, logged,
+                # and fell through to the explicit 0.0 "up to date" baseline
+                # with failed=False — turning an unknown state into a confident
+                # all-clear, which is the very class being fixed here. The
+                # caller now returns a FAILED reading; that is what makes
+                # raising the right move rather than a quieter bug.
                 raise RuntimeError(
                     f"git rev-list --count HEAD..{ref} failed; distance unknown"
                 )
@@ -416,7 +446,12 @@ class GenesisVersionCollector:
     async def _resolve_pending_update_available(self, current_head: str) -> None:
         """Resolve any unresolved genesis_update_available observations.
 
-        Called when the local HEAD changes (an update was applied).
+        TWO callers, and the second is not an update being applied:
+        (1) the local HEAD changed — an update was applied;
+        (2) an upstream check MEASURED zero commits behind — the target went
+            away (ref rewritten or rolled back) while HEAD stayed put, so no
+            HEAD change will ever fire and the alert would otherwise never
+            clear.
         Marks all pending update-available observations as resolved
         with a note pointing to the current head, so the dashboard
         alert clears immediately instead of waiting for the next
