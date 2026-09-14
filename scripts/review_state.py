@@ -1191,50 +1191,98 @@ def _valid_remedy(entry: object) -> dict | None:
     }
 
 
-def read_gate_demand(cwd: str | None = None) -> dict | None:
-    """The live gate demand for the CURRENT branch, or None. Never raises.
+# The three outcomes of trying to resolve a demand. They are DISTINCT on purpose:
+# only ABSENT may lead the commit gate to allow, and ABSENT means one thing only —
+# no demand key in the file at all.
+_DEMAND_ABSENT = "absent"
+_DEMAND_UNREADABLE = "unreadable"
+_DEMAND_USABLE = "usable"
 
-    Returns None — i.e. "no demand" — when the stored demand belongs to a different
-    branch. The streak counter is per-branch for the same reason: a new change
-    starts fresh, and a demand answered about a design that no longer exists must
-    not authorise a commit on the next one.
 
-    Remedy ORDER is preserved exactly as declared. Nothing here normalises to a dict
-    or a set: the cap tier's first option is hand-back, a test pins that position,
-    and a session takes the menu in the order the gate prints it.
+def _resolve_gate_demand(cwd: str | None = None) -> tuple[str, dict | None]:
+    """THE single decision point for "is there a demand, and can I use it?".
+
+    ROBUST BY CONSTRUCTION, and that phrasing is the point rather than decoration.
+    The generator behind more findings in this change than any other was "absent
+    means ALLOW": `read_gate_demand` returned a bare None for many unrelated reasons,
+    the commit gate read None as nothing-to-enforce, and every validation added later
+    became one more way to disarm the gate. Three separate reviews found three
+    separate axes of it — a corrupt `remedies` list, the legacy counter discard, and
+    a branch recorded as "unknown" while git was down — and each was patched at its
+    own axis. A fourth axis was always constructible, because the judgement lived in
+    two functions that each re-derived it.
+
+    So it lives HERE, once, and the SHAPE enforces the property. ABSENT is returned
+    for exactly three conditions, and each is an intentional "this gate has nothing
+    to say here" rather than a failure to read something: the kill switch is armed,
+    there is no demand key at all, or the demand belongs to a DIFFERENT branch. They
+    are all decided in the first half, before any field of the demand is inspected.
+
+    Past that point — the VALIDATION half, below the marker comment — every exit is
+    UNREADABLE. That is the invariant, and it is the one worth having: a validation
+    added next year lands there by construction and can only refuse-and-name-the-exit,
+    never allow. `test_no_validation_failure_can_make_a_demand_look_ABSENT` holds it
+    by corrupting each field in turn rather than by trusting this paragraph.
+
+    (An earlier draft of this docstring claimed "exactly ONE ABSENT return". That was
+    false — there are three — and the useful property was never the count.)
+
+    Never raises.
     """
     if gate_ack_disabled():
-        # The recovery path. Reporting "no demand" is what restores the pre-demand
-        # behaviour wholesale: the hook appends nothing, and the commit gate's ack
-        # paths take their no-demand branch, which is exactly the old contract.
-        return None
+        # The recovery path, and the ONE deliberate exception to the rule above. An
+        # operator who disarms the mechanism must get the pre-demand behaviour
+        # wholesale; reporting "present" here would leave the switch unable to
+        # unwedge anything, which is the opposite of a recovery tool.
+        return _DEMAND_ABSENT, None
+
     state = _load_round(cwd)
     demand = state.get(_GATE_DEMAND_KEY) if isinstance(state, dict) else None
     if not isinstance(demand, dict):
-        return None
-    if demand.get("branch") != get_current_branch(cwd=cwd):
-        return None
+        return _DEMAND_ABSENT, None
+
+    # ── Past this line every exit is UNREADABLE. Do not add an ABSENT return. ──
+
+    branch = demand.get("branch")
+    if not isinstance(branch, str) or branch in ("", "unknown"):
+        # Declared while git could not answer (`get_current_branch` returns the
+        # literal "unknown" on a timeout or OSError). It cannot be attributed to a
+        # branch, so it is not usable — but it is emphatically still THERE.
+        return _DEMAND_UNREADABLE, None
+    current = get_current_branch(cwd=cwd)
+    if current == "unknown":
+        return _DEMAND_UNREADABLE, None
+    if branch != current:
+        # A demand belonging to a DIFFERENT branch is the one case that is genuinely
+        # nothing to do with here — a new change starts fresh, and an answer about a
+        # design that no longer exists must not authorise a commit on the next one.
+        return _DEMAND_ABSENT, None
+
     status = demand.get("state")
-    if status not in _DEMAND_STATES:
-        return None
     gate = demand.get("gate")
     question = demand.get("question")
-    if not isinstance(gate, str) or not gate or not isinstance(question, str) or not question:
-        return None
+    if status not in _DEMAND_STATES:
+        return _DEMAND_UNREADABLE, None
+    if not isinstance(gate, str) or not gate:
+        return _DEMAND_UNREADABLE, None
+    if not isinstance(question, str) or not question:
+        return _DEMAND_UNREADABLE, None
+
     raw = demand.get("remedies")
     remedies = [r for r in (_valid_remedy(e) for e in raw) if r] if isinstance(raw, list) else []
     if not remedies:
-        # A demand with no INTELLIGIBLE remedy cannot be answered, so it cannot be
-        # satisfied — reporting it as live would wedge the branch with no route out.
-        # Treat it as absent; the gate then writes a fresh one on its next block.
-        return None
+        # No INTELLIGIBLE remedy means nothing the user could choose, so it cannot be
+        # answered. Refusing is right; the demand self-heals when the gate re-declares.
+        return _DEMAND_UNREADABLE, None
+
     answered_with = demand.get("answered_with")
     answer_text = demand.get("answer_text")
-    return {
+    worktree = demand.get("worktree")
+    return _DEMAND_USABLE, {
         "gate": gate,
         "tier": demand.get("tier") if isinstance(demand.get("tier"), str) else "",
-        "branch": demand.get("branch"),
-        "worktree": demand.get("worktree") if isinstance(demand.get("worktree"), str) else None,
+        "branch": branch,
+        "worktree": worktree if isinstance(worktree, str) else None,
         "question": question,
         "remedies": remedies,
         "state": status,
@@ -1244,42 +1292,30 @@ def read_gate_demand(cwd: str | None = None) -> dict | None:
     }
 
 
+def read_gate_demand(cwd: str | None = None) -> dict | None:
+    """The USABLE gate demand for the current branch, or None. Never raises.
+
+    None here means "not usable" and deliberately does NOT distinguish absent from
+    unreadable — callers that need that distinction ask `gate_demand_present`, and
+    both derive from the same resolution so they cannot disagree.
+
+    Remedy ORDER is preserved exactly as declared. Nothing normalises to a dict or a
+    set: the cap tier's first option is hand-back, a test pins that position, and a
+    session takes the menu in the order the gate prints it.
+    """
+    _, demand = _resolve_gate_demand(cwd)
+    return demand
+
+
 def gate_demand_present(cwd: str | None = None) -> bool:
     """True when a demand is RECORDED for this branch, readable or not. Never raises.
 
-    THE GENERATOR THIS CLOSES. `read_gate_demand` returns None for five unrelated
-    conditions — no demand, another branch's demand, a corrupt demand, an
-    unresolvable branch, the kill switch — and the commit gate reads None as "nothing
-    to enforce", i.e. ALLOW. So a single corrupt field disarmed the gate entirely
-    (MEASURED: setting `remedies` to `[{"key": "x"}]` after a real block took an acked
-    commit from exit 2 to exit 0), and so did a transient git failure, because
-    `get_current_branch` returns the literal "unknown" on timeout or OSError and the
-    branch comparison then mismatches.
-
-    This separates "there is nothing to enforce" from "there is something and I
-    cannot read it", so the gate can fail toward BLOCK on the second — which is what
-    the design's own state table always specified.
-
-    Two deliberate asymmetries:
-      * kill switch armed -> NOT present. That is the recovery path; reporting
-        present would make the switch unable to unwedge anything.
-      * branch UNRESOLVABLE -> present. Cannot verify whose demand this is, and the
-        fail direction for "cannot verify" is toward the block. `_worktree_root`'s
-        own docstring notes git is likeliest to be unavailable under exactly the
-        concurrent load this keying exists to survive.
+    This is what stops "cannot read it" collapsing into "nothing to enforce". Derived
+    from the same resolution as `read_gate_demand`, so the two cannot drift apart —
+    which they could when each re-implemented the branch logic.
     """
-    if gate_ack_disabled():
-        return False
-    state = _load_round(cwd)
-    if not isinstance(state, dict):
-        return False
-    demand = state.get(_GATE_DEMAND_KEY)
-    if not isinstance(demand, dict):
-        return False
-    branch = get_current_branch(cwd=cwd)
-    if branch == "unknown":
-        return True
-    return demand.get("branch") == branch
+    outcome, _ = _resolve_gate_demand(cwd)
+    return outcome != _DEMAND_ABSENT
 
 
 def find_session_gate_demand(cwd: str | None = None) -> dict | None:
@@ -1327,6 +1363,11 @@ def find_session_gate_demand(cwd: str | None = None) -> dict | None:
             continue
         worktree = demand.get("worktree")
         if not isinstance(worktree, str) or not worktree:
+            # A demand with no recorded root cannot be re-keyed, so it is not
+            # enumerable. It is still found by the direct read above whenever the
+            # session IS in its worktree, so this degrades to the pre-enumeration
+            # behaviour rather than losing anything. Only reachable across a version
+            # downgrade, since every demand this code writes records its root.
             continue
         found = read_gate_demand(worktree)
         if found is not None:

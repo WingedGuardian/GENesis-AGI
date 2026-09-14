@@ -1177,3 +1177,153 @@ def test_a_spent_demand_does_not_tell_you_to_ask_again(repo, rounds):
     assert msg is not None
     assert "does nothing" in msg, "the message must say asking again will not help"
     assert "WITHOUT the sigil" in msg, "...and name what actually re-declares"
+# ─── Regressions from the cross-model reviewer (Codex), round 1 ─────────────
+#
+# Codex reviewed the head this PR opened with and found six things. THREE of them
+# were the same defects the other round-1 reviewer found independently -- the
+# `git -C` routing, the unreadable-demand replacement, and the mode-switch consume --
+# which is corroboration rather than duplication, and all three were already fixed.
+# These two are the ones only Codex saw.
+
+
+def test_a_DISPATCHED_session_never_rides_a_foreground_answer(repo, rounds, monkeypatch):
+    """The hard stop is absolute, and the authorize path did not enforce it.
+
+    It relied on a background session being unable to CREATE an answer. It does not
+    have to: a foreground session records NARROW or REDESIGN, then a dispatched
+    session on the same branch acks straight through. REPRODUCED by the reviewer at
+    exit 0 under GENESIS_CC_SESSION=1, against a changelog line that states the stop
+    without qualification.
+
+    The recorded decision authorises the commit it was made about, and nobody is
+    present to confirm that is the work now being staged.
+    """
+    _declare(repo)
+    review_state.record_gate_answer(question=Q, label="REDESIGN it", cwd=str(repo))
+    demand = review_state.read_gate_demand(str(repo))
+
+    monkeypatch.delenv("GENESIS_CC_SESSION", raising=False)
+    foreground = _gate._demand_refusal(demand, REMEDIES, "# escalation-ack", gate="escalation_cap")
+    assert foreground is None, "control: with a human present the answer authorises"
+
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    dispatched = _gate._demand_refusal(demand, REMEDIES, "# escalation-ack", gate="escalation_cap")
+    assert dispatched is not None, "a dispatched session must not ride it"
+    assert "DISPATCHED session" in dispatched
+    assert "needs-architecture-session" in dispatched, "the exit must be named"
+
+
+def test_a_demand_declared_while_git_was_DOWN_does_not_vanish(repo, rounds, monkeypatch):
+    """`get_current_branch` returns the literal "unknown" on a timeout or OSError, so
+    a git hiccup DURING the block persists that as the demand's branch. Once git
+    recovers, the branch comparison reads the demand as belonging to somewhere else
+    and it silently disappears — taking the newly required user decision with it, and
+    letting the next acked attempt through.
+
+    A transient failure must not erase a demand.
+    """
+    real_branch = review_state.get_current_branch
+    monkeypatch.setattr(review_state, "get_current_branch", lambda cwd=None: "unknown")
+    _declare(repo)  # declared while git is "down"
+    stored = json.loads(review_state._round_file(str(repo)).read_text())
+    assert stored["gate_demand"]["branch"] == "unknown", "precondition: it stored the sentinel"
+
+    # Restore ONLY this patch. `monkeypatch.undo()` would also undo the `rounds`
+    # fixture's _ROUND_DIR redirection, sending the lookups below at the real home —
+    # where there is no demand, so the test would "fail" for a reason that has
+    # nothing to do with the code under test.
+    monkeypatch.setattr(review_state, "get_current_branch", real_branch)
+    assert review_state.read_gate_demand(str(repo)) is None, "unattributable -> unreadable"
+    assert review_state.gate_demand_present(str(repo)) is True, (
+        "...but PRESENT, so the gate refuses and names the exit rather than allowing"
+    )
+# ─── The robust-by-construction lock ────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("state", "not-a-state"),
+        ("state", None),
+        ("state", 42),
+        ("gate", ""),
+        ("gate", None),
+        ("gate", 7),
+        ("question", ""),
+        ("question", None),
+        ("question", ["not", "a", "string"]),
+        ("remedies", []),
+        ("remedies", "not a list"),
+        ("remedies", [{"key": "x"}]),
+        ("remedies", [None]),
+        ("remedies", None),
+        ("branch", "unknown"),
+        ("branch", ""),
+        ("branch", None),
+        ("branch", 3),
+        ("worktree", None),
+        ("answered_with", 5),
+        ("answer_text", {"a": 1}),
+        ("declared_at", "not a number"),
+        ("tier", 9),
+    ],
+)
+def test_no_validation_failure_can_make_a_demand_look_ABSENT(repo, rounds, field, value):
+    """THE CONSTRUCTION LOCK — the reason this is robust-by-construction rather than
+    a fixed list of three bugs.
+
+    "absent means ALLOW" produced findings in all three reviews of this change, at a
+    different field each time: a corrupt `remedies` list, then the legacy counter
+    discard, then a `branch` recorded as "unknown" while git was down. Each was
+    patched at its own axis, and a fourth axis stayed constructible every time,
+    because the judgement lived in two functions that each re-derived it.
+
+    So this does not test the three axes anyone found. It corrupts EVERY field in
+    turn and asserts the invariant that makes a fourth impossible: a demand whose key
+    is present for THIS branch is never reported ABSENT, whatever its contents. It
+    may be unusable — that is fine and expected, and the gate refuses on it — but it
+    must never read as "nothing to enforce", which is the only state that allows.
+
+    A new validation added to the resolver lands past the marker comment and is
+    therefore covered here without anyone remembering to extend this list.
+    """
+    _declare(repo)
+    stored = json.loads(review_state._round_file(str(repo)).read_text())
+    stored["gate_demand"][field] = value
+    review_state._round_file(str(repo)).write_text(json.dumps(stored))
+
+    assert review_state.gate_demand_present(str(repo)) is True, (
+        f"corrupting {field!r} made the demand look ABSENT — that is the disarm"
+    )
+
+
+def test_a_demand_for_another_branch_IS_absent_or_the_lock_above_is_vacuous(repo, rounds):
+    """Guard the guard. If everything read as present the lock above would pass for
+    the wrong reason, and a stale demand from an unrelated branch would block a
+    perfectly ordinary commit. A different branch is the one field-level difference
+    that legitimately means "nothing to enforce here"."""
+    _declare(repo)
+    stored = json.loads(review_state._round_file(str(repo)).read_text())
+    stored["gate_demand"]["branch"] = "some-other-branch"
+    review_state._round_file(str(repo)).write_text(json.dumps(stored))
+    assert review_state.gate_demand_present(str(repo)) is False
+    assert review_state.read_gate_demand(str(repo)) is None
+
+
+def test_the_two_readers_can_never_disagree(repo, rounds):
+    """They derive from ONE resolution. Previously each re-implemented the branch
+    logic, which is how they came to disagree in the allow direction three times."""
+    for mutate in (
+        lambda d: d.__setitem__("remedies", []),
+        lambda d: d.__setitem__("state", "bogus"),
+        lambda d: d.__setitem__("branch", "unknown"),
+        lambda d: d.__setitem__("question", ""),
+    ):
+        _declare(repo)
+        stored = json.loads(review_state._round_file(str(repo)).read_text())
+        mutate(stored["gate_demand"])
+        review_state._round_file(str(repo)).write_text(json.dumps(stored))
+        usable = review_state.read_gate_demand(str(repo)) is not None
+        present = review_state.gate_demand_present(str(repo))
+        assert not usable, "precondition: this mutation makes it unusable"
+        assert present, "unusable must imply present — the pair may never both say no"

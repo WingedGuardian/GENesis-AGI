@@ -872,6 +872,25 @@ def _demand_refusal(
             "re-offered. Commit WITHOUT the sigil first — that is what makes the gate "
             "declare a fresh demand — and the menu is appended to your next ask."
         )
+    # A dispatched session NEVER rides someone else's answer. The hard stop is the
+    # owner's decision and the changelog states it without qualification, but the
+    # authorize path did not consult the session context at all — it relied on a
+    # background session being unable to CREATE an answer. It does not have to: a
+    # foreground session records NARROW or REDESIGN, and a later dispatched session
+    # on the same branch acks straight through (REPRODUCED by the cross-model
+    # reviewer, exit 0 under GENESIS_CC_SESSION=1).
+    #
+    # The recorded decision authorises THE COMMIT THAT WAS BLOCKED, and nobody is
+    # present to confirm that what a dispatched session is now staging is that same
+    # work. Refuse, and name the exit.
+    if _background_session():
+        return (
+            "An answer is on record for this branch, but this is a DISPATCHED session "
+            "and the decision authorises the commit it was made about — nobody is here "
+            "to confirm that is the work now being staged.\n"
+            "Hand it back: apply the `needs-architecture-session` label, open a `ready` "
+            "follow-up naming this branch and the decision it awaits, and stop."
+        )
     remedy = _remedy_by_key(remedies, demand.get("answered_with"))
     if remedy is None:
         # Check the TIER before blaming the data. A demand answered at the other tier
