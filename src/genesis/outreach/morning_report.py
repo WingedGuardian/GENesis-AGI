@@ -47,6 +47,7 @@ def _drop_unredacted_sources(rows: list[dict]) -> list[dict]:
     """
     return [row for row in rows if row.get("source") not in _UNREDACTED_CONTENT_SOURCES]
 
+
 # Convert to tuple for db.execute() compatibility (requires sequence, not frozenset)
 _INTERNAL_OBS_TYPES = tuple(_INTERNAL_OBS_TYPES_SET)
 
@@ -91,7 +92,7 @@ _STALE_PRIORITY_DEMOTION = {"critical": "high", "high": "medium", "medium": "med
 # ── Capability-build lane report helpers ──────────────────────────────────
 
 _BUILD_PR_CI_TIMEOUT_S = 20  # per-PR gh call; PRs are checked concurrently
-_MAX_BUILD_PR_CHECKS = 10    # cap concurrent gh calls (rate-limit safety)
+_MAX_BUILD_PR_CHECKS = 10  # cap concurrent gh calls (rate-limit safety)
 
 _GITHUB_STATUS_URL = "https://www.githubstatus.com/api/v2/components.json"
 _GH_STATUS_TIMEOUT_S = 5  # preflight only; a slow/unreachable status page fails open
@@ -135,9 +136,7 @@ async def _github_actions_degraded() -> bool:
         return False
 
 
-async def _pr_ci_status(
-    pr_url: str, *, actions_degraded: bool | None = None
-) -> str | None:
+async def _pr_ci_status(pr_url: str, *, actions_degraded: bool | None = None) -> str | None:
     """One-shot CI rollup for a draft build PR via
     ``gh pr view <url> --json statusCheckRollup``. Returns a compact word
     ('passing'/'failing'/'pending'/'no checks'), or None on error/timeout.
@@ -157,7 +156,12 @@ async def _pr_ci_status(
     if not pr_url:
         return None
     raw = await run_gh(
-        "gh", "pr", "view", pr_url, "--json", "statusCheckRollup",
+        "gh",
+        "pr",
+        "view",
+        pr_url,
+        "--json",
+        "statusCheckRollup",
         timeout=_BUILD_PR_CI_TIMEOUT_S,
     )
     if not raw:
@@ -171,9 +175,7 @@ async def _pr_ci_status(
     # stuck 'pending' — annotate (never suppress) when GitHub confirms an incident.
     if summary in ("failing", "pending"):
         degraded = (
-            actions_degraded
-            if actions_degraded is not None
-            else await _github_actions_degraded()
+            actions_degraded if actions_degraded is not None else await _github_actions_degraded()
         )
         if degraded:
             return f"{summary} (GitHub Actions incident, may not be a code issue)"
@@ -185,8 +187,7 @@ def _summarize_ci_rollup(checks: list) -> str:
     into one word: failing > pending > passing."""
     if not checks:
         return "no checks"
-    _FAIL = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED",
-             "STARTUP_FAILURE", "ERROR"}
+    _FAIL = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"}
     _OK = {"SUCCESS", "NEUTRAL", "SKIPPED"}
     saw_fail = saw_pending = False
     for c in checks:
@@ -227,10 +228,7 @@ def _format_build_calibration(counts: list[dict]) -> list[str]:
         lines.append(f"- build verdicts: {rate}{extra}")
     if "dont_build" in agg:
         total = sum(agg["dont_build"].values())
-        lines.append(
-            f"- dont_build verdicts: {total} "
-            "(uncontested — reported, never carded)"
-        )
+        lines.append(f"- dont_build verdicts: {total} (uncontested — reported, never carded)")
     if "needs_discussion" in agg:
         total = sum(agg["needs_discussion"].values())
         lines.append(f"- needs_discussion verdicts: {total}")
@@ -379,7 +377,9 @@ class MorningReportGenerator:
                 sections.append(f"## Cognitive Subsystem Grades\n{eval_quality}")
         except Exception:
             logger.warning("Morning report: eval quality section unavailable", exc_info=True)
-            await self._emit_warning("eval_quality", "Cognitive subsystem grades section unavailable")
+            await self._emit_warning(
+                "eval_quality", "Cognitive subsystem grades section unavailable"
+            )
 
         # 4. Pending Items (user-actionable only)
         try:
@@ -470,18 +470,33 @@ class MorningReportGenerator:
         # Same queries the list sections run (un-truncated lens), so these
         # totals can never disagree with the samples below.
         try:
-            needs_input = len(await follow_ups.get_pending(
-                self._db, strategy="user_input_needed", domain="user_world",
-            ))
-            pending_all = len(await follow_ups.get_pending(
-                self._db, domain="user_world",
-            ))
-            blocked = len(await follow_ups.get_by_status(
-                self._db, "blocked", domain="user_world",
-            ))
-            failed = len(await follow_ups.get_by_status(
-                self._db, "failed", domain="user_world",
-            ))
+            needs_input = len(
+                await follow_ups.get_pending(
+                    self._db,
+                    strategy="user_input_needed",
+                    domain="user_world",
+                )
+            )
+            pending_all = len(
+                await follow_ups.get_pending(
+                    self._db,
+                    domain="user_world",
+                )
+            )
+            blocked = len(
+                await follow_ups.get_by_status(
+                    self._db,
+                    "blocked",
+                    domain="user_world",
+                )
+            )
+            failed = len(
+                await follow_ups.get_by_status(
+                    self._db,
+                    "failed",
+                    domain="user_world",
+                )
+            )
             lines.append(
                 f"- Follow-ups (user-world): {needs_input} awaiting your "
                 f"input, {pending_all} pending total, {blocked} blocked, "
@@ -516,6 +531,100 @@ class MorningReportGenerator:
         except Exception:
             logger.warning("Ground truth: observation count failed", exc_info=True)
 
+        try:
+            # Reads the SHARED assembler rather than re-deriving the counts, so
+            # this line and the Zero-Drop dashboard tab cannot answer the same
+            # question with two different numbers. An earlier version computed
+            # `tracked = open + acked` here independently, which is exactly the
+            # duplicate-denominator drift the shared assembler exists to stop.
+            #
+            # COUNTS ONLY — never a branch name or a ledger row's text. Every
+            # other line in this section emits integers, and that is what keeps
+            # the whole section free of the redaction concern that keeps
+            # `ledger_escalation` out of this report entirely: branch names are
+            # untrusted repository text and ledger rows on a live install have
+            # carried pasted credentials. A count cannot leak; a rendered row can.
+            #
+            # The freshness clause is not decoration. `read_last_run`'s reader
+            # contract is that an empty result means "the detector has not run",
+            # never "nothing is stranded" — so a zero here without its age is
+            # precisely the false-clean this subsystem exists to prevent.
+            from genesis.session_awareness.zero_drop_view import (
+                STATUS_OK,
+                build_view,
+            )
+
+            view = await build_view(self._db, now=datetime.now(UTC), findings_limit=1)
+            # Test for OK rather than for UNAVAILABLE, in BOTH directions. Two
+            # bugs live in the negative form and this line is the one place
+            # that cannot afford either.
+            #
+            # `items_by_store` is itself guarded, so when the whole part fails
+            # it IS `{"status": "unavailable", ...}` and carries no
+            # `stranded_work` child at all. `.get("stranded_work", {})` then
+            # yields `{}`, whose `.get("status")` is None — not UNAVAILABLE —
+            # so the happy branch ran, `stranded["open"]` raised KeyError, and
+            # the outer handler swallowed it. The line VANISHED in exactly the
+            # state its own comment below says it must never be silent in.
+            #
+            # And `== UNAVAILABLE` passes a STALE or DEGRADED status straight
+            # through, which would print a real-looking count beside
+            # "freshness unknown".
+            store = view.get("items_by_store")
+            stranded = store.get("stranded_work") if isinstance(store, dict) else None
+            gaps = view.get("gaps") or {}
+
+            # A BLIND detector passes every check above. A sweep whose GitHub
+            # leg failed is recent, its part status is `ok`, and its freshness
+            # verdict reads `fresh` — so the predicate accepted it and the line
+            # printed a numeric count followed by "detector fresh" while a whole
+            # class was frozen and uncounted. Fresh and complete are different
+            # claims, and only one of them was being checked.
+            detector = gaps.get("detector") if isinstance(gaps, dict) else None
+            blind = bool(detector.get("blind")) if isinstance(detector, dict) else False
+
+            unreadable = (
+                not isinstance(stranded, dict)
+                or stranded.get("status", STATUS_OK) != STATUS_OK
+                or not {"open", "tracked", "acked"} <= stranded.keys()
+                or gaps.get("status", STATUS_OK) != STATUS_OK
+                or blind
+            )
+            if unreadable:
+                # DELIBERATELY departs from this section's convention of dropping
+                # a line whose query failed. For every other line a missing line
+                # is merely missing; for this one, silence is the false-clean the
+                # whole subsystem exists to prevent — a reader who sees no
+                # stranded-work line concludes there is none.
+                reason = (
+                    # Named FIRST: a blind detector is the case where every
+                    # other field looks healthy, so falling through to
+                    # "unknown" would tell the reader nothing about why a
+                    # recent, ok-status sweep is not being trusted.
+                    (
+                        f"detector blind — {', '.join(sorted((detector or {}).get('degraded', {})))}"
+                        if blind
+                        else None
+                    )
+                    or (stranded or {}).get("reason")
+                    or (store or {}).get("reason")
+                    or gaps.get("reason")
+                    or "unknown"
+                )
+                lines.append(
+                    f"- Stranded work (zero-drop): UNAVAILABLE ({reason}) — "
+                    f"this is not a zero, it is an unread board"
+                )
+            else:
+                verdict = gaps.get("detector", {}).get("verdict", "freshness unknown")
+                lines.append(
+                    f"- Stranded work (zero-drop): {stranded['open']} open of "
+                    f"{stranded['tracked']} tracked ({stranded['acked']} acked) "
+                    f"— detector {verdict}"
+                )
+        except Exception:
+            logger.warning("Ground truth: stranded-work count failed", exc_info=True)
+
         return "\n".join(lines)
 
     async def _emit_warning(self, section: str, message: str) -> None:
@@ -525,7 +634,8 @@ class MorningReportGenerator:
             from genesis.observability.types import Severity, Subsystem
 
             await self._event_bus.emit(
-                Subsystem.OUTREACH, Severity.WARNING,
+                Subsystem.OUTREACH,
+                Severity.WARNING,
                 "morning_report.section_failed",
                 message,
                 section=section,
@@ -556,7 +666,7 @@ class MorningReportGenerator:
             f"- Awareness: ticks_24h={awareness.get('ticks_24h', '?')}",
             f"- CC Sessions: foreground={fg_active}, background={bg_active}, failed_24h={cc.get('failed_24h', 0)}",
         ]
-        pending_embed = queues.get('pending_embeddings', 0)
+        pending_embed = queues.get("pending_embeddings", 0)
         if pending_embed and pending_embed > 100:
             lines.append(f"- **Embedding queue elevated**: {pending_embed} pending")
         return "\n".join(lines)
@@ -618,14 +728,13 @@ class MorningReportGenerator:
         # goal_autonomous_action observation surfacing.
         try:
             ego_goal_counts = await goals_crud.count_by_status(
-                self._db, origin="genesis_ego",
+                self._db,
+                origin="genesis_ego",
             )
             n_active = ego_goal_counts.get("active", 0)
             n_paused = ego_goal_counts.get("paused", 0)
             if n_active or n_paused:
-                lines.append(
-                    f"- Genesis's own goals: {n_active} active, {n_paused} paused"
-                )
+                lines.append(f"- Genesis's own goals: {n_active} active, {n_paused} paused")
         except Exception:
             logger.warning("Failed to count Genesis-ego goals", exc_info=True)
 
@@ -654,11 +763,14 @@ class MorningReportGenerator:
                 await obs_crud.increment_retrieved_batch(self._db, obs_ids)
                 await obs_crud.mark_influenced_batch(self._db, obs_ids)
             except Exception:
-                logger.warning("Failed to track morning report observation consumption", exc_info=True)
+                logger.warning(
+                    "Failed to track morning report observation consumption", exc_info=True
+                )
 
         # Genesis-internal observation count (single summary line)
         internal_count = await obs_crud.count_unresolved_by_types(
-            self._db, types=_INTERNAL_OBS_TYPES,
+            self._db,
+            types=_INTERNAL_OBS_TYPES,
         )
         if internal_count:
             lines.append(
@@ -748,9 +860,7 @@ class MorningReportGenerator:
             actions_degraded = await _github_actions_degraded()
             ci_states = await asyncio.gather(
                 *[
-                    _pr_ci_status(
-                        r.get("pr_url") or "", actions_degraded=actions_degraded
-                    )
+                    _pr_ci_status(r.get("pr_url") or "", actions_degraded=actions_degraded)
                     for r in checked
                 ]
             )
@@ -769,9 +879,7 @@ class MorningReportGenerator:
 
         if dont_build:
             lines.append("")
-            lines.append(
-                "Wouldn't-build (Genesis declined; reported, never queued):"
-            )
+            lines.append("Wouldn't-build (Genesis declined; reported, never queued):")
             for row in dont_build:
                 title = row.get("item_title") or "(untitled)"
                 reason = row.get("verdict_reason") or "no reason recorded"
@@ -829,7 +937,8 @@ class MorningReportGenerator:
             if proposals:
                 shown = (
                     f" (showing {len(proposals)} of {total_proposals})"
-                    if total_proposals > len(proposals) else ""
+                    if total_proposals > len(proposals)
+                    else ""
                 )
                 lines.append(
                     f"- {total_proposals} pending ego proposal(s) "
@@ -842,7 +951,8 @@ class MorningReportGenerator:
                     )
         except Exception:
             logger.warning(
-                "Morning report: ego proposals query failed", exc_info=True,
+                "Morning report: ego proposals query failed",
+                exc_info=True,
             )
 
         # Pending approval requests
@@ -853,11 +963,10 @@ class MorningReportGenerator:
             if approvals:
                 shown = (
                     f" (showing {len(approvals)} of {total_approvals})"
-                    if total_approvals > len(approvals) else ""
+                    if total_approvals > len(approvals)
+                    else ""
                 )
-                lines.append(
-                    f"- {total_approvals} pending approval request(s){shown}:"
-                )
+                lines.append(f"- {total_approvals} pending approval request(s){shown}:")
                 for a in approvals:
                     lines.append(f"  - {(a.get('description') or '?')[:150]}")
         except Exception:
@@ -878,27 +987,23 @@ class MorningReportGenerator:
         # report is the USER's brief — internal-dev items (incl. internal
         # failed/blocked) belong to the genesis ego / health, not here.
         user_items = await follow_ups.get_pending(
-            self._db, strategy="user_input_needed", domain="user_world",
+            self._db,
+            strategy="user_input_needed",
+            domain="user_world",
         )
         user_items = _drop_unredacted_sources(user_items)
         if user_items:
-            shown = (
-                f" (showing 5 of {len(user_items)})" if len(user_items) > 5 else ""
-            )
+            shown = f" (showing 5 of {len(user_items)})" if len(user_items) > 5 else ""
             lines.append(f"**Needs your input ({len(user_items)} total){shown}:**")
             for fu in user_items[:5]:
-                lines.append(
-                    f"- {fu['content'][:200]} ({_relative_age(fu.get('created_at', ''))})"
-                )
+                lines.append(f"- {fu['content'][:200]} ({_relative_age(fu.get('created_at', ''))})")
 
         # Blocked/failed items
         blocked = await follow_ups.get_by_status(self._db, "failed", domain="user_world")
         blocked += await follow_ups.get_by_status(self._db, "blocked", domain="user_world")
         blocked = _drop_unredacted_sources(blocked)
         if blocked:
-            shown = (
-                f" (showing 5 of {len(blocked)})" if len(blocked) > 5 else ""
-            )
+            shown = f" (showing 5 of {len(blocked)})" if len(blocked) > 5 else ""
             lines.append(f"**Blocked/failed ({len(blocked)} total){shown}:**")
             for fu in blocked[:5]:
                 reason = fu.get("blocked_reason", "") or "no reason recorded"
@@ -909,7 +1014,10 @@ class MorningReportGenerator:
 
         # Recently completed (last 24h)
         completed = await follow_ups.get_recently_completed(
-            self._db, hours=24, limit=5, domain="user_world",
+            self._db,
+            hours=24,
+            limit=5,
+            domain="user_world",
         )
         completed = _drop_unredacted_sources(completed)
         if completed:
@@ -929,18 +1037,15 @@ class MorningReportGenerator:
         from genesis.db.crud import follow_ups
 
         resolved = await follow_ups.get_recently_resolved(
-            self._db, source="inbox_evaluation", days=7,
+            self._db,
+            source="inbox_evaluation",
+            days=7,
         )
         if not resolved:
             return None
 
-        header_shown = (
-            f" (showing 10 of {len(resolved)})" if len(resolved) > 10 else ""
-        )
-        lines = [
-            f"Ego resolved {len(resolved)} inbox follow-up(s) this week"
-            f"{header_shown}:"
-        ]
+        header_shown = f" (showing 10 of {len(resolved)})" if len(resolved) > 10 else ""
+        lines = [f"Ego resolved {len(resolved)} inbox follow-up(s) this week{header_shown}:"]
         for fu in resolved[:10]:
             content = (fu.get("content") or "?")[:150]
             notes = (fu.get("resolution_notes") or "no notes")[:100]
@@ -973,17 +1078,13 @@ class MorningReportGenerator:
             for a in alerts:
                 severity = a.get("severity", "").upper()
                 alert_id = a.get("id", "")
-                if (
-                    severity in ("ERROR", "CRITICAL")
-                    or (severity == "WARNING" and not alert_id.startswith("call_site:"))
+                if severity in ("ERROR", "CRITICAL") or (
+                    severity == "WARNING" and not alert_id.startswith("call_site:")
                 ):
                     lines.append(
-                        f"- **{severity}**: {a.get('message', 'Unknown')} "
-                        f"(id: {alert_id})"
+                        f"- **{severity}**: {a.get('message', 'Unknown')} (id: {alert_id})"
                     )
-                    if alert_id.startswith(
-                        ("subsystem_stale:", "subsystem_never_started:")
-                    ):
+                    if alert_id.startswith(("subsystem_stale:", "subsystem_never_started:")):
                         # never_started is rendered HERE (via the alert), and its
                         # heartbeat status ("never_started") is not "overdue" so the
                         # block below skips it anyway — capture the name regardless so
@@ -1018,12 +1119,18 @@ class MorningReportGenerator:
     async def _get_engagement_summary(self) -> str:
         try:
             from genesis.db.crud.outreach import get_engagement_stats
+
             stats = await get_engagement_stats(self._db, days=7)
         except Exception:
             # Fallback to simple count
             from genesis.db.crud.outreach import count_recent
+
             total = await count_recent(self._db, days=7)
-            return f"- {total} messages sent in last 7 days." if total else "- No outreach in last 7 days."
+            return (
+                f"- {total} messages sent in last 7 days."
+                if total
+                else "- No outreach in last 7 days."
+            )
 
         total = stats["total"]
         if not total:
@@ -1053,15 +1160,29 @@ class MorningReportGenerator:
     # ABSENT/broken — that IS a risk and must never be tagged protective
     # (the tag would instruct the drafter to soften or omit it).
     _NEGATION_CUES: tuple[str, ...] = (
-        "not ", "n't", "no ", "never", "disabled", "absent", "missing",
-        "unprotected", "inactive", "stopped", "failed", "broken", "off ",
-        "lost", "without",
+        "not ",
+        "n't",
+        "no ",
+        "never",
+        "disabled",
+        "absent",
+        "missing",
+        "unprotected",
+        "inactive",
+        "stopped",
+        "failed",
+        "broken",
+        "off ",
+        "lost",
+        "without",
     )
 
     # Sources that ONLY ever report missing/broken protections — never tag.
-    _NEVER_PROTECTIVE_SOURCES: frozenset[str] = frozenset({
-        "infra_protection_posture_monitor",
-    })
+    _NEVER_PROTECTIVE_SOURCES: frozenset[str] = frozenset(
+        {
+            "infra_protection_posture_monitor",
+        }
+    )
 
     def _protective_tag(self, content: str, *, source: str = "") -> str:
         """Return ' [protective: …]' when the observation cites a known
@@ -1117,11 +1238,10 @@ class MorningReportGenerator:
             content = obs["content"][:200].replace("\n", " ")
             age = _relative_age(obs.get("created_at", ""))
             protective = self._protective_tag(
-                content, source=obs.get("source") or "",
+                content,
+                source=obs.get("source") or "",
             )
-            lines.append(
-                f"- {badge} **{prio}**{aged} ({age}): {content}{protective}"
-            )
+            lines.append(f"- {badge} **{prio}**{aged} ({age}): {content}{protective}")
 
         # Defer surfacing until delivery is confirmed via confirm_delivery().
         # If delivery fails, these observations re-appear in the next report.
@@ -1149,6 +1269,7 @@ class MorningReportGenerator:
 
         # Provide last report timestamp so LLM can compress unchanged items
         from genesis.db.crud.outreach import get_previous_report_time
+
         last_report_at = await get_previous_report_time(self._db)
 
         # Parse last_report_at to datetime for correct comparison

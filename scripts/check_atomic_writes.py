@@ -9,8 +9,8 @@ both halves -- the leak happens, and nothing sweeps that directory
 (`disk_hygiene.sh` roots every find at a named SUBdirectory; `tmp_watchgod.sh`
 covers `~/.genesis/cc-tmp` and `/tmp`. Neither covers the `~/.genesis` root).
 
-WHY A GUARD AND NOT JUST FIXES. MEASURED 2026-09-11 against this branch
-containing main: 61 atomic-write sites across 53 files, 30 of them dirty.
+WHY A GUARD AND NOT JUST FIXES. MEASURED 2026-09-09 against the merge of this
+branch into main: 62 atomic-write sites across 54 files, 30 of them dirty.
 That denominator moved THREE times, in both directions, and every move is worth
 recording because each was invisible in a different way:
   * +1 site (58 -> 59). The temp-name test was anchored to the END of a string
@@ -33,6 +33,14 @@ recording because each was invisible in a different way:
     one is: scripts/hooks/audit_jsonl.py, the file main added in the same window
     and the file that ABSORBED the row dropped above. MEASURED: with its two
     exception-path unlinks deleted, the guard reported `0 NEW` and exited 0.
+  * +1 site (60 -> 61, dirty unchanged at 30). The zero-drop detector's own
+    `zero_drop_worker._atomic_write_json`, CLEANS_UP. Recorded because it is the
+    bullet above stated in the OTHER direction: that one is a fix landing on
+    main while a PR is open, this one is a PR adding a site while main
+    re-derives without it. Both make the ledger stale, and the second is the
+    easier to miss — the PR's own CI is where it surfaces, so a session that
+    pushes without reading `gh pr checks` will not see it. That is how this one
+    was found: three pushes late.
 Fixing 30 instances of a recurring pattern leaves nothing to stop instance 31.
 This is the prose-to-gate move: the rule was "clean up your temp", carried by
 convention, and conventions are what reviewers find one instance of at a time.

@@ -1229,6 +1229,81 @@ output format or flag semantics, our wrappers break silently.
 **Mitigation:** Integration tests that exercise CCInvoker with real CC CLI calls.
 Currently: `scripts/test_cc_cli.sh` (manual). Phase 7+: automated in CI.
 
+### An MCP server that misses the connect timeout is dropped SILENTLY for the life of the process (measured 2.1.246, 2026-09-13)
+
+CC gives each MCP server **30 000 ms** to connect, and a server that misses it is
+dropped for that CC PROCESS — not retried, and **not restored by `/clear`**, which
+starts a new session inside the same process. The session then runs with that
+server's tools simply absent from its registry. Nothing announces it: no banner,
+no context line, no tool-list note.
+
+MEASURED on this install, from CC's own log
+(`~/.cache/claude-cli-nodejs/<project>/mcp-logs-<server>/<start>.jsonl`):
+
+```
+23:36:16.161Z  Starting connection with timeout of 30000ms
+23:36:46.163Z  Connection timeout triggered after 30003ms (limit: 30000ms)
+23:36:46.170Z  Connection failed (CONNECT_TIMEOUT)
+```
+
+The session ran without all 34 `genesis-memory` tools and was discovered only by
+reaching for one. `claude mcp list` said `Connected` throughout — that command
+opens its OWN probe connections and says nothing about what a given running
+session holds.
+
+**Why it happens here.** A session starts **8 servers inside an 11-second
+window**, four of which are heavy Python trees. `-X importtime` on the memory
+server: 5.50 s of imports before any of its own code runs (`litellm` 4.37 s,
+`fastmcp` 2.50 s, `qdrant_client.http` 1.95 s — subtrees overlap, so they do not
+sum), then runtime init, for ~10.5 s standalone. Against 6 cores at load ~7.5,
+that overruns 30 s.
+
+**Rate, with the denominator each figure belongs to.** Across EVERY server in one
+install's log dir: **2 incidents / 1,646 connect attempts (0.12 %)**. Per server,
+the two that have ever timed out are `genesis-memory` (**1 / 217, 0.46 %**) and
+`gitnexus` (**1 / 215, 0.47 %**) — note it is not a single-server problem, which
+is the reason to fix the ceiling rather than one server. Count INCIDENTS, not
+matching lines: each timeout writes `CONNECT_TIMEOUT` twice (`Connection failed
+after Nms (CONNECT_TIMEOUT)` and `Connection failed (CONNECT_TIMEOUT)`), so a
+line-count double-counts.
+
+Frequency was never the real argument, though: the worst SUCCESSFUL connect was
+**25 395 ms**, i.e. 85 % of the 30 s ceiling. The margin was the problem.
+
+**Mitigation (shipped), in TWO halves — one is not enough:**
+
+1. `MCP_TIMEOUT: "120000"` in the repo's `.claude/settings.json` `env` block, for
+   sessions that read repo settings.
+2. The same value in `CCInvoker._build_env`, because **most dispatched sessions
+   never read those settings** — they run with a cwd outside any git repo, so CC
+   does not load them. Without half 2 the entire background fleet (reflection,
+   research, sentinel, direct sessions) keeps the 30 s default, which is the worst
+   place to miss: an unattended session has nobody to notice its tools are gone.
+   (A worktree-cwd dispatch is the exception and DOES load repo settings; both
+   halves carry the same number, so those paths agree either way. A test compares
+   the two, since they cannot share a constant.)
+
+VERIFIED end-to-end — a CC process started after the change logs
+`Starting connection with timeout of 120000ms` where it previously logged
+`30000ms`.
+
+**`MCP_TIMEOUT` is NOT connect-only, despite where it shows up in the log.**
+MEASURED in the 2.1.246 binary, one getter reads it and is applied to the server
+connect, generic MCP requests, `tools/list`, resource reads, the `mcp_tool` hook
+cap and the subscriptions listen stream. So raising it also widens the ceiling on
+a server that wedges MID-session, not just at startup — 120 s per operation
+instead of 30 s, against a shortest MCP-carrying dispatch budget of 600 s.
+
+CC has a **separate** `MCP_CONNECT_TIMEOUT_MS` (default 5000 ms) sitting beside it
+in the same env registry, and a third `MCP_TOOL_TIMEOUT`. Do not conflate them —
+naming a local constant after the connect variable sends the next maintainer to
+the wrong one, which is a mistake this repo made and corrected.
+
+**This makes the drop rarer, not visible.** Detecting and announcing a missing
+server is separate work (see the issue tracking it). Until that lands, the way to
+check a suspicion is to read the per-server log named above for the CURRENT
+process and look for `CONNECT_TIMEOUT` — not to run `claude mcp list`.
+
 ### Desktop vs Server Gap
 CC's feature roadmap prioritizes desktop app experiences (scheduled tasks, teleport,
 cowork). Server-side/CLI features are secondary. Genesis runs on a headless server.
