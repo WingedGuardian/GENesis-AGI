@@ -248,7 +248,9 @@ def marker_repo(tmp_path_factory):
     return repo, marker_file
 
 
-def _runs_the_subcommand(option: str, marker_repo, *, attached_value: str = "") -> bool:
+def _runs_the_subcommand(
+    option: str, marker_repo, *, attached_value: str = "", separate_value: str = ""
+) -> bool:
     """Whether the installed git still runs a subcommand placed after *option*.
 
     Two things about this probe are load-bearing, and the first version of it
@@ -270,8 +272,12 @@ def _runs_the_subcommand(option: str, marker_repo, *, attached_value: str = "") 
     """
     repo, marker_file = marker_repo
     spelling = f"{option}={attached_value}" if attached_value else option
+    argv = ["git", spelling]
+    if separate_value:
+        argv.append(separate_value)
+    argv += ["config", "--file", str(marker_file), "--get", "genesis.marker"]
     p = subprocess.run(
-        ["git", spelling, "config", "--file", str(marker_file), "--get", "genesis.marker"],
+        argv,
         capture_output=True,
         text=True,
         timeout=30,
@@ -320,20 +326,43 @@ def test_the_valueless_set_really_consumes_nothing(marker_repo):
 
     The mirror of the assertion above, in the other direction: the walk steps
     over these ALONE, so if one of them consumed the following token, that
-    token is the verb slot again and we are back at the original defect. The
-    marker proves both halves at once — the subcommand ran, and it ran with no
-    value taken from it.
+    token is the verb slot again and we are back at the original defect.
+
+    THREE-WAY, not two-way, because the set is VERSION-DEPENDENT and a first
+    version of this test demanded that every member run bare — which failed
+    the moment the set gained `--no-lazy-fetch`/`--no-advice`, valueless on the
+    git CI runs and REJECTED outright by the git on this box. An entry the
+    installed git rejects is INERT here (git refuses the command before any
+    walk matters — the consumer set's `--super-prefix` precedent), so:
+
+    * subcommand runs bare            -> valueless CONFIRMED on this git;
+    * bare fails but runs WITH a value
+      interposed                      -> a CONSUMER misfiled as valueless —
+                                         the dangerous direction, the walk is
+                                         off by one and a VALUE lands in the
+                                         verb slot. FAIL, loudly;
+    * neither runs                    -> this git rejects the option; inert.
+
+    Accepted residual, stated rather than hidden: a TERMINAL option misfiled
+    here (accepted, runs nothing, e.g. a future `--version` sibling) lands in
+    the third bucket and passes — that misfile makes the walk look for a verb
+    after an option git handles itself, an over-block in the safe direction.
     """
-    wrong = [
-        option
-        for option in sorted(sp._GIT_OPTS_VALUELESS)
-        if not _runs_the_subcommand(option, marker_repo)
-    ]
-    assert not wrong, (
-        f"{wrong} are listed as valueless, but on THIS git the subcommand did "
-        "not run after them bare — so either they consume a value (and the "
-        "walk is off by one, putting a VALUE in the verb slot) or git rejects "
-        "them. Re-derive the classification against the installed binary."
+    values = ("/tmp/x", "user.name=x", "HEAD", ".")
+    consumers_in_disguise = []
+    for option in sorted(sp._GIT_OPTS_VALUELESS):
+        if _runs_the_subcommand(option, marker_repo):
+            continue  # valueless confirmed on this git
+        if any(
+            _runs_the_subcommand(option, marker_repo, separate_value=value)
+            for value in values
+        ):
+            consumers_in_disguise.append(option)
+    assert not consumers_in_disguise, (
+        f"{consumers_in_disguise} are listed as valueless, but on THIS git the "
+        "subcommand runs only when a VALUE follows them — they CONSUME it, the "
+        "walk is off by one, and the token after them lands in the verb slot. "
+        "Move each to _GIT_OPTS_WITH_ARG (all four copies + the canonical set)."
     )
 
 

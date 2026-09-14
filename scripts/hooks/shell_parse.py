@@ -258,6 +258,15 @@ _GIT_OPTS_VALUELESS = frozenset(
         "--bare",
         "--paginate",
         "--no-pager",
+        # MEASURED on git 2.55.0 (compiled from source, marker oracle): both
+        # run the subcommand and consume nothing. git 2.43 REJECTS both
+        # outright, so on an older git these entries are inert — that git
+        # refuses the command before any walk matters — which is why the local
+        # sweep against 2.43 could not find them and CI's newer git could:
+        # its usage-line completeness test went RED naming exactly these two.
+        # Raised by review before CI confirmed it.
+        "--no-lazy-fetch",
+        "--no-advice",
         "--no-optional-locks",
         "--no-replace-objects",
         "--literal-pathspecs",
