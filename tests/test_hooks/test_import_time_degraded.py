@@ -3,12 +3,18 @@
 THE DEFECT THIS LOCKS. ``run_guard`` is called at the BOTTOM of a guard, so an
 exception raised while the module is still importing never reaches it. Python exits
 1, and Claude Code's PreToolUse contract is "exit 2 blocks; ANY other code is a
-non-blocking error, so the tool RUNS". MEASURED before the fix, across all four
-guards that import ``shell_parse`` at module scope: poison that one sibling and every
-guard went exit 2 -> exit 1, with a healthy-tree control still blocking at 2. The gate
-did not degrade — it VANISHED, silently, while the session still believed it was
-protected. Version skew between a worktree and the main tree makes this a real
-configuration here, not a hypothetical.
+non-blocking error, so the tool RUNS". MEASURED before the fix, across every guard
+wired here: poison one shared sibling and each went exit 2 -> exit 1, with a
+healthy-tree control still blocking at 2. The gate did not degrade — it VANISHED,
+silently, while the session still believed it was protected. Version skew between a
+worktree and the main tree makes this a real configuration here, not a hypothetical.
+
+THE POPULATION IS ENUMERATED, NOT ASSERTED. An earlier revision of this module said
+"all four guards that import ``shell_parse`` at module scope" — and an AST walk found
+five more, three of them blocking. That claim now lives in
+``test_every_module_scope_shell_parse_importer_is_accounted_for``, which derives the
+set from the source and fails on an importer nobody has accounted for, so a new guard
+added next year is a failing test rather than a silent hole.
 
 WHY BOTH DIRECTIONS ARE TESTED, and why the benign arm is not padding: a degraded
 guard that refused EVERYTHING would satisfy the blocking arm perfectly while wedging
@@ -71,9 +77,9 @@ _CASES = [
     (
         # The PRICE of matching on a single token, asserted rather than left to be
         # discovered: `make clean` names no git operation and is refused anyway. That
-        # is the chosen direction — a loud, overridable refusal while the hook tree is
-        # broken, against a silent deletion. If this cell ever has to change, the
-        # matcher got narrower and the line-continued cell above is the one to re-check.
+        # is the chosen direction — a loud refusal while the hook tree is broken,
+        # against a silent deletion. If this cell ever has to change, the matcher got
+        # narrower and the line-continued cell above is the one to re-check.
         "git_discard_guard",
         "hooks/git_discard_guard.py",
         "make clean",
@@ -81,11 +87,35 @@ _CASES = [
         "over-block (priced, intended)",
     ),
     (
+        # NO WAIVER IS HONOURED ON THIS PATH, and this cell is the one that changed
+        # when that was decided. It read `expect 0, waiver honoured` until a review
+        # showed the check was a bare substring — see the two decoys below, which is
+        # what a substring waiver actually admits. The waiver is a PARSER's judgement
+        # and the parser is what is missing; the way through is repairing the tree.
         "git_discard_guard",
         "hooks/git_discard_guard.py",
         "git clean -fd  # discard-override",
-        0,
-        "waiver honoured",
+        2,
+        "waiver NOT honoured",
+    ),
+    (
+        # DECOY, verified by execution before the fix: the sigil is part of an
+        # unrelated FILENAME in a later segment, and the substring check allowed an
+        # unrecoverable `git clean` on the strength of it.
+        "git_discard_guard",
+        "hooks/git_discard_guard.py",
+        "git clean -fd && echo notes-discard-override.md",
+        2,
+        "decoy: sigil inside a filename",
+    ),
+    (
+        # DECOY, same measurement: the sigil sits in a QUOTED string in an earlier
+        # segment and waived the review gate for the real commit that follows.
+        "review_enforcement_commit",
+        "review_enforcement_commit.py",
+        "echo '# review-override' && git commit -m wip",
+        2,
+        "decoy: sigil quoted in another segment",
     ),
     (
         "git_push_guard",
@@ -110,12 +140,23 @@ _CASES = [
         "benign",
     ),
     (
+        # Was `expect 0` on the reasoning that refusing a recoverable local commit
+        # would strand an operator mid-repair. It does not: repairing a broken sibling
+        # module needs no commit, and the substring check that granted the waiver was
+        # admitting the quoted decoy above.
         "review_enforcement_commit",
         "review_enforcement_commit.py",
         'git commit -m "x"  # review-override',
-        0,
-        "waiver honoured",
+        2,
+        "waiver NOT honoured",
     ),
+    # The two guards an AST enumeration found AFTER this file first claimed the
+    # population was complete. Both block in normal operation and both exited 1 — the
+    # fail-open — on a poisoned tree.
+    ("worktree_cwd_guard", "hooks/worktree_cwd_guard.py", "git worktree remove x", 2, "gated"),
+    ("worktree_cwd_guard", "hooks/worktree_cwd_guard.py", "ls -la /tmp", 0, "benign"),
+    ("full_suite_guard", "hooks/full_suite_guard.py", "pytest tests/", 2, "gated"),
+    ("full_suite_guard", "hooks/full_suite_guard.py", "ls -la /tmp", 0, "benign"),
 ]
 
 
@@ -123,9 +164,9 @@ def _tree(tmp_path: Path, *, poisoned: bool) -> Path:
     """A standalone copy of scripts/, optionally with ONE sibling poisoned.
 
     Everything is copied rather than symlinked so the poisoned module cannot leak
-    back into the real tree, and the poison replaces exactly `shell_parse` — the
-    shared import all four guards make at module scope — so a failure here can only
-    be the import-time path and never an unrelated missing file.
+    back into the real tree, and the poison replaces exactly `shell_parse` — the one
+    sibling every wired guard imports at module scope — so a failure here can only be
+    the import-time path and never an unrelated missing file.
     """
     root = tmp_path / ("poisoned" if poisoned else "healthy")
     (root / "scripts" / "hooks").mkdir(parents=True)
@@ -264,32 +305,200 @@ def test_a_payload_that_names_no_command_blocks(tmp_path, guard, rel, stdin, sha
     )
 
 
-def test_a_test_importing_a_broken_tree_sees_the_real_error(tmp_path):
+@pytest.mark.parametrize(("guard", "rel"), _GUARDS)
+def test_a_bash_payload_carrying_only_a_file_path_blocks(tmp_path, guard, rel):
+    """`file_path` is not a stand-in for `command`, and treating it as one fails OPEN.
+
+    All four callers are registered under Bash matchers alone, so a Bash payload with
+    no `command` is a broken contract. An earlier draft read `file_path` as the command
+    text when `command` was absent — which meant such a payload no longer reached the
+    empty-payload block and instead ran the gated-mention test against a PATH, which
+    names no operation, and exited 0. A field that is never legitimately present here
+    must not be a fallback.
+    """
+    root = _tree(tmp_path, poisoned=True)
+    home = tmp_path / "home_fp"
+    home.mkdir(parents=True, exist_ok=True)
+    res = subprocess.run(
+        [sys.executable, str(root / "scripts" / rel)],
+        input=json.dumps({"tool_name": "Bash", "tool_input": {"file_path": "/etc/hosts"}}),
+        capture_output=True,
+        text=True,
+        cwd=str(root),
+        env={**os.environ, "HOME": str(home)},
+        timeout=90,
+    )
+    assert res.returncode == 2, (
+        f"{guard} allowed a Bash payload with no command by reading file_path as one "
+        f"(exit {res.returncode}).\nstderr: {res.stderr[:300]}"
+    )
+
+
+@pytest.mark.parametrize(("guard", "rel"), _GUARDS)
+def test_the_degraded_allow_reaches_the_model_not_only_stderr(tmp_path, guard, rel):
+    """An allowed command under a broken tree must still SAY the tree is broken.
+
+    Claude Code discards stderr from an exit-0 PreToolUse hook (``git_discard_guard``
+    records the same constraint), so on the allow path a stderr-only notice is written
+    to nobody and a degraded guard is indistinguishable from a healthy one — the exact
+    invisibility this whole change exists to end. The channel that IS delivered on
+    exit 0 is ``hookSpecificOutput.additionalContext`` on stdout.
+
+    Asserted on the ALLOW path only, deliberately: on exit 2 the reason already reaches
+    the model through stderr, and a second copy would be noise.
+    """
+    root = _tree(tmp_path, poisoned=True)
+    home = tmp_path / "home_ctx"
+    home.mkdir(parents=True, exist_ok=True)
+    res = subprocess.run(
+        [sys.executable, str(root / "scripts" / "hooks" / "git_discard_guard.py")],
+        input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "git status"}}),
+        capture_output=True,
+        text=True,
+        cwd=str(root),
+        env={**os.environ, "HOME": str(home)},
+        timeout=90,
+    )
+    assert res.returncode == 0, f"expected the benign command to be allowed: {res.stderr[:300]}"
+    payload = json.loads(res.stdout.strip().splitlines()[-1])
+    context = payload["hookSpecificOutput"]["additionalContext"]
+    assert payload["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+    assert "GUARD DEGRADED" in context, (
+        "the allow path emitted an envelope with no degraded notice in it — the one "
+        "channel that reaches the model on exit 0 is carrying nothing"
+    )
+
+
+def test_the_discard_guards_allow_names_the_snapshot_it_did_not_take(tmp_path):
+    """A guard is not always only a gate, and the allow notice has to say what else went.
+
+    `git_discard_guard`'s main job is the worktree RECOVERY SNAPSHOT it takes before a
+    discarding verb — not a refusal at all. MEASURED on a poisoned tree: `git checkout
+    -- .` exits 0 with no snapshot written, so uncommitted work is destroyed
+    unrecoverably, and the generic notice mentioned only "gates". A reader told the
+    gates are off, when what actually went is their undo, has been misled rather than
+    informed.
+
+    Asserted on the word SNAPSHOT rather than the full sentence: the wording should be
+    free to improve, the fact that the allow names this specific loss should not.
+    """
+    root = _tree(tmp_path, poisoned=True)
+    home = tmp_path / "home_snap"
+    home.mkdir(parents=True, exist_ok=True)
+    res = subprocess.run(
+        [sys.executable, str(root / "scripts" / "hooks" / "git_discard_guard.py")],
+        input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "git status"}}),
+        capture_output=True,
+        text=True,
+        cwd=str(root),
+        env={**os.environ, "HOME": str(home)},
+        timeout=90,
+    )
+    assert res.returncode == 0, f"expected an allow: {res.stderr[:300]}"
+    payload = json.loads(res.stdout.strip().splitlines()[-1])
+    context = payload["hookSpecificOutput"]["additionalContext"]
+    assert "SNAPSHOT" in context.upper(), (
+        "the discard guard's degraded allow does not name the recovery snapshot it "
+        f"failed to take — the loss a reader most needs to know about.\ngot: {context}"
+    )
+
+
+def test_an_exception_that_cannot_render_itself_still_blocks(tmp_path):
+    """The failure message must not be able to cause the failure it reports.
+
+    ``f"{exc}"`` runs ``__str__``, which is arbitrary code. An earlier draft rendered
+    the reason BEFORE the protective blocks, so an exception whose ``__str__`` raises
+    propagated straight out of ``degraded_exit`` — Python exits 1, Claude Code reads
+    that as non-blocking, and the gated command runs. The fail-open reached through
+    the error message of the fix for the fail-open.
+    """
+    root = _tree(tmp_path, poisoned=True)
+    (root / "scripts" / "hooks" / "shell_parse.py").write_text(
+        "class _Unprintable(Exception):\n"
+        "    def __str__(self):\n"
+        "        raise RuntimeError('cannot render')\n"
+        "raise _Unprintable()\n"
+    )
+    home = tmp_path / "home_unprintable"
+    home.mkdir(parents=True, exist_ok=True)
+    res = subprocess.run(
+        [sys.executable, str(root / "scripts" / "hooks" / "git_discard_guard.py")],
+        input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "git clean -fd"}}),
+        capture_output=True,
+        text=True,
+        cwd=str(root),
+        env={**os.environ, "HOME": str(home)},
+        timeout=90,
+    )
+    assert res.returncode == 2, (
+        f"an unrenderable import error produced exit {res.returncode} — exit 1 here is "
+        f"the fail-open, reached through the message.\nstderr: {res.stderr[:300]}"
+    )
+
+
+def test_a_matcher_that_cannot_answer_blocks(monkeypatch):
+    """The only thing between an unanswerable matcher and a fail-open.
+
+    ``gated`` is a public parameter, so a caller can pass a pattern that makes
+    ``re.search`` raise — a bad escape, a catastrophic pattern. The except arm answers
+    that with a BLOCK, and an audit's mutation sweep found the arm SURVIVED being
+    flipped to ``hit = False``: nothing pinned the one branch whose whole job is to
+    refuse when the crude check cannot even run.
+
+    Driven in-process rather than as a subprocess because the failure has to be
+    injected into ``re`` itself, which no payload can do from outside.
+    """
+    sys.path.insert(0, str(_HOOKS))
+    import hook_input
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("the matcher itself failed")
+
+    monkeypatch.setattr(hook_input.re, "search", _boom)
+    monkeypatch.setattr(hook_input, "read_payload", lambda: {"tool_input": {"command": "ls"}})
+    with pytest.raises(SystemExit) as exc:
+        hook_input.degraded_exit("probe", gated=r"\bnever\b")
+    assert exc.value.code == 2, (
+        "a matcher that could not answer allowed the command. `ls` names nothing "
+        "gated, so the ALLOW looks correct — which is exactly why this needs pinning: "
+        "the wrong answer and the right one are indistinguishable from the outside."
+    )
+
+
+@pytest.mark.parametrize(("guard", "rel"), _GUARDS)
+def test_a_test_importing_a_broken_tree_sees_the_real_error(tmp_path, guard, rel):
     """Degrading is for the LIVE hook, never for an importer.
 
     The guards degrade only under ``__name__ == "__main__"``. A test or tool that
     imports a broken tree must get the traceback, not a process exit — otherwise a
     broken dependency is invisible to exactly the machinery meant to catch it.
+
+    Parametrized over every wired guard, because the carve-out is a separate copy in
+    each of them and an audit's mutation sweep found that deleting one copy left the
+    suite fully green. This module argues elsewhere that a fix proven on one caller
+    proves nothing about the population; that argument applies to its own tests.
     """
     root = _tree(tmp_path, poisoned=True)
+    module = Path(rel).stem
     res = subprocess.run(
         [
             sys.executable,
             "-c",
-            "import sys; sys.path.insert(0, 'scripts/hooks'); import protected_paths_guard",
+            f"import sys; sys.path.insert(0, 'scripts/hooks'); "
+            f"sys.path.insert(0, 'scripts'); import {module}",
         ],
         capture_output=True,
         text=True,
         cwd=str(root),
-        env={**os.environ, "HOME": str(tmp_path / "home_imp")},
+        env={**os.environ, "HOME": str(tmp_path / f"home_imp_{module}")},
         timeout=90,
     )
-    assert res.returncode == 1, "an importer should get the exception, not a guard exit"
+    assert res.returncode == 1, f"{guard}: an importer should get the exception, not a guard exit"
     assert "poisoned sibling" in res.stderr, (
-        "the real cause must reach the importer; got:\n" + res.stderr[-400:]
+        f"{guard}: the real cause must reach the importer; got:\n" + res.stderr[-400:]
     )
     assert "GUARD DEGRADED" not in res.stderr, (
-        "the degraded path fired for an importer — it is scoped to __main__ only"
+        f"{guard}: the degraded path fired for an importer — it is scoped to __main__ only"
     )
 
 
@@ -315,6 +524,126 @@ def test_git_push_guards_check_pr_cli_does_not_degrade(tmp_path):
     )
     assert "poisoned sibling" in res.stderr, (
         "the CLI path should surface the import error; got:\n" + res.stderr[-400:]
+    )
+
+
+#: Guards wired to ``degraded_exit``. Derived from _CASES rather than retyped, so the
+#: two lists cannot drift apart.
+_WIRED = {Path(rel).name for _g, rel, _c, _e, _l in _CASES}
+
+#: NOT wired, each with the reason it is not — and the reason is a MEASUREMENT, not a
+#: judgement, because an exemption whose ground can shift is a hole with a comment on
+#: it. Rates are over 74,282 unique real Bash commands harvested from this install.
+_NOT_WIRED = {
+    # Its only usable degraded token is the pipe character, which appears in 52,220 of
+    # 74,282 commands (70.30%). Wiring it would not make the broken state safe, it
+    # would make it UNREPAIRABLE — and a degraded matcher that blocks the majority of
+    # ordinary work is not a fail-closed option at all. What its refusal protects is
+    # also the mildest in this set: a backgrounded pipeline whose stdout is swallowed,
+    # i.e. a re-run. Revisit if it ever gains a distinctive token.
+    "background_pipe_guard.py": "only token is `|` at 70.30% — would wedge the repair",
+    # Advisory only: their sole verdict is a note, so an import-time exit 1 loses
+    # advice and never a refusal. Verified by the absence of any exit-2 path, not by
+    # reading their docstrings.
+    "pipe_status_guard.py": "advisory only — no exit-2 path to lose",
+    "tmux_kill_server_guard.py": "advisory only — no exit-2 path to lose",
+}
+
+
+def test_every_module_scope_shell_parse_importer_is_accounted_for():
+    """ALLOWLIST, so the next bare importer fails by CONSTRUCTION rather than by luck.
+
+    THIS TEST EXISTS BECAUSE ITS ABSENCE SHIPPED A FALSE CLAIM. An earlier revision of
+    this change stated — in this file, in the shared helper's docstring, in a public
+    changelog and in the pull request body — that the four guards it patched were the
+    whole population, "established by reading their import blocks, not by spot-check".
+    It was a spot-check. An AST enumeration found FIVE more, three of them blocking
+    guards, every one exiting 1 on a poisoned tree. `grep` cannot separate a guarded
+    import from a bare one, which is how a careful reading still missed them.
+
+    Polarity is ALLOWLIST, the same shape as `test_hook_output_contract.py`: a guard
+    added next year is unaccounted-for by default and fails here. A scan for known-bad
+    patterns could not do that, because the thing it would have to know about does not
+    exist yet.
+
+    Module scope ONLY — iterating ``tree.body`` rather than ``ast.walk`` — because an
+    import inside a ``try:`` lives in a ``Try`` node, and that is precisely the guarded
+    form this is checking for.
+    """
+    import ast
+
+    found: set[str] = set()
+    for path in [*_HOOKS.glob("*.py"), *_SCRIPTS.glob("*.py")]:
+        try:
+            tree = ast.parse(path.read_text())
+        except SyntaxError:  # pragma: no cover — a syntax error is another test's job
+            continue
+        for node in tree.body:
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module == "shell_parse"
+                or isinstance(node, ast.Import)
+                and any(alias.name == "shell_parse" for alias in node.names)
+            ):
+                found.add(path.name)
+
+    assert found, (
+        "no bare module-scope importer found at all — the walk is looking in the wrong "
+        "place, and an empty population would make this test pass forever"
+    )
+    unaccounted = found - set(_NOT_WIRED)
+    assert not unaccounted, (
+        f"{sorted(unaccounted)} import shell_parse at bare module scope. An exception "
+        "during that import never reaches run_guard, so the process exits 1 — which "
+        "Claude Code reads as NON-BLOCKING, and the guard vanishes instead of "
+        "degrading. Either call hook_input.degraded_exit from a guarded import, or add "
+        "the file to _NOT_WIRED with the MEASURED reason it does not need one."
+    )
+    # Both directions: a guard that gains the wiring must leave _NOT_WIRED, or the
+    # exemption silently outlives its reason. This is what a bare `len(found) == N`
+    # check could not catch.
+    stale = set(_NOT_WIRED) & _WIRED
+    assert not stale, f"{sorted(stale)} are wired now and must leave _NOT_WIRED"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git commit --no-verify -m x",
+        "git commit --no-verify;",
+        "git commit --no-verify&",
+        "git commit --no-verify|cat",
+        "(git commit --no-verify)",
+        "git push --force;",
+    ],
+)
+@pytest.mark.parametrize("constant", ["_GATED_MENTION", "_DEGRADED_GATED"])
+def test_a_flag_mention_is_not_starved_by_the_separator_after_it(command, constant):
+    """A narrowing conjunct inside the very pattern whose comment forbids them.
+
+    Both of the push guard's mention sets required whitespace, `=` or end-of-string
+    AFTER a destructive flag. Every ordinary shell separator therefore starved them:
+    MEASURED on the literal patterns, `--no-verify -m x` matched while `--no-verify;`,
+    `--no-verify&`, `--no-verify|cat` and `(… --no-verify)` did not. A word boundary
+    asks the one thing that was meant — that the flag is a whole token — without
+    naming what may follow it.
+
+    BOTH constants, because the defect was in both and fixing the degraded copy alone
+    would have left the LIVE net starved under a comment claiming the class was
+    closed. Cost of the widening, measured over 74,282 real commands: +50 (+0.07%).
+
+    The first case is the control: it matched before the fix too, so a pattern that
+    stopped matching anything at all would fail here rather than pass.
+    """
+    import importlib
+
+    sys.path.insert(0, str(_HOOKS))
+    guard = importlib.import_module("git_push_guard")
+    pattern = getattr(guard, constant)
+    rx = pattern if hasattr(pattern, "search") else __import__("re").compile(pattern)
+    assert rx.search(command), (
+        f"{constant} did not see the flag in {command!r} — a shell separator starved "
+        "the mention set, and an unseen mention is an unverified publish"
     )
 
 

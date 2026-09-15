@@ -43,17 +43,14 @@ try:
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
     if __name__ != "__main__":
         raise
-    # `review-override` IS honoured here, unlike in git_push_guard, and the asymmetry
-    # is the point: this sigil waives a LOCAL commit's review requirement, which is
-    # recoverable and already the documented escape for this gate. Refusing it in a
-    # degraded state would strand an operator mid-repair with no way to commit the
-    # repair itself.
-    degraded_exit(
-        "review_enforcement_commit",
-        gated=_DEGRADED_GATED,
-        override_sigils=("review-override",),
-        exc=_exc,
-    )
+    # `review-override` is NOT honoured on this path. An earlier version honoured it,
+    # on the reasoning that refusing a recoverable local commit would strand an operator
+    # mid-repair — but the check was a bare substring, and MEASURED on a poisoned tree
+    # it waived this gate from a sigil sitting inside a QUOTED STRING in an unrelated
+    # segment. Binding a sigil to the segment it waives needs the shared parser, whose
+    # absence is why this path runs at all. Nothing about a broken sibling module
+    # requires a commit to repair, so the operator is not in fact stranded.
+    degraded_exit("review_enforcement_commit", gated=_DEGRADED_GATED, exc=_exc)
 
 try:  # noqa: E402
     import discarded_write

@@ -30,6 +30,7 @@ dict, never an exception. Hooks must never crash CC.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -255,7 +256,7 @@ def degraded_exit(
     name: str,
     *,
     gated: str,
-    override_sigils: tuple[str, ...] = (),
+    also_lost: str = "",
     exc: BaseException | None = None,
 ) -> NoReturn:
     """Exit a guard whose MODULE-SCOPE imports failed, without failing OPEN.
@@ -264,11 +265,20 @@ def degraded_exit(
     but it is called at the BOTTOM of a guard — an exception raised while the module
     is still importing never reaches it. Python exits 1, and CC's PreToolUse contract
     is "exit 2 blocks; ANY other code is a non-blocking error, so the tool RUNS".
-    MEASURED on all four guards that import ``shell_parse`` at module scope: poison
-    that one sibling and every guard goes exit 2 -> exit 1 with a healthy-tree control
-    blocking at 2. The gate does not degrade; it VANISHES, silently, while the session
-    still believes it is protected. Version skew between a worktree and the main tree
-    is a real configuration here, not a hypothetical.
+    MEASURED on every guard wired to this function: poison one shared sibling and each
+    goes exit 2 -> exit 1, with a healthy-tree control blocking at 2. The gate does not
+    degrade; it VANISHES, silently, while the session still believes it is protected.
+    Version skew between a worktree and the main tree is a real configuration here, not
+    a hypothetical.
+
+    THE POPULATION IS ENUMERATED BY A TEST, NOT BY THIS SENTENCE. An earlier version of
+    this docstring said "all four guards that import ``shell_parse`` at module scope",
+    and that was false by more than half — an AST walk found five more, three of them
+    blocking guards, every one exiting 1 on a poisoned tree. ``grep`` cannot tell a
+    guarded import from a bare one, which is how a careful reading still missed them.
+    ``test_every_module_scope_shell_parse_importer_is_accounted_for`` now enumerates
+    the population and fails on an unaccounted-for importer, so the count lives
+    somewhere that can be wrong out loud.
 
     WHY A REGEX OVER RAW TEXT, which is normally forbidden in this repo. The shared
     parser is precisely what is unavailable — that is the whole premise — so there is
@@ -290,22 +300,48 @@ def degraded_exit(
     the exit 1 it exists to prevent — so every step is wrapped and the bare-except
     fallback blocks.
 
+    NO IN-BAND WAIVER IS HONOURED HERE, and that is the decision this function's first
+    version got wrong. It accepted a guard's sigil as a bare substring of the raw text —
+    which is not a waiver, it is the WORD appearing anywhere. MEASURED against the real
+    guards on a poisoned tree: an unrecoverable `git clean` was allowed because a LATER
+    segment named a file whose name contained the sigil, and the review gate was waived
+    by the sigil sitting inside a quoted string in an earlier segment. Binding a sigil
+    to the segment it waives is what the shared parser does — and the shared parser
+    being unavailable is this function's entire premise, so re-deriving that binding
+    here would be a second shell parser written precisely where the first one is known
+    to be missing.
+
+    So the recovery route is repairing the hook tree, which is the ACTUAL fix and is
+    always available: nothing about a broken sibling module requires a commit to
+    repair. ``git_push_guard`` already honoured no sigils on this path for the narrower
+    version of the same reason — waiving a publish while every gate in that file is
+    proven absent is the precise combination the net exists to prevent — and that
+    argument was always true of the other three callers too.
+
     Args:
-        name: guard name, for the operator-facing stderr line.
+        name: guard name, for the operator-facing notice.
         gated: regex (searched case-insensitively against the RAW command text).
             Pass a literal pattern defined ABOVE the guarded import, so it is still
             bound when the import that failed is the one being recovered from.
-        override_sigils: in-band trailing sigils this guard honours (``discard-override``
-            …). Present in the raw text -> allow, because a degraded guard must not
-            strand an operator with no way through.
+        also_lost: what this guard does BESIDES refusing, named on the allow path.
+            A guard is not always only a gate: `git_discard_guard`'s main job is the
+            recovery SNAPSHOT it takes before a discarding verb, and MEASURED on a
+            poisoned tree, `git checkout -- .` exits 0 here with no snapshot taken —
+            uncommitted work destroyed unrecoverably, under a notice that mentioned
+            only "gates". Naming the loss is the difference between an allow the
+            reader can act on and one that misleads.
         exc: the import error, named in the message so the cause is visible.
     """
-    reason = f"{type(exc).__name__}: {exc}" if exc is not None else "import failed"
+    reason = _degraded_reason(exc)
     try:
-        # ONE read: read_payload() consumes stdin, so a second call returns nothing and
-        # would silently lose `file_path` on a Write/Edit payload.
-        payload = read_payload()
-        raw = field(payload, "command") or field(payload, "file_path")
+        # ONE read: read_payload() consumes stdin, so a second call returns nothing.
+        # ONLY `command` is inspected. An earlier draft also accepted `file_path` as a
+        # substitute, which WEAKENED the empty-payload block below: all four callers are
+        # registered under Bash matchers alone (.claude/settings.json), so a Bash payload
+        # that carries a path instead of a command is a broken contract, and reading the
+        # path as if it were the command let it pass the gated-mention test by naming no
+        # operation. A field that is never legitimately present must not be a fallback.
+        raw = field(read_payload(), "command")
     except BaseException:  # noqa: BLE001 — unreadable payload cannot prove safety.
         raw = ""
 
@@ -314,50 +350,113 @@ def degraded_exit(
     # malformed JSON and for empty stdin, so without this the common case fell through to
     # the match below, matched nothing, and ALLOWED.
     if not raw.strip():
-        print(
+        _degraded_say(
+            2,
             f"GUARD DEGRADED ({name}): {reason} — and the tool payload could not be "
             "read, or named no command, so nothing here can establish the command is "
             "safe. BLOCKING. Repair the hook tree (version skew between a worktree and "
             "the main tree is the usual cause) or disable this hook deliberately.",
-            file=sys.stderr,
         )
-        sys.exit(2)
 
     try:
-        for sigil in override_sigils:
-            if sigil and sigil in raw:
-                print(
-                    f"GUARD DEGRADED ({name}): {reason} — allowing: the command carries "
-                    f"the in-band '{sigil}' waiver. NOTE this guard did NOT actually "
-                    "run, so the waiver was not checked against a parsed command.",
-                    file=sys.stderr,
+        hit = bool(re.search(gated, raw, re.IGNORECASE))
+    except BaseException:  # noqa: BLE001 — a matcher that cannot answer has not cleared it.
+        hit = True
+    if hit:
+        _degraded_say(
+            2,
+            f"GUARD DEGRADED ({name}): {reason} — BLOCKING: the raw command text "
+            "names a gated operation and this guard cannot run to judge it. This is a "
+            "crude text match, not a parse, so it may be over-broad; that is the "
+            "intended direction, and there is no in-band waiver for it. The way "
+            "through is to repair the hook tree — which is also the actual fix.",
+        )
+    _degraded_say(
+        0,
+        f"GUARD DEGRADED ({name}): {reason} — allowing: the raw command text names no "
+        "gated operation. This guard did NOT run, so no gate inside it is in force for "
+        f"this command either.{' ' + also_lost if also_lost else ''} Repair the hook "
+        "tree before relying on any of them.",
+    )
+
+
+#: Longest exception text carried into a degraded message. The notice rides the model's
+#: hook-output budget and an exception can carry an arbitrarily long payload, so this is
+#: a bound against an EXTERNAL budget rather than a self-imposed one, and the cut is
+#: declared in the text rather than silent.
+#:
+#: MEASURED IN CODEPOINTS, WHICH IS NOT THE UNIT THE HARNESS BILLS. It bills UTF-16 code
+#: units, and `hook_output.utf16_len` is deliberately unreachable from here — this module
+#: is stdlib-only and imported bare by 19 hooks. So the safety comes from HEADROOM, not
+#: from unit-correctness, and the honest statement is the measurement: an exception whose
+#: text is 5,000 astral codepoints yields a 420-codepoint reason worth 820 UTF-16 units,
+#: and a full stdout envelope of 5,139 against the measured 10,000 cap. Roughly 2x. At
+#: 800 that margin would be gone, so do not raise this without re-measuring in the
+#: harness's unit.
+_DEGRADED_REASON_MAX = 400
+
+
+def _degraded_reason(exc: BaseException | None) -> str:
+    """Render the import failure, without trusting the exception to render itself.
+
+    ``f"{exc}"`` calls ``__str__``, which is arbitrary code that can raise — and this
+    ran BEFORE the protective blocks, so a secondary failure there propagated out of
+    :func:`degraded_exit` and exited 1: the exact fail-open the function exists to
+    prevent, reached through its own error message.
+    """
+    if exc is None:
+        return "import failed"
+    try:
+        kind = type(exc).__name__
+    except BaseException:  # noqa: BLE001
+        kind = "Exception"
+    try:
+        text = str(exc)
+    except BaseException:  # noqa: BLE001 — an unprintable exception is still a cause.
+        return f"{kind} (its message could not be rendered)"
+    if len(text) > _DEGRADED_REASON_MAX:
+        text = text[:_DEGRADED_REASON_MAX] + f"… (+{len(text) - _DEGRADED_REASON_MAX} chars)"
+    return f"{kind}: {text}"
+
+
+def _degraded_say(code: int, message: str) -> NoReturn:
+    """Deliver a degraded verdict and exit — and exit with `code` whatever happens.
+
+    TWO CHANNELS, because they reach different readers and neither covers both cases:
+
+    * stderr is delivered to the model on exit 2 and DISCARDED on exit 0 (Claude Code
+      drops stderr from an exit-0 PreToolUse hook; ``git_discard_guard`` records the
+      same constraint). So on the ALLOW path stderr alone is written to nobody, and a
+      degraded guard looks exactly like a healthy one — which is the condition this
+      whole change exists to make visible.
+    * ``hookSpecificOutput.additionalContext`` on STDOUT is the channel that IS
+      delivered on exit 0. It is emitted only there: on exit 2 the reason already
+      reaches the model, and a second copy is noise.
+
+    EVERY WRITE IS SUPPRESSED ON FAILURE and the exit still happens. If stderr or
+    stdout is closed, ``print`` raises ``OSError`` — and an OSError escaping here means
+    Python exits 1, which Claude Code reads as NON-BLOCKING. A diagnostic that cannot
+    be written must never decide a verdict.
+    """
+    if code == 0:
+        try:
+            sys.stdout.write(
+                json.dumps(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "additionalContext": message,
+                        }
+                    }
                 )
-                sys.exit(0)
-        if re.search(gated, raw, re.IGNORECASE):
-            print(
-                f"GUARD DEGRADED ({name}): {reason} — BLOCKING: the raw command text "
-                "names a gated operation and this guard cannot run to judge it. This "
-                "is a crude text match, not a parse, so it may be over-broad; that is "
-                "the intended direction. Repair the hook tree, or re-run with an "
-                "in-band waiver if this guard has one.",
-                file=sys.stderr,
+                + "\n"
             )
-            sys.exit(2)
-        print(
-            f"GUARD DEGRADED ({name}): {reason} — allowing: the raw command text names "
-            "no gated operation. This guard did NOT run; other gates in it are not in "
-            "force for this command either.",
-            file=sys.stderr,
-        )
-        sys.exit(0)
-    except SystemExit:
-        raise
-    except BaseException:  # noqa: BLE001 — never reinstate the exit 1 we exist to stop.
-        print(
-            f"GUARD DEGRADED ({name}): {reason} — and the degraded check itself failed. BLOCKING.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
+            sys.stdout.flush()
+        except BaseException:  # noqa: BLE001 — see the docstring: never decide on a write.
+            pass
+    with contextlib.suppress(BaseException):  # see the docstring: never decide on a write
+        print(message, file=sys.stderr)
+    sys.exit(code)
 
 
 _BRACE_RE = re.compile(r"\{([^{}]*,[^{}]*)\}")

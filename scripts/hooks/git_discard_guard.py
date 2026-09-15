@@ -157,10 +157,22 @@ try:
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
     if __name__ != "__main__":
         raise
+    # `discard-override` is NOT honoured on this path — see degraded_exit, which used
+    # to accept a sigil as a bare substring and was MEASURED allowing an unrecoverable
+    # `git clean` because a later segment named a file whose name contained the word.
     degraded_exit(
         "git_discard_guard",
         gated=_DEGRADED_GATED,
-        override_sigils=("discard-override",),
+        # This guard is not only a gate, and the allow path has to say so: its main
+        # job is the recovery SNAPSHOT taken before a discarding verb. MEASURED on a
+        # poisoned tree, `git checkout -- .` exits 0 here and no snapshot is written,
+        # so uncommitted work goes unrecoverably — under a notice that otherwise
+        # mentions only gates.
+        also_lost=(
+            "NOTE this guard also takes the worktree RECOVERY SNAPSHOT before a "
+            "discarding verb (checkout/restore/switch/reset), and it did not take one "
+            "— a discard run now is not recoverable from it."
+        ),
         exc=_exc,
     )
 

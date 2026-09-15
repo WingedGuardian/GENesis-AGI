@@ -150,8 +150,13 @@ except Exception:  # noqa: BLE001 — see above: a load failure exits 1 = non-bl
 # deliberate breadth, same reasoning) and adds `gh` and `sqlite3`, because on this
 # path there is no parse to narrow with at all. Kept as its own literal rather than
 # shared: sharing would place the constant after the import it has to outlive.
+# Word-boundary rather than a trailing separator class, for the reason spelled out at
+# `_GATED_MENTION`: the anchor was a narrowing conjunct and every ordinary shell
+# separator starved it. Both copies carried it, so both were corrected — fixing the
+# degraded one alone would have left the LIVE net starved while the comment claimed
+# the class was closed.
 _DEGRADED_GATED = (
-    r"(?:^|\s)(?:--force(?:-with-lease)?|--no-verify|--admin)(?:\s|=|$)"
+    r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b"
     r"|\b(?:push|merge)\b|\bgh\b|\bsqlite3\b"
 )
 
@@ -167,17 +172,24 @@ try:
         split_segments,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
-    if __name__ != "__main__" or sys.argv[1:2] == ["--check-pr"]:
+    if __name__ != "__main__" or (len(sys.argv) >= 3 and sys.argv[1] == "--check-pr"):
         # Two cases that must NOT degrade. A test importing a broken tree needs the
         # real error. And `--check-pr` is a HUMAN-run CLI read that takes no stdin:
         # degrading there would block on a terminal read and then exit 2 at someone
         # who only asked a question. Let both see the traceback.
+        #
+        # The arity matches the REAL dispatch (`len(sys.argv) >= 3` at the bottom of
+        # this file), not just the flag. An earlier form tested the flag alone, so a
+        # bare `--check-pr` with no PR number took the CLI carve-out on a broken tree
+        # and the hook path on a healthy one — a carve-out whose boundary did not
+        # match the thing it was carving out.
         raise
-    # NO override_sigils, deliberately, and this is the one guard where that matters.
-    # Its sigils (stale-review-override, ci-override, merge-to-main-override …)
-    # authorise a PUBLISH past review gates. Honouring one here would wave a publish
-    # through with every gate in this file already proven absent — the precise
-    # combination this net exists to prevent. The recovery is to repair the tree.
+    # No sigil is honoured on this path. That is now true of every caller — see
+    # degraded_exit, whose substring-based waiver was measured allowing two decoys —
+    # but it was decided FIRST here and for a stronger reason worth keeping: this
+    # file's sigils (stale-review-override, ci-override, merge-to-main-override …)
+    # authorise a PUBLISH past review gates, so honouring one with every gate in this
+    # file already proven absent is the precise combination the net exists to prevent.
     degraded_exit("git_push_guard", gated=_DEGRADED_GATED, exc=_exc)
 
 # Mentions of a GATED operation, consulted ONLY on the un-parseable path where
@@ -192,8 +204,16 @@ except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degrad
 # flag-only, hard-block version had to be surgically precise, and precision is
 # exactly what an unreliable parse cannot deliver: every narrowing conjunct
 # became a new way to starve the trigger (measured).
+# THE TRAILING ANCHOR WAS ITSELF A NARROWING CONJUNCT — the exact thing the paragraph
+# above forbids, sitting inside the pattern it forbids it in. `(?:\s|=|$)` requires
+# whitespace, `=` or end-of-string AFTER the flag, so every ordinary shell separator
+# starved it. MEASURED on the literal pattern: `git commit --no-verify -m x` matched,
+# while `--no-verify;`, `--no-verify&`, `--no-verify|cat` and `(… --no-verify)` did
+# NOT. A word boundary asks the one thing that was meant — that the flag is a whole
+# token — without naming the characters that may follow it. MEASURED cost of the
+# widening over 74,282 real commands: 15,945 -> 15,995, i.e. +50 (+0.07%).
 _GATED_MENTION = re.compile(
-    r"(?:^|\s)(?:--force(?:-with-lease)?|--no-verify|--admin)(?:\s|=|$)|\b(?:push|merge)\b"
+    r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b|\b(?:push|merge)\b"
 )
 
 # `gh pr create` is the FOURTH gated operation (it can push or fork the branch —

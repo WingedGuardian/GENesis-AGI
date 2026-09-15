@@ -38,12 +38,29 @@ import sys
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import read_payload, run_guard, tool_input  # noqa: E402
-from shell_parse import (  # noqa: E402
-    analyze_checked,
-    git_subcommand_index,
-    untokenizable,
-)
+from hook_input import degraded_exit, read_payload, run_guard, tool_input  # noqa: E402
+
+# DEGRADED-path mention set, defined ABOVE the guarded import so it survives that
+# import failing. `run_guard`'s own docstring names worktree removal among the
+# operations for which fail-closed is correct, and this guard exited 1 on a poisoned
+# tree until now — so the helper listed a guard it did not cover.
+#
+# ONE TOKEN, and a distinctive one: MEASURED over 74,282 real commands it appears in
+# 2,245 (3.02%). That is the price of the broken-tree state and it is small, which is
+# what makes wiring this guard right where wiring the background-pipe guard would be
+# wrong (its only usable token is the pipe character, at 70.30%).
+_DEGRADED_GATED = r"\bworktree\b"
+
+try:
+    from shell_parse import (  # noqa: E402
+        analyze_checked,
+        git_subcommand_index,
+        untokenizable,
+    )
+except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
+    if __name__ != "__main__":
+        raise
+    degraded_exit("worktree_cwd_guard", gated=_DEGRADED_GATED, exc=_exc)
 
 try:  # noqa: E402
     import discarded_write
