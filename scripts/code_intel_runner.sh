@@ -10,14 +10,18 @@
 #
 # Flow per pending marker:
 #   idle gate (loadavg1 < 2, iowait < 10%, no CC session > 50% CPU; relaxed
-#   after 24h so work is never starved forever) -> move-aside claim -> run the
+#   after 24h so work is never starved forever) -> transactional claim -> run the
 #   entrypoint FOREGROUND with CODE_INTEL_INDEX_LOCK_SKIP_RC=75 -> act on rc:
-#     0  -> consume (drop the in-flight copy); stamp .last-full if it ran full
+#     0  -> consume the in-flight row; stamp the full-success clock if applicable
 #     75 -> lock held / host-frozen: restore the marker untouched (freeze-safe)
 #     3  -> a requested tool was missing: restore, NO attempts penalty, loud log
 #     *  -> failure: if this was an ESCALATED full (marker mode was fast), fall
 #           back to fast + back off full (no attempts penalty); otherwise
-#           restore with attempts+1 (euthanized to .failed.json at the cap).
+#           restore with attempts+1 (moved to terminal failed state at the cap).
+# The terminal action is persisted with the claim id before queue mutation. A
+# later tick replays that exact action if the runner loses queue access or dies
+# after the entrypoint returns, preventing a successful index from being run
+# again or charged as a failure.
 #
 # Escalation: a fast marker whose graph has no recent full index runs as full
 # (weekly refresh / first build), unless a recent full FAILED (backoff). cbm 0.9
@@ -65,6 +69,19 @@ _log() {
 
 _marker() { python3 "$MARKER_PY" "$@"; }
 
+_finish_outcome() {
+    local hash="$1" action="$2" state
+    if ! _marker remember-outcome --hash "$hash" --action "$action" >> "$LOG_FILE" 2>&1; then
+        _log "could not persist terminal action $action for $hash — stopping tick"
+        return 76
+    fi
+    if ! state="$(_marker apply-outcome --hash "$hash" 2>> "$LOG_FILE")"; then
+        _log "terminal action $action retained for $hash but could not be applied — stopping tick"
+        return 76
+    fi
+    printf '%s\n' "$state"
+}
+
 # Returns 0 (idle enough to run) or 1. Relaxed gate once a marker is starved.
 _idle_ok() {
     local age_s="$1" load iowait claude_cpu load_max iowait_max
@@ -92,15 +109,25 @@ _idle_ok() {
 }
 
 # Runner self-lock: one tick at a time (own lock, NOT the entrypoint's).
-# Fallback stays under $HOME so it works under the service's ProtectSystem=strict
-# + ReadWritePaths=%h (and honors the "~/tmp, never /tmp" convention).
-mkdir -p "$LOCK_DIR" 2>/dev/null || { mkdir -p "$HOME/tmp" 2>/dev/null; LOCK_DIR="$HOME/tmp"; }
+# Never switch lock paths or proceed unlocked: orphan recovery and single-flight
+# execution are only safe when every runner holds this SAME lock.
+if ! mkdir -p "$LOCK_DIR" 2>/dev/null; then
+    _log "cannot create runner lock directory — deferring"
+    exit 75
+fi
 RUNNER_LOCK="$LOCK_DIR/code-intel-runner.lock"
-if command -v flock >/dev/null 2>&1 && { exec 8>"$RUNNER_LOCK"; } 2>/dev/null; then
-    if ! flock -n 8; then
-        _log "another runner tick is in progress — exiting"
-        exit 0
-    fi
+if ! command -v flock >/dev/null 2>&1 || ! { exec 8>"$RUNNER_LOCK"; } 2>/dev/null; then
+    _log "runner lock unavailable — deferring"
+    exit 75
+fi
+lock_rc=0
+flock -n -E 75 8 || lock_rc=$?
+if [ "$lock_rc" -eq 75 ]; then
+    _log "another runner tick is in progress — exiting"
+    exit 0
+elif [ "$lock_rc" -ne 0 ]; then
+    _log "runner lock acquisition failed — deferring"
+    exit 75
 fi
 
 if [ ! -f "$ENTRYPOINT" ] || [ ! -f "$MARKER_PY" ]; then
@@ -110,8 +137,11 @@ fi
 
 # Re-pend any orphaned in-flight markers from a previous run that died mid-index
 # (OOM / host stop / unit timeout). Safe here: we hold the runner flock, so no
-# other tick is mid-claim — any *.inflight is necessarily from a dead run.
-_marker reconcile-inflight >> "$LOG_FILE" 2>&1 || true
+# other tick is mid-claim — any inflight row is necessarily from a dead run.
+if ! _marker reconcile-inflight >> "$LOG_FILE" 2>&1; then
+    _log "inflight reconciliation failed — stopping tick without claiming new work"
+    exit 76
+fi
 
 # Snapshot the pending markers up front (TSV: hash repo tools mode attempts age).
 mapfile -t _MARKERS < <(_marker list 2>/dev/null)
@@ -133,7 +163,7 @@ for line in "${_MARKERS[@]}"; do
         continue
     fi
 
-    # Move-aside claim FIRST (so a commit landing mid-index is never dropped),
+    # Claim into a separate row FIRST (so a commit landing mid-index is never dropped),
     # then act on the CLAIMED state — the authoritative snapshot for this run.
     claimed="$(_marker claim --hash "$hash" 2>/dev/null)"
     if [ -z "$claimed" ]; then
@@ -143,14 +173,14 @@ for line in "${_MARKERS[@]}"; do
     IFS=$'\t' read -r repo tools mode _attempts <<< "$claimed"
     if [ -z "${repo:-}" ]; then
         _log "claimed marker $hash has no repo — restoring"
-        _marker restore --hash "$hash" >/dev/null
+        _finish_outcome "$hash" restore >/dev/null || exit 76
         continue
     fi
 
     # Escalate a fast marker to full when the graph is due (and not backed off),
     # using the CLAIMED tools/mode. "full" is a cbm-only concept — gitnexus
     # analyze ignores mode (always incremental) — so a gitnexus-only marker must
-    # NOT escalate or it would stamp the shared .last-full and falsely suppress
+    # NOT escalate or it would stamp the shared full-success clock and falsely suppress
     # cbm's genuinely-needed full pass.
     run_mode="$mode"
     if [ "$mode" != "full" ] && { [ "$tools" = "cbm" ] || [ "$tools" = "both" ]; } \
@@ -166,17 +196,19 @@ for line in "${_MARKERS[@]}"; do
 
     case "$rc" in
         0)
-            _marker consume --hash "$hash"
-            # Only a successful FULL run that INCLUDED cbm records .last-full
+            # Only a successful FULL run that INCLUDED cbm records the full-success clock
             # (the escalation guard already ensures run_mode=full ⟹ cbm, but be
-            # explicit — .last-full is shared across tools and gates cbm's full).
+            # explicit — the clock is shared across tools and gates cbm's full).
             if [ "$run_mode" = "full" ] && { [ "$tools" = "cbm" ] || [ "$tools" = "both" ]; }; then
-                _marker stamp-full --hash "$hash"
+                action="consume_full"
+            else
+                action="consume"
             fi
+            _finish_outcome "$hash" "$action" >/dev/null || exit 76
             _log "indexed OK: $repo (mode=$run_mode)"
             ;;
         75)
-            _marker restore --hash "$hash" >/dev/null
+            _finish_outcome "$hash" restore >/dev/null || exit 76
             _log "lock held / host-frozen — kept marker for $repo"
             ;;
         3)
@@ -185,19 +217,22 @@ for line in "${_MARKERS[@]}"; do
             # with no attempts penalty — but if this was an escalated full, back
             # off full so it doesn't re-escalate a heavy cbm full EVERY idle tick;
             # it degrades to cheap fast retries until PATH is fixed.
-            _marker restore --hash "$hash" >/dev/null
-            [ "$run_mode" = "full" ] && _marker mark-full-backoff --hash "$hash"
+            if [ "$run_mode" = "full" ]; then
+                action="restore_backoff"
+            else
+                action="restore"
+            fi
+            _finish_outcome "$hash" "$action" >/dev/null || exit 76
             _log "requested tool missing (rc=3) — kept marker, no penalty: $repo"
             ;;
         *)
             if [ "$run_mode" = "full" ] && [ "$mode" != "full" ]; then
                 # Escalated-full failure: keep incremental fast indexing alive and
                 # back off full so a doomed full (cbm can't resume) can't thrash.
-                _marker restore --hash "$hash" >/dev/null
-                _marker mark-full-backoff --hash "$hash"
+                _finish_outcome "$hash" restore_backoff >/dev/null || exit 76
                 _log "escalated full failed (rc=$rc) — fell back to fast, backed off full: $repo"
             else
-                state="$(_marker restore --hash "$hash" --attempts-inc)"
+                state="$(_finish_outcome "$hash" restore_failure)" || exit 76
                 _log "index failed (rc=$rc) — marker $state: $repo"
             fi
             ;;

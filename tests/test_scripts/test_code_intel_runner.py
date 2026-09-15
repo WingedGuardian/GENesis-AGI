@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sqlite3
 import stat
 import subprocess
 from pathlib import Path
@@ -79,6 +80,25 @@ def _seed_marker(tmp_path, tools="both", mode="fast"):
     return im.marker_hash(_REPO)
 
 
+def test_unopenable_runner_lock_refuses_indexing(tmp_path):
+    _seed_marker(tmp_path)
+    lock = tmp_path / ".genesis" / "locks" / "code-intel-runner.lock"
+    lock.mkdir(parents=True)
+    result = _run_runner(tmp_path, 0)
+    assert result.returncode == 75
+    assert not (tmp_path / "entry.log").exists()
+    assert len(_markers(tmp_path)) == 1
+
+
+def test_unavailable_lock_directory_does_not_use_an_alternate_lock(tmp_path):
+    _seed_marker(tmp_path)
+    (tmp_path / ".genesis" / "locks").write_text("not a directory")
+    result = _run_runner(tmp_path, 0)
+    assert result.returncode == 75
+    assert not (tmp_path / "entry.log").exists()
+    assert len(_markers(tmp_path)) == 1
+
+
 def _markers(tmp_path):
     env = {**os.environ, "GENESIS_HOME": str(tmp_path / ".genesis")}
     out = subprocess.run(
@@ -92,6 +112,10 @@ def _markers(tmp_path):
 
 def _mdir(tmp_path) -> Path:
     return tmp_path / ".genesis" / "index-requests"
+
+
+def _db(tmp_path):
+    return sqlite3.connect(_mdir(tmp_path) / "queue.sqlite3")
 
 
 # ── idle gate ──────────────────────────────────────────────────────────────
@@ -122,12 +146,8 @@ def test_busy_cc_session_defers(tmp_path):
 def test_starved_marker_runs_under_relaxed_gate(tmp_path):
     h = _seed_marker(tmp_path)
     # Backdate requested_at so age > relax window; a moderate load then passes.
-    import json
-
-    mp = _mdir(tmp_path) / f"{h}.json"
-    data = json.loads(mp.read_text())
-    data["requested_at"] = 0  # ancient
-    mp.write_text(json.dumps(data))
+    with _db(tmp_path) as db:
+        db.execute("UPDATE pending SET requested_at=0 WHERE hash=?", (h,))
     _run_runner(
         tmp_path,
         entry_rc=0,
@@ -159,7 +179,8 @@ def test_rc3_tool_missing_keeps_marker_no_penalty(tmp_path):
     listed = _markers(tmp_path)
     assert len(listed) == 1
     assert listed[0].split("\t")[4] == "0"  # attempts NOT incremented
-    assert not (_mdir(tmp_path) / f"{h}.failed.json").exists()
+    with _db(tmp_path) as db:
+        assert db.execute("SELECT 1 FROM failed WHERE hash=?", (h,)).fetchone() is None
 
 
 def test_genuine_failure_increments_attempts(tmp_path):
@@ -189,7 +210,11 @@ def test_repeated_failures_euthanize(tmp_path):
     for _ in range(im.MAX_ATTEMPTS):
         _run_runner(tmp_path, entry_rc=1)
     assert _markers(tmp_path) == []
-    assert (_mdir(tmp_path) / f"{h}.failed.json").exists()
+    with _db(tmp_path) as db:
+        assert (
+            db.execute("SELECT attempts FROM failed WHERE hash=?", (h,)).fetchone()[0]
+            == im.MAX_ATTEMPTS
+        )
 
 
 # ── escalation ─────────────────────────────────────────────────────────────
@@ -209,7 +234,8 @@ def test_escalated_full_failure_falls_back_no_penalty(tmp_path):
     # marker stays fast, attempts NOT burned, and full is backed off
     assert listed[0].split("\t")[3] == "fast"
     assert listed[0].split("\t")[4] == "0"
-    assert (_mdir(tmp_path) / f".full-backoff-{h}").exists()
+    with _db(tmp_path) as db:
+        assert db.execute("SELECT full_backoff FROM repo_state WHERE hash=?", (h,)).fetchone()[0]
 
 
 def test_gitnexus_only_marker_does_not_escalate_or_stamp(tmp_path):
@@ -218,7 +244,9 @@ def test_gitnexus_only_marker_does_not_escalate_or_stamp(tmp_path):
     h = _seed_marker(tmp_path, tools="gitnexus", mode="fast")  # due (no .last-full)
     _run_runner(tmp_path, entry_rc=0)
     assert "mode=fast" in (tmp_path / "entry.log").read_text()  # NOT escalated
-    assert not (_mdir(tmp_path) / f".last-full-{h}").exists()  # NOT stamped
+    with _db(tmp_path) as db:
+        row = db.execute("SELECT last_full FROM repo_state WHERE hash=?", (h,)).fetchone()
+        assert row is None or row[0] is None  # NOT stamped
 
 
 def test_rc3_on_escalated_full_backs_off(tmp_path):
@@ -229,7 +257,8 @@ def test_rc3_on_escalated_full_backs_off(tmp_path):
     listed = _markers(tmp_path)
     assert len(listed) == 1
     assert listed[0].split("\t")[4] == "0"  # no attempts penalty
-    assert (_mdir(tmp_path) / f".full-backoff-{h}").exists()  # backed off
+    with _db(tmp_path) as db:
+        assert db.execute("SELECT full_backoff FROM repo_state WHERE hash=?", (h,)).fetchone()[0]
 
 
 def test_runner_reconciles_orphaned_inflight(tmp_path):
@@ -244,6 +273,23 @@ def test_runner_reconciles_orphaned_inflight(tmp_path):
     assert _markers(tmp_path) == []  # stranded as inflight
     _run_runner(tmp_path, entry_rc=0, load="9.0")  # busy → defers running, but re-pends
     assert len(_markers(tmp_path)) == 1
+
+
+def test_persisted_success_outcome_replays_without_reindex(tmp_path):
+    """A terminal result persisted before runner death must never run twice."""
+    h = _seed_marker(tmp_path, tools="gitnexus", mode="fast")
+    env = {**os.environ, "GENESIS_HOME": str(tmp_path / ".genesis")}
+    subprocess.run(["python3", str(_MARKER_PY), "claim", "--hash", h], env=env, check=True)
+    subprocess.run(
+        ["python3", str(_MARKER_PY), "remember-outcome", "--hash", h, "--action", "consume"],
+        env=env,
+        check=True,
+    )
+
+    second = _run_runner(tmp_path, entry_rc=0)
+    assert second.returncode == 0
+    assert _markers(tmp_path) == []
+    assert not (tmp_path / "entry.log").exists()
 
 
 def test_uses_claimed_state_not_stale_list_snapshot(tmp_path):

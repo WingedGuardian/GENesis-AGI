@@ -45,11 +45,13 @@ Stdlib-only (no genesis imports) so it runs even when the server is unhealthy.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 import pathlib
 import shutil
 import subprocess
 import sys
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -192,7 +194,7 @@ def _is_safe_target(path: Path) -> bool:
 
 
 def _drop_index_marker() -> bool:
-    """Queue an idle-gated reindex of ~/genesis after wiping a code-intel DB.
+    """Queue an idle-gated reindex of ~/genesis before wiping a code-intel DB.
 
     Deleting an index DB forces a from-scratch rebuild; routing it through a
     request marker means the idle-gated runner rebuilds it politely, instead of
@@ -208,11 +210,28 @@ def _drop_index_marker() -> bool:
         import index_marker  # stdlib-only sibling
 
         index_marker.write_marker(str(HOME / "genesis"), tools="both", mode="fast")
-        _log(f"Queued idle reindex marker for {HOME / 'genesis'} (index DB cleared)")
+        _log(f"Queued idle reindex marker for {HOME / 'genesis'} before index DB clear")
         return True
     except Exception as exc:  # noqa: BLE001 — best-effort, never block reclaim
         _log(f"WARN: could not drop index-request marker: {exc}")
         return False
+
+
+def _try_code_intel_runner_lock():
+    """Acquire the runner's canonical lock, or return None without blocking."""
+    base = Path(os.environ.get("GENESIS_HOME") or HOME / ".genesis")
+    lock_dir = base / "locks"
+    lock = None
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock = (lock_dir / "code-intel-runner.lock").open("a")
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock
+    except OSError:
+        if lock is not None:
+            with suppress(OSError):
+                lock.close()
+        return None
 
 
 def _clear_cache(target: CacheTarget, *, apply: bool) -> int:
@@ -334,23 +353,35 @@ def main() -> int:
 
     total = 0
     dropped_marker = False
-    for target in _CACHE_TARGETS:
-        if target.tier == "medium" and not include_medium:
-            if target.path.exists():
-                _log(f"HOLD [medium] {target.description}: disk {pct:.1f}% "
-                     f"< {args.if_above}% threshold ({target.path})")
-            continue
-        if target.tier == "last_resort" and not include_last_resort:
-            if target.path.exists():
-                _log(f"HOLD [last_resort] {target.description}: disk {pct:.1f}% "
-                     f"< {args.last_resort_above}% threshold ({target.path})")
-            continue
-        reclaimed = _clear_cache(target, apply=apply)
-        total += reclaimed
-        # A cleared index DB means the next index is from-scratch — queue it for
-        # the idle runner instead of leaving it to a reactive commit-time spawn.
-        if apply and reclaimed > 0 and target.tier == "last_resort":
-            dropped_marker = _drop_index_marker() or dropped_marker
+    runner_lock = None
+    try:
+        for target in _CACHE_TARGETS:
+            if target.tier == "medium" and not include_medium:
+                if target.path.exists():
+                    _log(f"HOLD [medium] {target.description}: disk {pct:.1f}% "
+                         f"< {args.if_above}% threshold ({target.path})")
+                continue
+            if target.tier == "last_resort" and not include_last_resort:
+                if target.path.exists():
+                    _log(f"HOLD [last_resort] {target.description}: disk {pct:.1f}% "
+                         f"< {args.last_resort_above}% threshold ({target.path})")
+                continue
+            if apply and target.tier == "last_resort" and target.path.exists():
+                if runner_lock is None:
+                    runner_lock = _try_code_intel_runner_lock()
+                if runner_lock is None:
+                    _log(f"HOLD [last_resort] {target.description}: code-intel runner is active")
+                    continue
+                if not dropped_marker:
+                    dropped_marker = _drop_index_marker()
+                if not dropped_marker:
+                    _log(f"HOLD [last_resort] {target.description}: rebuild request unavailable")
+                    continue
+            reclaimed = _clear_cache(target, apply=apply)
+            total += reclaimed
+    finally:
+        if runner_lock is not None:
+            runner_lock.close()
 
     if args.system:
         total += _system_clean(apply=apply)
