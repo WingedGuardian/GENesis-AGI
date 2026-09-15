@@ -196,7 +196,7 @@ Applies to every assertion — in conversation, and doubly in anything written t
   already be capped by a tool default you never chose** — the absence of a limit in the
   command is not evidence of a complete read, and that is the version of this you cannot
   feel. A preview is exempt (`| head`, a top-N sample): that is a selection you are not
-  counting. The house pattern is `session_awareness/repo_pulse_gh.py`, which records
+  counting. The house pattern is `src/genesis/session_awareness/repo_pulse_gh.py`, which records
   `limit_hit` and is loud rather than silent. Reporting your own limit back as a total
   has happened.
 - **Evidence tiers.** Every stated fact is one of: **MEASURED** (number + denominator),
