@@ -83,6 +83,7 @@ def _run_hook(
         body["cwd"] = payload_cwd
     payload = json.dumps(body)
     env = {**os.environ, "HOME": str(home)}
+    env.setdefault("_TEST_REVIEW_BUDGET_PR", "none")
     return subprocess.run(
         [sys.executable, str(_HOOK)],
         input=payload,

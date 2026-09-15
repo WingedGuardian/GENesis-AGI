@@ -14,6 +14,7 @@ Exit codes:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -53,6 +54,7 @@ try:
     from shell_parse import (  # noqa: E402
         analyze_checked,
         commit_skips_hooks,
+        gh_pr_subcommand,
         git_subcommand,
         has_trailing_override,
         split_segments,
@@ -696,6 +698,155 @@ def _merge_note(cwd: str | None) -> str:
     )
 
 
+def _is_dispatched() -> bool:
+    """Whether this hook runs inside a Genesis autonomous CC session."""
+    return os.environ.get("GENESIS_CC_SESSION") == "1"
+
+
+def _native_ask(reason: str) -> None:
+    """Emit a native PreToolUse decision and exit successfully for CC to ask."""
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "ask",
+                    "permissionDecisionReason": reason,
+                }
+            }
+        )
+    )
+    sys.exit(0)
+
+
+def _unknown_budget(reason: str) -> dict:
+    return {
+        "status": "unknown",
+        "reason": "evidence_unknown",
+        "errors": [reason],
+        "approval_required": True,
+        "commit_approval_required": True,
+        "strongly_discouraged": True,
+    }
+
+
+def _current_branch_pr_identity(raw: str) -> tuple[str, int] | None | dict:
+    """Parse ``gh pr status --json`` for the current branch.
+
+    ``None`` is a positive no-open-PR result.  A dict is an unknown-budget
+    result.  The status command is used instead of ``pr list --head`` because
+    it follows GitHub CLI's current-branch/remotes resolution and therefore
+    also identifies cross-repository PRs and branches with unpushed commits.
+    """
+    try:
+        payload = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return _unknown_budget("commit_pr_status_malformed")
+    if not isinstance(payload, dict):
+        return _unknown_budget("commit_pr_status_malformed")
+    current = payload.get("currentBranch")
+    if current is None:
+        return None
+    if not isinstance(current, dict):
+        return _unknown_budget("commit_pr_status_malformed")
+    state = current.get("state")
+    if state in {"CLOSED", "MERGED"}:
+        return None
+    number, url = current.get("number"), current.get("url")
+    if state != "OPEN" or not isinstance(number, int) or not isinstance(url, str):
+        return _unknown_budget("commit_pr_identity_malformed")
+    match = re.fullmatch(r"https?://[^/]+/([^/]+/[^/]+)/pull/(\d+)(?:[/?#].*)?", url)
+    if match is None or int(match.group(2)) != number:
+        return _unknown_budget("commit_pr_identity_malformed")
+    return match.group(1), number
+
+
+def _branch_review_budget(cwd: str | None, branch: str | None) -> dict | None:
+    """The current branch PR's shared budget; None means a proven no-open-PR.
+
+    A read/import/identity failure is an ``unknown`` result, never the same as
+    no pull request. Tests select a PR with ``_TEST_REVIEW_BUDGET_PR`` and feed
+    the shared evaluator through its endpoint seams.
+    """
+    if not cwd or not branch:
+        return _unknown_budget("commit_pr_identity_unknown")
+    try:
+        import review_budget
+    except Exception:  # noqa: BLE001 — reverse version skew asks/denies.
+        return _unknown_budget("review_budget_unavailable")
+
+    test_pr = os.environ.get("_TEST_REVIEW_BUDGET_PR")
+    if test_pr is not None:
+        if test_pr == "none":
+            return None
+        repo = os.environ.get("_TEST_REVIEW_BUDGET_REPO", "owner/repo")
+        if not test_pr.isdigit():
+            return _unknown_budget("commit_pr_identity_unknown")
+        result = review_budget.evaluate_pr(repo, test_pr)
+        result["pr"] = int(test_pr)
+        result["repo"] = repo
+        return result
+
+    try:
+        pr_read = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "status",
+                "--json",
+                "number,state,url",
+            ],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        if pr_read.returncode != 0:
+            return _unknown_budget("commit_pr_list_unreadable")
+        identity = _current_branch_pr_identity(pr_read.stdout)
+        if identity is None:
+            return None
+        if isinstance(identity, dict):
+            return identity
+        repo, number = identity
+        result = review_budget.evaluate_pr(repo, number)
+        result["pr"] = number
+        result["repo"] = repo
+        return result
+    except Exception:  # noqa: BLE001 — an uncertain budget cannot allow silently.
+        return _unknown_budget("commit_pr_lookup_failed")
+
+
+def _commit_budget_reason(result: dict) -> str:
+    if result.get("status") != "ok":
+        return (
+            "The open pull request's review history could not be read reliably. "
+            "Approve this one commit only if you independently verified that the "
+            "review budget permits it; autonomous sessions are denied."
+        )
+    pr = result.get("pr")
+    count = int(result.get("count") or 0)
+    if result.get("gate_surface"):
+        return (
+            f"PR #{pr} changes the review-gate surface and has {count} distinct "
+            "reviewed heads. Its two discovery rounds plus confirmation are spent. "
+            "Approve this one additional fix commit only; earlier approval does not "
+            "carry forward."
+        )
+    if result.get("strongly_discouraged"):
+        return (
+            f"PR #{pr} has {count} distinct reviewed heads. Further work is strongly "
+            "discouraged: stop, narrow or redesign, accept documented residue, or "
+            "abandon it. Approve only this single additional fix commit."
+        )
+    return (
+        f"PR #{pr} has {count} distinct reviewed heads; standing authorization ended "
+        "after four. Approve this single fix commit. A previous approval cannot "
+        "authorize another commit."
+    )
+
+
 def main() -> None:
     # Parse tool input
     payload = read_payload()
@@ -768,12 +919,8 @@ def main() -> None:
     try:
         from review_state import (
             ESCALATION_ROUND_CAP,
-            FINAL_ROUND_CAP,
-            consume_final_accept,
             get_current_branch,
-            get_final_accept_consumed,
-            get_review_lifetime,
-            get_review_round,
+            get_review_counters,
             has_code_changes,
             has_valid_review_marker,
             is_review_current,
@@ -968,100 +1115,47 @@ def main() -> None:
     # chained sibling commit). NOTE: on a nested `bash -c 'git commit …'` the ack
     # must sit on the INNER command (the sigil isn't propagated to wrappers); the
     # documented `git commit … # escalation-ack` form is a plain segment.
-    round_n = get_review_round(cwd=cwd)
+    round_n, _local_lifetime = get_review_counters(cwd=cwd)
     commit_segs = [s for s in segs if git_subcommand(s.argv) == "commit"]
 
-    # Set when Rule 3a honours a '# final-round-accept', SPENT only at an actual
-    # allow. The two must not be the same moment: Rule 3a is checked FIRST, but
-    # four later rules (the escalation cap, the mode-switch tier, the depth gate,
-    # Rule 2) can still deny the very same command — and consuming inside the tier
-    # burned the one-shot token on a commit that never ran. Because the consuming
-    # tier is then checked first on the retry, the branch became permanently
-    # uncommittable. MEASURED before this fix, at streak 7 / lifetime 7 (a state
-    # this file's own comment calls reachable): all four sigil combinations
-    # returned exit 2, including the one the block message itself prints.
-    spend_final_accept = False
+    branch = get_current_branch(cwd=cwd)
+    cloud_budget = _branch_review_budget(cwd, branch)
+    pending_round_approval = bool(
+        cloud_budget is not None
+        and (
+            cloud_budget.get("status") != "ok"
+            or cloud_budget.get("commit_approval_required")
+        )
+    )
+
+    if pending_round_approval:
+        separately_gated = [
+            s
+            for s in segs
+            if git_subcommand(s.argv) in {"push", "merge"}
+            or gh_pr_subcommand(s.argv) in {"create", "merge", "close"}
+            or (
+                gh_pr_subcommand(s.argv) == "comment"
+                and any("@codex review" in tok.lower() for tok in s.argv)
+            )
+        ]
+        if len(commit_segs) != 1 or separately_gated:
+            _deny(
+                "BLOCKED: this review-budget approval may authorize exactly one fix "
+                "commit. Run multiple commits and push/merge/close/PR-create/review "
+                "actions separately so each receives its own decision."
+            )
+            return
 
     def _allow() -> None:
-        """Exit 0, spending the acceptance only if one was actually honoured."""
-        if spend_final_accept:
-            consume_final_accept(cwd=cwd)
+        """Exit through the one approval chokepoint after all hard checks pass."""
+        if pending_round_approval and cloud_budget is not None:
+            reason = _commit_budget_reason(cloud_budget)
+            if _is_dispatched():
+                _deny("BLOCKED: " + reason)
+                return
+            _native_ask(reason)
         sys.exit(0)
-
-    # Rule 3a: the FINAL-ROUND terminal. Checked BEFORE the consecutive cap below,
-    # and that ordering is the entire point — at the terminal the round counter has
-    # typically just been reset by an earlier '# escalation-ack', so the cap would
-    # not fire and an escalation-ack must not be able to clear this.
-    #
-    # The cap below is REPEATABLE by construction: its ack calls
-    # reset_review_round, so a change can cycle 1-2-3-ack, 4-5-6-ack, without end.
-    # This tier is the terminal that cycle never reaches. It is deliberately NOT
-    # resettable by its own ack: '# final-round-accept' clears exactly ONE commit
-    # and the block returns on the next one. A sigil that kept working would just
-    # be a fourth repeatable sigil, which is the defect being closed.
-    #
-    # Counted the same way as the streak — EXTERNAL cross-model rounds only
-    # (see review_state.bump_review_round). Internal self/subagent audits stay
-    # free, including the one the mode-switch tier itself mandates; counting those
-    # would make the machine penalise the remedy it demands.
-    lifetime_n = get_review_lifetime(cwd=cwd)
-    if lifetime_n >= FINAL_ROUND_CAP:
-        final_acked = bool(commit_segs) and all(
-            has_trailing_override(s.raw, sigil="final-round-accept") for s in commit_segs
-        )
-        # "Clears exactly ONE commit" has to be RECORDED to be true. Re-requiring the
-        # sigil on every commit is not a terminal — a session under a mandate to make
-        # progress just appends it again, which is the fourth repeatable escape hatch
-        # this tier exists to remove. The acceptance is spent on first use and the
-        # branch cannot buy another.
-        if final_acked and get_final_accept_consumed(cwd=cwd):
-            _deny(
-                f"BLOCKED: the final-round acceptance for this branch was ALREADY USED "
-                f"(lifetime {lifetime_n} >= terminal {FINAL_ROUND_CAP}). It clears one "
-                "commit, once — re-applying the sigil does not buy another round, or it "
-                "would be the repeatable escape hatch this terminal replaced.\n\n"
-                "You accepted the outstanding findings and committed. If that commit "
-                "still needs work, the loop did not end, and continuing is no longer a "
-                "call this session makes:\n"
-                "  (a) TAKE IT TO THE USER — say what is still open and that the branch "
-                "is past its terminal. Only they can authorise more work here.\n"
-                "  (b) ABANDON the branch and restart from a design that does not need "
-                "seven rounds.\n\n"
-                "A dispatched session with nobody reading cannot choose either alone — "
-                "surface it and stop." + _merge_note(cwd)
-            )
-            return
-        if not final_acked:
-            # The terminal deliberately does NOT reset the streak, so streak>=3 and
-            # lifetime>=7 is a REACHABLE state in which BOTH sigils are genuinely
-            # required — the escalation cap below is still live once this one clears.
-            # Printing only one would send a session round a loop of alternating
-            # blocks, so name the co-required form when it applies.
-            escalation_hint = " escalation-ack" if round_n >= ESCALATION_ROUND_CAP else ""
-            _deny(
-                f"BLOCKED: FINAL ROUND reached — {lifetime_n} EXTERNAL cross-model review "
-                f"rounds on this branch (terminal {FINAL_ROUND_CAP}; internal same-model "
-                "audits are not counted). Two full escalation cycles have already run and "
-                "each already asked for a fresh decision; a change still surfacing new "
-                "defects from an independent reviewer after that is not converging, and "
-                "another round is not the answer.\n\n"
-                "This is a judgement call, and there are exactly two ways out:\n"
-                "  (a) ACCEPT the outstanding findings and merge — document each one and "
-                "why it is acceptable in the PR body, then:\n"
-                f'        git commit -m "your message"  # final-round-accept{escalation_hint}\n'
-                "      That clears ONE commit; the block returns on the next, so the "
-                "decision has to actually end the loop.\n"
-                "  (b) ABANDON the branch and restart from a design that does not need "
-                "seven rounds. No sigil — just stop committing here.\n\n"
-                "Take this to the user before choosing; neither option is yours to make "
-                "alone." + _merge_note(cwd)
-            )
-            return
-        # Acked = the accept decision was made. Deliberately NO reset: the counter
-        # stays at/above the terminal so the next commit blocks again. The spend is
-        # DEFERRED to the allow (see `_allow` above) — the later rules can still
-        # deny this command, and a token spent on a denied command bricks the branch.
-        spend_final_accept = True
 
     if round_n >= ESCALATION_ROUND_CAP:
         acked = bool(commit_segs) and all(

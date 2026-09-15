@@ -74,23 +74,17 @@ _ROUND_DIR = Path.home() / ".genesis" / "review_rounds"
 # pending an explicit '# escalation-ack'. Mirrors the genesis-development SKILL.md
 # prose cap.
 ESCALATION_ROUND_CAP = 3
-# After this many rounds over the branch's WHOLE LIFE, the commit gate blocks
-# pending a '# final-round-accept' — and unlike the cap above, that block returns
-# on every subsequent commit.
-#
-# WHY A SECOND COUNTER EXISTS. `# escalation-ack` makes the gate call
-# reset_review_round, so the consecutive cap is indefinitely REPEATABLE:
-# rounds 1-2-3, ack, 4-5-6, ack, 7-8-9, ack, without end. A change can consume
-# fifteen external review rounds and the machine never says "enough" — only
-# "enough, for now", once every three rounds. The consecutive counter cannot
-# express a terminal because resetting it is exactly what the ack is for.
-#
-# 7 is the start of the THIRD cycle: two complete free/audit/stop cycles have
-# already run, each of which already demanded a fresh decision. A change still
-# surfacing new defects from an independent reviewer after that is not converging,
-# and the remaining question is a judgement call a machine should not keep
-# deferring — accept the outstanding findings and merge, or abandon the branch and
-# restart from a design that does not need seven rounds.
+# Standing authorization is measured from GitHub's distinct reviewed heads, not
+# from the local streak/lifetime store below.  Keep these constants here as the
+# compatibility import surface used by hook trees at different revisions.
+STANDING_REVIEWED_HEAD_LIMIT = 4
+GATE_DISCOVERY_ROUND_LIMIT = 2
+STRONGLY_DISCOURAGED_REVIEWED_HEADS = 5
+# Legacy compatibility only. Older hook trees import this name and may still
+# carry the one-shot final-accept state below. Current gates use GitHub-backed
+# distinct reviewed heads and native per-action approval; they do not consult
+# this constant or honor ``final-round-accept``. Keep the value at 7 so a stale
+# worktree does not activate its old sigil at the new four-head boundary.
 FINAL_ROUND_CAP = 7
 # Legacy single-file marker (pre per-worktree scoping). Only read as a fallback
 # so an in-flight review from before an upgrade isn't lost mid-session.
@@ -871,7 +865,7 @@ def bump_review_round(
 
 
 def get_final_accept_consumed(cwd: str | None = None) -> bool:
-    """True once this branch has spent its ONE final-round acceptance.
+    """Legacy stale-hook state: whether the branch spent final acceptance.
 
     Branch-scoped on purpose: a global latch would permanently disarm the sigil
     for every later change on the install. Never raises — an unreadable or
@@ -886,18 +880,11 @@ def get_final_accept_consumed(cwd: str | None = None) -> bool:
 
 
 def consume_final_accept(cwd: str | None = None) -> None:
-    """Spend this branch's final-round acceptance. Best-effort, never raises.
+    """Legacy stale-hook API: spend a branch final acceptance. Never raises.
 
-    Recorded at the moment the gate ALLOWS the acked commit, because a PreToolUse
-    hook has no post-execution callback — there is no later point at which to
-    learn the commit succeeded. Burning it on allow is the deliberate direction:
-    if the commit then fails for an unrelated reason the change is stuck, and at
-    round seven "stuck" means "take it to the user", which is the intent.
-
-    No-ops when no same-branch counter exists. That state is unreachable from the
-    only caller — the terminal fires on ``lifetime >= FINAL_ROUND_CAP``, which
-    requires exactly such a counter — so writing a synthetic one here could only
-    invent a lifetime that was never counted.
+    Preserves the old one-shot state transition for a stale guard importing this
+    module. Current guards do not call it. No-ops when no same-branch counter
+    exists rather than inventing a lifetime that was never counted.
 
     ONE-SHOT IS NOT A HARD GUARANTEE, and the limit is worth naming: both this and
     ``get_final_accept_consumed`` compare against ``get_current_branch``, which
@@ -916,7 +903,7 @@ def consume_final_accept(cwd: str | None = None) -> None:
 
 
 def get_review_lifetime(cwd: str | None = None) -> int:
-    """Counted review rounds over this branch's WHOLE life. Never raises.
+    """Legacy branch-lifetime count retained for stale hook trees. Never raises.
 
     Differs from ``get_review_round`` in exactly one way that matters: an
     ``# escalation-ack`` resets the consecutive streak and does NOT reset this.
@@ -947,14 +934,9 @@ def get_review_counters(cwd: str | None = None) -> tuple[int, int]:
     (one ``git branch --show-current``, not two) -- which matters for the hook-path
     callers that run on every question a session asks.
 
-    THE COMMIT GATE DOES NOT USE THIS YET, and saying otherwise would be exactly the
-    kind of claim this accessor exists to make checkable. ``review_enforcement_commit``
-    still reads ``get_review_round`` at :934 and ``get_review_lifetime`` at :970, so it
-    remains open to the same torn pair -- there it would print the wrong TIER'S BLOCK
-    MESSAGE rather than the wrong menu. That is a pre-existing defect in the gate, not
-    one this accessor introduces; converting the gate is tracked separately, alongside
-    the round file's atomic-write work, since both concern concurrent access to the
-    same file.
+    The current commit gate uses this snapshot for the local consecutive-streak
+    rule. The lifetime value remains in the tuple for compatibility but no longer
+    selects a current authorization tier.
 
     Same branch-scoping contract as the two accessors it replaces: a counter written
     for a different branch reads as ``(0, 0)``, because a new change starts fresh.
@@ -971,11 +953,8 @@ def get_review_counters(cwd: str | None = None) -> tuple[int, int]:
 def reset_review_round(cwd: str | None = None) -> None:
     """Reset the CONSECUTIVE streak, PRESERVING the lifetime count. Never raises.
 
-    Deliberately a rewrite rather than the unlink this used to do. The only
-    caller is the escalation-cap ack, whose purpose is to clear the streak so the
-    next stop is a fresh cap away — but deleting the file would take the lifetime
-    counter with it, and a terminal that its own ack erases is not a terminal.
-    So: streak to 0, lifetime and branch carried forward.
+    Deliberately preserves the legacy lifetime fields so stale hook trees remain
+    compatible while clearing the current consecutive-streak rule.
 
     ``last_hash`` is dropped on purpose. It exists to make a re-mark of the SAME
     staged diff idempotent within a streak; once the streak is reset, the next
