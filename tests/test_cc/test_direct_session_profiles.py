@@ -110,6 +110,16 @@ def test_observe_blocks_memory_writes():
     assert "mcp__genesis-memory__procedure_store" in PROFILES["observe"]
 
 
+@pytest.mark.parametrize("profile", sorted(PROFILES))
+def test_every_profile_blocks_memory_supersede(profile):
+    """memory_supersede mutates BOTH stores (SQLite deprecation + Qdrant
+    payload) — a deprecation is a write by any name, so it sits behind the
+    same universal vector-store isolation as the store tools. A background
+    session deprecating owner memories would violate the declared isolation
+    without ever calling memory_store (Codex P1 3981896405, PR #1933)."""
+    assert "mcp__genesis-memory__memory_supersede" in PROFILES[profile]
+
+
 # --- Entity-merge human-approval gate (safety-critical) ---
 # The whole point of the entity-merge approval gate is that NO autonomous session
 # can approve+apply its own merges (self-approving the human gate). approve/apply/
@@ -302,7 +312,8 @@ def _make_runner():
     config_builder = MagicMock()
     surplus_cfg = {"system_prompt": "test"}
     config_builder.build_surplus_config.return_value = surplus_cfg
-    config_builder.build_mcp_config.return_value = None
+    config_builder.build_mcp_config.return_value = "/tmp/test-mcp.json"
+    config_builder.build_research_recon_disallowed.return_value = []
     return DirectSessionRunner(
         invoker=MagicMock(),
         session_manager=MagicMock(),
@@ -664,6 +675,76 @@ def test_non_steward_invocation_has_empty_bash_allowlist():
     req = DirectSessionRequest(prompt="test", profile="research", model=CCModel.SONNET)
     inv = runner._build_invocation(req, "test-session")
     assert inv.bash_allowlist == ()
+
+
+def test_research_profile_injects_shared_web_research_skill():
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="compare available libraries", profile="research")
+    inv = runner._build_invocation(req, "test-session")
+
+    assert "## Skill: web-research" in (inv.system_prompt or "")
+    assert "Evidence standard" in (inv.system_prompt or "")
+
+
+def test_research_profile_keeps_required_skill_with_explicit_skills():
+    runner = _make_runner()
+    explicit_skills = ["voice-master"]
+    req = DirectSessionRequest(
+        prompt="compare available libraries", profile="research", skills=explicit_skills,
+    )
+    inv = runner._build_invocation(req, "test-session")
+
+    assert "## Skill: web-research" in (inv.system_prompt or "")
+    assert explicit_skills == ["voice-master"]
+
+
+def test_research_profile_fails_when_required_skill_is_missing(monkeypatch):
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="research", profile="research")
+    monkeypatch.setattr("genesis.learning.skills.wiring.load_skill", lambda _name: None)
+
+    with pytest.raises(RuntimeError, match="requires the web-research skill"):
+        runner._build_invocation(req, "test-session")
+
+
+@pytest.mark.parametrize(
+    "load_error", [OSError("unreadable"), UnicodeError("invalid UTF-8")],
+)
+def test_research_profile_normalizes_required_skill_read_errors(monkeypatch, load_error):
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="research", profile="research")
+
+    def fail(_name):
+        raise load_error
+
+    monkeypatch.setattr("genesis.learning.skills.wiring.load_skill", fail)
+    with pytest.raises(RuntimeError, match="requires the web-research skill") as raised:
+        runner._build_invocation(req, "test-session")
+    assert raised.value.__cause__ is load_error
+
+
+def test_research_profile_fails_when_mcp_config_is_missing():
+    runner = _make_runner()
+    runner._config_builder.build_mcp_config.return_value = None
+    req = DirectSessionRequest(prompt="research", profile="research")
+
+    with pytest.raises(RuntimeError, match="requires its MCP configuration"):
+        runner._build_invocation(req, "test-session")
+
+
+def test_research_profile_uses_derived_recon_boundary():
+    runner = _make_runner()
+    runner._config_builder.build_research_recon_disallowed.return_value = [
+        "mcp__genesis-recon__recon_store_finding",
+    ]
+    req = DirectSessionRequest(
+        prompt="research",
+        profile="research",
+        tool_exceptions=["mcp__genesis-recon__recon_store_finding"],
+    )
+    inv = runner._build_invocation(req, "test-session")
+
+    assert "mcp__genesis-recon__recon_store_finding" in inv.disallowed_tools
 
 
 # --- Profile overlay mechanism (generic; install-local profiles) ---

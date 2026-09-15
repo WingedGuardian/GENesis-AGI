@@ -67,8 +67,8 @@ class TestLobbyDoor:
         assert result.returncode == 0, result.stderr
         out = result.stdout
         assert "Host testbox-lobby" in out
-        # opens the session picker (choose-tree), not a bare shell
-        assert "tmux -u new-session -A -s lobby \\; choose-tree -Zs" in out
+        # The door is a SCRIPT now (see TestLobbyDoorScript for why).
+        assert "scripts/lobby-door.sh" in out
         # PATH-prefixed so tmux resolves even when it's user-local (no .bashrc)
         assert 'RemoteCommand PATH="' in out and "/.local/bin:" in out
         assert "RequestTTY yes" in out
@@ -97,7 +97,7 @@ class TestLobbyDoor:
     def test_lobby_alias_is_not_a_cc_slot_name(self, gen):
         # 'lobby' must not look like cc-N (else it would count against the cap).
         out = gen().stdout
-        assert "-s lobby" in out
+        assert "testbox-lobby" in out
         assert "-s cc-" not in out  # the generator never hard-codes a cc-N session
 
 
@@ -123,10 +123,10 @@ class TestSshResolution:
         assert r.returncode == 0, r.stderr
         rc = [ln for ln in r.stdout.splitlines() if ln.lower().startswith("remotecommand ")]
         assert len(rc) == 1, rc
-        # PATH-prefixed, opens the picker via tmux (choose-tree)
-        assert rc[0].startswith("remotecommand PATH=") and (
-            "tmux -u new-session -A -s lobby" in rc[0] and "choose-tree" in rc[0]
-        ), rc
+        # PATH-prefixed, and routed to the lobby door SCRIPT (not cc-slot.sh).
+        assert rc[0].startswith("remotecommand PATH="), rc
+        assert "lobby-door.sh" in rc[0], rc
+        assert "cc-slot.sh" not in rc[0], rc
         # HostName resolves to the stable Tailscale IP, not the MagicDNS name.
         hn = [ln for ln in r.stdout.splitlines() if ln.lower().startswith("hostname ")]
         assert hn == ["hostname 192.0.2.5"], hn
@@ -149,3 +149,226 @@ class TestSshResolution:
 class TestScriptHygiene:
     def test_syntax_clean(self):
         subprocess.run(["bash", "-n", str(_GEN)], check=True, timeout=10)
+
+
+_LOBBY = _REPO_ROOT / "scripts" / "lobby-door.sh"
+
+
+class TestHeredocHasNoCommandSubstitution:
+    """The emitted config is built by an UNQUOTED heredoc, so a backtick in it
+    is command substitution, not quoting.
+
+    MEASURED while writing this change: a comment containing an inline tmux
+    example in backticks was EXECUTED at generation time and vanished from the
+    output, leaving "not an inline  chain". Two failures at once — silent
+    content loss in a file the operator pastes into ssh_config, and arbitrary
+    execution during generation. The heredoc must stay unquoted (it expands
+    ${TS_HOSTNAME} etc.), so the rule is: no unescaped backticks inside it.
+    """
+
+    def test_no_unescaped_backticks_in_the_heredoc(self):
+        text = _GEN.read_text()
+        start = text.index("cat << SSHEOF")
+        end = text.index("\nSSHEOF", start)
+        body = text[start:end]
+        offenders = [
+            ln for ln in body.split("\n")
+            if "`" in ln.replace("\\`", "")
+        ]
+        assert not offenders, (
+            "unescaped backtick inside the unquoted heredoc — it will be run as "
+            f"a command and its text silently dropped: {offenders}"
+        )
+
+    def test_the_door_comment_survives_generation(self, gen):
+        """Guard the SYMPTOM too, but precisely.
+
+        A generic "double space means eaten text" heuristic was tried and
+        rejected: it flags deliberately ALIGNED prose (`# Or:    ssh ...`), and a
+        check that cries wolf gets deleted by whoever hits it. This names the
+        block that was actually eaten and asserts its words arrive.
+        """
+        out = gen().stdout
+        for phrase in ("lobby-door.sh", "MEASURED", "stealing"):
+            assert phrase in out, (
+                f"{phrase!r} missing from the emitted config — the comment block "
+                "was probably swallowed by command substitution again"
+            )
+
+
+class TestLobbyDoorScript:
+    """The door destroys NOTHING, and that is a structural property, not a
+    predicate.
+
+    An earlier design kept one persistent shared session named `lobby` and tried
+    to make two facts about tmux safe: a pane mode outlives its client (so the
+    chooser goes stale), and sessions are shared (so a second window takes over
+    the first). It respawned the pane to clear the first and took a lock plus an
+    owner marker to serialise the second.
+
+    Every defect this door has had came from that one choice. Making the door
+    destructive forces a predicate for when destroying is safe, and there is no
+    such predicate: an unattached pane can hold live work, and `Ctrl-b s` opens
+    the chooser OVER a running process, so `mode=tree-mode` does not mean
+    disposable either (MEASURED: `mode=[tree-mode] cmd=sleep`). Three successive
+    predicates were each correct about their instance and wrong about the cause.
+
+    A per-connection picker removes the cause. It cannot go stale because it is
+    new; it cannot be shared because it is named by pid; and it resets nothing,
+    so nothing can be lost. The tests below pin the ABSENCE of the destructive
+    machinery, which a predicate could never give you.
+    """
+
+    def test_script_exists_and_is_executable(self):
+        assert _LOBBY.exists(), _LOBBY
+        assert _LOBBY.stat().st_mode & 0o111, "lobby-door.sh must be executable"
+
+    def test_syntax_clean(self):
+        subprocess.run(["bash", "-n", str(_LOBBY)], check=True, timeout=10)
+
+    def test_the_door_never_destroys_anything(self):
+        """THE invariant. Not "resets only when safe" — never resets.
+
+        A door that cannot kill, respawn or clear a pane has no unsafe case to
+        detect, so every finding in that class is answered by construction
+        rather than by a predicate that the next reviewer finds a hole in.
+        """
+        code = [
+            ln for ln in _LOBBY.read_text().split("\n")
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        forbidden = ("respawn-pane", "kill-session", "kill-pane", "kill-server",
+                     "send-keys", "clear-history")
+        offenders = [ln for ln in code for f in forbidden if f in ln]
+        assert not offenders, (
+            "the lobby door must not be able to destroy operator state; a "
+            f"predicate for when it is safe has failed three times: {offenders}"
+        )
+
+    def test_the_session_is_per_connection(self):
+        """Named by pid, so two windows cannot meet.
+
+        One pid cannot open two doors, so a collision is IMPOSSIBLE rather than
+        unlikely — which is why no lock, owner marker or liveness check is
+        needed. Those existed only to serialise access to a shared name.
+        """
+        code = [
+            ln for ln in _LOBBY.read_text().split("\n")
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        assert any('SESSION="lobby-$$"' in ln for ln in code), (
+            "the picker must be per-connection; a fixed name is shared by tmux "
+            "and a second client then takes over the first's pane"
+        )
+        # The door ATTACHES to exactly one session, and it must be the per-pid
+        # one. The persistent workspace is created if missing and then left
+        # alone — created DETACHED, never attached, never mutated.
+        attaches = [ln for ln in code if ln.strip().startswith("exec tmux")]
+        assert len(attaches) == 1, f"exactly one attach expected: {attaches}"
+        assert '"$SESSION"' in attaches[0] and "-d" not in attaches[0], attaches[0]
+        workspace = [ln for ln in code if "$WORKSPACE" in ln and "tmux" in ln]
+        assert workspace, "the persistent workspace must be ensured to exist"
+        for ln in workspace:
+            assert "has-session" in ln or "new-session -d" in ln, (
+                "the workspace may only be probed or created DETACHED — the old "
+                f"door's habit of attaching to it is what made it destructible: {ln}"
+            )
+
+    def test_no_serialization_machinery_remains(self):
+        """The lock, the owner marker and the HOME dependency existed ONLY to
+        make a shared session safe. Leaving any of them behind would mean the
+        shared-session design is still half-present — and the HOME one was
+        itself a self-inflicted CI failure."""
+        code = [
+            ln for ln in _LOBBY.read_text().split("\n")
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        for dead in ("flock", "@lobby_owner", "kill -0", "HOME"):
+            assert not [ln for ln in code if dead in ln], (
+                f"{dead!r} survives, but it only existed to serialise a shared "
+                "session that no longer exists"
+            )
+
+    def test_destroy_unattached_is_pinned_to_this_session_only(self):
+        """A global `set-option -g destroy-unattached on` would reap every cc-*
+        slot the moment its terminal window closed — the exact opposite of why
+        the slots exist. It must be scoped with -t."""
+        for line in _LOBBY.read_text().split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("#") or "destroy-unattached" not in stripped:
+                continue
+            assert " -g " not in stripped, f"must not be global: {stripped}"
+            assert "-t " in stripped, f"must be pinned to a session: {stripped}"
+
+    def test_destroy_unattached_is_set_after_the_attach(self):
+        """MEASURED: setting it on a still-DETACHED session destroys that
+        session immediately, before any client can arrive. The option must
+        therefore come after `new-session` in the same chain, where the attach
+        has already happened."""
+        text = _LOBBY.read_text()
+        code = [
+            ln for ln in text.split("\n")
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        # The PICKER's new-session, not the workspace's detached one.
+        new_i = next(
+            (i for i, ln in enumerate(code) if ln.strip().startswith("exec tmux")),
+            None,
+        )
+        opt_i = next(
+            (i for i, ln in enumerate(code) if "destroy-unattached" in ln), None
+        )
+        assert new_i is not None and opt_i is not None and new_i <= opt_i
+        assert "-d" not in code[new_i], (
+            "the picker must be created ATTACHED; a detached session with "
+            "destroy-unattached set dies before the client arrives"
+        )
+
+    def test_a_taken_picker_name_is_never_adopted(self):
+        """`new-session -A` ATTACHES when the name exists, and the next command
+        arms destroy-unattached on whatever it attached to.
+
+        Live pids are unique, but a STALE `lobby-<pid>` can outlive its door if
+        the chain was interrupted before the reap, and pids are reused. Adopting
+        that orphan and then arming destroy-unattached on it destroys whatever it
+        held — the same class this door exists to end. Failing a login is the
+        acceptable outcome; adopting somebody's session is not.
+        """
+        code = [
+            ln for ln in _LOBBY.read_text().split("\n")
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        attach = next(ln for ln in code if ln.strip().startswith("exec tmux"))
+        assert " -A " not in attach, (
+            "the picker must not be created with -A: on a name collision that "
+            f"attaches to the existing session instead of refusing: {attach}"
+        )
+        # And a taken name is stepped off rather than turning into a hard denial.
+        assert any("has-session" in ln and "SESSION" in ln for ln in code), (
+            "a taken picker name should be stepped off, not simply fatal"
+        )
+
+    def test_transient_pickers_are_hidden_from_the_tree(self):
+        """An unfiltered chooser lists the OTHER connection's picker.
+
+        Selecting that innocuous-looking `lobby-<pid>` entry switches the client
+        into the other throwaway session — two windows on one pane, which is the
+        shared-pane defect this door was written to remove, restored through its
+        own picker. MEASURED: the filter keeps `cc-*` and the persistent
+        `lobby`, and drops `lobby-12345` / `lobby-67890`.
+        """
+        code = [
+            ln for ln in _LOBBY.read_text().split("\n")
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        tree = next(ln for ln in code if "choose-tree" in ln)
+        assert "-f " in tree, (
+            f"choose-tree must filter out transient pickers: {tree}"
+        )
+        assert "lobby-*" in tree, (
+            f"the filter must name the transient pattern: {tree}"
+        )
+
+    def test_the_picker_opens(self):
+        """The door's entire remaining job."""
+        assert "choose-tree" in _LOBBY.read_text()

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import aiosqlite
 
 # Marker prefix stored in inbox_items.error_message for rows that are parked
@@ -29,6 +31,56 @@ APPROVAL_INVALIDATED_PREFIX = "approval_invalidated:"
 # into the retry path.
 DISPATCHING_PREFIX = "dispatching:"
 
+# Versioned structured encoding for ``batch_items``.  Legacy rows stored only
+# display text, joining distinct items with one newline and thereby losing the
+# distinction between ``note + URL`` and ``annotation attached to URL``.
+BATCH_ITEMS_V2_PREFIX = "inbox-items-v2:"
+
+
+def serialize_batch_items(item_texts: list[str]) -> str:
+    """Serialize exact logical item boundaries into the existing TEXT column."""
+    return BATCH_ITEMS_V2_PREFIX + json.dumps(item_texts, ensure_ascii=False)
+
+
+def _decode_v2_items(stored: str) -> list[str] | None:
+    """Strictly decode a v2 payload, returning ``None`` on any corruption."""
+    try:
+        values = json.loads(stored.removeprefix(BATCH_ITEMS_V2_PREFIX))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(values, list)
+        or not values
+        or not all(isinstance(value, str) and value.strip() for value in values)
+    ):
+        return None
+    return values
+
+
+def batch_items_for_dispatch(stored: object) -> str | None:
+    """Decode stored items; return ``None`` for corrupt versioned data."""
+    if stored is None or stored == "":
+        return ""
+    if not isinstance(stored, str):
+        return None
+    if not stored.startswith(BATCH_ITEMS_V2_PREFIX):
+        return stored
+    values = _decode_v2_items(stored)
+    if values is None:
+        return None
+    return "\n\n".join(values)
+
+
+def _handled_items_from_storage(stored: object) -> list[str]:
+    """Decode only item identities that storage represents unambiguously."""
+    if not isinstance(stored, str) or not stored:
+        return []
+    if stored.startswith(BATCH_ITEMS_V2_PREFIX):
+        return _decode_v2_items(stored) or []
+    # A legacy one-line batch is one unambiguous item. Multiple lines may be a
+    # single annotated item or several items whose blank boundary was erased.
+    return [stored] if "\n" not in stored and "\r" not in stored else []
+
 
 async def create(
     db: aiosqlite.Connection,
@@ -41,14 +93,16 @@ async def create(
     batch_id: str | None = None,
     drop_id: str | None = None,
     batch_items: str | None = None,
+    error_message: str | None = None,
+    retry_count: int = 0,
 ) -> str:
     await db.execute(
         """INSERT INTO inbox_items
            (id, file_path, content_hash, status, batch_id, created_at,
-            drop_id, batch_items)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            drop_id, batch_items, error_message, retry_count)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (id, file_path, content_hash, status, batch_id, created_at,
-         drop_id, batch_items),
+         drop_id, batch_items, error_message, retry_count),
     )
     await db.commit()
     return id
@@ -110,7 +164,7 @@ async def get_awaiting_approval(db: aiosqlite.Connection) -> list[dict]:
     """
     cursor = await db.execute(
         """SELECT id, file_path, content_hash, batch_id, error_message,
-                  created_at, drop_id, batch_items
+                  created_at, drop_id, batch_items, retry_count
            FROM inbox_items
            WHERE status = 'processing'
              AND error_message LIKE ? || '%'
@@ -213,6 +267,28 @@ async def claim_for_dispatch(
            WHERE id = ? AND status = 'processing'
              AND error_message = ? || ?""",
         (DISPATCHING_PREFIX, reqid, id, AWAITING_APPROVAL_PREFIX, reqid),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def claim_preapproved_for_dispatch(
+    db: aiosqlite.Connection, id: str, *, token: str,
+) -> bool:
+    """Claim a new, already-approved row immediately before dispatch.
+
+    New drops have no approval request id to carry after ``route()`` approves
+    them.  Their NULL marker is therefore the durable pre-dispatch state.  This
+    compare-and-set is the boundary between restart-safe re-derivation and a CC
+    invocation that may already have begun; awaiting or already-dispatching
+    rows never match.
+    """
+    cursor = await db.execute(
+        """UPDATE inbox_items
+           SET error_message = ? || ?
+           WHERE id = ? AND status = 'processing'
+             AND error_message IS NULL""",
+        (DISPATCHING_PREFIX, token, id),
     )
     await db.commit()
     return cursor.rowcount > 0
@@ -466,23 +542,38 @@ async def count_url_failures(
     file_path: str,
     *,
     since_hours: int = 48,
+    min_retry_count: int = 0,
+    opaque_only: bool = False,
 ) -> int:
     """Count recent partial_url_failure items for a file path.
 
     Used for retry storm prevention — stop re-evaluating files that
     persistently fail URL fetches.
+
+    ``min_retry_count`` restricts the count to rows that have EXHAUSTED their
+    retries. Without it the count is "distinct failing rows", which is not
+    persistence: under one-item-per-evaluation a single drop produces one row
+    per URL, so three different URLs each failing ONCE tripped a threshold
+    meant for three retries of the same content — parking the whole file with
+    its other URLs never evaluated (adversarial audit, 2026-09-06).
+
+    ``opaque_only`` counts only rows whose stored batch cannot prove logical
+    item boundaries: missing/blank content, malformed v2 data, or ambiguous
+    legacy multi-line serialization.
     """
     from datetime import UTC, datetime, timedelta
 
     cutoff = (datetime.now(UTC) - timedelta(hours=since_hours)).isoformat()
     cursor = await db.execute(
-        """SELECT COUNT(*) FROM inbox_items
-           WHERE file_path = ? AND error_message = 'partial_url_failure'
-             AND created_at > ?""",
-        (file_path, cutoff),
+        "SELECT batch_items FROM inbox_items "
+        "WHERE file_path = ? AND error_message LIKE 'partial_url_failure%' "
+        "AND created_at > ? AND retry_count >= ?",
+        (file_path, cutoff, min_retry_count),
     )
-    row = await cursor.fetchone()
-    return row[0] if row else 0
+    rows = await cursor.fetchall()
+    if opaque_only:
+        return sum(not _handled_items_from_storage(row[0]) for row in rows)
+    return len(rows)
 
 
 async def count_by_file_path(db: aiosqlite.Connection, file_path: str) -> int:
@@ -581,6 +672,28 @@ async def get_retriable_failure_files(
     return [row[0] for row in await cursor.fetchall()]
 
 
+async def get_handled_batch_content(
+    db: aiosqlite.Connection,
+    file_path: str,
+    *,
+    max_retries: int = 3,
+) -> list[str]:
+    """Return exact batch blocks that are completed or retry-exhausted."""
+    cursor = await db.execute(
+        """SELECT batch_items FROM inbox_items
+           WHERE file_path = ?
+             AND batch_items IS NOT NULL AND TRIM(batch_items) != ''
+             AND (status = 'completed'
+                  OR (status = 'failed' AND retry_count >= ?))
+           ORDER BY created_at ASC, rowid ASC""",
+        (file_path, max_retries),
+    )
+    handled: list[str] = []
+    for row in await cursor.fetchall():
+        handled.extend(_handled_items_from_storage(row[0]))
+    return handled
+
+
 async def mark_file_failures_abandoned(
     db: aiosqlite.Connection, file_path: str, *, max_retries: int = 3,
     reason: str = "content removed before retry",
@@ -649,6 +762,29 @@ async def query_pending(db: aiosqlite.Connection, *, limit: int = 50) -> list[di
         (limit,),
     )
     return [dict(r) for r in await cursor.fetchall()]
+
+
+async def requeue_pending_after_restart(
+    db: aiosqlite.Connection, *, processed_at: str
+) -> int:
+    """Atomically return every pre-dispatch row to the retry lane.
+
+    A crash can interrupt ``_queue_drop`` between per-row commits, so the set of
+    durable pending rows cannot prove that a multi-batch drop is complete. Mark
+    the entire state class retriable in one statement; the monitor then derives
+    complete outstanding work from the current file and completed baseline.
+    Retry counts are preserved because restart recovery is not an eval failure.
+    """
+    cursor = await db.execute(
+        """UPDATE inbox_items
+           SET status = 'failed', error_message = 'pending_restart_requeue',
+               processed_at = ?
+           WHERE status = 'pending'
+              OR (status = 'processing' AND error_message IS NULL)""",
+        (processed_at,),
+    )
+    await db.commit()
+    return cursor.rowcount
 
 
 async def query_by_batch(db: aiosqlite.Connection, batch_id: str) -> list[dict]:

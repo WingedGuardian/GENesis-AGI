@@ -158,6 +158,10 @@ _UNIVERSAL_DISALLOW = [
     "mcp__genesis-memory__memory_store",
     "mcp__genesis-memory__memory_synthesize",
     "mcp__genesis-memory__memory_extract",
+    # memory_supersede mutates BOTH stores (SQLite deprecation + Qdrant
+    # payload): a background session deprecating owner memories is a write
+    # by any name, so it sits behind the same isolation as the store tools.
+    "mcp__genesis-memory__memory_supersede",
     # Knowledge ingestion requires explicit user authorization.
     "mcp__genesis-memory__knowledge_ingest",
     "mcp__genesis-memory__knowledge_ingest_batch",
@@ -497,7 +501,7 @@ cannot access. Do not apologize for limitations. Handle what you can.
 # Skills auto-injected by profile (always loaded for that profile)
 _PROFILE_SKILLS: dict[str, list[str]] = {
     "interact": ["stealth-browser"],
-    "research": [],
+    "research": ["web-research"],
     "observe": [],
     "campaign": ["voice-master"],
     "steward": ["voice-master"],
@@ -677,7 +681,10 @@ def _build_profile_addendum(profile: str) -> str:
 def _resolve_skills(request: DirectSessionRequest) -> list[str]:
     """Determine which skills to inject: explicit > profile + auto-detect."""
     if request.skills is not None:
-        return request.skills
+        skills = list(request.skills)
+        if request.profile == "research" and "web-research" not in skills:
+            skills.append("web-research")
+        return skills
 
     # Start with profile-bound skills
     skills = list(_PROFILE_SKILLS.get(request.profile, []))
@@ -1499,7 +1506,16 @@ class DirectSessionRunner:
             from genesis.learning.skills.wiring import load_skill
 
             for name in skill_names:
-                content = load_skill(name)
+                try:
+                    content = load_skill(name)
+                except (OSError, UnicodeError) as exc:
+                    if request.profile == "research" and name == "web-research":
+                        raise RuntimeError(
+                            "research profile requires the web-research skill"
+                        ) from exc
+                    raise
+                if request.profile == "research" and name == "web-research" and not content:
+                    raise RuntimeError("research profile requires the web-research skill")
                 if content:
                     system_prompt += f"\n\n## Skill: {name}\n{content}"
 
@@ -1534,6 +1550,12 @@ class DirectSessionRunner:
         # observe/research get health + memory only.
         mcp_profile = _PROFILE_TO_MCP.get(request.profile, "reflection")
         mcp_config = self._config_builder.build_mcp_config(profile=mcp_profile)
+        if request.profile == "research":
+            if mcp_config is None:
+                raise RuntimeError("research profile requires its MCP configuration")
+            # Derive this from the live recon registry after tool exceptions so
+            # neither an exception nor a future recon tool can widen the pair.
+            disallowed += self._config_builder.build_research_recon_disallowed()
         # Secure-by-default: strict_mcp_config (CCInvocation default True) makes the
         # generated --mcp-config authoritative, dropping the user-scoped ~/.claude.json
         # servers. Honor an EXPLICIT mcp_profile="full" (a deliberate, trusted
