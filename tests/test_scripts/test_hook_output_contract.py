@@ -26,21 +26,25 @@ only the hook's own source is parsed.
 
 AN EXEMPTION STILL SKIPS THE PRINT SCAN — measured by adding an unbounded
 ``sys.stdout.write`` to an exempted hook and watching that scan stay green. What
-changed is the OTHER half: every row now carries a CHECKER that re-derives its
-stated claim from the current file on every run (see the block at the bottom),
-so a row can no longer rot quietly into prose while the code moves out from
-under it.
+changed is that every row now carries a CHECKER re-running a NECESSARY CONDITION
+of its claim against the current file (see the block at the bottom), so a row
+cannot drift silently from the code while nobody re-reads it.
 
-Be precise about what that does and does not buy, because the two are easy to
-conflate. The checker verifies THE CLAIM THE ROW MAKES — this file is under 1 KB
-and interpolates nothing, that script writes zero bytes to fd 1, those constants
-still multiply to less than the cap. It is not a general scan: a new unbounded
-print inside an exempt file is caught only if it breaks that specific claim. So
-the table still stays SMALL on purpose — every row is a place the print scan
-stops looking — and ROUTING a hook through the writer is still strictly
-preferred over adding a row, because routing enforces the bound at the write
-instead of asserting something about it. ``scripts/contribution_offer_hook.py``
-was a row here and is not any more, for exactly that reason.
+A necessary condition, NOT a verification, and the difference is the whole
+honesty of this block. A checker establishes that a constant or a pattern still
+EXISTS; none of them proves it still BINDS the output. Cross-model review made
+that concrete on all four: a structural clamp can be named and dead while the
+raw config value flows past it; declared ceilings can multiply under the cap
+while nothing applies them to a line; a shell file can contain no ``$`` and
+still pipe bulk output to stdout. Proving the binding needs dataflow analysis,
+pathological inputs driven through the real entry point, or a synthetic process
+ancestry — weighed and declined as a test suite per row for five small files.
+
+So the table still stays SMALL on purpose — every row is a place the print scan
+stops looking — and ROUTING a hook through the writer is strictly preferred over
+adding a row, because routing enforces the bound at the write instead of
+asserting anything about it. ``scripts/contribution_offer_hook.py`` was a row
+here and is not any more, for exactly that reason.
 
 SCOPE. Only ``SessionStart``, ``UserPromptSubmit`` and ``UserPromptExpansion``
 put a hook's BARE STDOUT in front of the model. ``_BARE_STDOUT_EVENTS`` is
@@ -826,6 +830,23 @@ def test_the_skill_exemption_bounds_the_line_not_the_identifiers() -> None:
 # checker fails `test_every_structural_exemption_has_a_checker`, so the pairing
 # is enforced rather than remembered.
 #
+# WHAT A CHECKER IS, AND WHAT IT IS NOT. Every one below tests a NECESSARY
+# condition for its row's claim, never a sufficient one, and each is named for
+# the condition it actually tests rather than for the row it serves. That
+# distinction is not pedantry — the first revision named them for the rows
+# (`_check_cbm_session_reminder`), which reads as "this row is verified", and
+# cross-model review returned four findings saying exactly that: the checks
+# establish that a constant or a pattern EXISTS, not that it BINDS the output.
+# All four were correct. A structural clamp can be named and dead; constants can
+# multiply under the cap and no longer constrain any line; a file can contain no
+# `$` and still pipe a large command into stdout.
+#
+# Proving the binding needs real machinery — assignment-to-call dataflow,
+# pathological inputs driven through the hook, a synthetic process ancestry.
+# That was weighed and declined: it is a test suite per row for five small
+# files. So these stay cheap, and the NAMES and docstrings carry the honest
+# scope instead. Each one below says what it cannot catch.
+#
 # Two dicts rather than one `path -> (reason, checker)` mapping, deliberately:
 # the reason table sits at the top of this file where it is read, and the
 # checkers need helpers defined further down. Keeping them separate and
@@ -833,12 +854,19 @@ def test_the_skill_exemption_bounds_the_line_not_the_identifiers() -> None:
 # on either side fails — without hoisting 120 lines of checker above the table.
 
 
-def _check_surfacing_caps(tmp_path: Path) -> None:
-    """Both surfacing hooks clamp to their CONSTANT, not to a bare literal.
+def _check_surfacing_clamp_still_names_the_constant(tmp_path: Path) -> None:
+    """A `min()` naming the cap CONSTANT still exists in each surfacing hook.
 
-    The substance lives in test_the_surfacing_caps_are_one_constant_shared_by_
-    clamp_and_validator, which also drives the validators; this re-runs the
-    structural half so the ROW cannot outlive it.
+    NECESSARY, NOT SUFFICIENT. This does not prove the clamp's RESULT is what
+    reaches `select_to_surface`: a regression passing `knob_int(cfg,
+    "max_surface")` straight through, while leaving the `min(...)` assignment
+    dead above it, keeps this green — and an overlay of `max_surface: 5000`
+    would then restore the oversized output the row exists to prevent. Catching
+    that needs assignment-to-call dataflow, or driving the hook with an over-cap
+    config; both were weighed and declined as disproportionate for this row.
+
+    What it DOES catch is the regression that actually happened here once: the
+    clamp reverting to a bare literal while a comment kept naming the constant.
     """
     for script, const_name in (
         ("surface_pr_updates.py", "MAX_SURFACE_CAP"),
@@ -860,8 +888,22 @@ def _check_surfacing_caps(tmp_path: Path) -> None:
         ], f"{script} min() no longer names {const_name}"
 
 
-def _check_skill_injection(tmp_path: Path) -> None:
-    """The nudge ceiling times the nudge count still fits under the cap."""
+def _check_skill_constants_still_multiply_under_the_cap(tmp_path: Path) -> None:
+    """The declared ceilings still multiply to less than the harness cap.
+
+    NECESSARY, NOT SUFFICIENT. It does not prove `skill_injection_hook.py` still
+    USES `_MAX_NUDGE_LINE` to constrain what it emits: a refactor dropping the
+    `len(line) > _MAX_NUDGE_LINE` degradation branches while leaving the
+    constants in place passes this — and passes the print scan too, since the
+    hook is exempt — after which user-authored catalog names and paths can push
+    the line over the cap again. Proving otherwise means driving pathological
+    catalog entries through the real `main()`, which the row's own history shows
+    is possible (~46,000 combinations were brute-forced once) and which is more
+    machinery than this cheap re-check is meant to be.
+
+    What it DOES catch is the regression its own row records: an audit raising
+    the per-line ceiling 125x with the whole suite still green.
+    """
     consts = _int_constants(_REPO / "scripts" / "hooks" / "skill_injection_hook.py")
     per_line = consts.get("_MAX_NUDGE_LINE")
     nudges = consts.get("_MAX_CATALOG_NUDGES")
@@ -875,13 +917,20 @@ def _check_skill_injection(tmp_path: Path) -> None:
     )
 
 
-def _check_cbm_session_reminder(tmp_path: Path) -> None:
-    """The row's claim is the FILE SIZE, which only holds while nothing expands.
+def _check_cbm_reminder_is_small_and_interpolates_nothing(tmp_path: Path) -> None:
+    """Size, no `$` anywhere, and no UNQUOTED heredoc.
 
-    Three independent checks, because any one of them alone is satisfiable by a
-    file that breaks the other two: total size, no `$` anywhere (so nothing
-    interpolates), and no UNQUOTED heredoc (an unquoted delimiter re-enables
-    expansion even with no `$` present today).
+    Three checks rather than one because any single one is satisfiable by a file
+    that breaks the others — an unquoted delimiter re-enables expansion even
+    with no `$` present today.
+
+    NECESSARY, NOT SUFFICIENT, and this is the row where the gap is widest: none
+    of the three establishes that the quoted heredoc is the ONLY thing writing
+    to stdout. A perfectly ordinary added line — a pipeline producing bulk
+    output — carries no `$`, adds no heredoc, keeps the file under 1 KB, and
+    still blows past the cap. Closing that means executing the script and
+    measuring fd 1, or structurally proving the heredoc is the sole output
+    command; both were weighed and declined here.
     """
     path = _REPO / ".claude" / "hooks" / "cbm-session-reminder.sh"
     src = path.read_text(encoding="utf-8")
@@ -900,19 +949,51 @@ def _check_cbm_session_reminder(tmp_path: Path) -> None:
     )
 
 
-def _check_session_activity_touch(tmp_path: Path) -> None:
-    """RUN it and read fd 1, rather than pattern-matching shell source.
+def _check_touch_script_has_no_output_command_and_is_silent_when_run(
+    tmp_path: Path,
+) -> None:
+    """Two passes, because running it ALONE is environment-dependent.
 
-    A static denylist over shell syntax is inherently incomplete, and this row's
-    claim is simply "writes 0 bytes to stdout" — which execution answers exactly.
-    Safe to run: the script reads /proc and its ONLY writes are `mkdir -p` and
-    `touch` under $HOME, so pointing HOME at tmp_path sandboxes every side effect
-    (verified by reading it — no network, no DB, no other writes).
+    The run was the whole checker first, and review caught why that is not
+    enough: the script walks its ancestry for a process named `claude` and exits
+    if it finds none. Under pytest on a developer box inside a CC session that
+    ancestor EXISTS, so the marker branch runs and an `echo` added there is
+    caught. On a CI runner it does not, the branch never executes, and the same
+    `echo` sails through while the checker reports empty stdout — passing for a
+    reason that has nothing to do with the claim. MEASURED here: an `echo`
+    injected into that branch failed this checker locally, which is precisely
+    what hid the problem.
 
-    States what it proves: the CURRENT path is silent. It cannot promise that a
-    future edit adds no output — that is what re-running this checker is for.
+    So the static pass carries the part that must hold everywhere, and the run
+    keeps catching anything at the top level that executes unconditionally.
+
+    NECESSARY, NOT SUFFICIENT. The static pass is a denylist over shell syntax
+    and cannot be complete; a controlled `claude`-named ancestor, or an
+    injectable proc root, is what would actually exercise the model-facing path.
+
+    Safe to run: the script reads /proc and its only writes are `mkdir -p` and
+    `touch` under $HOME, so HOME=tmp_path sandboxes every side effect — read,
+    not assumed.
     """
     path = _REPO / "scripts" / "hooks" / "session_activity_touch.sh"
+    src = path.read_text(encoding="utf-8")
+
+    # Pass 1 — STATIC, so it holds on a CI runner with no `claude` ancestor.
+    # Commands that write to fd 1 unless redirected. `cat` is excluded: this
+    # script uses it only inside `$(...)` substitutions, which capture rather
+    # than emit, and banning it outright would flag correct code.
+    for line in src.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        for cmd in ("echo ", "printf ", "echo\t", "printf\t"):
+            assert cmd not in stripped or ">" in stripped, (
+                f"{path.name} has an unredirected `{cmd.strip()}` ({stripped[:80]!r}). "
+                "The row claims zero bytes to fd 1, and this line may execute on a "
+                "path the run below does not reach."
+            )
+
+    # Pass 2 — RUN it. Catches anything unconditional that the denylist missed.
     proc = subprocess.run(
         ["bash", str(path)],
         capture_output=True,
@@ -930,14 +1011,23 @@ def _check_session_activity_touch(tmp_path: Path) -> None:
     )
 
 
-#: path -> the checker that re-derives that row's claim. Key set must equal
-#: _STRUCTURALLY_BOUNDED's; see the test below.
+#: path -> the checker re-running a NECESSARY condition of that row's claim.
+#: Key set must equal _STRUCTURALLY_BOUNDED's; see the test below. The checkers
+#: are named for what they TEST, not for the row they serve, so that reading
+#: this mapping does not leave the impression each row is verified — none of
+#: them proves its constant or pattern actually BINDS the output.
 _EXEMPTION_CHECKERS = {
-    "scripts/surface_pr_updates.py": _check_surfacing_caps,
-    "scripts/surface_open_prs.py": _check_surfacing_caps,
-    ".claude/hooks/cbm-session-reminder.sh": _check_cbm_session_reminder,
-    "scripts/hooks/skill_injection_hook.py": _check_skill_injection,
-    "scripts/hooks/session_activity_touch.sh": _check_session_activity_touch,
+    "scripts/surface_pr_updates.py": _check_surfacing_clamp_still_names_the_constant,
+    "scripts/surface_open_prs.py": _check_surfacing_clamp_still_names_the_constant,
+    ".claude/hooks/cbm-session-reminder.sh": (
+        _check_cbm_reminder_is_small_and_interpolates_nothing
+    ),
+    "scripts/hooks/skill_injection_hook.py": (
+        _check_skill_constants_still_multiply_under_the_cap
+    ),
+    "scripts/hooks/session_activity_touch.sh": (
+        _check_touch_script_has_no_output_command_and_is_silent_when_run
+    ),
 }
 
 
@@ -959,6 +1049,14 @@ def test_every_structural_exemption_has_a_checker() -> None:
 
 
 @pytest.mark.parametrize("path", sorted(_EXEMPTION_CHECKERS))
-def test_the_structural_exemption_still_holds(path: str, tmp_path: Path) -> None:
-    """Re-derive each row's claim from the CURRENT file, every run."""
+def test_a_necessary_condition_of_each_exemption_still_holds(
+    path: str, tmp_path: Path
+) -> None:
+    """Re-run a NECESSARY condition of each row's claim, against the CURRENT file.
+
+    Named for what it does. The first spelling was
+    `test_the_structural_exemption_still_holds`, which claims far more than any
+    of these checkers delivers — see the block header for the four ways a row can
+    be false while its checker is green.
+    """
     _EXEMPTION_CHECKERS[path](tmp_path)
