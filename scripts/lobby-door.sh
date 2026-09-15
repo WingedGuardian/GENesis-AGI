@@ -66,16 +66,45 @@ WORKSPACE="lobby"
 tmux has-session -t "=${WORKSPACE}" 2>/dev/null \
     || tmux new-session -d -s "$WORKSPACE" 2>/dev/null
 
-# The PICKER is per-connection, so two windows can never meet. One pid cannot
-# open two doors, so a collision is not possible rather than merely unlikely.
-# This is the session the door attaches to, and the only one it is allowed to.
+# The PICKER is per-connection, so two live windows can never meet: one pid
+# cannot open two doors. Concurrency is not the only way a name can be taken,
+# though — a STALE `lobby-<pid>` can outlive its door if the chain below was
+# interrupted between the create and the `destroy-unattached` that reaps it, and
+# pids are reused. Then `new-session -A` would ATTACH to that orphan and the
+# next command would arm destroy-unattached on it, so switching away destroys
+# whatever it held. Same work-destroying class this whole door exists to end.
+#
+# Two changes close it. Step off a taken name here, and — below — create WITHOUT
+# `-A`, so a name that becomes taken in the gap makes the door FAIL rather than
+# silently adopt somebody else's session. Failing is a lost login; adopting is
+# lost work.
 SESSION="lobby-$$"
+_n=0
+while tmux has-session -t "=${SESSION}" 2>/dev/null; do
+    _n=$((_n + 1))
+    SESSION="lobby-$$-${_n}"
+    # A bound, not a fallback: 20 taken names means something is wrong that
+    # another increment will not fix, and the un-`-A`'d create below still
+    # refuses rather than adopting.
+    [ "$_n" -ge 20 ] && break
+done
+unset _n
 
 # `destroy-unattached` is set ON THIS SESSION (-t), never globally: a global set
 # would reap every cc-* slot the moment its terminal window closed, which is the
 # exact opposite of why the slots exist. It is set AFTER the attach, deliberately
 # — MEASURED: setting it on a still-detached session destroys that session
 # immediately, before any client can arrive.
-exec tmux -u new-session -A -s "$SESSION" \; \
+# No `-A`: see above. On a name collision this FAILS instead of attaching to
+# whatever is already there.
+#
+# The tree is FILTERED to hide every transient `lobby-<pid>` — including this
+# one. Unfiltered, a second connection's picker is listed in this one's chooser,
+# and selecting that innocuous-looking entry switches the client into the other
+# throwaway session: two windows on one pane, which is the shared-pane defect
+# this door was written to remove, restored through its own picker. MEASURED:
+# the filter keeps `cc-*` and the persistent `lobby`, and drops `lobby-12345`
+# and `lobby-67890`.
+exec tmux -u new-session -s "$SESSION" \; \
     set-option -t "=${SESSION}:" destroy-unattached on \; \
-    choose-tree -Zs
+    choose-tree -Zs -f '#{!=:#{m:lobby-*,#{session_name}},1}'

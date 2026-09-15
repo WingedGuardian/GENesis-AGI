@@ -324,6 +324,51 @@ class TestLobbyDoorScript:
             "destroy-unattached set dies before the client arrives"
         )
 
+    def test_a_taken_picker_name_is_never_adopted(self):
+        """`new-session -A` ATTACHES when the name exists, and the next command
+        arms destroy-unattached on whatever it attached to.
+
+        Live pids are unique, but a STALE `lobby-<pid>` can outlive its door if
+        the chain was interrupted before the reap, and pids are reused. Adopting
+        that orphan and then arming destroy-unattached on it destroys whatever it
+        held — the same class this door exists to end. Failing a login is the
+        acceptable outcome; adopting somebody's session is not.
+        """
+        code = [
+            ln for ln in _LOBBY.read_text().split("\n")
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        attach = next(ln for ln in code if ln.strip().startswith("exec tmux"))
+        assert " -A " not in attach, (
+            "the picker must not be created with -A: on a name collision that "
+            f"attaches to the existing session instead of refusing: {attach}"
+        )
+        # And a taken name is stepped off rather than turning into a hard denial.
+        assert any("has-session" in ln and "SESSION" in ln for ln in code), (
+            "a taken picker name should be stepped off, not simply fatal"
+        )
+
+    def test_transient_pickers_are_hidden_from_the_tree(self):
+        """An unfiltered chooser lists the OTHER connection's picker.
+
+        Selecting that innocuous-looking `lobby-<pid>` entry switches the client
+        into the other throwaway session — two windows on one pane, which is the
+        shared-pane defect this door was written to remove, restored through its
+        own picker. MEASURED: the filter keeps `cc-*` and the persistent
+        `lobby`, and drops `lobby-12345` / `lobby-67890`.
+        """
+        code = [
+            ln for ln in _LOBBY.read_text().split("\n")
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        tree = next(ln for ln in code if "choose-tree" in ln)
+        assert "-f " in tree, (
+            f"choose-tree must filter out transient pickers: {tree}"
+        )
+        assert "lobby-*" in tree, (
+            f"the filter must name the transient pattern: {tree}"
+        )
+
     def test_the_picker_opens(self):
         """The door's entire remaining job."""
         assert "choose-tree" in _LOBBY.read_text()
