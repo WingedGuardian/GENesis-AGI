@@ -217,6 +217,23 @@ class MemoryStore:
                     f"got {life_domain!r}"
                 )
 
+        # Surface form normalization: expand known aliases before embedding.
+        # MUST run BEFORE the dedup lookup below, not after it. The lookup
+        # matches memory_fts content EXACTLY, and what lands in memory_fts is
+        # the NORMALIZED text — so normalizing afterwards meant a store of
+        # "CC ..." persisted "Claude Code ..." while the next store of the same
+        # raw text queried for "CC ...", missed its own row, and wrote a second
+        # copy whose STORED content was byte-identical to the first. Aliases are
+        # seeded by default ("CC" -> "Claude Code",
+        # entity_resolution._SEED_ALIASES), so this was not a configured-only
+        # hazard.
+        try:
+            from genesis.memory.entity_resolution import normalize_content
+
+            content = normalize_content(content)
+        except Exception:
+            pass  # best-effort — never block a store on normalization failure
+
         # Dedup: skip if exact content already stored (any collection)
         try:
             existing = await memory_crud.find_exact_duplicate(
@@ -228,14 +245,6 @@ class MemoryStore:
         except Exception:
             # Dedup check is best-effort — never block a store on lookup failure
             logger.warning("Dedup check failed, proceeding with store", exc_info=True)
-
-        # Surface form normalization: expand known aliases before embedding
-        try:
-            from genesis.memory.entity_resolution import normalize_content
-
-            content = normalize_content(content)
-        except Exception:
-            pass  # best-effort — never block a store on normalization failure
 
         # Confidence gate: low-confidence → FTS5 only, skip Qdrant
         # Deferred import to break circular: memory.store ↔ perception
