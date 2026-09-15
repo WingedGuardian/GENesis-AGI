@@ -10,14 +10,32 @@
 #
 # Safety properties, each load-bearing:
 #   * `pull_request_target` runs THIS file from the default branch and nothing
-#     here checks out or executes PR code — it is a single ref-deletion API
-#     call, so the elevated token is never exposed to PR content.
+#     here checks out or executes PR code — every PR-controlled value arrives
+#     through `env:` and never through `${{ }}` inside `run:`, so the elevated
+#     token is never exposed to PR content.
 #   * Same-repo branches only: a fork's head is not ours to delete.
 #   * Never the default branch, however a PR came to have it as head.
-#   * Skipped when the branch is still the HEAD or the BASE of another open
-#     PR (stacked PRs share branches; deleting the base strands the child).
-#   * Deletion is recoverable: GitHub retains `refs/pull/N/head`, and the
-#     closed PR's page offers "Restore branch" indefinitely.
+#   * The ref must still be AT THE CLOSED PR'S HEAD SHA. A name that was deleted
+#     and reused since the close event points at unrelated work, and this job has
+#     no claim on it.
+#   * Skipped when the branch is still the HEAD or the BASE of another open PR
+#     (stacked PRs share branches; deleting the base strands the child). The
+#     head-side question is asked over GraphQL because it must cross the FORK
+#     NETWORK: `GET /repos/{owner}/{repo}/pulls?head=` only returns requests
+#     whose BASE repo is this one, so an open request from our branch into a
+#     fork is invisible to it. Measured on a ref with exactly one such request:
+#     REST answers 0, `Ref.associatedPullRequests` answers 1.
+#
+# The residual race, stated rather than papered over: the keep-check and the
+# deletion are separate requests, so a PR opened onto this branch between them
+# is not seen. There is no post-hoc detector for it — GitHub CLOSES a branch's
+# open pull requests as part of deleting the branch, so a check running
+# afterwards would read state the deletion had already changed and would report
+# all-clear precisely when it should not. This is the same race
+# `delete_branch_on_merge` already runs, with the same recovery: the closed PR
+# offers "Restore branch", and the request is then reopened — two steps, both
+# manual, neither lossy. `refs/pull/N/head` is retained regardless, so no commit
+# becomes unreachable.
 #
 # Operator lever: disabling this workflow in the Actions UI turns the behaviour
 # off without a code change (Actions → Branch cleanup → Disable workflow).
@@ -40,6 +58,7 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.head.ref != github.event.repository.default_branch
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Delete the head branch unless another open PR still uses it
         env:
@@ -47,32 +66,92 @@ jobs:
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.event.pull_request.head.ref }}
           OWNER: ${{ github.repository_owner }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
+          # REQUIRED, not decoration: bash unsets errexit inside every command
+          # substitution, so `counts=$(keep_check)` would NOT fail when a `gh`
+          # call inside the function failed — the probe would return an empty
+          # string and the caller would act on it. Measured on bash 5.2:
+          # `set -e; f(){ h=$(false); echo SURVIVED; }; c=$(f)` exits 0 without
+          # this line and 1 with it.
+          shopt -s inherit_errexit
+
           # Branch names are attacker-shaped input and legally contain URL
-          # metacharacters (`&` is a valid ref character), which would rewrite
-          # the query-string filters below. The DELETE path is not affected (a
-          # path segment has no query semantics), so the failure would be a
-          # miscounted keep-check. Refuse the odd names outright: skipping a
-          # cleanup is free, and no legitimate branch here is named that way.
-          case "$BRANCH" in
-            *'&'*|*'?'*|*'#'*|*'%'*|*' '*)
-              echo "keep: branch name contains URL metacharacters; not touching it"
-              exit 0;;
-          esac
-          # Still the head of a different open PR? (This PR is closed, so any
-          # open hit is by definition a different one.)
-          open_heads=$(gh api "repos/$REPO/pulls?state=open&head=$OWNER:$BRANCH" --jq 'length')
-          # Still the base of an open (stacked) PR?
-          open_bases=$(gh api "repos/$REPO/pulls?state=open&base=$BRANCH" --jq 'length')
+          # metacharacters: `git check-ref-format` bans space, `~ ^ : ? * [ \`
+          # and control characters, but ALLOWS `& % # + @ { }` — each of which
+          # changes the meaning of a URL. So encode rather than denylist; a
+          # denylist is a list of the characters someone thought of, and `+`
+          # (decoded as a space in a query string) was the one missing.
+          #
+          # Per-SEGMENT encoding, because `refs/heads/a/b` must keep its
+          # separators literal while `#` or `%` inside a segment must not.
+          # Encoding `{` and `}` is load-bearing too: `gh api` substitutes
+          # literal `{owner}`/`{repo}` placeholders in an endpoint path, so a
+          # branch named `{repo}` would otherwise be rewritten before the call.
+          ENC_BRANCH=$(jq -rn --arg b "$BRANCH" '$b | split("/") | map(@uri) | join("/")')
+
+          # NOTE: `-f`, never `-F`. `gh api -F` treats a leading `@` as a
+          # FILENAME, and `@something` is a legal ref name — so `-F` here would
+          # turn an attacker-chosen branch name into a file read on the runner.
+          keep_check() {
+            local heads bases
+            # Head side over GraphQL: it crosses the fork network (see the
+            # header), and `qualifiedName` takes the bare branch name as a
+            # VARIABLE, so this leg needs no URL encoding and is structurally
+            # injection-proof. A ref that does not exist yields null -> 0.
+            # shellcheck disable=SC2016  # $o/$r/$b are GRAPHQL variables and
+            # must NOT expand in the shell — that is what makes this leg
+            # injection-proof; they are bound by the -f flags below.
+            heads=$(gh api graphql -f query='
+              query($o:String!,$r:String!,$b:String!){
+                repository(owner:$o,name:$r){
+                  ref(qualifiedName:$b){
+                    associatedPullRequests(states:OPEN,first:1){ totalCount } } } }' \
+              -f o="$OWNER" -f r="${REPO#*/}" -f b="$BRANCH" \
+              --jq '.data.repository.ref.associatedPullRequests.totalCount // 0')
+            # Base side stays REST: a pull request's BASE ref always lives in
+            # the base repository, so this filter is complete by construction.
+            bases=$(gh api --method GET "repos/$REPO/pulls" \
+              -f state=open -f "base=$BRANCH" --jq 'length')
+            echo "$heads $bases"
+          }
+
+          # The ref must still exist AND still point at the closed PR's tip. A
+          # missing ref is an ordinary outcome (manual deletion, an earlier run);
+          # a ref at a different SHA means the name was reused since the close
+          # event and now carries work this job has no claim on. Anything else —
+          # auth, rate limit, a network fault — must NOT be read as "already
+          # gone", which is what a bare `if gh api …` did: `gh` exits 1 for every
+          # failure, so operational errors were indistinguishable from the
+          # expected 404 and the run stayed green with nothing to retry.
+          if ! ref_json=$(gh api "repos/$REPO/git/ref/heads/$ENC_BRANCH" 2>"$RUNNER_TEMP/ref_err"); then
+            # Anchored to the whole status line: 401/403/5xx and connection
+            # errors carry no such line and propagate. A 404 can also mean the
+            # repo is invisible to this token, which would make the job do
+            # NOTHING — a bounded, non-destructive outcome, and the reason this
+            # leg exits 0 rather than deleting anything.
+            if grep -qE '^gh: .*\(HTTP 404\)$' "$RUNNER_TEMP/ref_err"; then
+              echo "note: $BRANCH no longer exists — nothing to do"
+              exit 0
+            fi
+            echo "ERROR: could not read $BRANCH:" >&2
+            cat "$RUNNER_TEMP/ref_err" >&2
+            exit 1
+          fi
+          current_sha=$(jq -r '.object.sha' <<<"$ref_json")
+          if [ "$current_sha" != "$HEAD_SHA" ]; then
+            echo "keep: $BRANCH is at $current_sha, not the closed PR's head $HEAD_SHA"
+            echo "      (the name was reused since the close event; not ours to delete)"
+            exit 0
+          fi
+
+          counts=$(keep_check)
+          read -r open_heads open_bases <<<"$counts"
           if [ "$open_heads" != "0" ] || [ "$open_bases" != "0" ]; then
             echo "keep: $BRANCH is still used by an open PR (heads=$open_heads bases=$open_bases)"
             exit 0
           fi
-          # The branch may already be gone (manual deletion, race with a
-          # restore). 422/404 here is success for our purposes.
-          if gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH"; then
-            echo "deleted: $BRANCH (restorable from the PR's Restore button)"
-          else
-            echo "note: $BRANCH was not deletable (already gone?) — nothing to do"
-          fi
+
+          gh api -X DELETE "repos/$REPO/git/refs/heads/$ENC_BRANCH"
+          echo "deleted: $BRANCH at $current_sha (restorable from the PR's Restore button)"
