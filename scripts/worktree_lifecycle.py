@@ -57,8 +57,10 @@ from __future__ import annotations
 import argparse
 import contextlib
 import errno
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -101,6 +103,107 @@ TRASH_DIR = Path.home() / ".genesis" / "worktree-trash"
 #: the per-worktree HEAD is the only thing keeping that chain reachable, and
 #: pruning the registration makes it collectable.
 _DETACHED_ANCHOR_PREFIX = "worktree-archive/"
+
+# Private modes for everything this module writes into the trash. A reaped
+# worktree is a verbatim copy of someone's working tree, which routinely holds a
+# 0600 `.env`, an SSH key, or a token. Rolling that into a tarball created under
+# a normal 022 umask republishes it at 0644, and the containing directory at
+# 0755, so a secret that was private in the worktree becomes readable to every
+# local account the moment it is archived. The archive must be no more readable
+# than the least readable thing it can contain.
+_PRIVATE_DIR_MODE = 0o700
+_PRIVATE_FILE_MODE = 0o600
+
+
+class WorktreeScanError(RuntimeError):
+    """Enumeration FAILED, as distinct from finding nothing.
+
+    These two were the same value — an empty list — and that is the whole bug.
+    A timed-out or erroring ``git worktree list`` produced exactly what a healthy
+    repository with no linked worktrees produces, so the board and the JSON
+    report published a valid-looking EMPTY view and exited 0. Every worktree then
+    reads as gone: not flagged as unknown, not stale, simply absent, until some
+    later run happens to succeed. A monitoring surface that reports "nothing"
+    when it means "I could not look" is worse than one that reports an error,
+    because nothing downstream can tell the difference.
+    """
+
+
+def _ref_safe_anchor(name: str) -> str:
+    """Build a tag name for ``name`` that ``git check-ref-format`` accepts.
+
+    A worktree basename is a FILESYSTEM name and a tag is a REF, and the two
+    grammars disagree. MEASURED with `git check-ref-format`: a leading dot, a
+    space, `~ ^ : ? * [ \\`, a `..` run, and a `.lock` suffix are all rejected,
+    and every one of them is a legal directory name. When tagging failed the
+    archive still registered, so the anchor this module exists to create was
+    silently absent and a later prune could orphan the commits it was protecting.
+
+    NOT reversible, and does not need to be: the chosen name is recorded in the
+    archive's metadata, so recovery reads it rather than recomputing it. The
+    short digest of the ORIGINAL name is what keeps it injective — without it,
+    two worktrees differing only in characters the slug replaces would collide
+    on one tag and the second would overwrite the first's anchor.
+    """
+    slug = re.sub(r"[^A-Za-z0-9._-]", "-", name)
+    slug = re.sub(r"\.{2,}", "-", slug)
+    slug = slug.strip(".-")
+    if slug.endswith(".lock"):
+        slug = slug[: -len(".lock")] + "-lock"
+    if not slug:
+        slug = "wt"
+    digest = hashlib.sha256(name.encode("utf-8", "surrogateescape")).hexdigest()[:8]
+    return f"{_DETACHED_ANCHOR_PREFIX}{slug}-{digest}"
+
+
+def _nested_worktrees_under(wt_path: Path, repo_root: Path) -> list[str]:
+    """Registered worktrees living INSIDE ``wt_path``, read fresh from git.
+
+    Read at act time rather than reused from the classification snapshot,
+    because the hazard is a worktree created DURING the scan — a snapshot taken
+    before it existed cannot show it.
+
+    Fails CLOSED in the sense that matters: if git cannot be enumerated, the
+    caller is told there may be nested worktrees rather than that there are
+    none, so an unanswerable question stops the move instead of permitting it.
+    """
+    try:
+        wts = _list_worktrees(repo_root)
+    except WorktreeScanError:
+        return [f"<enumeration failed: refusing to move {wt_path.name}>"]
+    parent = os.path.realpath(str(wt_path))
+    found = []
+    for wt in wts:
+        other = os.path.realpath(str(wt.get("path", "")))
+        if other != parent and other.startswith(parent + os.sep):
+            found.append(other)
+    return found
+
+
+def _fsync_path(path: Path) -> None:
+    """Flush a file or DIRECTORY to stable storage.
+
+    Directories need this too, and that is the half that is easy to miss: an
+    ``os.replace`` makes a name atomically VISIBLE, which is not the same as
+    making it DURABLE. Without fsyncing the containing directory a power loss
+    can replay the source deletion while losing the rename that published the
+    archive.
+
+    Best effort by design — a filesystem that refuses to fsync a directory
+    (some network mounts) must not turn archiving into a hard failure, since the
+    fallback is merely the durability we had before this existed.
+    """
+    flags = getattr(os, "O_DIRECTORY", 0) if path.is_dir() else 0
+    try:
+        fd = os.open(str(path), os.O_RDONLY | flags)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 LOG_DIR = Path.home() / ".genesis" / "logs"
 
 # ---------------------------------------------------------------------------
@@ -159,9 +262,11 @@ def _list_worktrees(repo_root: Path) -> list[dict]:
             capture_output=True, text=True, cwd=str(repo_root), timeout=10,
         )
         if result.returncode != 0:
-            return []
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return []
+            raise WorktreeScanError(
+                f"git worktree list exited {result.returncode}: {result.stderr.strip()[:200]}"
+            )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        raise WorktreeScanError(f"could not enumerate worktrees: {e}") from e
 
     worktrees: list[dict] = []
     current: dict = {}
@@ -634,8 +739,24 @@ def _compress_entry(trash_path: Path, meta: dict) -> Path | None:
     try:
         with contextlib.suppress(OSError):
             partial.unlink()
-        with tarfile.open(partial, "w:gz", compresslevel=COMPRESS_LEVEL) as tf:
-            tf.add(str(trash_path), arcname=trash_path.name)
+        # O_CREAT with an explicit 0600 rather than open-then-chmod: the latter
+        # leaves a window in which the archive exists at the umask's mode while
+        # the worktree's secrets are being written into it, and that window
+        # lasts for the whole compression of a ~50 MB tree.
+        fd = os.open(
+            str(partial),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            _PRIVATE_FILE_MODE,
+        )
+        with os.fdopen(fd, "wb") as raw:
+            with tarfile.open(fileobj=raw, mode="w:gz", compresslevel=COMPRESS_LEVEL) as tf:
+                tf.add(str(trash_path), arcname=trash_path.name)
+            # Inside the fdopen block and AFTER the tarfile closed, so gzip's
+            # trailer is in the buffer before it is forced to disk. Verifying a
+            # file that only exists in the page cache proves the bytes were
+            # written, not that they survive a crash.
+            raw.flush()
+            os.fsync(raw.fileno())
     except (OSError, tarfile.TarError) as e:
         _log(f"WARN compress failed for {trash_path.name}: {e} — kept uncompressed")
         with contextlib.suppress(OSError):
@@ -674,8 +795,17 @@ def _compress_entry(trash_path: Path, meta: dict) -> Path | None:
             partial.unlink()
         return None
 
+    # Make the RENAME durable before the source is destroyed. os.replace
+    # guarantees that no reader sees a half-published name; it guarantees
+    # nothing about what survives a power loss. Without this the deletion below
+    # can be replayed while the rename that published the archive is not, which
+    # is precisely the no-loss guarantee this module exists to make.
+    _fsync_path(TRASH_DIR)
+
     with contextlib.suppress(OSError):
-        _sidecar_meta_path(trash_path).write_text(json.dumps(meta, indent=2))
+        meta_path = _sidecar_meta_path(trash_path)
+        meta_path.write_text(json.dumps(meta, indent=2))
+        os.chmod(meta_path, _PRIVATE_FILE_MODE)
 
     try:
         shutil.rmtree(str(trash_path))
@@ -900,9 +1030,41 @@ def _trash_worktree(
     if _is_locked_now(wt_path):
         _log(f"SKIP {wt_path}: locked between classification and reap")
         return False
+    # AND refuse to move a worktree that CONTAINS another registered worktree.
+    # Moving the parent relocates the nested tree's files out from under git; a
+    # later prune then drops the nested worktree's per-worktree HEAD, which for a
+    # detached nested tree is the only ref keeping its commits reachable — and
+    # the anchor tag we take is for the PARENT's sha, not the nested one's, so
+    # the archive would preserve the wrong history.
+    #
+    # Deliberately NARROW. The finding that prompted this asked for the complete
+    # eligibility check and ref snapshot to be re-run immediately before the
+    # rename. That was not taken: re-running everything cannot close a
+    # time-of-check gap (the re-run has its own gap), it doubles a scan MEASURED
+    # at 19-41s over ~191 worktrees, and each re-derived value is another seam
+    # where this file's last several rounds of findings have landed. A direct
+    # check for the NAMED hazard is what the argument actually supports.
+    #
+    # MEASURED 2026-09-14 on this install: 0 of 279 linked worktrees sit inside
+    # another linked worktree, so this is a guard against a shape that is
+    # possible rather than one that is occurring. It costs one enumeration on the
+    # path already being reaped.
+    nested = _nested_worktrees_under(wt_path, repo_root)
+    if nested:
+        _log(
+            f"SKIP {wt_path}: contains {len(nested)} registered worktree(s) "
+            f"(first: {nested[0]}) — moving the parent would strand them"
+        )
+        return False
 
     try:
         TRASH_DIR.mkdir(parents=True, exist_ok=True)
+        # chmod separately rather than relying on mkdir(mode=): mkdir's mode is
+        # masked by the umask, so 0700 becomes 0700 only when the umask happens
+        # to cooperate — and this must hold for a directory that ALREADY exists
+        # from an earlier run under a laxer umask, which mode= cannot fix at all.
+        with contextlib.suppress(OSError):
+            os.chmod(TRASH_DIR, _PRIVATE_DIR_MODE)
 
         # Claim the name with mkdir(exist_ok=False), which is ATOMIC. The old
         # check-then-act loop had a real window: two reaper invocations handling
@@ -1052,7 +1214,19 @@ def _trash_worktree(
                      "the archive, but no patch file was written")
             else:
                 try:
-                    target.write_bytes(patch_text)
+                    # 0600 from creation. This patch is a verbatim diff of the
+                    # worktree's uncommitted changes, so it can contain anything
+                    # the working tree did — including a secret staged but not
+                    # yet committed. It also SURVIVES a failed compression, when
+                    # it sits in a plain directory rather than inside the
+                    # archive, which is exactly when its mode is what protects it.
+                    fd = os.open(
+                        str(target),
+                        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                        _PRIVATE_FILE_MODE,
+                    )
+                    with os.fdopen(fd, "wb") as fh:
+                        fh.write(patch_text)
                     _log(f"  saved uncommitted tracked changes → {trash_path}/{target.name}")
                 except OSError as e:
                     _log(f"  WARN could not save {target.name} for {trash_path.name}: {e}")
@@ -1085,7 +1259,7 @@ def _trash_worktree(
         pruned_safely = True
         commit_sha = str(wt.get("head") or "")
         if commit_sha:
-            anchor = f"{_DETACHED_ANCHOR_PREFIX}{trash_path.name}"
+            anchor = _ref_safe_anchor(trash_path.name)
             kind = "detached HEAD" if detached else f"branch {branch}"
             tag = subprocess.run(
                 ["git", "tag", "-f", anchor, commit_sha],
@@ -1281,8 +1455,45 @@ def _restore_from_dir(trash_path: Path, repo_root: Path) -> bool:
         capture_output=True, text=True, cwd=str(repo_root), timeout=30,
     )
 
+    if result.returncode != 0 and commit and not (detached or not branch):
+        # THE BRANCH IS GONE, AND THE COMMIT IS NOT. This is the ordinary case
+        # rather than an exotic one: `autonomy/executor/worktree_mgr.py` deletes
+        # a task worktree's branch with `git branch -D` right after reaping it,
+        # so by recovery time the branch named in the metadata routinely does not
+        # exist. Falling straight through to the plain-directory move — as this
+        # did — restored a tree whose `.git` file points at a pruned admin
+        # directory, so `git status` inside it fails while `_recover` has already
+        # reported success. A recovery that returns true and leaves an unusable
+        # checkout is worse than one that fails loudly.
+        #
+        # The archive anchor is what makes this recoverable: the commit was
+        # tagged before the prune precisely so it would still be here now. So
+        # retry DETACHED at the recorded commit, which reconstructs a real,
+        # working worktree; the branch name is recoverable from there by hand
+        # with one `git switch -c`, and that is stated rather than left implicit.
+        retry = subprocess.run(
+            ["git", "worktree", "add", "--detach", original_path, commit],
+            capture_output=True, text=True, cwd=str(repo_root), timeout=30,
+        )
+        if retry.returncode == 0:
+            print(
+                f"Branch {branch!r} no longer exists; recreated as a DETACHED "
+                f"worktree at {commit[:8]}. To restore the branch name: "
+                f"git -C {original_path} switch -c {branch}",
+                file=sys.stderr,
+            )
+            result = retry
+        else:
+            print(
+                f"git worktree add --detach also failed: {retry.stderr.strip()}",
+                file=sys.stderr,
+            )
+
     if result.returncode != 0:
-        # Branch might not exist — fall back to just moving files back
+        # Neither the branch nor the commit could produce a worktree — fall back
+        # to moving the files back. This leaves a PLAIN DIRECTORY with a dangling
+        # `.git` pointer, which the message says out loud rather than reporting a
+        # clean recovery.
         print(f"git worktree add failed: {result.stderr.strip()}", file=sys.stderr)
         print(f"Moving trash contents back to {original_path}...", file=sys.stderr)
         try:
@@ -1474,7 +1685,16 @@ def main() -> int:
         return 0 if _recover(args.recover, repo_root) else 1
 
     if args.report_json:
-        results = classify_all(repo_root, allow_network=not args.no_network)
+        try:
+            results = classify_all(repo_root, allow_network=not args.no_network)
+        except WorktreeScanError as e:
+            # Exit non-zero and publish NOTHING. Printing an empty board here
+            # would be indistinguishable from a healthy repo with no worktrees,
+            # and the caller pipes this into surfaces that cannot tell the two
+            # apart. The diagnostic goes to stderr so it cannot be mistaken for
+            # the JSON document on stdout.
+            print(f"ERROR: could not enumerate worktrees: {e}", file=sys.stderr)
+            return 2
         # `--dry-run` means "change nothing", and publishing the board cache is a
         # change — to state the dashboard and the session-start block both read.
         # The two flags are independently accepted, so the combination was
@@ -1517,7 +1737,15 @@ def main() -> int:
     # Normal run: archive stale worktrees into the trash. Nothing is deleted.
     _log("Worktree lifecycle check starting")
 
-    results = classify_all(repo_root, allow_network=not args.no_network)
+    try:
+        results = classify_all(repo_root, allow_network=not args.no_network)
+    except WorktreeScanError as e:
+        # Do not publish, and do not reap. An empty result here would mean the
+        # loop below simply does nothing, which is safe — but _write_board_cache
+        # would still overwrite a good board with an empty one, telling every
+        # reader that no worktrees exist.
+        _log(f"ERROR could not enumerate worktrees: {e} — board NOT updated, nothing reaped")
+        return 2
     _log(f"Found {len(results)} linked worktree(s)")
     # Publish BEFORE acting: if a reap below fails partway, the board still
     # describes the tree the run actually saw. NOT under --dry-run, whose whole
