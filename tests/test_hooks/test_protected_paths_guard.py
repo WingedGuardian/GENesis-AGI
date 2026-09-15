@@ -423,3 +423,125 @@ class TestBoundedParseNeverDowngradesToTheWeakerCheck:
         assert r.returncode == 0, (
             f"a buried non-rm command was blocked: out={r.stdout!r} err={r.stderr!r}"
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# A BLIND SPOT MUST NOT DISARM THE PRECISE SCAN
+#
+# For a NON-BOUNDS blind spot this guard runs its substring fallback, which its
+# own comment calls STRICTLY WEAKER than the segment scan — a substring test
+# cannot see an ANCESTOR of a protected directory, nor a GLOB over its contents,
+# because neither contains a protected path as a substring. That fallback used
+# to RETURN, so any such blind spot skipped the scan entirely.
+#
+# Latent while `untokenizable` was the only non-bounds cause; reachable once
+# there were two. MEASURED base-vs-branch, pairing a verb the shell builds with
+# an rm of the PARENT of the production database went BLOCK -> ALLOW. The
+# fallback now ADDS to the scan rather than replacing it.
+# ══════════════════════════════════════════════════════════════════════════
+
+# A segment whose operation the parser cannot establish, so `analyze_checked`
+# reports a non-bounds blind spot. Fixture data, per the sibling guard suites.
+_BLINDING_PREFIX = "git pus{h..h} origin main && "
+
+
+@pytest.mark.parametrize(
+    "target",
+    [f"{H}/genesis", f"{H}/genesis/*"],
+    ids=["ancestor", "glob"],
+)
+def test_a_blind_spot_does_not_disarm_the_precise_scan(target, fake_home):
+    """The two shapes the substring fallback structurally cannot see.
+
+    Each must still be refused when the command ALSO carries a blind spot.
+
+    The control is what makes this mean anything, and it is not decoration: the
+    same rm WITHOUT the prefix must already be refused, so a fixture whose
+    protected paths failed to resolve — or a guard that refused everything —
+    cannot pass this silently. The pair is the assertion.
+    """
+    plain = _run(f"rm -rf {target}", fake_home)
+    assert plain.returncode == 2, (
+        "CONTROL: the bare rm was not refused, so this fixture's protected paths "
+        f"do not resolve and the assertion below proves nothing.\n{plain.stderr}"
+    )
+    blinded = _run(f"{_BLINDING_PREFIX}rm -rf {target}", fake_home)
+    assert blinded.returncode == 2, (
+        "an rm the precise scan catches was ALLOWED because the command also "
+        "carried a blind spot — the substring fallback replaced the scan instead "
+        f"of adding to it, and it cannot see this shape.\n{blinded.stderr}"
+    )
+
+
+# An `rm -rf` of a protected ancestor placed BEFORE a construct the tokenizer
+# cannot read. Bash runs the removal; the parse is unreadable, so the segments come
+# from the naive fallback — and here the fallback is RIGHT. Two spellings plus a
+# glob, because the substring fallback can see none of the three.
+_UNREADABLE_REAL_REMOVAL = [
+    r"""rm -rf $HOME/genesis; echo $'don\'t'""",
+    """rm -rf $HOME/genesis; echo 'oops""",
+    r"""rm -rf $HOME/gen*; echo $'don\'t'""",
+]
+
+
+@pytest.mark.parametrize("cmd", _UNREADABLE_REAL_REMOVAL)
+def test_an_unreadable_parse_still_refuses_a_real_removal(cmd, fake_home):
+    """The fall-through must cover `untokenizable`, and THIS is why.
+
+    An unreadable parse makes the fallback segments unreliable in both directions.
+    When the segment is INVENTED the cost is a refused `printf`; when it is REAL —
+    as here, where bash genuinely runs the removal — an early return costs the
+    production database's parent directory, irreversibly.
+
+    The substring check cannot see an ancestor or a glob spelling, so it does not
+    catch any of these. Restoring an `untokenizable` early return fails here three
+    times, which is the whole argument for accepting the over-block beside it.
+    """
+    r = _run(cmd, fake_home)
+    assert r.returncode == 2, (
+        "a real rm of a protected ancestor was ALLOWED because the parse was "
+        "unreadable and the scan was skipped — the substring fallback cannot see "
+        f"this spelling.\n{r.stderr}"
+    )
+
+
+@pytest.mark.parametrize("cmd", _UNREADABLE_REAL_REMOVAL)
+def test_the_unreadable_removal_fixtures_really_are_unreadable(cmd, fake_home):
+    """Guard-the-guard. If these ever tokenized cleanly they would be caught by the
+    ordinary parsed path, and the test above would assert nothing about the
+    fall-through it exists to pin."""
+    assert shell_parse.untokenizable(cmd.replace("$HOME", "/home/x")), (
+        "fixture no longer produces an unreadable parse, so the test above "
+        "exercises the ordinary path instead of the fallback"
+    )
+
+
+def test_the_accepted_over_block_is_documented_not_accidental(fake_home):
+    """The price of the test above, pinned so it is a DECISION and not a surprise.
+
+    This command only prints text, and it is refused. That is the known cost of
+    letting the fall-through cover unreadable parses, and it is the cheap side of
+    the trade: rephrase the string. Pinned so that anyone who later makes this
+    ALLOW has to come here and read why it was not.
+    """
+    cmd = r"""printf %s $'don\'t; rm -rf $HOME/genesis; x'"""
+    r = _run(cmd, fake_home)
+    assert r.returncode == 2, (
+        "the documented over-block no longer fires. If that was deliberate, the "
+        "three real-removal cases above must still pass — check them before "
+        f"updating this test.\n{r.stderr}"
+    )
+
+
+def test_the_blinding_prefix_really_blinds(fake_home):
+    """The other half of the control: prove the prefix does what it claims.
+
+    If it stopped raising a blind spot, the tests above would still pass — via
+    the ordinary path — while covering nothing. Asserted against the parser
+    directly rather than inferred from a verdict.
+    """
+    _segs, blind = shell_parse.analyze_checked(_BLINDING_PREFIX + "rm -rf /tmp/x")
+    assert blind is not None and not blind.bounds_induced, (
+        "the prefix no longer produces a NON-BOUNDS blind spot, so the "
+        f"fall-through tests above exercise the ordinary path: {blind}"
+    )

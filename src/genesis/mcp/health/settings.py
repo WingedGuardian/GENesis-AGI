@@ -135,6 +135,23 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # each worker run is a fresh process
     ),
+    "zero_drop": SettingsDomain(
+        name="zero_drop",
+        description=(
+            "Zero-drop stranded-work detector — master `enabled` + `mode` "
+            "off/observe/alert plus the age gates, the recurrence threshold "
+            "and the PR-history limit. Observe (default) fills the board, read "
+            "via the `zero_drop_status` MCP tool; alert additionally maintains "
+            "ONE superseding observation naming the open findings. Blindness "
+            "is reported in both. Invalid mode degrades to observe — less "
+            "egress, never a silent off (a silently-off detector answers "
+            "'what fell through the cracks?' with a stale, confident zero). "
+            "Read at worker startup — takes effect at the next sweep."
+        ),
+        config_filename="zero_drop.yaml",
+        readonly=False,
+        needs_restart=False,  # each sweep is a fresh process
+    ),
     "contributor_worklog": SettingsDomain(
         name="contributor_worklog",
         description=(
@@ -888,19 +905,41 @@ def _validate_inbox_monitor(changes: dict) -> list[str]:
             errors.append("inbox_monitor.batch_size must be an integer")
 
     valid_models = VALID_MODEL_NAMES
-    if "model" in section and section["model"] not in valid_models:
+    model = section.get("model")
+    if "model" in section and (
+        not isinstance(model, str) or model not in valid_models
+    ):
         errors.append(
-            f"inbox_monitor.model must be one of {sorted(valid_models)}, got '{section['model']}'"
+            f"inbox_monitor.model must be one of {sorted(valid_models)}, got {model!r}"
         )
 
     valid_efforts = VALID_EFFORT_NAMES
-    if "effort" in section and section["effort"] not in valid_efforts:
+    effort = section.get("effort")
+    if "effort" in section and (
+        not isinstance(effort, str) or effort not in valid_efforts
+    ):
         errors.append(
             f"inbox_monitor.effort must be one of {sorted(valid_efforts)}, "
-            f"got '{section['effort']}'"
+            f"got {effort!r}"
         )
 
     # timezone removed — uses system timezone from genesis.env.user_timezone()
+
+    # The monitor reads this as `!= "enforce"`, so ANY unrecognised value runs in
+    # shadow. That direction is safe, but it is silent: a typo ("enfoce",
+    # "ENFORCE", True) would leave the gate observing forever while the operator
+    # believed it was live — and the operator only touches this lever at the one
+    # moment they have decided to act on the shadow measurement.
+    valid_coverage_modes = {"shadow", "enforce"}
+    coverage_mode = section.get("url_coverage_mode")
+    if "url_coverage_mode" in section and (
+        not isinstance(coverage_mode, str)
+        or coverage_mode not in valid_coverage_modes
+    ):
+        errors.append(
+            "inbox_monitor.url_coverage_mode must be one of "
+            f"{sorted(valid_coverage_modes)}, got {coverage_mode!r}"
+        )
 
     return errors
 
@@ -1426,6 +1465,32 @@ def _validate_repo_pulse(changes: dict) -> list[str]:
                 or not 0 <= value <= 1
             ):
                 errors.append("'inject_confidence_floor' must be a number in 0..1")
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
+def _validate_zero_drop(changes: dict) -> list[str]:
+    """Validate zero-drop detector lever changes (see
+    genesis.session_awareness.zero_drop_config)."""
+    from genesis.session_awareness.zero_drop_config import _INT_KNOBS, _PRIORITIES, MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode", "alert_priority", *_INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key == "mode":
+            if value not in MODES:
+                errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif key == "alert_priority":
+            if value not in _PRIORITIES:
+                errors.append(
+                    f"'alert_priority' must be one of {', '.join(_PRIORITIES)}; got {value!r}"
+                )
         elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             errors.append(f"'{key}' must be a positive int")
     return errors
@@ -1961,6 +2026,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "session_ledger_shadow": _validate_session_ledger_shadow,
     "ws2_ledger": _validate_ws2_ledger,
     "repo_pulse": _validate_repo_pulse,
+    "zero_drop": _validate_zero_drop,
     "contributor_worklog": _validate_contributor_worklog,
     "marketing_outreach": _validate_marketing_outreach,
     "pr_watch": _validate_pr_watch,
