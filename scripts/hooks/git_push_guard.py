@@ -7672,6 +7672,26 @@ def _push_config_is_simple(remote: str | None, cwd: str | None = None) -> bool:
     return not (rc == 0 and out == "true")
 
 
+def _push_is_dry_run(seg) -> bool:
+    """Whether this ``git push`` segment only SIMULATES the push.
+
+    `-n` / `--dry-run` publish nothing, so none of the states the adjacency
+    prompt reports can result from them. `-n` also travels inside a short
+    bundle (`-un`), which is why this reads the letters rather than the token.
+    """
+    argv = getattr(seg, "argv", None) or []
+    for t in argv[1:]:
+        if t == "--dry-run" or t.split("=", 1)[0] == "--dry-run":
+            return True
+        if t.startswith("-") and not t.startswith("--") and len(t) > 1:
+            for ch in t[1:]:
+                if ch == "o":
+                    break
+                if ch == "n":
+                    return True
+    return False
+
+
 def _push_ref_positionals(argv: list[str]) -> list[str] | None:
     """The positional tokens of a ``git push`` segment, or None if it is not a
     plain ref-set-neutral push.
@@ -7736,30 +7756,6 @@ def _push_ref_positionals(argv: list[str]) -> list[str] | None:
         positionals.append(t)
         i += 1
     return positionals
-
-
-def _push_source_is_head(seg) -> bool:
-    """Whether this push's SOURCE ref is the current ``HEAD`` commit.
-
-    Wider than ``_push_targets_current_branch`` on purpose. That predicate gates
-    an auto-ALLOW, so it refuses an explicit refspec it cannot vouch for. This
-    one gates an ENRICHMENT on a prompt shown regardless, and the forms it adds
-    are exactly the ones the duplicate-name problem takes: `git push -u origin
-    HEAD` publishes the current commit under the branch's own name, and
-    `HEAD:<new-name>` IS the second-name publication this detector exists to
-    catch — both previously fell to the plain prompt with no note at all.
-
-    True for: a bare push, `<remote>`, `<remote> HEAD`, `<remote> HEAD:<dst>`.
-    False for anything that pushes a ref other than HEAD, and for any form
-    ``_push_ref_positionals`` refuses.
-    """
-    positionals = _push_ref_positionals(getattr(seg, "argv", None) or [])
-    if positionals is None or len(positionals) >= 3:
-        return False
-    if len(positionals) < 2:
-        return True  # bare `git push` / `git push <remote>`: source is HEAD
-    src = positionals[1].split(":", 1)[0]
-    return src == "HEAD"
 
 
 def _push_targets_current_branch(
@@ -7945,7 +7941,9 @@ def _push_is_republish(remote: str | None, branch: str | None, cwd: str | None =
     return _remote_branch_sha(remote, branch, cwd=cwd) is not None
 
 
-def _open_pr_count_for_branch(branch: str, cwd: str | None = None) -> int | None:
+def _open_pr_count_for_branch(
+    branch: str, cwd: str | None = None, push_urls: set[str] | None = None
+) -> int | None:
     """How many OPEN PRs have ``branch`` as their head, or None if unknowable.
 
     Distinguishing 0 from None is the point of the return type: 0 is a measured
@@ -7972,7 +7970,7 @@ def _open_pr_count_for_branch(branch: str, cwd: str | None = None) -> int | None
     try:
         args = ["gh", "pr", "list", "--head", branch, "--state", "open",
                 "--json", "number,baseRefName,headRepositoryOwner,isCrossRepository",
-                "--limit", "10"]
+                "--limit", str(_PR_LIST_WINDOW)]
         result = subprocess.run(
             args, capture_output=True, text=True,
             timeout=_gh_timeout(10.0), cwd=cwd or None,
@@ -7991,10 +7989,24 @@ def _open_pr_count_for_branch(branch: str, cwd: str | None = None) -> int | None
         # prompt exists to report: public branch, no PR, no CI, no leak scan.
         if not rows:
             return 0
+        # A response that FILLS the window is a truncated read, not a complete
+        # one: the qualifying request may sit past the cap, and the filters
+        # below would then sum to a confident 0 — the answer that downgrades
+        # the allow to an ask. Refuse to infer absence from it.
+        if len(rows) >= _PR_LIST_WINDOW:
+            return None
         identity = _base_repo_identity(cwd=cwd)
         if identity is None:
             return None
-        default, base_owner = identity
+        default, base_owner, slug = identity
+        # The count is about the repo THIS PUSH GOES TO; gh answers about the
+        # repo it resolves, and in a fork workflow (`gh repo set-default
+        # upstream`) those are different. Trusting the mismatch would report
+        # "no open PR" forever for a contributor whose requests all live
+        # upstream. Only trust the count when the destination demonstrably IS
+        # the repo gh answered about; otherwise the question is unanswerable.
+        if push_urls is not None and not _urls_name_repo(push_urls, slug):
+            return None
         return sum(
             1
             for pr in rows
@@ -8014,8 +8026,35 @@ def _open_pr_count_for_branch(branch: str, cwd: str | None = None) -> int | None
         return None
 
 
-def _base_repo_identity(cwd: str | None = None) -> tuple[str, str] | None:
-    """``(default_branch, owner_login)`` for the repo gh resolves here, or None.
+_PR_LIST_WINDOW = 100
+"""Rows requested from ``gh pr list``. A FULL window is treated as unanswerable
+rather than counted — see ``_open_pr_count_for_branch``."""
+
+
+def _urls_name_repo(urls: set[str], slug: str) -> bool:
+    """Whether every URL in ``urls`` points at the repository ``slug``.
+
+    Deliberately ALL rather than ANY: a push that fans out to several remotes is
+    only answerable by one count if every destination is the same repository.
+    Matching is on the normalised ``owner/repo`` tail, so the ssh and https
+    spellings of one remote agree.
+    """
+    if not urls:
+        return False
+    want = slug.lower().removesuffix(".git")
+    for url in urls:
+        tail = url.lower().removesuffix(".git").rstrip("/")
+        tail = tail.split("://", 1)[-1]
+        if ":" in tail and "/" not in tail.split(":", 1)[0]:
+            tail = tail.split(":", 1)[1]          # git@host:owner/repo
+        parts = [x for x in tail.split("/") if x]
+        if len(parts) < 2 or "/".join(parts[-2:]) != want:
+            return False
+    return True
+
+
+def _base_repo_identity(cwd: str | None = None) -> tuple[str, str, str] | None:
+    """``(default_branch, owner_login, owner/repo)`` for the repo gh resolves, or None.
 
     Both facts come from ONE round-trip. They are needed together and each is a
     serialized subprocess on the push path, where the aggregate — not any single
@@ -8040,53 +8079,9 @@ def _base_repo_identity(cwd: str | None = None) -> tuple[str, str] | None:
         branch, slug = parts[0].strip(), parts[1].strip()
         if not branch or "/" not in slug:
             return None
-        return branch, slug.split("/", 1)[0]
+        return branch, slug.split("/", 1)[0], slug
     except Exception:
         return None
-
-
-def _prs_already_containing_head(cwd: str | None = None) -> list[tuple[int, str]]:
-    """PRs (number, state) that already contain the CURRENT HEAD commit.
-
-    The duplicate-name detector. The zombie-PR mechanism measured on this repo
-    was one body of work published under TWO branch names: the first merged by
-    squash (destroying ancestry), the second surviving to be mistaken for
-    unpublished work and grown into a duplicate PR for changes already on main.
-    At first-push time the question "does this exact commit already belong to a
-    PR?" answers that directly, and GitHub indexes it
-    (``commits/{sha}/pulls``) — no ancestry inference, which squash defeats.
-
-    Empty list on ANY failure: this only ENRICHES an ask prompt that is being
-    shown regardless, so an unanswerable lookup degrades to the prompt as it
-    was, never to a block and never to a silent pass of anything.
-    """
-    try:
-        head = subprocess.run(
-            ["git"] + (["-C", cwd] if cwd else []) + ["rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=_gh_timeout(10.0),
-        )
-        sha = head.stdout.strip()
-        if head.returncode != 0 or not sha:
-            return []
-        slug = subprocess.run(
-            ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
-            capture_output=True, text=True, timeout=_gh_timeout(10.0), cwd=cwd or None,
-        )
-        if slug.returncode != 0 or not slug.stdout.strip():
-            return []
-        result = subprocess.run(
-            ["gh", "api", f"repos/{slug.stdout.strip()}/commits/{sha}/pulls"],
-            capture_output=True, text=True, timeout=_gh_timeout(10.0), cwd=cwd or None,
-        )
-        if result.returncode != 0:
-            return []
-        return [
-            (int(pr["number"]), str(pr.get("state", "?")))
-            for pr in json.loads(result.stdout)
-            if isinstance(pr, dict) and "number" in pr
-        ][:5]
-    except Exception:
-        return []
 
 
 def _ask(reason: str) -> int:
@@ -8594,40 +8589,6 @@ def _run_merge_and_push_gates() -> int:
                             f"git push needs your approval before publishing externally "
                             f"(target: {branch or 'default'})."
                         )
-                        # FIRST PUBLICATION of this branch. If its tip commit
-                        # already belongs to a PR, this push is re-publishing
-                        # work under a SECOND NAME — the exact mechanism that
-                        # manufactured this repo's zombie PRs (one squash-merge
-                        # later, ancestry is gone and the survivor reads as
-                        # unmerged work forever). Say so IN the prompt the user
-                        # is about to answer; enrichment only, never a verdict.
-                        # SKIP when an earlier segment of this command creates
-                        # the commit being pushed. `git commit -m x && git push`
-                        # is the ordinary first-publication shape, and the hook
-                        # runs BEFORE any of it executes — so HEAD here is the
-                        # parent of the tip that will actually be pushed, and a
-                        # note about it would describe the wrong commit.
-                        # Silence beats a confident wrong answer in an
-                        # enrichment that exists to prevent a mistaken identity.
-                        # Only segments BEFORE the push can change the tip it
-                        # will publish. `git push && git commit -m after` would
-                        # otherwise silence a note that was correct.
-                        creates_commit = any(
-                            s.exe == "git" and git_subcommand(s.argv) == "commit"
-                            for s in segs[: segs.index(push_segs[0])]
-                        )
-                        dups = (
-                            [] if creates_commit
-                            else _prs_already_containing_head(cwd=pcwd)
-                        )
-                        if dups:
-                            listing = ", ".join(f"#{n} ({s})" for n, s in dups)
-                            ask_reason += (
-                                f" NOTE: this exact commit already belongs to "
-                                f"{listing} — publishing it under a new branch "
-                                f"name creates a duplicate of work that PR "
-                                f"already carries."
-                            )
                     # A RE-PUSH earns its silence by having been approved at
                     # first publication — but a public branch with NO OPEN PR is
                     # outside CI and the leak-detector (ci.yml triggers on
@@ -8659,7 +8620,16 @@ def _run_merge_and_push_gates() -> int:
                             f"separate commands so each is judged on the state it "
                             f"actually runs in."
                         )
-                    elif push_allow_reason and _open_pr_count_for_branch(cur, cwd=pcwd) == 0:
+                    # A DRY RUN publishes nothing, so it cannot create the
+                    # unchecked-branch state this prompt reports. `-n` and
+                    # `--dry-run` are both accepted by the predicate above, so
+                    # they reach here; asking about them is pure friction on an
+                    # inspection command.
+                    elif (
+                        push_allow_reason
+                        and not _push_is_dry_run(push_segs[0])
+                        and _open_pr_count_for_branch(cur, cwd=pcwd, push_urls=urls) == 0
+                    ):
                         push_allow_reason = None
                         ask_reason = (
                             f"re-push to '{cur}': this branch is PUBLIC but has "
@@ -8672,35 +8642,6 @@ def _run_merge_and_push_gates() -> int:
                         f"git push needs your approval before publishing externally "
                         f"(target: {branch or 'default'})."
                     )
-                    # The duplicate-name note belongs here too. It used to hang
-                    # off the auto-ALLOW predicate, which refuses any explicit
-                    # refspec it cannot vouch for — so `git push -u origin HEAD`
-                    # and `HEAD:<new-name>` fell to this plain prompt with no
-                    # note at all, and `HEAD:<new-name>` IS the second-name
-                    # publication the detector exists to catch. An enrichment is
-                    # not an authorization: it decorates a prompt shown either
-                    # way, so it does not need that predicate's posture — only a
-                    # source ref it can resolve.
-                    if not pcwd_unknown and _push_source_is_head(push_segs[0]):
-                        # Only segments BEFORE the push can change the tip it
-                        # will publish. `git push && git commit -m after` would
-                        # otherwise silence a note that was correct.
-                        creates_commit = any(
-                            s.exe == "git" and git_subcommand(s.argv) == "commit"
-                            for s in segs[: segs.index(push_segs[0])]
-                        )
-                        dups = (
-                            [] if creates_commit
-                            else _prs_already_containing_head(cwd=pcwd)
-                        )
-                        if dups:
-                            listing = ", ".join(f"#{n} ({st})" for n, st in dups)
-                            ask_reason += (
-                                f" NOTE: this exact commit already belongs to "
-                                f"{listing} — publishing it under a new branch "
-                                f"name creates a duplicate of work that PR "
-                                f"already carries."
-                            )
 
         # ── git merge into main ─────────────────────────────────────
         # Worktree-aware AND compound-aware: EVERY git-merge in the command is
