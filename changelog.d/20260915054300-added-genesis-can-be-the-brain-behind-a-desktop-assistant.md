@@ -1,17 +1,17 @@
 - **Genesis can now be the brain behind a desktop assistant.** Any tool that
   speaks OpenAI chat-completions to a configurable `base_url` can be pointed at
-  `POST /v1/jarvis/chat/completions` instead of a model vendor. Every turn then
+  `POST /v1/desk/chat/completions` instead of a model vendor. Every turn then
   routes through Genesis's router, so provider choice, cost tracking, circuit
   breakers and observability are Genesis's — and the desktop holds no model
   credential of its own. Authenticate with `GENESIS_MCP_HTTP_TOKEN`, the same
   token the voice API uses.
 
-  **Two lanes, because the turns are not the same shape.** `jarvis_desk` leads
+  **Two lanes, because the turns are not the same shape.** `desk_primary` leads
   with a capable model: a client that fires its own tools by emitting an exact
   control tag needs instruction-following, since a near-miss silently does
-  nothing. `jarvis_phone` leads with a fast one, for replies composed while a
-  call is live. Select with the `X-Genesis-Lane` header, or with a `-phone` /
-  `-desk` suffix on `model` where a proxy strips unknown headers; anything
+  nothing. `desk_fast` leads with a fast one, for replies composed while a
+  call is live. Select with the `X-Genesis-Lane` header, or with a `-fast` /
+  `-primary` suffix on `model` where a proxy strips unknown headers; anything
   unrecognised resolves to the capable lane, because being quietly served from
   the fast one is the harder failure to notice. Both chains are configurable in
   `config/model_routing.yaml`.

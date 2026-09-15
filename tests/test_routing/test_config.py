@@ -171,13 +171,13 @@ def test_load_full_yaml(monkeypatch):
     # added (entity-node merge-vs-distinct drainer).
     # 2026-08-07: 59 → 60 after 41_reflection_json_salvage added (deep-reflection
     # prose-output salvage retry).
-    # 2026-09-15: 61 → 63 after jarvis_desk + jarvis_phone added (the desktop
-    # assistant's two lanes behind /v1/jarvis/chat/completions — capable for
+    # 2026-09-15: 61 → 63 after desk_primary + desk_fast added (the desktop
+    # assistant's two lanes behind /v1/desk/chat/completions — capable for
     # control-tag turns, fast for turns composed during a live call).
     assert len(cfg.call_sites) == 63
     assert "dream_cycle_relationship_classify" in cfg.call_sites  # MW-2 classifier (2026-08-10)
-    assert "jarvis_desk" in cfg.call_sites  # desktop assistant, capable lane (2026-09-15)
-    assert "jarvis_phone" in cfg.call_sites  # desktop assistant, fast phone lane (2026-09-15)
+    assert "desk_primary" in cfg.call_sites  # desktop assistant, capable lane (2026-09-15)
+    assert "desk_fast" in cfg.call_sites  # desktop assistant, fast phone lane (2026-09-15)
     assert "41_reflection_json_salvage" in cfg.call_sites  # deep-reflection salvage (2026-08-07)
     assert cfg.call_sites["repo_pulse"].dispatch == "cli"
     assert cfg.call_sites["repo_pulse"].chain == []

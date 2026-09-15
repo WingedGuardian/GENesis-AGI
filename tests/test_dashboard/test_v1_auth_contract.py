@@ -31,13 +31,13 @@ def app_with_every_v1_blueprint(monkeypatch):
     """One app carrying every blueprint that serves a /v1 route."""
     monkeypatch.setenv("GENESIS_MCP_HTTP_TOKEN", "contract-test-token")
 
-    from genesis.dashboard.routes.jarvis_api import jarvis_api_bp
+    from genesis.dashboard.routes.desk_api import desk_api_bp
     from genesis.dashboard.routes.voice_api import voice_api_bp
     from genesis.hosting.openclaw.completions import blueprint as openclaw_bp
 
     app = Flask(__name__)
     app.config["TESTING"] = True
-    for bp in (openclaw_bp, voice_api_bp, jarvis_api_bp):
+    for bp in (openclaw_bp, voice_api_bp, desk_api_bp):
         app.register_blueprint(bp)
     return app
 

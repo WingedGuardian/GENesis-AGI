@@ -1,4 +1,4 @@
-"""Tests for POST /v1/jarvis/chat/completions — the desktop assistant's brain."""
+"""Tests for POST /v1/desk/chat/completions — the desktop assistant's brain."""
 
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 from flask import Flask
 
-from genesis.dashboard.routes.jarvis_api import jarvis_api_bp
+from genesis.dashboard.routes.desk_api import desk_api_bp
 
-_TOKEN = "test-jarvis-bearer-token"
+_TOKEN = "test-desk-bearer-token"
 
 
 @pytest.fixture(autouse=True)
@@ -22,7 +22,7 @@ def _configured_token(monkeypatch):
 @pytest.fixture()
 def app():
     app = Flask(__name__)
-    app.register_blueprint(jarvis_api_bp)
+    app.register_blueprint(desk_api_bp)
     app.config["TESTING"] = True
     loop = MagicMock()
     loop.is_running.return_value = True
@@ -72,7 +72,7 @@ BODY = {
     "model": "genesis",
     "max_tokens": 400,
     "messages": [
-        {"role": "system", "content": "You are Jarvis."},
+        {"role": "system", "content": "You are a desk assistant."},
         {"role": "user", "content": "what's on today?"},
     ],
 }
@@ -115,13 +115,13 @@ def _post(client, body=None, **kw):
     with (
         patch("genesis.runtime.GenesisRuntime") as MockRT,
         patch(
-            "genesis.dashboard.routes.jarvis_api.asyncio.run_coroutine_threadsafe",
+            "genesis.dashboard.routes.desk_api.asyncio.run_coroutine_threadsafe",
             side_effect=run_coro,
         ),
     ):
         MockRT.instance.return_value = rt
         resp = client.post(
-            "/v1/jarvis/chat/completions",
+            "/v1/desk/chat/completions",
             json=BODY if body is None else body,
             headers=kw.get("headers"),
         )
@@ -166,24 +166,24 @@ def test_messages_reach_the_router_unchanged(client):
 
 def test_no_lane_header_uses_the_desk_call_site(client):
     _, cap = _post(client)
-    assert cap["call_site_id"] == "jarvis_desk"
+    assert cap["call_site_id"] == "desk_primary"
 
 
 def test_phone_lane_header_selects_the_fast_call_site(client):
-    _, cap = _post(client, headers={"X-Genesis-Lane": "phone"})
-    assert cap["call_site_id"] == "jarvis_phone"
+    _, cap = _post(client, headers={"X-Genesis-Lane": "fast"})
+    assert cap["call_site_id"] == "desk_fast"
 
 
 def test_lane_header_is_case_and_space_insensitive(client):
-    _, cap = _post(client, headers={"X-Genesis-Lane": "  PHONE "})
-    assert cap["call_site_id"] == "jarvis_phone"
+    _, cap = _post(client, headers={"X-Genesis-Lane": "  FAST "})
+    assert cap["call_site_id"] == "desk_fast"
 
 
 def test_unknown_lane_falls_back_to_the_CAPABLE_lane(client):
     """Direction matters: silently serving an unknown lane from the FAST chain
     would degrade instruction-following with no error anywhere."""
     _, cap = _post(client, headers={"X-Genesis-Lane": "wingding"})
-    assert cap["call_site_id"] == "jarvis_desk"
+    assert cap["call_site_id"] == "desk_primary"
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -205,12 +205,12 @@ def test_unauthorized_request_never_reaches_the_router(anon_client):
     """A 401 alone would also hold if the route refused AFTER routing."""
     with (
         patch("genesis.runtime.GenesisRuntime") as MockRT,
-        patch("genesis.dashboard.routes.jarvis_api.asyncio.run_coroutine_threadsafe") as spawn,
+        patch("genesis.dashboard.routes.desk_api.asyncio.run_coroutine_threadsafe") as spawn,
     ):
         rt = MagicMock()
         rt.is_bootstrapped = True
         MockRT.instance.return_value = rt
-        resp = anon_client.post("/v1/jarvis/chat/completions", json=BODY)
+        resp = anon_client.post("/v1/desk/chat/completions", json=BODY)
     assert resp.status_code == 401
     spawn.assert_not_called()
 
@@ -267,10 +267,10 @@ def test_oversized_body_is_REFUSED_not_truncated(client):
     huge = {"messages": [{"role": "user", "content": "x" * (300 * 1024)}]}
     with (
         patch("genesis.runtime.GenesisRuntime") as MockRT,
-        patch("genesis.dashboard.routes.jarvis_api.asyncio.run_coroutine_threadsafe") as spawn,
+        patch("genesis.dashboard.routes.desk_api.asyncio.run_coroutine_threadsafe") as spawn,
     ):
         MockRT.instance.return_value = MagicMock()
-        resp = client.post("/v1/jarvis/chat/completions", json=huge)
+        resp = client.post("/v1/desk/chat/completions", json=huge)
     assert resp.status_code == 413
     spawn.assert_not_called()
 
@@ -315,7 +315,7 @@ def test_router_timeout_is_504_and_cancels(client):
     with (
         patch("genesis.runtime.GenesisRuntime") as MockRT,
         patch(
-            "genesis.dashboard.routes.jarvis_api.asyncio.run_coroutine_threadsafe",
+            "genesis.dashboard.routes.desk_api.asyncio.run_coroutine_threadsafe",
             return_value=timed_out,
         ),
     ):
@@ -323,7 +323,7 @@ def test_router_timeout_is_504_and_cancels(client):
         rt.is_bootstrapped = True
         rt.router = MagicMock()
         MockRT.instance.return_value = rt
-        resp = client.post("/v1/jarvis/chat/completions", json=BODY)
+        resp = client.post("/v1/desk/chat/completions", json=BODY)
     assert resp.status_code == 504
     timed_out.cancel.assert_called_once()
 
@@ -334,7 +334,7 @@ def test_router_exception_is_500(client):
     with (
         patch("genesis.runtime.GenesisRuntime") as MockRT,
         patch(
-            "genesis.dashboard.routes.jarvis_api.asyncio.run_coroutine_threadsafe",
+            "genesis.dashboard.routes.desk_api.asyncio.run_coroutine_threadsafe",
             return_value=boom,
         ),
     ):
@@ -342,7 +342,7 @@ def test_router_exception_is_500(client):
         rt.is_bootstrapped = True
         rt.router = MagicMock()
         MockRT.instance.return_value = rt
-        resp = client.post("/v1/jarvis/chat/completions", json=BODY)
+        resp = client.post("/v1/desk/chat/completions", json=BODY)
     assert resp.status_code == 500
     # The internal message must not reach the caller verbatim.
     assert "router blew up" not in resp.get_data(as_text=True)
@@ -494,21 +494,21 @@ def test_assistant_turn_with_null_content_degrades_instead_of_400(client):
 def test_model_field_selects_the_lane_when_the_header_is_absent(client):
     """A stripped header fails SILENTLY — the phone lane simply never engages
     and nothing errors. `model` is the one field every client sends."""
-    _, cap = _post(client, body={**BODY, "model": "genesis-phone"})
-    assert cap["call_site_id"] == "jarvis_phone"
+    _, cap = _post(client, body={**BODY, "model": "genesis-fast"})
+    assert cap["call_site_id"] == "desk_fast"
 
 
 def test_model_field_wins_over_a_contradicting_header(client):
-    _, cap = _post(client, body={**BODY, "model": "genesis-phone"},
-                   headers={"X-Genesis-Lane": "desk"})
-    assert cap["call_site_id"] == "jarvis_phone"
+    _, cap = _post(client, body={**BODY, "model": "genesis-fast"},
+                   headers={"X-Genesis-Lane": "primary"})
+    assert cap["call_site_id"] == "desk_fast"
 
 
 def test_generic_model_still_falls_through_to_the_header(client):
     """So pointing the same config at an ordinary provider stays valid."""
     _, cap = _post(client, body={**BODY, "model": "genesis"},
-                   headers={"X-Genesis-Lane": "phone"})
-    assert cap["call_site_id"] == "jarvis_phone"
+                   headers={"X-Genesis-Lane": "fast"})
+    assert cap["call_site_id"] == "desk_fast"
 
 
 # ── Concurrency ───────────────────────────────────────────────────────────────
@@ -517,12 +517,12 @@ def test_generic_model_still_falls_through_to_the_header(client):
 def test_concurrency_limit_rejects_with_503_not_a_200(client):
     """Busy must not become a 200 carrying apologetic prose — the caller would
     speak it as the answer."""
-    from genesis.dashboard.routes import jarvis_api
+    from genesis.dashboard.routes import desk_api
 
-    acquired = [jarvis_api._semaphore.acquire(timeout=1)
-                for _ in range(jarvis_api._MAX_CONCURRENT)]
+    acquired = [desk_api._semaphore.acquire(timeout=1)
+                for _ in range(desk_api._MAX_CONCURRENT)]
     try:
-        with patch("genesis.dashboard.routes.jarvis_api._semaphore.acquire",
+        with patch("genesis.dashboard.routes.desk_api._semaphore.acquire",
                    return_value=False):
             resp, cap = _post(client)
         assert resp.status_code == 503
@@ -531,23 +531,23 @@ def test_concurrency_limit_rejects_with_503_not_a_200(client):
     finally:
         for got in acquired:
             if got:
-                jarvis_api._semaphore.release()
+                desk_api._semaphore.release()
 
 
 def test_semaphore_is_released_on_the_error_path(client):
     """A leak here would wedge the endpoint after _MAX_CONCURRENT failures."""
-    from genesis.dashboard.routes import jarvis_api
+    from genesis.dashboard.routes import desk_api
 
-    for _ in range(jarvis_api._MAX_CONCURRENT + 2):
+    for _ in range(desk_api._MAX_CONCURRENT + 2):
         _post(client, result=_result(None))
-    free = [jarvis_api._semaphore.acquire(blocking=False)
-            for _ in range(jarvis_api._MAX_CONCURRENT)]
+    free = [desk_api._semaphore.acquire(blocking=False)
+            for _ in range(desk_api._MAX_CONCURRENT)]
     try:
         assert all(free), "semaphore leaked a permit on the failure path"
     finally:
         for got in free:
             if got:
-                jarvis_api._semaphore.release()
+                desk_api._semaphore.release()
 
 
 def test_chunked_body_over_the_cap_is_REFUSED(app):
@@ -571,7 +571,7 @@ def test_chunked_body_over_the_cap_is_REFUSED(app):
         {"messages": [{"role": "user", "content": "x" * (300 * 1024)}]}
     ).encode()
     environ = EnvironBuilder(
-        path="/v1/jarvis/chat/completions",
+        path="/v1/desk/chat/completions",
         method="POST",
         input_stream=io.BytesIO(huge),
         content_type="application/json",
@@ -584,7 +584,7 @@ def test_chunked_body_over_the_cap_is_REFUSED(app):
 
     with (
         patch("genesis.runtime.GenesisRuntime") as MockRT,
-        patch("genesis.dashboard.routes.jarvis_api.asyncio.run_coroutine_threadsafe") as spawn,
+        patch("genesis.dashboard.routes.desk_api.asyncio.run_coroutine_threadsafe") as spawn,
     ):
         rt = MagicMock()
         rt.is_bootstrapped = True

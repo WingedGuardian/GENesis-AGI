@@ -1,4 +1,4 @@
-"""POST /v1/jarvis/chat/completions — the desktop assistant's brain.
+"""POST /v1/desk/chat/completions — the desktop assistant's brain.
 
 A desktop assistant (a separate, third-party product running on the operator's
 own machine) speaks plain OpenAI chat-completions to whatever ``base_url`` it is
@@ -18,7 +18,7 @@ TWO LANES, because the caller's turns are not all the same shape. Desk turns mus
 follow long instructions exactly (the desktop side triggers its own tools by
 emitting an exact control tag, and a near-miss silently fires nothing), while
 phone turns are composed mid-call where latency is felt directly. The lane comes
-from ``X-Genesis-Lane``, or from a ``-phone``/``-desk`` suffix on ``model`` when a
+from ``X-Genesis-Lane``, or from a ``-fast``/``-primary`` suffix on ``model`` when a
 proxy strips unknown headers — a header alone fails silently and invisibly.
 
 Deliberately NOT a recall path. The caller builds its own system prompt from its
@@ -48,16 +48,16 @@ from flask import Blueprint, current_app, jsonify, request
 
 from genesis.dashboard.auth import check_bearer_token
 
-logger = logging.getLogger("genesis.dashboard.jarvis_api")
+logger = logging.getLogger("genesis.dashboard.desk_api")
 
-jarvis_api_bp = Blueprint("jarvis_api", __name__)
+desk_api_bp = Blueprint("desk_api", __name__)
 
 # Lane -> routing call site. Both are configured in config/model_routing.yaml.
 _LANES = {
-    "desk": "jarvis_desk",
-    "phone": "jarvis_phone",
+    "primary": "desk_primary",
+    "fast": "desk_fast",
 }
-_DEFAULT_LANE = "desk"
+_DEFAULT_LANE = "primary"
 
 # The caller's own client gives up at 120s. Failing INSIDE that window is what
 # lets it receive a parseable error it can speak, instead of a raw socket
@@ -107,7 +107,7 @@ def _lane_call_site(data: dict) -> tuple[str, str]:
     header fails silently, with the phone lane simply never engaging. A generic
     ``model`` (the ordinary case) falls through to the header.
 
-    An unknown or absent lane resolves to DESK, the capable one. That direction
+    An unknown or absent lane resolves to PRIMARY, the capable one. That direction
     is deliberate: silently serving an unrecognised lane from the fast chain
     would degrade instruction-following with no error anywhere, which is the
     failure that is hardest to notice from the desktop side.
@@ -199,10 +199,10 @@ def _sampling_from(data: dict) -> tuple[dict, str | None]:
     return kwargs, None
 
 
-@jarvis_api_bp.route("/v1/jarvis/chat/completions", methods=["POST"])
-def jarvis_chat_completions():
+@desk_api_bp.route("/v1/desk/chat/completions", methods=["POST"])
+def desk_chat_completions():
     """Route one desktop-assistant turn through Genesis and answer OpenAI-shaped."""
-    denied = check_bearer_token("Jarvis brain API")
+    denied = check_bearer_token("desk brain API")
     if denied:
         message, status = denied
         return _err(message, status)
@@ -240,7 +240,7 @@ def jarvis_chat_completions():
     lane, call_site = _lane_call_site(data)
 
     if not _semaphore.acquire(timeout=5):
-        logger.warning("Jarvis %s lane rejected — concurrency limit reached", lane)
+        logger.warning("Desk %s lane rejected — concurrency limit reached", lane)
         return _err("server busy, try again shortly", 503, "server_error")
     start = time.monotonic()
     try:
@@ -259,10 +259,10 @@ def jarvis_chat_completions():
         except TimeoutError:
             future.cancel()
             elapsed = time.monotonic() - start
-            logger.error("Jarvis %s lane timed out after %.1fs", lane, elapsed)
+            logger.error("Desk %s lane timed out after %.1fs", lane, elapsed)
             return _err(f"router timed out after {elapsed:.0f}s", 504, "server_error")
         except Exception:
-            logger.error("Jarvis %s lane raised", lane, exc_info=True)
+            logger.error("Desk %s lane raised", lane, exc_info=True)
             return _err("router call failed", 500, "server_error")
     finally:
         _semaphore.release()
@@ -274,7 +274,7 @@ def jarvis_chat_completions():
     content = (result.content or "").strip() if result.success else ""
     if not result.success or not content:
         logger.error(
-            "Jarvis %s lane produced no answer: success=%s provider=%s error=%s",
+            "Desk %s lane produced no answer: success=%s provider=%s error=%s",
             lane,
             result.success,
             result.provider_used,
@@ -288,7 +288,7 @@ def jarvis_chat_completions():
 
     elapsed_ms = int((time.monotonic() - start) * 1000)
     logger.info(
-        "Jarvis %s lane: %s/%s → %dms (%d msgs)",
+        "Desk %s lane: %s/%s → %dms (%d msgs)",
         lane,
         result.provider_used,
         result.model_id,
