@@ -929,14 +929,30 @@ verified: d0627c854 2026-09-11
   (`knowledge_ingest_source` MCP) requires explicit user confirmation —
   contrast the intake bypass in entry 4.
 - **inbox/**: file-drop monitor with approval-gated dispatch; phase order
-  resume → detect → create → dispatch; `approval_key_stable=True` (ONE
+  recover pending → resume approval → detect → create → dispatch;
+  `approval_key_stable=True` (ONE
   site-level approval key). The refresh path folds parked files into the
   batch so approvals fire once (#914). A pending approval is HELD until the
   user resolves it (no re-ask, no age-based cancel) and is auto-cancelled only
   when *orphaned* — no live inbox row (`awaiting_approval:`/`dispatching:`)
   still references it (`count_live_rows_for_approval`); this replaced the old
-  4h staleness cancel that re-detected unchanged files and nagged. Coherence +
-  URL-failure heuristics gate dispatch.
+  4h staleness cancel that re-detected unchanged files and nagged. Three checks
+  sit between a response and the baseline: a coherence check (annotates, never
+  blocks), a give-up-LANGUAGE URL-failure check, and a URL-COVERAGE check
+  requiring every scanner-recognized input URL's parsed identity to appear in
+  the response — that last one catches SILENT omission, which the language
+  check cannot see by construction. Scheme and host case plus one leading
+  `www.` are presentation variants; authority, path, query, and fragment
+  identity remain exact. Coverage
+  ships in SHADOW (`url_coverage_mode`, `config/inbox_monitor.yaml`): it computes
+  its verdict and logs only stable opaque URL ids, acting on nothing until
+  compliance under the `**Source:**` prompt has been measured. Follow-up and
+  build-lane durable writes finish before the completed baseline commits, so a
+  cancellation cannot permanently hide their absence. On restart every
+  pre-dispatch `pending` row is atomically returned to the bounded retry lane;
+  complete outstanding work is re-derived from the current source and completed
+  baseline, so a crash during multi-row creation cannot silently lose the
+  never-created tail or leave pending rows suppressing the file forever.
 - **recon/**: scheduled intelligence jobs (release watch, model intelligence
   Sun 8am, models.md synthesis Sun 10am, GitHub discovery, skill-security scan
   via external NVIDIA SkillSpector). Emits findings for triage
