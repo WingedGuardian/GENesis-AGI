@@ -779,4 +779,4 @@ jobs:
         # does not. That asymmetry is the trap: an under-set floor still passes,
         # so the guard quietly forfeits the exact fit it exists to hold and
         # nothing says a word.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23217
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23254
