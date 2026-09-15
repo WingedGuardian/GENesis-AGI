@@ -53,12 +53,42 @@ def _install_litellm_exceptions(mock_litellm):
     """Install real exception classes on a MagicMock'd litellm so the delegate's
     ``except litellm.X`` chain evaluates. An un-set Mock attribute used in an
     ``except`` clause raises ``TypeError: catching classes that do not inherit
-    from BaseException``."""
+    from BaseException``.
+
+    These stand-ins are deliberately SYNTHETIC: the real litellm classes
+    require ``(message, llm_provider, model)``, while every caller here
+    constructs them with one positional string. That is fine for tests about
+    which STATUS a handler returns.
+
+    It is NOT fine for a test about an attribute litellm SYNTHESIZES.
+    ``APIConnectionError.__init__`` hardcodes ``status_code = 500``, and a
+    stand-in has no such attribute — so a transport test built on one
+    exercises behaviour production does not have. Those tests install the real
+    class over this one (see ``_real_api_connection_error``); PR #1624 shipped
+    a transport fix that was green against a stand-in and dead on the real
+    path."""
     for _name in (
         "RateLimitError", "AuthenticationError", "NotFoundError", "Timeout",
         "ServiceUnavailableError", "BadRequestError", "UnprocessableEntityError",
+        "APIConnectionError",
     ):
         setattr(mock_litellm, _name, type(_name, (Exception,), {}))
+
+
+def _real_api_connection_error(mock_litellm, message):
+    """Put the REAL ``litellm.APIConnectionError`` on the mock and return an
+    instance of it, constructed the way litellm constructs it.
+
+    The delegate catches by type, so the class it sees and the class raised
+    must be the same real one — a stand-in would fall through to the generic
+    handler and silently test a different branch.
+    """
+    import litellm as real_litellm
+
+    mock_litellm.APIConnectionError = real_litellm.APIConnectionError
+    return real_litellm.APIConnectionError(
+        message=message, llm_provider="test-provider", model="llama-3.3-70b-versatile"
+    )
 
 
 # ── Model string construction ──────────────────────────────────────────────
@@ -723,22 +753,6 @@ async def test_call_no_params_passes_no_extra_body():
         )
 
         assert "extra_body" not in mock_litellm.acompletion.call_args.kwargs
-def _litellm_mock_with_real_exception_classes(mock_litellm):
-    """Give a patched `litellm` REAL exception classes.
-
-    `except litellm.RateLimitError` against a MagicMock attribute raises
-    TypeError ("catching classes that do not inherit from BaseException"), so
-    a bare module patch does not merely fail to catch — it breaks the whole
-    handler chain and the original exception escapes untouched. Any test
-    driving an ERROR path through the delegate needs this; the success-path
-    tests never reach an except clause, which is why they get away without it.
-    """
-    for name in (
-        "RateLimitError", "AuthenticationError", "NotFoundError", "Timeout",
-        "ServiceUnavailableError", "BadRequestError", "UnprocessableEntityError",
-    ):
-        setattr(mock_litellm, name, type(name, (Exception,), {}))
-    return mock_litellm
 
 
 async def test_a_statusless_exception_is_marked_as_never_reaching_the_provider():
@@ -756,7 +770,7 @@ async def test_a_statusless_exception_is_marked_as_never_reaching_the_provider()
     delegate = LiteLLMDelegate(config)
 
     with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
-        _litellm_mock_with_real_exception_classes(mock_litellm)
+        _install_litellm_exceptions(mock_litellm)
         mock_litellm.acompletion = AsyncMock(
             side_effect=OSError("[Errno -2] Name or service not known"),
         )
@@ -785,7 +799,7 @@ async def test_an_exception_carrying_a_real_status_still_counts_as_reached():
     boom.status_code = 503
 
     with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
-        _litellm_mock_with_real_exception_classes(mock_litellm)
+        _install_litellm_exceptions(mock_litellm)
         mock_litellm.acompletion = AsyncMock(side_effect=boom)
         result = await delegate.call(
             "test-provider",
@@ -798,4 +812,76 @@ async def test_an_exception_carrying_a_real_status_still_counts_as_reached():
     assert result.reached_provider is True, (
         "a real server error was marked unreached, which would stop the ledger "
         "counting requests the provider actually served"
+    )
+
+
+async def test_a_real_litellm_connection_error_is_marked_as_never_reached():
+    """THE production transport path, and the one the first fix missed.
+
+    litellm does not let a socket error through as a socket error: it
+    normalizes every DNS/TLS/refused-connection failure into
+    `APIConnectionError`, whose constructor HARDCODES `status_code = 500`
+    (MEASURED, litellm 1.78.7). So on the real path the exception always
+    carries a status, and any test keyed on the status being ABSENT is
+    testing a branch production never takes -- which is precisely how the
+    previous version of this fix passed its tests and failed in production.
+
+    Raised here as the real class, constructed the way litellm constructs it.
+    """
+    config = _config(is_free=True)
+    delegate = LiteLLMDelegate(config)
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        _install_litellm_exceptions(mock_litellm)
+        boom = _real_api_connection_error(
+            mock_litellm, "[Errno -2] Name or service not known"
+        )
+        mock_litellm.acompletion = AsyncMock(side_effect=boom)
+        result = await delegate.call(
+            "test-provider",
+            "llama-3.3-70b-versatile",
+            [{"role": "user", "content": "Hello"}],
+        )
+
+    assert result.success is False
+    assert result.status_code == 500, (
+        "the router classifies on this status; it must keep its 500"
+    )
+    assert getattr(boom, "status_code", None) == 500, (
+        "REGRESSION CANARY: litellm no longer synthesizes 500 on "
+        "APIConnectionError. That is the premise this handler exists for -- "
+        "re-read the delegate's transport branch before changing this"
+    )
+    assert result.reached_provider is False, (
+        "a real litellm transport failure was reported as having reached the "
+        "provider, so the daily ledger spends the vendor's allowance on a "
+        "request it never saw -- the exact defect this PR closes"
+    )
+
+
+async def test_a_timeout_is_not_swallowed_by_the_transport_handler():
+    """CONTROL on handler ORDER. `litellm.Timeout` is not a subclass of
+    `APIConnectionError`, so the new clause must not capture it: a timeout
+    keeps its own 408, which `_NOT_USAGE_STATUSES` already excludes.
+    """
+    config = _config(is_free=True)
+    delegate = LiteLLMDelegate(config)
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        _install_litellm_exceptions(mock_litellm)
+        # The REAL APIConnectionError is installed so the new clause is the
+        # real one; Timeout stays the stand-in this file already raises. That
+        # is the pairing under test: does the real transport clause capture a
+        # timeout it must not?
+        _real_api_connection_error(mock_litellm, "unused")
+        mock_litellm.acompletion = AsyncMock(
+            side_effect=mock_litellm.Timeout("took too long")
+        )
+        result = await delegate.call(
+            "test-provider", "llama-3.3-70b-versatile",
+            [{"role": "user", "content": "Hello"}],
+        )
+
+    assert result.status_code == 408, (
+        "the transport handler swallowed a timeout and relabelled it 500"
     )
