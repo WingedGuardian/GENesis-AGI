@@ -89,24 +89,55 @@ alarm: someone reads the failure, sees the answer is real, and adds a ``BENIGN``
 row with the reason. The failure it replaces was silence, and silence is what
 let all three incidents ship.
 
-SCOPE, stated rather than implied. This compares what is DECLARED and in what
-order the sheets load. It does not compute the cascade: shorthands are not
-expanded (``flex`` is not read as implying ``flex-direction``), a selector that
-is not identical is not analysed at all, and inline ``<style>`` blocks in a
-template are invisible. It is a lint against one specific failure — a vendor
-layout declaration with no Genesis answer — not a model of CSS. It also does not
-check the VALUE: a Genesis rule restating the vendor's own value is still an
-answer, because what this file asserts is that a Genesis DECISION exists on the
-declaration. Whether a particular answer neutralises the leak it names is pinned
-beside that answer, in ``test_panel_layout_neutralisation.py``.
+SCOPE, stated exactly, because every previous version of this paragraph claimed
+more than the code did. What is checked is: a vendor layout declaration is
+answered when a Genesis rule declares the same property, **on the same selector
+text**, at the top level, in a sheet that loads later, carrying ``!important`` if
+the vendor declaration does.
 
-Two gaps worth naming, because a guard is read as covering what it does not say
-it misses. The per-page test only fires where Genesis has ALREADY staked a layout
-claim on the selector; a leak onto a selector Genesis never lays out is invisible
-to it, which is the price of not drowning in ``a``, ``ul`` and ``input``. The
-cross-page test covers part of that gap and not all of it — it needs the answer
-to exist SOMEWHERE. A leak nobody has ever answered on any page is outside both,
-and neither of these tests found the third incident above; a person did.
+"The same selector text" is the whole boundary and it is narrower than it sounds.
+The guard relates a leak to an answer only when both sheets write the selector
+identically — after normalising whitespace, selector-group order and the case of
+type names, but not otherwise. A vendor rule that reaches the same elements
+through a different spelling is NOT related to a Genesis answer, and is skipped
+rather than reported.
+
+That is a deliberate retreat, not an oversight. Deciding which selectors reach
+which elements is what the two previous designs did, and both failed open in
+shapes nobody predicted — four rounds of it. An estimate that runs before the
+comparison decides whether a rule is ever looked at, so its errors are silent by
+construction. There is now no estimate anywhere in the pipeline; the price is
+this narrower reach, and the price is paid knowingly.
+
+What the guard REFUSES rather than skipping, because these are shapes it cannot
+read and silence would read as a clear: a rule nested inside another rule; an
+at-rule it does not descend into; ``@layer`` carrying a layout declaration, whose
+precedence outranks everything compared here; a local ``@import``, which pulls in
+a sheet nobody parses; a stylesheet link on another origin; a link under a media
+condition; a stylesheet that parses to zero rules; and a vendor layout rule whose
+selector embeds another selector, like ``:is(.panel)``, where a reader would
+reasonably expect a ``.panel`` answer to count and identity cannot say so.
+
+What it still does NOT model, deliberately: the cascade. Shorthands are not
+expanded (``flex`` is not read as implying ``flex-direction``), and specificity is
+never computed — identity makes it unnecessary, since two rules with the same
+selector have the same specificity by definition.
+
+It does not check the VALUE either. A Genesis rule restating the vendor's own
+value is still an answer, because what this file asserts is that a Genesis
+DECISION exists on that declaration — ``components.css`` deliberately restates
+``overflow: auto`` on ``.panel`` with a comment saying why. Whether a given answer
+neutralises the leak it names is pinned beside that answer, in
+``test_panel_layout_neutralisation.py``.
+
+One gap remains and is not refusable. The per-page test only fires where Genesis
+has ALREADY staked a layout claim on the identical selector; a vendor rule on a
+selector no Genesis sheet lays out is the vendor's business, and without that
+narrowing the check drowns in ``a``, ``ul`` and ``input``. The cross-page test
+covers part of it — it fires when an answer exists SOMEWHERE and is missing on
+one page, which is what the second incident was — but a leak nobody has ever
+answered on any page is outside both. Neither of these tests found the third
+incident; a person looking at a page did, and that remains true.
 """
 
 from __future__ import annotations
@@ -117,6 +148,8 @@ from pathlib import Path
 
 import pytest
 import tinycss2
+
+from tests.test_dashboard.dashboard_pages import stylesheet_pages
 
 ROOT = Path(__file__).resolve().parents[2]
 WEBUI = ROOT / "src/genesis/dashboard/webui"
@@ -204,6 +237,14 @@ BENIGN: dict[tuple[str, str, str], str] = {
         "did that, `height: 100%`, is answered in components.css."
     ),
     ("body", "min-height", "370px"): ("Same rule, same reason as `html`."),
+    (".collapse:not(.show)", "display", "none"): (
+        "Bootstrap's collapse behaviour, and the ONE instance in the vendor sheet "
+        "of a selector that embeds another. It is excused rather than refused "
+        "because neither class it names is one Genesis lays out: no Genesis sheet "
+        "declares `.collapse` at all, and the only `.show` rule is `.modal.show` "
+        "in modals.css, a different selector. `display: none` on an element the "
+        "markup has explicitly collapsed is that element doing what it is told."
+    ),
     (".section", "width", "100%"): (
         "`width: 100%` on a block box, and border-box means the padding and "
         "border modals.css adds sit INSIDE the 100% rather than overflowing it."
@@ -212,38 +253,75 @@ BENIGN: dict[tuple[str, str, str], str] = {
 
 
 class _LinkCollector(HTMLParser):
-    """Stylesheet hrefs in document order, indifferent to attribute order.
+    """Every stylesheet a page carries, in document order.
 
-    The regex this replaces required `rel` before `href` and so missed
+    LINKS AND INLINE `<style>` BLOCKS BOTH, because the cascade does not care
+    which one a declaration arrived in and neither can this. An earlier version
+    collected links only and said so in its docstring — "inline `<style>` blocks
+    in a template are invisible" — which is a gap, not a scope: MEASURED, four of
+    the six pages declare layout properties inline, 47 selectors' worth on one of
+    them. A Genesis layout claim the guard cannot see makes the vendor
+    declaration it answers read as unclaimed, and the page is skipped rather than
+    checked.
+
+    Each entry is `("link", href)` or `("inline", css)`; the list index is the
+    load order, which is what `_answers` needs and the only thing position is
+    used for.
+
+    A MEDIA-CONDITIONAL link is refused rather than recorded. `media="print"`
+    means the sheet applies under that condition only, so treating its
+    declarations as universal answers a leak that is still live at every other
+    width. There are none today.
+
+    The regex this class replaced required `rel` before `href` and so missed
     `<link href="…" rel="stylesheet">` — one of the dashboard's eight links,
     silently, while its docstring claimed to return them all.
     """
 
     def __init__(self) -> None:
         super().__init__()
-        self.hrefs: list[str] = []
+        self.sheets: list[tuple[str, str]] = []
+        self.conditional: list[str] = []
+        self._in_style = False
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "style":
+            self._in_style = True
+            return
         if tag != "link":
             return
         a = {k.lower(): (v or "") for k, v in attrs}
-        if "stylesheet" in a.get("rel", "").lower().split() and a.get("href"):
-            self.hrefs.append(a["href"])
+        if "stylesheet" not in a.get("rel", "").lower().split() or not a.get("href"):
+            return
+        media = a.get("media", "").strip().lower()
+        if media and media not in {"all", "screen"}:
+            self.conditional.append(f"{a['href']} (media={media})")
+            return
+        self.sheets.append(("link", a["href"]))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "style":
+            self._in_style = False
+
+    def handle_data(self, data: str) -> None:
+        if self._in_style and data.strip():
+            self.sheets.append(("inline", data))
 
 
-def _linked_stylesheets(template: Path) -> list[str]:
+def _sheets(html: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """(sheets in load order, media-conditional links refused).
+
+    Takes TEXT, because one of the six pages has no path — the login page is a
+    Python string. See `dashboard_pages.stylesheet_pages`.
+    """
     parser = _LinkCollector()
-    parser.feed(template.read_text())
-    return parser.hrefs
+    parser.feed(html)
+    return parser.sheets, parser.conditional
 
 
-def _strip_parens(text: str) -> str:
-    """Remove every parenthesised group, innermost first, including nesting."""
-    while True:
-        stripped = re.sub(r"\([^()]*\)", "", text)
-        if stripped == text:
-            return text
-        text = stripped
+def _linked_stylesheets(html: str) -> list[str]:
+    """Just the hrefs, for the checks that are about LINKS specifically."""
+    return [value for kind, value in _sheets(html)[0] if kind == "link"]
 
 
 def _selector_groups(prelude: list) -> list[str]:
@@ -294,6 +372,16 @@ def _normalise(tokens: list) -> str:
     out: list[str] = []
     for i, token in enumerate(tokens):
         if token.type == "whitespace":
+            # Collapse around a COMBINATOR TOKEN, here, rather than by rewriting
+            # the finished string. The regex that did the latter reached inside
+            # quoted values too, so `.panel[data-slot="a > b"]` and
+            # `.panel[data-slot="a>b"]` normalised to the same text and answered
+            # each other — a false clear, introduced by the fix for a false
+            # clear. Token types cannot be fooled by their own contents.
+            if _is_combinator(tokens[i - 1] if i else None) or _is_combinator(
+                next((t for t in tokens[i + 1 :] if t.type != "whitespace"), None)
+            ):
+                continue
             out.append(" ")
             continue
         text = tinycss2.serialize([token])
@@ -303,61 +391,59 @@ def _normalise(tokens: list) -> str:
         if token.type == "ident" and prev not in {".", "#", ":", "::"}:
             text = text.lower()
         out.append(text)
-    return re.sub(r"\s*([>+~])\s*", r"\1", "".join(out)).strip()
+    return "".join(out).strip()
+
+
+def _is_combinator(token) -> bool:
+    """A child/sibling combinator as a TOKEN, never as a character in some value."""
+    return token is not None and token.type == "literal" and token.value in {">", "+", "~"}
+
+
+_EMBEDS_A_SELECTOR = re.compile(r":(?:is|where|not|has|matches|-\w+-any)\(", re.I)
+
+
+def _embeds_a_selector(selector: str) -> bool:
+    """Does this selector contain ANOTHER selector inside a functional pseudo?
+
+    The one construct identity cannot be honest about. `:is(.panel)` reaches
+    exactly the elements `.panel` reaches, so a reader seeing a Genesis `.panel`
+    answer beside a vendor `:is(.panel)` leak expects the guard to connect them —
+    and under identity it does not, because the two texts differ.
+
+    MEASURED: appending `:is(.panel) { display: flex; height: 100% }` to the real
+    vendor sheet shipped silently, 37 passed, with `.panel` answered right there
+    in components.css.
+
+    Relating them means deciding which selectors reach which elements, which is
+    the model this file deleted after four rounds of it failing open. So the
+    shape is REFUSED instead. There are none in the shipped sheets, so this costs
+    nothing today and speaks the moment one appears.
+    """
+    return bool(_EMBEDS_A_SELECTOR.search(selector))
 
 
 def _selector_keys(prelude: list) -> set[str]:
-    """Approximate which elements a selector can match, as a set of keys.
+    """The selector list, as its normalised members. The key IS the selector.
 
-    The exact-string comparison this replaces treated `.panel` and `body .panel`
-    as unrelated, which is backwards: a descendant selector is MORE specific, so
-    it beats a Genesis `.panel` answer rather than missing it.
+    COLLAPSED from an approximation. The previous version reduced each member to
+    a "key" — last compound, classes only, bare elements, parenthesised arguments
+    stripped — so that two DIFFERENT selectors could be recognised as reaching the
+    same elements. That was the last estimate left in the pipeline, it ran BEFORE
+    the exact comparison, and it decided whether a rule was seen at all.
 
-    CLASS keys come from the LAST compound and ignore everything before it, so
-    `.panel`, `body .panel`, `div.panel` and `.wrap > .panel` all yield
-    `{".panel"}` and collide. A class name is a shared namespace: whoever writes
-    `.panel` is reaching for the same elements no matter what they scope it
-    under, and the descendant form is the one that WINS on specificity.
+    MEASURED on the shipped vendor sheet: 30 of its 175 layout declarations (17%)
+    derived NO key and were invisible to the guard entirely, `#right-panel
+    { display: flex }` among them. A rule nothing can see is a rule nothing can
+    report, which is the silent direction.
 
-    ELEMENT keys are far stricter — emitted only when the whole selector is a
-    bare element name, optionally with pseudo-classes. `html, body { … }` counts;
-    `.switch input` and `input[type="range"]` do not. Reducing those to `input`
-    reported two findings where the only thing the sheets shared was the tag
-    name, and a widget's own scoped rule can never reach Genesis markup. The two
-    real incidents are both in scope under this rule: `.panel` is a class, and
-    `html, body` is bare.
-
-    It still over-matches on classes, deliberately — `.panel.wide` yields
-    `.panel` too, so a rule that applies only to elements carrying both classes
-    is reported. A guard that errs toward reporting can be silenced with a
-    BENIGN entry and a stated reason; one that errs toward silence cannot be
-    noticed at all.
+    Since `_answers` already compares normalised selector text, the key can BE
+    that text: one stage instead of two, and no approximation anywhere. It costs
+    nothing measurable — zero new findings on the real corpus, because the
+    interest narrowing still requires Genesis to lay out that same selector — and
+    it deletes the last-compound split, the ASCII class regex, the bare-element
+    rule and `_strip_parens` along with the whole class of finding they generated.
     """
-    keys: set[str] = set()
-    for selector in _selector_groups(prelude):
-        # Drop the ARGUMENTS of every functional pseudo-class before looking for
-        # the last compound. They contain whitespace and combinators of their
-        # own, so `.panel:is(.a, .b)` split on whitespace yields `.b)` as the
-        # "last compound" and the rule registers under `.b` while `.panel` — the
-        # thing it actually targets — gets no key at all. The arguments never
-        # change WHAT a compound matches, only how narrowly, so removing them is
-        # exactly right for a key.
-        selector = _strip_parens(selector)
-        # Escapes, for the same reason as in `_specificity`: `.foo\.bar` is one
-        # class named `foo.bar`, and splitting it would register an ANSWER under
-        # `.foo` — a key it does not match, which reads as a clear.
-        selector = re.sub(r"\\.", "", selector)
-        # Last compound: everything after the final combinator or whitespace.
-        last = re.split(r"[\s>+~]+", selector)[-1]
-        # Drop pseudo-classes/elements — they narrow, they do not re-target.
-        bare = re.split(r"::?", last)[0]
-        classes = re.findall(r"\.([A-Za-z0-9_-]+)", bare)
-        if classes:
-            keys.update("." + c for c in classes)
-            continue
-        if re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*", selector.split(":")[0].strip()):
-            keys.add(bare)
-    return keys
+    return set(_selector_groups(prelude))
 
 
 def _declarations(css: str) -> dict[str, dict[str, list[dict]]]:
@@ -381,7 +467,13 @@ def _declarations(css: str) -> dict[str, dict[str, list[dict]]]:
         for node in nodes:
             if node.type == "qualified-rule":
                 contents = tinycss2.parse_blocks_contents(node.content)
-                nested = [n for n in contents if n.type == "qualified-rule"]
+                # BOTH nested forms. An earlier version checked only for a nested
+                # QUALIFIED rule, so `.shell { @media (min-width: 1px) { .panel
+                # { display: flex } } }` slipped through the refusal that exists
+                # for exactly this — the outer rule has no direct declarations,
+                # so it was skipped for being empty while the browser applied the
+                # rule two levels down.
+                nested = [n for n in contents if n.type in {"qualified-rule", "at-rule"}]
                 if nested:
                     raise AssertionError(
                         f"`{tinycss2.serialize(node.prelude).strip()}` contains a "
@@ -417,8 +509,25 @@ def _declarations(css: str) -> dict[str, dict[str, list[dict]]]:
                 # @media / @supports wrap ordinary rules; @keyframes wraps step
                 # rules whose "selectors" are `from`/`to`/percentages, which are
                 # not elements. Skipping it keeps those out of the key space.
-                if node.lower_at_keyword in {"media", "supports", "layer", "container"}:
+                if node.lower_at_keyword in {"media", "supports", "container"}:
                     walk(tinycss2.parse_rule_list(node.content), top_level=False)
+                elif node.lower_at_keyword == "layer":
+                    # `@layer` is NOT a conditional. Layer order beats everything
+                    # this guard models: an important declaration in a layer
+                    # outranks an important unlayered answer however the sheets
+                    # load, so flattening it would report a leak answered by a
+                    # rule the browser discards. Modelling it means modelling
+                    # layer ORDER, which is the kind of estimate this file has
+                    # now deleted twice. Refused instead.
+                    layered = _declarations(tinycss2.serialize(node.content))
+                    if any(prop in LAYOUT_PROPS for props in layered.values() for prop in props):
+                        raise AssertionError(
+                            "`@layer` carries a layout declaration. Layer precedence "
+                            "outranks load order and importance, which is what this "
+                            "guard compares, so it cannot judge the rules inside. "
+                            "Move the declaration out of the layer, or teach this "
+                            "file layer ORDER rather than flattening it."
+                        )
                 elif node.lower_at_keyword not in _AT_RULES_WITHOUT_ELEMENTS:
                     raise AssertionError(
                         f"`@{node.lower_at_keyword}` wraps rules this guard does not "
@@ -426,6 +535,18 @@ def _declarations(css: str) -> dict[str, dict[str, list[dict]]]:
                         "is a clear, not a pass. Add it to the descend list if it "
                         "wraps ordinary rules, or to _AT_RULES_WITHOUT_ELEMENTS with "
                         "the reason its contents cannot target elements."
+                    )
+            elif node.type == "at-rule" and node.lower_at_keyword == "import":
+                # BLOCKLESS, so the branch above never sees it. An import pulls in
+                # a stylesheet this guard does not read; if it is one of ours, the
+                # rules inside are invisible. The one in the shipped tree points at
+                # a font service, which is the only shape allowed through.
+                target = tinycss2.serialize(node.prelude).strip()
+                if not _is_external(target.strip("'\"").removeprefix("url(").strip("'\")")):
+                    raise AssertionError(
+                        f"`@import {target}` names a stylesheet this guard does not "
+                        "follow, so every rule in it is invisible. Link it from the "
+                        "page instead, where it is read like any other sheet."
                     )
 
     walk(tinycss2.parse_stylesheet(css, skip_whitespace=True, skip_comments=True), True)
@@ -507,22 +628,36 @@ def _unresolvable(hrefs: list[str]) -> list[str]:
     return [h for h in hrefs if not _is_external(h) and _resolve(h) is None]
 
 
-def _templates_linking_stylesheets() -> list[Path]:
-    return sorted(p for p in TEMPLATE_DIR.glob("*.html") if _linked_stylesheets(p))
+def _pages_linking_stylesheets() -> list[tuple[str, str]]:
+    """(name, html) for every servable page that links a stylesheet.
+
+    Sourced from `dashboard_pages.stylesheet_pages`, NOT from a glob of the
+    template directory. The login page is built as a Python string, so a glob
+    omits it — and had done so twice before this file was written, then a third
+    time in this file's first version.
+    """
+    return sorted(
+        (name, html) for name, html in stylesheet_pages().items() if _linked_stylesheets(html)
+    )
 
 
-TEMPLATES = _templates_linking_stylesheets()
+PAGES = _pages_linking_stylesheets()
 
 
 def test_the_template_scan_found_the_pages():
     """Guard the guard: an empty or shrinking population makes everything pass."""
-    assert len(TEMPLATES) >= 5, (
-        f"expected at least the five top-level pages, found {len(TEMPLATES)} — "
-        "the link parse or the glob is broken, not the CSS"
+    assert len(PAGES) >= 6, (
+        f"expected at least the five top-level pages and the login page, found "
+        f"{len(PAGES)} — the link parse or the page enumeration is broken, not the CSS"
     )
-    names = {p.name for p in TEMPLATES}
+    names = {name for name, _ in PAGES}
     assert "genesis_dashboard.html" in names and "genesis_voice.html" in names, (
         "the two pages that use `.panel` must both be in scope"
+    )
+    assert "auth.py::_LOGIN_HTML" in names, (
+        "the login page links the same vendor and Genesis sheets and is NOT a "
+        "template, so it is the page every glob-based check has missed — three "
+        "times now. It is in scope through dashboard_pages.stylesheet_pages()"
     )
     # The dashboard's eight links include one written `href` before `rel`; the
     # regex this replaced returned seven and said nothing. Pinned as the LIST,
@@ -538,7 +673,7 @@ def test_the_template_scan_found_the_pages():
     # fail here with a message about the parse.
     dash = [
         h.split("#", 1)[0].split("?", 1)[0]
-        for h in _linked_stylesheets(TEMPLATE_DIR / "genesis_dashboard.html")
+        for h in _linked_stylesheets(dict(PAGES)["genesis_dashboard.html"])
     ]
     assert dash == [
         "/index.css",
@@ -552,26 +687,45 @@ def test_the_template_scan_found_the_pages():
     ], "the dashboard's stylesheet links changed — re-check the order, then this list"
 
 
-@pytest.mark.parametrize("template", TEMPLATES, ids=lambda p: p.name)
-def test_no_vendor_layout_rule_is_left_unanswered(template: Path):
+@pytest.mark.parametrize("page,html", PAGES, ids=[n for n, _ in PAGES])
+def test_no_vendor_layout_rule_is_left_unanswered(page: str, html: str):
     """Every vendor layout declaration on a shared selector has a later answer.
 
     Fails the way the `.panel` defect should have failed: naming the page, the
     selector and the property, before anyone has to look at the rendered page.
     """
-    hrefs = _linked_stylesheets(template)
+    sheets, conditional = _sheets(html)
+    assert not conditional, (
+        f"{page} links a stylesheet under a media condition: {conditional}. Its "
+        "declarations apply only under that condition, so counting them as "
+        "answers clears a leak that is still live everywhere else. Drop the "
+        "condition, or state the exemption here."
+    )
+    hrefs = [v for kind, v in sheets if kind == "link"]
     missing = _unresolvable(hrefs)
     assert not missing, (
-        f"{template.name} links stylesheets that name no file under webui/: "
+        f"{page} links stylesheets that name no file under webui/: "
         f"{missing}. Either the page is broken or this guard cannot read the "
         "sheet it is supposed to check — and it must not quietly stand down "
         "over either. A version of this test dropped unresolvable hrefs, found "
         "no owned sheet, and SKIPPED: one `?v=` cache-buster disarmed the whole "
         "page and the run reported `25 passed, 1 skipped`, exit 0."
     )
-    order = {h: i for i, h in enumerate(hrefs)}
-    owned = [h for h in hrefs if h.startswith(OWNED_PREFIX) and _resolve(h)]
-    foreign = [h for h in hrefs if not h.startswith(OWNED_PREFIX) and _resolve(h)]
+    # Load order over SHEETS, not over hrefs: an inline `<style>` block is a
+    # Genesis layout claim at whatever position the document puts it, and
+    # ignoring it made a selector claimed only inline read as unclaimed.
+    order: dict[str, int] = {}
+    owned: list[str] = []
+    foreign: list[str] = []
+    css: dict[str, str] = {}
+    for i, (kind, value) in enumerate(sheets):
+        if kind == "inline":
+            name = f"{page} <style> #{sum(1 for n in owned if n.endswith('>')) + 1}>"
+            order[name], css[name] = i, value
+            owned.append(name)
+        elif _resolve(value):
+            order[value], css[value] = i, _resolve(value).read_text()
+            (owned if value.startswith(OWNED_PREFIX) else foreign).append(value)
     if not owned or not foreign:
         # The LAST door into the skip, and the one the fix above did not close.
         # An href on another origin is excused from `_unresolvable` — correctly,
@@ -581,25 +735,43 @@ def test_no_vendor_layout_rule_is_left_unanswered(template: Path):
         # same leaks as before. Not ours to READ is not the same as clean.
         external = [h for h in hrefs if _is_external(h)]
         assert not external, (
-            f"{template.name} links stylesheets on another origin ({external}). "
+            f"{page} links stylesheets on another origin ({external}). "
             "This guard cannot read them, so the page is UNCHECKED rather than "
             "clean, and a skip here is the same silent disarm already fixed at "
             "the resolver arriving by a different door. Vendor the sheet under "
             "webui/, or state the exemption here."
         )
-        pytest.skip(f"{template.name} links no owned/vendor pair we ship")
+        pytest.skip(f"{page} links no owned/vendor pair we ship")
 
-    owned_decls = {h: _declarations(_resolve(h).read_text()) for h in owned}
+    owned_decls = {h: _declarations(css[h]) for h in owned}
     for href in foreign:
-        assert _declarations(_resolve(href).read_text()), (
+        vendor = _declarations(css[href])
+        assert vendor, (
             f"{href} parsed to zero rules. A stylesheet that cannot be parsed "
             "reads as a sheet with no leaks, which is the wrong direction — "
             "check for an unclosed brace before believing this page is clean."
         )
+        embedded = sorted(
+            sel
+            for sel, props in vendor.items()
+            if _embeds_a_selector(sel)
+            and any(
+                (sel, prop, r["value"]) not in BENIGN
+                for prop in set(props) & LAYOUT_PROPS
+                for r in props[prop]
+            )
+        )
+        assert not embedded, (
+            f"{href} sets a layout property through a selector that embeds another "
+            f"selector: {embedded}. Identity cannot relate `:is(.panel)` to a "
+            "`.panel` answer, and teaching it to is the coverage model this file "
+            "deleted after four rounds of it failing open. Flatten the vendor rule, "
+            "or answer it on the identical selector."
+        )
     problems: list[str] = []
 
     for f_href in foreign:
-        for sel_key, props in _declarations(_resolve(f_href).read_text()).items():
+        for sel_key, props in _declarations(css[f_href]).items():
             for prop in sorted(set(props) & LAYOUT_PROPS):
                 # Only a selector Genesis LAYS OUT can be leaked into. Two
                 # narrowings, and the second is what keeps this usable:
@@ -666,7 +838,7 @@ def test_no_vendor_layout_rule_is_left_unanswered(template: Path):
                     problems.append(f"{f_href} sets `{prop}` on `{sel_key}` — {why}")
 
     assert not problems, (
-        f"{template.name}: a vendor stylesheet's layout rule wins on a selector "
+        f"{page}: a vendor stylesheet's layout rule wins on a selector "
         "Genesis styles:\n  "
         + "\n  ".join(sorted(set(problems)))
         + "\n\nDeclare the property at the TOP LEVEL of a Genesis stylesheet "
@@ -704,7 +876,7 @@ def test_the_panel_leak_that_motivated_this_is_answered_on_every_page_that_uses_
 
     # The page that would have been missed: it uses `.panel` and never loads
     # dashboard.css, which is where the fix was first (wrongly) written.
-    voice = _linked_stylesheets(TEMPLATE_DIR / "genesis_voice.html")
+    voice = _linked_stylesheets(dict(PAGES)["genesis_voice.html"])
     assert "/css/components.css" in voice and "/css/dashboard.css" not in voice, (
         "genesis_voice.html is the reason the answer lives in components.css; if "
         "its stylesheet list changed, re-check where the answer belongs"
@@ -742,24 +914,45 @@ def test_a_vendor_rule_answered_on_one_page_is_answered_on_every_page():
     this test wants anyway.
     """
     # (selector, property) pairs some Genesis sheet answers at top level
+    # Sourced the same way the per-page test sources its sheets — shared
+    # stylesheets AND the inline blocks, which are Genesis layout claims too.
+    # Reading only `css/*.css` here while the per-page test reads inline blocks
+    # as well would make one test's "answered somewhere" disagree with the
+    # other's "answered here", which is how an asymmetry check acquires one.
     answered_somewhere: set[tuple[str, str]] = set()
-    for sheet in (WEBUI / "css").glob("*.css"):
-        for sel_key, props in _declarations(sheet.read_text()).items():
-            for prop, rules in props.items():
-                if prop in LAYOUT_PROPS and any(r["top"] for r in rules):
-                    answered_somewhere.add((sel_key, prop))
+    for _name, page_html in PAGES:
+        for kind, value in _sheets(page_html)[0]:
+            text = (
+                value
+                if kind == "inline"
+                else (
+                    _resolve(value).read_text()
+                    if value.startswith(OWNED_PREFIX) and _resolve(value)
+                    else ""
+                )
+            )
+            for sel_key, props in _declarations(text).items() if text else ():
+                for prop, rules in props.items():
+                    if prop in LAYOUT_PROPS and any(r["top"] for r in rules):
+                        answered_somewhere.add((sel_key, prop))
 
     gaps: list[str] = []
-    for template in TEMPLATES:
-        hrefs = _linked_stylesheets(template)
-        order = {h: i for i, h in enumerate(hrefs)}
-        owned = [h for h in hrefs if h.startswith(OWNED_PREFIX) and _resolve(h)]
-        foreign = [h for h in hrefs if not h.startswith(OWNED_PREFIX) and _resolve(h)]
+    for page, html in PAGES:
+        sheets = _sheets(html)[0]
+        order, owned, foreign, css = {}, [], [], {}
+        for i, (kind, value) in enumerate(sheets):
+            if kind == "inline":
+                name = f"{page} <style>"
+                order[name], css[name] = i, value
+                owned.append(name)
+            elif _resolve(value):
+                order[value], css[value] = i, _resolve(value).read_text()
+                (owned if value.startswith(OWNED_PREFIX) else foreign).append(value)
         if not owned or not foreign:
             continue
-        owned_decls = {h: _declarations(_resolve(h).read_text()) for h in owned}
+        owned_decls = {h: _declarations(css[h]) for h in owned}
         for f_href in foreign:
-            for sel_key, props in _declarations(_resolve(f_href).read_text()).items():
+            for sel_key, props in _declarations(css[f_href]).items():
                 for prop in sorted(set(props) & LAYOUT_PROPS):
                     if (sel_key, prop) not in answered_somewhere:
                         continue
@@ -771,7 +964,7 @@ def test_a_vendor_rule_answered_on_one_page_is_answered_on_every_page():
                     ):
                         continue
                     gaps.append(
-                        f"{template.name}: {f_href} sets `{prop}` on `{sel_key}`, which "
+                        f"{page}: {f_href} sets `{prop}` on `{sel_key}`, which "
                         "Genesis answers on other pages but not on this one"
                     )
 
@@ -783,16 +976,31 @@ def test_a_vendor_rule_answered_on_one_page_is_answered_on_every_page():
     )
 
 
-def _leak(css: str, key: str, prop: str) -> dict:
-    """The single rule a one-rule stylesheet declares, for a comparison test."""
-    rules = _rules(_declarations(css), key, prop)
-    assert len(rules) == 1, f"expected one rule, got {len(rules)}"
-    return rules[0]
+def _leaks(css: str, prop: str) -> list[tuple[str, dict]]:
+    """Every rule a constructed stylesheet declares for `prop`, with its key.
+
+    The key is DERIVED rather than passed in. It used to be an argument because a
+    key was a separate concept — an approximation of which elements a selector
+    reached. Now the key IS the selector, so asking a caller for both is asking it
+    to state the same thing twice and get it wrong once.
+
+    A LIST rather than one rule, because `body, html { … }` is two group members
+    and therefore two keys. An earlier version asserted a single rule and failed
+    on exactly the selector this file was built for.
+    """
+    found = [(key, r) for key, props in _declarations(css).items() for r in props.get(prop, [])]
+    assert found, f"the constructed sheet declares no `{prop}`"
+    return found
 
 
-def _answered(answer_css: str, vendor_css: str, key: str, prop: str) -> bool:
-    """Does the answer sheet answer the vendor sheet's single rule on `key`?"""
-    return _answers(_rules(_declarations(answer_css), key, prop), _leak(vendor_css, key, prop))
+def _answered(answer_css: str, vendor_css: str, prop: str) -> bool:
+    """Is EVERY member of the vendor sheet's selector list answered?
+
+    Every member, not any: a rule that answers one half of `body, html` leaves
+    the other half taking the vendor declaration.
+    """
+    answer = _declarations(answer_css)
+    return all(_answers(_rules(answer, key, prop), leak) for key, leak in _leaks(vendor_css, prop))
 
 
 # Answers that are NOT the vendor's selector. Every one of these read as an
@@ -816,7 +1024,6 @@ def test_an_answer_on_a_different_selector_does_not_answer(answer_selector, why)
     assert not _answered(
         answer_selector + " { display: block }",
         ".panel { display: flex }",
-        ".panel",
         "display",
     ), f"`{answer_selector}` was accepted as an answer to `.panel` — {why}"
 
@@ -827,7 +1034,7 @@ def test_the_vendors_own_selector_does_answer():
     A guard that rejects every answer is as useless as one that accepts every
     answer, and it is the easier of the two to ship by accident.
     """
-    assert _answered(".panel { display: block }", ".panel { display: flex }", ".panel", "display")
+    assert _answered(".panel { display: block }", ".panel { display: flex }", "display")
 
 
 def test_a_selector_GROUP_answers_through_the_member_that_matches():
@@ -840,7 +1047,6 @@ def test_a_selector_GROUP_answers_through_the_member_that_matches():
     assert _answered(
         "#app .panel, .panel { display: block }",
         ".panel { display: flex }",
-        ".panel",
         "display",
     )
     # And the same group does NOT answer a vendor rule on `#app .panel` through
@@ -848,13 +1054,11 @@ def test_a_selector_GROUP_answers_through_the_member_that_matches():
     assert _answered(
         "#app .panel, .panel { display: block }",
         "#app .panel { display: flex }",
-        ".panel",
         "display",
     )
     assert not _answered(
         ".panel { display: block }",
         "#app .panel { display: flex }",
-        ".panel",
         "display",
     )
 
@@ -869,7 +1073,6 @@ def test_selector_text_is_compared_normalised_not_byte_for_byte():
     assert _answered(
         "html,\n  body { overflow: auto }",
         "body,html{overflow:hidden}",
-        "html",
         "overflow",
     )
 
@@ -879,7 +1082,6 @@ def test_an_answer_scoped_to_an_AT_RULE_does_not_answer_at_every_width():
     assert not _answered(
         "@media (min-width: 900px) { .panel { display: block } }",
         ".panel { display: flex }",
-        ".panel",
         "display",
     )
 
@@ -887,10 +1089,10 @@ def test_an_answer_scoped_to_an_AT_RULE_does_not_answer_at_every_width():
 def test_an_important_vendor_declaration_needs_an_important_answer():
     """Loading later is enough at equal importance, and not enough below it."""
     vendor = ".panel { display: flex !important }"
-    assert not _answered(".panel { display: block }", vendor, ".panel", "display")
-    assert _answered(".panel { display: block !important }", vendor, ".panel", "display")
+    assert not _answered(".panel { display: block }", vendor, "display")
+    assert _answered(".panel { display: block !important }", vendor, "display")
     # And an important ANSWER is never required when the vendor is not important.
-    assert _answered(".panel { display: block }", ".panel { display: flex }", ".panel", "display")
+    assert _answered(".panel { display: block }", ".panel { display: flex }", "display")
 
 
 def test_a_query_string_on_an_href_does_not_disarm_the_guard():
@@ -924,9 +1126,9 @@ def test_the_real_pages_resolve_every_stylesheet_they_link():
     once, instead of once per page.
     """
     unresolved = {
-        t.name: _unresolvable(_linked_stylesheets(t))
-        for t in TEMPLATES
-        if _unresolvable(_linked_stylesheets(t))
+        name: _unresolvable(_linked_stylesheets(html))
+        for name, html in PAGES
+        if _unresolvable(_linked_stylesheets(html))
     }
     assert not unresolved, f"stylesheet links naming no file under webui/: {unresolved}"
 
@@ -956,8 +1158,7 @@ def test_a_type_selector_is_matched_case_INSENSITIVELY(vendor, answer):
     with the shift key. The control case, the same rule in lowercase, failed on
     all five pages.
     """
-    key = next(iter(_selector_keys(tinycss2.parse_component_value_list(vendor.split("{")[0]))))
-    assert _answered(answer, vendor, key, "display")
+    assert _answered(answer, vendor, "display")
 
 
 def test_class_and_id_names_are_NOT_folded():
@@ -966,9 +1167,7 @@ def test_class_and_id_names_are_NOT_folded():
     Class and id names ARE case-sensitive, so `.Panel` and `.panel` are two
     different selectors and an answer on one does not answer the other.
     """
-    assert not _answered(
-        ".panel { display: block }", ".Panel { display: flex }", ".Panel", "display"
-    )
+    assert not _answered(".panel { display: block }", ".Panel { display: flex }", "display")
 
 
 @pytest.mark.parametrize(
@@ -987,7 +1186,7 @@ def test_whitespace_around_a_combinator_is_insignificant(vendor, answer):
     was fail-CLOSED — a false alarm, not a leak — but this file's whole trade is
     accepting false alarms, so manufacturing them is not free.
     """
-    assert _answered(answer, vendor, ".panel", "display")
+    assert _answered(answer, vendor, "display")
 
 
 def test_a_BENIGN_row_clears_its_own_VALUE_and_not_the_slot():
@@ -1058,15 +1257,15 @@ def test_every_real_page_is_CHECKED_and_not_merely_unskipped():
     into neither list and the page skipped. MEASURED: moving one page's three
     links to a CDN gave `22 passed, 1 skipped`, exit 0, on a page whose leaks had
     not changed. `test_the_template_scan_found_the_pages` could not see it: it
-    counts TEMPLATES, which was still five.
+    counts PAGES, which was still six.
     """
     unchecked = []
-    for template in TEMPLATES:
-        hrefs = _linked_stylesheets(template)
+    for page, html in PAGES:
+        hrefs = _linked_stylesheets(html)
         owned = [h for h in hrefs if h.startswith(OWNED_PREFIX) and _resolve(h)]
         foreign = [h for h in hrefs if not h.startswith(OWNED_PREFIX) and _resolve(h)]
         if not owned or not foreign:
-            unchecked.append(f"{template.name} (owned={len(owned)}, vendor={len(foreign)})")
+            unchecked.append(f"{page} (owned={len(owned)}, vendor={len(foreign)})")
     assert not unchecked, (
         "these pages link no readable owned/vendor pair, so the per-page test "
         f"skips them and they are UNCHECKED rather than clean: {unchecked}"
@@ -1082,3 +1281,168 @@ def test_the_layout_property_set_covers_the_near_neighbours_of_both_incidents():
     """
     for prop in ("height", "min-height", "max-height", "overflow", "overflow-x", "overflow-y"):
         assert prop in LAYOUT_PROPS
+
+
+# ---------------------------------------------------------------------------
+# Round six. The estimate that survived the identity redesign lived UPSTREAM of
+# it, in the key space, and decided whether a rule was looked at. Every test
+# below pins either that collapse or one of the refusals that replaced a
+# silently-dropped shape.
+# ---------------------------------------------------------------------------
+
+
+def test_every_vendor_layout_declaration_derives_a_key():
+    """The collapse, measured against the real vendor sheet.
+
+    The key used to be an APPROXIMATION of which elements a selector reached —
+    last compound, classes only, bare elements, parenthesised arguments stripped.
+    MEASURED on the shipped `index.css`: 30 of its 175 layout declarations, 17%,
+    derived no key at all and were invisible to every check in this file.
+    `#right-panel { display: flex }` was one of them.
+
+    The key is now the selector itself, so this is 0 by construction — and this
+    test exists to say so out loud if anyone reintroduces a reduction.
+    """
+    vendor = (WEBUI / "index.css").read_text()
+    invisible: list[str] = []
+    total = 0
+
+    def walk(nodes):
+        nonlocal total
+        for node in nodes:
+            if node.type == "qualified-rule":
+                decls = [
+                    d
+                    for d in tinycss2.parse_blocks_contents(node.content)
+                    if d.type == "declaration" and d.lower_name in LAYOUT_PROPS
+                ]
+                if not decls:
+                    continue
+                total += len(decls)
+                if not _selector_keys(node.prelude):
+                    invisible.append(tinycss2.serialize(node.prelude).strip())
+            elif (
+                node.type == "at-rule"
+                and node.content is not None
+                and node.lower_at_keyword in {"media", "supports", "container"}
+            ):
+                walk(tinycss2.parse_rule_list(node.content))
+
+    walk(tinycss2.parse_stylesheet(vendor, skip_whitespace=True, skip_comments=True))
+    assert total > 100, f"only {total} vendor layout declarations — is the sheet still there?"
+    assert not invisible, (
+        f"{len(invisible)} of {total} vendor layout declarations derive no key and "
+        f"are invisible to this guard: {invisible[:5]}"
+    )
+
+
+def test_an_attribute_value_is_not_rewritten_by_combinator_normalisation():
+    """The fail-open the previous round's own fix introduced.
+
+    Collapsing whitespace with a regex over the finished selector text reached
+    inside quoted values, so `.panel[data-slot="a > b"]` and
+    `.panel[data-slot="a>b"]` normalised to the same string and answered each
+    other. Token types cannot be fooled by their own contents.
+    """
+    assert not _answered(
+        '.panel[data-slot="a>b"] { display: block }',
+        '.panel[data-slot="a > b"] { display: flex }',
+        "display",
+    )
+    # And the collapse it was added for still happens.
+    assert _answered(
+        ".wrap > .panel { display: block }", ".wrap>.panel { display: flex }", "display"
+    )
+
+
+def test_a_nested_AT_rule_is_refused_like_a_nested_qualified_rule():
+    """The refusal added last round had a hole the shape it guards walks through.
+
+    It looked for a nested QUALIFIED rule only, so a conditional one step down
+    slipped past: the outer rule has no direct declarations, so it was skipped
+    for being empty while the browser applied the rule inside.
+    """
+    with pytest.raises(AssertionError, match="NESTED rule"):
+        _declarations(".shell { @media (min-width: 1px) { .panel { display: flex } } }")
+
+
+def test_layer_carrying_layout_is_refused_rather_than_flattened():
+    """`@layer` is not a conditional and must not be treated as one.
+
+    Layer precedence outranks load order and importance — an important
+    declaration inside a layer beats an important unlayered answer however the
+    sheets load — so flattening it would report a leak answered by a rule the
+    browser discards.
+    """
+    with pytest.raises(AssertionError, match="@layer"):
+        _declarations("@layer vendor { .panel { display: flex } }")
+    # A layer with no layout declaration is not this file's business.
+    _declarations("@layer vendor { .panel { color: red } }")
+
+
+def test_a_local_import_is_refused_and_a_font_service_import_is_not():
+    """`@import` is BLOCKLESS, so the at-rule refusal never saw it.
+
+    A local import pulls in a stylesheet nobody here parses, so every rule in it
+    reads as absent. The one in the shipped tree points at a font service and is
+    the only shape allowed through — CodeRabbit's suggested blanket refusal would
+    have failed `index.css` at line 1.
+    """
+    with pytest.raises(AssertionError, match="@import"):
+        _declarations('@import url("more-vendor.css");')
+    _declarations('@import url("https://fonts.googleapis.com/css2?family=Rubik");')
+    assert _declarations((WEBUI / "index.css").read_text()), (
+        "index.css itself must still parse — it opens with a font-service @import"
+    )
+
+
+def test_a_media_conditional_link_is_refused():
+    """A sheet linked `media="print"` answers nothing at any other width."""
+    sheets, conditional = _sheets(
+        '<link rel="stylesheet" href="/css/a.css" media="print">'
+        '<link rel="stylesheet" href="/css/b.css" media="screen">'
+        '<link rel="stylesheet" href="/css/c.css">'
+    )
+    assert conditional == ["/css/a.css (media=print)"]
+    assert [v for _k, v in sheets] == ["/css/b.css", "/css/c.css"]
+
+
+def test_inline_style_blocks_are_read_as_owned_sheets():
+    """They are Genesis layout claims and were previously invisible.
+
+    MEASURED: four of the six pages declare layout properties inline — 47
+    selectors' worth on one of them. A claim the guard cannot see makes the
+    vendor declaration it answers read as unclaimed, so the selector is skipped
+    rather than checked. Position comes from the document, not from an
+    assumption: every inline block in this repository happens to sit after every
+    link, and the guard reads the order rather than relying on that.
+    """
+    sheets, _ = _sheets(
+        '<link rel="stylesheet" href="/index.css"><style>.panel { display: block }</style>'
+    )
+    assert [k for k, _v in sheets] == ["link", "inline"]
+    assert _declarations(sheets[1][1])[".panel"]["display"][0]["value"] == "block"
+
+    pages_with_inline = [
+        name for name, html in PAGES if any(k == "inline" for k, _ in _sheets(html)[0])
+    ]
+    assert len(pages_with_inline) >= 4, (
+        f"expected inline <style> on at least four pages, found {pages_with_inline} "
+        "— if they have been moved to shared sheets, that is good news and this "
+        "test should be re-measured rather than relaxed"
+    )
+
+
+def test_a_vendor_selector_that_embeds_another_is_refused():
+    """`:is(.panel)` reaches `.panel` elements and identity cannot say so.
+
+    MEASURED: appending `:is(.panel) { display: flex; height: 100% }` to the real
+    vendor sheet shipped silently with 37 passed, `.panel` answered in
+    components.css all the while. Relating the two means deciding which selectors
+    reach which elements, which is the model this file deleted.
+    """
+    assert _embeds_a_selector(":is(.panel)")
+    assert _embeds_a_selector(".shell :where(.panel)")
+    assert _embeds_a_selector(".collapse:not(.show)")
+    assert not _embeds_a_selector(".panel:hover")
+    assert not _embeds_a_selector('.panel[data-x="is(y)"]')

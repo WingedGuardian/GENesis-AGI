@@ -81,10 +81,54 @@
   `max-height` passed while `height` was watched — and a stylesheet that parses
   to zero rules is reported instead of reading as a sheet with no leaks.
 
-- Measured both directions on the real stylesheets: eleven constructed leaks all
-  caught, including each of the four selector shapes the previous model accepted,
-  both original incidents replayed by deleting their answers, the capitalised
-  vendor rule, the value-substituted clearance, and the page moved to a content
-  network; and six correct trees all left alone, including the answer reformatted
-  to one line, its selector group reversed, an extra member added, and a
-  cache-busting query string on a link.
+- **The last approximation is gone, and it was never in the comparison.** Six
+  rounds of review each found this guard failing open in a new shape, and the
+  pattern only became legible when the findings were bucketed by pipeline stage:
+  none of them landed on the selector comparison the previous round introduced.
+  They landed one stage earlier, on the "key" — an estimate of which elements a
+  selector could reach, derived by reducing each selector to its last compound,
+  its classes, or a bare element name. That estimate ran BEFORE the comparison
+  and decided whether a rule was looked at, so its errors were silent by
+  construction. Measured against the shipped vendor sheet, thirty of its
+  hundred and seventy-five layout declarations — seventeen per cent — derived no
+  key at all and were invisible to every check here, an identifier-selected panel
+  rule among them.
+
+  Since the comparison already works on normalised selector text, the key can be
+  that text. One stage instead of two, no approximation left anywhere, and the
+  last-compound split, the class-name pattern, the bare-element rule and the
+  parenthesis stripper are deleted rather than fixed. Measured after: zero
+  invisible declarations, zero new findings on the real stylesheets, both
+  original incidents still caught. The round count had been tracking remaining
+  estimating stages, not remaining bugs.
+
+- **What the guard cannot read is now refused rather than skipped.** A rule
+  nested inside another was refused already; a conditional nested inside a rule
+  was not, so it walked through the refusal added for exactly that shape. Joining
+  it: a cascade layer carrying a layout declaration, whose precedence outranks
+  everything compared here; a local import, which pulls in a stylesheet nobody
+  parses, while the font-service import the vendor sheet opens with is allowed
+  through by name; a stylesheet link under a media condition, whose declarations
+  answer nothing outside it; and a vendor layout rule whose selector embeds
+  another selector, where a reader would reasonably expect an answer on the
+  embedded one to count and identity cannot say so. The single real instance of
+  that last shape carries a row explaining why it is inert.
+
+- **Inline style blocks are read, having been documented as invisible.** Four of
+  the six pages declare layout properties in a `<style>` block — forty-seven
+  selectors' worth on one of them — and a Genesis layout claim the guard cannot
+  see makes the vendor declaration it answers read as unclaimed, so the selector
+  was skipped rather than checked. Blocks are now collected alongside links, in
+  document order, and their position is read rather than assumed.
+
+- **The login page is in scope, at the third attempt.** It is built as a string in
+  Python rather than as a template, so every check written against a glob of the
+  template directory has omitted it: once when the viewport fix was copied per
+  page and it never got a copy, once while that very omission was being fixed,
+  and once more when this guard was first written. The enumeration now lives in
+  one place that both test files import, with the reason attached — a rule every
+  call site has to remember is a rule the next call site will not.
+
+- Measured both directions after all of it: fifteen of fifteen, nine constructed
+  leaks caught and six correct trees left alone, plus every replay from the
+  previous round still firing. The collected-test floor is re-derived again.
