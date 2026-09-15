@@ -535,8 +535,12 @@ _MERGE_GATE_BUDGET_S = 45.0
 # Shared merge-path deadline (a monotonic() instant). main() sets it once before the
 # gh-pr-merge gates; every merge-path gh call reads it via _gh_timeout so the AGGREGATE
 # finishes with headroom under the hook's ~60s wall-clock. A module global is safe:
-# this PreToolUse hook is a SINGLE-SHOT process (one command, no concurrency), and it
-# stays None on every other path (push, the --check-pr report) → those use full caps.
+# this PreToolUse hook is a SINGLE-SHOT process, so one deadline per
+# invocation is the whole lifecycle. ARMED AT THE TOP OF
+# `_run_merge_and_push_gates` for EVERY path it guards — the push path
+# included, which used to inherit it only as a side effect of the escalation
+# gate. It stays None on the `--check-pr` reporting path, which is not a hook
+# invocation and has no registration to overrun, so that one uses full caps.
 _merge_deadline: float | None = None
 
 
@@ -7725,6 +7729,92 @@ def _push_config_is_simple(remote: str | None, cwd: str | None = None) -> bool:
     return not (rc == 0 and out == "true")
 
 
+def _push_is_dry_run(seg) -> bool:
+    """Whether this ``git push`` segment only SIMULATES the push.
+
+    `-n` / `--dry-run` publish nothing, so none of the states the adjacency
+    prompt reports can result from them. `-n` also travels inside a short
+    bundle (`-un`), which is why this reads the letters rather than the token.
+    """
+    argv = getattr(seg, "argv", None) or []
+    for t in argv[1:]:
+        if t == "--dry-run" or t.split("=", 1)[0] == "--dry-run":
+            return True
+        if t.startswith("-") and not t.startswith("--") and len(t) > 1:
+            for ch in t[1:]:
+                if ch == "o":
+                    break
+                if ch == "n":
+                    return True
+    return False
+
+
+def _push_ref_positionals(argv: list[str]) -> list[str] | None:
+    """The positional tokens of a ``git push`` segment, or None if it is not a
+    plain ref-set-neutral push.
+
+    Separated from ``_push_targets_current_branch`` so the SCAN and the VERDICT
+    are not the same function: the scan answers "which tokens are refspecs", the
+    caller decides what that means. It was extracted for a second caller — the
+    duplicate-name enrichment — which has since been removed from this PR and
+    refiled; the separation is kept because a parser that returns data is worth
+    more than one that returns a verdict, and because the enrichment will need
+    it again.
+
+    None means "a flag here changes the ref set" (``--all``, ``--tags``,
+    ``--delete``, ``--mirror``, ``--stdin``, ``--repo``, a ``+refspec`` force
+    shorthand, or anything unknown). Both callers treat None as a refusal.
+    """
+    # Advance past git global options to the `push` token.
+    i = 1
+    while i < len(argv):
+        t = argv[i]
+        if t in _GIT_GLOBAL_VALUE_FLAGS:
+            i += 2
+            continue
+        if t.startswith("-"):
+            i += 1
+            continue
+        break
+    if i >= len(argv) or argv[i] != "push":
+        return None
+    i += 1
+    positionals: list[str] = []
+    while i < len(argv):
+        t = argv[i]
+        if t in _PUSH_SAFE_VALUE_FLAGS:
+            i += 2  # ref-neutral value flag: skip the flag and its value token
+            continue
+        if t.startswith("--"):
+            base = t.split("=", 1)[0]
+            if "=" in t and base in _PUSH_SAFE_VALUE_FLAGS:
+                i += 1  # --push-option=value etc.
+                continue
+            if "=" not in t and base in _PUSH_SAFE_LONG_FLAGS:
+                i += 1
+                continue
+            return None  # unknown/broadening long flag (or a =form of a no-value flag)
+        if t.startswith("+"):
+            return None  # +<refspec> force shorthand
+        if t.startswith("-") and len(t) > 1:
+            # Short single/bundle — every letter must be ref-neutral. An `o` starts a
+            # glued push-option value, so the rest of the token is that value.
+            safe = True
+            for ch in t[1:]:
+                if ch == "o":
+                    break
+                if ch not in _PUSH_SAFE_SHORT_LETTERS:
+                    safe = False
+                    break
+            if not safe:
+                return None
+            i += 1
+            continue
+        positionals.append(t)
+        i += 1
+    return positionals
+
+
 def _push_targets_current_branch(
     seg, cur: str | None, remote: str | None, cwd: str | None = None
 ) -> bool:
@@ -7751,54 +7841,9 @@ def _push_targets_current_branch(
     """
     if not cur:
         return False
-    argv = getattr(seg, "argv", None) or []
-    # Advance past git global options to the `push` token.
-    i = 1
-    while i < len(argv):
-        t = argv[i]
-        if t in _GIT_GLOBAL_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-"):
-            i += 1
-            continue
-        break
-    if i >= len(argv) or argv[i] != "push":
+    positionals = _push_ref_positionals(getattr(seg, "argv", None) or [])
+    if positionals is None:
         return False
-    i += 1
-    positionals: list[str] = []
-    while i < len(argv):
-        t = argv[i]
-        if t in _PUSH_SAFE_VALUE_FLAGS:
-            i += 2  # ref-neutral value flag: skip the flag and its value token
-            continue
-        if t.startswith("--"):
-            base = t.split("=", 1)[0]
-            if "=" in t and base in _PUSH_SAFE_VALUE_FLAGS:
-                i += 1  # --push-option=value etc.
-                continue
-            if "=" not in t and base in _PUSH_SAFE_LONG_FLAGS:
-                i += 1
-                continue
-            return False  # unknown/broadening long flag (or a =form of a no-value flag)
-        if t.startswith("+"):
-            return False  # +<refspec> force shorthand
-        if t.startswith("-") and len(t) > 1:
-            # Short single/bundle — every letter must be ref-neutral. An `o` starts a
-            # glued push-option value, so the rest of the token is that value.
-            safe = True
-            for ch in t[1:]:
-                if ch == "o":
-                    break
-                if ch not in _PUSH_SAFE_SHORT_LETTERS:
-                    safe = False
-                    break
-            if not safe:
-                return False
-            i += 1
-            continue
-        positionals.append(t)
-        i += 1
     if len(positionals) >= 3:
         return False  # multiple refspecs → not a single plain current-branch update
     if len(positionals) == 2:
@@ -7919,12 +7964,22 @@ def _remote_branch_sha(remote: str, branch: str, cwd: str | None = None) -> str 
     ref, which goes stale the moment a remote branch is deleted). Accepts only the
     line whose ref path is EXACTLY ``refs/heads/<branch>`` — a bare pattern
     tail-matches namespaced refs. Fail-safe: None on rc!=0 / timeout / any error /
-    absent branch — callers treat None as "not confirmed present". Bounded by a 10s
-    timeout inside the hook's 60s budget.
+    absent branch — callers treat None as "not confirmed present". Bounded by the
+    SHARED hook deadline (10s cap, less once the budget has drained), because the
+    aggregate across sequential probes is what overruns the registration, not any
+    single call.
     """
     try:
         args = ["git"] + (["-C", cwd] if cwd else []) + ["ls-remote", "--heads", remote, branch]
-        result = subprocess.run(args, capture_output=True, text=True, timeout=10)
+        # Under the SHARED deadline, like every other probe on this path. This
+        # is a NETWORK call sitting immediately upstream of them, and a flat cap
+        # here is what the arming comment cannot compensate for: the AGGREGATE
+        # is what overruns the hook's registration, and a SIGKILLed PreToolUse
+        # hook fails OPEN. `_gh_timeout` returns the full cap when no deadline
+        # is armed, so the --check-pr reporting path is unaffected.
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=_gh_timeout(10.0)
+        )
         if result.returncode != 0:
             return None
         target_ref = f"refs/heads/{branch}"
@@ -7951,6 +8006,169 @@ def _push_is_republish(remote: str | None, branch: str | None, cwd: str | None =
     if not remote or not branch:
         return False
     return _remote_branch_sha(remote, branch, cwd=cwd) is not None
+
+
+def _open_pr_count_for_branch(
+    branch: str, cwd: str | None = None, push_urls: set[str] | None = None
+) -> int | None:
+    """How many OPEN PRs have ``branch`` as their head, or None if unknowable.
+
+    Distinguishing 0 from None is the point of the return type: 0 is a measured
+    "this public branch has no PR" — the state where CI and the leak-detector
+    never run, since ci.yml triggers on pull_request — while None is "the
+    question could not be answered" (no gh, no network, no auth). Callers treat
+    None as the status quo, never as 0: this feeds a HYGIENE prompt, not a
+    security verdict, and the first-push approval it modulates already happened.
+
+    COUNTS ONLY PRs TARGETING THE DEFAULT BRANCH, because the question is "does
+    CI run on this branch" and `ci.yml` triggers on `pull_request` filtered to
+    `main`. A PR onto a non-default base contributes no CI and no leak scan at
+    all (issue #2035), so counting it would silence the prompt in exactly the
+    state the prompt exists to report.
+
+    AND ONLY PRs FROM THIS REPOSITORY. `gh pr list --head` matches a bare branch
+    NAME and documents no `owner:branch` form, so a fork's PR from an
+    identically-named branch would otherwise answer for ours.
+
+    Subprocess timeout comes from ``_gh_timeout`` so these probes share the
+    push-path deadline rather than each holding an independent 10s — the
+    aggregate is what SIGKILLs a hook, and a killed PreToolUse hook fails OPEN.
+    """
+    try:
+        args = ["gh", "pr", "list", "--head", branch, "--state", "open",
+                "--json", "number,baseRefName,headRepositoryOwner,isCrossRepository",
+                "--limit", str(_PR_LIST_WINDOW)]
+        result = subprocess.run(
+            args, capture_output=True, text=True,
+            timeout=_gh_timeout(10.0), cwd=cwd or None,
+        )
+        if result.returncode != 0:
+            return None
+        rows = json.loads(result.stdout)
+        if not isinstance(rows, list):
+            return None
+        # DESTINATION FIRST, and before the empty-list shortcut. `gh pr list`
+        # asked the repo GH RESOLVES; if that is not where this push goes, the
+        # answer describes a different repository and an EMPTY result is not
+        # evidence of anything — least of all the measured 0 that turns a silent
+        # allow into an ask.
+        identity = None
+        if push_urls is not None:
+            identity = _base_repo_identity(cwd=cwd)
+            if identity is None or not _urls_name_repo(push_urls, identity[2]):
+                return None
+        # Now an empty list IS a measured 0, and needs no further lookup: no
+        # request has this head, whatever the default branch is called. When the
+        # caller passed no URLs there is nothing to verify against, so the
+        # shortcut still skips the second gh call — which matters because
+        # `_gh_timeout` floors at 1.0s once the budget drains, making that call
+        # the likelier of the two to fail.
+        if not rows:
+            return 0
+        # A response that FILLS the window is a truncated read, not a complete
+        # one: the qualifying request may sit past the cap, and the filters
+        # below would then sum to a confident 0 — the answer that downgrades
+        # the allow to an ask. Refuse to infer absence from it.
+        if len(rows) >= _PR_LIST_WINDOW:
+            return None
+        if identity is None:
+            identity = _base_repo_identity(cwd=cwd)
+            if identity is None:
+                return None
+        default, base_owner, _canonical = identity
+        return sum(
+            1
+            for pr in rows
+            if isinstance(pr, dict)
+            and pr.get("baseRefName") == default
+            # Filter by the head repo's OWNER, not `isCrossRepository`. The
+            # concern is SOMEONE ELSE'S fork answering for us, because
+            # `gh pr list --head` matches a bare branch name. `isCrossRepository`
+            # is true for any head-repo != base-repo, which in a fork-based
+            # clone is EVERY legitimate PR the contributor opens — the count
+            # would read 0 forever and the prompt would fire on every re-push
+            # while telling the user something false, since a fork PR onto the
+            # default branch does run CI.
+            and (pr.get("headRepositoryOwner") or {}).get("login") == base_owner
+        )
+    except Exception:
+        return None
+
+
+_PR_LIST_WINDOW = 100
+"""Rows requested from ``gh pr list``. A FULL window is treated as unanswerable
+rather than counted — see ``_open_pr_count_for_branch``."""
+
+
+def _repo_identity_from_url(url: str) -> tuple[str, str] | None:
+    """``(host, owner/repo)`` for a git remote URL, or None if it has neither.
+
+    Normalises the spellings of one remote so they compare equal: `https://`,
+    bare `git@host:owner/repo`, `ssh://git@host/owner/repo`, and a trailing
+    `.git` or `/` all reduce to the same pair. Any userinfo before the host is
+    dropped, since `git@` is not part of the destination's identity.
+    """
+    raw = url.strip().lower().rstrip("/")
+    raw = raw.removesuffix(".git")
+    if "://" in raw:
+        raw = raw.split("://", 1)[1]
+    elif ":" in raw and "/" not in raw.split(":", 1)[0]:
+        raw = raw.replace(":", "/", 1)            # git@host:owner/repo
+    if "@" in raw.split("/", 1)[0]:
+        raw = raw.split("@", 1)[1]                # strip userinfo
+    parts = [x for x in raw.split("/") if x]
+    if len(parts) < 3:
+        return None
+    host = parts[0].split(":", 1)[0]              # drop any :port
+    return host, "/".join(parts[-2:])
+
+
+def _urls_name_repo(urls: set[str], canonical: str) -> bool:
+    """Whether every URL in ``urls`` names the SAME repository as ``canonical``.
+
+    HOST IS PART OF THE IDENTITY. Comparing only the `owner/repo` tail would
+    make a remote on any other host — an enterprise instance, a mirror, or a
+    look-alike — compare equal to the repository gh answered about, and the
+    count would then be trusted for a destination it never described.
+
+    Deliberately ALL rather than ANY: a push that fans out to several remotes is
+    only answerable by one count if every destination is the same repository.
+    """
+    want = _repo_identity_from_url(canonical)
+    if not urls or want is None:
+        return False
+    return all(_repo_identity_from_url(u) == want for u in urls)
+
+
+def _base_repo_identity(cwd: str | None = None) -> tuple[str, str, str] | None:
+    """``(default_branch, owner_login, canonical_url)`` for the repo gh resolves, or None.
+
+    Both facts come from ONE round-trip. They are needed together and each is a
+    serialized subprocess on the push path, where the aggregate — not any single
+    call — is what overruns the hook's registration.
+
+    None is propagated rather than defaulted to "main": the caller's contract is
+    that an unanswerable question keeps the status quo, and guessing the base
+    name here would turn a failed lookup into a confident count.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "repo", "view", "--json", "defaultBranchRef,nameWithOwner,url",
+             "-q", ".defaultBranchRef.name + \"\\n\" + .nameWithOwner + \"\\n\" + .url"],
+            capture_output=True, text=True,
+            timeout=_gh_timeout(10.0), cwd=cwd or None,
+        )
+        if result.returncode != 0:
+            return None
+        parts = result.stdout.strip().split("\n")
+        if len(parts) != 3:
+            return None
+        branch, slug, url = (x.strip() for x in parts)
+        if not branch or "/" not in slug or not url:
+            return None
+        return branch, slug.split("/", 1)[0], url
+    except Exception:
+        return None
 
 
 def _ask(reason: str) -> int:
@@ -8295,6 +8513,19 @@ def _run_merge_and_push_gates() -> int:
         # step-back (triage / mechanism / state-space) before round N+1.
         # Fail-open inside the check; '# escalation-ack' is the conscious
         # continue after a fresh user decision.
+        # ARM THE SHARED SUBPROCESS DEADLINE, once, for every gate below.
+        # It was previously armed only as a SIDE EFFECT of the escalation gate,
+        # which is documented fail-open, wraps its whole body in `except
+        # Exception: return`, and has already once had a top-of-function
+        # short-circuit that returned before the arming. The push path's
+        # wall-clock safety must not depend on another gate's internals: without
+        # a deadline the probes below are five sequential 10s caps plus an
+        # ls-remote, over the hook's registration — and a SIGKILLed PreToolUse
+        # hook fails OPEN, disengaging every gate in the stack.
+        global _merge_deadline
+        if _merge_deadline is None:
+            _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
+
         esc_block, esc_msg = _check_codex_round_escalation(segs)
         if esc_block:
             print(esc_msg, file=sys.stderr)
@@ -8445,6 +8676,54 @@ def _run_merge_and_push_gates() -> int:
                             f"git push needs your approval before publishing externally "
                             f"(target: {branch or 'default'})."
                         )
+                    # A RE-PUSH earns its silence by having been approved at
+                    # first publication — but a public branch with NO OPEN PR is
+                    # outside CI and the leak-detector (ci.yml triggers on
+                    # pull_request), so its silence is the state this repo's
+                    # standing rule forbids: published, unchecked, and quietly
+                    # growing. Downgrade the silent allow to an ASK naming the
+                    # gap. A lookup that cannot answer (None) keeps the status
+                    # quo — this is a hygiene prompt on an already-approved
+                    # branch, not a security boundary, so an unanswerable
+                    # question must not manufacture prompts on every network
+                    # blip.
+                    # An earlier segment that CLOSES a PR invalidates the state
+                    # this allow is read from. The hook runs before any of the
+                    # command executes, so `gh pr close <n> && git push` sees the
+                    # PR still open, keeps the silent allow, and then publishes
+                    # into exactly the PR-less state the ask exists to report.
+                    # The count cannot see a close that has not happened yet, so
+                    # the command's own shape has to.
+                    closes_pr = any(
+                        gh_pr_subcommand(s.argv) == "close" for s in segs
+                    )
+                    if push_allow_reason and closes_pr:
+                        push_allow_reason = None
+                        ask_reason = (
+                            f"re-push to '{cur}': an earlier step in this command "
+                            f"CLOSES a pull request, so the push that follows may "
+                            f"land on a branch with no open PR — outside CI and "
+                            f"the leak scan. Run the close and the push as "
+                            f"separate commands so each is judged on the state it "
+                            f"actually runs in."
+                        )
+                    # A DRY RUN publishes nothing, so it cannot create the
+                    # unchecked-branch state this prompt reports. `-n` and
+                    # `--dry-run` are both accepted by the predicate above, so
+                    # they reach here; asking about them is pure friction on an
+                    # inspection command.
+                    elif (
+                        push_allow_reason
+                        and not _push_is_dry_run(push_segs[0])
+                        and _open_pr_count_for_branch(cur, cwd=pcwd, push_urls=urls) == 0
+                    ):
+                        push_allow_reason = None
+                        ask_reason = (
+                            f"re-push to '{cur}': this branch is PUBLIC but has "
+                            f"NO OPEN PR, so CI and the leak scan never run on "
+                            f"it. Approve to push, then open its PR "
+                            f"(gh pr create) — or close the branch out."
+                        )
                 else:
                     ask_reason = (
                         f"git push needs your approval before publishing externally "
@@ -8522,7 +8801,8 @@ def _run_merge_and_push_gates() -> int:
             # Idempotent: the escalation gate may have already armed it for the same
             # command (round-6 P1) — reuse that deadline so the two gates share ONE
             # aggregate budget, never re-extend it here.
-            global _merge_deadline
+            # (armed at the top of this function; kept idempotent here so the
+            # merge path still works if it is ever reached another way)
             if _merge_deadline is None:
                 _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
             merge_repo = _merge_target_repo(merge_seg.argv, merge_seg.raw)
