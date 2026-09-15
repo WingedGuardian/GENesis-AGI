@@ -344,6 +344,31 @@ modules: [cc]
 verified: d0627c854 2026-09-11
 ```
 
+- **The slot door heals a bare slot — by CONSENT, never silently**
+  (`scripts/cc-slot.sh`, the block above every latch; probe:
+  `cc/slot_liveness.py`, a /proc walk for a live claude under any pane pid —
+  never `#{pane_current_command}`, which reports `bash` for the canonical
+  launch WHILE claude runs). A slot existing as a bare shell made
+  `new-session -A` silently attach and discard the launch command — the
+  operator landed at a prompt, every time, for weeks. The door now probes,
+  DISCLOSES what it found (a no-tty entry gets the report and the manual
+  route, nothing more), and on an explicit `[y/N]`-default-no at a real
+  terminal kills the session BY ID so the untouched create path rebuilds it.
+  Safety is three MEASURED tmux-3.4 properties: within one server, session
+  ids are never reused (kill-by-id is a compare-and-swap; a stale id is a
+  refused no-op); across server GENERATIONS the id counter RESTARTS at $0 —
+  measured by falsifying the naive design — which is why the server-PID
+  compare is load-bearing; and one `list-panes -s` call is one consistent
+  state, so the human wait sits between two snapshots, never between a read
+  and the kill. Consent binds to the DISCLOSED state: server pid, session id,
+  the attachment+pane-command projection, and a fresh POISONED verdict must
+  all re-derive identically after the yes, or the door stands down and `-A`
+  absorbs the interleaving. Every failure direction lands on ATTACH. The
+  block sits ABOVE `existing`/`_SESSION_EXISTS`/the capacity and OAuth gates
+  so each reads post-kill reality on its only read — the staleness class that
+  took the predecessor design through 7 review rounds is retired by
+  construction. Forbidden mechanisms are test-pinned (no send-keys /
+  respawn-pane / set-environment; exactly one new-session invocation).
 - **Roster peer availability is OBSERVATION, never a gate** (`cc/peer_availability.py`,
   recorded from the failover loop in `cc/conversation.py`). `roster.failover_chain`
   admits a peer on CREDENTIAL PRESENCE — "is `auth_env` set" — so a quota-blocked
@@ -929,14 +954,30 @@ verified: d0627c854 2026-09-11
   (`knowledge_ingest_source` MCP) requires explicit user confirmation —
   contrast the intake bypass in entry 4.
 - **inbox/**: file-drop monitor with approval-gated dispatch; phase order
-  resume → detect → create → dispatch; `approval_key_stable=True` (ONE
+  recover pending → resume approval → detect → create → dispatch;
+  `approval_key_stable=True` (ONE
   site-level approval key). The refresh path folds parked files into the
   batch so approvals fire once (#914). A pending approval is HELD until the
   user resolves it (no re-ask, no age-based cancel) and is auto-cancelled only
   when *orphaned* — no live inbox row (`awaiting_approval:`/`dispatching:`)
   still references it (`count_live_rows_for_approval`); this replaced the old
-  4h staleness cancel that re-detected unchanged files and nagged. Coherence +
-  URL-failure heuristics gate dispatch.
+  4h staleness cancel that re-detected unchanged files and nagged. Three checks
+  sit between a response and the baseline: a coherence check (annotates, never
+  blocks), a give-up-LANGUAGE URL-failure check, and a URL-COVERAGE check
+  requiring every scanner-recognized input URL's parsed identity to appear in
+  the response — that last one catches SILENT omission, which the language
+  check cannot see by construction. Scheme and host case plus one leading
+  `www.` are presentation variants; authority, path, query, and fragment
+  identity remain exact. Coverage
+  ships in SHADOW (`url_coverage_mode`, `config/inbox_monitor.yaml`): it computes
+  its verdict and logs only stable opaque URL ids, acting on nothing until
+  compliance under the `**Source:**` prompt has been measured. Follow-up and
+  build-lane durable writes finish before the completed baseline commits, so a
+  cancellation cannot permanently hide their absence. On restart every
+  pre-dispatch `pending` row is atomically returned to the bounded retry lane;
+  complete outstanding work is re-derived from the current source and completed
+  baseline, so a crash during multi-row creation cannot silently lose the
+  never-created tail or leave pending rows suppressing the file forever.
 - **recon/**: scheduled intelligence jobs (release watch, model intelligence
   Sun 8am, models.md synthesis Sun 10am, GitHub discovery, skill-security scan
   via external NVIDIA SkillSpector). Emits findings for triage
@@ -1933,7 +1974,15 @@ verified: 788dd9a9 2026-09-06
   comes from ONE read of it, so two sections of a board cannot disagree about
   the same population (`follow_ups.get_lane_counts` returns per-status
   actionable counts and the deferred remainder together; the remainder is a
-  COMPLEMENT, so a `kind` added later is absorbed rather than dropped). Both accounting surfaces
+  COMPLEMENT, so a `kind` added later is absorbed rather than dropped). The same
+  withholding rule reaches one axis further out, into the TAB's own TRANSPORT:
+  when a refresh starts failing after a board has loaded, the header badge drops
+  its number for a named warning rather than presenting the last board as
+  current, and it names every fault that holds at once instead of ranking them,
+  so fixing one does not hide the next. The predicate is the outstanding FAULT —
+  the last completed attempt failed and a board had loaded before it — never the
+  transport's current phase, which returns to "refreshing" for the duration of
+  every retry. Both accounting surfaces
   (`GET /api/genesis/zero-drop` + the Zero-Drop tab, and the morning report's
   Ground-Truth line) call that one assembler so they cannot disagree; the
   morning-report line is COUNTS ONLY, never a branch name, because that
