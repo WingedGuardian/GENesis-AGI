@@ -747,13 +747,26 @@ class StandaloneAdapter:
                 app.register_blueprint(voice_api_bp)
                 logger.info("Voice API blueprint registered")
             if not os.environ.get("GENESIS_MCP_HTTP_TOKEN"):
+                # Names BOTH surfaces: the token now also gates the OpenClaw
+                # completions endpoint, so a warning naming only voice sends an
+                # operator to the wrong subsystem while OpenClaw is dark too.
                 logger.warning(
-                    "voice API disabled: GENESIS_MCP_HTTP_TOKEN not configured "
-                    "— all /v1/voice/* routes answer 503 (fail-closed; set the "
-                    "token in secrets.env to enable the voice API)"
+                    "GENESIS_MCP_HTTP_TOKEN not configured — all /v1/voice/* "
+                    "routes AND /v1/chat/completions (OpenClaw) answer 503 "
+                    "(fail-closed; set the token in secrets.env to enable them)"
                 )
         except Exception:
             logger.exception("Failed to register voice API blueprint")
+
+        # Desk brain API — a desktop assistant's router-backed brain.
+        try:
+            from genesis.dashboard.routes.desk_api import desk_api_bp
+
+            if "desk_api" not in app.blueprints:
+                app.register_blueprint(desk_api_bp)
+                logger.info("Desk brain API blueprint registered")
+        except Exception:
+            logger.exception("Failed to register desk brain API blueprint")
 
     def _run_flask(self) -> None:
         """Run Flask in a thread (called from daemon thread)."""
