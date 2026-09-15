@@ -1288,6 +1288,18 @@ class CCInvoker:
         terminated_after_result = False
         line_count = 0
         oversized_dropped = 0
+        # Buffer overruns, which is NOT the same number. A physical line much
+        # larger than the limit makes `readline()` raise once per buffer fill:
+        # MEASURED on Python 3.12, one 20,000,000-byte line raised 18 times
+        # before its newline arrived. `oversized_dropped` is the public
+        # counter and must mean LINES — it reaches the caller as
+        # `stream_lines_dropped` and drives the MCP projections and the
+        # operator diagnostics, all of which would otherwise report 18 missing
+        # events for one (Codex P2, PR #1625).
+        oversized_overruns = 0
+        # True while the reader is still discarding one over-limit physical
+        # line: every raise after the first belongs to the SAME line.
+        mid_oversized_line = False
         multi_block_seen = False
 
         try:
@@ -1316,7 +1328,12 @@ class CCInvoker:
                         # can be parsed from a truncated span), so the only
                         # question is whether losing it costs the LINE or the
                         # SESSION. Drop the line.
-                        oversized_dropped += 1
+                        oversized_overruns += 1
+                        if not mid_oversized_line:
+                            # FIRST overrun of this physical line — the only
+                            # one that represents a lost event.
+                            oversized_dropped += 1
+                            mid_oversized_line = True
                         # Yield explicitly: this branch has no other await, so
                         # without it a readline() that raises WITHOUT consuming
                         # would spin with the event loop locked out and
@@ -1324,18 +1341,25 @@ class CCInvoker:
                         # real StreamReader is guaranteed by consumption, not by
                         # this — but the timeout is only a backstop if we yield.
                         await asyncio.sleep(0)
-                        if oversized_dropped <= 3 or oversized_dropped % 25 == 0:
+                        if oversized_overruns <= 3 or oversized_overruns % 25 == 0:
                             logger.warning(
                                 "CC stream line exceeded the %d-byte limit and was "
-                                "DROPPED (PID %s, dropped=%d) — a tool result was "
-                                "almost certainly too large; the session continues",
+                                "DROPPED (PID %s, lines=%d, buffer overruns=%d) — a "
+                                "tool result was almost certainly too large; the "
+                                "session continues",
                                 _STREAM_LINE_LIMIT,
                                 proc.pid,
                                 oversized_dropped,
+                                oversized_overruns,
                             )
                         continue
                     if not raw_line:
                         break  # EOF
+                    # A successful read means the over-limit line finally
+                    # ended (this is its unusable tail, which fails to parse
+                    # below like any other garbage). The NEXT raise starts a
+                    # new line and counts again.
+                    mid_oversized_line = False
                     line = raw_line.decode(errors="replace").strip()
                     if not line:
                         continue
@@ -1601,11 +1625,25 @@ class CCInvoker:
 
         if result_data is not None:
             output = self._parse_result_dict(result_data, invocation, elapsed)
-            # Unconditional: () is now a real report ("the runtime watched and
-            # saw no tool_use"), distinct from None ("nothing watched"). A
-            # `if tools_seen:` guard here would silently downgrade the former
-            # to the latter on every tool-free streaming turn.
-            output = replace(output, tools_used=tuple(tools_seen))
+            # () is a real report ("the runtime watched and saw no tool_use"),
+            # distinct from None ("nothing watched"). A `if tools_seen:` guard
+            # here would silently downgrade the former to the latter on every
+            # tool-free streaming turn.
+            #
+            # But a DROPPED event means the watching was incomplete, and a
+            # partial inventory presented as a complete one is worse than no
+            # inventory: triage reads a non-None tuple as authoritative
+            # (`learning/triage/summarizer.py:203` sets
+            # `tool_calls_from_runtime`), so if the dropped event was the only
+            # tool request, graders are told the runtime observed NO tools —
+            # a false fact entering permanent learning. None is the honest
+            # value, and it already means exactly this; triage then falls back
+            # to extracting from the text, as it does for every non-streaming
+            # turn (Codex P2, PR #1625).
+            output = replace(
+                output,
+                tools_used=None if oversized_dropped else tuple(tools_seen),
+            )
             # When CC uses extended thinking, the result field can be empty
             # but the actual response was emitted as text events during streaming
             if not output.text and collected_text:

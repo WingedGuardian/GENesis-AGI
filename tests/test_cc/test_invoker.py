@@ -3593,3 +3593,184 @@ async def test_a_timeout_without_a_drop_is_still_a_timeout(invoker, monkeypatch)
         pytest.raises(CCTimeoutError),
     ):
         await invoker.run_streaming(CCInvocation(prompt="x", timeout_s=1))
+
+
+def _proc_with_one_huge_line(data: bytes, *, overruns: int, at: int):
+    """A stdout whose line `at` is a SINGLE physical line far over the limit.
+
+    The existing `_make_async_stdout` models one raise per line, which is the
+    shape of a line slightly over the limit. A line MUCH larger behaves
+    differently and that difference is the defect under test: CPython's
+    `StreamReader.readline()` raises once per buffer fill, so one
+    20,000,000-byte line against a 1 MiB limit raised 18 times before its
+    newline arrived (MEASURED, Python 3.12). Only the last of those reads
+    returns anything — the unusable tail.
+    """
+
+    class _HugeLineStdout:
+        def __init__(self, payload: bytes):
+            self._lines = payload.splitlines(keepends=True)
+            self._i = 0
+            self._left = overruns
+            self.reads: list[int] = []
+            self.raises = 0
+
+        async def readline(self) -> bytes:
+            if self._i >= len(self._lines):
+                return b""
+            if self._i == at and self._left > 0:
+                # Same physical line, another buffer fill. The index is NOT
+                # advanced: nothing has been consumed to a newline yet.
+                self._left -= 1
+                self.raises += 1
+                raise ValueError(
+                    "Separator is not found, and chunk exceed the limit"
+                )
+            idx = self._i
+            self._i += 1
+            self.reads.append(idx)
+            return self._lines[idx]
+
+    proc = AsyncMock()
+    proc.stdout = _HugeLineStdout(data)
+    proc.stdin = _make_mock_stdin()
+    proc.stderr = _make_mock_stderr()
+    proc.wait = AsyncMock()
+    proc.terminate = MagicMock()
+    proc.returncode = 0
+    return proc
+
+
+@pytest.mark.asyncio
+async def test_one_huge_line_counts_as_one_dropped_line_not_many(invoker):
+    """`stream_lines_dropped` must mean LINES, because that is what every
+    consumer reads it as.
+
+    It reaches the caller as an event count, drives the MCP projections, and
+    is printed in operator diagnostics — so reporting 18 for a single missing
+    event is a false fact in all three places, and it inflates precisely when
+    the line is largest and the loss is most confusing (Codex P2, PR #1625).
+    """
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}},
+        _result_event("survived"),
+    )
+    proc = _proc_with_one_huge_line(data, overruns=18, at=1)
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert proc.stdout.raises == 18, (
+        f"the fake did not reproduce repeated overruns ({proc.stdout.raises})"
+    )
+    assert output.text == "survived", "the stream did not recover"
+    assert output.stream_lines_dropped == 1, (
+        "one oversized physical line was reported as "
+        f"{output.stream_lines_dropped} dropped lines — the counter is "
+        "measuring buffer overruns, not lost events"
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_separate_huge_lines_still_count_as_two(invoker):
+    """CONTROL. Collapsing every overrun into a single count would satisfy the
+    test above while under-reporting genuinely distinct losses — the opposite
+    error, and the one that hides missing events instead of inventing them."""
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "a"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "b"}]}},
+        _result_event("survived"),
+    )
+
+    class _TwoHuge:
+        def __init__(self, payload: bytes):
+            self._lines = payload.splitlines(keepends=True)
+            self._i = 0
+            self._left = {1: 5, 2: 7}
+            self.reads: list[int] = []
+
+        async def readline(self) -> bytes:
+            if self._i >= len(self._lines):
+                return b""
+            if self._left.get(self._i, 0) > 0:
+                self._left[self._i] -= 1
+                raise ValueError("Separator is not found, and chunk exceed the limit")
+            idx = self._i
+            self._i += 1
+            self.reads.append(idx)
+            return self._lines[idx]
+
+    proc = AsyncMock()
+    proc.stdout = _TwoHuge(data)
+    proc.stdin = _make_mock_stdin()
+    proc.stderr = _make_mock_stderr()
+    proc.wait = AsyncMock()
+    proc.terminate = MagicMock()
+    proc.returncode = 0
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert output.stream_lines_dropped == 2, (
+        "two distinct oversized lines (5 and 7 overruns) were reported as "
+        f"{output.stream_lines_dropped} — distinct losses are being merged"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_event_withholds_the_tool_inventory_from_triage(invoker):
+    """A partial inventory must not be presented to learning as a complete one.
+
+    `tools_used` has three meanings downstream: None is "no runtime report",
+    () is "the runtime watched and saw zero tools", and a populated tuple is
+    an authoritative list. Triage keys `tool_calls_from_runtime` on
+    non-None-ness (`learning/triage/summarizer.py:203`), so a tuple built from
+    a stream that DROPPED an event asserts something the runtime does not
+    know — and when the dropped event was the only tool request, graders are
+    told no tools ran. That false fact reaches prefiltering and permanent
+    learning (Codex P2, PR #1625).
+
+    None is the honest value and already carries this meaning, so triage falls
+    back to extracting from the text exactly as it does for a non-streaming
+    turn.
+    """
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}},
+        _result_event("survived"),
+    )
+    proc = _streaming_proc(data, raise_on=(1,))
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert output.stream_lines_dropped == 1, "the drop path was not exercised"
+    assert output.tools_used is None, (
+        "a stream with a dropped event still reported an authoritative tool "
+        f"inventory ({output.tools_used!r}) — triage will read it as a "
+        "complete runtime report"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_clean_stream_still_reports_an_empty_inventory(invoker):
+    """CONTROL, and the distinction this file already protects: on a clean
+    tool-free turn `tools_used` must stay `()`, not `None`. Collapsing them
+    would satisfy the test above while making "Tools used: none" unsayable on
+    every streaming turn — the exact downgrade the surrounding comment warns
+    against."""
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        _result_event("clean"),
+    )
+    proc = _streaming_proc(data)
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert output.stream_lines_dropped == 0
+    assert output.tools_used == (), (
+        f"a clean tool-free stream lost its runtime report ({output.tools_used!r})"
+    )

@@ -853,7 +853,16 @@ async def test_a_dropped_result_never_advances_to_another_failover_peer(
     assert invoker.run.await_count == 1, (
         f"the prompt was replayed on another peer ({invoker.run.await_count}x)"
     )
-    assert result is None, "contingency is tool-less and should still answer"
+    from genesis.cc.conversation import UNREPLAYABLE
+
+    assert result is UNREPLAYABLE, (
+        "the helper must report UNREPLAYABLE, not a bare None. Both are "
+        "'let tool-less contingency answer', but None ALSO reads as ordinary "
+        "exhausted failover, and the callers park that when contingency "
+        "fails — durably scheduling a full-tools replay of writes the "
+        "truncated peer already performed (Codex P1, PR #1625)"
+    )
+    assert result is not None, "contingency is tool-less and should still answer"
 
 
 @pytest.mark.asyncio

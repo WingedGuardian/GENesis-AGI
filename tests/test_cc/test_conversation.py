@@ -1,6 +1,7 @@
 """Tests for ConversationLoop."""
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -859,3 +860,90 @@ async def test_a_truncation_after_streaming_does_not_answer_twice(
     # caught the regression; `!= ""` alone would pass on any stray whitespace.
     assert result.strip(), "a truncated turn returned an empty, non-error reply"
     assert "lost this answer" in result, f"the user was told nothing useful: {result!r}"
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_failover_peer_is_never_parked(
+    loop_with_contingency, mock_invoker, monkeypatch,
+):
+    """The park hazard, reached through the FAILOVER peer rather than the home
+    attempt — the route the earlier suppression did not cover.
+
+    When the home model is rate-limited and a roster peer runs tools but then
+    truncates before emitting text, `_try_roster_failover` used to return a
+    bare `None`. Both call sites read that as ordinary exhausted failover, so
+    when contingency was also unavailable they called `park_conversation` —
+    which in live mode durably schedules the SAME prompt for a later
+    full-tools direct session, repeating every write and send the truncated
+    peer had already performed (Codex P1, PR #1625).
+
+    The helper now returns `UNREPLAYABLE`, which permits tool-less contingency
+    and forbids the park.
+    """
+    from genesis.cc import rate_limit_park
+    from genesis.cc.conversation import UNREPLAYABLE
+    from genesis.cc.exceptions import CCRateLimitError
+
+    loop, contingency = loop_with_contingency
+    parked: list = []
+    monkeypatch.setattr(
+        rate_limit_park, "park_conversation",
+        AsyncMock(side_effect=lambda *a, **k: parked.append(a)),
+    )
+    # Contingency unavailable — the only branch that reaches the park.
+    # Unsuccessful RESULT, not None: _try_contingency reads result.success,
+    # so None would crash before reaching the branch under test.
+    contingency.dispatch_conversation = AsyncMock(
+        return_value=SimpleNamespace(success=False, reason="unavailable",
+                                     text=None, model=None),
+    )
+    monkeypatch.setattr(
+        loop, "_try_roster_failover", AsyncMock(return_value=UNREPLAYABLE),
+    )
+    mock_invoker.run.side_effect = CCRateLimitError("429")
+
+    result = await loop.handle_message(
+        "hello", user_id="u1", channel=ChannelType.TERMINAL,
+    )
+
+    assert not parked, (
+        "a truncated failover peer queued its prompt for a full-tools "
+        "re-dispatch — every write and send it already performed will run again"
+    )
+    assert result, "the turn returned nothing at all"
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_exhausted_failover_still_parks(
+    loop_with_contingency, mock_invoker, monkeypatch,
+):
+    """CONTROL, and it is what keeps the sentinel meaningful.
+
+    Parking is the CORRECT behaviour when the peer chain is merely exhausted
+    and nothing ran — the turn auto-resumes when capacity returns. An
+    implementation that suppressed every park would satisfy the test above
+    while silently dropping turns that should have been retried.
+    """
+    from genesis.cc import rate_limit_park
+    from genesis.cc.exceptions import CCRateLimitError
+
+    loop, contingency = loop_with_contingency
+    parked: list = []
+    monkeypatch.setattr(
+        rate_limit_park, "park_conversation",
+        AsyncMock(side_effect=lambda *a, **k: parked.append(a)
+                  or SimpleNamespace(copy="parked")),
+    )
+    contingency.dispatch_conversation = AsyncMock(
+        return_value=SimpleNamespace(success=False, reason="unavailable",
+                                     text=None, model=None),
+    )
+    monkeypatch.setattr(loop, "_try_roster_failover", AsyncMock(return_value=None))
+    mock_invoker.run.side_effect = CCRateLimitError("429")
+
+    await loop.handle_message("hello", user_id="u1", channel=ChannelType.TERMINAL)
+
+    assert parked, (
+        "an ordinary exhausted failover was NOT parked — turns that should "
+        "auto-resume when capacity returns are now dropped instead"
+    )

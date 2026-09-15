@@ -67,6 +67,33 @@ def _bg_notice(output) -> str:
 # names the reason the turn is not being retried for the user — the tools the
 # first attempt already ran would run a second time — so "just try again" is
 # their decision rather than an invisible default.
+
+class _Unreplayable:
+    """The failover peer TRUNCATED after it had already done work.
+
+    A third outcome, distinct from both "here is the answer" (a string) and
+    "the peer chain is exhausted, try contingency" (None), because neither of
+    those expresses the constraint that matters: contingency MAY still run —
+    it is a tool-less API call and cannot repeat a side effect — but the turn
+    must NOT be parked. `rate_limit_park.park_conversation` durably schedules
+    the same prompt for a later FULL-TOOLS direct session, so parking a
+    truncated peer replays whatever writes or sends it already performed.
+
+    A distinct object rather than a magic string: the string channel here IS
+    the answer channel, and a sentinel that can be mistaken for an answer is
+    one `is not None` away from being delivered to a user (Codex P1, #1625).
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostic only
+        return "<unreplayable: peer truncated after doing work>"
+
+
+#: Singleton; compare with `is`, never `==`.
+UNREPLAYABLE = _Unreplayable()
+
+
 _TRUNCATION_NOTICE = (
     "⚠️ Genesis lost this answer: one line of the model's output was too "
     "large to read back. It is not being retried automatically, because the "
@@ -367,6 +394,22 @@ class ConversationLoop:
                     invocation, session=session, channel=channel,
                     model=model, effort=effort, prompt_text=prompt_text,
                 )
+                if roster_reply is UNREPLAYABLE:
+                    # The peer truncated AFTER doing work. Tool-less contingency
+                    # is still allowed; PARKING is not, because a park schedules
+                    # a full-tools replay of side effects that already ran.
+                    fallback = await self._try_contingency(
+                        prompt_text, system_prompt, channel,
+                        session_id=session["id"],
+                    )
+                    if fallback is not None:
+                        return fallback
+                    logger.error(
+                        "Truncated failover peer and no contingency — NOT "
+                        "parking, because a park would replay its writes: %s",
+                        e, exc_info=True,
+                    )
+                    return _TRUNCATION_NOTICE
                 if roster_reply is not None:
                     return roster_reply
                 fallback = await self._try_contingency(
@@ -748,6 +791,22 @@ class ConversationLoop:
                         model=model, effort=effort, prompt_text=prompt_text,
                         on_event=_failover_tracked, streamed=streamed,
                     )
+                    if roster_reply is UNREPLAYABLE:
+                        # The peer truncated AFTER doing work. Tool-less contingency
+                        # is still allowed; PARKING is not, because a park schedules
+                        # a full-tools replay of side effects that already ran.
+                        fallback = await self._try_contingency(
+                            prompt_text, system_prompt, channel,
+                            session_id=session["id"],
+                        )
+                        if fallback is not None:
+                            return fallback
+                        logger.error(
+                            "Truncated failover peer and no contingency — NOT "
+                            "parking, because a park would replay its writes: %s",
+                            e, exc_info=True,
+                        )
+                        return _TRUNCATION_NOTICE
                     if roster_reply is not None:
                         return roster_reply
                 fallback = await self._try_contingency(
@@ -1175,7 +1234,7 @@ class ConversationLoop:
         prompt_text: str,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
         streamed: dict | None = None,
-    ) -> str | None:
+    ) -> str | _Unreplayable | None:
         """STICKY conversation failover. During an account-wide home-model outage,
         run the turn on a roster peer (full tools) BEFORE the degraded contingency
         path. Returns the formatted reply on success, or None to fall through to
@@ -1337,12 +1396,17 @@ class ConversationLoop:
                         # either way; silence is not.
                         await _record_peer(peer_availability.note_success, peer_name)
                         return _TRUNCATION_NOTICE
-                    # None → contingency, which is a TOOL-LESS API call
-                    # (`contingency.dispatch_conversation`: "no CC tool access"),
-                    # so it cannot repeat what the peer already did. The turn
-                    # degrades instead of dead-ending, and no side effect runs
-                    # twice.
-                    return None
+                    # UNREPLAYABLE, not None. Contingency may still run — it
+                    # is TOOL-LESS (`contingency.dispatch_conversation`: "no
+                    # CC tool access"), so it cannot repeat what the peer
+                    # already did. But a bare None ALSO told both callers
+                    # "ordinary exhausted failover", and their next move when
+                    # contingency fails is `park_conversation`, which durably
+                    # schedules a FULL-TOOLS replay of this prompt — repeating
+                    # the writes and sends the truncated peer had already
+                    # performed. The same hazard this PR exists to prevent,
+                    # reached by a later route (Codex P1, PR #1625).
+                    return UNREPLAYABLE
                 except CCError as exc:
                     logger.warning("failover peer %s failed", peer_name, exc_info=True)
                     # Routed through the SAME classifier on purpose: a local fault
