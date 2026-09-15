@@ -935,8 +935,7 @@ def get_review_counters(cwd: str | None = None) -> tuple[int, int]:
     """``(round, lifetime)`` from ONE snapshot of the counter file. Never raises.
 
     WHY THIS EXISTS RATHER THAN TWO CALLS. Which enforcement tier is live is a
-    function of BOTH counters, and the gate evaluates them in one pass over one
-    in-memory state. A reader that calls ``get_review_round`` and
+    function of BOTH counters. A reader that calls ``get_review_round`` and
     ``get_review_lifetime`` separately performs two independent file reads with two
     independent branch resolutions, so a concurrent ``mark`` landing between them
     yields a PAIR THAT NEVER EXISTED -- e.g. the pre-update ``lifetime=6`` with the
@@ -947,6 +946,15 @@ def get_review_counters(cwd: str | None = None) -> tuple[int, int]:
     Reading once cannot make the pair inconsistent, and it halves the cost besides
     (one ``git branch --show-current``, not two) -- which matters for the hook-path
     callers that run on every question a session asks.
+
+    THE COMMIT GATE DOES NOT USE THIS YET, and saying otherwise would be exactly the
+    kind of claim this accessor exists to make checkable. ``review_enforcement_commit``
+    still reads ``get_review_round`` at :934 and ``get_review_lifetime`` at :970, so it
+    remains open to the same torn pair -- there it would print the wrong TIER'S BLOCK
+    MESSAGE rather than the wrong menu. That is a pre-existing defect in the gate, not
+    one this accessor introduces; converting the gate is tracked separately, alongside
+    the round file's atomic-write work, since both concern concurrent access to the
+    same file.
 
     Same branch-scoping contract as the two accessors it replaces: a counter written
     for a different branch reads as ``(0, 0)``, because a new change starts fresh.

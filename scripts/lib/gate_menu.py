@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """The escalation cap's remedy menu, as DATA, for the ask hook to substitute.
 
-THE FOUNDING INCIDENT (2026-08-31). The escalation cap printed three remedies. The
-relay to the user DROPPED the first, INVENTED a fourth, and added "ship as-is" -- the
-one outcome the cap exists to prevent. The gate said the right thing; the session
-retelling it did not.
+THE FOUNDING INCIDENT (2026-08-31). The escalation cap printed THREE remedies then; it
+prints the four lettered below today, which #1971 landed on 2026-09-13. The count in
+this paragraph is the count AT THE INCIDENT and does not drift with the gate. The relay
+to the user DROPPED the first, INVENTED one the gate never named, and added "ship
+as-is" -- the one outcome the cap exists to prevent. The gate said the right thing; the
+session retelling it did not.
 
 WHAT THIS MODULE IS FOR. `scripts/hooks/ask_gate_menu.py` turns these labels and
 descriptions into the options of an AskUserQuestion, so the user chooses from the

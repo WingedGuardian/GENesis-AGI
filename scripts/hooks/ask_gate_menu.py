@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Put the escalation cap's own menu in front of the user, not the session's retelling.
 
-THE PROBLEM. On 2026-08-31 the escalation cap printed three remedies and the relay to
-the user dropped the first, invented a fourth, and added "ship as-is" -- the one outcome
-the cap exists to prevent. The gate had said the right thing; the agent relaying it had
-not.
+THE PROBLEM. On 2026-08-31 the escalation cap printed THREE remedies -- it prints four
+today, lettered (a)-(d), a change that landed 2026-09-13 in #1971, so do not "correct"
+the count below against the current gate -- and the relay to the user dropped the first,
+invented one the gate never named, and added "ship as-is", the one outcome the cap exists
+to prevent. The gate had said the right thing; the agent relaying it had not.
 
 WHAT THIS DOES. When the review-round counter says the cap tier is live, this appends
 the gate's OWN question -- carrying the gate's own remedy labels, in the gate's own

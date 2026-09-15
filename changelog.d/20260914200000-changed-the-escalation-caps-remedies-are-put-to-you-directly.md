@@ -30,5 +30,10 @@
   a later rule then blocks that same commit — except after "hand it back",
   where the gate deliberately
   forbids that acknowledgement, so the menu keeps being offered on that branch
-  until you leave it or use the off switch. Finally, if a session is sitting in
-  one worktree and committing into another, the menu will not appear.
+  until you leave it or use the off switch. If a session is sitting in one
+  worktree and committing into another, the menu will not appear. And a session
+  in a long-lived worktree created before this change keeps that worktree's own
+  frozen hook configuration, so the commit gate there still blocks — its entry
+  is redirected to the current script — while the menu, which needs a new entry
+  that worktree does not have, stays silent until the worktree catches up with
+  the main branch.
