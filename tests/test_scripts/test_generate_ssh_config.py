@@ -212,24 +212,120 @@ class TestLobbyDoorScript:
     def test_syntax_clean(self):
         subprocess.run(["bash", "-n", str(_LOBBY)], check=True, timeout=10)
 
-    def test_pane_targets_use_the_colon_form(self):
-        """`=lobby` is a SESSION qualifier; for a PANE target it silently fails.
+    def test_primary_targets_use_the_colon_form(self):
+        """`=lobby` is a SESSION qualifier and nothing else — every other target
+        type either silently misreads it or fails outright.
 
-        MEASURED: `display-message -p -t =lobby` returns rc=0 with EMPTY output,
-        and `respawn-pane -t =lobby` errors with "can't find pane". The empty
-        read is the dangerous one — it made an earlier revision take the
-        secondary path on every connect, so the reset never ran and nothing
-        looked wrong. `=lobby:` resolves correctly and stays exact.
+        MEASURED across three commands (tmux 3.4):
+            display-message -p -t =lobby   rc=0 and EMPTY output
+            respawn-pane       -t =lobby   "can't find pane: =lobby"
+            set-option         -t =lobby   "no such session: =lobby"
+        The first two cost a reset that never runs; the third cost a CLAIM that
+        was never recorded while `2>/dev/null` hid the failure, leaving the race
+        it closes wide open and looking closed. The bare name `lobby` works only
+        while an exact match exists — with the primary gone it prefix-matches a
+        concurrent `lobby-<pid>`. `=lobby:` resolves for all of them and stays
+        exact (verified: respawning `=lobby:` left a decoy `lobby-99999`
+        untouched, and an option set through it did not reach that session).
+
+        Scoped to lines targeting the PRIMARY: the ephemeral secondary sets
+        `destroy-unattached` on its own `$SESSION`, which is a different target.
         """
         text = _LOBBY.read_text()
-        for cmd in ("display-message", "respawn-pane"):
-            for line in text.split("\n"):
-                stripped = line.strip()
-                if stripped.startswith("#") or cmd not in stripped:
-                    continue
-                assert '${PRIMARY}:"' in stripped or "=lobby:" in stripped, (
-                    f"{cmd} must use the =NAME: pane-target form: {stripped}"
-                )
+        cmds = ("display-message", "respawn-pane", "set-option", "show-options")
+        checked = 0
+        for line in text.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("#") or "PRIMARY" not in stripped:
+                continue
+            if not any(c in stripped for c in cmds):
+                continue
+            checked += 1
+            assert '${PRIMARY}:"' in stripped, (
+                f"a PRIMARY target must use the =NAME: form: {stripped}"
+            )
+        assert checked >= 4, (
+            f"expected every PRIMARY-targeting tmux call to be checked, saw {checked} "
+            "— if the script was restructured this test may be scanning nothing"
+        )
+
+    def test_the_reset_is_gated_on_the_pane_actually_being_a_chooser(self):
+        """"Nobody is attached" is NOT "this is a stale chooser".
+
+        The operator uses the lobby pane as a real command line. Cancelling the
+        picker, starting something long-running and then losing the SSH
+        connection leaves a DETACHED pane with live work in it — and respawning
+        on detachment alone kills that work on the next reconnect, which is the
+        same loss this door exists to prevent, arriving by the other door.
+
+        MEASURED, so the predicate is exact rather than inferred:
+            ordinary pane   in_mode=0  pane_mode=
+            copy mode       in_mode=1  pane_mode=copy-mode
+            stale chooser   in_mode=1  pane_mode=tree-mode
+        """
+        text = _LOBBY.read_text()
+        code = [
+            ln for ln in text.split("\n")
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        mode = next((i for i, ln in enumerate(code) if "tree-mode" in ln), None)
+        respawn = next((i for i, ln in enumerate(code) if "respawn-pane" in ln), None)
+        assert mode is not None, (
+            "the reset must be gated on pane_mode == tree-mode, or a detached "
+            "pane running real work is respawned on the next reconnect"
+        )
+        assert respawn is not None and mode < respawn, (
+            "the mode check must come BEFORE the respawn"
+        )
+
+    def test_the_claim_is_serialized_and_the_lock_never_spans_the_attach(self):
+        """Reading `session_attached` and then attaching is a TOCTOU.
+
+        Two logins landing together both read 0, both keep the primary, and the
+        second's `choose-tree` drags the first into the chooser — the very
+        window-stealing this door exists to stop. The check-and-claim runs under
+        a lock; the lock is BOUNDED (this is the login path, so a wedged holder
+        must cost a racy login, never a hung one) and RELEASED before the exec,
+        since holding it across the attach would serialize every lobby login for
+        as long as anyone stayed connected.
+        """
+        text = _LOBBY.read_text()
+        code = [
+            ln for ln in text.split("\n")
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        flock_i = next((i for i, ln in enumerate(code) if "flock -w" in ln), None)
+        release = next((i for i, ln in enumerate(code) if "exec 9>&-" in ln), None)
+        first_exec = next(
+            (i for i, ln in enumerate(code) if ln.strip().startswith("exec tmux")), None
+        )
+        assert flock_i is not None, "the claim must be serialized, and bounded (-w)"
+        assert release is not None, "the lock must be released explicitly"
+        assert first_exec is not None
+        assert release < first_exec, (
+            "releasing after the exec is unreachable — the lock would be held "
+            "for the whole tmux session and serialize every other lobby login"
+        )
+
+    def test_the_owner_marker_is_the_door_pid(self):
+        """`$$` is the door process, and `exec tmux` replaces it in place — so
+        that pid IS the tmux client and lives exactly as long as the attachment.
+
+        That is what closes the gap `session_attached` cannot: the claimer has
+        not attached yet, so it still reads 0. A dead pid frees the lobby again.
+        """
+        text = _LOBBY.read_text()
+        claim = [
+            ln for ln in text.split("\n")
+            if "@lobby_owner" in ln and not ln.strip().startswith("#")
+        ]
+        assert any('"$$"' in ln for ln in claim), (
+            f"the claim must record the door pid: {claim}"
+        )
+        assert any("kill -0" in ln for ln in text.split("\n")), (
+            "a recorded owner must be liveness-checked, or a crashed client "
+            "would lock the lobby out permanently"
+        )
 
     def test_reset_is_gated_on_nobody_being_attached(self):
         """The whole point of the second fix: never respawn a pane someone is

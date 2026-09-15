@@ -29,12 +29,32 @@
 #    dismissed that as "acceptable for a switchboard"; the operator uses the
 #    lobby as a real command line, so it is not.
 #
-# So: reset ONLY when nobody is attached, and give a concurrent window its own
+# So: reset ONLY an actual stale chooser, and give a concurrent window its own
 # session instead of taking over.
 set -uo pipefail
 
 SESSION="lobby"
 PRIMARY="lobby"
+LOCK="${HOME}/.genesis/lobby-door.lock"
+
+# ── Serialize the claim ──────────────────────────────────────────────────────
+# Reading `session_attached` and then attaching is a TOCTOU: two SSH logins
+# landing together both read 0, both keep SESSION=lobby, and the second's
+# `choose-tree` drags the first into the chooser — recreating defect 2 in a
+# narrow window. The whole check-and-claim runs under a lock.
+#
+# BOUNDED (-w 5) because this is the LOGIN path: a wedged holder must cost a
+# racy login, never a hung one. Released explicitly BEFORE the exec below, so
+# the lock never spans a tmux session — holding it across the attach would
+# serialise every lobby login for as long as someone stayed connected.
+#
+# flock is not assumed present. Without it the claim is exactly as racy as it
+# was before, which is a documented degradation rather than a silent one.
+mkdir -p "${HOME}/.genesis" 2>/dev/null
+_locked=0
+if command -v flock >/dev/null 2>&1 && exec 9>"$LOCK" 2>/dev/null; then
+    flock -w 5 9 2>/dev/null && _locked=1
+fi
 
 if tmux has-session -t "=${PRIMARY}" 2>/dev/null; then
     # NOTE THE TRAILING COLON, it is load-bearing. `=NAME` is the exact-match
@@ -49,7 +69,10 @@ if tmux has-session -t "=${PRIMARY}" 2>/dev/null; then
     # An empty read from the `=lobby` form is what made an earlier revision of
     # this script silently take the secondary path on EVERY connect, so the
     # reset never ran while everything looked correct.
-    attached=$(tmux display-message -p -t "=${PRIMARY}:" '#{session_attached}' 2>/dev/null || printf '')
+    state=$(tmux display-message -p -t "=${PRIMARY}:" \
+        '#{session_attached}|#{pane_mode}' 2>/dev/null || printf '')
+    attached=${state%%|*}
+    pane_mode=${state#*|}
     # Non-numeric (tmux raced away, or an empty answer) -> treat as ATTACHED.
     # Fail direction is deliberate: guessing "free" would let this window take
     # over someone's work, which is the defect above. Guessing "busy" only
@@ -57,22 +80,70 @@ if tmux has-session -t "=${PRIMARY}" 2>/dev/null; then
     case "$attached" in
         ''|*[!0-9]*) attached=1 ;;
     esac
-    if [ "$attached" -gt 0 ]; then
+
+    # The OWNER marker. `$$` is the door process, and `exec tmux` below replaces
+    # it in place — so this pid IS the tmux CLIENT and stays alive exactly as
+    # long as that client is connected. It therefore closes the window between
+    # the read above and the attach, which `session_attached` alone cannot: the
+    # claimer has not attached yet, so it still reads 0. A dead pid means the
+    # lobby is free again, and a recycled pid costs one ephemeral session.
+    # The colon form AGAIN, and for the same reason. MEASURED: `set-option -t
+    # =lobby` fails outright with "no such session" — so an earlier draft of this
+    # claim recorded NOTHING while `2>/dev/null` hid the failure, leaving the
+    # race it was written to close wide open and looking closed. The bare name
+    # `lobby` happens to work only while an exact match exists; with the primary
+    # gone it would prefix-match a concurrent `lobby-<pid>`. `=lobby:` resolves
+    # and stays exact.
+    owner=$(tmux show-options -qv -t "=${PRIMARY}:" @lobby_owner 2>/dev/null || printf '')
+    owner_live=0
+    case "$owner" in
+        ''|*[!0-9]*) ;;
+        *) kill -0 "$owner" 2>/dev/null && [ "$owner" != "$$" ] && owner_live=1 ;;
+    esac
+
+    if [ "$attached" -gt 0 ] || [ "$owner_live" = "1" ]; then
         # Somebody is in the lobby — do not touch it. This window gets its own
         # landing session, destroyed as soon as it is left, so these do not
         # accumulate. $$ keeps concurrent windows distinct.
         SESSION="lobby-$$"
     else
-        # Nobody home: clear any chooser the last visit left behind. The
-        # cc-* slots are a different target and are never touched.
-        if ! tmux respawn-pane -k -t "=${PRIMARY}:" 2>/dev/null; then
-            # Loud, not swallowed: a silent failure here is how the stale
-            # chooser survives while everything LOOKS fine. Still non-fatal —
-            # a usable lobby beats no lobby.
-            printf 'lobby-door: could not reset the lobby pane; it may still show the previous chooser (press q).\n' >&2
+        if ! tmux set-option -t "=${PRIMARY}:" @lobby_owner "$$" 2>/dev/null; then
+            # Not fatal, but not silent either: without the marker the claim
+            # degrades to the pre-lock race rather than failing closed.
+            printf 'lobby-door: could not record the lobby claim; a simultaneous open may share this pane.\n' >&2
+        fi
+        # RESET ONLY AN ACTUAL STALE CHOOSER. "Nobody is attached" is NOT the
+        # same question: the operator uses this pane as a real command line, so
+        # cancelling the picker, starting something long-running, and then
+        # losing the SSH connection leaves a DETACHED pane with live work in it.
+        # Respawning on detachment alone kills that work on the next reconnect —
+        # the same loss this door exists to stop, arriving by the other door.
+        #
+        # MEASURED (tmux 3.4) — the three states are distinct, so the predicate
+        # is exact rather than inferred:
+        #     ordinary pane   in_mode=0  pane_mode=
+        #     copy mode       in_mode=1  pane_mode=copy-mode
+        #     stale chooser   in_mode=1  pane_mode=tree-mode
+        # copy-mode is deliberately NOT reset: it holds a live process and a
+        # scrollback selection, and attaching clears it with one keypress.
+        #
+        # An unreadable mode does NOT reset. That flips the earlier fail
+        # direction on purpose: the cost of not resetting is one `q` once the
+        # operator is attached (they have a client then, so the mode keys work),
+        # and the cost of resetting wrongly is their work.
+        if [ "$pane_mode" = "tree-mode" ]; then
+            if ! tmux respawn-pane -k -t "=${PRIMARY}:" 2>/dev/null; then
+                # Loud, not swallowed: a silent failure here is how the stale
+                # chooser survives while everything LOOKS fine. Still non-fatal —
+                # a usable lobby beats no lobby.
+                printf 'lobby-door: could not reset the lobby pane; it may still show the previous chooser (press q).\n' >&2
+            fi
         fi
     fi
 fi
+
+# Release before the exec: see the bound above.
+[ "$_locked" = "1" ] && exec 9>&-
 
 if [ "$SESSION" = "$PRIMARY" ]; then
     exec tmux -u new-session -A -s "$SESSION" \; choose-tree -Zs
