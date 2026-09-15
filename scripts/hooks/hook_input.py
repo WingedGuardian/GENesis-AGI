@@ -35,6 +35,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 _LEGACY_INPUT_ENV = "CLAUDE_TOOL_INPUT"
 _LEGACY_RESULT_ENV = "CLAUDE_TOOL_USE_RESULT"
@@ -248,6 +249,102 @@ def run_guard(main_fn, name: str) -> None:
         )
         sys.exit(2)
     sys.exit(code if isinstance(code, int) else 0)
+
+
+def degraded_exit(
+    name: str,
+    *,
+    gated: str,
+    override_sigils: tuple[str, ...] = (),
+    exc: BaseException | None = None,
+) -> NoReturn:
+    """Exit a guard whose MODULE-SCOPE imports failed, without failing OPEN.
+
+    THE HOLE THIS CLOSES. ``run_guard`` converts an unexpected crash into exit 2,
+    but it is called at the BOTTOM of a guard — an exception raised while the module
+    is still importing never reaches it. Python exits 1, and CC's PreToolUse contract
+    is "exit 2 blocks; ANY other code is a non-blocking error, so the tool RUNS".
+    MEASURED on all four guards that import ``shell_parse`` at module scope: poison
+    that one sibling and every guard goes exit 2 -> exit 1 with a healthy-tree control
+    blocking at 2. The gate does not degrade; it VANISHES, silently, while the session
+    still believes it is protected. Version skew between a worktree and the main tree
+    is a real configuration here, not a hypothetical.
+
+    WHY A REGEX OVER RAW TEXT, which is normally forbidden in this repo. The shared
+    parser is precisely what is unavailable — that is the whole premise — so there is
+    nothing to parse with. This does not attempt to decide what the command MEANS. It
+    asks the much weaker question "does the raw text mention a gated operation at
+    all", and answers a mention with a BLOCK. Over-blocking in this state is a loud,
+    overridable refusal; under-blocking is the silent bypass above. The asymmetry is
+    the entire design, and it is why the answer is deliberately crude.
+
+    FAIL DIRECTION IS CLOSED THROUGHOUT, matching ``run_guard``: if the payload cannot
+    be read at all, we cannot prove the command is harmless, so we block rather than
+    guess. Nothing here may raise — an exception in this function would reinstate the
+    exit 1 it exists to prevent — so every step is wrapped and the bare-except
+    fallback blocks.
+
+    Args:
+        name: guard name, for the operator-facing stderr line.
+        gated: regex (searched case-insensitively against the RAW command text).
+            Pass a literal pattern defined ABOVE the guarded import, so it is still
+            bound when the import that failed is the one being recovered from.
+        override_sigils: in-band trailing sigils this guard honours (``discard-override``
+            …). Present in the raw text -> allow, because a degraded guard must not
+            strand an operator with no way through.
+        exc: the import error, named in the message so the cause is visible.
+    """
+    reason = f"{type(exc).__name__}: {exc}" if exc is not None else "import failed"
+    try:
+        # ONE read: read_payload() consumes stdin, so a second call returns nothing and
+        # would silently lose `file_path` on a Write/Edit payload.
+        payload = read_payload()
+        raw = field(payload, "command") or field(payload, "file_path")
+    except BaseException:  # noqa: BLE001 — unreadable payload cannot prove safety.
+        print(
+            f"GUARD DEGRADED ({name}): {reason} — and the tool payload could not be "
+            "read, so nothing here can establish the command is safe. BLOCKING. "
+            "Repair the hook tree (version skew between a worktree and the main tree "
+            "is the usual cause) or disable this hook deliberately.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    try:
+        for sigil in override_sigils:
+            if sigil and sigil in raw:
+                print(
+                    f"GUARD DEGRADED ({name}): {reason} — allowing: the command carries "
+                    f"the in-band '{sigil}' waiver. NOTE this guard did NOT actually "
+                    "run, so the waiver was not checked against a parsed command.",
+                    file=sys.stderr,
+                )
+                sys.exit(0)
+        if re.search(gated, raw, re.IGNORECASE):
+            print(
+                f"GUARD DEGRADED ({name}): {reason} — BLOCKING: the raw command text "
+                "names a gated operation and this guard cannot run to judge it. This "
+                "is a crude text match, not a parse, so it may be over-broad; that is "
+                "the intended direction. Repair the hook tree, or re-run with an "
+                "in-band waiver if this guard has one.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        print(
+            f"GUARD DEGRADED ({name}): {reason} — allowing: the raw command text names "
+            "no gated operation. This guard did NOT run; other gates in it are not in "
+            "force for this command either.",
+            file=sys.stderr,
+        )
+        sys.exit(0)
+    except SystemExit:
+        raise
+    except BaseException:  # noqa: BLE001 — never reinstate the exit 1 we exist to stop.
+        print(
+            f"GUARD DEGRADED ({name}): {reason} — and the degraded check itself failed. BLOCKING.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
 
 _BRACE_RE = re.compile(r"\{([^{}]*,[^{}]*)\}")

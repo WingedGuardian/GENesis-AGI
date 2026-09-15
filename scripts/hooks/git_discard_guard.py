@@ -122,12 +122,30 @@ try:
 except Exception:  # noqa: BLE001 — logging must never disarm the clean block.
     audit_jsonl = None
 
-from hook_input import field, read_payload  # noqa: E402
-from shell_parse import (  # noqa: E402
-    analyze_checked,
-    git_subcommand_index,
-    has_trailing_override,
-)
+from hook_input import degraded_exit, field, read_payload  # noqa: E402
+
+# Gated-operation pattern for the DEGRADED path, defined ABOVE the guarded import so it
+# survives that import failing. Scoped to this guard's BLOCK cases only — `git clean`
+# and the submodule-recursive forms. The snapshot verbs (checkout/restore/switch) are
+# advisory here and exit 0, so a degraded run has nothing to protect there and must not
+# start blocking work it never blocked.
+_DEGRADED_GATED = r"\bgit\b[^\n]*\bclean\b|--recurse-submodules|submodule\.recurse"
+
+try:
+    from shell_parse import (  # noqa: E402
+        analyze_checked,
+        git_subcommand_index,
+        has_trailing_override,
+    )
+except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
+    if __name__ != "__main__":
+        raise
+    degraded_exit(
+        "git_discard_guard",
+        gated=_DEGRADED_GATED,
+        override_sigils=("discard-override",),
+        exc=_exc,
+    )
 
 try:  # noqa: E402
     import discarded_write

@@ -59,8 +59,29 @@ from fnmatch import fnmatch
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import brace_expand, read_payload, run_guard, tool_input  # noqa: E402
-from shell_parse import analyze_checked  # noqa: E402
+from hook_input import (  # noqa: E402
+    brace_expand,
+    degraded_exit,
+    read_payload,
+    run_guard,
+    tool_input,
+)
+
+# Gated-operation pattern for the DEGRADED path. Defined ABOVE the guarded import
+# ON PURPOSE: it must still be bound when the import below is the one that failed.
+# Deliberately the same two verbs as `_RM_PATTERN` further down — kept as a separate
+# literal rather than shared, because sharing would put the constant after the import
+# it has to survive.
+_DEGRADED_GATED = r"\brm\b|\brmdir\b"
+
+try:
+    from shell_parse import analyze_checked  # noqa: E402
+except Exception as _exc:  # noqa: BLE001 — see degraded_exit: exit 1 is a FAIL-OPEN.
+    if __name__ != "__main__":
+        # A test importing a deliberately broken tree must see the real error, not a
+        # process exit. Only the live hook invocation degrades.
+        raise
+    degraded_exit("protected_paths_guard", gated=_DEGRADED_GATED, exc=_exc)
 
 try:  # noqa: E402
     import discarded_write

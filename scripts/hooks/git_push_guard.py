@@ -119,7 +119,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # scripts/ (parent dir) for review_state — the shared escalation-cap constant, so
 # the Codex-round gate below and the commit gate's Rule 3 stop at the same N.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from hook_input import field, read_payload, run_guard  # noqa: E402
+from hook_input import degraded_exit, field, read_payload, run_guard  # noqa: E402
 
 # SOFT dependency (mirrors review_enforcement_commit.py's guard for the SAME
 # import): an unimportable review_state must degrade ONLY the round-escalation
@@ -145,16 +145,40 @@ try:
 except Exception:  # noqa: BLE001 — see above: a load failure exits 1 = non-blocking.
     audit_jsonl = None
 
-from shell_parse import (  # noqa: E402
-    _KNOWN_SIGILS,
-    analyze,
-    analyze_checked,
-    commit_skips_hooks,
-    gh_pr_subcommand,
-    git_subcommand,
-    has_trailing_override,
-    split_segments,
+# DEGRADED-path mention set, defined ABOVE the guarded import so it survives that
+# import failing. It mirrors `_GATED_MENTION` below (same verbs and flags, same
+# deliberate breadth, same reasoning) and adds `gh` and `sqlite3`, because on this
+# path there is no parse to narrow with at all. Kept as its own literal rather than
+# shared: sharing would place the constant after the import it has to outlive.
+_DEGRADED_GATED = (
+    r"(?:^|\s)(?:--force(?:-with-lease)?|--no-verify|--admin)(?:\s|=|$)"
+    r"|\b(?:push|merge)\b|\bgh\b|\bsqlite3\b"
 )
+
+try:
+    from shell_parse import (  # noqa: E402
+        _KNOWN_SIGILS,
+        analyze,
+        analyze_checked,
+        commit_skips_hooks,
+        gh_pr_subcommand,
+        git_subcommand,
+        has_trailing_override,
+        split_segments,
+    )
+except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
+    if __name__ != "__main__" or sys.argv[1:2] == ["--check-pr"]:
+        # Two cases that must NOT degrade. A test importing a broken tree needs the
+        # real error. And `--check-pr` is a HUMAN-run CLI read that takes no stdin:
+        # degrading there would block on a terminal read and then exit 2 at someone
+        # who only asked a question. Let both see the traceback.
+        raise
+    # NO override_sigils, deliberately, and this is the one guard where that matters.
+    # Its sigils (stale-review-override, ci-override, merge-to-main-override …)
+    # authorise a PUBLISH past review gates. Honouring one here would wave a publish
+    # through with every gate in this file already proven absent — the precise
+    # combination this net exists to prevent. The recovery is to repair the tree.
+    degraded_exit("git_push_guard", gated=_DEGRADED_GATED, exc=_exc)
 
 # Mentions of a GATED operation, consulted ONLY on the un-parseable path where
 # analyze() has gone blind. Deliberately BROAD — both the gated verbs and the

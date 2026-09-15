@@ -23,14 +23,37 @@ from pathlib import Path
 # The shared hook-input helper lives in scripts/hooks/; this script runs from
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks"))
-from hook_input import field, read_payload, run_guard  # noqa: E402
-from shell_parse import (  # noqa: E402
-    analyze_checked,
-    commit_skips_hooks,
-    git_subcommand,
-    has_trailing_override,
-    split_segments,
-)
+from hook_input import degraded_exit, field, read_payload, run_guard  # noqa: E402
+
+# DEGRADED-path mention set, defined ABOVE the guarded import so it survives that
+# import failing. Same single verb as `_COMMIT_PATTERN` further down; kept separate
+# because sharing would put the constant after the import it has to outlive. The
+# scope is broad on purpose — every gate in this file (unreviewed commit, commit to
+# main, --no-verify) hangs off a commit, so a mention of one is the whole trigger.
+_DEGRADED_GATED = r"\bcommit\b"
+
+try:
+    from shell_parse import (  # noqa: E402
+        analyze_checked,
+        commit_skips_hooks,
+        git_subcommand,
+        has_trailing_override,
+        split_segments,
+    )
+except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
+    if __name__ != "__main__":
+        raise
+    # `review-override` IS honoured here, unlike in git_push_guard, and the asymmetry
+    # is the point: this sigil waives a LOCAL commit's review requirement, which is
+    # recoverable and already the documented escape for this gate. Refusing it in a
+    # degraded state would strand an operator mid-repair with no way to commit the
+    # repair itself.
+    degraded_exit(
+        "review_enforcement_commit",
+        gated=_DEGRADED_GATED,
+        override_sigils=("review-override",),
+        exc=_exc,
+    )
 
 try:  # noqa: E402
     import discarded_write
