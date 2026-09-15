@@ -643,3 +643,177 @@ class TestKillRuleFileScope:
         )
         assert result.returncode == 2
         assert "no-unguarded-kill" in result.stderr
+
+
+class TestBashSurface:
+    """Bash command text is linted too — but ONLY by rules that opt in.
+
+    Origin (2026-09-06): a session wrote a script that POSTed straight to a
+    provider endpoint and it never passed through Write/Edit at all — it arrived
+    as a heredoc and a ``python3 -c``. A linter wired only to the file-writing
+    tools cannot see that shape, so the rule it violated was unenforceable in
+    the exact form the violation took.
+
+    The opt-in (``check_bash: true``) is the other half: a rule's patterns are
+    written against source, and applying all of them to shell text would trade a
+    known hole for an unmeasured false-positive surface. These tests pin BOTH
+    directions — the opted-in rule fires, a non-opted one stays out.
+    """
+
+    # Split so this file does not itself contain a matching literal — the rule
+    # excludes tests/, but a fixture that cannot be grepped for is also a
+    # fixture that cannot be accidentally copied into production.
+    _ENDPOINT = "https://openrouter.ai/api/v1/" + "chat/completions"
+    _KILLPG = "os.killpg(0, 9)"  # matched by no-unguarded-kill, which does NOT opt in
+
+    def test_heredoc_writing_a_provider_call_is_blocked(self):
+        """The origin incident's actual shape: content reaching disk via Bash."""
+        cmd = f"cat > /tmp/probe.py <<'EOF'\nimport urllib.request\nurllib.request.urlopen('{self._ENDPOINT}')\nEOF\npython3 /tmp/probe.py"
+        result = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        assert result.returncode == 2
+        assert "no-raw-provider-calls" in result.stderr
+
+    def test_inline_python_provider_call_is_blocked(self):
+        cmd = f"python3 -c \"import urllib.request; urllib.request.urlopen('{self._ENDPOINT}')\""
+        result = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        assert result.returncode == 2
+
+    def test_curl_provider_call_is_blocked(self):
+        result = _run_linter(
+            {"tool_name": "Bash", "tool_input": {"command": f"curl -X POST {self._ENDPOINT}"}}
+        )
+        assert result.returncode == 2
+
+    def test_ordinary_command_is_untouched(self):
+        result = _run_linter(
+            {"tool_name": "Bash", "tool_input": {"command": "git status && pytest tests/ -q"}}
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_provider_name_without_an_endpoint_does_not_fire(self):
+        """Talking about a provider is not calling one — the rule matches the
+        API path, never the credential or the vendor name (60 files under src/
+        read API_KEY_*; matching on that would be a false-positive disaster).
+        """
+        result = _run_linter(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "grep -rn openrouter config/model_routing.yaml"},
+            }
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_escape_hatch_works_on_a_command(self):
+        cmd = f"curl {self._ENDPOINT}  # behavioral-lint: ignore no-raw-provider-calls"
+        result = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        assert result.returncode == 0, result.stderr
+
+    def test_non_opted_in_rule_does_not_reach_bash(self):
+        """THE boundary test. no-unguarded-kill is severity=block and matches
+        this text on the Write path, but it never declared check_bash — so a
+        command carrying it must pass. If this starts failing, every rule has
+        silently leaked onto Bash and the opt-in is decorative.
+        """
+        cmd = f"python3 -c 'import os; {self._KILLPG}'"
+        result = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        assert result.returncode == 0, result.stderr
+
+    def test_same_text_on_the_write_path_still_blocks(self):
+        """The control for the test above: the rule is live, just not on Bash."""
+        result = _run_linter({"content": self._KILLPG, "file_path": "scripts/thing.py"})
+        assert result.returncode == 2
+        assert "no-unguarded-kill" in result.stderr
+
+    def test_write_path_is_unchanged_by_the_bash_addition(self):
+        """Content still wins when both are somehow present, and excludes still
+        apply on the Write path (a Bash payload has no file_path, so it cannot).
+        """
+        blocked = _run_linter({"content": self._ENDPOINT, "file_path": "scripts/probe.py"})
+        assert blocked.returncode == 2
+        allowed = _run_linter(
+            {"content": self._ENDPOINT, "file_path": "src/genesis/routing/config.py"}
+        )
+        assert allowed.returncode == 0, allowed.stderr
+
+
+class TestBashAuditFindings:
+    """Regressions from an adversarial audit of the Bash widening (2026-09-06)."""
+
+    _ENDPOINT = "https://api.x.ai/v1/" + "chat/completions"
+
+    def test_escape_hatch_must_be_a_trailing_comment(self):
+        """A substring test over a whole COMMAND is a bypass, not a hatch.
+
+        On the Write path `content` is one file's body, so a substring is right.
+        On Bash it is a whole compound command, so any mention anywhere disarmed
+        the rule for everything else on the line — and the natural way to trip it
+        is to DOCUMENT the hatch, which is a plausible accident rather than an
+        attack. MEASURED: the two commands below exited 0 against a block rule.
+        """
+        for cmd in (
+            f"git commit -m 'doc the behavioral-lint: ignore no-raw-provider-calls hatch' && curl -X POST {self._ENDPOINT}",
+            f"rg 'behavioral-lint: ignore no-raw-provider-calls' && curl {self._ENDPOINT}",
+        ):
+            assert (
+                _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}}).returncode == 2
+            )
+
+    def test_trailing_comment_hatch_still_works(self):
+        """The control: the advertised form must keep working."""
+        cmd = f"curl {self._ENDPOINT}  # behavioral-lint: ignore no-raw-provider-calls"
+        r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        assert r.returncode == 0, r.stderr
+
+    def test_searching_for_an_endpoint_is_not_calling_one(self):
+        """A regex cannot tell `rg '<endpoint>'` from `curl '<endpoint>'`.
+
+        Blocking the search lands hardest on the audit and review sessions that
+        most need to grep for provider usage — so a single read-only invocation
+        with nothing chained onto it is exempt.
+        """
+        for cmd in (
+            "rg -n 'generativelanguage.googleapis.com/v1/models/x:generateContent' src/",
+            f"grep -rn '{self._ENDPOINT}' config/",
+            f"git log -S'{self._ENDPOINT}' --oneline",
+        ):
+            r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            assert r.returncode == 0, f"{cmd!r} -> {r.stderr}"
+
+    def test_a_search_cannot_smuggle_a_call(self):
+        """THE boundary: the exemption is for a search, not for anything starting
+        with a search verb. Chaining must forfeit it.
+        """
+        cmd = f"rg -n endpoint src/ && curl -X POST {self._ENDPOINT}"
+        assert _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}}).returncode == 2
+
+    def test_bare_host_no_longer_blocks_a_grep(self):
+        """Gemini and NVIDIA were host-only patterns; every other one requires an
+        API path. A host alone cannot distinguish a call from a mention.
+        """
+        for cmd in (
+            "grep -rn integrate.api.nvidia.com config/",
+            "rg -n generativelanguage.googleapis.com docs/",
+        ):
+            r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            assert r.returncode == 0, f"{cmd!r} -> {r.stderr}"
+
+    def test_a_redirect_forfeits_the_search_exemption(self):
+        """`cat`/`grep` become WRITES the moment a redirect or heredoc appears.
+
+        This is the acceptance bar for the exemption itself: an earlier revision
+        listed `cat` as read-only, and `cat > probe.py <<'EOF' … EOF` — the origin
+        incident's literal shape — went green. A filter that improves the fire
+        rate by blinding the rule to the case it exists for has made it worse.
+        """
+        endpoint = "https://api.x.ai/v1/" + "chat/completions"
+        cmd = f"cat > /tmp/p.py <<'EOF'\nimport urllib.request\nurllib.request.urlopen('{endpoint}')\nEOF"
+        assert _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}}).returncode == 2
+
+    def test_those_two_providers_still_block_a_real_call(self):
+        """The control for the test above — narrowing must not blind the rule."""
+        for cmd in (
+            "curl -X POST https://integrate.api.nvidia.com/v1/chat/completions -d @p.json",
+            "curl -X POST 'https://generativelanguage.googleapis.com/v1beta/models/gemini:generateContent'",
+        ):
+            r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            assert r.returncode == 2, f"{cmd!r} was not blocked"
