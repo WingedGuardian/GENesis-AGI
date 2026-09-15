@@ -408,10 +408,19 @@ async def outreach_poll(
     # `_discord_webhook_env` is imported rather than re-derived: this was the
     # THIRD copy of the env-naming rule, and a copy is what lets a refusal
     # message name a variable that would not actually configure the channel.
-    from genesis.runtime.init.outreach import _discord_webhook_env
+    from genesis.runtime.init.outreach import (
+        _discord_webhook_env,
+        _is_reserved_discord_channel,
+    )
 
     env_key = _discord_webhook_env(channel)
-    webhook_url = os.environ.get(env_key)
+    # The RESERVED name is checked BEFORE the lookup, not after. `url` (in any
+    # case) inverts onto DISCORD_WEBHOOK_URL — the default webhook — so a direct
+    # lookup SUCCEEDS, short-circuits the default-channel test below, and posts
+    # the poll to the default channel while reporting the `url` channel back.
+    # That is the redirect this whole change removes, arriving through the one
+    # channel name that is not a channel.
+    webhook_url = None if _is_reserved_discord_channel(channel) else os.environ.get(env_key)
     if not webhook_url:
         # The DEFAULT channel legitimately resolves to DISCORD_WEBHOOK_URL — it
         # need not also appear in the per-channel map. Any OTHER unconfigured

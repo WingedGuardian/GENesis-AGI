@@ -1232,3 +1232,91 @@ async def test_unconfigured_channel_is_terminal_and_never_defers(
     mock_deferred.enqueue.assert_not_called()
     # The operator still needs to know WHY — terminal must not mean silent.
     assert "bug-reports" in (result.error or ""), result.error
+
+
+@pytest.mark.asyncio
+async def test_channel_with_no_adapter_at_all_is_terminal_too(
+    config, db, mock_drafter, mock_formatter
+):
+    """The commoner half of the same misconfiguration, and the one the first
+    version of this fix missed.
+
+    An install with no ``DISCORD_WEBHOOK_URL`` never registers the Discord
+    adapter at all (``runtime/init/outreach.py``), so a Discord send never
+    reaches ``send_message`` and never raises ``ChannelNotConfiguredError`` — it
+    returns from the no-adapter branch and gets DEFERRED, then retried 5 times
+    over ~2.35h and re-attempted every drain cycle until the 24h age-out, each
+    exhaustion filing a non-deduping high-priority observation.
+
+    Deferring cannot help: ``self._channels`` is injected once at construction
+    and nothing mutates it, so within this process the channel is unreachable.
+    """
+    mock_deferred = AsyncMock()
+    mock_deferred.has_open = AsyncMock(return_value=False)
+
+    gate = GovernanceGate(config, db)
+    pipeline = OutreachPipeline(
+        governance=gate,
+        drafter=mock_drafter,
+        formatter=mock_formatter,
+        channels={},  # nothing registered — the unconfigured install
+        deferred_queue=mock_deferred,
+        db=db,
+        config=config,
+        recipients={"telegram": "12345"},
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.SURPLUS,
+        topic="No adapter test",
+        context="Nothing is configured at all",
+        salience_score=0.9,
+        signal_type="surplus_insight",
+    )
+    result = await pipeline.submit(req)
+
+    assert result.status == OutreachStatus.IGNORED, (
+        "a channel with no adapter is unreachable for this whole process; "
+        "deferring only buys the retry ladder and the age-out"
+    )
+    mock_deferred.enqueue.assert_not_called()
+    assert "No adapter" in (result.error or ""), result.error
+
+
+@pytest.mark.asyncio
+async def test_missing_recipient_still_defers(
+    config, db, mock_drafter, mock_formatter, mock_channel
+):
+    """The control, and the reason the branch was SPLIT rather than widened.
+
+    A missing recipient is genuinely transient — a reply thread or a later
+    configuration read can supply one — so it must keep deferring. A fix that
+    made the whole ``not adapter or not recipient`` branch terminal would pass
+    the test above while silently dropping recoverable sends.
+    """
+    mock_deferred = AsyncMock()
+    mock_deferred.has_open = AsyncMock(return_value=False)
+
+    gate = GovernanceGate(config, db)
+    pipeline = OutreachPipeline(
+        governance=gate,
+        drafter=mock_drafter,
+        formatter=mock_formatter,
+        channels={"telegram": mock_channel},
+        deferred_queue=mock_deferred,
+        db=db,
+        config=config,
+        recipients={},  # adapter present, recipient absent
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.SURPLUS,
+        topic="No recipient test",
+        context="Adapter exists, recipient does not",
+        salience_score=0.9,
+        signal_type="surplus_insight",
+    )
+    result = await pipeline.submit(req)
+
+    assert result.status == OutreachStatus.FAILED, (
+        "a missing recipient is recoverable and must stay retriable"
+    )
+    mock_deferred.enqueue.assert_called_once()

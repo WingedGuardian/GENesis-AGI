@@ -31,6 +31,28 @@ def _discord_webhook_env(channel: str) -> str:
     return _DISCORD_WEBHOOK_PREFIX + channel.upper().replace("-", "_")
 
 
+# The DEFAULT webhook's variable. The discovery loop below EXCLUDES it from the
+# per-channel map on purpose, so no channel name may resolve to it.
+_DISCORD_DEFAULT_ENV = _DISCORD_WEBHOOK_PREFIX + "URL"
+
+
+def _is_reserved_discord_channel(channel: str) -> bool:
+    """True when ``channel`` would name the DEFAULT webhook, not a per-channel one.
+
+    The forward rule has a HOLE in its domain: `DISCORD_WEBHOOK_URL` is filtered
+    out of the per-channel map, so there is no channel whose webhook it is. The
+    inverse rule does not know that, and maps the literal channel ``url`` — in
+    any letter case, and ``URL`` via the ``-``→``_`` rule too — straight onto it.
+
+    A caller that looks the variable up directly therefore found the DEFAULT
+    webhook, posted there, and reported success for a channel named ``url``:
+    exactly the undetectable redirect this module exists to prevent, reached
+    through the one name nobody thinks to test. Derived from the two rules
+    rather than hardcoded, so it cannot drift from either.
+    """
+    return _discord_webhook_env(channel) == _DISCORD_DEFAULT_ENV
+
+
 def _discord_channel_from_env(key: str) -> str:
     """Channel name for a ``DISCORD_WEBHOOK_<NAME>`` env var — the FORWARD rule.
 
@@ -114,7 +136,7 @@ async def init(rt: GenesisRuntime) -> None:
             for key, val in os.environ.items():
                 if (
                     key.startswith(_DISCORD_WEBHOOK_PREFIX)
-                    and key != "DISCORD_WEBHOOK_URL"
+                    and key != _DISCORD_DEFAULT_ENV
                     and val
                 ):
                     name = _discord_channel_from_env(key)

@@ -548,23 +548,56 @@ class OutreachPipeline:
                     error="self-addressed email suppressed",
                 )
 
-        if not adapter or not recipient:
+        if not adapter:
+            # NO ADAPTER IS PERMANENT, and that is what separates this from the
+            # missing-recipient case below. `self._channels` is injected once at
+            # construction by `runtime/init/outreach.py` from environment read at
+            # that moment, and nothing mutates it afterwards (verified: the map
+            # has no writer outside the constructor). So within this process the
+            # channel is unreachable, and deferring buys the full retry ladder —
+            # 5 attempts over ~2.35h, then re-attempts every drain cycle until
+            # the 24h age-out — rebuilding a channel that cannot appear.
+            #
+            # This is the same misconfiguration the ChannelNotConfiguredError
+            # handler below treats as terminal, arriving one branch earlier: an
+            # install with NO `DISCORD_WEBHOOK_URL` never registers the Discord
+            # adapter at all, so a Discord send returned HERE and was deferred,
+            # never reaching that handler. Naming the specific channel was not
+            # enough; the unconfigured-entirely case is the more common one.
+            #
+            # IGNORED, not FAILED, for the reason spelled out below: the drain
+            # treats FAILED as transient and retries it.
+            msg = (
+                f"No adapter for channel {channel} — this install has no way to "
+                f"reach it, so the message is dropped rather than retried."
+            )
+            logger.error("%s", msg)
+            return OutreachResult(
+                outreach_id=outreach_id,
+                status=OutreachStatus.IGNORED,
+                channel=channel,
+                message_content=formatted.text,
+                error=msg,
+            )
+        if not recipient:
+            # A missing RECIPIENT is genuinely transient — a reply thread or a
+            # later configuration read can supply one — so this keeps deferring.
             if best_effort:
                 logger.warning(
-                    "No adapter/recipient for channel %s — dropping (best-effort)", channel,
+                    "No recipient for channel %s — dropping (best-effort)", channel,
                 )
             else:
-                logger.warning("No adapter/recipient for channel %s — deferring", channel)
+                logger.warning("No recipient for channel %s — deferring", channel)
                 await self._defer(
                     outreach_id, channel, formatted.text, request,
-                    f"No adapter or recipient for {channel}",
+                    f"No recipient for {channel}",
                 )
             return OutreachResult(
                 outreach_id=outreach_id,
                 status=OutreachStatus.FAILED,
                 channel=channel,
                 message_content=formatted.text,
-                error=f"No adapter or recipient for {channel}",
+                error=f"No recipient for {channel}",
             )
 
         # WS-8 autonomy capability gate — deterministic owner-authorization for

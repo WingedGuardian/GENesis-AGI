@@ -842,3 +842,38 @@ class TestPollRefusesUnconfiguredChannel:
             )
         assert "error" not in out, out
         assert "0/default" in client.post.call_args[0][0]
+
+    @pytest.mark.parametrize("name", ["url", "URL", "Url"])
+    async def test_the_reserved_default_name_is_not_a_channel(self, monkeypatch, name):
+        """`url` names the DEFAULT webhook's VARIABLE, not a channel.
+
+        The env-naming rule inverts `url` — in any letter case, and `URL` via
+        the `-`→`_` rule too — onto `DISCORD_WEBHOOK_URL`, while the discovery
+        loop deliberately EXCLUDES that variable from the per-channel map. So no
+        channel owns it, yet a direct lookup SUCCEEDED: it short-circuited the
+        default-channel test above and posted to the default channel while
+        reporting the requested name back as `url`. Same undetectable redirect
+        this class exists to remove, through the one name nobody thinks to test.
+
+        The control for this is `test_the_default_channel_still_falls_back`
+        directly above — a fix that simply refused anything resolving to that
+        variable would break every default-channel poll.
+        """
+        self._env(
+            monkeypatch,
+            DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/0/default",
+            OUTREACH_RECIPIENT_DISCORD="dev-discussion",
+        )
+        tools = await mcp.get_tools()
+        with patch("genesis.mcp.outreach_mcp.httpx.AsyncClient") as mock_cls:
+            client = AsyncMock()
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            out = json.loads(
+                await tools["outreach_poll"].fn(
+                    channel=name, question="Where did this land?", answers=["A", "B"],
+                )
+            )
+        assert "error" in out, f"the reserved name must be refused, got {out}"
+        client.post.assert_not_called()
+
