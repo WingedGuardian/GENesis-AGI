@@ -731,13 +731,56 @@ jobs:
           # -m "not slow", so they run. Every timeout in this repo has
           # therefore been a guess. Print the 25 slowest so the next person
           # inherits a number instead of one.
-          pytest -v --durations=25 \
+          #
+          # NO -v, and that is a diagnosability decision, not tidiness.
+          # MEASURED 2026-09-14 (run 34898229755): -v printed one line per
+          # test across 26,074 tests, GitHub's log APIs truncated the step at
+          # ~44% of the suite — and pytest prints its FAILURES block at the
+          # TAIL, so a red run named no failing test through --log,
+          # --log-failed, the whole-run log or the raw endpoint. -rfE keeps a
+          # compact list in the summary; the failure-summary step below
+          # carries the names somewhere truncation cannot reach at all.
+          #
+          # -rfE, not -rf: E is ERRORS, which are a DIFFERENT outcome from
+          # failures, not a louder one. A fixture that raises or a module
+          # that fails to import is reported as an error and appears in
+          # NEITHER the -rf list nor the FAILURES block, so -rf alone leaves
+          # the collection-time breakages -- the ones hardest to read off a
+          # truncated log -- named nowhere.
+          pytest -rfE --durations=25 \
             --ignore-glob='**/test_*az*.py' \
             --ignore-glob='**/test_*shim*.py' \
             --ignore=tests/test_ui/ \
             --junit-xml=junit.xml
         env:
           GENESIS_TESTING: "1"
+      # The step log's tail is where pytest names the failures, and the tail
+      # is what GitHub's log cap drops (measurement above). The step summary
+      # is rendered by the Actions UI OUTSIDE the log, so it survives however
+      # long the suite grows. failure() rather than !cancelled(): on green
+      # there is nothing to narrate, and the script's own notice covers the
+      # report-never-written case (pytest died in collection) rather than
+      # letting a missing file read as a second failure.
+      - name: Name the failures where truncation cannot reach
+        if: ${{ failure() }}
+        run: python scripts/ci_failure_summary.py junit.xml >> "$GITHUB_STEP_SUMMARY"
+      # The junit report holds every traceback in full and was previously
+      # DISCARDED with the runner — the dormancy guard parsed it, then it
+      # died with the VM while the truncated log held ~44% of the run.
+      # !cancelled() matches the dormancy guard's reasoning below: always()
+      # would also fire on a re-push cancellation and archive a half-written
+      # report as though it described a finished run.
+      - name: Preserve the test report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-test-report
+          path: junit.xml
+          # pytest can die before writing any report (collection crash); the
+          # failure-summary step already names that case in the summary, so a
+          # missing file here is information, not an upload error.
+          if-no-files-found: ignore
+          retention-days: 14
       # A test that stops running is invisible: it makes the suite SMALLER,
       # not red. Two axes, because dormancy moves both ways — a broken
       # skipif RAISES the skip count, while a lost marker or a dropped
