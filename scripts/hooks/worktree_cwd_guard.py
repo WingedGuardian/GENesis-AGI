@@ -11,12 +11,23 @@ Three modes:
 
 Removal modes (1 + 2):
   - If another process has its CWD inside the target worktree → hard block
-    with PID list (cross-session safety).
+    with PID list. THIS BRANCH DOES NOT FIRE IN PRACTICE and must not be read
+    as the cross-session protection: MEASURED 2026-09-10, 0 of 200 worktrees
+    had any process CWD inside them while 7 session processes were running.
+    Sessions `cd` per command, so a session's process CWD never leaves the
+    main checkout, and this keys on a signal real sessions do not emit. It is
+    kept because it costs nothing and does catch a genuinely cwd-rooted
+    process; it is not what makes removal safe.
   - If the current session's CWD IS the target → hard block (self-brick
-    prevention).
-  - If no conflicts → still block. Worktrees are never removed directly.
-    The lifecycle manager (scripts/worktree_lifecycle.py) handles cleanup
-    via a trash bin with 7-day recovery.
+    prevention). Same caveat as above.
+  - If no conflicts → still block. THIS is the branch that actually protects
+    every worktree, and it does so without needing to know who owns what.
+    Worktrees are never removed directly; the lifecycle manager
+    (scripts/worktree_lifecycle.py) handles cleanup via a trash bin.
+
+  Ownership proper is RECORDED rather than inferred — see
+  scripts/hooks/worktree_claim.py, which writes it as a `git worktree lock`
+  reason that both the reaper and git's own removal already honour.
 
 Incident 1: 2026-05-27 — Session bricked after deleting its own worktree.
 Incident 2: 2026-06-09 — Session B deleted worktree still used by Session A,

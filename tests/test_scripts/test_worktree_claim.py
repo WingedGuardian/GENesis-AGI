@@ -60,8 +60,15 @@ def repo(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def worktree(repo: Path, tmp_path: Path) -> Path:
-    """A linked worktree on a branch already merged into ``main``."""
+def worktree(repo: Path, tmp_path: Path, monkeypatch) -> Path:
+    """A linked worktree on a branch already merged into ``main``.
+
+    Also declares this fixture's repository to be OURS. Without that,
+    ``worktree_root_for`` would correctly refuse every worktree here as
+    belonging to a different repository — which is the point of the ownership
+    check and is asserted directly by the cross-repo tests below.
+    """
+    monkeypatch.setattr(wc, "_our_common_dir", lambda: (repo / ".git").resolve())
     _git(repo, "checkout", "--quiet", "-b", "feature/done")
     (repo / "f.txt").write_text("work\n")
     _git(repo, "add", "f.txt")
@@ -469,3 +476,282 @@ def test_the_shipped_config_is_valid(monkeypatch) -> None:
     cfg = wc.load_config()
     assert cfg["mode"] in wc.MODES
     assert isinstance(cfg["enabled"], bool)
+
+
+# ─── cross-repo ownership ───────────────────────────────────────────────────
+
+
+@pytest.fixture
+def sibling_worktree(tmp_path: Path) -> Path:
+    """A linked worktree of a DIFFERENT repository, built the same way as ours.
+
+    Deliberately identical in shape to the `worktree` fixture: same layout, same
+    `.git` file, same branch geometry. The ONLY thing that distinguishes it is
+    which repository it belongs to, so a test that passes here cannot be passing
+    on some incidental difference.
+    """
+    root = tmp_path / "sibling"
+    root.mkdir()
+    _git(root, "init", "--quiet", "-b", "main")
+    _git(root, "config", "user.email", "probe@example.invalid")
+    _git(root, "config", "user.name", "Probe")
+    (root / "README.md").write_text("seed\n")
+    _git(root, "add", "README.md")
+    _git(root, "commit", "--quiet", "-m", "seed")
+    path = tmp_path / "sibling-wt"
+    _git(root, "worktree", "add", "--quiet", "-b", "feature/theirs", str(path))
+    return path
+
+
+def test_a_worktree_of_another_repository_is_never_claimed(
+    repo: Path, worktree: Path, sibling_worktree: Path
+) -> None:
+    """Ownership is decided by the git COMMON DIR, not by path shape.
+
+    This is the whole reason the check exists. A session rooted in this
+    repository can be handed a path inside an unrelated project's worktree --
+    an external orchestrator places its worktrees outside this tree entirely,
+    and so does anyone with a second checkout -- and nothing about the PATH
+    distinguishes the two cases. Without the common-dir comparison the hook
+    would write OUR lock into THEIR repository, where it pins their worktree
+    against their own tooling and carries our namespace and our session's pid.
+
+    Both halves are asserted from the same test, against two real repositories,
+    because "ours is accepted" alone would also pass an implementation that
+    accepts everything.
+    """
+    assert wc.worktree_root_for(worktree) == worktree.resolve()
+    assert wc.worktree_root_for(sibling_worktree / "README.md") is None
+
+
+def test_ownership_fails_closed_when_our_own_repository_cannot_be_resolved(
+    worktree: Path, monkeypatch
+) -> None:
+    """An unanswerable question means we do NOT claim.
+
+    The two failures are not symmetric. A false negative costs one missed
+    advisory; a false positive writes a lock into a repository that is not ours.
+    So an unresolvable common dir -- git absent, a timeout, a detached
+    environment -- resolves toward refusing.
+    """
+    monkeypatch.setattr(wc, "_our_common_dir", lambda: None)
+    assert wc.worktree_root_for(worktree) is None
+
+
+def test_an_exported_git_dir_cannot_make_a_foreign_worktree_look_like_ours(
+    sibling_worktree: Path, monkeypatch
+) -> None:
+    """Ambient git location overrides BEAT `-C`, and that defeats the whole check.
+
+    `git rev-parse --local-env-vars` lists GIT_DIR and GIT_COMMON_DIR as
+    repository-local: with either exported, every `rev-parse --git-common-dir`
+    answers for THAT repository no matter which directory it runs in. Both sides
+    of the ownership comparison then return the same foreign path and AGREE — and
+    agreeing is precisely what makes a foreign worktree read as ours. The check
+    would not merely fail; it would invert, accepting exactly what it exists to
+    refuse, and a claim would be written into someone else's repository.
+
+    This repo already knows the trap: `.claude/hooks/genesis-hook` scrubs the same
+    three variables so an exported override cannot redirect hook discovery to an
+    unrelated checkout. This is that trap one layer down.
+
+    Note `_our_common_dir` is deliberately NOT patched here — its real resolution
+    is half of what the override corrupts, so patching it would hide the bug.
+    """
+    sibling_git = str((sibling_worktree.parent / "sibling" / ".git").resolve())
+    monkeypatch.setenv("GIT_DIR", sibling_git)
+    monkeypatch.setenv("GIT_COMMON_DIR", sibling_git)
+    monkeypatch.setattr(wc, "_COMMON_DIR_CACHE", wc._UNSET)
+
+    assert wc.worktree_root_for(sibling_worktree / "README.md") is None, (
+        "an exported GIT_DIR made another repository's worktree resolve as ours"
+    )
+
+
+def test_the_scrub_removes_only_the_location_overrides(monkeypatch) -> None:
+    """The control: scrubbing must not blank the environment wholesale.
+
+    git needs the rest of the environment — HOME for config discovery, PATH to
+    be found at all — so an over-broad scrub would break the very calls it is
+    meant to protect, and would do it silently because both functions fail closed.
+    """
+    monkeypatch.setenv("GIT_DIR", "/nowhere/.git")
+    monkeypatch.setenv("GIT_COMMON_DIR", "/nowhere/.git")
+    monkeypatch.setenv("GIT_WORK_TREE", "/nowhere")
+    env = wc._git_env()
+    for var in ("GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE"):
+        assert var not in env, f"{var} survived the scrub"
+    for var in ("PATH", "HOME"):
+        if var in os.environ:
+            assert env.get(var) == os.environ[var], f"{var} must be preserved"
+
+
+def test_an_exported_git_dir_pointing_at_OUR_repo_cannot_adopt_a_foreign_worktree(
+    sibling_worktree: Path, monkeypatch
+) -> None:
+    """The dangerous direction, which the sibling-pointing case does not reach.
+
+    Found by mutation: removing the scrub from the CANDIDATE side alone left the
+    sibling-pointing test green, because both sides then disagreed and the
+    refusal happened for the wrong reason. That was a blind spot in the test, not
+    a harmless mutation — point the override at OUR repository instead and the
+    candidate side answers "ours" for a path inside someone else's worktree, so
+    the comparison AGREES and the foreign worktree is adopted.
+
+    This is the realistic shape too: a wrapper exporting GIT_DIR for the repo it
+    is operating on is ordinary, and it is exactly then that a stray absolute
+    path into another checkout gets claimed.
+    """
+    ours = wc._our_common_dir()
+    if ours is None:
+        pytest.skip("cannot resolve this repository's common dir")
+    monkeypatch.setenv("GIT_DIR", str(ours))
+    monkeypatch.setenv("GIT_COMMON_DIR", str(ours))
+    monkeypatch.setattr(wc, "_COMMON_DIR_CACHE", wc._UNSET)
+
+    assert wc.worktree_root_for(sibling_worktree / "README.md") is None, (
+        "a GIT_DIR pointing at our own repo made another repository's worktree "
+        "answer as ours, so it would have been claimed"
+    )
+
+
+# ─── final round: identity and the scrubbed action path ─────────────────────
+
+
+@pytest.mark.parametrize(
+    "sid",
+    [
+        "wt-agent-a1ea091e2a88cd6e2",
+        "745814ce-bf06-48c5-90d9-939bbbf9033c",
+        "session_with_underscores",
+        "PLAIN-Mixed_Case-123",
+    ],
+)
+def test_a_valid_session_id_survives_into_the_lock(
+    repo: Path, worktree: Path, sid, monkeypatch
+) -> None:
+    """The id is most of what the collision note is worth to whoever reads it.
+
+    The old check was UUID-shaped (`[0-9a-fA-F-]`), so Claude Code ids outside
+    that alphabet — the `wt-` prefixed form among them — were silently dropped
+    and the warning degraded to "another session" while it had the name in hand.
+
+    The predicate is now delegated to `hook_input.is_safe_session_id`, this
+    repository's single source of truth, whose own docstring records that hooks
+    had hand-copied it in three shapes and omitted it in four files. This was a
+    fourth shape.
+    """
+    monkeypatch.setattr(wc, "session_pid_from_ancestry", lambda *a, **k: 4242)
+    monkeypatch.setattr(wc, "proc_starttime", lambda pid: 99)
+    payload = wc.build_payload(wc.RULE_CLAIM, sid=sid)
+    assert payload is not None
+    assert payload["sid"] == sid, f"a valid id {sid!r} was dropped"
+
+
+@pytest.mark.parametrize("sid", ["has/slash", "has space", "..", "", "x" * 300])
+def test_an_unsafe_session_id_is_still_refused(repo: Path, sid, monkeypatch) -> None:
+    """The control: widening the alphabet must not accept a path-unsafe id.
+
+    This string is echoed into a lock reason and used as an identity, so
+    accepting everything would be worse than the narrow check it replaced.
+    """
+    monkeypatch.setattr(wc, "session_pid_from_ancestry", lambda *a, **k: 4242)
+    monkeypatch.setattr(wc, "proc_starttime", lambda pid: 99)
+    payload = wc.build_payload(wc.RULE_CLAIM, sid=sid)
+    assert payload is not None
+    assert "sid" not in payload, f"unsafe id {sid!r} was recorded"
+
+
+@pytest.mark.parametrize(
+    "argv0",
+    [
+        b"/opt/node/bin/claude",
+        b"/opt/node/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+        b"/usr/local/bin/claude-code",
+        b"claude.exe",
+    ],
+)
+def test_every_supported_launcher_name_is_recognised_as_a_session(argv0) -> None:
+    """Rejecting the real session does not merely miss a warning — it takes NO claim.
+
+    `session_pid_from_ancestry` finds nothing, `build_payload` refuses, and the
+    worktree goes unclaimed entirely, so the whole feature is silently off for
+    that session. The shipped npm bin map is `{claude: bin/claude.exe}`, so a
+    configured executable path presents `claude.exe`, and this repository's own
+    authoritative classifier (`scripts/check_cc_running_versions.sh:is_cc_name`)
+    already accepts all three names.
+    """
+    assert wc._is_session_argv0(argv0) is True, (
+        f"a session launched as {argv0!r} was not recognised, so it would claim nothing"
+    )
+
+
+@pytest.mark.parametrize(
+    "argv0",
+    [
+        b"/bin/claude-wrapper",
+        b"/bin/bash",
+        b"/usr/bin/node",
+        b"/bin/myclaude",
+        b"",
+    ],
+)
+def test_a_non_session_binary_is_still_rejected(argv0) -> None:
+    """The control: a CLOSED SET, not a substring test.
+
+    The launcher shell is why this compares basenames rather than searching the
+    command line — `bash -c "cd repo && claude ..."` contains "claude" too, and
+    recording the launcher records a pid that outlives the session it wraps.
+    """
+    assert wc._is_session_argv0(argv0) is False, f"{argv0!r} matched"
+
+
+def test_locking_uses_a_scrubbed_environment(repo: Path, worktree: Path, monkeypatch) -> None:
+    """Deciding a worktree is ours and then locking it elsewhere is the gap.
+
+    The earlier fix scrubbed the ownership CHECK. The lock and unlock ran through
+    a different helper that still inherited the environment, so an exported
+    GIT_DIR could send the WRITE to a repository the check had nothing to do
+    with. The decision and the action have to agree about which repository they
+    mean, and scrubbing only one guarantees they can disagree.
+    """
+    seen: dict = {}
+    real_run = wc.subprocess.run
+
+    def spy(cmd, *a, **k):
+        if cmd[:1] == ["git"]:
+            seen.update(k.get("env") or {})
+            seen["_had_env"] = k.get("env") is not None
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setenv("GIT_DIR", "/nowhere/.git")
+    monkeypatch.setenv("GIT_COMMON_DIR", "/nowhere/.git")
+    monkeypatch.setenv("GIT_WORK_TREE", "/nowhere")
+    monkeypatch.setattr(wc.subprocess, "run", spy)
+
+    wc.lock_worktree(worktree, P("claim", pid=4242, start=1))
+
+    assert seen.get("_had_env"), "the lock ran with the inherited environment"
+    for var in ("GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE"):
+        assert var not in seen, f"{var} reached the lock command"
+
+
+def test_the_session_id_check_really_is_the_canonical_one() -> None:
+    """Delegation has to HAPPEN, not merely be claimed in a comment.
+
+    Found by mutation: rewriting the delegating line changed nothing, because a
+    plain `from hook_input import ...` is not importable when this module is
+    loaded directly — so the fallback silently became the live code while the
+    comment above it said the predicate was delegated. That is a fourth
+    hand-copied regex with a citation attached, which is exactly what
+    `hook_input`'s own docstring warns against.
+
+    So assert the IDENTITY of the resolved predicate, not its behaviour. Two
+    regexes can agree on every input in a test and still be two regexes, and it
+    is the second one drifting later that this is meant to prevent.
+    """
+    predicate = wc._safe_sid_predicate()
+    assert predicate.__name__ == "is_safe_session_id", (
+        f"the sid check resolved to {predicate.__name__!r}, not the canonical "
+        "hook_input.is_safe_session_id — the fallback is live and will drift"
+    )

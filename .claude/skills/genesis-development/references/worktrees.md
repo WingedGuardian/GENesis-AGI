@@ -51,6 +51,48 @@ Multiple Claude Code sessions may work on this repo simultaneously. Rules:
   file in the diff belongs to your work. If you see files you didn't modify,
   STOP and investigate.
 
+## Who owns a worktree
+
+Ownership is RECORDED, not inferred. A worktree being worked in carries a
+`git worktree lock` whose reason names the live session holding it, and both the
+reaper and `git worktree remove` already honour that lock, so recording it is the
+whole protection.
+
+ONE fact is recorded — which live process is using this worktree — because that
+is the only thing that cannot be derived. Whether a worktree holds uncommitted
+work is NOT recorded: the reaper computes that itself, at the instant it decides.
+A lock records what cannot be derived; everything derivable is derived at the
+point of use.
+
+You do not have to do anything for this. A claim is taken automatically on your
+first Edit or Write into a worktree, and released when the claiming process
+exits.
+
+What you WILL see: a note **in your context** — not on stderr — when you edit
+inside a worktree another live session claims. It never blocks; check with that
+session, or work in your own worktree. Inspect a lock directly with
+`cat .git/worktrees/<name>/locked`, or `git worktree list --porcelain | grep -B3 locked`.
+
+**Do not infer ownership from `/proc/*/cwd`.** Two guards were built on that
+signal and it does not exist here: sessions `cd` per command, so a session's
+process CWD never leaves the main checkout. MEASURED 2026-09-10 — 0 of 200
+worktrees had any process CWD inside them while 7 session processes ran.
+
+**Never release a lock you did not take.** A lock reason that is not Genesis's
+own JSON belongs to someone else — a person, or Claude Code's own
+worktree-isolated subagents, which lock what they create. Those are read, named
+as foreign, and never touched.
+
+**Claims stop at this repository's boundary.** Ownership is decided by comparing
+git's COMMON DIR, never by where a path sits on disk. A session rooted here can
+be handed a path inside an unrelated project's worktree — an external review
+orchestrator places its worktrees outside this tree entirely, and so does any
+second checkout — and nothing about the path distinguishes that from our own. A
+worktree belonging to another repository is left alone: no claim, no advisory.
+Where the question cannot be answered at all, the answer is "not ours", because
+a missed advisory costs one warning while a wrong claim writes our lock into
+somebody else's repository.
+
 ## Testing code in a worktree
 
 `tests/conftest.py` pins `sys.path[0]` to the worktree's own `src`, so `pytest`

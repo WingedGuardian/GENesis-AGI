@@ -88,13 +88,82 @@ RULES = (RULE_CLAIM,)
 # wrapper that launches it (`bash -c cd ... && claude ...`) also contains the
 # string "claude", so a substring test over the whole cmdline matches the shell
 # too and would record the WRONG pid -- one that outlives the session it wraps.
-_SESSION_EXE = "claude"
+#
+# Widened to match this repo's OWN authoritative classifier,
+# `scripts/check_cc_running_versions.sh:is_cc_name`, which accepts
+# claude / claude.exe / claude-code. The shipped npm package's bin map is
+# `{claude: bin/claude.exe}`, so a session launched through a configured
+# executable path presents `claude.exe` — and a bare `== "claude"` rejected the
+# REAL session, which does not merely miss a warning: `session_pid_from_ancestry`
+# then finds no session, `build_payload` refuses, and NO CLAIM IS TAKEN AT ALL.
+# A closed set is cheap to widen and expensive to get wrong in this direction.
+_SESSION_EXE_NAMES = frozenset({"claude", "claude.exe", "claude-code"})
 
 _GIT_TIMEOUT = 30
 
+# Sentinel so "resolved to None" (this is not a git repo) is distinguishable from
+# "not resolved yet"; a plain None default would re-run the subprocess forever on
+# a box where the answer really is None.
+_UNSET: object = object()
+_COMMON_DIR_CACHE: object = _UNSET
+
+
 # Session ids are UUID-shaped. Anything else is not one, and is refused rather
 # than escaped -- the id is echoed into a lock reason a human reads.
-_SID_RE = re.compile(r"[0-9a-fA-F-]{1,64}\Z")
+#
+# DELEGATED rather than re-derived. This was `[0-9a-fA-F-]{1,64}` — a
+# UUID-shaped check — and Claude Code supplies ids outside that alphabet (the
+# measured `wt-`-prefixed form among them). Such an id was silently DROPPED, so
+# the collision warning could only say "another session" where it had the name
+# in hand, which is most of that warning's value to whoever reads it.
+#
+# `hook_input.is_safe_session_id` is this repo's single source of truth for the
+# question actually being asked — is this safe to interpolate as one path
+# component — and its own docstring records that hooks previously hand-copied it
+# in three different shapes and omitted it in four files. This was a fourth
+# shape. It is stdlib-only, so importing it does not cost this module its
+# stdlib-only property.
+_SAFE_SID: object = None
+
+
+def _safe_sid_predicate():
+    """The canonical predicate, loaded BY PATH rather than by import name.
+
+    A plain `from hook_input import ...` does NOT work here and quietly falls
+    back — MEASURED: `hook_input` is not on the path when this module is loaded
+    directly (as the tests load it, and as any consumer that does not go through
+    the advisory does), so the fallback below became the live code while the
+    comment above claimed delegation. A label is not a mechanism; the delegation
+    has to actually happen or this is just a fourth hand-copied regex with a
+    citation attached.
+
+    Loading by file location is what makes it real: the sibling lives next to
+    this file by construction, so its location is known without a path search.
+    """
+    global _SAFE_SID
+    if _SAFE_SID is None:
+        try:
+            import importlib.util
+
+            path = Path(__file__).resolve().parent / "hook_input.py"
+            spec = importlib.util.spec_from_file_location("_wc_hook_input", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _SAFE_SID = mod.is_safe_session_id
+        except (OSError, AttributeError, ImportError):
+            # Conservative, never permissive: this string is echoed into a lock
+            # reason a human reads, and used as an identity.
+            def _fallback(value: object) -> bool:
+                return isinstance(value, str) and bool(re.match(r"\A[A-Za-z0-9_-]{1,255}\Z", value))
+
+            _SAFE_SID = _fallback
+    return _SAFE_SID
+
+
+def _sid_is_usable(sid: object) -> bool:
+    """Whether a session id can be recorded in a lock reason."""
+    return bool(_safe_sid_predicate()(sid))
+
 
 # Locks written by something else that we can nonetheless NAME. Claude Code's own
 # `isolation: "worktree"` subagents lock the worktree they create, with a reason
@@ -146,11 +215,25 @@ class Lock:
 
 
 def worktree_root_for(path: str | Path) -> Path | None:
-    """The worktree containing ``path``, or None if it is not in a linked worktree.
+    """The worktree containing ``path``, if it belongs to THIS repository.
 
     A linked worktree's ``.git`` is a FILE holding a ``gitdir:`` pointer; the main
     checkout's is a directory. So this returns None for the main tree by
     construction, which is correct -- the main tree is never claimed or reaped.
+
+    AND IT MUST BE OUR REPOSITORY. Without that check this accepts the first
+    ancestor with any ``.git`` pointer, so a session rooted here that edits an
+    absolute path inside ANOTHER repository's worktree -- the companion voice
+    repo is the obvious one, and both live under the same home -- would have a
+    Genesis ownership lock written into that repository. Writing state into
+    someone else's repo is not a degraded version of this feature; it is a
+    different and worse thing than not having it.
+
+    Ownership is decided by the GIT COMMON DIR, not by path prefix: a worktree
+    can be created anywhere on disk (Archon puts ours under ``~/.archon/...``),
+    so "is it under our checkout" would reject our own worktrees and accept a
+    sibling repo's if it happened to sit inside. The common dir is what actually
+    says which repository a worktree belongs to.
 
     Resolves symlinks first so two spellings of one worktree cannot be treated as
     two different worktrees.
@@ -165,12 +248,91 @@ def worktree_root_for(path: str | Path) -> Path | None:
         dot_git = candidate / ".git"
         try:
             if dot_git.is_file():
-                return candidate
+                return candidate if _belongs_to_this_repo(candidate) else None
         except OSError:
             continue
         if candidate == candidate.parent:
             break
     return None
+
+
+# Ambient git LOCATION overrides. `git rev-parse --local-env-vars` lists these
+# among the repository-local variables, and they beat `-C`: with GIT_DIR or
+# GIT_COMMON_DIR exported for another repository, EVERY `rev-parse
+# --git-common-dir` below answers for THAT repository no matter which directory
+# it is run from. Both sides of the ownership comparison would then agree, and
+# agreeing is exactly what makes a foreign worktree look like ours — so the
+# cross-repo check would pass while doing the opposite of its job.
+#
+# The same three are scrubbed for the same reason in `.claude/hooks/genesis-hook`,
+# whose comment records that an exported override "would otherwise resolve an
+# UNRELATED repo despite the `cd`". This is that trap, one layer down.
+_GIT_LOCATION_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
+
+
+def _git_env() -> dict[str, str]:
+    """The environment with git's location overrides removed."""
+    env = dict(os.environ)
+    for var in _GIT_LOCATION_VARS:
+        env.pop(var, None)
+    return env
+
+
+def _our_common_dir() -> Path | None:
+    """This repository's git common dir, resolved from this file's location.
+
+    Cached per process: a hook runs once and exits, and the sweep-free design
+    means nothing calls this in a loop long enough for staleness to matter.
+    """
+    global _COMMON_DIR_CACHE
+    if _COMMON_DIR_CACHE is not _UNSET:
+        return _COMMON_DIR_CACHE
+    repo = Path(__file__).resolve().parent.parent.parent
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT,
+            env=_git_env(),
+        )
+        out = result.stdout.strip()
+        _COMMON_DIR_CACHE = Path(out).resolve() if result.returncode == 0 and out else None
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        _COMMON_DIR_CACHE = None
+    return _COMMON_DIR_CACHE
+
+
+def _belongs_to_this_repo(root: Path) -> bool:
+    """True when ``root`` is a worktree of THIS repository.
+
+    Fails CLOSED -- an unresolvable common dir on either side returns False, so
+    an unanswerable question means we do not claim. The cost of a false negative
+    is a missed advisory; the cost of a false positive is a lock written into
+    someone else's repository.
+    """
+    ours = _our_common_dir()
+    if ours is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT,
+            env=_git_env(),
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+    if result.returncode != 0:
+        return False
+    out = result.stdout.strip()
+    if not out:
+        return False
+    try:
+        return Path(out).resolve() == ours
+    except OSError:
+        return False
 
 
 def gitdir_for(root: Path) -> Path | None:
@@ -268,7 +430,20 @@ def is_session_process(pid: int) -> bool:
         return False
     if not argv or not argv[0]:
         return False
-    return os.path.basename(argv[0].decode(errors="replace")) == _SESSION_EXE
+    return _is_session_argv0(argv[0])
+
+
+def _is_session_argv0(argv0: bytes) -> bool:
+    """Whether argv[0] names a Claude Code session executable.
+
+    Split out from the /proc read so the CLOSED SET can be tested exhaustively
+    without a fake process tree. The set is the part that gets this wrong — the
+    plumbing above is one file read — and a set is only closed if something
+    checks every member and a few non-members.
+    """
+    if not argv0:
+        return False
+    return os.path.basename(argv0.decode(errors="replace")) in _SESSION_EXE_NAMES
 
 
 def session_pid_from_ancestry(start_pid: int | None = None, max_hops: int = 12) -> int | None:
@@ -414,18 +589,32 @@ def build_payload(
         "pid": pid,
         "start": start,
     }
-    if sid and _SID_RE.match(sid):
+    if sid and _sid_is_usable(sid):
         payload["sid"] = sid
     return payload
 
 
 def _git(root: Path, *args: str) -> subprocess.CompletedProcess | None:
+    """Run git against ``root``, with ambient location overrides removed.
+
+    The scrub belongs HERE and not only at the ownership check, which is the gap
+    the earlier fix left: deciding correctly that a worktree is ours and then
+    LOCKING it through an un-scrubbed call still writes into whatever repository
+    GIT_DIR names. The decision and the action have to agree about which
+    repository they mean, and only scrubbing one of them guarantees they can
+    disagree.
+
+    The launcher scrubs these variables for its own discovery command only; it
+    does not clean the Python process environment, so nothing upstream has
+    already done this for us.
+    """
     try:
         return subprocess.run(
             ["git", "-C", str(root), *args],
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT,
+            env=_git_env(),
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
