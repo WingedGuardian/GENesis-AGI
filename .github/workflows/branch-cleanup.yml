@@ -84,6 +84,8 @@ jobs:
           # denylist is a list of the characters someone thought of, and `+`
           # (decoded as a space in a query string) was the one missing.
           #
+          # Used by the ref READ below (the GraphQL leg binds a variable and
+          # the deletion goes over the git wire, so neither needs it).
           # Per-SEGMENT encoding, because `refs/heads/a/b` must keep its
           # separators literal while `#` or `%` inside a segment must not.
           # Encoding `{` and `}` is load-bearing too: `gh api` substitutes
@@ -97,9 +99,16 @@ jobs:
           keep_check() {
             local heads bases
             # Head side over GraphQL: it crosses the fork network (see the
-            # header), and `qualifiedName` takes the bare branch name as a
-            # VARIABLE, so this leg needs no URL encoding and is structurally
-            # injection-proof. A ref that does not exist yields null -> 0.
+            # header), and the ref travels as a bound VARIABLE, so this leg
+            # needs no URL encoding and is structurally injection-proof.
+            #
+            # FULLY QUALIFIED (`refs/heads/`), never the bare name: a short
+            # name is resolved with git's ambiguity rules, so a branch legally
+            # named `heads/topic` — or one colliding with a tag — could resolve
+            # to a DIFFERENT ref or to null. Null then becomes 0 via `// 0`,
+            # which reads as "no open request uses this branch" and clears the
+            # way to delete one that is still in use. Qualifying removes the
+            # ambiguity outright.
             # shellcheck disable=SC2016  # $o/$r/$b are GRAPHQL variables and
             # must NOT expand in the shell — that is what makes this leg
             # injection-proof; they are bound by the -f flags below.
@@ -108,7 +117,7 @@ jobs:
                 repository(owner:$o,name:$r){
                   ref(qualifiedName:$b){
                     associatedPullRequests(states:OPEN,first:1){ totalCount } } } }' \
-              -f o="$OWNER" -f r="${REPO#*/}" -f b="$BRANCH" \
+              -f o="$OWNER" -f r="${REPO#*/}" -f b="refs/heads/$BRANCH" \
               --jq '.data.repository.ref.associatedPullRequests.totalCount // 0')
             # Base side stays REST: a pull request's BASE ref always lives in
             # the base repository, so this filter is complete by construction.
@@ -153,5 +162,35 @@ jobs:
             exit 0
           fi
 
-          gh api -X DELETE "repos/$REPO/git/refs/heads/$ENC_BRANCH"
+          # ATOMIC DELETE. The SHA was read several API calls ago, and the REST
+          # ref-deletion endpoint offers no expected-value precondition — so an
+          # unconditional DELETE removes whatever the branch points at NOW,
+          # including a commit pushed in between. Git's own wire protocol does
+          # have the precondition: `--force-with-lease=<ref>:<expect>` refuses
+          # the update unless the remote ref still equals <expect>, and that
+          # applies to a DELETION refspec too.
+          #
+          # MEASURED, both directions: with a stale expectation the remote
+          # answers `! [rejected] (delete) -> topic (stale info)` and the branch
+          # survives; with the current one it answers `- [deleted] topic`.
+          #
+          # The push runs from an EMPTY BARE repo — a deletion carries no
+          # objects, so nothing is fetched and no PR content is ever checked out
+          # or executed. The `pull_request_target` posture is unchanged.
+          #
+          # The credential goes through GIT_CONFIG_* environment variables
+          # rather than argv or a URL, so it is not visible in the process table
+          # and cannot be echoed back by a failing push.
+          git init -q --bare "$RUNNER_TEMP/delete.git"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          export GIT_CONFIG_VALUE_0
+          if ! git -C "$RUNNER_TEMP/delete.git" push \
+                 --force-with-lease="refs/heads/$BRANCH:$current_sha" \
+                 "https://github.com/$REPO" ":refs/heads/$BRANCH"; then
+            echo "keep: $BRANCH moved after the check — deletion refused by the lease" >&2
+            echo "      (this is the guard working, not a failure to clean up)" >&2
+            exit 0
+          fi
           echo "deleted: $BRANCH at $current_sha (restorable from the PR's Restore button)"
