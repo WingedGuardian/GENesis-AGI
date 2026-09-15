@@ -41,9 +41,11 @@ from pathlib import Path
 
 from genesis.db.crud import follow_ups as followups_crud
 from genesis.db.crud import pending_issue_posts as pip_crud
+from genesis.db.crud import pr_verifications as verif_crud
 from genesis.db.crud import repo_pulse as pulse_crud
 from genesis.db.crud.session_charters import ledger_all, ledger_update
 from genesis.env import genesis_db_path, genesis_home
+from genesis.session_awareness.doc_paths import is_doc_path
 from genesis.session_awareness.headless import run_headless_json
 from genesis.session_awareness.repo_pulse import (
     PROMPT_VERSION,
@@ -58,12 +60,14 @@ from genesis.session_awareness.repo_pulse import (
 )
 from genesis.session_awareness.repo_pulse_config import (
     effective_mode,
+    knob_bool,
     knob_int,
     load_config,
 )
 from genesis.session_awareness.repo_pulse_gh import (
     list_merged_prs,
     list_open_prs,
+    list_pr_files,
     resolve_default_branch,
 )
 
@@ -108,10 +112,24 @@ def _read_cursor(root: Path) -> dict:
             return data
     except Exception:
         pass
-    return {"last_merged_at": None, "last_run_ts": None, "runs": 0}
+    return {
+        "last_merged_at": None,
+        "last_run_ts": None,
+        "runs": 0,
+        "verification_through": None,
+        "verification_repo": None,
+    }
 
 
-def _write_cursor(root: Path, prior: dict, *, merged_at: str | None) -> None:
+def _write_cursor(
+    root: Path,
+    prior: dict,
+    *,
+    merged_at: str | None,
+    verification_through: str | None = None,
+    verification_repo: str | None = None,
+    verification_reset: bool = False,
+) -> None:
     """Update the cursor after a RECORDED run.
 
     ``last_merged_at`` holds gh's own mergedAt strings (one consistent
@@ -120,16 +138,67 @@ def _write_cursor(root: Path, prior: dict, *, merged_at: str | None) -> None:
     when ``merged_at`` is passed (ok runs); failed/no_new_prs runs update
     only ``last_run_ts`` (the debounce basis) + the run counter. ``prior``
     was read under the flock, so max() against it is race-free.
+
+    ``verification_through`` is the PR-verification lane's OWN watermark, and
+    it exists because that lane can be switched off independently while the
+    shared cursor keeps advancing (Codex P2, PR #1836). With one cursor, every
+    PR merged during a `verification_enabled: false` window fell permanently
+    behind it: the lane never saw those PRs again, so the one-row-per-merged-PR
+    invariant broke for good — silently, since nothing reports a row that was
+    never opened. It advances ONLY on a tick where the lane actually ran to
+    completion, so a disabled (or failed) lane leaves it standing while
+    ``last_merged_at`` moves on.
     """
     last = prior.get("last_merged_at")
     if merged_at is not None:
         last = max(str(last), merged_at) if last else merged_at
+    verif = prior.get("verification_through")
+    if verification_reset:
+        # The repository changed under this cursor. CLEAR the watermark rather
+        # than advancing or preserving it: a foreign timestamp is not
+        # information about this repository, and the next tick then derives its
+        # window from the plain lookback and re-covers correctly.
+        _atomic_write_json(
+            root / CURSOR_FILENAME,
+            {
+                "last_merged_at": (
+                    max(str(last), merged_at) if (last and merged_at) else (merged_at or last)
+                ),
+                "last_run_ts": _now(),
+                "runs": int(prior.get("runs") or 0) + 1,
+                "verification_through": None,
+                "verification_repo": verification_repo,
+            },
+        )
+        return
+    if verification_through is not None:
+        # The monotonic max is only valid WITHIN one repository. Across a
+        # change of repo it carries the FOREIGN watermark forward whenever the
+        # old one is newer — which is the very thing the reset on the read side
+        # exists to prevent, defeated by the write side (CodeRabbit Major,
+        # PR #1836). Both halves of a stored pair have to agree about identity:
+        # I had fixed the reader and left the writer monotonic.
+        prior_repo = prior.get("verification_repo")
+        same_repo = not verification_repo or not prior_repo or prior_repo == verification_repo
+        if verif and same_repo:
+            verif = max(str(verif), verification_through)
+        else:
+            verif = verification_through
     _atomic_write_json(
         root / CURSOR_FILENAME,
         {
             "last_merged_at": last,
             "last_run_ts": _now(),
             "runs": int(prior.get("runs") or 0) + 1,
+            "verification_through": verif,
+            # Stored WITH the watermark: a timestamp from another repository is
+            # not information about this one, and the reader discards it rather
+            # than applying it (see `verification_repo` at the run's head).
+            "verification_repo": (
+                verification_repo
+                if verification_through is not None
+                else prior.get("verification_repo")
+            ),
         },
     )
 
@@ -207,14 +276,15 @@ async def _load_open_items(db_path: Path | str) -> list[dict] | None:
     one. Proceeding with [] would record an ok run and advance the cursor
     past PRs whose matches were never computed, skipping those closures
     forever; the caller must fail the run and keep the cursor instead
-    (Codex P2 on #1081). The limit is pinned at ledger_all's ceiling so
-    truncation can't silently hide newer open rows either."""
+    (Codex P2 on #1081). ledger_all is COMPLETE (keyset-paginated, raising
+    tripwire) so truncation can't silently hide newer open rows either —
+    its tripwire raise lands in the except below, which fails the run."""
     import aiosqlite
 
     try:
         async with aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5) as db:
             db.row_factory = aiosqlite.Row
-            rows = await ledger_all(db, limit=100_000)
+            rows = await ledger_all(db)
     except Exception:
         return None
     open_rows = [r for r in rows if r.get("status") in OPEN_STATUSES]
@@ -470,6 +540,105 @@ async def _run(
         lock_fh.close()
 
 
+async def _verification_lane(
+    db_path: Path | str,
+    prs: list[dict],
+    repo: str | None,
+    now_iso: str,
+) -> tuple[int, int, bool]:
+    """Open one pr_verifications row per merged PR (issue #1718 half B).
+
+    The durable half of the post-merge E2E obligation: a merge-time
+    declaration is advisory (#1824), so this row is what survives the merge.
+    A DOCS-ONLY diff (every changed path passes ``is_doc_path``) is born
+    CLOSED with the reason recorded — the owner's deterministic exemption, no
+    model in the loop. Everything else is born OPEN for the validator.
+
+    Fail directions, each deliberate:
+    - changed-file list unreadable (API error, cap, malformed row, or EMPTY —
+      a merged PR touches at least one file, so empty means the read lied,
+      the exact empty-vs-unreadable ambiguity measured as a security HIGH on
+      the hook's sibling reader) → the PR is NOT docs-only; its row opens.
+      Cost: one validator look. The other direction silently forgives an
+      unverified merge.
+    - tables absent (pre-migration subprocess window) → nothing written and
+      COMPLETE=FALSE, which makes the caller fail the run and KEEP the cursor.
+      That third value is load-bearing and was missing in review: idempotency
+      is not recovery. The unique index guarantees a retry cannot duplicate,
+      but nothing retries a PR the shared cursor has already advanced past —
+      so a silent no-op here would strand exactly the merges this lane exists
+      to record. The window is real and structural on every existing install:
+      the run-recording tables predate this one, so between a code deploy and
+      the next server restart (when migrations run) ``_record_run`` succeeds
+      while this lane cannot write.
+    - ``exists`` pre-check before the files fetch: window re-coverage must
+      not re-spend a GitHub API call per already-recorded PR. The INSERT OR
+      IGNORE against the unique index remains the actual guard; the
+      pre-check is an API-cost optimization only.
+
+    Returns (opened, auto_closed, complete). ``complete`` is False when this
+    run could not record every PR it was given — the caller then keeps the
+    cursor so the next tick re-covers the window (every other lane's writes
+    are dedup-guarded, so re-coverage is safe, and the ``exists`` pre-check
+    makes it nearly free). The caller also wraps this in its own try/except:
+    an exception must never break the absorb lanes or ``_record_run``.
+    """
+    if not repo:
+        # NOT complete: with no slug there is no (repo, pr_number) to address,
+        # so nothing could have been recorded. Returning True here would let the
+        # caller advance the watermark past PRs that got no row — the permissive
+        # value on the wrong side of the invariant this PR spent four rounds
+        # establishing. Unreachable today (`list_merged_prs` guarantees a slug on
+        # any non-error return); stated so it stays unreachable (audit, #1836).
+        return 0, 0, False
+    if not prs:
+        return 0, 0, True
+    import aiosqlite
+
+    opened = auto_closed = 0
+    async with aiosqlite.connect(str(db_path), timeout=10) as db:
+        await db.execute("PRAGMA busy_timeout=5000")
+        db.row_factory = aiosqlite.Row
+        if not await verif_crud.tables_available(db):
+            return 0, 0, False
+        for pr in prs:
+            number = pr["number"]
+            if await verif_crud.exists(db, repo=repo, pr_number=number):
+                continue
+            listing = await list_pr_files(number, repo=repo)
+            reason: str | None = None
+            if (
+                "error" not in listing
+                and listing["files"]
+                and all(is_doc_path(p) for p in listing["files"])
+            ):
+                reason = (
+                    f"docs-only by path rule "
+                    f"({len(set(listing['files']))} path(s), doc_paths.is_doc_path)"
+                    " — deterministic exemption"
+                )
+            outcome = await verif_crud.open_verification(
+                db,
+                repo=repo,
+                pr_number=number,
+                pr_title=str(pr.get("title") or "")[:200] or None,
+                merged_at=str(pr["mergedAt"]),
+                now=now_iso,
+                closed_reason=reason,
+            )
+            if outcome == "unavailable":
+                # The table vanished mid-loop (a restore, a hostile drop).
+                # Everything after this PR is unrecorded too — stop and let
+                # the caller keep the cursor.
+                return opened, auto_closed, False
+            if outcome == "created":
+                if reason:
+                    auto_closed += 1
+                else:
+                    opened += 1
+    return opened, auto_closed, True
+
+
 async def _run_locked(
     *,
     trigger: str,
@@ -495,6 +664,26 @@ async def _run_locked(
         return {"status": "debounced"}
 
     cursor_before = cursor.get("last_merged_at")
+    # The verification lane's own watermark (see `_write_cursor`). ABSENT is
+    # deliberately NOT read as "caught up": on the first tick after this ships
+    # it leaves the lane's window at the ordinary lookback, so PRs stranded by
+    # an earlier disabled window are re-covered rather than written off. That
+    # re-coverage is free of side effects — the (repo, pr_number) unique index
+    # dedups, and the lane's `exists` pre-check skips the API call per already
+    # recorded PR — and it is bounded by `lookback_days`, so it can never walk
+    # all history. PRs stranded LONGER than the lookback stay stranded; that is
+    # a stated limit of the self-heal, not a claim it cannot happen.
+    verification_before = cursor.get("verification_through")
+    # SCOPED TO ITS REPOSITORY, because the obligation's identity is
+    # (repo, pr_number) while this watermark is a bare timestamp. Retarget the
+    # checkout at a fork, or rename the repo so the resolved slug changes, and
+    # the old repository's timestamp would silently apply to the new one —
+    # every merge at or before it omitted forever, with no row and nothing to
+    # notice (Codex P2, PR #1836). A watermark recorded against a DIFFERENT
+    # repo is not information about this one, so it is discarded rather than
+    # trusted: the lane then re-covers its lookback, which the unique index
+    # makes free.
+    verification_repo = cursor.get("verification_repo")
     now_iso = _now()
     detail_notes: list[str] = []
 
@@ -508,7 +697,7 @@ async def _run_locked(
     # NEVER touches the cursor and writes only the fetch cache. A failure is
     # surfaced on the run row's detail (this module reports via DB telemetry, not
     # logging).
-    if cfg.get("open_pr_enabled", True):
+    if knob_bool(cfg, "open_pr_enabled"):
         try:
             open_listing = await list_open_prs(limit=knob_int(cfg, "max_open_prs"))
             if "error" in open_listing:
@@ -549,7 +738,30 @@ async def _run_locked(
         row.update(over)
         return row
 
-    since = _since_date(cursor_before, lookback_days or knob_int(cfg, "lookback_days"))
+    # The fetch window must cover the EARLIER of the two watermarks, or the
+    # verification lane could never see a PR the shared cursor already passed
+    # — the re-coverage above would be a window that never contains anything.
+    # When the lane is disabled its watermark is irrelevant: nothing will read
+    # those PRs, so paying for a wider gh query would be waste.
+    verification_on = knob_bool(cfg, "verification_enabled")
+    # THE WINDOW CANNOT BE TRUSTED WHEN THE REPOSITORY MAY HAVE CHANGED, and the
+    # identity is not known until the fetch returns. An earlier attempt hoisted
+    # `resolve_repo()` above the window to learn it early; that added a live API
+    # call and a NEW failure mode to this path — CI has no gh auth, so it
+    # returned None, the reset never fired, and the tests only passed locally
+    # because of ambient credentials. A check that silently stops checking is
+    # worse than a late one.
+    # So the check stays AFTER the fetch, and the recovery takes one extra tick
+    # instead of one extra call: on a repo change the watermark is RESET IN THE
+    # CURSOR (see `verification_reset` below), so the NEXT tick derives its
+    # window from the plain lookback and re-covers correctly. No API call, no
+    # new failure mode, and self-healing without operator action.
+    fetch_from = cursor_before
+    if verification_on and (verification_before is None or not cursor_before):
+        fetch_from = None  # fall back to the plain lookback (bounded)
+    elif verification_on and verification_before:
+        fetch_from = min(str(cursor_before), str(verification_before))
+    since = _since_date(fetch_from, lookback_days or knob_int(cfg, "lookback_days"))
     max_prs = knob_int(cfg, "max_prs")
     # Pagination on capped windows: GitHub search can't sort by mergedAt
     # ascending, so a single capped call may silently drop OLDER PRs in the
@@ -563,6 +775,7 @@ async def _run_locked(
     repo: str | None = None
     until: str | None = None
     pages = 0
+    dropped_rows = 0
     limit_hit_unresolved = True
     for _page in range(5):
         listing = await list_merged_prs(
@@ -577,6 +790,7 @@ async def _run_locked(
             return {"status": "failed", "detail": listing["error"]}
         repo = listing["repo"]
         pages += 1
+        dropped_rows += int(listing.get("dropped") or 0)
         for p in listing["prs"]:
             prs_by_number.setdefault(p["number"], p)
         if not listing["limit_hit"]:
@@ -608,13 +822,62 @@ async def _run_locked(
         ),
         key=lambda p: str(p["mergedAt"]),
     )
-    if not prs:
+    # The verification lane's window, derived from ITS watermark rather than
+    # the shared cursor (see `_write_cursor`). Computed HERE, above the
+    # no-new-PRs early return, because the recovery case is precisely the one
+    # where the shared cursor has passed every fetched PR and this lane has
+    # not: returning early on `not prs` would skip the lane on exactly the
+    # ticks it exists to catch up on, leaving the fix inert.
+    #
+    # THE LANE'S WATERMARK ADVANCES ONLY OVER A WINDOW IT CAN PROVE COMPLETE.
+    # That single invariant is the CLASS behind five separate round-2 findings
+    # (Codex, PR #1836): the watermark was advancing from `max(mergedAt)` of
+    # whatever happened to be in hand, while every mechanism that verifies a
+    # window IS complete — the limit_hit paging, the row-validation filter, the
+    # early returns — had been written for the shared cursor alone and knew
+    # nothing about this second window. Each finding was one way for the two to
+    # disagree; the fix is to make completeness a precondition of advancing,
+    # once, rather than to patch the ways it can fail.
+    #
+    # `verification_window_complete` is that precondition. It is False when the
+    # gh listing silently DROPPED a malformed merged-PR row (`dropped_rows`),
+    # because advancing past a dropped merge strands it forever — nothing
+    # re-presents a PR the watermark has passed. The capped-window case cannot
+    # reach here at all: `limit_hit_unresolved` already returns above.
+    verification_reset = bool(verification_repo and repo and verification_repo != repo)
+    if verification_reset:
+        detail_notes.append(
+            f"verification_watermark_reset: recorded for {verification_repo}, now {repo}"
+        )
+        verification_before = None
+    # A reset tick never ADVANCES the watermark: the window it fetched was
+    # derived from the OLD repository's cursor and may be narrower than the
+    # lookback, so anything older would be skipped. It clears the stored value
+    # instead, and the next tick re-covers from the lookback.
+    verification_window_complete = dropped_rows == 0 and not verification_reset
+    if dropped_rows:
+        detail_notes.append(f"verification_window_incomplete: {dropped_rows} row(s) dropped")
+    verif_prs: list[dict] = []
+    if verification_on:
+        verif_prs = sorted(
+            (
+                p
+                for p in prs_by_number.values()
+                if not verification_before or str(p["mergedAt"]) > str(verification_before)
+            ),
+            key=lambda p: str(p["mergedAt"]),
+        )
+    if not prs and not verif_prs:
         recorded = await _record_run(db_path, **_base_row(status="no_new_prs", repo=repo, n_prs=0))
         if recorded:
             _write_cursor(root, cursor, merged_at=None)
         await _record_telemetry(db_path, "no_new_prs", f"repo={repo}")
         return {"status": "no_new_prs"}
-    new_max_merged = max(str(p["mergedAt"]) for p in prs)
+    # `new_max_merged` stays the SHARED cursor's advance and is therefore
+    # derived from `prs` alone — a lane-only tick (nothing new for the other
+    # lanes) must not move it. None means "do not advance", which
+    # `_write_cursor` already honours.
+    new_max_merged = max((str(p["mergedAt"]) for p in prs), default=None)
 
     open_items = await _load_open_items(db_path)
     if open_items is None:
@@ -958,7 +1221,83 @@ async def _run_locked(
     if n_closes:
         detail_notes.append(f"issue-close exact={n_closes}")
 
-    remaining = [i for i in open_items if i["id"] not in absorbed]
+    # ── PR-verification lane (issue #1718 half B) ────────────────────────────
+    # One durable row per merged PR; docs-only diffs auto-close (deterministic).
+    # Placed BEFORE the fuzzy tier: that tier can return early on a judge
+    # timeout, and this lane must run on every tick that has new PRs. Own
+    # try/except + knob (the open-PR-lane posture): a gh/DB failure surfaces on
+    # the run row's detail and never breaks the absorb lanes or _record_run.
+    # Rides its own dedup (the (repo, pr_number) unique index), so the cursor
+    # advancing past a failed tick is recovered by the next window re-coverage
+    # only when the failure was per-PR transient — a hard lane failure is
+    # visible in detail and the rows self-heal on the next tick that sees the
+    # same PRs; PRs the cursor has passed are backfilled by nothing, which is
+    # why the failure note matters.
+    verif_through: str | None = None
+    if verification_on:
+        verif_complete = True
+        # `verif_prs` was derived above the no-new-PRs early return — the lane
+        # reads from its OWN watermark, not the shared cursor, and those two
+        # diverge exactly when it was off (or failed) while the cursor moved.
+        try:
+            n_verif_open, n_verif_autoclosed, verif_complete = await _verification_lane(
+                db_path, verif_prs, repo, now_iso
+            )
+            # THE INVARIANT: advance only over a window proven complete. Both
+            # conjuncts are load-bearing and neither implies the other —
+            # `verif_complete` says the LANE recorded every PR it was handed,
+            # `verification_window_complete` says the FETCH handed it every PR
+            # there was. A lane that perfectly records a listing which silently
+            # lost a row still moves the watermark past that row, forever.
+            if verif_complete and verification_window_complete and verif_prs:
+                verif_through = max(str(p["mergedAt"]) for p in verif_prs)
+            if n_verif_open or n_verif_autoclosed:
+                detail_notes.append(
+                    f"verification opened={n_verif_open} auto-closed={n_verif_autoclosed}"
+                )
+        except Exception as exc:  # never break the absorb lanes / _record_run
+            detail_notes.append(f"verification_lane_failed: {str(exc)[:120]}")
+            verif_complete = False
+        if not verif_complete:
+            # The lane could not record every PR in this window. FAIL the run and
+            # KEEP the cursor, the same posture every other lane takes on an
+            # incomplete read (posted_index_read_failed above) — because the
+            # cursor is SHARED: advancing it would retire these PRs from every
+            # future enumeration, and no mechanism re-presents them. Idempotency
+            # is not recovery. Re-coverage is cheap and safe: every lane's writes
+            # are dedup-guarded, and this lane's `exists` pre-check means the
+            # already-recorded PRs cost no GitHub calls on the retry.
+            detail_notes.append("verification_lane_incomplete")
+            recorded = await _record_run(
+                db_path,
+                **_base_row(
+                    status="failed",
+                    repo=repo,
+                    n_prs=len(prs),
+                    n_open_items=len(open_items),
+                    n_exact=n_exact,
+                ),
+                annotations=annotations,
+            )
+            if recorded:
+                _write_cursor(root, cursor, merged_at=None)
+            await _record_telemetry(db_path, "failed", "verification_lane_incomplete")
+            return {
+                "status": "failed",
+                "detail": "verification_lane_incomplete",
+                "n_exact": n_exact,
+            }
+
+    # A LANE-ONLY TICK HAS NO PRs FOR THE TIERS BELOW. When the shared cursor is
+    # current but the verification watermark is behind, `prs` is empty while
+    # `verif_prs` is not — the recovery case the early return was widened to
+    # reach. The fuzzy tier would then invoke the headless judge with no PRs at
+    # all: pure cost, and a timeout or malformed reply FAILS the run before
+    # `verification_through` is written, so the window the lane just recorded
+    # repeats on every later tick (Codex P2, PR #1836). Nothing below this point
+    # has anything to match, so skip straight to recording.
+    lane_only_tick = not prs
+    remaining = [] if lane_only_tick else [i for i in open_items if i["id"] not in absorbed]
     n_fuzzy = 0
     fuzzy_ran = False
     if remaining:
@@ -1022,8 +1361,13 @@ async def _run_locked(
         **_base_row(
             status="ok",
             repo=repo,
+            # `new_max_merged` is None on a lane-only tick (the verification
+            # lane had work, the other lanes did not), and max(str, None)
+            # raises — so the unchanged cursor is reported as itself.
             cursor_after=(
-                max(str(cursor_before), new_max_merged) if cursor_before else new_max_merged
+                max(str(cursor_before), new_max_merged)
+                if cursor_before and new_max_merged
+                else (new_max_merged or cursor_before)
             ),
             n_prs=len(prs),
             n_open_items=len(open_items),
@@ -1035,7 +1379,18 @@ async def _run_locked(
         annotations=annotations,
     )
     if recorded:
-        _write_cursor(root, cursor, merged_at=new_max_merged)
+        # `verif_through` is None on any tick where the lane did not run to
+        # completion over its own window — disabled, failed, or nothing new —
+        # and `_write_cursor` then leaves that watermark standing while the
+        # shared cursor advances. That asymmetry IS the fix.
+        _write_cursor(
+            root,
+            cursor,
+            merged_at=new_max_merged,
+            verification_through=verif_through,
+            verification_repo=repo,
+            verification_reset=verification_reset,
+        )
     else:
         detail_notes.append("pulse_write_failed_cursor_preserved")
     await _record_telemetry(

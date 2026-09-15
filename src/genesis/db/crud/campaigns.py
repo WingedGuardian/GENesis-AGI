@@ -30,6 +30,12 @@ async def create_campaign(
     # them. Strip (never reject) so the stored name is single-line; any printable
     # name is preserved untouched.
     name = strip_control_chars(name)
+    if not name:
+        # A name made only of control/format characters normalizes to empty. The
+        # column is NOT NULL and the scheduler derives its job id from the name,
+        # so an empty name would produce an unaddressable campaign. Reject at the
+        # storage choke point so no caller can create one.
+        raise ValueError("campaign name is empty after control-character removal")
     await db.execute(
         """INSERT INTO campaigns
            (id, name, strategy_doc_path, cron_cadence, model, effort,
@@ -106,6 +112,8 @@ async def update_campaign(db: Any, campaign_id: str, **fields: Any) -> None:
     # into the stored name (see create_campaign).
     if "name" in fields and isinstance(fields["name"], str):
         fields["name"] = strip_control_chars(fields["name"])
+        if not fields["name"]:
+            raise ValueError("campaign name is empty after control-character removal")
     set_clause = ", ".join(f"{k} = ?" for k in fields)
     values = list(fields.values()) + [campaign_id]
     await db.execute(

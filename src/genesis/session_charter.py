@@ -17,9 +17,30 @@ byte-identical output, so drift fails CI immediately.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# The canonical mirror root. Defined here, with the renderer that writes it, so
+# callers do not each keep their own copy of the path.
+SESSIONS_DIR = Path.home() / ".genesis" / "sessions"
+
+# A session id is used as a PATH SEGMENT, so it must not be able to leave the
+# sessions tree. Charset follows the in-repo precedent
+# (subsystem_traps_hook.py) rather than a strict UUID: measured ids on live
+# installs are not all hex-UUIDs (a `wt-` prefixed form exists), and this still
+# rejects `/`, `\`, `..`, NUL and the empty string.
+#
+# `\A…\Z` and 255, character-for-character identical to
+# scripts/hooks/hook_input.py:_SESSION_ID_RE — this is the src/ chokepoint for
+# the same rule, and callers in src/ import it from here rather than keeping a
+# fourth copy. Both halves of that sentence were wrong before and were caught
+# by review: `^…$` accepts a TRAILING NEWLINE in Python (`'abc\n'` matched),
+# which would have created a session directory whose name ends in a newline,
+# and the 128 cap rejected ids the upstream guard admits. A regex copied "to
+# mirror" a sibling must be diffed against it, not eyeballed.
+_SAFE_SESSION_ID = re.compile(r"\A[A-Za-z0-9_-]{1,255}\Z")
 
 _STATUS_MARKS = {
     "open": " ",
@@ -63,6 +84,22 @@ def charter_md(charter: dict, ledger: list[dict] | None = None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def session_dir(sessions_dir: Path, session_id: str) -> Path | None:
+    """The session's mirror directory, or ``None`` if the id is not path-safe.
+
+    Returns the PATH rather than a boolean deliberately: a bool leaves every
+    caller to decide what to skip on rejection, which is an open set and the
+    shape that let this class recur. Handing back the resolved directory (or
+    nothing) makes the safe use the only convenient one.
+    """
+    if not _SAFE_SESSION_ID.match(session_id or ""):
+        logger.warning(
+            "refusing charter mirror path for unsafe session id %r", session_id
+        )
+        return None
+    return sessions_dir / session_id
+
+
 def write_charter_md(
     sessions_dir: Path,
     session_id: str,
@@ -70,10 +107,49 @@ def write_charter_md(
     ledger: list[dict] | None = None,
 ) -> None:
     """Best-effort mirror write: the DB is canonical, a failed mirror only
-    means charter.md goes stale until the next write regenerates it."""
+    means charter.md goes stale until the next write regenerates it.
+
+    The id is validated before it becomes a path segment. Without that,
+    ``sessions_dir / "../.."`` escapes the sessions tree and this function
+    happily ``mkdir(parents=True)``s and writes model-controlled content there
+    — reproduced, not theorised.
+    """
+    target = session_dir(sessions_dir, session_id)
+    if target is None:
+        return
     try:
-        session_dir = sessions_dir / session_id
-        session_dir.mkdir(parents=True, exist_ok=True)
-        (session_dir / "charter.md").write_text(charter_md(charter, ledger), encoding="utf-8")
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "charter.md").write_text(charter_md(charter, ledger), encoding="utf-8")
     except OSError as exc:
         logger.warning("charter.md mirror write failed for %s: %s", session_id, exc)
+
+
+async def refresh_mirror(
+    db, session_id: str, sessions_dir: Path | None = None
+) -> None:
+    """Regenerate charter.md after a ledger/charter mutation.
+
+    One definition, shared by the MCP tools and the ambient extractor. A second
+    copy would be free to drift, and the two callers must agree — a promoted row
+    that never reaches the mirror is invisible to the next window.
+
+    *sessions_dir* is a PARAMETER rather than a hardcoded constant so a caller —
+    a test above all — can point it somewhere safe. Reading the module constant
+    directly makes the destination unredirectable, and a suite that cannot
+    redirect it writes into the operator's real ``~/.genesis/sessions``.
+
+    Best-effort by contract: the DB is canonical, so a failed mirror only means
+    charter.md is stale until the next write. Note that `db` must carry a row
+    factory — ``crud.get`` builds ``dict(row)`` — and that this `except` is
+    exactly what hid that from us once already.
+    """
+    try:
+        from genesis.db.crud import session_charters as crud
+
+        charter = await crud.get(db, session_id)
+        if charter is None:
+            return
+        ledger = await crud.ledger_list(db, session_id)
+        write_charter_md(sessions_dir or SESSIONS_DIR, session_id, charter, ledger)
+    except Exception:
+        logger.warning("charter.md refresh failed for %s", session_id, exc_info=True)

@@ -1,5 +1,7 @@
 """Tests for CC types."""
 
+import pytest
+
 from genesis.cc.types import (
     CCInvocation,
     CCModel,
@@ -267,3 +269,29 @@ def test_background_session_dir_returns_valid_path():
     assert "background-sessions" in result
     assert result.startswith(str(Path.home()))
     assert Path(result).is_dir()
+
+
+@pytest.mark.parametrize("blocks,expected", [
+    ([], 0),
+    ([{"type": "text", "text": "a"}], 1),
+    ([{"type": "thinking", "thinking": "a"}, {"type": "tool_use", "name": "x"}], 2),
+    # Unrecognized blocks do not count: from_raw skips them without losing
+    # anything, so a canary keyed on this must not fire for them.
+    ([{"type": "redacted_thinking"}, {"type": "text", "text": "a"}], 1),
+    ([{"type": "redacted_thinking"}, {"type": "who_knows"}], 0),
+    # Hostile shapes must not raise — this runs on the stream hot path.
+    ("not a list", 0),
+    ([None, "str", 7], 0),
+])
+def test_recognized_blocks_counts_only_what_from_raw_could_use(blocks, expected):
+    """Lives beside `from_raw` so the two cannot drift: the canary in
+    `invoker.run_streaming` asked the same question and spelled the extraction
+    itself, which would have kept warning if `from_raw` ever became
+    multi-block-aware."""
+    raw = {"type": "assistant", "message": {"content": blocks}}
+    assert StreamEvent.recognized_blocks(raw) == expected
+
+
+def test_recognized_blocks_survives_a_malformed_envelope():
+    assert StreamEvent.recognized_blocks({}) == 0
+    assert StreamEvent.recognized_blocks({"type": "assistant", "message": {}}) == 0

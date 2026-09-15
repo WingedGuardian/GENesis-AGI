@@ -27,11 +27,21 @@ from genesis.db.crud.session_charters import MAX_LEDGER_TEXT_CHARS
 
 EXTRACTOR_MODEL = "claude-haiku-4-5-20251001"  # arbiter's smoke-tested binary contract
 EXTRACTOR_TIMEOUT_S = 120.0  # arbiter is 90s at ~300ch candidates; this prompt is ~24k ch
-PROMPT_VERSION = "v1"
+# Bumped with the prompt: proposals carry their version, so a change in what
+# the extractor was ASKED for stays distinguishable in the shadow store rather
+# than silently mixing two populations in one precision number.
+PROMPT_VERSION = "v2"
 
 MAX_DELTA_CHARS = 24_000  # total prompt content budget (~6k tokens — trivial for Haiku)
-USER_TURN_CHARS = 1500  # typed prompts are short; pasted walls carry no agreement past the head
-ASSISTANT_SNIPPET_CHARS = 500
+# The SUBSTANCE of a work item lives in the assistant's proposal; the user's
+# turn usually supplies only the assent that ratifies it ("do it", "yes").
+# These were 1500/500 the other way round, which asked the model to write a
+# work item from the half of the exchange that does not contain one — and when
+# it could not, it paraphrased the assent instead. MEASURED consequence: 23% of
+# would-be-promoted rows were re-extractions of the user's standing
+# process directive, and hand adjudication of the whole set ran at ~43%.
+USER_TURN_CHARS = 700  # assent is short; a long paste carries none past the head
+ASSISTANT_SNIPPET_CHARS = 1400  # the proposal being ratified — the actual content
 MAX_AGREEMENTS = 8  # >8 genuine new commitments per compaction window is implausible
 MAX_PIVOTS = 4
 FUZZY_MATCH_THRESHOLD = 0.85  # SequenceMatcher precedent: memory/contact_tracker.py
@@ -45,12 +55,31 @@ are numbered conversation turns (the user's message, with the assistant text \
 that immediately preceded it where available) from the window since the last \
 checkpoint. Extract:
 
-- "agreements": moments where the USER commits to or approves work — "yes, do \
-that", plan approvals, direct requests for specific work, or explicit promises \
-the assistant makes that the user ratifies. Each becomes a durable TODO-ledger \
-candidate: write "text" as a short self-contained work item (imperative, \
-specific), and "quote" as a SHORT VERBATIM excerpt (copied exactly) from the \
-turn that evidences it.
+- "agreements": work this session COMMITTED TO. Each becomes a durable ledger \
+item, so "text" must name the WHAT — the SUBJECT of the work: the thing being \
+built, changed, fixed, decided or investigated.
+
+Take that subject from the ASSISTANT's proposal that the user is responding to. \
+The user's turn establishes THAT something was agreed; very often it carries \
+only the assent ("yes", "do it", "proceed") and none of the content. An item \
+you cannot name the subject of is not an item — skip it.
+
+A process, rule or protocol IS a valid subject when it is the thing being built \
+or changed: "add a rule that release tags carry no pre-release flag", "change \
+the review protocol to require a fresh audit". Work ON a process is still work.
+
+It is NOT a subject when it is an instruction about HOW to carry out other \
+work — how to verify, what confidence to state, where to work, which review to \
+run, what to update before finishing. Those govern execution; they are not what \
+the session is about. Watch for this especially in the USER's own words: a \
+standing instruction repeated at the top of a turn is never a work item, no \
+matter how emphatic.
+
+The test: if that instruction were removed, would the actual work still be the \
+same thing? If yes, it was HOW — skip it.
+
+Write "quote" as a SHORT VERBATIM excerpt (copied exactly) from the turn that \
+evidences the agreement.
 - "pivots": genuine direction changes for the session (topic/goal pivots \
 worth a waypoint), NOT routine back-and-forth.
 

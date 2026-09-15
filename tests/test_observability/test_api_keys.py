@@ -289,3 +289,121 @@ def test_recent_fallbacks_does_not_change_severity_or_color(monkeypatch):
         assert w["key_health"] == f["key_health"]
         assert w.get("alert_severity") == f.get("alert_severity")
     assert without["alerts"] == with_fb["alerts"]
+
+
+# ── Operator labels are EXHAUSTIVE over ErrorCategory ────────────────────────
+#
+# Origin (2026-09-06, cross-model review of PR #1733): the alert builder named
+# ONE category (`quota_exhausted`) and sent everything else to "down (circuit
+# breaker open)". Adding NOT_ENTITLED therefore made the operator experience
+# WORSE than before the category existed — the identical Mistral 403 used to
+# render "credits depleted", which at least pointed at the account, and started
+# rendering "Mistral down", which sends the operator to check a provider that is
+# perfectly healthy. Nothing raised. A new enum member just fell into the
+# default arm.
+#
+# So the test is not "not_entitled has a label". It is "every member has an
+# explicit decision" — the only shape that catches the NEXT category.
+
+
+def test_every_error_category_has_an_operator_label():
+    """A category must be labelled or explicitly generic — never merely absent.
+
+    This is the whole point: it fails when someone ADDS an ErrorCategory without
+    deciding how an operator should read it, which is exactly what happened.
+    """
+    from genesis.observability.snapshots.api_keys import (
+        _CB_ALERT_BY_CATEGORY,
+        _CB_GENERIC,
+        _CB_SHORT_LABEL,
+    )
+    from genesis.routing.types import ErrorCategory
+
+    members = {c.value for c in ErrorCategory}
+    decided = set(_CB_ALERT_BY_CATEGORY) | set(_CB_GENERIC)
+
+    undecided = members - decided
+    assert not undecided, (
+        f"ErrorCategory member(s) {sorted(undecided)} have no operator label decision. "
+        f"Add to _CB_ALERT_BY_CATEGORY (distinct wording) or _CB_GENERIC (reads as an "
+        f"outage) — absent from both means it silently renders as 'provider down'."
+    )
+    stale = decided - members
+    assert not stale, f"label table names non-existent categories: {sorted(stale)}"
+
+    # The two tables are the same decision at two lengths; they must not diverge.
+    assert set(_CB_SHORT_LABEL) == set(_CB_ALERT_BY_CATEGORY), (
+        "the long and short label tables disagree about which categories are special"
+    )
+    # A category cannot be both special-cased and generic.
+    assert not (set(_CB_ALERT_BY_CATEGORY) & set(_CB_GENERIC))
+
+
+def test_not_entitled_points_at_the_account_not_the_provider():
+    """The regression this came from, pinned as behaviour rather than wording.
+
+    An entitlement failure must not be described as the provider being down: the
+    provider is up, and only the account holder can fix it.
+    """
+    from genesis.observability.snapshots.api_keys import cb_alert_for
+
+    reason, prefix = cb_alert_for("not_entitled")
+    assert reason != "provider_down"
+    rendered = prefix.format(p="Mistral").lower()
+    assert "down" not in rendered
+    assert "plan" in rendered or "tier" in rendered
+
+
+def test_unknown_category_degrades_to_the_generic_outage():
+    """A rollback reading a value a newer build wrote must not crash the strip."""
+    from genesis.observability.snapshots.api_keys import _CB_GENERIC_ALERT, cb_alert_for
+
+    assert cb_alert_for("a_category_from_the_future") == _CB_GENERIC_ALERT
+    assert cb_alert_for(None) == _CB_GENERIC_ALERT
+
+
+def test_a_stale_category_on_a_closed_breaker_does_not_hijack_the_alert():
+    """A missing KEY must say so, even when a stale category is sitting around.
+
+    `record_failure` sets `_last_failure_category` on every failure, BEFORE the
+    trip threshold is checked, so a CLOSED breaker routinely carries a category
+    from a failure that never tripped it. Keying the alert on the category alone
+    therefore announced "not included on this plan/tier" for a provider whose
+    real problem was an absent API key — the branch that would have said so was
+    unreachable. Found at P3 by cross-model review of PR #1733.
+    """
+    from genesis.observability.snapshots.api_keys import _build_alerts
+
+    alerts = _build_alerts({
+        "mistral-large-free": {
+            "alert_severity": "critical",
+            "provider_type": "mistral",
+            "status": "missing",       # the ACTUAL problem
+            "cb_state": "closed",      # never tripped
+            "cb_reason": "not_entitled",  # stale, from a non-tripping failure
+            "chain_count": 3,
+            "sole_sites": ["30_triage_calibration"],
+        }
+    })
+    assert len(alerts) == 1
+    assert alerts[0]["reason"] == "missing_key", alerts
+    assert "API key missing" in alerts[0]["message"]
+
+
+def test_an_open_breaker_still_gets_its_category_label():
+    """The control: gating on cb_state must not blind the category labels."""
+    from genesis.observability.snapshots.api_keys import _build_alerts
+
+    alerts = _build_alerts({
+        "mistral-large-free": {
+            "alert_severity": "critical",
+            "provider_type": "mistral",
+            "status": "ok",
+            "cb_state": "open",
+            "cb_reason": "not_entitled",
+            "chain_count": 3,
+        }
+    })
+    assert len(alerts) == 1
+    assert alerts[0]["reason"] == "not_entitled"
+    assert "down" not in alerts[0]["message"].lower()

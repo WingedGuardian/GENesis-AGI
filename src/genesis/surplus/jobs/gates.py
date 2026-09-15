@@ -160,6 +160,9 @@ async def _promote_staged_ideas(db: aiosqlite.Connection) -> int:
 
     import aiosqlite as _aiosqlite
 
+    # source_session stays NULL here, honestly: surplus ideation rows carry no
+    # generating-session column, this job runs under no session scope (the crud
+    # ContextVar default reads None), and a guessed id is worse than none.
     from genesis.db.crud import follow_ups as fu_crud
     from genesis.surplus.promotion_config import cap_per_run, is_enabled
     from genesis.surplus.types import IDEA_TASK_TYPES

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import pytest
 
+from genesis.learning.signals import genesis_version
 from genesis.learning.signals.genesis_version import GenesisVersionCollector
 
 
@@ -194,6 +196,87 @@ class TestUpstreamCheck:
         error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert any("Upstream check failed" in r.message for r in error_records), \
             f"Expected ERROR log, got: {[r.message for r in caplog.records]}"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_upstream_check_is_not_reported_as_up_to_date(
+        self, collector, db,
+    ) -> None:
+        """A failed check must be a FAILED reading, never the up-to-date baseline.
+
+        The sibling test above pins that the failure is LOGGED. Logging is not
+        the contract that matters to a consumer: `collect()` used to catch, log,
+        and then fall through to the explicit "0.0=up to date" return with
+        failed=False, so an unknown state reached the caller wearing the same
+        grammar as a successful measurement. That is the defect class this
+        collector was rewritten to remove, one layer out from the count itself.
+        """
+        await db.execute(
+            "INSERT INTO observations (id, source, type, content, priority, created_at) "
+            "VALUES ('a', 'genesis_version', 'genesis_version_baseline', "
+            "?, 'low', '2026-04-01T00:00:00Z')",
+            (json.dumps({"version": "abc123"}),),
+        )
+        await db.commit()
+
+        async def raising_upstream(self):
+            raise RuntimeError("git rev-list --count HEAD..origin/main failed")
+
+        with _mock_head("abc123"), _mock_failure_file_check(), \
+             patch.object(GenesisVersionCollector, "_check_upstream", raising_upstream):
+            reading = await collector.collect()
+
+        assert reading.failed is True, (
+            "a failed upstream check was reported as a successful reading; "
+            "consumers cannot distinguish it from a measured 'up to date'"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_measured_zero_resolves_a_stale_update_alert(
+        self, collector, db,
+    ) -> None:
+        """Zero commits behind must clear a pending alert, not just skip.
+
+        Reachable only since the count stopped coercing with max(behind, 1):
+        if the upstream target is rewritten or rolled back after an observation
+        was stored, HEAD never moves, so the resolve on the HEAD-change path
+        never fires. Without a resolve here the dashboard keeps serving the
+        dead target indefinitely despite a successful zero measurement.
+        """
+        await db.execute(
+            "INSERT INTO observations (id, source, type, content, priority, created_at) "
+            "VALUES ('a', 'genesis_version', 'genesis_version_baseline', "
+            "?, 'low', '2026-04-01T00:00:00Z')",
+            (json.dumps({"version": "same111"}),),
+        )
+        await db.execute(
+            "INSERT INTO observations (id, source, type, content, priority, created_at) "
+            "VALUES ('b', 'genesis_version', 'genesis_update_available', "
+            "?, 'medium', '2026-04-01T00:00:00Z')",
+            (json.dumps({
+                "current_commit": "same111",
+                "target_commit": "gone999",
+                "commits_behind": 4,
+            }),),
+        )
+        await db.commit()
+
+        async def zero_upstream(self):
+            return 0, ""
+
+        # HEAD deliberately UNCHANGED, so the HEAD-change resolve cannot fire
+        # and only the measured-zero path can clear the alert.
+        with _mock_head("same111"), _mock_failure_file_check(), \
+             patch.object(GenesisVersionCollector, "_check_upstream", zero_upstream):
+            await collector.collect()
+
+        cursor = await db.execute(
+            "SELECT resolved FROM observations WHERE id = 'b'",
+        )
+        row = await cursor.fetchone()
+        assert row["resolved"] == 1, (
+            "a measured zero left the stale update_available observation "
+            "unresolved; the dashboard would keep claiming an update forever"
+        )
 
     @pytest.mark.asyncio
     async def test_throttle_skips_fetch_within_interval(self, collector, db) -> None:
@@ -521,3 +604,137 @@ class TestCheckDisabled:
         )
         row = await cursor.fetchone()
         assert row["cnt"] == 0
+
+
+# ── the count must be the READER's distance, not the release span ─────────
+#
+# Every test above mocks `_check_upstream`, so the counting itself was never
+# exercised — which is how this stayed wrong in two files at once. These drive it
+# against a real throwaway repo shaped like a live install: a release tag some
+# way back, and a deployed HEAD that has tracked main since.
+
+
+def _g(repo, *args):
+    return subprocess.run(
+        ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+@pytest.fixture()
+def tagged_repo(tmp_path):
+    """A repo where the release tag and the deployed HEAD are far apart.
+
+    The ordinary shape of an install that pulls main between releases, and the
+    shape on which the two candidate numbers diverge: 10 commits between the
+    tags, 2 between the deployed commit and the tip.
+    """
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _g(origin, "-c", "init.defaultBranch=main", "init", "-q")
+    _g(origin, "config", "user.email", "t@e.st")
+    _g(origin, "config", "user.name", "tester")
+    (origin / "f.txt").write_text("base\n")
+    _g(origin, "add", "-A")
+    _g(origin, "commit", "-qm", "base")
+    _g(origin, "tag", "-a", "v1.0", "-m", "release 1.0")
+
+    deployed = None
+    for i in range(1, 11):
+        (origin / "f.txt").write_text(f"c{i}\n")
+        _g(origin, "add", "-A")
+        _g(origin, "commit", "-qm", f"c{i}")
+        if i == 8:
+            deployed = _g(origin, "rev-parse", "HEAD")
+    _g(origin, "tag", "-a", "v2.0", "-m", "release 2.0")
+
+    clone = tmp_path / "clone"
+    _g(tmp_path, "clone", "-q", str(origin), str(clone))
+    _g(clone, "checkout", "-q", deployed)
+    return clone
+
+
+@pytest.mark.asyncio
+async def test_the_count_is_the_distance_from_the_DEPLOYED_commit(tagged_repo, db):
+    """MEASURED 2026-09-08: the dashboard read "v3.0b18 (668 commits behind)" on
+    a tree 20 commits behind that tag. 668 was the span between the two release
+    TAGS — true about the release, false about the reader, and the label says
+    "behind", so it is read as the reader's. That is worse than an arithmetic
+    error: it wears verified grammar.
+
+    Here the deployed commit is 2 behind the tip while the tag range is 10.
+    """
+    collector = GenesisVersionCollector(db)
+    with patch.object(genesis_version, "_GENESIS_ROOT", tagged_repo):
+        behind, summary = await collector._check_upstream()
+
+    assert behind == 2, f"expected the deployed tree's distance, got {behind}"
+    assert behind != 10, "counted the release span instead of the reader's distance"
+    # The summary must describe the SAME range, or one alert's two halves
+    # disagree — a count the reader reads as theirs beside a list that is not.
+    assert len([ln for ln in summary.splitlines() if ln.strip()]) == 2, summary
+
+
+@pytest.mark.asyncio
+async def test_the_untagged_fallback_measures_the_same_thing(tagged_repo, db):
+    """The two branches previously measured different things, so which number a
+    reader got depended on whether a tag happened to exist."""
+    remote = _g(tagged_repo, "remote", "get-url", "origin")
+    _g(remote, "tag", "-d", "v1.0", "v2.0")
+    _g(tagged_repo, "tag", "-d", "v1.0", "v2.0")
+    collector = GenesisVersionCollector(db)
+    with (
+        patch.object(genesis_version, "_GENESIS_ROOT", tagged_repo),
+        patch.object(
+            collector, "_check_upstream_by_commits", wraps=collector._check_upstream_by_commits
+        ) as fallback,
+    ):
+        behind, _ = await collector._check_upstream()
+    fallback.assert_awaited_once()
+    assert behind == 2
+
+
+def _count_returns(collector, value):
+    """Stub only the `rev-list --count` call; everything else stays real."""
+    original = collector._git_output
+
+    async def _stub(*args):
+        if args[:2] == ("rev-list", "--count"):
+            return value
+        return await original(*args)
+
+    return patch.object(collector, "_git_output", side_effect=_stub)
+
+
+@pytest.mark.asyncio
+async def test_an_unmeasurable_distance_raises_instead_of_reporting_one(tagged_repo, db):
+    """A failed count must not become a number.
+
+    The docstring on `_check_upstream` promises RuntimeError on git failure, and
+    it used to substitute 1 instead — which reached the reader as "New Genesis
+    version available (1 commit(s) behind)" beside an EMPTY change list. That is
+    the same defect the release-span fix was about: a statement about the reader
+    that nobody measured, wearing the grammar of one that was. The caller logs
+    and skips the cycle, so refusing costs one quiet cycle.
+    """
+    collector = GenesisVersionCollector(db)
+    with patch.object(genesis_version, "_GENESIS_ROOT", tagged_repo), _count_returns(
+        collector, None
+    ), pytest.raises(RuntimeError, match="distance unknown"):
+        await collector._check_upstream()
+
+
+@pytest.mark.asyncio
+async def test_a_measured_zero_stays_zero_when_the_tags_differ(tagged_repo, db):
+    """`max(behind, 1)` announced an update that did not exist for this reader.
+
+    Differing tags with a deployed commit that is NOT behind the ref is a real
+    state — a local tag, or a tree at the tip whose tag has not moved. The
+    reader's distance there is 0, and the caller's `if behind > 0` is what keeps
+    it quiet. Clamping to 1 defeated that from inside.
+    """
+    collector = GenesisVersionCollector(db)
+    with patch.object(genesis_version, "_GENESIS_ROOT", tagged_repo), _count_returns(
+        collector, "0"
+    ):
+        behind, _ = await collector._check_upstream()
+    assert behind == 0, "a measured zero must survive; max(behind, 1) fabricated an update"

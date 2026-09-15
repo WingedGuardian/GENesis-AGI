@@ -185,25 +185,80 @@ class DeepInfraBackend:
         api_key: str,
         model: str = "Qwen/Qwen3-Embedding-0.6B",
         client: httpx.AsyncClient | None = None,
+        service_tier: str | None = None,
     ) -> None:
+        """``service_tier`` opts this backend into a paid scheduling tier.
+
+        DeepInfra QUEUES default-tier requests when a model is under load — their
+        words: "requests queue up and some get shed with an HTTP 429" (Priority
+        Service Tier announcement, 2026-06-29). A queued request still returns a
+        clean 200, just late, so the symptom is pure latency with no error
+        anywhere to key on.
+
+        MEASURED 2026-09-04 on this model, three runs at each size:
+
+            input     default     priority
+            25 tok     8,646ms      602ms
+            120 tok   13,317ms      684ms
+            600 tok    7,830ms      613ms
+
+        Priority being FLAT across input size is the diagnostic: compute for a
+        0.6B embedding model is sub-second, so the seconds on default were
+        admission queue, not inference. Against the recall route's 4.5s deadline
+        the default tier produced a 100% 503 rate — 20 of 20 through the live
+        endpoint — because the route cancels long before the queue clears.
+
+        ``None`` (the default) sends no field and bills at the normal rate.
+        Callers opt in; this class never assumes a paid tier on someone's behalf.
+
+        CAVEAT, measured and unresolved: the announcement says the response echoes
+        ``service_tier`` "when (and only when) priority was actually applied", and
+        that billing follows the echo. Our embeddings responses carry NO such
+        field — the announcement lists only chat/completions under "Supported
+        Endpoints" and mentions embeddings for billing alone. The latency split
+        above is strong evidence the tier is honoured, but it cannot be confirmed
+        from the response, so the first invoice is the check.
+        """
         self._api_key = api_key
         self._model = model
         self._client = client or _build_embed_client(30.0, http2=True)
+        self._service_tier = service_tier
+        self._tier_echo_checked = False
 
     @property
     def name(self) -> str:
         return "deepinfra_embedding"
 
     async def embed(self, text: str) -> list[float]:
+        payload: dict[str, object] = {"model": self._model, "input": [text]}
+        if self._service_tier:
+            payload["service_tier"] = self._service_tier
         resp = await self._client.post(
             "https://api.deepinfra.com/v1/openai/embeddings",
             headers={
                 "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json",
             },
-            json={"model": self._model, "input": [text]},
+            json=payload,
         )
         resp.raise_for_status()
+        if self._service_tier and not self._tier_echo_checked:
+            # ONE debug line, once per backend instance, to settle a question the
+            # latency evidence cannot: the provider documents that the response
+            # echoes `service_tier` "when (and only when) priority was actually
+            # applied", and that billing follows that echo — but our embeddings
+            # responses carry no such field today. If it ever appears, this is how
+            # we find out we are (or are not) getting what we pay for. Costs one
+            # dict lookup on the first call and nothing thereafter.
+            self._tier_echo_checked = True
+            try:
+                echoed = resp.json().get("service_tier", "<absent>")
+            except Exception:  # noqa: BLE001 — diagnostics must never break embed
+                echoed = "<unreadable>"
+            logger.debug(
+                "deepinfra embed: requested service_tier=%s, response echoed %s",
+                self._service_tier, echoed,
+            )
         return resp.json()["data"][0]["embedding"]
 
     async def is_available(self) -> bool:
@@ -332,12 +387,24 @@ class EmbeddingProvider:
         logger.info("Embedding provider initialized: chain=%s", backend_names)
 
     @staticmethod
-    def build_chain(*, ollama_first: bool = True) -> list[EmbeddingBackend]:
+    def build_chain(
+        *, ollama_first: bool = True, priority_tier: bool = False
+    ) -> list[EmbeddingBackend]:
         """Build backend chain with configurable priority order.
 
         Args:
             ollama_first: If True, Ollama leads (storage/write path).
                          If False, cloud leads (recall/read path).
+            priority_tier: If True, the DeepInfra backend requests the paid
+                         priority scheduling tier (1.5x rate). Defaults to
+                         False so no caller is billed the premium implicitly —
+                         the DECISION belongs at the call site, where it is
+                         visible, not buried in a builder default.
+
+        The two flags are deliberately independent even though today only the
+        recall chain sets both. Ordering is about which backend answers;
+        ``priority_tier`` is about what that answer COSTS, and conflating them
+        would hide a billing decision behind a routing one.
         """
         import os
 
@@ -358,7 +425,12 @@ class EmbeddingProvider:
         cloud_backends: list[EmbeddingBackend] = []
         di_key = deepinfra_api_key()
         if di_key:
-            cloud_backends.append(DeepInfraBackend(api_key=di_key))
+            cloud_backends.append(
+                DeepInfraBackend(
+                    api_key=di_key,
+                    service_tier="priority" if priority_tier else None,
+                )
+            )
         ds_key = dashscope_api_key()
         if ds_key:
             cloud_backends.append(DashScopeBackend(api_key=ds_key))

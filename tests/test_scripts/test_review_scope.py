@@ -19,20 +19,23 @@ network, or gh auth (install-agnostic).
 
 from __future__ import annotations
 
-import importlib.util
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from tests.conftest import private_module
+
 _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 _SCRIPT_PATH = _SCRIPTS / "review_scope.py"
-_spec = importlib.util.spec_from_file_location("review_scope", _SCRIPT_PATH)
-_rs = importlib.util.module_from_spec(_spec)
-sys.modules["review_scope"] = _rs
-_spec.loader.exec_module(_rs)
+# Via conftest so the SHARED name is restored afterwards. `review_scope` is
+# imported at CALL time by review_enforcement_commit and git_push_guard, so a
+# leaked private copy here defeats any monkeypatch of it elsewhere — the same
+# defect as the `review_state` leak, one name over.
+_rs = private_module("review_scope", _SCRIPT_PATH)
 
 
 # --------------------------------------------------------------------------- #
@@ -636,3 +639,523 @@ def test_compare_rename_docs_to_docs_still_inline():
     # A docs->docs rename (neither side reviewable code) stays inline.
     files = [_cf("docs/b.md", additions=150, status="renamed", previous_filename="docs/a.md")]
     assert _rs.classify_compare_substantiality(files) == "inline"
+
+
+# --------------------------------------------------------------------------- #
+# classify_lane — the CONSEQUENCE axis
+#
+# Orthogonal to substantiality: substantiality asks "is this big enough to need a
+# deep review", the lane asks "how much does it cost to be wrong". A one-line edit
+# to an enforcement hook is `inline` and `critical` at once.
+#
+# The hook-surface verdict is passed IN (its authority is git_push_guard's
+# constant), so these tests drive that parameter directly rather than duplicating
+# the fence.
+# --------------------------------------------------------------------------- #
+
+
+def test_lane_hook_surface_is_critical_however_small():
+    """A one-line guard edit outranks every other signal."""
+    assert _rs.classify_lane(["scripts/hooks/git_push_guard.py"], hook_surface=True) == "critical"
+
+
+def test_lane_github_config_is_critical():
+    """Not hook surface, but a change here can disable a required check as
+    effectively as editing a gate — the rationale in .github/labeler.yml."""
+    assert _rs.classify_lane([".github/workflows/ci.yml"], hook_surface=False) == "critical"
+
+
+def test_lane_route_and_migration_DIRECTORIES_are_critical():
+    """The explicit PREFIXES, not the tags.
+
+    Renamed from `test_lane_api_and_migrations_are_critical`, which claimed the
+    tags while both of its paths also satisfy `_LANE_CRITICAL_PREFIXES` — so it
+    passed with the tag rule deleted, and a test that cannot say which of two
+    rules it proves is a lock on neither. The tag lock is
+    `test_lane_keeps_the_api_and_migrations_tags_that_MEASURED_clean`, which does
+    go red under that mutation.
+    """
+    assert _rs.classify_lane(["src/genesis/dashboard/routes/x.py"], hook_surface=False) == "critical"
+    assert _rs.classify_lane(["src/genesis/db/migrations/0001_x.py"], hook_surface=False) == "critical"
+
+
+def test_the_lane_consults_no_scope_tag():
+    """The lane reads path boundaries, never `_scope_tag`. Structural lock.
+
+    Three rounds of findings on `_is_lane_critical_path` were one question asked
+    of a NAME pattern: "is this an HTTP surface". `*route*` cannot answer it —
+    it matched `routing/router.py` (the LLM router) and
+    `reflection/output_router.py` while missing a root-level `api/` directory,
+    because `*/api/*` needs a preceding path component.
+
+    Re-admitting a tag is the obvious economy the next reader will reach for, and
+    it reads as a smaller change than it is. This test is what stops it: the tag
+    that would be re-admitted demonstrably classifies a non-HTTP module, so the
+    two assertions below cannot both hold while the lane consults tags.
+    """
+    assert _rs._scope_tag("src/genesis/routing/router.py") == "api", (
+        "precondition: the inherited glob still claims this non-HTTP module, "
+        "or this test no longer demonstrates why the lane ignores tags"
+    )
+    assert _rs.classify_lane(["src/genesis/routing/router.py"], hook_surface=False) == (
+        "standard"
+    )
+
+
+def test_every_route_defining_module_is_critical():
+    """The lock for the API class is an ENUMERATION, not another example.
+
+    The lane's own operator message names "API surfaces" as critical. MEASURED
+    2026-09-13 over every tracked `.py`: 54 of 58 route-defining modules reached
+    `critical`, and the four misses were `src/genesis/hosting/{standalone,
+    openclaw/completions,agent_zero/overlay}.py` and `dashboard/_blueprint.py` —
+    `standalone.py:647` serves `/genesis/login`, and it was reachable by neither
+    the `api` tag nor an `api.py`/`auth.py` basename.
+
+    Why this shape: neither of the change's own two methods could produce that
+    finding. The 40-PR distribution reproduced to the decimal across it, and every
+    constructed case passed. A population check is the only thing that fails when
+    a new route surface appears somewhere nobody listed.
+    """
+    root = Path(__file__).resolve().parents[2]
+    pat = re.compile(r"^\s*@\w+\.route\(|Blueprint\(|add_url_rule\(", re.M)
+    tracked = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "*.py"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    assert len(tracked) > 500, "precondition: ls-files returned a plausible population"
+    routed = [
+        f
+        for f in tracked
+        if not f.startswith("tests/") and pat.search((root / f).read_text(errors="ignore"))
+    ]
+    assert routed, "precondition: the detector finds route definitions at all"
+    misses = [f for f in routed if _rs.classify_lane([f], hook_surface=False) != "critical"]
+    assert not misses, (
+        f"{len(misses)} of {len(routed)} route-defining modules sit outside the "
+        f"critical lane, which the gate's own message promises covers API "
+        f"surfaces: {misses}"
+    )
+
+
+def _ci_invoked_scripts(workflow: Path) -> list[str]:
+    """Every `scripts/...` path the workflow EXECUTES, from its `run:` blocks.
+
+    Parsed from the YAML rather than regexed over the raw file, because the two
+    failure directions pull against each other and a flat regex loses both:
+
+      * TOO NARROW — the first version matched only `python3?|bash` followed
+        immediately by the path, so `python -u scripts/x.py`, `bash -e scripts/x.sh`
+        and a direct `./scripts/x.sh` all slipped past. A required check added in
+        any of those forms would never enter this list, and the count precondition
+        would not notice because the other 15 still matched.
+      * TOO BROAD — matching bare paths anywhere in the file picks up mentions in
+        COMMENTS (`scripts/genesis_mcp_server.py`, `scripts/lib/cc_version.sh` are
+        both named in prose here). Neither is a consequence surface, so a broad
+        matcher would demand they be critical and fail for the wrong reason.
+
+    Restricting to `run:` blocks separates the two: only executed text is
+    considered, and within it both interpreter-with-flags and direct execution.
+    """
+    import yaml
+
+    doc = yaml.safe_load(workflow.read_text())
+    runs: list[str] = []
+    for job in (doc.get("jobs") or {}).values():
+        for step in job.get("steps") or []:
+            if isinstance(step, dict) and isinstance(step.get("run"), str):
+                runs.append(step["run"])
+
+    invoked: set[str] = set()
+    # An interpreter, any number of its own flags, then the script.
+    interp = re.compile(
+        r"\b(?:python3?|bash|sh)\b(?:\s+-[^\s]+)*\s+((?:\./)?scripts/[A-Za-z0-9_/.-]+\.(?:py|sh))"
+    )
+    # Or the script executed directly.
+    direct = re.compile(r"(?:^|\s)(\./scripts/[A-Za-z0-9_/.-]+\.(?:py|sh))")
+    for text in runs:
+        invoked.update(m.lstrip("./") for m in interp.findall(text))
+        invoked.update(m.lstrip("./") for m in direct.findall(text))
+    return sorted(invoked)
+
+
+def test_required_check_implementations_are_critical():
+    """A required check's IMPLEMENTATION is the same consequence surface as the
+    workflow that invokes it — and the list is DERIVED, not remembered.
+
+    `.github/**` was critical from the first version of this lane, on the stated
+    reason that a change there can disable a required check. The implementation
+    disables it just as effectively, and for three rounds only the YAML layer was
+    covered: MEASURED, all 15 scripts `ci.yml` invokes took the standard
+    threshold, so three unresolved P2s passed in the leak scanner or the
+    review-depth gate where two would have blocked in the workflow calling them.
+
+    Derived from `ci.yml` ON PURPOSE. A hardcoded list is the shape that went
+    stale three times in this file; re-parsing the workflow means a required
+    check added next month fails HERE until someone puts its path in the lane's
+    vocabulary, which is the only version of this that survives its author.
+    """
+    root = Path(__file__).resolve().parents[2]
+    workflow = root / ".github" / "workflows" / "ci.yml"
+    assert workflow.exists(), "precondition: the required-CI workflow is where we think"
+
+    invoked = _ci_invoked_scripts(workflow)
+    assert len(invoked) >= 10, (
+        f"precondition: expected the workflow to invoke many checkers, found "
+        f"{len(invoked)} — if the invocation SPELLING changed, this test is "
+        f"measuring nothing and must be updated before it is trusted"
+    )
+
+    missed = [p for p in invoked if _rs.classify_lane([p], hook_surface=False) != "critical"]
+    assert not missed, (
+        f"{len(missed)} of {len(invoked)} required-check implementations are "
+        f"outside the critical lane — changing them disables enforcement as "
+        f"effectively as editing the workflow: {missed}"
+    )
+
+
+def test_the_extractor_sees_every_invocation_form():
+    """Guard the guard on the EXTRACTOR, not just on its current output.
+
+    The lock above is only as good as what it can see, and its first version was
+    measurably blind: `python -u`, `bash -e` and `./scripts/x.sh` all went
+    unnoticed while the count stayed at 15, so the precondition could not fire
+    either. A reviewer found that; nothing here could have.
+
+    Synthetic workflow rather than the live one, so this keeps testing the
+    extractor after `ci.yml` changes — and it asserts the NEGATIVE case too,
+    because the naive fix for the blind spot (match bare paths anywhere) picks up
+    comment-only mentions and fails for the wrong reason.
+    """
+    import textwrap
+
+    wf = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
+    assert wf.exists(), "precondition: real workflow present for the live test above"
+
+    import tempfile
+
+    synthetic = textwrap.dedent(
+        """\
+        jobs:
+          probe:
+            steps:
+              - run: python -u scripts/flagged_interp.py
+              - run: bash -e scripts/flagged_shell.sh
+              - run: ./scripts/direct_exec.sh
+              - run: python3 scripts/plain.py
+              - run: |
+                  # scripts/only_a_comment.py is named but never run
+                  echo done
+        """
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False) as fh:
+        fh.write(synthetic)
+        tmp = Path(fh.name)
+    try:
+        found = _ci_invoked_scripts(tmp)
+    finally:
+        tmp.unlink()
+
+    assert "scripts/flagged_interp.py" in found, "interpreter flags must not hide a checker"
+    assert "scripts/flagged_shell.sh" in found, "shell flags must not hide a checker"
+    assert "scripts/direct_exec.sh" in found, "direct execution must not hide a checker"
+    assert "scripts/plain.py" in found
+    assert "scripts/only_a_comment.py" not in found, (
+        "a path mentioned in a comment is not an invocation — matching it would "
+        "demand the critical lane for files that are not consequence surfaces"
+    )
+
+
+def test_trust_boundaries_are_never_relaxed_below_todays_bar():
+    """Approval and outbound-action gates must not get a wider finding budget.
+
+    This lane RELAXES thresholds, and main runs a flat 1.0 — so every file blocks
+    at two unresolved P2s today. Anything this change moves to `standard` gets
+    FOUR. For `autonomy/approval_gate.py`, `email_gate.py` and `cli_policy.py`
+    that is a live weakening of review on the autonomous-CLI approval gate, which
+    is a standing non-negotiable in this repo. MEASURED before the fix: all five
+    named modules classified `standard`.
+
+    Pinned as a FLOOR, not a preference. A future edit that widens the budget on
+    these fails here, which is the point — a lane that quietly relaxes a
+    sovereignty gate is a downgrade wearing a refactor.
+    """
+    for path in (
+        "src/genesis/autonomy/approval_gate.py",
+        "src/genesis/autonomy/email_gate.py",
+        "src/genesis/autonomy/cli_policy.py",
+        "src/genesis/autonomy/approval.py",
+        "src/genesis/autonomy/dispatch_gate.py",
+    ):
+        assert _rs.classify_lane([path], hook_surface=False) == "critical", (
+            f"{path} is a trust boundary; the lane must not widen its budget"
+        )
+
+
+def test_a_fixture_corpus_is_light_even_when_it_looks_like_source():
+    """Sample programs the eval harness loads as DATA are not consequence surfaces.
+
+    MEASURED: 19 tracked files under `gauntlet_fixtures/` split standard 15 /
+    critical 1 / light 3, and the CRITICAL one was `calc_longhorizon/calc/api.py`
+    — dragged in by THIS module's own `api.py` basename rule. A sample program in
+    the strictest lane is the same over-classification shape as the `*route*`
+    glob, self-inflicted this time.
+
+    The exemption is the one rule here that makes a change LIGHTER, so it is
+    anchored as a directory PREFIX and the negative case is asserted: a sibling
+    directory whose name merely STARTS with the exempt one must not inherit it.
+    A substring or `*fixture*` spelling would exempt every continuation, which is
+    how a loosening rule widens a budget by accident.
+    """
+    real = "src/genesis/eval/gauntlet_fixtures/calc_longhorizon/calc/api.py"
+    assert _rs.classify_lane([real], hook_surface=False) == "light"
+
+    # Controls, both directions.
+    assert _rs.classify_lane(["src/genesis/outreach/api.py"], hook_surface=False) == "critical", (
+        "a REAL api module must be unaffected, or the exemption is too wide"
+    )
+    assert _rs.classify_lane(
+        ["src/genesis/eval/gauntlet_fixtures_live/api.py"], hook_surface=False
+    ) == "critical", "a continuation of the prefix must NOT inherit the exemption"
+
+
+def test_the_explicit_rules_FULLY_EXPLAIN_the_critical_set():
+    """Nothing may reach `critical` for a reason the module does not state.
+
+    This is the lock on the defect that survived two rounds: `_scope_tag` — a
+    NAME vocabulary living outside this module — pulled 7 non-HTTP files into the
+    strictest lane (`routing/router.py` is the LLM router). The enumeration test
+    above could not see it, because it measures MISSES and that was the opposite
+    direction.
+
+    Stated as a STRUCTURAL property rather than an exemption list: re-derive the
+    critical set from the declared constants alone and require it to equal what
+    `classify_lane` actually produces. An exemption list would be a second copy
+    of those constants, and a drifting replica is the shape this file keeps
+    finding defects in. If the two sets ever disagree, something outside
+    `_LANE_CRITICAL_*` is classifying — which is exactly how the tag crept back
+    in twice.
+    """
+    root = Path(__file__).resolve().parents[2]
+    tracked = [
+        f
+        for f in subprocess.run(
+            ["git", "-C", str(root), "ls-files"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        if not f.startswith("tests/")
+    ]
+    assert len(tracked) > 500, "precondition: ls-files returned a plausible population"
+
+    def declared(path: str) -> bool:
+        """The critical rules, re-expressed from the module's own constants."""
+        if any(path.startswith(pre) for pre in _rs._LANE_CRITICAL_PREFIXES):
+            return True
+        base = os.path.basename(path)
+        if base in _rs._LANE_CRITICAL_BASENAMES:
+            return True
+        if base in _rs._LANE_CRITICAL_TRUST_BASENAMES or base.endswith(
+            _rs._LANE_CRITICAL_BASENAME_SUFFIXES
+        ):
+            return True
+        return base.endswith(_rs._LANE_CRITICAL_BASENAME_EXTS) and base.startswith(
+            _rs._LANE_CRITICAL_BASENAME_PREFIXES
+        )
+
+    unexplained = [
+        f
+        for f in tracked
+        if _rs.classify_lane([f], hook_surface=False) == "critical" and not declared(f)
+    ]
+    assert not unexplained, (
+        f"{len(unexplained)} file(s) reach the critical lane without matching any "
+        f"declared rule — something outside _LANE_CRITICAL_* is classifying, which "
+        f"is the shape that put the LLM router in the strictest lane: {unexplained}"
+    )
+
+
+def test_the_prose_vocabulary_mirrors_the_guards_doc_vocabulary():
+    """Third replica of ONE vocabulary; only two of the three were locked.
+
+    `_LANE_PROSE_*` here and `_DOC_*` in `git_push_guard` must agree, and the
+    docstring above says so in prose — which is a convention at a call site that
+    has to remember. `tests/test_session_awareness/test_doc_paths.py` already locks
+    the guard-vs-doc_paths pair the same way; this closes the third edge, so `.adoc`
+    cannot be added to one side while the lane and the doc-findings filter start
+    disagreeing about what prose is.
+
+    Loaded via `private_module` rather than a hand-rolled register/exec/restore.
+    This test originally did the latter, and the two changes met in a way neither
+    diff showed: the shared helper landed on main and removed this file's
+    `import importlib.util`, while this branch added a USE of it. The hunks are
+    far apart, so git merged both cleanly and CI failed on an undefined name that
+    exists in neither branch alone.
+    """
+    guard = private_module("_gpg_for_prose_parity", _SCRIPTS / "hooks" / "git_push_guard.py")
+    assert {e.lstrip(".") for e in _rs._LANE_PROSE_EXTS} == guard._DOC_EXTS
+    assert {s.lower() for s in _rs._LANE_PROSE_STEMS} == guard._DOC_STEMS
+    assert {e.lstrip(".") for e in _rs._LANE_PROSE_STEM_EXTS} == guard._DOC_STEM_EXTS
+
+
+def test_lane_config_is_ORDINARY_not_critical():
+    """`config/` was briefly a critical prefix, on the reasoning that config arms
+    behaviour. Removed: the genuinely arming directory, `config/behavioral_rules/`,
+    is already hook surface and reaches critical that way, while a blanket prefix
+    put routine threshold edits in the strictest lane AND contradicted the
+    instruction-file text this same change adds ("config is NOT prose, so a
+    `.yaml`/`.toml` change is ordinary").
+
+    Destructive-capability, egress and financial paths are the same shape and are
+    likewise out: naming them needs a taxonomy this repo does not yet have.
+    """
+    assert _rs.classify_lane(["config/reflex.yaml"], hook_surface=False) == "standard"
+    assert _rs.classify_lane(["config/github_steward.yaml"], hook_surface=False) == "standard"
+
+
+def test_lane_auth_tag_is_NOT_critical():
+    """The `auth` glob is `*auth* *session* ...`, and this repo is built on CC
+    SESSIONS. MEASURED 2026-09-13 over 3,999 tracked files: 59 tag `auth` and 58
+    of them (98%) matched on "session" — session_cache.py, session_cap.py,
+    genesis_session_context.py. Inheriting `_DOMAIN_SENSITIVE_TAGS` wholesale
+    would make 58 session files critical for a reason nobody intended.
+
+    This test is the lock on that decision: re-adding `auth` to the lane's
+    sensitive set fails here, with this docstring as the reason.
+    """
+    assert _rs._scope_tag("src/genesis/cc/session_cache.py") == "auth", (
+        "precondition: this path must still hit the auth glob, or the test proves nothing"
+    )
+    assert _rs.classify_lane(["src/genesis/cc/session_cache.py"], hook_surface=False) == "standard"
+
+
+def test_lane_ordinary_code_is_standard():
+    assert _rs.classify_lane(["src/genesis/memory/store.py"], hook_surface=False) == "standard"
+
+
+def test_lane_docs_and_tests_only_is_light():
+    assert _rs.classify_lane(
+        ["docs/a.md", "tests/test_x.py", "CHANGELOG.md"], hook_surface=False
+    ) == "light"
+
+
+def test_lane_prompt_surfaces_are_light():
+    """A rule-doc belongs in the widest budget, and this is the one behaviour the
+    vocabulary change actually moved.
+
+    MEASURED over the 40 most recently merged PRs (2026-09-13): 14 moved
+    `standard` -> `light` versus the tag-based draft, and every one is a prompt
+    surface — `_category` calls these `code`, so the inherited classifier put
+    them in `standard` while the plan's own lane table said rule-docs were light.
+    The move is mostly inert rather than a loosening: 11 of the 14 contain
+    nothing whose findings score at all, since every path in them is a
+    `git_push_guard._is_doc_path` and `doc_findings` defaults to `skip`.
+
+    The `_category` assertions are the precondition. Without them this test
+    passes for free the day something reclassifies these as docs, and would stop
+    being evidence that the lane makes its own decision here.
+    """
+    for path in (
+        ".claude/skills/genesis-development/SKILL.md",
+        ".claude/commands/deep-review.md",
+        "src/genesis/skills/voice-master/references/anti-slop.md",
+    ):
+        assert _rs._category(path) == "code", (
+            f"precondition: {path} must still reach _category()=='code', "
+            "or this test no longer shows the lane deciding for itself"
+        )
+        assert _rs.classify_lane([path], hook_surface=False) == "light"
+
+
+def test_lane_one_code_file_among_docs_is_not_light():
+    """The light lane is ALL-or-nothing: one real code file disqualifies it."""
+    assert _rs.classify_lane(["docs/a.md", "src/genesis/memory/store.py"], hook_surface=False) == (
+        "standard"
+    )
+
+
+def test_lane_unknown_scope_fails_CLOSED():
+    """An unreadable file list reaches us as []. The lane RELAXES a threshold, so
+    the safe default is the one that relaxes nothing."""
+    assert _rs.classify_lane([], hook_surface=False) == "critical"
+
+
+def test_lane_vendored_only_is_light():
+    """A lockfile refresh carries no reviewable code."""
+    assert _rs.classify_lane(["package-lock.json", "node_modules/x/y.js"], hook_surface=False) == (
+        "light"
+    )
+
+
+def test_lane_dependency_pins_are_NOT_light():
+    """`.txt` alone is not prose. `requirements.txt` and
+    `config/az-pip-constraints.txt` are dependency pins that reach
+    `_category() == "docs-config"`; admitting every `.txt` gave them a 3.0
+    budget one line under a comment saying config is not prose.
+
+    Each path is asserted against `_is_lane_light` as well as the lane, because a
+    lane assertion alone cannot tell "`.txt` is not prose" from "something else
+    made this non-light". The direct call is the rule actually under test.
+    """
+    for path in ("requirements.txt", "config/az-pip-constraints.txt"):
+        assert not _rs._is_lane_light(path)
+        assert _rs.classify_lane([path], hook_surface=False) == "standard"
+
+
+def test_lane_a_doc_stem_with_txt_is_still_light():
+    """The other half of that split, so tightening `.txt` did not take prose with
+    it: a KNOWN doc stem keeps `.txt`, mirroring `git_push_guard._is_doc_path`."""
+    assert _rs.classify_lane(["CHANGELOG.txt"], hook_surface=False) == "light"
+    assert _rs.classify_lane(["LICENSE"], hook_surface=False) == "light"
+
+
+def test_lane_every_authority_outranks_the_vendored_strip():
+    """`_is_vendored` REMOVES a path from `reviewable`, so anything that must
+    outrank a vendor glob has to be checked before the strip — not after it.
+
+    Both spellings measured: each of these is `_is_vendored` via `*/generated/*`
+    and each returned `light` while its check sat below the strip. The hook-surface
+    one was found first and fixed alone; `.github/` was the same class one line
+    away and a second reviewer had to find it.
+
+    These two are the MEASURED regressions, and that is all this test pins. The
+    general property is carried by STRUCTURE, not by these assertions:
+    `_is_lane_critical_path` is the entire critical vocabulary and it is called
+    above the strip, so an authority added inside it inherits the ordering for
+    free. An authority added as a separate `if` AFTER the strip would still slip
+    past, and nothing here can see that — said plainly because the earlier wording
+    credited this test with a guarantee only the structure provides.
+    """
+    assert _rs._is_vendored("scripts/hooks/generated/x.py"), "precondition: vendored"
+    assert _rs._is_vendored(".github/generated/ci.yml"), "precondition: vendored"
+    assert _rs.classify_lane(
+        ["scripts/hooks/generated/x.py"], hook_surface=True
+    ) == "critical"
+    assert _rs.classify_lane([".github/generated/ci.yml"], hook_surface=False) == "critical"
+
+
+def test_lane_real_api_modules_are_critical():
+    """`_SCOPE_PATTERNS`' api globs are `*controller* *route* *endpoint* */api/*`,
+    which miss a module simply NAMED `api.py` or `api_*.py` — those tag `backend`.
+    MEASURED: `src/genesis/outreach/api.py` defines Flask routes and classified
+    `standard`. Closed by name in `_is_lane_critical_path` rather than by widening
+    `_SCOPE_PATTERNS`, whose blast radius includes the blocking depth gate."""
+    assert _rs._scope_tag("src/genesis/outreach/api.py") == "backend", (
+        "precondition: the inherited tagger still misses this, or the test proves nothing"
+    )
+    assert _rs.classify_lane(["src/genesis/outreach/api.py"], hook_surface=False) == "critical"
+    assert _rs.classify_lane(
+        ["az_plugins/genesis/api_health.py"], hook_surface=False
+    ) == "critical"
+
+
+def test_lane_critical_beats_light_when_mixed():
+    """Guard the guard on ordering: a docs-heavy PR that also touches a migration
+    is critical, not light. The checks must not be order-dependent in the wrong
+    direction."""
+    assert _rs.classify_lane(
+        ["docs/a.md", "README.md", "src/genesis/db/migrations/0009_x.py"], hook_surface=False
+    ) == "critical"

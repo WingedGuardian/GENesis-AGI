@@ -478,6 +478,55 @@ _FIRST_PARTY_OBS_SOURCES: frozenset[str] = frozenset(
         # (It embeds a truncated follow-up snippet; that snippet's own hygiene is
         # a content concern, not an origin one — the OBSERVATION is Genesis's.)
         "follow_up_watchdog",
+        # Context-injection watcher (awareness/loop.py _check_context_injection_health)
+        # — Genesis observing its OWN runtime: whether the harness filed a
+        # SessionStart hook's output instead of delivering it. The evidence is
+        # file sizes, mtimes, PATHS, and the SESSION-DIR names of the harness's
+        # own persisted files under ~/.claude/projects — all filesystem metadata
+        # Genesis observed (the session id is the grandparent dir name, escaped
+        # at ingestion like the path; see context_injection.note_filing). No
+        # byte of a filed hook's CONTENT reaches the observation: the collector
+        # attributes each filing from a closed set of labels it authors itself
+        # (context_injection._attribute). That is what makes first_party true
+        # here rather than merely convenient. An earlier version quoted the
+        # first 80 characters of an unrecognised hook's output — sanitised and
+        # framed "unverified", which changes neither where the text came from
+        # nor the origin stamped on the row, so it would have carried external
+        # text past the trusted-only SAFE_SURFACING_ORIGINS filters used by
+        # reflection and perception. If a future change puts hook content back
+        # in this observation, this source must LOSE its place in this list.
+        "context_injection_monitor",
+        # Zero-drop stranded-work detector (session_awareness/zero_drop_worker.py)
+        # — Genesis observing its OWN repository: which local branches, pushed
+        # branches and worktrees hold work that is in no pipeline. Two sources
+        # because blindness is reported separately from findings: a DEAD
+        # detector is caught by its heartbeat, but a LIVE one with a failing leg
+        # keeps its board frozen while every health surface reads green, so that
+        # gets its own alarm rather than being folded into the findings alert.
+        #
+        # first_party is the honest classification, but it is NOT free here, and
+        # the reason is the same one context_injection_monitor states above: the
+        # observation embeds git-authored text — branch names and worktree paths
+        # — which Genesis did not write. That text is neutralised where THESE
+        # ROWS are built (`_render_identity` / `_neutralise` in
+        # zero_drop_worker flatten newlines and substitute the alert's
+        # row-grammar characters), which is what lets an observation carry it
+        # without smuggling a forged row past the trusted-only
+        # SAFE_SURFACING_ORIGINS filters. If a future change renders any
+        # untrusted repository content into these observations WITHOUT that
+        # neutralisation, these sources must LOSE their place in this list.
+        #
+        # Scope that claim precisely, because an earlier revision of it did not
+        # and was wrong: it covers the OBSERVATION path only. The sibling MCP
+        # read surface (`zero_drop_status`) returns `branch`, `worktree_path`
+        # and the `degraded` blob VERBATIM, and a filesystem path — unlike a git
+        # ref name — may contain newlines and escapes. That surface is not
+        # governed by this list (it is a tool result, not an observation), and
+        # its own neutralisation is outstanding: it cannot simply reuse
+        # `_render_identity`, because `branch` there is the KEY callers pass
+        # back to `zero_drop_ack` and mangling a key is worse than the problem.
+        "zero_drop_detector",
+        "zero_drop_detector_blind",
     }
 )
 

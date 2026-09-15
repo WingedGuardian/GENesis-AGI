@@ -24,9 +24,35 @@ ruff check . && pytest -v
 
 ## Test Suite Overview
 
-Genesis v3 has **2505+ tests** across all subsystems. The suite runs without
-external service dependencies -- Qdrant, Ollama, and LLM APIs are mocked in
-unit tests.
+Genesis v3 has **~21,000 test functions** across **~1,345 files** (counted
+2026-09-06 by `grep -rEh "^\s*(async )?def test_" tests/ --include=*.py | wc -l`;
+parametrized cases make the collected item count higher still). The suite runs
+without external service dependencies -- Qdrant, Ollama, and LLM APIs are
+mocked in unit tests.
+
+**Runtime.** CI runs the suite FULLY SERIALLY (no pytest-xdist; it is not a
+dependency). MEASURED 2026-09-06 over the last 23 successful `main` runs, for
+the **`test` job specifically** (`gh api .../actions/runs/<id>/jobs`, name ==
+`test`): min 19m38s, median 29m22s, max 31m15s. Do not quote workflow-RUN
+duration here — it is ~20 minutes longer because it spans 12 sibling jobs plus
+queue time, and it is not what any of the ceilings below bound.
+
+Two ceilings bound the suite, and they are different things:
+
+- `timeout = 3600` in `pyproject.toml` is pytest-timeout's **per-test** limit —
+  one hung test is killed and the suite continues. It is NOT a suite budget,
+  and it applies **in CI only**: `pytest-timeout` ships in the `[test]` extra,
+  so a local `pip install -e .` venv does not have it and pytest emits
+  `PytestConfigWarning: Unknown config option: timeout` on every local run.
+  Install with `pip install -e ".[test]"` if you want it locally.
+- `timeout-minutes: 180` on CI's `test` job bounds the whole job, for a hang
+  the per-test timeout cannot catch. It must stay above (max job + one
+  per-test kill) — 31m15s + 60m ≈ 91m — or it would pre-empt the per-test
+  limit and make it dead code.
+
+The per-test cost of individual tests had never been measured; CI now prints
+`--durations=25` so the slowest are visible in every run's log. Read them
+before changing either ceiling.
 
 ## Test Directory Structure
 

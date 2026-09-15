@@ -2,7 +2,9 @@
 
 Once-per-install backfills/transforms of NON-schema state — Qdrant payloads,
 entity graphs — that schema migrations (``db/migrations/``) can't express.
-Each ``dNNNN_*.py`` module exposes:
+Each module is named ``d`` + a UTC timestamp — ``dYYYYMMDDHHMMSS_desc.py``,
+from ``date -u +%Y%m%d%H%M%S`` (the legacy ``d0001``-``d0011`` ids are frozen;
+see ``db/migrations/runner.py`` for why new ids are timestamps). Each exposes:
 
     requires_operator: bool = False   # optional; True => auto-runner skips it
     def migrate() -> dict:  ...        # sync, idempotent; returns a summary

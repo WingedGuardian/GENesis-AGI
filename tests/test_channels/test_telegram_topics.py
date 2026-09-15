@@ -129,6 +129,11 @@ async def test_resolve_outreach_category(manager):
     assert manager.resolve_outreach_category("surplus") == "surplus"
     assert manager.resolve_outreach_category("recon") == "recon"
     assert manager.resolve_outreach_category("unknown") == "conversation"
+    # Marketing digests get their OWN topic — never the shared morning_report
+    # (the 'digest' category still routes there). This is the fix for the
+    # marketing campaign's tick digest landing in the Morning Reports topic.
+    assert manager.resolve_outreach_category("marketing") == "marketing"
+    assert manager.resolve_outreach_category("digest") == "morning_report"
 
 
 @pytest.mark.asyncio
@@ -144,6 +149,8 @@ async def test_default_categories(manager):
     assert "reflection_strategic" in cats
     assert "surplus" in cats
     assert "recon" in cats
+    # Marketing campaign gets its own forum topic with a proper display name.
+    assert cats["marketing"] == "Marketing"
 
 
 @pytest.mark.asyncio

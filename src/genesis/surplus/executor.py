@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from genesis.db.crud import observations
+from genesis.memory.taxonomy import WINGS
 from genesis.surplus.intake import FENCE_RE
 from genesis.surplus.types import ExecutorResult, SurplusTask, TaskType
 
@@ -270,6 +271,28 @@ _CALL_SITES: dict[TaskType, str] = {
 _DEFAULT_CALL_SITE = "12_surplus_brainstorm"
 
 
+# The wing vocabulary is closed (`taxonomy.WINGS`). A prompt that RESTATES the
+# list can only teach the model names the system will not honour: the three
+# agent-facing MCP doors REJECT an out-of-vocabulary wing outright, and
+# `MemoryStore.store()` COERCES it back to auto-classification (see the comment
+# there — the two tiers differ deliberately). Either way the model's answer is
+# discarded, so deriving the list is the only spelling that stays true as
+# `WINGS` changes. This prompt shipped a hand-copied list naming `architecture`
+# and `identity`, neither of which is a wing.
+#
+# `general` is excluded because this audit exists to move memories OUT of it;
+# offering it back as a destination defeats the task.
+_WING_VOCABULARY = ", ".join(sorted(WINGS - {"general"}))
+
+# NB: the template is `.format(context=...)`-ed at dispatch, which is why every
+# other brace in it is doubled. A wing name containing a brace would raise
+# inside _build_prompt and kill the surplus task. WINGS members are
+# identifier-shaped today; the guard against a future one that is not lives in
+# test_wing_audit_prompt_offers_only_real_wings, not here — an import-time
+# assert would take the whole module down on a bad wing, and asserts vanish
+# under `python -O` anyway.
+
+
 # ── Task-specific prompt templates ──────────────────────────────────
 
 _TASK_PROMPTS: dict[TaskType, str] = {
@@ -476,9 +499,7 @@ _TASK_PROMPTS: dict[TaskType, str] = {
         "memories that should be reclassified into a more specific wing/room.\n\n"
         "Rules:\n"
         "- Only propose a new wing/room if 3+ memories clearly belong together\n"
-        "- Use existing wings when possible: learning, infrastructure, channels, "
-        "routing, memory, autonomy, dev_workflow, career, integrations, research, "
-        "architecture, identity\n"
+        "- Use existing wings when possible: " + _WING_VOCABULARY + "\n"
         "- Propose new rooms within existing wings before proposing new wings\n"
         "- Be conservative — uncategorized is fine if nothing clearly clusters\n\n"
         "Respond with ONLY a JSON object in this exact format:\n"

@@ -230,6 +230,30 @@ RISK_SEVERITY: dict[RiskClass, int] = {
     RiskClass.FINANCIAL: 3,
 }
 
+#: Severity for a risk class absent from RISK_SEVERITY. Higher than every
+#: ranked class, so an UNRANKED value wins a highest-wins comparison instead of
+#: losing one silently. The only way to reach it is adding a RiskClass member
+#: and not ranking it — a code defect, not operator input — so the loud
+#: direction costs no real friction and is the one that gets noticed.
+_UNRANKED_SEVERITY = max(RISK_SEVERITY.values()) + 1
+
+
+def max_risk(*risks: RiskClass) -> RiskClass:
+    """The most consequential of *risks* on the RISK_SEVERITY gradient.
+
+    One authority for "highest wins", so a classifier combining several
+    independent risk signals does not hand-compare them. Hand-comparison is
+    what let a control labelled "Pay" classify STANDARD while a parallel signal
+    already called the same action IRREVERSIBLE: two answers existed and
+    nothing reconciled them.
+
+    Empty input is STANDARD — the identity element of the gradient, so
+    ``max_risk()`` over no signals adds no risk rather than inventing some.
+    """
+    if not risks:
+        return RiskClass.STANDARD
+    return max(risks, key=lambda r: RISK_SEVERITY.get(r, _UNRANKED_SEVERITY))
+
 
 class CellEvent(StrEnum):
     """Events that drive capability-cell state transitions."""
