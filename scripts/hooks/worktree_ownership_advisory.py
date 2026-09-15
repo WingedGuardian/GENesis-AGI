@@ -152,21 +152,32 @@ def _release(payload: dict) -> int:
     if mine is None:
         return 0
 
+    # `-z` because a worktree path may legally contain a NEWLINE on Unix, and
+    # porcelain puts that newline INSIDE the `worktree <path>` value. Splitting on
+    # lines then yields a truncated, nonexistent root, so the real worktree is
+    # never visited and its claim survives the session that took it — the precise
+    # leak this function exists to close, reintroduced by the parser. With `-z`,
+    # records are NUL-terminated and the path is unambiguous.
+    #
+    # The env scrub is the same trap as in the ownership check: an exported
+    # GIT_DIR / GIT_COMMON_DIR would enumerate ANOTHER repository's worktrees,
+    # and we would then read — and try to release — locks that are not ours.
     result = subprocess.run(
-        ["git", "worktree", "list", "--porcelain"],
+        ["git", "worktree", "list", "--porcelain", "-z"],
         capture_output=True,
         text=True,
         timeout=30,
         cwd=str(Path(__file__).resolve().parent.parent.parent),
+        env=wc._git_env(),
     )
     if result.returncode != 0:
         return 0
 
     released = 0
-    for line in result.stdout.splitlines():
-        if not line.startswith("worktree "):
+    for field_ in result.stdout.split("\0"):
+        if not field_.startswith("worktree "):
             continue
-        root = Path(line[len("worktree ") :])
+        root = Path(field_[len("worktree ") :])
         lock = wc.read_lock(root)
         if lock is None or lock.foreign or lock.rule != wc.RULE_CLAIM:
             continue
@@ -204,15 +215,32 @@ def _claim(payload: dict) -> int:
 
 
 def main() -> int:
+    payload = read_payload()
+    # RELEASE RUNS BEFORE THE MODE GATE, and the ordering is the fix.
+    #
+    # Turning the feature off must not strand the claims it already took. With
+    # the gate first, a session that had claimed worktrees and then saw `enabled`
+    # or `mode` flipped to off exited without unlocking ANY of them — and a
+    # locked worktree is skipped unconditionally by the reaper, so the claims
+    # would sit there permanently with the feature that created them switched
+    # off and no longer able to clean up after itself.
+    #
+    # It also contradicted this repo's own shipped promise:
+    # config/worktree_ownership.yaml says `off` does not release claims already
+    # taken because "a claim releases when its process exits regardless of this
+    # setting, so they drain on their own". That was documentation describing
+    # behaviour the code did not have; releasing first is what makes it true.
+    #
+    # Only RELEASE is exempt. Claiming and advising are the feature, and `off`
+    # correctly stops them.
+    if "--release" in sys.argv:
+        return _release(payload)
     if wc.effective_mode() == "off":
         return 0
-    payload = read_payload()
     if "--claim" in sys.argv:
         return _claim(payload)
     if "--advise" in sys.argv:
         return _advise(payload)
-    if "--release" in sys.argv:
-        return _release(payload)
     return 0
 
 

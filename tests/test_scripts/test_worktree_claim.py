@@ -536,3 +536,80 @@ def test_ownership_fails_closed_when_our_own_repository_cannot_be_resolved(
     """
     monkeypatch.setattr(wc, "_our_common_dir", lambda: None)
     assert wc.worktree_root_for(worktree) is None
+
+
+def test_an_exported_git_dir_cannot_make_a_foreign_worktree_look_like_ours(
+    sibling_worktree: Path, monkeypatch
+) -> None:
+    """Ambient git location overrides BEAT `-C`, and that defeats the whole check.
+
+    `git rev-parse --local-env-vars` lists GIT_DIR and GIT_COMMON_DIR as
+    repository-local: with either exported, every `rev-parse --git-common-dir`
+    answers for THAT repository no matter which directory it runs in. Both sides
+    of the ownership comparison then return the same foreign path and AGREE — and
+    agreeing is precisely what makes a foreign worktree read as ours. The check
+    would not merely fail; it would invert, accepting exactly what it exists to
+    refuse, and a claim would be written into someone else's repository.
+
+    This repo already knows the trap: `.claude/hooks/genesis-hook` scrubs the same
+    three variables so an exported override cannot redirect hook discovery to an
+    unrelated checkout. This is that trap one layer down.
+
+    Note `_our_common_dir` is deliberately NOT patched here — its real resolution
+    is half of what the override corrupts, so patching it would hide the bug.
+    """
+    sibling_git = str((sibling_worktree.parent / "sibling" / ".git").resolve())
+    monkeypatch.setenv("GIT_DIR", sibling_git)
+    monkeypatch.setenv("GIT_COMMON_DIR", sibling_git)
+    monkeypatch.setattr(wc, "_COMMON_DIR_CACHE", wc._UNSET)
+
+    assert wc.worktree_root_for(sibling_worktree / "README.md") is None, (
+        "an exported GIT_DIR made another repository's worktree resolve as ours"
+    )
+
+
+def test_the_scrub_removes_only_the_location_overrides(monkeypatch) -> None:
+    """The control: scrubbing must not blank the environment wholesale.
+
+    git needs the rest of the environment — HOME for config discovery, PATH to
+    be found at all — so an over-broad scrub would break the very calls it is
+    meant to protect, and would do it silently because both functions fail closed.
+    """
+    monkeypatch.setenv("GIT_DIR", "/nowhere/.git")
+    monkeypatch.setenv("GIT_COMMON_DIR", "/nowhere/.git")
+    monkeypatch.setenv("GIT_WORK_TREE", "/nowhere")
+    env = wc._git_env()
+    for var in ("GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE"):
+        assert var not in env, f"{var} survived the scrub"
+    for var in ("PATH", "HOME"):
+        if var in os.environ:
+            assert env.get(var) == os.environ[var], f"{var} must be preserved"
+
+
+def test_an_exported_git_dir_pointing_at_OUR_repo_cannot_adopt_a_foreign_worktree(
+    sibling_worktree: Path, monkeypatch
+) -> None:
+    """The dangerous direction, which the sibling-pointing case does not reach.
+
+    Found by mutation: removing the scrub from the CANDIDATE side alone left the
+    sibling-pointing test green, because both sides then disagreed and the
+    refusal happened for the wrong reason. That was a blind spot in the test, not
+    a harmless mutation — point the override at OUR repository instead and the
+    candidate side answers "ours" for a path inside someone else's worktree, so
+    the comparison AGREES and the foreign worktree is adopted.
+
+    This is the realistic shape too: a wrapper exporting GIT_DIR for the repo it
+    is operating on is ordinary, and it is exactly then that a stray absolute
+    path into another checkout gets claimed.
+    """
+    ours = wc._our_common_dir()
+    if ours is None:
+        pytest.skip("cannot resolve this repository's common dir")
+    monkeypatch.setenv("GIT_DIR", str(ours))
+    monkeypatch.setenv("GIT_COMMON_DIR", str(ours))
+    monkeypatch.setattr(wc, "_COMMON_DIR_CACHE", wc._UNSET)
+
+    assert wc.worktree_root_for(sibling_worktree / "README.md") is None, (
+        "a GIT_DIR pointing at our own repo made another repository's worktree "
+        "answer as ours, so it would have been claimed"
+    )

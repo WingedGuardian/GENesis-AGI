@@ -193,6 +193,28 @@ def worktree_root_for(path: str | Path) -> Path | None:
     return None
 
 
+# Ambient git LOCATION overrides. `git rev-parse --local-env-vars` lists these
+# among the repository-local variables, and they beat `-C`: with GIT_DIR or
+# GIT_COMMON_DIR exported for another repository, EVERY `rev-parse
+# --git-common-dir` below answers for THAT repository no matter which directory
+# it is run from. Both sides of the ownership comparison would then agree, and
+# agreeing is exactly what makes a foreign worktree look like ours — so the
+# cross-repo check would pass while doing the opposite of its job.
+#
+# The same three are scrubbed for the same reason in `.claude/hooks/genesis-hook`,
+# whose comment records that an exported override "would otherwise resolve an
+# UNRELATED repo despite the `cd`". This is that trap, one layer down.
+_GIT_LOCATION_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
+
+
+def _git_env() -> dict[str, str]:
+    """The environment with git's location overrides removed."""
+    env = dict(os.environ)
+    for var in _GIT_LOCATION_VARS:
+        env.pop(var, None)
+    return env
+
+
 def _our_common_dir() -> Path | None:
     """This repository's git common dir, resolved from this file's location.
 
@@ -209,6 +231,7 @@ def _our_common_dir() -> Path | None:
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT,
+            env=_git_env(),
         )
         out = result.stdout.strip()
         _COMMON_DIR_CACHE = Path(out).resolve() if result.returncode == 0 and out else None
@@ -234,6 +257,7 @@ def _belongs_to_this_repo(root: Path) -> bool:
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT,
+            env=_git_env(),
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return False

@@ -555,3 +555,122 @@ def test_session_end_with_no_resolvable_session_releases_nothing(
     assert hook._release({}) == 0
     assert wc.read_lock(worktree) is not None
 
+
+
+# ─── round-4 findings ────────────────────────────────────────────────────────
+
+
+def test_release_runs_even_when_ownership_is_switched_off(
+    worktree: Path, monkeypatch
+) -> None:
+    """Turning the feature off must not strand the claims it already took.
+
+    A locked worktree is skipped unconditionally by the reaper, so a claim left
+    behind by a disabled feature is permanent: the thing that created it is off
+    and can no longer clean up after it. This also contradicted the shipped
+    config, which states that `off` does not release existing claims BECAUSE a
+    claim releases when its process exits regardless of the setting. That was a
+    promise the code did not keep.
+
+    Driven through `main` rather than `_release`, because the defect was purely
+    the ORDER of the mode gate and the dispatch — `_release` itself was correct
+    and a direct call would pass against the broken version.
+    """
+    mine = 424242
+    monkeypatch.setattr(wc, "session_pid_from_ancestry", lambda: mine)
+    monkeypatch.setattr(wc, "pid_is_live_session", lambda *a, **k: True)
+    monkeypatch.setattr(wc, "effective_mode", lambda: "off")
+    monkeypatch.setattr(sys, "argv", ["worktree_ownership_advisory.py", "--release"])
+    monkeypatch.setattr(hook, "read_payload", lambda: {"hook_event_name": "SessionEnd"})
+
+    repo_root = worktree.parent / "repo"
+    _git(repo_root, "worktree", "lock", "--reason",
+         wc.format_reason(P("claim", pid=mine, start=wc.proc_starttime(mine) or 1, sid="s")),
+         str(worktree))
+    assert wc.read_lock(worktree) is not None, "precondition: the claim is in place"
+
+    # Point the enumeration at THIS repo, not the real one — without this the
+    # release lists the actual repository and never visits the fixture, which is
+    # exactly how an earlier control test in this file passed while blind.
+    real_run = hook.subprocess.run
+
+    def fake_run(cmd, *a, **k):
+        if cmd[:3] == ["git", "worktree", "list"]:
+            k = {**k, "cwd": str(repo_root)}
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setattr(hook.subprocess, "run", fake_run)
+
+    assert hook.main() == 0
+    assert wc.read_lock(worktree) is None, (
+        "the claim survived a SessionEnd taken while ownership was off"
+    )
+
+
+def test_claiming_is_still_suppressed_when_switched_off(
+    worktree: Path, monkeypatch
+) -> None:
+    """The control. Release is the ONLY thing exempt from the mode gate.
+
+    Without this, moving the dispatch above the gate could have exempted
+    everything, which would make the kill switch do nothing.
+    """
+    monkeypatch.setattr(wc, "effective_mode", lambda: "off")
+    monkeypatch.setattr(sys, "argv", ["worktree_ownership_advisory.py", "--claim"])
+    monkeypatch.setattr(
+        hook, "read_payload", lambda: payload(worktree / "target.py")
+    )
+    assert hook.main() == 0
+    assert wc.read_lock(worktree) is None, "a claim was taken while ownership was off"
+
+
+def test_a_worktree_path_containing_a_newline_is_still_released(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A newline is legal in a Unix path, and porcelain puts it INSIDE the value.
+
+    Splitting the enumeration on lines turns such a path into a truncated,
+    nonexistent root, so the real worktree is never visited and its claim
+    outlives the session — the leak `_release` exists to close, reintroduced by
+    the parser. `-z` makes the records NUL-terminated instead.
+
+    Built with a REAL worktree whose name contains a newline rather than a
+    synthetic porcelain string, because the bug is in how git's actual output is
+    parsed; a hand-written fixture would encode my own belief about that output.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init", "--quiet", "-b", "main")
+    _git(root, "config", "user.email", "probe@example.invalid")
+    _git(root, "config", "user.name", "Probe")
+    (root / "README.md").write_text("seed\n")
+    _git(root, "add", "README.md")
+    _git(root, "commit", "--quiet", "-m", "seed")
+
+    weird = tmp_path / "wt\nwith-newline"
+    added = _git(root, "worktree", "add", "--quiet", "-b", "feature/nl", str(weird))
+    if added.returncode != 0:
+        pytest.skip(f"this filesystem rejects a newline in a path: {added.stderr.strip()}")
+
+    mine = 515151
+    monkeypatch.setattr(wc, "session_pid_from_ancestry", lambda: mine)
+    monkeypatch.setattr(wc, "pid_is_live_session", lambda *a, **k: True)
+    monkeypatch.setattr(wc, "_our_common_dir", lambda: (root / ".git").resolve())
+    _git(root, "worktree", "lock", "--reason",
+         wc.format_reason(P("claim", pid=mine, start=1, sid="s")), str(weird))
+    assert wc.read_lock(weird) is not None, "precondition: the claim is in place"
+
+    real_run = hook.subprocess.run
+
+    def fake_run(cmd, *a, **k):
+        if cmd[:3] == ["git", "worktree", "list"]:
+            k = {**k, "cwd": str(root)}
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setattr(hook.subprocess, "run", fake_run)
+
+    assert hook._release({}) == 0
+    assert wc.read_lock(weird) is None, (
+        "a worktree whose path contains a newline was never visited, so its "
+        "claim outlived the session"
+    )

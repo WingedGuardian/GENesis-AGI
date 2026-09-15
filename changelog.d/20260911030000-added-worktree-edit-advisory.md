@@ -39,3 +39,25 @@
   and anything outside this one is left alone. Where the question cannot be
   answered, the answer is "not ours": a missed note costs a warning, a wrong
   claim costs someone else's repository.
+- **Turning worktree ownership off no longer strands the claims it already
+  took.** The shipped settings file says that switching it off leaves existing
+  claims alone precisely because they release when their session exits — but the
+  off switch was checked first, so a session that ended after the setting changed
+  released nothing. The claims then sat there permanently, skipped by the
+  cleanup, with the feature that made them switched off and unable to clear up
+  after itself. Releasing now happens regardless of the setting, which is what
+  the documentation already promised. Claiming and warning are still switched
+  off, as intended.
+- **An environment that points git at a different project can no longer make
+  someone else's worktree look like ours.** These overrides take precedence over
+  asking about a specific directory, so both halves of the ownership question
+  returned the same foreign answer and agreed — and agreement is exactly what
+  reads as "this is ours". The check did not merely fail, it inverted. The
+  project's own hook launcher already strips the same variables for the same
+  reason.
+- **A worktree whose folder name contains a line break is now released
+  properly.** Line breaks are legal in names on this platform, and one inside a
+  name split the listing the release step reads, producing a truncated name that
+  matches nothing — so that worktree was never visited and its claim outlived the
+  session. The listing is now read in a form that cannot be split by the names
+  inside it.
