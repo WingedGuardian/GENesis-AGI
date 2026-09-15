@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1444,20 +1445,159 @@ async def test_build_prompt_enumerates_urls(monitor, inbox_dir):
 
 
 @pytest.mark.asyncio
-async def test_build_prompt_enumerates_lossless_terminal_url(monitor, inbox_dir):
-    """The evaluator must be told to cite the same identity the gate checks."""
+@pytest.mark.parametrize(
+    ("content", "listed"),
+    [
+        # Balanced delimiters are URL-borne and must survive display trimming.
+        (
+            "https://en.wikipedia.org/wiki/Foo_(bar)",
+            "https://en.wikipedia.org/wiki/Foo_(bar)",
+        ),
+        # An IPv6 authority keeps its bracket -- the `[` is still open.
+        ("https://[::1]:8443/p", "https://[::1]:8443/p"),
+        # A markdown wrapper is NOT part of the URL and must not be requested.
+        ("[docs](https://example.com/foo)", "https://example.com/foo"),
+        # Nor is a surrounding quote, with or without trailing prose comma.
+        ('see "https://example.com/x", later', "https://example.com/x"),
+        # A code span around a URL is likewise presentation.
+        ("`https://example.com/y`.", "https://example.com/y"),
+        # A URL-shaped markdown LABEL is its own token and must not absorb
+        # `](https://...` -- this case reaches the bare-domain `]` stop, which
+        # the `[docs](...)` cases above never do.
+        ("[example.com/a](https://example.com/a)", "example.com/a"),
+    ],
+)
+async def test_build_prompt_lists_the_url_the_writer_meant(
+    monitor,
+    inbox_dir,
+    content,
+    listed,
+):
+    """The prompt asks for a fetchable URL, not the gate's lossless token.
+
+    The coverage grammar keeps every terminal character so the GATE can fail
+    closed on ambiguous punctuation. Handing that token to the evaluator asks
+    it to fetch a resource that does not exist -- MEASURED at 340 of 18,119
+    tokens (1.88%) ending in wrapper punctuation on this install's corpus,
+    falling to 11 (0.06%) once unmatched delimiters are trimmed.
+
+    Display trimming is structural: a paired delimiter is removed only when
+    the remainder leaves it unmatched. The gate accepts either rendering of
+    the SAME token, and no more -- see
+    ``test_a_truncated_sibling_still_cannot_vouch_for_another_url``.
+    """
     from genesis.inbox.types import InboxItem
 
-    url = "https://en.wikipedia.org/wiki/Foo_(bar)?q=bang!"
     item = InboxItem(
-        id="terminal-url",
+        id="display-url",
         file_path=str(inbox_dir / "links.md"),
-        content=url,
+        content=content,
         content_hash="abc",
-        detected_at="2026-09-12",
+        detected_at="2026-09-14",
     )
 
-    assert f"1. {url}" in monitor._build_prompt([item])
+    prompt = monitor._build_prompt([item])
+    # Assert the WHOLE enumerated line. A bare ``in`` check is vacuous here:
+    # "1. https://example.com/foo" is a substring of the untrimmed
+    # "1. https://example.com/foo)", so it passes on the failure path too.
+    enumerated = [
+        re.sub(r"^\d+\. ", "", line)
+        for line in prompt.splitlines()
+        if re.fullmatch(r"\d+\. \S+", line)
+    ]
+    assert listed in enumerated, f"{listed!r} not enumerated; got {enumerated!r}"
+
+
+def test_citing_exactly_what_the_prompt_asked_for_covers_the_url():
+    """A compliant answer must be able to satisfy the gate.
+
+    The prompt shows ``_display_url(token)`` while the gate discovered
+    ``token``. If only the untrimmed form counted, every URL whose two
+    renderings differ would be permanently uncoverable -- a floor under the
+    shadow flag rate, which is the signal the enforce decision reads.
+    """
+    from genesis.inbox.monitor import _display_url, _uncovered_urls
+
+    source = '"https://example.com/q?x=1",'
+    assert _display_url('https://example.com/q?x=1",') == "https://example.com/q?x=1"
+
+    # What the prompt actually asked for.
+    assert _uncovered_urls("**Source:** <https://example.com/q?x=1>", source) == []
+    # The untrimmed token the gate discovered still counts too.
+    assert _uncovered_urls('**Source:** <https://example.com/q?x=1",>', source) == []
+
+
+def test_ambiguous_sentence_punctuation_is_never_trimmed_for_display():
+    """Round 3's fail-closed rule survives the display layer.
+
+    ``/path;`` and ``/q?x=1!`` are legal URLs. Nothing structurally proves the
+    terminal character is prose, so trimming it would ask the evaluator for a
+    DIFFERENT resource than the user saved -- and the gate would then accept
+    that answer, which is the silent loss this whole gate exists to prevent.
+    A trim only stands when it removed a paired delimiter.
+    """
+    from genesis.inbox.monitor import _display_url, _uncovered_urls
+
+    for ambiguous in ("https://example.com/path;", "https://example.com/q?x=1!"):
+        assert _display_url(ambiguous) == ambiguous
+        truncated = ambiguous[:-1]
+        assert _uncovered_urls(f"**Source:** {truncated}", ambiguous) == [ambiguous]
+
+
+def test_a_truncated_sibling_still_cannot_vouch_for_another_url():
+    """Accepting two renderings of ONE token must not widen to siblings.
+
+    This is the round-3 guarantee. ``/foo`` and ``/foo:bar`` are distinct
+    resources; neither one's display form is the other's identity, so citing
+    one must leave the other uncovered.
+    """
+    from genesis.inbox.monitor import _uncovered_urls
+
+    source = "https://example.com/foo\nhttps://example.com/foo:bar"
+
+    cited_prefix = "**Source:** <https://example.com/foo>"
+    assert _uncovered_urls(cited_prefix, source) == ["https://example.com/foo:bar"]
+
+    cited_longer = "**Source:** <https://example.com/foo:bar>"
+    assert _uncovered_urls(cited_longer, source) == ["https://example.com/foo"]
+
+
+def test_bare_domain_label_does_not_swallow_the_link_target():
+    """DISCOVERY must end a bare-domain token at `]`.
+
+    A URL-shaped markdown LABEL is its own token. Without the stop it absorbs
+    `](https://...` into one string that is neither URL and that no response
+    can ever cite. Asserted on the extractor directly: the display layer
+    trims the trailing `)` and would mask a regression here.
+    """
+    from genesis.inbox.monitor import _extract_coverage_input_urls
+
+    assert _extract_coverage_input_urls("[example.com/a](https://example.com/a)") == [
+        "example.com/a",
+        "https://example.com/a)",
+    ]
+
+
+def test_evidence_validation_keeps_bracketed_query_params():
+    """VALIDATION must NOT inherit discovery's `]` stop.
+
+    A Source field is already delimited, so there is no prose to end at.
+    Narrowing it would reject a legitimate schemeless citation carrying a
+    bracketed query parameter, and the URL would read as uncovered even
+    though the evaluator cited it exactly.
+    """
+    from genesis.inbox.monitor import _extract_coverage_input_urls, _extract_source_urls
+
+    cited = "example.com/s?f[0]=x"
+    assert _extract_source_urls(f"**Source:** {cited}") == [cited]
+
+    # DISCOVERY is the narrowed one, and deliberately so: scanning prose it
+    # stops the bare-domain form at `]`. A schemeless URL carrying a bracketed
+    # query parameter is therefore discovered truncated -- a known limit, not
+    # a regression from sharing one pattern. The scheme'd form is unaffected,
+    # and in practice such params are written with a scheme.
+    assert _extract_coverage_input_urls(cited) == ["example.com/s?f[0"]
+    assert _extract_coverage_input_urls(f"https://{cited}") == [f"https://{cited}"]
 
 
 @pytest.mark.asyncio

@@ -160,14 +160,38 @@ _SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
 # the whole gate.
 _PLACEHOLDER_RE = re.compile(r"\{[^{}]*\}")
 
-# Coverage has a stricter grammar than general inbox discovery.  The input side
-# preserves every non-whitespace terminal character (ambiguous punctuation must
+# Coverage has a stricter grammar than general inbox discovery.  Both patterns
+# preserve every non-whitespace terminal character (ambiguous punctuation must
 # fail closed); the evidence side accepts only the evaluator's required Source
 # field, optionally enclosed in RFC-style angle brackets.
-_COVERAGE_INPUT_URL_RE = re.compile(
+#
+# DISCOVERY and VALIDATION are deliberately separate patterns. They differ in
+# exactly one place, because they are asked different questions.
+_COVERAGE_URL_VALUE_RE = re.compile(
     r"(?:https?://[^\s<>]+)"
     r"|"
     r"(?:(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}/[^\s<>]+)",
+    re.IGNORECASE,
+)
+
+# DISCOVERY scans free-form prose, so it must know where a token ENDS. Its
+# bare-domain alternative therefore stops at `]`: without that, a markdown
+# link's TEXT (`[example.com/a](https://example.com/a)`) matches here and then
+# swallows `](https://...`, yielding one token spanning the label and the
+# target -- an identity no response can ever cite. A scheme'd URL keeps `]` so
+# an IPv6 authority (`https://[::1]:8443/p`) survives; a bare-domain form has
+# no authority brackets to preserve.
+#
+# VALIDATION (`_COVERAGE_URL_VALUE_RE`, used as a fullmatch above) must NOT
+# inherit that stop. Its input is a single already-delimited Source field, so
+# there is no surrounding prose to end at, and narrowing it would silently
+# reject a legitimate schemeless citation carrying a bracketed query parameter
+# (`example.com/s?f[0]=x`) -- the URL would then read as uncovered even though
+# the evaluator cited it exactly.
+_COVERAGE_INPUT_URL_RE = re.compile(
+    r"(?:https?://[^\s<>]+)"
+    r"|"
+    r"(?:(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}/[^\s<>\]]+)",
     re.IGNORECASE,
 )
 _SOURCE_FIELD_RE = re.compile(
@@ -181,6 +205,63 @@ def _extract_coverage_input_urls(text: str) -> list[str]:
     return list(dict.fromkeys(match.group(0) for match in _COVERAGE_INPUT_URL_RE.finditer(text)))
 
 
+# Prose punctuation that ends a sentence, and delimiters that come in pairs.
+# Used ONLY to render a coverage token for the prompt -- never to decide
+# coverage identity.
+_DISPLAY_TRIM_CHARS = ".,;:!?"
+_DISPLAY_PAIRS = {")": "(", "]": "[", "}": "{", '"': '"', "'": "'", "`": "`"}
+
+
+def _display_url(url: str) -> str:
+    """Render a lossless coverage token as the URL the writer meant.
+
+    The coverage grammar keeps every non-whitespace terminal character so the
+    GATE can fail closed on ambiguous punctuation. That is wrong for the
+    PROMPT: a markdown link or a quoted URL yields a token carrying its own
+    wrapper, and telling the model to fetch ``https://example.com/foo)`` asks
+    for a resource that does not exist.
+
+    Trimming here is STRUCTURAL, not a prose heuristic. A paired delimiter is
+    removed only when the remainder leaves it unmatched -- so a markdown
+    wrapper goes and a balanced ``/wiki/Foo_(bar)`` stays, and an IPv6
+    authority keeps its ``]`` because the ``[`` is still open. Sentence
+    punctuation is trimmed outright.
+
+    This runs on the presentation side only. ``_coverage_identity`` still
+    compares the untrimmed token, so nothing here can make a truncated sibling
+    vouch for an omitted URL.
+    """
+    candidate = url
+    unwrapped = False
+    while candidate:
+        last = candidate[-1]
+        if last in _DISPLAY_TRIM_CHARS:
+            candidate = candidate[:-1]
+            continue
+        opener = _DISPLAY_PAIRS.get(last)
+        if opener is None:
+            break
+        body = candidate[:-1]
+        # Symmetric delimiters (quotes) pair off; asymmetric ones nest.
+        unmatched = (
+            body.count(last) % 2 == 0
+            if opener == last
+            else body.count(opener) <= body.count(last)
+        )
+        if not unmatched:
+            break
+        candidate = body
+        unwrapped = True
+    # Sentence punctuation alone is NOT evidence of a wrapper. `/path;` and
+    # `/q?x=1!` are legal URLs, and round 3 established that such ambiguity
+    # must fail CLOSED -- trimming them for display would ask the evaluator
+    # for a DIFFERENT resource than the one the user saved, and the gate
+    # would then accept that answer. So a trim only stands when it removed a
+    # paired delimiter, which is structurally provable. Sentence punctuation
+    # is consumed only to reach one (`...x",` -> `...x`).
+    return candidate if unwrapped else url
+
+
 def _extract_source_urls(response_text: str) -> list[str]:
     """Parse lossless coverage evidence from required ``**Source:**`` fields."""
     urls: list[str] = []
@@ -189,7 +270,7 @@ def _extract_source_urls(response_text: str) -> list[str]:
         value = match.group("source").strip()
         if value.startswith("<") and value.endswith(">"):
             value = value[1:-1]
-        if _COVERAGE_INPUT_URL_RE.fullmatch(value) and value not in seen:
+        if _COVERAGE_URL_VALUE_RE.fullmatch(value) and value not in seen:
             seen.add(value)
             urls.append(value)
     return urls
@@ -252,15 +333,36 @@ def _uncovered_urls(response_text: str, input_content: str) -> list[str]:
         for cited in _extract_source_urls(response_text)
         if (identity := _coverage_identity(cited)) is not None
     }
-    return [
-        url
-        for url in urls
-        if not _PLACEHOLDER_RE.search(url)
-        and (
-            (identity := _coverage_identity(url)) is None
-            or identity not in response_identities
-        )
-    ]
+    return [url for url in urls if not _PLACEHOLDER_RE.search(url)
+            and not _accepted_identities(url) & response_identities]
+
+
+def _accepted_identities(url: str) -> set[str]:
+    """Return the identities that count as citing THIS input URL.
+
+    Two renderings of one token, never a widened rule about URLs in general.
+    The prompt shows ``_display_url(url)`` while the gate discovered ``url``,
+    so a response that cites exactly what it was asked for must satisfy the
+    gate -- otherwise the item can never be covered by any compliant answer.
+    MEASURED 2026-09-14 over this install's corpus (284 stored baselines + 112
+    live inbox files, 18,119 tokens): 331 (1.83%) render differently, and 72
+    collapse two input tokens onto one prompt line. Without this, that 1.83%
+    would be a permanent floor under the shadow flag rate -- and the shadow
+    rate is precisely the signal the shadow->enforce decision is meant to read.
+
+    Scoping is what keeps this safe. The set is derived from ONE token, so a
+    truncated SIBLING still cannot vouch for it: given inputs ``/foo`` and
+    ``/foo:bar``, neither one's display form is the other's identity. That is
+    the guarantee the untrimmed comparison was introduced to provide, and it
+    is unchanged.
+
+    An empty set (both renderings unparseable) leaves the URL uncovered.
+    """
+    return {
+        identity
+        for candidate in (url, _display_url(url))
+        if (identity := _coverage_identity(candidate)) is not None
+    }
 
 
 _ACKNOWLEDGED_RE = re.compile(
@@ -2356,7 +2458,22 @@ class InboxMonitor:
 
         for idx, item in enumerate(items, 1):
             name = Path(item.file_path).name
-            urls = _extract_coverage_input_urls(item.content)
+            # The PROMPT is a presentation surface, the gate an identity one.
+            # Render each coverage token as the URL the writer meant, so a
+            # markdown link does not ask the model to fetch a trailing `)`.
+            # MEASURED over this install's corpus (284 evaluated baselines +
+            # 112 live inbox files, 18,119 extracted tokens): 340 (1.88%) end
+            # in wrapper punctuation; after trimming, 11 (0.06%) do. The
+            # residual is deliberate -- 8 trailing commas and 1 semicolon that
+            # no paired delimiter proves are prose, plus 2 `{...}` templates
+            # the gate already exempts.
+            #
+            # Where display and identity disagree (331 tokens, 1.83%) the gate
+            # accepts EITHER rendering of that same token, so a compliant
+            # answer always clears. See `_accepted_identities` for why that is
+            # scoped per-token rather than a widened rule.
+            urls = [_display_url(u) for u in _extract_coverage_input_urls(item.content)]
+            urls = list(dict.fromkeys(u for u in urls if u))
             parts.append(f"\n---\n\n## Item {idx}: {name}\n")
             if urls:
                 parts.append(
@@ -2366,7 +2483,7 @@ class InboxMonitor:
                 parts.append(
                     "Quote each URL VERBATIM in a dedicated Source field, "
                     "preferably angle-delimited: `**Source:** "
-                    "<https://example.com/path?q=value!>`. Only Source fields "
+                    "<https://example.com/path?q=value>`. Only Source fields "
                     "count as mechanical coverage evidence; an incidental URL "
                     "mention elsewhere does not. Missing or ambiguous evidence "
                     "re-queues the whole item as unevaluated — this matters "

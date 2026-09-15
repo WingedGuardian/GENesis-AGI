@@ -28,6 +28,32 @@
   `max_retries` with no notification. Watch the shadow log first; enforce when
   the rate reflects responses written under the `**Source:**` prompt.
 
+  **The link the evaluator is asked to fetch is now the link you wrote.** The
+  coverage check keeps every trailing character so it can fail closed on
+  ambiguous punctuation, which is right for deciding identity and wrong for
+  telling the evaluator what to open: a markdown link, a quoted URL or a URL in
+  a code span used to be handed over with its wrapper still attached
+  (`https://example.com/foo)`), so the fetch asked for a page that does not
+  exist. Measured across this install's stored evaluations and current inbox,
+  340 of 18,119 extracted links (1.9%) ended in wrapper punctuation; that is
+  now 11 (0.06%).
+
+  Trimming is structural rather than a guess at prose: a bracket or quote is
+  dropped only when nothing in the link opens it, so a balanced
+  `/wiki/Foo_(bar)` and an IPv6 address keep their brackets. Sentence
+  punctuation alone is never enough — a link ending in `;` or `!` is left
+  exactly as written, because nothing proves that character is prose and
+  asking for a different address than you saved is the very loss this check
+  exists to catch. That is what the 11 remaining are: 9 links ending in a
+  bare comma or semicolon, plus 2 templates the check already skips. Links
+  wrapped in markdown emphasis (`**`) are also out of scope and still reach
+  the evaluator wrapped.
+
+  The check itself is unchanged and still compares the link as written; it
+  simply also accepts the trimmed form **of that same link**, so an answer
+  citing exactly what it was asked for counts. A different link that merely
+  looks similar still does not.
+
   One known false positive, left documented rather than patched: a response that
   cites a URL *without* its tracking or query parameters (the prompt asks for
   verbatim) reads as a miss. Stripping tracking params does not fix it — measured
