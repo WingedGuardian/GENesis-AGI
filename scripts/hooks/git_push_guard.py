@@ -7980,13 +7980,22 @@ def _open_pr_count_for_branch(
         rows = json.loads(result.stdout)
         if not isinstance(rows, list):
             return None
-        # An EMPTY list is a measured 0 and needs no identity lookup: no PR has
-        # this head, whatever the default branch is called or who owns the base.
-        # Resolving identity first made a second gh call load-bearing for an
-        # answer that did not depend on it — and since `_gh_timeout` floors at
-        # 1.0s once the budget drains, that call is the MORE likely of the two to
-        # fail. The result was None (silent allow) in exactly the state this
-        # prompt exists to report: public branch, no PR, no CI, no leak scan.
+        # DESTINATION FIRST, and before the empty-list shortcut. `gh pr list`
+        # asked the repo GH RESOLVES; if that is not where this push goes, the
+        # answer describes a different repository and an EMPTY result is not
+        # evidence of anything — least of all the measured 0 that turns a silent
+        # allow into an ask.
+        identity = None
+        if push_urls is not None:
+            identity = _base_repo_identity(cwd=cwd)
+            if identity is None or not _urls_name_repo(push_urls, identity[2]):
+                return None
+        # Now an empty list IS a measured 0, and needs no further lookup: no
+        # request has this head, whatever the default branch is called. When the
+        # caller passed no URLs there is nothing to verify against, so the
+        # shortcut still skips the second gh call — which matters because
+        # `_gh_timeout` floors at 1.0s once the budget drains, making that call
+        # the likelier of the two to fail.
         if not rows:
             return 0
         # A response that FILLS the window is a truncated read, not a complete
@@ -7995,18 +8004,11 @@ def _open_pr_count_for_branch(
         # the allow to an ask. Refuse to infer absence from it.
         if len(rows) >= _PR_LIST_WINDOW:
             return None
-        identity = _base_repo_identity(cwd=cwd)
         if identity is None:
-            return None
-        default, base_owner, slug = identity
-        # The count is about the repo THIS PUSH GOES TO; gh answers about the
-        # repo it resolves, and in a fork workflow (`gh repo set-default
-        # upstream`) those are different. Trusting the mismatch would report
-        # "no open PR" forever for a contributor whose requests all live
-        # upstream. Only trust the count when the destination demonstrably IS
-        # the repo gh answered about; otherwise the question is unanswerable.
-        if push_urls is not None and not _urls_name_repo(push_urls, slug):
-            return None
+            identity = _base_repo_identity(cwd=cwd)
+            if identity is None:
+                return None
+        default, base_owner, _canonical = identity
         return sum(
             1
             for pr in rows
@@ -8031,30 +8033,48 @@ _PR_LIST_WINDOW = 100
 rather than counted — see ``_open_pr_count_for_branch``."""
 
 
-def _urls_name_repo(urls: set[str], slug: str) -> bool:
-    """Whether every URL in ``urls`` points at the repository ``slug``.
+def _repo_identity_from_url(url: str) -> tuple[str, str] | None:
+    """``(host, owner/repo)`` for a git remote URL, or None if it has neither.
+
+    Normalises the spellings of one remote so they compare equal: `https://`,
+    bare `git@host:owner/repo`, `ssh://git@host/owner/repo`, and a trailing
+    `.git` or `/` all reduce to the same pair. Any userinfo before the host is
+    dropped, since `git@` is not part of the destination's identity.
+    """
+    raw = url.strip().lower().rstrip("/")
+    raw = raw.removesuffix(".git")
+    if "://" in raw:
+        raw = raw.split("://", 1)[1]
+    elif ":" in raw and "/" not in raw.split(":", 1)[0]:
+        raw = raw.replace(":", "/", 1)            # git@host:owner/repo
+    if "@" in raw.split("/", 1)[0]:
+        raw = raw.split("@", 1)[1]                # strip userinfo
+    parts = [x for x in raw.split("/") if x]
+    if len(parts) < 3:
+        return None
+    host = parts[0].split(":", 1)[0]              # drop any :port
+    return host, "/".join(parts[-2:])
+
+
+def _urls_name_repo(urls: set[str], canonical: str) -> bool:
+    """Whether every URL in ``urls`` names the SAME repository as ``canonical``.
+
+    HOST IS PART OF THE IDENTITY. Comparing only the `owner/repo` tail would
+    make a remote on any other host — an enterprise instance, a mirror, or a
+    look-alike — compare equal to the repository gh answered about, and the
+    count would then be trusted for a destination it never described.
 
     Deliberately ALL rather than ANY: a push that fans out to several remotes is
     only answerable by one count if every destination is the same repository.
-    Matching is on the normalised ``owner/repo`` tail, so the ssh and https
-    spellings of one remote agree.
     """
-    if not urls:
+    want = _repo_identity_from_url(canonical)
+    if not urls or want is None:
         return False
-    want = slug.lower().removesuffix(".git")
-    for url in urls:
-        tail = url.lower().removesuffix(".git").rstrip("/")
-        tail = tail.split("://", 1)[-1]
-        if ":" in tail and "/" not in tail.split(":", 1)[0]:
-            tail = tail.split(":", 1)[1]          # git@host:owner/repo
-        parts = [x for x in tail.split("/") if x]
-        if len(parts) < 2 or "/".join(parts[-2:]) != want:
-            return False
-    return True
+    return all(_repo_identity_from_url(u) == want for u in urls)
 
 
 def _base_repo_identity(cwd: str | None = None) -> tuple[str, str, str] | None:
-    """``(default_branch, owner_login, owner/repo)`` for the repo gh resolves, or None.
+    """``(default_branch, owner_login, canonical_url)`` for the repo gh resolves, or None.
 
     Both facts come from ONE round-trip. They are needed together and each is a
     serialized subprocess on the push path, where the aggregate — not any single
@@ -8066,20 +8086,20 @@ def _base_repo_identity(cwd: str | None = None) -> tuple[str, str, str] | None:
     """
     try:
         result = subprocess.run(
-            ["gh", "repo", "view", "--json", "defaultBranchRef,nameWithOwner",
-             "-q", ".defaultBranchRef.name + \"\\n\" + .nameWithOwner"],
+            ["gh", "repo", "view", "--json", "defaultBranchRef,nameWithOwner,url",
+             "-q", ".defaultBranchRef.name + \"\\n\" + .nameWithOwner + \"\\n\" + .url"],
             capture_output=True, text=True,
             timeout=_gh_timeout(10.0), cwd=cwd or None,
         )
         if result.returncode != 0:
             return None
         parts = result.stdout.strip().split("\n")
-        if len(parts) != 2:
+        if len(parts) != 3:
             return None
-        branch, slug = parts[0].strip(), parts[1].strip()
-        if not branch or "/" not in slug:
+        branch, slug, url = (x.strip() for x in parts)
+        if not branch or "/" not in slug or not url:
             return None
-        return branch, slug.split("/", 1)[0], slug
+        return branch, slug.split("/", 1)[0], url
     except Exception:
         return None
 

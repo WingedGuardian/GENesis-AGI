@@ -81,10 +81,17 @@ def _pr(number: int, base: str = "main", owner: str = "owner") -> dict:
 
 
 def _script_pr_list(
-    fake: FakeRun, rows: list[dict], default: str = "main", owner: str = "owner"
+    fake: FakeRun,
+    rows: list[dict],
+    default: str = "main",
+    owner: str = "owner",
+    host: str = "github.com",
 ) -> None:
     fake.script(("gh", "pr", "list"), 0, json.dumps(rows))
-    fake.script(("gh", "repo", "view"), 0, f"{default}\n{owner}/repo\n")
+    fake.script(
+        ("gh", "repo", "view"), 0,
+        f"{default}\n{owner}/repo\nhttps://{host}/{owner}/repo\n",
+    )
 
 
 def test_zero_open_prs_is_a_measured_zero(monkeypatch) -> None:
@@ -218,7 +225,7 @@ def test_an_unanswerable_lookup_is_none_never_zero(monkeypatch, rc, out) -> None
     # the unscripted-argv AssertionError was what produced the None, so
     # replacing `json.loads(...)` with `[]` left the test green and the
     # malformed-payload path was never the thing under test.
-    fake.script(("gh", "repo", "view"), 0, "main\nowner/repo\n")
+    fake.script(("gh", "repo", "view"), 0, "main\nowner/repo\nhttps://github.com/owner/repo\n")
     monkeypatch.setattr(gpg.subprocess, "run", fake)
     assert gpg._open_pr_count_for_branch("feat/x") is None
 
@@ -519,3 +526,67 @@ def test_a_push_fanning_out_to_two_repos_is_unanswerable(monkeypatch) -> None:
             "https://github.com/someone-else/repo.git",
         },
     ) is None
+
+
+def test_a_remote_on_another_host_does_not_match(monkeypatch) -> None:
+    """HOST is part of a repository's identity.
+
+    Comparing only the `owner/repo` tail makes an enterprise instance, a mirror,
+    or a look-alike host compare EQUAL to the repository gh answered about — and
+    the count would then be trusted for a destination it never described. Found
+    in review after the tail-only matcher shipped.
+    """
+    fake = FakeRun()
+    _script_pr_list(fake, [_pr(7)])
+    monkeypatch.setattr(gpg.subprocess, "run", fake)
+    assert gpg._open_pr_count_for_branch(
+        "feat/x", push_urls={"https://not-github.example/owner/repo.git"}
+    ) is None
+
+
+def test_an_empty_list_from_the_wrong_repo_is_not_a_measured_zero(monkeypatch) -> None:
+    """The destination must gate EVERY answer, the empty one included.
+
+    `gh pr list` asks the repo gh resolves. If the push goes somewhere else, an
+    empty result describes a different repository — it is not evidence that THIS
+    branch has no request, and returning 0 would turn that non-evidence into the
+    value that downgrades a silent allow to an ask.
+    """
+    fake = FakeRun()
+    _script_pr_list(fake, [])
+    monkeypatch.setattr(gpg.subprocess, "run", fake)
+    assert gpg._open_pr_count_for_branch(
+        "feat/x", push_urls={"https://github.com/someone-else/repo.git"}
+    ) is None
+
+
+def test_an_empty_list_from_the_right_repo_is_still_zero(monkeypatch) -> None:
+    """The control: verifying the destination must not disable the measurement."""
+    fake = FakeRun()
+    _script_pr_list(fake, [])
+    monkeypatch.setattr(gpg.subprocess, "run", fake)
+    assert gpg._open_pr_count_for_branch(
+        "feat/x", push_urls={"https://github.com/owner/repo.git"}
+    ) == 0
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://github.com/owner/repo.git",
+        "https://github.com/owner/repo/",
+        "git@github.com:owner/repo.git",
+        "ssh://git@github.com/owner/repo.git",
+        "https://github.com:443/owner/repo",
+    ],
+)
+def test_every_spelling_of_one_remote_compares_equal(monkeypatch, url) -> None:
+    """One remote written five ways is one destination.
+
+    If any spelling failed to match, the count would be unanswerable forever for
+    anyone whose remote used it — a silent, permanent loss of the check.
+    """
+    fake = FakeRun()
+    _script_pr_list(fake, [_pr(7)])
+    monkeypatch.setattr(gpg.subprocess, "run", fake)
+    assert gpg._open_pr_count_for_branch("feat/x", push_urls={url}) == 1
