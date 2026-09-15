@@ -222,6 +222,26 @@ Optimized for specific tasks: speed, video reasoning, and massive memory ingesti
   critical analysis or design review.
 - Software Design: Great at reading code, but bad at writing it from scratch.
 
+### GLM-4 Flash (Zhipu direct)
+
+- **API ID:** `glm-4-flash` (Zhipu/Z.AI GENERAL endpoint `api/paas/v4`)
+- **Role:** Free structured-output fallback, vendor-independent of every other free lane
+- **Context:** 128k tokens
+- **Intelligence Tier:** B
+- **Cost:** Free (Zhipu's published free model)
+- **Free Tier:** see Free Tier Terms below
+
+**Best At (live-probed 2026-09):**
+1. Speed: ~3s round trip on a live probe from a Genesis install.
+2. Clean structured output: returned bare unfenced JSON on the probe —
+   unlike glm-4.5-flash, which reasons by default (10–18s) and fences its
+   JSON even with thinking disabled.
+
+**Worst For:**
+- Deep reasoning / code / math — small-model depth; quality beyond the smoke
+  probe is UNMEASURED on real Genesis workloads (it rides ahead of the paid
+  DeepSeek fallbacks only, until a real success rate is measured).
+
 ### Llama 4 Scout
 
 - **API ID:** `meta-llama/llama-4-scout` (OpenRouter)
@@ -425,6 +445,19 @@ Loose guidance — not prescriptive. Use your judgment based on the task require
 - EU/EEA/UK/Switzerland restricted on free tier
 - Full 1M token context window available on free tier
 - Free tier limits can change without warning (Google cut limits 50-80% in Dec 2025)
+
+### Zhipu / Z.AI (GLM direct)
+- **Endpoint:** `api.z.ai/api/paas/v4` (the GENERAL OpenAI-compatible endpoint;
+  `open.bigmodel.cn/api/paas/v4` is the mainland twin — both measured accepting
+  the same general key on a live completion probe, 2026-09)
+- **Setup:** `ZHIPU_API_KEY` in secrets.env — NOTE this var is shared with the
+  CC roster's glm failover (`cc_roster.yaml`), so it must be a GENERAL-endpoint
+  key, not a coding-plan-only key
+- **Limits:** published ~1K requests/day on flash models — NOT yet verified
+  against a live account; treat as provisional
+- **NEVER** point tooling at the coding-plan endpoints (`api/coding/…`) or use a
+  coding-plan key here: that surface is restricted to officially approved apps
+  and misuse risks the account.
 
 ### Nvidia NIM
 - **Endpoint:** build.nvidia.com

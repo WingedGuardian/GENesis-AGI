@@ -74,6 +74,10 @@ def _install_litellm_exceptions(mock_litellm):
         ("lmstudio", "TBD", "openai/TBD"),
         ("openrouter", "best-free", "openrouter/best-free"),
         ("mistral", "mistral-large-latest", "mistral/mistral-large-latest"),
+        # Zhipu GLM — OpenAI-compatible via base_url; the type name matches
+        # the shipped ZHIPU_API_KEY convention so key resolution needs no
+        # install-local env aliases.
+        ("zhipu", "glm-4-flash", "openai/glm-4-flash"),
     ],
 )
 def test_build_model_string(provider_type, model_id, expected):
