@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -138,11 +139,18 @@ if [[ "$*" == *session_cap* ]]; then
   # "probe unavailable" (exit 1, no output) — the door's documented fail-open.
   [[ -n "${FAKE_CAP_LOG:-}" ]] && echo "$*" >> "$FAKE_CAP_LOG"
   if [[ -z "${FAKE_CAP_REASON:-}" ]]; then exit 1; fi
-  if [[ "$FAKE_CAP_REASON" == "oom_floor" ]]; then
-    echo "RECLAIM"; echo "RAM low (512MB free, need >= 3072MB to start safely)."
-  else
-    echo "ALLOW"; echo "Slot available."
-  fi
+  case "$FAKE_CAP_REASON" in
+    oom_floor)
+      echo "RECLAIM"; echo "RAM low (512MB free, need >= 3072MB to start safely)." ;;
+    cap_reached)
+      # The population already exceeds the cap (the operator lowered it, or an
+      # older build seeded more slots), so even a net-zero rebuild is refused.
+      echo "RECLAIM"; echo "Session cap reached (4/3) — end one to continue." ;;
+    cap_full)
+      echo "DENY"; echo "Session cap reached (4/3)." ;;
+    *)
+      echo "ALLOW"; echo "Slot available." ;;
+  esac
   echo "$FAKE_CAP_REASON"
   exit 0
 fi
@@ -615,9 +623,17 @@ def _poisoned_slot(door, snap: str = _SNAP):
     return run, log
 
 
-def _run_door_pty(run, mode: str, feed: bytes):
+def _run_door_pty(run, mode: str, feed: bytes, before_answer=None):
     """Run the door under a pty so the consent `read < /dev/tty` is reachable,
-    with the EXACT environment the subprocess runner builds."""
+    with the EXACT environment the subprocess runner builds.
+
+    `before_answer` runs once the consent PROMPT has actually been observed on
+    the pty, and only then is the answer written. That lets a test change the
+    world while the 120-second prompt waits — which is the entire reason the
+    prompt is followed by a re-read — and it does so by WATCHING FOR THE PROMPT
+    rather than sleeping, so it neither races on a slow box nor needs a thread
+    (forkpty in a multi-threaded process is a documented deadlock risk).
+    """
     import contextlib
     import pty
     import select
@@ -630,9 +646,27 @@ def _run_door_pty(run, mode: str, feed: bytes):
             os.execve("/bin/bash", ["bash", str(_CC_SLOT), mode], env)  # noqa: S606
         except Exception:  # noqa: BLE001
             os._exit(127)
-    os.write(fd, feed)
     out = b""
     timed_out = False
+    if before_answer is not None:
+        # Wait for the prompt itself; the door must have finished its FIRST
+        # read of cc-slot.env before the callback edits it, or the test would
+        # be asserting about a file the door had not yet loaded.
+        deadline = time.monotonic() + 8
+        while b"[y/N]" not in out and time.monotonic() < deadline:
+            r, _, _ = select.select([fd], [], [], 0.2)
+            if not r:
+                continue
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+        assert b"[y/N]" in out, f"consent prompt never appeared:\n{out!r}"
+        before_answer()
+    os.write(fd, feed)
     while True:
         try:
             r, _, _ = select.select([fd], [], [], 8)
@@ -914,6 +948,119 @@ class TestRebuildAdmitsBeforeDestroying:
             os.environ.pop("_TEST_FAKE_LIVENESS", None)
         assert code == 0, out
         assert run.killlog.read_text().strip() == "$7", out
+
+
+class TestCountBasedRefusalsAlsoKeepTheSlot:
+    """Only ALLOW may proceed — the RAM floor is not the only refusal.
+
+    The first version of this admission check refused on `oom_floor` alone,
+    reasoning that a rebuild is net-zero so the COUNT gate cannot object. That
+    was right about the DELTA and wrong about the ABSOLUTE: when the population
+    ALREADY exceeds the cap (the operator lowered it, an older build seeded more
+    slots), post-kill `existing` is still over and the gate answers DENY or
+    RECLAIM. RECLAIM is not a safe yes either — declining its prompt exits 1
+    with the pane already destroyed.
+    """
+
+    @pytest.mark.parametrize("reason", ["cap_reached", "cap_full"])
+    def test_a_count_refusal_keeps_the_pane(self, door, reason):
+        run, log = _poisoned_slot(door)
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED,POISONED"
+        os.environ["_TEST_FAKE_CAP_REASON"] = reason
+        try:
+            code, out = _run_door_pty(run, "genesis-3-1", b"y\n")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+            os.environ.pop("_TEST_FAKE_CAP_REASON", None)
+        assert code == 0, out
+        assert not run.killlog.exists() or run.killlog.read_text().strip() == "", (
+            f"the slot was destroyed for a replacement the cap would refuse:\n{out}"
+        )
+        assert "NOT rebuilding" in out, out
+        # Named, so the operator can act — a refusal they cannot act on is just
+        # a different way to lose.
+        assert reason in out, out
+        assert "new-session" in log.read_text()
+
+
+class TestDeletedLeverRevertsOnReRead:
+    """Sourcing only OVERLAYS, so a deleted assignment used to survive.
+
+    The 120-second consent prompt is exactly when an operator goes and edits
+    this file — the message they just read is what sent them there. If they
+    REMOVE `GENESIS_CC_PERMISSION_MODE=bypass`, a bare re-source leaves the old
+    value in the shell and the rebuilt pane still launches
+    `--dangerously-skip-permissions`. The loader now clears the known levers
+    and restores the pre-source environment before reading the file.
+    """
+
+    def test_removing_the_permission_lever_disarms_the_rebuild(self, door):
+        run, log = _poisoned_slot(door)
+        env_file = run.home / ".genesis" / "cc-slot.env"
+        env_file.parent.mkdir(parents=True, exist_ok=True)
+        env_file.write_text("GENESIS_CC_PERMISSION_MODE=bypass\n")
+
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED,POISONED"
+        os.environ["_TEST_FAKE_CAP_REASON"] = "ok"
+        try:
+            # The operator goes and edits the file while the prompt waits —
+            # which is exactly what the message they just read sends them to do.
+            code, out = _run_door_pty(
+                run, "genesis-3-1", b"y\n",
+                before_answer=lambda: env_file.write_text("# lever removed\n"),
+            )
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+            os.environ.pop("_TEST_FAKE_CAP_REASON", None)
+        assert code == 0, out
+        launched = log.read_text()
+        assert "new-session" in launched
+        assert "--dangerously-skip-permissions" not in launched, (
+            "the rebuild used a permission mode the operator had already removed:"
+            f"\n{launched}"
+        )
+
+    def test_the_lever_still_applies_while_it_is_present(self, door):
+        """The control. A loader that dropped the lever unconditionally would
+        'pass' the test above while removing the feature."""
+        run, log = _poisoned_slot(door)
+        env_file = run.home / ".genesis" / "cc-slot.env"
+        env_file.parent.mkdir(parents=True, exist_ok=True)
+        env_file.write_text("GENESIS_CC_PERMISSION_MODE=bypass\n")
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED,POISONED"
+        os.environ["_TEST_FAKE_CAP_REASON"] = "ok"
+        try:
+            code, out = _run_door_pty(run, "genesis-3-1", b"y\n")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+            os.environ.pop("_TEST_FAKE_CAP_REASON", None)
+        assert code == 0, out
+        assert "--dangerously-skip-permissions" in log.read_text(), out
+
+
+class TestEveryBoundedGateHasAKillDeadline:
+    """`timeout N` sends TERM and then WAITS; `-k` is what adds the KILL.
+
+    Two of these gates run AFTER the consent rebuild has already destroyed the
+    slot, so a probe that ignores TERM leaves the operator with neither the old
+    pane nor a replacement. Asserted over the whole script rather than the two
+    known sites, so a bounded call added next year inherits the rule.
+    """
+
+    def test_no_timeout_without_kill_after(self):
+        offenders = []
+        for i, line in enumerate(_CC_SLOT.read_text().split("\n"), 1):
+            stripped = line.strip()
+            if stripped.startswith("#") or "timeout " not in stripped:
+                continue
+            for frag in stripped.split("timeout ")[1:]:
+                if not frag.startswith("-k "):
+                    offenders.append(f"{i}: {stripped}")
+                    break
+        assert not offenders, (
+            "a TERM-only bound is not a deadline against a process wedged in "
+            f"uninterruptible I/O: {offenders}"
+        )
 
 
 class TestTruncatedSnapshotNeverAuthorizesAKill:

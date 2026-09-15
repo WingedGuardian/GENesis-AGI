@@ -37,7 +37,9 @@ def test_gate_wired_via_venv_python_with_env_lever(script_text):
 
 def test_notice_captured_from_gate_stdout(script_text):
     # The gate authors the notice (single authority) — cc-slot captures it.
-    assert "_oauth_notice=$(timeout 30 env GENESIS_CC_SLOT_OAUTH=" in script_text
+    # `-k`: a TERM-only bound is not a deadline against a wedged probe, and this
+    # gate can run after the consent rebuild already destroyed the slot.
+    assert "_oauth_notice=$(timeout -k 2 30 env GENESIS_CC_SLOT_OAUTH=" in script_text
     # No hard-coded notice branch in bash anymore.
     assert 'if [ "$_slot_oauth_mode" = "always" ]; then' not in script_text
 

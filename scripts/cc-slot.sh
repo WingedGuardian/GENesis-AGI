@@ -192,18 +192,50 @@ unset TMUX
 # (GENESIS_CC_PERMISSION_MODE) and the OAuth-durability lever
 # (GENESIS_CC_SLOT_OAUTH), both consumed later. `|| echo` keeps a malformed file
 # from aborting the login under `set -e`.
-if [ -f "${HOME}/.genesis/cc-slot.env" ]; then
-    . "${HOME}/.genesis/cc-slot.env" \
-        || echo "cc-slot: warning: ~/.genesis/cc-slot.env sourced with errors (continuing)" >&2
-fi
-# A sourced var is a shell var, NOT exported — EXPORT the cap levers so the Python
-# gate subprocess inherits them. Only export those actually set (an empty export
-# would still read as unset → default, but keep the env clean).
-for _lever in GENESIS_CC_SYSTEM_RESERVE_MB GENESIS_CC_PER_SESSION_MB \
-              GENESIS_CC_OOM_FLOOR_MB GENESIS_CC_EMERGENCY_SLOTS; do
-    [ -n "${!_lever:-}" ] && export "$_lever"
+# Every lever this file may set. Named in ONE place because the consent-rebuild
+# path re-reads the file later and must be able to reproduce "the file's view"
+# exactly — including a lever the operator DELETED, which a bare `.` can never
+# express (sourcing only ever overlays).
+_CC_LEVERS="GENESIS_CC_SYSTEM_RESERVE_MB GENESIS_CC_PER_SESSION_MB \
+GENESIS_CC_OOM_FLOOR_MB GENESIS_CC_EMERGENCY_SLOTS \
+GENESIS_CC_PERMISSION_MODE GENESIS_CC_SLOT_OAUTH"
+
+# The pre-source environment, so a re-read can restore this exact baseline
+# instead of whatever the previous read left behind. Normally EMPTY: an SSH
+# RemoteCommand carries no arbitrary env (sshd's AcceptEnv is LANG/LC_* by
+# default), so in practice the file is the only source. Captured anyway, so the
+# re-read cannot silently drop a value that did arrive this way.
+_CC_ENV_BASELINE=""
+for _lever in $_CC_LEVERS; do
+    [ -n "${!_lever+set}" ] && _CC_ENV_BASELINE="${_CC_ENV_BASELINE}${_lever}=${!_lever}
+"
 done
 unset _lever
+
+# Load (or RE-load) the levers from the file, discarding anything a previous
+# read left in the shell. `unset` first is what makes a DELETED assignment take
+# effect: without it a removed `GENESIS_CC_PERMISSION_MODE=bypass` survives in
+# the shell and the rebuilt pane still launches --dangerously-skip-permissions,
+# moments after the operator removed exactly that line.
+_cc_load_levers() {
+    local _l _k _v
+    for _l in $_CC_LEVERS; do unset "$_l"; done
+    while IFS='=' read -r _k _v; do
+        [ -n "$_k" ] && export "$_k=$_v"
+    done <<< "$_CC_ENV_BASELINE"
+    if [ -f "${HOME}/.genesis/cc-slot.env" ]; then
+        . "${HOME}/.genesis/cc-slot.env" \
+            || echo "cc-slot: warning: ~/.genesis/cc-slot.env sourced with errors (continuing)" >&2
+    fi
+    # A sourced var is a shell var, NOT exported — EXPORT the levers so the
+    # Python gate subprocess inherits them. Only those actually set (an empty
+    # export still reads as unset → default, but keep the env clean).
+    for _l in $_CC_LEVERS; do
+        [ -n "${!_l:-}" ] && export "$_l"
+    done
+    return 0
+}
+_cc_load_levers
 
 # --- Session cap (capacity model; decision delegated to genesis.cc.session_cap) ---
 # The launcher only GATHERS inputs and EXECUTES the returned action; the pure,
@@ -581,15 +613,10 @@ if [[ "$MODE_ARG" != "manual" ]] && tmux has-session -t "=${SESSION_NAME}" 2>/de
                 # --dangerously-skip-permissions moments after the operator
                 # switched it to auto. Consent was given for the disclosed
                 # state; the configuration is part of that state.
-                if [ -f "${HOME}/.genesis/cc-slot.env" ]; then
-                    . "${HOME}/.genesis/cc-slot.env" \
-                        || echo "cc-slot: warning: ~/.genesis/cc-slot.env re-sourced with errors (continuing)" >&2
-                fi
-                for _lever in GENESIS_CC_SYSTEM_RESERVE_MB GENESIS_CC_PER_SESSION_MB \
-                              GENESIS_CC_OOM_FLOOR_MB GENESIS_CC_EMERGENCY_SLOTS; do
-                    [ -n "${!_lever:-}" ] && export "$_lever"
-                done
-                unset _lever
+                # Same loader as the initial read, so a lever the operator
+                # DELETED during the prompt actually reverts to its default
+                # rather than lingering from the first source.
+                _cc_load_levers
 
                 # ADMIT BEFORE DESTROYING — the one precondition read that
                 # belongs before the kill, and deliberately the ONLY one.
@@ -637,10 +664,30 @@ if [[ "$MODE_ARG" != "manual" ]] && tmux has-session -t "=${SESSION_NAME}" 2>/de
                     [ "$_s2_live" -gt 0 ] && _s2_live=$((_s2_live - 1))
                     _s2_cap=$(timeout -k 2 15 "${GENESIS_ROOT}/.venv/bin/python" \
                         -m genesis.cc.session_cap --existing "$_s2_live" 2>/dev/null || true)
-                    if [ "$(printf '%s\n' "$_s2_cap" | sed -n '3p')" = "oom_floor" ]; then
+                    _s2_cap_action=$(printf '%s\n' "$_s2_cap" | sed -n '1p')
+                    _s2_cap_reason=$(printf '%s\n' "$_s2_cap" | sed -n '3p')
+                    # Refuse on ANY verdict that is not ALLOW, not merely the RAM
+                    # floor. The earlier "a rebuild is net-zero so the COUNT gate
+                    # cannot refuse it" was right about the DELTA and wrong about
+                    # the ABSOLUTE: if the population ALREADY exceeds the cap —
+                    # the operator lowered it, or an older build seeded more slots
+                    # — then post-kill `existing` is still over, and the gate
+                    # answers DENY or RECLAIM. RECLAIM is not a safe "yes" either;
+                    # declining its prompt exits 1 with the pane already gone.
+                    #
+                    # An EMPTY action is the probe failing to run, which stays
+                    # FAIL-OPEN (see below). Only a verdict we actually read may
+                    # refuse, or an unreadable probe would become a hard block on
+                    # every rebuild.
+                    if [ -n "$_s2_cap_action" ] && [ "$_s2_cap_action" != "ALLOW" ]; then
                         _s2_rebuild_ok=0
-                        echo "cc-slot: NOT rebuilding ${SESSION_NAME} — RAM is below the floor, so the" >&2
-                        echo "cc-slot: replacement could not start and you would lose the pane for nothing." >&2
+                        if [ "$_s2_cap_reason" = "oom_floor" ]; then
+                            echo "cc-slot: NOT rebuilding ${SESSION_NAME} — RAM is below the floor, so the" >&2
+                            echo "cc-slot: replacement could not start and you would lose the pane for nothing." >&2
+                        else
+                            echo "cc-slot: NOT rebuilding ${SESSION_NAME} — the replacement would not be" >&2
+                            echo "cc-slot: admitted (${_s2_cap_reason:-capacity}), so you would lose the pane for nothing." >&2
+                        fi
                         echo "cc-slot: $(printf '%s\n' "$_s2_cap" | sed -n '2p')" >&2
                         echo "cc-slot: free memory (or end another slot) and reconnect; attaching as-is." >&2
                     fi
@@ -687,7 +734,7 @@ if [[ "$MODE_ARG" != "manual" ]] && tmux has-session -t "=${SESSION_NAME}" 2>/de
     fi
     unset _s2_snap1 _s2_snap2 _s2_verdict _s2_verdict2 _s2_srv1 _s2_srv2 \
           _s2_sid1 _s2_sid2 _s2_sid_ok _s2_proj1 _s2_proj2 _s2_cmds _s2_ans \
-          _s2_rebuild_ok _s2_live _s2_cap 2>/dev/null || true
+          _s2_rebuild_ok _s2_live _s2_cap _s2_cap_action _s2_cap_reason 2>/dev/null || true
 fi
 
 # Numeric slots only: retired cc-manual-<ts>-<pid> sessions from the old wrapper
@@ -712,7 +759,11 @@ else
     _cap_py="${GENESIS_ROOT}/.venv/bin/python"
     _cap_out=""
     if [ -x "$_cap_py" ]; then
-        _cap_out=$(timeout 15 "$_cap_py" -m genesis.cc.session_cap --existing "$existing" 2>/dev/null || true)
+        # `-k`: plain `timeout` sends TERM and then WAITS. This gate can run
+        # AFTER the consent rebuild already killed the slot, so a probe that
+        # ignores TERM leaves the operator with neither the old pane nor the
+        # replacement. Every bounded call on this path carries a kill deadline.
+        _cap_out=$(timeout -k 2 15 "$_cap_py" -m genesis.cc.session_cap --existing "$existing" 2>/dev/null || true)
     fi
     # Protocol: line 1 = action, line 2 = human message, line 3 = machine reason.
     _cap_action=$(printf '%s\n' "$_cap_out" | sed -n '1p')
@@ -854,7 +905,10 @@ if [ "$_SESSION_EXISTS" = "0" ] && [ "$_slot_oauth_mode" != "off" ] && [ "$_HAS_
     # a hung probe. `env` hands the resolved mode across (a plain
     # `GENESIS_CC_SLOT_OAUTH=always` in ~/.genesis/cc-slot.env is a non-exported
     # shell var the subprocess would otherwise never see).
-    if _oauth_notice=$(timeout 30 env GENESIS_CC_SLOT_OAUTH="$_slot_oauth_mode" \
+    # `-k` for the same reason as the capacity gate above: TERM-only is not a
+    # deadline against a probe wedged in uninterruptible I/O, and this one also
+    # runs after a consent rebuild has already destroyed the slot.
+    if _oauth_notice=$(timeout -k 2 30 env GENESIS_CC_SLOT_OAUTH="$_slot_oauth_mode" \
             "${GENESIS_ROOT}/.venv/bin/python" -m genesis.cc.login_gate); then
         # %q so the notice cannot break out of the pane command string (any
         # future notice edit is injection-proof by construction, not by luck).

@@ -15,6 +15,8 @@ from pathlib import Path
 import pytest
 
 from genesis.cc.slot_liveness import (
+    _CLAUDE_NAMES,
+    _INTERPRETERS,
     ALIVE,
     POISONED,
     UNKNOWN,
@@ -183,6 +185,104 @@ class TestClaudeIdentification:
         _mkproc(proc, 1800, "bash", 1)
         _mkproc(proc, 1801, "node", 1800, ["/usr/local/bin/claude", "-p", "x"])
         assert liveness([1800], proc) == POISONED
+
+
+class TestInterpreterWrappedInstalls:
+    """A `node .../cli.js` slot is a LIVE claude, and misreading it is the
+    expensive direction.
+
+    `comm` reads "node" and argv[0] is the interpreter, so a classifier that
+    looks only at those two marks a running session claude-less — and this door
+    then OFFERS TO DESTROY IT. The repo already carries the closed rule set for
+    these shapes in `scripts/check_cc_running_versions.sh`; these lock the port.
+    """
+
+    def test_node_running_the_entry_script_is_alive(self, proc):
+        _mkproc(proc, 2100, "bash", 1)
+        _mkproc(proc, 2101, "node", 2100, ["node", "/opt/cc/cli.js"])
+        assert liveness([2100], proc) == ALIVE
+
+    def test_a_flag_before_the_entry_script_does_not_hide_it(self, proc):
+        """The trap the bash twin documents: testing argv[1] reads
+        `node --enable-source-maps /opt/cc/cli.js` as proof of NOT-claude,
+        because the flag occupies the slot. Node CLIs carry such flags
+        routinely."""
+        _mkproc(proc, 2200, "bash", 1)
+        _mkproc(
+            proc, 2201, "node", 2200,
+            ["node", "--enable-source-maps", "--no-warnings", "/opt/cc/cli.js"],
+        )
+        assert liveness([2200], proc) == ALIVE
+
+    @pytest.mark.parametrize("interp", ["node", "nodejs", "bun", "deno"])
+    def test_every_supported_interpreter_counts(self, proc, interp):
+        _mkproc(proc, 2300, "bash", 1)
+        _mkproc(proc, 2301, interp, 2300, [interp, "/opt/cc/cli.js"])
+        assert liveness([2300], proc) == ALIVE
+
+    def test_claude_code_basename_counts(self, proc):
+        _mkproc(proc, 2400, "bash", 1)
+        _mkproc(proc, 2401, "node", 2400, ["/usr/local/bin/claude-code"])
+        assert liveness([2400], proc) == ALIVE
+
+    def test_an_interpreter_running_something_else_is_not_claude(self, proc):
+        """The control. Widening that swallowed every node process would make a
+        genuinely poisoned slot un-healable, and would 'pass' the tests above."""
+        _mkproc(proc, 2500, "bash", 1)
+        _mkproc(proc, 2501, "node", 2500, ["node", "/srv/app/server.js"])
+        assert liveness([2500], proc) == POISONED
+
+    def test_headless_still_excluded_through_the_interpreter_shape(self, proc):
+        _mkproc(proc, 2600, "bash", 1)
+        _mkproc(proc, 2601, "node", 2600, ["node", "/opt/cc/cli.js", "-p", "x"])
+        assert liveness([2600], proc) == POISONED
+
+
+class TestShapeRulesStayInStepWithTheirTwin:
+    """Two hand-synced copies of one closed set is how the set drifts.
+
+    `scripts/check_cc_running_versions.sh` is the older copy and the reason this
+    gap was found at all. They cannot share code across the language boundary,
+    so they share a TEST: the bash file's `case` patterns are parsed and the
+    Python sets must cover every one. A name added to either side alone fails
+    here instead of silently costing someone a live session.
+    """
+
+    _SH = Path(__file__).resolve().parents[2] / "scripts" / "check_cc_running_versions.sh"
+
+    @staticmethod
+    def _case_names(text: str, func: str) -> set[str]:
+        body = text.split(f"{func}() {{", 1)[1].split("\n}", 1)[0]
+        for line in body.split("\n"):
+            line = line.strip()
+            if line.endswith("return 0 ;;") and "|" in line or line.endswith(") return 0 ;;"):
+                pattern = line.split(")", 1)[0].strip()
+                return {n for n in pattern.split("|") if n}
+        raise AssertionError(f"no case pattern found in {func}")
+
+    def test_the_bash_twin_is_parseable(self):
+        """If this file moves or is rewritten, the parity tests below would
+        silently pass against an empty set. Fail loudly instead."""
+        assert self._SH.exists(), self._SH
+        text = self._SH.read_text()
+        assert self._case_names(text, "is_cc_name"), "no claude names parsed"
+        assert self._case_names(text, "is_interpreter_name"), "no interpreters parsed"
+
+    def test_every_claude_name_the_twin_knows_is_recognized_here(self):
+        names = self._case_names(self._SH.read_text(), "is_cc_name")
+        missing = {n for n in names if n.encode() not in _CLAUDE_NAMES}
+        assert not missing, (
+            f"{missing} is claude to check_cc_running_versions.sh but not to this "
+            "classifier — a live session running it would be offered for destruction"
+        )
+
+    def test_every_interpreter_the_twin_knows_is_recognized_here(self):
+        names = self._case_names(self._SH.read_text(), "is_interpreter_name")
+        missing = {n for n in names if n.encode() not in _INTERPRETERS}
+        assert not missing, (
+            f"{missing} can run the CC entry script per check_cc_running_versions.sh "
+            "but is not recognized here"
+        )
 
 
 class TestInconclusiveWalksSpare:

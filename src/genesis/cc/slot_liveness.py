@@ -89,17 +89,48 @@ def _is_headless(cmdline: bytes | None) -> bool:
 # therefore accepted as an alternative. Both are exact-basename matches, so a
 # neighbouring tool ("claude-wrapper", "claude-monitor") does not qualify;
 # widening here only ever costs a plain attach.
-_CLAUDE_NAMES = frozenset({b"claude", b"claude.exe"})
+_CLAUDE_NAMES = frozenset({b"claude", b"claude.exe", b"claude-code"})
+
+# An interpreter-wrapped install is a REAL shape, not a hypothetical: this repo
+# already carries a closed rule set for it in
+# `scripts/check_cc_running_versions.sh` (`is_cc_name`, `is_interpreter_name`,
+# `cmdline_runs_cc`). Recognising fewer shapes there means a false all-clear;
+# recognising fewer shapes HERE means classifying a live `node .../cli.js`
+# session as claude-less and offering to destroy it. Same sets, worse failure,
+# so they are kept in step by `test_slot_liveness` rather than by good
+# intentions.
+_INTERPRETERS = frozenset({b"node", b"nodejs", b"bun", b"deno"})
+_ENTRY_SCRIPTS = frozenset({b"cli.js"})
+
+
+def _runs_entry_script(args: list[bytes]) -> bool:
+    """True when this interpreter's argv runs the CC entry script.
+
+    The FIRST NON-FLAG token, never argv[1]. Node CLIs routinely carry
+    `--enable-source-maps`, `--no-warnings` or `--max-old-space-size`, and
+    testing argv[1] reads `node --enable-source-maps /opt/cc/cli.js` as proof of
+    NOT-claude because the flag occupies the slot. The bash twin documents the
+    same trap; it cost a reviewer a measurement there.
+    """
+    for arg in args:
+        if arg.startswith(b"-"):
+            continue
+        return arg.rsplit(b"/", 1)[-1] in _ENTRY_SCRIPTS
+    return False
 
 
 def _is_claude(comm: bytes | None, cmdline: bytes | None) -> bool:
     if comm is not None and comm.strip() in _CLAUDE_NAMES:
         return True
-    if cmdline:
-        argv0 = cmdline.split(b"\x00", 1)[0]
-        if argv0:
-            return argv0.rsplit(b"/", 1)[-1] in _CLAUDE_NAMES
-    return False
+    if not cmdline:
+        return False
+    args = [a for a in cmdline.split(b"\x00") if a]
+    if not args:
+        return False
+    base = args[0].rsplit(b"/", 1)[-1]
+    if base in _CLAUDE_NAMES:
+        return True
+    return base in _INTERPRETERS and _runs_entry_script(args[1:])
 
 
 def _ppid_of(proc_root: Path, pid: int) -> int | None:
