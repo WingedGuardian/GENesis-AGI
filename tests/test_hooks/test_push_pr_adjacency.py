@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -53,12 +54,18 @@ class FakeRun:
     def __init__(self) -> None:
         self.scripts: list[tuple[tuple[str, ...], int, str]] = []
         self.calls: list[list[str]] = []
+        # Recorded so a test can assert the TIMEOUT the code passed. Without
+        # this, reverting every `_gh_timeout(...)` to a flat `timeout=10` left
+        # the whole suite green — the deadline-sharing claim was asserted only
+        # by the diff that made it.
+        self.kwargs: list[dict] = []
 
     def script(self, prefix: tuple[str, ...], returncode: int, stdout: str) -> None:
         self.scripts.append((prefix, returncode, stdout))
 
     def __call__(self, args, **kwargs):
         self.calls.append(list(args))
+        self.kwargs.append(dict(kwargs))
         for prefix, rc, out in self.scripts:
             if tuple(args[: len(prefix)]) == prefix:
                 return subprocess.CompletedProcess(args, rc, out, "")
@@ -68,18 +75,136 @@ class FakeRun:
 # ─── _open_pr_count_for_branch: 0 is a measurement, None is an admission ─────
 
 
+def _pr(number: int, base: str = "main", owner: str = "owner") -> dict:
+    return {
+        "number": number,
+        "baseRefName": base,
+        "isCrossRepository": owner != "owner",
+        "headRepositoryOwner": {"login": owner},
+    }
+
+
+def _script_pr_list(
+    fake: FakeRun, rows: list[dict], default: str = "main", owner: str = "owner"
+) -> None:
+    fake.script(("gh", "pr", "list"), 0, json.dumps(rows))
+    fake.script(("gh", "repo", "view"), 0, f"{default}\n{owner}/repo\n")
+
+
 def test_zero_open_prs_is_a_measured_zero(monkeypatch) -> None:
     fake = FakeRun()
-    fake.script(("gh", "pr", "list"), 0, "[]")
+    _script_pr_list(fake, [])
     monkeypatch.setattr(gpg.subprocess, "run", fake)
     assert gpg._open_pr_count_for_branch("feat/x") == 0
 
 
 def test_an_open_pr_is_counted(monkeypatch) -> None:
     fake = FakeRun()
-    fake.script(("gh", "pr", "list"), 0, json.dumps([{"number": 7}]))
+    _script_pr_list(fake, [_pr(7)])
     monkeypatch.setattr(gpg.subprocess, "run", fake)
     assert gpg._open_pr_count_for_branch("feat/x") == 1
+
+
+def test_a_pr_onto_a_non_default_base_does_not_count(monkeypatch) -> None:
+    """A stacked PR contributes NO CI, so it must not silence the prompt.
+
+    ci.yml filters pull_request to the default branch, so a request onto a
+    feature base runs no CI and no leak scan at all (issue #2035). Counting it
+    would report covered for a branch in exactly the state this prompt exists
+    to surface.
+    """
+    fake = FakeRun()
+    _script_pr_list(fake, [_pr(7, base="feat/parent")])
+    monkeypatch.setattr(gpg.subprocess, "run", fake)
+    assert gpg._open_pr_count_for_branch("feat/x") == 0
+
+
+def test_another_owners_fork_pr_does_not_answer_for_ours(monkeypatch) -> None:
+    """The head filter matches a bare NAME — `gh pr list --head` documents no
+    owner-qualified form — so a DIFFERENT owner's fork carrying an
+    identically-named branch would otherwise be counted as our coverage.
+
+    Filtered on the head repo's OWNER, not on `isCrossRepository`: that flag is
+    true for any head-repo != base-repo, which in a fork-based clone is every
+    legitimate PR the contributor opens.
+    """
+    fake = FakeRun()
+    _script_pr_list(fake, [_pr(7, owner="someone-else")])
+    monkeypatch.setattr(gpg.subprocess, "run", fake)
+    assert gpg._open_pr_count_for_branch("feat/x") == 0
+
+
+def test_our_own_fork_pr_still_counts(monkeypatch) -> None:
+    """The control for the test above, and the bug it replaced.
+
+    `isCrossRepository` would have excluded this row. In a fork-based clone,
+    where gh resolves the base repo to the upstream, EVERY PR the contributor
+    opens is cross-repository — so the count would read 0 forever, the prompt
+    would fire on every re-push, and it would assert something false: a fork PR
+    onto the default branch does run CI and the leak scan.
+    """
+    fake = FakeRun()
+    _script_pr_list(fake, [_pr(7, owner="me")], owner="me")
+    monkeypatch.setattr(gpg.subprocess, "run", fake)
+    assert gpg._open_pr_count_for_branch("feat/x") == 1
+
+
+def test_a_non_main_default_branch_is_honoured(monkeypatch) -> None:
+    """Resolved live rather than assumed. Without this, comparing `baseRefName`
+    to a hardcoded "main" passes every other test in the file."""
+    fake = FakeRun()
+    _script_pr_list(fake, [_pr(7, base="develop")], default="develop")
+    monkeypatch.setattr(gpg.subprocess, "run", fake)
+    assert gpg._open_pr_count_for_branch("feat/x") == 1
+
+
+def test_an_empty_list_is_zero_even_when_identity_is_unresolvable(monkeypatch) -> None:
+    """No PR has this head — that answer does not depend on who owns the base
+    or what the default branch is called.
+
+    Found by audit: resolving identity FIRST made a second gh call load-bearing
+    for a result independent of it, and `_gh_timeout` floors at 1.0s once the
+    budget drains, so that call is the likelier of the two to fail. The result
+    was None — the silent allow — in precisely the state this prompt reports:
+    public branch, no PR, no CI, no leak scan.
+    """
+    fake = FakeRun()
+    fake.script(("gh", "pr", "list"), 0, "[]")
+    fake.script(("gh", "repo", "view"), 1, "")
+    monkeypatch.setattr(gpg.subprocess, "run", fake)
+    assert gpg._open_pr_count_for_branch("feat/x") == 0
+
+
+def test_the_probes_take_their_timeout_from_the_shared_deadline(monkeypatch) -> None:
+    """Per-call caps cannot bound a SEQUENCE; the shared deadline can.
+
+    Asserts the value actually passed to subprocess, because reverting every
+    `_gh_timeout(...)` to a flat `timeout=10` otherwise leaves the suite green.
+    """
+    fake = FakeRun()
+    _script_pr_list(fake, [_pr(7)])
+    monkeypatch.setattr(gpg.subprocess, "run", fake)
+    monkeypatch.setattr(gpg, "_merge_deadline", time.monotonic() + 2.0)
+    gpg._open_pr_count_for_branch("feat/x")
+    assert fake.kwargs, "no subprocess ran"
+    for call_args, call_kwargs in zip(fake.calls, fake.kwargs, strict=True):
+        assert "timeout" in call_kwargs, call_args
+        # Under a 2s deadline every probe must be clamped well below its own
+        # 10s cap — that clamping IS the shared budget.
+        assert call_kwargs["timeout"] <= 2.0 + 0.5, (call_args, call_kwargs)
+
+
+def test_an_unresolvable_default_branch_is_none_not_zero(monkeypatch) -> None:
+    """Guessing a default here would turn a failed lookup into a confident
+    count, the same collapse the None/0 split exists to prevent."""
+    fake = FakeRun()
+    # A NON-empty list: rows exist but cannot be attributed to a base or an
+    # owner, so the question is genuinely unanswerable. (An empty list needs no
+    # identity at all — see the test above.)
+    fake.script(("gh", "pr", "list"), 0, json.dumps([_pr(7)]))
+    fake.script(("gh", "repo", "view"), 1, "")
+    monkeypatch.setattr(gpg.subprocess, "run", fake)
+    assert gpg._open_pr_count_for_branch("feat/x") is None
 
 
 @pytest.mark.parametrize(
@@ -93,6 +218,11 @@ def test_an_unanswerable_lookup_is_none_never_zero(monkeypatch, rc, out) -> None
     would let the unchecked-public-branch state stay silent forever."""
     fake = FakeRun()
     fake.script(("gh", "pr", "list"), rc, out)
+    # Script the identity call too. Without it the `bad-json` case was BLIND:
+    # the unscripted-argv AssertionError was what produced the None, so
+    # replacing `json.loads(...)` with `[]` left the test green and the
+    # malformed-payload path was never the thing under test.
+    fake.script(("gh", "repo", "view"), 0, "main\nowner/repo\n")
     monkeypatch.setattr(gpg.subprocess, "run", fake)
     assert gpg._open_pr_count_for_branch("feat/x") is None
 
@@ -167,8 +297,8 @@ def test_the_listing_is_bounded(monkeypatch) -> None:
 # helpers never called (the blind-test shape this repo keeps re-learning).
 
 
-def _run_guard_on_push(monkeypatch, tmp_path, fake: FakeRun, capsys):
-    """Drive main() with a `git push` payload from a real repo on `feat/x`."""
+def _run_guard_on_push(monkeypatch, tmp_path, fake: FakeRun, capsys, command="git push"):
+    """Drive main() with a push payload from a real repo on `feat/x`."""
     repo = tmp_path / "repo"
     repo.mkdir()
     for args in (
@@ -188,7 +318,7 @@ def _run_guard_on_push(monkeypatch, tmp_path, fake: FakeRun, capsys):
 
     payload = {
         "tool_name": "Bash",
-        "tool_input": {"command": "git push"},
+        "tool_input": {"command": command},
         "cwd": str(repo),
     }
     monkeypatch.setattr(gpg.sys, "stdin", __import__("io").StringIO(json.dumps(payload)))
@@ -301,3 +431,227 @@ def test_a_containment_timeout_degrades_to_empty(monkeypatch) -> None:
 
     monkeypatch.setattr(gpg.subprocess, "run", boom)
     assert gpg._prs_already_containing_head() == []
+
+
+def test_a_commit_in_the_same_command_skips_the_duplicate_probe(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """`git commit -m x && git push` is the ordinary first-publication shape.
+
+    The hook runs BEFORE any of the command executes, so HEAD at this moment is
+    the PARENT of the tip that will actually be pushed. A note keyed on that
+    HEAD would name a PR for the wrong commit, inside an enrichment whose whole
+    purpose is preventing a mistaken identity — so the probe is skipped rather
+    than answered wrongly.
+
+    Drives the BARE push form on purpose: `git push -u origin HEAD` resolves the
+    branch to the literal "HEAD" and never reaches this block at all, so a test
+    written against that form passes without observing anything.
+    """
+    fake = FakeRun()
+    calls = []
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: False)
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(
+        gpg,
+        "_prs_already_containing_head",
+        lambda *a, **k: (calls.append(1), [(1586, "closed")])[1],
+    )
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+    rc, out, err = _run_guard_on_push(
+        monkeypatch, tmp_path, fake, capsys,
+        command="git commit -m wip && git push",
+    )
+    assert rc == 0
+    doc = json.loads(out)
+    reason = doc["hookSpecificOutput"]["permissionDecisionReason"]
+    assert doc["hookSpecificOutput"]["permissionDecision"] == "ask"
+    # Both halves: the probe was not run, and nothing about it reached the user.
+    assert calls == [], "the duplicate probe ran against a pre-commit HEAD"
+    assert "#1586" not in reason and "duplicate" not in reason, reason
+
+
+def test_the_probe_sees_an_armed_deadline_on_the_push_path(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """Per-call caps cannot bound a SEQUENCE of probes.
+
+    The lookups on this path run one after another, so three 10s caps permit
+    30s. A PreToolUse hook that overruns its registration is SIGKILLed, and a
+    killed hook fails OPEN — the tool runs and the gate stack disengages. The
+    shared deadline makes each probe fail FAST into its own fail-safe once the
+    budget is spent.
+
+    Asserted AT PROBE TIME, not after main() returns: a later merge-gate site
+    arms the same global regardless, so an after-the-fact read is green whether
+    or not this path ever armed anything.
+    """
+    fake = FakeRun()
+    seen = {}
+
+    def _count(*a, **k):
+        seen["deadline"] = gpg._merge_deadline
+        return 1  # keep the silent allow; the arming is what is under test
+
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", _count)
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+    monkeypatch.setattr(gpg, "_merge_deadline", None)
+
+    before = time.monotonic()
+    rc, out, err = _run_guard_on_push(monkeypatch, tmp_path, fake, capsys)
+    assert rc == 0
+    assert "deadline" in seen, "the PR-count probe never ran"
+    assert seen["deadline"] is not None, "probe ran with the deadline unarmed"
+    # Bounded in both directions: armed by THIS invocation, within the budget.
+    assert before <= seen["deadline"] <= time.monotonic() + gpg._MERGE_GATE_BUDGET_S
+
+
+def test_a_pr_close_in_the_same_command_cancels_the_silent_allow(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """`gh pr close <n> && git push` reads a state the command is about to void.
+
+    The hook runs before any segment executes, so the count sees the PR still
+    open and keeps the re-push allow — then the command closes it and pushes
+    into exactly the PR-less, CI-less state the ask exists to report. A count
+    cannot see a close that has not happened, so the command's SHAPE has to.
+    """
+    fake = FakeRun()
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    # A still-open PR: the ONLY reason to ask here is the close in the command.
+    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 1)
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+    rc, out, err = _run_guard_on_push(
+        monkeypatch, tmp_path, fake, capsys,
+        command="gh pr close 123 && git push",
+    )
+    assert rc == 0
+    doc = json.loads(out)
+    reason = doc["hookSpecificOutput"]["permissionDecisionReason"]
+    assert doc["hookSpecificOutput"]["permissionDecision"] == "ask", out
+    assert "CLOSES a pull request" in reason, reason
+
+
+def test_an_ordinary_repush_with_an_open_pr_is_still_silent(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """The control for the test above: without a close in the command, the
+    healthy re-push keeps its silence. Otherwise the new branch would repeal
+    the first-push-only relaxation for everyone."""
+    fake = FakeRun()
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 1)
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+    rc, out, err = _run_guard_on_push(monkeypatch, tmp_path, fake, capsys)
+    assert rc == 0
+    if out.strip():
+        doc = json.loads(out)
+        assert doc["hookSpecificOutput"]["permissionDecision"] != "ask", out
+
+
+def test_an_explicit_head_push_still_gets_the_duplicate_note(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """`git push -u origin HEAD` resolves the branch to the literal "HEAD" and
+    took the plain-prompt path, so the duplicate detector never ran on the most
+    common first-publication form. The enrichment was coupled to the auto-ALLOW
+    predicate, which refuses any refspec it cannot vouch for — the right posture
+    for an authorization, the wrong one for a note on a prompt shown anyway.
+    """
+    fake = FakeRun()
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: False)
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(gpg, "_prs_already_containing_head", lambda *a, **k: [(1586, "closed")])
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+    rc, out, err = _run_guard_on_push(
+        monkeypatch, tmp_path, fake, capsys,
+        command="git push -u origin HEAD",
+    )
+    assert rc == 0
+    doc = json.loads(out)
+    reason = doc["hookSpecificOutput"]["permissionDecisionReason"]
+    assert doc["hookSpecificOutput"]["permissionDecision"] == "ask"
+    assert "#1586" in reason and "duplicate" in reason, reason
+
+
+def test_a_head_to_new_name_push_gets_the_duplicate_note(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """`HEAD:<new-name>` IS the second-name publication this detector exists to
+    catch, stated in one command."""
+    fake = FakeRun()
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: False)
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(gpg, "_prs_already_containing_head", lambda *a, **k: [(1586, "closed")])
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+    rc, out, err = _run_guard_on_push(
+        monkeypatch, tmp_path, fake, capsys,
+        command="git push origin HEAD:feat/second-name",
+    )
+    assert rc == 0
+    doc = json.loads(out)
+    reason = doc["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "#1586" in reason, reason
+
+
+def test_a_push_of_some_other_branch_gets_no_duplicate_note(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """The control for the widening: the note keys on HEAD, so a push whose
+    SOURCE is not HEAD must not carry it — that would name a PR for a commit
+    the command is not publishing."""
+    fake = FakeRun()
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: False)
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(gpg, "_prs_already_containing_head", lambda *a, **k: [(1586, "closed")])
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+    rc, out, err = _run_guard_on_push(
+        monkeypatch, tmp_path, fake, capsys,
+        command="git push origin other-branch:other-branch",
+    )
+    assert rc == 0
+    doc = json.loads(out)
+    reason = doc["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "#1586" not in reason, reason
+
+
+def test_a_commit_after_the_push_does_not_silence_the_note(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """Only a commit BEFORE the push can change the tip it publishes.
+
+    `git push && git commit -m after` was silencing a note that was correct,
+    because the scan looked at every segment rather than the preceding ones.
+    """
+    fake = FakeRun()
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: False)
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(gpg, "_prs_already_containing_head", lambda *a, **k: [(1586, "closed")])
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+    rc, out, err = _run_guard_on_push(
+        monkeypatch, tmp_path, fake, capsys,
+        command="git push && git commit -m after",
+    )
+    assert rc == 0
+    doc = json.loads(out)
+    reason = doc["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "#1586" in reason, reason

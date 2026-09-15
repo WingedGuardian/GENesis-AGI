@@ -7672,6 +7672,96 @@ def _push_config_is_simple(remote: str | None, cwd: str | None = None) -> bool:
     return not (rc == 0 and out == "true")
 
 
+def _push_ref_positionals(argv: list[str]) -> list[str] | None:
+    """The positional tokens of a ``git push`` segment, or None if it is not a
+    plain ref-set-neutral push.
+
+    Extracted from ``_push_targets_current_branch`` so the duplicate-name
+    ENRICHMENT can reuse the same parsing without inheriting that predicate's
+    allowlist verdict. The two callers need different answers from the same
+    scan: one decides whether a push may be AUTO-ALLOWED (and so must refuse
+    every unrecognised form), the other decides whether a note is worth adding
+    to a prompt that is shown either way.
+
+    None means "a flag here changes the ref set" (``--all``, ``--tags``,
+    ``--delete``, ``--mirror``, ``--stdin``, ``--repo``, a ``+refspec`` force
+    shorthand, or anything unknown). Both callers treat None as a refusal.
+    """
+    i = 1
+    # Advance past git global options to the `push` token.
+    i = 1
+    while i < len(argv):
+        t = argv[i]
+        if t in _GIT_GLOBAL_VALUE_FLAGS:
+            i += 2
+            continue
+        if t.startswith("-"):
+            i += 1
+            continue
+        break
+    if i >= len(argv) or argv[i] != "push":
+        return None
+    i += 1
+    positionals: list[str] = []
+    while i < len(argv):
+        t = argv[i]
+        if t in _PUSH_SAFE_VALUE_FLAGS:
+            i += 2  # ref-neutral value flag: skip the flag and its value token
+            continue
+        if t.startswith("--"):
+            base = t.split("=", 1)[0]
+            if "=" in t and base in _PUSH_SAFE_VALUE_FLAGS:
+                i += 1  # --push-option=value etc.
+                continue
+            if "=" not in t and base in _PUSH_SAFE_LONG_FLAGS:
+                i += 1
+                continue
+            return None  # unknown/broadening long flag (or a =form of a no-value flag)
+        if t.startswith("+"):
+            return None  # +<refspec> force shorthand
+        if t.startswith("-") and len(t) > 1:
+            # Short single/bundle — every letter must be ref-neutral. An `o` starts a
+            # glued push-option value, so the rest of the token is that value.
+            safe = True
+            for ch in t[1:]:
+                if ch == "o":
+                    break
+                if ch not in _PUSH_SAFE_SHORT_LETTERS:
+                    safe = False
+                    break
+            if not safe:
+                return None
+            i += 1
+            continue
+        positionals.append(t)
+        i += 1
+    return positionals
+
+
+def _push_source_is_head(seg) -> bool:
+    """Whether this push's SOURCE ref is the current ``HEAD`` commit.
+
+    Wider than ``_push_targets_current_branch`` on purpose. That predicate gates
+    an auto-ALLOW, so it refuses an explicit refspec it cannot vouch for. This
+    one gates an ENRICHMENT on a prompt shown regardless, and the forms it adds
+    are exactly the ones the duplicate-name problem takes: `git push -u origin
+    HEAD` publishes the current commit under the branch's own name, and
+    `HEAD:<new-name>` IS the second-name publication this detector exists to
+    catch — both previously fell to the plain prompt with no note at all.
+
+    True for: a bare push, `<remote>`, `<remote> HEAD`, `<remote> HEAD:<dst>`.
+    False for anything that pushes a ref other than HEAD, and for any form
+    ``_push_ref_positionals`` refuses.
+    """
+    positionals = _push_ref_positionals(getattr(seg, "argv", None) or [])
+    if positionals is None or len(positionals) >= 3:
+        return False
+    if len(positionals) < 2:
+        return True  # bare `git push` / `git push <remote>`: source is HEAD
+    src = positionals[1].split(":", 1)[0]
+    return src == "HEAD"
+
+
 def _push_targets_current_branch(
     seg, cur: str | None, remote: str | None, cwd: str | None = None
 ) -> bool:
@@ -7698,54 +7788,9 @@ def _push_targets_current_branch(
     """
     if not cur:
         return False
-    argv = getattr(seg, "argv", None) or []
-    # Advance past git global options to the `push` token.
-    i = 1
-    while i < len(argv):
-        t = argv[i]
-        if t in _GIT_GLOBAL_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-"):
-            i += 1
-            continue
-        break
-    if i >= len(argv) or argv[i] != "push":
+    positionals = _push_ref_positionals(getattr(seg, "argv", None) or [])
+    if positionals is None:
         return False
-    i += 1
-    positionals: list[str] = []
-    while i < len(argv):
-        t = argv[i]
-        if t in _PUSH_SAFE_VALUE_FLAGS:
-            i += 2  # ref-neutral value flag: skip the flag and its value token
-            continue
-        if t.startswith("--"):
-            base = t.split("=", 1)[0]
-            if "=" in t and base in _PUSH_SAFE_VALUE_FLAGS:
-                i += 1  # --push-option=value etc.
-                continue
-            if "=" not in t and base in _PUSH_SAFE_LONG_FLAGS:
-                i += 1
-                continue
-            return False  # unknown/broadening long flag (or a =form of a no-value flag)
-        if t.startswith("+"):
-            return False  # +<refspec> force shorthand
-        if t.startswith("-") and len(t) > 1:
-            # Short single/bundle — every letter must be ref-neutral. An `o` starts a
-            # glued push-option value, so the rest of the token is that value.
-            safe = True
-            for ch in t[1:]:
-                if ch == "o":
-                    break
-                if ch not in _PUSH_SAFE_SHORT_LETTERS:
-                    safe = False
-                    break
-            if not safe:
-                return False
-            i += 1
-            continue
-        positionals.append(t)
-        i += 1
     if len(positionals) >= 3:
         return False  # multiple refspecs → not a single plain current-branch update
     if len(positionals) == 2:
@@ -7909,18 +7954,93 @@ def _open_pr_count_for_branch(branch: str, cwd: str | None = None) -> int | None
     question could not be answered" (no gh, no network, no auth). Callers treat
     None as the status quo, never as 0: this feeds a HYGIENE prompt, not a
     security verdict, and the first-push approval it modulates already happened.
-    Bounded by a 10s timeout inside the hook's budget, like the ls-remote probe
-    above.
+
+    COUNTS ONLY PRs TARGETING THE DEFAULT BRANCH, because the question is "does
+    CI run on this branch" and `ci.yml` triggers on `pull_request` filtered to
+    `main`. A PR onto a non-default base contributes no CI and no leak scan at
+    all (issue #2035), so counting it would silence the prompt in exactly the
+    state the prompt exists to report.
+
+    AND ONLY PRs FROM THIS REPOSITORY. `gh pr list --head` matches a bare branch
+    NAME and documents no `owner:branch` form, so a fork's PR from an
+    identically-named branch would otherwise answer for ours.
+
+    Subprocess timeout comes from ``_gh_timeout`` so these probes share the
+    push-path deadline rather than each holding an independent 10s — the
+    aggregate is what SIGKILLs a hook, and a killed PreToolUse hook fails OPEN.
     """
     try:
         args = ["gh", "pr", "list", "--head", branch, "--state", "open",
-                "--json", "number", "--limit", "10"]
+                "--json", "number,baseRefName,headRepositoryOwner,isCrossRepository",
+                "--limit", "10"]
         result = subprocess.run(
-            args, capture_output=True, text=True, timeout=10, cwd=cwd or None
+            args, capture_output=True, text=True,
+            timeout=_gh_timeout(10.0), cwd=cwd or None,
         )
         if result.returncode != 0:
             return None
-        return len(json.loads(result.stdout))
+        rows = json.loads(result.stdout)
+        if not isinstance(rows, list):
+            return None
+        # An EMPTY list is a measured 0 and needs no identity lookup: no PR has
+        # this head, whatever the default branch is called or who owns the base.
+        # Resolving identity first made a second gh call load-bearing for an
+        # answer that did not depend on it — and since `_gh_timeout` floors at
+        # 1.0s once the budget drains, that call is the MORE likely of the two to
+        # fail. The result was None (silent allow) in exactly the state this
+        # prompt exists to report: public branch, no PR, no CI, no leak scan.
+        if not rows:
+            return 0
+        identity = _base_repo_identity(cwd=cwd)
+        if identity is None:
+            return None
+        default, base_owner = identity
+        return sum(
+            1
+            for pr in rows
+            if isinstance(pr, dict)
+            and pr.get("baseRefName") == default
+            # Filter by the head repo's OWNER, not `isCrossRepository`. The
+            # concern is SOMEONE ELSE'S fork answering for us, because
+            # `gh pr list --head` matches a bare branch name. `isCrossRepository`
+            # is true for any head-repo != base-repo, which in a fork-based
+            # clone is EVERY legitimate PR the contributor opens — the count
+            # would read 0 forever and the prompt would fire on every re-push
+            # while telling the user something false, since a fork PR onto the
+            # default branch does run CI.
+            and (pr.get("headRepositoryOwner") or {}).get("login") == base_owner
+        )
+    except Exception:
+        return None
+
+
+def _base_repo_identity(cwd: str | None = None) -> tuple[str, str] | None:
+    """``(default_branch, owner_login)`` for the repo gh resolves here, or None.
+
+    Both facts come from ONE round-trip. They are needed together and each is a
+    serialized subprocess on the push path, where the aggregate — not any single
+    call — is what overruns the hook's registration.
+
+    None is propagated rather than defaulted to "main": the caller's contract is
+    that an unanswerable question keeps the status quo, and guessing the base
+    name here would turn a failed lookup into a confident count.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "repo", "view", "--json", "defaultBranchRef,nameWithOwner",
+             "-q", ".defaultBranchRef.name + \"\\n\" + .nameWithOwner"],
+            capture_output=True, text=True,
+            timeout=_gh_timeout(10.0), cwd=cwd or None,
+        )
+        if result.returncode != 0:
+            return None
+        parts = result.stdout.strip().split("\n")
+        if len(parts) != 2:
+            return None
+        branch, slug = parts[0].strip(), parts[1].strip()
+        if not branch or "/" not in slug:
+            return None
+        return branch, slug.split("/", 1)[0]
     except Exception:
         return None
 
@@ -7943,20 +8063,20 @@ def _prs_already_containing_head(cwd: str | None = None) -> list[tuple[int, str]
     try:
         head = subprocess.run(
             ["git"] + (["-C", cwd] if cwd else []) + ["rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=_gh_timeout(10.0),
         )
         sha = head.stdout.strip()
         if head.returncode != 0 or not sha:
             return []
         slug = subprocess.run(
             ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
-            capture_output=True, text=True, timeout=10, cwd=cwd or None,
+            capture_output=True, text=True, timeout=_gh_timeout(10.0), cwd=cwd or None,
         )
         if slug.returncode != 0 or not slug.stdout.strip():
             return []
         result = subprocess.run(
             ["gh", "api", f"repos/{slug.stdout.strip()}/commits/{sha}/pulls"],
-            capture_output=True, text=True, timeout=10, cwd=cwd or None,
+            capture_output=True, text=True, timeout=_gh_timeout(10.0), cwd=cwd or None,
         )
         if result.returncode != 0:
             return []
@@ -8311,6 +8431,19 @@ def _run_merge_and_push_gates() -> int:
         # step-back (triage / mechanism / state-space) before round N+1.
         # Fail-open inside the check; '# escalation-ack' is the conscious
         # continue after a fresh user decision.
+        # ARM THE SHARED SUBPROCESS DEADLINE, once, for every gate below.
+        # It was previously armed only as a SIDE EFFECT of the escalation gate,
+        # which is documented fail-open, wraps its whole body in `except
+        # Exception: return`, and has already once had a top-of-function
+        # short-circuit that returned before the arming. The push path's
+        # wall-clock safety must not depend on another gate's internals: without
+        # a deadline the probes below are five sequential 10s caps plus an
+        # ls-remote, over the hook's registration — and a SIGKILLed PreToolUse
+        # hook fails OPEN, disengaging every gate in the stack.
+        global _merge_deadline
+        if _merge_deadline is None:
+            _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
+
         esc_block, esc_msg = _check_codex_round_escalation(segs)
         if esc_block:
             print(esc_msg, file=sys.stderr)
@@ -8468,7 +8601,25 @@ def _run_merge_and_push_gates() -> int:
                         # later, ancestry is gone and the survivor reads as
                         # unmerged work forever). Say so IN the prompt the user
                         # is about to answer; enrichment only, never a verdict.
-                        dups = _prs_already_containing_head(cwd=pcwd)
+                        # SKIP when an earlier segment of this command creates
+                        # the commit being pushed. `git commit -m x && git push`
+                        # is the ordinary first-publication shape, and the hook
+                        # runs BEFORE any of it executes — so HEAD here is the
+                        # parent of the tip that will actually be pushed, and a
+                        # note about it would describe the wrong commit.
+                        # Silence beats a confident wrong answer in an
+                        # enrichment that exists to prevent a mistaken identity.
+                        # Only segments BEFORE the push can change the tip it
+                        # will publish. `git push && git commit -m after` would
+                        # otherwise silence a note that was correct.
+                        creates_commit = any(
+                            s.exe == "git" and git_subcommand(s.argv) == "commit"
+                            for s in segs[: segs.index(push_segs[0])]
+                        )
+                        dups = (
+                            [] if creates_commit
+                            else _prs_already_containing_head(cwd=pcwd)
+                        )
                         if dups:
                             listing = ", ".join(f"#{n} ({s})" for n, s in dups)
                             ask_reason += (
@@ -8488,7 +8639,27 @@ def _run_merge_and_push_gates() -> int:
                     # branch, not a security boundary, so an unanswerable
                     # question must not manufacture prompts on every network
                     # blip.
-                    if push_allow_reason and _open_pr_count_for_branch(cur, cwd=pcwd) == 0:
+                    # An earlier segment that CLOSES a PR invalidates the state
+                    # this allow is read from. The hook runs before any of the
+                    # command executes, so `gh pr close <n> && git push` sees the
+                    # PR still open, keeps the silent allow, and then publishes
+                    # into exactly the PR-less state the ask exists to report.
+                    # The count cannot see a close that has not happened yet, so
+                    # the command's own shape has to.
+                    closes_pr = any(
+                        gh_pr_subcommand(s.argv) == "close" for s in segs
+                    )
+                    if push_allow_reason and closes_pr:
+                        push_allow_reason = None
+                        ask_reason = (
+                            f"re-push to '{cur}': an earlier step in this command "
+                            f"CLOSES a pull request, so the push that follows may "
+                            f"land on a branch with no open PR — outside CI and "
+                            f"the leak scan. Run the close and the push as "
+                            f"separate commands so each is judged on the state it "
+                            f"actually runs in."
+                        )
+                    elif push_allow_reason and _open_pr_count_for_branch(cur, cwd=pcwd) == 0:
                         push_allow_reason = None
                         ask_reason = (
                             f"re-push to '{cur}': this branch is PUBLIC but has "
@@ -8501,6 +8672,35 @@ def _run_merge_and_push_gates() -> int:
                         f"git push needs your approval before publishing externally "
                         f"(target: {branch or 'default'})."
                     )
+                    # The duplicate-name note belongs here too. It used to hang
+                    # off the auto-ALLOW predicate, which refuses any explicit
+                    # refspec it cannot vouch for — so `git push -u origin HEAD`
+                    # and `HEAD:<new-name>` fell to this plain prompt with no
+                    # note at all, and `HEAD:<new-name>` IS the second-name
+                    # publication the detector exists to catch. An enrichment is
+                    # not an authorization: it decorates a prompt shown either
+                    # way, so it does not need that predicate's posture — only a
+                    # source ref it can resolve.
+                    if not pcwd_unknown and _push_source_is_head(push_segs[0]):
+                        # Only segments BEFORE the push can change the tip it
+                        # will publish. `git push && git commit -m after` would
+                        # otherwise silence a note that was correct.
+                        creates_commit = any(
+                            s.exe == "git" and git_subcommand(s.argv) == "commit"
+                            for s in segs[: segs.index(push_segs[0])]
+                        )
+                        dups = (
+                            [] if creates_commit
+                            else _prs_already_containing_head(cwd=pcwd)
+                        )
+                        if dups:
+                            listing = ", ".join(f"#{n} ({st})" for n, st in dups)
+                            ask_reason += (
+                                f" NOTE: this exact commit already belongs to "
+                                f"{listing} — publishing it under a new branch "
+                                f"name creates a duplicate of work that PR "
+                                f"already carries."
+                            )
 
         # ── git merge into main ─────────────────────────────────────
         # Worktree-aware AND compound-aware: EVERY git-merge in the command is
@@ -8573,7 +8773,8 @@ def _run_merge_and_push_gates() -> int:
             # Idempotent: the escalation gate may have already armed it for the same
             # command (round-6 P1) — reuse that deadline so the two gates share ONE
             # aggregate budget, never re-extend it here.
-            global _merge_deadline
+            # (armed at the top of this function; kept idempotent here so the
+            # merge path still works if it is ever reached another way)
             if _merge_deadline is None:
                 _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
             merge_repo = _merge_target_repo(merge_seg.argv, merge_seg.raw)
