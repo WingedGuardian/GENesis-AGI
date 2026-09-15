@@ -119,15 +119,19 @@ _CASES = [
 ]
 
 
-def _tree(tmp_path: Path, *, poisoned: bool) -> Path:
-    """A standalone copy of scripts/, optionally with ONE sibling poisoned.
+def _tree(tmp_path: Path, *, poisoned: bool, old_helper: bool = False) -> Path:
+    """A standalone scripts/ copy with an optional poisoned parser or old helper.
 
     Everything is copied rather than symlinked so the poisoned module cannot leak
-    back into the real tree, and the poison replaces exactly `shell_parse` — the
-    shared import all four guards make at module scope — so a failure here can only
-    be the import-time path and never an unrelated missing file.
+    back into the real tree. Parser poison replaces exactly `shell_parse`, the shared
+    import all four guards make at module scope. ``old_helper`` removes exactly the
+    newly introduced API. Either failure therefore comes from the intended import
+    boundary rather than unrelated test scaffolding.
     """
-    root = tmp_path / ("poisoned" if poisoned else "healthy")
+    variant = "poisoned" if poisoned else "healthy"
+    if old_helper:
+        variant += "_old_helper"
+    root = tmp_path / variant
     (root / "scripts" / "hooks").mkdir(parents=True)
     (root / "scripts" / "lib").mkdir(parents=True)
     for src, dst in (
@@ -141,6 +145,15 @@ def _tree(tmp_path: Path, *, poisoned: bool) -> Path:
         boom = 'raise RuntimeError("poisoned sibling")\n'
         (root / "scripts" / "hooks" / "shell_parse.py").write_text(boom)
         (root / "scripts" / "shell_parse.py").write_text(boom)
+    if old_helper:
+        # Reproduce the pre-PR helper API without carrying a frozen second copy of
+        # the whole module. The markers are adjacent to the one newly added function;
+        # everything else remains today's real helper implementation.
+        helper = root / "scripts" / "hooks" / "hook_input.py"
+        source = helper.read_text()
+        start = source.index("\ndef degraded_exit(")
+        end = source.index("\n\n_BRACE_RE", start)
+        helper.write_text(source[:start] + source[end:])
     return root
 
 
@@ -413,6 +426,36 @@ def test_legacy_override_keyword_is_accepted_but_cannot_waive(tmp_path):
     )
     res = _run_degraded_helper(tmp_path, body)
     assert res.returncode == 2
+
+
+@pytest.mark.parametrize(("guard", "rel"), _GUARDS)
+@pytest.mark.parametrize("command", ["git status", "git push origin main --force"])
+def test_new_guard_with_old_hook_input_fails_closed(tmp_path, guard, rel, command):
+    """Reverse skew cannot fail before the degraded shell-parser recovery exists."""
+    root = _tree(tmp_path, poisoned=False, old_helper=True)
+    res = _run(root, rel, command, tmp_path / "home_reverse_skew")
+    assert res.returncode == 2, (
+        f"{guard} with a pre-degraded_exit helper returned {res.returncode}; "
+        "non-2 lets Claude Code run the command"
+    )
+    assert "shared hook_input is incompatible" in res.stderr
+
+
+def test_check_pr_with_old_hook_input_surfaces_the_import_error(tmp_path):
+    """The human read-only CLI keeps its existing no-degradation carve-out."""
+    root = _tree(tmp_path, poisoned=False, old_helper=True)
+    res = subprocess.run(
+        [sys.executable, str(root / "scripts" / "hooks" / "git_push_guard.py"), "--check-pr", "1"],
+        input="",
+        capture_output=True,
+        text=True,
+        cwd=str(root),
+        env={**os.environ, "HOME": str(tmp_path / "home_old_helper_cli")},
+        timeout=90,
+    )
+    assert res.returncode == 1
+    assert "cannot import name 'degraded_exit'" in res.stderr
+    assert "GUARD DEGRADED" not in res.stderr
 
 
 def test_hook_input_stays_stdlib_only(tmp_path):

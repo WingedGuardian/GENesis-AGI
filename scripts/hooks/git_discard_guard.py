@@ -122,7 +122,24 @@ try:
 except Exception:  # noqa: BLE001 — logging must never disarm the clean block.
     audit_jsonl = None
 
-from hook_input import degraded_exit, field, read_payload  # noqa: E402
+try:
+    from hook_input import degraded_exit, field, read_payload  # noqa: E402
+except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must block.
+    if __name__ != "__main__":
+        raise
+    # Reverse version skew: this guard may be newer than hook_input.py. Nothing
+    # imported from that older helper can recover us, so fail closed locally. Do
+    # not render the exception — even __str__ can raise — and use os._exit so a
+    # broken diagnostic stream cannot replace exit 2 during interpreter shutdown.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (git_discard_guard): shared hook_input is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
 
 # Gated-operation pattern for the DEGRADED path, defined ABOVE the guarded import so it
 # survives that import failing. Scoped to this guard's BLOCK cases only — `git clean`

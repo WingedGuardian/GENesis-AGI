@@ -59,13 +59,30 @@ from fnmatch import fnmatch
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import (  # noqa: E402
-    brace_expand,
-    degraded_exit,
-    read_payload,
-    run_guard,
-    tool_input,
-)
+try:
+    from hook_input import (  # noqa: E402
+        brace_expand,
+        degraded_exit,
+        read_payload,
+        run_guard,
+        tool_input,
+    )
+except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must block.
+    if __name__ != "__main__":
+        raise
+    # Reverse version skew: this guard may be newer than hook_input.py. Nothing
+    # imported from that older helper can recover us, so fail closed locally. Do
+    # not render the exception — even __str__ can raise — and use os._exit so a
+    # broken diagnostic stream cannot replace exit 2 during interpreter shutdown.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (protected_paths_guard): shared hook_input is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
 
 # Gated-operation pattern for the DEGRADED path. Defined ABOVE the guarded import
 # ON PURPOSE: it must still be bound when the import below is the one that failed.

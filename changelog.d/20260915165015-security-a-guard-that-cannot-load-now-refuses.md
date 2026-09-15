@@ -8,5 +8,7 @@
   loud about it, rather than standing silently aside. Raw in-band waivers are not
   accepted because the unavailable parser cannot bind one to the command it is meant
   to waive. A payload that names no command at all is refused on the same reasoning.
-  Successful degraded notices use Claude Code's additional-context channel. The usual
-  cause is a partially updated hook tree, and the refusal now says so.
+  Successful degraded notices use Claude Code's additional-context channel. Both
+  partial-update orderings fail closed: an older guard can call the newer helper, and
+  a newer guard blocks locally when the helper is still old. The usual cause is a
+  partially updated hook tree, and the refusal now says so.
