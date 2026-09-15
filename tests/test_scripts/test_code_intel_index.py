@@ -55,8 +55,19 @@ def _fake_tools(bindir: Path, log: Path, *, sleep: float = 0) -> None:
             "#!/usr/bin/env bash\n"
             f'echo "{name} ARGS:$*" >> "{log}"\n'
             f'echo "{name} ULIMIT_V:$(ulimit -v)" >> "{log}"\n'
+            f'echo "{name} OOM_ADJ:$(cat /proc/self/oom_score_adj 2>/dev/null || echo NA)" >> "{log}"\n'
             + (f"sleep {sleep}\n" if sleep else ""),
         )
+
+
+def _inherited_oom_adj() -> str:
+    """This process's own oom_score_adj — what a child INHERITS absent a write.
+
+    Asserting a literal "0" is wrong: it is true on a developer box and NOT on a
+    GitHub runner (measured: a runner starts at 500). The invariant is "the value
+    did not CHANGE", not "the value is zero".
+    """
+    return Path("/proc/self/oom_score_adj").read_text().strip()
 
 
 def _fake_systemd_run(bindir: Path, log: Path, *, probe_ok: bool = True) -> None:
@@ -542,3 +553,207 @@ def test_triggers_enqueue_markers_and_do_not_spawn():
         assert "code_intel_index.sh" not in text, (
             f"{rel} must NOT spawn the entrypoint directly — enqueue a marker"
         )
+
+
+# ── 3b. OOM kill-order preference ─────────────────────────────────────────
+# The larger measured MemoryMax makes this job a bigger consumer, so it must
+# also become the kernel's PREFERRED victim — otherwise a bigger cap makes a
+# container-wide OOM more likely to take the server or a CC session instead.
+# CORRECTED 2026-09-09 (this comment previously had it wrong): raising needs no
+# privilege, and neither does LOWERING, as long as the target stays at or above
+# oom_score_adj_min (0 here, inherited from init). MEASURED directly: 500 -> 321
+# accepted, 321 -> 0 accepted, only -1 refused. So the kernel does NOT enforce a
+# raise-only contract — the script has to, which is what
+# test_oom_score_adj_keeps_a_higher_inherited_value pins.
+
+
+def test_oom_score_adj_reaches_the_indexer(tmp_path):
+    """The INDEXER must inherit the raised value, not merely the script.
+
+    `-p OOMScoreAdjust=` is invalid on `systemd-run --scope` (a scope does not
+    exec, so Exec properties do not apply), so the mechanism is a self-write
+    plus inheritance. What has to hold is that the tool actually sees it.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog, probe_ok=True)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
+    assert res.returncode == 0, res.stderr
+    assert "OOM_ADJ:900" in log.read_text()  # ABOVE invoker.py's 500 for CC subprocesses
+    # And NOT passed as a scope property, which systemd would reject outright.
+    assert "OOMScoreAdjust" not in slog.read_text()
+
+
+def test_oom_score_adj_override_reaches_the_indexer(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "321"},
+    )
+    assert res.returncode == 0, res.stderr
+    assert "OOM_ADJ:321" in log.read_text()
+
+
+def test_oom_score_adj_non_numeric_warns_and_still_indexes(tmp_path):
+    """A bad lever value must never cost the INDEX — only the preference.
+
+    The direction control for the cell above: without it, a guard that refused
+    every value would pass that test's sibling and silently disable the feature.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "not-a-number"},
+    )
+    assert res.returncode == 0, res.stderr
+    assert "ignoring non-numeric" in res.stdout
+    assert "codebase-memory-mcp ARGS:" in log.read_text()  # index still ran
+    # unchanged from what this process would pass down — not a literal 0
+    assert f"OOM_ADJ:{_inherited_oom_adj()}" in log.read_text()
+
+
+def test_oom_score_adj_negative_is_refused_not_attempted(tmp_path):
+    """A negative value is unachievable from a user manager anyway (measured:
+    -1 and -500 both land on the manager's own value), so the guard rejects it
+    at the lever rather than writing and failing.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "-500"},
+    )
+    assert res.returncode == 0, res.stderr
+    assert "ignoring non-numeric" in res.stdout
+    assert f"OOM_ADJ:{_inherited_oom_adj()}" in log.read_text()  # unchanged
+
+
+def test_oom_score_adj_keeps_a_higher_inherited_value(tmp_path):
+    """Raise-only must be enforced in code, because the kernel does not enforce it.
+
+    MEASURED: an unprivileged task may LOWER oom_score_adj freely as long as it
+    stays >= oom_score_adj_min (0 here) — 500 -> 321 and 321 -> 0 both succeed.
+    So an unconditional write of the 900 default would quietly UNDO a parent that
+    had deliberately raised this job to 1000, making it less likely to be chosen
+    than the parent intended. The script reads the current value and keeps it when
+    it is already at least what was requested.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    # Raise THIS process; the entrypoint inherits it. Restore the ORIGINAL value,
+    # not a hardcoded 0 — this is global process state shared with every later
+    # test in the session, and the value is not 0 everywhere: a GitHub runner
+    # starts at 500 (measured), so resetting to 0 would silently change what
+    # _inherited_oom_adj() returns for the cells that assert on it.
+    adj = Path("/proc/self/oom_score_adj")
+    original = adj.read_text().strip()
+    adj.write_text("1000\n")
+    try:
+        res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
+    finally:
+        adj.write_text(f"{original}\n")
+    assert res.returncode == 0, res.stderr
+    assert "OOM_ADJ:1000" in log.read_text(), (
+        "the inherited 1000 was lowered to the 900 default — raise-only broken"
+    )
+    assert "inherited" in res.stdout and "raise-only" in res.stdout
+
+
+def test_explicit_override_wins_over_raise_only_even_when_it_lowers(tmp_path):
+    """Raise-only guards the DEFAULT; an explicit lever is obeyed.
+
+    Found by CI, not locally: a GitHub runner starts at oom_score_adj=500, so
+    test_oom_score_adj_override_reaches_the_indexer (which asks for 321) failed
+    once raise-only was added — the script kept 500 and ignored the operator.
+    Locally the process starts at 0, so 321 was a raise and nothing showed.
+
+    The finding that prompted raise-only named "this unconditional write of the
+    DEFAULT 900", and that scoping is the correct one: the risk is this script's
+    own default undoing a parent's deliberate raise, not a human being overruled
+    by their own tool. An ignored lever is its own surprise. The override is
+    honoured and the lowering is logged, so a later OOM post-mortem can see it.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    adj = Path("/proc/self/oom_score_adj")
+    original = adj.read_text().strip()
+    adj.write_text("800\n")
+    try:
+        res = _run_entry(
+            tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+            env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "321"},
+        )
+    finally:
+        adj.write_text(f"{original}\n")
+    assert res.returncode == 0, res.stderr
+    assert "OOM_ADJ:321" in log.read_text(), (
+        "an EXPLICIT override was silently ignored because it lowered the "
+        "inherited value — raise-only must scope to the default only"
+    )
+    assert "LOWERS the inherited 800" in res.stdout, "the lowering was not logged"
+
+
+def test_oom_score_adj_oversized_value_is_rejected_not_wrapped(tmp_path):
+    """All-digit is not in-range. $((10#$v)) WRAPS past bash's signed 64-bit
+    range, so this value evaluates to 0, would sail through a `> 1000` check, and
+    would be written and logged as accepted — a silent downgrade to the least
+    preferred setting, from an input that looks like an obvious typo.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "18446744073709551616"},
+    )
+    assert res.returncode == 0, res.stderr
+    assert "exceeds the kernel maximum" in res.stdout
+    assert f"OOM_ADJ:{_inherited_oom_adj()}" in log.read_text()  # untouched
+    assert "codebase-memory-mcp ARGS:" in log.read_text()  # index still ran
+
+
+def test_success_log_does_not_quote_other_units_oom_scores(tmp_path):
+    """The log line must not name scores this script does not own.
+
+    It used to read "the server at 100" while the shipped unit template declared
+    -500 — a number that existed nowhere, presenting a kill ordering that was not
+    real. An operational log that invents its own facts is worse than a terse one,
+    because OOM diagnosis is exactly when someone trusts it.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
+    assert res.returncode == 0, res.stderr
+    assert "oom_score_adj=900" in res.stdout
+    for claim in ("the server at 100", "at 500", "at 0)"):
+        assert claim not in res.stdout, f"log still asserts a foreign score: {claim!r}"
+
+
+def test_oom_score_adj_is_above_the_cc_subprocess_rung(tmp_path):
+    """500 would TIE with CC subprocesses, which invoker.py already sets to 500.
+
+    At equal adj the kernel falls back to memory charge, so a large session could
+    be chosen over the indexer — defeating the ordering this feature exists for.
+    """
+    invoker = (_REPO_ROOT / "src/genesis/cc/invoker.py").read_text()
+    assert "def set_oom_score_adj(pid: int, score: int = 500)" in invoker, (
+        "invoker's CC-subprocess rung moved; the index adj must stay strictly above it"
+    )
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
+    assert res.returncode == 0, res.stderr
+    logged = log.read_text()
+    adj = int(re.search(r"OOM_ADJ:(\d+)", logged).group(1))
+    assert adj > 500, f"index adj {adj} does not outrank CC subprocesses at 500"
