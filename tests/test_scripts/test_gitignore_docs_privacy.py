@@ -169,8 +169,18 @@ def _classify_docs_negations() -> tuple[list[str], list[str]]:
             # `!docs/`, `!docs/**` — opens docs wholesale; not a shape any test
             # below models, so fail rather than silently ignore it.
             unparsed.append(line)
-        elif _is_directory_form(rest) or len(parts) == 1:
+        elif _is_directory_form(rest):
             dirs.append("/".join(parts))
+        elif len(parts) == 1:
+            # AMBIGUOUS, and git alone decides: `!docs/architecture` is a
+            # directory opt-in, `!docs/2027-secret.md` un-ignores one FILE.
+            # Treating every one-component negation as a directory probed
+            # descendants of something that has none, so a one-component FILE
+            # negation got no coverage at all (Codex P2, PR #1633). Both
+            # readings are registered; the directory probes are vacuous for a
+            # file and the targeted assertion is what catches it.
+            dirs.append("/".join(parts))
+            targeted.append("/".join(parts))
         else:
             targeted.append("/".join(parts))
     assert not unparsed, (
@@ -197,15 +207,21 @@ def _tracked_docs() -> list[str]:
     `.split()`, the second of which matches the dated pattern and is reported as
     a leak that does not exist (and inflates the corpus-size check besides).
     `-z` also disables the C-quoting git otherwise applies to unusual bytes.
+
+    NOT `text=True`: git emits pathnames VERBATIM under `-z`, and a pathname is
+    a byte string rather than UTF-8. A tracked file carrying byte 0xff under
+    `docs/` made this raise `UnicodeDecodeError` in nearly every test here, and
+    a privacy lock that crashes is a privacy lock that is not running. Decoded
+    with `surrogateescape` so an undecodable byte round-trips into a usable str
+    instead of taking the suite down (Codex P2, PR #1633).
     """
     out = subprocess.run(
         ["git", "ls-files", "-z", "--", "docs/"],
         cwd=REPO_ROOT,
         capture_output=True,
-        text=True,
         check=True,
         env=_GIT_ENV,
-    ).stdout
+    ).stdout.decode("utf-8", errors="surrogateescape")
     return [p for p in out.split("\0") if p]
 
 
@@ -579,6 +595,15 @@ _LEAKING_APPENDS = (
     ("negated-root-anchored", "!/docs/architecture/**"),
     ("negated-nested", "!docs/architecture/sub/**"),
     ("negated-wildcard-mid", "!docs/*/architecture/**"),
+    # The three spellings below carry NO literal `docs` segment, so the root
+    # parser dismisses each as "not a docs negation" and gives it no coverage —
+    # while git happily routes all three into `docs/`. They are one defect in
+    # three costumes: relevance was being judged by TEXT, and git decides it by
+    # pattern semantics. Registering them here means the harness answers the
+    # question by MEASUREMENT instead (Codex P2 x3, PR #1633).
+    ("negated-slashless-basename", "!20[0-9][0-9]-secret.md"),
+    ("negated-leading-glob", "!*/actions/20[0-9][0-9]-secret.md"),
+    ("negated-double-star-prefix", "!**/20[0-9][0-9]-secret.md"),
 )
 
 
@@ -609,8 +634,30 @@ def _privacy_probes() -> list[str]:
                 # INTERMEDIATE wildcard reopens the leak unseen (Codex P2,
                 # PR #1633) — and the harness reported it before a reviewer did.
                 f"{base}/{subdir}/{year}-namesake-draft.md",
+                # A BASENAME a slashless negation can reach. Git matches a
+                # pattern with no separator against the basename at ANY depth,
+                # so `!2026-secret.md` below the rule republishes this without
+                # the text "docs" appearing anywhere in the negation — which is
+                # exactly what the root-file parser keys on (Codex P2, #1633).
+                f"{base}/{year}-secret.md",
             ]
     return probes
+
+
+#: Dated paths OUTSIDE `docs/`, which the rule must NOT claim.
+#:
+#: Every probe above lives under `docs/`, so nothing constrained the rule's
+#: leading scope: broadening it to `**/20[0-9][0-9]-*` left the whole suite
+#: green while silently ignoring `src/2027-module.py`. A source file dropped
+#: from `git add -A` reports no error anywhere — it is simply never committed.
+#: Opposite polarity to the corpus above, hence its own list (Codex P2, #1633).
+_OUT_OF_SCOPE_PROBES = (
+    "src/2027-module.py",
+    "scripts/2026-migration.sh",
+    "tests/2031-regression.py",
+    "2026-README.md",
+    "config/2040-routing.yaml",
+)
 
 
 def test_the_probe_corpus_is_not_empty():
@@ -618,7 +665,7 @@ def test_the_probe_corpus_is_not_empty():
     which would fail loudly — but an almost-empty one fails for the wrong
     reason. Assert the shape directly."""
     probes = _privacy_probes()
-    assert len(probes) == len(_opt_in_dirs()) * 5 * 7, len(probes)
+    assert len(probes) == len(_opt_in_dirs()) * 5 * 8, len(probes)
     assert _ignored_subset(probes) == set(probes), (
         "the BASELINE rule does not ignore its own corpus — every mutation "
         "result below would be meaningless: "
@@ -716,4 +763,20 @@ def test_a_negation_in_a_nested_gitignore_is_detected(name, line):
         f"mutation '{name}' SURVIVED: a nested .gitignore under "
         f"docs/{subdir}/sub/ containing {line!r} left every probe still "
         "ignored, so this suite would not notice that subtree being reopened."
+    )
+
+
+def test_the_dated_rule_does_not_reach_outside_docs():
+    """The rule's leading SCOPE, which nothing else in this file constrains.
+
+    Every other probe lives under `docs/`, so a rule broadened to
+    `**/20[0-9][0-9]-*` satisfies all of them while swallowing
+    `src/2027-module.py`. A source file that disappears from `git add -A`
+    produces no error at any point; it is simply never committed, and the
+    first sign is something missing from a deploy (Codex P2, PR #1633).
+    """
+    wrongly_ignored = sorted(_ignored_subset(list(_OUT_OF_SCOPE_PROBES)))
+    assert not wrongly_ignored, (
+        "the dated-docs rule now reaches OUTSIDE docs/ and is hiding real "
+        f"source paths from git add -A: {wrongly_ignored}"
     )
