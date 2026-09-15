@@ -58,6 +58,22 @@ _OUTPUT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         re.compile(r"\b(?:gh[posur]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{50,})\b"),
     ),
     (
+        # AWS access key id. Real ids are AKIA + 16 uppercase alnum; the floor is
+        # 12 so a truncated-but-still-identifying id is not missed. Added because
+        # the table covered five key vendors and not this one, and a pre-push gate
+        # built on it inherited the gap (MEASURED: an AKIA line passed a coverage
+        # probe that every other vendor failed).
+        "api_key_aws",
+        re.compile(r"\bAKIA[A-Z0-9]{12,}\b"),
+    ),
+    (
+        # Credentials embedded in a URL — user:pass@host. Scheme-anchored so a
+        # bare "name:value@thing" in prose does not match, and the password class
+        # excludes '/' and '@' so it cannot run past the authority section.
+        "url_credentials",
+        re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s:/@]+:[^\s:/@]+@[^\s/]+"),
+    ),
+    (
         "credential_assignment",
         re.compile(
             r"(?i)(password|token|secret|api[_\s]?key)\s*[:=]\s*['\"]?"
@@ -97,9 +113,34 @@ _CRITICAL_PATTERNS = frozenset(
         "api_key_anthropic",
         "api_key_groq",
         "api_key_github",
+        "api_key_aws",
+        "url_credentials",
         "env_variable_secret",
     }
 )
+
+
+def iter_findings(content: str) -> list[tuple[str, str]]:
+    """Every (pattern_name, matched_text) in ``content``. No logging, no verdict.
+
+    Exists so a caller that needs to report WHERE a match is — a pre-push hook
+    reporting file:line, say — can reuse this table instead of copying it. A
+    second copy of a credential-pattern table is a table that drifts, and the
+    half that drifts is the half nobody is looking at.
+
+    ``scan_outbound`` is the verdict-returning wrapper over this; both read the
+    same ``_OUTPUT_PATTERNS``, so a pattern added for one is live for the other.
+    """
+    out: list[tuple[str, str]] = []
+    for name, pattern in _OUTPUT_PATTERNS:
+        for m in pattern.finditer(content):
+            out.append((name, m.group(0)))
+    return out
+
+
+def critical_pattern_names() -> frozenset[str]:
+    """The subset of pattern names that indicate a credential rather than a hint."""
+    return _CRITICAL_PATTERNS
 
 
 def scan_outbound(content: str) -> ScanResult:
