@@ -78,6 +78,28 @@ async def db():
                PRIMARY KEY (source_id, target_id, link_type)
            )"""
     )
+    # The successor check consults open delete-intent tombstones, which live
+    # here. DDL copied from production sqlite_master for the same reason as
+    # the tables above.
+    await conn.execute(
+        """CREATE TABLE deferred_work_queue (
+               id              TEXT PRIMARY KEY,
+               work_type       TEXT NOT NULL,
+               call_site_id    TEXT,
+               priority        INTEGER NOT NULL DEFAULT 50,
+               payload_json    TEXT NOT NULL,
+               deferred_at     TEXT NOT NULL,
+               deferred_reason TEXT NOT NULL,
+               staleness_policy TEXT NOT NULL DEFAULT 'drain',
+               staleness_ttl_s INTEGER,
+               status          TEXT NOT NULL DEFAULT 'pending',
+               attempts        INTEGER NOT NULL DEFAULT 0,
+               last_attempt_at TEXT,
+               completed_at    TEXT,
+               error_message   TEXT,
+               created_at      TEXT NOT NULL
+           )"""
+    )
     for mid in (OLD, NEW):
         await conn.execute(
             "INSERT INTO memory_metadata (memory_id, created_at, embedding_status) "
@@ -333,6 +355,219 @@ async def test_retrying_after_a_mirror_failure_completes_the_supersession(store,
 
     assert (await _row(db, OLD))["deprecated"] == 1
     assert (OLD, NEW, "succeeded_by") in await _links(db)
+
+
+@pytest.mark.asyncio()
+async def test_the_retry_repairs_even_if_the_successor_has_since_died(store, db, monkeypatch):
+    """The repair guarantee is UNCONDITIONAL or it is not a guarantee.
+
+    `SupersedeIncomplete` tells the caller that retrying the same call is the
+    repair. If the successor expires or is deprecated between the failed
+    attempt and the retry, re-running successor validation would reject that
+    retry and strand the stale Qdrant mirror forever — the one outcome the
+    exception exists to prevent. The successor's CURRENT validity cannot
+    un-commit a deprecation that already landed, so the retry takes the repair
+    path and skips the check.
+    """
+    from genesis.memory import store as store_mod
+
+    await db.execute(
+        "UPDATE memory_metadata SET embedding_status = 'embedded' WHERE memory_id = ?",
+        (OLD,),
+    )
+    await db.commit()
+
+    calls = {"n": 0}
+
+    def _fail_once(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("qdrant unavailable")
+
+    monkeypatch.setattr(store_mod, "update_payload", _fail_once)
+
+    with pytest.raises(SupersedeIncomplete):
+        await store.supersede(OLD, NEW)
+
+    # The successor dies between the two attempts.
+    await db.execute("UPDATE memory_metadata SET deprecated = 1 WHERE memory_id = ?", (NEW,))
+    await db.commit()
+
+    # Must NOT raise: this is a repair of a supersession that already committed.
+    await store.supersede(OLD, NEW)
+
+    # The retry must REACH the mirror write; an exact count would pin the
+    # locate loop's arity (it writes once per collection holding the point,
+    # exactly as delete() does) rather than the property under test.
+    assert calls["n"] > 1, "the retry never reached the Qdrant mirror write"
+    assert (OLD, NEW, "succeeded_by") in await _links(db)
+
+
+@pytest.mark.asyncio()
+async def test_the_repair_path_preserves_the_original_timestamp(store, db, monkeypatch):
+    """A retry completes an event; it does not re-date one."""
+    from genesis.memory import store as store_mod
+
+    await db.execute(
+        "UPDATE memory_metadata SET embedding_status = 'embedded' WHERE memory_id = ?",
+        (OLD,),
+    )
+    await db.commit()
+
+    calls = {"n": 0}
+
+    def _fail_once(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("qdrant unavailable")
+
+    monkeypatch.setattr(store_mod, "update_payload", _fail_once)
+
+    with pytest.raises(SupersedeIncomplete):
+        await store.supersede(OLD, NEW, timestamp="2026-01-01T00:00:00+00:00")
+
+    await store.supersede(OLD, NEW, timestamp="2099-12-31T00:00:00+00:00")
+
+    cur = await db.execute("SELECT superseded_at FROM memory_metadata WHERE memory_id = ?", (OLD,))
+    row = await cur.fetchone()
+    assert row["superseded_at"] == "2026-01-01T00:00:00+00:00"
+
+
+@pytest.mark.asyncio()
+async def test_the_retry_repairs_even_if_the_successor_row_is_GONE(store, db, monkeypatch):
+    """The repair must survive the successor becoming UNRESOLVABLE, not just
+    invalid.
+
+    Both handles are resolved BEFORE the repair-path check, so a successor row
+    that disappears between the failed attempt and the retry killed the retry
+    at resolution — the documented repair was unreachable in the one case it
+    exists for, and the vector stayed live permanently (`integrity.py` counts
+    `deprecated_divergence`; nothing repairs it).
+
+    Replays the audit probe that measured this.
+    """
+    from genesis.memory import store as store_mod
+
+    await db.execute(
+        "UPDATE memory_metadata SET embedding_status = 'embedded' WHERE memory_id = ?",
+        (OLD,),
+    )
+    await db.commit()
+
+    calls = {"n": 0}
+
+    def _fail_once(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("qdrant unavailable")
+
+    monkeypatch.setattr(store_mod, "update_payload", _fail_once)
+    store._qdrant.retrieve = lambda **kw: [object()]
+
+    with pytest.raises(SupersedeIncomplete):
+        await store.supersede(OLD, NEW)
+
+    # The successor row VANISHES entirely between the attempts.
+    await db.execute("DELETE FROM memory_metadata WHERE memory_id = ?", (NEW,))
+    await db.commit()
+
+    await store.supersede(OLD, NEW)
+
+    # The retry must REACH the mirror write; an exact count would pin the
+    # locate loop's arity (it writes once per collection holding the point,
+    # exactly as delete() does) rather than the property under test.
+    assert calls["n"] > 1, "the retry never reached the Qdrant mirror write"
+
+
+@pytest.mark.asyncio()
+async def test_a_successor_that_VANISHED_is_not_reported_as_deprecated(store, db):
+    """`meta is None` is a race, not a bad choice of successor.
+
+    The row resolved (so it existed) and was gone by validation — the remedy is
+    "retry", where a deprecated successor's remedy is "pick a different one".
+    Collapsing both into `successor_deprecated` is the same misattribution class
+    the `role` field fixed, and it survived the first mutation sweep because
+    nothing drove this branch: it is only reachable via that race, which is why
+    the validator is exercised directly here (the file already drives
+    `_mark_superseded` the same way).
+    """
+    with pytest.raises(SupersedeUnresolved) as exc:
+        await store._validate_supersede_pair(OLD, "ffffffff-0000-4000-8000-00000000dead")
+
+    assert exc.value.reason == "successor_vanished"
+    assert exc.value.role == "new_id"
+
+
+@pytest.mark.asyncio()
+async def test_a_post_commit_rejection_does_not_claim_nothing_happened(store, db):
+    """The message asserts durable state, so it must not lie about it.
+
+    `no deprecation was performed` was hardcoded into every rejection. Raised
+    after the deprecation committed, it tells the caller the opposite of what
+    the row says — and an LLM caller acts on the sentence.
+    """
+    exc = SupersedeUnresolved(NEW, "successor_vanished", NEW, role="new_id")
+    assert "no deprecation was performed" in str(exc)
+
+    committed = SupersedeUnresolved(NEW, "successor_vanished", NEW, role="new_id", committed=True)
+    assert "no deprecation was performed" not in str(committed)
+    assert "already committed" in str(committed)
+
+
+@pytest.mark.asyncio()
+async def test_a_successor_awaiting_deletion_is_refused(store, db, monkeypatch):
+    """A deferred delete leaves the row intact — deprecated=0, invalid_at NULL —
+    with only an open tombstone as the signal. Superseding onto it deprecates
+    the target and then loses the successor when the drain runs: both halves
+    gone, the exact harm the successor checks exist to prevent."""
+    from genesis.memory import delete_tombstones
+
+    async def _open(_db, *, memory_id):
+        return memory_id == NEW
+
+    monkeypatch.setattr(delete_tombstones, "has_open_tombstone", _open)
+
+    with pytest.raises(SupersedeUnresolved) as exc:
+        await store.supersede(OLD, NEW)
+
+    assert exc.value.reason == "successor_deleting"
+    assert exc.value.role == "new_id"
+    assert (await _row(db, OLD))["deprecated"] == 0, "a refusal wrote something"
+
+
+@pytest.mark.asyncio()
+async def test_the_mirror_follows_the_point_not_the_collection_column(store, db, monkeypatch):
+    """The metadata `collection` column is unreliable, and `delete()` has always
+    known it — it locates the point across both collections. Trusting the column
+    sent `set_payload` to the stale name, which SUCCEEDS as a no-op on a
+    nonexistent point: supersede reported success while the memory stayed
+    eligible for vector recall. A write that cannot fail is not evidence.
+    """
+    from genesis.memory import store as store_mod
+
+    await db.execute(
+        "UPDATE memory_metadata SET embedding_status = 'embedded', "
+        "collection = 'episodic_memory' WHERE memory_id = ?",
+        (OLD,),
+    )
+    await db.commit()
+
+    # The point actually lives in the OTHER collection.
+    store._qdrant.retrieve = lambda **kw: (
+        [object()] if kw["collection_name"] == "knowledge_base" else []
+    )
+    targeted: list[str] = []
+
+    def _record(_client, *, collection, point_id, payload):
+        targeted.append(collection)
+
+    monkeypatch.setattr(store_mod, "update_payload", _record)
+
+    await store.supersede(OLD, NEW)
+
+    assert targeted == ["knowledge_base"], (
+        "the payload went to the collection the column named, not the one the point lives in"
+    )
 
 
 @pytest.mark.asyncio()

@@ -39,8 +39,14 @@ time and never nests — with a single sanctioned exception: ``supersede()``
 takes exactly TWO, always acquired in sorted-id order, and a fixed total
 acquisition order cannot form a cycle (it also rejects an equal pair before
 locking, so it never nests the SAME lock). ``store()`` takes no lock, and the
-slow embed happens OUTSIDE the worker's locked section — so no lock is ever
-held across an unbounded wait.
+slow embed happens OUTSIDE the worker's locked section.
+
+What a lock IS held across is the Qdrant mirror call — ``delete()`` has always
+done this (retrieve + delete inside its lock) and ``supersede()`` now does it
+holding two. That is bounded by the client timeout rather than unbounded, but
+it is not free: a hung Qdrant blocks deletes of both ids for that long. An
+earlier version of this paragraph claimed no lock was ever held across an
+unbounded wait, which read as a guarantee that neither function kept.
 """
 
 from __future__ import annotations

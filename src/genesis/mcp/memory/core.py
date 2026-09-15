@@ -868,11 +868,16 @@ async def memory_store(
 async def memory_supersede(old_id: str, new_id: str) -> dict:
     """Deprecate a memory, recording another memory as its correction.
 
-    The supersede on its own, when the correction is ALREADY stored. Use this
-    when ``memory_store(supersedes=...)`` reported that the deprecation did not
-    happen, when you are linking two memories that both already exist, or
-    whenever you know both ids up front — it is the direct way to say "this one
-    replaces that one".
+    The supersede on its own, when the correction is ALREADY stored. Use it
+    when you are linking two memories that both already exist, or whenever you
+    know both ids up front — it is the direct way to say "this one replaces
+    that one".
+
+    It does NOT say "use this when ``memory_store(supersedes=...)`` told you the
+    deprecation failed", because that tool cannot tell you: ``store()`` catches
+    a failed deprecation and still returns only the new memory's id, so no such
+    report reaches this boundary. Saying otherwise described a recovery the
+    caller can never be prompted to make.
 
     Both arguments accept the same short ``id:<8-char>`` handles the proactive
     hook prints and ``memory_expand`` accepts; an ambiguous handle is never
