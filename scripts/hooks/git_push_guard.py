@@ -120,7 +120,24 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # scripts/ (parent dir) for review_state — the shared escalation-cap constant, so
 # the Codex-round gate below and the commit gate's Rule 3 stop at the same N.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from hook_input import field, read_payload, run_guard  # noqa: E402
+try:
+    from hook_input import degraded_exit, field, read_payload, run_guard  # noqa: E402
+except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must block.
+    if __name__ != "__main__" or sys.argv[1:2] == ["--check-pr"]:
+        raise
+    # Reverse version skew: this guard may be newer than hook_input.py. Nothing
+    # imported from that older helper can recover us, so fail closed locally. Do
+    # not render the exception — even __str__ can raise — and use os._exit so a
+    # broken diagnostic stream cannot replace exit 2 during interpreter shutdown.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (git_push_guard): shared hook_input is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
 
 # SOFT dependency (mirrors review_enforcement_commit.py's guard for the SAME
 # import): an unimportable review_state must degrade ONLY the round-escalation
@@ -146,16 +163,52 @@ try:
 except Exception:  # noqa: BLE001 — see above: a load failure exits 1 = non-blocking.
     audit_jsonl = None
 
-from shell_parse import (  # noqa: E402
-    _KNOWN_SIGILS,
-    analyze,
-    analyze_checked,
-    commit_skips_hooks,
-    gh_pr_subcommand,
-    git_subcommand,
-    has_trailing_override,
-    split_segments,
+# DEGRADED-path mention set, defined ABOVE the guarded import so it survives that
+# import failing. It mirrors `_GATED_MENTION` below (same verbs and flags, same
+# deliberate breadth, same reasoning) and adds `gh` and `sqlite3`, because on this
+# path there is no parse to narrow with at all. Kept as its own literal rather than
+# shared: sharing would place the constant after the import it has to outlive.
+# Word-boundary rather than a trailing separator class, for the reason spelled out at
+# `_GATED_MENTION`: the anchor was a narrowing conjunct and every ordinary shell
+# separator starved it. Both copies carried it, so both were corrected — fixing the
+# degraded one alone would have left the LIVE net starved while the comment claimed
+# the class was closed.
+_DEGRADED_GATED = (
+    r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b"
+    r"|\b(?:push|merge)\b|\bgh\b|\bsqlite3\b"
 )
+
+try:
+    from shell_parse import (  # noqa: E402
+        _KNOWN_SIGILS,
+        analyze,
+        analyze_checked,
+        commit_skips_hooks,
+        gh_pr_subcommand,
+        git_subcommand,
+        has_trailing_override,
+        split_segments,
+    )
+except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
+    if __name__ != "__main__" or (len(sys.argv) >= 3 and sys.argv[1] == "--check-pr"):
+        # Two cases that must NOT degrade. A test importing a broken tree needs the
+        # real error. And `--check-pr` is a HUMAN-run CLI read that takes no stdin:
+        # degrading there would block on a terminal read and then exit 2 at someone
+        # who only asked a question. Let both see the traceback.
+        #
+        # The arity matches the REAL dispatch (`len(sys.argv) >= 3` at the bottom of
+        # this file), not just the flag. An earlier form tested the flag alone, so a
+        # bare `--check-pr` with no PR number took the CLI carve-out on a broken tree
+        # and the hook path on a healthy one — a carve-out whose boundary did not
+        # match the thing it was carving out.
+        raise
+    # No sigil is honoured on this path. That is now true of every caller — see
+    # degraded_exit, whose substring-based waiver was measured allowing two decoys —
+    # but it was decided FIRST here and for a stronger reason worth keeping: this
+    # file's sigils (stale-review-override, ci-override, merge-to-main-override …)
+    # authorise a PUBLISH past review gates, so honouring one with every gate in this
+    # file already proven absent is the precise combination the net exists to prevent.
+    degraded_exit("git_push_guard", gated=_DEGRADED_GATED, exc=_exc)
 
 # Mentions of a GATED operation, consulted ONLY on the un-parseable path where
 # analyze() has gone blind. Deliberately BROAD — both the gated verbs and the
@@ -169,8 +222,16 @@ from shell_parse import (  # noqa: E402
 # flag-only, hard-block version had to be surgically precise, and precision is
 # exactly what an unreliable parse cannot deliver: every narrowing conjunct
 # became a new way to starve the trigger (measured).
+# THE TRAILING ANCHOR WAS ITSELF A NARROWING CONJUNCT — the exact thing the paragraph
+# above forbids, sitting inside the pattern it forbids it in. `(?:\s|=|$)` requires
+# whitespace, `=` or end-of-string AFTER the flag, so every ordinary shell separator
+# starved it. MEASURED on the literal pattern: `git commit --no-verify -m x` matched,
+# while `--no-verify;`, `--no-verify&`, `--no-verify|cat` and `(… --no-verify)` did
+# NOT. A word boundary asks the one thing that was meant — that the flag is a whole
+# token — without naming the characters that may follow it. MEASURED cost of the
+# widening over 74,282 real commands: 15,945 -> 15,995, i.e. +50 (+0.07%).
 _GATED_MENTION = re.compile(
-    r"(?:^|\s)(?:--force(?:-with-lease)?|--no-verify|--admin)(?:\s|=|$)|\b(?:push|merge)\b"
+    r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b|\b(?:push|merge)\b"
 )
 
 # `gh pr create` is the FOURTH gated operation (it can push or fork the branch —
