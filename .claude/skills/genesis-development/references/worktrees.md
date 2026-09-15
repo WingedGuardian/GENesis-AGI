@@ -54,20 +54,24 @@ Multiple Claude Code sessions may work on this repo simultaneously. Rules:
 ## Who owns a worktree
 
 Ownership is RECORDED, not inferred. A worktree being worked in carries a
-`git worktree lock` whose reason names the holder — a session's process, or
-"holds uncommitted tracked changes" — and both the reaper and `git worktree
-remove` already honour that lock, so recording it is the whole protection.
+`git worktree lock` whose reason names the live session holding it, and both the
+reaper and `git worktree remove` already honour that lock, so recording it is the
+whole protection.
+
+ONE fact is recorded — which live process is using this worktree — because that
+is the only thing that cannot be derived. Whether a worktree holds uncommitted
+work is NOT recorded: the reaper computes that itself, at the instant it decides.
+A lock records what cannot be derived; everything derivable is derived at the
+point of use.
 
 You do not have to do anything for this. A claim is taken automatically on your
-first Edit or Write into a worktree, and released when your process exits or the
-worktree goes idle past the reaper's staleness window. The daily sweep
-(`scripts/worktree_claim_sweep.py`, disk-hygiene step 0) locks worktrees holding
-uncommitted tracked work and releases everything whose condition has come true.
+first Edit or Write into a worktree, and released when the claiming process
+exits.
 
-What you WILL see: a stderr note when you edit inside a worktree another live
-session claims. It never blocks — check with that session, or work in your own
-worktree. Inspect ownership yourself with
-`python3 scripts/worktree_claim_sweep.py --list`.
+What you WILL see: a note **in your context** — not on stderr — when you edit
+inside a worktree another live session claims. It never blocks; check with that
+session, or work in your own worktree. Inspect a lock directly with
+`cat .git/worktrees/<name>/locked`, or `git worktree list --porcelain | grep -B3 locked`.
 
 **Do not infer ownership from `/proc/*/cwd`.** Two guards were built on that
 signal and it does not exist here: sessions `cd` per command, so a session's

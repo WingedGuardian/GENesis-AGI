@@ -229,10 +229,25 @@ def test_editing_a_worktree_a_live_session_holds_warns_without_blocking(
     monkeypatch.setattr(wc, "session_pid_from_ancestry", lambda *a, **k: 777)
 
     assert hook._advise(payload(worktree / "target.py")) == 0
-    err = capsys.readouterr().err
-    assert "claimed by session otherses" in err
-    assert "4242" in err
-    assert "Not blocked" in err
+
+    # THE CHANNEL IS THE POINT. An earlier version printed to stderr and exited
+    # 0, and was INERT: per docs/reference/cc-compatibility.md:1093-1099 only
+    # SessionStart / UserPromptSubmit / UserPromptExpansion put hook stdout in
+    # front of the model, and PreToolUse reaches it ONLY through this JSON
+    # envelope. Asserting the prose alone would pass just as well against the
+    # dead channel, so the SHAPE is asserted first and the prose second.
+    out = capsys.readouterr().out
+    doc = json.loads(out)
+    assert "additionalContext" not in doc, (
+        "a TOP-LEVEL additionalContext is silently discarded by Claude Code; "
+        "it must nest under hookSpecificOutput"
+    )
+    hso = doc["hookSpecificOutput"]
+    assert hso["hookEventName"] == "PreToolUse"
+    context = hso["additionalContext"]
+    assert "claimed by session otherses" in context
+    assert "4242" in context
+    assert "Not blocked" in context
 
 
 def test_our_own_claim_is_silent(worktree: Path, monkeypatch, capsys) -> None:
@@ -243,7 +258,7 @@ def test_our_own_claim_is_silent(worktree: Path, monkeypatch, capsys) -> None:
     monkeypatch.setattr(wc, "session_pid_from_ancestry", lambda *a, **k: 4242)
 
     assert hook._advise(payload(worktree / "target.py")) == 0
-    assert capsys.readouterr().err == ""
+    assert capsys.readouterr().out == "", "an advisory that stays silent must emit NOTHING on stdout"
 
 
 def test_a_stale_claim_is_silent(worktree: Path, monkeypatch, capsys) -> None:
@@ -254,7 +269,7 @@ def test_a_stale_claim_is_silent(worktree: Path, monkeypatch, capsys) -> None:
     monkeypatch.setattr(wc, "session_pid_from_ancestry", lambda *a, **k: 777)
 
     assert hook._advise(payload(worktree / "target.py")) == 0
-    assert capsys.readouterr().err == ""
+    assert capsys.readouterr().out == "", "an advisory that stays silent must emit NOTHING on stdout"
 
 
 @pytest.mark.parametrize(
@@ -269,12 +284,12 @@ def test_a_non_claim_lock_does_not_warn(worktree: Path, monkeypatch, capsys, rea
     monkeypatch.setattr(wc, "session_pid_from_ancestry", lambda *a, **k: 777)
 
     assert hook._advise(payload(worktree / "target.py")) == 0
-    assert capsys.readouterr().err == ""
+    assert capsys.readouterr().out == "", "an advisory that stays silent must emit NOTHING on stdout"
 
 
 def test_an_unclaimed_worktree_does_not_warn(worktree: Path, capsys) -> None:
     assert hook._advise(payload(worktree / "target.py")) == 0
-    assert capsys.readouterr().err == ""
+    assert capsys.readouterr().out == "", "an advisory that stays silent must emit NOTHING on stdout"
 
 
 def test_a_notebook_edit_resolves_its_own_path_field(worktree: Path, monkeypatch) -> None:
@@ -309,7 +324,7 @@ def test_mode_off_claims_nothing_and_warns_about_nothing(
     monkeypatch.setattr(wc, "session_pid_from_ancestry", lambda *a, **k: 777)
     monkeypatch.setattr(sys, "argv", [str(_HOOK), "--advise"])
     assert hook.main() == 0
-    assert capsys.readouterr().err == "", "mode=off must warn about nothing"
+    assert capsys.readouterr().out == "", "mode=off must warn about nothing"
 
 
 def test_the_hook_is_registered_for_both_modes() -> None:
@@ -338,3 +353,95 @@ def test_the_hook_is_registered_for_both_modes() -> None:
         if any("worktree_ownership_advisory" in h.get("command", "") for h in e["hooks"])
     }
     assert matchers == {"Edit|Write|MultiEdit|NotebookEdit"}
+
+
+# ─── the channel, and the never-block contract ───────────────────────────────
+
+
+def test_the_advisory_reaches_the_model_through_the_only_channel_that_works(
+    worktree: Path,
+) -> None:
+    """Delivery, not emission — the distinction that made the first version inert.
+
+    Driven as a REAL subprocess, the way Claude Code runs it, with a claim held
+    by a GENUINELY live session process. A monkeypatched liveness check cannot
+    reach a subprocess, and faking it would recreate the original error: testing
+    the thing I control instead of the thing I claimed.
+
+    The earlier version printed to stderr and exited 0, and I "verified" it by
+    reading that stderr back — which proves the hook produced bytes and nothing
+    about whether anyone receives them. Per
+    docs/reference/cc-compatibility.md:1093-1099 PreToolUse reaches the model
+    ONLY through this envelope, and it is the same one two sibling hooks in this
+    repo are observed delivering with.
+
+    SKIPS where no foreign session exists (CI), rather than faking one. A test
+    that cannot run says so; it does not pretend.
+    """
+    import os as _os
+
+    def _is_session(pid: str) -> bool:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = fh.read().split(b"\x00")
+        except OSError:
+            return False
+        return bool(argv and argv[0]) and _os.path.basename(
+            argv[0].decode(errors="replace")
+        ) == "claude"
+
+    mine = wc.session_pid_from_ancestry()
+    foreign = [
+        int(e)
+        for e in _os.listdir("/proc")
+        if e.isdigit() and _is_session(e) and int(e) != mine
+    ]
+    if not foreign:
+        pytest.skip("no foreign Claude Code session on this box to hold the claim")
+
+    holder = foreign[0]
+    start = wc.proc_starttime(holder)
+    reason = wc.format_reason(P("claim", pid=holder, start=start, sid="otherses"))
+    _git(worktree, "worktree", "lock", "--reason", reason, str(worktree))
+
+    result = run_hook("--advise", payload(worktree / "target.py"))
+    assert result.returncode == 0
+
+    doc = json.loads(result.stdout)
+    assert set(doc) == {"hookSpecificOutput"}, (
+        "nothing may sit beside the envelope: a top-level additionalContext is "
+        "silently discarded, which is the same failure as writing to stderr"
+    )
+    hso = doc["hookSpecificOutput"]
+    assert hso["hookEventName"] == "PreToolUse"
+    assert "claimed by session otherses" in hso["additionalContext"]
+    assert str(holder) in hso["additionalContext"]
+    assert result.stderr == "", "stderr is the dead channel; nothing should go there"
+
+
+def test_a_crash_inside_the_advisory_does_not_deny_the_edit(
+    worktree: Path, monkeypatch
+) -> None:
+    """The never-block contract, against the failure mode most likely to break it.
+
+    `run_guard` converts an unhandled exception into exit 2, and on PreToolUse
+    exit 2 DENIES the tool call — so wiring the fail-closed runner here would let
+    a bug in this advisory block an edit it has no business blocking. Its own
+    docstring says "never for advisory or convenience guards". This asserts the
+    fail-OPEN wrapper actually holds by making the hook raise.
+    """
+    import subprocess as _sp
+
+    # The real entry point, fed a payload that cannot parse, asserting the
+    # process still exits 0 — a non-zero exit here is a DENIED edit.
+    result = _sp.run(
+        [sys.executable, str(_HOOK), "--advise"],
+        input="{not json at all",
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, (
+        "an advisory must never exit non-zero: on PreToolUse that denies the edit"
+    )
+

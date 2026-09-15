@@ -6,7 +6,8 @@ Two modes, both non-blocking, both on the Edit/Write family:
     --claim    (PostToolUse)  after a successful write into an unclaimed
                               worktree, record that this session holds it
     --advise   (PreToolUse)   before writing into a worktree another LIVE
-                              session holds, say so on stderr and allow it
+                              session holds, say so IN THE MODEL'S CONTEXT and
+                              allow it
 
 WHY CLAIM ON EDIT RATHER THAN ONLY ON CREATION. There are ~200 worktrees already
 and sessions mostly ADOPT one rather than create it, so a claim taken only at
@@ -19,7 +20,27 @@ escalating to a block needs a specific, measured reason. This does not have one:
 editing another session's worktree is a mistake an agent corrects the moment it
 is told, and the damage it prevents (a lost uncommitted change) is already
 covered by the lock keeping the reaper away. A block would also stop background
-sessions that nobody intended to stop. So: stderr, exit 0, every time.
+sessions that nobody intended to stop. So: never a non-zero exit, every time.
+
+WHY JSON AND NOT STDERR -- the correction this file exists in its current shape
+for. An earlier version printed the warning to stderr and exited 0, and I
+"verified" it by running the hook as a subprocess and reading stderr back. That
+proves EMISSION. It does not prove DELIVERY, and delivery is the entire point of
+a component whose only job is to tell somebody something.
+
+It was INERT. Per this repo's own measured contract
+(docs/reference/cc-compatibility.md:1093-1099) only SessionStart,
+UserPromptSubmit and UserPromptExpansion put a hook's stdout in front of the
+model; PreToolUse and PostToolUse reach it ONLY through JSON
+``hookSpecificOutput.additionalContext``. A PreToolUse hook that prints advice
+and exits 0 writes to the debug log and nothing else. No session would ever have
+seen this warning.
+
+Two details that are easy to get wrong and are load-bearing here: a TOP-LEVEL
+``additionalContext`` key is silently discarded -- it must nest under
+``hookSpecificOutput`` (scripts/hooks/web_tools_gate.py records the same trap) --
+and the payload goes through ``print_json_bounded`` so that an oversized advisory
+loses its PROSE rather than its envelope.
 
 FAIL-OPEN THROUGHOUT. A hook must never crash a session or deny a tool call over
 its own bug, so every path returns 0 and unexpected exceptions are swallowed by
@@ -36,7 +57,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import worktree_claim as wc  # noqa: E402  (sibling import, stdlib-only module)
-from hook_input import field, read_payload, run_guard, session_id  # noqa: E402
+from hook_input import field, read_payload, session_id  # noqa: E402
+from hook_output import print_json_bounded  # noqa: E402
 
 # The tool-input keys that name a file across the Edit/Write family. NotebookEdit
 # uses `notebook_path`; the rest use `file_path`. A key not listed here simply
@@ -75,11 +97,25 @@ def _advise(payload: dict) -> int:
 
     sid = lock.payload.get("sid")
     who = f"session {sid}" if sid else "another session"
-    print(
+    note = (
         f"NOTE: {root.name} is claimed by {who} (pid {holder}), which is still running. "
         f"Editing {os.path.basename(target)} here may collide with its uncommitted work. "
-        "Not blocked — check with that session, or work in your own worktree.",
-        file=sys.stderr,
+        "Not blocked — check with that session, or work in your own worktree."
+    )
+    # `hookSpecificOutput`, NOT a top-level `additionalContext`: the latter is
+    # silently discarded by Claude Code, which is the same failure mode as the
+    # stderr version this replaced — output that exists and never arrives.
+    # Routed through `print_json_bounded` so an oversized payload loses the
+    # PROSE and keeps the envelope; without that a long worktree name could
+    # cost the whole advisory rather than shorten it.
+    print_json_bounded(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": note,
+            }
+        },
+        text_keys=("hookSpecificOutput.additionalContext",),
     )
     return 0
 
@@ -117,4 +153,22 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    run_guard(main, "worktree_ownership_advisory")
+    # FAIL-OPEN, deliberately NOT `run_guard`. That helper converts any unhandled
+    # exception into exit 2, and on PreToolUse exit 2 DENIES the tool call — so a
+    # bug in this advisory would block an edit it has no business blocking. Its
+    # own docstring says as much: "never for advisory or convenience guards,
+    # which must stay fail-open so a bug never blocks legit work." Wiring the
+    # fail-closed runner here contradicted that instruction directly.
+    #
+    # The exception is still printed, because "never hide broken things" applies
+    # to an advisory too — it just must not cost the user their edit. Matches the
+    # shape edit_verify_advisory.py uses for the same reason.
+    try:
+        sys.exit(main())
+    except Exception as exc:  # noqa: BLE001 — an advisory never blocks
+        print(
+            f"ADVISORY ERROR (worktree_ownership_advisory): failing OPEN — "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(0)
