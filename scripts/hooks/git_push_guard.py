@@ -120,7 +120,24 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # scripts/ (parent dir) for review_state — the shared escalation-cap constant, so
 # the Codex-round gate below and the commit gate's Rule 3 stop at the same N.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from hook_input import degraded_exit, field, read_payload, run_guard  # noqa: E402
+try:
+    from hook_input import degraded_exit, field, read_payload, run_guard  # noqa: E402
+except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must block.
+    if __name__ != "__main__" or sys.argv[1:2] == ["--check-pr"]:
+        raise
+    # Reverse version skew: this guard may be newer than hook_input.py. Nothing
+    # imported from that older helper can recover us, so fail closed locally. Do
+    # not render the exception — even __str__ can raise — and use os._exit so a
+    # broken diagnostic stream cannot replace exit 2 during interpreter shutdown.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (git_push_guard): shared hook_input is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
 
 # SOFT dependency (mirrors review_enforcement_commit.py's guard for the SAME
 # import): an unimportable review_state must degrade ONLY the round-escalation

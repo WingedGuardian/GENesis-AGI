@@ -38,7 +38,30 @@ import sys
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import degraded_exit, read_payload, run_guard, tool_input  # noqa: E402
+try:
+    from hook_input import (  # noqa: E402
+        degraded_exit,
+        read_payload,
+        run_guard,
+        tool_input,
+    )
+except Exception:  # noqa: BLE001 — a missing NEW helper must block.
+    if __name__ != "__main__":
+        raise
+    # REVERSE version skew: this guard may be newer than hook_input.py, in which case
+    # nothing it could import can recover it — degraded_exit is the thing that is
+    # missing. So fail closed locally. The exception is not rendered (even __str__ can
+    # raise) and os._exit is used so a broken diagnostic stream cannot replace exit 2
+    # during interpreter shutdown.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (worktree_cwd_guard): shared hook_input is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
 
 # DEGRADED-path mention set, defined ABOVE the guarded import so it survives that
 # import failing. `run_guard`'s own docstring names worktree removal among the

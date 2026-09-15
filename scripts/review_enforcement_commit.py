@@ -23,7 +23,24 @@ from pathlib import Path
 # The shared hook-input helper lives in scripts/hooks/; this script runs from
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks"))
-from hook_input import degraded_exit, field, read_payload, run_guard  # noqa: E402
+try:
+    from hook_input import degraded_exit, field, read_payload, run_guard  # noqa: E402
+except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must block.
+    if __name__ != "__main__":
+        raise
+    # Reverse version skew: this guard may be newer than hook_input.py. Nothing
+    # imported from that older helper can recover us, so fail closed locally. Do
+    # not render the exception — even __str__ can raise — and use os._exit so a
+    # broken diagnostic stream cannot replace exit 2 during interpreter shutdown.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (review_enforcement_commit): shared hook_input is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
 
 # DEGRADED-path mention set, defined ABOVE the guarded import so it survives that
 # import failing. Same single verb as `_COMMIT_PATTERN` further down; kept separate

@@ -17,6 +17,10 @@
   swallowed, which costs a re-run. Two advisory hooks are unaffected, since an
   import failure there loses a note and never a refusal.
 
+  Both partial-update orderings fail closed: an older guard calling the newer
+  helper, and a newer guard whose helper is still old — in which case nothing it
+  could import can recover it, so it refuses locally.
+
   While the hook tree is broken these guards refuse roughly a third of ordinary
   commands. That is the cost of the state, not of normal operation, and the usual
   cause is a partially updated install — which the refusal now says.
