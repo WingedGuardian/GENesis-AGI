@@ -129,6 +129,67 @@
   one place that both test files import, with the reason attached — a rule every
   call site has to remember is a rule the next call site will not.
 
-- Measured both directions after all of it: fifteen of fifteen, nine constructed
-  leaks caught and six correct trees left alone, plus every replay from the
-  previous round still firing. The collected-test floor is re-derived again.
+- **The redesign deleted every estimate about how the inputs RELATE and kept
+  every estimate about what the inputs ARE.** That is the sentence the last six
+  review rounds were circling. Specificity and coverage — estimates about whether
+  two selectors reach the same elements — were deleted and replaced by identity.
+  Four other estimates were left standing, all upstream of the comparison, all
+  deciding whether a rule was ever looked at: which pages exist, which sheets the
+  browser actually applies, which properties count as layout, and which selector
+  shapes are unreadable. Nine measured members, four of them live fail-opens
+  demonstrated against the shipped stylesheets.
+
+  Each is now closed the way the at-rule walk already worked — an allowlist with
+  a refusal on the tail, so a shape invented next year fails loudly instead of
+  vanishing.
+
+- **The page population is derived rather than listed.** The previous fix
+  replaced a directory glob with an explicit list of two page sources, which has
+  the glob's defect and more entries: it omits silently. A review then found a
+  third page — a terminal view serving a vendor stylesheet and declaring
+  `overflow: hidden` on the document root, the first incident's exact shape — and
+  a search of the tree found a fourth emitter besides. Emitters are now
+  discovered mechanically and each must be mapped to the page it serves or
+  exempted with a stated reason; an unmapped one fails, and so does a mapping for
+  a module that has stopped emitting.
+
+- **One function now answers whether a stylesheet is applied at all.** It was
+  answered in four places from four partial rules and not at all in three more.
+  Marking the sheet that carries the panel answer as an alternate stylesheet left
+  every test green; so did marking it disabled; so did putting a media condition
+  on an inline block rather than on a link. The same function is asked of a
+  `<style>` element and a `<link>`, and an unrecognised condition raises rather
+  than being guessed at.
+
+- **Refusals that fired only in the cases nobody reaches now fire
+  unconditionally.** The external-stylesheet refusal ran only when a page had no
+  readable local pair, so adding an unread content-network layout sheet to any
+  real page sidestepped it entirely. The import exemption admitted any absolute
+  URL rather than the font service it was written for, so a content-network
+  import was dropped whole. Both measured green before, both refused now.
+
+- **Three smaller members, each measured.** Ownership is classified from the
+  resolved path, because a link spelled with a dot segment resolves to the vendor
+  sheet while a prefix check called it ours. A stray brace is not reported as a
+  parse error — the parser folds it into the next rule's selector, so that rule
+  keys under the wrong name and its leaks read as absent; preludes that did not
+  parse are refused, and the check reads the token type the parser actually
+  produces rather than the one it seemed like it should. And `@namespace` is
+  refused outright, since prefixes are per-sheet and identical selector text in
+  two sheets can target different elements.
+
+- **The layout-property set gained the shorthands of what it already watched,
+  and an honest statement of what it is.** A flex shorthand bypassed the
+  longhand; an inset shorthand bypassed position. Those are closed at no cost —
+  zero new findings on the real stylesheets. The set is still a deliberate
+  sample: 136 non-custom properties in the shipped sheets sit outside it, of
+  which roughly 69 plausibly affect layout, and watching those would flood the
+  guard into uselessness. That the line is a judgement rather than a boundary is
+  now said rather than implied.
+
+- **The refusal list in the module docstring was four claims larger than the
+  code.** A reader trusts that list instead of re-checking, which is the same
+  mechanism that let the second incident ship — a page that obviously had a copy.
+  Every entry is now pinned by a test that constructs the shape it names.
+
+- Measured both directions throughout: fifteen of fifteen, nine constructed leaks caught and six correct trees left alone, plus every replay from every previous round still firing. The collected-test floor is re-derived again.
