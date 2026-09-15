@@ -931,6 +931,21 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
 
 ### Common Traps
 
+- **A `gh` listing is ALREADY capped before you pass a flag, and the caps are not
+  uniform.** MEASURED by reading `--help` on gh 2.98.0 (2026-08-20): `pr list` 30 ·
+  `issue list` 30 · `run list` **20** · `workflow list` **50** · `gist list` **10** ·
+  `release list` 30 · `repo list` 30 · `cache list` 30 · every `search` subcommand 30.
+  So `gh pr list --limit 30` is behaviourally identical to passing nothing, and a
+  session once reported its own cap back as the repo's open-PR count (said 30, the
+  real number was 78). The unflagged form is the dangerous one precisely because
+  nothing in the command hints a cap is in force. `scripts/hooks/capped_read_advisory.py`
+  now says so pre-flight, and a drift test re-reads `--help` so this table fails loudly
+  when gh moves a number rather than quietly naming a cap that no longer exists — treat
+  the numbers above as the reading at that version, not as durable facts. To get the
+  whole set, pass `--limit N` ABOVE your expected count and re-read until the result
+  comes back SHORT of it — `--paginate` is a `gh api` flag and MEASURED on gh 2.98.0
+  every one of these subcommands rejects it with `unknown flag: --paginate`.
+
 - **Fail-closed data access.** A data-access boundary must RAISE (or return a
   clearly-typed "unknown/unavailable") on missing scope or an unavailable
   dependency — it must NEVER silently return the wrong data, the singleton's
