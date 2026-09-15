@@ -368,7 +368,12 @@ def degraded_exit(
         )
 
     try:
-        hit = bool(re.search(gated, raw, re.IGNORECASE))
+        # Match against the text the SHELL would run, not the text as typed. See
+        # _join_continuations: a continuation may split the gated token itself, and a
+        # word-boundary matcher looking at the raw bytes then sees two fragments and
+        # nothing gated. MEASURED across all six wired guards: every one allowed the
+        # split spelling of a command it refused whole.
+        hit = bool(re.search(gated, _join_continuations(raw), re.IGNORECASE))
     except BaseException:  # noqa: BLE001 — a matcher that cannot answer has not cleared it.
         hit = True
     if hit:
@@ -387,6 +392,58 @@ def degraded_exit(
         f"this command either.{' ' + also_lost if also_lost else ''} Repair the hook "
         "tree before relying on any of them.",
     )
+
+
+def _join_continuations(command: str) -> str:
+    """Remove backslash-newline the way the shell removes it, before a text match.
+
+    WHY THIS IS NOT THE NORMALIZATION THIS REPO FORBIDS, because it looks exactly like
+    it and an earlier revision of this change refused to do it on those grounds. That
+    rule is about normalising ahead of a BLIND-SPOT PROBE — a probe asks "could the
+    parser read this", and preprocessing deletes the evidence it exists to find. This
+    is not a probe. It is a crude text matcher standing in for a parser that is gone,
+    and its whole job is to ask what the SHELL would run. Reproducing one step of the
+    shell's own lexer is the opposite of hiding evidence from it.
+
+    THE DEFECT THAT SETTLED IT, measured across all six wired guards: a continuation
+    inside the gated TOKEN (`git cl\\<newline>ean -fd`) is removed by the shell and runs
+    as `git clean -fd`, while a word-boundary matcher over the raw bytes sees `cl` and
+    `ean` and refuses nothing. 6 of 6 allowed the split spelling of a command each
+    refused whole. Dropping an adjacency conjunct — the earlier fix — closes the split
+    BETWEEN tokens and does nothing for a split INSIDE one.
+
+    DELETED, NOT REPLACED WITH A SPACE, and the distinction is load-bearing: `a\\<nl>b`
+    is one word `ab` to the shell. #1547 shipped the fold-to-space version and it was
+    itself the bug — it glued the wrong things together and allowed a destructive
+    command. ODD-LENGTH RUNS ONLY: in an even run each backslash is escaped by its
+    neighbour, so the last is a literal character and the newline after it really does
+    separate two commands. Consuming escaped pairs as we walk makes that parity fall
+    out with no counting.
+
+    Quote-blind on purpose. A continuation inside quotes is NOT removed by the shell,
+    so joining one here can only ever create a gated-looking token that does not run —
+    an over-block, in a state whose entire posture is over-blocking. Tracking quotes
+    would mean a quote model in the module whose premise is that the parser is gone.
+    """
+    out: list[str] = []
+    i, n = 0, len(command)
+    while i < n:
+        c = command[i]
+        if c == "\\" and i + 1 < n:
+            nxt = command[i + 1]
+            if nxt == "\n":  # odd run: an unescaped backslash — the shell removes both
+                i += 2
+                continue
+            if nxt == "\r" and i + 2 < n and command[i + 2] == "\n":
+                i += 3
+                continue
+            out.append(c)  # an escaped pair: keep both, and the parity flips with it
+            out.append(nxt)
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 #: Longest exception text carried into a degraded message. The notice rides the model's

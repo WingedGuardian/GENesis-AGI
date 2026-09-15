@@ -157,6 +157,35 @@ _CASES = [
     ("worktree_cwd_guard", "hooks/worktree_cwd_guard.py", "ls -la /tmp", 0, "benign"),
     ("full_suite_guard", "hooks/full_suite_guard.py", "pytest tests/", 2, "gated"),
     ("full_suite_guard", "hooks/full_suite_guard.py", "ls -la /tmp", 0, "benign"),
+    # INTRA-TOKEN continuation: the shell removes the pair and runs `git clean -fd`,
+    # while a word-boundary matcher over the raw bytes sees `cl` and `ean`. Dropping an
+    # adjacency conjunct — the earlier fix — closes the split BETWEEN tokens and does
+    # nothing for a split INSIDE one. MEASURED: 6 of 6 wired guards allowed the split
+    # spelling of a command each refused whole. One cell per guard, because the matcher
+    # is per-guard and a fix proven on one proves nothing about the rest.
+    ("git_discard_guard", "hooks/git_discard_guard.py", "git cl\\\nean -fd", 2, "split token"),
+    (
+        "git_push_guard",
+        "hooks/git_push_guard.py",
+        "git pu\\\nsh origin main",
+        2,
+        "split token",
+    ),
+    (
+        "review_enforcement_commit",
+        "review_enforcement_commit.py",
+        'git comm\\\nit -m "x"',
+        2,
+        "split token",
+    ),
+    ("full_suite_guard", "hooks/full_suite_guard.py", "py\\\ntest tests/", 2, "split token"),
+    (
+        "worktree_cwd_guard",
+        "hooks/worktree_cwd_guard.py",
+        "git work\\\ntree remove x",
+        2,
+        "split token",
+    ),
 ]
 
 
@@ -625,19 +654,21 @@ _WIRED = {Path(rel).name for _g, rel, _c, _e, _l in _CASES}
 #: NOT wired, each with the reason it is not — and the reason is a MEASUREMENT, not a
 #: judgement, because an exemption whose ground can shift is a hole with a comment on
 #: it. Rates are over 74,282 unique real Bash commands harvested from this install.
+#:
+#: The advisory hooks that used to sit here are gone from the table, because the scan
+#: no longer reaches them: it enumerates BLOCKING guards, and a hook with no exit-2
+#: path was never in the population to begin with. That is the difference between an
+#: exemption and a question that was asked wrongly.
 _NOT_WIRED = {
-    # Its only usable degraded token is the pipe character, which appears in 52,220 of
-    # 74,282 commands (70.30%). Wiring it would not make the broken state safe, it
-    # would make it UNREPAIRABLE — and a degraded matcher that blocks the majority of
-    # ordinary work is not a fail-closed option at all. What its refusal protects is
-    # also the mildest in this set: a backgrounded pipeline whose stdout is swallowed,
-    # i.e. a re-run. Revisit if it ever gains a distinctive token.
+    # Its remaining bare import is `shell_parse`, and its only usable degraded token
+    # would be the pipe character — 52,220 of 74,282 commands (70.30%). Wiring it would
+    # not make the broken state safe, it would make it UNREPAIRABLE, and a degraded
+    # matcher that refuses the majority of ordinary work is not a fail-closed option at
+    # all. What its refusal protects is also the mildest in this set: a backgrounded
+    # pipeline whose stdout is swallowed, i.e. a re-run. Its `hook_input` import IS
+    # wrapped, because there the failed module is the one that would read the payload
+    # and there is no matcher to choose — no token, no trade, no exemption.
     "background_pipe_guard.py": "only token is `|` at 70.30% — would wedge the repair",
-    # Advisory only: their sole verdict is a note, so an import-time exit 1 loses
-    # advice and never a refusal. Verified by the absence of any exit-2 path, not by
-    # reading their docstrings.
-    "pipe_status_guard.py": "advisory only — no exit-2 path to lose",
-    "tmux_kill_server_guard.py": "advisory only — no exit-2 path to lose",
 }
 
 
@@ -663,36 +694,45 @@ def test_every_module_scope_shell_parse_importer_is_accounted_for():
     """
     import ast
 
-    found: set[str] = set()
-    for path in [*_HOOKS.glob("*.py"), *_SCRIPTS.glob("*.py")]:
+    files = [*_HOOKS.glob("*.py"), *_SCRIPTS.glob("*.py")]
+    siblings = {p.stem for p in files} | {p.stem for p in (_SCRIPTS / "lib").glob("*.py")}
+
+    found: dict[str, set[str]] = {}
+    for path in files:
         try:
             tree = ast.parse(path.read_text())
         except SyntaxError:  # pragma: no cover — a syntax error is another test's job
             continue
-        for node in tree.body:
-            if (
-                isinstance(node, ast.ImportFrom)
-                and node.module == "shell_parse"
-                or isinstance(node, ast.Import)
-                and any(alias.name == "shell_parse" for alias in node.names)
-            ):
-                found.add(path.name)
+        text = path.read_text()
+        # A guard is BLOCKING if it can ever exit 2. Derived from the source rather than
+        # from a hand-kept list, because a hand-kept list is the thing that was wrong.
+        if not any(marker in text for marker in ("sys.exit(2)", "return 2", "os._exit(2)")):
+            continue
+        bare: set[str] = set()
+        for node in tree.body:  # module scope ONLY — a guarded import is in a Try node
+            if isinstance(node, ast.ImportFrom) and node.module in siblings:
+                bare.add(node.module)
+            elif isinstance(node, ast.Import):
+                bare.update(a.name for a in node.names if a.name in siblings)
+        if bare:
+            found[path.name] = bare
 
-    assert found, (
-        "no bare module-scope importer found at all — the walk is looking in the wrong "
-        "place, and an empty population would make this test pass forever"
+    assert found or _NOT_WIRED, (
+        "the walk found no blocking guard with a bare sibling import AND the exemption "
+        "table is empty — an empty population on both sides makes this pass forever"
     )
-    unaccounted = found - set(_NOT_WIRED)
+    unaccounted = {name: sorted(deps) for name, deps in found.items() if name not in _NOT_WIRED}
     assert not unaccounted, (
-        f"{sorted(unaccounted)} import shell_parse at bare module scope. An exception "
-        "during that import never reaches run_guard, so the process exits 1 — which "
-        "Claude Code reads as NON-BLOCKING, and the guard vanishes instead of "
-        "degrading. Either call hook_input.degraded_exit from a guarded import, or add "
-        "the file to _NOT_WIRED with the MEASURED reason it does not need one."
+        f"{unaccounted} are BLOCKING guards with a bare module-scope sibling import. An "
+        "exception during that import never reaches run_guard, so the process exits 1 — "
+        "which Claude Code reads as NON-BLOCKING, and the guard vanishes instead of "
+        "degrading. Wrap the import (call hook_input.degraded_exit where the failed "
+        "module is a parser; refuse locally where the failed module IS hook_input, since "
+        "nothing it could import can recover it), or add the file to _NOT_WIRED with the "
+        "MEASURED reason it does not need one."
     )
     # Both directions: a guard that gains the wiring must leave _NOT_WIRED, or the
-    # exemption silently outlives its reason. This is what a bare `len(found) == N`
-    # check could not catch.
+    # exemption silently outlives its reason. A bare count could not catch that.
     stale = set(_NOT_WIRED) & _WIRED
     assert not stale, f"{sorted(stale)} are wired now and must leave _NOT_WIRED"
 
@@ -766,6 +806,101 @@ def test_check_pr_with_old_hook_input_surfaces_the_import_error(tmp_path):
     assert res.returncode == 1
     assert "cannot import name 'degraded_exit'" in res.stderr
     assert "GUARD DEGRADED" not in res.stderr
+
+
+@pytest.mark.parametrize(
+    ("raw", "joined", "why"),
+    [
+        ("git cl\\\nean -fd", "git clean -fd", "odd run: the shell removes the pair"),
+        ("git \\\n  clean -fd", "git   clean -fd", "between tokens: spaces around it stay"),
+        ("a\\\r\nb", "ab", "CRLF form"),
+        (
+            "echo a \\\\\n  b",
+            "echo a \\\\\n  b",
+            "EVEN run: the last backslash is literal and the newline really separates",
+        ),
+        ("git clean -fd", "git clean -fd", "control: nothing to join"),
+        ("printf 'a\\tb'", "printf 'a\\tb'", "control: an escape that is not a newline"),
+    ],
+)
+def test_the_continuation_join_matches_the_shell(raw, joined, why):
+    """DELETED, not replaced with a space, and only for ODD-length runs.
+
+    `a\\<newline>b` is one word `ab` to the shell — #1547 shipped the fold-to-space
+    version and it was itself the bug, gluing the wrong things together and allowing a
+    destructive command. And in an EVEN run each backslash is escaped by its
+    neighbour, so the last is a literal character and the newline after it really does
+    separate two commands; joining there would be a pure over-block.
+
+    The two control rows matter as much as the rest: a function that returned its
+    input unchanged would pass every joining row if the expectations were sloppy, and
+    one that stripped every backslash would pass the joins and fail the controls.
+    """
+    sys.path.insert(0, str(_HOOKS))
+    import hook_input
+
+    assert hook_input._join_continuations(raw) == joined, why
+
+
+@pytest.mark.parametrize(
+    ("guard", "rel", "payload"),
+    [
+        (
+            "pretool_check",
+            "pretool_check.py",
+            {"tool_name": "Write", "tool_input": {"file_path": ".claude/settings.json"}},
+        ),
+        (
+            "destructive_command_guard",
+            "hooks/destructive_command_guard.py",
+            {"tool_name": "Bash", "tool_input": {"command": "rm -rf ~/genesis"}},
+        ),
+        (
+            "repo_routing_guard",
+            "hooks/repo_routing_guard.py",
+            {"tool_name": "Bash", "tool_input": {"command": "git push origin main"}},
+        ),
+        (
+            "background_pipe_guard",
+            "hooks/background_pipe_guard.py",
+            {"tool_name": "Bash", "tool_input": {"command": "ls | wc -l"}},
+        ),
+    ],
+)
+def test_a_blocking_guard_whose_hook_input_is_broken_still_blocks(tmp_path, guard, rel, payload):
+    """The dependency that cannot be recovered from, because it IS the recovery module.
+
+    `degraded_exit` lives in `hook_input`, so a guard whose `hook_input` import fails
+    has nothing to fall back on and must refuse outright. MEASURED before this: these
+    four blocking guards imported it bare and exited 1 on a poisoned copy — including
+    the CRITICAL-path Write/Edit gate, which would have permitted an autonomous edit to
+    `.claude/settings.json`.
+
+    THIS IS THE POPULATION QUESTION ASKED CORRECTLY, at the third attempt. The first
+    asked "who imports shell_parse bare" and answered four. The second asked the same
+    question properly and answered nine. The right question is "what module-scope
+    dependency does each BLOCKING guard have" — and the answer includes `hook_input`
+    itself, which the previous two framings could not see.
+    """
+    root = _tree(tmp_path, poisoned=False)
+    boom = 'raise RuntimeError("poisoned helper")\n'
+    (root / "scripts" / "hooks" / "hook_input.py").write_text(boom)
+    home = tmp_path / f"home_hi_{guard}"
+    home.mkdir(parents=True, exist_ok=True)
+    res = subprocess.run(
+        [sys.executable, str(root / "scripts" / rel)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        cwd=str(root),
+        env={**os.environ, "HOME": str(home), "GENESIS_CC_SESSION": "1"},
+        timeout=90,
+    )
+    assert res.returncode == 2, (
+        f"{guard} exited {res.returncode} with an unimportable hook_input. Exit 1 is "
+        f"the fail-open: Claude Code reads any non-2 code as non-blocking.\n"
+        f"stderr: {res.stderr[:300]}"
+    )
 
 
 def test_hook_input_stays_stdlib_only(tmp_path):
