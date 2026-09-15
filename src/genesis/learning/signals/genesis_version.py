@@ -180,6 +180,18 @@ class GenesisVersionCollector:
                 behind, summary = await self._check_upstream()
                 self._last_fetch_at = now
 
+                if behind == 0:
+                    # A MEASURED zero must clear a stale alert. Before this
+                    # method stopped coercing with max(behind, 1), zero was
+                    # unreachable here, so nothing downstream was written for
+                    # it. Now that a genuine zero can arrive, an upstream ref
+                    # that was rewritten or rolled back after an observation
+                    # was stored would otherwise leave the dashboard claiming
+                    # an update forever: HEAD never changes, so the resolve on
+                    # the HEAD-change path never fires, and update_status keeps
+                    # serving the unresolved target.
+                    await self._resolve_pending_update_available(current_head)
+
                 if behind > 0:
                     stored = await self._store_update_available(
                         current_head, behind, summary,
@@ -194,6 +206,19 @@ class GenesisVersionCollector:
             except Exception:
                 logger.error("Upstream check failed", exc_info=True)
                 self._last_fetch_at = now  # Don't retry immediately on failure
+                # A FAILED check is not "up to date". Falling through to the
+                # 0.0 return below would report an unknown state as the
+                # explicit baseline "0.0=up to date" with failed=False — the
+                # same defect class this method was rewritten to remove, since
+                # it is false about the reader while wearing verified grammar.
+                # Same shape as the HEAD-read failure above.
+                return SignalReading(
+                    name=self.signal_name,
+                    value=0.0,
+                    source="genesis_version",
+                    collected_at=now_iso,
+                    failed=True,
+                )
 
         return SignalReading(
             name=self.signal_name, value=0.0,
@@ -238,8 +263,12 @@ class GenesisVersionCollector:
         if commit SHAs differ.
 
         Returns (0, "") when tags match (up to date).
-        Returns (N, summary) where N is commits between tags and summary
-        shows what changed in the tag range.
+        Returns (N, summary) where N is how far the DEPLOYED COMMIT is behind
+        the upstream ref, and summary lists that same range. Not the distance
+        between the release tags — the caller renders this as "N commits
+        behind", which a reader takes as their own, and on an install that
+        tracks main between releases those numbers differ by an order of
+        magnitude.
         Raises RuntimeError on git failure.
         """
         remote = _update_remote()
@@ -273,40 +302,59 @@ class GenesisVersionCollector:
 
         # If only one side has tags, there's definitely an update
         if local_tag != origin_tag:
-            # Count commits in the tag range for a meaningful number
-            behind = 0
-            if local_tag and origin_tag:
-                count_str = await self._git_output(
-                    "rev-list", "--count", f"{local_tag}..{origin_tag}",
+            # Count from the DEPLOYED COMMIT, never between the release tags.
+            #
+            # This used to count `local_tag..origin_tag`, and the alert that
+            # renders it says "N commits behind" — which every reader takes as
+            # their own distance from the target. Those two numbers diverge by
+            # more than an order of magnitude on any install that tracks main
+            # between releases, because the tag moves at a release and HEAD moves
+            # constantly. MEASURED 2026-09-08: the dashboard read "v3.0b18 (668
+            # commits behind)" on a tree that was 20 commits behind the b18 tag
+            # and 31 behind origin/main. The number was true about the tag range
+            # and false about the reader, which is worse than an arithmetic
+            # error — it wears verified grammar.
+            #
+            # `observability/snapshots/deploy_health.py` already had this right,
+            # and its field name says so: `commits_behind_upstream`, counted
+            # `HEAD..@{upstream}`. This is the same measurement.
+            count_str = await self._git_output("rev-list", "--count", f"HEAD..{ref}")
+            if count_str is None or not count_str.isdigit():
+                # Honour the docstring above rather than substituting a 1. A
+                # fabricated distance is the same defect as the tag-span one
+                # this method was rewritten to fix: it is false about the
+                # reader while wearing verified grammar.
+                # An earlier revision of this comment said "the caller logs and
+                # skips the cycle". It did not: collect() caught this, logged,
+                # and fell through to the explicit 0.0 "up to date" baseline
+                # with failed=False — turning an unknown state into a confident
+                # all-clear, which is the very class being fixed here. The
+                # caller now returns a FAILED reading; that is what makes
+                # raising the right move rather than a quieter bug.
+                raise RuntimeError(
+                    f"git rev-list --count HEAD..{ref} failed; distance unknown"
                 )
-                behind = int(count_str) if count_str and count_str.isdigit() else 1
-            else:
-                # One side untagged — use commit count as fallback
-                count_str = await self._git_output(
-                    "rev-list", "--count", f"HEAD..{ref}",
-                )
-                behind = int(count_str) if count_str and count_str.isdigit() else 1
+            behind = int(count_str)
 
-            # Summary of what changed between tags
-            summary = ""
-            if local_tag and origin_tag:
-                raw = await self._git_output(
-                    "log", "--oneline", "--no-merges",
-                    f"{local_tag}..{origin_tag}",
-                )
-                summary = raw or ""
-            else:
-                raw = await self._git_output(
-                    "log", "--oneline", "--no-merges", f"HEAD..{ref}",
-                )
-                summary = raw or ""
+            # The summary must describe the SAME range as the count, or the two
+            # halves of one alert disagree: the tag-range version ended "... and
+            # 658 more" beside a count the reader reads as theirs.
+            raw = await self._git_output(
+                "log", "--oneline", "--no-merges", f"HEAD..{ref}",
+            )
+            summary = raw or ""
 
             # Truncate to first 10 lines
             lines = summary.split("\n")
             if len(lines) > 10:
                 summary = "\n".join(lines[:10]) + f"\n... and {len(lines) - 10} more"
 
-            return max(behind, 1), summary
+            # No max(behind, 1): when the tags differ but the deployed commit is
+            # not behind the ref, the reader's distance genuinely is 0 and the
+            # caller correctly stays silent. Clamping it to 1 announced an update
+            # that did not exist for this reader, which is the same class of
+            # falsehood as counting the release span.
+            return behind, summary
 
         # Same tag — up to date
         return 0, ""
@@ -398,7 +446,12 @@ class GenesisVersionCollector:
     async def _resolve_pending_update_available(self, current_head: str) -> None:
         """Resolve any unresolved genesis_update_available observations.
 
-        Called when the local HEAD changes (an update was applied).
+        TWO callers, and the second is not an update being applied:
+        (1) the local HEAD changed — an update was applied;
+        (2) an upstream check MEASURED zero commits behind — the target went
+            away (ref rewritten or rolled back) while HEAD stayed put, so no
+            HEAD change will ever fire and the alert would otherwise never
+            clear.
         Marks all pending update-available observations as resolved
         with a note pointing to the current head, so the dashboard
         alert clears immediately instead of waiting for the next

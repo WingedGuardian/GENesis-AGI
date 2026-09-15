@@ -62,6 +62,13 @@ _GIT_GLOBAL_VALUE_OPTS = (
     "--work-tree",
     "--namespace",
     "--super-prefix",
+    # MEASURED against the installed binary. `git -h` shows only ATTACHED forms
+    # and omits --attr-source and --shallow-file entirely, so the usage line
+    # cannot tell you a SEPARATED form is accepted — which is the property this
+    # tuple encodes. See test_value_flag_consistency for the derivation.
+    "--config-env",
+    "--attr-source",
+    "--shallow-file",
 )
 _PUSH_VALUE_FLAGS = ("-o", "--push-option", "--repo", "--receive-pack", "--exec")
 _MAX_LINES = 20

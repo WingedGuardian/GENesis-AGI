@@ -16,18 +16,19 @@ or ~/.genesis state.
 
 from __future__ import annotations
 
-import importlib.util
-import sys
 from pathlib import Path
 
-# Load the stdlib script as a module (not a package — use importlib).
+from tests.conftest import private_module
+
+# Load the stdlib script as a module (not a package) WITHOUT leaking the shared
+# name: `scripts/export_agents_md.py:43` imports `generate_skill_catalog`, so a
+# leaked private copy here becomes that importer's copy for the rest of the
+# session. Inert today (that import is module-level, so it binds at load), but
+# it is the same defect that bit `review_state` — see tests.conftest.
 _SCRIPT_PATH = (
     Path(__file__).resolve().parents[2] / "scripts" / "generate_skill_catalog.py"
 )
-_spec = importlib.util.spec_from_file_location("generate_skill_catalog", _SCRIPT_PATH)
-_gen = importlib.util.module_from_spec(_spec)
-sys.modules["generate_skill_catalog"] = _gen
-_spec.loader.exec_module(_gen)
+_gen = private_module("generate_skill_catalog", _SCRIPT_PATH)
 
 
 def _mk_skill(skill_dir: Path, name: str, description: str = "does things") -> None:
