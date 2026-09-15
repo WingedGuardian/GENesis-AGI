@@ -145,27 +145,47 @@ def _rules(css: str) -> list[tuple[frozenset[str], str]]:
     return [(_selector_parts(m.group(1)), m.group(2)) for m in _RULE_RE.finditer(body)]
 
 
+def _beats(candidate: tuple[str, bool], incumbent: tuple[str, bool] | None) -> bool:
+    """Does a later-seen declaration win over the one held so far?
+
+    Two rules, in the order the cascade applies them: `!important` beats
+    not-important whatever the document order, and between two of equal importance
+    the later one wins.
+
+    ONE function, used at both levels — within a block and across the rules of a
+    sheet — because the first version of this resolution expressed "last wins" in
+    two places and got importance wrong in both. A declaration marked important
+    would have lost to any later plain one, which is a FALSE FAILURE rather than a
+    fail-open, and unreachable in either sheet today (neither declares the same
+    property on the same selector twice with mixed importance). Fixing it is still
+    cheaper than a helper whose docstring promises the cascade and does not do it —
+    this file has been corrected for exactly that three times already.
+    """
+    return incumbent is None or candidate[1] or not incumbent[1]
+
+
 def _declaration(block: str, prop: str) -> tuple[str, bool] | None:
     """The winning value of `prop` within ONE block, and whether it is important.
 
-    Last declaration wins, which is what the cascade does inside a block — the
-    vendor's own `.panel` relies on it, declaring `display` twice so that
+    The vendor's own `.panel` depends on this, declaring `display` twice so that
     `-webkit-flex` loses to `flex`.
 
     Property names, values and `!important` are all case-insensitive in CSS, so
     the comparison is folded. A longhand is NOT a match for its shorthand:
     `overflow-y` does not answer `overflow`.
     """
-    values = re.findall(r"(?:^|;)\s*" + re.escape(prop) + r"\s*:([^;]+)", block, re.I)
-    if not values:
-        return None
-    raw = values[-1].strip()
-    important = bool(re.search(r"!\s*important$", raw, re.I))
-    return re.sub(r"!\s*important$", "", raw, flags=re.I).strip().casefold(), important
+    winner: tuple[str, bool] | None = None
+    for raw in re.findall(r"(?:^|;)\s*" + re.escape(prop) + r"\s*:([^;]+)", block, re.I):
+        raw = raw.strip()
+        important = bool(re.search(r"!\s*important$", raw, re.I))
+        value = re.sub(r"!\s*important$", "", raw, flags=re.I).strip().casefold()
+        if _beats((value, important), winner):
+            winner = (value, important)
+    return winner
 
 
 def _declared(css: str, selector: str, prop: str) -> tuple[str, bool] | None:
-    """The declaration a browser would use for `selector`, or None.
+    """The declaration THIS SHEET would contribute for `selector`, or None.
 
     EVERY matching rule is considered, not the first one found. An earlier version
     used a single `re.search` and returned the first textual match, so APPENDING
@@ -180,14 +200,24 @@ def _declared(css: str, selector: str, prop: str) -> tuple[str, bool] | None:
     not an answer for `html, body`, and splitting our own rule that way would turn
     these red. That is the conservative direction, and it is stated here rather
     than left to be discovered.
+
+    ONE sheet. Resolving the effective value ACROSS sheets is deliberately absent:
+    `dashboard.css` also sets `.panel`, loads after `components.css`, and is one of
+    several sheets whose order differs per page, so a two-sheet helper would
+    compute a number that is right on no page while looking authoritative. The
+    cross-sheet question belongs to the lint on its own branch. What covers it here
+    instead is the pair of guards either side — the vendor's values are pinned
+    exactly, `!important` included, so a vendor that starts winning fails loudly;
+    and every page is checked to load this sheet after that one.
     """
     wanted = _selector_parts(selector)
-    for parts, block in reversed(_rules(css)):
+    winner: tuple[str, bool] | None = None
+    for parts, block in _rules(css):
         if wanted <= parts:
             hit = _declaration(block, prop)
-            if hit is not None:
-                return hit
-    return None
+            if hit is not None and _beats(hit, winner):
+                winner = hit
+    return winner
 
 
 def _components() -> str:
