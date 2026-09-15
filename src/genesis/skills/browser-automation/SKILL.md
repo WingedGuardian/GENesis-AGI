@@ -204,6 +204,16 @@ intended. This converts every coordinate error — scaling, stale bounds, a
 window that moved between measuring and acting — from a wrong click into a
 refusal.
 
+⚠ **Genesis's own VNC fallback CANNOT do this, so do not assume the guarantee
+holds behind these tools.** `vncdo` drives raw pixel coordinates and has no
+concept of an element, so the fallback path moves and clicks and checks only
+whether the subprocess succeeded (`mcp/health/browser.py`). A wrong active
+window or stale bounds still produces a click there, not a refusal. Treat a
+VNC-fallback click as UNVERIFIED: confirm the outcome afterwards by screenshot
+or by a subsequent read, rather than trusting that a failed aim would have been
+caught. The readback rule above is achievable on the CDP/Playwright path, where
+elements exist to be read.
+
 **Log where it actually landed, not where you aimed.** Intent is a
 computation; a computation cannot notice that it is wrong. Record actual
 against intended with the drift and the scale factor, at the moment of the
