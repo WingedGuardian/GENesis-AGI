@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
 from hook_input import session_path  # noqa: E402
 from hook_output import (  # noqa: E402
     DEFAULT_BUDGET,
+    HOOK_STDOUT_CAP,
     BoundedStdout,
     clip_to_cost,
     utf16_len,
@@ -121,6 +122,26 @@ _MAX_PEERS_SHOWN = 12
 # code_symbols). So a cut drops a view, not data, which makes it a selection
 # rather than an amputation — and inventing a per-prompt mirror file would add a
 # new unbounded store, on the hottest path there is, to protect nothing.
+#: Headroom held back from `emit` so a cut can always be ANNOUNCED.
+#:
+#: Reserving is not by itself enough, and the reason is worth stating because it
+#: is the opposite of the obvious reading: BoundedStdout._cut_here computes its
+#: own room as `budget - reserve - emitted`, so the reserve is invisible to it
+#: too. When a block lands with nothing left, it closes the stream and emits NO
+#: marker — the silent stop the whole class of work exists to prevent. Only
+#: `emit_final` spends this reserve (it bills against the raw budget and still
+#: writes after a cut), so the announcement has to be a closing line, which is
+#: what _announce_cut is.
+#:
+#: 224 = the MEASURED widest rendering of that line (202 units: the longest
+#: block label this hook uses, `concurrent-directive`, plus a 7-digit dropped
+#: count) with headroom. The first value here was 160, picked by eyeballing the
+#: template, and the test below caught it — which is the whole reason the number
+#: is asserted against a rendering instead of argued for in a comment. 2.3% of
+#: the budget, spent so the full notice fits rather than degrading to the terse
+#: fallback every time.
+_CUT_NOTICE_RESERVE = 224
+
 _OUT: BoundedStdout | None = None
 
 
@@ -128,8 +149,27 @@ def _writer() -> BoundedStdout:
     """This hook's bounded stdout. Lazy so direct callers of helpers still work."""
     global _OUT
     if _OUT is None:
-        _OUT = BoundedStdout(DEFAULT_BUDGET, label="proactive")
+        _OUT = BoundedStdout(DEFAULT_BUDGET, label="proactive", reserve=_CUT_NOTICE_RESERVE)
     return _OUT
+
+
+def _announce_cut() -> None:
+    """If anything was dropped, say so — on stdout, where the reader is.
+
+    Load-bearing words FIRST: `emit_final` clips from the right as a last
+    resort, so "output was cut" must survive even if the block name and count do
+    not. A `fallback` is supplied so losing the detail takes both forms
+    overflowing, not just the long one.
+    """
+    if _OUT is None or _OUT.cut is None:
+        return
+    block, dropped = _OUT.cut
+    _OUT.emit_final(
+        f"[Proactive memory: output was CUT at '{block}' — {dropped} chars withheld. "
+        f"The harness files any hook over {HOOK_STDOUT_CAP} chars, so the rest was "
+        f"dropped here instead of risking the whole injection.]",
+        fallback="[Proactive memory: output was CUT — some context was dropped.]",
+    )
 
 
 # Recall delegation to the genesis-server engine (thin-client flip). The hook
@@ -614,12 +654,17 @@ def _render_trail_line(labels: list[str]) -> str | None:
     to stored keywords; this function reads the same file and must not assume the
     file was written by today's code.
     """
+    # SLICE FIRST, then clip. Clipping the whole list before slicing made this
+    # hook walk — and utf16-encode — every pivot a long session had ever
+    # recorded, on every prompt, to then discard all but the newest fifty. The
+    # elision flag is taken from the PRE-slice count so the marker still tells
+    # the truth about what was dropped.
+    display = labels[-_MAX_TRAIL_DISPLAY:]
+    elided = len(labels) > len(display)
     # Wide enough that no post-window label can reach it (131 units vs 400), so
     # this only ever bites a legacy label.
     cap = _MAX_TRAIL_LINE_CHARS // 4
-    labels = [x if utf16_len(x) <= cap else clip_to_cost(x, cap - 1) + "…" for x in labels]
-    display = labels[-_MAX_TRAIL_DISPLAY:]
-    elided = len(labels) > len(display)
+    display = [x if utf16_len(x) <= cap else clip_to_cost(x, cap - 1) + "…" for x in display]
     while display:
         prefix = "… → " if elided else ""
         line = f"[Session trail] {prefix}{' → '.join(display)}"
@@ -885,8 +930,13 @@ def _ws_measure(
     return stats
 
 
-def _extract_keywords(prompt: str) -> list[str]:
+def _extract_keywords(prompt: str, *, window: bool = True) -> list[str]:
     """Extract significant keywords from user prompt.
+
+    ``window=False`` applies the FLOOR only, skipping the upper bound. It exists
+    for one caller: deciding whether a prompt is worth recalling on at all. That
+    question must NOT be answered from the bounded list — see the note on
+    eligibility below.
 
     The length window is bounded at BOTH ends. ``>= 3`` drops greetings; the
     upper bound exists because this function caps the keyword COUNT and used to
@@ -929,13 +979,30 @@ def _extract_keywords(prompt: str) -> list[str]:
     contain a >32-char alphanumeric run and 9 contain a full 40-hex sha, so a
     dropped token can cost a match — rarely (0.03%), not never. The window is
     still right; the claim supporting it was one population too narrow.
+
+    THE WINDOW MUST NOT DECIDE ELIGIBILITY. A prompt whose only significant
+    token is over-window — a bare commit sha, a ULID, a pasted token, an
+    unsegmented CJK phrase — extracts NOTHING here, and _run's
+    ``len(keywords) < _MIN_PROMPT_WORDS`` gate would then return early and skip
+    recall ENTIRELY: not just the local FTS and code lanes, but the SERVER call,
+    which receives the raw prompt and runs its own semantic retrieval. That
+    would throw away recall this window has no business touching — the window
+    governs what gets RENDERED and STORED, not whether the prompt is worth
+    answering. Callers ask ``window=False`` for the eligibility question.
+
+    Found by Codex, and missed by my own before/after probe: that probe ran both
+    trees in ``local`` mode, where keyword-only FTS finds nothing for a unique
+    token either way, so both sides showed no recall and the regression was
+    invisible. The one mode that could have shown it is the one I did not run.
     """
     cleaned = "".join(c if c.isalnum() or c.isspace() else " " for c in prompt)
     words = cleaned.lower().split()
     keywords = [
         w
         for w in words
-        if w not in _STOP_WORDS and _MIN_KEYWORD_CHARS <= len(w) <= _MAX_KEYWORD_CHARS
+        if w not in _STOP_WORDS
+        and len(w) >= _MIN_KEYWORD_CHARS
+        and (not window or len(w) <= _MAX_KEYWORD_CHARS)
     ]
     return keywords[:8]
 
@@ -1833,7 +1900,16 @@ async def _run(prompt: str, session_id: str = "") -> None:
 
     # Skip recall only when there's nothing to search on (prompt has no
     # keywords AND no file context) — parity with the old merged-keyword gate.
-    if len(keywords) < _MIN_PROMPT_WORDS and not file_keywords:
+    #
+    # Asked WITHOUT the length window, on purpose. A prompt whose only
+    # significant token is over-window (a bare sha, a ULID, a pasted token, an
+    # unsegmented CJK phrase) still deserves recall: the server receives the RAW
+    # prompt and does its own retrieval, so the window — which exists to bound
+    # what this hook RENDERS and STORES — must not be what decides the prompt is
+    # not worth answering. Costs one more pass over the prompt string on a path
+    # that already walks it; the alternative is deriving eligibility from a list
+    # that was filtered for a different purpose.
+    if len(_extract_keywords(prompt, window=False)) < _MIN_PROMPT_WORDS and not file_keywords:
         _flush_deferred()
         return
 
@@ -2122,7 +2198,15 @@ def main() -> None:
             return
 
         session_id = data.get("session_id", "")
-        asyncio.run(_run(prompt, session_id=session_id))
+        try:
+            asyncio.run(_run(prompt, session_id=session_id))
+        finally:
+            # In a `finally`, so a cut is announced on EVERY exit: the ordinary
+            # return, an early return from one of _run's several gates, and the
+            # crash path below. _run has multiple exits and adding this to each
+            # would be a convention — the kind reviewers keep finding one missing
+            # instance of.
+            _announce_cut()
     except Exception:
         # Hooks must never crash — log to stderr for debugging
         import traceback

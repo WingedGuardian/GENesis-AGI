@@ -133,13 +133,33 @@ meaning** rather than by one blanket character cap:
 | surface | bound | why that shape |
 |---|---|---|
 | extracted keywords | length window, `_MAX_KEYWORD_CHARS` | the ROOT. An identifier cannot get long here (every non-alphanumeric char becomes whitespace, so identifiers SPLIT), but an unbroken alphanumeric run — a pasted hash, token, or minified blob — is one token of whatever length. DROPPED, not truncated: a keyword is a KEY (`_detect_pivot` compares keyword sets), so a truncated id would collide with a different id sharing its prefix. |
-| `[Session trail]` | `_MAX_TRAIL_LINE_CHARS` | drops WHOLE oldest pivots and marks it with the `… →` prefix the count bound already uses. A truncated arrow chain would end in half a topic that reads like a whole one. |
+| `[Session trail]` | `_MAX_TRAIL_LINE_CHARS` | drops WHOLE oldest pivots and marks it with the `… →` prefix the count bound already uses. A truncated arrow chain would end in half a topic that reads like a whole one. Slices to the displayed window BEFORE clipping labels — clipping first walked and encoded every pivot a long session had ever recorded, on every prompt, to discard all but the newest fifty. |
 | `[Code]` hints | `_MAX_CODE_HINT_CHARS` | the largest surface on REAL data. Clips the signature and keeps the file location whole — the location is the actionable half. |
 | `[Concurrent]` peers | `_MAX_PEERS_SHOWN` (a query `LIMIT`) | bounded by COUNT so the safety directive that follows always has room. Overflow is NAMED from a `COUNT`, never inferred from a read that stopped at its own limit. |
 
 `tests/test_scripts/test_hook_output_contract.py` fails this hook if any
 model-facing `print` reappears; `tests/test_hooks/test_proactive_hook_bounded_output.py`
 pins the behaviour of each bound above.
+
+**A bound must not decide eligibility.** The keyword window governs what is
+RENDERED and STORED. It must not decide whether the prompt is worth recalling on
+at all — `_run`'s `_MIN_PROMPT_WORDS` gate asks `_extract_keywords(...,
+window=False)` for exactly that reason. Without it, a prompt whose only
+significant token is over-window (a bare sha, a ULID, a pasted token, an
+unsegmented CJK phrase) extracted nothing, took the early return, and skipped
+recall entirely — including the SERVER call, which receives the raw prompt and
+runs its own semantic retrieval, so it is precisely the lane a keyword window has
+no business gating. MEASURED by instrumenting `_call_server` across three trees:
+for a bare 40-char sha the server call was reached on main, NOT reached with the
+window deciding, and reached again once eligibility was asked separately.
+
+**A cut is announced by a closing line, not by the writer.** `BoundedStdout`
+computes `_cut_here`'s room as `budget - reserve - emitted`, so the reserve is
+invisible to it too: fill the ceiling exactly and a cut closes the stream with no
+marker at all. `_CUT_NOTICE_RESERVE` plus `_announce_cut` via `emit_final`
+(which bills against the raw budget and still writes after a cut) is what makes
+the announcement unconditional. It is wired in `main()`'s `finally` because
+`_run` has several exit paths and per-path calls would be a convention.
 
 **Units.** The two SIZE bounds (trail line, code hint) are measured in UTF-16
 code units — what the harness bills — via `utf16_len` and `clip_to_cost`. The

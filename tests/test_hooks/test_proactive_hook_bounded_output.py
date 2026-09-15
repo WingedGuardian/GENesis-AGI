@@ -23,6 +23,7 @@ re-assert the constants only where a claim depends on their arithmetic.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -538,6 +539,195 @@ def test_every_model_facing_write_goes_through_the_bounded_writer() -> None:
     writer.emit("x" * 50_000, block="flood")
     assert writer.emitted_chars <= HOOK_STDOUT_CAP
     assert writer.cut is not None, "an over-budget write must cut LOUDLY"
+
+
+# ---------------------------------------------------------------------------
+# 6b. Codex round 1 — three findings, each pinned
+# ---------------------------------------------------------------------------
+
+
+def test_an_over_window_token_still_makes_a_prompt_eligible_for_recall() -> None:
+    """CODEX P2: the window must not decide whether recall runs at all.
+
+    A prompt whose only significant token is over-window extracts NOTHING, and
+    _run's `len(keywords) < _MIN_PROMPT_WORDS` gate would then skip recall
+    entirely — including the SERVER call, which receives the raw prompt and does
+    its own retrieval. The window governs what is rendered and stored, not
+    whether the prompt is worth answering.
+    """
+    sha = "854e316daee86c59232f62f79835b0f72ec703ea"  # 40 chars, over the window
+    assert len(sha) > pmh._MAX_KEYWORD_CHARS  # guard-the-guard: really over
+
+    assert pmh._extract_keywords(sha) == [], "the window should drop it for RENDERING"
+    assert pmh._extract_keywords(sha, window=False) == [sha], (
+        "but the eligibility question must still see it"
+    )
+    # The floor still applies without the window — this is not "no filtering".
+    assert pmh._extract_keywords("a " + sha, window=False) == [sha]
+
+
+def test_the_eligibility_gate_is_asked_without_the_window() -> None:
+    """Pins the CALL SITE, not just the capability.
+
+    A `window=False` parameter nothing uses would satisfy the test above while
+    the gate still consulted the bounded list.
+    """
+    src = Path(pmh.__file__).read_text()
+    after = src.split("_MIN_PROMPT_WORDS and not file_keywords")[0]
+    tail = after[-400:]
+    assert "window=False" in tail, (
+        "the _MIN_PROMPT_WORDS gate must be asked without the length window; "
+        f"nearest preceding source was: ...{tail[-200:]}"
+    )
+
+
+def test_a_cut_is_announced_even_when_the_budget_is_exactly_spent() -> None:
+    """CODEX P2: a cut with no room left emitted NO marker at all.
+
+    BoundedStdout._cut_here computes its own room as budget - reserve - emitted,
+    so the reserve is invisible to it: when a block lands with nothing left it
+    closes the stream silently. Only emit_final spends the reserve, so the
+    announcement has to be a closing line.
+
+    Driven through ``main()``, not by calling ``_announce_cut`` directly. The
+    first version of this test called the helper and passed happily with the
+    call REMOVED from main — it proved the function worked, not that anything
+    invoked it. _run has several exit paths, which is exactly why the wiring is
+    the part worth pinning.
+    """
+    import io
+
+    # Fill the emit ceiling EXACTLY, so the next block finds zero room and
+    # _cut_here cannot write even its short marker. Filling it merely NEARLY
+    # leaves room for that marker, which then prints "CUT" itself — the first
+    # version of this fixture did that and the mutation survived, because the
+    # assertion could not tell the writer's marker from the hook's notice.
+    # emit_cost bills one unit for the newline print() adds, hence the -1.
+    ceiling = pmh.DEFAULT_BUDGET - pmh._CUT_NOTICE_RESERVE
+
+    async def _flood(prompt: str, session_id: str = "") -> None:
+        out = pmh._writer()
+        out.emit("x" * (ceiling - 1), block="server-recall")
+        out.emit("y" * 500, block="code-hints")
+
+    buf = io.StringIO()
+    real_run, real_stdin, real_stdout = pmh._run, sys.stdin, sys.stdout
+    pmh._run = _flood
+    sys.stdin = io.StringIO(json.dumps({"session_id": _SID, "prompt": "anything"}))
+    sys.stdout = buf
+    try:
+        pmh.main()
+    finally:
+        pmh._run, sys.stdin, sys.stdout = real_run, real_stdin, real_stdout
+
+    printed = buf.getvalue()
+    writer = pmh._writer()
+    # Guard-the-guard: the scenario must really be the silent one — a cut
+    # happened AND the writer itself printed no marker for it.
+    assert writer.cut is not None, "fixture did not produce a cut at all"
+    assert "_[ctx proactive" not in printed, (
+        "the writer had room for its own marker, so this fixture is not "
+        "exercising the silent-cut case the finding is about"
+    )
+    # Assert the HOOK's notice specifically, not the substring "CUT" — only
+    # this phrasing distinguishes _announce_cut from the writer's own marker.
+    assert "Proactive memory: output was CUT" in printed, (
+        f"main() did not announce the cut: {printed[-200:]!r}"
+    )
+    assert writer.emitted_chars <= HOOK_STDOUT_CAP
+
+
+def test_the_cut_notice_fits_the_reserve_it_declares() -> None:
+    """The reserve is a number; this is what makes it the RIGHT number.
+
+    Widest rendering: the longest block label this hook uses, and a dropped-char
+    count wider than any real one.
+    """
+    widest_block = max(
+        [
+            "concurrent",
+            "concurrent-directive",
+            "server-recall",
+            "code-hints",
+            "degraded-recall",
+            "session-metadata",
+        ],
+        key=len,
+    )
+    notice = (
+        f"[Proactive memory: output was CUT at '{widest_block}' — {9_999_999} chars withheld. "
+        f"The harness files any hook over {HOOK_STDOUT_CAP} chars, so the rest was "
+        f"dropped here instead of risking the whole injection.]"
+    )
+    fallback = "[Proactive memory: output was CUT — some context was dropped.]"
+
+    # THE GUARANTEE: the short form always fits, so a cut is always announced.
+    assert emit_cost(fallback) + 1 <= pmh._CUT_NOTICE_RESERVE
+
+    # THE INTENT: the full form fits too, so the terse fallback is a genuine
+    # last resort rather than what every cut actually prints. This is the
+    # assertion that caught the first value (160 reserved, 202 rendered).
+    assert emit_cost(notice) + 1 <= pmh._CUT_NOTICE_RESERVE, (
+        f"the notice renders {emit_cost(notice) + 1} units but only "
+        f"{pmh._CUT_NOTICE_RESERVE} are reserved — raise _CUT_NOTICE_RESERVE"
+    )
+
+
+def test_no_announcement_when_nothing_was_cut() -> None:
+    """A notice on a clean run would be noise on every prompt."""
+    import io
+
+    out = pmh._writer()
+    out.emit("small", block="concurrent")
+    buf = io.StringIO()
+    out._stream = buf
+    pmh._announce_cut()
+    assert buf.getvalue() == ""
+
+
+def test_the_trail_clips_only_what_it_will_display() -> None:
+    """CODEX P2: clipping ran over EVERY persisted pivot before slicing to 50.
+
+    On a long-lived session that walks and utf16-encodes thousands of historical
+    labels on every prompt, in a latency-bounded hook, to then discard all but
+    the newest fifty.
+    """
+    calls: list[str] = []
+    real_utf16_len = pmh.utf16_len
+
+    def counting_utf16_len(s: str) -> int:
+        calls.append(s)
+        return real_utf16_len(s)
+
+    labels = [f"pivot {i}" for i in range(5000)]
+    pmh.utf16_len = counting_utf16_len
+    try:
+        line = pmh._render_trail_line(labels)
+    finally:
+        pmh.utf16_len = real_utf16_len
+
+    assert line is not None
+    # One call per DISPLAYED label for the clip check, plus one per rendered
+    # line inside the fitting loop. Nowhere near one per historical pivot.
+    assert len(calls) < 200, (
+        f"utf16_len called {len(calls)} times for a 50-label line — the clip is "
+        "running over the whole history instead of the displayed slice"
+    )
+
+
+def test_slicing_before_clipping_did_not_break_the_elision_marker() -> None:
+    """The flag must still come from the PRE-slice count.
+
+    Moving the slice earlier is exactly the edit that would silently start
+    computing `elided` from the already-sliced list, so the marker would vanish.
+    """
+    line = pmh._render_trail_line([f"topic {i}" for i in range(pmh._MAX_TRAIL_DISPLAY + 5)])
+    assert line is not None
+    assert line.startswith("[Session trail] … → "), line[:60]
+
+    exact = pmh._render_trail_line([f"topic {i}" for i in range(pmh._MAX_TRAIL_DISPLAY)])
+    assert exact is not None
+    assert "… → " not in exact, "nothing was dropped, so nothing should be marked"
 
 
 def test_a_cut_says_so_in_band() -> None:
