@@ -245,7 +245,7 @@ TABLES = {
             topic               TEXT NOT NULL,
             category            TEXT NOT NULL CHECK (category IN (
                 'blocker', 'alert', 'finding', 'insight', 'opportunity',
-                'digest', 'surplus', 'approval', 'content', 'notification'
+                'digest', 'surplus', 'approval', 'content', 'notification', 'marketing'
             )),
             salience_score      REAL NOT NULL,
             channel             TEXT NOT NULL,
@@ -286,7 +286,11 @@ TABLES = {
             delivered_at        TEXT,
             thread_id           TEXT,
             validated_recipient TEXT,
-            labeled_surplus     INTEGER NOT NULL DEFAULT 0
+            labeled_surplus     INTEGER NOT NULL DEFAULT 0,
+            -- NULL = live; non-NULL = cancelled at that time. Deliberately ONE
+            -- column rather than a flag + timestamp like `delivered` above: this
+            -- way "cancelled with no timestamp" is unrepresentable.
+            cancelled_at        TEXT
         )
     """,
     "brainstorm_log": """
@@ -1255,12 +1259,15 @@ TABLES = {
             -- All NULLable with NO default: expiry is strictly opt-in
             -- (durability='temporary' + an elapsed expires_at only), so an
             -- unclassified row NEVER expires. Contract in memory/judgment.py;
-            -- added to existing DBs by migration 0079.
+            -- added to existing DBs by migration 0081 (renumbered from 0079);
+            -- preference_domain by 20260906042425 (# GROUNDWORK(mw-4-preference-domain):
+            -- domain a preference is scoped to, open vocab, write-only).
             speech_act            TEXT,
             speech_act_confidence REAL,
             assertion_provenance  TEXT,
             durability            TEXT,
-            expires_at            TEXT
+            expires_at            TEXT,
+            preference_domain     TEXT
         )
     """,
     "graduation_events": """
@@ -1390,7 +1397,13 @@ TABLES = {
             file_path        TEXT,
             success          INTEGER NOT NULL DEFAULT 1,
             error_snippet    TEXT,
-            timestamp        TEXT NOT NULL
+            timestamp        TEXT NOT NULL,
+            -- LAST on purpose: ALTER TABLE ADD COLUMN appends, so declaring it
+            -- last keeps fresh-CREATE and legacy-ALTER column order identical.
+            -- Dedup key for the Stop-hook outcome scanner (#1597). Every row the
+            -- scanner writes carries a value; the pre-#1597 rows carry NULL
+            -- (SQLite allows multiple NULLs in a UNIQUE index).
+            tool_use_id      TEXT
         )
     """,
     "direct_session_queue": """
@@ -1917,8 +1930,10 @@ TABLES = {
                         CHECK(status IN ('open','in_progress','done','absorbed','dropped')),
             source_ref  TEXT,
             added_by    TEXT NOT NULL DEFAULT 'foreground'
-                        CHECK(added_by IN ('foreground','ambient','pulse')),
+                        CHECK(added_by IN ('foreground','ambient','pulse',
+                                           'ambient_ledger_extractor')),
             evidence    TEXT,
+            source_quote TEXT,   -- provenance; resolvers write `evidence`, never this
             created_at  TEXT NOT NULL,
             updated_at  TEXT
         )
@@ -1961,7 +1976,8 @@ TABLES = {
             matched_item_id TEXT,
             match_score     REAL,
             duplicate_of    TEXT,
-            mode            TEXT NOT NULL DEFAULT 'shadow'
+            mode            TEXT NOT NULL DEFAULT 'shadow',
+            promoted_item_id TEXT  -- session_ledger row this proposal became (live mode); NULL = unpromoted, retryable
         )
     """,
     # ── Repo-pulse annotator (session-manager PR-4a) ─────────────────────
@@ -2013,6 +2029,34 @@ TABLES = {
             -- 'ledger' | 'follow_up' — which store item_id addresses (a8a4f59e).
             -- LAST column: ALTER appends here, so fresh/migrated order stays in parity.
             target_kind     TEXT NOT NULL DEFAULT 'ledger'
+        )
+    """,
+    # ── PR-verification obligations (issue #1718 half B) ────────────────
+    # One row per MERGED PR: the durable record that its post-merge E2E
+    # decision survives the merge. Written only by the repo-pulse worker's
+    # verification lane; docs-only diffs arrive already closed with the
+    # reason (deterministic exemption by path — doc_paths.is_doc_path);
+    # the validator session closes the rest with evidence. Deliberately NOT
+    # follow_ups: these are a machine ledger for a validator, and follow_ups'
+    # readers (ego dispatch via get_actionable, morning report via
+    # get_pending) would surface them as actionable work — measured, see the
+    # 20260906234824 migration docstring. The (repo, pr_number) UNIQUE index
+    # (below) IS the dedup; INSERT OR IGNORE absorbs window re-coverage.
+    # This DDL and the migration are the sibling build-path pair — keep them
+    # identical (pinned by tests/test_session_awareness/test_pr_verifications.py).
+    "pr_verifications": """
+        CREATE TABLE IF NOT EXISTS pr_verifications (
+            id            TEXT PRIMARY KEY,
+            repo          TEXT NOT NULL,
+            pr_number     INTEGER NOT NULL,
+            pr_title      TEXT,
+            merged_at     TEXT NOT NULL,
+            status        TEXT NOT NULL DEFAULT 'open'
+                          CHECK(status IN ('open', 'closed')),
+            closed_reason TEXT,
+            closed_at     TEXT,
+            evidence      TEXT,
+            created_at    TEXT NOT NULL
         )
     """,
     # ── WS-2 sensor fabric (M9/M10) ──────────────────────────────────────
@@ -2283,6 +2327,42 @@ TABLES = {
             unknown_reason            TEXT                        -- set iff status='skipped'/'failed' on dependency outage
         )
     """,
+    # Zero-drop findings — one row per STANDING stranded-work condition (a local
+    # branch with no PR, a pushed branch with no PR, a dirty worktree), so the
+    # reconciler can ENUMERATE what fell through the cracks instead of a session
+    # having to remember. Identity is (class, branch), never the tip SHA — a
+    # SHA-keyed row resets the recurrence counter on every commit. See
+    # db/crud/zero_drop.py for the New-Store justification + retention (only
+    # RESOLVED rows are pruned; pruning an ACKED row would un-suppress it).
+    # DDL byte-identical to migration 20260905215957_zero_drop_findings.
+    "zero_drop_findings": """
+    CREATE TABLE IF NOT EXISTS zero_drop_findings (
+        id                TEXT PRIMARY KEY,
+        class             TEXT NOT NULL
+                            CHECK (class IN (
+                              'unpushed_branch','pushed_no_pr','dirty_worktree')),
+        branch            TEXT NOT NULL,
+        tip_sha           TEXT,
+        ahead_count       INTEGER,
+        worktree_path     TEXT,
+        status            TEXT NOT NULL DEFAULT 'open'
+                            CHECK (status IN ('open','acked','resolved')),
+        first_seen_at     TEXT NOT NULL,
+        last_seen_at      TEXT NOT NULL,
+        consecutive_runs  INTEGER NOT NULL DEFAULT 1,
+        escalated_at      TEXT,
+        last_run_id       TEXT,
+        ack_reason        TEXT,
+        acked_at          TEXT,
+        acked_tip_sha     TEXT,
+        resolved_at       TEXT,
+        reopen_count      INTEGER NOT NULL DEFAULT 0,
+        details           TEXT,
+        created_at        TEXT NOT NULL,
+        updated_at        TEXT NOT NULL,
+        UNIQUE(class, branch)
+    )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -2541,6 +2621,12 @@ INDEXES = [
     # tool call outcomes (edit failure sensor)
     "CREATE INDEX IF NOT EXISTS idx_tco_tool_ts ON tool_call_outcomes(tool_name, timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_tco_success ON tool_call_outcomes(success, timestamp)",
+    # UNIQUE dedup key for the Stop-hook transcript outcome scanner (INSERT OR
+    # IGNORE). tool_use_id is globally unique per CC; the pre-#1597 rows carry
+    # NULL, and SQLite treats each NULL as distinct so they never collide. #1597.
+    # (Column mirrored into _migrate_add_columns so this index is safe to build
+    # on a legacy DB before the numbered migration runs — #1123/#1127 class.)
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_tco_tool_use_id ON tool_call_outcomes(tool_use_id)",
     # cognitive self-modification ledger (rollback)
     "CREATE INDEX IF NOT EXISTS idx_cog_file_mods_target ON cognitive_file_modifications(target_path)",
     "CREATE INDEX IF NOT EXISTS idx_cog_file_mods_actor ON cognitive_file_modifications(actor)",
@@ -2604,6 +2690,10 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_rpa_status ON repo_pulse_annotations(status, observed_at)",
     "CREATE INDEX IF NOT EXISTS idx_rpa_session ON repo_pulse_annotations(item_session_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_rpr_started ON repo_pulse_runs(started_at)",
+    # PR-verification obligations: (repo, pr_number) unique IS the dedup —
+    # window re-coverage is absorbed by INSERT OR IGNORE, never duplicated.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_prv_repo_pr ON pr_verifications(repo, pr_number)",
+    "CREATE INDEX IF NOT EXISTS idx_prv_status ON pr_verifications(status, merged_at)",
     # WS-2 sensor fabric (M9/M10)
     "CREATE INDEX IF NOT EXISTS idx_jre_job_time ON job_run_events(job_name, recorded_at)",
     "CREATE INDEX IF NOT EXISTS idx_jre_recorded ON job_run_events(recorded_at)",
@@ -2634,6 +2724,11 @@ INDEXES = [
     # Memory integrity Phase 1 — reconcile-run audit rows
     "CREATE INDEX IF NOT EXISTS idx_mrr_created ON memory_reconcile_runs(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_mrr_status ON memory_reconcile_runs(status, created_at)",
+    # Zero-drop findings — the open-set scan (every surface reads status) and the
+    # detector-freshness / retention sweeps (both order by last_seen_at)
+    "CREATE INDEX IF NOT EXISTS idx_zero_drop_findings_status ON zero_drop_findings(status)",
+    "CREATE INDEX IF NOT EXISTS idx_zero_drop_findings_last_seen "
+    "ON zero_drop_findings(last_seen_at)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────

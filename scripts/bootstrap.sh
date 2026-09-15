@@ -311,7 +311,21 @@ if [ -f "$_cc_env" ]; then
     echo "--- Aligning Claude Code to pinned version ---"
     # shellcheck source=/dev/null
     source "$_cc_env"
+    unset CC_SUPPRESSION_STATE
     cc_ensure_local || true
+    # bootstrap must not abort on a CC hiccup (set -e is live), but it also must
+    # not swallow the suppression outcome — this was the one caller with no
+    # signal at all: `|| true` discarded the return code AND nothing read the
+    # state, so bootstrap completed cleanly over a failed suppression check.
+    case "${CC_SUPPRESSION_STATE:-unverified}" in
+        ok|repaired) : ;;
+        *)
+            echo "  WARNING: CC auto-updater suppression not verified" \
+                 "(${CC_SUPPRESSION_STATE:-unverified}) — CC may self-update past" \
+                 "the pin; the daily genesis-cc-settings-align timer will retry" \
+                 "and its unit goes red if it cannot"
+            ;;
+    esac
     cc_shadow_scan || true
 fi
 

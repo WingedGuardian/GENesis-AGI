@@ -85,6 +85,17 @@ DEFAULT_TARGETS: tuple[CredTarget, ...] = (
                "creds/claude_credentials.json.gpg", "json",
                required_keys=("claudeAiOauth",)),
     CredTarget("claude_json", ".claude.json", "creds/claude.json.gpg", "json"),
+    # User-level CC settings. The PROJECT .claude/settings.json is tracked in
+    # git; this one is not, and it carries its own live hooks block — so a
+    # process-internal write that empties it disarms those hooks with nothing
+    # to notice. Deliberately NO required_keys, for the same reason secrets.env
+    # has none: a user-level hooks block is install-local and a fresh install
+    # may legitimately have none, and missing_keys is RESTORABLE, so requiring
+    # it would trigger a destructive restore over a perfectly healthy file. The
+    # real outage signatures here (empty, NUL-zeroed, unparseable) are caught
+    # without any key assumption — the same shape as claude_json above.
+    CredTarget("claude_settings", ".claude/settings.json",
+               "creds/claude_settings.json.gpg", "json"),
     CredTarget("gh_hosts", ".config/gh/hosts.yml", "creds/gh_hosts.yml.gpg", "yaml"),
     CredTarget("guardian_remote", ".genesis/guardian_remote.yaml",
                "creds/guardian_remote.yaml.gpg", "yaml"),

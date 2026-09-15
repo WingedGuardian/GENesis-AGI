@@ -112,3 +112,66 @@ def test_never_negative():
     policy = RetryPolicy(base_delay_ms=1, max_delay_ms=1, jitter_pct=0.5)
     for _ in range(100):
         assert compute_delay(policy, 0) >= 0.0
+
+
+# --- entitlement 403s (NOT_ENTITLED) ---
+
+def test_entitlement_403_is_not_quota():
+    """A 403 that says 'your plan may not use this model' is NOT quota.
+
+    ACCEPTANCE BAR — the verbatim live body measured from the Mistral API on
+    2026-09-05 (and the same shape recorded in `record_probe_success`'s
+    docstring for the outage that began 2026-08-27). Its message contains
+    "subscription", a `_QUOTA_KEYWORDS` member, so before this change it
+    classified QUOTA_EXHAUSTED: the router then RETRIED it with backoff
+    instead of failing fast, burning the chain's aggregate `max_total_s`
+    budget on a provider that can never succeed.
+    """
+    live_body = (
+        '{"object":"error","message":"This model is not available in your '
+        'subscription tier","type":"tier_not_allowed","code":"1910"}'
+    )
+    assert classify_error(403, live_body) == ErrorCategory.NOT_ENTITLED
+
+
+def test_entitlement_markers_outrank_quota_keywords():
+    # PRECEDENCE. Only these two actually contest the ordering: each contains a
+    # member of _QUOTA_KEYWORDS ("subscription", "plan"), so with the checks in
+    # the other order the quota arm would win and return QUOTA_EXHAUSTED. This
+    # is the property the fix exists for, and it is what makes the test bite.
+    for msg in (
+        "This model is not available in your subscription tier",
+        "Your plan does not have access to this model",
+    ):
+        assert classify_error(403, msg) == ErrorCategory.NOT_ENTITLED, msg
+
+
+def test_entitlement_markers_match_without_any_quota_keyword():
+    # MARKER PRESENCE, a weaker and separate property. Neither string contains a
+    # quota keyword, so ordering is irrelevant to them — without the entitlement
+    # markers they would fall through to PERMANENT, never QUOTA_EXHAUSTED.
+    # Kept apart from the precedence test above because grouping them together
+    # let a comment claim all four contested the ordering when only two did.
+    for msg in (
+        "tier_not_allowed",
+        "You are not authorized to use this model",
+    ):
+        assert classify_error(403, msg) == ErrorCategory.NOT_ENTITLED, msg
+
+
+def test_real_quota_403_still_classifies_quota():
+    # The counter-direction control: consumption language must NOT be captured
+    # by the entitlement arm, or a genuine quota 403 loses its 4h breaker cap.
+    for msg in (
+        "Key limit exceeded",
+        "quota exhausted",
+        "You have exceeded your monthly usage",
+        "Billing credits depleted",
+    ):
+        assert classify_error(403, msg) == ErrorCategory.QUOTA_EXHAUSTED, msg
+
+
+def test_bare_403_still_permanent():
+    # Unchanged: no entitlement marker, no quota keyword → PERMANENT.
+    assert classify_error(403, "") == ErrorCategory.PERMANENT
+    assert classify_error(403, "access denied") == ErrorCategory.PERMANENT

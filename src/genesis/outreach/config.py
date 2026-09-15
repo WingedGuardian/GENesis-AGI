@@ -89,8 +89,22 @@ class OutreachConfig:
 
 _DEFAULTS = OutreachConfig(
     quiet_hours=QuietHours(start="22:00", end="07:00"),
-    channel_preferences={"default": "telegram"},
-    thresholds={"blocker": 0.0, "alert": 0.3, "surplus": 0.7, "digest": 0.0},
+    # Marketing is carried here (not just in config/outreach.yaml) so a pre-existing
+    # saved ~/.genesis/config/outreach.yaml — written before this category existed —
+    # still resolves it after load_outreach_config merges these defaults under the
+    # user's maps (see below). telegram+supergroup = the dedicated Marketing topic.
+    channel_preferences={"default": "telegram", "marketing": "telegram"},
+    thresholds={
+        "blocker": 0.0,
+        "alert": 0.3,
+        "surplus": 0.7,
+        "digest": 0.0,
+        # Marketing digests are owner-facing and (by strategy) only sent when
+        # material, so 0.0 exempts them from the SALIENCE gate. Like
+        # notification/content they are still subject to quiet-hours and the
+        # shared daily cap (max_daily) — not in _BYPASS_CATEGORIES.
+        "marketing": 0.0,
+    },
     max_daily=5,
     surplus_daily=1,
     content_daily=3,
@@ -111,7 +125,9 @@ _DEFAULTS = OutreachConfig(
         "backup:",  # Prefix — push channel now that backups are out of Sentinel scope
         "creds:",  # Prefix — credential corruption / auto-restore (creds:corrupt/restored)
     ),
-    delivery_routing={"default": "supergroup"},
+    # Pin marketing to the supergroup (its dedicated topic) explicitly, so it never
+    # falls back to an install whose delivery_routing.default is "dm".
+    delivery_routing={"default": "supergroup", "marketing": "supergroup"},
 )
 
 
@@ -236,8 +252,15 @@ def load_outreach_config(path: Path | None = None) -> OutreachConfig:
             start=qh.get("start", "22:00"),
             end=qh.get("end", "07:00"),
         ),
-        channel_preferences=raw.get("channel_preferences", {"default": "telegram"}),
-        thresholds=raw.get("thresholds", _DEFAULTS.thresholds),
+        # Merge the shipped defaults UNDER the user's maps (user overrides win),
+        # rather than taking a saved map wholesale — so a config saved before a
+        # category existed (e.g. marketing) still resolves that category's shipped
+        # channel/threshold instead of silently falling back to a generic default.
+        channel_preferences={
+            **_DEFAULTS.channel_preferences,
+            **raw.get("channel_preferences", {}),
+        },
+        thresholds={**_DEFAULTS.thresholds, **raw.get("thresholds", {})},
         max_daily=raw.get("rate_limits", {}).get("max_daily", 5),
         surplus_daily=raw.get("rate_limits", {}).get("surplus_daily", 1),
         content_daily=raw.get("rate_limits", {}).get("content_daily", 3),
@@ -253,5 +276,8 @@ def load_outreach_config(path: Path | None = None) -> OutreachConfig:
         ),
         voice_alert_ids=tuple(raw.get("voice", {}).get("alert_ids", _DEFAULTS.voice_alert_ids)),
         voice_hours=tuple(raw.get("voice", {}).get("hours", _DEFAULTS.voice_hours)),
-        delivery_routing=raw.get("delivery_routing", {"default": "supergroup"}),
+        delivery_routing={
+            **_DEFAULTS.delivery_routing,
+            **raw.get("delivery_routing", {}),
+        },
     )

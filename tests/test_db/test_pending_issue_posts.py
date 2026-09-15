@@ -496,3 +496,82 @@ class TestPostedIndexForRepo:
         )
         idx = await pip.posted_index_for_repo(db, "owner/repo")
         assert idx == {301: "fu-9"}
+
+
+# --------------------------------------------------------------------------- #
+# issue_by_follow_up — the reverse direction of the same authoritative link
+# --------------------------------------------------------------------------- #
+class TestIssueByFollowUp:
+    """The link read the way a follow-up asks it: does this row have an issue?
+
+    Shares ``_AUTHORITATIVE_LINK_SQL`` with ``posted_index_for_repo``, so these
+    assert the SAME exclusions hold in this direction. If the two ever disagree,
+    one direction of the close loop is counting issues the other does not.
+    """
+
+    _REPO = "WingedGuardian/GENesis-AGI"
+
+    async def _make(self, db, *, id, source_ref, status, issue_number=None, repo=None, source=None):
+        row = {**_ROW, "id": id, "request_id": f"req-{id}", "repo": repo or self._REPO}
+        row["source_ref"] = source_ref
+        if source is not None:
+            row["source"] = source
+        await pip.create(db, **row)
+        if status == "posted":
+            await pip.mark_posted(db, id, issue_number=issue_number, issue_url="u", posted_at=_TS)
+        elif status == "dry_run":
+            await pip.mark_dry_run(db, id, dry_run_at=_TS)
+
+    @pytest.mark.asyncio
+    async def test_maps_followup_id_to_issue(self, db):
+        await self._make(db, id="a", source_ref="fu-1", status="posted", issue_number=101)
+        out = await pip.issue_by_follow_up(db)
+        assert out == {"fu-1": {"number": 101, "url": "u", "repo": self._REPO}}
+
+    @pytest.mark.asyncio
+    async def test_same_exclusions_as_the_forward_direction(self, db):
+        await self._make(db, id="a", source_ref="fu-1", status="posted", issue_number=101)
+        await self._make(db, id="b", source_ref="fu-2", status="held")
+        await self._make(db, id="c", source_ref=None, status="posted", issue_number=102)
+        await self._make(db, id="d", source_ref="fu-3", status="dry_run")
+        out = await pip.issue_by_follow_up(db)
+        assert set(out) == {"fu-1"}, "held / NULL-ref / dry_run must all be excluded"
+
+    @pytest.mark.asyncio
+    async def test_is_repo_agnostic(self, db):
+        """Unlike the forward direction, this is keyed by a GLOBALLY unique id, so
+        an issue in another repo is still this follow-up's issue."""
+        await self._make(
+            db, id="a", source_ref="fu-1", status="posted", issue_number=101, repo="other/repo"
+        )
+        out = await pip.issue_by_follow_up(db)
+        assert out["fu-1"]["repo"] == "other/repo"
+
+    @pytest.mark.asyncio
+    async def test_adopted_issue_is_excluded(self, db):
+        """An ADOPTED pre-existing issue is not authoritative in either direction."""
+        await self._make(db, id="a", source_ref="fu-1", status="posted", issue_number=101)
+        await db.execute("UPDATE pending_issue_posts SET adopted = 1 WHERE id = 'a'")
+        await db.commit()
+        assert await pip.issue_by_follow_up(db) == {}
+
+    @pytest.mark.asyncio
+    async def test_codebase_sourced_row_is_excluded(self, db):
+        """source='follow_up' is the authoritative filter — write-time does not stop
+        a codebase row from carrying a stray source_ref."""
+        await self._make(
+            db, id="a", source_ref="fu-1", status="posted", issue_number=101, source="codebase"
+        )
+        assert await pip.issue_by_follow_up(db) == {}
+
+    @pytest.mark.asyncio
+    async def test_duplicate_resolves_deterministically(self, db):
+        await self._make(db, id="a", source_ref="fu-1", status="posted", issue_number=101)
+        await self._make(db, id="b", source_ref="fu-1", status="posted", issue_number=202)
+        out = await pip.issue_by_follow_up(db)
+        assert out["fu-1"]["number"] == 101, "first row by rowid wins"
+
+    @pytest.mark.asyncio
+    async def test_empty_when_nothing_posted(self, db):
+        await self._make(db, id="a", source_ref="fu-1", status="held")
+        assert await pip.issue_by_follow_up(db) == {}

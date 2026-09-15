@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from genesis.autonomy.executor.deterministic import (
+    _read_limited,
     execute_deterministic_step,
     validate_command,
 )
@@ -115,6 +116,21 @@ class TestValidateCommand:
 
 
 @pytest.mark.asyncio
+async def test_read_limited_reports_discarded_bytes() -> None:
+    """The reader retains a prefix while counting the full drained stream."""
+    import asyncio
+
+    stream = asyncio.StreamReader()
+    stream.feed_data(b"0123456789")
+    stream.feed_eof()
+
+    retained, total = await _read_limited(stream, limit=4)
+
+    assert retained == b"0123"
+    assert total == 10
+
+
+@pytest.mark.asyncio
 class TestExecuteDeterministicStep:
     """Test deterministic step execution."""
 
@@ -167,6 +183,15 @@ class TestExecuteDeterministicStep:
         result = await execute_deterministic_step(step)
         assert result.status == "failed"
         assert "STDERR" in result.result
+
+    async def test_truncation_reports_full_stream_size(self) -> None:
+        step = {"idx": 0, "type": "bash", "command": "seq 1 400000"}
+
+        result = await execute_deterministic_step(step)
+
+        expected_size = sum(len(str(number)) + 1 for number in range(1, 400001))
+        assert result.status == "completed"
+        assert f"(truncated, {expected_size} bytes total)" in result.result
 
     async def test_worktree_path_used(self, tmp_path: Path) -> None:
         step = {"idx": 0, "type": "bash", "command": "pwd"}

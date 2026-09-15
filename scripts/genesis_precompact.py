@@ -369,8 +369,10 @@ def _spawn_ledger_shadow_worker(session_id: str, transcript_path: str, trigger: 
     """Fire-and-forget the detached ledger shadow extractor (PR-3).
 
     The worker reads the transcript delta since its own cursor, proposes
-    missed agreements/pivots via headless Haiku, and logs SHADOW rows —
-    the live ledger is never written (see session_awareness/ledger_worker).
+    missed agreements/pivots via headless Haiku, and records SHADOW rows.
+    Whether any of those are promoted into the live ledger is the worker's
+    decision, governed by ``session_ledger_shadow.mode`` (off/shadow/live) —
+    see session_awareness/ledger_worker. This hook does not decide it.
     Cost to this hook's 5s budget: one stat + one Popen, both fail-open.
     ``--end-byte`` is stat'd HERE so post-compaction writes to the same
     transcript never leak into the window the worker processes.

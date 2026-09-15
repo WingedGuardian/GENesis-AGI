@@ -109,6 +109,19 @@ def _default_path() -> Path:
     return Path.home() / ".genesis" / "release-fingerprints.txt"
 
 
+def _section(cfg: object, name: str) -> dict:
+    """A mapping section out of a loaded yaml, or ``{}``.
+
+    Guards the SECTION as well as the root. `network:` with its children commented
+    out loads as None, and an unguarded `.get` on that raises straight into this
+    module's broad harvest `except` — dropping every pattern queued after it.
+    """
+    if not isinstance(cfg, dict):
+        return {}
+    section = cfg.get(name)
+    return section if isinstance(section, dict) else {}
+
+
 def _load_yaml(path: Path) -> dict:
     """Best-effort YAML load — returns ``{}`` on any failure (missing file,
     unreadable, malformed, PyYAML absent). Never raises."""
@@ -210,7 +223,12 @@ def harvest(
     #    exported them into the process.)
     cfg = _load_yaml(home / ".genesis" / "config" / "genesis.yaml")
     try:
-        net = cfg.get("network", {}) if isinstance(cfg, dict) else {}
+        # The isinstance must cover the SECTION, not just the root: `network:` with
+        # its children commented out loads as None, and `net.get(...)` below then
+        # raises into the bare `except` at the end of this block — silently skipping
+        # not only the subnet patterns but the install-timezone and private-repo
+        # patterns after them, thinning the very scan this function feeds.
+        net = _section(cfg, "network")
         effective = {
             "ollama_url": os.environ.get("OLLAMA_URL") or str(net.get("ollama_url", "") or ""),
             "lm_studio_url": os.environ.get("LM_STUDIO_URL")
@@ -230,7 +248,7 @@ def harvest(
             if tz and tz.upper() != "UTC" and tz not in _tz_seen:
                 _tz_seen.add(tz)
                 out.append((_bounded(tz), "install timezone"))
-        gh = cfg.get("github", {}) if isinstance(cfg, dict) else {}
+        gh = _section(cfg, "github")
         user = str(gh.get("user", "") or "").strip()
         priv = str(gh.get("private_repo", "") or "").strip()
         # Only the user/repo COMBINATION — never the bare user (it appears in
