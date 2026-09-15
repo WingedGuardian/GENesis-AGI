@@ -167,6 +167,26 @@ jobs:
             fi
           fi
 
+          # The ENABLE-ONLY units. These are deliberately not started now —
+          # cc-tmp-align fires in the CC-quiet cold-start window before
+          # genesis-server, and qdrant is started separately — so `is-active`
+          # would be the wrong question and `is-enabled` is the right one.
+          # Their enable calls are suppressed with `|| true` exactly like the
+          # others, so the same silent-death applies.
+          #
+          # Guarded on the unit FILE so a variant install that never renders one
+          # is not failed for it. Kept in step with install.sh by
+          # test_install_test_covers_every_enable_site, which parses the enable
+          # sites out of the installer — this list is derived, not remembered.
+          for _svc in genesis-cc-tmp-align.service qdrant.service; do
+            [ -f ~/.config/systemd/user/"$_svc" ] || continue
+            if ! systemctl --user is-enabled --quiet "$_svc"; then
+              echo "::error::$_svc rendered but NOT enabled — its enable failed silently"
+              systemctl --user status "$_svc" --no-pager -l || true
+              exit 1
+            fi
+          done
+
           # The user-facing artifacts that hardcoded ~/genesis until this PR: both
           # must point at where the repo ACTUALLY is, or they are installed dead on
           # any clone that is not at ~/genesis.

@@ -395,3 +395,53 @@ def test_user_facing_artifacts_use_the_actual_repo_dir_not_a_hardcoded_home_path
     autocd = re.search(r"# Auto-cd to Genesis project on login.*?\nfi", text, re.DOTALL)
     assert autocd, "auto-cd block not found — extraction is stale"
     assert "$REPO_DIR" in autocd.group(0)
+
+
+def test_install_test_covers_every_enable_site():
+    """Every unit install.sh ENABLES must be liveness-checked by the workflow.
+
+    The verification list and the installer are two hand-synced copies, and that
+    is what produced this class of finding: three review rounds each surfaced
+    another unit the job rendered but never looked at. The installer suppresses
+    every one of these failures with ``|| true``, so a unit with a bad directive
+    installs "successfully" and is simply dead — and the placeholder scan cannot
+    see it, because a unit can be fully substituted and still refuse to start.
+
+    So the two are kept in step by a test rather than by remembering. The enable
+    sites are PARSED out of install.sh; a new one fails here until the workflow
+    covers it.
+    """
+    install = INSTALL.read_text()
+    wf = (INSTALL.parent.parent / ".github/workflows/install-test.yml").read_text()
+
+    # Literal unit names on `systemctl --user enable [--now] <name>` lines.
+    enabled = set()
+    for m in re.finditer(r"systemctl --user enable (?:--now )?([A-Za-z0-9_.@-]+)", install):
+        name = m.group(1)
+        if name.startswith("$"):
+            continue  # the generic timer loop — covered by its own assertion
+        enabled.add(name if "." in name else f"{name}.service")
+
+    assert enabled, "no enable sites parsed from install.sh — extraction is stale"
+
+    # The timer loop is asserted generically, so its units need no literal entry.
+    # Scoped to the LIVENESS check, not merely "the glob appears somewhere": the
+    # placeholder scan iterates the same glob, so an unscoped `in wf` is
+    # satisfied by a loop that only greps for `__TOKEN__` and never asks whether
+    # anything started. Caught by mutation — replacing the liveness glob alone
+    # left the placeholder one and the check still passed.
+    liveness = re.search(
+        r"for _t in [^\n]*genesis-\*\.timer.*?is-enabled", wf, re.DOTALL,
+    )
+    assert liveness, (
+        "the workflow must iterate the rendered timers and assert is-enabled on "
+        "each; a placeholder scan over the same glob is not a liveness check, "
+        "and a new timer template would be rendered-but-dead with nothing noticing"
+    )
+
+    missing = sorted(n for n in enabled if n.split(".")[0] not in wf)
+    assert not missing, (
+        f"install.sh enables {missing} but the install test never checks whether "
+        "they came up. The enable is suppressed with `|| true`, so this is the "
+        "exact shape that ships a dead unit behind a green install."
+    )
