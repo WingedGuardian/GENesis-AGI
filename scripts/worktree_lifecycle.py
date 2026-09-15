@@ -725,7 +725,14 @@ def _write_board_cache(results: list[dict]) -> None:
             with contextlib.suppress(OSError):
                 tmp.unlink()
     except OSError as e:
-        _log(f"WARN could not write board cache {BOARD_CACHE}: {e}")
+        # STDERR. This is the THIRD instance of one class on this branch, so it
+        # is fixed as a class rather than a spot: under `--report-json` stdout is
+        # a MACHINE-READABLE channel, and `_log` writes to stdout, so any
+        # diagnostic emitted on the way to producing that document corrupts it.
+        # This path fires exactly when something is already wrong (full or
+        # read-only home), which is the worst moment to also hand the caller
+        # unparseable JSON — the dashboard board shells out to this flag.
+        print(f"WARN could not write board cache {BOARD_CACHE}: {e}", file=sys.stderr)
 
 
 def _append_tombstone(record: dict) -> None:
@@ -966,7 +973,16 @@ def _trash_worktree(
             "merge_method": merge_method,
             "name": trash_path.name,
             "unique_commits": _unique_commits(branch or wt.get("head", ""), repo_root),
-            "had_uncommitted_changes": bool(patch_text),
+            # DERIVED FROM STATUS, not from patch presence. `_dirty_patch` runs
+            # `git diff HEAD`, which sees TRACKED changes only — so a worktree
+            # whose only uncommitted content is an untracked file produced an
+            # empty patch and a tombstone saying there was nothing uncommitted.
+            # That is the wrong answer for precisely the case archives exist for:
+            # an untracked file is the one thing no branch and no commit
+            # protects. The tombstone is the greppable durable index, so a wrong
+            # value here is a wrong answer for as long as the archive lasts.
+            "had_uncommitted_changes": _has_uncommitted_changes(str(wt_path)),
+            "had_tracked_patch": bool(patch_text),
             "secret_files": _secret_shaped_files(wt_path),
         }
         # Both the patch and the commit list above are captured BEFORE the move:
@@ -1011,11 +1027,35 @@ def _trash_worktree(
             # write produced no output at all while the tombstone still recorded
             # had_uncommitted_changes=True — an index claiming a patch that is not
             # there. Report both outcomes.
-            try:
-                (trash_path / ".dirty.patch").write_bytes(patch_text)
-                _log(f"  saved uncommitted tracked changes → {trash_path}/.dirty.patch")
-            except OSError as e:
-                _log(f"  WARN could not save .dirty.patch for {trash_path.name}: {e}")
+            # COLLISION-CHECKED, because this name is not reserved. A worktree
+            # may legitimately contain an untracked `.dirty.patch` of its own,
+            # and an unconditional write would destroy it — in the archive AND in
+            # the worktree, since the archive is made from the moved directory.
+            # For a module whose contract is that it deletes nothing, silently
+            # replacing a user's file is the contract breaking, not a detail.
+            # Falling back to a suffixed name keeps both.
+            target = trash_path / ".dirty.patch"
+            if target.exists():
+                for n in range(1, 1000):
+                    alt = trash_path / f".dirty.patch.archived-{n}"
+                    if not alt.exists():
+                        target = alt
+                        break
+                else:
+                    target = None  # pathological; better to warn than to guess
+                if target is not None:
+                    _log(f"  NOTE {trash_path.name} already contains .dirty.patch — "
+                         f"saving recovery patch as {target.name} so the original survives")
+            if target is None:
+                _log(f"  WARN could not find a free name for the recovery patch in "
+                     f"{trash_path.name}; the uncommitted changes are still inside "
+                     "the archive, but no patch file was written")
+            else:
+                try:
+                    target.write_bytes(patch_text)
+                    _log(f"  saved uncommitted tracked changes → {trash_path}/{target.name}")
+                except OSError as e:
+                    _log(f"  WARN could not save {target.name} for {trash_path.name}: {e}")
 
         # A DETACHED worktree's per-worktree HEAD is the ONLY ref keeping its
         # commit chain reachable. `git worktree prune` removes that ref, after
@@ -1077,6 +1117,18 @@ def _trash_worktree(
 
         _log(f"TRASH {wt_path}: {ref_label} [{lane}] → {stored}")
         return True
+    except subprocess.TimeoutExpired as e:
+        # CAUGHT HERE, per worktree, rather than allowed to unwind. The `git tag`
+        # anchor and the `git worktree prune` below it both carry timeouts, and
+        # an uncaught TimeoutExpired aborts the WHOLE lifecycle run — after this
+        # worktree has already been moved. Every remaining stale worktree is then
+        # skipped for the day, and the moved one gets no tombstone, so the
+        # greppable index silently omits an archive that exists on disk.
+        # A slow git call is not a reason to stop archiving everything else.
+        _log(f"ERROR trashing {wt_path}: git command timed out ({e.cmd}); "
+             "the worktree may already be in the trash — check `--list-trash` "
+             "before re-running")
+        return False
     except (OSError, shutil.Error) as e:
         _log(f"ERROR trashing {wt_path}: {e}")
         return False
@@ -1153,7 +1205,15 @@ def _recover(name: str, repo_root: Path) -> bool:
             try:
                 with tarfile.open(stored, "r:gz") as tf:
                     tf.extractall(str(scratch), filter="data")
-            except tarfile.AbsoluteLinkError:
+            except (tarfile.AbsoluteLinkError, tarfile.LinkOutsideDestinationError):
+                # BOTH link errors, not just the absolute one. `data_filter`
+                # raises AbsoluteLinkError for `/abs/target` and
+                # LinkOutsideDestinationError for a RELATIVE escape such as
+                # `../../shared/secrets.env` — and this repo's own convention
+                # produces both shapes. Catching only the first made the second
+                # fall through to the outer handler and fail the whole recovery,
+                # even though the fallback below is designed to recreate exactly
+                # these links safely without dereferencing them.
                 shutil.rmtree(scratch, ignore_errors=True)
                 scratch.mkdir(parents=True, exist_ok=True)
                 with tarfile.open(stored, "r:gz") as tf:
@@ -1301,7 +1361,14 @@ def _iter_trash_entries() -> list[tuple[Path, Path]]:
     if not TRASH_DIR.exists():
         return out
     for e in sorted(TRASH_DIR.iterdir()):
-        if e.name.endswith(".meta.json") or e.name.startswith("."):
+        # Skip OUR OWN scratch and sidecar artifacts by name, not every
+        # dot-prefixed entry. A worktree whose basename legitimately starts with
+        # a dot is archived under a dot-prefixed name, and a blanket filter hid
+        # both it and its `.tar.gz` — `--list-trash` omitted it and `_recover`
+        # reported no match, while the archive sat there the whole time. A
+        # protection that silently hides a recoverable archive is the same class
+        # of failure as deleting it.
+        if e.name.endswith(".meta.json") or e.name.endswith(".meta.staging"):
             continue
         if e.is_dir():
             out.append((e, e / ".trash_meta.json"))
@@ -1349,12 +1416,24 @@ def _list_trash() -> None:
             with contextlib.suppress(OSError):
                 age_days = (now - stored.stat().st_mtime) / 86400
 
+        # DIRECTORIES ARE MEASURED TOO. An entry that stayed uncompressed —
+        # because compression failed, or because it predates archiving — was
+        # assigned zero bytes and shown as "dir", so the footer could report
+        # "0 MB archived" while gigabytes sat in the trash. That is most
+        # misleading in the case that produces it most often: compression
+        # failing under storage pressure, exactly when the number is being read
+        # to decide whether there is a problem.
         size_mb = 0.0
         if stored.is_file():
             with contextlib.suppress(OSError):
                 size_mb = stored.stat().st_size / 1048576
+        elif stored.is_dir():
+            with contextlib.suppress(OSError):
+                size_mb = sum(
+                    f.stat().st_size for f in stored.rglob("*") if f.is_file()
+                ) / 1048576
         total_mb += size_mb
-        size_str = f"{size_mb:.1f}M" if size_mb else "dir"
+        size_str = f"{size_mb:.1f}M" if stored.is_file() else f"{size_mb:.1f}M*"
 
         print(f"{stored.name:<44} {age_days:>4.0f}d {lane:<9} {size_str:>8}  "
               f"{branch:<28} {original}")
@@ -1396,6 +1475,12 @@ def main() -> int:
 
     if args.report_json:
         results = classify_all(repo_root, allow_network=not args.no_network)
+        # `--dry-run` means "change nothing", and publishing the board cache is a
+        # change — to state the dashboard and the session-start block both read.
+        # The two flags are independently accepted, so the combination was
+        # reachable and silently mutating shared state during what the caller
+        # asked to be a non-mutating inspection.
+        publish = not args.no_network and not args.dry_run
         # Publish ONLY a network-complete classification. --no-network skips the
         # gh PR check, which can only ever demote a merged branch to "unmerged" —
         # harmless for the caller who asked for it, corrosive as SHARED state.
@@ -1418,7 +1503,13 @@ def main() -> int:
                 "board other surfaces read).",
                 file=sys.stderr,
             )
-        else:
+        elif args.dry_run:
+            print(
+                "NOTE --dry-run: printing only; the shared board cache is left "
+                "as it was.",
+                file=sys.stderr,
+            )
+        if publish:
             _write_board_cache(results)
         print(json.dumps(results, indent=2))
         return 0
