@@ -242,7 +242,18 @@ async def test_get_all_known_recent_processing_not_expired(db):
 # ── Monitor edge cases ─────────────────────────────────────────────────
 
 
-def _success_output(text: str = "evaluation result") -> CCOutput:
+def _success_output(
+    # Default fake response echoes this file's fixture URLs the way the
+    # evaluation prompt now requires (**Source:** lines), so lifecycle tests
+    # pass the per-URL coverage gate. Coverage-gate behavior itself is pinned
+    # in test_url_failures.py.
+    text: str = (
+        "evaluation result\n"
+        "**Source:** https://example.com/first\n"
+        "**Source:** https://example.com/second\n"
+        "**Source:** https://example.com/article\n"
+    ),
+) -> CCOutput:
     return CCOutput(
         session_id="cc-sess-1", text=text, model_used="sonnet",
         cost_usd=0.05, input_tokens=100, output_tokens=200,
@@ -647,6 +658,71 @@ def test_compute_new_content_blank_lines_preserved():
     assert "new item 2" in delta
 
 
+def test_compute_new_content_keeps_changed_note_block_whole():
+    """A changed logical item retains its old lines as evaluation context."""
+    from genesis.inbox.monitor import _compute_new_content
+
+    old = "Random old note\n"
+    new = (
+        "TODO: reorganize this file\n"
+        "Random old note\n"
+        "https://example.com/new\n"
+    )
+    delta = _compute_new_content(old, new)
+    lines = delta.splitlines()
+    assert "TODO: reorganize this file" in lines
+    assert "https://example.com/new" in lines
+    assert "Random old note" in delta
+    assert delta == (
+        "TODO: reorganize this file\nRandom old note\nhttps://example.com/new"
+    )
+
+
+def test_compute_new_content_item_boundaries_reach_segmentation():
+    """The current file's adjacency, not elision artifacts, defines the item."""
+    from genesis.inbox.monitor import _compute_new_content
+    from genesis.inbox.scanner import segment_items
+
+    old = "Random old note\n"
+    new = (
+        "TODO: reorganize this file\n"
+        "Random old note\n"
+        "https://example.com/new\n"
+    )
+    items = segment_items(_compute_new_content(old, new))
+    assert [i.kind for i in items] == ["url"]
+    assert items[0].text == (
+        "TODO: reorganize this file\nRandom old note\nhttps://example.com/new"
+    )
+
+
+def test_compute_new_content_annotation_reopens_terminal_url_item():
+    from genesis.inbox.monitor import _compute_new_content
+
+    url = "https://example.com/dead"
+    annotation = "Retry this because the upstream project just shipped a fix"
+    assert _compute_new_content("", f"{annotation}\n{url}", [url]) == (
+        f"{annotation}\n{url}"
+    )
+
+
+def test_reused_annotation_text_on_a_different_url_is_a_new_association():
+    """File-global line membership must not erase annotation ownership."""
+    from genesis.inbox.monitor import _compute_new_content
+
+    annotation = "This solves the evaluator gap"
+    url_a = "https://example.com/tool-a"
+    url_b = "https://example.com/tool-b"
+    old = f"{annotation}\n{url_a}\n{url_b}"
+    current = f"{annotation}\n{url_a}\n{annotation}\n{url_b}"
+
+    assert _compute_new_content(
+        old,
+        current,
+        [f"{annotation}\n{url_a}", url_b],
+    ) == f"{annotation}\n{url_b}"
+
+
 def test_compute_new_content_dedups_tracking_param_variants():
     """The same URL re-pasted with different tracking params is not 'new'."""
     from genesis.inbox.monitor import _compute_new_content
@@ -675,6 +751,22 @@ def test_compute_new_content_preserves_original_url_line():
     assert "https://example.com/post?id=5&utm_source=x" in delta
 
 
+def test_compute_new_content_reattaches_baselined_url_to_new_annotation():
+    """A new adjacent annotation needs the existing URL as evaluation context."""
+    from genesis.inbox.monitor import _compute_new_content
+    from genesis.inbox.scanner import segment_items
+
+    url = "https://example.com/tool"
+    annotation = "This matters because it solves our evaluator gap"
+    delta = _compute_new_content(url, f"{annotation}\n{url}\n")
+
+    assert delta == f"{annotation}\n{url}"
+    items = segment_items(delta)
+    assert len(items) == 1
+    assert items[0].kind == "url"
+    assert items[0].text == delta
+
+
 @pytest.mark.asyncio
 async def test_modified_file_only_sends_delta(
     monitor, inbox_dir, mock_invoker, db,
@@ -698,6 +790,57 @@ async def test_modified_file_only_sends_delta(
     # InboxItem.content is the delta, which gets embedded in the prompt
     assert "example.com/second" in prompt
     assert "example.com/first" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_new_annotation_dispatches_with_baselined_url_context(
+    monitor, inbox_dir, mock_invoker,
+):
+    """The real monitor must send a new annotation together with its URL."""
+    from dataclasses import replace
+
+    monitor._config = replace(monitor._config, evaluation_cooldown_seconds=0)
+    f = inbox_dir / "links.md"
+    url = "https://example.com/tool"
+    f.write_text(url)
+    assert (await monitor.check_once()).batches_dispatched == 1
+
+    mock_invoker.run.reset_mock()
+    annotation = "This matters because it solves our evaluator gap"
+    f.write_text(f"{annotation}\n{url}\n")
+    assert (await monitor.check_once()).batches_dispatched == 1
+
+    invocation = mock_invoker.run.await_args.args[0]
+    assert annotation in invocation.prompt
+    assert url in invocation.prompt
+
+
+@pytest.mark.asyncio
+async def test_two_annotations_for_same_url_keep_source_context_in_each_batch(
+    monitor, inbox_dir, mock_invoker,
+):
+    """Queueing must not undo occurrence-aware delta segmentation."""
+    from dataclasses import replace
+
+    monitor._config = replace(
+        monitor._config,
+        evaluation_cooldown_seconds=0,
+        items_per_eval=1,
+    )
+    url = "https://example.com/tool"
+    f = inbox_dir / "links.md"
+    f.write_text(url)
+    assert (await monitor.check_once()).batches_dispatched == 1
+
+    mock_invoker.run.reset_mock()
+    first = "First reason this matters"
+    second = "Second, independent reason this matters"
+    f.write_text(f"{first}\n{url}\n\n{second}\n{url}\n")
+
+    assert (await monitor.check_once()).batches_dispatched == 2
+    prompts = [call.args[0].prompt for call in mock_invoker.run.await_args_list]
+    assert any(first in prompt and url in prompt for prompt in prompts)
+    assert any(second in prompt and url in prompt for prompt in prompts)
 
 
 @pytest.mark.asyncio

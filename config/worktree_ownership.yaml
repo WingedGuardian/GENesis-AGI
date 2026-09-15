@@ -27,6 +27,12 @@
 #              session holds. Claims are released when the claiming process is
 #              gone. Nothing is ever blocked.
 #   off      — claim nothing, release nothing, warn about nothing.
+#
+# SCOPE AT THIS COMMIT: the library only. Nothing here takes a claim — the
+# Edit/Write hook that does, and the reaper-side release, ship separately. Said
+# plainly because a setting that describes a protection it does not yet provide
+# is worse than one that describes less; that exact defect was a round-1 review
+# finding and this is where it would recur.
 # enabled: master switch; false is equivalent to off.
 #
 # An invalid mode degrades to `advisory`, not `off`: every surface here is

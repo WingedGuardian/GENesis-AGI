@@ -383,7 +383,7 @@ mission via `session_charter_update` when the session's purpose
 crystallizes or pivots — the tag prints `mission: UNSET after N compactions`
 until you do, because an unset mission falls back to the raw origin prompt and
 reads as noise. You are the first line of defense; ambient
-extraction (session-manager PR-3) is only the safety net. Plan files stay
+extraction is only the safety net. Plan files stay
 the working documents — ledger rows are the durable index, not a duplicate.
 
 **PR-body convention — `E2E:` (encouraged, advisory):** a PR body may declare
@@ -392,19 +392,13 @@ the POST-MERGE end-to-end verification its change needs, on its own line:
 This does NOT gate the merge — the merge gate prints an advisory NOTE when a
 body declares neither, and proceeds.
 
-**The obligation WILL be carried after the merge, not before it — and that half
-is NOT BUILT YET (issue #1718).** The design: every merged PR gets a post-merge
-verification row; a documentation-only diff has its row auto-closed with the
-reason recorded (a DETERMINISTIC exemption by path, so no LLM ever decides that
-a prompt or docs change "needs an E2E"); the validator session runs the rest, or
-records why nothing was needed. **Until that ships, this line is the only record
-there is** — so writing it is worth the ten seconds even though nothing forces
-you. When the row exists, declaring here will PRE-FILL it with your own lead:
-the author knows in one sentence what a validator would otherwise
-reverse-engineer from the diff days later. Note the row's exemption is by PATH,
-so it cannot recover a judgment the author skipped on a code PR — a bare
-`E2E: none` there just costs a validator round-trip instead of one sentence
-from the person who knew.
+**Write it whether or not anything reads it back.** The obligation belongs after
+the merge, and the line in the body is the author's own lead on it: one sentence
+from the person who knew, instead of a judgment someone reverse-engineers from
+the diff days later. That value does not depend on what consumes it — which is
+why the convention is worth the ten seconds even where nothing forces you, and
+why a bare `E2E: none` on a code PR is the weak form: it costs a round-trip to
+recover exactly the judgment you were closest to.
 
 **PR-body convention:** a PR that completes a ledger item cites
 `Ledger: <item-id>` (the 32-hex row id) on its own line in the PR body —
@@ -491,7 +485,7 @@ exempted in bulk.
 The hourly `context_injection_monitor` watches the harness's own filings
 independently of every emitter's arithmetic, so this class cannot go quiet
 again — and its record is the evidence that the chokepoint works: of 849 filings
-on this install, 842 were one emitter that stopped filing the day #1556 moved it
+on this install, 842 were one emitter that stopped filing the day it was moved
 behind the writer, and 7 were a guard since removed.
 
 ## Traps
@@ -533,6 +527,25 @@ behind the writer, and 7 were a guard since removed.
   whether one was requested. It reads published reviews only, so "never triggered"
   and "triggered, still running" are the SAME output; if you have not just requested
   one, request one rather than reading that line as proof nobody did.
+  **Codex is not the only reviewer that can block you.** CodeRabbit reviews on its
+  own schedule, and an unresolved **Critical or Major** inline finding on a file in
+  the PR diff blocks a merge by itself — the always-fix floor, which stops a Codex
+  **P1** the same way, in EVERY lane, before any score is consulted. Unless the
+  configured documentation-path exclusion applies.
+  Maintainer-replied findings and findings on files outside the PR diff do not
+  score; under the shipped `doc_findings: skip`, documentation findings do not
+  score either. Until 2026-09-10 CodeRabbit was
+  named in no instruction file in this repo, so sessions read `codex-at-head: ok` as
+  "review is clear" and were surprised by the score. Read the `inline-findings` row,
+  not just the Codex row.
+  **Below the floor, how much a change can afford depends on its LANE** — a
+  consequence class computed from the diff, not chosen by the author. Two P2s
+  block a `critical` change (enforcement hooks, `.github/**`, api/migration
+  paths); ordinary code takes four; prose-and-tests-only takes six — config is
+  NOT prose, so a `.yaml`/`.toml` change is ordinary. The gate prints the
+  lane and its threshold whenever a non-zero score passes under one, so "it did
+  not block" never has to be guessed at. Table and rationale: genesis-development
+  skill, Pre-Merge Gate.
   A PR whose diff touches the
   enforcement-hook surface additionally runs the **gate-fix lane** — wider round 1, and
   a hard stop at 2 rounds that is doctrine you keep, not a gate that stops you. Both
@@ -556,6 +569,11 @@ behind the writer, and 7 were a guard since removed.
   3 silently discards steps 1 and 2 while the error text mentions only step 3.
   Never chain a state-changing step (`cd`, heredoc, file write,
   restore-from-backup) with one a guard can block (test run, commit, push).
+  Most guards now append a note saying the whole command went whenever the
+  command had more than one step — a REMINDER, never a report: it names nothing
+  and cannot tell you which step mattered, so it does not replace the check. The
+  shell blockers (`bash_safety_hook.sh` and the inline `settings.json` one) do
+  NOT carry it yet, so its ABSENCE never means the command was single-step.
   After any block, run `pwd` and re-check the file you believed you wrote —
   never assume the earlier half ran. Prefer `git -C <literal path>` and
   `$ROOT/scripts/…` over a persistent `cd`, so a lost `cd` cannot silently

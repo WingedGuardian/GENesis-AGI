@@ -17,21 +17,19 @@ All git fixtures are synthetic tmp_path repos — install-agnostic.
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import subprocess
-import sys
 from pathlib import Path
+
+from tests.conftest import private_module
 
 _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 
 
 def _load(name: str):
-    spec = importlib.util.spec_from_file_location(name, _SCRIPTS / f"{name}.py")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    # Via conftest so the SHARED name is restored afterwards — see the note
+    # there. This file loads TWO scripts under shared names; both used to leak.
+    return private_module(name, _SCRIPTS / f"{name}.py")
 
 
 _rs = _load("review_scope")
