@@ -797,4 +797,10 @@ jobs:
         # because a test that silently no-ops when its tool is absent is the
         # dormancy this ceiling exists to catch. If this line ever goes red at
         # 100, that is the cause and the fix is one number.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23250
+        # RE-COUNTED after the adversarial round that fixed record-before-emit,
+        # the self-contradicting blind block and the duplicated cap table: this
+        # suite is now 50 collected (+1 in the advisory-channel net) = +51 over
+        # the 23217 base, so 23268. Counted by --collect-only AFTER the last
+        # test-adding edit, per the comment above -- which has now caught a stale
+        # number TWICE on this branch, both times from counting one edit early.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23268

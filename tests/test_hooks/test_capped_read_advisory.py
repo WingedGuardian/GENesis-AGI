@@ -290,3 +290,266 @@ def test_default_table_matches_the_installed_gh() -> None:
         f"drift check verified only {checked}/{len(_GH_DEFAULT_LIMITS)} entries; "
         f"unverified: {unverified}"
     )
+
+
+# --------------------------------------------------------------------------
+# The blind parse. CI caught this one, not a reviewer: the hook imported bare
+# `analyze`, which returns [] both for "no gh listing here" and for "a bound
+# stopped me looking" -- so the shape below made it go SILENT, which is the
+# exact failure the hook exists to prevent.
+# --------------------------------------------------------------------------
+
+
+def test_a_bound_that_blinds_the_parser_still_advises(tmp_path: Path) -> None:
+    """MEASURED: over MAX_COMMAND_CHARS, analyze_checked returns ZERO segments.
+
+    Bare `analyze` returns [] here too and cannot say why, so the old code fell
+    through its loop and emitted nothing. Mutation (import `analyze`, drop the
+    blind branch) -> no output -> BITES.
+    """
+    out = _run("gh pr list --json number " + "#" * 60_000, tmp_path)
+    ctx = _context(out)
+    assert "capped read" in ctx
+    assert "49152" in ctx or "longer than" in ctx
+
+
+def test_the_blind_advisory_claims_only_what_it_knows(tmp_path: Path) -> None:
+    """It must not assert a listing IS present -- it could not check."""
+    ctx = _context(_run("gh pr list " + "#" * 60_000, tmp_path))
+    assert "could not check" in ctx
+    # And it still has to be actionable, or it is just noise.
+    assert "--limit" in ctx
+
+
+def test_a_blind_parse_is_reported_even_when_a_listing_was_found(
+    tmp_path: Path,
+) -> None:
+    """ "Found something AND stopped looking" is the case worth surfacing.
+
+    An untokenizable command still yields segments, so the per-target advisory
+    fires -- and a second listing past the blind spot would go unmentioned under
+    cover of it unless the incompleteness is said out loud.
+    """
+    ctx = _context(_run('gh pr list --search "unbalanced', tmp_path))
+    assert "gh pr list" in ctx
+    assert "could not check" in ctx
+
+
+# --------------------------------------------------------------------------
+# One Bash call, several caps.
+# --------------------------------------------------------------------------
+
+
+def test_a_compound_warns_for_every_distinct_cap(tmp_path: Path) -> None:
+    """`gh pr list; gh run list` carries TWO different caps, 30 and 20.
+
+    Returning after the first mentioned only 30 and never recorded the run
+    listing, so a count drawn from it got no warning. Mutation (return after the
+    first block) -> "20" absent -> BITES.
+    """
+    ctx = _context(_run("gh pr list --json number; gh run list --json databaseId", tmp_path))
+    assert "gh pr list" in ctx and "30" in ctx
+    assert "gh run list" in ctx and "20" in ctx
+
+
+def test_a_compound_does_not_repeat_one_target(tmp_path: Path) -> None:
+    """Per-target dedup still holds WITHIN a single command."""
+    ctx = _context(_run("gh pr list; gh pr list", tmp_path))
+    assert ctx.count("[capped read] `gh pr list`") == 1
+
+
+# --------------------------------------------------------------------------
+# gh's flag semantics: last-value-wins, and the non-data modes.
+# --------------------------------------------------------------------------
+
+
+def test_the_effective_last_limit_wins(tmp_path: Path) -> None:
+    """pflag is last-value-wins, so reading the FIRST --limit inverts both cases.
+
+    Mutation (return on the first match) -> the widened case fires a FALSE
+    advisory and the capped case goes silent -> BITES in both directions.
+    """
+    # Widened last: really fetches 200, so there is nothing to warn about.
+    assert _run("gh pr list --limit 30 --limit 200", tmp_path) is None
+    # Restated-default last: really capped at 30, and must fire.
+    ctx = _context(_run("gh pr list --limit 200 --limit 30", tmp_path, session="s2"))
+    assert "30" in ctx
+
+
+@pytest.mark.parametrize("flag", ["--help", "--web"])
+def test_non_data_modes_are_not_capped_reads(flag: str, tmp_path: Path) -> None:
+    """`--help` prints usage and `--web` opens a browser. Neither returns rows."""
+    assert _run(f"gh pr list {flag}", tmp_path) is None
+
+
+def test_a_short_flag_that_is_not_web_is_never_read_as_non_data(
+    tmp_path: Path,
+) -> None:
+    """MEASURED on gh 2.98.0: `-w` is --web on `pr list` but --workflow on
+
+    `run list`, where it takes a VALUE. Excluding the short spelling would
+    silence `gh run list -w ci.yml` -- a real capped read at 20 -- which is the
+    harmful direction. The long forms are unambiguous and need no per-subcommand
+    model of gh's grammar. Mutation (add "-w" to _NON_DATA_FLAGS) -> BITES.
+    """
+    ctx = _context(_run("gh run list -w ci.yml", tmp_path))
+    assert "gh run list" in ctx
+    assert "20" in ctx
+
+
+def test_a_non_data_mode_does_not_burn_the_dedup_slot(tmp_path: Path) -> None:
+    """The once-per-session slot belongs to the first REAL listing.
+
+    Mutation (skip --help after the _already_fired call instead of before) ->
+    the real listing that follows goes silent -> BITES.
+    """
+    assert _run("gh pr list --help", tmp_path) is None
+    ctx = _context(_run("gh pr list", tmp_path))
+    assert "30" in ctx
+
+
+# --------------------------------------------------------------------------
+# The REMEDY. Two defects here shipped past a 13-cell detector matrix and an
+# 82k-command replay, because only the DETECTOR was ever tested.
+# --------------------------------------------------------------------------
+
+
+def test_search_names_the_api_ceiling_instead_of_a_bigger_limit(
+    tmp_path: Path,
+) -> None:
+    """MEASURED on gh 2.98.0: `gh search prs --limit 1500` is REFUSED --
+
+    "`--limit` must be between 1 and 1000". So "pass a limit above the number
+    you expect" is unfollowable for this family once you expect >= 1000, and
+    the generic remedy had to be executed against it rather than generalised.
+    """
+    ctx = _context(_run("gh search prs --owner o", tmp_path))
+    assert "1000" in ctx
+    assert "narrow the query" in ctx
+
+
+def test_the_short_result_form_is_conditional_not_blanket(tmp_path: Path) -> None:
+    """A short read is the TRUE count -- five open PRs is five, not "at least 30".
+
+    The old text asserted the hedge unconditionally, which teaches a false one.
+    """
+    ctx = _context(_run("gh pr list", tmp_path))
+    assert "exact" in ctx
+    assert "SHORTER than the limit" in ctx
+
+
+def test_the_json_envelope_survives_the_worst_case_output(tmp_path: Path) -> None:
+    """Many blocks now concatenate into ONE additionalContext, so the cap matters.
+
+    MEASURED 2026-09-15: all 13 table targets plus the blind block cost 10,521
+    units against a 9,800 budget under a 10,000-char cap -- so this path CAN
+    overrun, and what must survive is the envelope, never the prose. An
+    oversized advisory that loses `hookEventName` is not an advisory at all.
+
+    No corpus command has ever carried 13 listings (0 of 177,949), so this locks
+    a CONSTRUCTIBLE case rather than an observed one -- which is the point: the
+    cap moves between CC versions and nothing else would notice.
+    """
+    sys.path.insert(0, str(REPO / "scripts/hooks"))
+    from capped_read_advisory import _GH_DEFAULT_LIMITS
+
+    command = "; ".join(f"gh {group} {sub}" for group, sub in _GH_DEFAULT_LIMITS)
+    out = _run(command, tmp_path)
+    assert out is not None
+    # The envelope, in full -- this is the part the bounded writer must never trim.
+    assert out["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert ctx.startswith("[capped read]")
+    # It fit under the cap...
+    assert len(ctx) < 10_000
+    # ...and it got there by dropping WHOLE blocks, never by cutting across a
+    # block boundary. A half-block is a cap reminder with its remedy amputated,
+    # and the key for it would have been recorded as delivered.
+    assert ctx.count("[capped read]") > 1
+    for block in ctx.split("\n\n"):
+        assert block.rstrip().endswith("ignore this."), (
+            f"a block was cut mid-value rather than dropped whole: ...{block[-80:]!r}"
+        )
+
+
+# --------------------------------------------------------------------------
+# Round-2 review: a key recorded for a block nobody saw is a PERMANENT silence.
+# --------------------------------------------------------------------------
+
+
+def test_an_undelivered_block_is_never_recorded_as_delivered(tmp_path: Path) -> None:
+    """The defect: RECORD and EMIT were different events, and record went first.
+
+    MEASURED before the fix, on 13 targets plus an unparseable span: 14 keys were
+    written to the dedup file while the bounded writer destroyed the 14th block
+    entirely -- so the session reported a blind parse zero times, forever, in the
+    one direction this hook exists to prevent.
+
+    Mutation (record inside the selection loop instead of after the emit) -> the
+    dropped target is recorded and never advised again -> BITES.
+    """
+    sys.path.insert(0, str(REPO / "scripts/hooks"))
+    from capped_read_advisory import _GH_DEFAULT_LIMITS
+
+    targets = list(_GH_DEFAULT_LIMITS)
+    command = "; ".join(f"gh {g} {s}" for g, s in targets) + ' --search "unbalanced'
+    ctx = _context(_run(command, tmp_path))
+
+    dropped = [(g, s) for g, s in targets if f"`gh {g} {s}`" not in ctx]
+    assert dropped, "expected the budget to drop at least one block whole"
+    # Whatever did not ship was not recorded, so it still advises on its own.
+    for group, sub in dropped:
+        again = _context(_run(f"gh {group} {sub}", tmp_path))
+        assert f"`gh {group} {sub}`" in again, f"{group} {sub} was silently lost"
+
+
+def test_the_blind_block_is_reserved_against_the_budget(tmp_path: Path) -> None:
+    """Losing "I could not read this command" costs more than losing one cap.
+
+    It is also the cheapest block there is, so reserving it is nearly free.
+    Mutation (append the blind block last without reserving room) -> it is the
+    one the writer destroys -> BITES.
+    """
+    sys.path.insert(0, str(REPO / "scripts/hooks"))
+    from capped_read_advisory import _GH_DEFAULT_LIMITS
+
+    command = "; ".join(f"gh {g} {s}" for g, s in _GH_DEFAULT_LIMITS) + ' --search "unbalanced'
+    ctx = _context(_run(command, tmp_path))
+    assert "could not check" in ctx
+    # And nothing was cut mid-block -- whole blocks in, whole blocks out.
+    assert "truncated" not in ctx
+
+
+def test_the_blind_block_does_not_contradict_a_named_listing(tmp_path: Path) -> None:
+    """Two of the four blind causes return segments, so both blocks co-emit.
+
+    Saying "I could not check whether it contains a gh listing" directly under a
+    block that just named one and stated its cap is a message contradicting
+    itself. Mutation (drop found_any) -> BITES.
+    """
+    ctx = _context(_run('gh pr list --search "unbalanced', tmp_path))
+    assert "`gh pr list`" in ctx
+    assert "another `gh` listing" in ctx
+    assert "contains a `gh` listing" not in ctx
+
+
+def test_the_blind_block_says_a_listing_when_none_was_found(tmp_path: Path) -> None:
+    """The other side of the same word -- a bound yields NO segments at all."""
+    ctx = _context(_run("gh pr list " + "#" * 60_000, tmp_path))
+    assert "contains a `gh` listing" in ctx
+    assert "another" not in ctx
+
+
+def test_the_cap_summary_is_derived_from_the_table(tmp_path: Path) -> None:
+    """A second hand-written copy of the caps is one the drift test cannot see.
+
+    Mutation (hardcode the old prose) -> BITES, because the derived summary must
+    track _GH_DEFAULT_LIMITS rather than restate it.
+    """
+    sys.path.insert(0, str(REPO / "scripts/hooks"))
+    from capped_read_advisory import _GH_DEFAULT_LIMITS, _cap_summary
+
+    summary = _cap_summary()
+    for (group, _sub), cap in _GH_DEFAULT_LIMITS.items():
+        assert group in summary, f"{group} missing from the derived cap summary"
+        assert str(cap) in summary, f"cap {cap} missing from the derived cap summary"

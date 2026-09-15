@@ -943,8 +943,15 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   when gh moves a number rather than quietly naming a cap that no longer exists — treat
   the numbers above as the reading at that version, not as durable facts. To get the
   whole set, pass `--limit N` ABOVE your expected count and re-read until the result
-  comes back SHORT of it — `--paginate` is a `gh api` flag and MEASURED on gh 2.98.0
-  every one of these subcommands rejects it with `unknown flag: --paginate`.
+  comes back SHORT of it — a result of EXACTLY the limit means there may be more, while
+  a SHORTER one is the true count. `--paginate` is a `gh api` flag and MEASURED on gh
+  2.98.0 every one of these subcommands rejects it with `unknown flag: --paginate`.
+  **`gh search` is the exception and the raise-the-limit remedy does not work there:**
+  the API caps results at 1,000 and gh refuses a larger flag client-side (MEASURED,
+  `gh search prs --limit 1001` → `` `--limit` must be between 1 and 1000 ``), so
+  exactly 1,000 back is an incomplete read you cannot widen. Narrow the query instead
+  — `--created`/`--merged-at` date slices, `--owner`, `--repo` — and sum the slices,
+  each verified complete by coming back short of its own limit.
 
 - **Fail-closed data access.** A data-access boundary must RAISE (or return a
   clearly-typed "unknown/unavailable") on missing scope or an unavailable
