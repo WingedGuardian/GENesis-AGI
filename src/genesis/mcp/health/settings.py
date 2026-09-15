@@ -905,19 +905,41 @@ def _validate_inbox_monitor(changes: dict) -> list[str]:
             errors.append("inbox_monitor.batch_size must be an integer")
 
     valid_models = VALID_MODEL_NAMES
-    if "model" in section and section["model"] not in valid_models:
+    model = section.get("model")
+    if "model" in section and (
+        not isinstance(model, str) or model not in valid_models
+    ):
         errors.append(
-            f"inbox_monitor.model must be one of {sorted(valid_models)}, got '{section['model']}'"
+            f"inbox_monitor.model must be one of {sorted(valid_models)}, got {model!r}"
         )
 
     valid_efforts = VALID_EFFORT_NAMES
-    if "effort" in section and section["effort"] not in valid_efforts:
+    effort = section.get("effort")
+    if "effort" in section and (
+        not isinstance(effort, str) or effort not in valid_efforts
+    ):
         errors.append(
             f"inbox_monitor.effort must be one of {sorted(valid_efforts)}, "
-            f"got '{section['effort']}'"
+            f"got {effort!r}"
         )
 
     # timezone removed — uses system timezone from genesis.env.user_timezone()
+
+    # The monitor reads this as `!= "enforce"`, so ANY unrecognised value runs in
+    # shadow. That direction is safe, but it is silent: a typo ("enfoce",
+    # "ENFORCE", True) would leave the gate observing forever while the operator
+    # believed it was live — and the operator only touches this lever at the one
+    # moment they have decided to act on the shadow measurement.
+    valid_coverage_modes = {"shadow", "enforce"}
+    coverage_mode = section.get("url_coverage_mode")
+    if "url_coverage_mode" in section and (
+        not isinstance(coverage_mode, str)
+        or coverage_mode not in valid_coverage_modes
+    ):
+        errors.append(
+            "inbox_monitor.url_coverage_mode must be one of "
+            f"{sorted(valid_coverage_modes)}, got {coverage_mode!r}"
+        )
 
     return errors
 
