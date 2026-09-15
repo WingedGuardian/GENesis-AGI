@@ -139,17 +139,40 @@ def _audit_line(
     )
 
 
+def _audit_line_minimal(part: str, where: str) -> str:
+    """The counters-dropped fallback for :func:`_audit_line`'s cut form.
+
+    Emitted by ``emit_final`` only when the full cut line will not fit its
+    reserve. It keeps the two load-bearing parts — the part id and the mirror
+    pointer (``where``) — and drops the unbounded counters, which is the
+    'select, don't amputate' answer to a line that must shrink: omit the
+    volatile field explicitly rather than let a right-clip eat the pointer.
+    The widened reserve below makes this path unreachable for any real part;
+    it is the STRUCTURAL guarantee behind that arithmetic, not a substitute.
+    """
+    return f"\n_[ctx {part}: audit counts omitted for size{where}]_"
+
+
 # Room reserved for the trailing `_[ctx <part>: …]_` self-audit line — DERIVED
 # from the renderer above at its realistic worst case, not a round number.
-# Pinned by test_the_audit_reserve_fits_the_line_it_reserves_for, which rebuilds
-# this same worst case, so the two cannot drift.
+# The load-bearing invariant is that `_AUDIT_WORST_COUNTER` exceeds any counter a
+# real part can render (checked by test_the_audit_worst_counter_exceeds_any_real_part,
+# which asserts that margin directly — not by rebuilding the line, which would be
+# tautological against a reserve derived from the same figure); the pointer-safe
+# fallback in `_finish_part` is the structural backstop past even that.
+# 12-digit worst-case counters (999_999_999_999 ≈ 1 TB): `intended`/`dropped`
+# are unbounded, and the earlier 5-digit 99_999 under-reserved for any part that
+# renders a 6+-digit count — a right-clip would then eat the trailing mirror
+# pointer. 12 digits covers any real payload with room to spare; the fallback in
+# `_finish_part` is the structural backstop past even that.
+_AUDIT_WORST_COUNTER = 999_999_999_999
 _AUDIT_LINE_RESERVE = (
     len(
         _audit_line(
             "identity-user",
-            99_999,
-            99_999,
-            cut=("x" * _AUDIT_BLOCK_LABEL_MAX, 99_999),
+            _AUDIT_WORST_COUNTER,
+            _AUDIT_WORST_COUNTER,
+            cut=("x" * _AUDIT_BLOCK_LABEL_MAX, _AUDIT_WORST_COUNTER),
             where=(
                 f" — full text: {Path.home()}/.genesis/sessions/{'0' * 36}/context-identity-user.md"
             ),
@@ -179,7 +202,11 @@ def _audit_reserve(part: str, mirror: Path | None) -> int:
     """
     where = f" — full text: {mirror}" if mirror is not None else " — MIRROR UNAVAILABLE"
     worst = _audit_line(
-        part, 99_999, 99_999, cut=("x" * _AUDIT_BLOCK_LABEL_MAX, 99_999), where=where
+        part,
+        _AUDIT_WORST_COUNTER,
+        _AUDIT_WORST_COUNTER,
+        cut=("x" * _AUDIT_BLOCK_LABEL_MAX, _AUDIT_WORST_COUNTER),
+        where=where,
     )
     return max(_AUDIT_LINE_RESERVE, emit_cost(worst))
 
@@ -1073,7 +1100,7 @@ def _emit_body() -> tuple[str, str, str] | None:
         # The helper is fail-open end-to-end; pulse must never block session
         # start. Charter part (it feeds the charter's proposal sub-block).
         if _in("charter"):
-            _spawn_repo_pulse_worker(_hook_source)
+            _spawn_boundary_workers(_hook_source)
 
         # Critical-only alert: surface genuinely user-blocking issues (DB down, etc.)
         _status_file = Path.home() / ".genesis" / "status.json"
@@ -1452,7 +1479,8 @@ def _finish_part(part: str, session_id: str, miswired: str = "") -> None:
         block, dropped = cut
         where = f" — full text: {mirror}" if wrote_mirror else " — MIRROR UNAVAILABLE"
         out.emit_final(
-            _audit_line(part, out.intended_chars, out.emitted_chars, cut=cut, where=where)
+            _audit_line(part, out.intended_chars, out.emitted_chars, cut=cut, where=where),
+            fallback=_audit_line_minimal(part, where),
         )
     else:
         out.emit_final(_audit_line(part, out.emitted_chars, out.emitted_chars))
@@ -1706,6 +1734,83 @@ def _spawn_repo_pulse_worker(source: str) -> None:
             )
     except Exception:
         pass  # fail-open: pulse is advisory, session start is not
+
+
+def _spawn_boundary_workers(source: str) -> None:
+    """Every detached worker this session boundary starts — in ONE place.
+
+    A test that drives the emission path must neutralise these, or it forks
+    real background processes against the live repo. When each spawn was
+    called directly from that path, neutralising them was a CONVENTION every
+    such test had to remember for every spawn — and the second one broke it
+    immediately: `test_context_injection_budget` patched the repo-pulse spawn
+    (its comment even records why: "a side effect a budget test has no
+    business having, and one that only shows up as flakiness under load") and
+    then forked the zero-drop worker for real, which does a live `git
+    ls-remote` and a 2000-PR `gh pr list`.
+
+    Add new detached spawns HERE, never at the call site. That the emission
+    path calls this and nothing else is locked by
+    `test_session_context_zero_drop`, which asks the AST which `_spawn_*` names
+    `_emit_body` calls rather than checking a hardcoded list — so a third spawn
+    added at the call site fails that test without anyone updating it.
+
+    Not a guarantee, and worth saying so precisely: this makes ONE thing to
+    stub instead of N, for a test that drives the emission path IN-PROCESS. A
+    test that invokes this hook as a SUBPROCESS is not covered by any stub —
+    the durable answer there is a spawn-only kill switch, which does not exist
+    (`GENESIS_*_DISABLED` is overloaded: the workers read the same variables to
+    disable THEMSELVES, so arming them suite-wide breaks the worker tests —
+    MEASURED, 42 of them). Today the exposure is nil: only one test file drives
+    `main()`, and it stubs this function.
+    """
+    _spawn_repo_pulse_worker(source)
+    _spawn_zero_drop_worker(source)
+
+
+def _spawn_zero_drop_worker(source: str) -> None:
+    """Fire-and-forget the detached zero-drop stranded-work detector.
+
+    GLOBAL, not per-session: the sweep enumerates every branch and worktree of
+    the install, so one run serves all sessions; its 60-minute debounce makes
+    redundant spawns exit in ~100ms (the repo-pulse spawn posture, one Popen of
+    cost to this hook). Never on clear (/clear is a fresh start), and fail-open
+    end-to-end — a detector cannot be allowed to block session start. The sweep
+    itself (a gh round-trip plus ~160 worktree stats, MEASURED ~19s) is orders
+    of magnitude past this hook's 5s budget, which is why it is detached rather
+    than inline.
+    """
+    import subprocess
+
+    try:
+        if os.environ.get("GENESIS_ZERO_DROP_DISABLED") == "1":
+            return
+        if source == "clear":
+            return
+        script = Path(__file__).resolve().parent / "zero_drop_worker.py"
+        err_log = Path.home() / ".genesis" / "session_awareness" / "zero_drop_err.log"
+        err_log.parent.mkdir(parents=True, exist_ok=True)
+        with err_log.open("ab") as err_fh:
+            subprocess.Popen(  # noqa: S603 — fixed argv, sys.executable
+                [
+                    sys.executable,
+                    str(script),
+                    "--trigger",
+                    "session_start",
+                    # Same home-anchored resolution as the pulse spawn: a
+                    # worktree session's worker must not fall back to
+                    # genesis.env's repo-anchored default (worktree/data/ is a
+                    # void — silent no-op coverage loss).
+                    "--db-path",
+                    str(_charter_db_path()),
+                ],
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=err_fh,
+            )
+    except Exception:
+        pass  # fail-open: the detector is advisory, session start is not
 
 
 def _pulse_floor() -> float:

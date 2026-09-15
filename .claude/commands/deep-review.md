@@ -37,8 +37,10 @@ Use the Agent tool. Do NOT self-review — a self-review is anchored to your own
 which is exactly what lets Round-1 bugs through.
 
 - **`genesis-architect`** over the full diff — follow its protocol
-  (`.claude/agents/genesis-architect.md`): scope-drift check first, BLOCKER / SHOULD-FIX / NOTE
-  ladder with per-finding `file:line` + confidence, completion status last.
+  (`.claude/agents/genesis-architect.md`): scope-drift check first, then the **premise check**
+  (Step 0.6 — is this the right change at all, and is it the best available shape?), then the
+  BLOCKER / SHOULD-FIX / NOTE ladder with per-finding `file:line` + confidence, completion
+  status last.
 - **ALSO `genesis-security-reviewer`** when the diff touches auth, credentials/secrets,
   subprocess, SQL, path handling, external input (Telegram/dashboard/MCP), or hooks/gates.
 - Run them SEQUENTIALLY, almost never in parallel on the same diff (standing rule — the second
@@ -49,6 +51,12 @@ which is exactly what lets Round-1 bugs through.
 
 Prime each reviewer with the RIGHT SHAPE (what a lint scan misses). Paste this into the prompt:
 
+> Run the PREMISE CHECK (your Step 0.6) before reviewing the code: extract the claims this
+> change depends on, verdict each independently with evidence and a falsifier, ask what the
+> caller does differently because of its output, and say whether a better shape exists (an
+> existing chokepoint it re-implements, a simpler mechanism, a place the problem disappears).
+> A correct fix to the wrong problem is the one defect another review round cannot find.
+>
 > Assume there are bugs; enumerate the whole CLASS, not just the named cases. Read the
 > authoritative source (the library/loader/protocol you mirror) END-TO-END before deriving.
 > Apply the AI-code failure taxonomy in `.claude/skills/genesis-development/references/ai-code-audit.md`.
