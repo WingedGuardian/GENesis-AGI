@@ -26,6 +26,11 @@ class _Result:
     success: bool = True
     content: str = ""
     error: str | None = None
+    # The real router always sets this (`provider_used=provider_name`), and the
+    # suppression path now reads it, so a stub without it would feed the
+    # consumer a shape the producer never emits. Defaults to the VALIDATED
+    # provider because a healthy chain answers from its first rung.
+    provider_used: str | None = "openrouter-deepseek-v4"
 
 
 def _vec(i: int) -> list[float]:
@@ -40,10 +45,13 @@ def _embedder_returning(vec: list[float]) -> MagicMock:
     return e
 
 
-def _router_38a(redundant_with) -> MagicMock:
+def _router_38a(redundant_with, provider="openrouter-deepseek-v4") -> MagicMock:
     r = MagicMock()
     r.route_call = AsyncMock(
-        return_value=_Result(content=json.dumps({"redundant_with": redundant_with})),
+        return_value=_Result(
+            content=json.dumps({"redundant_with": redundant_with}),
+            provider_used=provider,
+        ),
     )
     return r
 
@@ -79,6 +87,52 @@ async def test_cross_type_duplicate_caught(db):
     assert is_novel is False
     assert fell_open is False
     router.route_call.assert_awaited_once()  # the 38a dedup call fired
+
+
+@pytest.mark.asyncio
+async def test_an_unvalidated_rung_may_answer_but_may_not_suppress(db):
+    """The second rung buys AVAILABILITY, and must not buy DELETION with it.
+
+    This call site's declared safety property is precision, and the evidence
+    for it — zero false-merges — was measured on deepseek-v4 alone; the second
+    rung matches it on TIER, which is not the same claim. A `redundant_with`
+    verdict destroys the new procedure silently, so a rung whose false-merge
+    rate is unmeasured must not be able to produce one.
+
+    Note what the chain looked like BEFORE the second rung: an outage made
+    `chain_has_available` false and everything was treated as novel and stored.
+    So an unvalidated rung that could suppress would be strictly WORSE than the
+    outage it was added to survive — trading "duplicates stored" for "real
+    procedures destroyed".
+    """
+    await _seed(db, "reindex-gitnexus", _vec(0))
+    router = _router_38a(1, provider="glm51")  # the fallback rung answers
+
+    is_novel, _max_sim, _vec_out, fell_open = await _principle_is_novel(
+        db, task_type="reindex-code-intel", new_principle="reindex the code graph",
+        embedder=_embedder_returning(_vec(0)), router=router, new_steps=["s"],
+    )
+
+    assert is_novel is True, "an unvalidated rung suppressed a procedure"
+    router.route_call.assert_awaited_once(), "the rung must still be ASKED"
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_provider_cannot_suppress_either(db):
+    """Fails toward STORING, which is the direction this path already prefers.
+
+    A result carrying no provider at all (an older stub, a future router shape)
+    must not inherit the validated provider's authority by default.
+    """
+    await _seed(db, "reindex-gitnexus", _vec(0))
+    router = _router_38a(1, provider=None)
+
+    is_novel, _max_sim, _vec_out, _fo = await _principle_is_novel(
+        db, task_type="reindex-code-intel", new_principle="reindex the code graph",
+        embedder=_embedder_returning(_vec(0)), router=router, new_steps=["s"],
+    )
+
+    assert is_novel is True
 
 
 @pytest.mark.asyncio

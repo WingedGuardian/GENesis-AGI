@@ -59,6 +59,22 @@ NOVELTY_THRESHOLD = 0.85
 # "is the new procedure redundant with any of these?". Precision-first (the dedup
 # spike found 0 false-merges on S-tier); fail-open (any error → treat as novel).
 _NOVELTY_CALL_SITE = "38a_procedure_novelty_llm"
+
+# Only a provider whose FALSE-MERGE rate has actually been MEASURED may return a
+# SUPPRESSING verdict. A `redundant_with` answer destroys the new procedure — it
+# is never stored, and nothing surfaces that — so the precision this call site
+# names as its safety property cannot rest on tier parity. Later rungs of the
+# chain exist for AVAILABILITY (a chain of one meant a single provider outage
+# took dedup judgment offline entirely): they may ANSWER, they may not DELETE.
+#
+# Compared against `RouteResult.provider_used`, which carries the CHAIN ALIAS
+# (`provider_used=provider_name`, routing/router.py). NOT `model_id` — that is
+# the provider's own model string (`p["model"]`, routing/config.py), so an alias
+# comparison against it would never match and would disable dedup outright.
+#
+# Adding a provider here requires running the same zero-false-merge evaluation
+# that put deepseek-v4 in it; matching S-tier is not that evidence.
+_NOVELTY_VALIDATED_PROVIDERS = frozenset({"openrouter-deepseek-v4"})
 CROSS_TYPE_PREFILTER = 0.62  # cosine floor for candidates (spike found dups @0.66)
 CROSS_TYPE_TOPK = 10  # cap candidates sent to the LLM (bounds cost)
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
@@ -184,6 +200,23 @@ async def _cross_type_duplicate(
         data = json.loads(match.group(1) if match else (result.content or ""))
         rw = data.get("redundant_with")
         if isinstance(rw, int) and 1 <= rw <= len(top):
+            # A suppressing verdict is only as trustworthy as the provider that
+            # produced it, and only one of them has been measured. An unknown or
+            # missing provider lands here too and is treated the same way —
+            # which fails toward STORING, the direction this call site is
+            # already documented to prefer (a paraphrase duplicate stored beats
+            # a real procedure destroyed).
+            answered_by = getattr(result, "provider_used", None) or ""
+            if answered_by not in _NOVELTY_VALIDATED_PROVIDERS:
+                logger.info(
+                    "Cross-type dedup: %s judged the new '%s' procedure "
+                    "redundant, but its false-merge rate is unmeasured — "
+                    "treating as novel and storing it. The rung answered; only "
+                    "a validated provider may suppress.",
+                    answered_by or "<unknown provider>",
+                    task_type,
+                )
+                return False, max_cross_sim
             dup = top[rw - 1][1]
             logger.info(
                 "Cross-type duplicate: new '%s' ~ existing '%s' (cosine=%.3f): %s",
