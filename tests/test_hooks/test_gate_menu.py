@@ -573,6 +573,59 @@ def test_malformed_or_irrelevant_payloads_emit_nothing(repo, home, payload):
     assert res.returncode == 0 and res.stdout == ""
 
 
+def test_the_two_counters_come_from_ONE_snapshot(tmp_path, repo, home):
+    """THE RACE, made deterministic — a behavioural test, not a structural one.
+
+    `get_review_round` and `get_review_lifetime` each perform their own file read AND
+    their own branch resolution. A concurrent `mark` landing between them hands the
+    caller a pair THAT NEVER EXISTED: the pre-update lifetime with the post-update
+    streak. Deciding a tier from that pair selects a tier the gate is not in — the
+    wrong-tier bug this hook was revised to remove, re-entering through a race.
+
+    Rather than try to lose a real race, the stand-in below makes it certain: the
+    snapshot accessor reports the CONSISTENT terminal state (menu must stay silent),
+    while the two separate accessors report the TORN pair that makes the cap look live
+    (menu would be shown). The two paths therefore disagree by construction, so this
+    test can only pass if the hook reads the snapshot. Asserting that the source
+    imports one name rather than two would pin spelling, not behaviour.
+    """
+    tree = tmp_path / "torn"
+    (tree / "scripts" / "hooks").mkdir(parents=True)
+    (tree / "scripts" / "lib").mkdir(parents=True)
+    (tree / "scripts" / "lib" / "gate_menu.py").write_text(
+        (_REPO_ROOT / "scripts" / "lib" / "gate_menu.py").read_text()
+    )
+    (tree / "scripts" / "review_state.py").write_text(
+        "ESCALATION_ROUND_CAP = 3\n"
+        "FINAL_ROUND_CAP = 7\n"
+        "# One snapshot: terminal is live, so the cap menu must NOT be shown.\n"
+        "def get_review_counters(cwd=None):\n"
+        "    return (3, 9)\n"
+        "# The torn pair a racing reader would assemble: cap looks live, terminal clear.\n"
+        "def get_review_round(cwd=None):\n"
+        "    return 3\n"
+        "def get_review_lifetime(cwd=None):\n"
+        "    return 6\n"
+    )
+    hook_copy = tree / "scripts" / "hooks" / "ask_gate_menu.py"
+    hook_copy.write_text(_HOOK.read_text())
+    res = subprocess.run(
+        [sys.executable, str(hook_copy)],
+        input=json.dumps(_ask_payload(repo)),
+        capture_output=True,
+        text=True,
+        cwd=str(repo),
+        env={"PATH": "/usr/bin:/bin", "HOME": str(home)},
+        timeout=30,
+    )
+    assert res.returncode == 0
+    assert res.stdout == "", (
+        "the hook assembled a tier from two independent reads: it saw the torn "
+        "(round=3, lifetime=6) pair and offered the cap menu, while one consistent "
+        "read says the FINAL ROUND terminal is live"
+    )
+
+
 def test_garbage_stdin_does_not_crash_the_hook(repo, home):
     res = subprocess.run(
         [sys.executable, str(_HOOK)],

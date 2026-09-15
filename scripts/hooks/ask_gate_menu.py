@@ -206,9 +206,16 @@ def _cap_is_live(cwd: str | None) -> bool:
     ACCEPT-and-merge / ABANDON. Checking lifetime first is what keeps the menu and the
     block talking about the same tier.
 
-    `get_review_round` and `get_review_lifetime` are both branch-scoped by construction
-    -- each returns 0 when the stored state belongs to a different branch -- so a menu
-    never follows you onto unrelated work.
+    BOTH VALUES COME FROM ONE SNAPSHOT, and that is not a micro-optimisation. Two
+    independent reads let a concurrent `mark` land between them, yielding a pair that
+    never existed -- the pre-update lifetime with the post-update streak -- from which
+    this function would select a tier the gate is not in. That is the wrong-tier bug
+    above, re-entering through a race instead of through a missing check. Reading once
+    cannot produce an inconsistent pair.
+
+    `get_review_counters` is branch-scoped by construction -- it reads (0, 0) when the
+    stored state belongs to a different branch -- so a menu never follows you onto
+    unrelated work.
 
     Every failure path returns False (no menu), including the one where the terminal
     cannot be read: if we cannot PROVE the terminal is clear, we say nothing rather than
@@ -219,15 +226,20 @@ def _cap_is_live(cwd: str | None) -> bool:
         from review_state import (
             ESCALATION_ROUND_CAP,
             FINAL_ROUND_CAP,
-            get_review_lifetime,
-            get_review_round,
+            get_review_counters,
         )
     except Exception:  # noqa: BLE001 -- no counters, no menu. Never a refusal.
+        # Deliberately NO fallback to the two-call pair on ImportError. `genesis-hook`
+        # resolves scripts from the MAIN worktree while GENESIS_HOOK_DEV_LOCAL=1 splits
+        # the trees, so version skew is a real configuration here -- and against a tree
+        # too old to have the snapshot accessor, the fallback's only effect would be to
+        # reinstate the race this import exists to close. No menu is the better miss.
         return False
     try:
-        if int(get_review_lifetime(cwd=cwd)) >= FINAL_ROUND_CAP:
+        round_n, lifetime_n = get_review_counters(cwd=cwd)
+        if int(lifetime_n) >= FINAL_ROUND_CAP:
             return False
-        return int(get_review_round(cwd=cwd)) >= ESCALATION_ROUND_CAP
+        return int(round_n) >= ESCALATION_ROUND_CAP
     except Exception:  # noqa: BLE001
         return False
 

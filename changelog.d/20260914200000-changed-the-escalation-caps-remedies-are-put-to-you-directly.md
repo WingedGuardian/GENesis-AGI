@@ -24,8 +24,11 @@
   relays the block as ordinary prose is not covered at all, and a session that
   happens to ask four questions at once will not get the menu appended (the tool
   caps a call at four, and a rejected call would cost you the session's own
-  questions too). It stops being offered once you acknowledge the block and a
-  commit lands — except after "hand it back", where the gate deliberately
+  questions too). It stops being offered as soon as the gate ACCEPTS your
+  acknowledgement — which is not the same as a commit landing: the gate clears
+  the streak the moment it recognises the acknowledgement, deliberately even if
+  a later rule then blocks that same commit — except after "hand it back",
+  where the gate deliberately
   forbids that acknowledgement, so the menu keeps being offered on that branch
   until you leave it or use the off switch. Finally, if a session is sitting in
   one worktree and committing into another, the menu will not appear.
