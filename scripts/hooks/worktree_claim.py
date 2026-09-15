@@ -310,16 +310,38 @@ def pid_is_live_session(pid: int | None, start: int | None = None) -> bool:
     """
     if not pid or pid <= 1:
         return False
-    if not is_session_process(pid):
-        return False
-    if start is None:
-        return True
-    return proc_starttime(pid) == start
+    if start is not None:
+        # THE RECORDED START TIME IS THE WHOLE TEST when we have one. A recycled
+        # pid necessarily starts LATER than the claim, so the timestamp already
+        # defeats reuse -- which is this module's own argument for recording it.
+        # The argv[0] check is deliberately NOT consulted here. It is required on
+        # the WRITE path, where claiming as the launcher shell would be wrong,
+        # and harmful on this one: it adds a whole class of false-dead (a
+        # different uid, a PID namespace, a hardened /proc, a renamed launcher)
+        # and every one of those resolves toward RELEASING a live session's
+        # claim. An identity check that must pass to TAKE a claim is not
+        # automatically the right check to RELEASE one.
+        return proc_starttime(pid) == start
+    # Legacy payloads only: no recorded start, so fall back to "is a session
+    # process". Weaker, and it keeps the same false-dead exposure -- which is
+    # why `build_payload` always records a start now.
+    return is_session_process(pid)
 
 
 # --------------------------------------------------------------------------
 # Reading and writing locks
 # --------------------------------------------------------------------------
+
+
+#: Upper bound for a plausible pid. Linux caps `kernel.pid_max` at 2**22 on
+#: 64-bit; anything above cannot name a live process, so accepting it would
+#: record a claim whose release condition is "always gone".
+_PID_CEILING = 4_194_304
+
+#: Upper bound for a plausible /proc start time (clock ticks since boot). Far
+#: past any real uptime; the point is to reject a value that can never MATCH,
+#: since a non-matching start reads as a dead session and releases the claim.
+_START_CEILING = 2**40
 
 
 def _parse_payload(raw: str) -> dict | None:
@@ -353,7 +375,12 @@ def _parse_payload(raw: str) -> dict | None:
     # its pid, or carrying a non-integer one, has no usable release condition --
     # `pid_is_live_session` would read it as dead and release immediately, which
     # is the opposite of what a malformed claim should do.
-    if not isinstance(payload.get("pid"), int) or payload["pid"] <= 1:
+    # Bounded at BOTH ends. A pid above the kernel's ceiling can never be live,
+    # so it is exactly as unusable a release condition as `pid: 1`, which the
+    # same line already rejects -- and an unusable release condition resolves to
+    # "the session is gone", which releases. `type(...) is not int` rather than
+    # isinstance, because a JSON boolean is an int and must not pass.
+    if type(payload.get("pid")) is not int or not (1 < payload["pid"] <= _PID_CEILING):
         return None
     # `start` needs the SAME "is it usable" bar as pid, for the same reason.
     # `isinstance(x, int)` is satisfied by a JSON boolean (bool subclasses int),
@@ -365,20 +392,42 @@ def _parse_payload(raw: str) -> dict | None:
     # `type(...) is not int` rather than `isinstance`, because excluding bool is
     # the point.
     start_time = payload.get("start")
-    if start_time is not None and (type(start_time) is not int or start_time <= 0):
+    if start_time is not None and (
+        type(start_time) is not int or not (0 < start_time <= _START_CEILING)
+    ):
         return None
     return payload
 
 
 def read_lock(root: Path) -> Lock | None:
-    """The lock on ``root``, or None when it is not locked."""
+    """The lock on ``root``, or None ONLY when it is provably not locked.
+
+    None means "there is no lock" and nothing else. An UNREADABLE lock -- the
+    gitdir resolved but its ``locked`` file could not be read (permissions, a
+    racing write, a truncated file) -- returns a FOREIGN Lock instead, because a
+    consumer handed None cannot tell those apart and the safe reading of an
+    unknown is "someone else holds this". The dangerous direction is specific:
+    this module's intended consumer is the reaper, which trashes with
+    ``shutil.move`` rather than ``git worktree remove``, so git's own refusal is
+    NOT a backstop for it -- an unknown that reads as None gets reaped.
+
+    A gitdir that cannot be resolved at all still returns None: that is not a
+    worktree we can reason about, and it is the same answer an unlocked plain
+    directory gives.
+    """
     gitdir = gitdir_for(root)
     if gitdir is None:
         return None
+    locked = gitdir / "locked"
     try:
-        raw = (gitdir / "locked").read_text(encoding="utf-8", errors="replace").strip()
-    except OSError:
+        raw = locked.read_text(encoding="utf-8", errors="replace").strip()
+    except FileNotFoundError:
         return None
+    except OSError:
+        # Present but unreadable. Report it as a foreign lock with an empty raw,
+        # so every "is this ours" test fails and every "may I release it" test
+        # answers no.
+        return Lock(raw="", payload=None, foreign=True)
     payload = _parse_payload(raw)
     return Lock(raw=raw, payload=payload, foreign=payload is None)
 
@@ -451,7 +500,19 @@ def lock_worktree(root: Path, payload: dict) -> bool:
     """
     if read_lock(root) is not None:
         return False
-    result = _git(root, "worktree", "lock", "--reason", format_reason(payload), str(root))
+    reason = format_reason(payload)
+    # WRITE AND READ ARE ONE CONTRACT. Everything below validates what we are
+    # about to write by the SAME predicate that will later have to recognise it.
+    # Without this the writer accepts payloads the reader classifies FOREIGN --
+    # `start: 0` is enough -- and a foreign lock is one this module refuses to
+    # release and `git worktree remove` refuses to override. The worktree is then
+    # pinned permanently: exactly the leak `build_payload` cites as the reason
+    # blanket-locking was rejected, reached through the unguarded door.
+    # MEASURED before this guard existed: lock_worktree -> True, read_lock ->
+    # foreign, unlock_worktree -> False, `git worktree remove` -> rc 128.
+    if _parse_payload(reason) is None:
+        return False
+    result = _git(root, "worktree", "lock", "--reason", reason, str(root))
     return bool(result and result.returncode == 0)
 
 
@@ -527,8 +588,12 @@ def _overlay_path() -> Path:
     Mirrors ``genesis._config_overlay._resolve_overlay_path``, which cannot be
     imported here: this module has to run under an interpreter with no
     ``genesis`` package on its path. Any change to the precedence there belongs
-    here too, and ``test_the_overlay_precedence_matches_the_canonical_resolver``
-    fails if the two disagree.
+    here too. NOTE what pins that and what does not:
+    ``test_the_overlay_precedence_matches_the_canonical_resolver`` asserts THIS
+    module's resolution order; it does not import the canonical resolver, so it
+    cannot fail if the two ever disagree. Keeping the two in step is a human
+    obligation, and saying so beats crediting a test with a guarantee it does
+    not give.
     """
     local_name = _config_path().with_suffix(".local.yaml").name
     user_path = Path.home() / ".genesis" / "config" / local_name

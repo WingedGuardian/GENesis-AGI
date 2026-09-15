@@ -23,6 +23,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import time
@@ -477,3 +478,110 @@ def test_the_shipped_config_is_valid(monkeypatch) -> None:
     cfg = wc.load_config()
     assert cfg["mode"] in wc.MODES
     assert isinstance(cfg["enabled"], bool)
+
+
+# ─── the write path and the read path are ONE contract ──────────────────────
+
+
+def test_we_never_write_a_lock_we_could_not_read_back_as_ours(repo, worktree) -> None:
+    """A writer that accepts what its reader rejects produces an UNRELEASABLE lock.
+
+    MEASURED before the guard existed, with `start: 0` — a value `build_payload`
+    itself could produce if `proc_starttime` ever returned 0:
+        lock_worktree      -> True      (written)
+        read_lock          -> foreign   (not ours)
+        unlock_worktree    -> False     (refused: we do not touch foreign locks)
+        git worktree remove-> rc 128    (refused: locked)
+    The worktree is then pinned permanently — which is exactly the leak
+    `build_payload` cites as its reason for rejecting blanket claims, reached
+    through the one door that had no guard on it.
+    """
+    bad = {"ns": wc.PAYLOAD_NAMESPACE, "v": 1, "rule": "claim", "pid": 4242, "start": 0}
+    assert wc.lock_worktree(worktree, bad) is False, (
+        "wrote a lock this module cannot read back as its own"
+    )
+    assert wc.read_lock(worktree) is None, "a refused write must leave no lock"
+
+
+def test_a_well_formed_payload_is_still_written(repo, worktree) -> None:
+    """The control. A validation guard that refuses everything would pass the
+    test above while silently disabling the whole mechanism."""
+    good = {"ns": wc.PAYLOAD_NAMESPACE, "v": 1, "rule": wc.RULE_CLAIM,
+            "pid": 4242, "start": 99}
+    assert wc.lock_worktree(worktree, good) is True
+    lock = wc.read_lock(worktree)
+    assert lock is not None and lock.foreign is False
+
+
+def test_an_unreadable_lock_is_foreign_not_absent(repo, worktree, monkeypatch) -> None:
+    """None means "no lock" and nothing else.
+
+    An unreadable `locked` file used to return None, identical to an unlocked
+    worktree — and the consumer this module is built for is the reaper, which
+    trashes with `shutil.move` rather than `git worktree remove`, so git's own
+    refusal is NOT a backstop for it. An unknown that reads as None gets reaped.
+    """
+    payload = {"ns": wc.PAYLOAD_NAMESPACE, "v": 1, "rule": wc.RULE_CLAIM,
+               "pid": 4242, "start": 99}
+    assert wc.lock_worktree(worktree, payload) is True
+
+    real_read = pathlib.Path.read_text
+
+    def unreadable(self, *a, **k):
+        if self.name == "locked":
+            raise PermissionError(13, "Permission denied")
+        return real_read(self, *a, **k)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", unreadable)
+    lock = wc.read_lock(worktree)
+    assert lock is not None, "an unreadable lock read as NO LOCK — the reaper would reap it"
+    assert lock.foreign is True
+    assert wc.is_releasable(lock)[0] is False
+
+
+def test_a_live_session_keeps_its_claim_when_argv0_is_unrecognisable(monkeypatch) -> None:
+    """Every liveness UNKNOWN must resolve toward KEEPING the claim.
+
+    The recorded start time already defeats pid reuse — a recycled pid
+    necessarily starts later — so consulting argv[0] here adds nothing on the
+    release path while adding a whole class of false-dead: a different uid, a PID
+    namespace, a hardened /proc, a renamed launcher. Every one of those resolves
+    toward RELEASING a live session's claim, which is the one direction that
+    loses someone's work.
+    """
+    monkeypatch.setattr(wc, "proc_starttime", lambda pid: 12345)
+    monkeypatch.setattr(wc, "is_session_process", lambda pid: False)
+    assert wc.pid_is_live_session(4242, 12345) is True, (
+        "a live session with a matching start time was reported dead because "
+        "argv[0] was not recognised"
+    )
+
+
+def test_a_recycled_pid_is_still_dead(monkeypatch) -> None:
+    """The control for the direction above: the start time must still be able to
+    say 'gone', or the claim would never release at all."""
+    monkeypatch.setattr(wc, "proc_starttime", lambda pid: 999999)
+    monkeypatch.setattr(wc, "is_session_process", lambda pid: True)
+    assert wc.pid_is_live_session(4242, 12345) is False
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        # pid above the kernel ceiling: as unusable a release condition as pid 1,
+        # which the same predicate already rejects.
+        '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": 99999999999999}',
+        # start beyond any plausible uptime: can never MATCH /proc, so it reads
+        # as a dead session and releases.
+        '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": 9, '
+        '"start": 99999999999999999999}',
+    ],
+)
+def test_values_that_can_never_be_live_are_foreign(repo, worktree, reason) -> None:
+    """Bounded at BOTH ends. A value that cannot possibly match a running
+    process is not a claim we can release safely — it is one whose release
+    condition is permanently "gone"."""
+    _lock(repo, worktree, reason)
+    lock = wc.read_lock(worktree)
+    assert lock is not None
+    assert lock.foreign is True

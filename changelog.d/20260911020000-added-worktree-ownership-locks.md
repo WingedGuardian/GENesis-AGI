@@ -1,10 +1,13 @@
-- **Genesis now records which live session is using which worktree, instead of
-  guessing.** With many sessions sharing one repository, nothing said who was
-  where, so the daily cleanup could archive a worktree a session was still
-  working in — leaving that session broken and its unsaved work recoverable only
-  by hand. Ownership is now written down, using git's own "this worktree is in
-  use" marker, which the cleanup job already respects. Recording the fact is the
-  whole protection; nothing new enforces anything.
+- **The library that will record which live session is using which worktree
+  lands here. Nothing calls it yet.** With many sessions sharing one repository,
+  nothing says who is where, so the daily cleanup can archive a worktree a
+  session is still working in — leaving that session broken and its unsaved work
+  recoverable only by hand. The fix records ownership using git's own "this
+  worktree is in use" marker, which the cleanup job already respects. This
+  release ships only the piece that knows how to write and read that marker: the
+  hook that takes a claim on first edit, and the cleanup-side release, follow
+  separately, and until they land nothing behaves differently. Recording the
+  fact is the whole protection when it arrives; nothing enforces anything.
 - **Both signals the cleanup job had for "is anyone using this" turned out not to
   work, and that is why this exists.** The first looked for a session whose
   working directory was inside the worktree; sessions change directory per
