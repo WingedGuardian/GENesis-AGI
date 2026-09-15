@@ -368,6 +368,12 @@ def main() -> int:
                          f"< {args.last_resort_above}% threshold ({target.path})")
                 continue
             if apply and target.tier == "last_resort" and target.path.exists():
+                # Queue a rebuild only when this call can actually delete index
+                # bytes. An empty or unsafe target must not create expensive
+                # work, and skipping it before the marker also closes the race
+                # where new bytes appear after a zero-size preflight.
+                if not _is_safe_target(target.path) or _dir_size(target.path) == 0:
+                    continue
                 if runner_lock is None:
                     runner_lock = _try_code_intel_runner_lock()
                 if runner_lock is None:

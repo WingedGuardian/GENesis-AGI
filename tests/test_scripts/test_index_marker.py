@@ -464,6 +464,39 @@ def test_crash_left_migration_claim_is_recovered(tmp_path, monkeypatch):
     assert not claim.exists()
 
 
+def test_unreadable_legacy_claim_is_quarantined_without_wedging_queue(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    h = im.marker_hash("/tmp")
+    path = im.marker_dir() / f"{h}.json"
+    _legacy(path, _queue_payload())
+    path.chmod(0)
+
+    try:
+        assert im.list_markers() == []
+        failed = im.get_failed(h)
+        assert failed["reason"] == "unreadable legacy marker (PermissionError)"
+        assert not path.exists()
+        assert list(im.marker_dir().glob(f"{h}.json.migrating-*")) == []
+        im.write_marker("/tmp", "gitnexus", "fast")
+        assert im.list_markers()[0]["tools"] == "gitnexus"
+    finally:
+        if path.exists():
+            path.chmod(0o600)
+
+
+def test_temporary_spool_files_are_never_discovered_as_legacy_state(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    h = im.marker_hash("/tmp")
+    claim_id = "a" * 32
+    outcome_tmp = im.marker_dir() / f".outcome-spool-{h}-{claim_id}-partial.tmp"
+    enqueue_tmp = im.marker_dir() / f".spool-{h}-partial.tmp"
+    _legacy(outcome_tmp, "partial")
+    _legacy(enqueue_tmp, "partial")
+
+    assert outcome_tmp not in im._legacy_files()
+    assert enqueue_tmp not in im._legacy_files()
+
+
 def test_malformed_enqueue_spool_is_quarantined(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     h = im.marker_hash("/tmp")

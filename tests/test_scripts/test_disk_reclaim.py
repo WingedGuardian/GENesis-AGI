@@ -187,6 +187,22 @@ class TestLastResortTier:
         with sqlite3.connect(home / "index-requests" / "queue.sqlite3") as db:
             assert db.execute("SELECT count(*) FROM pending").fetchone()[0] == 1
 
+    def test_empty_last_resort_cache_does_not_drop_rebuild_marker(self, tmp_path):
+        empty = _mod.CacheTarget("empty index", tmp_path / "empty-index", "last_resort")
+        empty.path.mkdir()
+        home = tmp_path / ".genesis"
+
+        with patch.object(_mod, "_CACHE_TARGETS", [empty]):
+            rc = self._run(
+                ["--apply", "--last-resort-above", "95"],
+                disk_pct=96.0,
+                home=home,
+            )
+
+        assert rc == 0
+        assert empty.path.exists()
+        assert not (home / "index-requests").exists()
+
     def test_busy_queue_spools_rebuild_before_last_resort_cache_clear(self, tmp_path):
         lr = _make_cache(tmp_path, "lr-busy", "last_resort")
         home = tmp_path / ".genesis"

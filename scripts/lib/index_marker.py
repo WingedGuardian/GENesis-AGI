@@ -317,7 +317,7 @@ def _write_outcome_spool(h: str, claim_id: str, action: str) -> Path:
     nonce = secrets.token_hex(16)
     return _write_durable_event(
         final_name=f".outcome-spool-{h}-{claim_id}-{nonce}.spool",
-        temp_prefix=f".outcome-spool-{h}-{claim_id}-",
+        temp_prefix=f".tmp-outcome-spool-{h}-{claim_id}-",
         data={
             "version": 1,
             "claim_id": claim_id,
@@ -334,6 +334,7 @@ def _legacy_files() -> list[Path]:
         path
         for path in marker_dir().iterdir()
         if path.is_file()
+        and not path.name.endswith(".tmp")
         and (
             path.name.endswith(".json")
             or _MIGRATION_CLAIM_RE.fullmatch(path.name)
@@ -417,6 +418,44 @@ def _record_failed_outcome(db: sqlite3.Connection, h: str, reason: str, raw: byt
         "raw_payload=excluded.raw_payload,failed_at=excluded.failed_at",
         (h, reason, raw, time.time()),
     )
+
+
+def _legacy_hash(path: Path) -> tuple[str | None, bool]:
+    """Return a legacy artifact's repo hash and whether it is outcome-like."""
+    name = path.name
+    outcome_spool = _OUTCOME_SPOOL_RE.fullmatch(name)
+    if outcome_spool:
+        return outcome_spool.group("hash"), True
+    spool = _SPOOL_RE.fullmatch(name)
+    if spool:
+        return spool.group("hash"), False
+    for prefix in (".outcome-", ".failed-outcome-", ".last-full-", ".full-backoff-"):
+        if name.startswith(prefix):
+            h = name.removeprefix(prefix)
+            return (h if _HASH_RE.fullmatch(h) else None), True
+    suffix = next(
+        (suffix for suffix in (".inflight.json", ".failed.json", ".json") if name.endswith(suffix)),
+        None,
+    )
+    if suffix is None:
+        return None, False
+    h = name[: -len(suffix)]
+    return (h if _HASH_RE.fullmatch(h) else None), False
+
+
+def _quarantine_unreadable(
+    db: sqlite3.Connection, source_path: Path, exc: OSError
+) -> None:
+    """Retire an unreadable claimed artifact without blocking other queue work."""
+    h, outcome_like = _legacy_hash(source_path)
+    if h is None:
+        return
+    reason = f"unreadable legacy marker ({exc.__class__.__name__})"
+    raw = source_path.name.encode(errors="replace")
+    if outcome_like:
+        _record_failed_outcome(db, h, reason, raw)
+    else:
+        _quarantine(db, h, reason, raw)
 
 
 def _record_outcome_db(
@@ -619,13 +658,20 @@ def _migrate_legacy() -> None:
         imported: list[Path] = []
         with _write_db() as db:
             for claimed_path, source_path in paths:
-                raw = claimed_path.read_bytes()
+                try:
+                    raw = claimed_path.read_bytes()
+                    source_mtime_ns = claimed_path.stat().st_mtime_ns
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    _quarantine_unreadable(db, source_path, exc)
+                    imported.append(claimed_path)
+                    continue
                 digest = hashlib.sha256(raw).hexdigest()
                 prior = db.execute(
                     "SELECT content_sha256,source_mtime_ns FROM legacy_imports WHERE path=?",
                     (source_path.name,),
                 ).fetchone()
-                source_mtime_ns = claimed_path.stat().st_mtime_ns
                 if (
                     not prior
                     or prior["content_sha256"] != digest

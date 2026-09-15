@@ -68,6 +68,9 @@ first atomically renames each replaceable legacy path into a unique, recoverable
 claim, then imports it idempotently. A later old-process replacement recreates
 the original pathname and survives retirement of the claimed file. Neither lock
 replaces the runner's execution lock or proves daemon workers terminated.
+Unreadable claimed artifacts are recorded by hash and retired individually so
+one privileged legacy file cannot wedge the batch. Writer `.tmp` paths use a
+non-discoverable prefix and are also excluded by suffix before legacy matching.
 
 Normal SQLite acquisition gives up after 0.5 seconds. Enqueues then write a
 unique, file-and-directory-fsynced spool entry rather than dropping the request
@@ -82,7 +85,8 @@ GitNexus scheduling job performs marker I/O in a worker thread so waiting does
 not stall the Genesis event loop. Last-resort disk reclamation establishes a
 durable SQLite or spool rebuild request before deleting an index cache;
 installation reports queue failure instead of claiming success if neither can
-be recorded.
+be recorded. It preflights target safety and nonzero size before queueing, so an
+empty index directory cannot schedule a needless rebuild.
 
 A second claim cannot replace an existing inflight row. A new request written
 while indexing remains a separate pending row and therefore survives consume.
@@ -157,7 +161,7 @@ fallback and stop rollout on material deviations.
   leaked temporary JSON could be consumed as work. Because the defects were
   concentrated in the same growing file state machine, the queue was replaced
   with SQLite rather than further expanding the multi-file protocol.
-- Current affected run: **134 passed**, including rollback-journal/integrity
+- Current affected run: **137 passed**, including rollback-journal/integrity
   assertions, independent CLI concurrency, transaction rollback injection,
   claim-output-to-terminal-spool cross-process contention, conflicting-outcome
   fail-closed behavior, every runner result path, disk reclamation and critical
