@@ -30,3 +30,12 @@
   install. What actually makes deletion safe there is the blanket refusal below
   it. The description now says so, because believing otherwise is how two guards
   came to be built on a signal that was never present.
+- **Claims no longer reach outside this project.** Ownership was worked out from
+  where a file sits on disk, which cannot tell one project's worktree from
+  another's — so a session working here, handed a path inside an unrelated
+  checkout, would have written this project's lock into that other project,
+  where it would pin a worktree the owner's own tools then refuse to remove.
+  Ownership is now decided by which repository a worktree actually belongs to,
+  and anything outside this one is left alone. Where the question cannot be
+  answered, the answer is "not ours": a missed note costs a warning, a wrong
+  claim costs someone else's repository.

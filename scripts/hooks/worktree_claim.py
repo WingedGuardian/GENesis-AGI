@@ -92,6 +92,12 @@ _SESSION_EXE = "claude"
 
 _GIT_TIMEOUT = 30
 
+# Sentinel so "resolved to None" (this is not a git repo) is distinguishable from
+# "not resolved yet"; a plain None default would re-run the subprocess forever on
+# a box where the answer really is None.
+_UNSET: object = object()
+_COMMON_DIR_CACHE: object = _UNSET
+
 # Session ids are UUID-shaped. Anything else is not one, and is refused rather
 # than escaped -- the id is echoed into a lock reason a human reads.
 _SID_RE = re.compile(r"[0-9a-fA-F-]{1,64}\Z")
@@ -146,11 +152,25 @@ class Lock:
 
 
 def worktree_root_for(path: str | Path) -> Path | None:
-    """The worktree containing ``path``, or None if it is not in a linked worktree.
+    """The worktree containing ``path``, if it belongs to THIS repository.
 
     A linked worktree's ``.git`` is a FILE holding a ``gitdir:`` pointer; the main
     checkout's is a directory. So this returns None for the main tree by
     construction, which is correct -- the main tree is never claimed or reaped.
+
+    AND IT MUST BE OUR REPOSITORY. Without that check this accepts the first
+    ancestor with any ``.git`` pointer, so a session rooted here that edits an
+    absolute path inside ANOTHER repository's worktree -- the companion voice
+    repo is the obvious one, and both live under the same home -- would have a
+    Genesis ownership lock written into that repository. Writing state into
+    someone else's repo is not a degraded version of this feature; it is a
+    different and worse thing than not having it.
+
+    Ownership is decided by the GIT COMMON DIR, not by path prefix: a worktree
+    can be created anywhere on disk (Archon puts ours under ``~/.archon/...``),
+    so "is it under our checkout" would reject our own worktrees and accept a
+    sibling repo's if it happened to sit inside. The common dir is what actually
+    says which repository a worktree belongs to.
 
     Resolves symlinks first so two spellings of one worktree cannot be treated as
     two different worktrees.
@@ -165,12 +185,67 @@ def worktree_root_for(path: str | Path) -> Path | None:
         dot_git = candidate / ".git"
         try:
             if dot_git.is_file():
-                return candidate
+                return candidate if _belongs_to_this_repo(candidate) else None
         except OSError:
             continue
         if candidate == candidate.parent:
             break
     return None
+
+
+def _our_common_dir() -> Path | None:
+    """This repository's git common dir, resolved from this file's location.
+
+    Cached per process: a hook runs once and exits, and the sweep-free design
+    means nothing calls this in a loop long enough for staleness to matter.
+    """
+    global _COMMON_DIR_CACHE
+    if _COMMON_DIR_CACHE is not _UNSET:
+        return _COMMON_DIR_CACHE
+    repo = Path(__file__).resolve().parent.parent.parent
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT,
+        )
+        out = result.stdout.strip()
+        _COMMON_DIR_CACHE = Path(out).resolve() if result.returncode == 0 and out else None
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        _COMMON_DIR_CACHE = None
+    return _COMMON_DIR_CACHE
+
+
+def _belongs_to_this_repo(root: Path) -> bool:
+    """True when ``root`` is a worktree of THIS repository.
+
+    Fails CLOSED -- an unresolvable common dir on either side returns False, so
+    an unanswerable question means we do not claim. The cost of a false negative
+    is a missed advisory; the cost of a false positive is a lock written into
+    someone else's repository.
+    """
+    ours = _our_common_dir()
+    if ours is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+    if result.returncode != 0:
+        return False
+    out = result.stdout.strip()
+    if not out:
+        return False
+    try:
+        return Path(out).resolve() == ours
+    except OSError:
+        return False
 
 
 def gitdir_for(root: Path) -> Path | None:

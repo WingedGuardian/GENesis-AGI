@@ -56,7 +56,14 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
 
 
 @pytest.fixture
-def worktree(tmp_path: Path) -> Path:
+def worktree(tmp_path: Path, monkeypatch) -> Path:
+    """A linked worktree, in a repository this fixture declares to be OURS.
+
+    The declaration is required rather than incidental: ``worktree_root_for``
+    refuses a worktree belonging to a different repository, so without it every
+    test here would exercise the refusal path instead of the claim path. The
+    refusal itself is asserted in test_worktree_claim.py against two real repos.
+    """
     root = tmp_path / "repo"
     root.mkdir()
     _git(root, "init", "--quiet", "-b", "main")
@@ -68,6 +75,7 @@ def worktree(tmp_path: Path) -> Path:
     wt = tmp_path / "wt"
     _git(root, "worktree", "add", "--quiet", "-b", "feature/x", str(wt))
     (wt / "target.py").write_text("x = 1\n")
+    monkeypatch.setattr(wc, "_our_common_dir", lambda: (root / ".git").resolve())
     return wt
 
 
@@ -359,7 +367,7 @@ def test_the_hook_is_registered_for_both_modes() -> None:
 
 
 def test_the_advisory_reaches_the_model_through_the_only_channel_that_works(
-    worktree: Path,
+    tmp_path: Path,
 ) -> None:
     """Delivery, not emission — the distinction that made the first version inert.
 
@@ -374,6 +382,13 @@ def test_the_advisory_reaches_the_model_through_the_only_channel_that_works(
     docs/reference/cc-compatibility.md:1093-1099 PreToolUse reaches the model
     ONLY through this envelope, and it is the same one two sibling hooks in this
     repo are observed delivering with.
+
+    Runs against a REAL worktree of THIS repository rather than a temporary one,
+    because the subprocess resolves ownership for itself: a hook handed a path in
+    some other repository correctly refuses to claim it, and a parent-process
+    monkeypatch cannot reach across the process boundary to say otherwise. Using
+    the genuine geometry is also the more faithful test — it is the only one here
+    that exercises the ownership check and the delivery channel together.
 
     SKIPS where no foreign session exists (CI), rather than faking one. A test
     that cannot run says so; it does not pretend.
@@ -402,21 +417,36 @@ def test_the_advisory_reaches_the_model_through_the_only_channel_that_works(
     holder = foreign[0]
     start = wc.proc_starttime(holder)
     reason = wc.format_reason(P("claim", pid=holder, start=start, sid="otherses"))
-    _git(worktree, "worktree", "lock", "--reason", reason, str(worktree))
 
-    result = run_hook("--advise", payload(worktree / "target.py"))
-    assert result.returncode == 0
+    # A genuine linked worktree of this repository, detached so no branch is
+    # created, removed in `finally` so a failing assertion cannot leave a
+    # registration behind.
+    real = tmp_path / "advisory-delivery-probe"
+    added = _git(_ROOT, "worktree", "add", "--quiet", "--detach", str(real))
+    assert added.returncode == 0, added.stderr
+    try:
+        target = real / "target.py"
+        target.write_text("x = 1\n")
+        locked = _git(_ROOT, "worktree", "lock", "--reason", reason, str(real))
+        assert locked.returncode == 0, locked.stderr
 
-    doc = json.loads(result.stdout)
-    assert set(doc) == {"hookSpecificOutput"}, (
-        "nothing may sit beside the envelope: a top-level additionalContext is "
-        "silently discarded, which is the same failure as writing to stderr"
-    )
-    hso = doc["hookSpecificOutput"]
-    assert hso["hookEventName"] == "PreToolUse"
-    assert "claimed by session otherses" in hso["additionalContext"]
-    assert str(holder) in hso["additionalContext"]
-    assert result.stderr == "", "stderr is the dead channel; nothing should go there"
+        result = run_hook("--advise", payload(target))
+        assert result.returncode == 0
+
+        doc = json.loads(result.stdout)
+        assert set(doc) == {"hookSpecificOutput"}, (
+            "nothing may sit beside the envelope: a top-level additionalContext is "
+            "silently discarded, which is the same failure as writing to stderr"
+        )
+        hso = doc["hookSpecificOutput"]
+        assert hso["hookEventName"] == "PreToolUse"
+        assert "claimed by session otherses" in hso["additionalContext"]
+        assert str(holder) in hso["additionalContext"]
+        assert result.stderr == "", "stderr is the dead channel; nothing should go there"
+    finally:
+        _git(_ROOT, "worktree", "unlock", str(real))
+        _git(_ROOT, "worktree", "remove", "--force", str(real))
+        _git(_ROOT, "worktree", "prune")
 
 
 def test_a_crash_inside_the_advisory_does_not_deny_the_edit(

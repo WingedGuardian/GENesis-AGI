@@ -60,8 +60,15 @@ def repo(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def worktree(repo: Path, tmp_path: Path) -> Path:
-    """A linked worktree on a branch already merged into ``main``."""
+def worktree(repo: Path, tmp_path: Path, monkeypatch) -> Path:
+    """A linked worktree on a branch already merged into ``main``.
+
+    Also declares this fixture's repository to be OURS. Without that,
+    ``worktree_root_for`` would correctly refuse every worktree here as
+    belonging to a different repository — which is the point of the ownership
+    check and is asserted directly by the cross-repo tests below.
+    """
+    monkeypatch.setattr(wc, "_our_common_dir", lambda: (repo / ".git").resolve())
     _git(repo, "checkout", "--quiet", "-b", "feature/done")
     (repo / "f.txt").write_text("work\n")
     _git(repo, "add", "f.txt")
@@ -469,3 +476,63 @@ def test_the_shipped_config_is_valid(monkeypatch) -> None:
     cfg = wc.load_config()
     assert cfg["mode"] in wc.MODES
     assert isinstance(cfg["enabled"], bool)
+
+
+# ─── cross-repo ownership ───────────────────────────────────────────────────
+
+
+@pytest.fixture
+def sibling_worktree(tmp_path: Path) -> Path:
+    """A linked worktree of a DIFFERENT repository, built the same way as ours.
+
+    Deliberately identical in shape to the `worktree` fixture: same layout, same
+    `.git` file, same branch geometry. The ONLY thing that distinguishes it is
+    which repository it belongs to, so a test that passes here cannot be passing
+    on some incidental difference.
+    """
+    root = tmp_path / "sibling"
+    root.mkdir()
+    _git(root, "init", "--quiet", "-b", "main")
+    _git(root, "config", "user.email", "probe@example.invalid")
+    _git(root, "config", "user.name", "Probe")
+    (root / "README.md").write_text("seed\n")
+    _git(root, "add", "README.md")
+    _git(root, "commit", "--quiet", "-m", "seed")
+    path = tmp_path / "sibling-wt"
+    _git(root, "worktree", "add", "--quiet", "-b", "feature/theirs", str(path))
+    return path
+
+
+def test_a_worktree_of_another_repository_is_never_claimed(
+    repo: Path, worktree: Path, sibling_worktree: Path
+) -> None:
+    """Ownership is decided by the git COMMON DIR, not by path shape.
+
+    This is the whole reason the check exists. A session rooted in this
+    repository can be handed a path inside an unrelated project's worktree --
+    an external orchestrator places its worktrees outside this tree entirely,
+    and so does anyone with a second checkout -- and nothing about the PATH
+    distinguishes the two cases. Without the common-dir comparison the hook
+    would write OUR lock into THEIR repository, where it pins their worktree
+    against their own tooling and carries our namespace and our session's pid.
+
+    Both halves are asserted from the same test, against two real repositories,
+    because "ours is accepted" alone would also pass an implementation that
+    accepts everything.
+    """
+    assert wc.worktree_root_for(worktree) == worktree.resolve()
+    assert wc.worktree_root_for(sibling_worktree / "README.md") is None
+
+
+def test_ownership_fails_closed_when_our_own_repository_cannot_be_resolved(
+    worktree: Path, monkeypatch
+) -> None:
+    """An unanswerable question means we do NOT claim.
+
+    The two failures are not symmetric. A false negative costs one missed
+    advisory; a false positive writes a lock into a repository that is not ours.
+    So an unresolvable common dir -- git absent, a timeout, a detached
+    environment -- resolves toward refusing.
+    """
+    monkeypatch.setattr(wc, "_our_common_dir", lambda: None)
+    assert wc.worktree_root_for(worktree) is None

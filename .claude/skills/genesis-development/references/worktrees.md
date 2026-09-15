@@ -80,8 +80,18 @@ worktrees had any process CWD inside them while 7 session processes ran.
 
 **Never release a lock you did not take.** A lock reason that is not Genesis's
 own JSON belongs to someone else — a person, or Claude Code's own
-worktree-isolated subagents, which lock what they create. The sweep reports
-those and leaves them alone.
+worktree-isolated subagents, which lock what they create. Those are read, named
+as foreign, and never touched.
+
+**Claims stop at this repository's boundary.** Ownership is decided by comparing
+git's COMMON DIR, never by where a path sits on disk. A session rooted here can
+be handed a path inside an unrelated project's worktree — an external review
+orchestrator places its worktrees outside this tree entirely, and so does any
+second checkout — and nothing about the path distinguishes that from our own. A
+worktree belonging to another repository is left alone: no claim, no advisory.
+Where the question cannot be answered at all, the answer is "not ours", because
+a missed advisory costs one warning while a wrong claim writes our lock into
+somebody else's repository.
 
 ## Testing code in a worktree
 
