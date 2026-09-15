@@ -300,6 +300,18 @@ def collect_cc_tmp_usage() -> dict:
         data = json.loads(_TMP_WATCHGOD_STATE.read_text())
         cc = data.get("cc_tmp", {})
         sys_tmp = data.get("system_tmp", {})
+        # Control plane: how many live CC sessions are listening on a socket path
+        # that no longer exists (severed → unreachable by peers, and unable to
+        # notice), plus socket files no process holds. Defaults to `unknown`
+        # rather than a zero, so a state file written before this field existed —
+        # or by a daemon that could not run the probe — never reads as healthy.
+        cp = data.get("control_plane")
+        if not isinstance(cp, dict):
+            # Absent, null, or a hand-edited/truncated state file. `.get` on a
+            # non-dict raises AttributeError, which the handler below does not
+            # catch and the infrastructure-snapshot caller does not either — so an
+            # unreadable field would take the whole snapshot down.
+            cp = {}
         return {
             "cc_tier": cc.get("tier", "unknown"),
             "cc_used_mb": cc.get("used_mb", 0),
@@ -309,6 +321,12 @@ def collect_cc_tmp_usage() -> dict:
             "cc_fs_total_mb": cc.get("fs_total_mb", None),
             "sys_tier": sys_tmp.get("tier", "unknown"),
             "sys_used_pct": sys_tmp.get("used_pct", 0),
+            "control_plane": {
+                "status": cp.get("status", "unknown"),
+                "severed_sockets": cp.get("severed_sockets", 0),
+                "stale_sockets": cp.get("stale_sockets", 0),
+                "listeners": cp.get("listeners", 0),
+            },
             "poll_at": data.get("poll_at", ""),
         }
     except (json.JSONDecodeError, OSError):
