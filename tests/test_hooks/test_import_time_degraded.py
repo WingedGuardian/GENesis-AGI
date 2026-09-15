@@ -213,10 +213,19 @@ def test_degraded_guard_keeps_its_fail_direction(tmp_path, guard, rel, command, 
         f"Exit 1 in particular is the FAIL-OPEN this exists to prevent — CC treats "
         f"any non-2 exit as non-blocking.\nstderr: {res.stderr[:400]}"
     )
-    assert "GUARD DEGRADED" in res.stderr, (
+    notice = res.stderr
+    if expected == 0 and res.stdout:
+        payload = json.loads(res.stdout)
+        hook_output = payload["hookSpecificOutput"]
+        assert hook_output["hookEventName"] == "PreToolUse"
+        assert "permissionDecision" not in hook_output
+        notice = hook_output["additionalContext"]
+    assert "GUARD DEGRADED" in notice, (
         f"{guard} [{label}] gave no GUARD DEGRADED notice. A degraded allow that "
         "looks identical to a real one has told the operator nothing."
     )
+    if expected == 0:
+        assert not res.stderr, "successful degradation notices belong on additionalContext"
 
 
 @pytest.mark.parametrize(("guard", "rel", "command", "expected", "label"), _CASES)
@@ -436,32 +445,101 @@ def test_an_exception_that_cannot_render_itself_still_blocks(tmp_path):
     )
 
 
-def test_a_matcher_that_cannot_answer_blocks(monkeypatch):
+def _run_degraded_helper(tmp_path: Path, body: str) -> subprocess.CompletedProcess:
+    """Drive ``degraded_exit`` itself in a FRESH PROCESS.
+
+    Not a convenience: the helper leaves by ``os._exit``, so calling it in-process
+    would take the test runner with it. A subprocess is the only way to observe the
+    exit code of a function whose contract is that nothing can change that code.
+    """
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, 'scripts/hooks'); import hook_input; " + body,
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(_REPO_ROOT),
+        env={**os.environ, "HOME": str(tmp_path / "home_helper")},
+        timeout=90,
+    )
+
+
+def test_a_matcher_that_cannot_answer_blocks(tmp_path):
     """The only thing between an unanswerable matcher and a fail-open.
 
-    ``gated`` is a public parameter, so a caller can pass a pattern that makes
-    ``re.search`` raise — a bad escape, a catastrophic pattern. The except arm answers
-    that with a BLOCK, and an audit's mutation sweep found the arm SURVIVED being
-    flipped to ``hit = False``: nothing pinned the one branch whose whole job is to
-    refuse when the crude check cannot even run.
+    ``gated`` is a public parameter, so a caller can pass a pattern that makes the
+    search raise. The except arm answers that with a BLOCK, and an audit's mutation
+    sweep found the arm SURVIVED being flipped to ``hit = False``: nothing pinned the
+    one branch whose whole job is to refuse when the crude check cannot even run.
 
-    Driven in-process rather than as a subprocess because the failure has to be
-    injected into ``re`` itself, which no payload can do from outside.
+    The command is `ls`, which names nothing gated — so an ALLOW here would LOOK
+    correct. That is exactly why it needs pinning: the wrong answer and the right one
+    are indistinguishable from the outside.
     """
-    sys.path.insert(0, str(_HOOKS))
-    import hook_input
+    body = (
+        "hook_input.read_payload=lambda: {'command': 'ls'}; "
+        "hook_input.re.search=lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom')); "
+        "hook_input.degraded_exit('probe', gated=r'\\bnever\\b', exc=RuntimeError('poison'))"
+    )
+    res = _run_degraded_helper(tmp_path, body)
+    assert res.returncode == 2, (
+        f"a matcher that could not answer allowed the command (exit {res.returncode})"
+    )
 
-    def _boom(*_args, **_kwargs):
-        raise RuntimeError("the matcher itself failed")
 
-    monkeypatch.setattr(hook_input.re, "search", _boom)
-    monkeypatch.setattr(hook_input, "read_payload", lambda: {"tool_input": {"command": "ls"}})
-    with pytest.raises(SystemExit) as exc:
-        hook_input.degraded_exit("probe", gated=r"\bnever\b")
-    assert exc.value.code == 2, (
-        "a matcher that could not answer allowed the command. `ls` names nothing "
-        "gated, so the ALLOW looks correct — which is exactly why this needs pinning: "
-        "the wrong answer and the right one are indistinguishable from the outside."
+@pytest.mark.parametrize(
+    ("stream", "command", "expected"),
+    [("stderr", "git push origin main", 2), ("stdout", "git status", 0)],
+)
+def test_broken_output_stream_cannot_change_the_verdict(tmp_path, stream, command, expected):
+    """A diagnostic that cannot be written must not decide the verdict.
+
+    Both directions and both streams: a broken stderr must not turn a BLOCK into
+    something else, and a broken stdout must not turn an ALLOW into one. This is also
+    what pins ``os._exit`` — under ``sys.exit`` the interpreter retries the failed
+    flush during shutdown and can replace the status with 120, which is not 2, so a
+    closed stream would still convert a block into a non-block after every write had
+    been carefully suppressed.
+
+    (From the concurrent session that reached this branch independently; kept because
+    it pins a failure mode this side had not considered.)
+    """
+    body = (
+        "Broken=type('Broken',(),{'write':lambda self,value: (_ for _ in ()).throw(OSError('broken')),"
+        "'flush':lambda self: (_ for _ in ()).throw(OSError('broken'))}); "
+        f"sys.{stream}=Broken(); "
+        f"hook_input.read_payload=lambda: {{'command': {command!r}}}; "
+        "hook_input.degraded_exit('test', gated=r'\\bpush\\b', exc=RuntimeError('poison'))"
+    )
+    res = _run_degraded_helper(tmp_path, body)
+    assert res.returncode == expected, (
+        f"a broken {stream} changed the verdict to {res.returncode}, expected {expected}"
+    )
+
+
+def test_legacy_override_keyword_is_accepted_but_cannot_waive(tmp_path):
+    """Version skew must not turn a signature change into a fail-open.
+
+    No sigil is honoured here, but the parameter is still ACCEPTED — because the
+    guards resolve from the main tree while a worktree can hold a different copy, so
+    an older caller can be paired with this newer helper. Removing the parameter makes
+    that pairing a ``TypeError`` at import, which exits 1, which Claude Code reads as
+    NON-BLOCKING: tidying the signature would have reintroduced the fail-open through
+    the very version skew that makes this bug reachable.
+
+    (From the concurrent session; this side had removed the parameter outright.)
+    """
+    body = (
+        "hook_input.read_payload=lambda: {'command': 'git commit -m x # review-override'}; "
+        "hook_input.degraded_exit('test', gated=r'\\bcommit\\b', "
+        "override_sigils=('review-override',), exc=RuntimeError('poison'))"
+    )
+    res = _run_degraded_helper(tmp_path, body)
+    assert res.returncode == 2, (
+        "an old-style caller either crashed the helper or had its sigil honoured; "
+        f"exit {res.returncode}"
     )
 
 

@@ -30,7 +30,6 @@ dict, never an exception. Hooks must never crash CC.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import re
@@ -256,6 +255,7 @@ def degraded_exit(
     name: str,
     *,
     gated: str,
+    override_sigils: tuple[str, ...] = (),  # noqa: ARG001 — kept; see the docstring
     also_lost: str = "",
     exc: BaseException | None = None,
 ) -> NoReturn:
@@ -323,6 +323,15 @@ def degraded_exit(
         gated: regex (searched case-insensitively against the RAW command text).
             Pass a literal pattern defined ABOVE the guarded import, so it is still
             bound when the import that failed is the one being recovered from.
+        override_sigils: ACCEPTED AND IGNORED. No sigil is honoured here — see above —
+            but the parameter stays, and the reason is the failure mode this whole
+            module exists to prevent: the guards resolve from the MAIN tree while a
+            worktree can hold a different copy, so an older caller can be paired with
+            this newer helper. Removing the parameter turns that pairing into a
+            ``TypeError`` at import time, which exits 1, which Claude Code reads as
+            NON-BLOCKING. Deleting a parameter to tidy a signature would have
+            reintroduced the fail-open through version skew — the exact configuration
+            named at the top of this docstring as the reason the bug is reachable.
         also_lost: what this guard does BESIDES refusing, named on the allow path.
             A guard is not always only a gate: `git_discard_guard`'s main job is the
             recovery SNAPSHOT it takes before a discarding verb, and MEASURED on a
@@ -433,13 +442,32 @@ def _degraded_say(code: int, message: str) -> NoReturn:
       delivered on exit 0. It is emitted only there: on exit 2 the reason already
       reaches the model, and a second copy is noise.
 
+    EITHER/OR, not both, and a test asserts the allow path writes nothing to stderr.
+    Writing both looks harmless and is not quite: on exit 0 stderr reaches nobody, so
+    a second copy there is a notice that appears delivered while going nowhere, which
+    is the failure this function is trying to stop rather than imitate.
+
     EVERY WRITE IS SUPPRESSED ON FAILURE and the exit still happens. If stderr or
-    stdout is closed, ``print`` raises ``OSError`` — and an OSError escaping here means
+    stdout is closed, a write raises ``OSError`` — and an OSError escaping here means
     Python exits 1, which Claude Code reads as NON-BLOCKING. A diagnostic that cannot
     be written must never decide a verdict.
+
+    ``os._exit`` RATHER THAN ``sys.exit``, and the difference is the whole point of the
+    paragraph above. ``sys.exit`` raises ``SystemExit`` and lets the interpreter shut
+    down normally — which RETRIES the flush of any stream that failed above, and on a
+    failure there CPython replaces the intended status with 120. 120 is not 2, so a
+    broken stdout could still turn a block into a non-block after every write had been
+    carefully suppressed. This is a short-lived hook process with no cleanup contract
+    and nothing registered at exit, so leaving by the immediate door costs nothing and
+    makes the exit code the one thing that cannot be taken away. Successful writes are
+    flushed explicitly above, because ``os._exit`` will not do it.
+
+    The message is bounded by CONSTRUCTION rather than by a cut here: it is fixed
+    literals plus ``reason`` (clipped, with the cut declared) plus a caller-supplied
+    ``also_lost`` literal. Nothing unbounded reaches it.
     """
-    if code == 0:
-        try:
+    try:
+        if code == 0:
             sys.stdout.write(
                 json.dumps(
                     {
@@ -447,16 +475,18 @@ def _degraded_say(code: int, message: str) -> NoReturn:
                             "hookEventName": "PreToolUse",
                             "additionalContext": message,
                         }
-                    }
+                    },
+                    ensure_ascii=True,
                 )
                 + "\n"
             )
             sys.stdout.flush()
-        except BaseException:  # noqa: BLE001 — see the docstring: never decide on a write.
-            pass
-    with contextlib.suppress(BaseException):  # see the docstring: never decide on a write
-        print(message, file=sys.stderr)
-    sys.exit(code)
+        else:
+            sys.stderr.write(message + "\n")
+            sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — see the docstring: never decide on a write.
+        pass
+    os._exit(code)
 
 
 _BRACE_RE = re.compile(r"\{([^{}]*,[^{}]*)\}")
