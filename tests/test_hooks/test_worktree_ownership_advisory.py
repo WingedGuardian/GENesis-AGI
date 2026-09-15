@@ -445,3 +445,83 @@ def test_a_crash_inside_the_advisory_does_not_deny_the_edit(
         "an advisory must never exit non-zero: on PreToolUse that denies the edit"
     )
 
+
+# ─── the releaser, without which the claimer is a leak ───────────────────────
+
+
+def test_session_end_releases_only_this_sessions_claims(
+    worktree: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """A claimer without a releaser is a leak, and this one was measured leaking.
+
+    The redesign that removed the daily sweep removed the only thing that
+    released claims, so every first edit took a lock nothing ever dropped — the
+    reaper skips a locked worktree permanently. On this install a claim sat for
+    three days after its session exited and had to be released by hand.
+
+    Three locks, one pass, and the discrimination is the whole test: ours goes,
+    another session's stays, a foreign one is never touched. A release that drops
+    everything would pass a test that only checked the first.
+    """
+    repo = worktree.parent / "repo"
+
+    mine_wt = worktree
+    other_wt = tmp_path / "wt-other"
+    foreign_wt = tmp_path / "wt-foreign"
+    _git(repo, "worktree", "add", "--quiet", "-b", "feature/other", str(other_wt))
+    _git(repo, "worktree", "add", "--quiet", "-b", "feature/foreign", str(foreign_wt))
+
+    monkeypatch.setattr(wc, "session_pid_from_ancestry", lambda *a, **k: 4242)
+    monkeypatch.setattr(wc, "proc_starttime", lambda pid: 99)
+
+    wc.lock_worktree(mine_wt, P("claim", pid=4242, start=99, sid="mine"))
+    wc.lock_worktree(other_wt, P("claim", pid=9999, start=1, sid="theirs"))
+    _git(repo, "worktree", "lock", "--reason", "a human said do not touch", str(foreign_wt))
+
+    # The release enumerates from the repo the hook lives in, so point it here.
+    real_run = hook.subprocess.run
+
+    def fake_run(cmd, **kw):
+        if cmd[:3] == ["git", "worktree", "list"]:
+            kw = {**kw, "cwd": str(repo)}
+        return real_run(cmd, **kw)
+
+    monkeypatch.setattr(hook.subprocess, "run", fake_run)
+
+    assert hook._release({}) == 0
+
+    assert wc.read_lock(mine_wt) is None, "this session's own claim must be released"
+    assert wc.read_lock(other_wt) is not None, "another session's claim must survive"
+    assert wc.read_lock(foreign_wt) is not None, "a foreign lock must never be touched"
+
+
+def test_session_end_with_no_resolvable_session_releases_nothing(
+    worktree: Path, monkeypatch
+) -> None:
+    """The control. With no pid there is no basis for deciding ownership, so the
+    safe answer is to touch nothing — not to release everything.
+
+    THE ENUMERATION IS REDIRECTED HERE TOO, and that is not incidental. Without
+    it `_release` lists the REAL repository's worktrees, never visits this
+    temporary one, and the lock survives no matter what the code does — the test
+    passes for the wrong reason. Caught by mutation: replacing the `is None`
+    guard with a default pid left this green until the redirect was added.
+    """
+    repo = worktree.parent / "repo"
+    real_run = hook.subprocess.run
+
+    def fake_run(cmd, **kw):
+        if cmd[:3] == ["git", "worktree", "list"]:
+            kw = {**kw, "cwd": str(repo)}
+        return real_run(cmd, **kw)
+
+    monkeypatch.setattr(hook.subprocess, "run", fake_run)
+    monkeypatch.setattr(wc, "session_pid_from_ancestry", lambda *a, **k: None)
+    monkeypatch.setattr(wc, "proc_starttime", lambda pid: 99)
+
+    wc.lock_worktree(worktree, P("claim", pid=4242, start=99, sid="mine"))
+    assert wc.read_lock(worktree) is not None, "precondition: the claim is in place"
+
+    assert hook._release({}) == 0
+    assert wc.read_lock(worktree) is not None
+

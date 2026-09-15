@@ -8,6 +8,8 @@ Two modes, both non-blocking, both on the Edit/Write family:
     --advise   (PreToolUse)   before writing into a worktree another LIVE
                               session holds, say so IN THE MODEL'S CONTEXT and
                               allow it
+    --release  (SessionEnd)   drop every claim this session still holds, so a
+                              claimer never ships without a releaser
 
 WHY CLAIM ON EDIT RATHER THAN ONLY ON CREATION. There are ~200 worktrees already
 and sessions mostly ADOPT one rather than create it, so a claim taken only at
@@ -51,6 +53,7 @@ crashed hook is the session.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -120,6 +123,65 @@ def _advise(payload: dict) -> int:
     return 0
 
 
+def _release(payload: dict) -> int:
+    """Release every claim this session holds. Wired to SessionEnd.
+
+    A CLAIMER WITHOUT A RELEASER IS A LEAK, and shipping one without the other
+    was a real gap in this stack rather than a theoretical one: the redesign that
+    removed the daily sweep removed the only thing that released claims, so every
+    first edit took a lock nothing ever dropped. The reaper then skips a locked
+    worktree permanently, and git refuses to delete one without a force flag, so
+    edited worktrees accumulate locks forever.
+
+    MEASURED on this install: a claim taken by one session sat for three days
+    after that session exited and had to be released by hand. That is the leak
+    observed, not predicted.
+
+    SessionEnd is the fast path and covers the ordinary case — a session that
+    ends normally drops what it holds. It is NOT sufficient alone and is not
+    claimed to be: a SIGKILLed or crashed session never runs it. The backstop is
+    the reaper releasing a claim whose process is gone, which ``is_releasable``
+    already decides and which lands separately. Until then a crashed session's
+    claim is recoverable exactly the way that three-day-old one was, and the lock
+    reason says so in its own first sentence.
+
+    Enumerates once via porcelain and releases ONLY locks whose recorded pid is
+    this session's. Another session's claim, and any FOREIGN lock, are untouched.
+    """
+    mine = wc.session_pid_from_ancestry()
+    if mine is None:
+        return 0
+
+    result = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=str(Path(__file__).resolve().parent.parent.parent),
+    )
+    if result.returncode != 0:
+        return 0
+
+    released = 0
+    for line in result.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        root = Path(line[len("worktree ") :])
+        lock = wc.read_lock(root)
+        if lock is None or lock.foreign or lock.rule != wc.RULE_CLAIM:
+            continue
+        if lock.payload.get("pid") != mine:
+            continue  # someone else's claim is not ours to drop
+        if wc.unlock_worktree(root):
+            released += 1
+    if released:
+        print(
+            f"released {released} worktree claim(s) held by this session",
+            file=sys.stderr,
+        )
+    return 0
+
+
 def _claim(payload: dict) -> int:
     """Take an unclaimed worktree for this session after a successful write."""
     target = _target_path(payload)
@@ -149,6 +211,8 @@ def main() -> int:
         return _claim(payload)
     if "--advise" in sys.argv:
         return _advise(payload)
+    if "--release" in sys.argv:
+        return _release(payload)
     return 0
 
 
