@@ -264,6 +264,65 @@ async def test_drain_reconstructs_request_with_thread_and_recipient(config, db):
 
 
 @pytest.mark.asyncio
+async def test_drain_carries_the_discord_subchannel_as_recipient(config, db):
+    """A queued Discord SUB-CHANNEL row must reach the pipeline as the discord
+    ADAPTER plus the sub-channel as the recipient override.
+
+    This is the half a live send caught rather than a test. The drain maps
+    "announcements" → channel="discord" so the adapter resolves; without also
+    setting target_chat_id, _deliver falls through to
+    `self._recipients["discord"]` (OUTREACH_RECIPIENT_DISCORD, default
+    "dev-discussion") and the webhook adapter USED to fall back to the default
+    webhook rather than failing — so a release announcement posted to the dev
+    channel and reported success.
+
+    Until this test existed, scheduler.py's target_chat_id line had NO coverage:
+    every other Discord test in the suite stubs `pipeline.submit` on the LIVE
+    path (outreach_send), so the drain path was asserted nowhere.
+    """
+    from genesis.db.crud import pending_outreach
+
+    await pending_outreach.enqueue(
+        db, message="v3.0b18 is out", category="notification", channel="announcements",
+    )
+    pipeline = _drain_pipeline(OutreachStatus.DELIVERED)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    pipeline.submit.assert_called_once()
+    req = pipeline.submit.call_args[0][0]
+    assert req.channel == "discord", "must route through the discord ADAPTER"
+    assert req.target_chat_id == "announcements", (
+        "the sub-channel must ride as the recipient override — without it the "
+        "drained send lands in OUTREACH_RECIPIENT_DISCORD (default dev-discussion)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_drain_leaves_a_non_discord_channel_untouched(config, db):
+    """The discord branch must not rewrite telegram/email rows.
+
+    Guards the opposite direction of the test above: a mapping applied too
+    broadly would give every queued row a target_chat_id, which on TELEGRAM is a
+    numeric chat id and would redirect owner messages to a bogus chat.
+    """
+    from genesis.db.crud import pending_outreach
+
+    await pending_outreach.enqueue(
+        db, message="ping", category="notification", channel="telegram",
+    )
+    pipeline = _drain_pipeline(OutreachStatus.DELIVERED)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    req = pipeline.submit.call_args[0][0]
+    assert req.channel == "telegram"
+    assert req.target_chat_id is None
+
+
+@pytest.mark.asyncio
 async def test_drain_delivers_verbatim_on_urgent_path(config, db):
     """High-urgency queued rows go through submit_urgent — which must ALSO
     receive verbatim=True so the drafter never rewrites the stored message."""

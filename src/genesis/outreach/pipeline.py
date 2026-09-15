@@ -11,6 +11,7 @@ from pathlib import Path
 
 import aiosqlite
 
+from genesis.channels.base import ChannelNotConfiguredError
 from genesis.content.drafter import ContentDrafter
 from genesis.content.egress import gate
 from genesis.content.formatter import ContentFormatter
@@ -699,6 +700,32 @@ class OutreachPipeline:
                     await adapter.send_message(recipient, formatted.text)
                 except Exception:
                     logger.warning("DM copy failed for 'both' routing", exc_info=True)
+        except ChannelNotConfiguredError as exc:
+            # PERMANENT: this install has no way to reach the named channel, so
+            # retrying cannot help. Must be caught BEFORE the generic handler
+            # below, which defers — and a deferred row is then retried 5 times
+            # over ~2.35h rebuilding the same unreachable channel
+            # (resilience/outreach_recovery.py), each exhaustion filing a
+            # priority="high" observation that does not dedupe across rows
+            # (its content embeds deferred_id), while the drain re-attempts a
+            # FAILED row every cycle until the 24h age-out.
+            #
+            # IGNORED rather than FAILED is what makes it terminal: the drain
+            # treats DELIVERED/ENGAGED/HELD/IGNORED as terminal and FAILED as
+            # "transient and retried next cycle" (outreach/scheduler.py), so
+            # FAILED here would still buy a day of pointless re-sends. IGNORED
+            # already means "the pipeline deliberately dropped it", which is
+            # exactly what a misconfigured channel is.
+            logger.error(
+                "Delivery refused on %s (not configured): %s", channel, exc,
+            )
+            return OutreachResult(
+                outreach_id=outreach_id,
+                status=OutreachStatus.IGNORED,
+                channel=channel,
+                message_content=formatted.text,
+                error=str(exc),
+            )
         except Exception as exc:
             logger.error("Delivery failed on %s: %s", channel, exc, exc_info=True)
             if not gate_cleared and not best_effort:

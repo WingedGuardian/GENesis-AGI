@@ -1171,3 +1171,64 @@ async def test_inflight_awaited_released_after_timeout_allows_retry(config):
     _r2, reply2 = await pipeline.submit_raw_and_wait("txt", req, timeout_s=0.05)
     assert reply2 is None
     pipeline.submit_raw.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_channel_is_terminal_and_never_defers(
+    config, db, mock_drafter, mock_formatter
+):
+    """A channel this install cannot reach must NOT enter the retry machinery.
+
+    The counterpart of test_delivery_failure_defers above: a ConnectionError is
+    transient and SHOULD defer, but "no webhook is configured for this channel"
+    cannot be fixed by retrying — no amount of waiting creates a webhook.
+
+    What deferring costs, all verified in the code rather than assumed:
+    resilience/outreach_recovery.py retries a deferred row 5 times over ~2.35h
+    (_BACKOFF_SCHEDULE 60/300/900/3600/3600, _MAX_RETRIES 5), rebuilding the
+    SAME channel and target_chat_id from the payload each time; on exhaustion it
+    files a priority="high" delivery-exhausted observation whose content embeds
+    `deferred_id`, so skip_if_duplicate does NOT collapse them across rows. And
+    the drain counts DELIVERED/ENGAGED/HELD/IGNORED as terminal while FAILED is
+    "transient and retried next cycle" (outreach/scheduler.py), so a FAILED here
+    would additionally be re-sent every drain cycle until the 24h age-out.
+
+    IGNORED is the status that stops both, and it already means "the pipeline
+    deliberately dropped it" — which is what a misconfigured channel is.
+    """
+    from genesis.channels.base import ChannelNotConfiguredError
+
+    refusing_channel = AsyncMock()
+    refusing_channel.send_message.side_effect = ChannelNotConfiguredError(
+        "No Discord webhook configured for channel 'bug-reports'"
+    )
+    mock_deferred = AsyncMock()
+    mock_deferred.has_open = AsyncMock(return_value=False)
+
+    gate = GovernanceGate(config, db)
+    pipeline = OutreachPipeline(
+        governance=gate,
+        drafter=mock_drafter,
+        formatter=mock_formatter,
+        channels={"telegram": refusing_channel},
+        deferred_queue=mock_deferred,
+        db=db,
+        config=config,
+        recipients={"telegram": "12345"},
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.SURPLUS,
+        topic="Refusal test",
+        context="Channel is not configured",
+        salience_score=0.9,
+        signal_type="surplus_insight",
+    )
+    result = await pipeline.submit(req)
+
+    assert result.status == OutreachStatus.IGNORED, (
+        "a permanent misconfiguration must be TERMINAL; FAILED would be re-sent "
+        "every drain cycle until the 24h age-out"
+    )
+    mock_deferred.enqueue.assert_not_called()
+    # The operator still needs to know WHY — terminal must not mean silent.
+    assert "bug-reports" in (result.error or ""), result.error
