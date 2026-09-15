@@ -458,13 +458,24 @@ not do. A STRUCTURAL exemption may only cite a bound **configuration cannot
 change** — a hardcoded slice or an in-code clamp, never a config DEFAULT, since a
 `.local.yaml` overlay can raise a default.
 
-There is a SECOND, weaker category, named here because describing only the first
-overstates the gate: `_MEASURED_PENDING_ROUTING` holds a hook that is NOT
-structurally bounded and has simply never been observed filing, with its routing
-tracked in a follow-up. `proactive_memory_hook.py` is its only member and its own
-reason concedes the peer loop is unbounded — so it CAN reach the cap. That is
-debt with a date on it, not a proof, and the two categories are kept separate so
-the debt stays visible rather than laundered into "bounded".
+There is a SECOND, weaker category, kept so that describing only the first does
+not overstate the gate: `_MEASURED_PENDING_ROUTING` is for a hook that is NOT
+structurally bounded and has simply never been observed filing. It is **empty** —
+its only ever member now routes through the writer and bounds each surface by
+meaning. The category stays because the next hook with that shape needs a
+labelled place to sit; a row filed under "structurally bounded" is a false claim
+rather than visible debt.
+
+Two rules from that work, because both are the kind you get wrong while
+believing otherwise. **A size bound must be measured in the unit the harness
+bills** (UTF-16 code units, via `utf16_len`/`clip_to_cost`) — mixing units does
+not loosen a bound, it SKIPS it, and the extremes hide that, so sweep a range
+rather than trying one huge value. A bound on MEANING (is this token a word?)
+stays in codepoints; say which you are writing. And **a bound must not decide
+eligibility** — filtering what gets rendered is not a judgement about whether the
+work is worth doing, and conflating them silently skipped recall for a whole
+class of prompt. Detail lives with the code, in
+`.claude/docs/proactive-memory-hook.md`.
 
 Three limits, so it is not read as total coverage. Hooks wired in a user-level
 `~/.claude/settings.json` or a `settings.local.json` are outside the repo and
