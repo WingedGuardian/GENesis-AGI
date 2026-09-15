@@ -153,6 +153,30 @@ def _writer() -> BoundedStdout:
     return _OUT
 
 
+def _emit_tracked(out: BoundedStdout, text: str, block: str) -> bool:
+    """Emit ``text`` and report whether the model will actually see it.
+
+    Delivery bookkeeping must count what LANDED, not what was offered. Once the
+    writer has closed, ``emit`` is a silent no-op, so a caller that records
+    unconditionally marks a memory as injected that was never printed — and the
+    working set PERSISTS, so that row then suppresses a memory the model has not
+    read. Routing the hook's output through a bounded writer is what created that
+    gap: before it, ``print`` always emitted and offered == delivered.
+
+    Returns True when this call was accepted, INCLUDING the call that trips the
+    cut — that one is written, clipped, with a marker, so the model does see it.
+    False means the stream was already closed and nothing was written at all.
+
+    Under-counting is the safe direction here and over-counting is not: a memory
+    wrongly marked surfaced is suppressed and never shown again, while one
+    wrongly left unmarked is merely offered again.
+    """
+    if out.closed:
+        return False
+    out.emit(text, block=block)
+    return True
+
+
 def _announce_cut() -> None:
     """If anything was dropped, say so — on stdout, where the reader is.
 
@@ -1949,8 +1973,10 @@ async def _run(prompt: str, session_id: str = "") -> None:
         # overlay. The gate's rule is that a structural exemption may only cite a
         # bound configuration cannot change — this is the opposite of that.
         out = _writer()
+        server_lines_landed = True
         for line in server_data.get("lines") or []:
-            out.emit(line, block="server-recall")
+            if not _emit_tracked(out, line, "server-recall"):
+                server_lines_landed = False
 
         # Code-index structural hints ([Code] symbol — location). The server
         # engine surfaces SEMANTIC memory only; the pre-flip fork also fused local
@@ -1964,20 +1990,27 @@ async def _run(prompt: str, session_id: str = "") -> None:
             code_keywords = keywords + [k for k in file_keywords if k not in keywords]
             for ch in _search_code_index(_DB_PATH, code_keywords)[:_MAX_RESULTS]:
                 content = ch.get("content")
-                if content:
-                    out.emit(content, block="code-hints")
+                if content and _emit_tracked(out, content, "code-hints"):
                     code_hits.append(ch)
 
         # Adapt structured rows for H-1 measurement: the engine emits pre-bump
         # ``retrieved_count``; _ws_measure reads ``_retrieved_count`` (default -1
         # → FTS-only hits stay excluded from the never-surfaced stat, exactly as
         # the old fork behaved).
+        # Only when the whole recall block reached the model. `lines` and
+        # `results` are parallel views of the same hits, but nothing here
+        # guarantees index correspondence, so a partial cut leaves it UNKNOWN
+        # which rows were shown. Counting none is the safe reading of unknown:
+        # an unrecorded hit is merely offered again, while one recorded as
+        # surfaced is suppressed and never shown. Only reachable after a cut,
+        # which the bounds above make unreachable in ordinary operation.
         fused: list[dict] = []
-        for r in server_data.get("results") or []:
-            row = dict(r)
-            if "retrieved_count" in r:
-                row["_retrieved_count"] = r["retrieved_count"]
-            fused.append(row)
+        if server_lines_landed:
+            for r in server_data.get("results") or []:
+                row = dict(r)
+                if "retrieved_count" in r:
+                    row["_retrieved_count"] = r["retrieved_count"]
+                fused.append(row)
         # Count the locally-injected code hints in the H-1 accounting too (their
         # ``code:`` ids classify as kind "code" in the working set) — the fork
         # fused them into the same measured set (Codex #1169).
@@ -2041,8 +2074,11 @@ async def _run(prompt: str, session_id: str = "") -> None:
         output = _format_degraded(
             fused, forced_local=(fallback_mode == "local"), reason=server_reason
         )
-        if output:
-            _writer().emit(output, block="degraded-recall")
+        # Unambiguous here, unlike the server path: _format_degraded renders the
+        # whole set as ONE blob, so if that single emit does not land, NOTHING in
+        # `fused` was shown and none of it may be recorded as injected.
+        if output and not _emit_tracked(_writer(), output, "degraded-recall"):
+            fused = []
 
     _flush_deferred()
 

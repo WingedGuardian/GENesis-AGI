@@ -771,6 +771,176 @@ def test_the_autouse_fixture_does_not_import_the_production_hook(tmp_path) -> No
     )
 
 
+def test_delivery_bookkeeping_counts_only_what_the_writer_accepted() -> None:
+    """CODEX round 2: a dropped block was still recorded as injected.
+
+    Once the writer closes, `emit` is a silent no-op, but the call sites recorded
+    unconditionally — so `_ws_measure` marked memories as surfaced that were
+    never printed. The working set PERSISTS, so such a row then suppresses a
+    memory the model has not read. Routing created the gap: before it, `print`
+    always emitted and offered == delivered.
+    """
+    out = pmh._writer()
+    assert pmh._emit_tracked(out, "first", "concurrent") is True
+
+    # Close the stream, then offer more.
+    out.emit("x" * pmh.DEFAULT_BUDGET, block="server-recall")
+    assert out.closed, "fixture did not close the writer"
+
+    assert pmh._emit_tracked(out, "dropped", "code-hints") is False, (
+        "a block offered to a closed writer must NOT be reported as delivered"
+    )
+
+
+def test_the_call_that_trips_the_cut_still_counts_as_delivered() -> None:
+    """The boundary case, and it is not academic.
+
+    The emit that trips the cut IS written — clipped, with a marker — so the
+    model does see it. Reporting it undelivered would under-count every cut by
+    exactly one, and the whole point of the helper is that it reports what
+    landed rather than a proxy for it.
+    """
+    out = pmh._writer()
+    assert pmh._emit_tracked(out, "y" * (pmh.DEFAULT_BUDGET * 2), "server-recall") is True
+    assert out.cut is not None, "fixture did not actually trip a cut"
+
+
+def test_a_cut_during_recall_does_not_mark_unseen_rows_surfaced(monkeypatch) -> None:
+    """The server path, end to end through `_run`.
+
+    `lines` and `results` are parallel views of the same hits but nothing
+    guarantees index correspondence, so a partial cut leaves it UNKNOWN which
+    rows were shown. Counting none is the safe reading of unknown — an
+    unrecorded hit is merely offered again, one wrongly recorded is suppressed
+    and never shown.
+    """
+    measured: list[list[dict]] = []
+
+    async def _server(*a, **k):
+        return {
+            # First line must exceed the EMIT ceiling (budget minus the cut
+            # reserve), not merely the budget — 9,000 fits and produced no cut.
+            "lines": ["[Memory] " + "z" * pmh.DEFAULT_BUDGET, "[Memory] second row"],
+            "results": [{"memory_id": "m1"}, {"memory_id": "m2"}],
+            "status": "ok",
+        }, None
+
+    monkeypatch.setattr(pmh, "_call_server", _server)
+    monkeypatch.setattr(
+        pmh,
+        "_ws_measure",
+        lambda fused, *a, **k: (
+            measured.append(fused)
+            or {
+                "injected_ids": [],
+                "repeat_count": 0,
+                "overlap_pct": 0.0,
+                "working_set_size": 0,
+                "zero_retrieved_injected": 0,
+                "procedure_repeat": 0,
+            }
+        ),
+    )
+    for name in ("_heartbeat_write", "_heartbeat_read_and_inject"):
+        monkeypatch.setattr(pmh, name, lambda *a, **k: 0.0)
+    for name in (
+        "_record_activity",
+        "_record_detail",
+        "_ambient_fold",
+        "_update_and_format_trail",
+        "_extract_genesis_summary",
+    ):
+        monkeypatch.setattr(pmh, name, lambda *a, **k: None)
+    monkeypatch.setattr(pmh, "_load_recent_files", lambda *a, **k: [])
+    monkeypatch.setattr(pmh, "_compute_suppress_ids", lambda *a, **k: [])
+    # A code hint too, so this test covers BOTH bookkeeping sites. Without it
+    # the code-hints call site could record unconditionally and still pass:
+    # asserting on `_emit_tracked` alone proves the helper works, not that the
+    # call site uses it.
+    monkeypatch.setattr(
+        pmh,
+        "_search_code_index",
+        lambda *a, **k: [{"content": "[Code] f — a.py", "memory_id": "c1"}],
+    )
+    monkeypatch.setattr(pmh, "_DB_PATH", Path(__file__))  # only existence is checked
+
+    import asyncio
+
+    asyncio.run(pmh._run("why did the merge gate block that push", session_id=_SID))
+
+    assert measured, "the fixture never reached _ws_measure"
+    assert pmh._writer().cut is not None, "fixture did not produce a cut"
+    assert measured[0] == [], (
+        "rows were marked surfaced after a cut swallowed the recall block — "
+        f"neither the server results nor the code hint reached the model: {measured[0]}"
+    )
+
+
+def test_the_degraded_path_records_nothing_when_its_blob_is_dropped(monkeypatch) -> None:
+    """The third bookkeeping site, and the unambiguous one.
+
+    `_format_degraded` renders the whole result set as ONE blob, so if that
+    single emit does not land, NOTHING in `fused` was shown — unlike the server
+    path, where a partial cut leaves the mapping unknown. Needs its own test:
+    the other two sites can be fixed while this one still records blind.
+    """
+    measured: list[list[dict]] = []
+
+    async def _no_server(*a, **k):
+        return None, "probe-forced-degraded"
+
+    monkeypatch.setattr(pmh, "_call_server", _no_server)
+    monkeypatch.setattr(
+        pmh,
+        "_search_fts5",
+        lambda *a, **k: [
+            {"memory_id": "d1", "content": "a degraded recall hit", "collection": "episodic_memory"}
+        ],
+    )
+    monkeypatch.setattr(pmh, "_search_code_index", lambda *a, **k: [])
+    monkeypatch.setattr(
+        pmh,
+        "_ws_measure",
+        lambda fused, *a, **k: (
+            measured.append(fused)
+            or {
+                "injected_ids": [],
+                "repeat_count": 0,
+                "overlap_pct": 0.0,
+                "working_set_size": 0,
+                "zero_retrieved_injected": 0,
+                "procedure_repeat": 0,
+            }
+        ),
+    )
+    for name in ("_heartbeat_write", "_heartbeat_read_and_inject"):
+        monkeypatch.setattr(pmh, name, lambda *a, **k: 0.0)
+    for name in (
+        "_record_activity",
+        "_record_detail",
+        "_ambient_fold",
+        "_update_and_format_trail",
+        "_extract_genesis_summary",
+    ):
+        monkeypatch.setattr(pmh, name, lambda *a, **k: None)
+    monkeypatch.setattr(pmh, "_load_recent_files", lambda *a, **k: [])
+    monkeypatch.setattr(pmh, "_compute_suppress_ids", lambda *a, **k: [])
+    monkeypatch.setattr(pmh, "_DB_PATH", Path(__file__))
+
+    # Close the writer BEFORE _run reaches the degraded emit.
+    pmh._writer().emit("x" * (pmh.DEFAULT_BUDGET * 2), block="server-recall")
+    assert pmh._writer().closed, "fixture did not close the writer"
+
+    import asyncio
+
+    asyncio.run(pmh._run("why did the merge gate block that push", session_id=_SID))
+
+    assert measured, "the fixture never reached _ws_measure"
+    assert measured[0] == [], (
+        f"degraded rows were marked surfaced although the blob never printed: {measured[0]}"
+    )
+
+
 def test_a_cut_says_so_in_band() -> None:
     """A silent stop is the exact failure this whole class of work exists to
     prevent — the marker is what makes a cut readable instead of invisible."""
