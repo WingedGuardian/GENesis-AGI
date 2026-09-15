@@ -163,6 +163,14 @@ def test_the_reason_leads_with_a_sentence_before_the_json() -> None:
         '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": "4242"}',
         '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": 1}',
         '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": 9, "start": "x"}',
+        # `start` values that pass an isinstance(int) check but cannot be a real
+        # process start time. A JSON boolean is the one that surprises: bool
+        # subclasses int, so `true` reads as 1. Each would make
+        # `pid_is_live_session` mismatch against /proc and report a LIVE session
+        # dead, releasing a lock we do not own the right to release.
+        '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": 9, "start": true}',
+        '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": 9, "start": 0}',
+        '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": 9, "start": -1}',
         '{"ns": "genesis.other-thing", "v": 1, "rule": "claim", "pid": 4242}',
     ],
 )

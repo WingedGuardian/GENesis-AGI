@@ -355,8 +355,17 @@ def _parse_payload(raw: str) -> dict | None:
     # is the opposite of what a malformed claim should do.
     if not isinstance(payload.get("pid"), int) or payload["pid"] <= 1:
         return None
+    # `start` needs the SAME "is it usable" bar as pid, for the same reason.
+    # `isinstance(x, int)` is satisfied by a JSON boolean (bool subclasses int),
+    # by zero, and by a negative number — none of which can equal a real process
+    # start time. `pid_is_live_session` then compares one of them against /proc,
+    # sees a mismatch, and reports the session DEAD, so `is_releasable` releases
+    # a lock whose pid belongs to a live session. That is the precise failure the
+    # pid validation above exists to prevent, reached through the other field.
+    # `type(...) is not int` rather than `isinstance`, because excluding bool is
+    # the point.
     start_time = payload.get("start")
-    if start_time is not None and not isinstance(start_time, int):
+    if start_time is not None and (type(start_time) is not int or start_time <= 0):
         return None
     return payload
 

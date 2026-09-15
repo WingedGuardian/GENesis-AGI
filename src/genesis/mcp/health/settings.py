@@ -327,8 +327,12 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
             "first write, and warns when a session writes into one another live "
             "session holds, ships separately, as does the reaper-side release. "
             "Until those land this lever gates nothing at runtime. Dirtiness is deliberately "
-            "NOT recorded here — the reaper computes it at decision time. Nothing "
-            "is ever blocked. Read live per call — takes effect immediately, no "
+            "NOT recorded here: it is DERIVABLE, so the design computes it at the "
+            "reaper's decision point rather than storing a snapshot that goes stale "
+            "between the write and the read. That predicate is NOT LANDED — it ships "
+            "with the reaper-side work — so today nothing in this system consults "
+            "dirtiness at all, and this line describes the design, not the runtime. "
+            "Nothing is ever blocked. Read live per call — takes effect immediately, no "
             "restart. Env kill switch GENESIS_WORKTREE_OWNERSHIP=1 forces off."
         ),
         config_filename="worktree_ownership.yaml",
