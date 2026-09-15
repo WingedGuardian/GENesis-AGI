@@ -33,9 +33,21 @@
 # session instead of taking over.
 set -uo pipefail
 
+# HOME may be unset in a stripped environment, and `set -u` would abort this
+# door at its first dereference — before any lobby can open. Resolve it from the
+# passwd entry for the current uid (the same source Path.home() uses). Unlike
+# the batch scripts that carry this guard, an unresolvable HOME is NOT fatal
+# here: the door's job is to get the operator a terminal, and only the advisory
+# LOCK needs a home. Degrade to the unlocked path rather than refusing to open.
+# Pinned by tests/test_scripts/test_home_guard_coverage.py.
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    export HOME
+fi
+
 SESSION="lobby"
 PRIMARY="lobby"
-LOCK="${HOME}/.genesis/lobby-door.lock"
+LOCK="${HOME:-}/.genesis/lobby-door.lock"
 
 # ── Serialize the claim ──────────────────────────────────────────────────────
 # Reading `session_attached` and then attaching is a TOCTOU: two SSH logins
@@ -50,10 +62,24 @@ LOCK="${HOME}/.genesis/lobby-door.lock"
 #
 # flock is not assumed present. Without it the claim is exactly as racy as it
 # was before, which is a documented degradation rather than a silent one.
-mkdir -p "${HOME}/.genesis" 2>/dev/null
 _locked=0
-if command -v flock >/dev/null 2>&1 && exec 9>"$LOCK" 2>/dev/null; then
-    flock -w 5 9 2>/dev/null && _locked=1
+if [ -n "${HOME:-}" ]; then
+    mkdir -p "${HOME}/.genesis" 2>/dev/null
+    if command -v flock >/dev/null 2>&1 && exec 9>"$LOCK" 2>/dev/null; then
+        flock -w 5 9 2>/dev/null && _locked=1
+    fi
+fi
+
+# CREATE THE PRIMARY UNDER THE LOCK when it does not exist yet. Without this the
+# whole claim below is skipped on the very path that needs it most — the first
+# logins after a reboot or a tmux-server restart, when nothing exists and two
+# connections arrive together. Both would find no session, both would fall
+# through to `new-session -A`, and the second's chooser would land in the
+# first's pane: the exact defect, on the one occasion the lock was not covering
+# anything. Creating it detached here makes the existing-session branch below
+# the ONLY branch, so the claim always runs.
+if ! tmux has-session -t "=${PRIMARY}" 2>/dev/null; then
+    tmux new-session -d -s "$PRIMARY" 2>/dev/null
 fi
 
 if tmux has-session -t "=${PRIMARY}" 2>/dev/null; then
@@ -108,10 +134,16 @@ if tmux has-session -t "=${PRIMARY}" 2>/dev/null; then
         SESSION="lobby-$$"
     else
         if ! tmux set-option -t "=${PRIMARY}:" @lobby_owner "$$" 2>/dev/null; then
-            # Not fatal, but not silent either: without the marker the claim
-            # degrades to the pre-lock race rather than failing closed.
-            printf 'lobby-door: could not record the lobby claim; a simultaneous open may share this pane.\n' >&2
+            # FAIL CLOSED. A claim we could not RECORD is not a claim: the next
+            # invocation sees no live owner, takes the primary too, and its
+            # chooser lands in this pane. Taking it anyway while printing a
+            # warning would leave the race open and call it handled — so this
+            # window steps aside instead, and touches nothing.
+            printf 'lobby-door: could not record the lobby claim — using a separate session so a simultaneous open cannot share this pane.\n' >&2
+            SESSION="lobby-$$"
         fi
+    fi
+    if [ "$SESSION" = "$PRIMARY" ]; then
         # RESET ONLY AN ACTUAL STALE CHOOSER. "Nobody is attached" is NOT the
         # same question: the operator uses this pane as a real command line, so
         # cancelling the picker, starting something long-running, and then

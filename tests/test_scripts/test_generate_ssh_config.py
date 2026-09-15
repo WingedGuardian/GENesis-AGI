@@ -307,6 +307,89 @@ class TestLobbyDoorScript:
             "for the whole tmux session and serialize every other lobby login"
         )
 
+    def test_home_is_resolved_before_nounset_dereferences_it(self):
+        """`set -u` + `$HOME` aborts a stripped-env launch at the first
+        expansion, before any lobby can open.
+
+        The repo has a guardrail for exactly this
+        (`test_home_guard_coverage.py`), and this script tripped it. Unlike the
+        batch scripts carrying the same fallback, an unresolvable HOME is NOT
+        fatal here: the door's job is to get the operator a terminal, and only
+        the advisory lock needs a home — so it degrades to the unlocked path.
+        """
+        text = _LOBBY.read_text()
+        assert "getent passwd" in text, "HOME must be resolvable when unset"
+        guard = text.index("getent passwd")
+        first_use = min(
+            i for i in (text.find('"${HOME}'), text.find('"${HOME:-}')) if i != -1
+        )
+        assert guard < first_use or text.index("HOME:-") < guard, (
+            "the fallback must precede the first dereference"
+        )
+        # And the lock must not be fatal when HOME stays unresolvable.
+        assert '${HOME:-}' in text, (
+            "the door must tolerate an unresolvable HOME rather than refusing "
+            "to open a terminal over a lock file"
+        )
+
+    def test_an_unrecordable_claim_steps_aside(self):
+        """A claim we could not RECORD is not a claim.
+
+        `set-option` can fail. Printing a warning and taking the primary anyway
+        leaves the next invocation seeing no live owner, taking it too, and
+        landing its chooser in this pane — the race, declared handled. The
+        failure branch must select the secondary session instead.
+        """
+        text = _LOBBY.read_text()
+        start = text.index("@lobby_owner \"$$\"")
+        # The failure branch for the claim, up to the end of that if-block.
+        window = text[start:start + 900]
+        assert 'SESSION="lobby-$$"' in window, (
+            "a failed claim must fall back to a separate session, not keep the "
+            "primary with a warning"
+        )
+
+    def test_the_reset_cannot_run_without_a_recorded_claim(self):
+        """The reset is gated on still holding the primary, so the fail-closed
+        branch above also skips the respawn — touching nothing at all."""
+        code = [
+            ln for ln in _LOBBY.read_text().split("\n")
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        gate = next(
+            (i for i, ln in enumerate(code)
+             if 'if [ "$SESSION" = "$PRIMARY" ]' in ln), None
+        )
+        respawn = next((i for i, ln in enumerate(code) if "respawn-pane" in ln), None)
+        assert gate is not None and respawn is not None and gate < respawn, (
+            "the respawn must sit inside the still-holding-the-primary branch"
+        )
+
+    def test_the_primary_is_created_under_the_lock(self):
+        """Otherwise the claim is skipped on the one path that needs it most.
+
+        After a reboot or a tmux-server restart nothing exists, so the
+        existing-session branch never runs: two simultaneous first logins both
+        find nothing, both fall through to `new-session -A`, and the second's
+        chooser lands in the first's pane. Creating it detached under the lock
+        makes the claim unconditional.
+        """
+        code = [
+            ln for ln in _LOBBY.read_text().split("\n")
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        flock_i = next((i for i, ln in enumerate(code) if "flock -w" in ln), None)
+        create = next(
+            (i for i, ln in enumerate(code) if "new-session -d -s" in ln), None
+        )
+        release = next((i for i, ln in enumerate(code) if "exec 9>&-" in ln), None)
+        assert create is not None, "the primary must be created before the claim"
+        assert flock_i is not None and release is not None
+        assert flock_i < create < release, (
+            "creation must happen while the lock is held, or the claim it "
+            "enables is racing the thing it protects"
+        )
+
     def test_the_owner_marker_is_the_door_pid(self):
         """`$$` is the door process, and `exec tmux` replaces it in place — so
         that pid IS the tmux client and lives exactly as long as the attachment.
