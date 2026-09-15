@@ -43,6 +43,28 @@ a verdict, only a rate, so it cannot be mistaken for one.
 It is also a REALISM check, not a coverage check: the corpus contains only shapes
 someone actually typed here. A construct nobody has typed has no entry and cannot
 show up as a false positive, so a clean sweep says nothing about it.
+
+WHY A GUARD IS REPLAYABLE, AND WHO CHECKED
+------------------------------------------
+Each guard carries a ReplaySafety record, and the default is refusal. Those
+records were prose for a while, and prose about code rots: the declarations have
+been wrong four times, including all six line-number citations going stale inside
+five days. So each one now also carries evidence a test re-derives —
+`--list` prints it:
+
+  * FACTS for a Python guard (reads_env / reads_argv / spawns / writes_fs),
+    checked against a transitive walk of every import resolving under
+    scripts/hooks/, bidirectionally: an undeclared fact fails, and so does a
+    declared one that stopped being true.
+  * CITATIONS, as symbol + VERBATIM fragment, re-resolved against the source.
+  * A DELEGATION SCAN for the two shell guards, which no Python walk can reach —
+    bash_safety has no module at all and hands off through a pipe. It is a
+    closed-set cross-reference, never a shell parser, and it proves OCCURRENCE
+    rather than invocation: the obligation is to say what each name is doing
+    there.
+
+None of this is a proof of purity, and --list says so with the number: a False
+fact means "none of the N spellings this checker knows", and the N are printed.
 """
 
 from __future__ import annotations
@@ -470,6 +492,285 @@ _run_python_guard._loaded = {}  # type: ignore[attr-defined]
 # never cover.
 
 
+class Cite(NamedTuple):
+    """One piece of evidence, in a form a test can re-resolve.
+
+    `why` is prose, and prose about code rots silently. Every line number in the
+    first revision of this table had drifted within five days — one of them onto
+    a comment about an unrelated cap — while the sentences around them still read
+    as verified. A Cite is the same evidence stated so a checker can go and look:
+    find `symbol` in `module`, and assert `fragment` still occurs inside it.
+
+    `fragment` is VERBATIM. Never elided, never reflowed — an ellipsis makes the
+    claim unresolvable, which is the failure mode this record exists to remove.
+    (One declaration cited `["git", "-C", cwd, "stash", "create", …]`; the source
+    reads `["git", "-C", cwd, "stash", "create", "git-discard-guard snapshot"]`,
+    and nothing could have told them apart.)
+
+    `symbol` is None for a file-level fragment — a shell script has no Python
+    symbol to scope to — and then the fragment need only occur somewhere in the
+    file.
+
+    An EMPTY `fragment` means "this symbol still exists", and nothing more. Some
+    evidence is a claim about absence ("_block_with_pids returns 2 on every
+    branch"), which no substring can carry; pinning the NAME at least fails when
+    the referent is renamed away, and overclaiming it as behaviour would be the
+    prose problem again in a machine-readable wrapper.
+    """
+
+    module: str  # a module basename under scripts/hooks/, or a repo-relative path
+    symbol: str | None
+    fragment: str
+
+
+class PyEvidence(NamedTuple):
+    """A guard whose behaviour a Python AST walk can establish.
+
+    The four facts are checked against the TRANSITIVE closure of `module`'s
+    imports that resolve under scripts/hooks/ — bounded there because that is the
+    same boundary `_GUARD_BARE_DEPS` already names, so the walk terminates and
+    never wanders into the stdlib. Transitive matters: `audit_jsonl` sits two hops
+    out from git_discard and git_push, writing files and reading argv, and no
+    declaration named it.
+    """
+
+    module: str
+    reads_env: bool
+    reads_argv: bool
+    spawns: bool
+    writes_fs: bool
+
+
+class ShEvidence(NamedTuple):
+    """A guard whose behaviour is established by scanning shell source.
+
+    There is no AST here and DELIBERATELY no shell parser. The two fields are a
+    closed-set cross-reference — every tracked repo script whose name occurs in
+    the text, and every program from `DELEGATED_PROGRAMS` — not a semantic model
+    of the shell. Modelling shell semantics by hand is the unbounded-divergence
+    tar pit the guards themselves are forbidden to enter, and a declaration
+    checker has no business entering it either.
+
+    This is the half a Python import walk cannot do, and it is not a corner case:
+    `bash_safety` has no Python module at all, and its delegation to
+    `git_discard_guard` — the side effect that got past prose review twice — is a
+    shell pipe. An import-closure walk misses it by construction.
+
+    Note what the fields are named for. The scan proves OCCURRENCE, never
+    invocation: it cannot tell `"$_py" "$SCRIPT_DIR/hooks/git_discard_guard.py"`
+    from the same name in a comment, and a checker that claimed to would be
+    modelling the shell again. So the obligation is to ACKNOWLEDGE each
+    occurrence in `why` — as a delegation, or as message text — which is exactly
+    the reading a human has to do anyway. MEASURED on the current tree:
+    bash_safety references six guards, invokes three, and its declaration named
+    one.
+
+    Both fail directions are cheap: a missed occurrence leaves a declaration
+    unchecked (the status quo), and a false positive costs one clause in a
+    sentence saying why the name is there.
+    """
+
+    source: Callable[[], str]  # returns the shell text at check time
+    label: str  # what to call it in a failure message
+    references_scripts: tuple[str, ...]  # repo script basenames occurring in it
+    references_programs: tuple[str, ...]  # DELEGATED_PROGRAMS occurring in it
+
+
+#: Dotted spellings, matched as an attribute chain rooted at a module name.
+_FACT_DOTTED: dict[str, frozenset[str]] = {
+    "reads_env": frozenset(
+        {"os.environ", "os.environb", "os.getenv", "os.path.expanduser", "os.path.expandvars"}
+    ),
+    "reads_argv": frozenset({"sys.argv"}),
+    "spawns": frozenset(
+        {
+            "subprocess.run",
+            "subprocess.Popen",
+            "subprocess.call",
+            "subprocess.check_call",
+            "subprocess.check_output",
+            "os.system",
+            "os.popen",
+            "os.fork",
+            "os.forkpty",
+            "os.execv",
+            "os.execve",
+            "os.execl",
+            "os.execlp",
+            "os.execvp",
+            "os.execvpe",
+            "os.spawnv",
+            "os.spawnve",
+            "os.posix_spawn",
+            "os.posix_spawnp",
+            "multiprocessing.Process",
+            "multiprocessing.Pool",
+        }
+    ),
+    "writes_fs": frozenset(
+        {
+            "os.replace",
+            "os.rename",
+            "os.remove",
+            "os.unlink",
+            "os.mkdir",
+            "os.makedirs",
+            "os.rmdir",
+            "os.truncate",
+            "os.chmod",
+            "os.symlink",
+            "os.link",
+            "os.write",
+            "os.open",
+            "shutil.copy",
+            "shutil.copy2",
+            "shutil.copyfile",
+            "shutil.copytree",
+            "shutil.move",
+            "shutil.rmtree",
+            "shutil.unpack_archive",
+            "shutil.make_archive",
+            "shutil.copyfileobj",
+            "shutil.copymode",
+            "shutil.copystat",
+            "shutil.chown",
+            "tempfile.mkstemp",
+            "tempfile.mkdtemp",
+            "tempfile.NamedTemporaryFile",
+            "tempfile.TemporaryDirectory",
+        }
+    ),
+}
+
+#: Bare method names, matched on ANY receiver because the AST cannot resolve the
+#: type. Only names no other common type carries are eligible.
+#:
+#: `.replace` and `.write` are deliberately ABSENT, and the reason is measured: a
+#: first cut of this walk reported `writes_fs=True` for protected_paths, from
+#: `prot.replace(home, "~", 1)` in protected_paths_guard._legacy_substring_block
+#: — a STRING replace. A matcher that counts it forces a pure argv classifier to
+#: declare a filesystem write, which is the declaration lying in the other
+#: direction. An over-reporting checker is not the safe kind of wrong here: it
+#: trains the reader to disbelieve the facts.
+#:
+#: ELIGIBILITY IS AN INVARIANT, NOT A LIST OF EXCLUSIONS. Naming `.replace`,
+#: `.write` and `.truncate` as forbidden is a three-name denylist: it cannot see
+#: `.read`, `.close`, `.seek`, `.flush` or `.pop`, and the next ambiguous name
+#: added would pass. The property that actually matters is "pathlib carries this
+#: name and the common non-filesystem receivers do not", which
+#: `test_a_bare_method_name_is_unambiguous_by_construction` asserts against the
+#: STDLIB rather than against a hand-maintained list.
+_FACT_METHODS: dict[str, frozenset[str]] = {
+    "reads_env": frozenset(),
+    "reads_argv": frozenset(),
+    "spawns": frozenset(),
+    "writes_fs": frozenset(
+        {"write_text", "write_bytes", "touch", "mkdir", "unlink", "symlink_to", "hardlink_to"}
+    ),
+}
+
+#: An `open()` whose mode contains any of these is a write.
+_WRITE_MODE_CHARS = "wax+"
+
+#: Names that OPEN a file and therefore need their MODE read, unlike write_text
+#: above which is a write whatever its arguments. Matched as the builtin, as
+#: `<expr>.open(...)` (the `Path(...).open("w")` idiom this very script uses at
+#: `_CACHE.open()`), and as `os.fdopen` / `io.open`.
+_OPEN_NAMES = frozenset({"open", "fdopen"})
+
+#: Where the mode sits POSITIONALLY, which is not the same for every spelling and
+#: cannot be inferred from the AST node type: `os.fdopen` is an Attribute like
+#: `p.open` is, but its mode is the second argument because the first is a file
+#: descriptor, while `p.open("w")`'s path is the receiver. Reading position 1 for
+#: both scored every `Path(...).open("w")` as a READ.
+_OPEN_MODE_AT_1 = frozenset({"open", "os.fdopen", "io.open"})
+
+#: The external programs a shell guard must ACKNOWLEDGE if their name occurs in
+#: it. Chosen for SIDE EFFECTS — each mutates state, calls out over the network,
+#: or executes something else.
+#:
+#: NOT exhaustive, and saying so is the point: an earlier revision of this comment
+#: called it "a closed set chosen for side effects", which reads as a guarantee it
+#: cannot make. There is no closed set of side-effecting programs. What IS closed
+#: is this list, and `test_every_published_spelling_is_actually_detected` binds it
+#: to the scanner so the list and the behaviour cannot drift.
+#:
+#: `python3` earns its place even though the delegates it runs are already caught
+#: by the script-name half: `bash_safety_hook.sh` invokes ALL THREE of its real
+#: delegates through it, so a shell guard that gained an inline `python3 -c` would
+#: otherwise be invisible to both halves.
+DELEGATED_PROGRAMS: tuple[str, ...] = (
+    "gh",
+    "git",
+    "curl",
+    "wget",
+    "ssh",
+    "sqlite3",
+    "rsync",
+    "python3",
+    "systemctl",
+    "rm",
+    "mv",
+    "chmod",
+    "dd",
+    "kill",
+    "pkill",
+)
+
+
+@functools.cache
+def repo_script_names() -> frozenset[str]:
+    """Basenames a shell guard could delegate to, from `git ls-files`.
+
+    Lives HERE rather than in the checker so the claim `--list` prints and the set
+    the scan uses are one object. They were two, and the published one was wrong
+    in three separate ways: a `{.py, .sh}` suffix filter dropped the six
+    extension-less git hooks sitting in the guards' OWN directory (`pre-push`,
+    `commit-msg`, …), a non-recursive glob dropped everything under `scripts/*/`,
+    and reading the filesystem rather than the index made the word "tracked"
+    false. MEASURED: 180 names against 236 tracked, missing 56.
+
+    Fail CLOSED. If git cannot answer, the scan must refuse rather than quietly
+    fall back to a glob that under-reports — an under-reporting delegation scan
+    is indistinguishable from a clean one, which is the whole failure this
+    mechanism exists to prevent.
+    """
+    proc = subprocess.run(  # noqa: S603
+        ["git", "-C", str(_REPO), "ls-files", "scripts"],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise SystemExit(
+            f"cannot enumerate tracked scripts (git exited {proc.returncode}): "
+            f"{proc.stderr.strip()[:200]}. The delegation scan refuses rather than "
+            "falling back to a filesystem glob, which would under-report and read "
+            "exactly like a clean result."
+        )
+    return frozenset(Path(rel).name for rel in proc.stdout.split())
+
+
+def fact_coverage() -> dict[str, tuple[str, ...]]:
+    """What each fact is actually checked against.
+
+    PUBLISHED, and printed by --list, because `spawns=False` means "none of the N
+    spellings this checker knows" and NEVER "proven pure". Saying which N is the
+    difference between a bounded claim and a false one — the same honesty
+    `check_atomic_writes.py` practises with its UNSCANNED_ROOTS.
+    """
+    out: dict[str, tuple[str, ...]] = {}
+    for fact in _FACT_DOTTED:
+        spellings = sorted(_FACT_DOTTED[fact]) + sorted(f".{m}()" for m in _FACT_METHODS[fact])
+        if fact == "writes_fs":
+            spellings += [
+                f"{n}(..., mode with any of {_WRITE_MODE_CHARS!r})"
+                for n in [*sorted(_OPEN_MODE_AT_1), ".open"]
+            ]
+        out[fact] = tuple(spellings)
+    return out
+
+
 @dataclass(frozen=True)
 class ReplaySafety:
     """Whether replaying a guard once per corpus row is safe, and the evidence.
@@ -492,21 +793,48 @@ class ReplaySafety:
     # Printed WITH the rate rather than instead of it. A caveat has to travel
     # with the number, because the number is what gets pasted into a PR body.
     caveat: str = ""
+    # The machine-checkable half. `evidence` says WHAT to check and how; `cites`
+    # says which constructs the prose above is standing on. Both are keyword-only
+    # and un-defaulted at the constructors, so a guard added later cannot arrive
+    # unchecked — the same allowlist polarity that makes _UNDECLARED the default.
+    evidence: PyEvidence | ShEvidence | None = None
+    cites: tuple[Cite, ...] = ()
 
 
-def replay_safe(why: str, *, caveat: str = "") -> ReplaySafety:
+def replay_safe(
+    why: str,
+    *,
+    evidence: PyEvidence | ShEvidence,
+    cites: tuple[Cite, ...] = (),
+    caveat: str = "",
+) -> ReplaySafety:
     """Declare a guard replayable. `why` is the EVIDENCE, not an assurance — it
     is printed verbatim by --list, so a claim in it that turns out to be false
     (as "no environment reads" was for protected_paths) is worse than saying
-    nothing. `caveat` qualifies the resulting number and prints beside it."""
-    return ReplaySafety(safe=True, why=why, caveat=caveat)
+    nothing. `caveat` qualifies the resulting number and prints beside it.
+
+    `evidence` is required and has no default: the whole point of this record was
+    that a newcomer who did not think about side effects gets refused rather than
+    trusted, and a fact field that defaults to "unknown" would put that hole back
+    one level in."""
+    return ReplaySafety(safe=True, why=why, caveat=caveat, evidence=evidence, cites=cites)
 
 
-def not_replay_safe(why: str) -> ReplaySafety:
+def not_replay_safe(
+    why: str,
+    *,
+    evidence: PyEvidence | ShEvidence,
+    cites: tuple[Cite, ...] = (),
+) -> ReplaySafety:
     """Refuse a guard, with the evidence for the refusal. Refused guards stay in
     the table and still appear in --list: absence teaches nothing, and
-    exclusion-by-absence is the pattern this replaced."""
-    return ReplaySafety(safe=False, why=why)
+    exclusion-by-absence is the pattern this replaced.
+
+    A REFUSED guard still declares its facts, and that is not ceremony: the facts
+    are what JUSTIFY the refusal, so they are the ones most worth checking. If
+    git_push's `spawns` ever went false, the paragraph explaining that it makes
+    thousands of live API calls would have quietly stopped being true."""
+    return ReplaySafety(safe=False, why=why, evidence=evidence, cites=cites)
 
 
 _UNDECLARED = ReplaySafety(
@@ -544,6 +872,33 @@ class Guard:
     # has. Without it each worker resolved the resource itself, which made the
     # "the parent parses once and workers inherit it" claim below false.
     prepare: Callable[[], object] | None = None
+    # The module _run_python_guard loads, or None for a shell guard. It exists so
+    # the evidence KIND can be bound to the MECHANISM, and that binding is not
+    # cosmetic: requiring `evidence` to be present is NOT allowlist polarity,
+    # because an isinstance check is satisfied by whichever type is cheapest to
+    # fake. MEASURED — git_discard, refused because `git stash create` writes
+    # objects into whatever live repo a row was recorded in, was re-declared
+    # `replay_safe` with an ShEvidence over an empty string and passed ALL FOUR
+    # checkers: the fact walk iterates PyEvidence only, and the shell scan found
+    # nothing in nothing. Four green, zero verification, on the most dangerous
+    # guard in the table.
+    #
+    # Set it through `python_guard()` rather than by hand, so the module name is
+    # written once and the runner and the evidence cannot name different things.
+    py_module: str | None = None
+
+
+def python_guard(module: str, *, safety: ReplaySafety, **kw) -> Guard:
+    """A guard that loads `module` in-process, with the name written ONCE.
+
+    The runner used to be a lambda closing over the module name while nothing
+    else recorded it, so no checker could tell which artifact a declaration was
+    about — and adding a `py_module` field by hand would just create a second
+    copy of the string to drift from the first. Here there is one.
+    """
+    return Guard(
+        run=lambda c, w: _run_python_guard(module, c, w), py_module=module, safety=safety, **kw
+    )
 
 
 def _run_shell_guard(argv: list[str], cmd: str, cwd: str) -> bool:
@@ -625,8 +980,8 @@ def _inline_blob() -> str:
 
 
 GUARDS: dict[str, Guard] = {
-    "protected_paths": Guard(
-        run=lambda c, w: _run_python_guard("protected_paths_guard", c, w),
+    "protected_paths": python_guard(
+        "protected_paths_guard",
         safety=replay_safe(
             "a pure argv/string classifier — no filesystem writes, no subprocess, "
             "no network. It DOES read the environment, which an earlier version "
@@ -645,10 +1000,32 @@ GUARDS: dict[str, Guard] = {
                 "install, but it means an operand like $SOME_PATH is classified "
                 "against today's value rather than the one it had when typed."
             ),
+            evidence=PyEvidence(
+                module="protected_paths_guard",
+                reads_env=True,
+                reads_argv=False,
+                spawns=False,
+                writes_fs=False,
+            ),
+            cites=(
+                Cite(
+                    "protected_paths_guard",
+                    "_expand",
+                    "os.path.expanduser(os.path.expandvars(token))",
+                ),
+                Cite("protected_paths_guard", "main", 'if "$" in os.path.expandvars(operand):'),
+                Cite(
+                    "protected_paths_guard",
+                    "_legacy_substring_block",
+                    'home = os.path.expanduser("~")',
+                ),
+                Cite("protected_paths_guard", "_protected_dirs", 'home = os.path.expanduser("~")'),
+                Cite("protected_paths_guard", "_protected_files", 'home = os.path.expanduser("~")'),
+            ),
         ),
     ),
-    "worktree_cwd": Guard(
-        run=lambda c, w: _run_python_guard("worktree_cwd_guard", c, w),
+    "worktree_cwd": python_guard(
+        "worktree_cwd_guard",
         safety=replay_safe(
             "no writes, no network, no subprocess. It does scan /proc — "
             "worktree_cwd_guard._find_processes_in_dir runs "
@@ -667,6 +1044,29 @@ GUARDS: dict[str, Guard] = {
                 "(_block_with_pids and _block_no_direct_removal are both "
                 "unconditional), so the rate is reproducible even though the "
                 "message is not."
+            ),
+            evidence=PyEvidence(
+                module="worktree_cwd_guard",
+                reads_env=True,
+                reads_argv=True,
+                spawns=False,
+                writes_fs=False,
+            ),
+            cites=(
+                Cite(
+                    "worktree_cwd_guard", "_find_processes_in_dir", 'entries = os.listdir("/proc")'
+                ),
+                Cite(
+                    "worktree_cwd_guard",
+                    "_find_processes_in_dir",
+                    'os.readlink(f"/proc/{pid}/cwd")',
+                ),
+                Cite("worktree_cwd_guard", "main", 'if "--enter-worktree" in sys.argv:'),
+                # Empty fragment: the caveat's claim is that every branch after
+                # the /proc read returns 2, which is an absence and not a
+                # substring. Pinning the names is what a citation can honestly do.
+                Cite("worktree_cwd_guard", "_block_with_pids", ""),
+                Cite("worktree_cwd_guard", "_block_no_direct_removal", ""),
             ),
         ),
     ),
@@ -693,7 +1093,21 @@ GUARDS: dict[str, Guard] = {
             "_run_shell_guard pins BASH_ENV/ENV/SHELLOPTS/BASHOPTS/BASH_XTRACEFD "
             "absent: without it, replaying this guard executes an operator's "
             "startup file twice per corpus row, and one exported option turns "
-            "the whole measurement into a fail-open."
+            "the whole measurement into a fail-open. It REFERENCES no other repo "
+            "script, and the three program names in it — `git`, `sqlite3` and "
+            "`systemctl`, the last inside the advice string "
+            '`"Use: systemctl --user restart …"` — are '
+            "both non-invocations: `git` appears inside the case pattern "
+            '`*"git reset --hard"*` and in the advice text that follows it, and '
+            '`sqlite3` inside the grep pattern `"sqlite3.*genesis\\.db"`. A '
+            "pattern that MATCHES a command is not a command, and neither is a "
+            "sentence telling the operator which one to run.",
+            evidence=ShEvidence(
+                source=_inline_blob,
+                label=".claude/settings.json inline blob",
+                references_scripts=(),
+                references_programs=("git", "sqlite3", "systemctl"),
+            ),
         ),
     ),
     "bash_safety": Guard(
@@ -708,7 +1122,9 @@ GUARDS: dict[str, Guard] = {
             'git_discard_guard.py"`) on a git '
             "checkout/restore/reset/switch/clean/rm/mv/read-tree glob, and "
             "git_discard_guard._snapshot_worktree then runs git stash create "
-            '(`["git", "-C", cwd, "stash", "create", …]`) against the LIVE '
+            '(`["git", "-C", cwd, "stash", "create", "git-discard-guard '
+            'snapshot"]` — quoted whole, because the elided form this line used '
+            "to carry was a claim no checker could resolve) against the LIVE "
             "repository at each row's recorded directory. The objects that writes "
             "are not redirectable by any knob: _snapshot_dir's "
             '`resolve_store_dir("GENESIS_DISCARD_SNAPSHOT_DIR")` relocates the '
@@ -719,11 +1135,65 @@ GUARDS: dict[str, Guard] = {
             "problem. Secondary, and latent rather than live: bash_safety_hook.sh "
             "calls `gh pr view` (twice, for the PR number and its mergeable "
             "state), reachable when _in_genesis is 0 or when GENESIS_CC_SESSION "
-            'is exactly "1" — the value every dispatched session sets.'
+            'is exactly "1" — the value every dispatched session sets. '
+            "It delegates to TWO MORE guards, which no earlier revision of this "
+            "line mentioned and the delegation scan added here found: the loop "
+            "`for _guard in destructive_command_guard.py protected_paths_guard.py` "
+            'pipes the same raw command into each ("$_py" "$SCRIPT_DIR/hooks/'
+            '$_guard"). Both are pure argv/string classifiers — walked '
+            "transitively, neither spawns nor writes — so they add no side effect "
+            "to a replay, and the refusal above still rests entirely on "
+            "git_discard_guard. Recorded anyway, because the reason this guard's "
+            "declaration was wrong twice is that it reasoned about the script and "
+            "not about what the script runs. The remaining three guard names in "
+            "the file are not invocations: git_push_guard.py appears only in an "
+            "`[ -f ... ]` existence test used to detect a genesis checkout, and "
+            "shell_parse.py and worktree_cwd_guard.py only in comments. The "
+            "delegates run through `python3` — `_py=$(command -v python3 …)`, "
+            "which no earlier revision of this line mentioned either — so a "
+            "replay pays a process spawn per matching row on top of the guard's "
+            "own work. `rm` and `mv` occur as the SUBCOMMAND names in the "
+            "`*git*rm*|*git*mv*` case glob and in comments about what the guard "
+            "matches; neither is invoked.",
+            evidence=ShEvidence(
+                source=lambda: (_REPO / "scripts" / "bash_safety_hook.sh").read_text(),
+                label="scripts/bash_safety_hook.sh",
+                references_scripts=(
+                    "destructive_command_guard.py",
+                    "git_discard_guard.py",
+                    "git_push_guard.py",
+                    "protected_paths_guard.py",
+                    "shell_parse.py",
+                    "worktree_cwd_guard.py",
+                ),
+                references_programs=("gh", "git", "python3", "rm", "mv"),
+            ),
+            cites=(
+                Cite(
+                    "scripts/bash_safety_hook.sh",
+                    None,
+                    'printf \'%s\' "$RAW" | "$_py" "$SCRIPT_DIR/hooks/git_discard_guard.py"',
+                ),
+                Cite(
+                    "scripts/bash_safety_hook.sh",
+                    None,
+                    "for _guard in destructive_command_guard.py protected_paths_guard.py; do",
+                ),
+                Cite(
+                    "git_discard_guard",
+                    "_snapshot_worktree",
+                    '["git", "-C", cwd, "stash", "create", "git-discard-guard snapshot"]',
+                ),
+                Cite(
+                    "git_discard_guard",
+                    "_snapshot_dir",
+                    'resolve_store_dir("GENESIS_DISCARD_SNAPSHOT_DIR")',
+                ),
+            ),
         ),
     ),
-    "git_discard": Guard(
-        run=lambda c, w: _run_python_guard("git_discard_guard", c, w),
+    "git_discard": python_guard(
+        "git_discard_guard",
         safety=not_replay_safe(
             "PRESENT AND REFUSED rather than absent, because absence teaches "
             "nothing at --list and absence-as-exclusion is the pattern that "
@@ -739,11 +1209,35 @@ GUARDS: dict[str, Guard] = {
             "it; the conclusion is unchanged, the mechanism is not.) "
             "It is also the one guard not wrapped by run_guard, so this harness's "
             "crash-counts-as-block rule would misreport it: in production it "
-            "fails OPEN."
+            "fails OPEN.",
+            evidence=PyEvidence(
+                module="git_discard_guard",
+                reads_env=True,
+                reads_argv=True,
+                spawns=True,
+                writes_fs=True,
+            ),
+            cites=(
+                Cite(
+                    "git_discard_guard",
+                    "_snapshot_worktree",
+                    '["git", "-C", cwd, "stash", "create", "git-discard-guard snapshot"]',
+                ),
+                Cite(
+                    "git_discard_guard",
+                    "_snapshot_dir",
+                    'resolve_store_dir("GENESIS_DISCARD_SNAPSHOT_DIR")',
+                ),
+                # run_guard is cited by NAME only. The claim is that this guard is
+                # not wrapped by it — an absence, which no substring of anything
+                # can establish. What the citation pins is that the wrapper still
+                # exists under that name, so the sentence keeps a live referent.
+                Cite("hook_input", "run_guard", ""),
+            ),
         ),
     ),
-    "git_push": Guard(
-        run=lambda c, w: _run_python_guard("git_push_guard", c, w),
+    "git_push": python_guard(
+        "git_push_guard",
         safety=not_replay_safe(
             "read-only on the filesystem, but it shells out to `gh repo view` / "
             "`gh pr view` and to git at classify time, and a large fraction of "
@@ -754,7 +1248,21 @@ GUARDS: dict[str, Guard] = {
             "their rate limit, from a tool whose docstring says it replays local "
             'history. "Read-only" and "safe to run thousands of times against a '
             'remote API" are different claims, and the count only grows: the '
-            "same three figures read 1,195 / 924 / 51,052 five days earlier."
+            "same three figures read 1,195 / 924 / 51,052 five days earlier.",
+            evidence=PyEvidence(
+                module="git_push_guard",
+                reads_env=True,
+                reads_argv=True,
+                spawns=True,
+                writes_fs=True,
+            ),
+            cites=(
+                # `spawns` is the fact this refusal rests on, so it gets the cites
+                # that fail if the shelling-out moves. writes_fs arrives
+                # transitively through audit_jsonl, the override-record store.
+                Cite("git_push_guard", "_current_branch", "subprocess.run"),
+                Cite("git_push_guard", "_derive_repo_from_cwd", "subprocess.run"),
+            ),
         ),
     ),
 }
@@ -1043,6 +1551,47 @@ def main() -> int:
             print(f"    {safety.why}")
             if safety.caveat:
                 print(f"    caveat: {safety.caveat}")
+            ev = safety.evidence
+            if isinstance(ev, PyEvidence):
+                facts = " ".join(
+                    f"{f}={getattr(ev, f)}"
+                    for f in ("reads_env", "reads_argv", "spawns", "writes_fs")
+                )
+                print(f"    facts ({ev.module}, transitive): {facts}")
+            elif isinstance(ev, ShEvidence):
+                print(
+                    f"    shell ({ev.label}): "
+                    f"scripts={', '.join(ev.references_scripts) or 'none'} | "
+                    f"programs={', '.join(ev.references_programs) or 'none'}"
+                )
+            if safety.cites:
+                print(f"    cites: {len(safety.cites)} construct(s), machine-resolved")
+        # Printed ONCE, at the end, because it qualifies every `false` above. A
+        # fact is only ever "none of these spellings" — the tool says which, so
+        # nobody reads `spawns=False` as a proof of purity it cannot be.
+        print("\ncoverage — a False fact means none of these spellings were found:")
+        for fact, spellings in fact_coverage().items():
+            print(f"  {fact:11s} {len(spellings):2d}  {', '.join(spellings)}")
+        print(
+            f"  shell       {len(DELEGATED_PROGRAMS):2d}  {', '.join(DELEGATED_PROGRAMS)}"
+            f"\n              plus {len(repo_script_names())} tracked script basenames "
+            "under scripts/ (git ls-files)"
+        )
+        print(
+            "\nNot covered, and named rather than left silent:"
+            "\n  - Facts are matched as TEXT, over the transitive import closure. An"
+            "\n    aliased or from-imported spelling IS resolved (import subprocess as"
+            "\n    sp; from subprocess import run), but a name reached through getattr"
+            "\n    or rebound at runtime is not."
+            "\n  - The shell scan reads NAMES in the text. A path built at runtime —"
+            '\n    bash_safety_hook.sh already invokes through "$SCRIPT_DIR/hooks/$_guard"'
+            "\n    — is only visible because the loop above it lists the basenames"
+            "\n    literally. Replace that with a glob and the delegation disappears from"
+            "\n    this scan while widening in reality."
+            "\n  - inline_blob's claim that the blob reads no inherited variable is a"
+            "\n    MEASUREMENT over an embedded shell string, not a citation. Re-running"
+            "\n    it is different machinery and this checker does not vouch for it."
+        )
         return 0
     if not args.guard and not args.all:
         ap.error("pass --guard <name>, --all, or --list")

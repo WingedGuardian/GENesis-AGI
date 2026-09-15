@@ -177,13 +177,17 @@ is a tool for it:** `python3 scripts/replay_guard_corpus.py --guard <name>`
 replays this install's own recorded `(command, cwd)` pairs through the guard and
 prints `blocked k/N`. Read `--list` first — a guard is REFUSED for replay until
 someone declares what running it a few hundred thousand times does to the
-machine, and three of the six are refused today for exactly that reason. Two
-limits travel with the number: it is stamped UNCLASSIFIED because the corpus
-contains dangerous commands too, so it is one side of the tradeoff and needs the
-positive control the bullet above demands; and the blocked samples are real
-command lines that contain secrets passed in argv, so `--show` is off by default
-and its output must never reach a PR body, an issue, or a commit message. The
-count and the verdict are what go public.
+machine, and three of the six are refused today for exactly that reason. That
+declaration is machine-checked rather than prose: `--list` prints each guard's
+facts (env/argv/spawn/write, from a transitive AST walk), its citations, and the
+spelling set behind them, so a `False` is a bounded claim and not a proof of
+purity. Two limits travel with the number: it is stamped UNCLASSIFIED because the
+corpus contains dangerous commands too, so it is one side of the tradeoff and
+needs the positive control the bullet above demands; and there is **no way to
+print the blocked command lines** — the `--show` flag that used to do it was
+removed, because those lines are real commands that contain secrets passed in
+argv (issue #2007 tracks what a correct version owes). The count and the verdict
+are what go public.
 
 The measurement is a GATE, not a footnote. Decide the acceptable threshold
 BEFORE measuring, and if the number misses it, tighten and re-measure rather
