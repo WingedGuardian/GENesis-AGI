@@ -83,25 +83,53 @@ only tree that inherits the counters — after establishing it is not live:
 
 ```bash
 git -C <worktree> status --short          # uncommitted work = another session's
-# a session ROOTED there — compare each pid's cwd, never grep command lines:
-for p in $(pgrep -x node); do
-  [ "$(readlink /proc/$p/cwd)" = "<worktree>" ] && echo "LIVE: pid $p"
-done
+
+# Who last committed here? The prepare-commit-msg hook stamps every in-session
+# commit with the session id (scripts/hooks/prepare-commit-msg).
+sid8=$(git -C <worktree> log -1 --format='%(trailers:key=Genesis-Session,valueonly)')
+
+# Is a session with that id still alive? session_heartbeats is written every
+# prompt; 10 minutes is the staleness window its own reader uses.
+sqlite3 "file:$HOME/genesis/data/genesis.db?mode=ro" \
+  "SELECT cc_session_id, topic FROM session_heartbeats
+    WHERE cc_session_id LIKE '${sid8}%'
+      AND updated_at > datetime('now','-10 minutes');"
+
+# Coverage filler: a session that has TOUCHED this worktree without committing
+# yet. Cross-check each id against the heartbeat query above — this file
+# outlives the session that wrote it, so on its own it reports the dead as live.
+grep -l '<worktree>' ~/.genesis/sessions/*/recent_files.json
 ```
 
-**Do not substitute `pgrep -af claude | grep <worktree>` for that loop.** The
-grep matches any command line CONTAINING the path — including the very command
-you are running, since your own shell invocation carries it. Measured while
-writing this section: that form reported a live session in a worktree where
-`/proc/<pid>/cwd` showed none. It is the same self-match that makes
-`pgrep -f pytest` report itself; the repo already documents that one.
+**Do NOT use a `/proc` cwd scan for this.** The obvious form —
 
-If it IS live, the PR is not yours to work; take the next one. Never
-`git worktree remove` it, and never assume it is stale — the standing rule
-(`references/worktrees.md`) is that every other worktree is an active session
-until shown otherwise. There is no PR-level claim or lease in the system today,
-so this check is the whole interlock, and it is advisory: it makes a collision
-visible, it does not prevent one.
+```bash
+for p in $(pgrep -x node); do [ "$(readlink /proc/$p/cwd)" = "<worktree>" ]; done
+```
+
+— cannot fire. MEASURED on a live install: of 15 candidate processes (11
+matching `node`, 4 matching `claude`), **zero** had a worktree as cwd. Every
+agent session sits at the main checkout, because the workflow this repo
+mandates keeps the session rooted in main and edits linked worktrees through
+absolute paths (`references/worktrees.md`). The probe returns "not live"
+unconditionally, which is worse than no check: it reads as an interlock and
+answers the same way whether or not anyone is there. `pgrep -af claude | grep
+<worktree>` is worse still — it matches any command line CONTAINING the path,
+including the one you are running.
+
+**Each of the three signals is partial, so use them together and state what
+they miss.** MEASURED on this install: the commit trailer is present on 119 of
+164 worktrees (73%), so 45 have no trailer at all; `recent_files.json` holds
+only the last 20 paths and only from `Read|Edit|Write|Glob|Grep`;
+`session_heartbeats` carries foreground sessions, so a dispatched one does not
+appear. A worktree can therefore be live and show nothing here.
+
+**None of this is a lock.** There is no lease or ownership record in the system
+today — this is evidence, read the same way the repo reads a peer's claim
+(`.claude/docs/concurrent-sessions.md`): a LEAD, not a fact. It makes a
+collision visible; it does not prevent one. So the standing rule still governs:
+every other worktree is an active session until shown otherwise, the PR is not
+yours to work if it is live, and you never `git worktree remove` it.
 
 ### The constraint this session type is measured against
 
@@ -169,20 +197,32 @@ the session type most exposed to both.
   the change under review — and step 3 requires the PR's code checked out, since
   verifying a finding means reading the code the finding is about.
 
-Before calling any red live, establish freshness by comparing REFS, not dates:
+Before calling any red live, establish freshness by comparing REFS, not dates —
+and note the two trees need DIFFERENT comparisons, because they have different
+invariants:
 
 ```bash
 git fetch origin main --quiet
-git merge-base --is-ancestor origin/main HEAD && echo "contains current main"
+
+# TOOLING tree: EQUALITY, not ancestry. Ancestry is satisfied by any branch
+# that merely CONTAINS main — including a PR branch that modifies the gate,
+# which is exactly when the verdict differs and exactly what you must not run.
+[ "$(git -C <tooling-tree> rev-parse HEAD)" = "$(git rev-parse origin/main)" ] \
+  && echo "tooling is canonical"
+
+# PR tree: ANCESTRY is the right test — it must CONTAIN main, and it is
+# supposed to carry the PR's own commits on top.
+git -C <pr-tree> merge-base --is-ancestor origin/main HEAD \
+  && echo "PR branch contains current main"
 ```
 
-Dating the code (`git log -1 --format=%ad -- <file>`) does not answer the
-question and will mislead in both directions: it reports the last commit
-touching that file on the current `HEAD`, so a fully current tree holding an
-unchanged old file looks stale, while a stale branch carrying one recent
-unrelated commit looks current. Only a fetch plus an ancestry comparison
-establishes that the checkout actually contains `origin/main` — which is the
-false blocker this section exists to prevent.
+Dating the code (`git log -1 --format=%ad -- <file>`, or the reflog) does not
+answer the question and will mislead in both directions: it reports the last
+commit touching that file on the current `HEAD`, so a fully current tree
+holding an unchanged old file looks stale, while a stale branch carrying one
+recent unrelated commit looks current. Only a fetch plus a REF comparison
+establishes what the checkout actually contains — which is the false blocker
+this section exists to prevent.
 
 *"Verify against actual code" needs the companion clause "verify against actual
 CURRENT code."*

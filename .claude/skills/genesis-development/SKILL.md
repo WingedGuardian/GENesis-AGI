@@ -659,14 +659,26 @@ these are the GATES that make it enforceable:
   describing state that no longer existed. Nothing warns you — `git log --all`
   and `git status` both work perfectly on a stale tree, and `git log --all`
   even SHOWS the fix, because the fetch is fine and only the checkout is old.
-  Before calling any red live: `git log -1 --format=%ad -- <file>`, or check
-  the reflog for when the tree last moved.
+  Before calling any red live, FETCH AND COMPARE REFS —
+  `git fetch origin main --quiet` then
+  `git merge-base --is-ancestor origin/main HEAD`. Do NOT date the code
+  (`git log -1 --format=%ad -- <file>`) or read the reflog: neither compares
+  the checkout against current `origin/main`, and both mislead in BOTH
+  directions — a current tree holding an unchanged old file looks stale, and a
+  stale branch carrying one recent unrelated commit looks current. Dating it
+  can therefore reproduce the exact false blocker this bullet exists to
+  prevent.
   **The same trap applies to your TOOLS, which is easier to miss**: a worktree
   carries its own copy of `scripts/`, so a script run from an old branch is the
   OLD script. MEASURED the same day — `git_push_guard.py --check-pr 1611` from
   a days-old worktree reported `ci: pending` where the current copy reported
   `ci: green`, same PR, same minute. Run repo tooling from a tree at
-  `origin/main`, not from whatever branch you happen to be on.
+  `origin/main`, not from whatever branch you happen to be on — and verify
+  that with EQUALITY, not the ancestry test above:
+  `[ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ]`. Ancestry is
+  satisfied by any branch that merely CONTAINS main, including a PR branch
+  that MODIFIES the tool — which is precisely the case where the verdict
+  differs and the one you must not run.
   *"Verify against actual code" needs the companion "verify against actual
   CURRENT code."*
 - **Boundary instrumentation for multi-component failures.** When the path
