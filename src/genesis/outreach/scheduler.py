@@ -12,15 +12,20 @@ from genesis.outreach.config import OutreachConfig
 from genesis.outreach.engagement import EngagementTracker
 from genesis.outreach.morning_report import MorningReportGenerator
 from genesis.outreach.pipeline import OutreachPipeline
-from genesis.outreach.types import OutreachCategory, OutreachRequest, OutreachStatus
+from genesis.outreach.types import (
+    # Discord SUB-CHANNEL names used by campaign sessions in pending_outreach.
+    # The outreach pipeline routes via adapter name ("discord"), not sub-channel.
+    # Lives in outreach.types so `outreach_send` and this module share ONE list;
+    # the private alias keeps existing references here reading unchanged.
+    DISCORD_CHANNELS as _DISCORD_CHANNELS,
+)
+from genesis.outreach.types import (
+    OutreachCategory,
+    OutreachRequest,
+    OutreachStatus,
+)
 
 logger = logging.getLogger(__name__)
-
-# Discord sub-channel names used by campaign sessions in pending_outreach.
-# The outreach pipeline routes via adapter name ("discord"), not sub-channel.
-# Moved to outreach.types so `outreach_send` shares ONE list with this module;
-# the alias is kept so existing references here keep reading.
-from genesis.outreach.types import DISCORD_CHANNELS as _DISCORD_CHANNELS  # noqa: E402
 
 
 class OutreachScheduler:
@@ -793,10 +798,18 @@ class OutreachScheduler:
                     ):
                         delivered_at = datetime.now(UTC).isoformat()
                         await self._mark_row_delivered(row, delivered_at)
+                        # Carry result.error, as the retry branch below already
+                        # does. A terminal disposition is not always a success:
+                        # IGNORED covers a self-send, a missing recipient, AND a
+                        # channel this install cannot reach — and that last one
+                        # is a misconfiguration the operator has to fix. Marking
+                        # the row delivered while logging only "ignored" turns a
+                        # refused announcement into a silent drop.
                         logger.info(
-                            "Drained pending outreach %s: %s (terminal)",
+                            "Drained pending outreach %s: %s (terminal)%s",
                             row.get("id") or f"rowid:{row.get('rowid')}",
                             result.status.value,
+                            f" — {result.error}" if result.error else "",
                         )
                     else:
                         logger.warning(

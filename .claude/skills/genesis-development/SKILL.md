@@ -80,6 +80,45 @@ path. Apply this 4-level verification taxonomy:
 
 Mark nothing "done" below Level 3.
 
+### Measure, Do Not Choose
+
+**If your reason for picking a command, a flag, a value or a procedure is a claim
+about how something OUTSIDE this repo behaves — git, the shell, the harness, a
+provider API — then "which of these is right?" is an experiment you have not run,
+not a judgement you are entitled to make.** Run it first. Ship what the run says.
+
+The tripwire is mechanical, so it cannot be reasoned around: you are about to write
+an instruction someone will execute, and your justification is a sentence about
+another program's semantics that you did not observe. Reading the manual feels like
+evidence. It is not.
+
+Three clauses, each bought by a defect:
+
+1. **Enumerate the space; do not pick cases from it.** List the AXES that
+   independently change the behaviour, sweep the cross product, score every
+   candidate on every cell. The cases you would think of are the cases you already
+   believe in, which is exactly why they pass.
+2. **Pre-register the predicate, the decision rule, and what you will do if
+   nothing passes.** That last clause is what stops the least-bad option being
+   rationalised into the right one.
+3. **Control the instrument.** An ORACLE arm that must score 100% and a NO-OP arm
+   that must fail. If the oracle is not perfect, every number in the run is void —
+   including the flattering ones. Treat a surprising result as a suspicion about
+   the harness before it is a finding about the code.
+
+MEASURED instance: a hook note telling a reader how to undo a destructive git
+operation was wrong FOUR times, each version reasoned out and each refuted by a
+state nobody had constructed. The fifth was swept rather than chosen — 320 states x
+6 procedures with an oracle and a no-op. Of the 240 states where the reader's HEAD
+had not moved, the winner scored 240/240; the best alternative managed 80, and the
+procedure that had actually SHIPPED managed 56. The sweep also surfaced a boundary
+no reasoning had: that same winner scores 0/80 once the reader has committed, where
+a different command gets 72. Twenty minutes of compute against three review rounds
+of guessing.
+
+Full method, including how to split a space where the question stops being
+well-posed: `references/high-stakes-verification.md` section 9.
+
 **A new SKILL has its own version of this, and it is easy to miss.** Dropping a
 `SKILL.md` into `.claude/skills/` gets it INDEXED automatically (the catalog
 generator scans the directory — no registry to update), which looks like done.
@@ -94,7 +133,6 @@ shorter than 3 characters and does no stemming, so `pr` can never match and
 `merge` will not match "merging" — declare the surface forms. Verify a new
 skill by scoring it against the phrasings a user would really type, in BOTH
 directions.
-
 ### GROUNDWORK Code Is NOT Dead Code
 
 Code tagged `# GROUNDWORK(feature-id): why` is intentional future
@@ -3517,6 +3555,7 @@ references on every trigger.
 | Pending work, active incidents, subsystem status | `references/build-state.md` |
 | Auditing/deep-reviewing AI-generated code (failure taxonomy, audit passes) | `references/ai-code-audit.md` |
 | Pre-release review, bug hunt, guard/gate change — verification method | `references/high-stakes-verification.md` |
+| Choosing a command/value/procedure by reasoning about an external tool | same, section 9 |
 | Which code tool to use (CBM vs Serena vs GitNexus vs Grep) | `.claude/docs/code-intelligence.md` |
 
 **Freshness rule:** On first read of `codebase-map.md` in a session,
