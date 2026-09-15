@@ -183,7 +183,11 @@ def make_marketing_reply_notifier(pipeline):
         # the 200-char cap on the other reply fields.
         message_id = (getattr(reply, "message_id", "") or thread.get("id") or "")[:200]
         request = OutreachRequest(
-            category=OutreachCategory.NOTIFICATION,
+            # MARKETING (not NOTIFICATION) so the reply-ping lands in the dedicated
+            # Marketing topic like the rest of the campaign's owner updates, instead
+            # of the DM that `notification` routes to. submit_raw still skips
+            # governance/quiet-hours, so this stays an always-deliver owner ping.
+            category=OutreachCategory.MARKETING,
             channel="telegram",
             topic=f"Marketing reply {message_id}",
             context=f"{message_id}\n{text}",

@@ -810,19 +810,40 @@ def test_charter_block_db_missing_table_falls_back_to_file(tmp_path):
 
 
 def test_charter_block_budget_guard(tmp_path):
-    db_file = _seed_db_charter(
-        tmp_path,
+    """The block stays under its ceiling, and the ceiling is read from the code.
+
+    Asserts `_ctx._CHARTER_BLOCK_MAX` rather than a literal: this test carried a
+    second, hardcoded copy of that constant and went RED in CI when the constant
+    moved, which is the drift a duplicated bound always produces. Two cells, so
+    the bound is not vacuous — one charter that FITS (proving the per-field
+    origin cap still applies when no degrade is needed) and one that does not
+    (proving the guard actually fires and lands back under the ceiling).
+    """
+    fitting = _seed_db_charter(
+        tmp_path / "fits",
+        origin_prompt="o" * 4000,
+        mission="m" * 1000,
+        pointers=json.dumps(["p" * 60] * 3),
+    )
+    _seed_ledger(fitting, "sid-db", [(f"l{i}", "t" * 200, "open") for i in range(3)])
+    block = _ctx._charter_emission_block(
+        "sid-db", "compact", sessions_dir=tmp_path / "fits" / "sessions", db_path=fitting
+    )
+    assert len(block) <= _ctx._CHARTER_BLOCK_MAX, len(block)
+    assert "truncated" in block  # origin capped even though the block fits
+
+    # Same shape, enough open rows to blow the ceiling -> structured degrade.
+    over = _seed_db_charter(
+        tmp_path / "over",
         origin_prompt="o" * 4000,
         mission="m" * 1000,
         pointers=json.dumps(["p" * 300] * 12),
     )
-    _seed_ledger(
-        db_file,
-        "sid-db",
-        [(f"l{i}", "t" * 900, "open") for i in range(6)],
+    ids = [f"l{i}" for i in range(20)]
+    _seed_ledger(over, "sid-db", [(i, "t" * 900, "open") for i in ids])
+    degraded = _ctx._charter_emission_block(
+        "sid-db", "compact", sessions_dir=tmp_path / "over" / "sessions", db_path=over
     )
-    block = _ctx._charter_emission_block(
-        "sid-db", "compact", sessions_dir=tmp_path / "sessions", db_path=db_file
-    )
-    assert len(block) <= 2900
-    assert "truncated" in block
+    assert len(degraded) <= _ctx._CHARTER_BLOCK_MAX, len(degraded)
+    for row_id in ids:
+        assert row_id in degraded, f"degrade dropped open row id {row_id}"

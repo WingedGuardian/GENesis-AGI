@@ -22,17 +22,30 @@ def test_validate_accepts_native_default():
     assert _validate_cc_roster({"default": "claude"}) == []
 
 
+# Hermetic peer. The shipped config deliberately contains NO peers (they are
+# install-specific, configured in ~/.genesis/config/cc_roster.local.yaml), so a
+# test must supply its own. `_validate_cc_roster` merges `changes["models"]` over
+# the loaded roster before validating, which is exactly the "add a peer and make
+# it default in one call" path — so this exercises more than the old version did.
+_TEST_PEER = {
+    "test-peer": {
+        "anthropic_base_url": "https://example.invalid/api/anthropic",
+        "model_id": "test-model",
+        "auth_env": "GENESIS_TEST_ROSTER_KEY",
+    }
+}
+
+
 def test_validate_accepts_routed_default_when_auth_present(monkeypatch):
-    # config/cc_roster.yaml ships glm-5.2 with auth_env ZHIPU_API_KEY.
-    monkeypatch.setenv("ZHIPU_API_KEY", "sk-test")
-    assert _validate_cc_roster({"default": "glm-5.2"}) == []
+    monkeypatch.setenv("GENESIS_TEST_ROSTER_KEY", "sk-test")
+    assert _validate_cc_roster({"default": "test-peer", "models": _TEST_PEER}) == []
 
 
 def test_validate_rejects_routed_default_when_auth_missing(monkeypatch):
     # no-silent-degrade: setting a routed default with no key must be loud.
-    monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
-    errs = _validate_cc_roster({"default": "glm-5.2"})
-    assert errs and "ZHIPU_API_KEY" in errs[0]
+    monkeypatch.delenv("GENESIS_TEST_ROSTER_KEY", raising=False)
+    errs = _validate_cc_roster({"default": "test-peer", "models": _TEST_PEER})
+    assert errs and "GENESIS_TEST_ROSTER_KEY" in errs[0]
 
 
 def test_validate_rejects_unknown_default():

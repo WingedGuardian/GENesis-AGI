@@ -80,7 +80,39 @@ async def outreach_send(
     For email replies, pass thread_id to route to the correct recipient.
     The thread_id maps to a registered email thread whose recipient is
     used for delivery.
+
+    **Discord: name the CHANNEL, not the adapter.** Pass
+    ``channel="announcements"`` (or any name in ``DISCORD_CHANNELS``) and it is
+    routed to that channel. ``channel="discord"`` still works and goes wherever
+    ``OUTREACH_RECIPIENT_DISCORD`` points, which defaults to ``dev-discussion``.
+
+    That default is why this exists. The pipeline has always supported steering
+    a Discord send (the recipient IS the webhook name), but this tool exposed no
+    way to say which channel — so every caller asking for "Discord" got
+    dev-discussion, silently, including a release announcement that belonged in
+    announcements. A caller could not tell it had been redirected: nothing
+    errored, and the log line recorded the REQUESTED name.
+
+    That fallback is gone. A channel with no configured webhook is now REFUSED
+    with an error naming the setting to add. The refusal is correct, expected
+    behaviour and not a fault to work around: configure the named setting, or
+    send to the default channel. Do not retry it — the condition is permanent
+    until an operator changes configuration.
     """
+    # Discord sub-channel → adapter + recipient. `target_chat_id` is the
+    # pipeline's existing per-request recipient override (it wins over the
+    # configured default in _deliver), so this needs no new plumbing — only a
+    # name the caller can actually pass.
+    #
+    # NOTE THE ORDERING, it is load-bearing. `channel` is NOT rewritten here,
+    # because the queued path below enqueues it verbatim and the scheduler's
+    # drain does its own sub-channel mapping from the RAW name. Rewriting it up
+    # front would store "discord" in pending_outreach and lose which channel was
+    # asked for — the exact bug this change exists to remove, reintroduced one
+    # code path over. MEASURED: a first version of this fix did precisely that.
+    from genesis.outreach.types import DISCORD_CHANNELS
+
+    discord_channel: str | None = channel if channel in DISCORD_CHANNELS else None
     # Resolve the per-thread recipient for email sends BEFORE the
     # pipeline/fallback split — so a QUEUED follow-up (pipeline=None subprocess)
     # carries its thread recipient through pending_outreach instead of arriving
@@ -155,9 +187,16 @@ async def outreach_send(
         context=message,
         salience_score=salience_score,
         signal_type=category,
-        channel=channel,
+        # Adapter name for the live-pipeline path. The raw sub-channel rides in
+        # target_chat_id beside it; the queued path above kept the raw name and
+        # lets the drain do this same mapping.
+        channel="discord" if discord_channel else channel,
         labeled_surplus=labeled_surplus,
         validated_recipient=validated_recipient,
+        # The Discord sub-channel, when one was named. `_deliver` resolves
+        # `validated_recipient or target_chat_id or <configured default>`, so
+        # this steers the send without disturbing any other channel.
+        target_chat_id=discord_channel,
         thread_id=thread_id,
         # The caller composed this message; deliver it exactly — never route an
         # agent-authored message back through the LLM drafter (it once inverted
@@ -286,6 +325,62 @@ async def marketing_send(prospect_id: str, subject: str, body: str) -> str:
 
 
 @mcp.tool()
+async def marketing_prospects_list(limit: int = 100) -> str:
+    """List the ACTIVE, non-opted-out marketing prospects — the cold-outreach targets
+    the campaign may pitch — so it can enumerate → personalise a pitch → call
+    ``marketing_send(prospect_id, subject, body)``.
+
+    READ-ONLY (never sends). Returns ``id``/``email``/``name``/``company`` per row.
+    Excludes any prospect that is opted-out OR already ``contacted``/``replied``
+    (``list_active`` semantics), so a target that has been delivered a pitch never
+    reappears here — this is what stops the campaign re-pitching the same person.
+    Also returns the live ``mode`` of the ``marketing_outreach`` lever so the campaign
+    can do nothing when it is ``off``. On a fresh clone the store is empty and this
+    returns an empty list.
+
+    Args:
+        limit: max prospects to return (default 100). ``truncated`` flags a longer store.
+    """
+    from genesis.outreach.marketing_config import effective_mode
+
+    mode = effective_mode()
+    if _db is None:
+        return json.dumps({"status": "error", "reason": "no_database", "mode": mode, "prospects": []})
+    if mode == "off":
+        # Mirror marketing_send's OUTER off-switch: when the marketing lever is off the
+        # cold-send substrate surfaces NOTHING — don't hand the target inventory to a
+        # campaign session that shouldn't be running. Code-gated (not LLM-trusted to
+        # read the `mode` field), so the off posture holds even for a misbehaving caller.
+        return json.dumps({
+            "status": "ok", "mode": mode, "count": 0, "total": 0, "truncated": False,
+            "prospects": [],
+        })
+
+    from genesis.db.crud import marketing_prospects as mp
+
+    n = limit if isinstance(limit, int) and limit > 0 else 100
+    rows = await mp.list_active(_db)
+    truncated = len(rows) > n
+    prospects = [
+        {
+            "id": r["id"],
+            "email": r["email"],
+            "name": r.get("name"),
+            "company": r.get("company"),
+        }
+        for r in rows[:n]
+    ]
+    return json.dumps({
+        "status": "ok",
+        "mode": mode,
+        "count": len(prospects),
+        "total": len(rows),  # denominator for `truncated` (no silent cap)
+        "truncated": truncated,
+        "prospects": prospects,
+    })
+
+
+@mcp.tool()
 async def outreach_poll(
     channel: str,
     question: str,
@@ -302,11 +397,45 @@ async def outreach_poll(
         duration_hours: How long the poll stays open (default 7 days, max 768h).
         allow_multiselect: Whether users can vote for multiple options.
     """
-    # Resolve webhook URL from environment
-    env_key = f"DISCORD_WEBHOOK_{channel.upper().replace('-', '_')}"
-    webhook_url = os.environ.get(env_key) or os.environ.get("DISCORD_WEBHOOK_URL")
+    # Resolve the webhook, REFUSING an unconfigured named channel rather than
+    # posting to the default one. This tool kept its own copy of the `or
+    # DISCORD_WEBHOOK_URL` fallback, so `outreach_poll(channel="bug-reports")`
+    # posted to the default channel and returned {"status": "created",
+    # "channel": "bug-reports"} — the same undetectable redirect this change
+    # removes from outreach_send, and worse for a poll, which then collects the
+    # wrong audience's votes.
+    #
+    # `_discord_webhook_env` is imported rather than re-derived: this was the
+    # THIRD copy of the env-naming rule, and a copy is what lets a refusal
+    # message name a variable that would not actually configure the channel.
+    from genesis.runtime.init.outreach import (
+        _discord_webhook_env,
+        _is_reserved_discord_channel,
+    )
+
+    env_key = _discord_webhook_env(channel)
+    # The RESERVED name is checked BEFORE the lookup, not after. `url` (in any
+    # case) inverts onto DISCORD_WEBHOOK_URL — the default webhook — so a direct
+    # lookup SUCCEEDS, short-circuits the default-channel test below, and posts
+    # the poll to the default channel while reporting the `url` channel back.
+    # That is the redirect this whole change removes, arriving through the one
+    # channel name that is not a channel.
+    webhook_url = None if _is_reserved_discord_channel(channel) else os.environ.get(env_key)
     if not webhook_url:
-        return json.dumps({"error": f"No webhook URL found (tried {env_key} and DISCORD_WEBHOOK_URL)"})
+        # The DEFAULT channel legitimately resolves to DISCORD_WEBHOOK_URL — it
+        # need not also appear in the per-channel map. Any OTHER unconfigured
+        # name is refused.
+        default_channel = os.environ.get("OUTREACH_RECIPIENT_DISCORD") or "dev-discussion"
+        if not channel or channel == default_channel:
+            webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
+        if not webhook_url:
+            return json.dumps({
+                "error": (
+                    f"No Discord webhook configured for channel {channel!r} — "
+                    f"refusing to post to the default channel instead. Configure "
+                    f"{env_key}, or send to {default_channel}."
+                )
+            })
 
     # ── Dedup check: skip if same poll posted within 7 days ──
     if _db is not None:
@@ -442,6 +571,111 @@ async def outreach_queue(
         return [dict(zip(columns, row, strict=False)) for row in await cursor.fetchall()]
     except Exception as exc:
         return [{"error": f"Query failed: {exc}"}]
+
+
+@mcp.tool()
+async def outreach_pending(limit: int = 50, offset: int = 0) -> dict:
+    """List messages QUEUED but not yet sent — the ones `outreach_cancel` can act on.
+
+    Deliberately a separate tool from ``outreach_queue``, which reads
+    ``outreach_history`` (messages already DELIVERED) and therefore never shows a
+    scheduled message at all. That gap is why this exists: without it, a queued
+    message is only addressable by the id its ``outreach_send`` call returned, so
+    once that id is out of view the message cannot be found, inspected, or
+    cancelled — it simply arrives.
+
+    Returns each row's id, when it is due (``deliver_after``), and a short message
+    preview, soonest-due first. A NULL ``deliver_after`` means "goes out on the
+    next drain tick", so it sorts FIRST — ordering on ``deliver_after`` directly
+    would push the imminent messages behind everything scheduled for next month,
+    and the LIMIT would then drop exactly the ones worth cancelling.
+
+    PAGED, with a denominator. Returns
+    ``{items, total, offset, limit, truncated}`` — never a bare list. A bare list
+    capped at 50 is indistinguishable from a complete one, so a caller with 60
+    queued messages would have concluded it had seen them all and that the missing
+    ten did not exist; and since every id worth cancelling comes from this tool,
+    the invisible ones were also the uncancellable ones. ``total`` is the real
+    count and ``truncated`` says outright whether more remain; page with ``offset``.
+    """
+    if not _db:
+        return {"error": "not initialized"}
+    try:
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        return {"error": "limit and offset must be integers"}
+    try:
+        from genesis.db.crud import pending_outreach
+
+        await pending_outreach.ensure_table(_db)  # idempotent; init is fire-and-forget
+        where = "WHERE delivered = 0 AND cancelled_at IS NULL"
+        count_cursor = await _db.execute(
+            f"SELECT COUNT(*) FROM pending_outreach {where}"  # noqa: S608 — literal
+        )
+        total = int((await count_cursor.fetchone())[0])
+        cursor = await _db.execute(
+            f"""SELECT id, category, channel, urgency, deliver_after, created_at,
+                      substr(message, 1, 160) AS message_preview
+                 FROM pending_outreach
+                {where}
+                ORDER BY COALESCE(deliver_after, created_at) ASC, created_at ASC
+                LIMIT ? OFFSET ?""",  # noqa: S608 — `where` is a literal above
+            (limit, offset),
+        )
+        columns = [d[0] for d in cursor.description]
+        items = [dict(zip(columns, row, strict=False)) for row in await cursor.fetchall()]
+        return {
+            "items": items,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "truncated": offset + len(items) < total,
+        }
+    except Exception as exc:
+        return {"error": f"Query failed: {exc}"}
+
+
+@mcp.tool()
+async def outreach_cancel(pending_id: str) -> str:
+    """Cancel a queued, not-yet-sent message by its pending id.
+
+    Use this to retract or reschedule a queued message: cancel, then re-send with
+    the new timing. Before this existed the only options were to send a duplicate
+    or to mark the original DELIVERED — and that second one writes a false record
+    into a table that gets read back, so a later session concludes the recipient
+    was told something they were not.
+
+    Returns a status naming what actually happened, because "cancelled" and "there
+    was nothing to cancel" must not look alike:
+      cancelled         — this call cancelled a live queued message
+      already_cancelled — a previous cancel already took effect
+      already_dequeued  — the message has left the queue. It was sent, OR it is
+                          HELD at the autonomy gate awaiting the owner's approval
+                          (in which case it has NOT been sent and still will be),
+                          OR it aged out after 24h. The queue writes the same flag
+                          for all three, so this tool does not claim delivery it
+                          cannot verify.
+      unknown_id        — no such pending message
+
+    Get ids from ``outreach_pending`` (paged: check its ``truncated`` flag).
+    """
+    if not _db:
+        return json.dumps({"error": "not initialized"})
+    try:
+        from genesis.db.crud import pending_outreach
+
+        await pending_outreach.ensure_table(_db)  # idempotent; init is fire-and-forget
+        did, reason = await pending_outreach.cancel(_db, pending_id)
+    except Exception as exc:
+        return json.dumps({"error": f"Cancel failed: {exc}"})
+    payload = {"status": reason, "cancelled": did, "pending_id": pending_id}
+    if reason == "already_dequeued":
+        payload["note"] = (
+            "left the queue — sent, awaiting approval at the autonomy gate, or aged "
+            "out. Not necessarily delivered."
+        )
+    return json.dumps(payload)
 
 
 async def _server_rpc(path: str, payload: dict, *, read_timeout_s: float) -> dict:

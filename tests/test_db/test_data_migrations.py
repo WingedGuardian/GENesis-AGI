@@ -130,7 +130,14 @@ def _patch_migrations(monkeypatch, mods: dict):
     """Wire discovery + import to a dict of {stem: fake module}."""
     from pathlib import Path
 
-    available = [(stem[:5], stem, Path(f"/fake/{stem}.py")) for stem in mods]
+    # Derive the id with the RUNNER's pattern rather than a fixed slice:
+    # `stem[:5]` silently yields "d2026" for a timestamp-shaped fake, so a
+    # future timestamp fixture would test a nonsense id and still pass.
+    available = []
+    for stem in mods:
+        m = runner_mod._DATA_MIGRATION_PATTERN.match(f"{stem}.py")
+        assert m, f"fake migration stem {stem!r} does not match the runner pattern"
+        available.append((m.group(1), stem, Path(f"/fake/{stem}.py")))
     monkeypatch.setattr(DataMigrationRunner, "_discover", lambda self: available)
     monkeypatch.setattr(
         runner_mod.importlib, "import_module", lambda name: mods[name.rsplit(".", 1)[-1]]
@@ -238,29 +245,26 @@ def test_no_duplicate_migration_prefixes_in_tree():
     test fires at CI time on the offending PR's merge ref, where the collision
     is cheap to fix.
     """
-    import re
     from collections import Counter
 
     from genesis.db._migration_discovery import discover_numbered_modules
+    from genesis.db._migration_ids import DATA, SCHEMA
 
+    # The NAMESPACE, not a pattern: discovery resolves the pattern from the
+    # contract itself, so this test cannot bind to a regex that disagrees with
+    # the directory it is scanning. (A copied regex here silently stopped
+    # covering timestamp-id migrations the moment the runner's pattern widened.)
     surfaces = [
-        (
-            runner_mod._DATA_MIGRATIONS_DIR,
-            runner_mod._DATA_MIGRATION_PATTERN,
-            "data migration",
-        ),
-        (
-            runner_mod._DATA_MIGRATIONS_DIR.parent / "migrations",
-            re.compile(r"^(\d{4})_\w+\.py$"),
-            "schema migration",
-        ),
+        (runner_mod._DATA_MIGRATIONS_DIR, DATA, "data migration"),
+        (runner_mod._DATA_MIGRATIONS_DIR.parent / "migrations", SCHEMA, "schema migration"),
     ]
-    for directory, pattern, label in surfaces:
-        ids = [mid for mid, _, _ in discover_numbered_modules(directory, pattern)]
+    for directory, namespace, label in surfaces:
+        ids = [mid for mid, _, _ in discover_numbered_modules(directory, namespace)]
         dupes = {mid: n for mid, n in Counter(ids).items() if n > 1}
         assert not dupes, (
             f"duplicate {label} prefix(es) {dupes} in {directory} — "
-            "rename the newer file to the next free prefix"
+            "rename the newer file to a fresh UTC timestamp id "
+            "(`date -u +%Y%m%d%H%M%S`; data migrations prefix a 'd')"
         )
 
 

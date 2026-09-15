@@ -129,6 +129,43 @@ def is_dispatched_session_env() -> bool:
     )
 
 
+class DispatchGateRefused(PermissionError):
+    """A dispatched/unsupervised session attempted a human-only gated action.
+
+    Raised by :func:`guard_human_gate` at the SERVICE/CRUD layer for irreversible,
+    human-gated actions (the entity-merge approve/apply/reject writes), so a direct
+    ``import``+call from a Bash-capable dispatched session is refused too — not only the
+    MCP-tool wrapper. A dispatched session's subprocess inherits ``GENESIS_CC_SESSION=1``,
+    so the naive ``python3 -c "…approve…"`` bypass trips this.
+
+    NOT a sandbox: this is an env-var self-report. A session that deliberately forges
+    ``GENESIS_SESSION_SUPERVISED=1`` in a subprocess it spawns, or opens the SQLite file
+    with raw SQL, still bypasses it — full containment of Bash-capable autonomous builders
+    (Sentinel/Ego run unrestricted Bash with same-host DB access) is a separate
+    architecture concern, tracked as a follow-up. This closes the normal tool-call and the
+    naive-import self-approval paths, and the raise surfaces the attempt in logs.
+    """
+
+
+def guard_human_gate(action: str) -> None:
+    """Raise :class:`DispatchGateRefused` if the caller is a dispatched/unsupervised session.
+
+    Chokepoint for irreversible human-only actions, placed at the service/CRUD layer
+    (below any MCP wrapper) so no caller can bypass it by importing the function directly.
+    Fail direction is safe: a foreground human terminal has no dispatch marker, and an
+    owner-attended conversation is supervised → both pass.
+    """
+    if is_dispatched_session_env():
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "human-only gate refused a dispatched/unsupervised session: %s", action
+        )
+        raise DispatchGateRefused(
+            f"{action} is human-only; a dispatched/unsupervised session must not call it"
+        )
+
+
 def should_enforce_drop(
     *,
     gate: str,

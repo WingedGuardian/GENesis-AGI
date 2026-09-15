@@ -63,6 +63,70 @@ async def _status(db, eid):
     return (await cur.fetchone())[0]
 
 
+@pytest.fixture
+async def file_db():
+    """File-backed DB at the conftest-redirected ``genesis_db_path()``.
+
+    The live apply path opens its OWN connection via ``get_raw_db(genesis_db_path())``;
+    an ``:memory:`` database is private to a single connection, so the shared ``db``
+    fixture cannot be seen by that owned connection. This fixture seeds the SAME file the
+    owned connection will open, so apply-path tests exercise the real two-connection
+    isolation. (The autouse ``_isolate_genesis_db_path`` conftest fixture has already
+    redirected ``genesis_db_path()`` to ``tmp_path/isolated-genesis.db``.)
+    """
+    import aiosqlite
+
+    from genesis.db.connection import SerializedConnection
+    from genesis.db.schema import create_all_tables, seed_data
+    from genesis.env import genesis_db_path
+
+    conn = await aiosqlite.connect(str(genesis_db_path()))
+    conn.row_factory = aiosqlite.Row
+    await conn.execute("PRAGMA journal_mode=WAL")
+    await conn.execute("PRAGMA foreign_keys=ON")
+    await create_all_tables(conn)
+    await seed_data(conn)
+    await conn.commit()
+    wrapped = SerializedConnection(conn)
+    try:
+        yield wrapped
+    finally:
+        await wrapped.close()
+
+
+async def _status_fresh(eid):
+    """Read entity status on a FRESH connection to the file DB — proves COMMITTED state,
+    independent of any open txn on the fixture/owned connection."""
+    import aiosqlite
+
+    from genesis.env import genesis_db_path
+
+    conn = await aiosqlite.connect(str(genesis_db_path()))
+    try:
+        cur = await conn.execute("SELECT status FROM entities WHERE entity_id=?", (eid,))
+        row = await cur.fetchone()
+        return row[0] if row else None
+    finally:
+        await conn.close()
+
+
+async def _verdict_fresh(pair_key):
+    """Read an adjudication verdict on a FRESH connection (committed state)."""
+    import aiosqlite
+
+    from genesis.env import genesis_db_path
+
+    conn = await aiosqlite.connect(str(genesis_db_path()))
+    try:
+        cur = await conn.execute(
+            "SELECT verdict FROM entity_adjudications WHERE pair_key=?", (pair_key,)
+        )
+        row = await cur.fetchone()
+        return row[0] if row else None
+    finally:
+        await conn.close()
+
+
 # ── digit guard ──────────────────────────────────────────────────────────────
 
 
@@ -335,7 +399,8 @@ async def test_live_merge_race_guard_falls_back_to_proposed(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_live_phase0_applies_proposed_backlog(db):
+async def test_live_phase0_applies_proposed_backlog(file_db):
+    db = file_db  # apply path opens its own get_raw_db conn → needs a file-backed DB
     a = await _mk_entity(db, "kappa", "kappa")
     b = await _mk_entity(db, "kappaa", "kappaa")
     # a proposal recorded during a prior shadow run
@@ -349,6 +414,8 @@ async def test_live_phase0_applies_proposed_backlog(db):
         norm_a="kappa",
         norm_b="kappaa",
     )
+    # PR-1 gate: a shadow proposal is applied ONLY after a human approves it.
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="test")
     counts = await adj.run_adjudication_drain(db, _router({}), mode="live", budget=10)
     assert counts["merged"] == 1
     assert await _status(db, b) == "merged"
@@ -356,7 +423,8 @@ async def test_live_phase0_applies_proposed_backlog(db):
 
 
 @pytest.mark.asyncio
-async def test_live_phase0_stale_on_norm_drift(db):
+async def test_live_phase0_stale_on_norm_drift(file_db):
+    db = file_db
     a = await _mk_entity(db, "lambda", "lambda")
     b = await _mk_entity(db, "lambdaa", "lambdaa")
     await adj_crud.record_verdict(
@@ -369,10 +437,322 @@ async def test_live_phase0_stale_on_norm_drift(db):
         norm_a="lambda",
         norm_b="OLD-DIFFERENT-NORM",
     )
+    # Even an APPROVED proposal is not applied if identity drifted — staleness
+    # guard still wins over approval.
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="test")
     counts = await adj.run_adjudication_drain(db, _router({}), mode="live", budget=10)
     assert counts["stale"] == 1 and counts["merged"] == 0
     assert await _status(db, b) == "active"  # not applied
     assert (await adj_crud.get_by_pair(db, a, b))["verdict"] == "stale"
+
+
+@pytest.mark.asyncio
+async def test_live_backlog_skips_unapproved(db):
+    """The core PR-1 gate: an UN-approved proposal is never applied, even in live."""
+    a = await _mk_entity(db, "mu", "mu")
+    b = await _mk_entity(db, "muu", "muu")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="mu",
+        norm_b="muu",
+    )
+    # No approve() call → the backlog scan (approved_only) must skip it.
+    counts = await adj.run_adjudication_drain(db, _router({}), mode="live", budget=10)
+    assert counts["merged"] == 0
+    assert await _status(db, b) == "active"  # NOT merged
+    assert (await adj_crud.get_by_pair(db, a, b))["verdict"] == "proposed_merge"
+
+
+@pytest.mark.asyncio
+async def test_apply_approved_merges_applies_and_stamps(file_db):
+    """apply_approved_merges (mode-independent) applies an approved proposal + journals it."""
+    db = file_db
+    a = await _mk_entity(db, "nu", "nu")
+    b = await _mk_entity(db, "nuu", "nuu")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="nu",
+        norm_b="nuu",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="owner")
+
+    counts = await adj.apply_approved_merges(db, budget=10)  # no mode='live' needed
+
+    assert counts["merged"] == 1
+    assert await _status(db, b) == "merged"
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["verdict"] == "merge" and row["applied_at"]
+    # reversibility snapshot written
+    cur = await db.execute("SELECT loser_id FROM entity_merge_journal WHERE loser_id = ?", (b,))
+    assert await cur.fetchone() is not None
+
+
+@pytest.mark.asyncio
+async def test_reject_records_distinct_and_not_applied(db):
+    """Rejecting a proposal makes it 'distinct' (never applied) and drops approval."""
+    a = await _mk_entity(db, "xi", "xi")
+    b = await _mk_entity(db, "xii", "xii")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+    )
+    moved = await adj_crud.reject(db, pair_key=adj_crud.pair_key(a, b), reason="different things")
+    assert moved is True
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["verdict"] == "distinct" and row["approved_at"] is None
+    # A distinct pair is settled → excluded from re-nomination.
+    assert adj_crud.pair_key(a, b) in await adj_crud.settled_pair_keys(db)
+    # And it is never applied.
+    counts = await adj.apply_approved_merges(db, budget=10)
+    assert counts["merged"] == 0
+    assert await _status(db, b) == "active"
+
+
+@pytest.mark.asyncio
+async def test_reapprove_not_clobbered_by_readjudication(db):
+    """A re-adjudication of an already-approved pair must NOT wipe the approval."""
+    a = await _mk_entity(db, "omicron", "omicron")
+    b = await _mk_entity(db, "omicronn", "omicronn")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="omicron",
+        norm_b="omicronn",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="owner")
+    # Re-judge records a fresh proposed_merge on the same pair (upsert on pair_key).
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="omicron",
+        norm_b="omicronn",
+        provider="strong-model",
+    )
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["approved_at"] is not None and row["approved_by"] == "owner"
+    assert row["provider"] == "strong-model"  # the re-judge DID update other fields
+
+
+@pytest.mark.asyncio
+async def test_stale_voids_approval_no_silent_reapply(file_db):
+    """BLOCKER regression: a drifted APPROVED proposal is marked stale AND loses its
+    approval, so it cannot silently re-apply after re-adjudication under norms the
+    human never saw. mark_stale is the only transition that re-opens an approved row."""
+    db = file_db
+    a = await _mk_entity(db, "john smith", "john smith")
+    b = await _mk_entity(db, "jon smith", "jon smith")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="john smith",
+        norm_b="jon smith",
+    )
+    pk = adj_crud.pair_key(a, b)
+    await adj_crud.approve(db, pair_key=pk, approved_by="owner")
+    # `a` drifts (rename) before apply — still active, so it will re-pair later.
+    await db.execute("UPDATE entities SET norm_name='john q smith' WHERE entity_id=?", (a,))
+    await db.commit()
+
+    counts = await adj.apply_approved_merges(db, budget=10)
+    assert counts["stale"] == 1 and counts["merged"] == 0
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["verdict"] == "stale"
+    assert row["approved_at"] is None and row["approved_by"] is None  # approval VOIDED
+
+    # Re-adjudication re-proposes the pair (record_verdict preserves approval if any —
+    # but there is none now, so the re-proposed row is UN-approved).
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="john q smith",
+        norm_b="jon smith",
+    )
+    assert (await adj_crud.get_by_pair(db, a, b))["approved_at"] is None
+    # And it does NOT apply without a fresh human approval.
+    counts2 = await adj.apply_approved_merges(db, budget=10)
+    assert counts2["merged"] == 0
+    assert await _status(db, b) == "active"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_apply_does_not_clobber_applied_merge(file_db):
+    """P2#4: two appliers list the same approved row; the winner flips
+    proposed_merge→merge and commits. The loser then runs _apply_one_proposal on its
+    already-fetched proposal dict, re-reads identities (now both resolving to the
+    survivor), and enters the staleness branch. It must NOT rewrite the applied `merge`
+    back to `stale` (that stale write happens BEFORE the atomic claim, so the claim
+    never arbitrates it). mark_stale is conditional on verdict='proposed_merge', so it
+    is a no-op; the row stays `merge` and the loser counts it skipped (Codex P2, #1477)."""
+    db = file_db
+    a = await _mk_entity(db, "acme corp", "acme corp")
+    b = await _mk_entity(db, "acme inc", "acme inc")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="acme corp",
+        norm_b="acme inc",
+    )
+    pk = adj_crud.pair_key(a, b)
+    await adj_crud.approve(db, pair_key=pk, approved_by="owner")
+    # The loser captured this proposal dict BEFORE the winner committed.
+    proposal = (await adj_crud.list_proposed_merges(db, approved_only=True))[0]
+    # WINNER applies first: merge b into a and atomically flip the row to `merge`.
+    await entities_crud.merge_entity(db, loser_id=b, survivor_id=a)
+    assert (
+        await adj_crud.claim_approved_for_apply(db, pair_key=pk, loser_id=b, survivor_id=a) is True
+    )
+    assert (await adj_crud.get_by_pair(db, a, b))["verdict"] == "merge"
+    # LOSER now applies its stale proposal dict on its own owned connection.
+    counts: dict[str, int] = {"merged": 0, "stale": 0}
+    await adj._apply_one_proposal(proposal, counts, [])
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["verdict"] == "merge"  # NOT clobbered back to stale
+    assert counts.get("stale", 0) == 0
+    assert counts.get("skipped", 0) == 1
+
+
+@pytest.mark.asyncio
+async def test_apply_approved_merges_refuses_dispatched_session(file_db, monkeypatch):
+    """P1#2 CRITICAL: the irreversible apply entry refuses a dispatched/unsupervised
+    session at the SERVICE layer, so a Bash-capable dispatched session that imports
+    apply_approved_merges directly (inherited GENESIS_CC_SESSION=1) cannot self-apply an
+    entity tombstone. The approved row is left untouched (#1477)."""
+    from genesis.security.immunity_shadow import DispatchGateRefused
+
+    db = file_db
+    a = await _mk_entity(db, "delta co", "delta co")
+    b = await _mk_entity(db, "delta inc", "delta inc")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="delta co",
+        norm_b="delta inc",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="owner")
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    monkeypatch.delenv("GENESIS_SESSION_SUPERVISED", raising=False)
+    with pytest.raises(DispatchGateRefused):
+        await adj.apply_approved_merges(db, budget=10)
+    # Nothing applied: row still an approved proposed_merge, loser still active.
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["verdict"] == "proposed_merge" and row["approved_at"] is not None
+    assert await _status(db, b) == "active"
+
+
+@pytest.mark.asyncio
+async def test_merge_entity_refuses_dispatched_session(db, monkeypatch):
+    """P1#2 CRITICAL (round-2): merge_entity is the app-level FLOOR of the approval gate
+    — the actual irreversible tombstone. It refuses a dispatched/unsupervised session,
+    so a Bash-capable dispatched session can't bypass the approve/apply guards by
+    importing merge_entity one layer deeper. The two in-server callers (live-mode
+    drainer, gated apply path) are non-dispatched, so this is a no-op for them (#1477)."""
+    from genesis.security.immunity_shadow import DispatchGateRefused
+
+    a = await _mk_entity(db, "epsilon co", "epsilon co")
+    b = await _mk_entity(db, "epsilon inc", "epsilon inc")
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    monkeypatch.delenv("GENESIS_SESSION_SUPERVISED", raising=False)
+    with pytest.raises(DispatchGateRefused):
+        await entities_crud.merge_entity(db, loser_id=b, survivor_id=a)
+    assert await _status(db, b) == "active"  # loser NOT tombstoned
+    # Supervised/foreground passes and performs the merge.
+    monkeypatch.setenv("GENESIS_SESSION_SUPERVISED", "1")
+    await entities_crud.merge_entity(db, loser_id=b, survivor_id=a)
+    assert await _status(db, b) == "merged"
+
+
+@pytest.mark.asyncio
+async def test_apply_batch_isolates_failing_row(file_db, monkeypatch):
+    """A row that raises in merge_entity is rolled back + skipped; other approved rows
+    in the same batch still apply, and the failed row's partial write is discarded."""
+    db = file_db
+    g1 = await _mk_entity(db, "good a", "good a")
+    g2 = await _mk_entity(db, "good b", "good b")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=g1,
+        entity_b=g2,
+        verdict="proposed_merge",
+        loser_id=g2,
+        survivor_id=g1,
+        norm_a="good a",
+        norm_b="good b",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(g1, g2), approved_by="owner")
+    b1 = await _mk_entity(db, "bad a", "bad a")
+    b2 = await _mk_entity(db, "bad b", "bad b")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=b1,
+        entity_b=b2,
+        verdict="proposed_merge",
+        loser_id=b2,
+        survivor_id=b1,
+        norm_a="bad a",
+        norm_b="bad b",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(b1, b2), approved_by="owner")
+
+    real_merge = entities_crud.merge_entity
+
+    async def _flaky(db_, *, loser_id, survivor_id, _commit=True):
+        if loser_id == b2:  # write a partial row, then raise → must be rolled back
+            await db_.execute(
+                "INSERT INTO entity_mentions "
+                "(memory_id, entity_id, provenance, confidence, source, created_at) "
+                "VALUES ('partial', ?, 'EXTRACTED', 0.9, 's', '2026-01-01T00:00:00+00:00')",
+                (survivor_id,),
+            )
+            raise RuntimeError("boom mid-merge")
+        return await real_merge(db_, loser_id=loser_id, survivor_id=survivor_id, _commit=_commit)
+
+    monkeypatch.setattr(entities_crud, "merge_entity", _flaky)
+
+    counts = await adj.apply_approved_merges(db, budget=10)
+    assert counts["merged"] == 1 and counts.get("errors", 0) == 1
+    assert await _status(db, g2) == "merged"  # good pair applied
+    assert await _status(db, b2) == "active"  # failed pair NOT merged
+    # the failed row's partial mention was rolled back
+    cur = await db.execute("SELECT count(*) FROM entity_mentions WHERE memory_id='partial'")
+    assert (await cur.fetchone())[0] == 0
 
 
 @pytest.mark.asyncio
@@ -491,3 +871,274 @@ async def test_maybe_run_sweep_low_water_gate(db):
         await _enqueue(db, f"x{i}", f"y{i}")
     out = await adj.maybe_run_sweep(db, drain_budget=2, slice_size=100, enqueue_cap=50)
     assert out is None  # skipped: queue too deep
+
+
+# ── safety-critical apply-path rails (remediation) ───────────────────────────
+
+
+async def _add_mentions(db, entity_id, n):
+    """Give an entity ``n`` distinct mentions so count_entity_mentions() diverges."""
+    for i in range(n):
+        await entities_crud.upsert_mention(
+            db,
+            memory_id=f"mem-{entity_id}-{i}",
+            entity_id=entity_id,
+            provenance="EXTRACTED",
+            confidence=0.7,
+        )
+
+
+@pytest.mark.asyncio
+async def test_apply_honors_stored_direction_not_recomputed_survivor(file_db):
+    """apply must tombstone the STORED loser — never re-pick from live mention counts.
+
+    The human approved survivor=a / loser=b. Then b accrues MORE mentions than a,
+    so a survivor RECOMPUTED from current counts (_pick_survivor) would flip the
+    direction and tombstone `a` — the entity the human chose to KEEP. Honoring the
+    stored direction keeps `a` active and merges `b`. (Verified-RED: with the old
+    recompute this asserts the opposite outcome and fails.)
+    """
+    db = file_db
+    a = await _mk_entity(db, "keep", "keep")
+    b = await _mk_entity(db, "keepp", "keepp")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,  # stored, human-approved direction: keep a, drop b
+        survivor_id=a,
+        norm_a="keep",
+        norm_b="keepp",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="owner")
+    # Counts now DISAGREE with the stored direction: b is better-attested.
+    await _add_mentions(db, b, 3)
+    assert await entities_crud.count_entity_mentions(
+        db, b
+    ) > await entities_crud.count_entity_mentions(db, a)
+
+    counts = await adj.apply_approved_merges(db, budget=10)
+
+    assert counts["merged"] == 1
+    assert await _status(db, a) == "active"  # the human's survivor is kept
+    assert await _status(db, b) == "merged"  # the stored loser is tombstoned
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["survivor_id"] == a and row["loser_id"] == b
+
+
+@pytest.mark.asyncio
+async def test_claim_approved_for_apply_is_atomic_single_winner(db):
+    """The conditional claim flips proposed_merge→merge exactly once.
+
+    A second claim (concurrent double-apply) loses; a claim after a reject also
+    loses. This is the TOCTOU / double-apply lock at the SQL boundary.
+    """
+    a = await _mk_entity(db, "cl", "cl")
+    b = await _mk_entity(db, "cll", "cll")
+    pk = adj_crud.pair_key(a, b)
+    await adj_crud.record_verdict(
+        db, entity_a=a, entity_b=b, verdict="proposed_merge", loser_id=b, survivor_id=a
+    )
+    await adj_crud.approve(db, pair_key=pk, approved_by="owner")
+
+    first = await adj_crud.claim_approved_for_apply(db, pair_key=pk, loser_id=b, survivor_id=a)
+    second = await adj_crud.claim_approved_for_apply(db, pair_key=pk, loser_id=b, survivor_id=a)
+    assert first is True and second is False
+    assert (await adj_crud.get_by_pair(db, a, b))["verdict"] == "merge"
+
+
+@pytest.mark.asyncio
+async def test_claim_fails_when_the_approved_direction_changed_under_it(db):
+    """A stale snapshot must not overwrite a freshly-approved direction.
+
+    The applier works from a batch snapshot taken before its transaction, and
+    the in-transaction staleness re-check compares `{survivor_id, loser_id}` as
+    a SET — order-independent on purpose, so it answers "same pair?" and not
+    "same direction?". A row that is marked stale, re-adjudicated with the
+    direction FLIPPED, and re-approved therefore passes staleness while the
+    snapshot still holds the OLD direction.
+
+    The claim is the last line of defence, and it OVERWRITES both id columns —
+    so it has to check them. Without that, this merges the wrong entity, and
+    `merge_entity` deletes the loser's mentions and links with no unmerge path.
+    """
+    a = await _mk_entity(db, "dir", "dir")
+    b = await _mk_entity(db, "dirr", "dirr")
+    pk = adj_crud.pair_key(a, b)
+
+    # A human approves a -> survivor, b -> loser. This is the batch snapshot.
+    await adj_crud.record_verdict(
+        db, entity_a=a, entity_b=b, verdict="proposed_merge", loser_id=b, survivor_id=a
+    )
+    await adj_crud.approve(db, pair_key=pk, approved_by="owner")
+
+    # ...then it is re-adjudicated the OTHER way round and re-approved, while the
+    # applier still holds the old snapshot. Same pair, same norms — only the
+    # direction moved, which is exactly what the set comparison cannot see.
+    await adj_crud.mark_stale(db, pair_key=pk)
+    await adj_crud.record_verdict(
+        db, entity_a=a, entity_b=b, verdict="proposed_merge", loser_id=a, survivor_id=b
+    )
+    await adj_crud.approve(db, pair_key=pk, approved_by="owner")
+
+    # The applier claims with its STALE direction. It must lose.
+    claimed = await adj_crud.claim_approved_for_apply(db, pair_key=pk, loser_id=b, survivor_id=a)
+    assert claimed is False, "stale direction won the claim — the wrong entity would be merged"
+
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["verdict"] == "proposed_merge", "a lost claim must not consume the row"
+    assert (row["loser_id"], row["survivor_id"]) == (a, b), "the approved direction was overwritten"
+    assert await _status(db, a) == "active" and await _status(db, b) == "active"
+
+    # And the CURRENT direction still claims cleanly — the guard rejects staleness,
+    # not the row itself.
+    assert await adj_crud.claim_approved_for_apply(db, pair_key=pk, loser_id=a, survivor_id=b)
+
+
+@pytest.mark.asyncio
+async def test_claim_fails_after_reject(db):
+    """A reject landing before the claim (read-then-apply TOCTOU) blocks the apply."""
+    a = await _mk_entity(db, "rj", "rj")
+    b = await _mk_entity(db, "rjj", "rjj")
+    pk = adj_crud.pair_key(a, b)
+    await adj_crud.record_verdict(
+        db, entity_a=a, entity_b=b, verdict="proposed_merge", loser_id=b, survivor_id=a
+    )
+    await adj_crud.approve(db, pair_key=pk, approved_by="owner")
+    await adj_crud.reject(db, pair_key=pk, reason="not the same")
+    claimed = await adj_crud.claim_approved_for_apply(db, pair_key=pk, loser_id=b, survivor_id=a)
+    assert claimed is False
+    assert await _status(db, b) == "active"  # never merged
+
+
+@pytest.mark.asyncio
+async def test_apply_negative_budget_applies_nothing(db):
+    """A negative budget (SQLite LIMIT -1 = unlimited) must apply NOTHING, not everything."""
+    a = await _mk_entity(db, "nb", "nb")
+    b = await _mk_entity(db, "nbb", "nbb")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="nb",
+        norm_b="nbb",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="owner")
+
+    counts = await adj.apply_approved_merges(db, budget=-1)
+
+    assert counts["merged"] == 0
+    assert await _status(db, b) == "active"  # the approved merge was NOT bulk-applied
+    # And the crud query itself refuses to dump the table on a negative limit.
+    assert await adj_crud.list_proposed_merges(db, limit=-1, approved_only=True) == []
+
+
+@pytest.mark.asyncio
+async def test_apply_stale_when_stored_direction_absent(file_db):
+    """A proposal missing a stored survivor/loser can't be honored → marked stale."""
+    db = file_db
+    a = await _mk_entity(db, "sd", "sd")
+    b = await _mk_entity(db, "sdd", "sdd")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=None,
+        survivor_id=None,
+        norm_a="sd",
+        norm_b="sdd",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="owner")
+
+    counts = await adj.apply_approved_merges(db, budget=10)
+
+    assert counts["merged"] == 0 and counts["stale"] == 1
+    assert await _status(db, b) == "active"
+
+
+# ── owned-connection isolation: foreign commit + CancelledError (#6/#7) ────────
+
+
+@pytest.mark.asyncio
+async def test_apply_foreign_commit_cannot_flush_partial_merge(file_db, monkeypatch):
+    """#6: the apply runs on its OWN connection, so a foreign commit landing mid-merge
+    (the MCP middleware, or another coroutine on the shared conn) can NOT durably commit
+    THIS row's partial merge. Verified-RED against the shared-connection SAVEPOINT code —
+    there the foreign commit flushes the open savepoint's partial write."""
+    db = file_db
+    a = await _mk_entity(db, "iso keep", "iso keep")
+    b = await _mk_entity(db, "iso lose", "iso lose")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="iso keep",
+        norm_b="iso lose",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="test")
+
+    async def _foreign_commit_then_fail(conn, *, loser_id, survivor_id, _commit=True):
+        # Partial destructive write, THEN a foreign commit on the SHARED conn, THEN fail.
+        await conn.execute(
+            "UPDATE entities SET status='merged', merged_into=? WHERE entity_id=?",
+            (survivor_id, loser_id),
+        )
+        await db.commit()  # foreign commit — would flush a shared-conn savepoint's partial
+        raise RuntimeError("merge failed after a foreign commit")
+
+    monkeypatch.setattr(entities_crud, "merge_entity", _foreign_commit_then_fail)
+
+    counts = await adj.apply_approved_merges(db, budget=10)
+
+    assert counts.get("errors", 0) == 1
+    # Read on a FRESH connection: the partial merge must NOT have survived.
+    assert await _status_fresh(b) != "merged"
+
+
+@pytest.mark.asyncio
+async def test_apply_cancelled_mid_merge_rolls_back(file_db, monkeypatch):
+    """#7: a CancelledError during merge_entity is a BaseException that bypasses
+    `except Exception`; the owned transaction must still roll back so NO claim and NO
+    partial merge survive — even if a commit follows. Verified-RED against the
+    `except Exception` + shared-conn savepoint code (the claim + partial stay in the open
+    savepoint and a following commit flushes them)."""
+    import asyncio
+
+    db = file_db
+    a = await _mk_entity(db, "cx keep", "cx keep")
+    b = await _mk_entity(db, "cx lose", "cx lose")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="cx keep",
+        norm_b="cx lose",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="test")
+
+    async def _partial_then_cancel(conn, *, loser_id, survivor_id, _commit=True):
+        await conn.execute(
+            "UPDATE entities SET status='merged', merged_into=? WHERE entity_id=?",
+            (survivor_id, loser_id),
+        )
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(entities_crud, "merge_entity", _partial_then_cancel)
+
+    with pytest.raises(asyncio.CancelledError):
+        await adj.apply_approved_merges(db, budget=10)
+    await db.commit()  # a following commit must NOT flush a leaked partial/claim
+
+    assert await _status_fresh(b) != "merged"  # loser not tombstoned
+    assert await _verdict_fresh(adj_crud.pair_key(a, b)) == "proposed_merge"  # claim rolled back

@@ -1,0 +1,31 @@
+[Unit]
+Description=Genesis CC settings alignment — daily auto-updater suppression check
+
+[Timer]
+# Daily is proportionate: the drift this guards against comes from setup-time
+# skew and occasional rewrites of settings.json, not from anything that changes
+# minute to minute. The cost of a miss is bounded by one day rather than by the
+# gap between deploys (measured at 14 days on a live install), which is the whole
+# reason this timer exists.
+#
+# Persistent=true covers a box that was powered off across its scheduled hour —
+# systemd replays the missed run on the next activation. RandomizedDelaySec
+# de-correlates it from the other Genesis timers.
+#
+# Deliberately NO OnBootSec. It is relative to MACHINE BOOT, not to the user
+# manager starting (OnStartupSec is the per-user-manager one), and a timer whose
+# configured moment is already in the past elapses IMMEDIATELY when the unit is
+# activated. install.sh and bootstrap.sh run `systemctl --user enable --now` on
+# every bootstrap and every update, at which point boot is essentially always
+# more than any OnBootSec ago — so the reconcile fired seconds after the same
+# deploy's cc_ensure_local had already done it. Two unsynchronised writers on one
+# file is the contention the write path's compare-and-swap exists to survive; the
+# schedule should not manufacture it. Persistent already provides what the
+# boot-relative run was there for.
+OnCalendar=*-*-* 04:40:00
+Persistent=true
+AccuracySec=1h
+RandomizedDelaySec=900
+
+[Install]
+WantedBy=timers.target

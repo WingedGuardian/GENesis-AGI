@@ -69,7 +69,8 @@ async def get_by_id(db: aiosqlite.Connection, id: str) -> dict | None:
 
 async def get_by_email(db: aiosqlite.Connection, email: str) -> dict | None:
     cursor = await db.execute(
-        "SELECT * FROM marketing_prospects WHERE email = ?", (_normalize_email(email),)
+        "SELECT * FROM marketing_prospects WHERE email = ? COLLATE NOCASE",
+        (_normalize_email(email),),
     )
     row = await cursor.fetchone()
     return dict(row) if row else None
@@ -104,6 +105,37 @@ async def mark_contacted(
         "UPDATE marketing_prospects "
         "SET last_contacted_at = ?, status = ?, updated_at = ? WHERE id = ?",
         (contacted_at, status, contacted_at, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def mark_contacted_by_email(
+    db: aiosqlite.Connection, email: str, *, contacted_at: str
+) -> bool:
+    """Advance the ACTIVE prospect matching ``email`` → contacted. The by-email entry
+    point for the delivery paths (which know the resolved recipient, not the id) —
+    called on a CONFIRMED delivery so ``list_active`` stops re-pitching the prospect
+    (the loop-fix: ``mark_contacted`` had no caller, so a delivered prospect stayed
+    'active' and got re-pitched every tick).
+
+    No-op returning False when there is no matching prospect, or the row is not
+    'active' (an already-'contacted'/'replied' row is never downgraded, and a
+    non-marketing recipient is never touched). Keyed on the RECIPIENT being a curated
+    prospect — NOT on cell_risk_class — so a cold pitch that misclassified FINANCIAL
+    (money-term body) is still stamped. Only ``opted_out`` — NOT this status — gates
+    authorization, so this write can never weaken a send gate.
+
+    ATOMIC: a single conditional UPDATE (``WHERE email = ? COLLATE NOCASE AND
+    status = 'active'``), NOT a read-then-write. A concurrent writer flipping the row
+    (e.g. active → replied) between a lookup and an update can't be clobbered back to
+    'contacted' — the never-downgrade guarantee holds under concurrency. ``rowcount``
+    is the stamped/not-stamped signal."""
+    cursor = await db.execute(
+        "UPDATE marketing_prospects "
+        "SET last_contacted_at = ?, status = 'contacted', updated_at = ? "
+        "WHERE email = ? COLLATE NOCASE AND status = 'active'",
+        (contacted_at, contacted_at, _normalize_email(email)),
     )
     await db.commit()
     return cursor.rowcount > 0

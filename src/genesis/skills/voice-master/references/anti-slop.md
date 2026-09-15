@@ -118,6 +118,12 @@ in any medium. Tier 1 words include "delve", "tapestry", "testament",
 "fostering", "garner", "interplay", "enduring", "vibrant", "crucial",
 "enhance".
 
+The **Tier 1: significance & structure inflation** section in
+`ai-vocabulary.md` is Tier 1 as well. It includes phrases such as "stands as",
+"sits at the intersection of", "a hallmark of", "a plethora of", and
+"rich tapestry". Scan the whole section; these examples are illustrative, not
+an exhaustive allowlist.
+
 ### Em dashes (hard rule)
 
 A spaced em dash (` — `) is the #1 AI punctuation tell. **Hard fail:** if

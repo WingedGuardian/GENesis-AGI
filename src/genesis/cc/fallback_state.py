@@ -43,7 +43,7 @@ class FallbackState:
 
     is_fallback: bool = False
     original: str = ""  # home model name (e.g. "claude")
-    fallback: str = ""  # active peer name (e.g. "glm-5.2")
+    fallback: str = ""  # active peer name, from the roster overlay
     reason: str = ""  # short cause (e.g. "rate_limit")
     since: str = ""  # ISO8601 UTC when the fallback began
 

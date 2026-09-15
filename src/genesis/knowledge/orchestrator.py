@@ -459,43 +459,46 @@ class KnowledgeOrchestrator:
             `knowledge_units` rows already point at, and deleting it because a
             later step failed would destroy their vector (Codex P1, #1653).
 
-            Removes the SQLite rows as well as the point. `MemoryStore.store`
-            commits `memory_fts` and `memory_metadata` through the SHARED
-            connection during phase one, so dropping only the vector leaves
-            metadata claiming `embedding_status='embedded'` with no vector
-            behind it — and a retry then deduplicates against the surviving FTS
-            row, gets the same id back, and never recreates the vector. The
-            unit would be permanently FTS-only and invisible to the
-            pending-embedding worker (Codex P1, #1653).
+            DELEGATES to `MemoryStore.delete()` rather than removing the point
+            and a couple of tables by hand. An earlier version of this did the
+            hand-rolled version and was wrong in two ways that only a complete
+            delete gets right:
 
-            Best-effort throughout: this runs while an ingest is ALREADY
-            failing, so a compensation error must be logged, never raised over
-            the original cause.
+            * `store()` writes FIVE places (Qdrant, `memory_fts`,
+              `memory_metadata`, `pending_embeddings`, `entity_mentions`).
+              Removing two of them leaves the `pending_embeddings` row alive,
+              and `embedding_recovery` then re-embeds the content and upserts
+              a point for an ingest that was rolled back — the rollback
+              resurrects itself.
+            * When Qdrant is unavailable, `delete()` DEFERS and keeps the rows
+              (`store.py:853-865`: "deferring to keep stores consistent (no
+              orphan)"), leaving its write-ahead tombstone open as the durable
+              retry record. Deleting the rows anyway would leave a live point
+              holding the document text that no row names — manufacturing the
+              exact ghost that method exists to prevent.
+
+            Best-effort at the CALL level only: this runs while an ingest is
+            already failing, so a compensation error is logged, never raised
+            over the original cause.
             """
-            from genesis.db.crud import memory as memory_crud
-
             for qid in ids:
                 try:
-                    delete_point(
-                        memory_mod._store.qdrant_client,
-                        collection="knowledge_base",
-                        point_id=qid,
-                    )
+                    result = await memory_mod._store.delete(qid)
                 except Exception:
-                    logger.warning("Qdrant delete failed (%s) for %s", why, qid)
-                # Order matters only for crash windows, and this is the safe
-                # one: vector first, then the rows that claim it exists. The
-                # reverse can leave an orphan vector no row names.
-                for remover, what in (
-                    (memory_crud.delete, "memory_fts"),
-                    (memory_crud.delete_metadata, "memory_metadata"),
-                ):
-                    try:
-                        await remover(memory_mod._store._db, memory_id=qid)
-                    except Exception:
-                        logger.warning(
-                            "%s delete failed (%s) for %s", what, why, qid
-                        )
+                    logger.warning(
+                        "Compensation delete failed (%s) for %s", why, qid,
+                        exc_info=True,
+                    )
+                    continue
+                if result.get("deferred"):
+                    # Not a failure: Qdrant was unreachable, the tombstone is
+                    # open, and the nightly reconcile lane drains it. Said out
+                    # loud because the rows are still present meanwhile.
+                    logger.warning(
+                        "Compensation for %s (%s) DEFERRED — Qdrant "
+                        "unavailable; tombstone left open for reconcile",
+                        qid, why,
+                    )
 
         # WS-3: curated ingest is external_untrusted (authority tier, not
         # authorship); derived once, mirrored to both stores.
@@ -635,7 +638,14 @@ class KnowledgeOrchestrator:
                     # survives as un-retrievable, which is worse than the orphan the
                     # compensation path already handles. Collected and dropped only
                     # once the commit has made the new id the real one.
-                    if old_qdrant_id and old_qdrant_id != qdrant_id:
+                    # `not in qdrant_ids`, not merely `!= qdrant_id`: with
+                    # dedup, the id this row is superseding can be one ANOTHER
+                    # unit in this same batch just stored. Comparing against
+                    # only the current unit's id lets `_drop_vectors` delete it
+                    # as "superseded" while a row this batch committed still
+                    # points at it — the same class as the P1 above, one
+                    # function away (PR #1653 merge audit).
+                    if old_qdrant_id and old_qdrant_id not in qdrant_ids:
                         stale_ids.append(old_qdrant_id)
 
                     # Upsert to SQLite on the OWNED conn (_commit=False — batch txn)

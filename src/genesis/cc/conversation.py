@@ -10,7 +10,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from genesis.cc import rate_limit_park, roster
+from genesis.cc import peer_availability, rate_limit_park, roster
 from genesis.cc.context_injector import ContextInjector
 from genesis.cc.exceptions import (
     CCError,
@@ -31,6 +31,7 @@ from genesis.cc.types import (
     EffortLevel,
     StreamEvent,
     is_owner_attended_channel,
+    model_name_supports_effort,
     origin_delivery_supported,
     session_origin_for_channel,
     task_detected_origin,
@@ -79,6 +80,131 @@ _BG_RESEARCH_ROUTING = (
     "success or failure — back to this exact conversation. Keep quick answers and short "
     "tool use inline as usual."
 )
+
+
+# The block's own delimiter, shared by the builder and the stripper below so
+# the two cannot drift. A failover peer must NOT receive this block — it
+# describes the HOME model and effort, and the peer runs a different one — so
+# something has to be able to find it again after composition.
+_SESSION_CONTROL_HEADING = "\n\n## Changing your own model / effort\n"
+
+
+def _strip_session_control_block(prompt: str | None) -> str | None:
+    """Remove the session-control block, leaving every other fragment intact.
+
+    The peer is told what it is by its OWN invocation; forwarding the home
+    block states a model and effort the peer is not running, and `session_config`
+    cannot change a peer dispatch that has already been created. Topic context,
+    the research-routing nudge and the assembled identity are all
+    peer-independent and must survive — which is why this removes one named
+    section rather than rebuilding the prompt from scratch.
+
+    Bounded by the NEXT top-level section, or the end of the prompt. Verified
+    against the builder's output: the block is exactly one `## ` heading plus
+    one paragraph and contains no nested section, so the next `\\n\\n## ` is
+    always the start of a different fragment.
+    """
+    if not prompt or _SESSION_CONTROL_HEADING not in prompt:
+        return prompt
+    start = prompt.index(_SESSION_CONTROL_HEADING)
+    # Search for the next section AFTER this heading's own delimiter.
+    nxt = prompt.find("\n\n## ", start + len(_SESSION_CONTROL_HEADING))
+    end = nxt if nxt != -1 else len(prompt)
+    # `or None` normalises a prompt that was ENTIRELY this block. Kept, though
+    # it is unreachable today: the block and the research-routing nudge are
+    # gated on the same channel predicate, so the block never appears without
+    # a fragment after it. Both spellings are falsy and every caller tests
+    # truthiness, so the branch cannot change behaviour either way — which is
+    # also why it is not worth changing.
+    return (prompt[:start] + prompt[end:]) or None
+
+
+def _session_control_block(
+    channel: ChannelType | str | None,
+    model,
+    effort,
+    session_id: str | None,
+) -> str:
+    """Tell a conversation session what it currently IS, and that it can change it.
+
+    Two failures this closes, both MEASURED on a Telegram DM session 2026-09-02.
+
+    1. The session was asked to "switch to Opus, medium effort" and replied that
+       it could not change its own model. It could: `session_config` has existed
+       on the health MCP since long before, its docstring literally says "Call
+       when the user asks to switch models ('use opus', 'switch to haiku')", and
+       `GENESIS_SESSION_ID` — the id that tool needs — was in its environment.
+       It had even run `env` and seen that variable 31 seconds earlier. No
+       capability was missing; the session simply held a false belief about
+       itself. A tool the model does not know it has is not a capability.
+
+    2. The model/effort a session believes it is running are stated ONLY in the
+       fresh-session system prompt. A resumed turn sends no system prompt, so
+       after any /model or /effort switch the session's self-description goes
+       stale and stays stale for the life of the conversation.
+
+    Both are fixed by re-stating the CURRENT values every turn, which is why this
+    rides `--append-system-prompt` alongside `--resume` (the same delivery the
+    topic-context block uses) rather than living in the assembler — an assembler
+    change would reach fresh sessions only, i.e. it would have missed the very
+    turn that failed.
+
+    Deliberately NOT a natural-language intent matcher. The failure was
+    self-knowledge, not parsing: no pattern over the USER's words would have
+    corrected a model that believed the capability did not exist.
+
+    Scoped to OWNER-ATTENDED channels via ``origin_delivery_supported`` — i.e.
+    Telegram today. That predicate was written for a different purpose (can a
+    background result be delivered back here) but it is the correct one here for
+    an independent reason: it is the same "the owner is on the other end" test.
+
+    Withheld everywhere else, deliberately:
+    - TERMINAL: the human already has Claude Code's own /model and /effort, and
+      a terminal resume carries NO system prompt at all (an invariant
+      test_second_message_resumes pins).
+    - WEB (OpenClaw): `/v1/chat/completions` is registered with NO auth gate and
+      the invocation is stamped supervised=False, origin=external_untrusted.
+      Telling THAT session it can switch its own model — and never to refuse —
+      hands an anonymous caller a lever the user is supposed to own. Quality
+      over cost is the USER's tradeoff to make.
+    - VOICE / WHATSAPP: no ConversationLoop call sites exist for them today.
+    """
+    if not origin_delivery_supported(channel):
+        return ""
+    # Haiku does not use --effort at all: `invoker._build_args` gates the flag on
+    # `model_supports_effort`, so a stored effort never reaches dispatch there —
+    # while `session_config` still writes the row and returns success. Stating an
+    # ACTIVE effort on Haiku would have the session confirm a change dispatch
+    # never saw, which is the same false self-belief this block exists to remove.
+    # An unrecognised (roster/provider) id resolves to effort-capable, so nothing
+    # is silently stripped of effort on a model we cannot classify.
+    if model_name_supports_effort(str(model)):
+        current = (
+            f"You are currently running model={model}, effort={effort}. "
+            "Neither is fixed for the conversation. "
+        )
+        asks = '("use opus", "switch to haiku", "think harder", "low effort")'
+    else:
+        current = (
+            f"You are currently running model={model}, which has no effort "
+            f"setting — a stored effort ({effort}) is inert until you switch "
+            "models. Your model is not fixed. "
+        )
+        # No effort examples here: on a model with no effort setting, "think
+        # harder" is not a switch this session can make.
+        asks = '("use opus", "switch to sonnet")'
+    return (
+        _SESSION_CONTROL_HEADING
+        + current
+        + f"When the user asks you to switch {asks}, "
+        f'call `mcp__genesis-health__session_config` with session_id="{session_id}" '
+        "(not the shorter id in the [Clock | Session: x] tag). The change takes "
+        "effect on your next response, so say what you switched to and continue. "
+        "You DO have this capability when that tool is listed — do not refuse on "
+        "the belief that you cannot. If it is absent from this session, or "
+        "returns an error, report that verbatim rather than a change that did "
+        "not happen."
+    )
 
 
 def _apply_research_routing(system_prompt: str | None, channel) -> str | None:
@@ -284,6 +410,13 @@ class ConversationLoop:
                 )
                 resume_id = None
 
+            # Self-knowledge on BOTH new and resumed turns — see
+            # _session_control_block. Same slot as the routing nudge below and
+            # for the same reason: a resumed turn carries no system prompt.
+            _ctl = _session_control_block(channel, model, effort, session["id"])
+            if _ctl:
+                system_prompt = (system_prompt + _ctl) if system_prompt else _ctl
+
             # Non-terminal (dispatched) channels end the turn after replying, so long
             # inline work is killed at the CC bg-wait ceiling with nothing left to report
             # back — nudge routing to the durable background lane (delivers back via
@@ -357,6 +490,7 @@ class ConversationLoop:
                 fallback = await self._try_contingency(
                     prompt_text, system_prompt, channel,
                     session_id=session["id"],
+                    was_resume=resume_id is not None,
                 )
                 if fallback is not None:
                     return fallback
@@ -629,6 +763,14 @@ class ConversationLoop:
                     else:
                         system_prompt = topic_ctx
 
+            # Self-knowledge, injected for BOTH new and resumed sessions for the
+            # same reason as the topic context above: a resumed turn carries no
+            # system prompt, so anything stated only at session start is both
+            # absent from every later turn AND stale after a /model switch.
+            _ctl = _session_control_block(channel, model, effort, session["id"])
+            if _ctl:
+                system_prompt = (system_prompt + _ctl) if system_prompt else _ctl
+
             # Route long research off this turn to the durable background lane
             # (dispatched channels end the turn). See _apply_research_routing.
             system_prompt = _apply_research_routing(system_prompt, channel)
@@ -660,13 +802,29 @@ class ConversationLoop:
                 **resume_overrides,
             )
 
-            # Phase 3: track whether any answer TEXT streamed this turn. If it did,
-            # we must NOT fail over (re-streaming a peer's reply would double-output
-            # to the user); tool_use/system_notice progress is fine before a failover.
-            streamed = {"text": False}
+            # Phase 3: track what this turn actually DID. Two different stakes:
+            #
+            #   text  — answer text reached the user, so failing over would
+            #           double-output. Cosmetic-but-confusing.
+            #   tools — the peer executed MCP tools, so re-running the prompt on
+            #           another peer can REPEAT the effect: an outreach send, a
+            #           database write. These invocations carry the full
+            #           user-scoped toolset with permission checks skipped, so
+            #           there is nothing downstream to catch a duplicate.
+            #
+            # Only `text` was tracked before, and a comment here asserted
+            # "tool_use progress is fine before a failover". That was true while
+            # failover happened solely on an exception; it stopped being true when
+            # an empty non-error return also advanced to the next peer.
+            streamed = {"text": False, "tools": False}
 
             async def _failover_tracked(ev: StreamEvent) -> None:
-                if ev.event_type == "text" and ev.text:
+                # strip(): this flag is EVIDENCE — it gates the double-output
+                # guard and, in the failover loop, records the peer as having
+                # SERVED and clears stale blocks. A whitespace-only text block
+                # is truthy but shows the user nothing, so counting it let a
+                # silent-cap attempt erase a genuine quota block.
+                if ev.event_type == "text" and ev.text and ev.text.strip():
                     streamed["text"] = True
                 if on_event:
                     await on_event(ev)
@@ -715,6 +873,7 @@ class ConversationLoop:
                 fallback = await self._try_contingency(
                     prompt_text, system_prompt, channel,
                     session_id=session["id"],
+                    was_resume=resume_id is not None,
                 )
                 if fallback is not None:
                     return fallback
@@ -919,8 +1078,14 @@ class ConversationLoop:
             session_id=session_id,
         )
         system_prompt = await self._enrich_with_context(system_prompt, prompt_text)
-        # A stale-resume retry rebuilds the prompt from scratch — re-apply the
-        # dispatched-channel research routing so the nudge isn't lost on recovery.
+        # A stale-resume retry rebuilds the prompt from scratch — re-apply both
+        # the dispatched-channel research routing and the session-control block,
+        # so neither is lost on recovery.
+        # This path always has a freshly assembled prompt, so a plain append is
+        # enough; the block is "" on TERMINAL and appends nothing.
+        system_prompt += _session_control_block(
+            channel, model, effort, session_id,
+        )
         system_prompt = _apply_research_routing(system_prompt, channel)
         return CCInvocation(
             prompt=prompt_text,
@@ -1030,6 +1195,7 @@ class ConversationLoop:
         peer_inv: CCInvocation,
         *,
         sticky: dict | None,
+        resume_system_prompt: str | None = None,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None,
         streamed: dict | None = None,
     ) -> Any:
@@ -1037,14 +1203,29 @@ class ConversationLoop:
         peer, resume it for continuity; on a stale resume (non-rate-limit CCError)
         retry once FRESH on the same peer — UNLESS answer text already streamed (a
         fresh retry would re-stream and double-output). Rate-limit/quota propagate
-        to the caller (which moves to the next peer)."""
+        to the caller (which moves to the next peer).
+
+        ``resume_system_prompt`` is the turn's own fragments WITHOUT the
+        assembled identity, and it is used on exactly one branch: the resume
+        below. `peer_inv` carries the identity, so every FRESH path — a peer
+        the sticky session does not name, and the stale-resume retry — keeps
+        it by construction. THAT is why the choice lives here rather than
+        upstream: whether this turn resumes is a per-PEER fact decided on the
+        next three lines, and predicting it before the loop got it wrong for a
+        non-matching peer and for the retry (both measured)."""
         inv = peer_inv  # fresh by default (failover_invocations set resume=None)
         if (
             sticky
             and sticky.get("roster_model") == peer_name
             and sticky.get("cc_session_id")
         ):
-            inv = replace(peer_inv, resume_session_id=sticky["cc_session_id"])
+            # The peer's OWN session already holds the identity; re-sending it
+            # duplicates the whole SOUL/user prompt on every sticky turn.
+            inv = replace(
+                peer_inv,
+                resume_session_id=sticky["cc_session_id"],
+                system_prompt=resume_system_prompt,
+            )
         try:
             return await self._invoke_peer(inv, on_event)
         except (CCRateLimitError, CCQuotaExhaustedError, CCNetworkOfflineError):
@@ -1052,10 +1233,32 @@ class ConversationLoop:
             # network is not a stale peer resume — retrying fresh won't help and
             # must not mark the sticky peer session stale.
             raise
-        except CCError:
-            # Don't re-stream: nothing to recover if already fresh, and never retry
-            # once answer text has reached the user (would double-output).
-            if inv.resume_session_id is None or (streamed and streamed.get("text")):
+        except CCError as exc:
+            # Don't re-run: nothing to recover if already fresh, and never once
+            # answer text has reached the user (would double-output) — this is a
+            # full re-run of the same prompt on the same peer.
+            #
+            # And never for a provider refusal. A DRAINED prepaid account arrives
+            # here as a generic CCProcessError rather than CCQuotaExhaustedError,
+            # because the invoker's global classifier deliberately does not know
+            # the balance phrases (teaching it would let a drained BACKUP report
+            # the primary as down — see peer_availability._BALANCE_REFUSALS). So
+            # it lands on this branch and buys a full second invocation of the
+            # same dead peer before the caller ever classifies it. A fresh
+            # session cannot refill an empty balance.
+            #
+            # Module-level import, deliberately: a DEFERRED import here would sit
+            # inside the `except` block, and an ImportError from it is not a
+            # CCError — it would skip both handlers in the peer loop, land on the
+            # outer `except Exception`, and abandon every remaining peer. That is
+            # the same outage-amplifier shape the never-raises guard exists to
+            # prevent. `peer_availability` imports only stdlib and `genesis.env`,
+            # so there is no cycle to work around.
+            if (
+                inv.resume_session_id is None
+                or (streamed and streamed.get("text"))
+                or peer_availability.is_provider_refusal(exc)
+            ):
                 raise
             logger.warning(
                 "failover peer %s sticky resume failed — retrying fresh", peer_name,
@@ -1085,19 +1288,118 @@ class ConversationLoop:
             # session being resumed). The peer runs a FRESH session, so re-assemble
             # the identity/context — otherwise the peer answers with no Genesis
             # persona/instructions.
-            if base_inv.system_prompt is None:
-                system_prompt = await self._assembler.assemble(
+            # Keyed on the RESUME FACT, not on `system_prompt is None`. The
+            # latter is a proxy that silently breaks the moment anything is
+            # appended to a resumed turn's prompt (the research-routing nudge
+            # already does this on Telegram), leaving the peer with only that
+            # fragment as its whole identity.
+            # The re-assembled identity COMPOSES with whatever fragments the
+            # turn already assembled (topic context with the live proposal
+            # board, session-control block, research-routing nudge) — it never
+            # replaces them. Those fragments are the only place that per-turn
+            # context exists on a resume; dropping them made "approve this
+            # proposal" arrive at the peer with no referent.
+            sticky = self._session_fallback_session(session)
+
+            # The home session-control block never travels to a peer, sticky or
+            # fresh. It names the HOME model and effort, the peer runs its own,
+            # and `session_config` cannot change a dispatch already created —
+            # so forwarding it states something false and actionable. Stripped
+            # rather than suppressed upstream: the block is correct for the
+            # home invocation, and only this path needs it gone.
+            base_inv = replace(
+                base_inv,
+                system_prompt=_strip_session_control_block(base_inv.system_prompt),
+            )
+
+            # The turn's own fragments, WITHOUT the identity below. A sticky
+            # resume gets these and nothing more, because the peer's session
+            # already holds the identity — but that choice is made per PEER,
+            # in `_run_failover_peer`, not here. Gating the rebuild on
+            # `not sticky` at this point was wrong twice, both measured: a
+            # peer the sticky session does not NAME runs fresh, and so does
+            # the stale-resume retry, and neither would have had any identity
+            # at all.
+            fragments_only = base_inv.system_prompt
+
+            if base_inv.resume_session_id is not None:
+                identity = await self._assembler.assemble(
                     db=self._db, model=str(model), effort=str(effort),
                     session_id=session["id"],
                 )
-                system_prompt = await self._enrich_with_context(
-                    system_prompt, prompt_text,
+                identity = await self._enrich_with_context(
+                    identity, prompt_text,
                 )
-                base_inv = replace(base_inv, system_prompt=system_prompt)
+                fragments = base_inv.system_prompt
+                base_inv = replace(
+                    base_inv,
+                    system_prompt=(
+                        f"{identity}\n\n{fragments}" if fragments else identity
+                    ),
+                )
             peers = roster.failover_invocations(home, base_inv)
             if not peers:
+                # Say so. This is the one branch that degrades SILENTLY at the
+                # exact moment the fallback exists for — the subscription has
+                # capped and there is nothing to fail over to. The turn goes on
+                # to contingency and rate_limit_park, which do surface something
+                # to the user, but nothing anywhere names the actual cause: no
+                # usable peer is configured. `failover_chain` also drops any
+                # peer whose auth_env is unset, so "declared but keyless" lands
+                # here too and looks identical to "none declared".
+                logger.warning(
+                    "CC failover: no usable roster peer for home=%r — degrading "
+                    "to contingency. Declare one in "
+                    "~/.genesis/config/cc_roster.local.yaml (a peer whose "
+                    "auth_env key is unset is skipped).",
+                    home,
+                )
                 return None
-            sticky = self._session_fallback_session(session)
+            async def _record_peer(fn, *args) -> bool:
+                """Run a peer_availability recorder OFF the event loop, safely.
+
+                The recorder itself is exhaustively guarded against raising,
+                because a raise here escapes into the peer loop and abandons
+                every REMAINING peer. Moving it to a worker thread put that
+                guarantee back at risk: `asyncio.to_thread` raises RuntimeError
+                once the default executor is shut down, which the outer handler
+                catches by returning None — abandoning the whole failover, which
+                is strictly worse than the lost row it was protecting. Advisory
+                bookkeeping must never decide whether the user gets an answer.
+
+                CancelledError is deliberately re-raised: it is a BaseException
+                and means the turn itself is going away.
+                """
+                try:
+                    return await asyncio.to_thread(fn, *args)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.debug("peer availability record failed", exc_info=True)
+                    return False
+
+            async def _remember_peer_session(out) -> None:
+                """Persist this peer's session id so the turn can be continued.
+
+                Only with a real session id: an empty one cannot resume anything.
+                One named writer rather than an inline block, so any future path
+                that ends the turn on a peer has exactly one thing to call.
+                """
+                if not getattr(out, "session_id", ""):
+                    return
+                await self._merge_session_metadata(
+                    session["id"],
+                    {"fallback_session": {
+                        "cc_session_id": out.session_id,
+                        "roster_model": peer_name,
+                    }},
+                )
+
+            # `sticky` was resolved above, where the prompt is composed. Not
+            # for a race — `_session_fallback_session` parses the in-memory
+            # `session` dict and touches no store, and nothing between the two
+            # points reassigns it, so a second read would be identical. It is
+            # simply needed there.
             for peer_name, peer_inv in peers:
                 if streamed and streamed.get("text"):
                     break  # a prior peer already streamed answer text — can't fail
@@ -1105,25 +1407,88 @@ class ConversationLoop:
                 try:
                     output = await self._run_failover_peer(
                         peer_name, peer_inv, sticky=sticky,
+                        resume_system_prompt=fragments_only,
                         on_event=on_event, streamed=streamed,
                     )
-                except (CCRateLimitError, CCQuotaExhaustedError):
+                except (CCRateLimitError, CCQuotaExhaustedError) as exc:
+                    # The prose lives HERE, not in the availability record. This
+                    # handler previously logged nothing at all, while the record
+                    # persisted the provider's text into a file that is read into
+                    # every health snapshot and JSON-dumped into an LLM prompt.
+                    # The log is both the better home for it and outside that
+                    # exposure path, so the record carries no free text.
+                    logger.warning(
+                        "failover peer %s refused: %s", peer_name, exc, exc_info=True,
+                    )
+                    # Provider refused on a usage ceiling — real evidence about the
+                    # peer. Recording is advisory and never changes which peers are
+                    # tried; it exists so a blocked standby is VISIBLE, since the
+                    # roster admits a peer on credential presence alone.
+                    # to_thread: the recorder takes a lock with bounded retry
+                    # sleeps, then a tempfile write, fsync and replace. Run inline
+                    # it blocks the event loop — stalling every other conversation
+                    # during the very outage it exists to observe.
+                    # This branch is no longer refusals-only: since the MCP
+                    # exclusion, a tool's own 429 arrives HERE typed as a
+                    # rate-limit error and is correctly DECLINED as evidence.
+                    # So the declined-plus-streamed cleanup below applies on
+                    # this branch too — without it, a previously blocked peer
+                    # that just SERVED text stayed falsely blocked for days
+                    # because its clearing lived only on the generic branch.
+                    declined = not peer_availability.is_provider_refusal(exc)
+                    await _record_peer(peer_availability.note_failure, peer_name, exc)
+                    if streamed and streamed.get("text"):
+                        if declined:
+                            await _record_peer(
+                                peer_availability.note_success, peer_name,
+                            )
+                        # Text already reached the user this turn. Returning ""
+                        # (not None) stops the caller running contingency, which
+                        # would stack a SECOND answer on the first.
+                        return ""
                     continue  # this peer is also down → try the next one
-                except CCError:
+                except CCError as exc:
                     logger.warning("failover peer %s failed", peer_name, exc_info=True)
+                    # Routed through the SAME classifier on purpose: a local fault
+                    # (offline — which never left the box — our own timeout, an MCP
+                    # server crash, a stale sticky session) is a CCError here too,
+                    # but is not evidence about the peer. note_failure declines it,
+                    # so one local blip can't mark the whole standby fleet down.
+                    # Classified SEPARATELY from recording: `note_failure` returns
+                    # False for four different reasons, so reading its return as
+                    # "declined" let a transient write failure flip a refusal into
+                    # a recorded success.
+                    declined = not peer_availability.is_provider_refusal(exc)
+                    await _record_peer(peer_availability.note_failure, peer_name, exc)
+                    if streamed and streamed.get("text"):
+                        if declined:
+                            # The peer ANSWERED — text is on the user's screen —
+                            # and then a local fault ended the turn. A PRIOR block
+                            # must not survive an attempt that demonstrably served
+                            # from this peer; records only refresh during a home
+                            # outage, so a stale "blocked" stands for days.
+                            await _record_peer(
+                                peer_availability.note_success, peer_name,
+                            )
+                        return ""  # double-output guard, as above
                     continue
+                # Record availability only when the peer DEMONSTRABLY served the
+                # turn: a usable output, or answer text already on the user's
+                # screen. The degenerate empty non-error output (a silent cap)
+                # otherwise takes the success path below — behaviour identical to
+                # what shipped before this feature — and recording "available" on
+                # it would clear a real block with a turn that showed nothing.
+                # What to DO about that empty reply (advance? dead-end?) is retry
+                # policy, deliberately out of scope here; the effects-guard
+                # follow-up owns it.
+                usable = not output.is_error and bool((output.text or "").strip())
+                if usable or (streamed and streamed.get("text")):
+                    await _record_peer(peer_availability.note_success, peer_name)
                 # Success on this peer. Record the account-wide flag + this session's
                 # sticky peer session (only with a real session id, else continuity
                 # can't resume). Home identity in cc_sessions stays on Claude.
                 transitioned = fallback_state.enter(home, peer_name, "rate_limit")
-                if output.session_id:
-                    await self._merge_session_metadata(
-                        session["id"],
-                        {"fallback_session": {
-                            "cc_session_id": output.session_id,
-                            "roster_model": peer_name,
-                        }},
-                    )
+                await _remember_peer_session(output)
                 # Keep the session fresh. Cost + triage are intentionally NOT recorded
                 # for failover turns: CC's cost_usd is bogus for routed models, and
                 # triage must not attribute a peer model's output to the home model's
@@ -1540,6 +1905,7 @@ class ConversationLoop:
         system_prompt: str | None,
         channel: ChannelType,
         session_id: str | None = None,
+        was_resume: bool = False,
     ) -> str | None:
         """Attempt to route through API contingency dispatcher.
 
@@ -1548,16 +1914,34 @@ class ConversationLoop:
         if self._contingency is None:
             return None
 
-        # Rebuild system prompt if it was None (resume case)
-        if system_prompt is None:
+        # Rebuild the system prompt for the resume case. Keyed on the resume
+        # FACT: a resumed turn's prompt may be a non-empty fragment (an appended
+        # nudge) rather than None, and shipping that fragment alone to a raw
+        # router LLM would answer as Genesis with no Genesis identity at all.
+        # The rebuilt identity COMPOSES with the incoming fragments (same rule
+        # as _try_roster_failover): the tool-less router has no other referent
+        # for "this one" / "the older ones" than the topic context the turn
+        # already assembled — replacing it strips exactly that.
+        # The contingency router gets the same treatment as a roster peer, and
+        # for a sharper reason: it is TOOL-LESS. The block tells the session to
+        # call `session_config` and not to refuse on the belief that it cannot
+        # — said to a model with no MCP tools at all — and states a model and
+        # effort that are not what `result.model` will actually run. Same
+        # finding as the peer path, worse instance (CodeRabbit Major, #1627).
+        system_prompt = _strip_session_control_block(system_prompt)
+
+        if was_resume or system_prompt is None:
             try:
-                system_prompt = await self._assembler.assemble(
+                identity = await self._assembler.assemble(
                     db=self._db, model="sonnet", effort="medium",
                     session_id=session_id,
                 )
             except Exception:
                 logger.error("Failed to assemble system prompt for contingency", exc_info=True)
                 return None
+            system_prompt = (
+                f"{identity}\n\n{system_prompt}" if system_prompt else identity
+            )
 
         messages = [{"role": "user", "content": prompt_text}]
 

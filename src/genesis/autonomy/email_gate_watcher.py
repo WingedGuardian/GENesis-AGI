@@ -70,6 +70,46 @@ async def _recipient_opted_out(db: object, recipient: str | None) -> bool:
     return bool(row.get("opted_out"))
 
 
+async def _stamp_prospect_contacted(db: object, recipient: str | None, now: str) -> None:
+    """LOOP-FIX helper: on a CONFIRMED delivery, advance the matching prospect
+    active → contacted so the campaign's ``list_active`` never re-pitches it.
+    Delegates to the shared, active-guarded CRUD (the same entry point
+    ``pipeline._deliver`` uses for the GRANTED autonomous path), so the stamp
+    semantics live in one place. A non-marketing / non-active / absent recipient is
+    a no-op."""
+    if not recipient:
+        return
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.mark_contacted_by_email(db, recipient, contacted_at=now)
+
+
+async def _terminalize_delivered_hold(db: object, row: dict, now: str) -> None:
+    """Terminalize an owner-approved DELIVERED hold (held → sent) AND record its
+    capability success EXACTLY ONCE, shared by the DELIVERED branch and the
+    consumed-approval reconcile branch so both do the identical terminal accounting.
+
+    ``pes.mark_sent`` is the single-flip claim (``WHERE status='held'``): only the
+    ONE drain cycle that wins the flip records the success, so record_success is
+    called AT MOST once per hold (no double-count), and a reconcile replay of a hold
+    the prior cycle delivered-but-never-terminalized records it — closing the window
+    where a stamp/DB failure in the DELIVERED branch (before mark_sent) permanently
+    dropped an owner-approved delivery from promotion evidence. Residual (fail-safe,
+    tracked in follow-up 6a518adc): a crash in the microsecond between mark_sent
+    committing and record_success leaves the hold 'sent' (unrecoverable) → the success
+    is under-counted, delaying cell promotion but NEVER over-granting."""
+    if await pes.mark_sent(db, row["id"], sent_at=now):
+        await cg.record_success(
+            db,
+            domain=row["cell_domain"],
+            verb=row["cell_verb"],
+            risk_class=row["cell_risk_class"],
+            updated_at=now,
+            # WS-3 gate-3: the OWNER approved this send — owner evidence.
+            origin_class="owner",
+        )
+
+
 def _subject(context: str | None) -> str:
     if not context:
         return ""
@@ -107,7 +147,17 @@ async def drain_pending_email_sends(rt: object) -> int:
                 # but crashed before marking the hold 'sent'. Reconcile WITHOUT
                 # re-sending: this narrows the at-least-once window to the gap
                 # between adapter.send and mark_consumed.
-                await pes.mark_sent(db, row["id"], sent_at=now)
+                # LOOP-FIX: this row was genuinely DELIVERED by the prior (crashed)
+                # cycle, which never reached the DELIVERED-branch terminal accounting —
+                # complete it here too, identically. Stamp BEFORE terminalizing, then
+                # _terminalize_delivered_hold (mark_sent single-flip claim → gated
+                # record_success): if this recovery itself crashes/DB-errors before the
+                # claim, the hold stays 'held' (re-drained → this branch re-runs, the
+                # stamp being idempotent and record_success gated on the flip) rather
+                # than going 'sent' with the prospect left 'active' or the owner-approved
+                # success dropped from promotion evidence.
+                await _stamp_prospect_contacted(db, row["validated_recipient"], now)
+                await _terminalize_delivered_hold(db, row, now)
                 resolved += 1
                 logger.info(
                     "Reconciled held email %s (approval already consumed) — not re-sent",
@@ -188,16 +238,20 @@ async def drain_pending_email_sends(rt: object) -> int:
             )
             if result.status == OutreachStatus.DELIVERED:
                 await approval_crud.mark_consumed(db, row["request_id"], consumed_at=now)
-                await pes.mark_sent(db, row["id"], sent_at=now)
-                await cg.record_success(
-                    db,
-                    domain=row["cell_domain"],
-                    verb=row["cell_verb"],
-                    risk_class=row["cell_risk_class"],
-                    updated_at=now,
-                    # WS-3 gate-3: the OWNER approved this send — owner evidence.
-                    origin_class="owner",
-                )
+                # LOOP-FIX: stamp the prospect BEFORE the hold goes terminal
+                # (`mark_sent`), so a crash in this window leaves the hold 'held' —
+                # re-drained via the consumed-approval reconcile branch above, which
+                # re-stamps — rather than 'sent' with the prospect never advanced.
+                # `mark_consumed` already ran, so a re-drain can never double-send.
+                # Advance a matching curated prospect active → contacted (a no-op for
+                # a non-prospect recipient) so list_active stops re-pitching it. Keyed
+                # on the RECIPIENT being a curated prospect, NOT cell_risk_class, so a
+                # cold pitch that misclassified FINANCIAL (money-term body) is stamped.
+                await _stamp_prospect_contacted(db, row["validated_recipient"], now)
+                # Terminalize + record the owner-approved success exactly once (the
+                # mark_sent single-flip gates record_success; identical to the reconcile
+                # branch, so a crash-recovery replay accounts for it the same way).
+                await _terminalize_delivered_hold(db, row, now)
                 resolved += 1
                 logger.info(
                     "Resolved held email %s → sent to %s",

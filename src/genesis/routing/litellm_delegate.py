@@ -310,6 +310,30 @@ class LiteLLMDelegate:
             if _should_log_failure(provider):
                 logger.warning("Provider %s unavailable: %s", provider, e)
             return CallResult(success=False, error=str(e), status_code=503)
+        except litellm.APIConnectionError as e:
+            # A TRANSPORT failure: DNS, refused socket, TLS. The vendor never
+            # saw the request, so nothing that meters a provider's allowance
+            # may count it.
+            #
+            # CAUGHT BY TYPE, and the status attribute is exactly why. MEASURED
+            # on litellm 1.78.7: `APIConnectionError.__init__` HARDCODES
+            # `self.status_code = 500`, so `getattr(e, "status_code", None)`
+            # returns 500 on a connection error that never reached anyone —
+            # indistinguishable from a 500 the provider really served. An
+            # earlier version of this fix keyed on the status being absent and
+            # was therefore dead on the real path; only a mocked `acompletion`
+            # raising a bare OSError, which skips litellm's own exception
+            # normalization, made it look like it worked (Codex P2, PR #1624).
+            #
+            # Placed AFTER `litellm.Timeout`, which is not a subclass of this
+            # and keeps its own 408; 500 is preserved here so the router's
+            # error classification is unchanged.
+            if _should_log_failure(provider):
+                logger.warning("Provider %s unreachable: %s", provider, e)
+            return CallResult(
+                success=False, error=str(e), status_code=500,
+                reached_provider=False,
+            )
         except litellm.BadRequestError as e:
             # 400-family: context-window-exceeded, content-policy, malformed
             # request. ContextWindowExceededError + ContentPolicyViolationError
@@ -328,7 +352,24 @@ class LiteLLMDelegate:
             status = raw_status if raw_status is not None else 500
             if _should_log_failure(provider):
                 logger.exception("Unexpected error calling %s", provider)
-            return CallResult(success=False, error=str(e), status_code=status)
+            # A statusless exception — DNS, socket, TLS — means we never got a
+            # response, and synthesizing 500 makes it indistinguishable from a
+            # server error the provider actually returned. Keep the
+            # distinction on the result rather than losing it here, so a
+            # consumer that must not spend a provider's allowance on requests
+            # the vendor never saw can tell them apart (Codex P2, PR #1624).
+            return CallResult(
+                success=False,
+                error=str(e),
+                status_code=status,
+                # An exception that carried no status at all did not come back
+                # from a server. This is NOT the transport test — litellm
+                # normalizes transport failures into APIConnectionError above,
+                # with a synthesized status, so they never arrive here. This
+                # only keeps an unclassified statusless exception from being
+                # metered on the strength of a 500 this code invented.
+                reached_provider=raw_status is not None,
+            )
 
 
 def _build_model_string(cfg: ProviderConfig) -> str:

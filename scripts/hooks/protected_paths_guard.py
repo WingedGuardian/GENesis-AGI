@@ -30,9 +30,24 @@ not hidden): a `cd` INSIDE a compound command shifts the real cwd and is not
 tracked here — same posture as shell_parse: this is an approval/friction
 layer, not a sandbox. The old substring check missed that case too.
 
-Fail modes: an untokenizable command (shlex error) falls back to the legacy
-substring check — conservative, never weaker than the old guard. An unexpected
-crash fails CLOSED via hook_input.run_guard (exit 2).
+Fail modes — THE TWO BLIND SPOTS ARE NOT TREATED ALIKE, and stating them as one
+was this docstring's own bug for a while:
+
+  * A command shlex cannot tokenize (ANSI-C quoting) falls back to the legacy
+    substring check. That is unchanged, pre-existing behaviour, and the word
+    "conservative" applies only relative to the OLD guard being reinstated — it
+    is strictly WEAKER than the parse it stands in for (see `_block`'s caller).
+  * A command past one of `shell_parse`'s BOUNDS is REFUSED outright and never
+    reaches that fallback, because the fallback is weakest exactly where the
+    command is most destructive: it cannot see an ancestor of a protected
+    directory, nor a glob over its contents. The bounds are a SECURITY limit,
+    not a nicety — an unbounded parse of a deeply-nested command runs this guard
+    past its registered 10s timeout, and a hook killed at its timeout does not
+    block, it PERMITS.
+
+`shell_parse.analyze_checked` reports which one fired; `bounds_induced` is the
+only thing this module branches on. An unexpected crash fails CLOSED via
+hook_input.run_guard (exit 2).
 """
 
 from __future__ import annotations
@@ -45,7 +60,14 @@ from fnmatch import fnmatch
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import brace_expand, read_payload, run_guard, tool_input  # noqa: E402
-from shell_parse import analyze, untokenizable  # noqa: E402
+from shell_parse import analyze_checked  # noqa: E402
+
+try:  # noqa: E402
+    import discarded_write
+except Exception:  # noqa: BLE001 — GUARDED ON PURPOSE: an unguarded import that
+    # failed would abort module load → exit 1 → CC reads non-2 as NON-blocking →
+    # the rm RUNS. A cosmetic note must never fail this guard open.
+    discarded_write = None  # type: ignore[assignment]
 
 # Directories that must never be deleted.  Relative to $HOME.
 _PROTECTED_RELATIVE = [
@@ -139,14 +161,25 @@ def _rm_operands(argv: list[str]) -> list[str]:
     return operands
 
 
-def _legacy_substring_block(cmd: str, dirs: list[str]) -> str | None:
-    """The pre-2026-08 substring check — kept ONLY as the fallback for a
-    command shlex cannot tokenize (conservative: over-blocks, never under)."""
+def _legacy_substring_block(cmd: str, dirs: list[str], because: str) -> str | None:
+    """The pre-2026-08 substring check — kept ONLY as the fallback for a command whose
+    real target this module cannot pin down (conservative: over-blocks, never under).
+
+    `because` names the situation, and the CALLER owns it because the three that
+    reach here are genuinely different: the parse went blind (see
+    `shell_parse.analyze_checked` — either shlex could not tokenize the command, or it
+    nested deeper than the parser follows); or the parse succeeded and an operand is
+    an unresolved shell variable; or a relative operand has no resolvable base.
+
+    The last two are not parse failures at all. This message used to call every one of
+    them "an untokenizable rm command" — accurate for one caller of three, and for the
+    other two it sent the reader off to fix quoting that was never the problem.
+    """
     home = os.path.expanduser("~")
     for prot in dirs:
         for alias in (prot, prot.replace(home, "~", 1), prot.replace(home, "$HOME", 1)):
             if alias in cmd:
-                return f"protected path {alias} appears in an untokenizable rm command"
+                return f"protected path {alias} appears in a command {because}"
     return None
 
 
@@ -172,6 +205,8 @@ def _block(reason: str) -> int:
         "them exactly (no globs).",
         file=sys.stderr,
     )
+    if discarded_write is not None:
+        discarded_write.warn()
     return 2
 
 
@@ -180,6 +215,10 @@ def main() -> int:
     cmd = tool_input(payload).get("command", "")
     if not cmd or not isinstance(cmd, str):
         return 0
+    # Hand it over once, here: stdin is already consumed, and _block takes only a
+    # reason so it cannot reach the command itself.
+    if discarded_write is not None:
+        discarded_write.remember(cmd)
 
     # Fast path: no rm/rmdir word anywhere in the command.
     if not _RM_PATTERN.search(cmd):
@@ -188,9 +227,12 @@ def main() -> int:
     dirs = _protected_dirs()
     files = _protected_files()
 
-    # Explicit tokenizability probe, now SHARED rather than inline here.
-    # shell_parse._argv silently degrades to a naive split on shlex errors, so
-    # analyze() alone can never signal one.
+    # ONE call answers both "what does this run" and "could I read all of it".
+    # shell_parse._argv silently degrades to a naive split on shlex errors and the
+    # descent stops at a depth bound, so `analyze()` alone can never signal either —
+    # a truncated parse and a clean one are the same empty list. Asking through
+    # analyze_checked also means a blind spot found LATER is wired in one place
+    # rather than in every guard that has to remember to ask about it.
     #
     # (An earlier draft of this comment called it "the third hand-rolled copy,
     # already drifted from one another". Not true of the tree this lands on: on
@@ -206,12 +248,98 @@ def main() -> int:
     # over 12,099 real commands: the two classify identically (339 un-tokenizable
     # either way, zero commands differ), so this is a semantics correction with
     # no observed behaviour change.
-    if untokenizable(cmd):
-        reason = _legacy_substring_block(cmd, dirs)
-        return _block(reason) if reason else 0
+    segs, blind = analyze_checked(cmd)
+    if blind is not None:
+        # A parse stopped by one of shell_parse's BOUNDS blocks OUTRIGHT. It must not
+        # fall through to the substring check, because that check is STRICTLY WEAKER
+        # than the parse it replaces, and the gap is exactly where the worst commands
+        # live. MEASURED at depth 9 — base refuses all three; this guard allowed the
+        # first two before this branch existed:
+        #     rm -rf $HOME/genesis       (ANCESTOR of a protected dir)  -> ALLOWED
+        #     rm -rf $HOME/genesis/*     (GLOB over its contents)       -> ALLOWED
+        #     rm -rf $HOME/genesis/data  (the exact path)               -> refused
+        # The parse catches the first two via `prot.startswith(expanded + "/")` and
+        # via fnmatch; a substring test catches NEITHER, because a protected path is
+        # not a substring of a command naming its PARENT. The fallback is therefore
+        # at its weakest precisely where the command is most destructive — and the
+        # acceptance test that missed this used the one shape the substring test
+        # does catch.
+        #
+        # We are past the _RM_PATTERN fast path, so this can only ever refuse a
+        # command that mentions rm, and bounds-induced blindness fires on 0 of 45,956
+        # real commands — so refusing outright costs nothing measurable.
+        #
+        # Both bounds refuse, uniformly with every other fail-closed guard here.
+        # The known cost is real and accepted — a here-doc above the cap whose PROSE
+        # quotes an `rm -rf` (a review note like this one) is refused rather than
+        # scanned. `blind.hint` says to write the payload to a file, which is the
+        # action that shape wants anyway.
+        if blind.bounds_induced:
+            return _block(
+                f"an rm command that {blind.cause}, so its real targets cannot be "
+                f"resolved. To proceed: {blind.hint}"
+            )
+        # The substring fallback ADDS to the precise scan below; it does not replace
+        # it, and the missing `else` here used to be a fail-open.
+        #
+        # The comment this replaces said the fallback was kept "unchanged" so as not
+        # to "newly refuse ordinary work". True of the fallback itself, and it missed
+        # what the early RETURN did: any non-bounds blind spot skipped the segment
+        # scan entirely, downgrading this guard to a test the comment 25 lines above
+        # already calls STRICTLY WEAKER — precisely on the ANCESTOR and GLOB shapes
+        # it lists, which a substring test structurally cannot see.
+        #
+        # That was latent while `untokenizable` was the only non-bounds cause. It
+        # stopped being latent when shell_parse gained a second one: MEASURED
+        # base-vs-branch through this guard, `<a command whose verb the shell
+        # builds> && rm -rf ~/genesis` — the PARENT of the protected production
+        # database — went BLOCK -> ALLOW, because the concealed verb raised a blind
+        # spot and the blind spot skipped the scan that catches an ancestor.
+        #
+        # Falling through is safe in the direction that matters: the scan can only
+        # ADD refusals, and it runs on segments that tokenized fine (the bounds
+        # branch above has already returned for the case where there are none).
+        # MEASURED over 129,179 real commands: 1,697 mention rm, 68 of those reach
+        # this branch at all, and 0 change verdict.
+        reason = _legacy_substring_block(cmd, dirs, f"that {blind.cause}. To proceed: {blind.hint}")
+        if reason:
+            return _block(reason)
+
+        # THE FALL-THROUGH APPLIES TO `untokenizable` TOO, DELIBERATELY, AND THE
+        # OVER-BLOCK IT CAUSES IS THE PRICE. Both directions were measured, because
+        # each reviewer who looked at this saw only one of them.
+        #
+        # An unreadable parse makes the fallback segments unreliable in BOTH
+        # directions, and the two costs are not comparable:
+        #
+        #   * segment INVENTED. A `printf` of one quoted argument that merely
+        #     CONTAINS rm-shaped prose runs nothing, yet the naive split emits an
+        #     `rm` segment naming a protected path. Falling through refuses it.
+        #     Cost: a refused `printf`, rephrase and move on.
+        #   * segment REAL. An `rm -rf` of a protected ancestor placed BEFORE the
+        #     construct the tokenizer cannot read — bash runs the removal. The
+        #     substring check cannot see an ancestor or a glob spelling, so an early
+        #     return here ALLOWS it. Cost: the production database's parent
+        #     directory, irreversibly.
+        #
+        # MEASURED, three constructed removals of that parent (two spellings plus a
+        # glob) against one benign `printf`:
+        #
+        #     with the early return   3 real removals ALLOWED, prose allowed
+        #     falling through         3 real removals BLOCKED, prose refused
+        #
+        # So this is not "scan or do not scan", it is which error to make when the
+        # command cannot be read, and for the guard standing in front of the
+        # database it is not close. The BOUNDS branch above already refuses outright
+        # on the same reasoning, and this module's docstring already says the
+        # fallback is weakest exactly where the command is most destructive.
+        #
+        # An earlier revision took the other side, having measured only the invented
+        # case. Recorded here because the shape recurs: a rate measured on one side
+        # of a trade-off reads as a clean result and is half a measurement.
 
     cwd = payload.get("cwd") if isinstance(payload, dict) else None
-    for seg in analyze(cmd):
+    for seg in segs:
         if seg.exe not in ("rm", "rmdir"):
             continue
         seg_unresolved = False
@@ -231,7 +359,9 @@ def main() -> int:
                     # already expanded (no `$` left) and handled by _operand_blocks,
                     # so this neither fires on env vars nor resurrects the
                     # mention-only FP (which has no opaque-$var operand).
-                    reason = _legacy_substring_block(cmd, dirs)
+                    reason = _legacy_substring_block(
+                        cmd, dirs, "whose rm target is an unresolved shell variable"
+                    )
                     if reason:
                         return _block(reason)
                 elif _expand(operand, cwd) is None:
@@ -240,7 +370,9 @@ def main() -> int:
             # A relative rm target with no resolvable base: substring-check THIS
             # SEGMENT's raw text (not the whole command — that would resurrect
             # the mention-only false positive this rewrite kills).
-            reason = _legacy_substring_block(seg.raw, dirs)
+            reason = _legacy_substring_block(
+                seg.raw, dirs, "whose relative rm target has no resolvable base"
+            )
             if reason:
                 return _block(reason)
 

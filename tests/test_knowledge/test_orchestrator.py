@@ -35,6 +35,10 @@ def _wire_store_mock(mock_store, *, ids=None, side_effect=None, created=True):
             side_effect=[(i, created) for i in seq]
         )
     mock_store._db = AsyncMock()
+    # Compensation delegates to MemoryStore.delete(), which is the whole
+    # point: it carries the tombstone, the defer-when-Qdrant-is-down
+    # behaviour and all five cascades that a hand-rolled subset missed.
+    mock_store.delete = AsyncMock(return_value={"deferred": False})
     return mock_store
 
 
@@ -216,7 +220,7 @@ async def test_store_units_rollback_on_failure(tmp_path: Path):
          patch("genesis.mcp.memory_mcp._store", mock_store), \
          patch("genesis.mcp.memory_mcp.knowledge", mock_knowledge), \
          patch("genesis.db.connection.get_raw_db", _fake_get_raw_db), \
-         patch("genesis.qdrant.collections.delete_point") as mock_delete_point:
+         patch("genesis.qdrant.collections.delete_point"):
 
         file = tmp_path / "test.txt"
         file.write_text("some content")
@@ -234,9 +238,10 @@ async def test_store_units_rollback_on_failure(tmp_path: Path):
         mock_own.rollback.assert_awaited_once()
         mock_own.commit.assert_not_awaited()
 
-        # All 3 Qdrant vectors should be compensation-deleted
-        assert mock_delete_point.call_count == 3
-        deleted_ids = [call.kwargs["point_id"] for call in mock_delete_point.call_args_list]
+        # All 3 memories should be compensation-deleted, through the
+        # complete MemoryStore.delete() rather than a point-only removal.
+        assert mock_store.delete.await_count == 3
+        deleted_ids = [call.args[0] for call in mock_store.delete.call_args_list]
         assert deleted_ids == ["qid-0", "qid-1", "qid-2"]
 
 
@@ -532,14 +537,18 @@ async def test_a_rollback_does_not_delete_the_vector_a_surviving_row_points_at(
          patch("genesis.mcp.memory_mcp._store", mock_store), \
          patch("genesis.mcp.memory_mcp.knowledge", mock_knowledge), \
          patch("genesis.db.connection.get_raw_db", _fake_get_raw_db), \
-         patch("genesis.qdrant.collections.delete_point") as mock_delete_point:
+         patch("genesis.qdrant.collections.delete_point"):
         file = tmp_path / "test.txt"
         file.write_text("some content")
         result = await orch.ingest_source(str(file), project_type="test")
 
     assert result.error is not None
     mock_own.rollback.assert_awaited_once()
-    deleted = {c.kwargs["point_id"] for c in mock_delete_point.call_args_list}
+    # Compensation routes through MemoryStore.delete() now, so the assertion
+    # follows it there. The PROPERTY is unchanged and is the point of the
+    # test: only ids this batch created, never the stale ones a restored row
+    # still points at.
+    deleted = {c.args[0] for c in mock_store.delete.call_args_list}
     assert deleted == {"qid-new-0", "qid-new-1"}, (
         f"the rollback deleted a vector a restored row still points at: {deleted}"
     )
@@ -618,16 +627,10 @@ async def test_a_failure_opening_the_owned_connection_still_drops_phase_one_vect
     mock_store._qdrant = MagicMock()
     mock_store._embeddings = MagicMock(model_name="test-model")
 
-    dropped: list[str] = []
-
-    def _delete_point(_client, collection, point_id):
-        dropped.append(point_id)
-
     with patch("genesis.mcp.memory_mcp._require_init"), \
          patch("genesis.mcp.memory_mcp._store", mock_store), \
          patch("genesis.mcp.memory_mcp.knowledge", MagicMock()), \
-         patch("genesis.db.connection.get_raw_db", _refuses_to_open), \
-         patch("genesis.qdrant.collections.delete_point", _delete_point):
+         patch("genesis.db.connection.get_raw_db", _refuses_to_open):
         file = tmp_path / "test.txt"
         file.write_text("some content")
         await orch.ingest_source(str(file), project_type="test")
@@ -635,9 +638,10 @@ async def test_a_failure_opening_the_owned_connection_still_drops_phase_one_vect
     assert stored == ["qid-0", "qid-1", "qid-2"], (
         f"phase 1 did not run, so this never exercised the hazard: {stored}"
     )
-    assert sorted(dropped) == ["qid-0", "qid-1", "qid-2"], (
-        "phase-1 vectors were left orphaned when the owned connection could "
-        f"not be opened — compensation never ran (dropped={dropped})"
+    compensated = sorted(c.args[0] for c in mock_store.delete.call_args_list)
+    assert compensated == ["qid-0", "qid-1", "qid-2"], (
+        "phase-1 memories were left behind when the owned connection could "
+        f"not be opened — compensation never ran (compensated={compensated})"
     )
 
 
@@ -670,41 +674,46 @@ async def test_a_deduplicated_vector_is_never_compensated(tmp_path: Path):
     mock_store._qdrant = MagicMock()
     mock_store._embeddings = MagicMock(model_name="test-model")
 
-    dropped: list[str] = []
-
-    def _delete_point(_client, collection, point_id):
-        dropped.append(point_id)
+    mock_store.delete = AsyncMock(return_value={"deferred": False})
 
     with patch("genesis.mcp.memory_mcp._require_init"), \
          patch("genesis.mcp.memory_mcp._store", mock_store), \
          patch("genesis.mcp.memory_mcp.knowledge", MagicMock()), \
-         patch("genesis.db.connection.get_raw_db", _refuses_to_open), \
-         patch("genesis.qdrant.collections.delete_point", _delete_point):
+         patch("genesis.db.connection.get_raw_db", _refuses_to_open):
         file = tmp_path / "test.txt"
         file.write_text("some content")
         await orch.ingest_source(str(file), project_type="test")
 
-    assert dropped, "compensation never ran, so this proves nothing"
-    assert "qid-PREEXISTING" not in dropped, (
-        "compensation deleted a DEDUPLICATED point — that vector belongs to "
-        "memories written by an earlier ingest, and every knowledge_units row "
-        f"pointing at it just lost its embedding (dropped={dropped})"
+    compensated = sorted(c.args[0] for c in mock_store.delete.call_args_list)
+    assert compensated, "compensation never ran, so this proves nothing"
+    assert "qid-PREEXISTING" not in compensated, (
+        "compensation deleted a DEDUPLICATED memory — it belongs to an "
+        "earlier ingest, and every knowledge_units row pointing at it just "
+        f"lost its vector (compensated={compensated})"
     )
-    assert sorted(dropped) == ["qid-0", "qid-2"], (
-        f"created points must still be compensated (dropped={dropped})"
+    assert compensated == ["qid-0", "qid-2"], (
+        f"created memories must still be compensated ({compensated})"
     )
 
 
-async def test_compensation_also_removes_the_rows_store_committed(tmp_path: Path):
-    """Dropping the vector alone leaves the ingest permanently unrecoverable.
+async def test_compensation_delegates_to_the_complete_delete(tmp_path: Path):
+    """Compensation must use `MemoryStore.delete()`, not a hand-rolled subset.
 
-    ``MemoryStore.store`` commits ``memory_fts`` and ``memory_metadata``
-    through the SHARED connection during phase one. Compensating only the
-    Qdrant point leaves metadata claiming ``embedding_status='embedded'`` with
-    no vector behind it — and a retry then deduplicates against the surviving
-    FTS row, gets the same id back, and never recreates the vector. The unit
-    ends up visible only through FTS and invisible to the pending-embedding
-    worker. (Codex P1, PR #1653.)
+    `store()` writes FIVE places: the Qdrant point, `memory_fts`,
+    `memory_metadata`, `pending_embeddings` and `entity_mentions`. An earlier
+    version of this compensation removed the point and two tables by hand,
+    which failed in two ways only the complete delete gets right:
+
+    * the surviving `pending_embeddings` row made `embedding_recovery`
+      re-embed the content and upsert a point for an ingest that had been
+      rolled back — the rollback resurrected itself;
+    * when Qdrant is unavailable `delete()` DEFERS and keeps the rows, leaving
+      its tombstone open, because removing them anyway leaves a live point
+      holding the document text that no row names.
+
+    Asserting on the DELEGATION rather than on each cascade is deliberate:
+    re-listing the tables here would be a second copy of `delete()`'s contract,
+    drifting the moment a sixth write is added. (PR #1653 merge audit.)
     """
     orch = _make_orchestrator(tmp_path, mock_distill_result=_units(2))
 
@@ -718,33 +727,49 @@ async def test_compensation_also_removes_the_rows_store_committed(tmp_path: Path
     mock_store._qdrant = MagicMock()
     mock_store._embeddings = MagicMock(model_name="test-model")
 
-    fts_deleted: list[str] = []
-    meta_deleted: list[str] = []
-
-    async def _del_fts(_db, *, memory_id):
-        fts_deleted.append(memory_id)
-        return True
-
-    async def _del_meta(_db, *, memory_id):
-        meta_deleted.append(memory_id)
-        return True
-
     with patch("genesis.mcp.memory_mcp._require_init"), \
          patch("genesis.mcp.memory_mcp._store", mock_store), \
          patch("genesis.mcp.memory_mcp.knowledge", MagicMock()), \
-         patch("genesis.db.connection.get_raw_db", _refuses_to_open), \
-         patch("genesis.qdrant.collections.delete_point", lambda *a, **k: None), \
-         patch("genesis.db.crud.memory.delete", _del_fts), \
-         patch("genesis.db.crud.memory.delete_metadata", _del_meta):
+         patch("genesis.db.connection.get_raw_db", _refuses_to_open):
         file = tmp_path / "test.txt"
         file.write_text("some content")
         await orch.ingest_source(str(file), project_type="test")
 
-    assert sorted(fts_deleted) == ["qid-0", "qid-1"], (
-        "the memory_fts rows survived compensation, so a retry will "
-        f"deduplicate against them and never rebuild the vector ({fts_deleted})"
+    compensated = sorted(c.args[0] for c in mock_store.delete.call_args_list)
+    assert compensated == ["qid-0", "qid-1"], (
+        "compensation did not route through MemoryStore.delete(), so the "
+        "pending_embeddings and entity_mentions cascades never ran and the "
+        f"rolled-back ingest can be resurrected by the recovery worker "
+        f"({compensated})"
     )
-    assert sorted(meta_deleted) == ["qid-0", "qid-1"], (
-        "memory_metadata survived still claiming embedding_status='embedded' "
-        f"with no vector behind it ({meta_deleted})"
-    )
+
+
+async def test_a_deferred_compensation_is_reported_not_swallowed(tmp_path: Path):
+    """When Qdrant is down `delete()` returns `deferred` and KEEPS the rows,
+    on purpose. That is correct but temporarily inconsistent, so it must be
+    visible rather than silent — the tombstone is drained by the nightly
+    reconcile lane, not by this ingest."""
+    orch = _make_orchestrator(tmp_path, mock_distill_result=_units(1))
+
+    @contextlib.asynccontextmanager
+    async def _refuses_to_open(_path):
+        raise RuntimeError("disk I/O error opening database")
+        yield  # pragma: no cover - unreachable, required to make this a CM
+
+    mock_store = MagicMock()
+    _wire_store_mock(mock_store, ids=["qid-0"])
+    mock_store._qdrant = MagicMock()
+    mock_store._embeddings = MagicMock(model_name="test-model")
+    mock_store.delete = AsyncMock(return_value={"deferred": True})
+
+    with patch("genesis.mcp.memory_mcp._require_init"), \
+         patch("genesis.mcp.memory_mcp._store", mock_store), \
+         patch("genesis.mcp.memory_mcp.knowledge", MagicMock()), \
+         patch("genesis.db.connection.get_raw_db", _refuses_to_open):
+        file = tmp_path / "test.txt"
+        file.write_text("some content")
+        # Must not raise: a deferred compensation is a known state, not a
+        # second failure stacked on the original.
+        await orch.ingest_source(str(file), project_type="test")
+
+    assert mock_store.delete.await_count == 1

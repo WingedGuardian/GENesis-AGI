@@ -110,6 +110,36 @@ def test_observe_blocks_memory_writes():
     assert "mcp__genesis-memory__procedure_store" in PROFILES["observe"]
 
 
+# --- Entity-merge human-approval gate (safety-critical) ---
+# The whole point of the entity-merge approval gate is that NO autonomous session
+# can approve+apply its own merges (self-approving the human gate). approve/apply/
+# reject must therefore be denied in EVERY profile; only the read-only list stays.
+
+_ENTITY_ADJUD_WRITE_TOOLS = (
+    "mcp__genesis-memory__entity_adjudication_approve",
+    "mcp__genesis-memory__entity_adjudication_apply",
+    "mcp__genesis-memory__entity_adjudication_reject",
+)
+
+
+@pytest.mark.parametrize("profile", sorted(PROFILES))
+def test_every_profile_blocks_entity_adjudication_writes(profile):
+    """No autonomous profile may approve/apply/reject entity merges — that would
+    let a background session self-approve the human gate it exists to enforce."""
+    for tool in _ENTITY_ADJUD_WRITE_TOOLS:
+        assert tool in PROFILES[profile], (
+            f"{profile} must block {tool} — a background session that can "
+            "approve+apply defeats the entity-merge human-approval gate"
+        )
+
+
+@pytest.mark.parametrize("profile", sorted(PROFILES))
+def test_entity_adjudication_list_stays_readable(profile):
+    """The read-only review listing is safe — it must NOT be swept into the deny
+    list (a profile with memory access may surface proposals for a human)."""
+    assert "mcp__genesis-memory__entity_adjudication_list" not in PROFILES[profile]
+
+
 def test_observe_blocks_outreach_send():
     assert "mcp__genesis-outreach__outreach_send" in PROFILES["observe"]
     assert "mcp__genesis-outreach__outreach_send_and_wait" in PROFILES["observe"]
@@ -272,7 +302,8 @@ def _make_runner():
     config_builder = MagicMock()
     surplus_cfg = {"system_prompt": "test"}
     config_builder.build_surplus_config.return_value = surplus_cfg
-    config_builder.build_mcp_config.return_value = None
+    config_builder.build_mcp_config.return_value = "/tmp/test-mcp.json"
+    config_builder.build_research_recon_disallowed.return_value = []
     return DirectSessionRunner(
         invoker=MagicMock(),
         session_manager=MagicMock(),
@@ -470,6 +501,71 @@ def test_marketing_send_cannot_be_re_enabled_via_tool_exceptions(profile):
     assert _MARKETING_SEND in inv.disallowed_tools
 
 
+@pytest.mark.parametrize("profile", list(PROFILES))
+@pytest.mark.parametrize(
+    "tool",
+    [
+        "mcp__genesis-memory__entity_adjudication_approve",
+        "mcp__genesis-memory__entity_adjudication_apply",
+        "mcp__genesis-memory__entity_adjudication_reject",
+    ],
+)
+def test_entity_adjudication_writes_cannot_be_re_enabled_via_tool_exceptions(profile, tool):
+    """A per-request tool_exception must NOT unblock approve/apply/reject on ANY
+    profile — otherwise a background session could self-approve the human entity-
+    merge gate through the exception hole, defeating the universal deny. Mirrors
+    the marketing_send / recursive-spawn (direct_session_run) protections."""
+    runner = _make_runner()
+    req = DirectSessionRequest(
+        prompt="t",
+        profile=profile,
+        model=CCModel.SONNET,
+        tool_exceptions=(tool,),
+    )
+    inv = runner._build_invocation(req, "test-session")
+    assert tool in inv.disallowed_tools
+
+
+_MARKETING_LIST = "mcp__genesis-outreach__marketing_prospects_list"
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [p for p in PROFILES if p != "campaign"],
+)
+def test_marketing_prospects_list_denied_outside_campaign(profile):
+    """The prospect ENUMERATION tool exposes private names+addresses from the
+    marketing_prospects store. Like the actuator, it must be reachable ONLY from
+    `campaign`; every other profile — crucially the untrusted-inbound perimeter
+    (mail + community-responder) — must deny it, so an injected inbound message can
+    never enumerate the list and echo it back through the reply tool."""
+    assert _MARKETING_LIST in PROFILES[profile], f"{profile} must deny {_MARKETING_LIST}"
+
+
+def test_marketing_prospects_list_allowed_in_campaign():
+    """campaign is the intended marketing caller — it must NOT deny the enumeration."""
+    assert _MARKETING_LIST not in PROFILES["campaign"]
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [p for p in PROFILES if p != "campaign"],
+)
+def test_marketing_prospects_list_cannot_be_re_enabled_via_tool_exceptions(profile):
+    """A per-request tool_exception must NOT unblock the enumeration on a non-campaign
+    profile — otherwise the exception mechanism is a prospect-PII exfil hole from the
+    untrusted-inbound perimeter."""
+    runner = _make_runner()
+    req = DirectSessionRequest(
+        prompt="t",
+        profile=profile,
+        model=CCModel.SONNET,
+        tool_exceptions=(_MARKETING_LIST,),
+    )
+    inv = runner._build_invocation(req, "test-session")
+    assert _MARKETING_LIST in inv.disallowed_tools
+
+
 def test_mail_blocks_outreach_extras():
     assert "mcp__genesis-outreach__outreach_send_and_wait" in PROFILES["mail"]
     assert "mcp__genesis-outreach__outreach_poll" in PROFILES["mail"]
@@ -569,6 +665,76 @@ def test_non_steward_invocation_has_empty_bash_allowlist():
     req = DirectSessionRequest(prompt="test", profile="research", model=CCModel.SONNET)
     inv = runner._build_invocation(req, "test-session")
     assert inv.bash_allowlist == ()
+
+
+def test_research_profile_injects_shared_web_research_skill():
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="compare available libraries", profile="research")
+    inv = runner._build_invocation(req, "test-session")
+
+    assert "## Skill: web-research" in (inv.system_prompt or "")
+    assert "Evidence standard" in (inv.system_prompt or "")
+
+
+def test_research_profile_keeps_required_skill_with_explicit_skills():
+    runner = _make_runner()
+    explicit_skills = ["voice-master"]
+    req = DirectSessionRequest(
+        prompt="compare available libraries", profile="research", skills=explicit_skills,
+    )
+    inv = runner._build_invocation(req, "test-session")
+
+    assert "## Skill: web-research" in (inv.system_prompt or "")
+    assert explicit_skills == ["voice-master"]
+
+
+def test_research_profile_fails_when_required_skill_is_missing(monkeypatch):
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="research", profile="research")
+    monkeypatch.setattr("genesis.learning.skills.wiring.load_skill", lambda _name: None)
+
+    with pytest.raises(RuntimeError, match="requires the web-research skill"):
+        runner._build_invocation(req, "test-session")
+
+
+@pytest.mark.parametrize(
+    "load_error", [OSError("unreadable"), UnicodeError("invalid UTF-8")],
+)
+def test_research_profile_normalizes_required_skill_read_errors(monkeypatch, load_error):
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="research", profile="research")
+
+    def fail(_name):
+        raise load_error
+
+    monkeypatch.setattr("genesis.learning.skills.wiring.load_skill", fail)
+    with pytest.raises(RuntimeError, match="requires the web-research skill") as raised:
+        runner._build_invocation(req, "test-session")
+    assert raised.value.__cause__ is load_error
+
+
+def test_research_profile_fails_when_mcp_config_is_missing():
+    runner = _make_runner()
+    runner._config_builder.build_mcp_config.return_value = None
+    req = DirectSessionRequest(prompt="research", profile="research")
+
+    with pytest.raises(RuntimeError, match="requires its MCP configuration"):
+        runner._build_invocation(req, "test-session")
+
+
+def test_research_profile_uses_derived_recon_boundary():
+    runner = _make_runner()
+    runner._config_builder.build_research_recon_disallowed.return_value = [
+        "mcp__genesis-recon__recon_store_finding",
+    ]
+    req = DirectSessionRequest(
+        prompt="research",
+        profile="research",
+        tool_exceptions=["mcp__genesis-recon__recon_store_finding"],
+    )
+    inv = runner._build_invocation(req, "test-session")
+
+    assert "mcp__genesis-recon__recon_store_finding" in inv.disallowed_tools
 
 
 # --- Profile overlay mechanism (generic; install-local profiles) ---
@@ -864,3 +1030,75 @@ def test_interact_allows_follow_up_update():
 
 def test_research_maps_to_research_mcp_profile():
     assert _PROFILE_TO_MCP["research"] == "research"
+
+
+# --- perimeter outreach surface: ALLOWLIST polarity ---
+# PROFILES entries are DENY lists, so a tool nobody enumerates is ALLOWED. Every
+# test above is `in` / `not in` on a named tool, which by construction cannot fail
+# for a tool that was just added — the `mail` profile's own comment claims "only
+# outreach_send is available", but nothing enforced that claim.
+#
+# This test states it as an allowlist instead: enumerate what the genesis-outreach
+# server actually registers, and require the perimeter profile to deny everything
+# outside a small, explicitly-reasoned allowed set. A new outreach tool now fails
+# this test until someone decides which side of the boundary it belongs on.
+#
+# It caught a real regression on the change that added it: outreach_pending (up to
+# 50 queued messages with previews — an exfiltration surface for injected inbound
+# content) and outreach_cancel (silently retracts the owner's queued alerts) were
+# both reachable from `mail`.
+
+# Deliberately allowed on the untrusted-inbound perimeter, with the reason:
+#   outreach_send  — the profile exists to reply to email; this IS its actuator.
+_PERIMETER_ALLOWED_OUTREACH = {"outreach_send"}
+
+
+async def test_perimeter_profiles_deny_every_outreach_tool_but_the_reply_actuator():
+    from genesis.mcp.outreach_mcp import mcp as outreach_mcp
+
+    registered = set(await outreach_mcp.get_tools())
+    assert "outreach_send" in registered, "enumeration is stale — the server changed"
+
+    for profile in ("mail", "community-responder"):
+        denied = set(PROFILES[profile])
+        should_deny = registered - _PERIMETER_ALLOWED_OUTREACH
+        missing = sorted(
+            name for name in should_deny if f"mcp__genesis-outreach__{name}" not in denied
+        )
+        assert not missing, (
+            f"profile {profile!r} does not deny outreach tool(s) {missing}. PROFILES is a "
+            "DENY list, so an unlisted tool is ALLOWED to a session reading "
+            "attacker-controlled inbound content. Add each to a _NO_OUTREACH_* group, "
+            "or to _PERIMETER_ALLOWED_OUTREACH with a written reason."
+        )
+
+
+def test_no_background_profile_can_read_or_cancel_the_pending_queue():
+    """EVERY background profile must deny the queue controls — allowed set is empty.
+
+    PROFILES governs background sessions only; the owner's own interactive session
+    does not go through it. No background session has business reading what the
+    owner has scheduled or retracting it, so this is stated over ALL profiles
+    rather than over a hand-maintained perimeter list.
+
+    That distinction is the finding: enumerating the perimeter profile-by-profile
+    left `steward` reachable, and steward ingests external GitHub PR content and
+    can publish `gh` comments — so an injected PR body could read queued-message
+    previews out through a comment, or silently cancel the owner's alerts.
+    `interact` (arbitrary browser pages) and `campaign` (external platform
+    replies) have the same shape. Iterating PROFILES removes the judgement call,
+    and a NEW profile is covered the moment it is added.
+    """
+    queue_controls = {
+        "mcp__genesis-outreach__outreach_pending",
+        "mcp__genesis-outreach__outreach_cancel",
+    }
+    gaps = {
+        profile: sorted(queue_controls - set(denied))
+        for profile, denied in PROFILES.items()
+        if queue_controls - set(denied)
+    }
+    assert not gaps, (
+        "background profile(s) can reach the pending-queue controls: "
+        f"{gaps}. Add _NO_OUTREACH_QUEUE_CONTROL to each."
+    )

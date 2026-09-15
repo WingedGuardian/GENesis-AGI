@@ -365,10 +365,27 @@ class TestPaidProviderProfilePricing:
         ]
 
     def test_the_pairing_is_actually_discovered(self):
-        """Guard the guard — an empty list makes the test below vacuous."""
+        """Guard the guard — an empty list makes the test below vacuous.
+
+        Deliberately does NOT name a provider. It used to anchor on
+        `mistral-large-free`, which broke the day that provider's `free:` flag
+        legitimately changed — a guard-the-guard test that fails on a correct
+        config change is itself a defect, because it teaches the next person to
+        edit the assertion rather than read it. The property that matters is
+        "some paid provider carries a profile", not which one.
+        """
         pairs = self._paid_providers_with_profiles()
         assert len(pairs) >= 5, pairs
-        assert any(n == "mistral-large-free" for n, _ in pairs), pairs
+        # Every discovered profile NAME must resolve in the registry. The
+        # previous line here was `all(name and profile for ...)`, which cannot
+        # fail: `pairs` is built with `if spec.get("profile")`, so `profile` is
+        # truthy by construction and `name` is a non-empty YAML key. It read as
+        # coverage while providing none — the exact defect this class of test
+        # exists to prevent, written into the guard-the-guard itself.
+        registry = ModelProfileRegistry(_repo_config_dir() / "model_profiles.yaml")
+        registry.load()
+        unresolved = [(n, p) for n, p in pairs if registry.get(p) is None]
+        assert not unresolved, f"routing names a profile that does not exist: {unresolved}"
 
     def test_every_paid_provider_profile_has_a_nonzero_rate(self):
         """A paid provider whose profile prices it at 0 records $0 spend on the

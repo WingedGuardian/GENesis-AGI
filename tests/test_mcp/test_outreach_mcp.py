@@ -20,6 +20,10 @@ async def test_all_tools_registered():
         "outreach_digest",
         "outreach_send_and_wait",
         "provision_grow",
+        # Queue controls (#1911). Listed here because this assertion is the only
+        # thing that notices a tool silently failing to register.
+        "outreach_pending",
+        "outreach_cancel",
     ]:
         assert name in tools, f"Missing tool: {name}"
 
@@ -225,7 +229,14 @@ async def test_outreach_poll_no_webhook():
         )
     data = json.loads(result)
     assert "error" in data
-    assert "No webhook URL" in data["error"]
+    # The message changed when the silent default-webhook fallback was removed:
+    # it now names the channel AND the exact setting to configure, instead of
+    # the generic "No webhook URL found". The INTENT this test pins — an
+    # unconfigured channel is refused rather than posted somewhere else — is
+    # unchanged and is asserted more strictly than before.
+    assert "announcements" in data["error"], data["error"]
+    assert "DISCORD_WEBHOOK_ANNOUNCEMENTS" in data["error"], data["error"]
+    assert data.get("status") != "created"
 
 
 @pytest.mark.asyncio
@@ -537,3 +548,332 @@ async def test_generic_outreach_send_forwards_labeled_surplus(tmp_path):
     finally:
         mcp_mod._pipeline, mcp_mod._db = old_pipeline, old_db
         await conn.close()
+
+
+# ── Discord sub-channel routing ──────────────────────────────────────────────
+#
+# Origin (2026-09-07): asked to post a release announcement to Discord, the only
+# thing `outreach_send` accepted was `channel="discord"` — which resolves to
+# `OUTREACH_RECIPIENT_DISCORD`, defaulting to "dev-discussion". So a release
+# announcement would have landed in the dev channel, silently: no error, and the
+# webhook adapter falls back to the default webhook rather than failing on an
+# unknown name, so nothing anywhere says "that is not where you asked to go".
+#
+# The pipeline could always steer this (`target_chat_id` beats the configured
+# default in _deliver). What was missing was a way for a caller to SAY it.
+
+
+class TestDiscordSubChannelRouting:
+    @staticmethod
+    def _capture():
+        """A pipeline stub that records the OutreachRequest it was handed.
+
+        Patches `submit` — the method outreach_send actually calls. An earlier
+        version of this stub patched a `process_request` that does not exist, so
+        every test failed on `MagicMock can't be used in 'await'` rather than on
+        the assertion. A stub that mocks the wrong method tests nothing.
+        """
+        seen = {}
+
+        async def _send(req):
+            seen["req"] = req
+            # outreach_send reads result.status.value / .channel / .error, so the
+            # stub has to carry that shape or the test dies formatting its own
+            # success rather than on an assertion.
+            return MagicMock(
+                outreach_id="o-test",
+                status=MagicMock(value="delivered"),
+                channel=req.channel,
+                error=None,
+            )
+
+        pipe = MagicMock()
+        pipe.submit = AsyncMock(side_effect=_send)
+        pipe.submit_urgent = AsyncMock(side_effect=_send)
+        return pipe, seen
+
+    async def test_named_channel_routes_to_that_channel(self):
+        """`channel="announcements"` must reach announcements, not the default."""
+        pipe, seen = self._capture()
+        old = mcp_mod._pipeline
+        try:
+            mcp_mod._pipeline = pipe
+            tools = await mcp.get_tools()
+            await tools["outreach_send"].fn(
+                message="release notes", category="notification", channel="announcements",
+            )
+        finally:
+            mcp_mod._pipeline = old
+
+        req = seen["req"]
+        assert req.channel == "discord", "must route through the discord ADAPTER"
+        assert req.target_chat_id == "announcements", (
+            "the sub-channel must ride as the recipient override — without it the "
+            "send silently lands in OUTREACH_RECIPIENT_DISCORD (default dev-discussion)"
+        )
+
+    async def test_every_known_channel_is_accepted(self):
+        """Whole-set, not just the one that bit us — a name in DISCORD_CHANNELS
+        that this tool does not recognise is a channel nobody can target."""
+        from genesis.outreach.types import DISCORD_CHANNELS
+
+        for name in sorted(DISCORD_CHANNELS):
+            pipe, seen = self._capture()
+            old = mcp_mod._pipeline
+            try:
+                mcp_mod._pipeline = pipe
+                tools = await mcp.get_tools()
+                await tools["outreach_send"].fn(
+                    message="m", category="notification", channel=name,
+                )
+            finally:
+                mcp_mod._pipeline = old
+            assert seen["req"].channel == "discord", name
+            assert seen["req"].target_chat_id == name, name
+
+    async def test_bare_discord_still_uses_the_configured_default(self):
+        """Backward compatibility: `channel="discord"` must not gain an override."""
+        pipe, seen = self._capture()
+        old = mcp_mod._pipeline
+        try:
+            mcp_mod._pipeline = pipe
+            tools = await mcp.get_tools()
+            await tools["outreach_send"].fn(
+                message="m", category="notification", channel="discord",
+            )
+        finally:
+            mcp_mod._pipeline = old
+        assert seen["req"].channel == "discord"
+        assert seen["req"].target_chat_id is None, (
+            "bare 'discord' must keep resolving to the configured recipient"
+        )
+
+    async def test_a_non_discord_channel_is_untouched(self):
+        """Telegram/email must not be rewritten by the discord branch."""
+        pipe, seen = self._capture()
+        old = mcp_mod._pipeline
+        try:
+            mcp_mod._pipeline = pipe
+            tools = await mcp.get_tools()
+            await tools["outreach_send"].fn(
+                message="m", category="notification", channel="telegram",
+            )
+        finally:
+            mcp_mod._pipeline = old
+        assert seen["req"].channel == "telegram"
+        assert seen["req"].target_chat_id is None
+
+    async def test_the_two_channel_lists_are_one_list(self):
+        """scheduler and outreach_send must not drift apart on what a channel is."""
+        from genesis.outreach.scheduler import _DISCORD_CHANNELS
+        from genesis.outreach.types import DISCORD_CHANNELS
+
+        assert _DISCORD_CHANNELS is DISCORD_CHANNELS
+
+    async def test_the_queued_path_keeps_the_raw_channel_name(self):
+        """THE second half, and the one a live send caught rather than a test.
+
+        When no pipeline is wired (standalone MCP), outreach_send ENQUEUES to
+        pending_outreach and genesis-server drains it later. The drain does its
+        own sub-channel mapping from the RAW name, so the row must keep
+        "announcements" — not the "discord" the live path uses. A first version
+        of this fix rewrote `channel` before the queued branch, which stored
+        "discord" and lost which channel was asked for: the same defect, one
+        code path over. MEASURED with a real release announcement that was
+        caught in the queue before it drained to dev-discussion.
+        """
+        old_pipe, old_db = mcp_mod._pipeline, mcp_mod._db
+        seen = {}
+
+        async def _enqueue(_db, **kw):
+            seen.update(kw)
+            return "pending-test"
+
+        try:
+            mcp_mod._pipeline = None
+            mcp_mod._db = MagicMock()
+            with patch("genesis.db.crud.pending_outreach.ensure_table", new_callable=AsyncMock), \
+                 patch("genesis.db.crud.pending_outreach.enqueue", side_effect=_enqueue):
+                tools = await mcp.get_tools()
+                await tools["outreach_send"].fn(
+                    message="m", category="notification", channel="announcements",
+                )
+        finally:
+            mcp_mod._pipeline, mcp_mod._db = old_pipe, old_db
+
+        assert seen["channel"] == "announcements", (
+            "the queued row must keep the sub-channel name for the drain to map; "
+            f"got {seen['channel']!r}"
+        )
+
+
+async def test_outreach_pending_pages_with_a_denominator(tmp_path):
+    """The listing must report a TOTAL and a truncation flag, not a bare list.
+
+    A bare list capped at 50 is indistinguishable from a complete one. With 60
+    queued messages a caller would have concluded it had seen them all — and since
+    every id worth cancelling comes from this tool, the invisible rows were also
+    the uncancellable ones. Paging with `total` + `truncated` is the house shape
+    for a bounded read: whole elements, plus a denominator.
+    """
+    import aiosqlite
+
+    from genesis.db.crud import pending_outreach
+
+    old_pipeline, old_db = mcp_mod._pipeline, mcp_mod._db
+    async with aiosqlite.connect(str(tmp_path / "p.db")) as conn:
+        conn.row_factory = aiosqlite.Row
+        await pending_outreach.ensure_table(conn)
+        for i in range(60):
+            await pending_outreach.enqueue(
+                conn, message=f"queued {i}", category="notification",
+                deliver_after=f"2030-01-{(i % 28) + 1:02d}T00:00:00+00:00",
+            )
+        try:
+            mcp_mod._pipeline = None
+            mcp_mod._db = conn
+            tools = await mcp.get_tools()
+
+            first = await tools["outreach_pending"].fn()
+            assert first["total"] == 60, first
+            assert len(first["items"]) == 50
+            assert first["truncated"] is True, "60 rows behind a 50 cap must say so"
+
+            # The tail is REACHABLE, which is the point of paging.
+            rest = await tools["outreach_pending"].fn(offset=50)
+            assert len(rest["items"]) == 10
+            assert rest["truncated"] is False
+            ids = {r["id"] for r in first["items"]} | {r["id"] for r in rest["items"]}
+            assert len(ids) == 60, "paging lost or duplicated rows"
+
+            # A cancelled row leaves the listing AND the denominator.
+            await pending_outreach.cancel(conn, first["items"][0]["id"])
+            after = await tools["outreach_pending"].fn()
+            assert after["total"] == 59
+        finally:
+            mcp_mod._pipeline, mcp_mod._db = old_pipeline, old_db
+
+
+class TestPollRefusesUnconfiguredChannel:
+    """The LIVE poll path, which kept its own copy of the silent fallback.
+
+    The adapter's `send_poll` has ZERO production callers (`grep -rn "send_poll"
+    src/` returns only its definition), so hardening it guarded nothing. The
+    reachable path is this MCP tool, which resolved
+    `os.environ.get(env_key) or os.environ.get("DISCORD_WEBHOOK_URL")` and then
+    returned `{"status": "created", "channel": "bug-reports"}` — the requested
+    name, on a post that went to the default channel. For a poll that is worse
+    than a misdirected message: it collects the wrong audience's votes.
+    """
+
+    @staticmethod
+    def _env(monkeypatch, **overrides):
+        """Only the vars this path reads, so a real local env cannot leak in."""
+        for var in (
+            "DISCORD_WEBHOOK_URL",
+            "DISCORD_WEBHOOK_BUG_REPORTS",
+            "DISCORD_WEBHOOK_ANNOUNCEMENTS",
+            "OUTREACH_RECIPIENT_DISCORD",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        for k, v in overrides.items():
+            monkeypatch.setenv(k, v)
+
+    async def test_unconfigured_named_channel_is_refused(self, monkeypatch):
+        self._env(monkeypatch, DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/0/default")
+        tools = await mcp.get_tools()
+        out = json.loads(
+            await tools["outreach_poll"].fn(
+                channel="bug-reports", question="Ship it?", answers=["Yes", "No"],
+            )
+        )
+        assert "error" in out, out
+        assert "bug-reports" in out["error"]
+        assert "DISCORD_WEBHOOK_BUG_REPORTS" in out["error"], (
+            "the refusal must name the exact setting to add"
+        )
+        assert out.get("status") != "created"
+
+    async def test_a_configured_channel_still_resolves(self, monkeypatch):
+        """Guard the other direction: the refusal must not break a channel that
+        IS configured."""
+        self._env(
+            monkeypatch,
+            DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/0/default",
+            DISCORD_WEBHOOK_ANNOUNCEMENTS="https://discord.com/api/webhooks/1/ann",
+        )
+        tools = await mcp.get_tools()
+        with patch("genesis.mcp.outreach_mcp.httpx.AsyncClient") as mock_cls:
+            client = AsyncMock()
+            client.post.return_value = AsyncMock(
+                status_code=200, json=lambda: {"id": "poll-1"},
+            )
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            out = json.loads(
+                await tools["outreach_poll"].fn(
+                    channel="announcements", question="Ship it?", answers=["Yes", "No"],
+                )
+            )
+        assert "error" not in out, out
+        assert "1/ann" in client.post.call_args[0][0], client.post.call_args
+
+    async def test_the_default_channel_still_falls_back(self, monkeypatch):
+        """'The default channel' IS whatever DISCORD_WEBHOOK_URL points at, so it
+        need not appear in the per-channel map. This is the case a too-broad
+        refusal would break first."""
+        self._env(
+            monkeypatch,
+            DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/0/default",
+            OUTREACH_RECIPIENT_DISCORD="dev-discussion",
+        )
+        tools = await mcp.get_tools()
+        with patch("genesis.mcp.outreach_mcp.httpx.AsyncClient") as mock_cls:
+            client = AsyncMock()
+            client.post.return_value = AsyncMock(
+                status_code=200, json=lambda: {"id": "poll-2"},
+            )
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            out = json.loads(
+                await tools["outreach_poll"].fn(
+                    channel="dev-discussion", question="Ship it?", answers=["Yes", "No"],
+                )
+            )
+        assert "error" not in out, out
+        assert "0/default" in client.post.call_args[0][0]
+
+    @pytest.mark.parametrize("name", ["url", "URL", "Url"])
+    async def test_the_reserved_default_name_is_not_a_channel(self, monkeypatch, name):
+        """`url` names the DEFAULT webhook's VARIABLE, not a channel.
+
+        The env-naming rule inverts `url` — in any letter case, and `URL` via
+        the `-`→`_` rule too — onto `DISCORD_WEBHOOK_URL`, while the discovery
+        loop deliberately EXCLUDES that variable from the per-channel map. So no
+        channel owns it, yet a direct lookup SUCCEEDED: it short-circuited the
+        default-channel test above and posted to the default channel while
+        reporting the requested name back as `url`. Same undetectable redirect
+        this class exists to remove, through the one name nobody thinks to test.
+
+        The control for this is `test_the_default_channel_still_falls_back`
+        directly above — a fix that simply refused anything resolving to that
+        variable would break every default-channel poll.
+        """
+        self._env(
+            monkeypatch,
+            DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/0/default",
+            OUTREACH_RECIPIENT_DISCORD="dev-discussion",
+        )
+        tools = await mcp.get_tools()
+        with patch("genesis.mcp.outreach_mcp.httpx.AsyncClient") as mock_cls:
+            client = AsyncMock()
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            out = json.loads(
+                await tools["outreach_poll"].fn(
+                    channel=name, question="Where did this land?", answers=["A", "B"],
+                )
+            )
+        assert "error" in out, f"the reserved name must be refused, got {out}"
+        client.post.assert_not_called()
+
