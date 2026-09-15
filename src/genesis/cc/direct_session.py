@@ -158,6 +158,10 @@ _UNIVERSAL_DISALLOW = [
     "mcp__genesis-memory__memory_store",
     "mcp__genesis-memory__memory_synthesize",
     "mcp__genesis-memory__memory_extract",
+    # memory_supersede mutates BOTH stores (SQLite deprecation + Qdrant
+    # payload): a background session deprecating owner memories is a write
+    # by any name, so it sits behind the same isolation as the store tools.
+    "mcp__genesis-memory__memory_supersede",
     # Knowledge ingestion requires explicit user authorization.
     "mcp__genesis-memory__knowledge_ingest",
     "mcp__genesis-memory__knowledge_ingest_batch",
