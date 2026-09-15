@@ -779,4 +779,20 @@ jobs:
         # does not. That asymmetry is the trap: an under-set floor still passes,
         # so the guard quietly forfeits the exact fit it exists to hold and
         # nothing says a word.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23217
+        #
+        # RAISED 99 -> 101 and 23217 -> 23250 by the wrapper-arity lock, both
+        # counted rather than padded, and the skip axis measured where it counts:
+        # CI itself reported "101 skipped, ceiling is 99", i.e. exactly the two
+        # this file adds. Those two are environment-gated by construction — one
+        # wrapper is not installed on either this runner or the dev box, and
+        # `time` is excluded because bash's keyword and /usr/bin/time are
+        # different programs sharing a basename, so no single help output can
+        # settle its entry.
+        #
+        # The collected axis: +33, MEASURED by collection
+        # (`--collect-only -q` on the new file) and not by counting `def test_`,
+        # because six of its cases are parametrised and read as one apiece. This
+        # is the axis the note above warns gets forgotten — it does not turn CI
+        # red when it is left low, so it was re-derived deliberately rather than
+        # noticed.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 101 --min-collected 23250

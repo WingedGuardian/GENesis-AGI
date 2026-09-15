@@ -79,6 +79,13 @@ _WRAPPER_SPEC = {
         0,
     ),
     "doas": ({"-u", "-C"}, 0),
+    # `-S`/`--split-string` is deliberately ABSENT, and its absence is tracked
+    # rather than accidental. It carries a whole command line as ONE token, so
+    # listing it here would stop that token being read as the executable while
+    # HIDING what it carries — strictly worse than today's visible mis-read. It
+    # needs the nested walk, and `-S` has its own escape language, appends the
+    # arguments that follow it, and re-reads the split fields as env's own
+    # options. That is a grammar to model against the binary, not a table entry.
     "env": ({"-u", "--unset", "-C", "--chdir"}, 0),
     "nice": ({"-n", "--adjustment"}, 0),
     "ionice": ({"-c", "--class", "-n", "--classdata", "-p", "--pid"}, 0),
@@ -90,10 +97,19 @@ _WRAPPER_SPEC = {
     "time": ({"-o", "--output", "-f", "--format"}, 0),
     "command": (set(), 0),
     "exec": ({"-a"}, 0),
+    # `-e/--eof` and `-i/--replace` are NOT here, and their absence is the point.
+    # xargs gives them OPTIONAL values (`--eof[=END]`, `--replace[=R]`), so as a
+    # bare token they consume nothing — and listing them made this walk eat the
+    # command word instead. MEASURED: `xargs -i <cmd>` and `xargs -e <cmd>` both
+    # RUN <cmd>, while the parser resolved past it and the push guard exited 0 on
+    # a command it blocks when written plainly. This is the same failure
+    # `--isolated` taught the uv table: a wrongly-listed flag is the dangerous
+    # direction of a list like this, because it mis-parses a form that works
+    # rather than one that does not. `-E` and `-I` keep REQUIRED separate values
+    # (`-E END`, `-I R`) and stay.
     "xargs": (
         {
             "-I",
-            "-i",
             "-n",
             "--max-args",
             "-P",
@@ -107,9 +123,7 @@ _WRAPPER_SPEC = {
             "--delimiter",
             "-a",
             "--arg-file",
-            "-e",
-            "--eof",
-            "--replace",
+            "--process-slot-var",
         },
         0,
     ),
