@@ -19,8 +19,15 @@ enabled_tools = [
   "subsystem_heartbeats",
   "job_health",
   "provider_activity",
-  "infrastructure_profile",
 ]
+# NOT here: `infrastructure_profile`. An allowlist grants the TOOL, not its
+# ARGUMENTS, and `refresh=true` persists profile files, emits DB drift
+# observations and renders shared documents — so admitting it would put the one
+# write in an otherwise entirely read-only surface, and the tool's own
+# empty-state hint ("pass refresh=true") actively invites that call. The value
+# here is that this list is auditable by inspection. Restoring machine-facts
+# visibility means splitting the tool into a read-only view plus a separate
+# refresh, not re-adding this line.
 default_tools_approval_mode = "approve"
 
 [mcp_servers.genesis-memory]

@@ -83,6 +83,27 @@ def test_main_executes_launcher_with_sanitized_environment(monkeypatch) -> None:
 
 
 def test_project_config_exposes_only_the_read_oriented_pilot_tools() -> None:
+    """The external surface admits no tool a CALLER can ask to write.
+
+    This list is the whole security story for the external client, and it is
+    worth stating precisely, because the obvious phrasing is false. Several of
+    these tools do write incidentally — recall is read-MOSTLY, and bumps access
+    counters on a hit. The invariant is narrower and it is the one that matters:
+    **no allowlisted tool takes an argument by which a caller can REQUEST a
+    mutation.** Incidental bookkeeping the caller cannot steer is not the same
+    as handing it a switch.
+
+    `infrastructure_profile` is deliberately absent for exactly that reason: an
+    allowlist grants the TOOL, not its ARGUMENTS, so admitting it would admit
+    `refresh=true` — which persists profile files, emits DB drift observations
+    and renders shared documents. The tool's own empty-state response hints
+    "pass refresh=true", so an agent would reach for it unprompted.
+
+    Enumerated rather than spot-checked: at the time of writing every other
+    entry has a read-only signature. Adding a tool here means checking its
+    ARGUMENTS for a caller-requestable write, not just its name — and this
+    assertion is what forces that check to happen deliberately.
+    """
     root = Path(__file__).resolve().parents[2]
     config = tomllib.loads((root / ".codex" / "config.toml").read_text())
 
@@ -99,7 +120,6 @@ def test_project_config_exposes_only_the_read_oriented_pilot_tools() -> None:
         "subsystem_heartbeats",
         "job_health",
         "provider_activity",
-        "infrastructure_profile",
     ]
     assert servers["genesis-memory"]["enabled_tools"] == [
         "memory_recall",
