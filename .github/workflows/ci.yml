@@ -779,4 +779,28 @@ jobs:
         # does not. That asymmetry is the trap: an under-set floor still passes,
         # so the guard quietly forfeits the exact fit it exists to hold and
         # nothing says a word.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23217
+        #
+        # +33 collected by the capped-read advisory (2026-09-14), MEASURED BY
+        # COLLECTION on the two files that change: the new suite collects 32 and
+        # the advisory-channel net gains 1. 23217 -> 23250.
+        #
+        # RE-COUNTED after the adversarial review's fixes added four cases (the
+        # literal defect command, the remedy-correctness lock, and two limit
+        # spellings). The first count of +29 was taken BEFORE those landed --
+        # which is the exact trap the comment below describes, caught this time
+        # by re-counting after the last test-adding edit rather than before.
+        #
+        # The CEILING is deliberately NOT raised. The one test that can skip is
+        # the gh-defaults drift check, gated on `shutil.which("gh")`, and gh is
+        # pre-installed on GitHub-hosted runners, so it RUNS rather than skips.
+        # That skip was kept rather than softened into a vacuous pass precisely
+        # because a test that silently no-ops when its tool is absent is the
+        # dormancy this ceiling exists to catch. If this line ever goes red at
+        # 100, that is the cause and the fix is one number.
+        # RE-COUNTED after the adversarial round that fixed record-before-emit,
+        # the self-contradicting blind block and the duplicated cap table: this
+        # suite is now 50 collected (+1 in the advisory-channel net) = +51 over
+        # the 23217 base, so 23268. Counted by --collect-only AFTER the last
+        # test-adding edit, per the comment above -- which has now caught a stale
+        # number TWICE on this branch, both times from counting one edit early.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23268
