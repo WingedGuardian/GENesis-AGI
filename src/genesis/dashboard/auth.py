@@ -365,6 +365,20 @@ _LOGIN_HTML = """<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Genesis — Login</title>
   <link rel="stylesheet" href="/index.css">
+  <!-- tokens + components AFTER index.css, for the same reason every other page
+       links them: index.css pins `html, body` to `overflow: hidden;
+       position: fixed`, written for an app shell, and an ordinary document
+       cannot scroll under it. MEASURED on this page before this line existed:
+       `html` computed `overflow: hidden`, `position: fixed`, and
+       `scrollHeight == innerHeight` with scrolling unavailable — the login card
+       fits a normal viewport, so nothing was visibly wrong until the viewport
+       was short or the error variant made the card taller.
+       components.css carries the shared neutralisation; tokens.css carries the
+       variables components.css is built on. Linking them rather than copying
+       three declarations into the <style> below is the whole point — this page
+       was missed precisely because the fix used to be copied per page. -->
+  <link rel="stylesheet" href="/css/tokens.css">
+  <link rel="stylesheet" href="/css/components.css">
   <style>
     body {
       margin: 0; padding: 0;
