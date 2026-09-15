@@ -24,7 +24,7 @@ Filesystem-only: `_gh` is replaced, so no test here touches the network.
 from __future__ import annotations
 
 import importlib.util
-import json as _json
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -45,33 +45,46 @@ def _iso(weeks_ago: float) -> str:
 
 @pytest.fixture
 def fake_gh(monkeypatch):
-    """Replace the gh call, ROUTING BY POPULATION.
+    """Replace the gh call, ROUTING BY POPULATION and by WEEK WINDOW.
 
-    The script now issues three independent queries, and routing them to one
-    shared list is what the old harness did — which is precisely the conflation
-    the P1 is about. A fixture that cannot tell openings from closures cannot
-    catch a bug about telling openings from closures.
+    The script counts each week with its own `search/issues` query and reads
+    `total_count`, so the fake has to answer a COUNT for a specific window
+    rather than hand back a list of rows. Routing openings and closures to one
+    shared answer is what the old harness did, and a fixture that cannot tell
+    them apart cannot catch a bug about telling them apart.
 
-    Each argument is a list of week-offsets (floats, weeks ago).
+    Each argument is a list of week-offsets (floats, weeks ago); the fake
+    buckets them the same way the real query's date range does.
     """
 
     def _install(opened: list[float], closed: list[float], open_now: int = 0):
+        def _bucket_counts(offsets: list[float]) -> dict[int, int]:
+            counts: dict[int, int] = {}
+            for off in offsets:
+                counts[int(off)] = counts.get(int(off), 0) + 1
+            return counts
+
+        opened_by_week = _bucket_counts(opened)
+        closed_by_week = _bucket_counts(closed)
+
         def _fake(args):
             if "repo" in args and "view" in args:
                 return "owner/repo\n"
-            search = args[args.index("--search") + 1] if "--search" in args else ""
-            state = args[args.index("--state") + 1]
-            if state == "open":
-                rows = [{"number": i} for i in range(open_now)]
-            elif search.startswith("created:"):
-                rows = [{"number": i, "createdAt": _iso(w)} for i, w in enumerate(opened)]
-            else:
-                rows = [
-                    {"number": i, "closedAt": _iso(w), "mergedAt": None}
-                    for i, w in enumerate(closed)
-                ]
-            limit = int(args[args.index("--limit") + 1])
-            return _json.dumps(rows[:limit])
+            q = args[args.index("-f") + 1] if "-f" in args else ""
+            if "is:open" in q:
+                return f"{open_now}\n"
+            # q carries `created:START..END` or `closed:START..END`. Recover
+            # the bucket index from START rather than re-deriving it, so the
+            # fixture cannot drift from the window the script actually asks
+            # for — if the script's arithmetic changes, this stops matching
+            # and the test fails loudly instead of quietly agreeing.
+            match = re.search(r"(created|closed):(\S+)\.\.", q)
+            assert match, f"unrecognised count query: {q!r}"
+            field, start = match.group(1), match.group(2)
+            start_dt = datetime.strptime(start, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+            week = round((NOW - start_dt).total_seconds() / (7 * 24 * 3600)) - 1
+            table = opened_by_week if field == "created" else closed_by_week
+            return f"{table.get(week, 0)}\n"
 
         monkeypatch.setattr(pfr, "_gh", _fake)
 
@@ -94,83 +107,23 @@ class TestTheSampleMustSupportTheVerdict:
         """
         opened = [1.5] * 10 + [2.5] * 10 + [0.2] * 30
         fake_gh(opened, closed=[], open_now=1)
-        report = pfr.collect(weeks=3, limit=800, repo="owner/repo", now=NOW)
+        report = pfr.collect(weeks=3, repo="owner/repo", now=NOW)
 
         week0 = next(r for r in report["rows"] if r["weeks_ago"] == 0)
         assert week0["complete"] is True
         assert report["open_rate_per_week"] == pytest.approx(16.7, abs=0.05), report["rows"]
-
-    def test_a_capped_query_excludes_its_own_oldest_week_too(self, fake_gh):
-        """The cap can fall PARTWAY THROUGH the oldest week it returns, so that
-        week's counts are a floor rather than a total. Scoring it averages an
-        underreported week into the rate (Codex P2, PR #1613).
-
-        `gh pr list` returns NEWEST first, so a cap cuts the OLD end: weeks
-        newer than the oldest returned row are trustworthy, that week is not.
-
-        Fixture: 3 openings in week 0 and 2 in week 1, capped at 5. Week 1 is
-        the oldest the query can see — the cap may have fallen inside it — so
-        week 0 is scored and week 1 is not.
-        """
-        fake_gh(opened=[0.2] * 3 + [1.5] * 2, closed=[], open_now=0)
-        report = pfr.collect(weeks=10, limit=5, repo="owner/repo", now=NOW)
-
-        assert report["samples"]["opened"]["truncated"] is True
-        assert report["complete_weeks_scored"] == 1, report["rows"]
-        week1 = next(r for r in report["rows"] if r["weeks_ago"] == 1)
-        assert week1["complete"] is False, "the cap-boundary week was scored as complete"
-        assert week1["opened"] == 2, "the boundary week is still REPORTED, just not scored"
-        assert "hit its" in pfr.render(report), "truncation must be stated in the output"
-
-    def test_an_untruncated_sample_is_not_flagged(self, fake_gh):
-        """CONTROL: without it, a check that always warns is useless.
-
-        NOT `"cap" not in ...` — "capacity" appears in the GROWING verdict, so
-        that assertion fails on a perfectly untruncated sample for a reason
-        that has nothing to do with truncation.
-        """
-        fake_gh(opened=[1.5] * 5, closed=[1.5] * 5, open_now=2)
-        report = pfr.collect(weeks=3, limit=800, repo="owner/repo", now=NOW)
-        assert not any(s["truncated"] for s in report["samples"].values())
-        assert "hit its" not in pfr.render(report)
-
-    def test_a_truncated_openings_query_cannot_corrupt_the_closure_count(self, fake_gh):
-        """THE P1. Openings and closures are different populations, and the old
-        single `--state all` fetch was ordered by CREATION — so hitting its cap
-        dropped PRs created long ago, which are exactly the ones that may have
-        CLOSED this week or still be open today. Closures and backlog were
-        understated by a cap that had nothing to do with them, and the verdict
-        could flip on it.
-
-        Fixture: the openings query fills its cap of 5 (truncated) while the
-        closures and backlog queries do not. The three answers disagree — 5, 1
-        and 3 — which they cannot do if one fetch feeds all of them. Under the
-        single-fetch design the backlog was counted as the `state == "OPEN"`
-        rows INSIDE that capped sample, so it was a function of the cap.
-        """
-        fake_gh(opened=[0.2] * 5, closed=[0.2], open_now=3)
-        report = pfr.collect(weeks=3, limit=5, repo="owner/repo", now=NOW)
-
-        assert report["samples"]["opened"]["truncated"] is True
-        assert report["samples"]["closed"]["truncated"] is False, (
-            "one query's cap was applied to another population"
-        )
-        assert report["samples"]["open_now"]["truncated"] is False
-        week0 = next(r for r in report["rows"] if r["weeks_ago"] == 0)
-        assert week0["closed"] == 1, "the closure count followed the openings cap"
-        assert report["currently_open"] == 3, "the backlog was derived from the wrong sample"
 
 
 class TestTheVerdict:
     def test_growing_and_draining_are_distinguishable(self, fake_gh):
         """The verdict is the whole point — it must flip on the real condition."""
         fake_gh(opened=[1.5] * 10, closed=[1.5] * 3, open_now=7)
-        growing = pfr.collect(weeks=3, limit=800, repo="owner/repo", now=NOW)
+        growing = pfr.collect(weeks=3, repo="owner/repo", now=NOW)
         assert growing["verdict"] == "GROWING"
         assert "GROWING" in pfr.render(growing)
 
         fake_gh(opened=[1.5] * 3, closed=[1.5] * 9, open_now=4)
-        draining = pfr.collect(weeks=3, limit=800, repo="owner/repo", now=NOW)
+        draining = pfr.collect(weeks=3, repo="owner/repo", now=NOW)
         assert draining["verdict"] == "DRAINING"
         assert "DRAINING" in pfr.render(draining)
 
@@ -180,22 +133,38 @@ class TestTheVerdict:
         equality is ordinary over a short integer-count window (Codex P2,
         PR #1613)."""
         fake_gh(opened=[1.5] * 8, closed=[1.5] * 8, open_now=5)
-        report = pfr.collect(weeks=3, limit=800, repo="owner/repo", now=NOW)
+        report = pfr.collect(weeks=3, repo="owner/repo", now=NOW)
         assert report["verdict"] == "FLAT"
         assert report["draining"] is False
         rendered = pfr.render(report)
         assert "FLAT" in rendered and "without bound" not in rendered
 
-    def test_no_complete_week_says_unknown_rather_than_guessing(self, fake_gh):
-        """With nothing scoreable the script must WITHHOLD the verdict. The old
-        version fell through to the GROWING branch, so a sample that supported
-        no conclusion still printed one."""
-        fake_gh(opened=[0.2] * 3, closed=[], open_now=1)
-        report = pfr.collect(weeks=10, limit=3, repo="owner/repo", now=NOW)
+    def test_no_scoreable_week_withholds_the_verdict(self, fake_gh):
+        """With nothing scoreable the script must WITHHOLD a verdict.
+
+        RESTORED coverage, not a new test. The rewrite that replaced the capped
+        listing with per-week `total_count` queries deleted the old
+        `test_no_complete_week_says_unknown_rather_than_guessing`, because it
+        passed the now-removed `limit=` argument. But the branch it guarded is
+        still live at `scripts/pr_flow_rate.py:218-219` and `:268-269`, so
+        deleting the test deleted the coverage, not the behaviour — and the
+        defect it originally caught was the script falling through to GROWING
+        and printing a conclusion its sample could not support.
+
+        `weeks=0` is the reachable way in now: no week is scored, so `scored`
+        is empty and `n == 0`.
+        """
+        fake_gh(opened=[], closed=[], open_now=1)
+        report = pfr.collect(weeks=0, repo="owner/repo", now=NOW)
         assert report["complete_weeks_scored"] == 0
-        assert report["verdict"] == "UNKNOWN"
-        assert "UNKNOWN" in pfr.render(report)
-        assert "GROWING" not in pfr.render(report)
+        assert report["verdict"] == "UNKNOWN", (
+            "a sample with no scoreable week produced a directional verdict"
+        )
+        rendered = pfr.render(report)
+        assert "UNKNOWN" in rendered
+        assert "GROWING" not in rendered
+        assert "DRAINING" not in rendered
+
 
     def test_a_tiny_positive_net_still_renders_a_clearance_estimate(self, fake_gh):
         """`net_per_week` is ROUNDED for display and hits 0.0 for a real net
@@ -210,7 +179,7 @@ class TestTheVerdict:
             closed=[0.2] + [w + 0.5 for w in range(25)],
             open_now=3,
         )
-        report = pfr.collect(weeks=25, limit=800, repo="owner/repo", now=NOW)
+        report = pfr.collect(weeks=25, repo="owner/repo", now=NOW)
 
         assert report["verdict"] == "DRAINING"
         assert report["net_per_week"] == 0.0, "the fixture no longer exercises the rounding"
@@ -241,9 +210,44 @@ def test_reopens_are_declared_not_silently_ignored(fake_gh):
     the script SAYS so rather than letting the number be read as something it
     is not (Codex P2, PR #1613)."""
     fake_gh(opened=[1.5] * 4, closed=[1.5] * 4, open_now=2)
-    report = pfr.collect(weeks=3, limit=800, repo="owner/repo", now=NOW)
+    report = pfr.collect(weeks=3, repo="owner/repo", now=NOW)
     assert report["counts_reopens"] is False
     assert "reopen" in pfr.render(report).lower()
+
+
+def test_each_bucket_asks_for_a_true_total_not_a_page(monkeypatch):
+    """The central claim of this script, pinned where the fixture cannot.
+
+    `fake_gh` replaces `_gh` wholesale and hands back a number, so it proves
+    the arithmetic but never exercises the QUERY — MEASURED: swapping
+    `.total_count` for another field left all 15 tests green. Since "ask for an
+    exact total instead of counting a capped page" is the entire fix for the
+    two P1s on this PR, the one thing no other test could see was worth its own
+    assertion.
+
+    An argv contract test, and nothing more: it pins what is asked for, not
+    what GitHub returns.
+    """
+    seen: list[list[str]] = []
+
+    def _record(args):
+        seen.append(list(args))
+        return "0\n"
+
+    monkeypatch.setattr(pfr, "_gh", _record)
+    pfr.collect(weeks=2, repo="owner/repo", now=NOW)
+
+    assert seen, "no query was issued at all"
+    for args in seen:
+        assert args[:4] == ["api", "-X", "GET", "search/issues"], (
+            f"a bucket used something other than the search endpoint: {args}"
+        )
+        assert "--jq" in args, f"no jq selector, so the field is unpinned: {args}"
+        assert args[args.index("--jq") + 1] == ".total_count", (
+            "a bucket read a field other than .total_count — a page-derived "
+            "number reintroduces exactly the cap-and-ordering defect this "
+            f"script was rewritten to remove: {args}"
+        )
 
 
 def test_a_failed_gh_call_raises_rather_than_reporting_an_empty_queue(monkeypatch):
@@ -257,3 +261,84 @@ def test_a_failed_gh_call_raises_rather_than_reporting_an_empty_queue(monkeypatc
     monkeypatch.setattr(subprocess, "run", _boom)
     with pytest.raises(RuntimeError, match="auth required"):
         pfr._gh(["pr", "list"])
+class TestTheWindowsTileTheSpan:
+    """The per-week ranges must PARTITION the window — no gap, no overlap.
+
+    This is the defect class the whole redesign exists to remove, turned on
+    the redesign itself. GitHub ranges are inclusive at both ends, so a
+    bucket whose end is not pulled back one second claims the same instant as
+    the next bucket's start, and a PR landing there is counted TWICE — a
+    silent overcount of exactly the kind the capped-listing version produced
+    by undercounting.
+
+    Found by mutation: removing the one-second pullback left all ten other
+    tests green, because the fixture recovers a bucket from its START and
+    never looks at the END.
+    """
+
+    @staticmethod
+    def _parse(stamp: str) -> datetime:
+        return datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+
+    def test_adjacent_windows_do_not_share_an_instant(self):
+        for w in range(6):
+            newer_start, _ = pfr._week_window(w, NOW)
+            _, older_end = pfr._week_window(w + 1, NOW)
+            assert self._parse(older_end) < self._parse(newer_start), (
+                f"bucket {w + 1} ends at {older_end}, at or after bucket {w} "
+                f"starts at {newer_start} — an event there is counted twice"
+            )
+
+    def test_adjacent_windows_leave_no_gap(self):
+        # The converse failure: pulling the end back too far drops any event
+        # in the hole. One second apart is exactly adjacent at the resolution
+        # GitHub search accepts.
+        for w in range(6):
+            newer_start, _ = pfr._week_window(w, NOW)
+            _, older_end = pfr._week_window(w + 1, NOW)
+            gap = (self._parse(newer_start) - self._parse(older_end)).total_seconds()
+            assert gap == 1, f"bucket {w + 1}->{w} gap is {gap}s, expected 1s"
+
+    def test_each_window_spans_one_week(self):
+        for w in range(6):
+            start, end = pfr._week_window(w, NOW)
+            span = (self._parse(end) - self._parse(start)).total_seconds()
+            assert span == 7 * 24 * 3600 - 1, f"bucket {w} spans {span}s"
+
+
+def test_the_backlog_is_counted_not_derived_from_openings(fake_gh):
+    """`currently_open` is its OWN population and must never be inferred.
+
+    A PR opened before the window can still be open today, so deriving the
+    backlog from the openings sample is simply wrong — it was wrong in the
+    first version and the fix is load-bearing for the DRAINING clearance
+    estimate, which divides the backlog by the net rate.
+
+    Fixture makes the two numbers disagree on purpose: 12 openings inside the
+    window, but 4 PRs open right now. Any derivation from openings yields 12.
+
+    Found by mutation: replacing the backlog count with `sum(opened.values())`
+    left every other test green.
+    """
+    fake_gh(opened=[1.5] * 12, closed=[1.5] * 12, open_now=4)
+    report = pfr.collect(weeks=3, repo="owner/repo", now=NOW)
+    assert report["currently_open"] == 4, (
+        "the backlog was derived from the openings sample rather than counted"
+    )
+
+
+def test_an_unparseable_total_raises_rather_than_counting_as_zero(monkeypatch):
+    """Zero is a LEGITIMATE answer here, which is what makes a silent fallback
+    dangerous: an API error, a rate-limit body, or an HTML error page would be
+    indistinguishable from a genuinely quiet week and would publish a rate
+    derived from nothing.
+
+    `_count` raises for exactly this reason and said so in its docstring, but
+    nothing tested it — MEASURED: replacing the raise with `return 0` left the
+    whole file green. Distinct from the failed-call test above, which covers
+    `gh` exiting non-zero; this covers `gh` succeeding and returning something
+    that is not a number.
+    """
+    monkeypatch.setattr(pfr, "_gh", lambda args: "API rate limit exceeded\n")
+    with pytest.raises(RuntimeError, match="total_count"):
+        pfr.collect(weeks=2, repo="owner/repo", now=NOW)
