@@ -109,7 +109,8 @@ class ProviderConfig:
     has_api_key: bool = True
     # Provider-side DAILY caps, each in the provider's OWN unit — requests
     # per UTC day and tokens per UTC day. Never converted between units
-    # (Groq caps tokens, Gemini caps requests). None = no daily budget.
+    # A provider may carry either, both, or neither: as shipped, Groq sets
+    # both and Gemini sets neither. None = no daily budget for that unit.
     # Enforced by DailyBudgetLedger via chain-walk DESELECTION, never a
     # breaker trip. NOTE: a daily budget is per API key/account — keep one
     # provider entry per account for daily-limited providers, or one real

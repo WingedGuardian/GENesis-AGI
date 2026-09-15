@@ -2227,8 +2227,12 @@ verified: ee9ebf85c 2026-09-05
   each a free-first → paid-last chain; `never_pays` sites are filtered to
   free-only. **Daily free-tier budgets** (`daily_budget.py`,
   `DailyBudgetLedger`): providers may carry `rpd_limit` / `tpd_limit`, each in
-  the provider's OWN unit (Groq caps tokens/day, Gemini requests/day — never
-  converted); when spent, the chain walk DESELECTS the provider until the next
+  the provider's OWN unit and never converted between them. As SHIPPED today:
+  Groq carries both (`rpd_limit: 1000`, `tpd_limit: 200000`, the latter read
+  off Groq's own 429 text), and Gemini carries NEITHER — a daily cap for it is
+  inferred from a live 429 but not measured, and a wrong shipped cap would
+  deselect the provider on every install. When spent, the chain walk DESELECTS
+  the provider until the next
   UTC day — no breaker trip (budget is not a health signal), one WARNING
   `provider.budget_exhausted` event at the crossing, counters visible in the
   routing config route (`daily_budget` map). Counters are router-observed and
