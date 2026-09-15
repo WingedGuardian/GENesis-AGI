@@ -913,6 +913,43 @@ call_sites:
     description: "Voice channel conversation \u2014 low-latency free-tier chain\
       \ for HA voice assistant. Groq first for speed (~1s), Gemini/Mistral\
       \ as fallbacks."
+  jarvis_desk:
+    chain:
+    - openrouter-deepseek-v4
+    - glm51
+    - openrouter-sonnet
+    default_paid: true
+    retry_profile: user_facing
+    dispatch: api
+    description: "Desktop assistant \u2014 the conversational brain behind a local
+      OpenAI-compatible client (/v1/jarvis/chat/completions). CAPABLE first, not
+      cheapest: that client fires its own tools by emitting an exact control tag
+      and a near-miss silently does nothing, so instruction-following is the
+      binding constraint. DeepSeek V4-pro leads on the owner's stated preference
+      for open models over frontier pricing; Sonnet is last-resort resilience,
+      never the default."
+  jarvis_phone:
+    chain:
+    - groq-free
+    - openrouter-deepseek-v4-flash
+    - gemini-free
+    default_paid: true
+    retry_profile: user_facing
+    dispatch: api
+    description: "Desktop assistant, PHONE lane \u2014 briefings and hotline answers
+      composed while a call is live, where latency is heard directly. Upstream
+      pinned a fast tier here for exactly that reason; this chain preserves the
+      intent. No control tags are emitted on this lane, so the capability bar
+      that governs jarvis_desk does not apply.
+      default_paid is TRUE because the middle hop bills: the field is display-only
+      (the router enforces never_pays, not this), so labelling a chain with a paid
+      link 'false' would be a lever that looks pulled and is not connected. The
+      paid fallback is deliberate \u2014 both free hops sit on shared rate gates.
+      HONEST LIMIT: the model is only half the latency budget. groq-free is a
+      2.0s serialized interval shared with ~33 call sites and gemini-free a 4.0s
+      one shared with ~32, so during background reflection a turn can queue in the
+      rate gate before any model is reached. Fixing that needs a non-blocking
+      acquire in the router, not a chain edit."
   attention_salience:
     chain:
     - mistral-small-free

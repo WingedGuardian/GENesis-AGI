@@ -758,6 +758,16 @@ class StandaloneAdapter:
         except Exception:
             logger.exception("Failed to register voice API blueprint")
 
+        # Jarvis brain API — the desktop assistant's router-backed brain.
+        try:
+            from genesis.dashboard.routes.jarvis_api import jarvis_api_bp
+
+            if "jarvis_api" not in app.blueprints:
+                app.register_blueprint(jarvis_api_bp)
+                logger.info("Jarvis brain API blueprint registered")
+        except Exception:
+            logger.exception("Failed to register Jarvis brain API blueprint")
+
     def _run_flask(self) -> None:
         """Run Flask in a thread (called from daemon thread)."""
         self._app.run(
