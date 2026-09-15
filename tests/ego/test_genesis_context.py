@@ -157,8 +157,8 @@ def mock_health_data():
         },
         "resilience": "healthy",
         "queues": {
-            "deferred_work_queue": {"pending": 3},
-            "dead_letter_queue": {"count": 0},
+            "deferred_work": 3,
+            "dead_letters": 0,
         },
         "surplus": {"queue_depth": 2, "last_dispatch": "2026-04-24T08:00:00"},
     }

@@ -12,9 +12,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from genesis.cc import fallback_state, roster
+from genesis.cc import fallback_state, peer_availability, roster
 from genesis.cc.conversation import ConversationLoop
-from genesis.cc.exceptions import CCError, CCNetworkOfflineError, CCRateLimitError
+from genesis.cc.exceptions import (
+    CCError,
+    CCMCPError,
+    CCNetworkOfflineError,
+    CCProcessError,
+    CCRateLimitError,
+)
 from genesis.cc.invoker import CCInvoker
 from genesis.cc.system_prompt import SystemPromptAssembler
 from genesis.cc.types import (
@@ -285,3 +291,528 @@ async def test_run_failover_peer_offline_propagates_without_fresh_retry(loop, in
             on_event=None,
         )
     assert invoker.run.call_count == 1  # no fresh retry
+
+
+# ── peer-availability recording (advisory observation on the failover path) ──
+# These live here, not in test_peer_availability.py, because this is where the
+# behaviour can actually break: roster.py never references peer_availability, so
+# a test asserting "selection is unchanged" is tautological by construction.
+
+
+@pytest.mark.asyncio
+async def test_blocked_peer_is_still_attempted(loop, invoker, db):
+    """THE SAFETY PROPERTY: the record is advisory and must never suppress a peer.
+
+    A stale or wrong "unavailable" record that removed a peer from the attempt
+    would drop a WORKING backup at exactly the moment the home model is down,
+    turning a recoverable outage into a degraded one. Pre-mark the only peer as
+    blocked, then require that it is still invoked AND still serves the turn.
+    """
+    peer_availability.note_failure("glm-5.2", CCRateLimitError("earlier 429"))
+    assert peer_availability.read_peer("glm-5.2").available is False
+
+    invoker.run = AsyncMock(side_effect=[
+        CCRateLimitError("limit"), _output(text="GLM reply", session_id="glm-1"),
+    ])
+    result = await loop.handle_message("hi", user_id="u1", channel=ChannelType.TERMINAL)
+
+    assert "GLM reply" in result, "a peer recorded as blocked was skipped — gating regression"
+    assert invoker.run.await_count == 2  # home, then the 'blocked' peer
+    # ...and serving the turn clears the stale block.
+    assert peer_availability.read_peer("glm-5.2").available is True
+
+
+@pytest.mark.asyncio
+async def test_peer_quota_refusal_is_recorded(loop, invoker):
+    # Home AND peer rate-limited → the peer's refusal is real evidence about it.
+    invoker.run = AsyncMock(side_effect=CCRateLimitError("limit"))
+    await loop.handle_message("hi", user_id="u1", channel=ChannelType.TERMINAL)
+    st = peer_availability.read_peer("glm-5.2")
+    assert st is not None and st.available is False
+    assert st.reason == peer_availability.QUOTA
+
+
+@pytest.mark.asyncio
+async def test_local_fault_does_not_mark_the_peer_down(loop, invoker):
+    """A dead local network never reaches the provider — blaming the peer would
+    mark the standby fleet down for a blip that had nothing to do with it."""
+    invoker.run = AsyncMock(side_effect=[
+        CCRateLimitError("limit"), CCNetworkOfflineError("no route"),
+    ])
+    await loop.handle_message("hi", user_id="u1", channel=ChannelType.TERMINAL)
+    assert peer_availability.read_peer("glm-5.2") is None
+
+
+@pytest.mark.asyncio
+async def test_successful_peer_is_recorded_available(loop, invoker):
+    invoker.run = AsyncMock(side_effect=[
+        CCRateLimitError("limit"), _output(text="GLM reply", session_id="glm-1"),
+    ])
+    await loop.handle_message("hi", user_id="u1", channel=ChannelType.TERMINAL)
+    st = peer_availability.read_peer("glm-5.2")
+    assert st is not None and st.available is True
+
+
+# Captured at import, BEFORE the `loop` fixture monkeypatches it, so one test
+# below can exercise the REAL selection path instead of a stub.
+_REAL_FAILOVER_INVOCATIONS = roster.failover_invocations
+
+
+@pytest.mark.asyncio
+async def test_blocked_peer_survives_the_real_selection_path(loop, invoker, monkeypatch):
+    """The advisory property, without stubbing the place a gate would go.
+
+    The shared fixture monkeypatches ``roster.failover_invocations`` — the most
+    natural home for a suppression gate — so a test resting on it cannot observe
+    a gate added there. This one restores the real function and drives it from a
+    fake roster, so selection genuinely runs while the peer is recorded blocked.
+    """
+    fake_roster = {
+        "default": "claude",
+        "models": {
+            "claude": {"native_subscription": True, "failover_order": 0},
+            "glm-5.2": {
+                "anthropic_base_url": "https://glm.invalid/anthropic",
+                "auth_env": "FAKE_PEER_KEY",
+                "model_id": "glm-5.2",
+                "failover_order": 1,
+            },
+        },
+    }
+    monkeypatch.setenv("FAKE_PEER_KEY", "token-value-long-enough")
+    monkeypatch.setattr(roster, "failover_invocations", _REAL_FAILOVER_INVOCATIONS)
+    monkeypatch.setattr(roster, "load_roster", lambda *a, **k: fake_roster)
+
+    peer_availability.note_failure("glm-5.2", CCRateLimitError("earlier 429"))
+    assert peer_availability.read_peer("glm-5.2").available is False
+
+    invoker.run = AsyncMock(side_effect=[
+        CCRateLimitError("limit"), _output(text="GLM reply", session_id="glm-1"),
+    ])
+    result = await loop.handle_message("hi", user_id="u1", channel=ChannelType.TERMINAL)
+
+    assert "GLM reply" in result, "blocked peer was suppressed by real selection — gating regression"
+    assert peer_availability.read_peer("glm-5.2").available is True
+
+
+@pytest.mark.asyncio
+async def test_degenerate_empty_success_does_not_clear_a_block(loop, invoker):
+    """A silent cap returns a non-error output with NO text. Treating that as
+    'available' would erase a real prior block — deleting the one signal an
+    operator would act on."""
+    peer_availability.note_failure("glm-5.2", CCRateLimitError("earlier 429"))
+    invoker.run = AsyncMock(side_effect=[
+        CCRateLimitError("limit"), _output(text="", session_id="glm-1"),
+    ])
+    await loop.handle_message("hi", user_id="u1", channel=ChannelType.TERMINAL)
+    assert peer_availability.read_peer("glm-5.2").available is False
+
+
+@pytest.mark.asyncio
+async def test_empty_answer_after_streaming_does_not_double_output(loop, invoker, monkeypatch):
+    """The limit on the fix above. If a peer ALREADY streamed text, continuing
+    would hit the loop-top guard, break to contingency, and answer a second time
+    on top of text the user can already see — the exact double-output the guard
+    at the top of the loop exists to prevent. So a streamed-then-empty peer keeps
+    the old behaviour and does NOT advance."""
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV), ("peer-b", _PEER_INV)],
+    )
+    # streamed starts EMPTY — the loop-top guard would otherwise break before
+    # any peer is attempted, which tests nothing. peer-a streams text DURING its
+    # attempt and then returns an empty output: the case the guard is for.
+    streamed: dict = {}
+    base_inv = CCInvocation(prompt="x", roster_eligible=True)
+    session = {"id": "s1"}
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+
+    async def _stream_then_empty(*a, **k):
+        streamed["text"] = "partial answer already shown to the user"
+        return _output(text="", session_id="a-1")
+
+    invoker.run = AsyncMock(side_effect=_stream_then_empty)
+
+    result = await loop._try_roster_failover(
+        session=session, base_inv=base_inv, channel=ChannelType.TERMINAL,
+        model=CCModel.SONNET, effort=EffortLevel.LOW, prompt_text="x",
+        streamed=streamed,
+    )
+    # Only peer-a was attempted — we did NOT advance to peer-b...
+    assert invoker.run.await_count == 1
+    # ...and the RETURN VALUE is what actually prevents the second answer: the
+    # call sites test `is not None`, so "" suppresses contingency while None
+    # would let it answer again over the streamed text. Counting calls alone
+    # certified a property this test never exercised.
+    assert result == ""
+
+
+@pytest.mark.asyncio
+async def test_streamed_then_raised_does_not_let_contingency_answer_again(loop, invoker, monkeypatch):
+    """The double-output reasoning applied only to the EMPTY-output branch; the
+    exception branches still `continue`. A peer that streams text and then
+    raises hit the loop-top break, returned None, and contingency answered a
+    second time on top of the partial text the user could already see."""
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV), ("peer-b", _PEER_INV)],
+    )
+    streamed: dict = {}
+
+    async def _stream_then_raise(*a, **k):
+        streamed["text"] = "partial answer already shown to the user"
+        raise CCRateLimitError("limit")
+
+    invoker.run = AsyncMock(side_effect=_stream_then_raise)
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+
+    result = await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x", streamed=streamed,
+    )
+    assert result == "", "None here lets contingency answer over the streamed text"
+    assert invoker.run.await_count == 1  # peer-b never attempted
+
+
+@pytest.mark.asyncio
+async def test_streamed_then_empty_still_records_the_peer_as_available(loop, invoker, monkeypatch):
+    """The surface was blind in exactly the degenerate case it was built for:
+    streamed-then-empty skipped recording entirely while still entering fallback
+    state and telling the user replies were running on that peer."""
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV)],
+    )
+    streamed: dict = {}
+
+    async def _stream_then_empty(*a, **k):
+        streamed["text"] = "partial answer already shown"
+        return _output(text="", session_id="a-1")
+
+    invoker.run = AsyncMock(side_effect=_stream_then_empty)
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+
+    await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x", streamed=streamed,
+    )
+    st = peer_availability.read_peer("peer-a")
+    assert st is not None, "served the turn but recorded nothing"
+    assert st.available is True
+
+
+@pytest.mark.asyncio
+async def test_streamed_then_local_error_clears_a_stale_block(loop, invoker, monkeypatch):
+    """A peer that ANSWERS must not keep a stale "blocked" record.
+
+    The peer streams text — the user can see it — and then a LOCAL fault ends the
+    turn (an MCP crash, our own timeout). `note_failure` correctly declines that
+    as evidence about the peer, but the earlier quota block then survives an
+    attempt that demonstrably reached and served from this peer. Because records
+    refresh only during a home-model outage, that false "blocked" can stand for
+    days on the one surface built to show whether the standby is usable.
+    """
+    peer_availability.note_failure("peer-a", CCRateLimitError("429 quota"))
+    assert peer_availability.read_peer("peer-a").available is False, "fixture precondition"
+
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV)],
+    )
+    streamed: dict = {}
+
+    async def _stream_then_local_error(*a, **k):
+        streamed["text"] = "answer already shown to the user"
+        raise CCMCPError("genesis-health MCP server crashed")
+
+    invoker.run = AsyncMock(side_effect=_stream_then_local_error)
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+
+    result = await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x", streamed=streamed,
+    )
+
+    assert result == "", "streamed text must still suppress contingency"
+    st = peer_availability.read_peer("peer-a")
+    assert st.available is True, "a peer that answered is still recorded blocked"
+    assert st.reason == "", "stale quota reason survived a served turn"
+
+
+@pytest.mark.asyncio
+async def test_local_error_without_streaming_leaves_the_block_untouched(loop, invoker, monkeypatch):
+    """The CONVERSE, so the fix above cannot over-reach.
+
+    With no text streamed the peer did NOT demonstrably serve, so a local fault
+    is no evidence of recovery — clearing the block there would invent an
+    observation, which is the failure mode this whole module exists to avoid.
+    """
+    peer_availability.note_failure("peer-a", CCRateLimitError("429 quota"))
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV)],
+    )
+    invoker.run = AsyncMock(side_effect=CCMCPError("MCP crashed before any output"))
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+
+    await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x", streamed={},
+    )
+    st = peer_availability.read_peer("peer-a")
+    assert st.available is False, "invented a recovery from a local fault"
+
+
+@pytest.mark.asyncio
+async def test_recorder_failure_never_abandons_the_failover(loop, invoker, monkeypatch):
+    """Advisory bookkeeping must never decide whether the user gets an answer.
+
+    Moving the recorder off the event loop put the module's never-raises
+    guarantee at risk at the WRAPPER: `asyncio.to_thread` raises RuntimeError
+    once the default executor is shut down, and the outer handler catches that
+    by returning None — abandoning the entire failover, which is strictly worse
+    than the lost row the move was protecting.
+    """
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV)],
+    )
+
+    async def _explode(*a, **k):
+        raise RuntimeError("cannot schedule new futures after shutdown")
+
+    monkeypatch.setattr("asyncio.to_thread", _explode)
+    invoker.run = AsyncMock(return_value=_output(text="the peer's answer"))
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+
+    result = await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x", streamed={},
+    )
+    assert result is not None, "a recorder fault threw away the peer's reply"
+    assert "the peer's answer" in result
+
+
+# NOTE: the generator-E effects matrix (what an attempt DID deciding whether it
+# may be retried) lives on the feat/peer-effects-guard branch with the guard it
+# tests. This file covers RECORDING semantics only.
+
+
+@pytest.mark.asyncio
+async def test_a_balance_refusal_after_streaming_is_not_cleared_as_available(
+    loop, invoker, monkeypatch,
+):
+    """A drained peer that streamed text must stay BLOCKED.
+
+    The stale-block clearing keys on whether `note_failure` DECLINED the
+    exception — not on whether its write landed, which returns False for four
+    different reasons (declined, lock contention, failed write, internal fault).
+
+    This is the case that distinguishes them: a drained prepaid account surfaces
+    as `CCProcessError("insufficient balance")`, which `_is_provider_refusal`
+    accepts, and it arrives on the generic `CCError` branch alongside genuine
+    local faults. Keyed on the write result, a transient write failure here would
+    flip a real refusal into a recorded SUCCESS — and records only refresh during
+    a home outage, so that false "available" stands for days.
+    """
+    peer_availability.note_failure("peer-a", CCRateLimitError("429 earlier"))
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV)],
+    )
+    streamed: dict = {"text": False, "tools": False}
+
+    async def _stream_then_drained(*a, **k):
+        streamed["text"] = True
+        raise CCProcessError("API error: insufficient balance")
+
+    invoker.run_streaming = AsyncMock(side_effect=_stream_then_drained)
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+
+    await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x",
+        on_event=AsyncMock(), streamed=streamed,
+    )
+    st = peer_availability.read_peer("peer-a")
+    assert st is not None and st.available is False, (
+        "a drained peer was recorded AVAILABLE — a refusal was read as a decline"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_balance_refusal_does_not_trigger_a_fresh_sticky_retry(
+    loop, invoker, monkeypatch,
+):
+    """R5-P2. A DRAINED prepaid account reaches us as a generic ``CCProcessError``,
+    because the invoker's global classifier deliberately does not know the
+    balance phrases (teaching it would let a drained BACKUP report the primary as
+    down). So the refusal lands on the generic stale-resume branch and buys a
+    redundant full re-invocation on the same dead peer before the outer handler
+    ever gets to classify it.
+
+    A fresh session cannot refill an empty balance. Re-raise instead, and let the
+    peer loop advance.
+    """
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV)],
+    )
+    invoker.run_streaming = AsyncMock(
+        side_effect=CCProcessError("API error: insufficient balance"),
+    )
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+    loop._session_fallback_session = lambda s: {
+        "roster_model": "peer-a", "cc_session_id": "sticky-1",
+    }
+
+    await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x",
+        on_event=AsyncMock(), streamed={"text": False, "tools": False},
+    )
+    assert invoker.run_streaming.await_count == 1, (
+        "retried a drained account with a fresh session"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_stale_resume_still_retries_fresh(loop, invoker, monkeypatch):
+    """The other direction of the same gate, so the fix cannot be satisfied by
+    simply never retrying. An ambiguous CCError on a sticky resume is exactly
+    what the fresh retry exists for."""
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV)],
+    )
+    invoker.run_streaming = AsyncMock(side_effect=CCMCPError("stale resume"))
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+    loop._session_fallback_session = lambda s: {
+        "roster_model": "peer-a", "cc_session_id": "sticky-1",
+    }
+
+    await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x",
+        on_event=AsyncMock(), streamed={"text": False, "tools": False},
+    )
+    assert invoker.run_streaming.await_count == 2, "the fresh retry was lost"
+
+
+
+
+@pytest.mark.asyncio
+async def test_a_declined_limit_error_after_streaming_clears_a_stale_block(
+    loop, invoker, monkeypatch,
+):
+    """The typed rate-limit branch is no longer refusals-only: since the MCP
+    exclusion, a tool's own 429 arrives there typed CCRateLimitError and is
+    correctly DECLINED as evidence about the peer. But the declined-plus-streamed
+    stale-block clearing lived only on the generic CCError branch — so a
+    previously blocked peer that had just SERVED text stayed falsely blocked,
+    potentially for days, on exactly the branch that runs first.
+    """
+    peer_availability.note_failure("peer-a", CCRateLimitError("429 earlier"))
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV)],
+    )
+    streamed: dict = {"text": False}
+
+    async def _stream_then_tool_429(*a, **k):
+        streamed["text"] = True
+        raise CCRateLimitError("MCP server 'web-search' returned error: 429 rate limit")
+
+    invoker.run_streaming = AsyncMock(side_effect=_stream_then_tool_429)
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+
+    await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x",
+        on_event=AsyncMock(), streamed=streamed,
+    )
+    st = peer_availability.read_peer("peer-a")
+    assert st is not None and st.available is True, (
+        "a peer that served text stayed blocked after a declined tool 429"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_genuine_refusal_after_streaming_still_blocks(
+    loop, invoker, monkeypatch,
+):
+    """The control: a REAL refusal after streaming must keep the peer blocked —
+    the cleanup fires only for declined evidence, or the branch would launder
+    genuine quota blocks into availability."""
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV)],
+    )
+    streamed: dict = {"text": False}
+
+    async def _stream_then_refused(*a, **k):
+        streamed["text"] = True
+        raise CCRateLimitError("429 rate limit exceeded")
+
+    invoker.run_streaming = AsyncMock(side_effect=_stream_then_refused)
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+
+    await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x",
+        on_event=AsyncMock(), streamed=streamed,
+    )
+    st = peer_availability.read_peer("peer-a")
+    assert st is not None and st.available is False, (
+        "a genuine refusal after streaming was laundered into availability"
+    )
+
+
+@pytest.mark.asyncio
+async def test_whitespace_only_streaming_is_not_evidence_of_service(
+    loop, invoker, monkeypatch,
+):
+    """A whitespace-only text block is truthy but shows the user nothing. It set
+    streamed["text"], and that flag is EVIDENCE — it records the peer as having
+    served and clears stale blocks — so a silent-cap attempt emitting one blank
+    could erase a genuine quota block."""
+    peer_availability.note_failure("glm-5.2", CCRateLimitError("429 earlier"))
+
+    async def _blank_stream(inv, on_event=None):
+        calls = getattr(_blank_stream, "n", 0)
+        _blank_stream.n = calls + 1
+        if calls == 0:
+            raise CCRateLimitError("limit")  # home
+        if on_event:
+            await on_event(StreamEvent(event_type="text", text="   \n  "))
+        return _output(text="   ", session_id="glm-9")
+
+    invoker.run_streaming = AsyncMock(side_effect=_blank_stream)
+    await loop.handle_message_streaming(
+        "hi", user_id="u1", channel=ChannelType.TERMINAL, on_event=AsyncMock(),
+    )
+    st = peer_availability.read_peer("glm-5.2")
+    assert st is not None and st.available is False, (
+        "a whitespace-only attempt cleared a genuine quota block"
+    )

@@ -24,6 +24,14 @@ class OutreachCategory(StrEnum):
     # Routed through the outreach pipeline with governance (dedup, rate limit,
     # quiet hours) but no approval gate. Added in PR #530.
     NOTIFICATION = "notification"
+    # Marketing campaign updates — the campaign's tick digest / reply pings.
+    # Routed to a dedicated "Marketing" supergroup topic (never the shared
+    # Morning Reports topic that 'digest' lands in). Must match the DB CHECK
+    # constraint on outreach_history (see db/schema/_migrations.py — the
+    # 'marketing' table-rebuild block) AND carry a delivery threshold (see
+    # config/outreach.yaml thresholds.marketing) so an owner-facing digest is
+    # never dropped by the default salience gate.
+    MARKETING = "marketing"
 
 
 class OutreachStatus(StrEnum):
@@ -201,3 +209,33 @@ class FreshEyesResult:
     score: float
     reason: str
     model_used: str
+
+
+#: Discord SUB-CHANNEL names. The outreach pipeline routes by ADAPTER name
+#: ("discord"); which channel inside the server a message lands in is the
+#: *recipient*, and for the webhook adapter a recipient is a webhook name whose
+#: env-var naming rule lives in `runtime/init/outreach.py` — spelled out ONLY
+#: there, because `check_external_io.py` line-greps those names and this module
+#: is not an egress door.
+#:
+#: Lives here rather than in scheduler.py because it now has two readers — the
+#: campaign scheduler and `outreach_send` — and two copies of a list like this
+#: is a defect waiting for someone to add a channel to one of them.
+#:
+#: Adding a name here is not enough on its own: with no per-channel webhook for
+#: it the adapter falls back to the DEFAULT webhook, which posts to the DEFAULT
+#: channel rather than failing — the reason a caller can believe it targeted one
+#: channel and hit another.
+DISCORD_CHANNELS: frozenset[str] = frozenset(
+    {
+        "announcements",
+        "dev-discussion",
+        "general",
+        "showcase",
+        "getting-started",
+        "design",
+        "bug-reports",
+        "feature-requests",
+        "troubleshooting",
+    }
+)

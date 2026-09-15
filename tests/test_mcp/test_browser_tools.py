@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import re
 import signal
+from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1344,3 +1347,121 @@ class TestTurnstileShortGrace:
             result = await browser._wait_for_turnstile(page, response=resp)
         assert result == {"status": "blocked", "method": "timeout"}
         alert.assert_awaited()         # ladder ran to exhaustion
+
+
+# Must stay in step with scripts/browser.py's copy of the scheme
+# (tests/test_scripts/test_browser_cli_screenshot_path.py asserts the same
+# shape on that side). Format: %Y%m%dT%H%M%S%fZ -> 20260902T190142123456Z
+_MCP_STAMP = re.compile(r"^\d{8}T\d{12}Z$")
+
+
+class TestBrowserScreenshotUniquePath:
+    """Consecutive screenshots must not overwrite one another.
+
+    The tool previously wrote every capture to the single fixed path
+    ~/tmp/genesis_browser_screenshot.png, so a session that captured N pages
+    was left with only the last one — silently, since each call still returned
+    a valid-looking path.
+    """
+
+    @staticmethod
+    def _page():
+        page = MagicMock()
+        page.url = "https://example.com"
+        page.title = AsyncMock(return_value="Example")
+
+        async def _write(path: str) -> None:
+            # Mimic Playwright: actually create the file at the given path, so
+            # the test measures files-on-disk rather than returned strings.
+            with open(path, "wb") as fh:
+                fh.write(b"\x89PNG")
+
+        page.screenshot = AsyncMock(side_effect=_write)
+        return page
+
+    @pytest.mark.asyncio
+    async def test_consecutive_screenshots_do_not_overwrite(self, tmp_path):
+        browser._active_page = self._page()
+        with patch.object(browser, "_SCREENSHOT_DIR", tmp_path):
+            first = await browser._impl_browser_screenshot()
+            second = await browser._impl_browser_screenshot()
+
+        assert "error" not in first, first
+        assert "error" not in second, second
+        assert first["path"] != second["path"], (
+            "both captures wrote to the same path — the second overwrote the first"
+        )
+        # The property that actually matters: two files survive on disk.
+        written = sorted(p.name for p in tmp_path.glob("*.png"))
+        assert len(written) == 2, written
+        assert all(n.startswith("genesis_browser_screenshot_") for n in written), written
+
+    @pytest.mark.asyncio
+    async def test_returned_path_is_the_path_actually_written(self, tmp_path):
+        """The returned path must be the one Playwright wrote to.
+
+        Callers (and the tool's own docstring) treat the returned "path" as
+        authoritative, so a divergence here would hand out a path pointing at
+        nothing while the real capture sat elsewhere.
+        """
+        page = self._page()
+        browser._active_page = page
+        with patch.object(browser, "_SCREENSHOT_DIR", tmp_path):
+            result = await browser._impl_browser_screenshot()
+
+        assert "error" not in result, result
+        page.screenshot.assert_awaited_once_with(path=result["path"])
+        assert Path(result["path"]).is_file()
+
+    @pytest.mark.asyncio
+    async def test_capture_names_sort_chronologically(self, tmp_path):
+        """Names must sort into CAPTURE ORDER — the motivating incident was a
+        run of 8 captures with no way to tell which page was which.
+
+        The clock is CONTROLLED here on purpose. Two real back-to-back captures
+        land in the same wall-clock instant, which would make a
+        `stamps == sorted(stamps)` assertion a tautology over equal values —
+        i.e. green whatever the format string does. Distinct injected times make
+        the ordering claim the thing actually under test.
+        """
+        browser._active_page = self._page()
+        # These two instants STRADDLE MIDNIGHT on purpose: the earlier capture
+        # has the LATER clock time. Any format that does not lead with the date
+        # (e.g. a %H%M%S-first ordering) sorts them backwards, while two
+        # same-day times would sort correctly under such a format and let the
+        # bug through. The inputs are what make the ordering claim testable.
+        times = [
+            datetime(2026, 9, 2, 23, 59, 58, 900000, tzinfo=UTC),
+            datetime(2026, 9, 3, 0, 0, 1, 100000, tzinfo=UTC),
+        ]
+        with patch.object(browser, "_SCREENSHOT_DIR", tmp_path), \
+             patch.object(browser, "datetime") as fake_dt:
+            fake_dt.now.side_effect = times
+            first = await browser._impl_browser_screenshot()
+            second = await browser._impl_browser_screenshot()
+
+        stamps = [Path(r["path"]).name.split("_")[-2] for r in (first, second)]
+        # STRICT: an equal pair must not satisfy this.
+        assert stamps[0] < stamps[1], stamps
+        # SHAPE, not just order — ordering alone stays green if the T/Z are
+        # dropped, which is exactly how the two writers would drift apart.
+        assert all(_MCP_STAMP.match(x) for x in stamps), stamps
+
+    @pytest.mark.asyncio
+    async def test_stamp_resolves_below_one_second(self, tmp_path):
+        """A second-resolution stamp ties a rapid burst. Two captures 1ms apart
+        must still produce distinguishable, correctly-ordered stamps."""
+        browser._active_page = self._page()
+        times = [
+            datetime(2026, 9, 2, 19, 1, 42, 1000, tzinfo=UTC),
+            datetime(2026, 9, 2, 19, 1, 42, 2000, tzinfo=UTC),
+        ]
+        with patch.object(browser, "_SCREENSHOT_DIR", tmp_path), \
+             patch.object(browser, "datetime") as fake_dt:
+            fake_dt.now.side_effect = times
+            first = await browser._impl_browser_screenshot()
+            second = await browser._impl_browser_screenshot()
+
+        stamps = [Path(r["path"]).name.split("_")[-2] for r in (first, second)]
+        assert stamps[0] != stamps[1], stamps
+        assert stamps[0] < stamps[1], stamps

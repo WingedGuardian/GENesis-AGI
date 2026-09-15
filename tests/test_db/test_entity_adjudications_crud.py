@@ -6,6 +6,7 @@ from __future__ import annotations
 import pytest
 
 from genesis.db.crud import entity_adjudications as adj
+from genesis.security.immunity_shadow import DispatchGateRefused
 
 
 def test_pair_key_order_independent():
@@ -95,7 +96,146 @@ async def test_mark_applied_promotes_proposed_to_merge(db):
 @pytest.mark.asyncio
 async def test_mark_stale(db):
     await adj.record_verdict(db, entity_a="a", entity_b="b", verdict="proposed_merge")
-    await adj.mark_stale(db, pair_key="a|b")
+    assert await adj.mark_stale(db, pair_key="a|b") is True
     row = await adj.get_by_pair(db, "a", "b")
     assert row["verdict"] == "stale"
     assert await adj.list_proposed_merges(db) == []
+
+
+@pytest.mark.asyncio
+async def test_mark_stale_noop_on_already_merged(db):
+    """P2#4: mark_stale is conditional on verdict='proposed_merge'. Once a concurrent
+    winner has flipped the row to 'merge', a losing applier's stale write must be a
+    no-op (returns False) — never clobber the applied merge back to stale."""
+    await adj.record_verdict(
+        db, entity_a="a", entity_b="b", verdict="proposed_merge", loser_id="b", survivor_id="a"
+    )
+    await adj.approve(db, pair_key="a|b", approved_by="owner")
+    # A concurrent winner already applied: proposed_merge → merge.
+    assert (
+        await adj.claim_approved_for_apply(db, pair_key="a|b", loser_id="b", survivor_id="a")
+        is True
+    )
+    # The loser now tries to mark it stale — must NOT corrupt the applied merge.
+    assert await adj.mark_stale(db, pair_key="a|b") is False
+    assert (await adj.get_by_pair(db, "a", "b"))["verdict"] == "merge"
+
+
+@pytest.mark.asyncio
+async def test_readjudication_direction_flip_clears_approval(db):
+    """P1#1: a re-adjudication that FLIPS survivor/loser (same pair, opposite
+    direction) must CLEAR the human approval. The apply path's staleness check compares
+    {survivor_id, loser_id} as an order-INDEPENDENT set, so a flipped direction passes
+    staleness and would apply the human's old approval the WRONG way — tombstoning the
+    entity they chose to keep (Codex P1, #1477)."""
+    await adj.record_verdict(
+        db,
+        entity_a="e1",
+        entity_b="e2",
+        verdict="proposed_merge",
+        loser_id="e2",
+        survivor_id="e1",
+        norm_a="n1",
+        norm_b="n2",
+    )
+    await adj.approve(db, pair_key=adj.pair_key("e1", "e2"), approved_by="owner")
+    assert (await adj.get_by_pair(db, "e1", "e2"))["approved_at"] is not None
+    # Re-judge flips the direction (survivor/loser swapped).
+    await adj.record_verdict(
+        db,
+        entity_a="e1",
+        entity_b="e2",
+        verdict="proposed_merge",
+        loser_id="e1",
+        survivor_id="e2",
+        norm_a="n1",
+        norm_b="n2",
+        provider="strong-model",
+    )
+    row = await adj.get_by_pair(db, "e1", "e2")
+    assert row["survivor_id"] == "e2" and row["loser_id"] == "e1"  # the re-judge landed
+    assert row["approved_at"] is None and row["approved_by"] is None  # approval cleared
+
+
+@pytest.mark.asyncio
+async def test_readjudication_norm_change_clears_approval(db):
+    """P1#1: a re-adjudication that changes a norm snapshot the apply path reads
+    (identity drift) clears approval — the human approved a merge under norms they saw."""
+    await adj.record_verdict(
+        db,
+        entity_a="e1",
+        entity_b="e2",
+        verdict="proposed_merge",
+        loser_id="e2",
+        survivor_id="e1",
+        norm_a="n1",
+        norm_b="n2",
+    )
+    await adj.approve(db, pair_key=adj.pair_key("e1", "e2"), approved_by="owner")
+    await adj.record_verdict(
+        db,
+        entity_a="e1",
+        entity_b="e2",
+        verdict="proposed_merge",
+        loser_id="e2",
+        survivor_id="e1",
+        norm_a="n1-DRIFTED",
+        norm_b="n2",
+    )
+    assert (await adj.get_by_pair(db, "e1", "e2"))["approved_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_readjudication_same_decision_preserves_approval(db):
+    """P1#1 guard against over-broadening the field set: a re-judge that reaches the
+    SAME decision (only provider/reasoning changed) KEEPS approval — the CRUD-layer
+    mirror of test_reapprove_not_clobbered_by_readjudication."""
+    await adj.record_verdict(
+        db,
+        entity_a="e1",
+        entity_b="e2",
+        verdict="proposed_merge",
+        loser_id="e2",
+        survivor_id="e1",
+        norm_a="n1",
+        norm_b="n2",
+    )
+    await adj.approve(db, pair_key=adj.pair_key("e1", "e2"), approved_by="owner")
+    await adj.record_verdict(
+        db,
+        entity_a="e1",
+        entity_b="e2",
+        verdict="proposed_merge",
+        loser_id="e2",
+        survivor_id="e1",
+        norm_a="n1",
+        norm_b="n2",
+        provider="strong-model",
+        reasoning="re-confirmed",
+    )
+    row = await adj.get_by_pair(db, "e1", "e2")
+    assert row["approved_at"] is not None and row["approved_by"] == "owner"
+
+
+@pytest.mark.asyncio
+async def test_approve_reject_refuse_dispatched_at_crud_layer(db, monkeypatch):
+    """P1#2 CRITICAL: the human-only guard lives in the CRUD functions, not only the
+    MCP wrapper — so a Bash-capable dispatched session that imports adj_crud.approve/
+    reject directly (its subprocess inherits GENESIS_CC_SESSION=1) is refused too. A
+    foreground/supervised session passes (#1477)."""
+    await adj.record_verdict(
+        db, entity_a="e1", entity_b="e2", verdict="proposed_merge", loser_id="e2", survivor_id="e1"
+    )
+    pk = adj.pair_key("e1", "e2")
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    monkeypatch.delenv("GENESIS_SESSION_SUPERVISED", raising=False)
+    with pytest.raises(DispatchGateRefused):
+        await adj.approve(db, pair_key=pk, approved_by="sentinel")
+    with pytest.raises(DispatchGateRefused):
+        await adj.reject(db, pair_key=pk, reason="x")
+    # Nothing moved: still an un-approved proposed_merge.
+    row = await adj.get_by_pair(db, "e1", "e2")
+    assert row["verdict"] == "proposed_merge" and row["approved_at"] is None
+    # Supervised foreground session passes.
+    monkeypatch.setenv("GENESIS_SESSION_SUPERVISED", "1")
+    assert await adj.approve(db, pair_key=pk, approved_by="owner") is True

@@ -324,3 +324,91 @@ class TestStaleness:
         stale = reg.stale_profiles(days=30)
         assert len(stale) == 1
         assert stale[0].name == "no-date"
+
+
+# --- a paid provider's profile carries its FALLBACK PRICE ---------------------
+# `free: false` in model_routing.yaml activates the profile-based cost fallback
+# in litellm_delegate._cost_from_profile (used whenever litellm.completion_cost()
+# raises), so the profile's cost_per_mtok_* figures ARE the recorded spend on
+# that path. A stale figure there is not cosmetic — it is a wrong number in the
+# cost ledger. Found by review of PR #1619: flipping mistral-large-free to
+# free:false left its profile at 2.00/6.00 while the real paid rate is
+# 0.50/1.50, i.e. every fallback-priced call recorded at 4x.
+#
+# NOT tested here, deliberately: agreement between routing `free:` and profile
+# `free_tier.available`. They answer different questions and legitimately
+# differ. `free:` is ACCOUNT-tier semantics (does THIS account pay), while
+# `free_tier.available` is a fact about the model in the world. `glm51` is the
+# live proof: routing free=false because this install pays via zenmux, profile
+# free_tier.available=true because GLM really does offer "20M free tokens for
+# new users". An invariant forcing those to match would be false, and was
+# written and then withdrawn during this review. (`require_free`, the only
+# consumer of `free_tier.available`, has zero callers in src/ today.)
+
+
+def _repo_config_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "config"
+
+
+class TestPaidProviderProfilePricing:
+    """Invariant over the SHIPPED configs, not a fixture."""
+
+    @staticmethod
+    def _paid_providers_with_profiles():
+        import yaml
+
+        routing = yaml.safe_load((_repo_config_dir() / "model_routing.yaml").read_text())
+        return [
+            (name, spec["profile"])
+            for name, spec in (routing.get("providers") or {}).items()
+            if spec.get("profile") and not spec.get("free", False)
+        ]
+
+    def test_the_pairing_is_actually_discovered(self):
+        """Guard the guard — an empty list makes the test below vacuous.
+
+        Deliberately does NOT name a provider. It used to anchor on
+        `mistral-large-free`, which broke the day that provider's `free:` flag
+        legitimately changed — a guard-the-guard test that fails on a correct
+        config change is itself a defect, because it teaches the next person to
+        edit the assertion rather than read it. The property that matters is
+        "some paid provider carries a profile", not which one.
+        """
+        pairs = self._paid_providers_with_profiles()
+        assert len(pairs) >= 5, pairs
+        # Every discovered profile NAME must resolve in the registry. The
+        # previous line here was `all(name and profile for ...)`, which cannot
+        # fail: `pairs` is built with `if spec.get("profile")`, so `profile` is
+        # truthy by construction and `name` is a non-empty YAML key. It read as
+        # coverage while providing none — the exact defect this class of test
+        # exists to prevent, written into the guard-the-guard itself.
+        registry = ModelProfileRegistry(_repo_config_dir() / "model_profiles.yaml")
+        registry.load()
+        unresolved = [(n, p) for n, p in pairs if registry.get(p) is None]
+        assert not unresolved, f"routing names a profile that does not exist: {unresolved}"
+
+    def test_every_paid_provider_profile_has_a_nonzero_rate(self):
+        """A paid provider whose profile prices it at 0 records $0 spend on the
+        fallback path — silently, and forever."""
+        registry = ModelProfileRegistry(_repo_config_dir() / "model_profiles.yaml")
+        registry.load()
+
+        zero_rated = [
+            f"{provider} -> profile {profile_name!r} has "
+            f"in={p.cost_per_mtok_in} out={p.cost_per_mtok_out}"
+            for provider, profile_name in self._paid_providers_with_profiles()
+            if (p := registry.get(profile_name)) is not None
+            and not (p.cost_per_mtok_in > 0 and p.cost_per_mtok_out > 0)
+        ]
+        assert not zero_rated, zero_rated
+
+    def test_mistral_large_profile_matches_its_declared_paid_rate(self):
+        """The specific pair PR #1619 flipped, pinned so a later edit to either
+        file has to move both."""
+        registry = ModelProfileRegistry(_repo_config_dir() / "model_profiles.yaml")
+        registry.load()
+        p = registry.get("mistral-large-3")
+        assert p is not None
+        assert p.cost_per_mtok_in == 0.50
+        assert p.cost_per_mtok_out == 1.50
+        assert p.free_tier.get("available") is False
