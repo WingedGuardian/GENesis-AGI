@@ -295,17 +295,62 @@ def degraded_exit(
         gated: regex (searched case-insensitively against the RAW command text).
             Pass a literal pattern defined ABOVE the guarded import, so it is still
             bound when the import that failed is the one being recovered from.
-        override_sigils: in-band trailing sigils this guard honours (``discard-override``
-            …). Present in the raw text -> allow, because a degraded guard must not
-            strand an operator with no way through.
+        override_sigils: Retained only so an older caller paired with this newer
+            helper cannot fail open with ``TypeError`` during worktree/main version
+            skew. Degraded guards cannot safely bind an in-band sigil to a parsed
+            command segment, so this value is deliberately ignored.
         exc: the import error, named in the message so the cause is visible.
     """
-    reason = f"{type(exc).__name__}: {exc}" if exc is not None else "import failed"
+    # A hostile or simply broken exception can raise from __str__. This function is
+    # the last line of defence before CC interprets the process exit, so even its
+    # diagnostic rendering must be total.
+    if exc is None:
+        reason = "import failed"
+    else:
+        try:
+            detail = str(exc)
+        except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+            detail = "<exception text unavailable>"
+        reason = f"{type(exc).__name__}: {detail}"
+    reason = reason[:512]
+
+    def finish(code: int, message: str, *, advisory: bool = False) -> NoReturn:
+        """Emit one bounded notice and terminate with *exactly* ``code``.
+
+        ``SystemExit`` is not enough after an output failure: CPython retries stream
+        flushes during interpreter shutdown and can replace the intended code with
+        120. This is a short-lived hook process with no cleanup contract, so flush the
+        successful write explicitly and use ``os._exit`` in all cases. That makes a
+        broken stdout/stderr incapable of turning a block into CC's non-blocking exit.
+        """
+        bounded = message[:4096]
+        try:
+            if advisory:
+                payload = {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "additionalContext": bounded,
+                    }
+                }
+                sys.stdout.write(json.dumps(payload, ensure_ascii=True) + "\n")
+                sys.stdout.flush()
+            else:
+                sys.stderr.write(bounded + "\n")
+                sys.stderr.flush()
+        except BaseException:  # noqa: BLE001 — output must never change the verdict.
+            pass
+        os._exit(code)
+
+    # Compatibility only; see the argument documentation above. Reading it here
+    # makes the deliberate no-op explicit to type-checkers and future maintainers.
+    del override_sigils
     try:
         # ONE read: read_payload() consumes stdin, so a second call returns nothing and
-        # would silently lose `file_path` on a Write/Edit payload.
+        # would silently lose the Bash command. Every caller is a PreToolUse/Bash hook;
+        # accepting a file_path from some other tool would judge unrelated text as a
+        # shell command and could allow a malformed Bash payload.
         payload = read_payload()
-        raw = field(payload, "command") or field(payload, "file_path")
+        raw = field(payload, "command")
     except BaseException:  # noqa: BLE001 — unreadable payload cannot prove safety.
         raw = ""
 
@@ -314,50 +359,37 @@ def degraded_exit(
     # malformed JSON and for empty stdin, so without this the common case fell through to
     # the match below, matched nothing, and ALLOWED.
     if not raw.strip():
-        print(
+        finish(
+            2,
             f"GUARD DEGRADED ({name}): {reason} — and the tool payload could not be "
             "read, or named no command, so nothing here can establish the command is "
             "safe. BLOCKING. Repair the hook tree (version skew between a worktree and "
             "the main tree is the usual cause) or disable this hook deliberately.",
-            file=sys.stderr,
         )
-        sys.exit(2)
 
     try:
-        for sigil in override_sigils:
-            if sigil and sigil in raw:
-                print(
-                    f"GUARD DEGRADED ({name}): {reason} — allowing: the command carries "
-                    f"the in-band '{sigil}' waiver. NOTE this guard did NOT actually "
-                    "run, so the waiver was not checked against a parsed command.",
-                    file=sys.stderr,
-                )
-                sys.exit(0)
         if re.search(gated, raw, re.IGNORECASE):
-            print(
+            finish(
+                2,
                 f"GUARD DEGRADED ({name}): {reason} — BLOCKING: the raw command text "
                 "names a gated operation and this guard cannot run to judge it. This "
                 "is a crude text match, not a parse, so it may be over-broad; that is "
-                "the intended direction. Repair the hook tree, or re-run with an "
-                "in-band waiver if this guard has one.",
-                file=sys.stderr,
+                "the intended direction. Repair the hook tree or disable this hook "
+                "deliberately before retrying.",
             )
-            sys.exit(2)
-        print(
+        finish(
+            0,
             f"GUARD DEGRADED ({name}): {reason} — allowing: the raw command text names "
             "no gated operation. This guard did NOT run; other gates in it are not in "
             "force for this command either.",
-            file=sys.stderr,
+            advisory=True,
         )
-        sys.exit(0)
-    except SystemExit:
-        raise
     except BaseException:  # noqa: BLE001 — never reinstate the exit 1 we exist to stop.
-        print(
-            f"GUARD DEGRADED ({name}): {reason} — and the degraded check itself failed. BLOCKING.",
-            file=sys.stderr,
+        finish(
+            2,
+            f"GUARD DEGRADED ({name}): {reason} — and the degraded check itself "
+            "failed. BLOCKING.",
         )
-        sys.exit(2)
 
 
 _BRACE_RE = re.compile(r"\{([^{}]*,[^{}]*)\}")

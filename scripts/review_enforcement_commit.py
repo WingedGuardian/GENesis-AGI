@@ -43,15 +43,13 @@ try:
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
     if __name__ != "__main__":
         raise
-    # `review-override` IS honoured here, unlike in git_push_guard, and the asymmetry
-    # is the point: this sigil waives a LOCAL commit's review requirement, which is
-    # recoverable and already the documented escape for this gate. Refusing it in a
-    # degraded state would strand an operator mid-repair with no way to commit the
-    # repair itself.
+    # `review-override` is NOT honoured here: without the parser, an in-band sigil
+    # cannot be bound to the command segment it is supposed to waive. Repair the hook
+    # tree or disable the hook deliberately before retrying instead of authorising
+    # from raw text.
     degraded_exit(
         "review_enforcement_commit",
         gated=_DEGRADED_GATED,
-        override_sigils=("review-override",),
         exc=_exc,
     )
 

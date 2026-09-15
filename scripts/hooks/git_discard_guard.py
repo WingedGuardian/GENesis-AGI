@@ -160,7 +160,6 @@ except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degrad
     degraded_exit(
         "git_discard_guard",
         gated=_DEGRADED_GATED,
-        override_sigils=("discard-override",),
         exc=_exc,
     )
 

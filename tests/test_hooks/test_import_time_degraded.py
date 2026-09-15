@@ -84,8 +84,8 @@ _CASES = [
         "git_discard_guard",
         "hooks/git_discard_guard.py",
         "git clean -fd  # discard-override",
-        0,
-        "waiver honoured",
+        2,
+        "waiver ignored while parser is unavailable",
     ),
     (
         "git_push_guard",
@@ -113,8 +113,8 @@ _CASES = [
         "review_enforcement_commit",
         "review_enforcement_commit.py",
         'git commit -m "x"  # review-override',
-        0,
-        "waiver honoured",
+        2,
+        "waiver ignored while parser is unavailable",
     ),
 ]
 
@@ -172,10 +172,19 @@ def test_degraded_guard_keeps_its_fail_direction(tmp_path, guard, rel, command, 
         f"Exit 1 in particular is the FAIL-OPEN this exists to prevent — CC treats "
         f"any non-2 exit as non-blocking.\nstderr: {res.stderr[:400]}"
     )
-    assert "GUARD DEGRADED" in res.stderr, (
+    notice = res.stderr
+    if expected == 0 and res.stdout:
+        payload = json.loads(res.stdout)
+        hook_output = payload["hookSpecificOutput"]
+        assert hook_output["hookEventName"] == "PreToolUse"
+        assert "permissionDecision" not in hook_output
+        notice = hook_output["additionalContext"]
+    assert "GUARD DEGRADED" in notice, (
         f"{guard} [{label}] gave no GUARD DEGRADED notice. A degraded allow that "
         "looks identical to a real one has told the operator nothing."
     )
+    if expected == 0:
+        assert not res.stderr, "successful degradation notices belong on additionalContext"
 
 
 @pytest.mark.parametrize(("guard", "rel", "command", "expected", "label"), _CASES)
@@ -316,6 +325,94 @@ def test_git_push_guards_check_pr_cli_does_not_degrade(tmp_path):
     assert "poisoned sibling" in res.stderr, (
         "the CLI path should surface the import error; got:\n" + res.stderr[-400:]
     )
+
+
+@pytest.mark.parametrize(
+    ("rel", "command"),
+    [
+        ("hooks/git_discard_guard.py", "echo '# discard-override'; git clean -fd"),
+        ("review_enforcement_commit.py", "echo '# review-override'; git commit -m x"),
+    ],
+)
+def test_degraded_waiver_decoy_cannot_authorize_a_later_segment(tmp_path, rel, command):
+    """Without the parser, a sigil cannot be bound to the operation it may waive."""
+    res = _run(_tree(tmp_path, poisoned=True), rel, command, tmp_path / "home_decoy")
+    assert res.returncode == 2
+    assert "BLOCKING" in res.stderr
+
+
+def test_file_path_is_not_treated_as_a_bash_command(tmp_path):
+    """All degraded callers are Bash hooks; file_path cannot repair a missing command."""
+    root = _tree(tmp_path, poisoned=True)
+    home = tmp_path / "home_file_path"
+    home.mkdir()
+    res = subprocess.run(
+        [sys.executable, str(root / "scripts" / "hooks" / "git_push_guard.py")],
+        input=json.dumps({"tool_name": "Bash", "tool_input": {"file_path": "git status"}}),
+        capture_output=True,
+        text=True,
+        cwd=str(root),
+        env={**os.environ, "HOME": str(home)},
+        timeout=90,
+    )
+    assert res.returncode == 2
+    assert "named no command" in res.stderr
+
+
+def _run_degraded_helper(tmp_path: Path, body: str) -> subprocess.CompletedProcess:
+    """Invoke the real shared helper in a fresh process; os._exit is intentional."""
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, 'scripts/hooks'); "
+            "import hook_input; "
+            + body,
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(_REPO_ROOT),
+        env={**os.environ, "HOME": str(tmp_path / "home_helper")},
+        timeout=90,
+    )
+
+
+def test_exception_whose_str_raises_cannot_reopen_the_guard(tmp_path):
+    body = (
+        "hook_input.read_payload=lambda: {'command': 'git push origin main'}; "
+        "Bad=type('Bad',(Exception,),{'__str__':lambda self: (_ for _ in ()).throw(RuntimeError('boom'))}); "
+        "hook_input.degraded_exit('test', gated=r'\\bpush\\b', exc=Bad())"
+    )
+    res = _run_degraded_helper(tmp_path, body)
+    assert res.returncode == 2
+    assert "exception text unavailable" in res.stderr
+
+
+@pytest.mark.parametrize(
+    ("stream", "command", "expected"),
+    [("stderr", "git push origin main", 2), ("stdout", "git status", 0)],
+)
+def test_broken_output_stream_cannot_change_the_verdict(tmp_path, stream, command, expected):
+    body = (
+        "Broken=type('Broken',(),{'write':lambda self,value: (_ for _ in ()).throw(OSError('broken')),"
+        "'flush':lambda self: (_ for _ in ()).throw(OSError('broken'))}); "
+        f"sys.{stream}=Broken(); "
+        f"hook_input.read_payload=lambda: {{'command': {command!r}}}; "
+        "hook_input.degraded_exit('test', gated=r'\\bpush\\b', exc=RuntimeError('poison'))"
+    )
+    res = _run_degraded_helper(tmp_path, body)
+    assert res.returncode == expected
+
+
+def test_legacy_override_keyword_is_accepted_but_cannot_waive(tmp_path):
+    """Mixed-version callers keep running, while raw sigils grant no permission."""
+    body = (
+        "hook_input.read_payload=lambda: {'command': 'git commit -m x # review-override'}; "
+        "hook_input.degraded_exit('test', gated=r'\\bcommit\\b', "
+        "override_sigils=('review-override',), exc=RuntimeError('poison'))"
+    )
+    res = _run_degraded_helper(tmp_path, body)
+    assert res.returncode == 2
 
 
 def test_hook_input_stays_stdlib_only(tmp_path):

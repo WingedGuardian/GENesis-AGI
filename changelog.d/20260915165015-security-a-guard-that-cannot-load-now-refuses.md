@@ -5,6 +5,8 @@
   every guard that shares the command parser: all of them, with a healthy control
   still refusing. They now fall back to a deliberately crude read of the raw command
   text and refuse anything that names a gated operation, over-broad by design and
-  loud about it, rather than standing silently aside. A payload that names no command
-  at all is refused on the same reasoning. The usual cause is a partially updated
-  hook tree, and the refusal now says so.
+  loud about it, rather than standing silently aside. Raw in-band waivers are not
+  accepted because the unavailable parser cannot bind one to the command it is meant
+  to waive. A payload that names no command at all is refused on the same reasoning.
+  Successful degraded notices use Claude Code's additional-context channel. The usual
+  cause is a partially updated hook tree, and the refusal now says so.
