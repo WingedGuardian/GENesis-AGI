@@ -432,7 +432,15 @@ class KnowledgeOrchestrator:
         # per-unit Qdrant writes — a rare post-timeout BUSY instead fails cleanly through
         # the compensation path below.
         def _drop_vectors(ids: list[str], why: str) -> None:
-            """Delete Qdrant points, best-effort. ONE implementation, two callers."""
+            """Delete Qdrant points ONLY, best-effort.
+
+            For the SUPERSEDED path, which runs after a successful batch and is
+            not compensation: every row that pointed at one of these old
+            vectors is durably pointing at its replacement, so the points are
+            garbage while the MemoryStore rows are not this helper's to judge.
+            Failure paths use `_compensate`, which also removes the rows this
+            batch wrote.
+            """
             for qid in ids:
                 try:
                     delete_point(
@@ -442,6 +450,52 @@ class KnowledgeOrchestrator:
                     )
                 except Exception:
                     logger.warning("Qdrant delete failed (%s) for %s", why, qid)
+
+        async def _compensate(ids: list[str], why: str) -> None:
+            """Undo this batch's MemoryStore writes, best-effort. ONE impl.
+
+            Takes only ids this batch CREATED — see `created_ids`. A
+            deduplicated id names a pre-existing memory that other
+            `knowledge_units` rows already point at, and deleting it because a
+            later step failed would destroy their vector (Codex P1, #1653).
+
+            Removes the SQLite rows as well as the point. `MemoryStore.store`
+            commits `memory_fts` and `memory_metadata` through the SHARED
+            connection during phase one, so dropping only the vector leaves
+            metadata claiming `embedding_status='embedded'` with no vector
+            behind it — and a retry then deduplicates against the surviving FTS
+            row, gets the same id back, and never recreates the vector. The
+            unit would be permanently FTS-only and invisible to the
+            pending-embedding worker (Codex P1, #1653).
+
+            Best-effort throughout: this runs while an ingest is ALREADY
+            failing, so a compensation error must be logged, never raised over
+            the original cause.
+            """
+            from genesis.db.crud import memory as memory_crud
+
+            for qid in ids:
+                try:
+                    delete_point(
+                        memory_mod._store.qdrant_client,
+                        collection="knowledge_base",
+                        point_id=qid,
+                    )
+                except Exception:
+                    logger.warning("Qdrant delete failed (%s) for %s", why, qid)
+                # Order matters only for crash windows, and this is the safe
+                # one: vector first, then the rows that claim it exists. The
+                # reverse can leave an orphan vector no row names.
+                for remover, what in (
+                    (memory_crud.delete, "memory_fts"),
+                    (memory_crud.delete_metadata, "memory_metadata"),
+                ):
+                    try:
+                        await remover(memory_mod._store._db, memory_id=qid)
+                    except Exception:
+                        logger.warning(
+                            "%s delete failed (%s) for %s", what, why, qid
+                        )
 
         # WS-3: curated ingest is external_untrusted (authority tier, not
         # authorship); derived once, mirrored to both stores.
@@ -472,10 +526,15 @@ class KnowledgeOrchestrator:
         # "non-transactional, immediate"), so it was never covered by it and
         # loses nothing by moving. Each id is appended the moment it exists, so a
         # failure anywhere after that has the full list to compensate with.
+        # `created_ids` is the COMPENSABLE subset of `qdrant_ids`. The two
+        # differ whenever exact-content deduplication matched: `qdrant_ids`
+        # still needs every id, in order, because it is zipped against `units`
+        # below to write each row's `qdrant_id` — but only the ids this batch
+        # actually created may be deleted on failure.
+        created_ids: list[str] = []
         try:
             for unit in units:
-                qdrant_ids.append(
-                    await memory_mod._store.store(
+                qdrant_id, was_created = await memory_mod._store.store_reporting_creation(
                         unit.body,
                         f"knowledge:{project_type}/{unit.domain}",
                         memory_type="knowledge",
@@ -485,8 +544,10 @@ class KnowledgeOrchestrator:
                         auto_link=False,
                         source_pipeline="curated",
                         origin_class=resolved_origin,
-                    )
                 )
+                qdrant_ids.append(qdrant_id)
+                if was_created:
+                    created_ids.append(qdrant_id)
         except Exception:
             logger.error(
                 "Qdrant write failed after %d/%d units from %s — compensating",
@@ -495,7 +556,7 @@ class KnowledgeOrchestrator:
                 source,
                 exc_info=True,
             )
-            _drop_vectors(qdrant_ids, "phase-1 failure")
+            await _compensate(created_ids, "phase-1 failure")
             raise
 
         # PHASE 2 — the owned SQLite envelope. Nothing inside it writes through
@@ -547,7 +608,7 @@ class KnowledgeOrchestrator:
                     source,
                     exc_info=True,
                 )
-                _drop_vectors(qdrant_ids, "phase-2 acquisition failure")
+                await _compensate(created_ids, "phase-2 acquisition failure")
                 raise
             try:
                 await own.execute("BEGIN IMMEDIATE")
@@ -631,7 +692,7 @@ class KnowledgeOrchestrator:
                 # Compensate: delete the vectors this batch wrote. `stale_ids` is
                 # deliberately NOT touched — those points are still the live ones
                 # for rows the rollback has just restored.
-                _drop_vectors(qdrant_ids, "batch rollback")
+                await _compensate(created_ids, "batch rollback")
 
                 raise
 

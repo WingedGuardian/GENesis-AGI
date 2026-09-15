@@ -11,6 +11,40 @@ from genesis.knowledge.processors.registry import ContentProcessorRegistry
 from genesis.knowledge.processors.text import TextProcessor
 
 
+def _wire_store_mock(mock_store, *, ids=None, side_effect=None, created=True):
+    """Stub BOTH store surfaces on a mocked MemoryStore.
+
+    ``_store_units`` calls ``store_reporting_creation`` because it must know
+    whether each id names a memory THIS batch created: a deduplicated id
+    belongs to a pre-existing memory that other knowledge_units rows point at,
+    and compensating for it would delete their vector (Codex P1, PR #1653).
+
+    ``store`` is stubbed alongside it so a test that asserts on the older
+    surface keeps working, and ``_db`` is a real AsyncMock because the
+    compensation path now removes the memory_fts and memory_metadata rows too.
+    """
+    if side_effect is not None:
+        async def _reporting(*a, **kw):
+            return (await _maybe(side_effect, *a, **kw), created)
+        mock_store.store = AsyncMock(side_effect=side_effect)
+        mock_store.store_reporting_creation = AsyncMock(side_effect=_reporting)
+    else:
+        seq = list(ids)
+        mock_store.store = AsyncMock(side_effect=list(seq))
+        mock_store.store_reporting_creation = AsyncMock(
+            side_effect=[(i, created) for i in seq]
+        )
+    mock_store._db = AsyncMock()
+    return mock_store
+
+
+async def _maybe(fn, *a, **kw):
+    """Call a side_effect that may be a coroutine function or a plain one."""
+    out = fn(*a, **kw)
+    if hasattr(out, "__await__"):
+        return await out
+    return out
+
 def _make_orchestrator(tmp_path: Path, mock_distill_result: list[KnowledgeUnit] | None = None):
     """Build an orchestrator with a mock distillation pipeline."""
     registry = ContentProcessorRegistry()
@@ -166,7 +200,7 @@ async def test_store_units_rollback_on_failure(tmp_path: Path):
 
     mock_store = MagicMock()
     # store() succeeds for first 2 calls, then the 3rd SQLite insert fails
-    mock_store.store = AsyncMock(side_effect=["qid-0", "qid-1", "qid-2"])
+    _wire_store_mock(mock_store, ids=["qid-0", "qid-1", "qid-2"])
     mock_store._qdrant = MagicMock()
     mock_store._embeddings = MagicMock(model_name="test-model")
 
@@ -434,7 +468,7 @@ async def test_no_qdrant_write_happens_inside_the_sqlite_transaction(tmp_path: P
         return f"qid-{len([t for t in trace if t == 'qdrant-store']) - 1}"
 
     mock_store = MagicMock()
-    mock_store.store = AsyncMock(side_effect=_store)
+    _wire_store_mock(mock_store, side_effect=_store)
     mock_store._qdrant = MagicMock()
     mock_store._embeddings = MagicMock(model_name="test-model")
 
@@ -480,7 +514,7 @@ async def test_a_rollback_does_not_delete_the_vector_a_surviving_row_points_at(
         yield mock_own
 
     mock_store = MagicMock()
-    mock_store.store = AsyncMock(side_effect=["qid-new-0", "qid-new-1"])
+    _wire_store_mock(mock_store, ids=["qid-new-0", "qid-new-1"])
     mock_store._qdrant = MagicMock()
     mock_store._embeddings = MagicMock(model_name="test-model")
 
@@ -524,7 +558,7 @@ async def test_a_successful_batch_still_drops_the_superseded_vector(tmp_path: Pa
         yield mock_own
 
     mock_store = MagicMock()
-    mock_store.store = AsyncMock(return_value="qid-new")
+    _wire_store_mock(mock_store, ids=["qid-new"])
     mock_store._qdrant = MagicMock()
     mock_store._embeddings = MagicMock(model_name="test-model")
 
@@ -580,7 +614,7 @@ async def test_a_failure_opening_the_owned_connection_still_drops_phase_one_vect
         return stored[-1]
 
     mock_store = MagicMock()
-    mock_store.store = AsyncMock(side_effect=_store)
+    _wire_store_mock(mock_store, side_effect=_store)
     mock_store._qdrant = MagicMock()
     mock_store._embeddings = MagicMock(model_name="test-model")
 
@@ -604,4 +638,113 @@ async def test_a_failure_opening_the_owned_connection_still_drops_phase_one_vect
     assert sorted(dropped) == ["qid-0", "qid-1", "qid-2"], (
         "phase-1 vectors were left orphaned when the owned connection could "
         f"not be opened — compensation never ran (dropped={dropped})"
+    )
+
+
+async def test_a_deduplicated_vector_is_never_compensated(tmp_path: Path):
+    """A deduplicated id names a memory this batch did NOT create.
+
+    ``MemoryStore.store`` returns early on exact-content deduplication, handing
+    back the id of an EXISTING point. If a later step fails and compensation
+    treats that id as its own, it deletes a vector that prior
+    ``knowledge_units`` rows still point at — losing their embedding because an
+    unrelated ingest hit a transient error. (Codex P1, PR #1653.)
+
+    The middle unit here deduplicates; the owned connection then refuses to
+    open, so compensation runs over a mix of created and deduplicated ids.
+    """
+    orch = _make_orchestrator(tmp_path, mock_distill_result=_units(3))
+
+    @contextlib.asynccontextmanager
+    async def _refuses_to_open(_path):
+        raise RuntimeError("disk I/O error opening database")
+        yield  # pragma: no cover - unreachable, required to make this a CM
+
+    # unit 1 deduplicates onto a pre-existing point; units 0 and 2 are created.
+    outcomes = [("qid-0", True), ("qid-PREEXISTING", False), ("qid-2", True)]
+
+    mock_store = MagicMock()
+    mock_store.store_reporting_creation = AsyncMock(side_effect=list(outcomes))
+    mock_store.store = AsyncMock(side_effect=[i for i, _ in outcomes])
+    mock_store._db = AsyncMock()
+    mock_store._qdrant = MagicMock()
+    mock_store._embeddings = MagicMock(model_name="test-model")
+
+    dropped: list[str] = []
+
+    def _delete_point(_client, collection, point_id):
+        dropped.append(point_id)
+
+    with patch("genesis.mcp.memory_mcp._require_init"), \
+         patch("genesis.mcp.memory_mcp._store", mock_store), \
+         patch("genesis.mcp.memory_mcp.knowledge", MagicMock()), \
+         patch("genesis.db.connection.get_raw_db", _refuses_to_open), \
+         patch("genesis.qdrant.collections.delete_point", _delete_point):
+        file = tmp_path / "test.txt"
+        file.write_text("some content")
+        await orch.ingest_source(str(file), project_type="test")
+
+    assert dropped, "compensation never ran, so this proves nothing"
+    assert "qid-PREEXISTING" not in dropped, (
+        "compensation deleted a DEDUPLICATED point — that vector belongs to "
+        "memories written by an earlier ingest, and every knowledge_units row "
+        f"pointing at it just lost its embedding (dropped={dropped})"
+    )
+    assert sorted(dropped) == ["qid-0", "qid-2"], (
+        f"created points must still be compensated (dropped={dropped})"
+    )
+
+
+async def test_compensation_also_removes_the_rows_store_committed(tmp_path: Path):
+    """Dropping the vector alone leaves the ingest permanently unrecoverable.
+
+    ``MemoryStore.store`` commits ``memory_fts`` and ``memory_metadata``
+    through the SHARED connection during phase one. Compensating only the
+    Qdrant point leaves metadata claiming ``embedding_status='embedded'`` with
+    no vector behind it — and a retry then deduplicates against the surviving
+    FTS row, gets the same id back, and never recreates the vector. The unit
+    ends up visible only through FTS and invisible to the pending-embedding
+    worker. (Codex P1, PR #1653.)
+    """
+    orch = _make_orchestrator(tmp_path, mock_distill_result=_units(2))
+
+    @contextlib.asynccontextmanager
+    async def _refuses_to_open(_path):
+        raise RuntimeError("disk I/O error opening database")
+        yield  # pragma: no cover - unreachable, required to make this a CM
+
+    mock_store = MagicMock()
+    _wire_store_mock(mock_store, ids=["qid-0", "qid-1"])
+    mock_store._qdrant = MagicMock()
+    mock_store._embeddings = MagicMock(model_name="test-model")
+
+    fts_deleted: list[str] = []
+    meta_deleted: list[str] = []
+
+    async def _del_fts(_db, *, memory_id):
+        fts_deleted.append(memory_id)
+        return True
+
+    async def _del_meta(_db, *, memory_id):
+        meta_deleted.append(memory_id)
+        return True
+
+    with patch("genesis.mcp.memory_mcp._require_init"), \
+         patch("genesis.mcp.memory_mcp._store", mock_store), \
+         patch("genesis.mcp.memory_mcp.knowledge", MagicMock()), \
+         patch("genesis.db.connection.get_raw_db", _refuses_to_open), \
+         patch("genesis.qdrant.collections.delete_point", lambda *a, **k: None), \
+         patch("genesis.db.crud.memory.delete", _del_fts), \
+         patch("genesis.db.crud.memory.delete_metadata", _del_meta):
+        file = tmp_path / "test.txt"
+        file.write_text("some content")
+        await orch.ingest_source(str(file), project_type="test")
+
+    assert sorted(fts_deleted) == ["qid-0", "qid-1"], (
+        "the memory_fts rows survived compensation, so a retry will "
+        f"deduplicate against them and never rebuild the vector ({fts_deleted})"
+    )
+    assert sorted(meta_deleted) == ["qid-0", "qid-1"], (
+        "memory_metadata survived still claiming embedding_status='embedded' "
+        f"with no vector behind it ({meta_deleted})"
     )

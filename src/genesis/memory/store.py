@@ -168,7 +168,26 @@ class MemoryStore:
         """Public access to the memory linker for extraction typed links."""
         return self._linker
 
-    async def store(
+    async def store(self, content: str, source: str, **kwargs) -> str:
+        """Full store pipeline. Returns memory_id.
+
+        Thin wrapper over :meth:`store_reporting_creation`, kept because the
+        memory_id is all that ~47 call sites want and widening a return value
+        changes every reader of it. Takes ``**kwargs`` rather than restating
+        thirty keyword-only parameters, which would be a second copy to drift.
+
+        Callers that must know whether the id names a NEWLY created memory or
+        one deduplication matched — anything that may later COMPENSATE for the
+        write — must use :meth:`store_reporting_creation` instead. Deleting a
+        deduplicated id destroys a pre-existing memory that other rows point
+        at (Codex P1, PR #1653).
+        """
+        memory_id, _created = await self.store_reporting_creation(
+            content, source, **kwargs
+        )
+        return memory_id
+
+    async def store_reporting_creation(
         self,
         content: str,
         source: str,
@@ -199,8 +218,13 @@ class MemoryStore:
         assertion_provenance: str | None = None,
         durability: str | None = None,
         expires_at: str | None = None,
-    ) -> str:
-        """Full store pipeline: embed -> Qdrant -> FTS5 -> auto-link. Returns memory_id.
+    ) -> tuple[str, bool]:
+        """Full store pipeline: embed -> Qdrant -> FTS5 -> auto-link.
+
+        Returns ``(memory_id, created)``. ``created`` is False when exact-content
+        deduplication matched an EXISTING memory, in which case the id names a
+        row this call did not write and does not own — compensating for it would
+        delete a memory other rows already reference.
 
         Args:
             collection: Explicit Qdrant collection override. If provided, bypasses
@@ -236,7 +260,8 @@ class MemoryStore:
             )
             if existing:
                 logger.debug("Skipping duplicate memory store: %s", existing)
-                return existing
+                # NOT created by this call: the caller must not compensate it.
+                return (existing, False)
         except Exception:
             # Dedup check is best-effort — never block a store on lookup failure
             logger.warning("Dedup check failed, proceeding with store", exc_info=True)
@@ -568,7 +593,7 @@ class MemoryStore:
                     supersedes, memory_id, exc_info=True,
                 )
 
-        return memory_id
+        return (memory_id, True)
 
     async def _mark_superseded(
         self,
