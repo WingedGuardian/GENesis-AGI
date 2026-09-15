@@ -43,6 +43,17 @@ if [[ "$args" == *has-session* ]]; then
         prev="$a"
     done
     name="${name#=}"
+    # TOCTOU simulation: a session that is ABSENT when manual mode's selection
+    # loop asks, and PRESENT when the rebuild branch asks later. That is the race
+    # — a concurrent manual launch creating the slot in between — and it cannot
+    # be reproduced with a stateless session list, because the same file answers
+    # both questions.
+    if [[ -n "${FAKE_TMUX_SESSIONS_APPEAR:-}" && "$name" == "$FAKE_TMUX_SESSIONS_APPEAR" ]]; then
+        _n=0; [[ -f "$FAKE_TMUX_APPEAR_N" ]] && _n=$(cat "$FAKE_TMUX_APPEAR_N")
+        echo $(( _n + 1 )) > "$FAKE_TMUX_APPEAR_N"
+        [[ "$_n" -ge 1 ]] && exit 0
+        exit 1
+    fi
     [[ -f "$FAKE_TMUX_SESSIONS" ]] && grep -qxF "$name" "$FAKE_TMUX_SESSIONS" && exit 0
     exit 1
 fi
@@ -116,6 +127,20 @@ if [[ "$*" == *slot_liveness* ]]; then
   echo $(( n + 1 )) > "$FAKE_LIVENESS_N"
   exit 0
 fi
+if [[ "$*" == *session_cap* ]]; then
+  # The rebuild's pre-kill admission probe. Speaks session_cap's 3-line stdout
+  # protocol: action / message / machine reason. FAKE_CAP_REASON empty means
+  # "probe unavailable" (exit 1, no output) — the door's documented fail-open.
+  [[ -n "${FAKE_CAP_LOG:-}" ]] && echo "$*" >> "$FAKE_CAP_LOG"
+  if [[ -z "${FAKE_CAP_REASON:-}" ]]; then exit 1; fi
+  if [[ "$FAKE_CAP_REASON" == "oom_floor" ]]; then
+    echo "RECLAIM"; echo "RAM low (512MB free, need >= 3072MB to start safely)."
+  else
+    echo "ALLOW"; echo "Slot available."
+  fi
+  echo "$FAKE_CAP_REASON"
+  exit 0
+fi
 exit 1
 """
 
@@ -151,6 +176,7 @@ def door(tmp_path):
     snap = tmp_path / "snap.txt"
     snap2 = tmp_path / "snap2.txt"
     killlog = tmp_path / "kill.log"
+    cap_log = tmp_path / "cap_calls.txt"
 
     def _env() -> dict:
         return {
@@ -173,6 +199,15 @@ def door(tmp_path):
             "FAKE_TMUX_SNAP_N": str(tmp_path / "snap_calls.txt"),
             "FAKE_TMUX_KILLLOG": str(killlog),
             "FAKE_TMUX_KILL_RC": os.environ.get("_TEST_FAKE_KILL_RC", "0"),
+            # Pre-kill admission probe: "" = unavailable (fail-open),
+            # "oom_floor" = refuse the rebuild, anything else = admit.
+            "FAKE_CAP_REASON": os.environ.get("_TEST_FAKE_CAP_REASON", ""),
+            "FAKE_CAP_LOG": str(cap_log),
+            # A slot that appears between manual mode's selection and the
+            # rebuild branch's check — the concurrent-launch race.
+            "FAKE_TMUX_SESSIONS_APPEAR": os.environ.get(
+                "_TEST_FAKE_SESSION_APPEARS", ""),
+            "FAKE_TMUX_APPEAR_N": str(tmp_path / "appear_calls.txt"),
         }
     def run(*args: str) -> subprocess.CompletedProcess:
         env = _env()
@@ -198,6 +233,7 @@ def door(tmp_path):
     run.snap = snap  # consent-block snapshot 1 (5-field lines)
     run.snap2 = snap2  # snapshot served from the SECOND call on (TOCTOU tests)
     run.killlog = killlog  # exact kill-session targets, one per line
+    run.cap_log = cap_log  # argv of each pre-kill admission probe
     run.home = home  # so a test can make the temp-dir candidates unusable
     return run, log, sessions, listing, panes
 
@@ -574,8 +610,10 @@ def _poisoned_slot(door, snap: str = _SNAP):
 def _run_door_pty(run, mode: str, feed: bytes):
     """Run the door under a pty so the consent `read < /dev/tty` is reachable,
     with the EXACT environment the subprocess runner builds."""
+    import contextlib
     import pty
     import select
+    import signal
 
     env = run.env_fn()
     pid, fd = pty.fork()
@@ -586,12 +624,14 @@ def _run_door_pty(run, mode: str, feed: bytes):
             os._exit(127)
     os.write(fd, feed)
     out = b""
+    timed_out = False
     while True:
         try:
             r, _, _ = select.select([fd], [], [], 8)
         except OSError:
             break
         if not r:
+            timed_out = True
             break
         try:
             chunk = os.read(fd, 4096)
@@ -600,6 +640,15 @@ def _run_door_pty(run, mode: str, feed: bytes):
         if not chunk:
             break
         out += chunk
+    if timed_out:
+        # The read loop is bounded by select; os.waitpid is NOT. Leaving the loop
+        # on a timeout means the door produced no further output — typically it
+        # is parked at the consent prompt, whose own `read -t 120` would hold the
+        # test for two minutes, and a child blocked for any other reason would
+        # hold it forever. There is no subprocess.run(timeout=...) equivalent on
+        # the pty path, so the deadline has to be enforced here.
+        with contextlib.suppress(OSError, ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
     _, status = os.waitpid(pid, 0)
     return os.waitstatus_to_exitcode(status), out.decode(errors="replace")
 
@@ -770,3 +819,144 @@ class TestConsentRebuild:
             if "new-session" in ln and not ln.lstrip().startswith("#")
         ]
         assert len(invocations) == 1, invocations
+
+
+class TestRebuildAdmitsBeforeDestroying:
+    """The one precondition read that belongs BEFORE the destructive action.
+
+    Every other read in this script is deliberately post-kill so nothing can go
+    stale — but the capacity gate downstream can REFUSE after the slot is gone.
+    `_cap_reclaim` has six `exit 1` paths and all of them run post-kill; the
+    likeliest is mundane: consent, kill, gate returns RECLAIM, operator presses
+    Enter to cancel. Pane and scrollback destroyed, no replacement.
+
+    Only the RAM floor can legitimately refuse a REBUILD. The COUNT check cannot:
+    the slot is counted before and counted again after, so a rebuild is net-zero
+    (reattach already bypasses the cap for the same reason). So the pre-kill probe
+    asks the SHIPPED decision engine about the post-kill world and acts only on a
+    verdict of `oom_floor`.
+    """
+
+    def test_low_ram_refuses_the_rebuild_and_keeps_the_slot(self, door):
+        run, log = _poisoned_slot(door)
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED,POISONED"
+        os.environ["_TEST_FAKE_CAP_REASON"] = "oom_floor"
+        try:
+            code, out = _run_door_pty(run, "genesis-3-1", b"y\n")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+            os.environ.pop("_TEST_FAKE_CAP_REASON", None)
+        assert code == 0, out
+        # THE POINT: consent was given, and the slot still exists.
+        assert not run.killlog.exists() or run.killlog.read_text().strip() == "", (
+            f"the slot was destroyed even though the replacement could not start:\n{out}"
+        )
+        assert "NOT rebuilding" in out, out
+        # The operator is told WHY and what to do — a refusal they cannot act on
+        # is just a different way to lose.
+        assert "RAM is below the floor" in out, out
+        assert "free memory" in out, out
+        # And it still attaches rather than dropping them at a bare prompt.
+        assert "new-session" in log.read_text()
+
+    def test_healthy_ram_still_rebuilds(self, door):
+        """The control. A refusal that fires always would 'pass' the test above
+        while removing the feature."""
+        run, log = _poisoned_slot(door)
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED,POISONED"
+        os.environ["_TEST_FAKE_CAP_REASON"] = "ok"
+        try:
+            code, out = _run_door_pty(run, "genesis-3-1", b"y\n")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+            os.environ.pop("_TEST_FAKE_CAP_REASON", None)
+        assert code == 0, out
+        assert run.killlog.read_text().strip() == "$7", (
+            f"a healthy rebuild must still kill by id:\n{out}"
+        )
+
+    def test_probe_models_the_post_kill_world(self, door):
+        """`--existing` must be the count AFTER this slot goes, or the COUNT
+        check could refuse a rebuild that is net-zero by construction."""
+        run, _ = _poisoned_slot(door)
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED,POISONED"
+        os.environ["_TEST_FAKE_CAP_REASON"] = "ok"
+        try:
+            _run_door_pty(run, "genesis-3-1", b"y\n")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+            os.environ.pop("_TEST_FAKE_CAP_REASON", None)
+        argv = run.cap_log.read_text()
+        assert "--existing" in argv, argv
+        # The fixture's listing holds exactly one cc-N session, so post-kill is 0.
+        assert "--existing 0" in argv, (
+            f"probe must model the post-kill count, not the current one: {argv}"
+        )
+
+    def test_unavailable_probe_fails_open(self, door):
+        """Stated rather than hidden: if the probe cannot run, the door behaves
+        exactly as it did before this change. This NARROWS the window, it does
+        not close it, and a test that pretended otherwise would be a lie."""
+        run, _ = _poisoned_slot(door)
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED,POISONED"
+        # FAKE_CAP_REASON unset -> the fake exits 1 with no output.
+        try:
+            code, out = _run_door_pty(run, "genesis-3-1", b"y\n")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+        assert code == 0, out
+        assert run.killlog.read_text().strip() == "$7", out
+
+
+class TestRebuildIsHostnameModeOnly:
+    """Manual mode allocated a slot with NO live session, so reaching the rebuild
+    branch at all means something created it in between — a concurrent manual
+    launch. Relying on that earlier availability probe is a TOCTOU whose window
+    spans the cc-slot.env sourcing, and whose consequence is the worst one: a
+    session that is still starting has no claude child yet, probes POISONED, and
+    an affirmative answer kills the session someone just created.
+    """
+
+    def test_manual_mode_never_offers_to_rebuild_under_the_race(self, door):
+        """Reproduces the actual TOCTOU, not merely 'manual mode picks a free slot'.
+
+        A first draft of this test only arranged an existing cc-1, so manual mode
+        selected cc-2, the rebuild branch was never reached, and the test PASSED
+        with the guard deleted — vacuous for its stated purpose, and caught by
+        mutating the guard rather than by reading it.
+
+        The real shape needs a session that is ABSENT when the selection loop asks
+        and PRESENT when the rebuild branch asks, which is what a concurrent manual
+        launch does. `FAKE_TMUX_SESSIONS_APPEAR` produces exactly that.
+        """
+        run, log = _poisoned_slot(door)
+        # cc-1 exists, so selection moves to cc-2 — which then "appears".
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED,POISONED"
+        os.environ["_TEST_FAKE_SESSION_APPEARS"] = "cc-2"
+        try:
+            code, out = _run_door_pty(run, "manual", b"y\n")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+            os.environ.pop("_TEST_FAKE_SESSION_APPEARS", None)
+        assert code == 0, out
+        assert "runs NO claude" not in out, (
+            f"manual mode entered the rebuild branch on a slot a concurrent "
+            f"launch had just created:\n{out}"
+        )
+        assert not run.killlog.exists() or run.killlog.read_text().strip() == "", (
+            f"manual mode killed a session someone else had just created:\n{out}"
+        )
+
+    def test_hostname_mode_still_rebuilds(self, door):
+        """The control: the gate must exclude manual mode WITHOUT disabling the
+        feature on the door it exists for."""
+        run, _log = _poisoned_slot(door)
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED,POISONED"
+        os.environ["_TEST_FAKE_CAP_REASON"] = "ok"
+        try:
+            code, out = _run_door_pty(run, "genesis-3-1", b"y\n")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+            os.environ.pop("_TEST_FAKE_CAP_REASON", None)
+        assert code == 0, out
+        assert run.killlog.read_text().strip() == "$7", out

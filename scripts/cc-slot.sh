@@ -77,7 +77,11 @@ _map_verdict() {
         [ "$_rem" -le 0 ] && { printf '%s' "TIMEOUT"; return 0; }
         [ "$_rem" -lt "$_budget" ] && _budget="$_rem"
     fi
-    out=$(timeout "$_budget" "${GENESIS_ROOT}/.venv/bin/python" \
+    # `-k`: plain `timeout` sends only TERM, so an interpreter that ignores or
+    # delays it blocks past the budget this line exists to enforce. The map is
+    # COSMETIC and must never be what makes a login feel slow, so follow with
+    # KILL 2s later. Same omission was in the login-path probe below.
+    out=$(timeout -k 2 "$_budget" "${GENESIS_ROOT}/.venv/bin/python" \
         -m genesis.cc.slot_liveness "$@" 2>/dev/null | sed -n '1p') || rc=$?
     # 124 is timeout(1)'s "deadline expired".
     [ "$rc" = "124" ] && { printf '%s' "TIMEOUT"; return 0; }
@@ -490,11 +494,23 @@ _s2_liveness() {
     _pids=$(printf '%s\n' "$1" | cut -d'|' -f4 | tr '\n' ' ') || true
     [ -n "${_pids// /}" ] || { return 0; }
     [ -x "${GENESIS_ROOT}/.venv/bin/python" ] || { return 0; }
-    timeout 5 "${GENESIS_ROOT}/.venv/bin/python" \
+    # `-k`: without it this is a TERM-only deadline, so the claimed 5s ceiling
+    # on the LOGIN path is not enforced against a probe wedged in uninterruptible
+    # I/O — which is the exact condition the bound was added for.
+    timeout -k 2 5 "${GENESIS_ROOT}/.venv/bin/python" \
         -m genesis.cc.slot_liveness $_pids 2>/dev/null | sed -n '1p' || true
     return 0
 }
-if tmux has-session -t "=${SESSION_NAME}" 2>/dev/null; then
+# HOSTNAME MODE ONLY. In manual mode SESSION_NAME was chosen above as a slot with
+# no live session, so reaching this branch at all means something created it in
+# between — a concurrent manual launch. Relying on that earlier availability probe
+# still being true is a TOCTOU, and the window is not small: sourcing cc-slot.env
+# sits between the two points. The consequence is the bad one — a concurrent
+# session that is still starting has no claude child yet, so it probes POISONED,
+# and an affirmative answer KILLS a session someone just created. Gate on the mode
+# explicitly rather than on a stale probe; manual mode falls through to `-A`, which
+# simply attaches to whatever is there.
+if [[ "$MODE_ARG" != "manual" ]] && tmux has-session -t "=${SESSION_NAME}" 2>/dev/null; then
     _s2_snap1=$(_s2_snapshot)
     _s2_verdict=$(_s2_liveness "$_s2_snap1")
     _s2_srv1=$(printf '%s\n' "$_s2_snap1" | sed -n '1p' | cut -d'|' -f1)
@@ -537,6 +553,26 @@ if tmux has-session -t "=${SESSION_NAME}" 2>/dev/null; then
                 # command, fields 3 on — to be STRING-IDENTICAL, and the slot
                 # to still probe POISONED. Anything moved -> stand down; the
                 # `-A` attach below absorbs every interleaving.
+                # RE-READ the launch levers before acting on consent. They
+                # were sourced at the top of this script, and the prompt above
+                # can sit for up to 120s — during which the operator may well be
+                # in another terminal editing exactly this file, because the
+                # message they just read is what sent them there. The levers
+                # decide the capacity model, the OAuth behaviour and the
+                # PERMISSION MODE, so a stale read can rebuild the slot
+                # --dangerously-skip-permissions moments after the operator
+                # switched it to auto. Consent was given for the disclosed
+                # state; the configuration is part of that state.
+                if [ -f "${HOME}/.genesis/cc-slot.env" ]; then
+                    . "${HOME}/.genesis/cc-slot.env" \
+                        || echo "cc-slot: warning: ~/.genesis/cc-slot.env re-sourced with errors (continuing)" >&2
+                fi
+                for _lever in GENESIS_CC_SYSTEM_RESERVE_MB GENESIS_CC_PER_SESSION_MB \
+                              GENESIS_CC_OOM_FLOOR_MB GENESIS_CC_EMERGENCY_SLOTS; do
+                    [ -n "${!_lever:-}" ] && export "$_lever"
+                done
+                unset _lever
+
                 _s2_snap2=$(_s2_snapshot)
                 _s2_srv2=$(printf '%s\n' "$_s2_snap2" | sed -n '1p' | cut -d'|' -f1)
                 _s2_sid2=$(printf '%s\n' "$_s2_snap2" | sed -n '1p' | cut -d'|' -f2)
@@ -548,7 +584,52 @@ if tmux has-session -t "=${SESSION_NAME}" 2>/dev/null; then
                     && [ "$_s2_sid2" = "$_s2_sid1" ] \
                     && [ "$_s2_proj2" = "$_s2_proj1" ] \
                     && [ "$_s2_verdict2" = "POISONED" ]; then
-                    if tmux kill-session -t "$_s2_sid1" 2>/dev/null; then
+                    # ADMIT BEFORE DESTROYING — the one precondition read that
+                    # belongs before the kill, and deliberately the ONLY one.
+                    #
+                    # Everything else in this script reads AFTER the destructive
+                    # action on purpose (see the header above) so no precondition
+                    # can go stale. But the capacity gate below can REFUSE after
+                    # the slot is already gone: `_cap_reclaim` has six `exit 1`
+                    # paths (no cc-N to trade under an OOM floor; no tty; an empty
+                    # answer at the prompt; an invalid selection; declining the
+                    # attached-victim confirm; a failed victim kill) and every one
+                    # of them runs post-kill. The likeliest is not exotic: consent,
+                    # kill, gate says RECLAIM, operator presses Enter to cancel —
+                    # pane and scrollback gone, no replacement.
+                    #
+                    # Only the RAM floor can legitimately refuse a REBUILD. The
+                    # COUNT check cannot: this slot is counted now and is counted
+                    # again after, so a rebuild is net-zero (reattach already
+                    # bypasses the cap for the same reason, below). So model the
+                    # POST-KILL world — existing minus this slot — and let the
+                    # shipped decision engine answer; `ram_ok` there does not
+                    # depend on `existing` at all, so that framing isolates the
+                    # floor rather than reimplementing it here.
+                    #
+                    # FAIL-OPEN, stated rather than hidden: if the probe cannot
+                    # run we proceed to the kill, which is exactly today's
+                    # behaviour. This NARROWS the window; it does not close it,
+                    # and the post-kill gate keeps its own fail-open fallback.
+                    _s2_rebuild_ok=1
+                    if [ -x "${GENESIS_ROOT}/.venv/bin/python" ]; then
+                        _s2_live=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
+                                   | grep -cE "^${SESSION_PREFIX}-[0-9]+$" || true)
+                        [ -n "$_s2_live" ] || _s2_live=0
+                        [ "$_s2_live" -gt 0 ] && _s2_live=$((_s2_live - 1))
+                        _s2_cap=$(timeout -k 2 15 "${GENESIS_ROOT}/.venv/bin/python" \
+                            -m genesis.cc.session_cap --existing "$_s2_live" 2>/dev/null || true)
+                        if [ "$(printf '%s\n' "$_s2_cap" | sed -n '3p')" = "oom_floor" ]; then
+                            _s2_rebuild_ok=0
+                            echo "cc-slot: NOT rebuilding ${SESSION_NAME} — RAM is below the floor, so the" >&2
+                            echo "cc-slot: replacement could not start and you would lose the pane for nothing." >&2
+                            echo "cc-slot: $(printf '%s\n' "$_s2_cap" | sed -n '2p')" >&2
+                            echo "cc-slot: free memory (or end another slot) and reconnect; attaching as-is." >&2
+                        fi
+                    fi
+                    if [ "$_s2_rebuild_ok" = "0" ]; then
+                        :
+                    elif tmux kill-session -t "$_s2_sid1" 2>/dev/null; then
                         echo "cc-slot: ${SESSION_NAME} ended — rebuilding it fresh." >&2
                     else
                         echo "cc-slot: could not end ${SESSION_NAME} (it may have just changed) — attaching instead." >&2
