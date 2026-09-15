@@ -69,10 +69,24 @@ that can accomplish the task. **Token cost increases with each layer.**
 - Use when you need network inspection, Lighthouse, or performance tracing
   beyond what the built-in Genesis browser tools provide
 
-### Layer 4: Computer Use (visual fallback — V4)
-- Claude Computer Use API (screenshot-based interaction)
-- ~1000 tokens per screenshot, expensive but universal
-- Not yet implemented
+### Layer 4: Computer Use — the operator's whole desktop, not just a browser
+- Reaches what no browser layer can: native applications, OS dialogs, and any
+  window that is not a web page. Also drives a browser when the point is to
+  drive it *as the operator sees it*.
+- **Perceive leg is live.** `scripts/capture_desktop.sh` triggers a capture on
+  the operator's machine and returns the image. Window-scoped by default;
+  full-screen exists but is never the default and is never inherited from a
+  window grant (it discloses every open window at once).
+- **Act leg — mouse, keyboard, drag — is NOT live**, and is gated behind an
+  approval design. Do not attempt to construct it ad hoc.
+- Mechanism, and it is not obvious: an SSH login on Windows lands in
+  SessionId 0 while the desktop is SessionId 1, so **nothing run over SSH can
+  see or touch the desktop**. Work reaches the desktop only via a scheduled
+  task registered with an Interactive logon type.
+  Full detail: `docs/reference/windows-remote-execution.md`.
+- Cost is a screenshot per observation, so prefer a lower layer whenever the
+  target is reachable by one. A browser task is almost always cheaper at
+  Layer 2 or 3.
 
 ### Layer Selection Guide
 | Need | Layer | Why |
@@ -86,6 +100,8 @@ that can accomplish the task. **Token cost increases with each layer.**
 | Submit on user's logged-in site | Remote CDP | User's sessions |
 | Network inspection / Lighthouse | On-Demand MCP | Chrome DevTools |
 | Take action in user's banking app | Remote CDP | MUST confirm |
+| Native app / OS dialog / non-web window | Computer Use | No browser layer can reach it |
+| See what is actually on the operator's screen | Computer Use | Capture, not a page |
 
 ## When to Use
 
@@ -152,6 +168,51 @@ button:has-text("Add to Cart")
 6. **Screenshot before submit** — Visual verification before irreversible action
 7. **Submit** — Click submit button
 8. **Verify result** — Read resulting page to confirm success
+
+## Coordinate Safety
+
+Applies to every layer that computes a position rather than naming an element,
+and to the desktop layer especially. Two of these were live bugs in this
+codebase, found 2026-09-06.
+
+**Prefer a selector to a coordinate.** `browser_click` resolves the element
+through Playwright, so there is no coordinate to get wrong. A computed
+coordinate can be wrong for reasons the computation cannot see. Reach for
+coordinates only when nothing else can hit the target.
+
+**Never mix coordinate spaces.** The recurring defect is arithmetic that adds
+two numbers from different spaces:
+
+| space | comes from |
+|---|---|
+| CSS pixels | `getBoundingClientRect()`, `outerHeight - innerHeight` |
+| physical screen pixels | `xdotool` window geometry, `SendInput` absolute mode |
+| DPI-virtualised pixels | any Windows API read by a process that has not called `SetProcessDPIAware()` |
+
+They coincide **only at `devicePixelRatio == 1` and 100% display scaling**,
+which is why this class of bug sits dormant on an unscaled dev machine and
+breaks on a real laptop. On Windows at 125% scaling a DPI-unaware process is
+told the screen is 1536x864 when it is 1920x1080 — every measurement it then
+takes is wrong by 1.25, silently.
+
+**Set DPI awareness before the first measurement, not before the first use.**
+Anything measured beforehand is already in the wrong space.
+
+**Confirm the target, then act.** After positioning and before clicking, read
+back what is actually under the pointer and refuse if it is not the element
+intended. This converts every coordinate error — scaling, stale bounds, a
+window that moved between measuring and acting — from a wrong click into a
+refusal.
+
+**Log where it actually landed, not where you aimed.** Intent is a
+computation; a computation cannot notice that it is wrong. Record actual
+against intended with the drift and the scale factor, at the moment of the
+action, so a mis-click leaves a forensic trail instead of a log that looks
+correct. If the readback fails, say so — "unknown" must never render as fine.
+
+**A zero return is a refusal.** `SendInput` returns the number of events
+injected and returns `0` rather than raising when the OS declines. Any API of
+this shape must have its return value checked; ignoring it reads as success.
 
 ## Safety Gates
 
