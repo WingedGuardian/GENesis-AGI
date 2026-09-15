@@ -60,6 +60,29 @@ def _bg_notice(output) -> str:
     return _BG_TRUNCATION_NOTICE if getattr(output, "bg_truncated", False) else ""
 
 
+def _is_oom_death(exc: BaseException) -> bool:
+    """Whether this failure was attributed to an out-of-memory reap.
+
+    Reads ``CCError.oom_suspected`` — the machine-readable half of the attribution
+    — never the message prose, which is a human-facing string that will be
+    reworded. The flag lives on the BASE, so a reap that also produced recognisable
+    output (an MCP line, a session-expiry message, buffered quota text) is still
+    attributed: those exits classify as a typed error, and while the flag lived only
+    on ``CCProcessError`` they arrived here with nothing to read and took the
+    stale-resume branch anyway. ``getattr`` is kept for the non-CCError case, since
+    this is called on a bare ``BaseException``.
+
+    An OOM death is a THIRD kind of failure alongside the rate/quota/timeout/offline
+    family already fast-re-raised: not a stale resume. The resumed session is
+    perfectly valid and the process was reaped, so ``_recover_stale_resume`` would
+    fail a live session for the wrong reason AND immediately re-run the identical
+    memory-heavy work under the same pressure — the retry amplification the
+    attribution exists to end. Worse, a retry that happens to succeed swallows the
+    cause entirely: the user learns nothing about why the first attempt died.
+    """
+    return bool(getattr(exc, "oom_suspected", False))
+
+
 # Nudge for dispatched, delivery-addressable (Telegram) channels: route long research/bg work
 # durable direct_session lane instead of an inline Workflow, which the CC bg-wait ceiling
 # kills after ~10min with nothing left to report back (the 2026-07-20 silent-death class).
@@ -858,8 +881,8 @@ class ConversationLoop:
             # retry fresh (which would also just re-raise offline). Let the
             # caller's terminal handler deal with it.
             raise
-        except CCError:
-            if not was_resume:
+        except CCError as exc:
+            if not was_resume or _is_oom_death(exc):
                 raise
             # Resume failed — recover and retry fresh
             session = await self._recover_stale_resume(
@@ -904,8 +927,8 @@ class ConversationLoop:
             # network-offline preflight (PR-3) likewise must NOT fail the live
             # session as a stale resume — the internet is down, not the session.
             raise
-        except CCError:
-            if not was_resume:
+        except CCError as exc:
+            if not was_resume or _is_oom_death(exc):
                 raise
             session = await self._recover_stale_resume(
                 session, user_id=user_id, channel=channel,
@@ -1089,10 +1112,14 @@ class ConversationLoop:
             # the same outage-amplifier shape the never-raises guard exists to
             # prevent. `peer_availability` imports only stdlib and `genesis.env`,
             # so there is no cycle to work around.
+            # And never for an attributed OOM death: the peer's sticky session is
+            # fine, the LOCAL subprocess was reaped, and re-running the identical
+            # workload under the same memory pressure simply re-arms the failure.
             if (
                 inv.resume_session_id is None
                 or (streamed and streamed.get("text"))
                 or peer_availability.is_provider_refusal(exc)
+                or _is_oom_death(exc)
             ):
                 raise
             logger.warning(
@@ -1191,7 +1218,7 @@ class ConversationLoop:
                 )
 
             sticky = self._session_fallback_session(session)
-            for peer_name, peer_inv in peers:
+            for peer_idx, (peer_name, peer_inv) in enumerate(peers):
                 if streamed and streamed.get("text"):
                     break  # a prior peer already streamed answer text — can't fail
                     # over to another without double-output; degrade instead.
@@ -1238,6 +1265,26 @@ class ConversationLoop:
                         return ""
                     continue  # this peer is also down → try the next one
                 except CCError as exc:
+                    if _is_oom_death(exc):
+                        # STOP, do not try the next peer. Every peer runs the same
+                        # memory-heavy prompt through a LOCAL subprocess, so "try
+                        # another model" re-arms the identical failure under the
+                        # identical pressure — the retry amplification this
+                        # attribution exists to end, once per peer. The peer is not
+                        # what failed; this box ran out of memory.
+                        #
+                        # Logged at ERROR, not warning: a peer being down is routine
+                        # and a reap is not, and if a later peer had succeeded the
+                        # cause would have vanished entirely from the record.
+                        logger.error(
+                            "failover peer %s was OOM-reaped locally — abandoning "
+                            "failover rather than re-arming the workload on the "
+                            "remaining %d peer(s): %s",
+                            peer_name,
+                            len(peers) - peer_idx - 1,
+                            exc,
+                        )
+                        break
                     logger.warning("failover peer %s failed", peer_name, exc_info=True)
                     # Routed through the SAME classifier on purpose: a local fault
                     # (offline — which never left the box — our own timeout, an MCP
