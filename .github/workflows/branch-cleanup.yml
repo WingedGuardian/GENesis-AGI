@@ -1,0 +1,78 @@
+# Delete a PR's head branch when the PR closes WITHOUT merging.
+#
+# The merged half is native (`delete_branch_on_merge`); this is the half GitHub
+# has no setting for. Without it, every closed-unmerged PR strands its branch on
+# the public remote — measured on this repo 2026-09-15: 30 of 104 remote
+# branches were exactly that, every one a closed or merged PR's leftover. Under
+# squash-merge those leftovers are indistinguishable from unmerged work by any
+# ancestry test, so they later get mistaken for pending changes and grow
+# duplicate PRs for work that already landed.
+#
+# Safety properties, each load-bearing:
+#   * `pull_request_target` runs THIS file from the default branch and nothing
+#     here checks out or executes PR code — it is a single ref-deletion API
+#     call, so the elevated token is never exposed to PR content.
+#   * Same-repo branches only: a fork's head is not ours to delete.
+#   * Never the default branch, however a PR came to have it as head.
+#   * Skipped when the branch is still the HEAD or the BASE of another open
+#     PR (stacked PRs share branches; deleting the base strands the child).
+#   * Deletion is recoverable: GitHub retains `refs/pull/N/head`, and the
+#     closed PR's page offers "Restore branch" indefinitely.
+#
+# Operator lever: disabling this workflow in the Actions UI turns the behaviour
+# off without a code change (Actions → Branch cleanup → Disable workflow).
+name: Branch cleanup
+
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  delete-unmerged-head:
+    # merged == true is delete_branch_on_merge's job; doing it here too would
+    # just race it. This job exists for the closed-without-merge case.
+    if: >
+      github.event.pull_request.merged == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref != github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete the head branch unless another open PR still uses it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          # Branch names are attacker-shaped input and legally contain URL
+          # metacharacters (`&` is a valid ref character), which would rewrite
+          # the query-string filters below. The DELETE path is not affected (a
+          # path segment has no query semantics), so the failure would be a
+          # miscounted keep-check. Refuse the odd names outright: skipping a
+          # cleanup is free, and no legitimate branch here is named that way.
+          case "$BRANCH" in
+            *'&'*|*'?'*|*'#'*|*'%'*|*' '*)
+              echo "keep: branch name contains URL metacharacters; not touching it"
+              exit 0;;
+          esac
+          # Still the head of a different open PR? (This PR is closed, so any
+          # open hit is by definition a different one.)
+          open_heads=$(gh api "repos/$REPO/pulls?state=open&head=$OWNER:$BRANCH" --jq 'length')
+          # Still the base of an open (stacked) PR?
+          open_bases=$(gh api "repos/$REPO/pulls?state=open&base=$BRANCH" --jq 'length')
+          if [ "$open_heads" != "0" ] || [ "$open_bases" != "0" ]; then
+            echo "keep: $BRANCH is still used by an open PR (heads=$open_heads bases=$open_bases)"
+            exit 0
+          fi
+          # The branch may already be gone (manual deletion, race with a
+          # restore). 422/404 here is success for our purposes.
+          if gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH"; then
+            echo "deleted: $BRANCH (restorable from the PR's Restore button)"
+          else
+            echo "note: $BRANCH was not deletable (already gone?) — nothing to do"
+          fi
