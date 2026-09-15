@@ -26,6 +26,7 @@ import os
 import stat
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -204,87 +205,6 @@ def test_fsync_path_tolerates_a_directory_and_a_missing_path(tmp_path: Path) -> 
 
 
 # ─── reachability: the anchor ────────────────────────────────────────────────
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        ".hidden-20260915",
-        "has space-20260915",
-        "tilde~name",
-        "caret^name",
-        "colon:name",
-        "question?name",
-        "star*name",
-        "bracket[name",
-        "back\\slash",
-        "dot..dot",
-        "ends.lock",
-        "trailing.",
-        "-leading-dash",
-        "..",
-        ".",
-    ],
-)
-def test_every_anchor_name_is_a_legal_ref(repo: Path, name: str) -> None:
-    """The anchor is the ONLY thing keeping an archived commit reachable.
-
-    MEASURED with `git check-ref-format`: every name in this list is a legal
-    directory name and an ILLEGAL ref. When tagging failed the archive still
-    registered, so the anchor was silently absent and a later prune could orphan
-    the very commits it existed to protect.
-
-    Validated against git itself rather than against a regex of my own, because
-    a hand-written rule would only prove the encoder agrees with my belief about
-    ref syntax — which is the belief that was wrong.
-    """
-    anchor = wl._ref_safe_anchor(name)
-    result = _git(repo, "check-ref-format", f"refs/tags/{anchor}")
-    assert result.returncode == 0, (
-        f"{name!r} encoded to {anchor!r}, which git rejects: {result.stderr.strip()}"
-    )
-
-
-def test_anchors_stay_distinct_for_names_that_slugify_alike(repo: Path) -> None:
-    """The control for the encoder: collapsing is not enough, it must be injective.
-
-    `a b` and `a-b` both reduce to the same slug. Without the digest they would
-    share one tag, and the second worktree archived would silently overwrite the
-    first one's anchor — losing the ref for commits that are still only reachable
-    through it. That is the same data loss the anchor exists to prevent, arriving
-    by a different route.
-    """
-    a = wl._ref_safe_anchor("a b")
-    b = wl._ref_safe_anchor("a-b")
-    assert a != b, f"distinct worktree names collided on one anchor: {a}"
-    for anchor in (a, b):
-        assert _git(repo, "check-ref-format", f"refs/tags/{anchor}").returncode == 0
-
-
-def test_a_ref_hostile_worktree_name_still_gets_a_real_anchor(
-    repo: Path, tmp_path: Path, monkeypatch
-) -> None:
-    """End to end: archive a worktree whose basename is ref-illegal.
-
-    Drives `_trash_worktree` rather than the encoder, because the defect was not
-    in an encoder (there wasn't one) — it was that the raw basename reached
-    `git tag`. A test of the helper alone would pass while the call site still
-    passed the raw name.
-    """
-    wt = tmp_path / ".hidden-wt"
-    _git(repo, "worktree", "add", "--quiet", "-b", "feature/hidden", str(wt))
-    sha = _git(wt, "rev-parse", "HEAD").stdout.strip()
-
-    monkeypatch.setattr(wl, "TRASH_DIR", tmp_path / "trash")
-    monkeypatch.setattr(wl, "TOMBSTONE_INDEX", tmp_path / "tomb.jsonl")
-    entry = {"path": str(wt), "branch": "feature/hidden", "head": sha, "detached": False}
-    assert wl._trash_worktree(entry, repo) is True
-
-    pointing = _git(repo, "for-each-ref", "--points-at", sha).stdout
-    assert wl._DETACHED_ANCHOR_PREFIX in pointing, (
-        "a ref-illegal basename produced no anchor at all; the commit is now "
-        f"reachable only through whatever else happens to point at it: {pointing!r}"
-    )
 
 
 # ─── reachability: recovery when the branch is gone ──────────────────────────
@@ -481,3 +401,103 @@ def test_report_json_still_emits_a_document_on_a_healthy_scan(
     out = capsys.readouterr()
     assert rc == 0
     assert json.loads(out.out) == []
+
+
+# ─── round-4: the archive must not eat the worktree's own files ──────────────
+
+
+def test_a_worktree_owning_a_trash_meta_json_does_not_lose_it(
+    repo: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """`.trash_meta.json` is not a reserved name, and the worktree may own one.
+
+    The same class as the `.dirty.patch` collision fixed in the previous round,
+    at the second archive-time write that was missed: `Path.rename` replaces the
+    destination silently, so the worktree's own file was destroyed in the
+    worktree AND in the archive — the archive is made from the moved directory,
+    so there is no surviving copy anywhere.
+
+    OURS must keep the canonical name, because recovery locates entries by it
+    (including archives already on disk), so the assertion is that the user's
+    bytes survive under some other name — not that ours moved aside.
+    """
+    wt = tmp_path / "wt-meta-collide"
+    _git(repo, "worktree", "add", "--quiet", "-b", "feature/metacollide", str(wt))
+    mine = '{"this": "is the worktree owner s own file"}\n'
+    (wt / ".trash_meta.json").write_text(mine)
+
+    trash = tmp_path / "trash-meta"
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "TOMBSTONE_INDEX", tmp_path / "tomb-meta.jsonl")
+    entry = {
+        "path": str(wt), "branch": "feature/metacollide", "head": "", "detached": False,
+    }
+    assert wl._trash_worktree(entry, repo) is True
+
+    archive = next(trash.glob("*.tar.gz"))
+    with tarfile.open(archive, "r:gz") as tf:
+        names = tf.getnames()
+        preserved = [n for n in names if ".trash_meta.json.from-worktree-" in n]
+        assert preserved, (
+            f"the worktree's own .trash_meta.json was destroyed; archive holds {names[:10]}"
+        )
+        assert tf.extractfile(preserved[0]).read().decode() == mine, (
+            "the preserved file is not the worktree's original bytes"
+        )
+        canonical = [n for n in names if n.endswith("/.trash_meta.json")]
+        assert canonical, "our own metadata must still be at the canonical name"
+        ours = json.loads(tf.extractfile(canonical[0]).read())
+        assert ours.get("name") == trash_entry_name(archive), (
+            "the canonical file must be OURS, not the worktree's"
+        )
+
+
+def trash_entry_name(archive: Path) -> str:
+    return archive.name.split(".tar.gz")[0]
+
+
+def test_a_bundle_that_does_not_verify_blocks_the_prune(
+    repo: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """Reading the bundle back is what makes it trustworthy, so prove it is read.
+
+    Found by mutation: disabling the verification branch left every other test
+    GREEN, because in all of them the bundle verifies. That is a NULL mutation
+    against the existing suite and a real coverage hole — nothing asserted what
+    happens when verification FAILS, which is the only situation the check
+    exists for.
+
+    A file that exists is not a file that parses. If an unverifiable bundle were
+    accepted, the reaper would prune on the strength of a history it cannot read
+    and the archive would be unrecoverable in exactly the way the bundle was
+    added to prevent.
+    """
+    wt = tmp_path / "wt-badbundle"
+    _git(repo, "worktree", "add", "--quiet", "-b", "feature/badbundle", str(wt))
+    (wt / "f.txt").write_text("x\n")
+    _git(wt, "add", "f.txt")
+    _git(wt, "commit", "--quiet", "-m", "unique")
+
+    real_run = wl.subprocess.run
+
+    def fail_verify(cmd, *a, **k):
+        if cmd[:3] == ["git", "bundle", "verify"]:
+            return subprocess.CompletedProcess(cmd, 1, "", "corrupt bundle")
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setattr(wl.subprocess, "run", fail_verify)
+
+    meta: dict = {}
+    trash = tmp_path / "trash-bad"
+    trash.mkdir()
+    moved = trash / "wt-badbundle"
+    wt.rename(moved)
+
+    assert wl._bundle_history(moved, repo, meta) is False, (
+        "an unverifiable bundle was accepted; the reaper would prune against a "
+        "history it cannot read"
+    )
+    assert not (moved / wl._HISTORY_BUNDLE).exists(), (
+        "the unusable bundle must not be left in the archive, where it would "
+        "read as preserved history"
+    )

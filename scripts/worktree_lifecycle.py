@@ -60,7 +60,6 @@ import errno
 import hashlib
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -102,7 +101,6 @@ TRASH_DIR = Path.home() / ".genesis" / "worktree-trash"
 #: Tag namespace for a reaped DETACHED worktree's HEAD commit. Without an anchor
 #: the per-worktree HEAD is the only thing keeping that chain reachable, and
 #: pruning the registration makes it collectable.
-_DETACHED_ANCHOR_PREFIX = "worktree-archive/"
 
 # Private modes for everything this module writes into the trash. A reaped
 # worktree is a verbatim copy of someone's working tree, which routinely holds a
@@ -129,31 +127,151 @@ class WorktreeScanError(RuntimeError):
     """
 
 
-def _ref_safe_anchor(name: str) -> str:
-    """Build a tag name for ``name`` that ``git check-ref-format`` accepts.
+# The archive's own copy of its commit history, stored INSIDE the tarball.
+_HISTORY_BUNDLE = ".genesis-history.bundle"
 
-    A worktree basename is a FILESYSTEM name and a tag is a REF, and the two
-    grammars disagree. MEASURED with `git check-ref-format`: a leading dot, a
-    space, `~ ^ : ? * [ \\`, a `..` run, and a `.lock` suffix are all rejected,
-    and every one of them is a legal directory name. When tagging failed the
-    archive still registered, so the anchor this module exists to create was
-    silently absent and a later prune could orphan the commits it was protecting.
+# Ambient git LOCATION overrides. `git rev-parse --local-env-vars` lists these as
+# repository-local and they beat `-C`, so with GIT_DIR or GIT_COMMON_DIR exported
+# for another repository every git call answers for THAT repository.
+#
+# Applied to the BUNDLE path specifically, and the reason is the failure shape
+# rather than tidiness: everywhere else a redirected repo makes a command FAIL,
+# which is noisy and recoverable. Here it would SUCCEED and write another
+# project's history into this archive — a wrong archive that verifies, which is
+# the one outcome no later check can catch. The remaining call sites in this file
+# are unchanged and unaudited for this; that is tracked separately rather than
+# swept into a review round about the archive.
+_GIT_LOCATION_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
 
-    NOT reversible, and does not need to be: the chosen name is recorded in the
-    archive's metadata, so recovery reads it rather than recomputing it. The
-    short digest of the ORIGINAL name is what keeps it injective — without it,
-    two worktrees differing only in characters the slug replaces would collide
-    on one tag and the second would overwrite the first's anchor.
+
+def _git_env() -> dict[str, str]:
+    """The environment with git's repository-location overrides removed."""
+    env = dict(os.environ)
+    for var in _GIT_LOCATION_VARS:
+        env.pop(var, None)
+    return env
+
+# Candidate bases to exclude from the bundle, most specific first. Bundling only
+# the commits a worktree does NOT share with the mainline keeps it small:
+# MEASURED on this repo, a full-history bundle is 27 MB while the unique-commit
+# bundles for two real branches are 68 KB and 88 KB (5 and 16 commits).
+_BUNDLE_BASES = ("origin/main", "main")
+
+
+def _bundle_history(trash_path: Path, repo_root: Path, meta: dict) -> bool:
+    """Write the worktree's commit history into the archive itself.
+
+    WHY THIS REPLACED THE TAG ANCHOR. The archive stored the worktree's FILES and
+    left its HISTORY reachable only through a ref outside the archive — first the
+    branch, then a tag created before pruning. Every one of those is something
+    another process can remove, and review kept finding new ways for the link to
+    break rather than for the archive to: a name that is legal on disk and
+    illegal as a ref produced no anchor at all; a truncated digest could repoint
+    an older archive's only anchor; the anchor captured a HEAD that was already
+    minutes stale; and a deleted branch left recovery with nothing to rebuild
+    from. Those are four findings about one thing — the archive depending on
+    state it does not contain.
+    A bundle is a FILE. It travels inside the tarball, it cannot be repointed by
+    a name collision, there is no name to be illegal, and nothing outside the
+    archive has to survive for it to be read.
+
+    MEASURED end to end before this was written: bundle a branch's unique
+    commits, delete the branch, prune the worktree, expire every reflog and
+    `gc --prune=now` until `cat-file -e` confirms the commit is GONE — then
+    `git bundle unbundle` restores it and `git worktree add --detach` rebuilds a
+    working checkout with that commit's file contents. The tag anchor could not
+    survive that sequence; this does.
+
+    HEAD IS RE-READ HERE, not taken from the classification snapshot, which is
+    the stale-HEAD finding. Classification can be minutes old and a session may
+    have committed since. VERIFIED that `rev-parse HEAD` still answers from a
+    worktree that has already been moved, so the fresh read is available at
+    exactly this point.
+
+    Returns True when the history is safe to prune against — either a bundle was
+    written and verified, or there was provably nothing unique to preserve.
     """
-    slug = re.sub(r"[^A-Za-z0-9._-]", "-", name)
-    slug = re.sub(r"\.{2,}", "-", slug)
-    slug = slug.strip(".-")
-    if slug.endswith(".lock"):
-        slug = slug[: -len(".lock")] + "-lock"
-    if not slug:
-        slug = "wt"
-    digest = hashlib.sha256(name.encode("utf-8", "surrogateescape")).hexdigest()[:8]
-    return f"{_DETACHED_ANCHOR_PREFIX}{slug}-{digest}"
+    head = _run_git(repo_root, ["-C", str(trash_path), "rev-parse", "HEAD"], timeout=15)
+    if head is None or not head.strip():
+        return False
+    sha = head.strip()
+    # Overwrite the value taken from the CLASSIFICATION SNAPSHOT, which is the
+    # stale-HEAD defect: `wt["head"]` was sampled before the scan and before the
+    # archive step, and a session can commit in between. Recovery reads `commit`,
+    # so the snapshot value would send it to a commit this archive never bundled.
+    meta["head"] = sha
+    meta["commit"] = sha
+
+    base = ""
+    for candidate in _BUNDLE_BASES:
+        if _run_git(repo_root, ["rev-parse", "--verify", "--quiet", candidate], timeout=15):
+            base = candidate
+            break
+
+    # A temporary ref, because `git bundle` records REFS and refuses a bare sha
+    # ("Refusing to create empty bundle"). Named from the entry so two concurrent
+    # runs cannot collide, and deleted in `finally` so it never becomes the very
+    # kind of ambient ref this function exists to stop depending on.
+    tmp_ref = (
+        "refs/genesis-archive/"
+        + hashlib.sha256(trash_path.name.encode("utf-8", "surrogateescape")).hexdigest()[:16]
+    )
+    bundle = trash_path / _HISTORY_BUNDLE
+    try:
+        if _run_git(repo_root, ["update-ref", tmp_ref, sha], timeout=15) is None:
+            return False
+        args = ["bundle", "create", str(bundle), tmp_ref]
+        if base:
+            args += ["--not", base]
+        result = subprocess.run(
+            ["git", *args], capture_output=True, text=True,
+            cwd=str(repo_root), timeout=120, env=_git_env(),
+        )
+        if result.returncode != 0:
+            # "Refusing to create empty bundle" is not a failure: it means this
+            # worktree holds no commit the mainline does not already have, so
+            # there is nothing for the archive to preserve and pruning is safe.
+            if "empty bundle" in result.stderr.lower():
+                meta["history_bundle"] = ""
+                meta["history_note"] = f"no commits unique to this worktree vs {base or 'HEAD'}"
+                return True
+            _log(f"  WARN could not bundle history for {trash_path.name}: "
+                 f"{result.stderr.strip()[:160]}")
+            return False
+    finally:
+        _run_git(repo_root, ["update-ref", "-d", tmp_ref], timeout=15)
+
+    # Read it back before trusting it, for the same reason the tarball is read
+    # back: a file that exists is not a file that parses.
+    verify = subprocess.run(
+        ["git", "bundle", "verify", str(bundle)], capture_output=True, text=True,
+        cwd=str(repo_root), timeout=120, env=_git_env(),
+    )
+    if verify.returncode != 0:
+        _log(f"  WARN history bundle for {trash_path.name} does not verify: "
+             f"{verify.stderr.strip()[:160]} — NOT pruning")
+        with contextlib.suppress(OSError):
+            bundle.unlink()
+        return False
+
+    with contextlib.suppress(OSError):
+        os.chmod(bundle, _PRIVATE_FILE_MODE)
+    meta["history_bundle"] = _HISTORY_BUNDLE
+    meta["history_base"] = base
+    _log(f"  bundled history at {sha[:8]} into {_HISTORY_BUNDLE}")
+    return True
+
+
+def _run_git(repo_root: Path, args: list[str], *, timeout: int) -> str | None:
+    """Run git, returning stdout on success and None on any failure."""
+    try:
+        result = subprocess.run(
+            ["git", *args], capture_output=True, text=True,
+            cwd=str(repo_root), timeout=timeout, env=_git_env(),
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    return result.stdout if result.returncode == 0 else None
 
 
 def _nested_worktrees_under(wt_path: Path, repo_root: Path) -> list[str]:
@@ -1180,8 +1298,36 @@ def _trash_worktree(
             trash_path.rmdir()
             shutil.move(str(wt_path), str(trash_path))
 
-        # Move staging metadata into the trash entry
+        # Move staging metadata into the trash entry.
+        #
+        # COLLISION-CHECKED FIRST, for the same reason `.dirty.patch` is below:
+        # `.trash_meta.json` is not a reserved name and a worktree may legitimately
+        # contain its own untracked one. `Path.rename` REPLACES the destination
+        # silently, so an unconditional move destroyed the user's file in the
+        # worktree AND in the archive, since the archive is made from the moved
+        # directory. For a module contracted to delete nothing, that is the
+        # contract breaking.
+        #
+        # OURS keeps the canonical name rather than being suffixed, because
+        # recovery locates an entry BY that name — including the archives already
+        # on disk. So the worktree's own file is the one moved aside, and the log
+        # says where it went rather than leaving it to be discovered.
         final_meta = trash_path / ".trash_meta.json"
+        if final_meta.exists():
+            preserved = None
+            for n in range(1, 1000):
+                candidate = trash_path / f".trash_meta.json.from-worktree-{n}"
+                if not candidate.exists():
+                    preserved = candidate
+                    break
+            if preserved is not None:
+                with contextlib.suppress(OSError):
+                    final_meta.rename(preserved)
+                _log(f"  NOTE {trash_path.name} contained its own .trash_meta.json — "
+                     f"kept as {preserved.name} so it survives in the archive")
+            else:
+                _log(f"  WARN {trash_path.name} contains a .trash_meta.json and no free "
+                     "name was available to preserve it; it will be REPLACED")
         staging_meta.rename(final_meta)
 
         if patch_text:
@@ -1256,23 +1402,35 @@ def _trash_worktree(
         # comment above calls the worst available one — so anchor EVERY archived
         # worktree, not only the detached ones. A tag costs nothing, and the
         # branch case is strictly more likely than the detached case here.
-        pruned_safely = True
-        commit_sha = str(wt.get("head") or "")
-        if commit_sha:
-            anchor = _ref_safe_anchor(trash_path.name)
-            kind = "detached HEAD" if detached else f"branch {branch}"
-            tag = subprocess.run(
-                ["git", "tag", "-f", anchor, commit_sha],
-                capture_output=True, text=True, cwd=str(repo_root), timeout=10,
-            )
-            if tag.returncode != 0:
-                pruned_safely = False
-                _log(f"  WARN could not anchor {kind} at {commit_sha[:8]} "
-                     f"({tag.stderr.strip()}) — SKIPPING prune so the commits stay "
-                     f"reachable; `git worktree prune` by hand once anchored")
-            else:
-                meta["detached_anchor"] = anchor
-                _log(f"  anchored {kind} {commit_sha[:8]} at refs/tags/{anchor}")
+        # PRESERVE THE HISTORY INSIDE THE ARCHIVE, then prune.
+        #
+        # `git worktree prune` drops the per-worktree HEAD, and for a detached
+        # worktree that ref is the only thing keeping its commits reachable. A
+        # branch is no safer: the task runner deletes a reaped worktree's branch
+        # with `git branch -D` immediately afterwards. Either way the tarball
+        # would hold checked-out FILES and a pointer to commits a later gc can
+        # collect — silent, delayed, and invisible until someone tries to
+        # recover.
+        #
+        # The archive now carries its own commit graph, so pruning costs nothing
+        # it cannot rebuild. If bundling FAILS we do not prune: a stale worktree
+        # registration is recoverable, lost commits are not.
+        kind = "detached HEAD" if detached else f"branch {branch}"
+        pruned_safely = _bundle_history(trash_path, repo_root, meta)
+        if not pruned_safely:
+            _log(f"  WARN could not preserve history for {kind} — SKIPPING prune "
+                 f"so the commits stay reachable; re-run once the cause is fixed")
+
+        # REWRITE the metadata now that bundling has corrected it. The file was
+        # placed from staging BEFORE this point, so it still carried the
+        # classification snapshot's sha — and the snapshot is exactly what
+        # `_bundle_history` replaces with a fresh read. Without this the archive
+        # would bundle one commit and its own metadata would name another, which
+        # is the stale-HEAD defect surviving in the only place recovery reads.
+        # Caught by its own regression test rather than by inspection.
+        with contextlib.suppress(OSError):
+            final_meta.write_text(json.dumps(meta, indent=2))
+            os.chmod(final_meta, _PRIVATE_FILE_MODE)
 
         if pruned_safely:
             subprocess.run(
@@ -1444,6 +1602,39 @@ def _restore_from_dir(trash_path: Path, repo_root: Path) -> bool:
     if Path(original_path).exists():
         print(f"Original path already exists: {original_path}", file=sys.stderr)
         return False
+
+    # RESTORE THE COMMITS BEFORE ASKING GIT FOR A WORKTREE AT THEM. The archive
+    # carries its own history, so this is what makes recovery independent of any
+    # ref that survived outside it — the branch may be deleted and the commits
+    # already collected, which is the ordinary case rather than the exotic one.
+    #
+    # Unconditionally safe to repeat: unbundling objects the repository already
+    # has is a no-op, so this costs nothing in the common case where nothing was
+    # lost.
+    #
+    # ARCHIVES WRITTEN BEFORE THIS EXISTS HAVE NO BUNDLE, and there are real ones
+    # on disk right now. They fall through to the old path — their commits are
+    # reachable through the tag anchor recorded in their own metadata — so this
+    # is additive rather than a format break.
+    bundle = trash_path / _HISTORY_BUNDLE
+    if bundle.exists():
+        unbundled = subprocess.run(
+            ["git", "bundle", "unbundle", str(bundle)],
+            capture_output=True, text=True, cwd=str(repo_root), timeout=300,
+            env=_git_env(),
+        )
+        if unbundled.returncode != 0:
+            # Not fatal on its own: the commits may still be present through a
+            # surviving ref, and `git worktree add` below will say so. Reported
+            # rather than swallowed, because if recovery then fails THIS is the
+            # reason and it must not have to be guessed at.
+            print(
+                f"WARNING: could not unbundle archived history: "
+                f"{unbundled.stderr.strip()[:200]}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"restored archived history from {_HISTORY_BUNDLE}", file=sys.stderr)
 
     # Recreate the worktree: detached at its commit, or checked out on its branch.
     if detached or not branch:

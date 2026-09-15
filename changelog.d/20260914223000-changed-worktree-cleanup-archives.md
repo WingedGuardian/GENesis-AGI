@@ -55,3 +55,23 @@
   which every worktree had vanished, and nothing downstream could tell that from
   the truth. Such a run now reports the error, changes nothing, and leaves the
   previous view in place.
+- **An archived worktree now carries its own history, instead of pointing at
+  history kept somewhere else.** Previously the archive held the files while the
+  commits stayed reachable only through a reference outside it — first the
+  branch, then a marker created just before cleanup. Every one of those is
+  something another process can remove, and each removal left a perfectly intact
+  archive whose contents could no longer be reconstructed. The archive now
+  contains the commits themselves, so nothing outside it has to survive for a
+  recovery to work. Verified by deleting the branch, expiring every reference and
+  running a full garbage collection until the commit was provably gone, then
+  recovering it from the archive alone.
+- **The commit recorded for an archive is the one it actually contains.** The
+  identifier was taken from a scan that runs over every worktree up front and can
+  be minutes old, so anything committed in that window was archived but recorded
+  under the earlier commit — sending a later recovery to a commit the archive
+  never held. It is now read at the moment of archiving.
+- **A worktree that contains its own bookkeeping file no longer loses it.** The
+  internal metadata file was written unconditionally, which replaced a file of
+  the same name belonging to the worktree — in the worktree and in the archive at
+  once, since the archive is made from the moved copy. The worktree file is now
+  preserved alongside ours, under a name that says where it came from.

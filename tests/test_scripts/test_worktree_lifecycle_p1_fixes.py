@@ -14,9 +14,11 @@ indiscriminately.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -190,20 +192,25 @@ def test_a_rename_onto_a_NON_empty_directory_is_refused(tmp_path: Path) -> None:
 # ─── every archived worktree anchored, not only detached ones ────────────────
 
 
-def test_a_branch_backed_worktree_is_anchored_too(repo: Path, tmp_path: Path) -> None:
-    """A branch is not a durable anchor, and assuming it was is the gap.
+def test_an_archived_worktree_survives_branch_deletion_and_a_gc(
+    repo: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """THE invariant the archive exists for, asserted against the worst case.
 
-    The branch ref keeps the commits reachable right up until something deletes
-    it — and something does: the autonomy executor deletes a task worktree's
-    branch with `git branch -D`, which git deletes even when unmerged. After
-    that the tarball holds files and a pointer to nothing, and a GC takes the
-    commits.
+    This replaces three tests that asserted a tag anchor. The tag is gone — the
+    archive now carries its own commit graph — but the property it protected is
+    unchanged and is what is locked here: after the executor deletes the branch
+    (`git branch -D`, which git performs even when unmerged) and a gc collects
+    the now-unreferenced commit, the archived work must still be recoverable.
 
-    Asserted by REPLAYING that sequence: anchor, delete the branch, and check the
-    commit is still reachable. The control is the same sequence WITHOUT the
-    anchor, where it must not be.
+    The sequence is REPLAYED rather than simulated, and deliberately total:
+    delete the branch, prune, expire every reflog, `gc --prune=now`, then assert
+    with `cat-file -e` that the commit is genuinely GONE before recovering it.
+    Without that precondition this would pass against a repository that simply
+    still had the commit, which is the failure mode of every "recovery worked"
+    assertion.
     """
-    wt = tmp_path / "wt-branch"
+    wt = tmp_path / "wt-doomed"
     _git(repo, "worktree", "add", "--quiet", "-b", "feature/doomed", str(wt))
     (wt / "only-copy.txt").write_text("the sole record of this work\n")
     _git(wt, "add", "only-copy.txt")
@@ -211,62 +218,113 @@ def test_a_branch_backed_worktree_is_anchored_too(repo: Path, tmp_path: Path) ->
     sha = _git(wt, "rev-parse", "HEAD").stdout.strip()
     assert sha
 
-    # CONTROL: without an anchor, deleting the branch leaves the commit
-    # unreferenced — reachable only until a gc.
-    before = _git(repo, "for-each-ref", "--points-at", sha).stdout
-    assert "feature/doomed" in before, "precondition: the branch points at it"
-
-    anchor = f"{wl._DETACHED_ANCHOR_PREFIX}wt-branch-archived"
-    tagged = _git(repo, "tag", "-f", anchor, sha)
-    assert tagged.returncode == 0, tagged.stderr
-
-    _git(repo, "worktree", "remove", "--force", str(wt))
-    deleted = _git(repo, "branch", "-D", "feature/doomed")
-    assert deleted.returncode == 0, deleted.stderr
-
-    after = _git(repo, "for-each-ref", "--points-at", sha).stdout
-    assert "feature/doomed" not in after, "the branch is gone, as the executor leaves it"
-    assert anchor in after, "but the archive anchor still points at the commit"
-    assert _git(repo, "cat-file", "-e", sha).returncode == 0, "so the commit survives"
-
-
-def test_the_anchor_prefix_is_a_namespace_not_a_branch(repo: Path) -> None:
-    """Anchors are tags under a dedicated prefix so they cannot be mistaken for
-    live branches, and cannot collide with one."""
-    assert wl._DETACHED_ANCHOR_PREFIX.endswith("/")
-    assert "worktree-archive" in wl._DETACHED_ANCHOR_PREFIX
-
-
-def test_trash_worktree_ANCHORS_a_branch_backed_worktree(
-    repo: Path, tmp_path: Path, monkeypatch
-) -> None:
-    """Drives the reaper, not git, because the finding is about OUR code.
-
-    The sibling test below replays the executor's `git branch -D` by hand and so
-    only proves git's behaviour — a mutation restoring `if detached and ...`
-    leaves it green. This one archives a BRANCH-backed worktree through
-    `_trash_worktree` and asserts the anchor tag exists afterwards, which is the
-    property that actually protects the commits.
-    """
-    wt = tmp_path / "wt-anchor-me"
-    _git(repo, "worktree", "add", "--quiet", "-b", "feature/anchor-me", str(wt))
-    (wt / "only-copy.txt").write_text("the sole record\n")
-    _git(wt, "add", "only-copy.txt")
-    _git(wt, "commit", "--quiet", "-m", "work that exists nowhere else")
-    sha = _git(wt, "rev-parse", "HEAD").stdout.strip()
-
-    monkeypatch.setattr(wl, "TRASH_DIR", tmp_path / "trash-anchor")
-    monkeypatch.setattr(wl, "TOMBSTONE_INDEX", tmp_path / "tomb-anchor.jsonl")
-    entry = {
-        "path": str(wt), "branch": "feature/anchor-me", "head": sha, "detached": False,
-    }
-
+    trash = tmp_path / "trash-doomed"
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "TOMBSTONE_INDEX", tmp_path / "tomb-doomed.jsonl")
+    entry = {"path": str(wt), "branch": "feature/doomed", "head": sha, "detached": False}
     assert wl._trash_worktree(entry, repo) is True
 
-    tags = _git(repo, "for-each-ref", "--format=%(refname)", "refs/tags/").stdout
-    assert wl._DETACHED_ANCHOR_PREFIX in tags, (
-        "a branch-backed worktree was archived without a durable anchor — after "
-        "the executor's `git branch -D` its commits would be collectable"
+    # Destroy every ref to the commit, exactly as the executor plus routine gc do.
+    _git(repo, "worktree", "prune")
+    assert _git(repo, "branch", "-D", "feature/doomed").returncode == 0
+    _git(repo, "reflog", "expire", "--expire=now", "--all")
+    _git(repo, "gc", "--prune=now", "--quiet")
+    assert _git(repo, "cat-file", "-e", sha).returncode != 0, (
+        "precondition: the commit must be genuinely collected, or this test "
+        "proves nothing about recovery"
     )
-    anchored = _git(repo, "for-each-ref", "--points-at", sha).stdout
-    assert wl._DETACHED_ANCHOR_PREFIX in anchored, "the anchor must point at THIS commit"
+
+    name = next(trash.iterdir()).name.split(".tar.gz")[0]
+    assert wl._recover(name, repo) is True
+
+    assert _git(repo, "cat-file", "-e", sha).returncode == 0, (
+        "the archived commit was not restored — the archive held files whose "
+        "history no longer exists anywhere"
+    )
+    restored = Path(str(wt))
+    status = _git(restored, "status", "--porcelain")
+    assert status.returncode == 0, f"recovered tree is not usable: {status.stderr.strip()}"
+    assert (restored / "only-copy.txt").read_text() == "the sole record of this work\n"
+
+
+def test_the_archive_carries_its_history_rather_than_pointing_at_it(
+    repo: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """The structural half: the history must be INSIDE the archive.
+
+    The previous design left the commits reachable only through a ref outside the
+    archive, and every finding in that cluster was a different way for that
+    external link to break while the archive itself stayed perfectly intact. So
+    this asserts the bundle is a member of the tarball — and that NO tag was
+    created, because the point is that the dependency is gone rather than merely
+    unused.
+    """
+    wt = tmp_path / "wt-selfcontained"
+    _git(repo, "worktree", "add", "--quiet", "-b", "feature/selfcontained", str(wt))
+    (wt / "f.txt").write_text("x\n")
+    _git(wt, "add", "f.txt")
+    _git(wt, "commit", "--quiet", "-m", "unique work")
+    sha = _git(wt, "rev-parse", "HEAD").stdout.strip()
+
+    trash = tmp_path / "trash-sc"
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "TOMBSTONE_INDEX", tmp_path / "tomb-sc.jsonl")
+    entry = {
+        "path": str(wt),
+        "branch": "feature/selfcontained",
+        "head": sha,
+        "detached": False,
+    }
+    assert wl._trash_worktree(entry, repo) is True
+
+    archive = next(trash.glob("*.tar.gz"))
+    with tarfile.open(archive, "r:gz") as tf:
+        members = tf.getnames()
+    assert any(m.endswith(wl._HISTORY_BUNDLE) for m in members), (
+        f"the archive does not contain {wl._HISTORY_BUNDLE}; its history lives "
+        f"outside it again. members sampled: {members[:8]}"
+    )
+    tags = _git(repo, "for-each-ref", "--format=%(refname)", "refs/tags/").stdout
+    assert "worktree-archive/" not in tags, (
+        "a tag anchor was still created — the dependency this replaced is back"
+    )
+
+
+def test_the_recorded_commit_is_head_at_ARCHIVE_time_not_classification_time(
+    repo: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """A commit made between the scan and the move must still be preserved.
+
+    Classification runs over every worktree up front (MEASURED at 19-41s across
+    ~191), so the snapshot HEAD can be minutes old and a session can commit in
+    that window. Passing a deliberately STALE head in the entry is what makes
+    this a real test: the reaper must ignore it and re-read the worktree.
+    """
+    wt = tmp_path / "wt-moving"
+    _git(repo, "worktree", "add", "--quiet", "-b", "feature/moving", str(wt))
+    (wt / "a.txt").write_text("first\n")
+    _git(wt, "add", "a.txt")
+    _git(wt, "commit", "--quiet", "-m", "A")
+    stale = _git(wt, "rev-parse", "HEAD").stdout.strip()
+
+    (wt / "b.txt").write_text("second\n")
+    _git(wt, "add", "b.txt")
+    _git(wt, "commit", "--quiet", "-m", "B, committed after classification")
+    fresh = _git(wt, "rev-parse", "HEAD").stdout.strip()
+    assert stale != fresh
+
+    trash = tmp_path / "trash-moving"
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "TOMBSTONE_INDEX", tmp_path / "tomb-moving.jsonl")
+    entry = {"path": str(wt), "branch": "feature/moving", "head": stale, "detached": False}
+    assert wl._trash_worktree(entry, repo) is True
+
+    archive = next(trash.glob("*.tar.gz"))
+    with tarfile.open(archive, "r:gz") as tf:
+        member = next(m for m in tf.getnames() if m.endswith(".trash_meta.json"))
+        meta = json.loads(tf.extractfile(member).read())
+    assert meta["commit"] == fresh, (
+        f"metadata recorded {meta['commit'][:8]} (the classification snapshot) "
+        f"rather than {fresh[:8]} (HEAD at archive time), so recovery would land "
+        "on a commit this archive never bundled"
+    )
