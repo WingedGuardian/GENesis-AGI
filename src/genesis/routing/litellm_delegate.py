@@ -328,7 +328,18 @@ class LiteLLMDelegate:
             status = raw_status if raw_status is not None else 500
             if _should_log_failure(provider):
                 logger.exception("Unexpected error calling %s", provider)
-            return CallResult(success=False, error=str(e), status_code=status)
+            # A statusless exception — DNS, socket, TLS — means we never got a
+            # response, and synthesizing 500 makes it indistinguishable from a
+            # server error the provider actually returned. Keep the
+            # distinction on the result rather than losing it here, so a
+            # consumer that must not spend a provider's allowance on requests
+            # the vendor never saw can tell them apart (Codex P2, PR #1624).
+            return CallResult(
+                success=False,
+                error=str(e),
+                status_code=status,
+                reached_provider=raw_status is not None,
+            )
 
 
 def _build_model_string(cfg: ProviderConfig) -> str:

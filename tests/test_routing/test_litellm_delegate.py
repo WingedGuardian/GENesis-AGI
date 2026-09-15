@@ -723,3 +723,79 @@ async def test_call_no_params_passes_no_extra_body():
         )
 
         assert "extra_body" not in mock_litellm.acompletion.call_args.kwargs
+def _litellm_mock_with_real_exception_classes(mock_litellm):
+    """Give a patched `litellm` REAL exception classes.
+
+    `except litellm.RateLimitError` against a MagicMock attribute raises
+    TypeError ("catching classes that do not inherit from BaseException"), so
+    a bare module patch does not merely fail to catch — it breaks the whole
+    handler chain and the original exception escapes untouched. Any test
+    driving an ERROR path through the delegate needs this; the success-path
+    tests never reach an except clause, which is why they get away without it.
+    """
+    for name in (
+        "RateLimitError", "AuthenticationError", "NotFoundError", "Timeout",
+        "ServiceUnavailableError", "BadRequestError", "UnprocessableEntityError",
+    ):
+        setattr(mock_litellm, name, type(name, (Exception,), {}))
+    return mock_litellm
+
+
+async def test_a_statusless_exception_is_marked_as_never_reaching_the_provider():
+    """DNS, socket and TLS failures carry no HTTP status, and this delegate
+    reports them as a SYNTHESIZED 500 — indistinguishable by status alone
+    from a server error the provider really returned.
+
+    Anything that spends a provider's allowance has to tell those apart, so
+    the distinction lives on the result rather than being inferred downstream.
+    Driven through the REAL delegate: asserting it on a hand-built CallResult
+    would test the fixture, and the mutation that deletes this flag from the
+    delegate would survive. (Codex P2, PR #1624.)
+    """
+    config = _config(is_free=True)
+    delegate = LiteLLMDelegate(config)
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        _litellm_mock_with_real_exception_classes(mock_litellm)
+        mock_litellm.acompletion = AsyncMock(
+            side_effect=OSError("[Errno -2] Name or service not known"),
+        )
+        result = await delegate.call(
+            "test-provider",
+            "llama-3.3-70b-versatile",
+            [{"role": "user", "content": "Hello"}],
+        )
+
+    assert result.success is False
+    assert result.status_code == 500, "the synthesized status is unchanged"
+    assert result.reached_provider is False, (
+        "a transport failure was reported as having reached the provider, so a "
+        "budget ledger would spend the vendor's allowance on a request it never saw"
+    )
+
+
+async def test_an_exception_carrying_a_real_status_still_counts_as_reached():
+    """CONTROL, and it is what keeps the flag honest: a provider that really
+    answered 503 DID receive the request. A delegate that marked everything
+    unreached would pass the test above and make the flag useless.
+    """
+    config = _config(is_free=True)
+    delegate = LiteLLMDelegate(config)
+    boom = RuntimeError("upstream is unwell")
+    boom.status_code = 503
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        _litellm_mock_with_real_exception_classes(mock_litellm)
+        mock_litellm.acompletion = AsyncMock(side_effect=boom)
+        result = await delegate.call(
+            "test-provider",
+            "llama-3.3-70b-versatile",
+            [{"role": "user", "content": "Hello"}],
+        )
+
+    assert result.success is False
+    assert result.status_code == 503
+    assert result.reached_provider is True, (
+        "a real server error was marked unreached, which would stop the ledger "
+        "counting requests the provider actually served"
+    )

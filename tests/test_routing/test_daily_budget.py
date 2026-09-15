@@ -47,8 +47,10 @@ def _ok(tokens_in=0, tokens_out=0):
     )
 
 
-def _fail(status):
-    return CallResult(success=False, error="e", status_code=status)
+def _fail(status, *, reached=True):
+    return CallResult(
+        success=False, error="e", status_code=status, reached_provider=reached,
+    )
 
 
 def _ledger(tmp_path, *, day="2026-09-02", persist=True):
@@ -459,6 +461,22 @@ class TestATimeoutDoesNotSpendTheBudget:
         for _ in range(5):
             ledger.record(cfg, _fail(429))
         assert not ledger.exhausted(cfg)
+
+    def test_a_transport_failure_is_not_counted_despite_its_500(self, tmp_path):
+        """A statusless exception — DNS, socket, TLS — is reported by the
+        delegate as a SYNTHESIZED 500, indistinguishable from a real server
+        error by status alone. Counting it spends the vendor's allowance on a
+        request it never saw, so repeated connection failures would deselect a
+        usable provider for the rest of the day — the OVERCOUNT direction this
+        module's invariant forbids. (Codex P2, PR #1624.)
+        """
+        ledger, _ = _ledger(tmp_path)
+        cfg = _cfg(rpd=2)
+        for _ in range(5):
+            ledger.record(cfg, _fail(500, reached=False))
+        assert not ledger.exhausted(cfg), (
+            "transport failures the provider never saw exhausted its daily budget"
+        )
 
     def test_a_real_server_error_IS_counted(self, tmp_path):
         """CONTROL on the other side, and it is what keeps the exclusion honest:

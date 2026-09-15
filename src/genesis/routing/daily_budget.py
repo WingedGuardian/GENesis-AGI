@@ -228,8 +228,18 @@ class DailyBudgetLedger:
         # Stated as a SET of not-usage statuses rather than `!= 429`, because
         # the next status that means "the vendor never served this" will be
         # added here rather than discovered the same way.
+        # `reached_provider` is checked FIRST because a status code cannot
+        # answer this one. The delegate synthesizes 500 for any exception
+        # carrying no HTTP status — DNS, socket, TLS — so a transport failure
+        # is indistinguishable from a server error by status alone, and
+        # counting it spends the vendor's allowance on a request it never
+        # saw. Repeated connection failures would otherwise deselect a
+        # perfectly usable provider for the rest of the day, which is the
+        # OVERCOUNT direction this module's own invariant forbids.
         count_request = result.success or (
-            result.status_code is not None and result.status_code not in _NOT_USAGE_STATUSES
+            result.reached_provider
+            and result.status_code is not None
+            and result.status_code not in _NOT_USAGE_STATUSES
         )
         tokens = (result.input_tokens + result.output_tokens) if result.success else 0
         if not count_request and tokens == 0:

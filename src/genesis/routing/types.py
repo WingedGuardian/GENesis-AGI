@@ -166,6 +166,13 @@ class CallResult:
     cost_usd: float = 0.0
     cost_known: bool = True
     retry_after_s: float | None = None
+    # Did the request actually REACH the provider? False only where the
+    # delegate caught an exception carrying no HTTP status — DNS, socket and
+    # TLS failures — which it reports as a synthesized 500 indistinguishable
+    # from a real server error. Anything that consumes a provider's allowance
+    # must not count those: the vendor never saw the request. Defaults True so
+    # every existing construction keeps its meaning (Codex P2, PR #1624).
+    reached_provider: bool = True
 
 
 @dataclass(frozen=True)

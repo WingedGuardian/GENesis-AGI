@@ -650,7 +650,14 @@ class Router:
         *, deadline: float | None = None, **kwargs,
     ) -> CallResult:
         """Try calling a provider with retries. Returns last result."""
-        last_result = CallResult(success=False, error="no attempts made")
+        # reached_provider=False: nothing was called yet. Unreachable at the
+        # ledger today (attempt 0 always runs, so any escape has already been
+        # overwritten by a real result, and status_code=None gates it anyway) —
+        # set so the flag means the same thing at every site that builds a
+        # result the provider never saw.
+        last_result = CallResult(
+            success=False, error="no attempts made", reached_provider=False
+        )
         max_attempts = policy.max_retries + 1
 
         for attempt in range(max_attempts):
