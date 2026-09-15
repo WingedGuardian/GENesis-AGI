@@ -15,6 +15,7 @@ import aiosqlite
 import pytest
 
 from genesis.autonomy.approval import ApprovalManager
+from genesis.autonomy.capabilities import InvalidTransition
 from genesis.autonomy.email_gate import (
     _RATE_LIMIT_MAX,
     EMAIL_GATE_ACTION_TYPE,
@@ -180,7 +181,17 @@ async def test_granted_known_thread_reply_is_allowed(db):
 
 @pytest.mark.asyncio
 async def test_financial_is_hardline_held_without_a_cell(db):
-    # Even pre-granting a financial cell must not let a financial email through.
+    # Even a GRANTED financial cell must not let a financial email through.
+    #
+    # The cell is forced to GRANTED with raw SQL deliberately: apply_event now
+    # REFUSES to promote a financial cell at all (capability_grants
+    # .is_promotable_cell — "never trust-unlockable" is a mechanism now, not
+    # only a docstring), so this state is no longer reachable through the CRUD.
+    # Asserting that refusal HERE keeps the two layers' relationship visible,
+    # and forcing the row anyway is what makes this the genuinely adversarial
+    # case: even if a granted financial cell existed by some other route — a
+    # migration, a manual edit, a future writer — the gate's own hardline,
+    # which runs BEFORE any cell lookup, still holds on its own.
     await cg.apply_event(
         db,
         origin_class="first_party",
@@ -190,15 +201,22 @@ async def test_financial_is_hardline_held_without_a_cell(db):
         event=CellEvent.CLASSIFY,
         updated_at=_TS,
     )
-    await cg.apply_event(
-        db,
-        origin_class="first_party",
-        domain="email",
-        verb="send",
-        risk_class="financial",
-        event=CellEvent.APPROVE,
-        updated_at=_TS,
+    with pytest.raises(InvalidTransition, match="not promotable"):
+        await cg.apply_event(
+            db,
+            origin_class="first_party",
+            domain="email",
+            verb="send",
+            risk_class="financial",
+            event=CellEvent.APPROVE,
+            updated_at=_TS,
+        )
+    await db.execute(
+        "UPDATE capability_grants SET state = 'granted' WHERE id = ?",
+        ("email:send:financial",),
     )
+    await db.commit()
+    assert (await cg.get_cell(db, "email", "send", "financial"))["state"] == "granted"
     gate = _gate(db)
     req = _req(validated_recipient="alice@example.com", thread_id="t1")
     decision = await gate.check(

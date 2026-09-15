@@ -18,19 +18,9 @@ logger = logging.getLogger(__name__)
 
 # Discord sub-channel names used by campaign sessions in pending_outreach.
 # The outreach pipeline routes via adapter name ("discord"), not sub-channel.
-_DISCORD_CHANNELS = frozenset(
-    {
-        "announcements",
-        "dev-discussion",
-        "general",
-        "showcase",
-        "getting-started",
-        "design",
-        "bug-reports",
-        "feature-requests",
-        "troubleshooting",
-    }
-)
+# Moved to outreach.types so `outreach_send` shares ONE list with this module;
+# the alias is kept so existing references here keep reading.
+from genesis.outreach.types import DISCORD_CHANNELS as _DISCORD_CHANNELS  # noqa: E402
 
 
 class OutreachScheduler:
@@ -705,6 +695,29 @@ class OutreachScheduler:
                             )
                             continue
 
+                    # Re-read the cancel state immediately before committing to a
+                    # send. `drain` took a snapshot up to 20 rows ago, and each
+                    # row ahead of this one can cost an LLM draft plus an adapter
+                    # round-trip — so the snapshot is stale by seconds to minutes,
+                    # and that is precisely the window in which someone cancels
+                    # (they cancel because the message is about to go out). Without
+                    # this, `pending_outreach.cancel` returns "cancelled" and the
+                    # message ships anyway, leaving a row recorded as both
+                    # cancelled and delivered. A narrow race remains between this
+                    # read and the send itself; that one is inherent without row
+                    # locking, and it is microseconds rather than minutes.
+                    _cancel_cursor = await self._db.execute(
+                        "SELECT cancelled_at FROM pending_outreach WHERE rowid = ?",
+                        (row["rowid"],),
+                    )
+                    _cancel_row = await _cancel_cursor.fetchone()
+                    if _cancel_row is not None and _cancel_row[0] is not None:
+                        logger.info(
+                            "Pending outreach %s cancelled after drain — not sending",
+                            row.get("id") or f"rowid:{row.get('rowid')}",
+                        )
+                        continue
+
                     # Validate category — map known non-enum values, fall
                     # back to DIGEST (not ALERT) for truly unknown ones.
                     _CATEGORY_ALIASES = {
@@ -726,8 +739,18 @@ class OutreachScheduler:
                     # Map Discord sub-channel names to adapter name.
                     # Campaign sessions queue with channel="announcements" etc.,
                     # but the pipeline adapter is registered as "discord".
+                    #
+                    # AND CARRY THE SUB-CHANNEL. Mapping the name away without
+                    # keeping it is how a queued "announcements" post silently
+                    # became a dev-discussion post: _deliver then resolves the
+                    # recipient from OUTREACH_RECIPIENT_DISCORD (default
+                    # "dev-discussion"), and the webhook adapter falls back to
+                    # the default webhook rather than failing, so nothing
+                    # anywhere reports the redirect. MEASURED 2026-09-07 with a
+                    # real v3.0b18 announcement, caught before it drained.
                     raw_channel = row.get("channel", "telegram")
-                    channel = "discord" if raw_channel in _DISCORD_CHANNELS else raw_channel
+                    is_discord_subchannel = raw_channel in _DISCORD_CHANNELS
+                    channel = "discord" if is_discord_subchannel else raw_channel
 
                     req = OutreachRequest(
                         category=cat,
@@ -738,6 +761,10 @@ class OutreachScheduler:
                         channel=channel,
                         thread_id=row.get("thread_id"),
                         validated_recipient=row.get("validated_recipient"),
+                        # The sub-channel the row asked for. _deliver resolves
+                        # validated_recipient or target_chat_id or <default>, so
+                        # an explicit recipient on the row still wins.
+                        target_chat_id=raw_channel if is_discord_subchannel else None,
                         # Preserve the BULK/campaign flag through the queue so a
                         # QUEUED cold-marketing send classifies BULK at the
                         # autonomy gate (a legacy row lacking the column → False).

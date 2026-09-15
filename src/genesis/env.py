@@ -201,6 +201,20 @@ def genesis_home() -> Path:
     return Path(value).expanduser() if value else Path.home() / ".genesis"
 
 
+def falkordb_socket_path() -> Path:
+    """Unix socket the graph engine listens on (``~/.genesis/falkordb/falkordb.sock``).
+
+    Composed from ``genesis_home()`` so it honors ``GENESIS_HOME``, which is what
+    lets a test point it at a tmp dir instead of the live engine. The path is a
+    convention shared with the systemd unit template, which renders the same
+    location — the unit is the writer, this is the reader, and they must agree.
+
+    Socket-only by design: the engine runs with ``--port 0``, so there is no TCP
+    URL accessor to pair with this one.
+    """
+    return genesis_home() / "falkordb" / "falkordb.sock"
+
+
 def alert_queue_root() -> Path:
     """Durable alert-queue root for the CONTAINER side (``~/.genesis/alerts/queue``).
 
@@ -315,6 +329,45 @@ def recall_read_pool_size() -> int:
         return int(raw)
     except ValueError:
         return DEFAULT_READ_POOL_SIZE
+
+
+def session_read_pool_size() -> int:
+    """Size of the read pool in a PER-SESSION MCP child (not the server's).
+
+    Deliberately a separate reader from :func:`recall_read_pool_size`, because the
+    two callers differ in CARDINALITY, not just in taste: the server is one per
+    box and fields every session's per-prompt recall, while an MCP child exists
+    once PER CC SESSION and serves only that session's explicit ``memory_recall``
+    calls. One host-derived number applied to both is multiplied by the number of
+    live sessions — MEASURED with 6 children on an 8-core box, that is 56 pooled
+    connections instead of 28.
+
+    Tunable via ``GENESIS_SESSION_READ_POOL_SIZE``; the pool floors it at 1, and a
+    missing or non-integer value falls back to the default. Set it explicitly on
+    an install that genuinely runs concurrent tool calls within one session.
+    """
+    from genesis.db.connection import DEFAULT_SESSION_READ_POOL_SIZE
+
+    # Precedence: the new per-session knob, then the LEGACY one, then the default.
+    #
+    # The legacy fallback is a compatibility obligation, not politeness. Before
+    # the role split this process honoured GENESIS_RECALL_READ_POOL_SIZE, so an
+    # install that set it to CONSTRAIN per-session resource use — say 1 — would
+    # otherwise be silently RAISED to the new default on upgrade, in every live
+    # MCP child at once. That is the opposite of what such an operator asked for,
+    # and nothing would report it.
+    for var in ("GENESIS_SESSION_READ_POOL_SIZE", "GENESIS_RECALL_READ_POOL_SIZE"):
+        raw = os.environ.get(var, "").strip()
+        if not raw:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            # A malformed value in the PREFERRED variable must not silently fall
+            # through to the legacy one — that would let a typo change which knob
+            # is in effect. Take the default, as the server-side reader does.
+            return DEFAULT_SESSION_READ_POOL_SIZE
+    return DEFAULT_SESSION_READ_POOL_SIZE
 
 
 # SQLite busy_timeout default (ms). Defined HERE, not in db/connection.py: it is

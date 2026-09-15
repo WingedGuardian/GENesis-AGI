@@ -1,4 +1,12 @@
 #!/bin/bash
+# SUPERSEDED — changelog entries now come from changelog.d/ fragments, folded in
+# at release time by scripts/assemble_changelog.py. See changelog.d/README.md and
+# the release procedure in docs/reference/recovery-and-portability-workflow.md.
+#
+# This script has been inert for some time regardless: it refuses to run when an
+# [Unreleased] section already exists, and one always does. Kept only because
+# deleting it is a separate change with its own blast radius.
+#
 # Draft an [Unreleased] CHANGELOG section from conventional commits.
 # Appends to CHANGELOG.md (or prints to stdout with --dry-run).
 #

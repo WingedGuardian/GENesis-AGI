@@ -74,6 +74,7 @@ class StateData:
     last_recovery_at: str | None = None  # ISO8601 timestamp of last recovery attempt
     io_triage_attempts: int = 0  # Separate counter for IO_TRIAGE (low-risk, repeatable)
     snapshot_size_history: list[int] = field(default_factory=list)  # Last N snapshot sizes in bytes
+    boot_id: str = ""  # kernel boot UUID when this state was last written; "" = unknown
 
     def to_dict(self) -> dict:
         return {
@@ -99,6 +100,7 @@ class StateData:
             "last_recovery_at": self.last_recovery_at,
             "io_triage_attempts": self.io_triage_attempts,
             "snapshot_size_history": self.snapshot_size_history[-5:],
+            "boot_id": self.boot_id,
         }
 
     @classmethod
@@ -130,6 +132,7 @@ class StateData:
             last_recovery_at=data.get("last_recovery_at"),
             io_triage_attempts=data.get("io_triage_attempts", 0),
             snapshot_size_history=data.get("snapshot_size_history", []),
+            boot_id=str(data.get("boot_id") or ""),
         )
 
 
@@ -612,6 +615,77 @@ class ConfirmationStateMachine:
             return elapsed < self._config.confirmation.bootstrap_grace_s
         except (ValueError, TypeError):
             return False
+
+    def reset_if_rebooted(self, current_boot_id: str | None) -> bool:
+        """Drop a stale episode when the host has rebooted since it was written.
+
+        Returns True if a reset happened.
+
+        The escalation ladder must never resume mid-climb across a reboot. The
+        state file survives (`load_state` restores it verbatim, fresh only on
+        corruption) and the 300s bootstrap grace is consulted from exactly one
+        transition — CONFIRMING->SURVEYING — so past CONFIRMING the grace is
+        never reached, and inside CONFIRMING it is computed from the persisted
+        PRE-reboot ``first_failure_at`` and has already expired on arrival.
+        Resetting to HEALTHY re-arms the grace that already works, through the
+        normal HEALTHY->SIGNAL_DROPPED->CONFIRMING path.
+
+        This deliberately does NOT call ``_reset_to_healthy``: that zeroes
+        ``recovery_attempts``, ``io_triage_attempts`` and ``last_recovery_at``,
+        which are three of the values that must survive.
+
+        The budgets are preserved because a reboot is not evidence the incident
+        is over, and the Guardian cannot tell a reboot it provoked from an
+        unrelated one. Refunding the escalation budget on every reboot would turn
+        a bounded 3-rung ladder into an unbounded loop on a box that is
+        reboot-cycling — which is exactly the box where reboots get observed.
+        (The gateway's manual ``reset-state`` verb DOES zero them, correctly: a
+        human has looked at the machine and decided the incident is over.)
+
+        Fails OPEN on an unknown boot id: a false positive silently discards a
+        live episode, which is worse than carrying a stale one for another tick.
+        """
+        if not current_boot_id:
+            return False
+        stored = self._state.boot_id
+        # Adopt, don't reset, when the state predates this field — otherwise the
+        # first tick after deploying this would wipe a live episode everywhere.
+        if not stored:
+            self._state.boot_id = current_boot_id
+            return False
+        if stored == current_boot_id:
+            return False
+
+        was_paused = self._state.current_state is GuardianState.PAUSED
+        logger.warning(
+            "Host rebooted since this state was written (boot %s -> %s) — %s; "
+            "recovery budgets are preserved",
+            stored, current_boot_id,
+            "staying PAUSED (user sovereignty), clearing episode tracking only"
+            if was_paused else
+            f"dropping the '{self._state.current_state.value}' episode and "
+            "re-arming the bootstrap grace",
+        )
+        # PAUSED is not a rung on the ladder: process() re-derives it from the
+        # snapshot every tick, and forcing it to HEALTHY here would make
+        # _handle_paused rewrite paused_since, restarting the long-pause reminder
+        # clock on every reboot.
+        if self._state.current_state is not GuardianState.PAUSED:
+            self._state.current_state = GuardianState.HEALTHY
+        self._state.consecutive_failures = 0
+        self._state.recheck_count = 0
+        self._state.first_failure_at = None
+        # Stale pre-reboot signals would otherwise be quoted into post-reboot
+        # alert bodies (check.py reads signal_history[-5:] at three alert sites)
+        # as if the episode were contiguous. Nothing holds a live reference to
+        # this list — process() rebinds it every tick — so clear() is for
+        # symmetry with snapshot_size_history, which IS aliased, not because it
+        # has to be in place here.
+        self._state.signal_history.clear()
+        self._clear_dialogue_state()
+        self.clear_cc_unavailable()
+        self._state.boot_id = current_boot_id
+        return True
 
     def _reset_to_healthy(self, now: str) -> None:
         """Reset all failure tracking state."""
