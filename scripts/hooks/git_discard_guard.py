@@ -129,7 +129,24 @@ from hook_input import degraded_exit, field, read_payload  # noqa: E402
 # and the submodule-recursive forms. The snapshot verbs (checkout/restore/switch) are
 # advisory here and exit 0, so a degraded run has nothing to protect there and must not
 # start blocking work it never blocked.
-_DEGRADED_GATED = r"\bgit\b[^\n]*\bclean\b|--recurse-submodules|submodule\.recurse"
+#
+# SINGLE-TOKEN ALTERNATION, matching every other degraded matcher in this repo
+# (``protected_paths_guard._RM_PATTERN``, ``review_enforcement_commit._COMMIT_PATTERN``,
+# ``git_push_guard._GATED_MENTION``). It deliberately does NOT require the word `git` to
+# sit near `clean`. An ADJACENCY form can be starved: put between the two words anything
+# the pattern will not cross and it matches nothing, while the degraded path — which by
+# definition has no parser — cannot tell that the two words are still one command. #1861
+# measured exactly this on the repo's other blind-spot net and stated the general rule:
+# every narrowing conjunct was measured to starve the trigger. A single token has nothing
+# to narrow, so there is nothing to starve. MEASURED here before the change.
+#
+# The cost is real and intended: `make clean`, `npm run clean` and the bare word "clean"
+# in a quoted string all over-block — but ONLY while the hook tree is broken, where a
+# loud overridable refusal is the direction this whole path exists to take. Normalising
+# the text before matching was considered and REJECTED: normalisation ahead of a
+# blind-spot check is a pattern this repo has been bitten by before, and it would leave
+# an adjacency construct whose behaviour could be argued but not proven.
+_DEGRADED_GATED = r"\bclean\b|--recurse-submodules|submodule\.recurse"
 
 try:
     from shell_parse import (  # noqa: E402

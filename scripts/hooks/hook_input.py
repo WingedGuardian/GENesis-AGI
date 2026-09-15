@@ -279,9 +279,15 @@ def degraded_exit(
     the entire design, and it is why the answer is deliberately crude.
 
     FAIL DIRECTION IS CLOSED THROUGHOUT, matching ``run_guard``: if the payload cannot
-    be read at all, we cannot prove the command is harmless, so we block rather than
-    guess. Nothing here may raise — an exception in this function would reinstate the
-    exit 1 it exists to prevent — so every step is wrapped and the bare-except
+    be read, OR carries no command to look at, we cannot prove the command is harmless,
+    so we block rather than guess. Both halves matter, and the second one is easy to
+    miss: ``read_payload`` NEVER raises (malformed JSON and empty stdin both return
+    ``{}``), so an unusable payload does not reach the except-clause — it arrives here
+    as an empty string that matches nothing and would exit 0. Every caller of this
+    function is wired to ``PreToolUse``/``Bash`` only, where a payload without a
+    ``command`` is a broken contract rather than a benign shape, so blocking it costs
+    nothing real. Nothing here may raise — an exception in this function would reinstate
+    the exit 1 it exists to prevent — so every step is wrapped and the bare-except
     fallback blocks.
 
     Args:
@@ -301,11 +307,18 @@ def degraded_exit(
         payload = read_payload()
         raw = field(payload, "command") or field(payload, "file_path")
     except BaseException:  # noqa: BLE001 — unreadable payload cannot prove safety.
+        raw = ""
+
+    # An empty payload and a raised one are the SAME state — nothing to judge — and they
+    # share this branch deliberately. read_payload() returns {} rather than raising for
+    # malformed JSON and for empty stdin, so without this the common case fell through to
+    # the match below, matched nothing, and ALLOWED.
+    if not raw.strip():
         print(
             f"GUARD DEGRADED ({name}): {reason} — and the tool payload could not be "
-            "read, so nothing here can establish the command is safe. BLOCKING. "
-            "Repair the hook tree (version skew between a worktree and the main tree "
-            "is the usual cause) or disable this hook deliberately.",
+            "read, or named no command, so nothing here can establish the command is "
+            "safe. BLOCKING. Repair the hook tree (version skew between a worktree and "
+            "the main tree is the usual cause) or disable this hook deliberately.",
             file=sys.stderr,
         )
         sys.exit(2)

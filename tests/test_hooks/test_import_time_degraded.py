@@ -59,6 +59,28 @@ _CASES = [
     ("git_discard_guard", "hooks/git_discard_guard.py", "git clean -fd", 2, "gated"),
     ("git_discard_guard", "hooks/git_discard_guard.py", "git status", 0, "benign"),
     (
+        # The shell runs this as one command, and an ADJACENCY matcher does not see it
+        # that way — the starving shape the earlier degraded pattern fell to. The exact
+        # bytes ARE the fixture: do not reformat this literal onto one line.
+        "git_discard_guard",
+        "hooks/git_discard_guard.py",
+        "git \\\n  clean -fd",
+        2,
+        "gated (line-continued)",
+    ),
+    (
+        # The PRICE of matching on a single token, asserted rather than left to be
+        # discovered: `make clean` names no git operation and is refused anyway. That
+        # is the chosen direction — a loud, overridable refusal while the hook tree is
+        # broken, against a silent deletion. If this cell ever has to change, the
+        # matcher got narrower and the line-continued cell above is the one to re-check.
+        "git_discard_guard",
+        "hooks/git_discard_guard.py",
+        "make clean",
+        2,
+        "over-block (priced, intended)",
+    ),
+    (
         "git_discard_guard",
         "hooks/git_discard_guard.py",
         "git clean -fd  # discard-override",
@@ -186,6 +208,59 @@ def test_the_healthy_tree_is_unchanged(tmp_path, guard, rel, command, expected, 
     assert "GUARD DEGRADED" not in res.stderr, (
         f"{guard} [{label}] reported GUARD DEGRADED on a healthy tree — the degraded "
         "path is firing when the import succeeded."
+    )
+
+
+_GUARDS = sorted({(guard, rel) for guard, rel, _c, _e, _l in _CASES})
+
+
+@pytest.mark.parametrize(("guard", "rel"), _GUARDS)
+@pytest.mark.parametrize(
+    ("stdin", "shape"),
+    [
+        ("", "empty stdin"),
+        ("not json at all", "unparseable stdin"),
+        ('{"tool_name": "Bash", "tool_input": {}}', "well-formed but no command"),
+        ('["not", "an", "object"]', "JSON that is not an object"),
+    ],
+)
+def test_a_payload_that_names_no_command_blocks(tmp_path, guard, rel, stdin, shape):
+    """A degraded guard with nothing to look at must BLOCK, not shrug.
+
+    THE DEFECT THIS LOCKS, and why it hid: ``read_payload`` never raises — malformed
+    JSON and empty stdin both return ``{}`` — so an unusable payload never reached the
+    except-clause that was meant to catch it. It arrived as an empty string, matched no
+    gated pattern, and the guard exited 0. The docstring already promised the opposite
+    ("we cannot prove the command is harmless, so we block"), so the prose was the spec
+    and the code was the defect.
+
+    Parametrized across every guard and every unusable SHAPE rather than one example,
+    because the branch lives in shared ``degraded_exit`` — a fix proven on one caller
+    proves nothing about the population that actually uses it.
+
+    Scope, stated rather than implied: this is about the DEGRADED path only. A HEALTHY
+    guard given empty stdin also exits 0 (MEASURED on the real hooks) — pre-existing,
+    a different question, and deliberately not changed here.
+    """
+    root = _tree(tmp_path, poisoned=True)
+    home = tmp_path / "home_empty"
+    home.mkdir(parents=True, exist_ok=True)
+    res = subprocess.run(
+        [sys.executable, str(root / "scripts" / rel)],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        cwd=str(root),
+        env={**os.environ, "HOME": str(home)},
+        timeout=90,
+    )
+    assert res.returncode == 2, (
+        f"{guard} with {shape} exited {res.returncode}. The guard could not establish "
+        "what would run and allowed it anyway — the fail-open this whole change exists "
+        f"to close, relocated into its own recovery path.\nstderr: {res.stderr[:400]}"
+    )
+    assert "GUARD DEGRADED" in res.stderr, (
+        f"{guard} with {shape} blocked without saying why it was degraded."
     )
 
 
