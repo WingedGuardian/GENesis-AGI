@@ -560,10 +560,12 @@ class OutreachPipeline:
             #
             # This is the same misconfiguration the ChannelNotConfiguredError
             # handler below treats as terminal, arriving one branch earlier: an
-            # install with NO `DISCORD_WEBHOOK_URL` never registers the Discord
-            # adapter at all, so a Discord send returned HERE and was deferred,
-            # never reaching that handler. Naming the specific channel was not
-            # enough; the unconfigured-entirely case is the more common one.
+            # install with no default Discord webhook configured never registers
+            # the Discord adapter at all (see `runtime/init/outreach.py`, which
+            # owns that variable's name — the external-io guard keeps it there),
+            # so a Discord send returned HERE and was deferred, never reaching
+            # that handler. Naming the specific channel was not enough; the
+            # unconfigured-entirely case is the more common one.
             #
             # IGNORED, not FAILED, for the reason spelled out below: the drain
             # treats FAILED as transient and retries it.
