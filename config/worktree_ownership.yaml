@@ -28,11 +28,21 @@
 #              gone. Nothing is ever blocked.
 #   off      — claim nothing, release nothing, warn about nothing.
 #
-# SCOPE AT THIS COMMIT: the library only. Nothing here takes a claim — the
-# Edit/Write hook that does, and the reaper-side release, ship separately. Said
-# plainly because a setting that describes a protection it does not yet provide
-# is worse than one that describes less; that exact defect was a round-1 review
-# finding and this is where it would recur.
+# SCOPE AT THIS COMMIT: LIVE. The Edit/Write hooks are registered, so a claim is
+# taken on the first write into an unclaimed worktree of THIS repository, a note
+# is delivered when a session writes into one another live session holds, and
+# claims are released at session end.
+#
+# NOT yet shipped: the reaper-side backstop that releases a claim whose process
+# is gone. A session killed before it can run its release therefore leaves a
+# claim behind, and a locked worktree is skipped unconditionally by the reaper,
+# so that one must be cleared by hand until the backstop lands. The lock reason
+# says so in its own first sentence, which is what git echoes when it refuses.
+#
+# Said plainly because a setting that MISDESCRIBES its protection is worse than
+# one that describes less — in either direction. That was a round-1 review
+# finding when this claimed more than it did, and it recurred inverted when the
+# hooks went live and this text still said nothing took a claim.
 # enabled: master switch; false is equivalent to off.
 #
 # An invalid mode degrades to `advisory`, not `off`: every surface here is

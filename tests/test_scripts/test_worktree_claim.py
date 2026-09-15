@@ -613,3 +613,145 @@ def test_an_exported_git_dir_pointing_at_OUR_repo_cannot_adopt_a_foreign_worktre
         "a GIT_DIR pointing at our own repo made another repository's worktree "
         "answer as ours, so it would have been claimed"
     )
+
+
+# ─── final round: identity and the scrubbed action path ─────────────────────
+
+
+@pytest.mark.parametrize(
+    "sid",
+    [
+        "wt-agent-a1ea091e2a88cd6e2",
+        "745814ce-bf06-48c5-90d9-939bbbf9033c",
+        "session_with_underscores",
+        "PLAIN-Mixed_Case-123",
+    ],
+)
+def test_a_valid_session_id_survives_into_the_lock(
+    repo: Path, worktree: Path, sid, monkeypatch
+) -> None:
+    """The id is most of what the collision note is worth to whoever reads it.
+
+    The old check was UUID-shaped (`[0-9a-fA-F-]`), so Claude Code ids outside
+    that alphabet — the `wt-` prefixed form among them — were silently dropped
+    and the warning degraded to "another session" while it had the name in hand.
+
+    The predicate is now delegated to `hook_input.is_safe_session_id`, this
+    repository's single source of truth, whose own docstring records that hooks
+    had hand-copied it in three shapes and omitted it in four files. This was a
+    fourth shape.
+    """
+    monkeypatch.setattr(wc, "session_pid_from_ancestry", lambda *a, **k: 4242)
+    monkeypatch.setattr(wc, "proc_starttime", lambda pid: 99)
+    payload = wc.build_payload(wc.RULE_CLAIM, sid=sid)
+    assert payload is not None
+    assert payload["sid"] == sid, f"a valid id {sid!r} was dropped"
+
+
+@pytest.mark.parametrize("sid", ["has/slash", "has space", "..", "", "x" * 300])
+def test_an_unsafe_session_id_is_still_refused(repo: Path, sid, monkeypatch) -> None:
+    """The control: widening the alphabet must not accept a path-unsafe id.
+
+    This string is echoed into a lock reason and used as an identity, so
+    accepting everything would be worse than the narrow check it replaced.
+    """
+    monkeypatch.setattr(wc, "session_pid_from_ancestry", lambda *a, **k: 4242)
+    monkeypatch.setattr(wc, "proc_starttime", lambda pid: 99)
+    payload = wc.build_payload(wc.RULE_CLAIM, sid=sid)
+    assert payload is not None
+    assert "sid" not in payload, f"unsafe id {sid!r} was recorded"
+
+
+@pytest.mark.parametrize(
+    "argv0",
+    [
+        b"/opt/node/bin/claude",
+        b"/opt/node/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+        b"/usr/local/bin/claude-code",
+        b"claude.exe",
+    ],
+)
+def test_every_supported_launcher_name_is_recognised_as_a_session(argv0) -> None:
+    """Rejecting the real session does not merely miss a warning — it takes NO claim.
+
+    `session_pid_from_ancestry` finds nothing, `build_payload` refuses, and the
+    worktree goes unclaimed entirely, so the whole feature is silently off for
+    that session. The shipped npm bin map is `{claude: bin/claude.exe}`, so a
+    configured executable path presents `claude.exe`, and this repository's own
+    authoritative classifier (`scripts/check_cc_running_versions.sh:is_cc_name`)
+    already accepts all three names.
+    """
+    assert wc._is_session_argv0(argv0) is True, (
+        f"a session launched as {argv0!r} was not recognised, so it would claim nothing"
+    )
+
+
+@pytest.mark.parametrize(
+    "argv0",
+    [
+        b"/bin/claude-wrapper",
+        b"/bin/bash",
+        b"/usr/bin/node",
+        b"/bin/myclaude",
+        b"",
+    ],
+)
+def test_a_non_session_binary_is_still_rejected(argv0) -> None:
+    """The control: a CLOSED SET, not a substring test.
+
+    The launcher shell is why this compares basenames rather than searching the
+    command line — `bash -c "cd repo && claude ..."` contains "claude" too, and
+    recording the launcher records a pid that outlives the session it wraps.
+    """
+    assert wc._is_session_argv0(argv0) is False, f"{argv0!r} matched"
+
+
+def test_locking_uses_a_scrubbed_environment(repo: Path, worktree: Path, monkeypatch) -> None:
+    """Deciding a worktree is ours and then locking it elsewhere is the gap.
+
+    The earlier fix scrubbed the ownership CHECK. The lock and unlock ran through
+    a different helper that still inherited the environment, so an exported
+    GIT_DIR could send the WRITE to a repository the check had nothing to do
+    with. The decision and the action have to agree about which repository they
+    mean, and scrubbing only one guarantees they can disagree.
+    """
+    seen: dict = {}
+    real_run = wc.subprocess.run
+
+    def spy(cmd, *a, **k):
+        if cmd[:1] == ["git"]:
+            seen.update(k.get("env") or {})
+            seen["_had_env"] = k.get("env") is not None
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setenv("GIT_DIR", "/nowhere/.git")
+    monkeypatch.setenv("GIT_COMMON_DIR", "/nowhere/.git")
+    monkeypatch.setenv("GIT_WORK_TREE", "/nowhere")
+    monkeypatch.setattr(wc.subprocess, "run", spy)
+
+    wc.lock_worktree(worktree, P("claim", pid=4242, start=1))
+
+    assert seen.get("_had_env"), "the lock ran with the inherited environment"
+    for var in ("GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE"):
+        assert var not in seen, f"{var} reached the lock command"
+
+
+def test_the_session_id_check_really_is_the_canonical_one() -> None:
+    """Delegation has to HAPPEN, not merely be claimed in a comment.
+
+    Found by mutation: rewriting the delegating line changed nothing, because a
+    plain `from hook_input import ...` is not importable when this module is
+    loaded directly — so the fallback silently became the live code while the
+    comment above it said the predicate was delegated. That is a fourth
+    hand-copied regex with a citation attached, which is exactly what
+    `hook_input`'s own docstring warns against.
+
+    So assert the IDENTITY of the resolved predicate, not its behaviour. Two
+    regexes can agree on every input in a test and still be two regexes, and it
+    is the second one drifting later that this is meant to prevent.
+    """
+    predicate = wc._safe_sid_predicate()
+    assert predicate.__name__ == "is_safe_session_id", (
+        f"the sid check resolved to {predicate.__name__!r}, not the canonical "
+        "hook_input.is_safe_session_id — the fallback is live and will drift"
+    )

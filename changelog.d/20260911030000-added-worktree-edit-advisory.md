@@ -61,3 +61,26 @@
   matches nothing — so that worktree was never visited and its claim outlived the
   session. The listing is now read in a form that cannot be split by the names
   inside it.
+- **The settings text now matches what is actually switched on.** Both
+  operator-facing descriptions still said this shipped a library only and that
+  nothing took a claim, which stopped being true when the hooks were registered
+  — so the settings view could tell an operator that an enabled lever gated
+  nothing while it was live. They now say what runs and, just as importantly,
+  what does not: a session killed before it can release leaves a claim that must
+  be cleared by hand until the cleanup-side backstop lands.
+- **A session is recognised however it was launched.** The check accepted only
+  one executable name, so a session started through a configured path — which
+  presents a different name on this platform, one the project's own process
+  classifier already accepts — was not recognised as a session at all. The
+  consequence was not a missing warning but a missing claim: nothing was
+  recorded for that session, so the feature was silently off for it.
+- **A valid session identifier is no longer discarded.** The identifier was
+  checked against a pattern narrower than the one this project treats as
+  canonical, so ordinary identifiers were dropped and the collision note fell
+  back to "another session" while it had the name in hand. It now uses the
+  shared check rather than a fourth private copy of it.
+- **Taking and releasing a claim no longer trusts the ambient environment.** The
+  earlier fix cleaned the question — which project does this worktree belong
+  to — but not the action that followed it, so a stray environment setting could
+  still send the write somewhere the check had nothing to do with. The decision
+  and the action now agree about which project they mean.
