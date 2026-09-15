@@ -978,13 +978,17 @@ fi
 # the idle-gated runner (genesis-code-intel.timer) instead of spawning an
 # indexer inline. A fire-and-forget full-mode index at setup helped storm the
 # container (D-state I/O); a guardrail test bans raw spawns. The runner does the
-# first (full, no .last-full) rebuild at its first idle window, under watchdog.
+# first (full, no recorded full success) rebuild at its first idle window, under watchdog.
 CI_LOG="$HOME/.genesis/code-intelligence-setup.log"
 mkdir -p "$(dirname "$CI_LOG")"
 if [ -f "$REPO_DIR/scripts/lib/index_marker.py" ]; then
-    python3 "$REPO_DIR/scripts/lib/index_marker.py" write \
-        --repo "$REPO_DIR" --tools both --mode fast >> "$CI_LOG" 2>&1 || true
-    echo "    + code intelligence: initial index queued (idle-gated runner)"
+    if python3 "$REPO_DIR/scripts/lib/index_marker.py" write \
+        --repo "$REPO_DIR" --tools both --mode fast >> "$CI_LOG" 2>&1; then
+        echo "    + code intelligence: initial index queued (idle-gated runner)"
+    else
+        echo "    WARNING: could not queue initial code intelligence index (see $CI_LOG)"
+        SETUP_WARNINGS=1
+    fi
 fi
 
 

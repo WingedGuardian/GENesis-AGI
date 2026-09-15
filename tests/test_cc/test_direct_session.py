@@ -67,7 +67,7 @@ class TestSpawnRecordsSkillSignal:
             row = await cc_sessions.get_by_id(db, sid)
             assert row is not None
             meta = json.loads(row["metadata"])
-            assert meta["skill_tags"] == ["voice-master", "research"]
+            assert meta["skill_tags"] == ["voice-master", "research", "web-research"]
             # The analyzer matches via `metadata LIKE '%"<skill>"%'` — confirm
             # the persisted JSON shape actually satisfies that query.
             assert '"voice-master"' in row["metadata"]

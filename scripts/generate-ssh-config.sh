@@ -40,6 +40,7 @@ fi
 REMOTE_USER=$(whoami)
 REMOTE_HOME=$(eval echo "~${REMOTE_USER}")
 SLOT_SCRIPT="${REMOTE_HOME}/genesis/scripts/cc-slot.sh"
+LOBBY_SCRIPT="${REMOTE_HOME}/genesis/scripts/lobby-door.sh"
 
 cat << SSHEOF
 # ─── Genesis tmux slots: ${TS_HOSTNAME} ───────────────────────
@@ -48,11 +49,16 @@ cat << SSHEOF
 # Each slot maps to a persistent tmux session with claude.
 # Or:    ssh ${TS_HOSTNAME}-lobby  → opens the session picker; pick any live slot.
 
-# One-click "lobby": a stable landing session that sees ALL live cc-* slots.
+# One-click "lobby": a FRESH picker over ALL live cc-* slots, every connection.
 # After a client/reboot, ONE reconnect here brings the whole fleet back — the
 # slots never died (they live in tmux on the box). It opens straight into the
 # session picker (choose-tree): pick a slot and jump into it, in the state you
 # left it; Ctrl-b s reopens the picker anytime.
+#
+# The picker itself is throwaway, named per connection and destroyed when you
+# leave it. Anything you want to KEEP lives in its own session — a cc-* slot, or
+# a scratch session of your own — which this door never touches and which shows
+# up in the picker like everything else.
 #
 # This specific block MUST precede the wildcard below: ssh uses the FIRST
 # matching RemoteCommand, and the wildcard would otherwise route
@@ -61,10 +67,20 @@ cat << SSHEOF
 # The RemoteCommand sets PATH (an ssh RemoteCommand does NOT source .bashrc), so
 # tmux resolves even where it is user-local — mirrors cc-slot.sh's toolchain PATH
 # so the lobby door matches the numeric-slot door's behavior.
+#
+# The door is a SCRIPT (lobby-door.sh), not an inline tmux command chain, for
+# the same reason the numeric slot door is one: an inline chain has to survive
+# ssh_config -> remote shell -> tmux quoting, which is the documented failure
+# mode of this block, and a script can be tested. A bare
+# new-session-plus-choose-tree on a fixed name gets two things wrong: it
+# inherits the previous visit's chooser, and a second window ends up stealing
+# the first window's session. A per-connection picker cannot do either, because
+# it is new every time and shared with nobody. Both failures are MEASURED and
+# explained in full at the top of that script.
 Host ${TS_HOSTNAME}-lobby
     HostName ${TS_IP}
     User ${REMOTE_USER}
-    RemoteCommand PATH="${REMOTE_HOME}/.n/bin:${REMOTE_HOME}/.bun/bin:${REMOTE_HOME}/.npm-global/bin:${REMOTE_HOME}/.local/bin:\$PATH" tmux -u new-session -A -s lobby \; choose-tree -Zs
+    RemoteCommand PATH="${REMOTE_HOME}/.n/bin:${REMOTE_HOME}/.bun/bin:${REMOTE_HOME}/.npm-global/bin:${REMOTE_HOME}/.local/bin:\$PATH" ${LOBBY_SCRIPT}
     RequestTTY yes
     ServerAliveInterval 30
     ServerAliveCountMax 6
