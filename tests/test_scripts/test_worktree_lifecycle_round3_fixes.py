@@ -241,7 +241,11 @@ def test_recovery_rebuilds_a_real_worktree_after_its_branch_was_deleted(
     assert _git(repo, "branch", "-D", "feature/gone").returncode == 0
     assert "feature/gone" not in _git(repo, "branch", "--list").stdout
 
-    name = next(trash.iterdir()).name.split(".tar.gz")[0]
+    # Select the ARCHIVE explicitly. `next(trash.iterdir())` is ordered by the
+    # filesystem, and the entry also has a sidecar `.meta.json` beside it — so
+    # this picked the sidecar in CI and the tarball locally, which is a flaky
+    # test rather than a flaky product. Caught by CI, not by me.
+    name = next(trash.glob("*.tar.gz")).name[: -len(".tar.gz")]
     assert wl._recover(name, repo) is True
 
     restored = Path(str(wt))
@@ -273,7 +277,11 @@ def test_recovery_still_restores_a_branch_that_survives(
     assert wl._trash_worktree(entry, repo) is True
     _git(repo, "worktree", "prune")
 
-    name = next(trash.iterdir()).name.split(".tar.gz")[0]
+    # Select the ARCHIVE explicitly. `next(trash.iterdir())` is ordered by the
+    # filesystem, and the entry also has a sidecar `.meta.json` beside it — so
+    # this picked the sidecar in CI and the tarball locally, which is a flaky
+    # test rather than a flaky product. Caught by CI, not by me.
+    name = next(trash.glob("*.tar.gz")).name[: -len(".tar.gz")]
     assert wl._recover(name, repo) is True
 
     restored = Path(str(wt))

@@ -234,7 +234,11 @@ def test_an_archived_worktree_survives_branch_deletion_and_a_gc(
         "proves nothing about recovery"
     )
 
-    name = next(trash.iterdir()).name.split(".tar.gz")[0]
+    # Select the ARCHIVE explicitly. `next(trash.iterdir())` is ordered by the
+    # filesystem, and the entry also has a sidecar `.meta.json` beside it — so
+    # this picked the sidecar in CI and the tarball locally, which is a flaky
+    # test rather than a flaky product. Caught by CI, not by me.
+    name = next(trash.glob("*.tar.gz")).name[: -len(".tar.gz")]
     assert wl._recover(name, repo) is True
 
     assert _git(repo, "cat-file", "-e", sha).returncode == 0, (
