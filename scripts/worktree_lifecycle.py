@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import json
 import os
 import shutil
@@ -344,6 +345,40 @@ _IN_PROGRESS_MARKERS = (
     "rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD",
     "REVERT_HEAD", "BISECT_LOG", "sequencer",
 )
+
+
+def _is_locked_now(worktree_path: Path) -> bool:
+    """True if this worktree is under ``git worktree lock`` RIGHT NOW.
+
+    `_classify` already reads the lock from `git worktree list --porcelain`, but
+    that answer is minutes old by the time a reap acts on it. A lock is the one
+    protection a third party takes DURING the scan — `git worktree lock` is how a
+    session declares "I am working here" — so the stale answer is wrong in
+    exactly the window that matters.
+
+    Reads the admin dir's ``locked`` file directly rather than re-running
+    porcelain: one stat on a path already resolved, against a subprocess per
+    worktree. Fails CLOSED — an unreadable `.git` pointer reports LOCKED, because
+    the alternative is archiving a worktree whose protection we could not read.
+    """
+    try:
+        dot_git = worktree_path / ".git"
+        if dot_git.is_dir():  # the main checkout, never reaped anyway
+            return False
+        text = dot_git.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("gitdir:"):
+            target = line[len("gitdir:") :].strip()
+            if not target:
+                return True
+            admin = Path(target)
+            if not admin.is_absolute():
+                admin = (worktree_path / admin).resolve()
+            return (admin / "locked").exists()
+    return True
 
 
 def _has_in_progress_op(worktree_path: str) -> bool:
@@ -848,6 +883,16 @@ def _trash_worktree(
     if _find_processes_in_dir(str(wt_path)) or _has_in_progress_op(str(wt_path)):
         _log(f"SKIP {wt_path}: became active or protected between classification and reap")
         return False
+    # AND RE-READ THE LOCK, because `_classify` treats it as PROTECTED and this
+    # revalidation previously did not repeat it. A lock is the one protection a
+    # third party takes DURING the scan: `git worktree lock` is how a session
+    # says "I am working here", so the window this whole block exists for is
+    # exactly when it gets taken. Re-reading the on-disk `locked` file rather
+    # than re-running `git worktree list` keeps it to one stat on the path we
+    # already resolved.
+    if _is_locked_now(wt_path):
+        _log(f"SKIP {wt_path}: locked between classification and reap")
+        return False
 
     try:
         TRASH_DIR.mkdir(parents=True, exist_ok=True)
@@ -885,7 +930,22 @@ def _trash_worktree(
         if not claimed:
             _log(f"ERROR {wt_path}: could not claim a free trash name after 1000 tries")
             return False
-        trash_path.rmdir()  # hand the name to shutil.move, which recreates it
+        # THE CLAIM IS HELD, not handed over. Releasing it here — the old
+        # `trash_path.rmdir()` — reopened the very race the atomic `mkdir` above
+        # closes, because between the rmdir and the move completing the name is
+        # free again. A second invocation archiving a same-basename worktree
+        # could claim it, and `shutil.move` onto a directory that now EXISTS
+        # nests the source inside it: one archive holding two worktrees, from
+        # which neither can be independently recovered, with whichever staging
+        # metadata landed last.
+        #
+        # `os.rename` replaces an EMPTY directory atomically on POSIX, so the
+        # claim can survive right up to the instant it becomes the moved
+        # worktree. VERIFIED on this platform, including that the worktree and
+        # trash roots share a device, so that is the path actually taken here.
+        # The move itself stays BELOW, after the metadata capture — `git diff`
+        # and `git log` stop resolving once the directory leaves its registered
+        # path, so nothing may move before those run.
 
         # Write metadata to staging file BEFORE the move. If the move
         # fails we just have a harmless orphan file. If the process
@@ -924,8 +984,23 @@ def _trash_worktree(
             _log(f"  NOTE {trash_path.name} archives secret-shaped file(s): "
                  f"{', '.join(meta['secret_files'][:5])} — retained indefinitely")
 
-        # Move worktree to trash
-        shutil.move(str(wt_path), str(trash_path))
+        # Move worktree to trash, WITHOUT ever releasing the claimed name.
+        # `os.rename` atomically replaces the empty claim directory, so the name
+        # is never free between the claim and the move. Only EXDEV — a trash root
+        # on another filesystem, where rename cannot reach — falls back to the
+        # copy, and that path must release the claim first because `shutil.move`
+        # onto an existing directory would nest the source inside it. The
+        # fallback therefore keeps the original (narrower) race; it is logged
+        # rather than hidden, so a cross-filesystem install knows it has it.
+        try:
+            os.rename(str(wt_path), str(trash_path))
+        except OSError as e:
+            if e.errno != errno.EXDEV:
+                raise
+            _log(f"  NOTE {trash_path.name}: trash is on another filesystem — "
+                 "copying instead; the claimed name is briefly unheld")
+            trash_path.rmdir()
+            shutil.move(str(wt_path), str(trash_path))
 
         # Move staging metadata into the trash entry
         final_meta = trash_path / ".trash_meta.json"
@@ -953,22 +1028,37 @@ def _trash_worktree(
         # namespace is the cheapest durable anchor and does not pollute the
         # branch list. If tagging fails we do NOT prune: leaving a stale worktree
         # registration is recoverable, losing the commits is not.
+        # A BRANCH IS NOT A DURABLE ANCHOR EITHER, and assuming it was is the
+        # gap this block used to have. The reasoning above is correct for a
+        # detached HEAD and INCOMPLETE for a branch: the branch ref does keep the
+        # commits reachable — right up until something deletes it. Something
+        # does. `autonomy/executor/worktree_mgr.py` deletes a task worktree's
+        # branch with `git branch -D`, which git documents as deleting even an
+        # unmerged branch, and once that ref is gone the archived tarball holds
+        # checked-out FILES and a `.git` pointer to nothing. A later GC collects
+        # the commits and `--recover` can never reconstruct them.
+        #
+        # That is the same silent, delayed, invisible-until-recovery failure the
+        # comment above calls the worst available one — so anchor EVERY archived
+        # worktree, not only the detached ones. A tag costs nothing, and the
+        # branch case is strictly more likely than the detached case here.
         pruned_safely = True
         commit_sha = str(wt.get("head") or "")
-        if detached and commit_sha:
+        if commit_sha:
             anchor = f"{_DETACHED_ANCHOR_PREFIX}{trash_path.name}"
+            kind = "detached HEAD" if detached else f"branch {branch}"
             tag = subprocess.run(
                 ["git", "tag", "-f", anchor, commit_sha],
                 capture_output=True, text=True, cwd=str(repo_root), timeout=10,
             )
             if tag.returncode != 0:
                 pruned_safely = False
-                _log(f"  WARN could not anchor detached commit {commit_sha[:8]} "
+                _log(f"  WARN could not anchor {kind} at {commit_sha[:8]} "
                      f"({tag.stderr.strip()}) — SKIPPING prune so the commits stay "
                      f"reachable; `git worktree prune` by hand once anchored")
             else:
                 meta["detached_anchor"] = anchor
-                _log(f"  anchored detached HEAD {commit_sha[:8]} at refs/tags/{anchor}")
+                _log(f"  anchored {kind} {commit_sha[:8]} at refs/tags/{anchor}")
 
         if pruned_safely:
             subprocess.run(
