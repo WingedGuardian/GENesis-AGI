@@ -1859,3 +1859,109 @@ class TestGitGlobalOptionValueIsNotMistakenForTheVerb:
             "option's value was taken for the subcommand, so the publish was "
             f"never seen.\n{r.stdout}{r.stderr}"
         )
+
+
+class TestAnUnlistedGlobalLeavesTheVerbUnestablished:
+    """The closed world: an option the parser cannot classify stops the walk.
+
+    The class behind the three options pinned above. Listing a consumer fixes
+    the instance; this fixes the direction — an option no table has heard of
+    can no longer be ASSUMED valueless, because if it does consume a value,
+    that value lands in the verb slot and every gate keyed on the subcommand
+    stands down. MEASURED on the merged tree before this change:
+    `git --future-opt somevalue <publish>` was ALLOWED.
+
+    Verify-RED: each test here passes on a tree with the closed world removed
+    ONLY if the option it names is already listed, which is what the
+    unlisted-by-construction spellings below rule out.
+    """
+
+    @pytest.mark.parametrize(
+        "option",
+        [
+            "--future-opt",  # a consumer a later git release might add
+            "--totally-unknown-global",
+            "-Z",  # short spellings are equally unclassifiable
+        ],
+    )
+    def test_an_unclassified_global_refuses_the_publish(self, option, tmp_path, monkeypatch):
+        """Whether it eats the next token is unknown, so the verb is unknown."""
+        cwd = _unpushed_repo(tmp_path, monkeypatch)
+        cmd = f"{GIT} {option} somevalue {PUSH} {FORCE} origin main"
+        r = _run(_PUSH_GUARD, cmd, cwd=cwd)
+        assert _decision(r) in ("ask", "block"), (
+            f"a force-publish behind the unlisted global `{option}` was "
+            "ALLOWED — the walk assumed it consumes nothing and read its VALUE "
+            f"as the subcommand.\n{r.stdout}{r.stderr}"
+        )
+
+    def test_the_attached_exec_path_form_still_refuses_the_publish(self, tmp_path, monkeypatch):
+        """`--exec-path=<path>` RUNS the subcommand; bare `--exec-path` does not.
+
+        The distinction is MEASURED, with a marker only the subcommand can
+        print: `git --exec-path config --get <marker>` prints nothing, while
+        `git --exec-path=<path> config --get <marker>` prints it. Exempting the
+        option by NAME — ignoring whether a value is attached — reopened the
+        bypass this file exists to close, on a spelling the command corpus
+        contains zero times. It is pinned here because no corpus replay can
+        find it.
+        """
+        cwd = _unpushed_repo(tmp_path, monkeypatch)
+        cmd = f"{GIT} --exec-path=/usr/lib/git-core {PUSH} {FORCE} origin main"
+        r = _run(_PUSH_GUARD, cmd, cwd=cwd)
+        assert _decision(r) in ("ask", "block"), (
+            "a force-publish behind `--exec-path=<path>` was ALLOWED. The "
+            "attached form sets the exec path and RUNS the subcommand, so it "
+            f"cannot share the bare form's no-subcommand exemption.\n{r.stdout}{r.stderr}"
+        )
+
+    @pytest.mark.parametrize(
+        "cmd_tail",
+        [
+            "--no-pager log --oneline -3",
+            "--no-optional-locks status",
+            "--version",
+            "-h",
+            "--exec-path",
+            "--help",
+        ],
+    )
+    def test_the_benign_globals_are_not_swept_up(self, cmd_tail, tmp_path, monkeypatch):
+        """The allowlists are what make the closed world affordable.
+
+        Without them the inversion would refuse the commonest globals on the
+        box: these six account for 117 of the corpus's unknown-option
+        occurrences. A failure here is the over-block the classification sets
+        exist to prevent, not a safety regression.
+        """
+        cwd = _unpushed_repo(tmp_path, monkeypatch)
+        r = _run(_PUSH_GUARD, f"{GIT} {cmd_tail}", cwd=cwd)
+        assert _decision(r) == "allow", (
+            f"`git {cmd_tail}` performs no gated operation and was refused: "
+            f"the option is missing from the valueless/no-subcommand sets.\n{r.stdout}{r.stderr}"
+        )
+
+    def test_the_refusal_names_a_remedy_that_applies(self):
+        """Two causes reach one predicate; the message must fit the one that fired.
+
+        A hard block's message is the only route out of it, so a refusal that
+        prescribes "write the subcommand out literally" to a session whose
+        subcommand IS literal names a rewrite already performed — the session
+        then has no move, which is worse than the over-block itself.
+        """
+        unclassified = sp.analyze_checked(f"{GIT} --future-opt v {PUSH} {FORCE} origin main")[1]
+        expansion = sp.analyze_checked(f"{GIT} ${{A:-{PUSH}}} {FORCE} origin main")[1]
+        assert unclassified is not None and expansion is not None, (
+            "both shapes must still be reported as blind spots"
+        )
+        assert unclassified.cause != expansion.cause, (
+            "an unclassifiable option and a shell-built verb are different "
+            "failures and cannot share one cause line"
+        )
+        assert "literally" not in unclassified.hint, (
+            "the unclassified-option refusal tells the session to write the "
+            f"subcommand out literally, but it already is.\n{unclassified.hint}"
+        )
+        assert "literally" in expansion.hint, (
+            "the shell-built-verb refusal lost the rewrite that does apply to it"
+        )

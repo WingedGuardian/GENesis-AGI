@@ -711,7 +711,17 @@ When a new CC version is released, run through this:
    safety guard a real payload, so it catches a changed hook payload shape that
    would otherwise silently disable the guards (see the hook input contract
    under "Actively Used" above).
-8. **Update this document** with findings.
+8. **Re-probe the `AskUserQuestion` rewrite path.** The gate-menu substitution
+   (`scripts/hooks/ask_gate_menu.py`) rests on `updatedInput` rewriting an
+   `AskUserQuestion` call, and on it working ONLY without a `permissionDecision` field.
+   Both are documented or measured, but the docs carry no version contract and do not
+   enumerate the contexts where the field degrades. Make one real ask at the cap and
+   confirm the appended question renders.
+   **Failure here is QUIET, and quiet in the direction that does not announce itself:**
+   the session simply relays the gate's options in its own words again — the
+   pre-2026-09 behaviour, and the exact thing the mechanism exists to stop. Nothing
+   blocks and nothing errors, because by design no gate reads this back.
+9. **Update this document** with findings.
 
 ---
 
@@ -1154,6 +1164,76 @@ size, not the cap; (2) a Bash TOOL result probe does not transfer to hooks
 typed turn writes no transcript, and "newest transcript" mis-attributes a
 concurrent session's — identify your own transcript by before/after set
 difference and send a real turn.
+
+### A PreToolUse hook can REWRITE an `AskUserQuestion` — variant B only (measured 2.1.246, 2026-09-13; docs confirmed 2026-09-14)
+
+A PreToolUse hook returning `updatedInput` under `hookSpecificOutput` rewrites the
+tool input before the tool runs. It is **documented** (hooks reference), it is
+**documented as applying to `AskUserQuestion`**, and it is what lets a gate put its own
+question in front of the user instead of the session's retelling
+(`scripts/hooks/ask_gate_menu.py`).
+
+| shape | payload | result |
+|---|---|---|
+| A — with a decision | `{"hookSpecificOutput": {…, "permissionDecision": "allow", "updatedInput": {…}}}` | the call returns **"user did not answer"** WITHOUT the user acting |
+| **B — the only one that works** | `{"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {…}}}` | the rewritten questions render; the user answers normally |
+
+Variant A's failure is a FALSE NEGATIVE that reads exactly like a real decline, which is
+what makes it dangerous. The docs independently state that a `permissionDecision: "deny"`
+alongside `updatedInput` discards the rewrite; the `"allow"` case above is undocumented
+and measured here. Two reasons, one rule: never emit that field alongside `updatedInput`.
+A test pins its absence.
+
+**The apparent docs contradiction is NOT one.** "There is no built-in `AskUserQuestion`
+hook type" is about hook EVENT types (there is no `AskUserQuestion` event); "all tools
+fire PreToolUse" is about which TOOLS fire it. Both true, and the tool does fire it.
+
+**Schema bounds, read from the binary — the OPTIONS axis has a hard MINIMUM**, which the
+questions axis does not: `options:Me(J7o()).min(2).max(4)` against
+`questions:Me(mnr()).min(1).max(4)`. Out of range is not a shorter menu — CC rejects the
+WHOLE call, the person never sees it, and the steer says *"Do not retry this call."* So a
+hook that rewrites this tool must bound the option count itself, since the rewrite
+bypasses whatever the model would have produced — and must TEST that bound by driving
+the builder with an out-of-range set, not by asserting statically about the shipped
+constant. MEASURED: a static assertion left the guard unexercised, and deleting it
+entirely kept the suite green.
+
+The 4-question maximum has a consequence worth stating for any hook that APPENDS: a
+call already carrying four questions cannot be appended to, so the append must be
+skipped rather than risk the rejection. That makes an appending hook suppressible by
+a caller that pads to four. `header` is described as max 12
+characters but is a bare `z.string()`, so an over-long value renders clipped rather than
+rejecting. There is also a whole-call refinement an appending hook can violate without
+touching any single field: **question TEXTS must be unique across the call**, and option
+labels unique within a question. Replacing a forged copy of your question in place (rather
+than appending a second one) satisfies the first by construction; appending blind does not.
+These bounds are **undocumented** — the binary is the only source.
+
+**An invalid rewrite is a DENY, not a no-op — so a rewriting hook's own bounds checks are
+load-bearing, not defensive padding.** MEASURED in the binary: `updatedInput` is accepted
+only on the branch where no `permissionBehavior` is set, and if it fails the tool's input
+schema CC converts it to `behavior: "deny"` **attributed to the hook by name**. So the
+cheerful framing "a broken rewrite just costs the feature" is wrong: it costs the user's
+question. Anyone relaxing an option-count or uniqueness guard on the grounds that the
+failure is harmless is mis-pricing it by a severity level.
+
+Also measured: exactly **one** PreToolUse invocation per call, so an unconditional append
+cannot compound. And `procedure_advisor.py` (matcher `.*`) emits **nothing** for
+`AskUserQuestion`, so its `permissionDecision: "allow"` never meets another hook's
+`updatedInput` — verified by feeding it the payload directly, not inferred from the
+matcher.
+
+**The transcript is NOT a record of what the user saw.** It stores the tool call AS THE
+AGENT EMITTED IT — substitution is applied afterwards — so a transcript-read
+"verification" of what was presented reads exactly the untrusted values it is trying to
+check. PR #1863 built that; do not rebuild it.
+
+**Undocumented edges, stated so the gap is not mistaken for a guarantee.** The docs do
+not enumerate contexts where `updatedInput` degrades (remote/cloud, headless, subagents),
+and a path exists in the bundle that records the field as dropped on the PreToolUse
+branch — scope UNVERIFIED. Failure THERE is menu-absent (the field is dropped, so the
+call proceeds unrewritten), which is distinct from the schema-invalid case above. Re-probe
+on every pin bump; there is no version contract for the field.
 
 ### Bypass/auto mode tells the agent to edit via Bash — safe for reads, NOT for writes (measured 2.1.246, 2026-09-05)
 
