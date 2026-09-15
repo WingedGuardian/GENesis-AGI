@@ -182,6 +182,43 @@ def test_reset_clears(repo, _isolate_rounds):
     assert review_state.get_review_round(cwd=str(repo)) == 0
 
 
+def test_snapshot_accessor_agrees_with_the_two_it_replaces(repo, _isolate_rounds):
+    """`get_review_counters` exists so a reader deciding a TIER cannot assemble a pair
+    that never existed (two reads, a concurrent mark between them). That is only safe
+    while it reports the SAME values the individual accessors do — a drift here would
+    make every tier decision quietly wrong rather than loudly broken, so the agreement
+    is pinned across the states that actually differ: fresh, mid-streak, after a reset
+    (streak clears, lifetime does NOT), and on another branch.
+    """
+
+    def both():
+        return (
+            review_state.get_review_round(cwd=str(repo)),
+            review_state.get_review_lifetime(cwd=str(repo)),
+        )
+
+    assert review_state.get_review_counters(cwd=str(repo)) == both() == (0, 0)
+
+    _stage(repo, "a = 2\n")
+    review_state.bump_review_round(cwd=str(repo), source="external")
+    assert review_state.get_review_counters(cwd=str(repo)) == both()
+
+    _stage(repo, "a = 3\n")
+    review_state.bump_review_round(cwd=str(repo), source="external")
+    mid = review_state.get_review_counters(cwd=str(repo))
+    assert mid == both() and mid[0] > 0, mid
+
+    # The asymmetry the pair exists to carry: the ack clears the streak, never lifetime.
+    review_state.reset_review_round(cwd=str(repo))
+    after = review_state.get_review_counters(cwd=str(repo))
+    assert after == both(), after
+    assert after[0] == 0 and after[1] == mid[1], after
+
+    _git(repo, "commit", "-qm", "wip")
+    _git(repo, "checkout", "-q", "-b", "other-branch")
+    assert review_state.get_review_counters(cwd=str(repo)) == both() == (0, 0)
+
+
 def test_legacy_counter_without_last_source_is_discarded(repo, _isolate_rounds):
     # A round file written by the pre-source-axis (reviewer-agnostic) code has a `round`
     # but NO `last_source`; under the old model that count was built entirely from INTERNAL
