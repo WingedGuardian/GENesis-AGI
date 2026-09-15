@@ -3,29 +3,25 @@
 from __future__ import annotations
 
 import sqlite3
-import sys
 from pathlib import Path
 from unittest.mock import patch
 
-# The hook script lives in scripts/, not a package — put that dir on the path and
-# import it normally, exactly as tests/test_hooks/test_concurrent_tag_render.py
-# and test_proactive_memory_keywords.py do.
-#
-# This file used to build the module with importlib and ASSIGN it over
-# ``sys.modules["proactive_memory_hook"]``. That produced a SECOND module object
-# for the same source while its sibling test files kept a reference to the
-# first, so the two halves of the suite ran different copies of the hook — and a
-# fixture resetting module state on one could not see the other. Harmless while
-# the hook held no cross-call state; it stopped being harmless the moment the
-# hook gained a per-process stdout writer, at which point one file's flood test
-# left the OTHER file's writer closed and eight unrelated tests emitted nothing.
-# The old comment claimed this avoided auto-running the module or importing heavy
-# deps; ``exec_module`` runs the top level just as an import does, so it never
-# did either.
-_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
-sys.path.insert(0, str(_SCRIPTS_DIR))
+from tests.conftest import private_module
 
-import proactive_memory_hook as _mod  # noqa: E402
+# The hook script lives in scripts/, not a package — load it manually
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+_HOOK_PATH = _SCRIPTS_DIR / "proactive_memory_hook.py"
+
+# Load the module from file path, without leaving the name registered for the
+# rest of the session — see tests.conftest. No production code imports this one
+# by bare name at call time, so it is not the exploitable shape `review_state`
+# was; converted anyway so the helper is the one way this repo loads a script
+# privately. NOT because the tree is clean: ~22 test modules still register a
+# shared name without restoring it. Every one is a FIRST bind — no other module
+# binds those names, which is why the census finds zero replacements — but that
+# is a property of today's tree, not an invariant. The two locked names are the
+# two production imports at call time.
+_mod = private_module("proactive_memory_hook", _HOOK_PATH)
 
 _jaccard_similarity = _mod._jaccard_similarity
 _detect_pivot = _mod._detect_pivot
