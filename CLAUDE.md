@@ -479,8 +479,11 @@ class of prompt. Detail lives with the code, in
 
 Three limits, so it is not read as total coverage. Hooks wired in a user-level
 `~/.claude/settings.json` or a `settings.local.json` are outside the repo and
-invisible to it. An EXEMPTION SKIPS SCANNING ENTIRELY, so a row is only as good
-as its last read — which is why the table stays small. And the detector's
+invisible to it. An exemption still skips the PRINT SCAN — every row now carries
+a checker, but it re-runs a NECESSARY CONDITION of the row's claim, never a
+verification of it: a checker shows a constant or pattern still EXISTS, not that
+it still BINDS the output. Which is why the table stays small and why ROUTING a
+hook through the writer still beats adding a row. And the detector's
 enumeration is bounded, not total: it covers `print`, `builtins.print`,
 `file=None`, `file=sys.stdout`/`__stdout__`, and `sys.stdout[.buffer].write`,
 but NOT `os.write(1, …)`, an aliased handle, a rebound `print`, or a subprocess
