@@ -84,20 +84,63 @@ class TestDiscrimination:
         _mkproc(proc, 701, "claude", 700, ["claude"])
         assert liveness([600], proc) == POISONED
 
-    def test_headless_claude_p_does_not_count_as_a_session(self, proc):
-        # Genesis spawns `claude -p` for triage/reflection; those share
-        # comm=="claude" but are not interactive sessions.
-        _mkproc(proc, 800, "bash", 1)
-        _mkproc(proc, 801, "claude", 800, ["claude", "-p", "summarise this"])
-        assert liveness([800], proc) == POISONED
+    @pytest.mark.parametrize("flag", ["-p", "--print"])
+    def test_a_headless_task_under_the_pane_is_that_panes_work(self, proc, flag):
+        """CHANGED semantics, and the module's own contract is why.
 
-    def test_headless_long_form_print_flag(self, proc):
-        _mkproc(proc, 850, "bash", 1)
-        _mkproc(proc, 851, "claude", 850, ["claude", "--print", "x"])
-        assert liveness([850], proc) == POISONED
+        Genesis spawns `claude -p` for triage and reflection, and those must not
+        make some unrelated slot look alive — but that is a question about WHERE
+        the process is, and it was being answered by discarding every headless
+        process before any ancestry was known. A headless task DESCENDING FROM
+        THE PANE is not a stray probe, it is that slot running something, and
+        the door's next move is to destroy it.
+
+        This module's stated fail direction is "deliberately biased toward
+        reporting ALIVE ... every ambiguity resolves the cheap way", and its
+        header explains that it does NOT reuse `cc_slots._is_interactive`
+        precisely because that predicate's purpose ("never let an internal
+        `claude -p` masquerade as a slot") is backwards here. The global filter
+        had imported that backwards purpose anyway.
+
+        `test_a_headless_probe_elsewhere_is_still_invisible` is the control that
+        keeps the original intent.
+        """
+        _mkproc(proc, 800, "bash", 1)
+        _mkproc(proc, 801, "claude", 800, ["claude", flag, "summarise this"])
+        assert liveness([800], proc) == ALIVE
+
+    @pytest.mark.parametrize(
+        ("argv", "expected"),
+        [
+            (["claude", "-p", "x"], POISONED),          # headless: never votes UNKNOWN
+            (["claude", "--print", "x"], POISONED),
+            (["claude", "--model", "opus-p"], UNKNOWN),  # "-p" in a VALUE is not the flag
+            (["claude"], UNKNOWN),
+        ],
+    )
+    def test_headless_is_what_decides_an_unresolvable_ancestry(
+        self, proc, argv, expected
+    ):
+        """Where the headless flag is still OBSERVABLE, now that in-pane
+        headless counts as alive.
+
+        A claude whose ancestry cannot be resolved makes the whole probe
+        UNKNOWN — the broken walk is the one that might have connected it to the
+        pane. A HEADLESS process does not get that vote: it is ignored outside
+        the pane, and one unresolvable background probe anywhere on the box
+        would otherwise suppress every heal. So this is the case that still
+        distinguishes the two, and it keeps the flag PARSING under test —
+        including that `-p` inside a value is not the flag.
+        """
+        _mkproc(proc, 2700, "bash", 1)            # the pane, unrelated
+        _mkproc(proc, 2701, "bash", 999999)       # parent that does not exist
+        _mkproc(proc, 2702, "claude", 2701, argv)
+        assert liveness([2700], proc) == expected
 
     def test_p_inside_an_argument_value_is_still_interactive(self, proc):
         # Exact-arg match: "-p" as part of a VALUE must not read as the flag.
+        # In-pane this is ALIVE either way now, so the case that actually
+        # DISCRIMINATES lives in the unresolvable-ancestry test below.
         _mkproc(proc, 860, "bash", 1)
         _mkproc(proc, 861, "claude", 860, ["claude", "--model", "opus-p"])
         assert liveness([860], proc) == ALIVE
@@ -181,10 +224,12 @@ class TestClaudeIdentification:
         _mkproc(proc, 1701, "node", 1700, ["/usr/local/bin/claude-monitor"])
         assert liveness([1700], proc) == POISONED
 
-    def test_headless_still_excluded_when_matched_by_argv0(self, proc):
+    def test_headless_under_the_pane_counts_when_matched_by_argv0(self, proc):
+        # Same semantics change as TestDiscrimination above: a headless task
+        # descending from the pane is that pane's work, however it was matched.
         _mkproc(proc, 1800, "bash", 1)
         _mkproc(proc, 1801, "node", 1800, ["/usr/local/bin/claude", "-p", "x"])
-        assert liveness([1800], proc) == POISONED
+        assert liveness([1800], proc) == ALIVE
 
 
 class TestInterpreterWrappedInstalls:
@@ -232,10 +277,10 @@ class TestInterpreterWrappedInstalls:
         _mkproc(proc, 2501, "node", 2500, ["node", "/srv/app/server.js"])
         assert liveness([2500], proc) == POISONED
 
-    def test_headless_still_excluded_through_the_interpreter_shape(self, proc):
+    def test_headless_under_the_pane_counts_through_the_interpreter_shape(self, proc):
         _mkproc(proc, 2600, "bash", 1)
         _mkproc(proc, 2601, "node", 2600, ["node", "/opt/cc/cli.js", "-p", "x"])
-        assert liveness([2600], proc) == POISONED
+        assert liveness([2600], proc) == ALIVE
 
 
 class TestShapeRulesStayInStepWithTheirTwin:
@@ -381,3 +426,70 @@ class TestCliEntryPoint:
         )
         assert main(["1"]) == 0
         assert capsys.readouterr().out.splitlines()[0] == UNKNOWN
+
+
+class TestInterpreterOptionsWithOperands:
+    """`node -r preload /opt/cc/cli.js` is a live Claude.
+
+    Skipping flags without consuming their OPERANDS is not a parser: `-r` /
+    `--require` take a value, so the first non-flag token is the preload module,
+    not the entry script. Doing it correctly means knowing which of an
+    interpreter's options take values, per interpreter and per version — which
+    this module cannot know, and being wrong costs a live session.
+
+    So the question was weakened until no grammar is needed: does the argv
+    mention the entry script at all. The price is a false ALIVE for a command
+    that merely names it, which costs a rebuild offer.
+    """
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["node", "-r", "preload", "/opt/cc/cli.js"],
+            ["node", "--require", "preload", "/opt/cc/cli.js"],
+            ["node", "--require=preload", "/opt/cc/cli.js"],
+            ["node", "--max-old-space-size", "4096", "/opt/cc/cli.js"],
+            ["node", "-r", "a", "-r", "b", "/opt/cc/cli.js"],
+        ],
+    )
+    def test_an_option_operand_does_not_hide_the_entry_script(self, proc, argv):
+        _mkproc(proc, 3100, "bash", 1)
+        _mkproc(proc, 3101, "node", 3100, argv)
+        assert liveness([3100], proc) == ALIVE
+
+    def test_an_interpreter_with_no_entry_script_is_still_not_claude(self, proc):
+        """The control. Answering ALIVE for every node process would pass the
+        cases above while making a genuinely poisoned slot un-healable."""
+        _mkproc(proc, 3200, "bash", 1)
+        _mkproc(proc, 3201, "node", 3200, ["node", "-r", "preload", "/srv/app.js"])
+        assert liveness([3200], proc) == POISONED
+
+
+class TestHeadlessInsideThePaneIsLiveWork:
+    """`claude -p` running IN the slot is that slot's work.
+
+    Headless processes were filtered out globally, before any ancestry was
+    known, so a slot running a long headless task reported POISONED and the door
+    offered to destroy it — with a message saying the pane ran no claude. The
+    filter exists for background probes elsewhere on the host, and that is
+    exactly the distinction it failed to make.
+    """
+
+    def test_a_headless_task_in_the_pane_is_alive(self, proc):
+        _mkproc(proc, 3300, "bash", 1)
+        _mkproc(proc, 3301, "claude", 3300, ["claude", "-p", "long task"])
+        assert liveness([3300], proc) == ALIVE
+
+    def test_a_headless_probe_elsewhere_is_still_invisible(self, proc):
+        """The control, and the reason the filter existed. A background
+        `claude -p` under some other parent must NOT keep a genuinely dead slot
+        looking alive, or no slot would ever heal while Genesis is working."""
+        _mkproc(proc, 3400, "bash", 1)  # the pane, nothing under it
+        _mkproc(proc, 3401, "bash", 1)  # an unrelated parent
+        _mkproc(proc, 3402, "claude", 3401, ["claude", "-p", "background probe"])
+        assert liveness([3400], proc) == POISONED
+
+    def test_an_interactive_claude_in_the_pane_still_wins(self, proc):
+        _mkproc(proc, 3500, "bash", 1)
+        _mkproc(proc, 3501, "claude", 3500, ["claude"])
+        assert liveness([3500], proc) == ALIVE

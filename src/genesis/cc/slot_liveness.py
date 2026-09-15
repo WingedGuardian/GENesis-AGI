@@ -104,19 +104,23 @@ _ENTRY_SCRIPTS = frozenset({b"cli.js"})
 
 
 def _runs_entry_script(args: list[bytes]) -> bool:
-    """True when this interpreter's argv runs the CC entry script.
+    """True when this interpreter's argv mentions the CC entry script anywhere.
 
-    The FIRST NON-FLAG token, never argv[1]. Node CLIs routinely carry
-    `--enable-source-maps`, `--no-warnings` or `--max-old-space-size`, and
-    testing argv[1] reads `node --enable-source-maps /opt/cc/cli.js` as proof of
-    NOT-claude because the flag occupies the slot. The bash twin documents the
-    same trap; it cost a reviewer a measurement there.
+    ANY token, not the first non-flag one — and that is a deliberate retreat
+    from parsing. `node --enable-source-maps /opt/cc/cli.js` already defeats
+    testing argv[1]; `node -r preload /opt/cc/cli.js` then defeats
+    first-non-flag, because skipping a flag without consuming its OPERAND is
+    not a parser. Getting that right means knowing which of an interpreter's
+    options take values — per interpreter, per version — which is not knowledge
+    this module can hold, and being wrong costs a live session.
+
+    So the question is weakened until it needs no grammar at all. The price is
+    a false ALIVE for a command that merely mentions the entry script without
+    running it (`node server.js --config /opt/cc/cli.js`), which costs the
+    operator a rebuild offer. The alternative price is a false POISONED on a
+    running session, which costs their work. Asymmetric, so the safe side wins.
     """
-    for arg in args:
-        if arg.startswith(b"-"):
-            continue
-        return arg.rsplit(b"/", 1)[-1] in _ENTRY_SCRIPTS
-    return False
+    return any(a.rsplit(b"/", 1)[-1] in _ENTRY_SCRIPTS for a in args)
 
 
 def _is_claude(comm: bytes | None, cmdline: bytes | None) -> bool:
@@ -150,8 +154,17 @@ def _ppid_of(proc_root: Path, pid: int) -> int | None:
         return None
 
 
-def claude_pids(proc_root: Path) -> list[int] | None:
-    """Interactive `claude` pids, or None if /proc could not be enumerated."""
+def claude_pids(proc_root: Path) -> list[tuple[int, bool]] | None:
+    """``(pid, is_headless)`` for every claude process, or None if /proc failed.
+
+    Headless processes are RETAINED rather than dropped here, because whether
+    one matters depends on WHERE it is running and that is not known yet. The
+    caller resolves it: a headless task outside the target pane is somebody
+    else's background probe and is ignored exactly as before, but one INSIDE
+    the pane is that pane's own work. Dropping them all up front reported a
+    slot running `claude -p` as claude-less, and the door then offered to
+    destroy a live headless task with a message saying nothing was running.
+    """
     try:
         entries = [p for p in proc_root.iterdir() if p.name.isdigit()]
     except OSError:
@@ -162,9 +175,7 @@ def claude_pids(proc_root: Path) -> list[int] | None:
         comm = _read(entry / "comm")
         if not _is_claude(comm, cmdline):
             continue
-        if _is_headless(cmdline):
-            continue
-        found.append(int(entry.name))
+        found.append((int(entry.name), _is_headless(cmdline)))
     return found
 
 
@@ -186,13 +197,19 @@ def liveness(pane_pids: list[int], proc_root: Path = Path("/proc")) -> str:
     # ancestry (a stat cycle, a >hop-bound chain) suppresses heals box-wide for
     # as long as it lives — that is the fail-direction's price, not a bug.
     inconclusive = False
-    for pid in pids:
+    for pid, headless in pids:
         if pid in targets:
             return ALIVE  # the pane process IS claude (legacy `exec` shape)
         verdict = _walk_verdict(proc_root, pid, targets)
         if verdict == ALIVE:
             return ALIVE
-        if verdict == UNKNOWN:
+        # A HEADLESS process only ever votes ALIVE. Outside the pane it is a
+        # background probe elsewhere on the host and must stay invisible here —
+        # which is what dropping it early achieved, and letting its UNKNOWN walk
+        # set `inconclusive` would over-achieve: a single unresolvable headless
+        # ancestry anywhere on the box would suppress every heal (see the note
+        # above on that consequence being priced, not free).
+        if verdict == UNKNOWN and not headless:
             inconclusive = True
     return UNKNOWN if inconclusive else POISONED
 

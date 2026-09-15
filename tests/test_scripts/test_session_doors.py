@@ -1230,3 +1230,61 @@ class TestRebuildIsHostnameModeOnly:
             os.environ.pop("_TEST_FAKE_CAP_REASON", None)
         assert code == 0, out
         assert run.killlog.read_text().strip() == "$7", out
+
+
+class TestAdmissionSurvivesTheKill:
+    """A sampled precondition that does not survive the action it guards is not
+    a guard.
+
+    The preflight says the rebuild is admissible, the slot is destroyed, and
+    then the ORDINARY capacity gate runs again on the way to the replacement —
+    a second, differently-timed, fallible answer that can be DENY or RECLAIM
+    with the pane already gone. `_cap_reclaim` alone has six `exit 1` paths.
+    Narrowing that window was the wrong shape; the admitted rebuild now bypasses
+    the second gate entirely, exactly as a REATTACH does, and for the identical
+    net-zero reason the script already states for reattach.
+    """
+
+    def test_the_rebuild_carries_its_admission_to_the_gate(self):
+        code = [
+            ln for ln in _CC_SLOT.read_text().split("\n")
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        set_i = next((i for i, ln in enumerate(code) if "_CC_REBUILT=1" in ln), None)
+        gate_i = next(
+            (i for i, ln in enumerate(code) if '"$_CC_REBUILT" = "1"' in ln), None
+        )
+        cap_i = next(
+            (i for i, ln in enumerate(code) if "_cap_out=$(timeout" in ln), None
+        )
+        assert set_i is not None, "a successful rebuild must record its admission"
+        assert gate_i is not None, "the capacity gate must honour a carried admission"
+        assert cap_i is not None
+        assert set_i < gate_i < cap_i, (
+            "the carried admission must be consulted BEFORE the ordinary gate "
+            "runs, or the second answer can still take the replacement away"
+        )
+
+    def test_the_flag_is_initialized_before_the_consent_block(self):
+        """`set -u` is on; an unset flag would abort the login outright, and on
+        the path where no rebuild happens it is never assigned."""
+        code = [
+            ln for ln in _CC_SLOT.read_text().split("\n")
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        init = next((i for i, ln in enumerate(code) if ln.strip() == "_CC_REBUILT=0"), None)
+        use = next((i for i, ln in enumerate(code) if "_CC_REBUILT=1" in ln), None)
+        assert init is not None and use is not None and init < use
+
+    def test_the_oauth_gate_is_not_bypassed_by_a_rebuild(self):
+        """Deliberately unlike `_SESSION_EXISTS`. A reattach skips the OAuth
+        probe because attaching does NOT re-run the pane command, so the token
+        work would be moot. A rebuild DOES re-run it, so that reasoning does not
+        transfer and the probe must still happen."""
+        text = _CC_SLOT.read_text()
+        oauth = text.index("_oauth_notice=$(timeout")
+        # The bypass branch must not extend over the OAuth gate.
+        branch = text.index('"$_CC_REBUILT" = "1"')
+        assert branch < oauth
+        window = text[branch:oauth]
+        assert "_oauth_notice" not in window

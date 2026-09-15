@@ -506,6 +506,11 @@ _cap_fail_open() {
 #   3. One `list-panes -s` call is one round-trip to the single-threaded
 #      server = one consistent state. The human wait sits BETWEEN two such
 #      snapshots, never between a read and the kill.
+# Set only when the consent rebuild actually destroyed a slot, and read by the
+# capacity gate far below. A rebuild is NET-ZERO by construction — this slot was
+# counted before and is counted again after — so the count gate has nothing to
+# decide, and the RAM floor was already answered by the preflight.
+_CC_REBUILT=0
 _S2_SNAP_FMT='#{pid}|#{session_id}|#{session_attached}|#{pane_pid}|#{pane_current_command}'
 _s2_snapshot() {
     # Bounded like the slot-map probe and for the same reason: a blocking
@@ -719,6 +724,15 @@ if [[ "$MODE_ARG" != "manual" ]] && tmux has-session -t "=${SESSION_NAME}" 2>/de
                         && [ "$_s2_proj2" = "$_s2_proj1" ] \
                         && [ "$_s2_verdict2" = "POISONED" ]; then
                         if tmux kill-session -t "$_s2_sid1" 2>/dev/null; then
+                            # CARRY the admission past the destructive act. The
+                            # preflight above said this rebuild is admissible;
+                            # re-asking afterwards reintroduces exactly the
+                            # failure the preflight exists to prevent, because
+                            # the second answer can be DENY or RECLAIM and the
+                            # pane is already gone by then. A sampled precondition
+                            # that does not survive the action it guards is not a
+                            # guard. See the bypass at the capacity gate below.
+                            _CC_REBUILT=1
                             echo "cc-slot: ${SESSION_NAME} ended — rebuilding it fresh." >&2
                         else
                             echo "cc-slot: could not end ${SESSION_NAME} (it may have just changed) — attaching instead." >&2
@@ -752,6 +766,20 @@ if tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
     _SESSION_EXISTS=1  # bypass cap check; also skips the OAuth gate below —
                        # attach does NOT re-run the pane command, so any token
                        # injection would be moot (and would waste a probe).
+elif [ "$_CC_REBUILT" = "1" ]; then
+    # A CONSENTED REBUILD BYPASSES THE CAP, for the same reason a reattach does
+    # and stated in the same terms: the slot was counted a moment ago and will
+    # be counted again in a moment, so the count gate has nothing to decide.
+    # What it CAN do is refuse — `_cap_reclaim` alone has six `exit 1` paths —
+    # and every one of them now runs with the operator's pane already destroyed.
+    # The preflight answered the one question that is genuinely open (the RAM
+    # floor) BEFORE anything was touched; asking a second, differently-timed,
+    # fallible question afterwards can only take the answer away.
+    #
+    # Note this is NOT a narrowed window: re-asking is removed, not shortened.
+    # Deliberately unlike `_SESSION_EXISTS`, the OAuth gate below still runs —
+    # this path DOES re-run the pane command, so its token work is not moot.
+    echo "cc-slot: rebuilding ${SESSION_NAME} (admitted before the rebuild; cap not re-checked)." >&2
 else
     # New session → consult the capacity gate (SSH_CONNECTION classifies origin
     # inside the Python helper). `timeout` bounds a hung import; trailing
