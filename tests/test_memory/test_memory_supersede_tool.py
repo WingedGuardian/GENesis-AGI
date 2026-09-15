@@ -24,11 +24,16 @@ from unittest.mock import AsyncMock, MagicMock
 import aiosqlite
 import pytest
 
-from genesis.memory.store import MemoryStore, SupersedeUnresolved
+from genesis.memory.store import (
+    MemoryStore,
+    SupersedeIncomplete,
+    SupersedeUnresolved,
+)
 
 OLD = "abcd1234-0000-4000-8000-000000000001"
 NEW = "efab5678-0000-4000-8000-000000000002"
 DEAD = "beef9999-0000-4000-8000-000000000003"
+EXPIRED = "cafe0000-0000-4000-8000-000000000004"
 
 
 @pytest.fixture()
@@ -84,6 +89,15 @@ async def db():
         "(memory_id, created_at, embedding_status, deprecated) "
         "VALUES (?, '2026-09-06T00:00:00+00:00', 'fts5_only', 1)",
         (DEAD,),
+    )
+    # Live (not deprecated) but temporally invalid: recall's bitemporal
+    # filter hides it exactly like a deprecated row.
+    await conn.execute(
+        "INSERT INTO memory_metadata "
+        "(memory_id, created_at, embedding_status, invalid_at) "
+        "VALUES (?, '2026-09-06T00:00:00+00:00', 'fts5_only', "
+        "'2020-01-01T00:00:00+00:00')",
+        (EXPIRED,),
     )
     await conn.commit()
     yield conn
@@ -142,9 +156,20 @@ async def test_supersede_accepts_short_handles_on_both_sides(store, db):
         ("deadbeef", NEW, "not_found", "supersedes"),
         (OLD, "deadbeef", "not_found", "new_id"),
         (OLD, OLD, "self_supersede", "supersedes"),
-        (OLD, DEAD, "successor_deprecated", "supersedes"),
+        # Successor failures are the SUCCESSOR's fault: role must say new_id,
+        # or the caller is sent to fix the handle it got right (Codex P2
+        # 3981896399 / CodeRabbit 3996743250 — the old expectation here
+        # encoded the buggy attribution).
+        (OLD, DEAD, "successor_deprecated", "new_id"),
+        (OLD, EXPIRED, "successor_expired", "new_id"),
     ],
-    ids=["target-unknown", "successor-unknown", "self", "successor-deprecated"],
+    ids=[
+        "target-unknown",
+        "successor-unknown",
+        "self",
+        "successor-deprecated",
+        "successor-expired",
+    ],
 )
 async def test_a_rejected_pair_changes_nothing(store, db, old_handle, new_handle, reason, role):
     """Every rejection is pre-write, so a failed supersede is a no-op.
@@ -235,3 +260,167 @@ async def test_the_tool_raises_rather_than_reporting_a_failure(db):
             await tools["memory_supersede"].fn("deadbeef", NEW)
 
     assert (await _row(db, OLD))["deprecated"] == 0
+
+
+@pytest.mark.asyncio()
+async def test_a_future_invalid_at_successor_is_accepted(store, db):
+    """Control for the expiry check: bitemporal validity that has not run out
+    is a LIVE successor — the rejection is about hidden-from-recall, not about
+    the column being set."""
+    await db.execute(
+        "UPDATE memory_metadata SET invalid_at = '2035-01-01T00:00:00+00:00' WHERE memory_id = ?",
+        (NEW,),
+    )
+    await db.commit()
+
+    await store.supersede(OLD, NEW)
+
+    assert (await _row(db, OLD))["deprecated"] == 1
+
+
+@pytest.mark.asyncio()
+async def test_a_qdrant_failure_raises_instead_of_reporting_success(store, db, monkeypatch):
+    """The standalone path must not say `superseded: true` over a stale vector
+    mirror (Codex P1 3981896382 / CodeRabbit 3996743248): vector search only
+    excludes a memory through the Qdrant `deprecated` payload, so a swallowed
+    update_payload failure leaves the superseded fact surfacing forever."""
+    from genesis.memory import store as store_mod
+
+    await db.execute(
+        "UPDATE memory_metadata SET embedding_status = 'embedded' WHERE memory_id = ?",
+        (OLD,),
+    )
+    await db.commit()
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("qdrant unavailable")
+
+    monkeypatch.setattr(store_mod, "update_payload", _boom)
+
+    with pytest.raises(SupersedeIncomplete) as exc:
+        await store.supersede(OLD, NEW)
+
+    assert exc.value.stage == "qdrant"
+    # HONEST partial state: SQLite committed — the error must describe a
+    # half-finished operation, not pretend nothing happened.
+    assert (await _row(db, OLD))["deprecated"] == 1
+
+
+@pytest.mark.asyncio()
+async def test_retrying_after_a_mirror_failure_completes_the_supersession(store, db, monkeypatch):
+    """SupersedeIncomplete's contract: the retry IS the repair."""
+    from genesis.memory import store as store_mod
+
+    await db.execute(
+        "UPDATE memory_metadata SET embedding_status = 'embedded' WHERE memory_id = ?",
+        (OLD,),
+    )
+    await db.commit()
+
+    calls = {"n": 0}
+
+    def _fail_once(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("qdrant unavailable")
+
+    monkeypatch.setattr(store_mod, "update_payload", _fail_once)
+
+    with pytest.raises(SupersedeIncomplete):
+        await store.supersede(OLD, NEW)
+
+    await store.supersede(OLD, NEW)
+
+    assert (await _row(db, OLD))["deprecated"] == 1
+    assert (OLD, NEW, "succeeded_by") in await _links(db)
+
+
+@pytest.mark.asyncio()
+async def test_a_link_failure_raises_in_strict_mode(store, db, monkeypatch):
+    """The succeeded_by edge is half the advertised outcome — losing it
+    silently orphans the correction from graph traversal."""
+    from genesis.memory import store as store_mod
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("disk I/O error")
+
+    monkeypatch.setattr(store_mod.memory_links_crud, "create", _boom)
+
+    with pytest.raises(SupersedeIncomplete) as exc:
+        await store.supersede(OLD, NEW)
+
+    assert exc.value.stage == "link"
+
+
+@pytest.mark.asyncio()
+async def test_the_store_path_stays_best_effort_on_mirror_failure(store, db, monkeypatch):
+    """Control: `store(supersedes=...)` keeps swallowing mirror failures — the
+    new content's fate dominates that call's outcome. Only the standalone
+    path is strict. Drives `_mark_superseded` at its default, the exact seam
+    `store()` uses."""
+    from genesis.memory import store as store_mod
+
+    await db.execute(
+        "UPDATE memory_metadata SET embedding_status = 'embedded' WHERE memory_id = ?",
+        (OLD,),
+    )
+    await db.commit()
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("qdrant unavailable")
+
+    monkeypatch.setattr(store_mod, "update_payload", _boom)
+
+    # Default (non-strict) — must NOT raise.
+    await store._mark_superseded(OLD, NEW, "2026-09-15T00:00:00+00:00")
+
+    assert (await _row(db, OLD))["deprecated"] == 1
+
+
+@pytest.mark.asyncio()
+async def test_supersede_serializes_with_a_lock_on_the_successor(store, db):
+    """The validate→mark window (CodeRabbit 3996743245): a delete or
+    supersession of new_id must not commit between the successor check and
+    the write. supersede() holds BOTH id locks (sorted order), so an
+    operation already holding the successor's lock blocks it."""
+    import asyncio
+
+    from genesis.memory._locks import memory_id_lock
+
+    async with memory_id_lock(NEW):
+        task = asyncio.create_task(store.supersede(OLD, NEW))
+        await asyncio.sleep(0.05)
+        assert not task.done(), (
+            "supersede proceeded without the successor's lock — the validate→mark window is open"
+        )
+    await asyncio.wait_for(task, timeout=2)
+
+    assert (await _row(db, OLD))["deprecated"] == 1
+
+
+@pytest.mark.asyncio()
+async def test_supersede_serializes_with_a_lock_on_the_target(store, db):
+    """BOTH ids are locked, not just the successor.
+
+    `MemoryStore.delete(old_id)` holds the target's id-lock and writes the
+    same memory across SQLite AND Qdrant — the exact interleaving `_locks.py`
+    exists to prevent. Locking only the successor would leave supersede free
+    to run through a concurrent delete of its own target.
+
+    Added because the successor-side test ALONE let a mutation that decoys the
+    target's lock survive: the property was true and pinned by nothing.
+    """
+    import asyncio
+
+    from genesis.memory._locks import memory_id_lock
+
+    async with memory_id_lock(OLD):
+        task = asyncio.create_task(store.supersede(OLD, NEW))
+        await asyncio.sleep(0.05)
+        assert not task.done(), (
+            "supersede proceeded without the target's lock — it can interleave "
+            "with delete(old_id), which writes the same memory in both stores"
+        )
+    await asyncio.wait_for(task, timeout=2)
+
+    assert (await _row(db, OLD))["deprecated"] == 1

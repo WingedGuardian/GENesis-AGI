@@ -878,7 +878,7 @@ async def memory_supersede(old_id: str, new_id: str) -> dict:
     hook prints and ``memory_expand`` accepts; an ambiguous handle is never
     guessed.
 
-    Nothing is written unless every check passes, so a failure here costs
+    Nothing is written unless every check passes, so a REJECTION costs
     nothing and is safe to retry once you have corrected the ids. It raises
     rather than returning a verdict, because there is no stored content whose
     fate you would have to interpret alongside the error — that asymmetry is
@@ -887,8 +887,16 @@ async def memory_supersede(old_id: str, new_id: str) -> dict:
     Rejected, with nothing changed:
       * either id naming no memory, or a prefix naming several
       * ``old_id == new_id`` — a memory cannot replace itself
-      * a ``new_id`` that is itself deprecated, which normal recall filters out,
-        so the correction would be unreachable while the target went away
+      * a ``new_id`` that is itself deprecated OR already temporally invalid
+        (past ``invalid_at``) — normal recall filters both out, so the
+        correction would be unreachable while the target went away
+
+    One failure is NOT a rejection: ``SupersedeIncomplete`` means the SQLite
+    deprecation committed but a mirror (the Qdrant payload or the
+    ``succeeded_by`` link) did not. Retrying the SAME call is safe and is the
+    repair — every step is idempotent. Do not treat it as "nothing happened":
+    the old memory is already deprecated for keyword recall, and the retry
+    finishes the vector/graph half.
 
     Args:
         old_id: The memory being corrected. Marked deprecated.
