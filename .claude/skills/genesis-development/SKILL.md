@@ -211,6 +211,19 @@ honestly which are real signal and which are noise; a "false-positive rate" that
 turns out to be mostly true positives is a fire rate, and saying so is part of
 the result.
 
+**For a Bash GUARD's predicate specifically, the corpus already exists and there
+is a tool for it:** `python3 scripts/replay_guard_corpus.py --guard <name>`
+replays this install's own recorded `(command, cwd)` pairs through the guard and
+prints `blocked k/N`. Read `--list` first — a guard is REFUSED for replay until
+someone declares what running it a few hundred thousand times does to the
+machine, and three of the six are refused today for exactly that reason. Two
+limits travel with the number: it is stamped UNCLASSIFIED because the corpus
+contains dangerous commands too, so it is one side of the tradeoff and needs the
+positive control the bullet above demands; and the blocked samples are real
+command lines that contain secrets passed in argv, so `--show` is off by default
+and its output must never reach a PR body, an issue, or a commit message. The
+count and the verdict are what go public.
+
 The measurement is a GATE, not a footnote. Decide the acceptable threshold
 BEFORE measuring, and if the number misses it, tighten and re-measure rather
 than shipping with a caveat. When you tighten, re-run the acceptance bar in the
@@ -685,6 +698,18 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
      (measured, this session) a path relative to a process whose cwd had moved to
      another worktree. The mutation applied, the run happened, the test is sound,
      and none of the other causes fits.
+     **A test module can manufacture this for everyone else**, which is the
+     variant that hides longest: loading a script under a SHARED `sys.modules`
+     name and not restoring it. pytest imports every test module at COLLECTION,
+     so the last registration wins for the session — a module collected earlier
+     keeps the object it bound while production code doing a call-time
+     `from <name> import …` resolves the newer one, and
+     `monkeypatch.setattr(<module>, …)` then patches nobody. It passes in a
+     single-file run and fails only in the full suite, in collection order, so it
+     reads as a bug in whichever test depended on the patch. MEASURED on main:
+     four such modules, across `review_state` and `review_scope` — both imported
+     at call time by the commit gate. Use `tests.conftest.private_module`, which
+     registers, execs and restores; never hand-roll the sequence.
   4. **The mutation was BEHAVIOURALLY NULL** — it applied and parses, so every
      postcondition below passes, but it changed no behaviour: swapped operands
      that commute, an edit inside a dead branch, a type annotation Python does
@@ -1610,7 +1635,7 @@ did not read; never vague ("improve error handling") — always `file:line` + wh
 matters. (Deliberately NOT a "praise-first / acknowledge strengths" balance: an
 adversarial audit's job is to assume bugs and enumerate the class, not to reassure.)
 
-Two protocol steps apply to every review at "Code-reviewer inline" level or
+Three protocol steps apply to every review at "Code-reviewer inline" level or
 above (full definitions in `.claude/agents/genesis-architect.md`):
 
 - **Scope-drift check first**: compare stated intent (plan file / PR
@@ -1618,6 +1643,18 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   and open the review with the `Scope Check: CLEAN / DRIFT DETECTED /
   REQUIREMENTS MISSING` + Intent/Delivered block. Informational, never
   blocking.
+- **Premise check second** (Step 0.6, method in `.claude/docs/premise-check.md`):
+  before reviewing the code, verdict each claim the change DEPENDS on
+  independently — with evidence, a confidence, and a falsifier — ask what the
+  caller does differently because of its output, and say whether a better shape
+  exists (an existing chokepoint it re-implements, a simpler mechanism, a place
+  the problem disappears). Emit the `Design-premise:` block. Also informational,
+  and its BROKEN verdict has a HIGH bar: it routes to the EXISTING
+  premise-wrong disposition (architecture conversation, or
+  `needs-architecture-session` + a `ready` row) rather than to another round, so everything short of "the change cannot do what it
+  says" is SOUND-BUT-INFERIOR with the better shape named. Render a
+  better-shape finding on the severity ladder too (normally SHOULD-FIX), or it
+  is invisible to every surface that scores findings.
 - **Completion status last**: every review (and every skill workflow that
   concludes work) ends with exactly one of DONE / DONE_WITH_CONCERNS /
   BLOCKED / NEEDS_CONTEXT — with concerns listed, or blocker + what was
@@ -1897,8 +1934,16 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      Continuing a round-4+ loop on an earlier instruction is a violation, not
      obedience — STOP, post the round ledger (round → what it found → what it
      cost), name the cap explicitly ("we've hit the 3-round escalation cap"),
-     and get a FRESH decision: keep hardening, switch to a robust-by-
-     construction redesign, narrow scope, or shelve.
+     and get a FRESH decision: HAND IT BACK through the established disposition
+     — architecture conversation, or `needs-architecture-session` + a `ready` row
+     (three rounds
+     each finding something new, after a class-level audit, is the strongest
+     evidence available that the PREMISE and not the code is what is wrong —
+     and no further round can fix that), switch to a robust-by-construction
+     redesign, narrow scope, or shelve. The hand-back option is first because
+     it is the one nothing used to name, not because it is the likeliest —
+     decide it on evidence via `.claude/docs/premise-check.md`, and see the
+     two-path doctrine below.
   **Tabulate findings by CLASS before fixing — but never let that change what
   COUNTS.**
   Tabulate the findings with a CLASS column before fixing ANY round's findings,
@@ -1938,7 +1983,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
 
   | Round | Gate | Demands | Sigil | Resets counter? |
   |---|---|---|---|---|
-  | 2 (`cap-1`) | **MODE-SWITCH block** | Stop patching the named instance. Dispatch a FRESH-CONTEXT adversarial subagent over the ENTIRE diff; READ authoritative docs/source for any domain semantics; fix the whole enumerated CLASS in one commit. | `# audit-ack` | **No** |
+  | 2 (`cap-1`) | **MODE-SWITCH block** | Decide PREMISE-vs-POLISH first (`.claude/docs/premise-check.md`). If the premise is wrong: hand it back via `needs-architecture-session`, and do NOT ack past this block. If it holds: stop patching the named instance — dispatch a FRESH-CONTEXT adversarial subagent over the ENTIRE diff; READ authoritative docs/source for any domain semantics; fix the whole enumerated CLASS in one commit. | `# audit-ack` (attests the AUDIT happened — it is not an exit for the hand-back branch) | **No** |
   | 3 (`cap`) | **HARD STOP** | The full round-ledger stop above. | `# escalation-ack` | **Yes** — which is what makes the cycle repeat |
   | **7 (`FINAL_ROUND_CAP`, lifetime)** | **TERMINAL** | Two full cycles have already run. Decide: ACCEPT the outstanding findings and merge (document each in the PR body), or ABANDON and restart from a design that does not need seven rounds. | `# final-round-accept` | **No, and it is ONE-SHOT** |
 
@@ -3113,12 +3158,88 @@ The review-findings gate specifically:
    for automated review findings (ERROR, [P1], HARD BLOCK).
 2. If review present with **blocking findings** → merge is **BLOCKED**
    by the hook (exit code 2). Fix the findings first.
-3. Inline findings are SCORED and the gate blocks at score **>= 1.0**. THREE
-   things carry weight, and the third is missing from every prompt surface in
-   this repo — including, until 2026-09-10, this one:
-   **Codex P1 = 1.0 · Codex P2 = 0.5 · CodeRabbit Critical OR Major = 1.0 each**
-   (`_CR_BLOCKING_SEVERITIES = {"critical", "major"}`, `_CR_BLOCKING_WEIGHT = 1.0`).
-   So a lone Codex P2 is advisory (0.5), two block — and **a single CodeRabbit
+3. Inline findings are SCORED, and **SEVERITY FLOORS while the LANE governs
+   VOLUME.** Two independent rules, checked in that order:
+
+   **(a) The always-fix floor, every lane, before the score is consulted.** Any
+   unresolved Codex **P1**, or any unresolved CodeRabbit **Critical/Major**,
+   blocks the merge outright — whatever the change is. This is
+   `floor_hits = len(p1) + len(cr_block)` in `_check_inline_review_findings`.
+   It is a RULE because it used to be an ACCIDENT: before the lanes existed the
+   single threshold was 1.0 and a P1 scores exactly 1.0, so the floor held by
+   arithmetic, unnamed and untested — and raising any threshold would have
+   deleted it in silence.
+
+   **(b) The per-lane score threshold, for everything below the floor.** Weights
+   are unchanged — **Codex P1 = 1.0 · Codex P2 = 0.5 · CodeRabbit Critical OR
+   Major = 1.0 each** (`_CR_BLOCKING_SEVERITIES = {"critical", "major"}`,
+   `_CR_BLOCKING_WEIGHT = 1.0`) — but what a change can AFFORD now depends on
+   what it costs to be wrong (`_INLINE_SCORE_BLOCK_THRESHOLDS`):
+
+   | lane | blocks at | what lands there |
+   |---|---|---|
+   | `critical` | **1.0** | enforcement-hook surface · `.github/**` AND the implementations behind its required checks (`scripts/ci/**`, `check_*.py`/`.sh`) · schema and data migrations · HTTP surfaces (`dashboard/routes/**`, `hosting/**`, `api.py`/`api_*`, `_blueprint.py`) · secrets and credentials |
+   | `standard` | **2.0** | ordinary runtime code |
+   | `light` | **3.0** | PROSE (including prompt surfaces) / tests / fixtures only, or vendored-only |
+
+   **`light` is PROSE, not `docs-config`.** A `.yaml`/`.toml`/`.ini`/`.cfg`
+   reaches `_category() == "docs-config"` through the shared classifier, but
+   config is not documentation — `config/desktop_takeover.yaml` arms desktop
+   takeover and `pyproject.toml` pins dependencies, so both are `standard`. The
+   light lane is `.md`/`.rst`/`.markdown`/`.adoc`, plus `.txt` and the
+   extensionless form ONLY on a known documentation stem (`CHANGELOG.txt` and a
+   bare `LICENSE` yes, `requirements.txt` no — the same split `_is_doc_path`
+   makes), plus tests and fixtures (`review_scope._is_lane_light`). Those
+   spellings are matched DIRECTLY rather than behind `_category`, because
+   `_category` calls `.adoc` and an extensionless `README` **code** — so an
+   earlier draft that listed them behind it advertised prose formats nothing
+   could reach.
+
+   **A PROMPT SURFACE is prose here.** `_category` calls `SKILL.md`,
+   `.claude/commands/*.md` and `src/genesis/skills/**/*.md` *code*; the lane
+   reads them as what they are. MEASURED: this is the single biggest effect of
+   the lane's own vocabulary — 14 of 40 recent PRs classify `light` where the
+   inherited tagger said `standard` — and it is mostly INERT, because 11 of those
+   14 touch nothing whose findings score at all (every path is an `_is_doc_path`
+   and `doc_findings` defaults to `skip`). Where it bites is a prose-plus-TESTS
+   PR, whose test findings then clear at 3.0.
+
+   So on a CRITICAL change two P2s still block exactly as before; on ordinary
+   code it now takes four. MEASURED over the 40 most recently merged PRs:
+   critical 35.0%, standard 20.0%, light 45.0% (a SLIDING window — see the
+   classifier docstring; re-running will not reproduce it, and a difference is
+   the merge queue moving, not a regression). The lane comes from
+   `review_scope.classify_lane`, which FAILS CLOSED to `critical` on an
+   unreadable file list — the lane relaxes a threshold, so the safe default is
+   the one that relaxes nothing.
+
+   ⚠ **A stable distribution is NOT a coverage proof, and neither is a passing
+   example.** Building this lane produced the same miss twice, each time caught by
+   a method the previous one could not reach:
+
+   * A draft held critical at an unchanged 30.0% while having silently stopped
+     classifying `*route*`/`*controller*`/`*endpoint*` paths as critical — same
+     percentage, different membership, because none of the 40 sampled PRs touched
+     such a file. A **constructed test case** found it; the measurement could not.
+   * Four route-defining modules — `src/genesis/hosting/**` and
+     `dashboard/_blueprint.py`, one serving `/genesis/login` — were still outside
+     the lane after that fix. Every constructed case passed and the distribution
+     reproduced to the decimal. Only an **enumeration over every tracked module**
+     found them, which is why that class is now locked by a population check
+     rather than by more examples.
+
+   When you change what feeds a classifier: diff the per-item ASSIGNMENTS rather
+   than the totals, and lock a category by enumerating its population rather than
+   by naming the members you happened to think of.
+
+   **`auth` is deliberately NOT a critical input**, though it sits in
+   `_DOMAIN_SENSITIVE_TAGS` and drives the depth gate. Its glob is
+   `*auth* *session* …`, and MEASURED over 3,999 tracked files, 58 of the 59
+   `auth`-tagged files (98%) match on **"session"** — CC-session machinery, not
+   authentication. Exactly one is real (`dashboard/auth.py`). Re-inheriting that
+   set is the obvious "cleanup"; don't.
+
+   One thing the lane does not change: **a single CodeRabbit
    Critical or Major blocks on its own, but ONLY from the INLINE endpoint.**
    `_check_inline_review_findings` reads two channels and they are NOT symmetric:
    `pulls/N/comments` (findings anchored inline) feeds the score, while the review
@@ -3228,14 +3349,18 @@ The review-findings gate specifically:
    `gh repo view --json nameWithOwner --jq .nameWithOwner` — NEVER hardcode
    it (configs name several repos; the working repo is not the org default).
    A **404 from that endpoint means WRONG SLUG or PR number, never "no
-   findings"** — a clean PR returns `[]`. The merge-gate hook blocks on the
-   weighted inline SCORE (P1=1.0, P2=0.5; block at >= 1.0), so a lone P2 is
-   advisory but TWO unresolved P2s block — unread P2s no longer slip through in
-   pairs (2026-07-10: 8 real P2s on the entity-layer PRs merged past the OLD
-   P1-only gate, the exact gap this score closes). Note what it does NOT close,
-   and do not read it as more than it is: a LONE P2 still passes unread, which is
-   how #1620's HTTP-500 finding merged (2026-09-03). The score bounds what the
-   gate stops; only reading the report stops the rest. And the two
+   findings"** — a clean PR returns `[]`. The merge-gate hook blocks on a P1 or a
+   CodeRabbit Critical/Major OUTRIGHT (the always-fix floor), and otherwise on the
+   weighted inline SCORE against this change's LANE threshold — so two unresolved
+   P2s block a CRITICAL change, while ordinary code takes four (full table in the
+   Pre-Merge Gate section above). Unread P2s no longer slip through in pairs on the
+   surface where that mattered (2026-07-10: 8 real P2s on the entity-layer PRs
+   merged past the OLD P1-only gate, the exact gap this score closes). Note what it
+   does NOT close, and do not read it as more than it is: a LONE P2 still passes
+   unread, which is how #1620's HTTP-500 finding merged (2026-09-03), and on an
+   ordinary change three now do. The score bounds what the gate stops; only reading
+   the report stops the rest — which is exactly why the gate prints a NOTE naming
+   the lane and threshold whenever a non-zero score passes under one. And the two
    channels are INDEPENDENT: Codex can post a quota/usage-limit message as an
    ISSUE comment while a later `@codex review` trigger delivers real inline
    findings anyway — a quota message is evidence about that channel at that

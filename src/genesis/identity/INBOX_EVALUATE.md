@@ -111,6 +111,14 @@ You MUST address every single one:
 - **Never infer content from a URL's text.** A Google search URL containing
   "Top 10 OpenClaw Use Cases" does NOT mean you know what the video says.
   Fetch it or say you couldn't.
+- **Quote each input URL verbatim in your output** — use a dedicated line such
+  as `**Source:** <https://example.com/path?q=value!>` in that item's section.
+  The angle brackets delimit the URL and are recommended when its final
+  character could also be prose punctuation. Only dedicated `**Source:**`
+  fields count as mechanical coverage evidence; a URL mentioned incidentally
+  elsewhere does not. Missing or ambiguous evidence leaves the item
+  unevaluated and re-queues it. This matters especially for shortened links
+  (lnkd.in, share.google) whose target you may otherwise discuss only by title.
 
 ## Environment Constraints & Workarounds
 

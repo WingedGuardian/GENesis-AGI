@@ -544,12 +544,15 @@ def print_json_bounded(
     # wrong direction for a size check, since it says "fine" about the one
     # outcome this module exists to prevent.
     #
-    # Latent rather than live today, stated plainly: this function has no
-    # caller outside its tests (grep across .claude/, scripts/, src/), and the
-    # default budget sits 200 chars under the cap, so the off-by-one only bites
-    # a caller passing budget=HOOK_STDOUT_CAP. Fixed now because the adopters
-    # this module was written for are the next PR, and an off-by-one in a size
-    # guarantee is not something to hand them.
+    # The off-by-one only bites a caller passing budget=HOOK_STDOUT_CAP, since the
+    # default budget sits 200 chars under the cap. It was fixed while still latent,
+    # because an off-by-one in a size guarantee is not something to hand an adopter.
+    #
+    # No longer caller-less: `git_discard_guard._emit_additional_context` uses it as
+    # the envelope backstop behind its own whole-note selection. That sentence used
+    # to read "this function has no caller outside its tests", which the adopting
+    # change quietly falsified — the kind of stale claim a grep cannot catch because
+    # it lives in a file the adopter never edits.
     for _ in range(4 * max(1, len(text_keys))):
         blob = json.dumps(payload)
         if emit_cost(blob) <= budget:
