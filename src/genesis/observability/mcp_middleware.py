@@ -13,12 +13,14 @@ import logging
 import time
 from typing import Any
 
+from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware
 
 from genesis.observability.commit_identity import is_stale
 from genesis.observability.commit_identity import (
     same_commit as _same_commit,  # noqa: F401 — re-exported for Part A's guard test
 )
+from genesis.observability.mcp_arg_diagnostics import absorbed_parameter_hint
 from genesis.observability.mcp_guarded_tools import GUARDED_MCP_TOOLS
 from genesis.observability.provider_activity import ProviderActivityTracker
 
@@ -40,14 +42,19 @@ class InstrumentationMiddleware(Middleware):
     the MCP tool handler.
 
     Per-call transaction boundary (WS-15 follow-up): when constructed with the
-    server's long-lived ``db`` connection, each tool call ends with a
-    commit-on-success / rollback-on-error. This releases the read snapshot that
-    a read-only tool would otherwise leave open in deferred-isolation mode —
-    which pins the SQLite WAL checkpoint and makes later writes fail
-    "database is locked". Writes already commit at the CRUD layer before the
-    tool returns, so the commit here only closes a *trailing* read txn (it can
-    never discard a tool's own write); rollback-on-error discards a partial.
-    DB errors in this boundary never propagate to the tool handler.
+    server's long-lived ``db`` connection, each tool call commits only after a
+    clean return and rolls back otherwise. This releases the read snapshot that a
+    read-only tool would otherwise leave open in deferred-isolation mode — which
+    pins the SQLite WAL checkpoint and makes later writes fail "database is locked".
+    Writes already commit at the CRUD layer before the tool returns, so the commit
+    here only closes a *trailing* read txn (it can never discard a tool's own
+    write); any non-clean exit — a raised ``Exception``, or a ``BaseException`` no
+    clause catches (``asyncio.CancelledError``, ``SystemExit``, …) — rolls back the
+    possibly-partial write instead of committing it. The boundary swallows
+    nothing: a ``BaseException`` is not caught at all, and the one ``except
+    Exception`` clause always re-raises — sometimes as a ``ToolError`` chained to
+    the original, when the argument diagnosis below can name a better cause. DB
+    errors in this boundary never propagate to the tool handler.
     """
 
     def __init__(
@@ -70,7 +77,15 @@ class InstrumentationMiddleware(Middleware):
         tool_name = context.message.name
         provider = f"mcp.{self._server}.{tool_name}"
         t0 = time.monotonic()
-        success = True
+        # Default False so the finally COMMITS only after a clean return. Any exit
+        # that is NOT a normal return leaves this False and rolls back the
+        # possibly-partial write instead of committing it: a raised ``Exception``,
+        # or a ``BaseException`` no clause catches — ``asyncio.CancelledError``,
+        # ``SystemExit``, ``KeyboardInterrupt``, ``GeneratorExit`` (follow-up
+        # 3183405d — the old ``except Exception`` let all of those keep success=True
+        # and commit a partial). Nothing is swallowed: the ``except Exception``
+        # below always re-raises, and a cancellation is not caught at all.
+        success = False
         try:
             if tool_name in GUARDED_MCP_TOOLS:
                 # Raises ToolError (block mode) if this subprocess is running
@@ -78,34 +93,82 @@ class InstrumentationMiddleware(Middleware):
                 # the read snapshot the staleness check opened on self._db.
                 await self._enforce_freshness(tool_name)
             result = await call_next(context)
+            success = True
             return result
-        except Exception:
-            success = False
+        except Exception as exc:
+            # success stays False — it is only set True after a clean return, so
+            # there is nothing to reset here.
+            # A "missing argument" error is sometimes the WRONG explanation: if a
+            # long free-text argument was emitted with a mismatched closing tag,
+            # it swallowed every parameter after it, and those are then reported
+            # missing though they were sent. Replace the message with the real
+            # cause when the evidence is in the arguments themselves.
+            #
+            # Only ever runs on a call that is ALREADY failing, never alters
+            # arguments, and returns None on every uncertain path — so it cannot
+            # make a well-formed call fail, and a false positive costs only a
+            # slightly wrong explanation on a call that was refused regardless.
+            hint = None
+            try:
+                hint = absorbed_parameter_hint(
+                    exc,
+                    getattr(context.message, "arguments", None) or {},
+                    tool_name,
+                )
+            except Exception:  # diagnosis must never replace the real error
+                # WARNING, not debug: this only fires when the diagnosis ITSELF
+                # is broken, on a path that is already an error, so it cannot
+                # spam — and at debug a persistent bug here would stay invisible
+                # across all four servers.
+                logger.warning(
+                    "argument diagnosis failed for %s", provider, exc_info=True
+                )
+            if hint:
+                raise ToolError(hint) from exc
             raise
         finally:
-            if self._db is not None:
+            # Nested try/finally so a BaseException raised by the DB step cannot
+            # skip the tracker record below it. Cancellation is the reachable
+            # case: `except Exception` does not catch `asyncio.CancelledError`,
+            # so before this nesting a cancellation landing in the commit await
+            # left the call unrecorded — the tool ran, and the activity tracker
+            # never heard about it.
+            #
+            # What that cancellation does NOT do is lose the write, which is
+            # worth stating because the obvious remedy (roll back on cancel) is
+            # built on the opposite assumption. aiosqlite QUEUES the operation
+            # to its worker thread BEFORE awaiting — `_execute` does
+            # `self._tx.put_nowait((future, function))` and only then
+            # `await future` — so cancelling the await cancels the WAIT, not the
+            # commit. MEASURED against aiosqlite 0.21: a row inserted before a
+            # cancelled `commit()` is durable afterwards. Issuing a rollback
+            # here would either be a no-op behind the commit already in the
+            # queue, or would discard a successful tool call's writes.
+            try:
+                if self._db is not None:
+                    try:
+                        if success:
+                            await self._db.commit()
+                        else:
+                            await self._db.rollback()
+                    except Exception:
+                        logger.warning(
+                            "DB %s after %s failed",
+                            "commit" if success else "rollback",
+                            provider, exc_info=True,
+                        )
+            finally:
                 try:
-                    if success:
-                        await self._db.commit()
-                    else:
-                        await self._db.rollback()
+                    self._tracker.record(
+                        provider,
+                        latency_ms=(time.monotonic() - t0) * 1000,
+                        success=success,
+                    )
                 except Exception:
                     logger.warning(
-                        "DB %s after %s failed",
-                        "commit" if success else "rollback",
+                        "Activity tracker record failed for %s",
                         provider, exc_info=True,
                     )
-            try:
-                self._tracker.record(
-                    provider,
-                    latency_ms=(time.monotonic() - t0) * 1000,
-                    success=success,
-                )
-            except Exception:
-                logger.warning(
-                    "Activity tracker record failed for %s",
-                    provider, exc_info=True,
-                )
 
     async def _enforce_freshness(self, tool_name: str) -> None:
         """Block a guarded tool when this subprocess is running stale code.
@@ -131,8 +194,9 @@ class InstrumentationMiddleware(Middleware):
             )
             return
         # block (default; any unexpected mode already degraded to block upstream)
-        from fastmcp.exceptions import ToolError
-
+        # ToolError is imported at module level now (the absorbed-parameter
+        # diagnosis needs it too), so the local re-import here would shadow it
+        # with the identical symbol.
         from genesis.observability import mcp_spawn_identity as si
 
         raise ToolError(

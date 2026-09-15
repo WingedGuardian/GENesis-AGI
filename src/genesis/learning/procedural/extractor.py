@@ -573,12 +573,15 @@ async def extract_procedure(
             gate_result.adjusted_confidence,
         )
 
-        # WS-3 B1 gate-1 (procedure): NOT gated here — this legacy path has no
-        # reliable source-session tool signal. The only origin candidates are
-        # data["tools_used"] (the extractor LLM's proposed REPLAY tools, not
-        # source provenance) and summary.tool_calls (a heuristic, hyphen-
-        # truncating prose scrape from the summarizer). Gating on either would
-        # undercount silently. Deferred with the path's own removal (follow-up
+        # WS-3 B1 gate-1 (procedure): NOT gated here. The premise USED to be
+        # that this legacy path has no reliable source-session tool signal —
+        # data["tools_used"] is the extractor LLM's proposed REPLAY tools
+        # rather than source provenance, and summary.tool_calls was a prose
+        # scrape. That is now only half true: `InteractionSummary` carries
+        # `tool_calls_from_runtime`, and where it is set the names come from the
+        # runtime's own tool_use events. It is NOT set on the non-streaming
+        # paths, so gating here would still undercount silently — the same
+        # conclusion, for a narrower reason. Deferred with the path's own removal (follow-up
         # 3558802740d5); the primary judge path (extraction_job) IS gated on the
         # real transcript spine.
 

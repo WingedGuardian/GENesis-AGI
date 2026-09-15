@@ -80,7 +80,34 @@ async def outreach_send(
     For email replies, pass thread_id to route to the correct recipient.
     The thread_id maps to a registered email thread whose recipient is
     used for delivery.
+
+    **Discord: name the CHANNEL, not the adapter.** Pass
+    ``channel="announcements"`` (or any name in ``DISCORD_CHANNELS``) and it is
+    routed to that channel. ``channel="discord"`` still works and goes wherever
+    ``OUTREACH_RECIPIENT_DISCORD`` points, which defaults to ``dev-discussion``.
+
+    That default is why this exists. The pipeline has always supported steering
+    a Discord send (the recipient IS the webhook name), but this tool exposed no
+    way to say which channel — so every caller asking for "Discord" got
+    dev-discussion, silently, including a release announcement that belonged in
+    announcements. A caller could not tell it had been redirected: there is no
+    error, and the webhook adapter falls back to the default webhook rather than
+    failing on an unknown name.
     """
+    # Discord sub-channel → adapter + recipient. `target_chat_id` is the
+    # pipeline's existing per-request recipient override (it wins over the
+    # configured default in _deliver), so this needs no new plumbing — only a
+    # name the caller can actually pass.
+    #
+    # NOTE THE ORDERING, it is load-bearing. `channel` is NOT rewritten here,
+    # because the queued path below enqueues it verbatim and the scheduler's
+    # drain does its own sub-channel mapping from the RAW name. Rewriting it up
+    # front would store "discord" in pending_outreach and lose which channel was
+    # asked for — the exact bug this change exists to remove, reintroduced one
+    # code path over. MEASURED: a first version of this fix did precisely that.
+    from genesis.outreach.types import DISCORD_CHANNELS
+
+    discord_channel: str | None = channel if channel in DISCORD_CHANNELS else None
     # Resolve the per-thread recipient for email sends BEFORE the
     # pipeline/fallback split — so a QUEUED follow-up (pipeline=None subprocess)
     # carries its thread recipient through pending_outreach instead of arriving
@@ -155,9 +182,16 @@ async def outreach_send(
         context=message,
         salience_score=salience_score,
         signal_type=category,
-        channel=channel,
+        # Adapter name for the live-pipeline path. The raw sub-channel rides in
+        # target_chat_id beside it; the queued path above kept the raw name and
+        # lets the drain do this same mapping.
+        channel="discord" if discord_channel else channel,
         labeled_surplus=labeled_surplus,
         validated_recipient=validated_recipient,
+        # The Discord sub-channel, when one was named. `_deliver` resolves
+        # `validated_recipient or target_chat_id or <configured default>`, so
+        # this steers the send without disturbing any other channel.
+        target_chat_id=discord_channel,
         thread_id=thread_id,
         # The caller composed this message; deliver it exactly — never route an
         # agent-authored message back through the LLM drafter (it once inverted
@@ -498,6 +532,111 @@ async def outreach_queue(
         return [dict(zip(columns, row, strict=False)) for row in await cursor.fetchall()]
     except Exception as exc:
         return [{"error": f"Query failed: {exc}"}]
+
+
+@mcp.tool()
+async def outreach_pending(limit: int = 50, offset: int = 0) -> dict:
+    """List messages QUEUED but not yet sent — the ones `outreach_cancel` can act on.
+
+    Deliberately a separate tool from ``outreach_queue``, which reads
+    ``outreach_history`` (messages already DELIVERED) and therefore never shows a
+    scheduled message at all. That gap is why this exists: without it, a queued
+    message is only addressable by the id its ``outreach_send`` call returned, so
+    once that id is out of view the message cannot be found, inspected, or
+    cancelled — it simply arrives.
+
+    Returns each row's id, when it is due (``deliver_after``), and a short message
+    preview, soonest-due first. A NULL ``deliver_after`` means "goes out on the
+    next drain tick", so it sorts FIRST — ordering on ``deliver_after`` directly
+    would push the imminent messages behind everything scheduled for next month,
+    and the LIMIT would then drop exactly the ones worth cancelling.
+
+    PAGED, with a denominator. Returns
+    ``{items, total, offset, limit, truncated}`` — never a bare list. A bare list
+    capped at 50 is indistinguishable from a complete one, so a caller with 60
+    queued messages would have concluded it had seen them all and that the missing
+    ten did not exist; and since every id worth cancelling comes from this tool,
+    the invisible ones were also the uncancellable ones. ``total`` is the real
+    count and ``truncated`` says outright whether more remain; page with ``offset``.
+    """
+    if not _db:
+        return {"error": "not initialized"}
+    try:
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        return {"error": "limit and offset must be integers"}
+    try:
+        from genesis.db.crud import pending_outreach
+
+        await pending_outreach.ensure_table(_db)  # idempotent; init is fire-and-forget
+        where = "WHERE delivered = 0 AND cancelled_at IS NULL"
+        count_cursor = await _db.execute(
+            f"SELECT COUNT(*) FROM pending_outreach {where}"  # noqa: S608 — literal
+        )
+        total = int((await count_cursor.fetchone())[0])
+        cursor = await _db.execute(
+            f"""SELECT id, category, channel, urgency, deliver_after, created_at,
+                      substr(message, 1, 160) AS message_preview
+                 FROM pending_outreach
+                {where}
+                ORDER BY COALESCE(deliver_after, created_at) ASC, created_at ASC
+                LIMIT ? OFFSET ?""",  # noqa: S608 — `where` is a literal above
+            (limit, offset),
+        )
+        columns = [d[0] for d in cursor.description]
+        items = [dict(zip(columns, row, strict=False)) for row in await cursor.fetchall()]
+        return {
+            "items": items,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "truncated": offset + len(items) < total,
+        }
+    except Exception as exc:
+        return {"error": f"Query failed: {exc}"}
+
+
+@mcp.tool()
+async def outreach_cancel(pending_id: str) -> str:
+    """Cancel a queued, not-yet-sent message by its pending id.
+
+    Use this to retract or reschedule a queued message: cancel, then re-send with
+    the new timing. Before this existed the only options were to send a duplicate
+    or to mark the original DELIVERED — and that second one writes a false record
+    into a table that gets read back, so a later session concludes the recipient
+    was told something they were not.
+
+    Returns a status naming what actually happened, because "cancelled" and "there
+    was nothing to cancel" must not look alike:
+      cancelled         — this call cancelled a live queued message
+      already_cancelled — a previous cancel already took effect
+      already_dequeued  — the message has left the queue. It was sent, OR it is
+                          HELD at the autonomy gate awaiting the owner's approval
+                          (in which case it has NOT been sent and still will be),
+                          OR it aged out after 24h. The queue writes the same flag
+                          for all three, so this tool does not claim delivery it
+                          cannot verify.
+      unknown_id        — no such pending message
+
+    Get ids from ``outreach_pending`` (paged: check its ``truncated`` flag).
+    """
+    if not _db:
+        return json.dumps({"error": "not initialized"})
+    try:
+        from genesis.db.crud import pending_outreach
+
+        await pending_outreach.ensure_table(_db)  # idempotent; init is fire-and-forget
+        did, reason = await pending_outreach.cancel(_db, pending_id)
+    except Exception as exc:
+        return json.dumps({"error": f"Cancel failed: {exc}"})
+    payload = {"status": reason, "cancelled": did, "pending_id": pending_id}
+    if reason == "already_dequeued":
+        payload["note"] = (
+            "left the queue — sent, awaiting approval at the autonomy gate, or aged "
+            "out. Not necessarily delivered."
+        )
+    return json.dumps(payload)
 
 
 async def _server_rpc(path: str, payload: dict, *, read_timeout_s: float) -> dict:

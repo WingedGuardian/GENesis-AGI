@@ -133,7 +133,9 @@ def test_load_full_yaml(monkeypatch):
     # unwired openrouter-qwen3coder (delisted qwen/qwen3-coder:free slug).
     # 2026-08-19: 26 → 25 after removing dead nvidia-nim-kimi (moonshotai/kimi-k2.6
     # 404-for-account on NIM); nvidia-nim-deepseek repointed v4-pro → v4-flash-0731.
-    assert len(cfg.providers) == 25
+    # 2026-09-05: 25 -> 26 with mistral-medium-free — the in-family rung
+    # directly below Large (presumptive free tier; see model_routing.yaml).
+    assert len(cfg.providers) == 26
     assert "lmstudio-30b" not in cfg.providers
     assert "github-o3mini" not in cfg.providers
     assert "openrouter-deepseek-r1" not in cfg.providers  # removed from config
@@ -222,22 +224,39 @@ def test_load_full_yaml(monkeypatch):
     assert cfg.call_sites["29_retrospective_triage"].chain == [
         "groq-free",
         "mistral-large-free",
+        "mistral-medium-free",
         "openrouter-nemo",
     ]
     assert cfg.call_sites["30_triage_calibration"].default_paid is True
-    # lmstudio-30b filtered out, only mistral-large-free remains
-    assert cfg.call_sites["30_triage_calibration"].chain == ["mistral-large-free"]
+    # lmstudio-30b filtered out; the Mistral family rungs remain (Large, then
+    # Medium directly below it — the in-family fallback added 2026-09-05).
+    assert cfg.call_sites["30_triage_calibration"].chain == [
+        "mistral-large-free",
+        "mistral-medium-free",
+    ]
     assert cfg.call_sites["31_outcome_classification"].chain == [
         "glm51",
         "mistral-large-free",
+        "mistral-medium-free",
     ]
 
     # mistral-large-free provider (consolidated from mistral-free + mistral-large).
-    # free: false since 2026-09: Mistral removed Large from free-tier entitlement
-    # (403 tier_not_allowed, measured on two independent free-tier accounts), so
-    # cost is tracked at paid rates and never_pays chains exclude it.
+    #
+    # `free: true` since 2026-09-07, reverting a one-day `false`. The flag answers
+    # MARGINAL COST ("does a successful call add to the bill?") and nothing else —
+    # every consumer reads it that way (litellm_delegate sets cost=0.0 on it,
+    # router.py's budget gate, _filter_chain's never_pays filter). Mistral's tier
+    # is $0 per call under its rate limits, and the 403 tier_not_allowed this
+    # account gets is an ENTITLEMENT refusal, so it costs no MONEY — the call
+    # DOES happen and fails, on the three never_pays sites `free: true` re-admits
+    # Large to. (An earlier draft said "costs nothing precisely because the call
+    # never happens". That sentence was retracted in model_routing.yaml by this
+    # same change and left standing here — the copy outliving its correction,
+    # which is the instance-patching signature this PR is otherwise about.)
+    # Entitlement now lives in the profile's `entitlement:` block, where it can
+    # be stated without corrupting the budget.
     ml = cfg.providers["mistral-large-free"]
-    assert ml.is_free is False
+    assert ml.is_free is True
     assert ml.model_id == "mistral-large-latest"
 
     # groq-free provider — MIGRATED 2026-08-06: Groq deprecated

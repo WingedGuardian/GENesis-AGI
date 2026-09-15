@@ -49,10 +49,18 @@ logger = logging.getLogger(__name__)
 def set_oom_score_adj(pid: int, score: int = 500) -> None:
     """Set OOM score adjustment for a process.
 
-    Higher scores make the process more likely to be OOM-killed.
-    CC subprocesses get +500 so the kernel kills them before genesis-server
-    (-500) or qdrant. This is the container-side complement to the
-    host VM's cgroup OOM scoring.
+    Higher scores make the process more likely to be OOM-killed. CC subprocesses
+    get +500 so the kernel kills them before genesis-server or qdrant. This is
+    the container-side complement to the host VM's cgroup OOM scoring.
+
+    This docstring used to say genesis-server sits at ``-500``. It never did.
+    MEASURED 2026-09-08: the unit declared ``-500`` while the live process ran at
+    ``100``, because a user manager cannot lower oom_score_adj below the inherited
+    ``oom_score_adj_min`` of 0 without CAP_SYS_RESOURCE — the write fails silently.
+    The unit now declares an achievable ``100``. Only the direction this function
+    uses is actually available to us: RAISING needs no privilege, LOWERING is
+    always refused, so every rung of the kill order has to be built by pushing
+    sacrificial processes UP rather than protecting important ones DOWN.
     """
     try:
         Path(f"/proc/{pid}/oom_score_adj").write_text(str(score))
@@ -262,6 +270,29 @@ _CC_SPAN_SETTINGS_PATH = Path.home() / ".genesis" / "cc-span-settings.json"
 # marker) BEFORE our asyncio watchdog kills the process group. One source of truth
 # for the "graceful truncation beats hard kill" invariant.
 _BG_WAIT_HARD_MARGIN_MS = 60_000
+# CC's general MCP operation timeout (env MCP_TIMEOUT, CC default 30_000ms), as a
+# string because it goes straight into the child's environment.
+#
+# NOT named after CONNECT, deliberately. It DOES bound the server connect — the
+# failure this ships for — but MEASURED in the shipped CC binary (2.1.246), the
+# same getter also bounds tools/list, resource reads, generic MCP requests, the
+# mcp_tool hook cap and the subscriptions listen stream. And CC has a SEPARATE
+# MCP_CONNECT_TIMEOUT_MS (default 5_000ms) sitting next to it in the same env
+# registry, so a constant called _MCP_CONNECT_TIMEOUT_MS would send the next
+# maintainer grepping for the wrong variable.
+#
+# The widened ceiling therefore has a mid-session cost as well as a startup one: a
+# server that wedges on tools/list now stalls 120s per operation rather than 30s.
+# The shortest MCP-carrying dispatch budget is 600s (reflection LIGHT), so that is
+# 20% of the smallest budget it is paid out of.
+#
+# MUST stay in step with the MCP_TIMEOUT in the repo's .claude/settings.json — the
+# two cannot share a constant (one is JSON read by CC, one is Python read by us),
+# so tests/test_cc/test_invoker_mcp_timeout.py compares them instead.
+#
+# 120s is ~11x the measured typical connect and ~4.7x the worst SUCCESSFUL one
+# (25,395ms against CC's 30,000ms default, which is what made a drop possible).
+_MCP_TIMEOUT_MS = "120000"
 # Grace granted to surviving DESCENDANTS after the leader exits post-terminate,
 # before the group-kill escalation (reap_bounded waits only on the leader, so
 # without this a still-flushing MCP child gets zero grace of its own).
@@ -610,6 +641,29 @@ class CCInvoker:
             env.pop("GENESIS_PARENT_SPAN_ID", None)
         if inv and inv.stream_idle_timeout_ms is not None:
             env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = str(inv.stream_idle_timeout_ms)
+        # The repo's .claude/settings.json carries the same value, but MOST
+        # dispatched sessions cannot read it: they run with a cwd outside any git
+        # repo (background_session_dir), so CC never loads the repo settings.
+        # Without this line the background fleet — reflection, research, sentinel,
+        # direct sessions — keeps CC's 30s default.
+        #
+        # The exception is a worktree-cwd dispatch (autonomy/executor/review.py
+        # passes working_dir=<worktree>), where CC DOES load repo settings — see
+        # the --settings comment in _build_args, which says so explicitly. Both
+        # halves carry the same number, so those two paths agree either way.
+        #
+        # This is the half that matters most. A server dropped on connect is gone
+        # for the life of the process and nothing announces it, so a foreground
+        # session at least has someone present to notice the tools are missing. An
+        # unattended one does not: it runs to completion believing it had memory.
+        #
+        # setdefault, matching the ceiling below: WITHIN THE ENV WE BUILD, an
+        # operator's inherited MCP_TIMEOUT wins and env_overrides (applied last)
+        # wins over both. Scoped deliberately — on a worktree-cwd dispatch CC then
+        # applies .claude/settings.json over the inherited environment
+        # (Object.assign, MEASURED in CC 2.1.246), so the repo value wins there
+        # regardless of what we set. Harmless while both carry the same number.
+        env.setdefault("MCP_TIMEOUT", _MCP_TIMEOUT_MS)
         # Own the headless background-task wait ceiling for lanes that run long
         # dispatched work. Clamp strictly below the hard timeout_s so the CLI's
         # graceful truncation + partial flush always precedes our SIGKILL. An
@@ -1228,6 +1282,7 @@ class CCInvoker:
         result_data: dict | None = None
         collected_text: list[str] = []
         event_types: list[str] = []
+        tools_seen: list[str] = []
         rate_limit_raw: dict | None = None
         timed_out = False
         terminated_after_result = False
@@ -1372,6 +1427,27 @@ class CCInvoker:
 
                     if event.event_type == "text" and event.text:
                         collected_text.append(event.text)
+                    if etype == "assistant":
+                        # Read off the RAW content array, not the parsed
+                        # StreamEvent: `from_raw` returns ONE event per message
+                        # and stops at the first recognised block, so a message
+                        # shaped `thinking + text + tool_use` parses as "text"
+                        # and drops the tool name entirely. MEASURED on this
+                        # install's own transcripts: 13 of 8655 assistant
+                        # messages carrying a tool_use (0.15%) have it in a
+                        # non-first position. Rare, but the failure is
+                        # asymmetric — if OTHER tools were captured the list is
+                        # marked runtime-sourced and rendered as authoritative
+                        # while silently incomplete, which is the exact grammar
+                        # this change exists to remove.
+                        for block in event_raw.get("message", {}).get("content", []) or []:
+                            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                                continue
+                            name = block.get("name")
+                            # First-seen order, deduplicated — the same shape
+                            # the text-scraping fallback produces.
+                            if name and name not in tools_seen:
+                                tools_seen.append(name)
                     if event.event_type == "result":
                         result_data = event_raw
                         result_text = event_raw.get("result", "")
@@ -1525,6 +1601,11 @@ class CCInvoker:
 
         if result_data is not None:
             output = self._parse_result_dict(result_data, invocation, elapsed)
+            # Unconditional: () is now a real report ("the runtime watched and
+            # saw no tool_use"), distinct from None ("nothing watched"). A
+            # `if tools_seen:` guard here would silently downgrade the former
+            # to the latter on every tool-free streaming turn.
+            output = replace(output, tools_used=tuple(tools_seen))
             # When CC uses extended thinking, the result field can be empty
             # but the actual response was emitted as text events during streaming
             if not output.text and collected_text:
@@ -1694,6 +1775,7 @@ class CCInvoker:
             model_requested=str(invocation.model),
             via_proxy=bool(invocation.anthropic_base_url),
             bg_truncated=bg_truncated,
+            tools_used=tuple(tools_seen),
             stream_lines_dropped=oversized_dropped,
         )
         if bg_truncated:

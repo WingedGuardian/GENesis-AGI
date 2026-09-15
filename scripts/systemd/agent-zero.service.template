@@ -14,7 +14,12 @@ Restart=on-failure
 RestartSec=10
 MemoryMax=80%
 LimitNOFILE=65536
-OOMScoreAdjust=-500
+# 100, not -500: a user manager cannot set a negative oom_score_adj (that needs
+# CAP_SYS_RESOURCE to go below the inherited oom_score_adj_min of 0), so the old
+# value was a SILENT no-op. Deleting the line instead would land on systemd's
+# unset default of 200 and make this unit MORE killable. See the fuller note in
+# genesis-server.service.template.
+OOMScoreAdjust=100
 StandardOutput=journal
 StandardError=journal
 NoNewPrivileges=yes

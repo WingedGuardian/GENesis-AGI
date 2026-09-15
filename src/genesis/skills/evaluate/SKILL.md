@@ -22,8 +22,10 @@ to Genesis. Produce a structured evaluation with clear recommendations.
 
 ## Workflow
 
-1. **Gather context** — Read the target material. If a URL, fetch and summarize.
-   If a concept, research current state.
+1. **Gather context** — Read the target material. If the request supplies URLs,
+   fetch every supplied URL and individually address each source; do not stop
+   because the first source seems sufficient. If a concept, research current
+   state.
 2. **Map to Genesis** — Identify which Genesis components or design decisions
    the target intersects (routing, memory, perception, surplus, etc.).
 3. **Assess fit** — Score along these axes:
@@ -50,6 +52,43 @@ to Genesis. Produce a structured evaluation with clear recommendations.
    it is not a polite default for "I don't want to act" — reach for ADOPT when the
    thing itself fits.
 5. **Write output** — Structured evaluation in the format below.
+
+## Decision Protocol: Reuse Before Rebuild
+
+Apply this protocol to concrete tools, products, libraries, repositories, and
+services. The disposition labels are the final roll-up, not the analysis.
+
+1. **Name the distinctive mechanism.** Decompose the item into the capabilities
+   or operating mechanisms that create its value. Do not compare only category
+   labels: “both route models” says nothing about how either router learns,
+   observes failures, or improves.
+2. **Separate evidence from inference.** Identify what the source demonstrates,
+   what the live Genesis map/code demonstrates, what you infer, and what remains
+   unknown. Do not turn a source claim or a plausible analogy into a fact.
+3. **Compare mechanism by mechanism.** A product can duplicate one Genesis
+   capability and still contain a valuable mechanism Genesis lacks. Rejecting
+   the package or vendor does not dispose of each mechanism inside it.
+4. **Walk the reuse ladder before proposing implementation:** direct use or
+   configuration; library/API/MCP/CLI integration; subprocess, sidecar, or
+   container; reuse of a separable upstream component; adaptation of a proven
+   pattern; only then a new Genesis implementation for the irreducible delta.
+   Language or runtime mismatch changes integration cost; it is not by itself a
+   veto. For commodity tooling, prefer a bounded trial of a mature external
+   implementation before rebuilding it.
+5. **Compare complete lifecycle cost.** External adoption includes integration,
+   operations, lock-in, privacy, and compatibility risk. Internal construction
+   includes design, implementation, testing, security review, battle-hardening,
+   maintenance, and the opportunity cost borne by a single maintainer. “Native
+   is cleaner” is not a cost comparison.
+6. **Decide at the mechanism level, then roll up.** State the viable reuse path
+   considered and why ADOPT, ADAPT, WATCH, or IGNORE beats the alternatives. If
+   recommending new implementation, name why every less-owning reuse rung fails.
+
+This is not an adoption quota. Preserve non-adoption when the evidence shows
+poor mechanism fit, unacceptable privacy/security exposure, architectural-core
+conflict, abandonment, or lifecycle cost that exceeds the value. Missing
+decisive evidence calls for a bounded investigation with the exact question and
+decision trigger—not a confident rejection or an open-ended WATCH.
 
 ## Output Format
 
@@ -106,11 +145,14 @@ we're behind, and what the actionable delta is.}
 
 ### How It Helps
 
-{Direct applicability, ready-to-use tools, validated patterns}
+{Direct applicability, ready-to-use tools, validated patterns. For a concrete
+external tool, identify its distinctive mechanism and the least-owning viable
+reuse path.}
 
 ### How It Doesn't Help
 
-{Incompatibilities, misalignment, maturity concerns}
+{Incompatibilities, misalignment, maturity concerns. Distinguish a true veto
+from integration work and compare complete lifecycle cost.}
 
 ### How It COULD Help
 

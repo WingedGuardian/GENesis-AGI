@@ -15,6 +15,7 @@ from genesis.env import ollama_enabled
 from genesis.observability.health import (
     probe_ambient_health,
     probe_db,
+    probe_falkordb,
     probe_guardian,
     probe_ollama,
     probe_qdrant,
@@ -684,6 +685,22 @@ async def infrastructure(
                 infra["ambient"].update(result.details)
     except Exception as exc:
         infra["ambient"] = {"status": "error", "error": str(exc)}
+
+    # Optional graph engine. Omitted entirely when the engine is not armed —
+    # provisioning is staged during the cutover rather than default-on, so an
+    # absent engine is a deliberate choice rather than a fault. Same shape as
+    # the ambient edge above.
+    try:
+        result = await probe_falkordb()
+        if result is not None:
+            infra["falkordb"] = {
+                "status": str(result.status),
+                "latency_ms": result.latency_ms,
+            }
+            if result.message:
+                infra["falkordb"]["message"] = result.message
+    except Exception as exc:
+        infra["falkordb"] = {"status": "error", "error": str(exc)}
 
     # Internet connectivity — from the network sentinel's window store. Key is
     # omitted when the sentinel is disabled / never ran (empty-state install).

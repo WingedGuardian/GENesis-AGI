@@ -24,6 +24,7 @@ Blocked:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 
@@ -32,11 +33,19 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import field, read_payload  # noqa: E402
 from shell_parse import (  # noqa: E402
+    _RUN_CARRIER_VALUE_FLAGS,
     Segment,
-    analyze,
+    _basename,
+    analyze_checked,
     has_trailing_override,
     is_pytest_invocation,
 )
+
+try:  # noqa: E402
+    import discarded_write
+except Exception:  # noqa: BLE001 — GUARDED: an unguarded import failure would abort
+    # module load → exit 1 → CC reads non-2 as NON-blocking → the full suite RUNS.
+    discarded_write = None  # type: ignore[assignment]
 
 _OVERRIDE = "full-suite-ok"
 
@@ -107,7 +116,11 @@ def _targets_specific_test(args: list[str]) -> bool:
         arg = args[i]
         if arg.startswith("-"):
             # a -k/-m selector (separate value, =form, or glued) narrows the run
-            if arg in ("-k", "-m") or arg.startswith(("-k", "-m", "--keyword")) or arg == "--pyargs":
+            if (
+                arg in ("-k", "-m")
+                or arg.startswith(("-k", "-m", "--keyword"))
+                or arg == "--pyargs"
+            ):
                 has_selector = True
             elif arg in _VALUE_FLAGS:
                 i += 2  # skip the flag AND its value
@@ -124,23 +137,174 @@ def _targets_specific_test(args: list[str]) -> bool:
     return has_selector or (has_file and not has_dir)
 
 
+#: Front-ends that can carry another command. If the resolver could not see PAST
+#: one of these, the segment is UNRESOLVED — which is not the same as clean.
+_CARRIER_EXES = frozenset({"uv", "uvx", "poetry", "hatch", "pdm", "pipenv", "rye"})
+
+
+def _carried_pytest_args(seg: Segment) -> list[str] | None:
+    """Args after a carried pytest executable inside an UNRESOLVED carrier, else None.
+
+    The resolver models uv's option grammar to find the carried command, and that
+    grammar is an OPEN set: a value-taking flag before `run` swallows `run`
+    itself, so the carrier stays opaque and the segment resolves to `uv`.
+    MEASURED: `uv --color always run pytest` was ALLOWED where `uv run pytest`
+    blocks. Four such gaps were reported on this PR alone, which is the signature
+    of enumerating someone else's CLI rather than a list that was merely short.
+
+    So this does not extend the grammar. It identifies the first command token
+    after the literal ``run`` and hands its following tokens to the SAME
+    `_targets_specific_test` used on a resolved run. Scanning every later token
+    is incorrect: ``uv --color always run echo pytest`` runs ``echo``, while
+    ``pytest`` is only its argument.
+
+    The scan starts AFTER the `run` literal, because a `pytest` token ahead of it
+    is a package NAME, not an invocation. MEASURED on this PR's own tree: scanning
+    the whole argv blocked 18 install/inspect commands — `uv pip install pytest`,
+    `uv add pytest`, `poetry add pytest`, `pipenv install pytest`, `pdm remove
+    pytest`, `uv pip show pytest` — with a message telling the user to target a
+    specific file, advice that means nothing for an install. Requiring the literal
+    keeps the whole fail-open set closed: `uv --color always run pytest` and
+    `uv --cache-dir /tmp/c run pytest` both carry `run` AHEAD of the token, which
+    is exactly why the closed question beats modelling the flag grammar. `uvx`
+    takes the command directly and has no subcommand to require.
+
+    Both walks skip a value-flag's VALUE, using the SAME list the resolver walks
+    with. That is one grammar dependency back, taken deliberately, because the
+    unlisted-flag direction of this list is the safe one: a missing entry costs an
+    extra token read (an over-block, overridable), while the list's one dangerous
+    direction — a BOOLEAN flag wrongly listed — is the failure `--isolated` already
+    taught this module, and is guarded there. Without the skip, a package NAME
+    passed to a flag was read as the command: MEASURED, `uv --color always run
+    --with pytest ruff check .` (a ruff run) and `uv --color always run --with
+    pytest pytest tests/foo.py` (a correctly TARGETED run) both blocked.
+
+    SECOND KNOWN RESIDUAL, also safe direction, and it is the price of the
+    confidence rule below: once the walk meets an option it cannot size, it stops
+    claiming to know which bare word is the command and looks for a `pytest`
+    token among the rest. So `uvx --allow-insecure-host h echo pytest` — which
+    runs `echo` — is refused. That is the same over-read the docstring above
+    rejects for the CONFIDENT case, accepted here only because confidence is
+    gone: the alternative is committing to the flag's value and allowing the
+    whole-suite run this function exists to stop. It costs a refusal
+    `# full-suite-ok` clears.
+
+    It is narrower than it first looks, and the narrowing was MEASURED rather
+    than assumed — the first example written here was wrong and a test caught it.
+    The option must be unknown to BOTH this list and the resolver's `uvx` wrapper
+    spec. A flag only the resolver lacks (`--directory`) leaves the segment on
+    the carrier, but THIS walk still sizes it, stays confident, and reads `echo`
+    as the command exactly as before.
+
+    KNOWN RESIDUAL, safe direction: the `run` walk skips only flags it knows, so a
+    literal `run` reached as an unlisted flag's value still ends the walk —
+    `uv pip install --target run pytest` over-blocks. It is an install into a
+    directory named `run`, it is refused rather than allowed, and `# full-suite-ok`
+    clears it. Closing it needs pip's grammar, which is the open set this function
+    exists to avoid.
+
+    Returns None when the segment is not a carrier, carries no `run` subcommand,
+    or carries a command other than pytest — `uv pip install requests` must stay
+    allowed.
+    """
+    if _basename(seg.exe) not in _CARRIER_EXES:
+        return None  # resolved to a real command (or not a carrier at all)
+    argv = seg.argv
+    i = 1
+    if _basename(seg.exe) != "uvx":
+        # `uv pip install pytest` installs pytest, it does not run it — only a
+        # `run` subcommand carries a command. (`uvx` takes the command directly.)
+        while i < len(argv):
+            tok = argv[i]
+            if tok in _RUN_CARRIER_VALUE_FLAGS and "=" not in tok:
+                i += 2  # a flag's value is never the subcommand
+                continue
+            if tok == "run":
+                i += 1
+                break
+            i += 1
+        else:
+            return None
+    confident = True
+    while i < len(argv):
+        tok = argv[i]
+        if tok in _RUN_CARRIER_VALUE_FLAGS and "=" not in tok:
+            i += 2  # `--with pytest` names a DEPENDENCY, not the command being run
+            continue
+        if tok.startswith("-"):
+            # An option of unknown arity. From here the walk can no longer say
+            # WHICH bare word is the command, because the next one may be this
+            # flag's value — so it stops treating the first bare word as the
+            # answer. Committing to it is the fail-OPEN reading: MEASURED,
+            # `uvx --directory /tmp pytest` resolved `tmp`, concluded "not
+            # pytest" and exited 0 where `uvx pytest` exits 2.
+            confident = confident and "=" in tok
+            i += 1
+            continue
+        if _basename(tok).split("@", 1)[0] != "pytest":  # uv permits `pytest@8.3.5`
+            if confident:
+                return None  # the command is known, and it is not pytest
+            i += 1  # unsure which token is the command — keep looking for one
+            continue
+        return argv[i + 1 :]
+    return None
+
+
 def main() -> None:
     cmd = field(read_payload(), "command")
+    if discarded_write is not None:
+        with contextlib.suppress(Exception):  # not run_guard-wrapped: a raise here exits 1 = NON-blocking
+            discarded_write.remember(cmd)
     if not cmd:
         return
     try:
-        segments = analyze(cmd)
+        segments, blind = analyze_checked(cmd)
     except Exception:
         return  # parse failure → fail open; never wrongly block a legit command
 
+    # A parse cut short by one of shell_parse's BOUNDS is not evidence there is no
+    # pytest run in here. This guard's fail-open posture is about a command it cannot
+    # read AT ALL; a bound does not raise, it quietly returns fewer segments, so
+    # reading that as "no pytest" turned a refusal into an allow. MEASURED before this
+    # call was switched: a bare `pytest` nested 9 deep went from refused to allowed.
+    #
+    # `untokenizable` is deliberately EXCLUDED — it predates the bounds, this guard
+    # already allowed those, and failing closed on it would newly refuse 161 of 3,222
+    # real pytest-mentioning commands (against 0 for the bounds). Restore what the
+    # bound took; do not widen under cover of the same edit.
+    #
+    # BOTH bounds refuse. There is no per-axis severity to consult, for the reason
+    # documented at length in git_discard_guard._clean_violation. This guard's only
+    # verdicts are BLOCK and ALLOW; it cannot ask. For a guard with no third option,
+    # softening an axis is not "a lighter verdict", it is a silent permit, and the
+    # sibling layer that was supposed to cover the softened case did not.
+    # Cost of refusing both: 0 of 45,956 real commands reach either bound.
+    if blind is not None and blind.bounds_induced and "pytest" in cmd:
+        print(
+            f"BLOCKED: this command {blind.cause}, so this guard cannot check whether "
+            f"the pytest run inside it is targeted — and an untargeted full-suite run "
+            f"starves the live services on this shared box. To proceed: {blind.hint}. "
+            f"Run the pytest on its own line and it will be checked precisely; "
+            f"'# full-suite-ok' still works on the parsed path.",
+            file=sys.stderr,
+        )
+        if discarded_write is not None:
+            with contextlib.suppress(Exception):  # not run_guard-wrapped: a raise here exits 1 = NON-blocking
+                discarded_write.warn()
+        sys.exit(2)
+
     pytest_segs = [s for s in segments if is_pytest_invocation(s)]
-    if not pytest_segs:
+    # Unresolved carriers are evaluated on the same rule, not waved through.
+    carried = [a for a in (_carried_pytest_args(s) for s in segments) if a is not None]
+    if not pytest_segs and not carried:
         return
     if any(has_trailing_override(s.raw, _OVERRIDE) for s in segments):
         return  # explicit opt-in to a local full/dir run
 
-    # Block if ANY pytest segment is a non-targeted (bare or directory) run.
-    if all(_targets_specific_test(_pytest_args(s)) for s in pytest_segs):
+    # Block if ANY pytest run — resolved or carried — is non-targeted.
+    resolved_ok = all(_targets_specific_test(_pytest_args(s)) for s in pytest_segs)
+    carried_ok = all(_targets_specific_test(a) for a in carried)
+    if resolved_ok and carried_ok:
         return
 
     print(
@@ -151,6 +315,9 @@ def main() -> None:
         f"local full run, append '# {_OVERRIDE}' to the command.",
         file=sys.stderr,
     )
+    if discarded_write is not None:
+        with contextlib.suppress(Exception):  # not run_guard-wrapped: a raise here exits 1 = NON-blocking
+            discarded_write.warn()
     sys.exit(2)
 
 
