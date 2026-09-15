@@ -90,10 +90,27 @@ sid8=$(git -C <worktree> log -1 --format='%(trailers:key=Genesis-Session,valueon
 
 # Is a session with that id still alive? session_heartbeats is written every
 # prompt; 10 minutes is the staleness window its own reader uses.
-sqlite3 "file:$HOME/genesis/data/genesis.db?mode=ro" \
-  "SELECT cc_session_id, topic FROM session_heartbeats
-    WHERE cc_session_id LIKE '${sid8}%'
-      AND updated_at > datetime('now','-10 minutes');"
+#
+# GUARD THE EMPTY TRAILER FIRST. 45 of 164 worktrees have none, and an empty
+# `sid8` makes the predicate `LIKE '%'`, which matches every live session
+# INCLUDING YOUR OWN — MEASURED: 3 of 3 rows. That reports an idle worktree as
+# owned and stalls the queue, so an empty trailer must fall through to the
+# recent_files scan below, never to this query.
+#
+# And compare the timestamps with `julianday`, not as text. `updated_at` is
+# written by `datetime.now(UTC).isoformat()` (`2026-09-15T15:17:36.5+00:00`)
+# while `datetime('now', …)` returns `2026-09-15 15:08:09` — a space where the
+# stored value has `T`. MEASURED: `'…T12:00:00+00:00' > '… 14:00:00'` is TRUE
+# because `T` sorts after a space, so a two-hour-stale heartbeat passes a
+# ten-minute window and the advertised staleness check is fiction for any
+# heartbeat sharing today's date. `julianday` parses both spellings and
+# returns FALSE on that same pair.
+if [ -n "$sid8" ]; then
+  sqlite3 "file:$HOME/genesis/data/genesis.db?mode=ro" \
+    "SELECT cc_session_id, topic FROM session_heartbeats
+      WHERE cc_session_id LIKE '${sid8}%'
+        AND julianday(updated_at) > julianday('now','-10 minutes');"
+fi
 
 # Coverage filler: a session that has TOUCHED this worktree without committing
 # yet. Cross-check each id against the heartbeat query above — this file
@@ -123,6 +140,14 @@ they miss.** MEASURED on this install: the commit trailer is present on 119 of
 only the last 20 paths and only from `Read|Edit|Write|Glob|Grep`;
 `session_heartbeats` carries foreground sessions, so a dispatched one does not
 appear. A worktree can therefore be live and show nothing here.
+
+**RUN, not just written — and the complementarity is the measured part.** The
+block above was executed against three worktrees and discriminated all three
+correctly: a live one whose HEAD carries a trailer (the heartbeat named the
+session and its topic), a live one whose HEAD is a MERGE COMMIT and therefore
+carries NO trailer (heartbeat correctly skipped, `recent_files` caught it), and
+an idle one (neither fired). The middle case is why the filler is not optional:
+merging main into a branch strips the only signal the first two steps read.
 
 **None of this is a lock.** There is no lease or ownership record in the system
 today — this is evidence, read the same way the repo reads a peer's claim
@@ -210,8 +235,17 @@ git fetch origin main --quiet
 [ "$(git -C <tooling-tree> rev-parse HEAD)" = "$(git rev-parse origin/main)" ] \
   && echo "tooling is canonical"
 
-# PR tree: ANCESTRY is the right test — it must CONTAIN main, and it is
-# supposed to carry the PR's own commits on top.
+# PR tree: TWO tests, and ancestry alone is not enough. Ancestry says the
+# branch CONTAINS main; it says nothing about whether this tree sits at the
+# commit `--check-pr` is grading. If a peer pushed H2 while this worktree
+# stayed at H1, H1 still contains main and still passes ancestry — so the gate
+# diagnoses H2 while you read and test H1. Require EQUALITY with the PR's live
+# head, then ancestry for main.
+head=$(gh pr view <N> --json headRefOid --jq .headRefOid)
+[ "$(git -C <pr-tree> rev-parse HEAD)" = "$head" ] \
+  && echo "worktree is at the PR head" \
+  || echo "STALE — pull before reading findings or running tests"
+
 git -C <pr-tree> merge-base --is-ancestor origin/main HEAD \
   && echo "PR branch contains current main"
 ```
@@ -356,8 +390,14 @@ merges on its own initiative is worse than no closing session.
 - **It fixes findings on other sessions' PRs.** That is the normal case, not an
   exception — measured: PR #1541's originating session had died and the work sat
   unowned. Ownership lives with the queue, not with the author.
-- **It does not open new work.** If it finds an UNRELATED bug, it files it
-  (`follow_up_create`) and moves on. Note this is a deliberate narrowing of
+- **It does not open new work.** If it finds an UNRELATED bug, it files it and
+  moves on — **routed by OWNER, per CLAUDE.md's "Where deferred work goes"**.
+  An unrelated defect in Genesis itself is repo work, so it becomes a **GitHub
+  issue**, scrubbed to technical detail only; that is what lets another
+  contributor pick it up instead of leaving it install-local and invisible to
+  the project queue. `follow_up_create` is for user-owned work and state purely
+  local to this box, not for a repo bug. A security defect is never filed
+  publicly before it is fixed. Note this is a deliberate narrowing of
   CLAUDE.md's "bias = FIX NOW" default, not an exemption from it: a closing
   session is the standing case (3) of that rule — fixing unrelated things in
   place is how it turns back into a build session and stops closing anything. A
@@ -385,11 +425,19 @@ not assume the absence of a recorded dependency means there is none.
    against an independent denominator before trusting it:
 
    ```bash
-   gh pr list --state open --limit 200 --json number,title | jq length
+   gh pr list --state open --limit 200 --json number,title,isDraft | jq length
    gh search prs --repo <owner>/<repo> --state open --json number --limit 200 | jq length
    ```
 
    The two numbers must agree; if either equals its limit, raise both and re-run.
+
+   **Ask for `isDraft` and split on it.** `--state open` includes drafts, and
+   nothing downstream separates them: `--check-pr` has no draft check, and its
+   `mergeable` row is GitHub's conflict field, so a draft whose CI and review
+   evidence are current reports `MERGEABLE (all gates pass)` and sorts into the
+   queue as a merge candidate — which GitHub will then refuse to merge. A draft
+   is not a merge candidate until someone marks it ready; count it, list it,
+   and keep it out of the closing set.
    Re-reading the same capped list on every pass never discovers the remainder,
    so the omitted PRs are neither checked nor weighed when sorting by cost — they
    simply never enter the queue. Then `--check-pr` each one.
