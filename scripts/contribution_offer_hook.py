@@ -12,7 +12,10 @@ Budget: 10s hook timeout configured in .claude/settings.json (CC hook timeouts
 are in seconds). Real cost should be <5ms even when pending offers exist. No
 network, no heavy I/O.
 
-Stdlib only — no Genesis imports, no venv required.
+Stdlib only — no Genesis imports, no venv required. ``hook_output`` is a sibling
+hook helper importing nothing but ``json``/``sys``/``typing``, so routing through
+it keeps that contract; five other ``scripts/*.py`` hooks already import it the
+same way.
 """
 from __future__ import annotations
 
@@ -22,6 +25,11 @@ import os
 import sys
 import traceback
 from pathlib import Path
+
+# hook_output lives in scripts/hooks/; this script runs from scripts/, a
+# different sys.path[0] — same insert the other cross-dir hooks use.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
+from hook_output import print_bounded  # noqa: E402
 
 
 def _pending_dir() -> Path:
@@ -58,8 +66,10 @@ def _load_marker(marker: Path) -> dict | None:
 
 def _format_reminder(marker_data: dict) -> str:
     sha = str(marker_data.get("sha", "unknown"))[:12]
-    # Sliced: a git commit subject has no length limit, and this hook is exempt
-    # from the bounding gate on the claim that its output cannot reach the cap.
+    # Sliced because a git commit subject has no length limit. This is no longer
+    # the thing that bounds the hook — main() writes through print_bounded, which
+    # enforces the cap at the write — but the slice stays: it keeps the reminder a
+    # readable one-liner rather than something the writer has to truncate.
     subject = str(marker_data.get("subject", "<unknown subject>"))[:200]
     return (
         f"[Contribution] A 'fix:' commit just landed ({sha} \"{subject}\"). "
@@ -93,7 +103,13 @@ def main() -> int:
         with contextlib.suppress(OSError):
             marker.unlink()
 
-        print(reminder, flush=True)
+        # Routed rather than exempted. The two slices in _format_reminder above
+        # still bound this in practice, but a slice is a claim someone has to keep
+        # re-reading, and an exemption makes the gate stop scanning the file
+        # entirely — so the claim rots silently. Going through the writer costs one
+        # call and removes the row: the bound is then enforced at the point of
+        # writing rather than asserted about it.
+        print_bounded(reminder, label="contribution")
         return 0
     except Exception:
         # Fail-open. Log to stderr (CC captures it for debug but never shows
