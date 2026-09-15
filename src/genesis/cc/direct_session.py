@@ -1076,6 +1076,14 @@ class DirectSessionRunner:
                         tools_summary=None if _incomplete else metadata.get("tools_summary"),
                         session_success=result.success,
                         caller_context=_audit_ctx,
+                        # Withholding the summary routes the auditor to the
+                        # transcript; telling it the stream was incomplete is
+                        # what lets it distinguish "the transcript says nothing
+                        # happened" from "there is no transcript". Without
+                        # this, a dropped event plus a background-truncated
+                        # run with no session_id produced a CLEAN audit over
+                        # no evidence at all (Codex P1, PR #1625).
+                        stream_incomplete=_incomplete,
                     )
                 except Exception:
                     logger.debug(
