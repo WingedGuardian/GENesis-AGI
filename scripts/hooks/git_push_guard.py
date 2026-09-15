@@ -7900,6 +7900,75 @@ def _push_is_republish(remote: str | None, branch: str | None, cwd: str | None =
     return _remote_branch_sha(remote, branch, cwd=cwd) is not None
 
 
+def _open_pr_count_for_branch(branch: str, cwd: str | None = None) -> int | None:
+    """How many OPEN PRs have ``branch`` as their head, or None if unknowable.
+
+    Distinguishing 0 from None is the point of the return type: 0 is a measured
+    "this public branch has no PR" — the state where CI and the leak-detector
+    never run, since ci.yml triggers on pull_request — while None is "the
+    question could not be answered" (no gh, no network, no auth). Callers treat
+    None as the status quo, never as 0: this feeds a HYGIENE prompt, not a
+    security verdict, and the first-push approval it modulates already happened.
+    Bounded by a 10s timeout inside the hook's budget, like the ls-remote probe
+    above.
+    """
+    try:
+        args = ["gh", "pr", "list", "--head", branch, "--state", "open",
+                "--json", "number", "--limit", "10"]
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=10, cwd=cwd or None
+        )
+        if result.returncode != 0:
+            return None
+        return len(json.loads(result.stdout))
+    except Exception:
+        return None
+
+
+def _prs_already_containing_head(cwd: str | None = None) -> list[tuple[int, str]]:
+    """PRs (number, state) that already contain the CURRENT HEAD commit.
+
+    The duplicate-name detector. The zombie-PR mechanism measured on this repo
+    was one body of work published under TWO branch names: the first merged by
+    squash (destroying ancestry), the second surviving to be mistaken for
+    unpublished work and grown into a duplicate PR for changes already on main.
+    At first-push time the question "does this exact commit already belong to a
+    PR?" answers that directly, and GitHub indexes it
+    (``commits/{sha}/pulls``) — no ancestry inference, which squash defeats.
+
+    Empty list on ANY failure: this only ENRICHES an ask prompt that is being
+    shown regardless, so an unanswerable lookup degrades to the prompt as it
+    was, never to a block and never to a silent pass of anything.
+    """
+    try:
+        head = subprocess.run(
+            ["git"] + (["-C", cwd] if cwd else []) + ["rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        sha = head.stdout.strip()
+        if head.returncode != 0 or not sha:
+            return []
+        slug = subprocess.run(
+            ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+            capture_output=True, text=True, timeout=10, cwd=cwd or None,
+        )
+        if slug.returncode != 0 or not slug.stdout.strip():
+            return []
+        result = subprocess.run(
+            ["gh", "api", f"repos/{slug.stdout.strip()}/commits/{sha}/pulls"],
+            capture_output=True, text=True, timeout=10, cwd=cwd or None,
+        )
+        if result.returncode != 0:
+            return []
+        return [
+            (int(pr["number"]), str(pr.get("state", "?")))
+            for pr in json.loads(result.stdout)
+            if isinstance(pr, dict) and "number" in pr
+        ][:5]
+    except Exception:
+        return []
+
+
 def _ask(reason: str) -> int:
     """Emit a PreToolUse ``ask`` decision — a native approve/deny dialog.
 
@@ -8391,6 +8460,41 @@ def _run_merge_and_push_gates() -> int:
                         ask_reason = (
                             f"git push needs your approval before publishing externally "
                             f"(target: {branch or 'default'})."
+                        )
+                        # FIRST PUBLICATION of this branch. If its tip commit
+                        # already belongs to a PR, this push is re-publishing
+                        # work under a SECOND NAME — the exact mechanism that
+                        # manufactured this repo's zombie PRs (one squash-merge
+                        # later, ancestry is gone and the survivor reads as
+                        # unmerged work forever). Say so IN the prompt the user
+                        # is about to answer; enrichment only, never a verdict.
+                        dups = _prs_already_containing_head(cwd=pcwd)
+                        if dups:
+                            listing = ", ".join(f"#{n} ({s})" for n, s in dups)
+                            ask_reason += (
+                                f" NOTE: this exact commit already belongs to "
+                                f"{listing} — publishing it under a new branch "
+                                f"name creates a duplicate of work that PR "
+                                f"already carries."
+                            )
+                    # A RE-PUSH earns its silence by having been approved at
+                    # first publication — but a public branch with NO OPEN PR is
+                    # outside CI and the leak-detector (ci.yml triggers on
+                    # pull_request), so its silence is the state this repo's
+                    # standing rule forbids: published, unchecked, and quietly
+                    # growing. Downgrade the silent allow to an ASK naming the
+                    # gap. A lookup that cannot answer (None) keeps the status
+                    # quo — this is a hygiene prompt on an already-approved
+                    # branch, not a security boundary, so an unanswerable
+                    # question must not manufacture prompts on every network
+                    # blip.
+                    if push_allow_reason and _open_pr_count_for_branch(cur, cwd=pcwd) == 0:
+                        push_allow_reason = None
+                        ask_reason = (
+                            f"re-push to '{cur}': this branch is PUBLIC but has "
+                            f"NO OPEN PR, so CI and the leak scan never run on "
+                            f"it. Approve to push, then open its PR "
+                            f"(gh pr create) — or close the branch out."
                         )
                 else:
                     ask_reason = (
