@@ -547,3 +547,61 @@ async def test_a_successful_batch_still_drops_the_superseded_vector(tmp_path: Pa
     mock_own.commit.assert_awaited()
     deleted = [c.kwargs["point_id"] for c in mock_delete_point.call_args_list]
     assert deleted == ["qid-old"], deleted
+
+
+async def test_a_failure_opening_the_owned_connection_still_drops_phase_one_vectors(
+    tmp_path: Path,
+):
+    """Acquiring the phase-2 connection is itself a phase-2 failure point.
+
+    ``get_raw_db`` connects AND runs setup PRAGMAs, either of which can raise.
+    That happens BEFORE the inner ``try``, and by then phase 1 has already made
+    every unit's vector visible — so the exception escaped past both the
+    rollback and ``_drop_vectors``. ``ingest_source`` then reported zero stored
+    units while the vectors stayed recallable, with no ``knowledge_units`` row
+    or manifest entry naming them: orphans nothing could find to clean up.
+    (Codex P2, PR #1653.)
+
+    Asserted on the COMPENSATION rather than on the raised error, because the
+    error was never the defect — it propagated correctly all along. What went
+    missing is the cleanup.
+    """
+    orch = _make_orchestrator(tmp_path, mock_distill_result=_units(3))
+
+    @contextlib.asynccontextmanager
+    async def _refuses_to_open(_path):
+        raise RuntimeError("disk I/O error opening database")
+        yield  # pragma: no cover - unreachable, required to make this a CM
+
+    stored: list[str] = []
+
+    async def _store(*_a, **_kw):
+        stored.append(f"qid-{len(stored)}")
+        return stored[-1]
+
+    mock_store = MagicMock()
+    mock_store.store = AsyncMock(side_effect=_store)
+    mock_store._qdrant = MagicMock()
+    mock_store._embeddings = MagicMock(model_name="test-model")
+
+    dropped: list[str] = []
+
+    def _delete_point(_client, collection, point_id):
+        dropped.append(point_id)
+
+    with patch("genesis.mcp.memory_mcp._require_init"), \
+         patch("genesis.mcp.memory_mcp._store", mock_store), \
+         patch("genesis.mcp.memory_mcp.knowledge", MagicMock()), \
+         patch("genesis.db.connection.get_raw_db", _refuses_to_open), \
+         patch("genesis.qdrant.collections.delete_point", _delete_point):
+        file = tmp_path / "test.txt"
+        file.write_text("some content")
+        await orch.ingest_source(str(file), project_type="test")
+
+    assert stored == ["qid-0", "qid-1", "qid-2"], (
+        f"phase 1 did not run, so this never exercised the hazard: {stored}"
+    )
+    assert sorted(dropped) == ["qid-0", "qid-1", "qid-2"], (
+        "phase-1 vectors were left orphaned when the owned connection could "
+        f"not be opened — compensation never ran (dropped={dropped})"
+    )

@@ -474,3 +474,158 @@ class TestAnchorWritesGoWhereTheCallerSaid:
             "--db is not honoured: writes would go to the default database while "
             "the run reports against the file the operator named"
         )
+
+class TestAnchorWritesFollowTheStoresDatabase:
+    """A MemoryStore must anchor into the database its OWN connection is on.
+
+    `record_anchors` deliberately takes a PATH, not this store's connection —
+    owning its own connection is what keeps it off the shared
+    `SerializedConnection`. But it resolves `genesis_db_path()` when given no
+    target, so a store bound to a NON-default database silently enriched the
+    live default entity graph while the database the caller named stayed
+    unenriched: dangling mentions in one, missing anchors in the other, both
+    halves quiet. (Codex P1, PR #1653.)
+
+    Asserted on the EFFECT — which rows land in which FILE — rather than on
+    the argument, because the argument is an implementation detail of how the
+    target reaches the writer, and the rows are the thing that was wrong.
+    """
+
+    ANCHORED = "the fix lives in src/genesis/memory/store.py and nowhere else"
+    ANCHOR_TABLES = ("entities", "entity_mentions", "entity_links", "deferred_work_queue")
+
+    @classmethod
+    async def _create_tables(cls, conn):
+        for table in cls.ANCHOR_TABLES:
+            await conn.execute(TABLES[table])
+        await conn.commit()
+
+    @classmethod
+    async def _make_db(cls, path):
+        conn = await aiosqlite.connect(str(path))
+        try:
+            await cls._create_tables(conn)
+        finally:
+            await conn.close()
+
+    @staticmethod
+    async def _mentions_in(path) -> int:
+        conn = await aiosqlite.connect(str(path))
+        try:
+            cur = await conn.execute("SELECT COUNT(*) FROM entity_mentions")
+            return (await cur.fetchone())[0]
+        finally:
+            await conn.close()
+
+    @classmethod
+    async def _store_through(cls, conn):
+        from genesis.memory.store import MemoryStore
+
+        ep = MagicMock()
+        ep.embed = AsyncMock(return_value=[0.1] * 1024)
+        ep.enrich = MagicMock(return_value="episodic: x")
+        store = MemoryStore(
+            embedding_provider=ep,
+            qdrant_client=MagicMock(),
+            db=conn,
+            linker=None,
+        )
+        with (
+            patch("genesis.memory.store.upsert_point"),
+            patch("genesis.memory.store.memory_crud") as mock_mem,
+        ):
+            mock_mem.upsert = AsyncMock(return_value="mem-1")
+            mock_mem.create_metadata = AsyncMock(return_value=None)
+            mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
+            await store.store(
+                content=cls.ANCHORED,
+                memory_type="episodic",
+                source="test",
+            )
+
+    @pytest.mark.asyncio
+    async def test_an_isolated_store_anchors_into_its_own_database(self, tmp_path):
+        default_db = tmp_path / "default.db"
+        isolated_db = tmp_path / "isolated.db"
+        await self._make_db(default_db)
+        await self._make_db(isolated_db)
+
+        # genesis_db_path() is what record_anchors falls back to with no
+        # target. Pointing it at a sentinel makes a regression VISIBLE here
+        # instead of writing into the real graph of whoever runs the suite.
+        with patch("genesis.env.genesis_db_path", return_value=str(default_db)):
+            conn = await aiosqlite.connect(str(isolated_db))
+            conn.row_factory = aiosqlite.Row
+            try:
+                await self._store_through(conn)
+            finally:
+                await conn.close()
+
+        assert await self._mentions_in(isolated_db) == 1, (
+            "the database this store is bound to received no anchors"
+        )
+        assert await self._mentions_in(default_db) == 0, (
+            "anchors leaked into the DEFAULT graph — the reported defect"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_in_memory_store_does_not_anchor_into_the_default(self, tmp_path):
+        # An in-memory database reports '' from PRAGMA database_list: no file
+        # another connection could open. Falling back to genesis_db_path()
+        # there would write into a database the caller never named — the same
+        # defect wearing different clothes — so anchoring is SKIPPED.
+        default_db = tmp_path / "default.db"
+        await self._make_db(default_db)
+
+        with patch("genesis.env.genesis_db_path", return_value=str(default_db)):
+            conn = await aiosqlite.connect(":memory:")
+            conn.row_factory = aiosqlite.Row
+            await self._create_tables(conn)
+            try:
+                await self._store_through(conn)
+            finally:
+                await conn.close()
+
+        assert await self._mentions_in(default_db) == 0, (
+            "an in-memory store wrote anchors into the default database"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_target_is_resolved_once_per_store(self, tmp_path):
+        # The target is derived from the connection rather than passed in, so
+        # it sits on the hot store path. Pin the cache: a regression here is a
+        # PRAGMA per store() call, which is silent and shows up only as load.
+        from genesis.memory.store import MemoryStore
+
+        db_file = tmp_path / "x.db"
+        await self._make_db(db_file)
+        conn = await aiosqlite.connect(str(db_file))
+        conn.row_factory = aiosqlite.Row
+        try:
+            ep = MagicMock()
+            ep.embed = AsyncMock(return_value=[0.1] * 1024)
+            store = MemoryStore(
+                embedding_provider=ep,
+                qdrant_client=MagicMock(),
+                db=conn,
+                linker=None,
+            )
+            first = await store._anchor_target()
+
+            real_execute = conn.execute
+            seen: list[str] = []
+
+            async def _counting(sql, *a, **kw):
+                seen.append(str(sql))
+                return await real_execute(sql, *a, **kw)
+
+            conn.execute = _counting  # type: ignore[assignment]
+            second = await store._anchor_target()
+        finally:
+            await conn.close()
+
+        assert first == (True, str(db_file)), first
+        assert second == first
+        assert not [s for s in seen if "database_list" in s], (
+            f"the target was re-derived instead of cached: {seen}"
+        )

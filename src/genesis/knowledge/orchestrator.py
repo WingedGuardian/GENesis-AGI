@@ -501,7 +501,54 @@ class KnowledgeOrchestrator:
         # PHASE 2 — the owned SQLite envelope. Nothing inside it writes through
         # another connection, so the writer slot it holds is uncontended by us.
         stale_ids: list[str] = []
-        async with get_raw_db(genesis_db_path()) as own:
+        async with contextlib.AsyncExitStack() as stack:
+            # ACQUISITION IS ITSELF A PHASE-2 FAILURE POINT, and it sits before
+            # the envelope's own guard. `get_raw_db` connects AND runs setup
+            # PRAGMAs, either of which can raise — by which time phase 1 has
+            # already made every unit's vector visible. Such an exception used
+            # to escape past both the rollback and `_drop_vectors`, so
+            # `ingest_source` reported zero stored units while the vectors
+            # stayed recallable with no `knowledge_units` row or manifest entry
+            # naming them: orphans nothing could find to clean up. Entering
+            # through the stack keeps the guard here without moving the
+            # envelope's body. (Codex P2, PR #1653.)
+            #
+            # This closes the ACQUISITION path, not every path. TWO remain,
+            # both pre-existing and unchanged here, written down so the guard
+            # below is not read as total coverage:
+            #   - commit succeeds, then the connection fails to CLOSE. The
+            #     exception escapes both handlers and nothing is dropped,
+            #     which is correct because the rows are durable — but
+            #     `ingest_source` still returns units_created=0 and skips the
+            #     manifest update, so committed rows exist that no manifest
+            #     names.
+            #   - CANCELLATION. `aiosqlite.connect` awaits a thread future and
+            #     is a cancellation point, and `except Exception` does not
+            #     catch `CancelledError`, so a cancel here skips compensation
+            #     exactly as an acquisition exception used to. Deliberate:
+            #     broadening to BaseException would fire Qdrant delete calls
+            #     from an already-cancelled coroutine.
+            #
+            # The review offered a second remedy — acquire the connection
+            # BEFORE phase 1, so the failure cannot happen with vectors already
+            # written. Not taken, deliberately: it holds an open connection
+            # across the embedding and Qdrant calls, which are the slow part of
+            # this method, and it buys that by reindenting phase 1 into the
+            # envelope. Guarding the acquisition costs neither. The tradeoff is
+            # that compensation here is best-effort, since _drop_vectors only
+            # warns per point.
+            try:
+                own = await stack.enter_async_context(get_raw_db(genesis_db_path()))
+            except Exception:
+                logger.error(
+                    "Owned connection unavailable after %d/%d vectors from %s — compensating",
+                    len(qdrant_ids),
+                    len(units),
+                    source,
+                    exc_info=True,
+                )
+                _drop_vectors(qdrant_ids, "phase-2 acquisition failure")
+                raise
             try:
                 await own.execute("BEGIN IMMEDIATE")
                 for unit, qdrant_id in zip(units, qdrant_ids, strict=True):

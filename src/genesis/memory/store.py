@@ -84,8 +84,74 @@ class MemoryStore:
         self._embeddings = embedding_provider
         self._qdrant = qdrant_client
         self._db = db
+        # Cache for _anchor_target(); resolved once, lazily, from `db` itself.
+        self._anchor_target_cache: tuple[bool, str | None] | None = None
         self._linker = linker
         self._event_bus = event_bus
+
+    async def _anchor_target(self) -> tuple[bool, str | None]:
+        """Which database the anchor writer should own a connection to.
+
+        Returns ``(should_write, db_path)``.
+
+        `record_anchors` deliberately takes a PATH rather than this store's
+        connection — owning its own connection is what keeps it off the shared
+        `SerializedConnection`. But it resolves `genesis_db_path()` when given
+        no target, so a store bound to a NON-default database silently enriched
+        the live default entity graph while the database the caller named
+        stayed unenriched: dangling mentions in one, missing anchors in the
+        other, both halves quiet. (Codex P1, PR #1653.)
+
+        The target is DERIVED from the connection rather than passed in
+        alongside it. A parameter would be a convention every one of the 24
+        construction sites has to remember, and the two that were wrong are
+        proof of how that ends; asking the connection cannot drift from it.
+        MEASURED on the real `SerializedConnection`: `PRAGMA database_list`
+        answers in ~0.32 ms, and it is cached here after the first call.
+
+        An in-memory database reports `''` — no file another connection could
+        open — so anchoring is SKIPPED rather than redirected. Falling back to
+        `genesis_db_path()` there would write into a database the caller never
+        named, which is the whole defect this path exists to prevent.
+
+        UNKNOWN and IN-MEMORY are different answers and degrade differently.
+        A reported `''` is knowledge — there is no file — and anchoring is
+        skipped. A pragma that fails, or a row this cannot read, is the
+        ABSENCE of knowledge, and falls back to `(True, None)`: the historical
+        behaviour, so an unexpected shape degrades to what shipped before
+        rather than silently dropping every anchor. Collapsing the two is what
+        the first version of this did, and it disarmed the seam test above by
+        routing its mock connection into the skip branch.
+
+        The unknown answer is NOT cached: a transient failure — a SQLITE_BUSY
+        that outlives the retry, a call mid-reconnect — must not pin the
+        degraded target for a store that lives as long as the process.
+        """
+        if self._anchor_target_cache is not None:
+            return self._anchor_target_cache
+
+        resolved: str | None = None
+        try:
+            cursor = await self._db.execute("PRAGMA database_list")
+            row = await cursor.fetchone()
+            # (seq, name, file). Anything that is not a readable row of that
+            # shape is an unknown target, never an in-memory one — note a
+            # MagicMock satisfies `len(row)` as 0, which is exactly how the
+            # collapsed version routed mocks into "skip".
+            if row is not None and len(row) >= 3 and isinstance(row[2], str):
+                resolved = row[2]
+        except Exception:
+            logger.debug(
+                "could not resolve the store's database path for anchors; "
+                "falling back to the default target",
+                exc_info=True,
+            )
+
+        if resolved is None:
+            return (True, None)
+
+        self._anchor_target_cache = (bool(resolved), resolved or None)
+        return self._anchor_target_cache
 
     @property
     def qdrant_client(self) -> QdrantClient:
@@ -432,10 +498,22 @@ class MemoryStore:
         # longer writes on self._db), so the metadata write above must already be
         # committed here — it is (create_metadata commits) — or the owned conn's
         # BEGIN IMMEDIATE would deadlock against this coroutine's own open txn.
+        #
+        # Owning the connection means it also needs the TARGET — see
+        # _anchor_target(), which derives it from `self._db` so it cannot drift
+        # from the database this store is actually bound to.
         try:
             from genesis.memory.entity_anchors import record_anchors
 
-            await record_anchors(memory_id, content)
+            should_anchor, anchor_db_path = await self._anchor_target()
+            if should_anchor:
+                await record_anchors(memory_id, content, db_path=anchor_db_path)
+            else:
+                logger.debug(
+                    "skipping anchors for %s: the store's database reports no "
+                    "file the anchor writer could own (an in-memory database)",
+                    memory_id,
+                )
         except Exception:
             logger.debug(
                 "entity anchor extraction failed for %s",
