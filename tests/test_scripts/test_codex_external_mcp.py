@@ -7,6 +7,8 @@ import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import scripts.codex_external_mcp as subject
 
 
@@ -54,6 +56,48 @@ def test_runtime_root_falls_back_when_git_is_unavailable(monkeypatch, tmp_path) 
     monkeypatch.setattr(subject.subprocess, "run", unavailable)
 
     assert subject.runtime_root(tmp_path) == tmp_path.resolve()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param("raise", id="git-times-out"),
+        pytest.param("empty", id="git-returns-nothing"),
+    ],
+)
+def test_an_unresolved_LINKED_worktree_refuses_rather_than_substituting(
+    monkeypatch, tmp_path, failure
+) -> None:
+    """Falling back to the checkout is right in main and WRONG in a worktree.
+
+    The substitution is silent and self-concealing: the shell launcher runs its
+    own unbounded git lookup and still finds the main virtualenv, so the server
+    starts — with GENESIS_REPO_ROOT naming the worktree and the DB path
+    resolving to its missing or stale copy. Memory is then unavailable or
+    pointed at the wrong state, and nothing says so.
+
+    A linked worktree's `.git` is a FILE (a `gitdir:` pointer); main's is a
+    directory. That is checked WITHOUT git, because git is what just failed.
+    """
+    worktree = tmp_path / "feature"
+    worktree.mkdir()
+    (worktree / ".git").write_text("gitdir: /elsewhere/.git/worktrees/feature\n")
+
+    if failure == "raise":
+
+        def broken(*args, **kwargs):
+            raise subprocess.TimeoutExpired("git", 2)
+    else:
+
+        def broken(*args, **kwargs):
+            return SimpleNamespace(returncode=1, stdout="")
+
+    monkeypatch.setattr(subject.subprocess, "run", broken)
+
+    with pytest.raises(SystemExit) as exc:
+        subject.runtime_root(worktree)
+
+    assert "linked worktree" in str(exc.value)
 
 
 def test_launcher_path_targets_existing_portable_launcher() -> None:

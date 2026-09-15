@@ -34,6 +34,32 @@ def sanitized_environment(source: dict[str, str] | None = None) -> dict[str, str
     return environment
 
 
+def _refuse_unresolved_worktree(checkout: Path, why: str) -> None:
+    """Abort rather than substitute *checkout* when it is a LINKED worktree.
+
+    Falling back to the directory this file lives in is correct in the MAIN
+    checkout and wrong everywhere else. In a linked worktree it silently names
+    the wrong root, and nothing downstream notices: the shell launcher runs its
+    own unbounded git lookup and still finds the main checkout's virtualenv, so
+    the server STARTS — while ``GENESIS_REPO_ROOT`` points at the worktree and
+    ``genesis_db_path()`` resolves to its missing or stale ``data/genesis.db``.
+    Memory is then unavailable or, worse, aimed at the wrong state, and the
+    only symptom is an answer that looks fine.
+
+    Detected without git, deliberately: git is the thing that just failed. A
+    linked worktree's ``.git`` is a FILE holding a ``gitdir:`` pointer, where
+    the main checkout's is a directory — which is exactly the distinction
+    needed and costs one stat.
+    """
+    if (checkout / ".git").is_file():
+        raise SystemExit(
+            f"refusing to start: {checkout} is a linked worktree and the main "
+            f"checkout could not be resolved ({why}). Substituting the worktree "
+            "would point Genesis at the wrong runtime state — re-run once git "
+            "responds, or start from the main checkout."
+        )
+
+
 def runtime_root(root: Path | None = None) -> Path:
     """Resolve the main checkout that owns Genesis's live runtime state."""
     checkout = (root or Path(__file__).resolve().parent.parent).resolve()
@@ -45,9 +71,13 @@ def runtime_root(root: Path | None = None) -> Path:
             text=True,
             timeout=2,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _refuse_unresolved_worktree(checkout, f"git lookup failed: {exc!r}")
         return checkout
     if result.returncode != 0 or not result.stdout.strip():
+        _refuse_unresolved_worktree(
+            checkout, f"git rev-parse returned {result.returncode} with no path"
+        )
         return checkout
     common_dir = Path(result.stdout.strip()).resolve()
     return common_dir.parent if common_dir.name == ".git" else checkout
