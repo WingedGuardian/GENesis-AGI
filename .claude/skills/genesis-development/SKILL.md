@@ -178,10 +178,13 @@ replays this install's own recorded `(command, cwd)` pairs through the guard and
 prints `blocked k/N`. Read `--list` first — a guard is REFUSED for replay until
 someone declares what running it a few hundred thousand times does to the
 machine, and three of the six are refused today for exactly that reason. That
-declaration is machine-checked rather than prose: `--list` prints each guard's
-facts (env/argv/spawn/write, from a transitive AST walk), its citations, and the
-spelling set behind them, so a `False` is a bounded claim and not a proof of
-purity. Two limits travel with the number: it is stamped UNCLASSIFIED because the
+declaration is machine-checked rather than prose, and the tool enforces it
+itself — every path verifies the declarations against source first and REFUSES
+on a mismatch, so a stale one cannot be replayed against your whole command
+history while you wait for CI. `--list` prints each guard's facts
+(env/argv/network/spawn/write, from a transitive AST walk), its citations, the
+spelling set behind them, and the three blind spots that remain, so a `False` is
+a bounded claim and not a proof of purity. Two limits travel with the number: it is stamped UNCLASSIFIED because the
 corpus contains dangerous commands too, so it is one side of the tradeoff and
 needs the positive control the bullet above demands; and there is **no way to
 print the blocked command lines** — the `--show` flag that used to do it was

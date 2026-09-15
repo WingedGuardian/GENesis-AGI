@@ -18,7 +18,6 @@ the tool announces is read back off the file rather than asserted.
 
 from __future__ import annotations
 
-import ast
 import contextlib
 import importlib.util
 import json
@@ -1326,248 +1325,28 @@ def test_a_dependency_from_another_checkout_is_refused_not_worked_around(rgc, mo
 
 
 def _hooks(rgc) -> Path:
+    """The guards directory the tool itself resolves. The checkers now live in
+    the SCRIPT — these tests call the same functions `main()` does, which is the
+    property that made moving them worth the churn."""
     return Path(rgc._HOOKS)
 
 
-def _import_closure(module: str, hooks: Path) -> list[str]:
-    """Every module reachable from `module` whose name resolves under `hooks`.
+@contextlib.contextmanager
+def _fake_repo_scripts(rgc, names: set[str]):
+    """Swap the tracked-script inventory for one test, and put it back.
 
-    Bounded to that directory on purpose — the same boundary `_GUARD_BARE_DEPS`
-    already names — so the walk terminates and never wanders into the stdlib.
-    Transitive is what reaches `audit_jsonl`, two hops out from git_discard and
-    git_push, writing files and reading argv where no declaration named it.
+    `repo_script_names()` is `functools.cache`d and shells out to git, so a test
+    that needs a synthetic delegate has to replace it AND clear the cache on both
+    sides — otherwise the fake leaks into every later test in the module, which
+    is the same process-global-memo hazard `fake_loaded` exists for.
     """
-    seen: set[str] = set()
-    stack = [module]
-    order: list[str] = []
-    while stack:
-        name = stack.pop()
-        path = hooks / f"{name}.py"
-        if name in seen or not path.is_file():
-            continue
-        seen.add(name)
-        order.append(name)
-        for node in ast.walk(ast.parse(path.read_text(), str(path))):
-            if isinstance(node, ast.Import):
-                stack.extend(a.name.split(".")[0] for a in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                stack.append(node.module.split(".")[0])
-    return sorted(order)
-
-
-def _alias_map(tree: ast.AST) -> dict[str, str]:
-    """Local name -> canonical dotted path, for every import in one module.
-
-    Without this the matcher compares literal text, so `import subprocess as sp`
-    hides `sp.run` and `from subprocess import run` hides a bare `run(...)` —
-    while `--list` goes on publishing `subprocess.run` as a covered spelling. That
-    is the fail-OPEN direction on the two facts that gate replay safety, and it
-    was MEASURED: ten realistic spellings, ten missed, two controls detected.
-
-    The residual risk is the mirror image and much smaller: a module that imports
-    a name AND shadows it with a local of the same name gets a false positive,
-    costing one over-cautious declaration. Under-reporting a spawn costs a guard
-    running 140,293 times that nobody knew spawned.
-    """
-    aliases: dict[str, str] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for a in node.names:
-                aliases[a.asname or a.name.split(".")[0]] = a.name if a.asname else a.name
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            for a in node.names:
-                aliases[a.asname or a.name] = f"{node.module}.{a.name}"
-    return aliases
-
-
-def _dotted(node: ast.AST, aliases: dict[str, str] | None = None) -> str | None:
-    """`os.path.expandvars` from an attribute chain, with the root un-aliased."""
-    parts: list[str] = []
-    while isinstance(node, ast.Attribute):
-        parts.append(node.attr)
-        node = node.value
-    if not isinstance(node, ast.Name):
-        return None
-    root = (aliases or {}).get(node.id, node.id)
-    parts.append(root)
-    return ".".join(reversed(parts))
-
-
-def _open_mode(node: ast.Call, index: int) -> str | None:
-    """The mode an open()-family call was given, or None when it is not constant.
-
-    `index` is where the mode sits positionally, and it DIFFERS by spelling:
-    `open(path, "w")` and `os.fdopen(fd, "w")` put it second, while the method
-    form `Path(...).open("w")` puts it first because the path is the receiver.
-    Reading position 1 for both scored every `p.open("w")` as a read — caught by
-    `test_every_published_spelling_is_actually_detected`, which is what that test
-    is for.
-
-    None means UNKNOWN, and the caller treats unknown as a WRITE. A non-constant
-    mode used to fall through as `""` and read as a plain read, so a guard doing
-    `open(path, mode)` was scored pure. Fail closed: an over-cautious declaration
-    is cheap, an unnoticed write is what this table exists to prevent.
-    """
-    if len(node.args) > index:
-        arg = node.args[index]
-        return str(arg.value) if isinstance(arg, ast.Constant) else None
-    for kw in node.keywords:
-        if kw.arg == "mode":
-            return str(kw.value.value) if isinstance(kw.value, ast.Constant) else None
-    return ""  # genuinely absent -> the default "r"
-
-
-def _walk_facts(rgc, module: str, hooks: Path) -> dict[str, set[str]]:
-    """The four facts, as the SPELLINGS that produced each, over the closure.
-
-    Returns the evidence rather than a bool so a failure can name what it found —
-    "spawns is declared False but git_discard_guard uses subprocess.run" is
-    actionable where "spawns mismatch" is not.
-    """
-    found: dict[str, set[str]] = {fact: set() for fact in rgc._FACT_DOTTED}
-    for name in _import_closure(module, hooks):
-        path = hooks / f"{name}.py"
-        src = path.read_text()
-        tree = ast.parse(src, str(path))
-        aliases = _alias_map(tree)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Attribute):
-                dotted = _dotted(node, aliases)
-                for fact, spellings in rgc._FACT_DOTTED.items():
-                    if dotted in spellings:
-                        found[fact].add(f"{name}: {dotted}")
-                for fact, methods in rgc._FACT_METHODS.items():
-                    if node.attr in methods:
-                        found[fact].add(f"{name}: .{node.attr}()")
-            elif isinstance(node, ast.Name):
-                # A bare name bound by `from X import y`. Resolved through the
-                # same map, so the published spelling and the match agree.
-                dotted = aliases.get(node.id)
-                for fact, spellings in rgc._FACT_DOTTED.items():
-                    if dotted in spellings:
-                        found[fact].add(f"{name}: {node.id} (from {dotted})")
-            if isinstance(node, ast.Call):
-                func = node.func
-                if isinstance(func, ast.Name) and func.id in rgc._OPEN_NAMES:
-                    spelled = func.id
-                elif isinstance(func, ast.Attribute) and func.attr in rgc._OPEN_NAMES:
-                    spelled = _dotted(func, aliases) or f".{func.attr}"
-                    if spelled not in rgc._OPEN_MODE_AT_1:
-                        spelled = f".{func.attr}"  # a method: the path is the receiver
-                else:
-                    continue
-                mode = _open_mode(node, 1 if spelled in rgc._OPEN_MODE_AT_1 else 0)
-                if mode is None:
-                    found["writes_fs"].add(f"{name}: {spelled}(..., <non-constant mode>)")
-                elif any(c in mode for c in rgc._WRITE_MODE_CHARS):
-                    found["writes_fs"].add(f"{name}: {spelled}(..., {mode!r})")
-    return found
-
-
-def _cite_source(rgc, cite, hooks: Path) -> tuple[str, str]:
-    """(haystack, where) for one citation, or raise AssertionError naming the miss."""
-    # A "/" means a repo-relative path (a shell script); a bare name is a module
-    # under scripts/hooks/, resolved exactly the way the harness itself resolves
-    # guards, so a citation cannot point somewhere the loader would not go.
-    path = Path(rgc._REPO) / cite.module if "/" in cite.module else hooks / f"{cite.module}.py"
-    assert path.is_file(), f"cited file no longer exists: {cite.module}"
-    src = path.read_text()
-    if cite.symbol is None:
-        return src, cite.module
-
-    matches = [
-        node
-        for node in ast.walk(ast.parse(src, str(path)))
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
-        and node.name == cite.symbol
-    ]
-    if not matches:
-        raise AssertionError(
-            f"cited symbol {cite.module}.{cite.symbol} no longer exists — it was "
-            "renamed, moved, or deleted, and the declaration still leans on it"
-        )
-    # REFUSE rather than take the first. `ast.walk` is breadth-first, so among a
-    # method and a module function of the same name — or an ImportError fallback
-    # pair — it returns whichever is shallower, which for a redefinition is the
-    # DEAD one. A citation that silently resolves against unreachable code is
-    # worse than one that fails.
-    assert len(matches) == 1, (
-        f"{cite.module}.{cite.symbol} is defined {len(matches)}x in that file, so a "
-        "citation naming only the symbol cannot say which one it means. Cite a "
-        "fragment unique to the definition you mean, or rename one of them."
-    )
-    node = matches[0]
-    segment = ast.get_source_segment(src, node)
-    assert segment is not None, f"could not read source for {cite.module}.{cite.symbol}"
-    # get_source_segment EXCLUDES decorators (verified: a decorated def returns
-    # only the `def` line onward), so a fragment living in `@functools.cache` or
-    # `@dataclass(frozen=True)` would report "the fragment is no longer there" —
-    # a true failure with a false cause. Prepend them.
-    if node.decorator_list:
-        first = min(d.lineno for d in node.decorator_list)
-        lines = src.splitlines()
-        segment = "\n".join(lines[first - 1 : node.lineno - 1]) + "\n" + segment
-    return segment, f"{cite.module}.{cite.symbol}"
-
-
-def _scan_shell(rgc, text: str, self_name: str) -> tuple[set[str], set[str]]:
-    """Closed-set cross-reference over shell source. Deliberately not a parser.
-
-    Returns (repo script basenames occurring, DELEGATED_PROGRAMS occurring). It
-    proves OCCURRENCE, never invocation — see ShEvidence's docstring for why that
-    is the honest claim and why it is still the one that catches the delegation.
-
-    The name set comes from `rgc.repo_script_names()`, in the script beside
-    `DELEGATED_PROGRAMS`, so what `--list` publishes and what this matches are one
-    object. They were two, and the published one over-claimed in three ways at
-    once (see that function).
-    """
-    scripts = {n for n in rgc.repo_script_names() if n != self_name and n in text}
-    programs = {
-        p for p in rgc.DELEGATED_PROGRAMS if re.search(rf"(?<![\w-]){re.escape(p)}(?![\w-])", text)
-    }
-    return scripts, programs
-
-
-def _check_facts(rgc, name: str, evidence, hooks: Path) -> list[str]:
-    """Bidirectional. An undeclared fact fails, and a declared-but-untrue one
-    fails too — a one-directional check lets the table rot in the safe-looking
-    direction, which is the direction nobody inspects.
-
-    Both messages name the file and the field to edit. The asymmetry they used to
-    have was backwards: the declared-False-but-found branch is the one an
-    UNRELATED author hits — someone editing `shell_parse.py`, which sits in all
-    four guards' closures — and it was the terse one. They have never heard of
-    this table.
-    """
-    found = _walk_facts(rgc, evidence.module, hooks)
-    problems = []
-    for fact in sorted(rgc._FACT_DOTTED):
-        declared = getattr(evidence, fact)
-        actual = bool(found[fact])
-        if declared and not actual:
-            problems.append(
-                f"{name}: {fact}=True is declared for {evidence.module}, but a "
-                f"transitive walk found none of the {len(rgc.fact_coverage()[fact])} "
-                "spellings this checker knows. Either the guard stopped doing it "
-                f"(set {fact}=False in GUARDS[{name!r}].safety.evidence in "
-                "scripts/replay_guard_corpus.py) or the spelling is new (add it to "
-                "_FACT_DOTTED/_FACT_METHODS there, so --list keeps telling the truth)."
-            )
-        if actual and not declared:
-            problems.append(
-                f"{name}: {fact}=False is declared for {evidence.module}, but a "
-                f"transitive walk of its imports under scripts/hooks/ found "
-                f"{', '.join(sorted(found[fact]))}.\n"
-                f"  If you edited one of those modules and this is a real new {fact}: "
-                f"set {fact}=True in GUARDS[{name!r}].safety.evidence in "
-                "scripts/replay_guard_corpus.py — and check whether the guard is "
-                "still replay-safe at all, because that table decides whether it may "
-                "be run against every command on the box.\n"
-                "  If it is a false positive, narrow _FACT_DOTTED/_FACT_METHODS in "
-                "the same file."
-            )
-    return problems
+    real = rgc.repo_script_names
+    rgc.repo_script_names = lambda: frozenset(names)
+    try:
+        yield
+    finally:
+        rgc.repo_script_names = real
+        real.cache_clear()
 
 
 def _module_using(spelling: str) -> str | None:
@@ -1681,7 +1460,7 @@ def test_every_published_spelling_is_actually_detected(rgc, tmp_path):
             for stale in hooks.glob("*.py"):
                 stale.unlink()
             (hooks / "probe.py").write_text(body)
-            if not _walk_facts(rgc, "probe", hooks)[fact]:
+            if not rgc.walk_facts("probe", hooks)[fact]:
                 undetected.append(f"{fact}: {spelling!r} is published but not matched")
     assert not undetected, "\n".join(undetected)
 
@@ -1734,7 +1513,7 @@ def test_the_declared_facts_match_a_transitive_walk_of_the_guards_imports(rgc):
     for name, guard in sorted(rgc.GUARDS.items()):
         evidence = guard.safety.evidence
         if isinstance(evidence, rgc.PyEvidence):
-            problems += _check_facts(rgc, name, evidence, _hooks(rgc))
+            problems += rgc._check_facts(name, evidence, _hooks(rgc))
     assert not problems, "\n".join(problems)
 
 
@@ -1750,8 +1529,8 @@ def test_every_citation_still_resolves(rgc):
     for name, guard in sorted(rgc.GUARDS.items()):
         for cite in guard.safety.cites:
             try:
-                haystack, where = _cite_source(rgc, cite, _hooks(rgc))
-            except AssertionError as exc:
+                haystack, where = rgc.cite_source(cite, _hooks(rgc))
+            except rgc.DeclarationError as exc:
                 problems.append(f"{name}: {exc}")
                 continue
             # An empty fragment is a deliberate symbol-existence citation; getting
@@ -1802,7 +1581,7 @@ def test_a_shell_guard_acknowledges_every_program_and_script_it_names(rgc):
                 "matching its text, so the locator needs updating, not the scan."
             )
             continue
-        scripts, programs = _scan_shell(rgc, text, self_name)
+        scripts, programs = rgc.scan_shell(text, self_name)
         for kind, actual, declared in (
             ("script", scripts, set(evidence.references_scripts)),
             ("program", programs, set(evidence.references_programs)),
@@ -1856,7 +1635,7 @@ def test_arm1_deleting_a_declared_fact_turns_the_check_red(rgc):
     """
     real = rgc.GUARDS["worktree_cwd"].safety.evidence
     understated = real._replace(reads_argv=False)
-    problems = _check_facts(rgc, "worktree_cwd", understated, _hooks(rgc))
+    problems = rgc._check_facts("worktree_cwd", understated, _hooks(rgc))
     assert problems, "removing a TRUE fact from the declaration was not noticed"
     assert any("reads_argv" in p and "sys.argv" in p for p in problems), problems
 
@@ -1874,11 +1653,16 @@ def test_arm2_a_guard_that_gains_a_subprocess_turns_the_check_red(rgc, tmp_path)
     )
     _write_guard(hooks, "helper", "n = 0\n")
     declared_pure = rgc.PyEvidence(
-        module="pure_guard", reads_env=False, reads_argv=False, spawns=False, writes_fs=False
+        module="pure_guard",
+        reads_env=False,
+        reads_argv=False,
+        network=False,
+        spawns=False,
+        writes_fs=False,
     )
     # Guard-the-guard: the fixture must be clean BEFORE the mutation, or a red
     # below proves nothing about the subprocess we are about to add.
-    assert not _check_facts(rgc, "pure_guard", declared_pure, hooks)
+    assert not rgc._check_facts("pure_guard", declared_pure, hooks)
 
     # The spawn arrives TRANSITIVELY, through the imported helper — which is the
     # shape that matters. A subprocess in the guard's own file would be caught by
@@ -1886,7 +1670,7 @@ def test_arm2_a_guard_that_gains_a_subprocess_turns_the_check_red(rgc, tmp_path)
     _write_guard(
         hooks, "helper", "import subprocess\n\nn = 0\n\n\ndef go():\n    subprocess.run(['true'])\n"
     )
-    problems = _check_facts(rgc, "pure_guard", declared_pure, hooks)
+    problems = rgc._check_facts("pure_guard", declared_pure, hooks)
     assert problems, "a guard that gained a transitive subprocess.run was not noticed"
     assert any("spawns" in p and "subprocess.run" in p for p in problems), problems
 
@@ -1901,23 +1685,23 @@ def test_arm3_editing_or_renaming_a_cited_construct_turns_the_check_red(rgc, tmp
     hooks = tmp_path / "hooks"
     _write_guard(hooks, "cited", 'def target():\n    return os.path.expanduser("~")\n')
     good = rgc.Cite("cited", "target", 'os.path.expanduser("~")')
-    haystack, where = _cite_source(rgc, good, hooks)
+    haystack, where = rgc.cite_source(good, hooks)
     assert good.fragment in haystack and where == "cited.target"
 
     # (a) the construct is EDITED in place — symbol still resolves
     _write_guard(hooks, "cited", 'def target():\n    return os.path.expanduser("$HOME")\n')
-    haystack, _ = _cite_source(rgc, good, hooks)
+    haystack, _ = rgc.cite_source(good, hooks)
     assert good.fragment not in haystack, "an edited fragment still matched"
 
     # (b) the symbol is RENAMED
     _write_guard(hooks, "cited", 'def renamed():\n    return os.path.expanduser("~")\n')
-    with pytest.raises(AssertionError, match="no longer exists"):
-        _cite_source(rgc, good, hooks)
+    with pytest.raises(rgc.DeclarationError, match="no longer exists"):
+        rgc.cite_source(good, hooks)
 
     # (c) the file is gone entirely
     (hooks / "cited.py").unlink()
-    with pytest.raises(AssertionError, match="cited file no longer exists"):
-        _cite_source(rgc, good, hooks)
+    with pytest.raises(rgc.DeclarationError, match="cited file no longer exists"):
+        rgc.cite_source(good, hooks)
 
     # (d) the name is DEFINED TWICE — refuse rather than silently resolve. Not a
     # live case today (14 cited symbols, 0 duplicates across 188 defs), but
@@ -1929,14 +1713,14 @@ def test_arm3_editing_or_renaming_a_cited_construct_turns_the_check_red(rgc, tmp
         'def target():\n    return os.path.expanduser("~")\n\n\n'
         'def target():\n    return "shadowed"\n',
     )
-    with pytest.raises(AssertionError, match="is defined 2x"):
-        _cite_source(rgc, good, hooks)
+    with pytest.raises(rgc.DeclarationError, match="is defined 2x"):
+        rgc.cite_source(good, hooks)
 
     # (e) a DECORATED symbol: ast.get_source_segment drops the decorator lines,
     # so a fragment living in one would read as "no longer there" — a true
     # failure with a false cause.
     _write_guard(hooks, "cited", "@staticmethod\ndef target():\n    return 1\n")
-    segment, _ = _cite_source(rgc, rgc.Cite("cited", "target", "@staticmethod"), hooks)
+    segment, _ = rgc.cite_source(rgc.Cite("cited", "target", "@staticmethod"), hooks)
     assert "@staticmethod" in segment
 
 
@@ -1954,7 +1738,7 @@ def test_a_shell_guard_that_gains_a_delegation_turns_the_check_red(rgc):
             s for s in evidence.references_scripts if s != "git_discard_guard.py"
         )
     )
-    scripts, _ = _scan_shell(rgc, understated.source(), Path(understated.label).name)
+    scripts, _ = rgc.scan_shell(understated.source(), Path(understated.label).name)
     assert "git_discard_guard.py" in scripts - set(understated.references_scripts), (
         "dropping the delegate from the declaration went unnoticed — this is "
         "exactly the omission that got past prose review twice"
@@ -1984,3 +1768,207 @@ def test_list_prints_the_facts_and_says_what_a_false_means(rgc, monkeypatch, cap
     assert "getattr" in uncovered, "the runtime-rebinding blind spot is unstated"
     assert "$_guard" in uncovered, "the variable-built delegation path is unstated"
     assert "inline_blob" in uncovered, "the uncheckable blob measurement is unstated"
+# ── external review round 1: one arm per finding ─────────────────────────────
+#
+# Six P2s, all verified by execution before anything was changed. Four of them
+# were one class — a published claim broader than the implementation — and the
+# generator was structural: the checkers lived in THIS file, so "the
+# declarations are checked" held only while CI ran this module, while the
+# script, --list and the PR body said it unconditionally. The checkers now live
+# in the script and `main()` enforces them; these arms pin each fix.
+
+
+def test_the_tool_verifies_its_own_declarations(rgc):
+    """The end-to-end property, and the one worth stating plainly: the shipped
+    table passes the shipped verifier. Everything below tests that individual
+    checks BITE; this tests that they are satisfied by what we actually ship."""
+    assert rgc.verify_declarations() == []
+
+
+def test_an_unaliased_dotted_import_binds_its_first_component(rgc, tmp_path):
+    """Round 1, finding 2 — a fail-open introduced BY the fix for a fail-open.
+
+    `import os.path` binds the name `os`, not `os.path`. Recording `os ->
+    os.path` turned `os.path.expandvars` into `os.path.path.expandvars`, so a
+    guard written in that style kept `reads_env=False` while reading the
+    environment on every operand — and the bidirectional check stayed green.
+    Caught by the external reviewer, not by this file's own tests, which is the
+    reason it gets an arm rather than a comment.
+    """
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    for label, body in (
+        ("import os.path", "import os.path\n\n\ndef f(t):\n    return os.path.expandvars(t)\n"),
+        ("import os", "import os\n\n\ndef f(t):\n    return os.path.expandvars(t)\n"),
+        ("aliased", "import os.path as p\n\n\ndef f(t):\n    return p.expandvars(t)\n"),
+    ):
+        (hooks / "probe.py").write_text(body)
+        found = rgc.walk_facts("probe", hooks)
+        assert found["reads_env"], f"{label}: the environment read went undetected"
+
+
+def test_a_network_call_is_a_declared_fact(rgc, tmp_path):
+    """Round 1, finding 3 — the record's own docstring defines replay safety as
+    whether repeated invocation "writes, spawns, or calls out", and the
+    undeclared-guard message demands network effects be stated, but nothing
+    checked one. A guard could add an HTTP call per corpus row and stay green.
+
+    `urllib.parse` is the negative control and it is not incidental: push_allowlist
+    imports it for URL string parsing, so counting it would force git_push to
+    declare a network call it does not make.
+    """
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    (hooks / "probe.py").write_text(
+        "import urllib.request\n\n\ndef f(u):\n    return urllib.request.urlopen(u)\n"
+    )
+    assert rgc.walk_facts("probe", hooks)["network"]
+
+    (hooks / "probe.py").write_text(
+        "import urllib.parse\n\n\ndef f(u):\n    return urllib.parse.urlsplit(u)\n"
+    )
+    assert not rgc.walk_facts("probe", hooks)["network"], (
+        "URL parsing is pure string work and must not read as a network call"
+    )
+
+
+def test_a_fragment_surviving_only_in_a_comment_does_not_resolve(rgc, tmp_path):
+    """Round 1, finding 4 — a citation is supposed to anchor BEHAVIOUR.
+
+    Matching raw text let a fragment live on in a comment after the
+    implementation it described was deleted: the citation stayed green while the
+    thing it vouched for was gone. That is this record's own failure mode, one
+    level in.
+    """
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    cite = rgc.Cite("cited", "target", 'os.path.expanduser("~")')
+
+    (hooks / "cited.py").write_text(
+        "def target():\n"
+        '    # historical: used to call os.path.expanduser("~") before the rewrite\n'
+        '    return "no longer does it"\n'
+    )
+    haystack, _ = rgc.cite_source(cite, hooks)
+    assert cite.fragment not in haystack, "a comment-only fragment still resolved"
+
+    # A docstring is the same hazard with different syntax.
+    (hooks / "cited.py").write_text(
+        'def target():\n    """Once called os.path.expanduser("~")."""\n    return 1\n'
+    )
+    haystack, _ = rgc.cite_source(cite, hooks)
+    assert cite.fragment not in haystack, "a docstring-only fragment still resolved"
+
+    # Guard-the-guard: the real construct must still match, or the strip is just
+    # deleting evidence.
+    (hooks / "cited.py").write_text('def target():\n    return os.path.expanduser("~")\n')
+    haystack, _ = rgc.cite_source(cite, hooks)
+    assert cite.fragment in haystack, "comment stripping ate a live construct"
+
+
+def test_a_shell_guards_delegates_have_their_facts_checked(rgc, tmp_path):
+    """Round 1, finding 5 — the sharpest of the six.
+
+    `bash_safety`'s declaration asserts its two extra delegates are "pure
+    argv/string classifiers ... neither spawns nor writes". That was verified by
+    hand with a throwaway probe and by NOTHING shipped: MEASURED, both
+    destructive_command_guard and shell_parse were referenced by the declaration
+    and fact-walked by no check at all. A prose claim nobody checks, committed
+    inside the mechanism built to end prose claims nobody checks.
+    """
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    _write_guard(hooks, "delegate", "def main() -> int:\n    return 0\n")
+    pure = rgc.PyEvidence(
+        module="delegate",
+        reads_env=False,
+        reads_argv=False,
+        network=False,
+        spawns=False,
+        writes_fs=False,
+    )
+    # Drive the REAL seam. An earlier version of this test called _check_facts
+    # directly, and a mutation sweep proved that vacuous: deleting the delegate
+    # walk from _check_shell entirely left it GREEN, because the integration
+    # point — the thing the finding was actually about — was never exercised.
+    evidence = rgc.ShEvidence(
+        source=lambda: '"$_py" "$SCRIPT_DIR/hooks/delegate.py"\n',
+        label="fake_hook.sh",
+        references_scripts=("delegate.py",),
+        # Nothing declared here that the fake text does not contain — the
+        # guard-the-guard below is what caught an earlier version declaring
+        # "python3" against source that never mentions it.
+        references_programs=(),
+        invokes=(pure,),
+    )
+    with _fake_repo_scripts(rgc, {"delegate.py"}):
+        # Guard-the-guard: clean before the mutation, or the RED proves nothing.
+        assert not rgc._check_shell("fake", evidence, hooks)
+
+        _write_guard(
+            hooks,
+            "delegate",
+            "import subprocess\n\n\ndef main() -> int:\n"
+            "    subprocess.run(['true'])\n    return 0\n",
+        )
+        problems = rgc._check_shell("fake", evidence, hooks)
+    assert problems, "a delegate that gained a subprocess was not noticed"
+    assert any("spawns" in p for p in problems), problems
+
+    # And a delegate the shell text does not even mention is refused, because
+    # "invokes" is the author's claim and it has to be a claim about this file.
+    stray = rgc.ShEvidence(
+        source=lambda: "echo hi\n",
+        label="fake_hook.sh",
+        references_scripts=(),
+        references_programs=(),
+        invokes=(pure,),
+    )
+    assert any("does not occur" in p for p in rgc._check_shell("fake", stray, hooks))
+
+
+def test_the_cli_refuses_to_replay_on_a_stale_declaration(rgc, monkeypatch, capsys):
+    """Round 1, finding 6 — and the reason the checkers moved out of this file.
+
+    A developer who edits a guard and follows the documented --list-then-replay
+    workflow used to get no protection at all: `replay()` trusted `safety.safe`,
+    and the verifier only ran when CI ran this module. The window between the
+    edit and CI is exactly when a declaration is most likely to be stale.
+    """
+    monkeypatch.setattr(
+        rgc, "verify_declarations", lambda *a, **k: ["worktree_cwd: reads_argv is stale"]
+    )
+    monkeypatch.setattr(
+        rgc,
+        "load_corpus",
+        lambda **kw: pytest.fail("the corpus was built despite a stale declaration"),
+    )
+    for argv in (["--list"], ["--guard", "protected_paths"], ["--all"]):
+        monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", *argv])
+        assert rgc.main() == 2, f"{argv} did not refuse"
+        err = capsys.readouterr().err
+        assert "REFUSED" in err and "reads_argv is stale" in err
+        assert "no --force" in err
+
+
+def test_a_quoted_path_cannot_fall_out_of_the_script_name_set(rgc, monkeypatch):
+    """Round 1, finding 1 — git QUOTES a path containing whitespace, so a plain
+    split() mangles it and the real basename silently leaves the set. An
+    under-reporting delegation scan reads exactly like a clean one."""
+    import subprocess as sp
+
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(argv, **kw):
+        captured["argv"] = argv
+        return sp.CompletedProcess(argv, 0, "scripts/a b.sh\0scripts/hooks/pre-push\0", "")
+
+    monkeypatch.setattr(rgc.subprocess, "run", fake_run)
+    rgc.repo_script_names.cache_clear()
+    try:
+        names = rgc.repo_script_names()
+    finally:
+        rgc.repo_script_names.cache_clear()
+    assert "-z" in captured["argv"], "NUL-delimited output was not requested"
+    assert "a b.sh" in names, "a path with a space did not survive as a basename"
+    assert "pre-push" in names

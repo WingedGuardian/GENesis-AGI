@@ -49,37 +49,56 @@ WHY A GUARD IS REPLAYABLE, AND WHO CHECKED
 Each guard carries a ReplaySafety record, and the default is refusal. Those
 records were prose for a while, and prose about code rots: the declarations have
 been wrong four times, including all six line-number citations going stale inside
-five days. So each one now also carries evidence a test re-derives —
-`--list` prints it:
+five days. So each one now carries evidence THIS TOOL re-derives before it will
+run anything — `verify_declarations()`, which `--list` and every replay path call
+first, refusing on any mismatch:
 
-  * FACTS for a Python guard (reads_env / reads_argv / spawns / writes_fs),
-    checked against a transitive walk of every import resolving under
+  * FACTS for a Python guard (reads_env / reads_argv / network / spawns /
+    writes_fs), checked against a transitive walk of every import resolving under
     scripts/hooks/, bidirectionally: an undeclared fact fails, and so does a
-    declared one that stopped being true.
-  * CITATIONS, as symbol + VERBATIM fragment, re-resolved against the source.
+    declared one that stopped being true. Import aliases are resolved, so
+    `import subprocess as sp` cannot hide a spawn behind a name the published
+    coverage claims to cover.
+  * CITATIONS, as symbol + VERBATIM fragment, re-resolved against the EXECUTABLE
+    source — comments and docstrings are stripped first, so a fragment cannot
+    survive in a comment after the code it described is deleted.
   * A DELEGATION SCAN for the two shell guards, which no Python walk can reach —
     bash_safety has no module at all and hands off through a pipe. It is a
     closed-set cross-reference, never a shell parser, and it proves OCCURRENCE
     rather than invocation: the obligation is to say what each name is doing
-    there.
+    there. The Python delegates a shell guard says it INVOKES get their own facts
+    walked, so a claim like "both are pure classifiers" is checked rather than
+    asserted.
+
+The verifier lives HERE rather than in the test suite, and that placement is the
+point. It began in the test file, and four of the six findings on the first
+external review were the same consequence: "these declarations are checked" held
+only while CI happened to run one module, while this file and `--list` said it
+unconditionally — leaving a developer who had just edited a guard, which is
+exactly when a declaration is most likely stale, replaying against every recorded
+command with no check at all.
 
 None of this is a proof of purity, and --list says so with the number: a False
-fact means "none of the N spellings this checker knows", and the N are printed.
+fact means "none of the N spellings this checker knows", the N are printed, and
+the three things it still cannot see are named beside them.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import functools
 import importlib.util
 import io
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
 import tempfile
+import tokenize
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
@@ -492,6 +511,12 @@ _run_python_guard._loaded = {}  # type: ignore[attr-defined]
 # never cover.
 
 
+class DeclarationError(Exception):
+    """A citation that cannot be resolved at all, as distinct from one that
+    resolves and no longer matches. Raised rather than returned because a
+    caller that cannot find the file has nothing to compare."""
+
+
 class Cite(NamedTuple):
     """One piece of evidence, in a form a test can re-resolve.
 
@@ -537,6 +562,7 @@ class PyEvidence(NamedTuple):
     module: str
     reads_env: bool
     reads_argv: bool
+    network: bool
     spawns: bool
     writes_fs: bool
 
@@ -574,6 +600,15 @@ class ShEvidence(NamedTuple):
     label: str  # what to call it in a failure message
     references_scripts: tuple[str, ...]  # repo script basenames occurring in it
     references_programs: tuple[str, ...]  # DELEGATED_PROGRAMS occurring in it
+    #: The Python delegates this shell guard actually RUNS, each with its own
+    #: facts, walked exactly like a top-level guard's. The scan above can only
+    #: prove a name OCCURS; `why` then makes claims about what those delegates
+    #: DO ("both are pure argv/string classifiers"), and until this field existed
+    #: nothing checked them — MEASURED, destructive_command_guard and shell_parse
+    #: were referenced by bash_safety and fact-walked by nothing at all. Which
+    #: names belong here is the author's claim, and a narrow visible one; that
+    #: they are pure is not.
+    invokes: tuple[PyEvidence, ...] = ()
 
 
 #: Dotted spellings, matched as an attribute chain rooted at a module name.
@@ -582,6 +617,37 @@ _FACT_DOTTED: dict[str, frozenset[str]] = {
         {"os.environ", "os.environb", "os.getenv", "os.path.expanduser", "os.path.expandvars"}
     ),
     "reads_argv": frozenset({"sys.argv"}),
+    #: `urllib.parse` is DELIBERATELY absent and the omission is measured:
+    #: push_allowlist imports it, and URL parsing is pure string work. Including
+    #: it would force git_push to declare a network call it does not make, which
+    #: is the declaration lying in the direction that trains readers to stop
+    #: believing the facts.
+    "network": frozenset(
+        {
+            "socket.socket",
+            "socket.create_connection",
+            "socket.getaddrinfo",
+            "urllib.request.urlopen",
+            "urllib.request.Request",
+            "urllib.request.urlretrieve",
+            "http.client.HTTPConnection",
+            "http.client.HTTPSConnection",
+            "requests.get",
+            "requests.post",
+            "requests.put",
+            "requests.delete",
+            "requests.head",
+            "requests.patch",
+            "requests.request",
+            "requests.Session",
+            "httpx.get",
+            "httpx.post",
+            "httpx.Client",
+            "httpx.AsyncClient",
+            "ftplib.FTP",
+            "smtplib.SMTP",
+        }
+    ),
     "spawns": frozenset(
         {
             "subprocess.run",
@@ -663,6 +729,7 @@ _FACT_DOTTED: dict[str, frozenset[str]] = {
 _FACT_METHODS: dict[str, frozenset[str]] = {
     "reads_env": frozenset(),
     "reads_argv": frozenset(),
+    "network": frozenset(),
     "spawns": frozenset(),
     "writes_fs": frozenset(
         {"write_text", "write_bytes", "touch", "mkdir", "unlink", "symlink_to", "hardlink_to"}
@@ -736,7 +803,11 @@ def repo_script_names() -> frozenset[str]:
     mechanism exists to prevent.
     """
     proc = subprocess.run(  # noqa: S603
-        ["git", "-C", str(_REPO), "ls-files", "scripts"],  # noqa: S607
+        # -z: git QUOTES a path containing whitespace or a special character,
+        # so a plain split() would mangle it and drop the real basename out of
+        # the set — an under-reporting delegation scan reads exactly like a
+        # clean one.
+        ["git", "-C", str(_REPO), "ls-files", "-z", "scripts"],  # noqa: S607
         capture_output=True,
         text=True,
         check=False,
@@ -748,7 +819,7 @@ def repo_script_names() -> frozenset[str]:
             "falling back to a filesystem glob, which would under-report and read "
             "exactly like a clean result."
         )
-    return frozenset(Path(rel).name for rel in proc.stdout.split())
+    return frozenset(Path(rel).name for rel in proc.stdout.split("\0") if rel)
 
 
 def fact_coverage() -> dict[str, tuple[str, ...]]:
@@ -1003,6 +1074,7 @@ GUARDS: dict[str, Guard] = {
             evidence=PyEvidence(
                 module="protected_paths_guard",
                 reads_env=True,
+                network=False,
                 reads_argv=False,
                 spawns=False,
                 writes_fs=False,
@@ -1048,6 +1120,7 @@ GUARDS: dict[str, Guard] = {
             evidence=PyEvidence(
                 module="worktree_cwd_guard",
                 reads_env=True,
+                network=False,
                 reads_argv=True,
                 spawns=False,
                 writes_fs=False,
@@ -1167,6 +1240,35 @@ GUARDS: dict[str, Guard] = {
                     "worktree_cwd_guard.py",
                 ),
                 references_programs=("gh", "git", "python3", "rm", "mv"),
+                # The three it actually RUNS. Their facts are walked exactly as a
+                # top-level guard's are, so the sentence above claiming two of
+                # them are pure is now checked rather than asserted.
+                invokes=(
+                    PyEvidence(
+                        module="destructive_command_guard",
+                        reads_env=True,
+                        network=False,
+                        reads_argv=False,
+                        spawns=False,
+                        writes_fs=False,
+                    ),
+                    PyEvidence(
+                        module="protected_paths_guard",
+                        reads_env=True,
+                        network=False,
+                        reads_argv=False,
+                        spawns=False,
+                        writes_fs=False,
+                    ),
+                    PyEvidence(
+                        module="git_discard_guard",
+                        reads_env=True,
+                        network=False,
+                        reads_argv=True,
+                        spawns=True,
+                        writes_fs=True,
+                    ),
+                ),
             ),
             cites=(
                 Cite(
@@ -1213,6 +1315,7 @@ GUARDS: dict[str, Guard] = {
             evidence=PyEvidence(
                 module="git_discard_guard",
                 reads_env=True,
+                network=False,
                 reads_argv=True,
                 spawns=True,
                 writes_fs=True,
@@ -1252,6 +1355,7 @@ GUARDS: dict[str, Guard] = {
             evidence=PyEvidence(
                 module="git_push_guard",
                 reads_env=True,
+                network=False,
                 reads_argv=True,
                 spawns=True,
                 writes_fs=True,
@@ -1266,6 +1370,440 @@ GUARDS: dict[str, Guard] = {
         ),
     ),
 }
+
+# ── verifying the declarations ────────────────────────────────────────────────
+#
+# This lives in the SCRIPT, not in the test, and that is the whole point of it.
+# It began in the test file, and four of the six findings on the first external
+# review were the same consequence: "these declarations are checked" was true
+# only while CI happened to run one test module, while this file, `--list` and
+# the PR body all said it unconditionally. A developer who edited a guard and
+# replayed before CI got no protection at all — which is exactly the moment a
+# declaration is most likely to be stale.
+#
+# So `main()` runs `verify_declarations()` on both paths and REFUSES on failure.
+# There is deliberately no --force, for the same reason the refusal default has
+# none: an override on a measurement tool is a bypass.
+
+
+def _import_closure(module: str, hooks: Path) -> list[str]:
+    """Every module reachable from `module` whose name resolves under `hooks`.
+
+    Bounded to that directory on purpose — the same boundary `_GUARD_BARE_DEPS`
+    already names — so the walk terminates and never wanders into the stdlib.
+    Transitive is what reaches `audit_jsonl`, two hops out from git_discard and
+    git_push, writing files and reading argv where no declaration named it.
+    """
+    seen: set[str] = set()
+    stack = [module]
+    order: list[str] = []
+    while stack:
+        name = stack.pop()
+        path = hooks / f"{name}.py"
+        if name in seen or not path.is_file():
+            continue
+        seen.add(name)
+        order.append(name)
+        for node in ast.walk(ast.parse(path.read_text(), str(path))):
+            if isinstance(node, ast.Import):
+                stack.extend(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                stack.append(node.module.split(".")[0])
+    return sorted(order)
+
+
+def _alias_map(tree: ast.AST) -> dict[str, str]:
+    """Local name -> canonical dotted path, for every import in one module.
+
+    Without this the matcher compares literal text, so `import subprocess as sp`
+    hides `sp.run` and `from subprocess import run` hides a bare `run(...)` —
+    while --list goes on publishing `subprocess.run` as covered. MEASURED before
+    the fix: ten realistic spellings, ten missed, two controls detected.
+
+    An UNALIASED dotted import binds only its FIRST component: `import os.path`
+    binds the name `os`, not `os.path`. Recording `os -> os.path` turned
+    `os.path.expandvars` into `os.path.path.expandvars` and lost the environment
+    read entirely — a fail-open introduced by the fix for the previous fail-open,
+    and caught by the external review rather than by this file's own tests.
+
+    The residual risk is the mirror image and much smaller: a module that imports
+    a name AND shadows it with a local of the same name gets a false positive,
+    costing one over-cautious declaration. Under-reporting a spawn costs a guard
+    running against every command on the box that nobody knew spawned.
+    """
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.asname:
+                    aliases[a.asname] = a.name
+                else:
+                    root = a.name.split(".")[0]
+                    aliases[root] = root
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            for a in node.names:
+                aliases[a.asname or a.name] = f"{node.module}.{a.name}"
+    return aliases
+
+
+def _dotted(node: ast.AST, aliases: dict[str, str] | None = None) -> str | None:
+    """`os.path.expandvars` from an attribute chain, with the root un-aliased."""
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append((aliases or {}).get(node.id, node.id))
+    return ".".join(reversed(parts))
+
+
+def _open_mode(node: ast.Call, index: int) -> str | None:
+    """The mode an open()-family call was given, or None when it is not constant.
+
+    `index` differs by spelling: `open(path, "w")` and `os.fdopen(fd, "w")` put
+    the mode second, while `Path(...).open("w")` puts it first because the path
+    is the receiver. Reading position 1 for both scored every `p.open("w")` as a
+    read.
+
+    None means UNKNOWN, and the caller treats unknown as a WRITE. A non-constant
+    mode used to fall through as `""` and read as a plain read, so a guard doing
+    `open(path, mode)` was scored pure. Fail closed.
+    """
+    if len(node.args) > index:
+        arg = node.args[index]
+        return str(arg.value) if isinstance(arg, ast.Constant) else None
+    for kw in node.keywords:
+        if kw.arg == "mode":
+            return str(kw.value.value) if isinstance(kw.value, ast.Constant) else None
+    return ""  # genuinely absent -> the default "r"
+
+
+def walk_facts(module: str, hooks: Path | None = None) -> dict[str, set[str]]:
+    """The facts, as the SPELLINGS that produced each, over `module`'s closure.
+
+    Returns the evidence rather than a bool so a failure can name what it found —
+    "spawns is declared False but git_discard_guard uses subprocess.run" is
+    actionable where "spawns mismatch" is not.
+    """
+    hooks = hooks or _HOOKS
+    found: dict[str, set[str]] = {fact: set() for fact in _FACT_DOTTED}
+    for name in _import_closure(module, hooks):
+        path = hooks / f"{name}.py"
+        tree = ast.parse(path.read_text(), str(path))
+        aliases = _alias_map(tree)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                dotted = _dotted(node, aliases)
+                for fact, spellings in _FACT_DOTTED.items():
+                    if dotted in spellings:
+                        found[fact].add(f"{name}: {dotted}")
+                for fact, methods in _FACT_METHODS.items():
+                    if node.attr in methods:
+                        found[fact].add(f"{name}: .{node.attr}()")
+            elif isinstance(node, ast.Name):
+                # A bare name bound by `from X import y`, resolved through the
+                # same map so the published spelling and the match agree.
+                dotted = aliases.get(node.id)
+                for fact, spellings in _FACT_DOTTED.items():
+                    if dotted in spellings:
+                        found[fact].add(f"{name}: {node.id} (from {dotted})")
+            if isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Name) and func.id in _OPEN_NAMES:
+                    spelled = func.id
+                elif isinstance(func, ast.Attribute) and func.attr in _OPEN_NAMES:
+                    spelled = _dotted(func, aliases) or f".{func.attr}"
+                    if spelled not in _OPEN_MODE_AT_1:
+                        spelled = f".{func.attr}"  # a method: the path is the receiver
+                else:
+                    continue
+                mode = _open_mode(node, 1 if spelled in _OPEN_MODE_AT_1 else 0)
+                if mode is None:
+                    found["writes_fs"].add(f"{name}: {spelled}(..., <non-constant mode>)")
+                elif any(c in mode for c in _WRITE_MODE_CHARS):
+                    found["writes_fs"].add(f"{name}: {spelled}(..., {mode!r})")
+    return found
+
+
+def _executable_source(src: str, path: Path) -> str:
+    """`src` with comments and docstrings removed, for citation matching.
+
+    A citation is supposed to anchor BEHAVIOUR. Matching the raw text lets a
+    fragment survive in a comment after the implementation it described is gone —
+    the citation stays green while the thing it vouches for has been deleted,
+    which is precisely the rot this record exists to catch, one level in.
+
+    Python is tokenized, so a `#` inside a string literal is safe. A shell file
+    has no tokenizer here and gets FULL-LINE comments stripped only; a trailing
+    `# …` on a command line is left in place rather than guessed at, because
+    deciding whether a `#` starts a comment is shell parsing and this file does
+    not do shell parsing. Stated rather than silently partial.
+    """
+    if path.suffix != ".py":
+        return "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
+    try:
+        tree = ast.parse(src, str(path))
+    except SyntaxError:
+        return src
+    # Docstrings are ordinary Expr/Constant statements; blank their spans.
+    lines = src.splitlines()
+    drop: set[int] = set()
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if not isinstance(body, list) or not body:
+            continue
+        first = body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+            and first.end_lineno is not None
+        ):
+            drop.update(range(first.lineno, first.end_lineno + 1))
+    kept = [("" if n in drop else line) for n, line in enumerate(lines, 1)]
+    stripped = "\n".join(kept)
+    try:
+        toks = tokenize.generate_tokens(io.StringIO(stripped).readline)
+        out_lines = stripped.splitlines()
+        for tok in toks:
+            if tok.type == tokenize.COMMENT:
+                row, col = tok.start
+                out_lines[row - 1] = out_lines[row - 1][:col]
+        return "\n".join(out_lines)
+    except (tokenize.TokenError, IndentationError):
+        return stripped
+
+
+def cite_source(cite: Cite, hooks: Path | None = None) -> tuple[str, str]:
+    """(executable haystack, where) for one citation, or raise naming the miss."""
+    hooks = hooks or _HOOKS
+    # A "/" means a repo-relative path (a shell script); a bare name is a module
+    # under scripts/hooks/, resolved exactly the way the harness resolves guards,
+    # so a citation cannot point somewhere the loader would not go.
+    path = _REPO / cite.module if "/" in cite.module else hooks / f"{cite.module}.py"
+    if not path.is_file():
+        raise DeclarationError(f"cited file no longer exists: {cite.module}")
+    src = path.read_text()
+    if cite.symbol is None:
+        return _executable_source(src, path), cite.module
+
+    matches = [
+        node
+        for node in ast.walk(ast.parse(src, str(path)))
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+        and node.name == cite.symbol
+    ]
+    if not matches:
+        raise DeclarationError(
+            f"cited symbol {cite.module}.{cite.symbol} no longer exists — it was "
+            "renamed, moved, or deleted, and the declaration still leans on it"
+        )
+    # REFUSE rather than take the first. `ast.walk` is breadth-first, so among a
+    # method and a module function of the same name — or an ImportError fallback
+    # pair — it returns whichever is shallower, which for a redefinition is the
+    # DEAD one. A citation silently resolving against unreachable code is worse
+    # than one that fails.
+    if len(matches) != 1:
+        raise DeclarationError(
+            f"{cite.module}.{cite.symbol} is defined {len(matches)}x in that file, "
+            "so a citation naming only the symbol cannot say which one it means. "
+            "Cite a fragment unique to the definition you mean, or rename one."
+        )
+    node = matches[0]
+    segment = ast.get_source_segment(src, node)
+    if segment is None:
+        raise DeclarationError(f"could not read source for {cite.module}.{cite.symbol}")
+    # get_source_segment EXCLUDES decorators, so a fragment living in
+    # `@functools.cache` would report "no longer there" — a true failure with a
+    # false cause. Prepend them.
+    if node.decorator_list:
+        first = min(d.lineno for d in node.decorator_list)
+        segment = "\n".join(src.splitlines()[first - 1 : node.lineno - 1]) + "\n" + segment
+    return _executable_source(segment, path), f"{cite.module}.{cite.symbol}"
+
+
+def scan_shell(text: str, self_name: str) -> tuple[set[str], set[str]]:
+    """Closed-set cross-reference over shell source. Deliberately not a parser.
+
+    Returns (repo script basenames occurring, DELEGATED_PROGRAMS occurring). It
+    proves OCCURRENCE, never invocation — see ShEvidence for why that is the
+    honest claim and why it still catches the delegation.
+    """
+    scripts = {n for n in repo_script_names() if n != self_name and n in text}
+    programs = {
+        p for p in DELEGATED_PROGRAMS if re.search(rf"(?<![\w-]){re.escape(p)}(?![\w-])", text)
+    }
+    return scripts, programs
+
+
+def _check_facts(name: str, evidence: PyEvidence, hooks: Path) -> list[str]:
+    """Bidirectional. An undeclared fact fails, and a declared-but-untrue one
+    fails too — a one-directional check lets the table rot in the safe-looking
+    direction, which is the direction nobody inspects.
+
+    Both messages name the file and the field. The asymmetry they used to have
+    was backwards: declared-False-but-found is the branch an UNRELATED author
+    hits — someone editing `shell_parse.py`, which sits in all four guards'
+    closures — and they have never heard of this table.
+    """
+    found = walk_facts(evidence.module, hooks)
+    problems = []
+    for fact in sorted(_FACT_DOTTED):
+        declared = getattr(evidence, fact)
+        actual = bool(found[fact])
+        if declared and not actual:
+            problems.append(
+                f"{name}: {fact}=True is declared for {evidence.module}, but a "
+                f"transitive walk found none of the {len(fact_coverage()[fact])} "
+                "spellings this checker knows. Either the guard stopped doing it "
+                f"(set {fact}=False in GUARDS[{name!r}].safety.evidence in "
+                "scripts/replay_guard_corpus.py) or the spelling is new (add it to "
+                "_FACT_DOTTED/_FACT_METHODS there, so --list keeps telling the truth)."
+            )
+        if actual and not declared:
+            problems.append(
+                f"{name}: {fact}=False is declared for {evidence.module}, but a "
+                f"transitive walk of its imports under scripts/hooks/ found "
+                f"{', '.join(sorted(found[fact]))}.\n"
+                f"  If you edited one of those modules and this is a real new {fact}: "
+                f"set {fact}=True in GUARDS[{name!r}].safety.evidence in "
+                "scripts/replay_guard_corpus.py — and check whether the guard is "
+                "still replay-safe at all, because that table decides whether it "
+                "may be run against every command on the box.\n"
+                "  If it is a false positive, narrow _FACT_DOTTED/_FACT_METHODS in "
+                "the same file."
+            )
+    return problems
+
+
+def verify_declarations(hooks: Path | None = None) -> list[str]:
+    """Every declaration in GUARDS, re-derived from source. Empty list = clean.
+
+    Four checks, because no three of them cover the fourth:
+      * the evidence KIND matches the guard's MECHANISM (a presence check is
+        satisfied by whichever variant is cheapest to fake);
+      * declared FACTS match a transitive AST walk, bidirectionally;
+      * every CITATION still resolves, against executable source;
+      * a shell guard ACKNOWLEDGES every repo script and program name occurring
+        in it, and the Python delegates it says it INVOKES have their own facts
+        checked the same way the top-level guards do.
+    """
+    hooks = hooks or _HOOKS
+    problems: list[str] = []
+    for name, guard in sorted(GUARDS.items()):
+        evidence = guard.safety.evidence
+
+        if not isinstance(evidence, PyEvidence | ShEvidence):
+            problems.append(f"{name}: no machine-checkable evidence at all")
+            continue
+        if guard.py_module is not None:
+            if not isinstance(evidence, PyEvidence):
+                problems.append(
+                    f"{name} runs the Python guard {guard.py_module!r} but declares "
+                    f"{type(evidence).__name__}, which the fact walk never looks at. "
+                    "Shell evidence on a Python guard is an unchecked declaration "
+                    "wearing a checked one's clothes."
+                )
+                continue
+            if evidence.module != guard.py_module:
+                problems.append(
+                    f"{name} runs {guard.py_module!r} but its evidence describes "
+                    f"{evidence.module!r} — the declaration is about a different "
+                    "artifact from the one that will be replayed."
+                )
+                continue
+        elif not isinstance(evidence, ShEvidence):
+            problems.append(
+                f"{name} is a shell guard (no py_module) but declares "
+                f"{type(evidence).__name__}, whose module the fact walk would look "
+                "for under scripts/hooks/ and never find."
+            )
+            continue
+
+        if isinstance(evidence, PyEvidence):
+            problems += _check_facts(name, evidence, hooks)
+        else:
+            problems += _check_shell(name, evidence, hooks)
+
+        for cite in guard.safety.cites:
+            try:
+                haystack, where = cite_source(cite, hooks)
+            except DeclarationError as exc:
+                problems.append(f"{name}: {exc}")
+                continue
+            # An empty fragment is a deliberate symbol-existence citation; getting
+            # here already proved the symbol resolves, and `"" in x` would be the
+            # vacuous assertion this file bans elsewhere.
+            if cite.fragment and cite.fragment not in haystack:
+                problems.append(
+                    f"{name}: the fragment cited from {where} is no longer in its "
+                    f"EXECUTABLE source —\n    {cite.fragment!r}\n"
+                    "  It was edited, reflowed, moved to another symbol, or is now "
+                    "only present in a comment. Re-read the source and restate the "
+                    "evidence; do NOT relax the fragment until it matches, which "
+                    "keeps the citation green while the claim it supports has "
+                    "quietly changed."
+                )
+    return problems
+
+
+def _check_shell(name: str, evidence: ShEvidence, hooks: Path) -> list[str]:
+    """The delegation scan, plus the facts of every delegate it says it invokes."""
+    problems: list[str] = []
+    try:
+        text = evidence.source()
+    except BaseException as exc:  # noqa: BLE001 - SystemExit is the live case
+        # `_inline_blob` locates the blob by CONTENT, so a reword in
+        # .claude/settings.json raises SystemExit out of source(). Unwrapped it
+        # surfaces as an unhandled BaseException with no hint of the cause.
+        return [
+            f"{name}: could not read {evidence.label} ({exc!r}). If this is the "
+            "inline blob, it was probably reworded — `_inline_blob` finds it by "
+            "matching its text, so the locator needs updating, not the scan."
+        ]
+    if not text.strip():
+        return [
+            f"{name}: ShEvidence.source() is empty, so the delegation scan reads "
+            "nothing and asserts nothing. Point it at the real text."
+        ]
+
+    self_name = Path(evidence.label).name
+    scripts, programs = scan_shell(text, self_name)
+    for kind, actual, declared in (
+        ("script", scripts, set(evidence.references_scripts)),
+        ("program", programs, set(evidence.references_programs)),
+    ):
+        for extra in sorted(actual - declared):
+            problems.append(
+                f"{name}: {evidence.label} references {kind} {extra!r}, which the "
+                "declaration does not acknowledge. Say what it is doing there — a "
+                "delegation whose side effects belong in `why`, or message text "
+                "that only looks like one."
+            )
+        for stale in sorted(declared - actual):
+            problems.append(
+                f"{name}: declares {kind} {stale!r}, which no longer occurs in "
+                f"{evidence.label}. The prose about it is describing something "
+                "that is not there."
+            )
+
+    # The half the name-matching cannot do. A shell guard's `why` makes claims
+    # about what its delegates DO ("both are pure argv/string classifiers"), and
+    # until this existed nothing checked them: MEASURED, destructive_command_guard
+    # and shell_parse were referenced by bash_safety and fact-walked by nothing.
+    # A prose claim nobody checks, inside the mechanism built to end prose claims
+    # nobody checks.
+    for delegate in evidence.invokes:
+        if f"{delegate.module}.py" not in evidence.references_scripts:
+            problems.append(
+                f"{name}: declares it invokes {delegate.module!r}, which does not "
+                f"occur in {evidence.label} at all. You cannot invoke what you do "
+                "not reference."
+            )
+            continue
+        problems += _check_facts(f"{name} -> {delegate.module}", delegate, hooks)
+    return problems
 
 
 class Result(NamedTuple):
@@ -1533,6 +2071,26 @@ def main() -> int:
         # message at all. A wrong number is loud here; a wrong runtime is not.
         ap.error("--jobs must be >= 1")
 
+    # BEFORE anything else on every path. The declarations decide whether a
+    # guard may be run against this install's entire command history, so a stale
+    # one is most dangerous exactly when someone has just edited a guard and is
+    # reaching for this tool. Verifying only in CI left that window open.
+    problems = verify_declarations()
+    if problems:
+        print(
+            "REFUSED: the replay-safety declarations do not match the source.\n",
+            file=sys.stderr,
+        )
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        print(
+            "\nThere is deliberately no --force. A declaration is what permits a "
+            "guard to run against every command on this box; an override on it is "
+            "a bypass, not a convenience. Fix the declaration or the code.",
+            file=sys.stderr,
+        )
+        return 2
+
     if args.list:
         if args.rebuild:
             # --list returns before load_corpus, so --rebuild here does nothing.
@@ -1555,7 +2113,7 @@ def main() -> int:
             if isinstance(ev, PyEvidence):
                 facts = " ".join(
                     f"{f}={getattr(ev, f)}"
-                    for f in ("reads_env", "reads_argv", "spawns", "writes_fs")
+                    for f in ("reads_env", "reads_argv", "network", "spawns", "writes_fs")
                 )
                 print(f"    facts ({ev.module}, transitive): {facts}")
             elif isinstance(ev, ShEvidence):
