@@ -260,10 +260,19 @@ class TestLobbyDoorScript:
             "the picker must be per-connection; a fixed name is shared by tmux "
             "and a second client then takes over the first's pane"
         )
-        # And nothing may target a fixed shared name.
-        assert not [ln for ln in code if '-s "lobby"' in ln or "=lobby:" in ln], (
-            "no command may target a fixed lobby session"
-        )
+        # The door ATTACHES to exactly one session, and it must be the per-pid
+        # one. The persistent workspace is created if missing and then left
+        # alone — created DETACHED, never attached, never mutated.
+        attaches = [ln for ln in code if ln.strip().startswith("exec tmux")]
+        assert len(attaches) == 1, f"exactly one attach expected: {attaches}"
+        assert '"$SESSION"' in attaches[0] and "-d" not in attaches[0], attaches[0]
+        workspace = [ln for ln in code if "$WORKSPACE" in ln and "tmux" in ln]
+        assert workspace, "the persistent workspace must be ensured to exist"
+        for ln in workspace:
+            assert "has-session" in ln or "new-session -d" in ln, (
+                "the workspace may only be probed or created DETACHED — the old "
+                f"door's habit of attaching to it is what made it destructible: {ln}"
+            )
 
     def test_no_serialization_machinery_remains(self):
         """The lock, the owner marker and the HOME dependency existed ONLY to
@@ -301,11 +310,15 @@ class TestLobbyDoorScript:
             ln for ln in text.split("\n")
             if ln.strip() and not ln.strip().startswith("#")
         ]
-        new_i = next((i for i, ln in enumerate(code) if "new-session" in ln), None)
+        # The PICKER's new-session, not the workspace's detached one.
+        new_i = next(
+            (i for i, ln in enumerate(code) if ln.strip().startswith("exec tmux")),
+            None,
+        )
         opt_i = next(
             (i for i, ln in enumerate(code) if "destroy-unattached" in ln), None
         )
-        assert new_i is not None and opt_i is not None and new_i < opt_i
+        assert new_i is not None and opt_i is not None and new_i <= opt_i
         assert "-d" not in code[new_i], (
             "the picker must be created ATTACHED; a detached session with "
             "destroy-unattached set dies before the client arrives"

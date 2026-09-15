@@ -51,8 +51,24 @@
 # leaving zero sessions behind. That is the property the whole design rests on.
 set -uo pipefail
 
-# Per-connection, so two windows can never meet. One pid cannot open two doors,
-# so a collision is not possible rather than merely unlikely.
+# The persistent container command line. It is one of the things the operator
+# picks from the tree — "the lobby" as they think of it — so it must always be
+# there to pick, including after a reboot. The old door got that for free by
+# ATTACHING to it, which is what made it destructible; this one CREATES it if
+# absent and then never touches it again.
+#
+# Idempotent and silent, MEASURED against a session holding live work under a
+# stale chooser: three runs left pane_pid, pane_mode and pane_current_command
+# byte-identical and printed nothing. (`new-session -d -A` would do the same job
+# but prints "open terminal failed: not a terminal" every time, so the
+# has-session form is used instead.)
+WORKSPACE="lobby"
+tmux has-session -t "=${WORKSPACE}" 2>/dev/null \
+    || tmux new-session -d -s "$WORKSPACE" 2>/dev/null
+
+# The PICKER is per-connection, so two windows can never meet. One pid cannot
+# open two doors, so a collision is not possible rather than merely unlikely.
+# This is the session the door attaches to, and the only one it is allowed to.
 SESSION="lobby-$$"
 
 # `destroy-unattached` is set ON THIS SESSION (-t), never globally: a global set
