@@ -449,9 +449,15 @@ _cap_fail_open() {
 #
 # Placed ABOVE every latch and gate ON PURPOSE: `existing`, `_SESSION_EXISTS`,
 # the capacity gate, the OAuth gate and the exec all take their first and only
-# read AFTER this block, so no precondition is ever read before the destructive
-# action — the staleness class that killed the predecessor design (7 review
-# rounds) is retired by construction, not by re-checking.
+# read AFTER this block — the staleness class that killed the predecessor design
+# (7 review rounds) is retired by construction, not by re-checking.
+#
+# ONE deliberate exception, and it is bounded rather than hidden: the rebuild
+# path asks the capacity engine about the post-kill RAM floor before it kills,
+# because that gate can otherwise refuse AFTER the pane is gone. It sits ahead
+# of the final state snapshot, never between it and the kill, so it cannot
+# lengthen the interval the design is built to keep short. See "ADMIT BEFORE
+# DESTROYING" below for why the RAM floor is the only check that qualifies.
 #
 # Manual/dashboard mode reaches here too but allocated a slot with NO existing
 # session, so the has-session guard makes this a structural no-op there — only
@@ -473,7 +479,19 @@ _s2_snapshot() {
     # Bounded like the slot-map probe and for the same reason: a blocking
     # round-trip to a possibly-wedged server on the LOGIN path. `-k` because
     # timeout SIGTERMs and then waits, which uninterruptible I/O outlives.
-    timeout -k 2 3 tmux list-panes -s -t "=${SESSION_NAME}" -F "$_S2_SNAP_FMT" 2>/dev/null || true
+    #
+    # A PARTIAL read must never pass as a snapshot. `|| true` alone kept
+    # whatever tmux had already written before it timed out or the socket went
+    # away AND reported success, so a multi-pane session could be projected
+    # without the pane running claude: both reads see the same visible subset,
+    # both probe POISONED, the projections compare EQUAL, and a live session is
+    # destroyed. Take the status separately and emit nothing unless tmux exited
+    # clean. Empty is already this block's "no verdict", which attaches — the
+    # fail direction the whole block is built around.
+    local _out _rc=0
+    _out=$(timeout -k 2 3 tmux list-panes -s -t "=${SESSION_NAME}" -F "$_S2_SNAP_FMT" 2>/dev/null) || _rc=$?
+    [ "$_rc" -eq 0 ] || return 0
+    [ -n "$_out" ] && printf '%s\n' "$_out"
     return 0
 }
 _s2_liveness() {
@@ -573,69 +591,94 @@ if [[ "$MODE_ARG" != "manual" ]] && tmux has-session -t "=${SESSION_NAME}" 2>/de
                 done
                 unset _lever
 
-                _s2_snap2=$(_s2_snapshot)
-                _s2_srv2=$(printf '%s\n' "$_s2_snap2" | sed -n '1p' | cut -d'|' -f1)
-                _s2_sid2=$(printf '%s\n' "$_s2_snap2" | sed -n '1p' | cut -d'|' -f2)
-                _s2_proj1=$(printf '%s\n' "$_s2_snap1" | cut -d'|' -f3-)
-                _s2_proj2=$(printf '%s\n' "$_s2_snap2" | cut -d'|' -f3-)
-                _s2_verdict2=$(_s2_liveness "$_s2_snap2")
-                if [ -n "$_s2_snap2" ] \
-                    && [ "$_s2_srv2" = "$_s2_srv1" ] \
-                    && [ "$_s2_sid2" = "$_s2_sid1" ] \
-                    && [ "$_s2_proj2" = "$_s2_proj1" ] \
-                    && [ "$_s2_verdict2" = "POISONED" ]; then
-                    # ADMIT BEFORE DESTROYING — the one precondition read that
-                    # belongs before the kill, and deliberately the ONLY one.
-                    #
-                    # Everything else in this script reads AFTER the destructive
-                    # action on purpose (see the header above) so no precondition
-                    # can go stale. But the capacity gate below can REFUSE after
-                    # the slot is already gone: `_cap_reclaim` has six `exit 1`
-                    # paths (no cc-N to trade under an OOM floor; no tty; an empty
-                    # answer at the prompt; an invalid selection; declining the
-                    # attached-victim confirm; a failed victim kill) and every one
-                    # of them runs post-kill. The likeliest is not exotic: consent,
-                    # kill, gate says RECLAIM, operator presses Enter to cancel —
-                    # pane and scrollback gone, no replacement.
-                    #
-                    # Only the RAM floor can legitimately refuse a REBUILD. The
-                    # COUNT check cannot: this slot is counted now and is counted
-                    # again after, so a rebuild is net-zero (reattach already
-                    # bypasses the cap for the same reason, below). So model the
-                    # POST-KILL world — existing minus this slot — and let the
-                    # shipped decision engine answer; `ram_ok` there does not
-                    # depend on `existing` at all, so that framing isolates the
-                    # floor rather than reimplementing it here.
-                    #
-                    # FAIL-OPEN, stated rather than hidden: if the probe cannot
-                    # run we proceed to the kill, which is exactly today's
-                    # behaviour. This NARROWS the window; it does not close it,
-                    # and the post-kill gate keeps its own fail-open fallback.
-                    _s2_rebuild_ok=1
-                    if [ -x "${GENESIS_ROOT}/.venv/bin/python" ]; then
-                        _s2_live=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
-                                   | grep -cE "^${SESSION_PREFIX}-[0-9]+$" || true)
-                        [ -n "$_s2_live" ] || _s2_live=0
-                        [ "$_s2_live" -gt 0 ] && _s2_live=$((_s2_live - 1))
-                        _s2_cap=$(timeout -k 2 15 "${GENESIS_ROOT}/.venv/bin/python" \
-                            -m genesis.cc.session_cap --existing "$_s2_live" 2>/dev/null || true)
-                        if [ "$(printf '%s\n' "$_s2_cap" | sed -n '3p')" = "oom_floor" ]; then
-                            _s2_rebuild_ok=0
-                            echo "cc-slot: NOT rebuilding ${SESSION_NAME} — RAM is below the floor, so the" >&2
-                            echo "cc-slot: replacement could not start and you would lose the pane for nothing." >&2
-                            echo "cc-slot: $(printf '%s\n' "$_s2_cap" | sed -n '2p')" >&2
-                            echo "cc-slot: free memory (or end another slot) and reconnect; attaching as-is." >&2
-                        fi
+                # ADMIT BEFORE DESTROYING — the one precondition read that
+                # belongs before the kill, and deliberately the ONLY one.
+                #
+                # Everything else in this script reads AFTER the destructive
+                # action on purpose (see the header above) so no precondition
+                # can go stale. But the capacity gate below can REFUSE after
+                # the slot is already gone: `_cap_reclaim` has six `exit 1`
+                # paths (no cc-N to trade under an OOM floor; no tty; an empty
+                # answer at the prompt; an invalid selection; declining the
+                # attached-victim confirm; a failed victim kill) and every one
+                # of them runs post-kill. The likeliest is not exotic: consent,
+                # kill, gate says RECLAIM, operator presses Enter to cancel —
+                # pane and scrollback gone, no replacement.
+                #
+                # Only the RAM floor can legitimately refuse a REBUILD. The
+                # COUNT check cannot: this slot is counted now and is counted
+                # again after, so a rebuild is net-zero (reattach already
+                # bypasses the cap for the same reason, below). So model the
+                # POST-KILL world — existing minus this slot — and let the
+                # shipped decision engine answer; `ram_ok` there does not
+                # depend on `existing` at all, so that framing isolates the
+                # floor rather than reimplementing it here.
+                #
+                # It runs HERE, ahead of the final snapshot, and the ordering is
+                # the point: this probe can spend seconds (a cold import behind
+                # a 15s+2s bound), and anything between the last state read and
+                # the kill is a window in which the operator's disclosed state
+                # can change underneath them. Sequenced after the compare it
+                # re-opened, inside this very block, the staleness class the
+                # design exists to retire. RAM staleness costs the opposite and
+                # far less: a rebuild admitted against a reading a few seconds
+                # old simply meets the post-kill gate, which is what happened
+                # before this probe existed.
+                #
+                # FAIL-OPEN, stated rather than hidden: if the probe cannot
+                # run we proceed to the kill, which is exactly today's
+                # behaviour. This NARROWS the window; it does not close it,
+                # and the post-kill gate keeps its own fail-open fallback.
+                _s2_rebuild_ok=1
+                if [ -x "${GENESIS_ROOT}/.venv/bin/python" ]; then
+                    _s2_live=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
+                               | grep -cE "^${SESSION_PREFIX}-[0-9]+$" || true)
+                    [ -n "$_s2_live" ] || _s2_live=0
+                    [ "$_s2_live" -gt 0 ] && _s2_live=$((_s2_live - 1))
+                    _s2_cap=$(timeout -k 2 15 "${GENESIS_ROOT}/.venv/bin/python" \
+                        -m genesis.cc.session_cap --existing "$_s2_live" 2>/dev/null || true)
+                    if [ "$(printf '%s\n' "$_s2_cap" | sed -n '3p')" = "oom_floor" ]; then
+                        _s2_rebuild_ok=0
+                        echo "cc-slot: NOT rebuilding ${SESSION_NAME} — RAM is below the floor, so the" >&2
+                        echo "cc-slot: replacement could not start and you would lose the pane for nothing." >&2
+                        echo "cc-slot: $(printf '%s\n' "$_s2_cap" | sed -n '2p')" >&2
+                        echo "cc-slot: free memory (or end another slot) and reconnect; attaching as-is." >&2
                     fi
-                    if [ "$_s2_rebuild_ok" = "0" ]; then
-                        :
-                    elif tmux kill-session -t "$_s2_sid1" 2>/dev/null; then
-                        echo "cc-slot: ${SESSION_NAME} ended — rebuilding it fresh." >&2
-                    else
-                        echo "cc-slot: could not end ${SESSION_NAME} (it may have just changed) — attaching instead." >&2
-                    fi
+                fi
+
+                if [ "$_s2_rebuild_ok" = "0" ]; then
+                    # Refused above, with the reason already printed. Fall
+                    # through to the `-A` attach — nothing was touched.
+                    :
                 else
-                    echo "cc-slot: ${SESSION_NAME} changed while you decided — leaving it alone and attaching." >&2
+                    # Consent was given for the DISCLOSED state, not for the
+                    # slot: re-snapshot and require the server generation (#1),
+                    # the id, and the consent projection — attachment + every
+                    # pane's command, fields 3 on — to be STRING-IDENTICAL, and
+                    # the slot to still probe POISONED. Anything moved -> stand
+                    # down; the `-A` attach below absorbs every interleaving.
+                    #
+                    # This is the LAST read before the kill, and nothing may be
+                    # inserted between the two.
+                    _s2_snap2=$(_s2_snapshot)
+                    _s2_srv2=$(printf '%s\n' "$_s2_snap2" | sed -n '1p' | cut -d'|' -f1)
+                    _s2_sid2=$(printf '%s\n' "$_s2_snap2" | sed -n '1p' | cut -d'|' -f2)
+                    _s2_proj1=$(printf '%s\n' "$_s2_snap1" | cut -d'|' -f3-)
+                    _s2_proj2=$(printf '%s\n' "$_s2_snap2" | cut -d'|' -f3-)
+                    _s2_verdict2=$(_s2_liveness "$_s2_snap2")
+                    if [ -n "$_s2_snap2" ] \
+                        && [ "$_s2_srv2" = "$_s2_srv1" ] \
+                        && [ "$_s2_sid2" = "$_s2_sid1" ] \
+                        && [ "$_s2_proj2" = "$_s2_proj1" ] \
+                        && [ "$_s2_verdict2" = "POISONED" ]; then
+                        if tmux kill-session -t "$_s2_sid1" 2>/dev/null; then
+                            echo "cc-slot: ${SESSION_NAME} ended — rebuilding it fresh." >&2
+                        else
+                            echo "cc-slot: could not end ${SESSION_NAME} (it may have just changed) — attaching instead." >&2
+                        fi
+                    else
+                        echo "cc-slot: ${SESSION_NAME} changed while you decided — leaving it alone and attaching." >&2
+                    fi
                 fi
             else
                 echo "cc-slot: leaving ${SESSION_NAME} as it is." >&2
@@ -643,7 +686,8 @@ if [[ "$MODE_ARG" != "manual" ]] && tmux has-session -t "=${SESSION_NAME}" 2>/de
         fi
     fi
     unset _s2_snap1 _s2_snap2 _s2_verdict _s2_verdict2 _s2_srv1 _s2_srv2 \
-          _s2_sid1 _s2_sid2 _s2_sid_ok _s2_proj1 _s2_proj2 _s2_cmds _s2_ans 2>/dev/null || true
+          _s2_sid1 _s2_sid2 _s2_sid_ok _s2_proj1 _s2_proj2 _s2_cmds _s2_ans \
+          _s2_rebuild_ok _s2_live _s2_cap 2>/dev/null || true
 fi
 
 # Numeric slots only: retired cc-manual-<ts>-<pid> sessions from the old wrapper

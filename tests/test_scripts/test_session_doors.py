@@ -86,6 +86,11 @@ if [[ "$args" == *list-panes* ]]; then
         elif [[ -f "${FAKE_TMUX_SNAP:-/nonexistent}" ]]; then
             cat "$FAKE_TMUX_SNAP"
         fi
+        # A TRUNCATED read: rows already on stdout, then the command dies (a
+        # timeout, or the server going away mid-listing). The real tmux does
+        # exactly this, and the partial rows are indistinguishable from a whole
+        # session unless the EXIT STATUS is consulted.
+        if [[ -n "${FAKE_TMUX_SNAP_PARTIAL_FAIL:-}" ]]; then exit 1; fi
         exit 0
     fi
     [[ -f "$FAKE_TMUX_PANES" ]] && cat "$FAKE_TMUX_PANES"
@@ -205,6 +210,9 @@ def door(tmp_path):
             "FAKE_CAP_LOG": str(cap_log),
             # A slot that appears between manual mode's selection and the
             # rebuild branch's check — the concurrent-launch race.
+            "FAKE_TMUX_SNAP_PARTIAL_FAIL": os.environ.get(
+                "_TEST_FAKE_SNAP_PARTIAL_FAIL", ""
+            ),
             "FAKE_TMUX_SESSIONS_APPEAR": os.environ.get(
                 "_TEST_FAKE_SESSION_APPEARS", ""),
             "FAKE_TMUX_APPEAR_N": str(tmp_path / "appear_calls.txt"),
@@ -906,6 +914,121 @@ class TestRebuildAdmitsBeforeDestroying:
             os.environ.pop("_TEST_FAKE_LIVENESS", None)
         assert code == 0, out
         assert run.killlog.read_text().strip() == "$7", out
+
+
+class TestTruncatedSnapshotNeverAuthorizesAKill:
+    """A partial `list-panes` read must not pass as a snapshot.
+
+    `tmux list-panes` can write rows and THEN die — a timeout, or the server
+    going away mid-listing. The rows already on stdout are indistinguishable
+    from a complete session unless the exit status is consulted, and the door
+    used to swallow that status with `|| true`. In a multi-pane session the
+    omitted row can be the one running claude: both reads then see the same
+    bash-only subset, both probe POISONED, the projections compare EQUAL, every
+    identity check passes, and a live session is destroyed by a door whose
+    entire contract is "anything unrecognised attaches".
+
+    The status is now taken separately and a nonzero exit yields an EMPTY
+    snapshot, which is already this block's "no verdict".
+    """
+
+    def test_a_partial_read_falls_toward_attach(self, door):
+        run, log = _poisoned_slot(door)
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED,POISONED"
+        os.environ["_TEST_FAKE_SNAP_PARTIAL_FAIL"] = "1"
+        os.environ["_TEST_FAKE_CAP_REASON"] = "ok"
+        try:
+            code, out = _run_door_pty(run, "genesis-3-1", b"y\n")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+            os.environ.pop("_TEST_FAKE_SNAP_PARTIAL_FAIL", None)
+            os.environ.pop("_TEST_FAKE_CAP_REASON", None)
+        assert code == 0, out
+        # THE POINT: nothing was killed on the strength of a truncated read.
+        assert not run.killlog.exists() or run.killlog.read_text().strip() == "", (
+            f"a truncated snapshot authorized a kill:\n{out}"
+        )
+        # And the operator is not stranded — the door still attaches.
+        assert "new-session" in log.read_text()
+
+    def test_a_clean_read_of_the_same_rows_still_rebuilds(self, door):
+        """The control, and it is load-bearing.
+
+        Identical fixture, identical rows, identical liveness verdicts — the
+        ONLY difference is tmux's exit status. Without this the test above
+        passes against a door that never rebuilds anything.
+        """
+        run, _ = _poisoned_slot(door)
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED,POISONED"
+        os.environ["_TEST_FAKE_CAP_REASON"] = "ok"
+        try:
+            code, out = _run_door_pty(run, "genesis-3-1", b"y\n")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+            os.environ.pop("_TEST_FAKE_CAP_REASON", None)
+        assert code == 0, out
+        assert run.killlog.read_text().strip() == "$7", out
+
+
+class TestNothingSitsBetweenTheLastReadAndTheKill:
+    """The admission probe runs BEFORE the final snapshot, not after it.
+
+    The probe is a Python start-up behind a 15s+2s bound. Sequenced after the
+    snapshot/liveness compare — which is where it first landed — it re-opened
+    the exact staleness window this block exists to retire: the operator
+    consents to a disclosed state, the probe spends seconds, someone starts a
+    process in that pane, and the kill lands on a session that no longer
+    matches what was disclosed. There is no third snapshot to catch it.
+
+    Ordering is the whole fix, so it is pinned structurally: the last read
+    before `kill-session` must be the snapshot compare.
+    """
+
+    def test_the_capacity_probe_precedes_the_final_snapshot(self):
+        text = _CC_SLOT.read_text()
+        code = [
+            ln for ln in text.split("\n")
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        probe = next(
+            (i for i, ln in enumerate(code) if "session_cap --existing" in ln), None
+        )
+        snap2 = next(
+            (i for i, ln in enumerate(code) if "_s2_snap2=$(_s2_snapshot)" in ln), None
+        )
+        kill = next(
+            (i for i, ln in enumerate(code) if 'kill-session -t "$_s2_sid1"' in ln), None
+        )
+        assert probe is not None, "the rebuild path must admit before destroying"
+        assert snap2 is not None, "the rebuild path must re-read state after consent"
+        assert kill is not None, "the rebuild path must kill by id"
+        assert probe < snap2, (
+            "the capacity probe must run BEFORE the final snapshot — after it, "
+            "its own latency becomes a stale window on the disclosed state"
+        )
+        assert snap2 < kill, (
+            "the snapshot compare must be the LAST read before the kill"
+        )
+
+    def test_no_subprocess_bound_sits_between_the_compare_and_the_kill(self):
+        """Guard the class, not just today's instance.
+
+        The ordering test above would still pass if a NEW bounded call were
+        added between the compare and the kill. Name the window itself: no
+        `timeout` (the shape every probe here takes) may appear in it.
+        """
+        text = _CC_SLOT.read_text()
+        start = text.index("_s2_verdict2=$(_s2_liveness")
+        end = text.index('kill-session -t "$_s2_sid1"', start)
+        window = [
+            ln for ln in text[start:end].split("\n")
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        offenders = [ln for ln in window if "timeout " in ln]
+        assert not offenders, (
+            "a bounded subprocess between the final state read and the kill is "
+            f"a stale window on the operator's consent: {offenders}"
+        )
 
 
 class TestRebuildIsHostnameModeOnly:
