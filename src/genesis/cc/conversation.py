@@ -82,6 +82,43 @@ _BG_RESEARCH_ROUTING = (
 )
 
 
+# The block's own delimiter, shared by the builder and the stripper below so
+# the two cannot drift. A failover peer must NOT receive this block — it
+# describes the HOME model and effort, and the peer runs a different one — so
+# something has to be able to find it again after composition.
+_SESSION_CONTROL_HEADING = "\n\n## Changing your own model / effort\n"
+
+
+def _strip_session_control_block(prompt: str | None) -> str | None:
+    """Remove the session-control block, leaving every other fragment intact.
+
+    The peer is told what it is by its OWN invocation; forwarding the home
+    block states a model and effort the peer is not running, and `session_config`
+    cannot change a peer dispatch that has already been created. Topic context,
+    the research-routing nudge and the assembled identity are all
+    peer-independent and must survive — which is why this removes one named
+    section rather than rebuilding the prompt from scratch.
+
+    Bounded by the NEXT top-level section, or the end of the prompt. Verified
+    against the builder's output: the block is exactly one `## ` heading plus
+    one paragraph and contains no nested section, so the next `\\n\\n## ` is
+    always the start of a different fragment.
+    """
+    if not prompt or _SESSION_CONTROL_HEADING not in prompt:
+        return prompt
+    start = prompt.index(_SESSION_CONTROL_HEADING)
+    # Search for the next section AFTER this heading's own delimiter.
+    nxt = prompt.find("\n\n## ", start + len(_SESSION_CONTROL_HEADING))
+    end = nxt if nxt != -1 else len(prompt)
+    # `or None` normalises a prompt that was ENTIRELY this block. Kept, though
+    # it is unreachable today: the block and the research-routing nudge are
+    # gated on the same channel predicate, so the block never appears without
+    # a fragment after it. Both spellings are falsy and every caller tests
+    # truthiness, so the branch cannot change behaviour either way — which is
+    # also why it is not worth changing.
+    return (prompt[:start] + prompt[end:]) or None
+
+
 def _session_control_block(
     channel: ChannelType | str | None,
     model,
@@ -157,7 +194,7 @@ def _session_control_block(
         # harder" is not a switch this session can make.
         asks = '("use opus", "switch to sonnet")'
     return (
-        "\n\n## Changing your own model / effort\n"
+        _SESSION_CONTROL_HEADING
         + current
         + f"When the user asks you to switch {asks}, "
         f'call `mcp__genesis-health__session_config` with session_id="{session_id}" '
@@ -1158,6 +1195,7 @@ class ConversationLoop:
         peer_inv: CCInvocation,
         *,
         sticky: dict | None,
+        resume_system_prompt: str | None = None,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None,
         streamed: dict | None = None,
     ) -> Any:
@@ -1165,14 +1203,29 @@ class ConversationLoop:
         peer, resume it for continuity; on a stale resume (non-rate-limit CCError)
         retry once FRESH on the same peer — UNLESS answer text already streamed (a
         fresh retry would re-stream and double-output). Rate-limit/quota propagate
-        to the caller (which moves to the next peer)."""
+        to the caller (which moves to the next peer).
+
+        ``resume_system_prompt`` is the turn's own fragments WITHOUT the
+        assembled identity, and it is used on exactly one branch: the resume
+        below. `peer_inv` carries the identity, so every FRESH path — a peer
+        the sticky session does not name, and the stale-resume retry — keeps
+        it by construction. THAT is why the choice lives here rather than
+        upstream: whether this turn resumes is a per-PEER fact decided on the
+        next three lines, and predicting it before the loop got it wrong for a
+        non-matching peer and for the retry (both measured)."""
         inv = peer_inv  # fresh by default (failover_invocations set resume=None)
         if (
             sticky
             and sticky.get("roster_model") == peer_name
             and sticky.get("cc_session_id")
         ):
-            inv = replace(peer_inv, resume_session_id=sticky["cc_session_id"])
+            # The peer's OWN session already holds the identity; re-sending it
+            # duplicates the whole SOUL/user prompt on every sticky turn.
+            inv = replace(
+                peer_inv,
+                resume_session_id=sticky["cc_session_id"],
+                system_prompt=resume_system_prompt,
+            )
         try:
             return await self._invoke_peer(inv, on_event)
         except (CCRateLimitError, CCQuotaExhaustedError, CCNetworkOfflineError):
@@ -1246,6 +1299,29 @@ class ConversationLoop:
             # replaces them. Those fragments are the only place that per-turn
             # context exists on a resume; dropping them made "approve this
             # proposal" arrive at the peer with no referent.
+            sticky = self._session_fallback_session(session)
+
+            # The home session-control block never travels to a peer, sticky or
+            # fresh. It names the HOME model and effort, the peer runs its own,
+            # and `session_config` cannot change a dispatch already created —
+            # so forwarding it states something false and actionable. Stripped
+            # rather than suppressed upstream: the block is correct for the
+            # home invocation, and only this path needs it gone.
+            base_inv = replace(
+                base_inv,
+                system_prompt=_strip_session_control_block(base_inv.system_prompt),
+            )
+
+            # The turn's own fragments, WITHOUT the identity below. A sticky
+            # resume gets these and nothing more, because the peer's session
+            # already holds the identity — but that choice is made per PEER,
+            # in `_run_failover_peer`, not here. Gating the rebuild on
+            # `not sticky` at this point was wrong twice, both measured: a
+            # peer the sticky session does not NAME runs fresh, and so does
+            # the stale-resume retry, and neither would have had any identity
+            # at all.
+            fragments_only = base_inv.system_prompt
+
             if base_inv.resume_session_id is not None:
                 identity = await self._assembler.assemble(
                     db=self._db, model=str(model), effort=str(effort),
@@ -1319,7 +1395,11 @@ class ConversationLoop:
                     }},
                 )
 
-            sticky = self._session_fallback_session(session)
+            # `sticky` was resolved above, where the prompt is composed. Not
+            # for a race — `_session_fallback_session` parses the in-memory
+            # `session` dict and touches no store, and nothing between the two
+            # points reassigns it, so a second read would be identical. It is
+            # simply needed there.
             for peer_name, peer_inv in peers:
                 if streamed and streamed.get("text"):
                     break  # a prior peer already streamed answer text — can't fail
@@ -1327,6 +1407,7 @@ class ConversationLoop:
                 try:
                     output = await self._run_failover_peer(
                         peer_name, peer_inv, sticky=sticky,
+                        resume_system_prompt=fragments_only,
                         on_event=on_event, streamed=streamed,
                     )
                 except (CCRateLimitError, CCQuotaExhaustedError) as exc:
@@ -1841,6 +1922,14 @@ class ConversationLoop:
         # as _try_roster_failover): the tool-less router has no other referent
         # for "this one" / "the older ones" than the topic context the turn
         # already assembled — replacing it strips exactly that.
+        # The contingency router gets the same treatment as a roster peer, and
+        # for a sharper reason: it is TOOL-LESS. The block tells the session to
+        # call `session_config` and not to refuse on the belief that it cannot
+        # — said to a model with no MCP tools at all — and states a model and
+        # effort that are not what `result.model` will actually run. Same
+        # finding as the peer path, worse instance (CodeRabbit Major, #1627).
+        system_prompt = _strip_session_control_block(system_prompt)
+
         if was_resume or system_prompt is None:
             try:
                 identity = await self._assembler.assemble(
