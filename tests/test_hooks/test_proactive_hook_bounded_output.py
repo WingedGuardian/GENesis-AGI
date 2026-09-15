@@ -24,13 +24,17 @@ re-assert the constants only where a claim depends on their arithmetic.
 from __future__ import annotations
 
 import json
+import os
+import re
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent / "scripts"
+_REPO = Path(__file__).resolve().parent.parent.parent
+SCRIPTS_DIR = _REPO / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import proactive_memory_hook as pmh  # noqa: E402
@@ -728,6 +732,43 @@ def test_slicing_before_clipping_did_not_break_the_elision_marker() -> None:
     exact = pmh._render_trail_line([f"topic {i}" for i in range(pmh._MAX_TRAIL_DISPLAY)])
     assert exact is not None
     assert "… → " not in exact, "nothing was dropped, so nothing should be marked"
+
+
+def test_the_autouse_fixture_does_not_import_the_production_hook(tmp_path) -> None:
+    """CODEX round 2: the autouse writer-reset must not IMPORT the hook.
+
+    The hook is an executable script: its import-time body calls load_dotenv on
+    the real secrets.env and then sys.exit(0) when GENESIS_CC_SESSION=1 — the
+    variable every dispatched background session exports. An autouse fixture
+    importing it therefore killed tests that have nothing to do with this hook.
+    MEASURED before the fix: test_file_context_hook.py went 5 passed -> 5 ERRORS
+    with that variable set, while main was unaffected.
+
+    Driven as a SUBPROCESS in that environment, because the defect is about what
+    happens at collection in a fresh interpreter — in-process the module is
+    already imported and the bug is invisible. GENESIS_PYTEST_LOCK=0 because the
+    box-wide test lock is already held by the run executing this test.
+    """
+    target = "tests/test_hooks/test_file_context_hook.py"
+    if not (_REPO / target).exists():  # pragma: no cover - file renamed/removed
+        pytest.skip(f"{target} no longer exists; pick another hook test as the canary")
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", target, "-q", "--no-header", "-p", "no:cacheprovider"],
+        cwd=_REPO,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "GENESIS_CC_SESSION": "1", "GENESIS_PYTEST_LOCK": "0"},
+    )
+    out = proc.stdout + proc.stderr
+    # Guard-the-guard: a run that never executed would "pass" this vacuously.
+    assert re.search(r"\d+ (passed|failed|error)", out), (
+        f"pytest produced no result line:\n{out[-800:]}"
+    )
+    assert proc.returncode == 0, (
+        "an unrelated hook test died under GENESIS_CC_SESSION=1 — the autouse "
+        f"fixture is importing the production hook again:\n{out[-800:]}"
+    )
 
 
 def test_a_cut_says_so_in_band() -> None:

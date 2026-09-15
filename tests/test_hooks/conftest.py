@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import warnings
+import sys
 from pathlib import Path
 
 import pytest
@@ -26,23 +26,26 @@ def _fresh_proactive_writer():
     Reset rather than reconstruct, so a test asserting on ``_writer()`` state
     (emitted totals, whether a cut happened) starts from zero.
 
-    The import failure is AUDIBLE on purpose. Swallowing it silently reproduces
-    exactly the condition described above — the reset stops happening, and the
-    test that later exhausts the budget fails on an assertion about the hook,
-    with nothing anywhere pointing at the fixture. Demonstrated under review by
-    typo-ing this import: the suite went red on a product assertion and said
-    nothing about the reset. Narrow (`ImportError` only, since most
-    ``tests/test_hooks`` files never put ``scripts/`` on ``sys.path``) and loud.
+    READS ``sys.modules``; DOES NOT IMPORT. An autouse fixture runs for every
+    test in this directory, and importing the hook is not free: the module is an
+    executable script whose import-time body calls ``load_dotenv`` on the real
+    ``secrets.env`` and then ``sys.exit(0)`` when ``GENESIS_CC_SESSION=1``.
+    MEASURED: with that variable set — which is exactly what a dispatched
+    background session exports — importing here turned
+    ``tests/test_hooks/test_file_context_hook.py`` from 5 passed into 5 ERRORS,
+    in a file that has nothing to do with this hook. ``SystemExit`` does not
+    inherit from ``Exception``, so no plausible ``except`` around the import
+    would have contained it either.
+
+    Looking the module up instead is not a weaker version of the same thing: a
+    test module that needs the writer has already imported it AT COLLECTION,
+    which happens before any fixture runs, so the lookup finds it whenever it
+    matters. When it is absent there is no writer to reset and nothing to warn
+    about — the previous revision warned on that path, which was noise for every
+    test in this directory that legitimately never touches the hook.
     """
-    try:
-        import proactive_memory_hook as pmh
-    except ImportError:
-        warnings.warn(
-            "proactive_memory_hook not importable — its bounded writer was NOT "
-            "reset, so its 9,800-unit budget is shared across every test in this "
-            "run. A later test may fail on a cut it did not cause.",
-            stacklevel=2,
-        )
+    pmh = sys.modules.get("proactive_memory_hook")
+    if pmh is None:
         yield
         return
     pmh._OUT = None
