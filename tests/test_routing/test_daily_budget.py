@@ -220,6 +220,77 @@ class TestRouterIntegration:
         assert [c["provider"] for c in delegate.calls] == ["second"]
 
     @pytest.mark.asyncio
+    async def test_an_all_exhausted_walk_names_the_provider_and_the_reason(
+        self, tmp_path
+    ):
+        """The journal message is built from `skipped`, not `failed_providers`.
+
+        A budget-deselected provider was appended only to `failed_providers`,
+        so a walk where every provider was exhausted rendered as
+        "0 attempted of N walkable" — no provider named, no reason given.
+        That message is what this codebase relies on to diagnose why nothing
+        was called, and it was silent in exactly the case it exists for.
+        (Codex P2, PR #1624.)
+        """
+        bus = _RecordingBus()
+        only = _cfg("only", rpd=1)
+        router, ledger, delegate = self._stack(
+            tmp_path, providers={"only": only}, chain=["only"], event_bus=bus,
+        )
+        ledger.record(only, _ok())  # spend the whole budget
+
+        result = await router.route_call("site", [{"role": "user", "content": "x"}])
+
+        assert result.success is False
+        assert delegate.calls == [], "an exhausted provider was still called"
+        # The diagnosis lives on the JOURNAL event, not on the result — that is
+        # the message this codebase reads to find out why nothing was called.
+        exhausted = [e for e in bus.events if e["type"] == "all_exhausted"]
+        assert exhausted, f"no all_exhausted event was emitted: {bus.events}"
+        msg = exhausted[-1]["message"]
+        assert "only" in msg, (
+            f"the exhausted provider is not named in the journal: {msg!r}"
+        )
+        assert "budget" in msg.lower(), (
+            f"the budget reason is not stated in the journal: {msg!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_post_gate_deselection_is_named_in_the_journal(self, tmp_path):
+        """The RECHECK branch is the harder one to reach, so it is the one
+        that must not be silent — and it was the untested one: deleting only
+        the post-gate `skipped.append` left all tests green while the pre-gate
+        deletion was caught.
+
+        Reaches it the way production does: the budget is NOT spent when the
+        pre-gate check runs, and a concurrent caller crosses it while this
+        turn is queued in the rate gate.
+        """
+        bus = _RecordingBus()
+        only = _cfg("only", rpd=1)
+        router, ledger, delegate = self._stack(
+            tmp_path, providers={"only": only}, chain=["only"], event_bus=bus,
+        )
+        real_acquire = router._rate_gates.acquire
+
+        async def _someone_else_spends_it_mid_gate(name, *a, **kw):
+            out = await real_acquire(name, *a, **kw)
+            ledger.record(only, _ok())
+            return out
+
+        router._rate_gates.acquire = _someone_else_spends_it_mid_gate
+        result = await router.route_call("site", [{"role": "user", "content": "x"}])
+
+        assert result.success is False
+        assert delegate.calls == [], "an exhausted provider was still called"
+        events = [e for e in bus.events if e["type"] == "all_exhausted"]
+        assert events, f"no all_exhausted event: {bus.events}"
+        msg = events[-1]["message"]
+        assert "after rate gate" in msg, (
+            f"a POST-GATE deselection reached the journal with no cause: {msg!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_the_budget_is_rechecked_after_the_rate_gate(self, tmp_path):
         """The first check happens BEFORE a sleep that can last seconds.
 
@@ -432,3 +503,121 @@ class TestTheLedgerLivesUnderGenesisHome:
         (tmp_path / "b").mkdir()
         b = DailyBudgetLedger(state_path=mod._state_file())
         assert not b.exhausted(cfg), "install B inherited install A's spend"
+class TestADamagedRowCannotBuyExtraBudget:
+    """A persisted counter is only trustworthy if it is a COUNT.
+
+    `isinstance(x, int)` was the whole check, and it admits two values that
+    defeat the budget this ledger exists to enforce. A NEGATIVE count offsets
+    later increments, so a row carrying `"requests": -1000` lets the provider
+    run a thousand calls past its configured limit before `exhausted()` turns
+    true. And `isinstance(True, int)` is True, so a JSON boolean is accepted
+    and then behaves as 1 — the same trap `_parse_daily_limit` already guards
+    on the config side. (CodeRabbit Major, PR #1624.)
+
+    Discarding the row rather than repairing it is the fail-open direction
+    this class already takes for an unreadable file: start that provider from
+    zero, never silence it for a day on bad data.
+    """
+
+    @staticmethod
+    def _write_state(tmp_path, entry: dict):
+        import json as _json
+
+        # Must match the path `_ledger` constructs, or the row is written
+        # where nothing reads it and every assertion below is vacuous.
+        path = tmp_path / "budget.json"
+        path.write_text(_json.dumps({"providers": {"groq-ish": entry}}))
+        return path
+
+    def test_a_negative_count_does_not_extend_the_limit(self, tmp_path):
+        self._write_state(tmp_path, {"day": "2026-09-02", "requests": -1000, "tokens": 0})
+        ledger, _ = _ledger(tmp_path)
+        cfg = _cfg(rpd=2)
+        for _ in range(2):
+            ledger.record(cfg, _ok())
+        assert ledger.exhausted(cfg), (
+            "a negative persisted counter bought extra calls past the daily limit"
+        )
+
+    def test_a_boolean_count_is_not_read_as_one(self, tmp_path):
+        self._write_state(tmp_path, {"day": "2026-09-02", "requests": True, "tokens": 0})
+        ledger, _ = _ledger(tmp_path)
+        cfg = _cfg(rpd=2)
+        # Discarded -> starts at 0, so exactly the limit is still available.
+        ledger.record(cfg, _ok())
+        assert not ledger.exhausted(cfg)
+        ledger.record(cfg, _ok())
+        assert ledger.exhausted(cfg)
+
+    def test_a_valid_row_is_still_loaded(self, tmp_path):
+        # CONTROL: a validator that rejected everything would pass both tests
+        # above and make persistence inert across restarts.
+        self._write_state(tmp_path, {"day": "2026-09-02", "requests": 2, "tokens": 0})
+        ledger, _ = _ledger(tmp_path)
+        cfg = _cfg(rpd=2)
+        assert ledger.exhausted(cfg), "a VALID persisted row was discarded"
+
+    def test_a_negative_token_count_does_not_extend_the_limit(self, tmp_path):
+        """TOKENS is the unit groq actually caps (`tpd_limit: 200000`), and it
+        was the untested half: mutating the validator to `("requests",)` left
+        all 32 tests green. The module's own opening line says Groq caps
+        tokens per day, so the unvalidated half was the live one.
+        """
+        self._write_state(tmp_path, {"day": "2026-09-02", "requests": 0, "tokens": -1000})
+        ledger, _ = _ledger(tmp_path)
+        cfg = _cfg(tpd=100)
+        ledger.record(cfg, _ok(50, 50))
+        assert ledger.exhausted(cfg), (
+            "a negative persisted TOKEN counter bought extra tokens past the limit"
+        )
+
+    def test_one_damaged_counter_does_not_refund_its_sibling(self, tmp_path):
+        """The INVERSE defect, and the first version of this fix had it.
+
+        Rejecting the whole row on one bad field discards the other field's
+        valid spend, handing the provider a fresh allowance on a day it
+        already spent — the same over-spend the validator exists to prevent,
+        in the other unit. MEASURED before the fix: a row with 190000 tokens
+        spent and a damaged `requests` loaded as tokens_used=0.
+        """
+        self._write_state(
+            tmp_path, {"day": "2026-09-02", "requests": -1, "tokens": 190_000}
+        )
+        ledger, _ = _ledger(tmp_path)
+        cfg = _cfg(rpd=1000, tpd=200_000)
+        status = ledger.status(cfg)
+        assert status["tokens_used"] == 190_000, (
+            "the damaged requests counter wiped a valid 190k token spend — "
+            "the provider gets a fresh daily allowance it already used"
+        )
+        assert status["requests_used"] == 0, "the damaged counter should zero"
+
+    def test_a_row_that_is_not_a_counter_row_is_dropped_whole(self, tmp_path):
+        # CONTROL on the per-field repair: without `day` there is no row to
+        # repair, and per-field salvage must not resurrect one.
+        self._write_state(tmp_path, {"requests": 999, "tokens": 190_000})
+        ledger, _ = _ledger(tmp_path)
+        cfg = _cfg(rpd=1000, tpd=200_000)
+        status = ledger.status(cfg)
+        assert status["requests_used"] == 0 and status["tokens_used"] == 0
+
+    def test_a_non_string_day_never_yields_stale_counters(self, tmp_path):
+        """Pins the OUTCOME, and says plainly which mechanism it does not pin.
+
+        Two things independently produce it: `_sanitized_counters` rejects a
+        non-string `day`, and `_peek` compares `day` for equality with
+        today's date string, which a non-string can never satisfy. Mutating
+        the type check away leaves this green — measured — so this test does
+        NOT cover that check; the equality comparison alone carries it.
+
+        Kept anyway, because the property is the one that matters: a row with
+        a malformed day must not contribute counters to today. Recorded as a
+        behaviourally-redundant guard rather than left looking like coverage.
+        """
+        self._write_state(tmp_path, {"day": 20260902, "requests": 999, "tokens": 5})
+        ledger, _ = _ledger(tmp_path)
+        cfg = _cfg(rpd=1000, tpd=200_000)
+        status = ledger.status(cfg)
+        assert status["requests_used"] == 0 and status["tokens_used"] == 0, (
+            "a row with a non-string `day` was loaded as a counter row"
+        )

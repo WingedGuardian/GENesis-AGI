@@ -360,6 +360,13 @@ class Router:
                 provider_cfg
             ):
                 failed_providers.append(provider_name)
+                # `skipped` is what the journal renders, and the paid-budget
+                # branch below already feeds it. Without this entry an
+                # all-exhausted walk produced "0 attempted of N walkable" with
+                # no provider named and no reason given — the one message this
+                # codebase relies on to diagnose why nothing was called
+                # (Codex P2, PR #1624).
+                skipped.append((provider_name, "daily budget spent"))
                 continue
 
             # Skip paid providers if budget exceeded (unless override)
@@ -387,6 +394,9 @@ class Router:
                 provider_cfg
             ):
                 failed_providers.append(provider_name)
+                # Same reason as the pre-gate branch: a provider deselected
+                # here is a SKIP with a cause, not an anonymous failure.
+                skipped.append((provider_name, "daily budget spent (after rate gate)"))
                 continue
 
             # Try with retry (timed for activity tracking)

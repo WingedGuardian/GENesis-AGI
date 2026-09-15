@@ -24,12 +24,37 @@ Semantics and invariants — read before changing:
   connection errors are NOT counted (whether a provider debits a rejected
   429 against daily quota is unproven, and the cost of guessing wrong is
   asymmetric). Tokens count on success only.
-- **UTC-day accounting.** Sound while every limited provider's window is
-  rolling or resets at-or-after 00:00 UTC: count-since-UTC-midnight is a
-  subset of any rolling-24h window, so vs a rolling window this only
-  under-deselects. A provider with a fixed reset BEFORE UTC midnight would
-  be over-deselected for the gap — none is configured today; retry-hint
-  parsing (W3) is the exact fix if one appears.
+- **UTC-day accounting, and it is sound only for a ROLLING window.**
+  Count-since-UTC-midnight is a subset of any rolling-24h window, so against
+  a rolling limit this under-deselects, which is the safe direction.
+
+  A FIXED reset at any hour other than 00:00 UTC is NOT safe in either
+  direction, and an earlier version of this note claimed at-or-after was
+  fine. It is not. Take a provider resetting at midnight Pacific: requests
+  made between 00:00 UTC and that reset land in the ledger's NEW day while
+  the provider still counts them against its OLD window, and they remain
+  after the provider resets — so the ledger OVER-deselects a provider whose
+  allowance is available. (CodeRabbit P2, PR #1624, verified.)
+
+  LATENT, not live — WITH ONE LEG UNVERIFIED, and the shape of the argument
+  is why that is easy to miss. Reaching this needs a provider with BOTH a
+  configured daily limit AND a non-UTC reset. `groq-free` is the only
+  provider carrying limits today (enumerated: every `rpd_limit`/`tpd_limit`
+  in `config/model_routing.yaml` is in its block), and Gemini — the known
+  Pacific-reset case, `docs/reference/models.md` — deliberately carries none.
+
+  But that eliminates the candidate whose boundary is KNOWN and says nothing
+  about the one that is live. Groq's own reset window is recorded NOWHERE in
+  this repo: `docs/reference/models.md` gives its limits and not its
+  boundary, and a search across `docs/`, `config/` and `src/` for groq near
+  reset/midnight/boundary returns zero. So "latent" rests on an unmeasured
+  assumption about the only provider it actually depends on, not on an
+  enumeration. Closing it is cheap — observe when groq's TPD counter resets
+  against UTC midnight — and worth doing before the next limit is added.
+
+  The real fix models the provider's own reset boundary, including DST, from
+  authoritative metadata rather than applying one calendar to everyone; the
+  trigger is the first provider given a limit whose window is not UTC.
 - **Limits live in config, not here.** ``exhausted()`` / ``record()`` take
   the live ``ProviderConfig``, so a dashboard config reload takes effect on
   the next check with zero ledger code. A provider with neither limit set is
@@ -89,6 +114,42 @@ def _state_file() -> Path:
     from genesis.env import genesis_home
 
     return genesis_home() / _STATE_FILENAME
+
+
+def _sanitized_counters(entry: dict) -> dict | None:
+    """Trustworthy COUNTS from a persisted row, or None if it is not a row.
+
+    `isinstance(x, int)` alone is not that test, in two ways that both let a
+    damaged row defeat the budget it exists to enforce. A NEGATIVE count
+    offsets later increments, so `"requests": -1000` lets the provider run a
+    thousand calls past its configured limit before `exhausted()` turns true —
+    the one outcome this ledger exists to prevent (CodeRabbit Major, PR #1624).
+    And `isinstance(True, int)` is True, so a JSON boolean is accepted and then
+    behaves as 1, the same trap `_parse_daily_limit` guards on the config side.
+
+    Sanitised PER FIELD, and that is the load-bearing part. Rejecting the whole
+    row on one damaged counter discards the SIBLING's valid spend and hands the
+    provider a fresh allowance on a day it already spent — the identical
+    over-spend, in the other unit. MEASURED on the first version of this fix:
+    a row carrying `requests: 999, tokens: -1` loaded as 999 requests before
+    the change and as ZERO after it, so tightening the validator re-created the
+    defect it was closing. Keep what is trustworthy, zero only what is not.
+    """
+    if not isinstance(entry.get("day"), str):
+        return None
+    out = {"day": entry["day"], "requests": 0, "tokens": 0}
+    for key in ("requests", "tokens"):
+        value = entry.get(key)
+        if not isinstance(value, bool) and isinstance(value, int) and value >= 0:
+            out[key] = value
+        else:
+            logger.warning(
+                "Daily budget counter %r is not a count (%r) — that unit starts "
+                "from zero; the sibling unit is kept",
+                key,
+                value,
+            )
+    return out
 
 
 class DailyBudgetLedger:
@@ -230,13 +291,22 @@ class DailyBudgetLedger:
             if not isinstance(providers, dict):
                 raise ValueError("bad shape")
             for name, entry in providers.items():
-                if (
-                    isinstance(entry, dict)
-                    and isinstance(entry.get("day"), str)
-                    and isinstance(entry.get("requests"), int)
-                    and isinstance(entry.get("tokens"), int)
-                ):
-                    self._counters[name] = entry
+                row = _sanitized_counters(entry) if isinstance(entry, dict) else None
+                if row is not None:
+                    self._counters[name] = row
+                else:
+                    # Not a counter row at all (no `day`). Nothing here is
+                    # salvageable, so the provider starts from zero — the
+                    # fail-open direction this class already takes for an
+                    # unreadable file. A row that IS a counter row but has one
+                    # damaged field is repaired field-wise above rather than
+                    # dropped, so its good counter survives.
+                    logger.warning(
+                        "Daily budget row for %r is not a counter row (%r) — "
+                        "starting it from zero",
+                        name,
+                        entry,
+                    )
         except FileNotFoundError:
             return
         except Exception:
