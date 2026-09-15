@@ -21,8 +21,6 @@ import asyncio
 import contextlib
 import logging
 import os
-import shutil
-import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -30,44 +28,52 @@ from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 logger = logging.getLogger(__name__)
 
-# Per-call working directory for ambient judges, under one stable parent.
+# ONE stable working directory for every ambient judge, and customization
+# suppression as the actual isolation.
 #
-# The judge child must not inherit CONTEXT it did not author: CC reads
-# CLAUDE.md / CLAUDE.local.md / .mcp.json from its cwd, and a project
-# .claude/settings.json there gives it HOOKS THAT EXECUTE. Tool denial does
-# not stop instruction poisoning, and dispatched background sessions
-# (research/interact/campaign) hold Write with no path scope — so any
-# directory that outlives a call is a plantable surface.
+# The judge child must not inherit CONTEXT it did not author. CC reads
+# CLAUDE.md / CLAUDE.local.md / .mcp.json from its cwd, reads memory files
+# from every ANCESTOR of that cwd, and always loads the user-level
+# ~/.claude/CLAUDE.md. Tool denial does not stop instruction poisoning, and
+# dispatched background sessions (research/interact/campaign) hold Write with
+# no path scope, so they can plant a memory file these judges would read.
 #
-# Rather than defend a fixed directory, each call gets a FRESH one: nothing
-# can PRE-plant in a directory whose name did not exist a moment ago. Three
-# review rounds went into finding holes in a defended-fixed-directory design
-# (a shared parent, then a sweep a symlink walked past); this shape has no
-# interior at the cwd level for such a hole to live in — no sweep, no
-# tripwire, no symlink case there.
+# An earlier design answered that with a FRESH per-call directory: nothing can
+# pre-plant in a directory whose name did not exist a moment ago. Three review
+# rounds went into it, and it was still the wrong shape — it defends the LEAF
+# while the poisonable surfaces are the ANCESTORS, which a fresh leaf does not
+# make fresh. Its own comment conceded that boundary.
 #
-# HONEST BOUNDARY — what this does NOT close, MEASURED 2026-09-05 with the
-# shipped argv against a real child: CC also reads memory files from every
-# ANCESTOR of the cwd, and always loads the user-level ~/.claude/CLAUDE.md.
-# A memory file placed in this parent, in ~/.genesis, or in the home
-# directory is therefore read by every judge — the cwd being fresh does not
-# make the directories ABOVE it fresh. Constraining what may write those
-# paths is a separate control and is tracked as such; do not read this
-# design as closing it. (Parent-level .claude/settings.json hooks do NOT
-# execute: CC resolves the project root from the cwd, which has none.)
+# The control is now `--safe-mode` in build_argv, which disables CLAUDE.md,
+# skills, plugins, hooks, MCP servers and custom commands outright while
+# keeping OAuth — the only OAuth-compatible way to suppress the user-level
+# memory file (cc/types.py:347-353). That closes the ancestor class the fresh
+# directory could not, and it closes it for the cwd too.
 #
-# Residual within scope, accepted: a RESIDENT same-uid process can watch
-# this parent and write into a per-call directory between its creation and
-# the child reading it — 0700 is no barrier to the same uid. The redesign
-# converts a plant-once-poison-every-future-call attack into one needing
-# continuous presence and a won race. A real reduction, not an elimination.
+# With suppression doing the work, per-call freshness buys nothing and COSTS:
+# CC derives a Claude project identity from the cwd, so every distinct cwd
+# creates its own tree under ~/.claude/projects/ that the cwd's own cleanup
+# does not touch (cc/types.py:481-492). A per-call directory therefore leaked
+# one project tree per judgment, unbounded across the ledger backfill loop.
+# One stable directory means one project tree, reused (Codex P1 + P2, #1693).
 #
-# The stable PARENT gives the debris one predictable home for disk hygiene
-# to target (transcript-retention issue #1709); it is never itself a cwd.
-#
-# Out of any git repo, as before, so CC's resume picker never lists these
-# one-turn judgments beside interactive sessions.
-_AMBIENT_JUDGE_ROOT = Path.home() / ".genesis" / "ambient-judges"
+# Still out of any git repo, so CC's resume picker never lists these one-turn
+# judgments beside interactive sessions.
+
+
+def _ambient_judge_dir() -> Path:
+    """The ONE stable working directory shared by every ambient judge call.
+
+    Resolved through ``genesis_home()`` rather than a hardcoded
+    ``~/.genesis``, so a relocated install (read-only home, state on another
+    volume) does not silently write outside itself and fail every judgment.
+    Resolved at CALL time, never frozen at import, because GENESIS_HOME is
+    read from the environment (Codex P2, PR #1693).
+    """
+    from genesis.env import genesis_home
+
+    return genesis_home() / "ambient-judges" / "judge"
+
 
 
 @contextlib.contextmanager
@@ -79,25 +85,17 @@ def _judge_cwd() -> Iterator[str]:
     directory is disk debris for hygiene to reap, never a reason to fail a
     call that already ran.
     """
-    _AMBIENT_JUDGE_ROOT.mkdir(parents=True, exist_ok=True)
+    path = _ambient_judge_dir()
+    path.mkdir(parents=True, exist_ok=True)
     # mkdir(exist_ok=True) ACCEPTS a symlink-to-directory — is_dir() follows
     # links — which would silently relocate every judge cwd under a path
-    # somebody else chose. That is the same shape as the symlink that walked
-    # past the sweep this design replaced, one level up. O_NOFOLLOW is the
-    # check that cannot be faked; failure propagates into the caller's status
-    # dict rather than running a judge from an unverified location.
-    fd = os.open(
-        _AMBIENT_JUDGE_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    )
-    os.close(fd)
-    path = tempfile.mkdtemp(prefix="judge-", dir=_AMBIENT_JUDGE_ROOT)
-    try:
-        yield path
-    finally:
-        try:
-            shutil.rmtree(path)
-        except OSError:
-            logger.warning("ambient-judge dir %s not removed", path, exc_info=True)
+    # somebody else chose. O_NOFOLLOW is the check that cannot be faked;
+    # failure propagates into the caller's status dict rather than running a
+    # judge from an unverified location.
+    os.close(os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
+    # Nothing is removed. The directory is STABLE and deliberately reused, so
+    # there is nothing here to clean up per call.
+    yield str(path)
 
 
 def build_argv(
@@ -142,6 +140,26 @@ def build_argv(
         "--max-turns",
         "1",
         "--dangerously-skip-permissions",
+        # --safe-mode: the CUSTOMIZATION half of the isolation, and the part a
+        # fresh working directory could never provide. CC reads memory files
+        # from every ANCESTOR of the cwd and always loads the user-level
+        # ~/.claude/CLAUDE.md, which it finds through the passwd-resolved home
+        # regardless of $HOME or $CLAUDE_CONFIG_DIR (probe-verified
+        # 2026-07-09, cc/types.py:347-353). So any write-enabled session that
+        # can drop a memory file in a parent directory poisons every later
+        # judge, and no cwd discipline closes that — the directories ABOVE a
+        # fresh directory are not themselves fresh.
+        #
+        # safe-mode disables CLAUDE.md, skills, plugins, hooks, MCP servers
+        # and custom commands/agents while leaving OAuth intact, which --bare
+        # does not (it refuses OAuth and demands an API key). These judges read
+        # EXTERNAL text — PR titles and bodies via repo-pulse — so instruction
+        # suppression is the control that matters: tool denial stops execution
+        # but not a fabricated arbiter, ledger or repo-pulse verdict.
+        # Precedent in this repo: the eval bench's bare arm (eval/bench/arms.py)
+        # and skill-replay both rely on it, and --system-prompt is honoured
+        # under it (probe-verified 2026-07-20). (Codex P1, PR #1693.)
+        "--safe-mode",
         "--disallowedTools",
         "*",
         "--mcp-config",

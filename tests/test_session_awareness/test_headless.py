@@ -38,6 +38,16 @@ def test_build_argv_pinned_shape():
     # directions). Default-deny without the flag was REFUTED on a live
     # install — user settings made the tool run.
     assert argv[argv.index("--disallowedTools") + 1] == "*"
+    # --safe-mode is the CUSTOMIZATION half, and the half no cwd discipline
+    # can supply: CC reads memory files from every ANCESTOR of the cwd and
+    # always loads the user-level ~/.claude/CLAUDE.md. Tool denial stops
+    # execution; only suppression stops a planted instruction producing a
+    # fabricated verdict from a judge that reads external text.
+    assert "--safe-mode" in argv, (
+        "ambient judges must run with customizations suppressed — without "
+        "this, any session that can write a parent CLAUDE.md poisons every "
+        "later judgment"
+    )
     assert "--effort" not in argv
     assert "--output-format" in argv
     assert argv.index("claude") == 0  # bare command stays bare (PATH lookup)
@@ -228,7 +238,7 @@ async def test_parent_symlink_refused(tmp_path, monkeypatch):
     real.mkdir()
     link = tmp_path / "judge-root"
     link.symlink_to(real, target_is_directory=True)
-    monkeypatch.setattr(headless_mod, "_AMBIENT_JUDGE_ROOT", link)
+    monkeypatch.setattr(headless_mod, "_ambient_judge_dir", lambda: link)
 
     spawned = []
 
@@ -285,9 +295,13 @@ async def test_cancel_group_kills_and_reraises(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert killpg_calls and killpg_calls[0][0] == 424243
-    # _judge_cwd's docstring promises cleanup "including after a timeout or a
-    # cancellation" — the timeout half is locked elsewhere; this is the other.
-    assert cwds and not Path(cwds[0]).exists()
+    # The cwd is STABLE and shared now, so cancellation must NOT remove it —
+    # a cancelled call that deleted the shared directory would sabotage every
+    # concurrent and subsequent judge. What cancellation still owes is the
+    # group-kill above; the directory outliving it is correct, not a leak.
+    assert cwds and Path(cwds[0]).exists(), (
+        "cancellation removed the shared judge cwd"
+    )
 
 
 def test_production_dirs_disjoint_and_unnested(production_dirs):
@@ -302,34 +316,33 @@ def test_production_dirs_disjoint_and_unnested(production_dirs):
 
 
 @pytest.mark.asyncio
-async def test_each_call_gets_a_fresh_private_cwd(tmp_path, monkeypatch):
-    """The isolation mechanism, end to end: every call runs from a
-    directory created for it alone, under the stable judge root, outside
-    the shared background-sessions dir — and the directory is gone
-    afterwards.
+async def test_every_call_reuses_one_stable_cwd(tmp_path, monkeypatch):
+    """REPLACES test_each_call_gets_a_fresh_private_cwd, whose invariant this
+    design deliberately reverses.
 
-    Nothing can pre-plant context (CLAUDE.md, .mcp.json, a hook-bearing
-    .claude/) in a directory whose name did not exist a moment ago, which
-    is why this design needs no sweep. It also keeps the original fix: an
-    out-of-repo cwd means CC's resume picker never lists these one-turn
-    judgments (measured 2026-09-04)."""
+    That test pinned a fresh directory per call, on the theory that nothing
+    can pre-plant in a name that did not exist a moment ago. True, and beside
+    the point: CC reads memory files from every ANCESTOR of the cwd, so a
+    fresh LEAF never made the poisonable directories fresh — the old code's
+    own comment conceded it. `--safe-mode` closes that class outright, and
+    once it does, per-call freshness only COSTS: CC derives a Claude project
+    identity from the cwd, so each distinct cwd leaves its own tree under
+    ~/.claude/projects/ that removing the cwd does not touch. Unbounded over
+    the ledger backfill loop.
+
+    So the invariant is now stability, and it is asserted as such.
+    """
     import genesis.cc.types as cc_types
-    import genesis.session_awareness.headless as headless_mod
 
-    root = tmp_path / "judge-root"
-    monkeypatch.setattr(headless_mod, "_AMBIENT_JUDGE_ROOT", root)
     shared = tmp_path / "bg-sessions"
     monkeypatch.setattr(cc_types, "_BACKGROUND_SESSION_DIR", shared)
     seen: list[str] = []
-    # Recorded, not asserted, INSIDE the mock: the runner's `except Exception`
-    # would swallow an AssertionError raised here into a status dict with an
-    # empty reason, destroying the diagnostic. Assert after the call.
-    at_spawn: list[tuple[bool, list]] = []
+    at_spawn: list[bool] = []
 
     async def fake_exec(*argv, **kwargs):
         cwd = kwargs["cwd"]
         seen.append(cwd)
-        at_spawn.append((Path(cwd).is_dir(), list(Path(cwd).iterdir())))
+        at_spawn.append(Path(cwd).is_dir())
 
         class _P:
             returncode = 0
@@ -341,48 +354,42 @@ async def test_each_call_gets_a_fresh_private_cwd(tmp_path, monkeypatch):
         return _P()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    for _ in range(2):
+    for _ in range(3):
         res = await run_headless_json(
             "p", model=MODEL, claude_path="claude",
             no_mcp_config="/dev/null", timeout_s=5,
         )
         assert res["status"] == "ok"
 
-    # LIVE and EMPTY at spawn time, every call.
-    assert at_spawn and all(live and files == [] for live, files in at_spawn), at_spawn
-    assert len(set(seen)) == 2, "each call must get its OWN directory"
-    for cwd in seen:
-        assert Path(cwd).parent == root
-        assert not Path(cwd).exists(), "the call must remove its own dir"
-        assert shared not in Path(cwd).parents
+    assert at_spawn and all(at_spawn), "cwd must exist at spawn time"
+    assert len(set(seen)) == 1, (
+        f"every call must reuse ONE cwd — got {len(set(seen))} distinct, which "
+        "is one ~/.claude/projects/ tree per judgment"
+    )
+    assert Path(seen[0]).exists(), (
+        "the stable cwd must SURVIVE the call; removing it recreates the "
+        "per-call project-tree leak this change exists to close"
+    )
+    # Still out of the shared background-sessions dir, and still out of a repo,
+    # so CC's resume picker never lists these one-turn judgments.
+    assert shared not in Path(seen[0]).parents
 
 
 @pytest.mark.asyncio
-async def test_judge_cwd_removed_after_timeout(tmp_path, monkeypatch):
-    """Cleanup is in a finally — a timed-out call leaks no directory."""
+async def test_the_judge_cwd_follows_genesis_home(tmp_path, monkeypatch):
+    """A relocated install must not have its judgments written outside itself.
+
+    The accessor resolves through genesis_home() at CALL time, so GENESIS_HOME
+    set after import is still honoured — the autouse fixture in conftest relies
+    on exactly this, which is why the redirect there is an env var rather than
+    a patched constant.
+    """
     import genesis.session_awareness.headless as headless_mod
 
-    root = tmp_path / "judge-root"
-    monkeypatch.setattr(headless_mod, "_AMBIENT_JUDGE_ROOT", root)
-    seen: list[str] = []
-
-    async def fake_exec(*argv, **kwargs):
-        seen.append(kwargs["cwd"])
-
-        class _P:
-            returncode = None
-            pid = 12345
-
-            async def communicate(self, _in):
-                await asyncio.sleep(10)
-
-        return _P()
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", lambda *a: None)
-    res = await run_headless_json(
-        "p", model=MODEL, claude_path="claude",
-        no_mcp_config="/dev/null", timeout_s=0.05,
+    relocated = tmp_path / "elsewhere" / "genesis"
+    monkeypatch.setenv("GENESIS_HOME", str(relocated))
+    resolved = headless_mod._ambient_judge_dir()
+    assert relocated in resolved.parents, (
+        f"{resolved} ignores GENESIS_HOME — a read-only or relocated home "
+        "would fail every ambient judgment"
     )
-    assert res["status"] == "timeout"
-    assert seen and not Path(seen[0]).exists()

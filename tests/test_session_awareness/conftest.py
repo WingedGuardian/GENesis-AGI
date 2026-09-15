@@ -54,7 +54,12 @@ def _hermetic_background_session_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(
         _cc_types, "_BACKGROUND_SESSION_DIR", tmp_path / "bg-sessions"
     )
-    monkeypatch.setattr(_headless, "_AMBIENT_JUDGE_ROOT", tmp_path / "ambient-judges")
+    # The judge cwd resolves through genesis_home() at CALL time now, so the
+    # redirect is the environment variable rather than a module constant —
+    # which also means the test exercises the real resolution path instead of
+    # stepping over it.
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "genesis-home"))
+    _ = _headless  # imported for the assertion below that the module loads
 
 
 # Captured at import time — before any fixture patches the modules — so the
@@ -64,5 +69,7 @@ import genesis.session_awareness.headless as _headless_orig  # noqa: E402
 
 _PRODUCTION_DIRS = {
     "background": _cc_types_orig._BACKGROUND_SESSION_DIR,
-    "judge": _headless_orig._AMBIENT_JUDGE_ROOT,
+    # Resolved here, at import scope, before the autouse fixture sets
+    # GENESIS_HOME — so the invariant test sees the REAL production path.
+    "judge": _headless_orig._ambient_judge_dir(),
 }
