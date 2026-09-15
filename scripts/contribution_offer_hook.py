@@ -66,8 +66,10 @@ def _load_marker(marker: Path) -> dict | None:
 
 def _format_reminder(marker_data: dict) -> str:
     sha = str(marker_data.get("sha", "unknown"))[:12]
-    # Sliced: a git commit subject has no length limit, and this hook is exempt
-    # from the bounding gate on the claim that its output cannot reach the cap.
+    # Sliced because a git commit subject has no length limit. This is no longer
+    # the thing that bounds the hook — main() writes through print_bounded, which
+    # enforces the cap at the write — but the slice stays: it keeps the reminder a
+    # readable one-liner rather than something the writer has to truncate.
     subject = str(marker_data.get("subject", "<unknown subject>"))[:200]
     return (
         f"[Contribution] A 'fix:' commit just landed ({sha} \"{subject}\"). "
@@ -101,12 +103,12 @@ def main() -> int:
         with contextlib.suppress(OSError):
             marker.unlink()
 
-        # Routed rather than exempted. The two slices below still bound this in
-        # practice, but a slice is a claim someone has to keep re-reading, and an
-        # exemption makes the gate stop scanning the file entirely — so the claim
-        # rots silently. Going through the writer costs one call and removes the
-        # row: the bound is then enforced at the point of writing rather than
-        # asserted about it.
+        # Routed rather than exempted. The two slices in _format_reminder above
+        # still bound this in practice, but a slice is a claim someone has to keep
+        # re-reading, and an exemption makes the gate stop scanning the file
+        # entirely — so the claim rots silently. Going through the writer costs one
+        # call and removes the row: the bound is then enforced at the point of
+        # writing rather than asserted about it.
         print_bounded(reminder, label="contribution")
         return 0
     except Exception:

@@ -103,16 +103,49 @@ def _load_bare_stdout_events() -> tuple[str, ...]:
     notice a fourth event. So the list now genuinely lives in one file.
     """
     src = (_REPO / "scripts" / "hooks" / "hook_output.py").read_text(encoding="utf-8")
-    for node in ast.walk(ast.parse(src)):
-        if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "BARE_STDOUT_EVENTS"
-            for t in node.targets
+    # Module body, not ast.walk, for the reason spelled out in _int_constants:
+    # walking would accept a same-named local left behind in a function after the
+    # real declaration was deleted, and derive the allowlist -- the one whose
+    # whole guarantee is that an unlisted event fails by construction -- from it.
+    #
+    # FIRST module-level declaration wins, where _int_constants lets the LAST one
+    # win. The asymmetry is deliberate rather than overlooked: accumulating a dict
+    # has no first, and here an early return is what keeps a re-declaration from
+    # quietly WIDENING the derived set. It does mean a later re-declaration, an
+    # augmented assignment, or a conditional re-assign is not seen -- all of which
+    # scope the gate NARROWER than the writer's real constant, and none of which
+    # the containment test downstream can notice, since a subset satisfies it.
+    # Named here because that is a real hole, pre-dating this reader.
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            # AnnAssign for genuine parity with _int_constants, which the comment
+            # above now sends the reader to. Without it an annotated declaration
+            # raises "no longer declares BARE_STDOUT_EVENTS" -- fail-loud, but the
+            # message is FALSE, which is the failure mode this module exists over.
+            targets = [node.target]
+        else:
+            continue
+        if not any(
+            isinstance(t, ast.Name) and t.id == "BARE_STDOUT_EVENTS" for t in targets
         ):
-            return tuple(
-                e.value
-                for e in node.value.elts
-                if isinstance(e, ast.Constant) and isinstance(e.value, str)
+            continue
+        value = node.value
+        if not isinstance(value, (ast.Tuple, ast.List)):
+            # A name, a call, a concatenation: this reader cannot derive the set
+            # from it, and must say THAT rather than raise AttributeError on
+            # `.elts` or claim the declaration is gone.
+            raise AssertionError(
+                "hook_output.py declares BARE_STDOUT_EVENTS as something other "
+                f"than a tuple/list literal ({type(value).__name__}); this reader "
+                "derives the gated set from the literal and cannot follow that"
             )
+        return tuple(
+            e.value
+            for e in value.elts
+            if isinstance(e, ast.Constant) and isinstance(e.value, str)
+        )
     raise AssertionError("hook_output.py no longer declares BARE_STDOUT_EVENTS")
 
 
@@ -129,11 +162,34 @@ def _int_constants(path: Path) -> dict[str, int]:
     and silently missed an annotated constant, which reads as "the constant is
     gone" rather than as a gap in the reader.
 
+    MODULE SCOPE IS THE CONTRACT, so this iterates the parsed module's own body
+    rather than ``ast.walk``. Walking descends into function and class bodies,
+    where an ordinary local of the same name shadows the real constant — and the
+    direction that matters is the silent one: delete the module constant, leave a
+    nested literal behind, and a caller asserting a ceiling still reads a number
+    and still passes, with the ceiling it names gone. Measured on the two files
+    read here: walking additionally collected ``matches``, ``named`` and
+    ``total``, all function locals, and none of them a constant of any kind.
+
+    IT IS A TRADE, NOT A PURE WIN, and saying otherwise here would be this file's
+    own recurring defect wearing the opposite polarity. Narrowing gives up the one
+    case the wide scan caught: a ``global`` rebind inside a function, where the
+    module literal stays honest and the runtime ceiling is something else.
+    MEASURED — module ``_MAX_NUDGE_LINE = 400`` left in place, a ``global`` rebind
+    to 50_000 added inside a function: ``ast.walk`` went RED, this reader stays
+    GREEN, with the hook's real ceiling 125x over the cap. Taken deliberately on
+    three grounds. The wide scan caught it BY ACCIDENT and only in one direction —
+    a rebind to a SMALLER number passes either way. A leftover local after a
+    deleted constant is the common refactor; a ``global`` rebind of a ceiling is
+    not. And the caller most exposed to it already declares itself a necessary,
+    not sufficient, condition. Proving the ceiling actually binds needs dataflow,
+    which is the row's standing open alternative rather than this reader's job.
+
     By AST, never by import: these constants are version-volatile by design, and
     importing the hook would execute it.
     """
     consts: dict[str, int] = {}
-    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
         if isinstance(node, ast.Assign):
             targets = node.targets
         elif isinstance(node, ast.AnnAssign):
