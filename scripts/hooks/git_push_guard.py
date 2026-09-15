@@ -534,8 +534,12 @@ _MERGE_GATE_BUDGET_S = 45.0
 # Shared merge-path deadline (a monotonic() instant). main() sets it once before the
 # gh-pr-merge gates; every merge-path gh call reads it via _gh_timeout so the AGGREGATE
 # finishes with headroom under the hook's ~60s wall-clock. A module global is safe:
-# this PreToolUse hook is a SINGLE-SHOT process (one command, no concurrency), and it
-# stays None on every other path (push, the --check-pr report) → those use full caps.
+# this PreToolUse hook is a SINGLE-SHOT process, so one deadline per
+# invocation is the whole lifecycle. ARMED AT THE TOP OF
+# `_run_merge_and_push_gates` for EVERY path it guards — the push path
+# included, which used to inherit it only as a side effect of the escalation
+# gate. It stays None on the `--check-pr` reporting path, which is not a hook
+# invocation and has no registration to overrun, so that one uses full caps.
 _merge_deadline: float | None = None
 
 
@@ -7696,18 +7700,18 @@ def _push_ref_positionals(argv: list[str]) -> list[str] | None:
     """The positional tokens of a ``git push`` segment, or None if it is not a
     plain ref-set-neutral push.
 
-    Extracted from ``_push_targets_current_branch`` so the duplicate-name
-    ENRICHMENT can reuse the same parsing without inheriting that predicate's
-    allowlist verdict. The two callers need different answers from the same
-    scan: one decides whether a push may be AUTO-ALLOWED (and so must refuse
-    every unrecognised form), the other decides whether a note is worth adding
-    to a prompt that is shown either way.
+    Separated from ``_push_targets_current_branch`` so the SCAN and the VERDICT
+    are not the same function: the scan answers "which tokens are refspecs", the
+    caller decides what that means. It was extracted for a second caller — the
+    duplicate-name enrichment — which has since been removed from this PR and
+    refiled; the separation is kept because a parser that returns data is worth
+    more than one that returns a verdict, and because the enrichment will need
+    it again.
 
     None means "a flag here changes the ref set" (``--all``, ``--tags``,
     ``--delete``, ``--mirror``, ``--stdin``, ``--repo``, a ``+refspec`` force
     shorthand, or anything unknown). Both callers treat None as a refusal.
     """
-    i = 1
     # Advance past git global options to the `push` token.
     i = 1
     while i < len(argv):
@@ -7907,12 +7911,22 @@ def _remote_branch_sha(remote: str, branch: str, cwd: str | None = None) -> str 
     ref, which goes stale the moment a remote branch is deleted). Accepts only the
     line whose ref path is EXACTLY ``refs/heads/<branch>`` — a bare pattern
     tail-matches namespaced refs. Fail-safe: None on rc!=0 / timeout / any error /
-    absent branch — callers treat None as "not confirmed present". Bounded by a 10s
-    timeout inside the hook's 60s budget.
+    absent branch — callers treat None as "not confirmed present". Bounded by the
+    SHARED hook deadline (10s cap, less once the budget has drained), because the
+    aggregate across sequential probes is what overruns the registration, not any
+    single call.
     """
     try:
         args = ["git"] + (["-C", cwd] if cwd else []) + ["ls-remote", "--heads", remote, branch]
-        result = subprocess.run(args, capture_output=True, text=True, timeout=10)
+        # Under the SHARED deadline, like every other probe on this path. This
+        # is a NETWORK call sitting immediately upstream of them, and a flat cap
+        # here is what the arming comment cannot compensate for: the AGGREGATE
+        # is what overruns the hook's registration, and a SIGKILLed PreToolUse
+        # hook fails OPEN. `_gh_timeout` returns the full cap when no deadline
+        # is armed, so the --check-pr reporting path is unaffected.
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=_gh_timeout(10.0)
+        )
         if result.returncode != 0:
             return None
         target_ref = f"refs/heads/{branch}"
