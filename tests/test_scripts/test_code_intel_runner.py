@@ -226,6 +226,39 @@ def test_escalates_fast_marker_to_full_when_due(tmp_path):
     assert "mode=full" in (tmp_path / "entry.log").read_text()
 
 
+def test_escalation_query_error_restores_marker_and_stops_tick(tmp_path):
+    """A real helper exception must not be interpreted as "full not due"."""
+    h = _seed_marker(tmp_path, mode="fast")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    python_wrapper = bin_dir / "python3"
+    python_wrapper.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [ \"${2:-}\" = should-escalate ]; then\n"
+        "  /usr/bin/python3 -c 'import os,sqlite3,subprocess,sys; "
+        "db=sqlite3.connect(sys.argv[1],isolation_level=None); db.execute(\"BEGIN EXCLUSIVE\"); "
+        "result=subprocess.run([\"/usr/bin/python3\",*sys.argv[2:]],env=os.environ); "
+        "db.rollback(); db.close(); raise SystemExit(result.returncode)' "
+        "\"$GENESIS_HOME/index-requests/queue.sqlite3\" \"$@\"\n"
+        "  exit $?\n"
+        "fi\n"
+        "exec /usr/bin/python3 \"$@\"\n"
+    )
+    python_wrapper.chmod(python_wrapper.stat().st_mode | stat.S_IXUSR)
+
+    result = _run_runner(
+        tmp_path,
+        entry_rc=0,
+        extra_env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+    )
+
+    assert result.returncode == 76
+    assert not (tmp_path / "entry.log").exists()
+    rows = _markers(tmp_path)
+    assert len(rows) == 1
+    assert rows[0].split("\t")[0] == h
+
+
 def test_escalated_full_failure_falls_back_no_penalty(tmp_path):
     h = _seed_marker(tmp_path, mode="fast")  # escalates to full, then fails
     _run_runner(tmp_path, entry_rc=1)

@@ -11,8 +11,9 @@ may be unavailable. SQLite uses rollback journaling and ``synchronous=FULL``.
 Do not switch to WAL until every supported SQLite contains the WAL-reset fix
 (3.51.3 or an official backport); Ubuntu's current Python runtime is older.
 
-Legacy JSON markers are imported idempotently under the old queue lock and then
-removed, preserving pending and orphaned work across deployment.
+Legacy JSON markers are renamed into recoverable claims before import, then
+imported idempotently under the old queue lock. Busy enqueues fall back to
+unique, fsynced spool files that the same importer coalesces into SQLite.
 """
 
 from __future__ import annotations
@@ -28,8 +29,9 @@ import re
 import secrets
 import sqlite3
 import sys
+import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 MAX_ATTEMPTS = 5
@@ -42,6 +44,8 @@ LOCK_WAIT_S = 0.5
 OUTCOME_LOCK_WAIT_S = 5.0
 SCHEMA_VERSION = 1
 _HASH_RE = re.compile(r"^[0-9a-f]{16}$")
+_MIGRATION_CLAIM_RE = re.compile(r"^(?P<source>.+)\.migrating-[0-9a-f]{32}$")
+_SPOOL_RE = re.compile(r"^\.spool-(?P<hash>[0-9a-f]{16})-[0-9a-f]{32}\.spool$")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS pending (
@@ -243,6 +247,37 @@ def _coalesce_pending(db: sqlite3.Connection, h: str, data: dict) -> None:
     )
 
 
+def _fsync_dir(path: Path) -> None:
+    """Persist a directory-entry change before reporting it durable."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_spool(h: str, data: dict) -> Path:
+    """Durably spool one immutable enqueue when SQLite is temporarily busy."""
+    directory = marker_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    nonce = secrets.token_hex(16)
+    final = directory / f".spool-{h}-{nonce}.spool"
+    fd, tmp_name = tempfile.mkstemp(prefix=f".spool-{h}-", suffix=".tmp", dir=directory)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(json.dumps(data, sort_keys=True).encode() + b"\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, final)
+        _fsync_dir(directory)
+        return final
+    except BaseException:
+        with suppress(OSError):
+            tmp.unlink()
+        raise
+
+
 def _legacy_files() -> list[Path]:
     if not marker_dir().is_dir():
         return []
@@ -252,11 +287,45 @@ def _legacy_files() -> list[Path]:
         if path.is_file()
         and (
             path.name.endswith(".json")
+            or _MIGRATION_CLAIM_RE.fullmatch(path.name)
+            or _SPOOL_RE.fullmatch(path.name)
             or path.name.startswith(
                 (".outcome-", ".failed-outcome-", ".last-full-", ".full-backoff-")
             )
         )
     )
+
+
+def _legacy_source_name(path: Path) -> str:
+    match = _MIGRATION_CLAIM_RE.fullmatch(path.name)
+    return match.group("source") if match else path.name
+
+
+def _claim_legacy_files(paths: list[Path]) -> list[tuple[Path, Path]]:
+    """Move replaceable legacy paths aside before reading them.
+
+    The deployed JSON writer does not honor ``.queue.lock``. A unique rename is
+    therefore the ownership boundary: a later atomic replacement recreates the
+    original pathname and cannot be deleted when this claim is retired. Existing
+    claims and immutable spool files are already safe and are resumed in place.
+    """
+    claimed: list[tuple[Path, Path]] = []
+    changed = False
+    for path in paths:
+        source_name = _legacy_source_name(path)
+        if _MIGRATION_CLAIM_RE.fullmatch(path.name) or _SPOOL_RE.fullmatch(path.name):
+            claimed.append((path, path.with_name(source_name)))
+            continue
+        claim = path.with_name(f"{path.name}.migrating-{secrets.token_hex(16)}")
+        try:
+            os.replace(path, claim)
+        except FileNotFoundError:
+            continue
+        claimed.append((claim, path))
+        changed = True
+    if changed:
+        _fsync_dir(marker_dir())
+    return claimed
 
 
 def _legacy_lock():
@@ -289,6 +358,18 @@ def _quarantine(db: sqlite3.Connection, h: str, reason: str, raw: bytes) -> None
 
 def _import_one(db: sqlite3.Connection, path: Path, raw: bytes) -> None:
     name = path.name
+    spool = _SPOOL_RE.fullmatch(name)
+    if spool:
+        h = spool.group("hash")
+        try:
+            data = json.loads(raw)
+        except (UnicodeDecodeError, ValueError):
+            data = None
+        if _valid_queue_data(data) and marker_hash(data["repo_path"]) == h:
+            _coalesce_pending(db, h, data)
+        else:
+            _quarantine(db, h, "malformed enqueue spool", raw)
+        return
     for prefix, column in ((".last-full-", "last_full"), (".full-backoff-", "full_backoff")):
         if name.startswith(prefix):
             h = name[len(prefix) :]
@@ -407,35 +488,37 @@ def _migrate_legacy() -> None:
         return
     lock = _legacy_lock()
     try:
-        paths = _legacy_files()
+        paths = _claim_legacy_files(_legacy_files())
         # Import ownership before sidecar outcomes.
-        paths.sort(key=lambda p: p.name.startswith(".outcome-"))
+        paths.sort(key=lambda item: item[1].name.startswith(".outcome-"))
         imported: list[Path] = []
         with _write_db() as db:
-            for path in paths:
-                raw = path.read_bytes()
+            for claimed_path, source_path in paths:
+                raw = claimed_path.read_bytes()
                 digest = hashlib.sha256(raw).hexdigest()
                 prior = db.execute(
                     "SELECT content_sha256,source_mtime_ns FROM legacy_imports WHERE path=?",
-                    (path.name,),
+                    (source_path.name,),
                 ).fetchone()
-                source_mtime_ns = path.stat().st_mtime_ns
+                source_mtime_ns = claimed_path.stat().st_mtime_ns
                 if (
                     not prior
                     or prior["content_sha256"] != digest
                     or prior["source_mtime_ns"] != source_mtime_ns
                 ):
-                    _import_one(db, path, raw)
+                    _import_one(db, source_path, raw)
                     db.execute(
                         "INSERT INTO legacy_imports(path,content_sha256,source_mtime_ns,imported_at) "
                         "VALUES(?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
                         "content_sha256=excluded.content_sha256,"
                         "source_mtime_ns=excluded.source_mtime_ns,imported_at=excluded.imported_at",
-                        (path.name, digest, source_mtime_ns, time.time()),
+                        (source_path.name, digest, source_mtime_ns, time.time()),
                     )
-                imported.append(path)
+                imported.append(claimed_path)
         for path in imported:
             path.unlink(missing_ok=True)
+        if imported:
+            _fsync_dir(marker_dir())
     finally:
         lock.close()
 
@@ -447,11 +530,11 @@ def _prepare() -> None:
 
 
 def write_marker(repo_path: str, tools: str, mode: str) -> Path:
+    """Create/coalesce a request, durably spooling it if SQLite is busy."""
     if tools not in VALID_TOOLS:
         raise ValueError(f"tools must be one of {VALID_TOOLS}, got {tools!r}")
     if mode not in VALID_MODES:
         raise ValueError(f"mode must be one of {VALID_MODES}, got {mode!r}")
-    _prepare()
     data = {
         "repo_path": canonical_repo(repo_path),
         "tools": tools,
@@ -459,9 +542,18 @@ def write_marker(repo_path: str, tools: str, mode: str) -> Path:
         "requested_at": time.time(),
         "attempts": 0,
     }
-    with _write_db() as db:
-        _coalesce_pending(db, marker_hash(repo_path), data)
-    return database_path()
+    h = marker_hash(repo_path)
+    try:
+        _prepare()
+        with _write_db() as db:
+            _coalesce_pending(db, h, data)
+        return database_path()
+    except TimeoutError:
+        return _write_spool(h, data)
+    except sqlite3.OperationalError as exc:
+        if not _is_busy(exc):
+            raise
+        return _write_spool(h, data)
 
 
 def list_markers() -> list[dict]:
@@ -751,7 +843,12 @@ def main(argv: list[str] | None = None) -> int:
         print(restore(args.hash, attempts_inc=args.attempts_inc))
         return 0
     if args.cmd == "should-escalate":
-        return 0 if should_escalate_full(args.hash) else 1
+        try:
+            due = should_escalate_full(args.hash)
+        except Exception as exc:  # noqa: BLE001 — CLI must reserve rc=1 for "not due"
+            print(f"ERROR: should-escalate failed: {exc}", file=sys.stderr)
+            return 2
+        return 0 if due else 1
     if args.cmd == "stamp-full":
         stamp_full(args.hash)
         return 0

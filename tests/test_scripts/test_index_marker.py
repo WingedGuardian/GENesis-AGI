@@ -118,19 +118,21 @@ def test_concurrent_thread_writers_do_not_lose_widening(tmp_path, monkeypatch):
     assert (row["tools"], row["mode"]) == ("both", "full")
 
 
-def test_database_write_lock_times_out_without_mutation(tmp_path, monkeypatch):
+def test_database_write_lock_durably_spools_without_losing_widening(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     im.write_marker("/tmp", "cbm", "fast")
-    before = im.list_markers()[0]
     blocker = sqlite3.connect(im.database_path(), isolation_level=None)
     blocker.execute("BEGIN IMMEDIATE")
     try:
-        with pytest.raises(TimeoutError):
-            im.write_marker("/tmp", "gitnexus", "full")
+        spool = im.write_marker("/tmp", "gitnexus", "full")
+        assert spool.exists()
+        assert spool.suffix == ".spool"
     finally:
         blocker.rollback()
         blocker.close()
-    assert im.list_markers()[0] == before
+    row = im.list_markers()[0]
+    assert (row["tools"], row["mode"]) == ("both", "full")
+    assert not spool.exists()
 
 
 def test_failed_transaction_rolls_back_entire_coalesce(tmp_path, monkeypatch):
@@ -329,6 +331,57 @@ def test_identical_legacy_request_recreated_later_is_not_deduped_away(tmp_path, 
     assert im.list_markers()[0]["attempts"] == 0
 
 
+def test_migration_never_unlinks_a_concurrently_replaced_legacy_marker(tmp_path, monkeypatch):
+    """A pre-SQLite writer may replace the pathname while migration is active."""
+    _home(tmp_path, monkeypatch)
+    h = im.marker_hash("/tmp")
+    path = im.marker_dir() / f"{h}.json"
+    _legacy(path, _queue_payload(tools="cbm", mode="fast"))
+    original_import = im._import_one
+    replaced = False
+
+    def replace_during_import(db, source_path, raw):
+        nonlocal replaced
+        result = original_import(db, source_path, raw)
+        if source_path.name == path.name and not replaced:
+            replaced = True
+            _legacy(path, _queue_payload(tools="gitnexus", mode="full"))
+        return result
+
+    monkeypatch.setattr(im, "_import_one", replace_during_import)
+    first = im.list_markers()[0]
+    assert (first["tools"], first["mode"]) == ("cbm", "fast")
+    assert path.exists(), "the replacement written after the claim must survive"
+    second = im.list_markers()[0]
+    assert (second["tools"], second["mode"]) == ("both", "full")
+    assert not path.exists()
+
+
+def test_crash_left_migration_claim_is_recovered(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    h = im.marker_hash("/tmp")
+    claim = im.marker_dir() / f"{h}.json.migrating-{'a' * 32}"
+    _legacy(claim, _queue_payload(tools="gitnexus", mode="full"))
+
+    row = im.list_markers()[0]
+
+    assert (row["tools"], row["mode"]) == ("gitnexus", "full")
+    assert not claim.exists()
+
+
+def test_malformed_enqueue_spool_is_quarantined(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    h = im.marker_hash("/tmp")
+    spool = im.marker_dir() / f".spool-{h}-{'b' * 32}.spool"
+    _legacy(spool, "{truncated")
+
+    assert im.list_markers() == []
+    failed = im.get_failed(h)
+    assert failed["reason"] == "malformed enqueue spool"
+    assert bytes(failed["raw_payload"]) == b"{truncated"
+    assert not spool.exists()
+
+
 def test_crash_left_legacy_file_is_not_imported_twice(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     h = im.marker_hash("/tmp")
@@ -434,3 +487,33 @@ def test_cli_roundtrip_and_cross_process_coalesce(tmp_path):
     assert cli("remember-outcome", "--hash", h, "--action", "consume").returncode == 0
     assert cli("apply-outcome", "--hash", h).stdout.strip() == "consumed"
     assert cli("claim", "--hash", h, check=False).returncode == 1
+
+
+def test_cli_enqueue_spools_across_process_boundary_when_database_is_busy(tmp_path):
+    """Exercise the exact CLI path used by the detached post-commit hook."""
+    env = {**os.environ, "GENESIS_HOME": str(tmp_path / ".genesis")}
+
+    def cli(*args):
+        return subprocess.run(
+            ["python3", str(_MARKER_PY), *args],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=True,
+        )
+
+    cli("write", "--repo", "/tmp", "--tools", "cbm", "--mode", "fast")
+    blocker = sqlite3.connect(tmp_path / ".genesis" / "index-requests" / "queue.sqlite3")
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        result = cli("write", "--repo", "/tmp", "--tools", "gitnexus", "--mode", "full")
+        spool = Path(result.stdout.strip())
+        assert spool.exists() and spool.suffix == ".spool"
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    fields = cli("list").stdout.strip().split("\t")
+    assert fields[2:4] == ["both", "full"]
+    assert not spool.exists()

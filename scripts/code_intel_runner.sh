@@ -183,10 +183,22 @@ for line in "${_MARKERS[@]}"; do
     # NOT escalate or it would stamp the shared full-success clock and falsely suppress
     # cbm's genuinely-needed full pass.
     run_mode="$mode"
-    if [ "$mode" != "full" ] && { [ "$tools" = "cbm" ] || [ "$tools" = "both" ]; } \
-        && _marker should-escalate --hash "$hash"; then
-        run_mode="full"
-        _log "escalating $repo to full (weekly/first full cbm index due)"
+    if [ "$mode" != "full" ] && { [ "$tools" = "cbm" ] || [ "$tools" = "both" ]; }; then
+        escalation_rc=0
+        _marker should-escalate --hash "$hash" || escalation_rc=$?
+        case "$escalation_rc" in
+            0)
+                run_mode="full"
+                _log "escalating $repo to full (weekly/first full cbm index due)"
+                ;;
+            1)
+                ;;
+            *)
+                _log "full-escalation query failed (rc=$escalation_rc) — restoring $repo and stopping tick"
+                _finish_outcome "$hash" restore >/dev/null || true
+                exit 76
+                ;;
+        esac
     fi
 
     _log "indexing $repo (tools=$tools mode=$run_mode)"

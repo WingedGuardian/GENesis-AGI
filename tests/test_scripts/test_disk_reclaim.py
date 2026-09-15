@@ -187,7 +187,7 @@ class TestLastResortTier:
         with sqlite3.connect(home / "index-requests" / "queue.sqlite3") as db:
             assert db.execute("SELECT count(*) FROM pending").fetchone()[0] == 1
 
-    def test_busy_queue_preserves_last_resort_cache_until_marker_can_be_written(self, tmp_path):
+    def test_busy_queue_spools_rebuild_before_last_resort_cache_clear(self, tmp_path):
         lr = _make_cache(tmp_path, "lr-busy", "last_resort")
         home = tmp_path / ".genesis"
         marker_dir = home / "index-requests"
@@ -198,10 +198,17 @@ class TestLastResortTier:
         try:
             with patch.object(_mod, "_CACHE_TARGETS", [lr]):
                 self._run(["--apply", "--last-resort-above", "95"], disk_pct=96.0, home=home)
+            spools = list(marker_dir.glob(".spool-*.spool"))
+            assert len(spools) == 1, "the rebuild request must be durable before deletion"
+            assert not lr.path.exists()
         finally:
             lock.rollback()
             lock.close()
-        assert lr.path.exists(), "index cache must survive when its rebuild cannot be queued"
+        with patch.dict(_mod.os.environ, {"GENESIS_HOME": str(home)}):
+            import index_marker
+
+            assert len(index_marker.list_markers()) == 1
+        assert not spools[0].exists()
 
     def test_runner_cannot_consume_marker_during_last_resort_deletion(self, tmp_path):
         lr = _make_cache(tmp_path, "lr-race", "last_resort")

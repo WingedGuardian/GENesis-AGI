@@ -62,16 +62,23 @@ The database uses rollback journaling plus `synchronous=FULL`: both Python
 runtimes exercised here embed SQLite versions in the documented WAL-reset
 bug range, so WAL is intentionally forbidden until the runtimes receive the
 upstream fix. No indexing occurs while holding a short database transaction.
-The legacy `.queue.lock` remains only as a rolling-upgrade migration boundary
-while pre-SQLite JSON requests are imported idempotently and removed. Neither
-lock replaces the runner's execution lock or proves daemon workers terminated.
-Normal acquisition gives up after 0.5 seconds without mutating requests;
-errors propagate to callers instead of permitting unlocked writes. The async
+The legacy `.queue.lock` remains only as a rolling-upgrade migration boundary.
+Because an already-running pre-SQLite writer does not honor that lock, migration
+first atomically renames each replaceable legacy path into a unique, recoverable
+claim, then imports it idempotently. A later old-process replacement recreates
+the original pathname and survives retirement of the claimed file. Neither lock
+replaces the runner's execution lock or proves daemon workers terminated.
+
+Normal SQLite acquisition gives up after 0.5 seconds. Enqueues then write a
+unique, file-and-directory-fsynced spool entry rather than dropping the request
+or waiting in a commit-sensitive caller; the importer coalesces that immutable
+entry on the next queue access. Database corruption and non-contention I/O
+errors still propagate instead of being mislabeled as lock pressure. The async
 GitNexus scheduling job performs marker I/O in a worker thread so waiting does
 not stall the Genesis event loop. Last-resort disk reclamation establishes a
-rebuild request before deleting an index cache and preserves the cache if that
-request cannot be recorded; installation reports queue failure instead of
-claiming success.
+durable SQLite or spool rebuild request before deleting an index cache;
+installation reports queue failure instead of claiming success if neither can
+be recorded.
 
 A second claim cannot replace an existing inflight row. A new request written
 while indexing remains a separate pending row and therefore survives consume.
@@ -80,6 +87,10 @@ counts an unknown runner outcome against the existing five-attempt budget;
 normal frozen/missing-tool deferrals still do not consume that budget. This is
 only the prerequisite policy: immediate quarantine of resource failures and
 deliberate retry are still pending managed-runtime work.
+The full-escalation query has a three-way shell contract: exit 0 means due,
+exit 1 means not due, and any other status restores the claimed request and
+stops the tick. An operational queue error therefore cannot silently downgrade
+an overdue full build to fast and then consume it.
 Once the index entrypoint returns, the runner first persists the terminal
 action on the owned inflight row, then applies the queue transition. A later
 tick replays that action before generic orphan recovery.
