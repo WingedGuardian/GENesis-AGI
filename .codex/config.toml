@@ -1,0 +1,41 @@
+# Codex is an external Genesis MCP client. This initial surface is deliberately
+# read-oriented; expand it only after a separately reviewed capability decision.
+# The launcher strips Genesis/Claude session identity before starting a server.
+
+# Genesis servers are optional. Wait for their configured startup timeout so a
+# fresh Codex turn receives their tool schemas before planning its response.
+mcp_optional_startup_grace_ms = 0
+
+[mcp_servers.genesis-health]
+command = "python3"
+args = ["scripts/codex_external_mcp.py", "--server", "health"]
+cwd = "."
+startup_timeout_sec = 30
+enabled_tools = [
+  "health_status",
+  "health_errors",
+  "health_alerts",
+  "bootstrap_manifest",
+  "subsystem_heartbeats",
+  "job_health",
+  "provider_activity",
+  "infrastructure_profile",
+]
+default_tools_approval_mode = "approve"
+
+[mcp_servers.genesis-memory]
+command = "python3"
+args = ["scripts/codex_external_mcp.py", "--server", "memory"]
+cwd = "."
+startup_timeout_sec = 30
+enabled_tools = [
+  "memory_recall",
+  "memory_expand",
+  "memory_core_facts",
+  "memory_stats",
+  "knowledge_recall",
+  "knowledge_status",
+  "procedure_recall",
+  "observation_query",
+]
+default_tools_approval_mode = "approve"
