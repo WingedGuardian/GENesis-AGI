@@ -262,6 +262,42 @@ def _bundle_history(trash_path: Path, repo_root: Path, meta: dict) -> bool:
     return True
 
 
+def _scratch_dir_for(stored: Path) -> Path:
+    """The temporary extraction directory for ``stored``, with a BOUNDED name.
+
+    Prepending a prefix to the full archive filename can exceed the 255-byte
+    component limit ext4 and most Linux filesystems enforce, and the asymmetry is
+    the worst available: the archive is created SUCCESSFULLY and can then never
+    be opened, because `mkdir` raises ENAMETOOLONG on a name derived from a name
+    that already fit. A fixed-width digest makes "archivable" and "recoverable"
+    the same set. The archive's own name identifies it; this directory is
+    transient and only has to be unique.
+
+    A function rather than an inline expression so a test can assert the REAL
+    derivation — recomputing the formula in the test would pass against any
+    implementation, including the broken one.
+    """
+    digest = hashlib.sha256(stored.name.encode("utf-8", "surrogateescape")).hexdigest()[:24]
+    return TRASH_DIR / f".extract-{digest}"
+
+
+def _default_branch(repo_root: Path) -> str:
+    """The repository's default branch, asked of the remote rather than assumed.
+
+    Hardcoding "main" would silently mis-narrow the merged-PR query on any fork
+    or mirror whose default differs, and a mis-narrowed query returns nothing —
+    which reads as "not merged" and is the safe direction, but for the wrong
+    reason and invisibly. Falls back to "main" only when the question cannot be
+    answered at all.
+    """
+    head = _run_git(repo_root, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], timeout=15)
+    if head:
+        name = head.strip().removeprefix("origin/")
+        if name:
+            return name
+    return "main"
+
+
 def _run_git(repo_root: Path, args: list[str], *, timeout: int) -> str | None:
     """Run git, returning stdout on success and None on any failure."""
     try:
@@ -343,8 +379,22 @@ def _repo_root() -> Path:
 
 
 def _find_processes_in_dir(dir_path: str) -> list[int]:
-    """Return PIDs with CWD inside dir_path (excluding self + parent)."""
-    exclude = {os.getpid(), os.getppid()}
+    """Return PIDs whose CWD is inside ``dir_path``.
+
+    THIS PROCESS AND ITS PARENT COUNT. They used to be excluded, which is wrong
+    for the documented hand-run: `python scripts/worktree_lifecycle.py` invoked
+    from inside a cold unmerged worktree has its own cwd — and its shell's — in
+    the very directory being considered, so the one process that certainly IS
+    using it was the one process guaranteed not to be seen. Entering a directory
+    does not refresh any mtime either, so an otherwise idle 14-day-old worktree
+    satisfies the staleness test while somebody is standing in it, and it gets
+    renamed and archived out from under their shell.
+
+    The exclusion was there so the reaper would not see itself, but a scheduled
+    run has its cwd at the repository root and therefore inside NO linked
+    worktree — so counting self and parent costs that run nothing and protects
+    the interactive one.
+    """
     pids: list[int] = []
     try:
         entries = os.listdir("/proc")
@@ -354,8 +404,6 @@ def _find_processes_in_dir(dir_path: str) -> list[int]:
         if not entry.isdigit():
             continue
         pid = int(entry)
-        if pid in exclude:
-            continue
         try:
             cwd = os.readlink(f"/proc/{pid}/cwd")
             if cwd == dir_path or cwd.startswith(dir_path + "/"):
@@ -374,23 +422,39 @@ def _list_worktrees(repo_root: Path) -> list[dict]:
     worktree is under ``git worktree lock``.
     Excludes the main worktree (bare=True or first entry).
     """
+    # `-z` AND BYTES, for two different failure modes that share a cause: a path
+    # is not text and is not line-structured.
+    #
+    #  * A NEWLINE is legal in a Unix path, and porcelain puts it INSIDE the
+    #    `worktree <path>` value, so splitting on lines invents a truncated ghost
+    #    path that matches nothing on disk. `-z` terminates records with NUL, so
+    #    the value is unambiguous. (`git worktree list -h` documents `-z`.)
+    #  * A path containing NON-UTF-8 bytes raised UnicodeDecodeError under
+    #    `text=True` — BEFORE the failure normalisation below could turn it into
+    #    a WorktreeScanError, so `--report-json` crashed with a traceback instead
+    #    of reporting a scan failure. Reading bytes and decoding with
+    #    `surrogateescape` round-trips such a path back to the filesystem intact.
     try:
         result = subprocess.run(
-            ["git", "worktree", "list", "--porcelain"],
-            capture_output=True, text=True, cwd=str(repo_root), timeout=10,
+            ["git", "worktree", "list", "--porcelain", "-z"],
+            capture_output=True, cwd=str(repo_root), timeout=10,
         )
         if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", "replace").strip()[:200]
             raise WorktreeScanError(
-                f"git worktree list exited {result.returncode}: {result.stderr.strip()[:200]}"
+                f"git worktree list exited {result.returncode}: {detail}"
             )
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         raise WorktreeScanError(f"could not enumerate worktrees: {e}") from e
 
     worktrees: list[dict] = []
     current: dict = {}
     is_first = True
 
-    for line in result.stdout.splitlines():
+    # With -z each attribute is its own NUL-terminated field and an EMPTY field
+    # ends a record, which is the same shape the old blank-line branch handled.
+    fields = result.stdout.decode("utf-8", "surrogateescape").split("\0")
+    for line in fields:
         if line.startswith("worktree "):
             if current and "path" in current and not is_first:
                 worktrees.append(current)
@@ -530,15 +594,30 @@ def _merge_verdict(
     try:
         if not allow_network:
             raise _SkipNetwork
+        # VALIDATED against the base AND the merged head, not merely "a merged PR
+        # once used this branch name". Branch names are reused, and a PR merged
+        # into a non-default base says nothing about whether this work reached
+        # main — so `--head <name>` alone can report "merged" for a branch that
+        # still carries unique unmerged commits, and the 7-day merged lane would
+        # then archive it a week early.
+        #
+        # `--base` narrows to the default branch; `mergeCommit`/`headRefOid` let
+        # the CURRENT tip be compared with what was actually merged. A PR whose
+        # merged head differs from the tip means work landed after the merge.
         result = subprocess.run(
-            ["gh", "pr", "list", "--head", ref, "--state", "merged",
-             "--limit", "1", "--json", "number"],
+            ["gh", "pr", "list", "--head", ref, "--base", _default_branch(repo_root),
+             "--state", "merged", "--limit", "10", "--json", "number,headRefOid"],
             capture_output=True, text=True, cwd=str(repo_root), timeout=30,
         )
         if result.returncode == 0:
             prs = json.loads(result.stdout)
-            if prs:
-                return "pr"
+            tip = _run_git(repo_root, ["rev-parse", ref], timeout=15)
+            tip = (tip or "").strip()
+            for pr in prs:
+                # No tip to compare against is NOT a pass: without it this is the
+                # name-only check that produced the false positive.
+                if tip and pr.get("headRefOid") == tip:
+                    return "pr"
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError,
             _SkipNetwork):
         pass
@@ -1517,7 +1596,15 @@ def _recover(name: str, repo_root: Path) -> bool:
     if stored.is_dir():
         return _restore_from_dir(stored, repo_root)
 
-    scratch = TRASH_DIR / f".extract-{stored.name}"
+    # BOUNDED scratch name. Prepending `.extract-` to the full archive filename
+    # can exceed the 255-byte component limit that ext4 and most Linux
+    # filesystems enforce, and the failure is asymmetric in the worst way: the
+    # archive is created SUCCESSFULLY and can then never be recovered, because
+    # `mkdir` raises ENAMETOOLONG on a name derived from a name that already fit.
+    # A digest is fixed-width, so no archive can be archivable and unrecoverable.
+    # The archive's own name is what identifies it; this directory is transient
+    # and only has to be unique.
+    scratch = _scratch_dir_for(stored)
     try:
         shutil.rmtree(scratch, ignore_errors=True)
         scratch.mkdir(parents=True, exist_ok=True)
@@ -1686,6 +1773,43 @@ def _restore_from_dir(trash_path: Path, repo_root: Path) -> bool:
         # `.git` pointer, which the message says out loud rather than reporting a
         # clean recovery.
         print(f"git worktree add failed: {result.stderr.strip()}", file=sys.stderr)
+
+        # `git worktree add` can FAIL AFTER creating and registering the
+        # destination — a `post-checkout` hook exiting non-zero is the
+        # reproducible case. The directory then exists, and `shutil.move` onto an
+        # existing directory places the source INSIDE it, so the whole archive
+        # lands one level down as `<path>/<name>/...` while this function reports
+        # success. Everything is present and nothing is where recovery said it
+        # would be, which is worse than a clean failure.
+        #
+        # So clear the half-made destination first, and only when it is one git
+        # itself just made and left EMPTY of real content. Anything else is
+        # somebody's data and is refused instead.
+        if Path(original_path).exists():
+            leftover = [p for p in Path(original_path).iterdir() if p.name != ".git"]
+            if leftover:
+                print(
+                    f"Refusing to move onto {original_path}: it exists and is not "
+                    f"empty ({len(leftover)} entries). Recovery ABORTED rather than "
+                    "nesting the archive inside it.",
+                    file=sys.stderr,
+                )
+                return False
+            try:
+                shutil.rmtree(original_path)
+                subprocess.run(
+                    ["git", "worktree", "prune"], capture_output=True,
+                    cwd=str(repo_root), timeout=30, env=_git_env(),
+                )
+                print(
+                    f"cleared the empty directory {original_path} that the failed "
+                    "worktree add left behind",
+                    file=sys.stderr,
+                )
+            except OSError as e:
+                print(f"Could not clear {original_path}: {e}", file=sys.stderr)
+                return False
+
         print(f"Moving trash contents back to {original_path}...", file=sys.stderr)
         try:
             shutil.move(str(trash_path), original_path)

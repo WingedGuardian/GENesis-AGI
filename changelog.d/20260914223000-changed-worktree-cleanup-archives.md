@@ -75,3 +75,28 @@
   the same name belonging to the worktree — in the worktree and in the archive at
   once, since the archive is made from the moved copy. The worktree file is now
   preserved alongside ours, under a name that says where it came from.
+- **A cleanup run started from inside a worktree no longer archives the
+  directory you are standing in.** The check for processes using a worktree
+  skipped the running process and its parent shell, so a hand-run from a cold
+  worktree could not see the one user it definitely had. Entering a directory
+  refreshes no timestamps either, so an otherwise idle worktree passed the
+  staleness test while somebody was working in it.
+- **Worktree names that are not plain text no longer break the scan.** A name
+  containing a line break was split into a truncated name matching nothing on
+  disk, and a name containing bytes that are not valid text crashed the scan
+  outright rather than reporting a failure. Names are now read as the bytes they
+  are, with records separated unambiguously.
+- **An archive with a very long name can be opened again.** The temporary
+  directory used during recovery was named after the archive, which could push it
+  past the length limit the filesystem enforces — so an archive that was created
+  successfully could never be recovered. That name is now a fixed length.
+- **Recovery no longer buries the archive one level down.** When creating the
+  worktree fails after the destination has already been made, moving the archive
+  into that destination places it inside rather than at it. Recovery now refuses
+  and says so, leaving the archive intact for another attempt, instead of
+  reporting success with everything one directory deeper than stated.
+- **A branch is only treated as merged when the merge matches it.** The check
+  accepted any merged request that had once used the same branch name, whatever
+  it was merged into and whatever has been committed since — so a branch carrying
+  unmerged work could be archived early. It now requires the default target and
+  the same commit.

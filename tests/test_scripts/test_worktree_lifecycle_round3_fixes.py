@@ -501,3 +501,182 @@ def test_a_bundle_that_does_not_verify_blocks_the_prune(
         "the unusable bundle must not be left in the archive, where it would "
         "read as preserved history"
     )
+# ─── round-4: enumeration, recovery, and act-time protection ─────────────────
+
+
+def test_a_worktree_path_with_a_newline_is_parsed_whole(repo: Path, tmp_path: Path) -> None:
+    """A newline is legal in a Unix path and porcelain puts it INSIDE the value.
+
+    Splitting the listing on lines invents a truncated path that matches nothing
+    on disk, so that worktree is either invisible or acted on under a name that
+    is not its own. `-z` makes records NUL-terminated instead.
+    """
+    weird = tmp_path / "wt\nnewline"
+    added = _git(repo, "worktree", "add", "--quiet", "-b", "feature/nl", str(weird))
+    if added.returncode != 0:
+        pytest.skip(f"filesystem rejects a newline in a path: {added.stderr.strip()}")
+
+    paths = [w["path"] for w in wl._list_worktrees(repo)]
+    assert str(weird) in paths, f"the newline path was not parsed whole; got {paths}"
+
+
+def test_a_non_utf8_worktree_path_does_not_crash_enumeration(repo: Path, tmp_path: Path) -> None:
+    """A path is bytes, not text, and decoding it strictly raises.
+
+    Under `text=True` a non-UTF-8 path raised UnicodeDecodeError BEFORE the
+    failure normalisation could turn it into a WorktreeScanError — so
+    `--report-json` died with a traceback rather than reporting a scan failure,
+    which is the one outcome the error type exists to prevent.
+    """
+    raw = str(tmp_path).encode() + b"/wt-bad-\xff"
+    try:
+        os.mkdir(raw)
+        os.rmdir(raw)
+    except (OSError, ValueError):
+        pytest.skip("filesystem rejects non-UTF-8 path bytes")
+
+    added = _git(
+        repo,
+        "worktree",
+        "add",
+        "--quiet",
+        "-b",
+        "feature/bad",
+        raw.decode("utf-8", "surrogateescape"),
+    )
+    if added.returncode != 0:
+        pytest.skip(f"git refused the non-UTF-8 path: {added.stderr.strip()}")
+
+    worktrees = wl._list_worktrees(repo)  # must not raise
+    assert any("wt-bad-" in w["path"] for w in worktrees), (
+        "the non-UTF-8 worktree vanished from the listing instead of crashing, "
+        "which is the other way to get this wrong"
+    )
+
+
+def test_a_long_archive_name_still_yields_a_usable_scratch_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Archivable-but-unrecoverable is the worst asymmetry available here.
+
+    A 231-character basename produces a valid `.tar.gz`, and prepending
+    `.extract-` to it exceeded the 255-byte component limit — so `mkdir` raised
+    ENAMETOOLONG and the archive could never be opened. Recovery must not be able
+    to fail on a name that archiving accepted.
+    """
+    monkeypatch.setattr(wl, "TRASH_DIR", tmp_path / "trash")
+    (tmp_path / "trash").mkdir()
+    # 240 + ".tar.gz" = 247, a LEGAL archive name. Prefixing ".extract-" (9)
+    # gives 256, one over the limit — the exact asymmetry: creatable, then
+    # unopenable. An earlier version used 231 and produced a 247-byte scratch
+    # name that fit, so the mutation survived and the test proved nothing.
+    long_name = "w" * 240 + ".tar.gz"
+    assert len(long_name.encode()) == 247, "precondition: a legal archive name"
+    assert len(long_name.encode()) + len(".extract-") > 255, (
+        "precondition: the NAIVE derivation would exceed the component limit"
+    )
+
+    # Calls the PRODUCTION derivation. An earlier version recomputed the formula
+    # here and therefore passed against the broken implementation too; mutation
+    # caught it, and that is why this goes through wl.
+    scratch = wl._scratch_dir_for(Path(long_name))
+    assert len(scratch.name.encode()) <= 255, (
+        f"scratch component is {len(scratch.name.encode())} bytes, so an archive "
+        "that was creatable could never be opened"
+    )
+    scratch.mkdir()  # must not raise ENAMETOOLONG
+    assert scratch.is_dir()
+
+
+def test_the_invoking_shell_counts_as_a_user_of_its_own_worktree(tmp_path: Path) -> None:
+    """The one process certainly using a worktree was the one guaranteed unseen.
+
+    Self and parent were excluded so the reaper would not see itself. But the
+    documented hand-run happens FROM a worktree, so its own cwd and its shell's
+    are in the directory under consideration — and entering a directory refreshes
+    no mtime, so an idle 14-day-old worktree passes the staleness test while
+    somebody is standing in it.
+
+    Driven by actually changing this process's cwd rather than by simulating one,
+    because the defect was about which pids are skipped.
+    """
+    target = tmp_path / "standing-here"
+    target.mkdir()
+    before = os.getcwd()
+    try:
+        os.chdir(target)
+        found = wl._find_processes_in_dir(str(target))
+    finally:
+        os.chdir(before)
+    assert os.getpid() in found, (
+        "the running process was not counted as a user of its own cwd, so the "
+        "reaper would archive the directory its invoker is standing in"
+    )
+
+
+def test_an_unrelated_directory_still_reports_no_users(tmp_path: Path) -> None:
+    """The control: counting self must not make every directory look occupied."""
+    empty = tmp_path / "nobody-here"
+    empty.mkdir()
+    assert wl._find_processes_in_dir(str(empty)) == []
+
+
+def test_recovery_does_not_nest_when_worktree_add_half_succeeds(
+    repo: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """`git worktree add` can CREATE its destination and then fail.
+
+    A `post-checkout` hook exiting non-zero is the reproducible case, and it is
+    the one that matters: the directory now exists, so the fallback's
+    `shutil.move` places the whole archive INSIDE it as `<path>/<name>/...` while
+    recovery reports success. Everything present, nothing where recovery said.
+
+    An earlier version of this test pre-created the destination, which can never
+    reach the fallback — `_recover` returns False at the "original path already
+    exists" check long before it. That test passed for a reason unrelated to the
+    guard, and mutation is what exposed it. The destination here is created by
+    GIT, mid-recovery, exactly as the finding describes.
+    """
+    hook = repo / ".git" / "hooks" / "post-checkout"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text("#!/bin/sh\nexit 1\n")
+    hook.chmod(0o755)
+
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert head
+
+    trash = tmp_path / "trash-half"
+    trash.mkdir()
+    entry = trash / "wt-half"
+    entry.mkdir()
+    (entry / "archived-file.txt").write_text("from the archive\n")
+    original = tmp_path / "never-created-yet"
+    (entry / ".trash_meta.json").write_text(
+        json.dumps(
+            {
+                "original_path": str(original),
+                "branch": "",
+                "commit": head,
+                "detached": True,
+            }
+        )
+    )
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    assert not original.exists(), "precondition: git must be the one to create it"
+
+    result = wl._recover("wt-half", repo)
+
+    # The archive must NEVER end up one level down, whatever the verdict.
+    nested = original / "wt-half"
+    assert not nested.exists(), (
+        f"the archive was nested at {nested} — recovery relocated everything "
+        "one level deeper than it reported"
+    )
+    # Refusing is the correct outcome here: git had already checked files out
+    # into the destination, so it is not a directory we may clear. The important
+    # property is that a refusal is LOUD and LOSSLESS — reported as failure, with
+    # the archive still intact in the trash for another attempt.
+    assert result is False, "a refusal must be reported as failure, not success"
+    assert (entry / "archived-file.txt").exists(), (
+        "the archive was consumed by a recovery that did not complete"
+    )
