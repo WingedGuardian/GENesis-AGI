@@ -867,3 +867,58 @@ def test_a_network_complete_report_does_publish(reaper_repo, tmp_path, monkeypat
         argv=("worktree_lifecycle.py", "--report-json"),
     )
     assert cache.exists(), "a complete classification SHOULD be published"
+
+
+def test_archiving_leaves_the_registration_and_recovery_clears_it(
+    reaper_repo, tmp_path, monkeypatch, capsys
+):
+    """The whole point of this split, in one test.
+
+    Archiving no longer prunes, because pruning drops the per-worktree HEAD and
+    for a detached worktree that ref is the only thing keeping its commits
+    reachable — unsafe until the archive carries its own copy of the history.
+    So the registration is expected to SURVIVE the reap.
+
+    And that is exactly what breaks recovery if nothing clears it: `git worktree
+    add` refuses a path that is still registered ("missing but already
+    registered"), and `_recover` would fall through to its plain-directory
+    fallback, producing a tree that is not a git worktree at all — the failure
+    the fallback exists to avoid rather than to cause.
+
+    Both halves are asserted here, because either alone passes for the wrong
+    reason: the registration surviving is only correct if recovery still returns
+    a REAL worktree, and recovery working proves nothing if the registration was
+    silently pruned after all.
+    """
+    trash = tmp_path / "trash"
+    trash.mkdir()
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
+
+    wt = reaper_repo.wt_branch_merged
+    wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo)
+
+    # 1. The registration SURVIVES the archive. `git worktree list` still names
+    #    the path even though the directory is now a tarball.
+    listed = _git(reaper_repo.repo, "worktree", "list", "--porcelain")
+    assert str(wt) in listed, (
+        "the registration was pruned at archive time — the commits an archive "
+        "refers to would be collectable"
+    )
+
+    # 2. Recovery clears it and rebuilds a REAL worktree, not the fallback.
+    #
+    # Keyed on the RECOVERY PATH TAKEN, not on whether `git status` works
+    # afterwards. That distinction was found by mutation: with nothing pruning
+    # anywhere, the admin directory also survives, so the plain-directory
+    # fallback leaves a `.git` file still pointing at a valid admin dir and
+    # `git status` succeeds inside it. A status check therefore passes for BOTH
+    # outcomes and discriminates nothing. The message the function prints when
+    # it falls back is the only thing that actually differs.
+    assert wl._recover("wt_branch_merged", reaper_repo.repo) is True
+    out = capsys.readouterr().out
+    assert "not git worktree" not in out, (
+        "recovery fell through to its plain-directory fallback — `git worktree "
+        "add` refused the still-registered path, so nothing cleared it"
+    )
+    assert (wt / ".git").exists(), "recovery produced no .git at all"

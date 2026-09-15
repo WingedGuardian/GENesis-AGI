@@ -98,9 +98,6 @@ TOMBSTONE_INDEX = Path.home() / ".genesis" / "worktree-tombstones.jsonl"
 BOARD_CACHE = Path.home() / ".genesis" / "worktree-board.json"
 TRASH_DIR = Path.home() / ".genesis" / "worktree-trash"
 
-#: Tag namespace for a reaped DETACHED worktree's HEAD commit. Without an anchor
-#: the per-worktree HEAD is the only thing keeping that chain reachable, and
-#: pruning the registration makes it collectable.
 
 # Private modes for everything this module writes into the trash. A reaped
 # worktree is a verbatim copy of someone's working tree, which routinely holds a
@@ -127,8 +124,6 @@ class WorktreeScanError(RuntimeError):
     """
 
 
-# The archive's own copy of its commit history, stored INSIDE the tarball.
-_HISTORY_BUNDLE = ".genesis-history.bundle"
 
 # Ambient git LOCATION overrides. `git rev-parse --local-env-vars` lists these as
 # repository-local and they beat `-C`, so with GIT_DIR or GIT_COMMON_DIR exported
@@ -155,111 +150,6 @@ def _git_env() -> dict[str, str]:
 # the commits a worktree does NOT share with the mainline keeps it small:
 # MEASURED on this repo, a full-history bundle is 27 MB while the unique-commit
 # bundles for two real branches are 68 KB and 88 KB (5 and 16 commits).
-_BUNDLE_BASES = ("origin/main", "main")
-
-
-def _bundle_history(trash_path: Path, repo_root: Path, meta: dict) -> bool:
-    """Write the worktree's commit history into the archive itself.
-
-    WHY THIS REPLACED THE TAG ANCHOR. The archive stored the worktree's FILES and
-    left its HISTORY reachable only through a ref outside the archive — first the
-    branch, then a tag created before pruning. Every one of those is something
-    another process can remove, and review kept finding new ways for the link to
-    break rather than for the archive to: a name that is legal on disk and
-    illegal as a ref produced no anchor at all; a truncated digest could repoint
-    an older archive's only anchor; the anchor captured a HEAD that was already
-    minutes stale; and a deleted branch left recovery with nothing to rebuild
-    from. Those are four findings about one thing — the archive depending on
-    state it does not contain.
-    A bundle is a FILE. It travels inside the tarball, it cannot be repointed by
-    a name collision, there is no name to be illegal, and nothing outside the
-    archive has to survive for it to be read.
-
-    MEASURED end to end before this was written: bundle a branch's unique
-    commits, delete the branch, prune the worktree, expire every reflog and
-    `gc --prune=now` until `cat-file -e` confirms the commit is GONE — then
-    `git bundle unbundle` restores it and `git worktree add --detach` rebuilds a
-    working checkout with that commit's file contents. The tag anchor could not
-    survive that sequence; this does.
-
-    HEAD IS RE-READ HERE, not taken from the classification snapshot, which is
-    the stale-HEAD finding. Classification can be minutes old and a session may
-    have committed since. VERIFIED that `rev-parse HEAD` still answers from a
-    worktree that has already been moved, so the fresh read is available at
-    exactly this point.
-
-    Returns True when the history is safe to prune against — either a bundle was
-    written and verified, or there was provably nothing unique to preserve.
-    """
-    head = _run_git(repo_root, ["-C", str(trash_path), "rev-parse", "HEAD"], timeout=15)
-    if head is None or not head.strip():
-        return False
-    sha = head.strip()
-    # Overwrite the value taken from the CLASSIFICATION SNAPSHOT, which is the
-    # stale-HEAD defect: `wt["head"]` was sampled before the scan and before the
-    # archive step, and a session can commit in between. Recovery reads `commit`,
-    # so the snapshot value would send it to a commit this archive never bundled.
-    meta["head"] = sha
-    meta["commit"] = sha
-
-    base = ""
-    for candidate in _BUNDLE_BASES:
-        if _run_git(repo_root, ["rev-parse", "--verify", "--quiet", candidate], timeout=15):
-            base = candidate
-            break
-
-    # A temporary ref, because `git bundle` records REFS and refuses a bare sha
-    # ("Refusing to create empty bundle"). Named from the entry so two concurrent
-    # runs cannot collide, and deleted in `finally` so it never becomes the very
-    # kind of ambient ref this function exists to stop depending on.
-    tmp_ref = (
-        "refs/genesis-archive/"
-        + hashlib.sha256(trash_path.name.encode("utf-8", "surrogateescape")).hexdigest()[:16]
-    )
-    bundle = trash_path / _HISTORY_BUNDLE
-    try:
-        if _run_git(repo_root, ["update-ref", tmp_ref, sha], timeout=15) is None:
-            return False
-        args = ["bundle", "create", str(bundle), tmp_ref]
-        if base:
-            args += ["--not", base]
-        result = subprocess.run(
-            ["git", *args], capture_output=True, text=True,
-            cwd=str(repo_root), timeout=120, env=_git_env(),
-        )
-        if result.returncode != 0:
-            # "Refusing to create empty bundle" is not a failure: it means this
-            # worktree holds no commit the mainline does not already have, so
-            # there is nothing for the archive to preserve and pruning is safe.
-            if "empty bundle" in result.stderr.lower():
-                meta["history_bundle"] = ""
-                meta["history_note"] = f"no commits unique to this worktree vs {base or 'HEAD'}"
-                return True
-            _log(f"  WARN could not bundle history for {trash_path.name}: "
-                 f"{result.stderr.strip()[:160]}")
-            return False
-    finally:
-        _run_git(repo_root, ["update-ref", "-d", tmp_ref], timeout=15)
-
-    # Read it back before trusting it, for the same reason the tarball is read
-    # back: a file that exists is not a file that parses.
-    verify = subprocess.run(
-        ["git", "bundle", "verify", str(bundle)], capture_output=True, text=True,
-        cwd=str(repo_root), timeout=120, env=_git_env(),
-    )
-    if verify.returncode != 0:
-        _log(f"  WARN history bundle for {trash_path.name} does not verify: "
-             f"{verify.stderr.strip()[:160]} — NOT pruning")
-        with contextlib.suppress(OSError):
-            bundle.unlink()
-        return False
-
-    with contextlib.suppress(OSError):
-        os.chmod(bundle, _PRIVATE_FILE_MODE)
-    meta["history_bundle"] = _HISTORY_BUNDLE
-    meta["history_base"] = base
-    _log(f"  bundled history at {sha[:8]} into {_HISTORY_BUNDLE}")
-    return True
 
 
 def _scratch_dir_for(stored: Path) -> Path:
@@ -1456,66 +1346,73 @@ def _trash_worktree(
                 except OSError as e:
                     _log(f"  WARN could not save {target.name} for {trash_path.name}: {e}")
 
-        # A DETACHED worktree's per-worktree HEAD is the ONLY ref keeping its
-        # commit chain reachable. `git worktree prune` removes that ref, after
-        # which nothing points at those commits and a GC can collect them — so
-        # the archive would survive while the history it refers to did not. In a
-        # module whose contract is that it deletes nothing, that is the worst
-        # available failure: silent, delayed, and invisible until a recovery.
+        # THE REGISTRATION IS LEFT IN PLACE, DELIBERATELY.
         #
-        # So anchor the commit in a real ref FIRST. A tag under a dedicated
-        # namespace is the cheapest durable anchor and does not pollute the
-        # branch list. If tagging fails we do NOT prune: leaving a stale worktree
-        # registration is recoverable, losing the commits is not.
-        # A BRANCH IS NOT A DURABLE ANCHOR EITHER, and assuming it was is the
-        # gap this block used to have. The reasoning above is correct for a
-        # detached HEAD and INCOMPLETE for a branch: the branch ref does keep the
-        # commits reachable — right up until something deletes it. Something
-        # does. `autonomy/executor/worktree_mgr.py` deletes a task worktree's
-        # branch with `git branch -D`, which git documents as deleting even an
-        # unmerged branch, and once that ref is gone the archived tarball holds
-        # checked-out FILES and a `.git` pointer to nothing. A later GC collects
-        # the commits and `--recover` can never reconstruct them.
+        # `git worktree prune` drops the per-worktree HEAD. For a DETACHED
+        # worktree that ref is the only thing keeping its commits reachable,
+        # and a branch is no safer: autonomy/executor/worktree_mgr.py deletes
+        # a reaped worktree branch with `git branch -D`, which git documents
+        # as removing even an unmerged one. Either way the tarball would hold
+        # checked-out FILES and a pointer to commits a later GC can collect --
+        # silent, delayed, and invisible until someone tries to recover.
         #
-        # That is the same silent, delayed, invisible-until-recovery failure the
-        # comment above calls the worst available one — so anchor EVERY archived
-        # worktree, not only the detached ones. A tag costs nothing, and the
-        # branch case is strictly more likely than the detached case here.
-        # PRESERVE THE HISTORY INSIDE THE ARCHIVE, then prune.
+        # Pruning is therefore only safe once the archive carries its OWN copy
+        # of the commit graph. That work ships separately. Until it lands this
+        # module takes the tradeoff it states everywhere else: a stale
+        # worktree registration is recoverable, lost commits are not. So the
+        # archive is written and the registration is left for a later
+        # `git worktree prune` to clear, once preservation exists to make it
+        # safe.
         #
-        # `git worktree prune` drops the per-worktree HEAD, and for a detached
-        # worktree that ref is the only thing keeping its commits reachable. A
-        # branch is no safer: the task runner deletes a reaped worktree's branch
-        # with `git branch -D` immediately afterwards. Either way the tarball
-        # would hold checked-out FILES and a pointer to commits a later gc can
-        # collect — silent, delayed, and invisible until someone tries to
-        # recover.
-        #
-        # The archive now carries its own commit graph, so pruning costs nothing
-        # it cannot rebuild. If bundling FAILS we do not prune: a stale worktree
-        # registration is recoverable, lost commits are not.
+        # The visible cost is that `git worktree list` keeps naming a
+        # directory that is now a tarball. Cosmetic and recoverable, and the
+        # correct side of this trade to land on.
         kind = "detached HEAD" if detached else f"branch {branch}"
-        pruned_safely = _bundle_history(trash_path, repo_root, meta)
-        if not pruned_safely:
-            _log(f"  WARN could not preserve history for {kind} — SKIPPING prune "
-                 f"so the commits stay reachable; re-run once the cause is fixed")
+        # LOCK the registration. Leaving it merely unpruned is NOT an anchor:
+        # `autonomy/executor/worktree_mgr.py` prunes on every task-worktree
+        # creation, `contribution/pr_opener.py` prunes on every contribution run,
+        # this module's own --recover used to prune, and `git gc` prunes such
+        # registrations by itself past `gc.worktreePruneExpire` (default 3
+        # months). Any one of those would silently de-anchor the archive and let
+        # a later gc collect the commits it points at.
+        #
+        # MEASURED on git 2.43, all three directions:
+        #   * a LOCKED registration survives `worktree prune`, `prune --expire
+        #     now`, and `gc` with gc.worktreePruneExpire=now;
+        #   * an UNLOCKED sibling did not — its commit was collected;
+        #   * locking CLEARS the `prunable` porcelain marker, which is what keeps
+        #     the zero-drop sweep from holding an archived worktree's findings
+        #     open forever.
+        # Locking works AFTER the directory has already moved, so there is no
+        # window where a failed move leaves a live worktree locked.
+        locked_anchor = _run_git(
+            repo_root,
+            ["worktree", "lock", "--reason", f"archived by the reaper -> {trash_path.name}; recover with --recover",
+             str(wt_path)],
+            timeout=15,
+        )
+        if locked_anchor is None:
+            _log(f"  WARN could not lock the registration for {trash_path.name} — its "
+                 f"history is anchored only until the next `git worktree prune`")
+        _log(f"  archived {kind}; registration LOCKED as the history anchor "
+             f"(pruning it needs the in-archive commit graph, which ships separately)")
 
-        # REWRITE the metadata now that bundling has corrected it. The file was
-        # placed from staging BEFORE this point, so it still carried the
-        # classification snapshot's sha — and the snapshot is exactly what
-        # `_bundle_history` replaces with a fresh read. Without this the archive
-        # would bundle one commit and its own metadata would name another, which
-        # is the stale-HEAD defect surviving in the only place recovery reads.
-        # Caught by its own regression test rather than by inspection.
+        # RE-READ HEAD and rewrite the metadata. The file was placed from
+        # staging BEFORE this point, so it still carries the CLASSIFICATION
+        # SNAPSHOT sha -- sampled before the scan and before the archive step,
+        # with a session free to commit in between. Recovery reads `commit`,
+        # so the snapshot value would send it to a commit this archive never
+        # captured. That is the stale-HEAD defect, and it is INDEPENDENT of
+        # how history is preserved: it has to survive the bundle leaving this
+        # PR, which it would not have while it lived inside the bundling
+        # helper. VERIFIED that `rev-parse HEAD` still answers from a worktree
+        # that has already been moved, so the fresh read is available here.
+        fresh = _run_git(repo_root, ["-C", str(trash_path), "rev-parse", "HEAD"], timeout=15)
+        if fresh and fresh.strip():
+            meta["head"] = meta["commit"] = fresh.strip()
         with contextlib.suppress(OSError):
             final_meta.write_text(json.dumps(meta, indent=2))
             os.chmod(final_meta, _PRIVATE_FILE_MODE)
-
-        if pruned_safely:
-            subprocess.run(
-                ["git", "worktree", "prune"],
-                capture_output=True, cwd=str(repo_root), timeout=10,
-            )
 
         ref_label = f"branch={branch}" if branch else f"detached {wt.get('head', '')[:8]}"
 
@@ -1690,44 +1587,28 @@ def _restore_from_dir(trash_path: Path, repo_root: Path) -> bool:
         print(f"Original path already exists: {original_path}", file=sys.stderr)
         return False
 
-    # RESTORE THE COMMITS BEFORE ASKING GIT FOR A WORKTREE AT THEM. The archive
-    # carries its own history, so this is what makes recovery independent of any
-    # ref that survived outside it — the branch may be deleted and the commits
-    # already collected, which is the ordinary case rather than the exotic one.
+    # RELEASE THIS ONE REGISTRATION, and only this one.
     #
-    # Unconditionally safe to repeat: unbundling objects the repository already
-    # has is a no-op, so this costs nothing in the common case where nothing was
-    # lost.
+    # Archiving LOCKS the registration (that lock is the history anchor), and
+    # `git worktree add` refuses a path that is still registered:
+    #     fatal: '<path>' is a missing but already registered worktree;
+    #            use 'add -f' to override, or 'prune' or 'remove' to clear
+    # `prune` is the wrong tool for that: it clears EVERY registration whose
+    # directory is missing, repo-wide — and under this design every OTHER
+    # archive's registration is exactly that, and is the only thing keeping its
+    # commits reachable. MEASURED: recovering one archive with a repo-wide prune
+    # de-anchored a sibling archive and the next `gc --prune=now` COLLECTED its
+    # commit. A recovery must not be able to destroy a different archive.
     #
-    # ARCHIVES WRITTEN BEFORE THIS EXISTS HAVE NO BUNDLE, and there are real ones
-    # on disk right now. They fall through to the old path — their commits are
-    # reachable through the tag anchor recorded in their own metadata — so this
-    # is additive rather than a format break.
-    bundle = trash_path / _HISTORY_BUNDLE
-    if bundle.exists():
-        unbundled = subprocess.run(
-            ["git", "bundle", "unbundle", str(bundle)],
-            capture_output=True, text=True, cwd=str(repo_root), timeout=300,
-            env=_git_env(),
-        )
-        if unbundled.returncode != 0:
-            # Not fatal on its own: the commits may still be present through a
-            # surviving ref, and `git worktree add` below will say so. Reported
-            # rather than swallowed, because if recovery then fails THIS is the
-            # reason and it must not have to be guessed at.
-            print(
-                f"WARNING: could not unbundle archived history: "
-                f"{unbundled.stderr.strip()[:200]}",
-                file=sys.stderr,
-            )
-        else:
-            print(f"restored archived history from {_HISTORY_BUNDLE}", file=sys.stderr)
+    # So: unlock this path, then override this path with `--force`. Measured
+    # rc=0 on a still-registered missing path, with a working checkout after.
+    _run_git(repo_root, ["worktree", "unlock", original_path], timeout=10)
 
     # Recreate the worktree: detached at its commit, or checked out on its branch.
     if detached or not branch:
-        add_cmd = ["git", "worktree", "add", "--detach", original_path, commit]
+        add_cmd = ["git", "worktree", "add", "--force", "--detach", original_path, commit]
     else:
-        add_cmd = ["git", "worktree", "add", original_path, branch]
+        add_cmd = ["git", "worktree", "add", "--force", original_path, branch]
     result = subprocess.run(
         add_cmd,
         capture_output=True, text=True, cwd=str(repo_root), timeout=30,
@@ -1744,13 +1625,16 @@ def _restore_from_dir(trash_path: Path, repo_root: Path) -> bool:
         # reported success. A recovery that returns true and leaves an unusable
         # checkout is worse than one that fails loudly.
         #
-        # The archive anchor is what makes this recoverable: the commit was
-        # tagged before the prune precisely so it would still be here now. So
-        # retry DETACHED at the recorded commit, which reconstructs a real,
+        # What makes this recoverable is that the commit is still REACHABLE:
+        # this module no longer prunes when it archives, so the per-worktree HEAD
+        # that keeps the chain alive is still registered right up until the
+        # `prune` above — by which point `git worktree add` is about to put the
+        # commit back in a real worktree. So retry DETACHED at the recorded
+        # commit, which reconstructs a real,
         # working worktree; the branch name is recoverable from there by hand
         # with one `git switch -c`, and that is stated rather than left implicit.
         retry = subprocess.run(
-            ["git", "worktree", "add", "--detach", original_path, commit],
+            ["git", "worktree", "add", "--force", "--detach", original_path, commit],
             capture_output=True, text=True, cwd=str(repo_root), timeout=30,
         )
         if retry.returncode == 0:

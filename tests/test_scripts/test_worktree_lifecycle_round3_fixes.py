@@ -213,13 +213,20 @@ def test_fsync_path_tolerates_a_directory_and_a_missing_path(tmp_path: Path) -> 
 def test_recovery_rebuilds_a_real_worktree_after_its_branch_was_deleted(
     repo: Path, tmp_path: Path, monkeypatch
 ) -> None:
-    """The executor deletes the branch, so this is the ORDINARY recovery case.
+    """Recovery rebuilds a usable worktree even when the branch is gone.
 
-    `autonomy/executor/worktree_mgr.py` runs `git branch -D` after reaping, so by
-    recovery time the branch named in the metadata is routinely gone. The old
-    code fell straight through to moving a plain directory back and returned
-    True — leaving a tree whose `.git` points at a pruned admin dir, so
-    `git status` fails inside a "successful" recovery.
+    This USED to be the ordinary case: `autonomy/executor/worktree_mgr.py` runs
+    `git branch -D` after reaping, so the branch named in the metadata was
+    routinely absent by recovery time. Archiving now LOCKS the registration as
+    its history anchor, and git refuses to delete a branch a registration still
+    uses — so the executor's delete fails and the branch usually survives. The
+    scenario is therefore rarer, and the test forces it explicitly below.
+
+    It is still worth pinning, because it is reachable whenever someone clears
+    up by hand, and the failure it guards is nasty: the old code fell through to
+    moving a plain directory back and returned True, leaving a tree whose `.git`
+    points at a pruned admin dir, so `git status` fails inside a "successful"
+    recovery.
 
     The assertion is therefore on git USABILITY, not on the return value or on
     the files being present. Both of those were already true when this was broken.
@@ -237,6 +244,14 @@ def test_recovery_rebuilds_a_real_worktree_after_its_branch_was_deleted(
     entry = {"path": str(wt), "branch": "feature/gone", "head": sha, "detached": False}
     assert wl._trash_worktree(entry, repo) is True
 
+    # FORCE the branch-gone state. It is no longer reachable by accident: the
+    # archive LOCKS the registration as its history anchor, a locked
+    # registration survives `prune`, and git refuses to delete a branch a
+    # registration still uses. So this scenario now takes a deliberate unlock +
+    # prune + delete -- which is exactly what a human clearing up by hand would
+    # do, and is the only route by which recovery can still meet a missing
+    # branch. The assertion below is unchanged and is what this test is for.
+    assert _git(repo, "worktree", "unlock", str(wt)).returncode == 0
     _git(repo, "worktree", "prune")
     assert _git(repo, "branch", "-D", "feature/gone").returncode == 0
     assert "feature/gone" not in _git(repo, "branch", "--list").stdout
@@ -464,54 +479,6 @@ def trash_entry_name(archive: Path) -> str:
     return archive.name.split(".tar.gz")[0]
 
 
-def test_a_bundle_that_does_not_verify_blocks_the_prune(
-    repo: Path, tmp_path: Path, monkeypatch
-) -> None:
-    """Reading the bundle back is what makes it trustworthy, so prove it is read.
-
-    Found by mutation: disabling the verification branch left every other test
-    GREEN, because in all of them the bundle verifies. That is a NULL mutation
-    against the existing suite and a real coverage hole — nothing asserted what
-    happens when verification FAILS, which is the only situation the check
-    exists for.
-
-    A file that exists is not a file that parses. If an unverifiable bundle were
-    accepted, the reaper would prune on the strength of a history it cannot read
-    and the archive would be unrecoverable in exactly the way the bundle was
-    added to prevent.
-    """
-    wt = tmp_path / "wt-badbundle"
-    _git(repo, "worktree", "add", "--quiet", "-b", "feature/badbundle", str(wt))
-    (wt / "f.txt").write_text("x\n")
-    _git(wt, "add", "f.txt")
-    _git(wt, "commit", "--quiet", "-m", "unique")
-
-    real_run = wl.subprocess.run
-
-    def fail_verify(cmd, *a, **k):
-        if cmd[:3] == ["git", "bundle", "verify"]:
-            return subprocess.CompletedProcess(cmd, 1, "", "corrupt bundle")
-        return real_run(cmd, *a, **k)
-
-    monkeypatch.setattr(wl.subprocess, "run", fail_verify)
-
-    meta: dict = {}
-    trash = tmp_path / "trash-bad"
-    trash.mkdir()
-    moved = trash / "wt-badbundle"
-    wt.rename(moved)
-
-    assert wl._bundle_history(moved, repo, meta) is False, (
-        "an unverifiable bundle was accepted; the reaper would prune against a "
-        "history it cannot read"
-    )
-    assert not (moved / wl._HISTORY_BUNDLE).exists(), (
-        "the unusable bundle must not be left in the archive, where it would "
-        "read as preserved history"
-    )
-# ─── round-4: enumeration, recovery, and act-time protection ─────────────────
-
-
 def test_a_worktree_path_with_a_newline_is_parsed_whole(repo: Path, tmp_path: Path) -> None:
     """A newline is legal in a Unix path and porcelain puts it INSIDE the value.
 
@@ -687,4 +654,53 @@ def test_recovery_does_not_nest_when_worktree_add_half_succeeds(
     assert result is False, "a refusal must be reported as failure, not success"
     assert (entry / "archived-file.txt").exists(), (
         "the archive was consumed by a recovery that did not complete"
+    )
+
+
+def test_the_archived_registration_is_locked_and_survives_a_prune(
+    repo: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """The anchor has to be one every other caller RESPECTS, not merely one
+    nobody has cleared yet.
+
+    Leaving the registration unlocked anchors nothing durable: three callers in
+    this repo run `git worktree prune` on their own schedule
+    (`autonomy/executor/worktree_mgr.py` on task-worktree creation,
+    `contribution/pr_opener.py` per contribution run, and this module's own
+    recovery), and `git gc` clears such registrations by itself once the archive
+    passes `gc.worktreePruneExpire` — three months by default. Any one of them
+    would silently de-anchor the archive and let a later gc collect the commits
+    it points at.
+
+    MEASURED on git 2.43 while writing this: an UNLOCKED sibling archive was
+    de-anchored by exactly this prune and its commit was then collected, while
+    the locked one survived. Locking also clears the `prunable` porcelain
+    marker, which is what keeps the zero-drop sweep from holding an archived
+    worktree's findings open forever.
+    """
+    wt = tmp_path / "wt-anchored"
+    _git(repo, "worktree", "add", "--quiet", "--detach", str(wt))
+    (wt / "w.txt").write_text("unique\n")
+    _git(wt, "add", "w.txt")
+    _git(wt, "commit", "--quiet", "-m", "unique work")
+    sha = _git(wt, "rev-parse", "HEAD").stdout.strip()
+
+    trash = tmp_path / "trash"
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "TOMBSTONE_INDEX", tmp_path / "tomb.jsonl")
+    entry = {"path": str(wt), "branch": "", "head": sha, "detached": True}
+    assert wl._trash_worktree(entry, repo) is True
+
+    listing = _git(repo, "worktree", "list", "--porcelain").stdout
+    assert "locked" in listing, "the archived registration was not locked"
+
+    # The whole point: a prune must not be able to take the anchor away.
+    _git(repo, "worktree", "prune")
+    assert str(wt) in _git(repo, "worktree", "list", "--porcelain").stdout, (
+        "a plain `git worktree prune` removed the archive's only anchor"
+    )
+    _git(repo, "reflog", "expire", "--expire=now", "--all")
+    _git(repo, "gc", "--prune=now")
+    assert _git(repo, "cat-file", "-e", sha).returncode == 0, (
+        "the archived commit was collected — the anchor did not hold"
     )
