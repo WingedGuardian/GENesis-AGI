@@ -26,8 +26,18 @@ on:
       - "scripts/systemd/**"
       - "scripts/hooks/pre-commit"
       - "scripts/hooks/pre-push"
-      - "config/mcp.json.template"
-      - "config/genesis-tmp-watchgod.service"
+      # config/** rather than the two files install.sh itself renders. The
+      # filter's rule is "what the verified OUTCOME depends on", and this job's
+      # smoke test STARTS the installed server — which reads config/ at boot,
+      # not just at install time. `router` is in `_CRITICAL_SUBSYSTEMS`
+      # (runtime/_core.py:172) and `runtime/init/router.py` loads
+      # config/model_routing.yaml, so a malformed routing config makes the
+      # freshly installed server fail to bootstrap while this check never runs.
+      # ENUMERATED: runtime init reads autonomy, inbox_monitor, mail_monitor,
+      # model_profiles, model_routing, observability and reflex yaml plus
+      # config/modules — NONE of which were filtered. Listing seven paths that
+      # will grow is worse than the directory.
+      - "config/**"
       - "pyproject.toml"
       - "secrets.env.example"
       - "src/genesis/identity/*.example"
@@ -121,6 +131,41 @@ jobs:
               exit 1
             fi
           done
+
+          # AUTO-STARTED units must actually be RUNNING, for the same reason
+          # genesis-server is checked above and for a sharper one: the installer
+          # SUPPRESSES these failures. Both `enable --now` call sites end in
+          # `|| true` (install.sh, the timer loop and the watchgod block), so a
+          # timer with an invalid directive or a watchgod with a bad ExecStart
+          # installs "successfully" and is simply dead. The placeholder loop
+          # above cannot catch that — a unit can be fully substituted and still
+          # refuse to start.
+          #
+          # The skip rule MIRRORS the installer's own (genesis-backup.timer is
+          # a deliberate setup step it passes over by name) rather than being a
+          # restated list, so a newly added timer template is covered here
+          # automatically — which is the gap that once left genesis-cc-align
+          # rendered-but-dead.
+          for _t in ~/.config/systemd/user/genesis-*.timer; do
+            [ -f "$_t" ] || continue
+            _n=$(basename "$_t")
+            [ "$_n" = "genesis-backup.timer" ] && continue
+            if ! systemctl --user is-enabled --quiet "$_n"; then
+              echo "::error::$_n rendered but NOT enabled — the installer's enable --now failed silently"
+              systemctl --user status "$_n" --no-pager -l || true
+              exit 1
+            fi
+          done
+
+          # Temp protection is not optional on this install: cc-tmp filling is
+          # what kills CC sessions, and this unit is the thing that watches it.
+          if [ -f ~/.config/systemd/user/genesis-tmp-watchgod.service ]; then
+            if ! systemctl --user is-active --quiet genesis-tmp-watchgod.service; then
+              echo "::error::genesis-tmp-watchgod.service rendered but NOT active"
+              systemctl --user status genesis-tmp-watchgod.service --no-pager -l || true
+              exit 1
+            fi
+          fi
 
           # The user-facing artifacts that hardcoded ~/genesis until this PR: both
           # must point at where the repo ACTUALLY is, or they are installed dead on

@@ -195,6 +195,9 @@ def test_every_warning_setter_goes_through_setup_warn():
         "/home/u/plain",
         '/home/u/say "hi"',
         "/home/u/with space",
+        # Closes the double-quoted diagnostic and appends a command. This is the
+        # shape that proved the message was code, not prose.
+        '/home/u/x"; echo PWNED; echo "',
     ],
 )
 def test_generated_genesis_wrapper_parses_for_any_repo_path(repo_dir):
@@ -241,13 +244,36 @@ def test_generated_genesis_wrapper_parses_for_any_repo_path(repo_dir):
     )
 
     # And its `cd` must target the SAME directory, not a truncated one.
-    cd_line = next(line for line in script.splitlines() if line.startswith("cd "))
+    #
+    # Everything UP TO AND INCLUDING the cd is executed, not the cd line alone.
+    # The line is no longer self-contained: the path is interpolated once into a
+    # variable and the cd reads that, so running the cd in isolation left the
+    # variable unset, `cd ""` silently stayed put, and the probe reported the
+    # TEST's cwd — a false failure that looks exactly like a truncated path.
+    # Running the generated prefix is also the more faithful check: it is the
+    # script as installed, not a fragment of it.
+    lines = script.splitlines()
+    cd_i = next(i for i, line in enumerate(lines) if line.startswith("cd "))
+    prefix = "\n".join(lines[:cd_i])
+    cd_line = lines[cd_i].split(" 2>/dev/null")[0]
     probe = subprocess.run(
-        ["bash", "-c", f'{cd_line.split(" 2>/dev/null")[0]} 2>/dev/null && pwd || echo MISSING'],
+        ["bash", "-c", f'{prefix}\n{cd_line} 2>/dev/null && pwd || echo MISSING'],
         capture_output=True, text=True,
     ).stdout.strip()
     assert probe in (repo_dir, "MISSING"), (
         f"the generated cd resolved to {probe!r}, a DIFFERENT directory than {repo_dir!r}"
+    )
+
+    # The path must appear as DATA exactly once. Interpolating it a second time —
+    # into the diagnostic, on the reasoning that a message is "prose, not code" —
+    # put it inside a double-quoted string in generated shell, where %q was
+    # protecting only the cd operand. MEASURED with a path carrying `"; echo
+    # PWNED; echo "`, the old form emitted an `echo PWNED` that runs the first
+    # time someone types `genesis` and the cd fails.
+    assert "$REPO_DIR" not in heredoc_body, (
+        "the wrapper heredoc interpolates the RAW path; it is unquoted, so any "
+        "shell metacharacter in the checkout path becomes code in the generated "
+        "script. Interpolate the %q-escaped form once and reference it."
     )
 
 
@@ -341,7 +367,23 @@ def test_user_facing_artifacts_use_the_actual_repo_dir_not_a_hardcoded_home_path
     wrapper = re.search(r"sudo tee /usr/local/bin/genesis .*?\nWRAPPER", text, re.DOTALL)
     assert wrapper, "genesis wrapper heredoc not found — extraction is stale"
     body = wrapper.group(0)
-    assert "$REPO_DIR" in body, "the genesis wrapper must cd to $REPO_DIR"
+    # The wrapper must reference the INSTALLER-KNOWN path, but via the %q-escaped
+    # form rather than the raw variable. Asserting `$REPO_DIR` appears in the
+    # heredoc would now require the injection site back: unquoted, the raw value
+    # is code in the generated script (see the hostile-path case in
+    # test_generated_genesis_wrapper_parses_for_any_repo_path). The derivation
+    # from REPO_DIR is still asserted — one line up, where it belongs.
+    assert "$_repo_q" in body, (
+        "the wrapper heredoc must reference the %q-escaped path variable"
+    )
+    assert "$REPO_DIR" not in body, (
+        "the heredoc interpolates the RAW path — unquoted, that is code in the "
+        "generated script, not prose"
+    )
+    assert re.search(r'_repo_q="\$\(printf .%q. "\$REPO_DIR"\)"', text), (
+        "_repo_q must be derived from $REPO_DIR via printf %q — the installer "
+        "already knows its own location, and the escaping is what makes it safe"
+    )
     assert "~/genesis" not in body, (
         "the genesis wrapper still hardcodes ~/genesis — dead on any other clone"
     )

@@ -1386,11 +1386,23 @@ if [ ! -f /usr/local/bin/genesis ]; then
     # quoted string early, so the GENERATED script would not even parse
     # (`bash -n` fails on it) — and the failure would only show up the first time
     # someone typed `genesis`. %q emits a form the shell re-reads as exactly this
-    # path. The message keeps the raw path, since it is prose, not code.
+    # path.
+    #
+    # The path is interpolated EXACTLY ONCE, into a variable, and everything
+    # downstream reads that variable. An earlier form kept the raw `$REPO_DIR` in
+    # the diagnostic on the grounds that a message is "prose, not code" — it is
+    # not: the message lives inside a double-quoted string in a GENERATED shell
+    # script, so `%q` was protecting only the `cd` operand while the echo was
+    # still a substitution site. MEASURED with REPO_DIR='/home/u/x"; echo PWNED;
+    # echo "', the old form emitted
+    #     ... || { echo "Genesis repo not found at /home/u/x"; echo PWNED; echo ""; exit 1; }
+    # i.e. an injected command that runs the first time someone types `genesis`
+    # and the cd fails. This form emits the path as data and prints it verbatim.
     _repo_q="$(printf '%q' "$REPO_DIR")"
     sudo tee /usr/local/bin/genesis >/dev/null <<WRAPPER
 #!/bin/bash
-cd $_repo_q 2>/dev/null || { echo "Genesis repo not found at $REPO_DIR"; exit 1; }
+repo=$_repo_q
+cd "\$repo" 2>/dev/null || { echo "Genesis repo not found at \$repo"; exit 1; }
 exec claude "\$@"
 WRAPPER
     sudo chmod +x /usr/local/bin/genesis
