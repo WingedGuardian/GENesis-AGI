@@ -41,6 +41,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   day it matters.
 ### Fixed
 
+- **Code-intelligence queue results now survive SQLite lock pressure without
+  replaying successful work.** Enqueues and terminal runner outcomes have a
+  file-and-directory-fsynced fallback inbox, and terminal events are bound to
+  the exact claim generation so stale or conflicting results cannot consume
+  newer work. Legacy numeric state is range-checked before SQLite binding, an
+  exhausted inflight generation no longer deletes a newer pending request, and
+  direct queue mutations require the claim nonce. Daily disk hygiene also exits
+  non-zero after completing its other cleanup steps when disk remains critical
+  or last-resort cache reclaim had to defer, making the unit failure visible;
+  the existing reactive disk remediation independently retries every 30 minutes
+  and escalates after its configured attempt limit.
 - **Captured session output is now redacted before it is stored.** When an
   interactive session exits, Genesis records a tail of the terminal scrollback to
   `~/.genesis/logs/cc_exit_<slot>.log` so a crash can be diagnosed afterwards.

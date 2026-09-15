@@ -235,6 +235,23 @@ class TestLastResortTier:
         with sqlite3.connect(home / "index-requests" / "queue.sqlite3") as db:
             assert db.execute("SELECT count(*) FROM pending").fetchone()[0] == 1
 
+    def test_active_runner_at_critical_threshold_returns_failure_signal(self, tmp_path):
+        lr = _make_cache(tmp_path, "lr-active", "last_resort")
+        home = tmp_path / ".genesis"
+        runner_lock = home / "locks" / "code-intel-runner.lock"
+        runner_lock.parent.mkdir(parents=True)
+        with runner_lock.open("a") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch.object(_mod, "_CACHE_TARGETS", [lr]):
+                rc = self._run(
+                    ["--apply", "--last-resort-above", "95"],
+                    disk_pct=96.0,
+                    home=home,
+                )
+
+        assert rc == 2
+        assert lr.path.exists()
+
     def test_dry_run_never_drops_marker(self, tmp_path):
         lr = _make_cache(tmp_path, "lr3", "last_resort")
         home = tmp_path / ".genesis"

@@ -312,9 +312,26 @@ def test_persisted_success_outcome_replays_without_reindex(tmp_path):
     """A terminal result persisted before runner death must never run twice."""
     h = _seed_marker(tmp_path, tools="gitnexus", mode="fast")
     env = {**os.environ, "GENESIS_HOME": str(tmp_path / ".genesis")}
-    subprocess.run(["python3", str(_MARKER_PY), "claim", "--hash", h], env=env, check=True)
+    claimed = subprocess.run(
+        ["python3", str(_MARKER_PY), "claim", "--hash", h],
+        env=env,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    claim_id = claimed.stdout.strip().split("\t")[4]
     subprocess.run(
-        ["python3", str(_MARKER_PY), "remember-outcome", "--hash", h, "--action", "consume"],
+        [
+            "python3",
+            str(_MARKER_PY),
+            "remember-outcome",
+            "--hash",
+            h,
+            "--action",
+            "consume",
+            "--claim-id",
+            claim_id,
+        ],
         env=env,
         check=True,
     )
@@ -323,6 +340,57 @@ def test_persisted_success_outcome_replays_without_reindex(tmp_path):
     assert second.returncode == 0
     assert _markers(tmp_path) == []
     assert not (tmp_path / "entry.log").exists()
+
+
+def test_runner_spools_busy_success_and_replays_without_reindex(tmp_path):
+    """Exercise the exact shell claim/outcome path across a real DB lock."""
+    h = _seed_marker(tmp_path, tools="gitnexus", mode="fast")
+    db_path = _mdir(tmp_path) / "queue.sqlite3"
+    ready = tmp_path / "blocker.ready"
+    locker = tmp_path / "hold_queue.py"
+    locker.write_text(
+        "import sqlite3,sys,time\n"
+        "db=sqlite3.connect(sys.argv[1],isolation_level=None)\n"
+        "db.execute('BEGIN IMMEDIATE')\n"
+        "open(sys.argv[2],'w').close()\n"
+        "time.sleep(7)\n"
+        "db.rollback()\n"
+        "db.close()\n"
+    )
+    entry = tmp_path / "contention_entry.sh"
+    entry.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "ENTRY repo=$1 tools=$2 mode=$3" >> "{tmp_path}/entry.log"\n'
+        f'python3 "{locker}" "{db_path}" "{ready}" &\n'
+        f'while [ ! -e "{ready}" ]; do sleep 0.01; done\n'
+        "exit 0\n"
+    )
+    entry.chmod(entry.stat().st_mode | stat.S_IXUSR)
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(tmp_path),
+        "GENESIS_HOME": str(tmp_path / ".genesis"),
+        "CODE_INTEL_ENTRYPOINT": str(entry),
+        "CODE_INTEL_FAKE_LOADAVG": "0.1",
+        "CODE_INTEL_FAKE_IOWAIT": "0",
+        "CODE_INTEL_FAKE_CLAUDE_CPU": "0",
+    }
+
+    first = subprocess.run(
+        ["bash", str(_RUNNER)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert first.returncode == 76
+    assert len(list(_mdir(tmp_path).glob(f".outcome-spool-{h}-*.spool"))) == 1
+    assert (tmp_path / "entry.log").read_text().count("ENTRY ") == 1
+
+    second = _run_runner(tmp_path, entry_rc=0)
+    assert second.returncode == 0
+    assert _markers(tmp_path) == []
+    assert (tmp_path / "entry.log").read_text().count("ENTRY ") == 1
 
 
 def test_uses_claimed_state_not_stale_list_snapshot(tmp_path):

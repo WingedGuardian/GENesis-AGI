@@ -70,8 +70,9 @@ _log() {
 _marker() { python3 "$MARKER_PY" "$@"; }
 
 _finish_outcome() {
-    local hash="$1" action="$2" state
-    if ! _marker remember-outcome --hash "$hash" --action "$action" >> "$LOG_FILE" 2>&1; then
+    local hash="$1" action="$2" claim_id="$3" state
+    if ! _marker remember-outcome --hash "$hash" --action "$action" \
+        --claim-id "$claim_id" >> "$LOG_FILE" 2>&1; then
         _log "could not persist terminal action $action for $hash — stopping tick"
         return 76
     fi
@@ -170,11 +171,12 @@ for line in "${_MARKERS[@]}"; do
         _log "could not claim marker $hash (already consumed?) — skipping"
         continue
     fi
-    IFS=$'\t' read -r repo tools mode _attempts <<< "$claimed"
-    if [ -z "${repo:-}" ]; then
-        _log "claimed marker $hash has no repo — restoring"
-        _finish_outcome "$hash" restore >/dev/null || exit 76
-        continue
+    IFS=$'\t' read -r repo tools mode _attempts claim_id <<< "$claimed"
+    if [ -z "${repo:-}" ] || [ -z "${claim_id:-}" ]; then
+        _log "claimed marker $hash has incomplete ownership data — stopping tick"
+        # Without the claim nonce a terminal event cannot be safely bound to
+        # this generation. Reconciliation on the next tick will recover it.
+        exit 76
     fi
 
     # Escalate a fast marker to full when the graph is due (and not backed off),
@@ -195,7 +197,7 @@ for line in "${_MARKERS[@]}"; do
                 ;;
             *)
                 _log "full-escalation query failed (rc=$escalation_rc) — restoring $repo and stopping tick"
-                _finish_outcome "$hash" restore >/dev/null || true
+                _finish_outcome "$hash" restore "$claim_id" >/dev/null || true
                 exit 76
                 ;;
         esac
@@ -216,11 +218,11 @@ for line in "${_MARKERS[@]}"; do
             else
                 action="consume"
             fi
-            _finish_outcome "$hash" "$action" >/dev/null || exit 76
+            _finish_outcome "$hash" "$action" "$claim_id" >/dev/null || exit 76
             _log "indexed OK: $repo (mode=$run_mode)"
             ;;
         75)
-            _finish_outcome "$hash" restore >/dev/null || exit 76
+            _finish_outcome "$hash" restore "$claim_id" >/dev/null || exit 76
             _log "lock held / host-frozen — kept marker for $repo"
             ;;
         3)
@@ -234,17 +236,17 @@ for line in "${_MARKERS[@]}"; do
             else
                 action="restore"
             fi
-            _finish_outcome "$hash" "$action" >/dev/null || exit 76
+            _finish_outcome "$hash" "$action" "$claim_id" >/dev/null || exit 76
             _log "requested tool missing (rc=3) — kept marker, no penalty: $repo"
             ;;
         *)
             if [ "$run_mode" = "full" ] && [ "$mode" != "full" ]; then
                 # Escalated-full failure: keep incremental fast indexing alive and
                 # back off full so a doomed full (cbm can't resume) can't thrash.
-                _finish_outcome "$hash" restore_backoff >/dev/null || exit 76
+                _finish_outcome "$hash" restore_backoff "$claim_id" >/dev/null || exit 76
                 _log "escalated full failed (rc=$rc) — fell back to fast, backed off full: $repo"
             else
-                state="$(_finish_outcome "$hash" restore_failure)" || exit 76
+                state="$(_finish_outcome "$hash" restore_failure "$claim_id")" || exit 76
                 _log "index failed (rc=$rc) — marker $state: $repo"
             fi
             ;;

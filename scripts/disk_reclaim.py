@@ -353,6 +353,7 @@ def main() -> int:
 
     total = 0
     dropped_marker = False
+    last_resort_deferred = False
     runner_lock = None
     try:
         for target in _CACHE_TARGETS:
@@ -371,11 +372,13 @@ def main() -> int:
                     runner_lock = _try_code_intel_runner_lock()
                 if runner_lock is None:
                     _log(f"HOLD [last_resort] {target.description}: code-intel runner is active")
+                    last_resort_deferred = True
                     continue
                 if not dropped_marker:
                     dropped_marker = _drop_index_marker()
                 if not dropped_marker:
                     _log(f"HOLD [last_resort] {target.description}: rebuild request unavailable")
+                    last_resort_deferred = True
                     continue
             reclaimed = _clear_cache(target, apply=apply)
             total += reclaimed
@@ -395,6 +398,12 @@ def main() -> int:
     if apply and new_pct >= args.fail_above:
         _log(f"STILL CRITICAL: disk {new_pct:.1f}% >= {args.fail_above}% after "
              f"reclaim — escalating (exit 2)")
+        return 2
+    if apply and last_resort_deferred and new_pct >= args.last_resort_above:
+        _log(
+            f"STILL CRITICAL: disk {new_pct:.1f}% >= {args.last_resort_above}% "
+            "and last-resort reclaim was deferred — retry required (exit 2)"
+        )
         return 2
     return 0
 

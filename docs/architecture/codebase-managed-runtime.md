@@ -71,8 +71,12 @@ replaces the runner's execution lock or proves daemon workers terminated.
 
 Normal SQLite acquisition gives up after 0.5 seconds. Enqueues then write a
 unique, file-and-directory-fsynced spool entry rather than dropping the request
-or waiting in a commit-sensitive caller; the importer coalesces that immutable
-entry on the next queue access. Database corruption and non-contention I/O
+or waiting in a commit-sensitive caller. Terminal outcomes use the same durable
+event inbox after their bounded five-second SQLite wait, but each event carries
+the exact claim nonce. The importer coalesces enqueue events and applies an
+outcome only to its matching inflight generation. Duplicate identical outcomes
+are idempotent; conflicting outcomes fail closed to one bounded retry rather
+than choosing a winner by file order. Database corruption and non-contention I/O
 errors still propagate instead of being mislabeled as lock pressure. The async
 GitNexus scheduling job performs marker I/O in a worker thread so waiting does
 not stall the Genesis event loop. Last-resort disk reclamation establishes a
@@ -82,8 +86,9 @@ be recorded.
 
 A second claim cannot replace an existing inflight row. A new request written
 while indexing remains a separate pending row and therefore survives consume.
-Orphan recovery
-counts an unknown runner outcome against the existing five-attempt budget;
+If the older inflight generation exhausts its attempt budget, only that
+generation becomes failed; the newer pending request remains runnable. Orphan
+recovery counts an unknown runner outcome against the existing five-attempt budget;
 normal frozen/missing-tool deferrals still do not consume that budget. This is
 only the prerequisite policy: immediate quarantine of resource failures and
 deliberate retry are still pending managed-runtime work.
@@ -93,14 +98,20 @@ stops the tick. An operational queue error therefore cannot silently downgrade
 an overdue full build to fast and then consume it.
 Once the index entrypoint returns, the runner first persists the terminal
 action on the owned inflight row, then applies the queue transition. A later
-tick replays that action before generic orphan recovery.
+tick imports and replays either the SQLite row or its claim-bound durable event
+before generic orphan recovery.
 This prevents a successful index whose consume step lost queue access from
 being rerun or charged as a crash, while a stale action cannot affect a newer
-claim. Schema checks make invalid new queue rows unrepresentable. Malformed or
-stale legacy files are retained in bounded failed/failed-outcome tables and
-cannot block a separately valid pending request. Missing state remains a no-op,
-while database corruption, permission, and I/O errors propagate instead of
-being reported as an empty queue.
+claim. Direct consume, restore, and terminal-outcome operations also require
+the matching claim nonce, so no public mutation path bypasses ownership. Imported
+numeric fields are normalized before binding and values outside the queue's
+declared attempt range are quarantined. Schema checks make invalid new queue rows
+unrepresentable. Malformed or stale legacy files are retained in bounded
+failed/failed-outcome tables and
+cannot block a separately valid pending request. Missing read/list state remains
+empty, while an ownership mutation without its live claim fails loudly. Database
+corruption, permission, and I/O errors propagate instead of being reported as an
+empty queue.
 
 ## Resource and verification contract
 
@@ -146,10 +157,13 @@ fallback and stop rollout on material deviations.
   leaked temporary JSON could be consumed as work. Because the defects were
   concentrated in the same growing file state machine, the queue was replaced
   with SQLite rather than further expanding the multi-file protocol.
-- Current targeted run: **117 passed**, including rollback-journal/integrity
+- Current affected run: **134 passed**, including rollback-journal/integrity
   assertions, independent CLI concurrency, transaction rollback injection,
-  every runner result path, disk reclamation, legacy migration, async
-  responsiveness and job integration. Ruff and diff-whitespace checks pass.
+  claim-output-to-terminal-spool cross-process contention, conflicting-outcome
+  fail-closed behavior, every runner result path, disk reclamation and critical
+  failure propagation, legacy migration, async responsiveness and job
+  integration. Targeted Ruff and shell-syntax checks pass; whole-tree gates are
+  rerun before each push.
 - A harmless capped-service property probe passed. A separate native lifecycle
   probe used private runtime/cache directories and a 512 MiB/no-swap service,
   but its eight-second `daemon start` deadline expired before MCP checks. Upstream
