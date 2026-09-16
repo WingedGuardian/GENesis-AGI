@@ -929,13 +929,20 @@ def test_hook_input_stays_stdlib_only(tmp_path):
 # sovereign"). Its healthy session test is `os.environ.get("GENESIS_CC_SESSION")`,
 # which needs nothing from `hook_input`. Degraded, it used to exit 2 BEFORE reaching
 # that test, so it blocked the interactive owner from editing ANYTHING — a category
-# it was built never to block, and the one that repairs the tree. With the six Bash
-# guards also refusing, the session could neither run a command nor edit a file: on a
-# headless box, a brick.
+# it was built never to block, and the one that repairs the tree. With 9 of the 13 PYTHON
+# hooks wired on matcher `Bash` also refusing (MEASURED 2026-09-15 by execution; that
+# matcher carries 15 hook commands in all, the other 2 being shell hooks that never
+# import `hook_input`, plus a 16th wired install-locally), the session could neither
+# run a command nor edit a file: on a headless
+# box, a brick. Not by `grep degraded_exit(`, which finds six callers — on THIS leg
+# `degraded_exit` is unreachable and all nine refuse from their own import handler.
 #
-# The four cases below are one 2x2 (dispatched|interactive) x (healthy|degraded).
-# The healthy row is the control that makes the claim "zero security delta" checkable
-# rather than asserted: whatever the guard permits when healthy, it must still permit.
+# FIVE cases follow. The first four are one 2x2 (dispatched|interactive) x
+# (healthy|degraded); the healthy row is the control that makes the claim "zero security
+# delta" checkable rather than asserted, since whatever the guard permits when healthy it
+# must still permit. The fifth is outside that grid and locks predicate PARITY: a non-"1"
+# stamp must read as interactive in BOTH paths, which no cell of the 2x2 can see because
+# every cell passes one of the two canonical values.
 
 _CRITICAL_WRITE = {"tool_name": "Write", "tool_input": {"file_path": ".claude/settings.json"}}
 
