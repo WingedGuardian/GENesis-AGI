@@ -216,9 +216,13 @@ def test_the_divider_phrase_in_prose_does_not_truncate(hook, tmp_path):
 def test_an_unterminated_fence_does_not_swallow_the_file(hook, tmp_path):
     """A `---` whose partner never comes must not blank the title.
 
-    The closing-fence search is bounded; past that bound the text is scanned
-    as written, so a malformed plan degrades to the old behaviour rather than
-    to silence.
+    The search runs to the end of the document and finds no closing fence, so
+    nothing is skipped and the text is scanned as written — a malformed plan
+    degrades to the pre-change behaviour rather than to silence.
+
+    (This docstring described a BOUNDED search until 2026-09-16. The bound was
+    removed one round earlier and the claim was left behind, so the test
+    documented the opposite of the code it exercises.)
     """
     body = "---\n" + ("key: value\n" * 200) + "# Never reached anyway\n"
     plan_path, title = _info(hook, tmp_path, body)
