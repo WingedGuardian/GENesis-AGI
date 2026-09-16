@@ -362,6 +362,16 @@
                 ]
             },
             {
+                "matcher": "EnterPlanMode|ExitPlanMode",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/plan_confidence_reminder.py",
+                        "timeout": 10
+                    }
+                ]
+            },
+            {
                 "matcher": "AskUserQuestion",
                 "hooks": [
                     {
