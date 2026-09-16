@@ -64,6 +64,10 @@ on:
 # answered here, and an earlier version of this comment read as though it were.
 permissions:
   contents: read
+  # Read-only, and for exactly one call: the run's own `run_started_at`, which
+  # is what makes each arm's allocation delay measurable. There is no context
+  # property for it (see the capture step), so the API is the only source.
+  actions: read
 
 concurrency:
   # Never let two benchmarks overlap: they would compete for the same cache
@@ -174,18 +178,7 @@ jobs:
       # and allocation is not a part, it is the cost of getting to the parts.
       - name: Record start
         id: t0
-        env:
-          RUN_STARTED_AT: ${{ github.run_started_at }}
-        run: |
-          set -u
-          now=$(date +%s)
-          echo "epoch=$now" >> "$GITHUB_OUTPUT"
-          # An unparseable timestamp records nothing rather than a zero: zero
-          # would compare equal to the other arm's zero and read as "neither
-          # queued", which is the agreement-from-absence failure this whole
-          # file exists to refuse.
-          started=$(date -u -d "$RUN_STARTED_AT" +%s 2>/dev/null || true)
-          printf 'alloc=%s\n' "${started:+$(( now - started ))}" >> "$GITHUB_OUTPUT"
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
 
       # fetch-depth: 0 mirrors CI's `test` job, where it is load-bearing —
       # measurement tests derive a rate from this repository's commit history
@@ -260,10 +253,18 @@ jobs:
         run: |
           rm -f junit.xml
           # PYTEST_ARGS arrives through `env`, never interpolated into this
-          # script. A `${{ }}` expansion here would be substituted as TEXT
+          # script. An Actions expression here would be substituted as TEXT
           # before bash ever sees it, so a dispatch input containing shell
           # metacharacters would execute — the standard Actions script
           # injection. Through `env` the value is only ever data.
+          #
+          # This comment used to DEMONSTRATE the expression it warns about, and
+          # that was a parse error rather than an illustration: Actions
+          # evaluates expressions inside a `run` block before the shell sees a
+          # character of it, and a `#` buys nothing because bash never gets the
+          # chance to treat it as a comment. An empty expression is invalid, so
+          # a comment about injection safety was itself capable of stopping this
+          # workflow from running at all.
           #
           # Unquoted on purpose so several args split into several words;
           # that is the whole point of the input. It also means globbing
@@ -297,14 +298,65 @@ jobs:
         if: ${{ always() }}
         env:
           ARM: ${{ matrix.arm.label }}
-          ALLOC: ${{ steps.t0.outputs.alloc }}
+          T0: ${{ steps.t0.outputs.epoch }}
+          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
           python3 - <<'PY'
-          import hashlib, json, os, pathlib, subprocess, sys
+          import hashlib, json, os, pathlib, subprocess, sys, urllib.request
           import xml.etree.ElementTree as ET
           arm = os.environ["ARM"]
-          alloc = os.environ.get("ALLOC") or ""
+
+          # ALLOCATION DELAY — measured here rather than at t0, because getting
+          # it needs an API call and t0 runs before checkout and before Python.
+          #
+          # There is NO `github.run_started_at` CONTEXT PROPERTY. An earlier
+          # revision of this file used one, and a reviewer caught it: the
+          # documented `github` context does not define it, and Actions
+          # evaluates a nonexistent property to an EMPTY STRING rather than
+          # failing — so every arm would have recorded "not measured", on every
+          # run, forever, and the summary would have read like a runner quirk
+          # instead of a bug. The value exists only on the RUN object in the
+          # REST API, which is why this costs a request and an `actions: read`
+          # scope.
+          #
+          # Why it matters at all: every phase below is timed from t0, which is
+          # after a machine was allocated. One workflow run fixes when the RUN
+          # starts, identically for both arms — not when each arm is handed a
+          # machine. So run_started_at is the common origin, and t0 minus it IS
+          # this arm's queue time.
+          def _alloc_delay():
+              t0 = os.environ.get("T0") or ""
+              if not t0.isdigit():
+                  return None
+              api = os.environ.get("GITHUB_API_URL") or "https://api.github.com"
+              repo = os.environ.get("GITHUB_REPOSITORY") or ""
+              run_id = os.environ.get("GITHUB_RUN_ID") or ""
+              token = os.environ.get("GH_API_TOKEN") or ""
+              if not (repo and run_id and token):
+                  return None
+              req = urllib.request.Request(
+                  f"{api}/repos/{repo}/actions/runs/{run_id}",
+                  headers={"Authorization": f"Bearer {token}",
+                           "Accept": "application/vnd.github+json",
+                           "User-Agent": "genesis-runner-benchmark"},
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      started = json.load(resp).get("run_started_at")
+              except Exception:  # noqa: BLE001 — a benchmark never fails on telemetry
+                  return None
+              if not isinstance(started, str) or not started:
+                  return None
+              from datetime import datetime
+              try:
+                  origin = datetime.fromisoformat(started.replace("Z", "+00:00"))
+              except ValueError:
+                  return None
+              # None, never 0, on every failure path above: 0 on both arms would
+              # compare EQUAL and read as "neither queued" — the
+              # agreement-from-absence failure this whole file exists to refuse.
+              return int(t0) - int(origin.timestamp())
           p = pathlib.Path("junit.xml")
           if not p.is_file():
               # No report at all — record that rather than a zero, which would
@@ -359,7 +411,7 @@ jobs:
                   "\n".join(cases).encode()
               ).hexdigest()[:16]
               pathlib.Path(f"cases-{arm}.txt").write_text("\n".join(cases) + "\n")
-          pop["alloc_delay_s"] = int(alloc) if alloc.lstrip("-").isdigit() else None
+          pop["alloc_delay_s"] = _alloc_delay()
           # Dependency identity. `pip install -e ".[test]"` resolves RANGES, and
           # pip's default upgrade strategy is `only-if-needed` — so a package
           # already present in a runner image that satisfies the range is KEPT.
@@ -368,9 +420,22 @@ jobs:
           # attributed to the provider. Captured rather than enforced: a lock
           # file would change what CI measures, while a manifest lets the
           # comparison say whether the sets actually matched.
+          # `pip list --format=freeze`, NOT `pip freeze`. This repo is installed
+          # EDITABLE, and MEASURED in this venv, `pip freeze` emits the install
+          # LOCATION rather than a version:
+          #     # Editable install with no version control (genesis-memory==0.1.0)
+          #     -e /tmp/genesis-memory
+          #     -e git+https://…@<40-hex sha>#egg=genesis_v3
+          # Two providers with different workspace paths therefore produce
+          # different digests with every package version identical, and the
+          # comparison would reject a perfectly valid benchmark — a FALSE
+          # mismatch, the mirror image of the false agreements this round fixed,
+          # and just as bad because it discards a good run. `pip list
+          # --format=freeze` reports `genesis-v3==3.0.0b18` with no location.
           try:
-              freeze = subprocess.run([sys.executable, "-m", "pip", "freeze"],
-                                      capture_output=True, text=True, timeout=120)
+              freeze = subprocess.run(
+                  [sys.executable, "-m", "pip", "list", "--format=freeze"],
+                  capture_output=True, text=True, timeout=120)
               # A NONZERO EXIT IS NOT A MANIFEST. `check=True` was absent, so a
               # pip that died on malformed installed-package metadata returned
               # normally and whatever partial — often empty — stdout it had
