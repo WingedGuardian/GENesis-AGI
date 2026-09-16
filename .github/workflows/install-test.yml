@@ -150,8 +150,30 @@ jobs:
             [ -f "$_t" ] || continue
             _n=$(basename "$_t")
             [ "$_n" = "genesis-backup.timer" ] && continue
+            # BOTH questions. is-enabled catches "never armed"; is-active
+            # catches an `enable --now` whose START leg failed — the triggered
+            # .service missing or unloadable — which install.sh swallows with
+            # `2>/dev/null ... || true`.
+            #
+            # Deliberately NOT the watchgod rationale: that one is about a
+            # Type=simple + Restart=always SERVICE parked in `activating
+            # (auto-restart)`, and a [Timer] unit has no ExecStart and no
+            # Restart=, so it cannot reach that state. Same assertion, different
+            # reason — worth saying, so nobody trusts a measurement that does
+            # not apply here.
+            #
+            # No legitimate enabled-but-inactive state exists for these
+            # templates: none sets RemainAfterElapse=no (default yes), so a
+            # far-future OnCalendar, a Persistent= catch-up, an already-fired
+            # one-shot and a timer whose service is running all read active.
+            # Measured 7/7 active on a live install.
             if ! systemctl --user is-enabled --quiet "$_n"; then
               echo "::error::$_n rendered but NOT enabled — the installer's enable --now failed silently"
+              systemctl --user status "$_n" --no-pager -l || true
+              exit 1
+            fi
+            if ! systemctl --user is-active --quiet "$_n"; then
+              echo "::error::$_n is enabled but NOT active — enable --now reported success on a dead unit"
               systemctl --user status "$_n" --no-pager -l || true
               exit 1
             fi
@@ -194,7 +216,16 @@ jobs:
           grep -qF "$PWD" ~/.bashrc
 
           test -f .mcp.json
-          ! grep -q '{{' .mcp.json
+          # An explicit conditional, NOT `! grep -q`: bash exempts a
+          # negated command from errexit, and this is not the last line
+          # of the step, so the old form could never fail it. A rendered
+          # placeholder would have sailed through — and it stays valid
+          # JSON inside a string, so the parse check below cannot catch
+          # it either.
+          if grep -q '{{' .mcp.json; then
+            echo "::error::unsubstituted placeholder in .mcp.json"
+            exit 1
+          fi
           # PARSE it. Placeholder-free is not the same as valid: a trailing comma
           # in the template renders clean and Claude Code then rejects the file,
           # leaving every MCP server unavailable behind a green install.

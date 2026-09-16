@@ -286,28 +286,37 @@ def test_generated_genesis_wrapper_parses_for_any_repo_path(repo_dir):
         "/home/u/agent-zero",
     ],
 )
-def test_az_root_survives_sed_substitution_verbatim(az_root):
-    """A configurable path used as a sed REPLACEMENT must render verbatim.
+@pytest.mark.parametrize(
+    "placeholder",
+    ["__HOME__", "__VENV__", "__REPO_DIR__", "__CC_BIN_DIR__", "__AZ_ROOT__"],
+)
+def test_every_sed_substitution_value_renders_verbatim(az_root, placeholder):
+    """EVERY value used as a sed REPLACEMENT must render verbatim, not just AZ_ROOT.
 
-    AZ_ROOT is operator-set, so it is the one substitution value that can carry a
-    metacharacter. Unescaped, `/tmp/R&D` rendered
-    `WorkingDirectory=/tmp/R__AZ_ROOT__D` (& means "the whole match") and `|` made
-    sed reject the expression, aborting the install under `set -e`.
+    Unescaped, `/tmp/R&D` rendered `WorkingDirectory=/tmp/R__TOKEN__D` — `&` means
+    "the whole match" — and `|` is the delimiter, so sed rejected the expression
+    outright and aborted the install under `set -e`.
+
+    Parametrized over the placeholders rather than over AZ_ROOT alone, because
+    the original reasoning for escaping only AZ_ROOT — "the others are
+    installer-derived paths, not user input" — is false for REPO_DIR, which is
+    simply wherever the operator chose to clone. The installer had already
+    demonstrated a shell injection through that same value elsewhere.
 
     The escape is extracted from the shipped script so this tests the real
-    expression, not a restatement of it — and the first version I wrote emitted
-    TWO backslashes and still mis-rendered, which is exactly why this asserts the
-    rendered OUTPUT rather than the shape of the escape.
+    expression, not a restatement of it — and the first version emitted TWO
+    backslashes and still mis-rendered, which is why this asserts the rendered
+    OUTPUT rather than the shape of the escape.
     """
     text = INSTALL.read_text()
-    m = re.search(r"_az_root_esc=\$\(printf '%s' \S+ \| (sed -e '[^']+')\)", text)
-    assert m, "could not extract the AZ_ROOT escape from install.sh — stale"
+    m = re.search(r"_sed_repl_esc\(\) \{ printf '%s' \"\$1\" \| (sed -e '[^']+'); \}", text)
+    assert m, "could not extract the sed replacement escape from install.sh — stale"
     escape_cmd = m.group(1)
 
     rendered = subprocess.run(
         ["bash", "-c",
          f'esc=$(printf "%s" "$1" | {escape_cmd}); '
-         f'printf "WorkingDirectory=__AZ_ROOT__\n" | sed -e "s|__AZ_ROOT__|$esc|g"',
+         f'printf "WorkingDirectory={placeholder}\n" | sed -e "s|{placeholder}|$esc|g"',
          "_", az_root],
         capture_output=True, text=True,
     )
@@ -444,4 +453,46 @@ def test_install_test_covers_every_enable_site():
         f"install.sh enables {missing} but the install test never checks whether "
         "they came up. The enable is suppressed with `|| true`, so this is the "
         "exact shape that ships a dead unit behind a green install."
+    )
+
+
+def test_every_sed_replacement_uses_an_ESCAPED_variable():
+    """The escape must be APPLIED, not merely defined.
+
+    The sibling test above extracts `_sed_repl_esc` and proves the expression
+    itself is correct — but it says nothing about whether the render loop uses
+    it. MEASURED: reverting `__REPO_DIR__` to the raw `$REPO_DIR` left that
+    whole matrix green, because a function tested in isolation is a claim about
+    the function and not about the call site.
+
+    So this asserts the BINDING: every substitution in the render loop must
+    interpolate a variable produced by the escape, never a raw path variable.
+    """
+    text = INSTALL.read_text()
+    pairs = re.findall(r'-e "s\|(__[A-Z0-9_]+__)\|\$(\w+)\|g"', text)
+    assert pairs, "found no sed substitutions in install.sh — this test is stale"
+
+    escaped_vars = set(re.findall(r"(\w+)=\$\(_sed_repl_esc ", text))
+    assert escaped_vars, "no variables are produced by _sed_repl_esc"
+
+    # The denominator comes from the TEMPLATES, not from what the regex happened
+    # to match. `assert pairs` only proves the regex found something: a sixth
+    # placeholder written as ${X}, without `g`, or not on its own -e line would
+    # contribute no pair and go silently unchecked — a weaker version of the
+    # exists-vs-binds failure this test was written to close.
+    declared = set()
+    for tpl in (REPO_ROOT / "scripts" / "systemd").glob("*.template"):
+        declared |= set(re.findall(r"__[A-Z0-9_]+__", tpl.read_text()))
+    covered = {token for token, _ in pairs}
+    missing = sorted(declared - covered)
+    assert not missing, (
+        f"placeholder(s) declared in a template with no checked sed substitution: {missing}"
+    )
+
+    raw = [f"{token} <- ${var}" for token, var in pairs if var not in escaped_vars]
+    assert not raw, (
+        "a sed replacement interpolates a RAW value rather than an escaped one. "
+        "An unescaped `&` means the whole matched text and `|` is the delimiter, "
+        "so either corrupts the rendered unit or aborts the install:\n  "
+        + "\n  ".join(raw)
     )

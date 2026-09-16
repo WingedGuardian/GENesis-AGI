@@ -25,9 +25,12 @@ PyYAML is awkward to stage live).
 
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = REPO_ROOT / "scripts" / "bootstrap.sh"
@@ -230,3 +233,261 @@ def test_b10_no_clobber_fallback_in_text():
     assert "--update=none" in code  # coreutils 9.3+ stable no-clobber (proper exit codes)
     # The only best-effort `|| true` is the pre-9.3 cp -an fallback (last resort).
     assert code.count("|| true") <= 1
+
+
+# ── S3: install.sh's Auto-cd hook rewriter ───────────────────────────────────
+#
+# The guard used to be `! grep -q <marker>`, so an install that already had the
+# hook never received the repo-path fix: its login line kept pointing at
+# wherever the repo used to be, and `cd` into a missing directory is what the
+# fix existed to prevent. Rewriting it means editing ~/.bashrc in place, which
+# every interactive shell sources — so the write is atomic and the shapes it
+# does NOT recognise are refused rather than guessed at.
+
+INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
+_AUTOCD_MARK = "# Auto-cd to Genesis project on login"
+
+
+def _extract_autocd_rewriter() -> str:
+    """Pull the shipped Auto-cd rewriter out of install.sh — the real program."""
+    text = INSTALL_SH.read_text()
+    m = re.search(
+        r"python3 - \"\$HOME/\.bashrc\" <<'PYEOF'.*?\n(.*?)\nPYEOF", text, re.DOTALL
+    )
+    assert m, "could not find the Auto-cd rewriter heredoc in install.sh"
+    prog = m.group(1)
+    assert "GENESIS_AUTOCD_MARK" in prog, "matched the wrong heredoc"
+    return prog
+
+
+def _shipped_autocd_line(repo: str) -> str:
+    """Build the hook line with install.sh's OWN construction, not a lookalike.
+
+    An earlier version of this helper used `shlex.quote`. That is a different
+    producer from the shipped `printf %q` — measured on bash 5.2.21 they emit
+    different text for the same hostile path — so the test proved a quoting
+    scheme EXISTS rather than that install.sh uses it, and reverting line 795 to
+    a raw $REPO_DIR left this whole file green. Same shape as the sed-escape
+    miss on this branch: a mechanism verified in isolation binds nothing.
+    """
+    m = re.search(r"^\s*(_AUTOCD_LINE=.*)$", INSTALL_SH.read_text(), re.MULTILINE)
+    assert m, "could not extract _AUTOCD_LINE from install.sh — stale"
+    built = subprocess.run(
+        ["bash", "-c",
+         f'REPO_DIR="$1"\n{m.group(1).strip()}\nprintf "%s" "$_AUTOCD_LINE"', "_", repo],
+        capture_output=True, text=True, check=True,
+    )
+    return built.stdout
+
+
+def _run_autocd(tmp_path, bashrc_text: str, repo: str):
+    src = tmp_path / "autocd.py"
+    src.write_text(_extract_autocd_rewriter())
+    bashrc = tmp_path / ".bashrc"
+    bashrc.write_text(bashrc_text)
+    proc = subprocess.run(
+        [sys.executable, str(src), str(bashrc)],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "GENESIS_AUTOCD_MARK": _AUTOCD_MARK,
+            "GENESIS_AUTOCD_LINE": _shipped_autocd_line(repo),
+        },
+    )
+    return proc, bashrc.read_text()
+
+
+def test_autocd_rewrites_a_stale_repo_path(tmp_path):
+    """The defect: an existing install keeps pointing at the old checkout."""
+    proc, out = _run_autocd(
+        tmp_path,
+        f"{_AUTOCD_MARK}\n[ -d /old/path ] && cd /old/path\nexport KEEPME=yes\n",
+        "/new/repo",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "[ -d /new/repo ] && cd /new/repo" in out
+    assert "/old/path" not in out
+    # Everything below the hook is the user's and must survive the rewrite.
+    assert "export KEEPME=yes" in out
+
+
+def test_autocd_leaves_an_already_correct_hook_alone(tmp_path):
+    """rc 10 means "nothing to do" — not an error, and not a rewrite."""
+    text = f"{_AUTOCD_MARK}\n[ -d /new/repo ] && cd /new/repo\n"
+    proc, out = _run_autocd(tmp_path, text, "/new/repo")
+    assert proc.returncode == 10, proc.stderr
+    assert out == text, "an already-correct hook was rewritten anyway"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        f'{_AUTOCD_MARK}\nalias ll="ls -l"\n',  # marker, then something else
+        f"{_AUTOCD_MARK}\n",  # marker is the last line
+    ],
+)
+def test_autocd_refuses_a_shape_it_did_not_write(tmp_path, body):
+    """Refuse rather than guess which line to overwrite.
+
+    ~/.bashrc is sourced by every interactive shell. Overwriting a line this
+    installer did not write is worse than leaving a stale path alone, so the
+    unrecognised shapes exit with a distinct rc the caller turns into a warning.
+    """
+    proc, out = _run_autocd(tmp_path, body, "/new/repo")
+    assert proc.returncode == 4, proc.stderr
+    assert out == body, "refused, but the file changed anyway"
+
+
+def test_autocd_survives_a_repo_path_full_of_shell_metacharacters(tmp_path):
+    """The path crosses via the ENVIRONMENT and is %q-quoted by the caller.
+
+    A path containing a quote and a semicolon must land as data — the resulting
+    .bashrc has to still parse, or every future login breaks.
+    """
+    # A real directory whose NAME carries the metacharacters, so the assertion
+    # can be about where the shell ENDS UP rather than about text.
+    hostile_dir = tmp_path / 'x"; echo PWNED; echo "'
+    hostile_dir.mkdir()
+    hostile = str(hostile_dir)
+    proc, out = _run_autocd(
+        tmp_path, f"{_AUTOCD_MARK}\n[ -d /old ] && cd /old\n", hostile
+    )
+    assert proc.returncode == 0, proc.stderr
+    written = tmp_path / ".bashrc"
+
+    # PARSING is not the property that matters, and asserting it is how this
+    # test used to pass on a broken line: with a RAW $REPO_DIR the quotes still
+    # balance across the line, so `bash -n` is happy while the shell executes
+    # something else entirely. MEASURED — reverting the %q left this green.
+    # So SOURCE it and ask where the shell actually went, and whether anything
+    # else ran.
+    # PWD goes to its own FILE so stdout stays free to catch anything the line
+    # executed. Grepping the combined output for a marker cannot work here —
+    # the marker is part of the directory NAME, so it appears in a correct PWD
+    # too, and an earlier version of this assertion failed on exactly that.
+    landed = tmp_path / "landed.txt"
+    probe = subprocess.run(
+        ["bash", "-c",
+         f'cd /; . {shlex.quote(str(written))}; printf "%s" "$PWD" > {shlex.quote(str(landed))}'],
+        capture_output=True, text=True,
+    )
+    assert probe.returncode == 0, f"sourcing the rewritten .bashrc failed: {probe.stderr}"
+    assert landed.read_text() == hostile, (
+        f"the hook did not cd to the intended directory.\n"
+        f"  wanted: {hostile!r}\n  landed: {landed.read_text()!r}\n{out}"
+    )
+    assert probe.stdout == "" and probe.stderr == "", (
+        f"the path escaped its quoting and executed something:\n"
+        f"  stdout: {probe.stdout!r}\n  stderr: {probe.stderr!r}"
+    )
+
+
+def test_autocd_write_is_atomic_and_the_caller_captures_rc():
+    """Same contract as the tmux-wrap rewriter: temp + rename, rc not swallowed."""
+    prog = _extract_autocd_rewriter()
+    assert "mkstemp(" in prog and "os.replace(" in prog, "the write is not atomic"
+    text = INSTALL_SH.read_text()
+    assert "<<'PYEOF' || _ac_rc=$?" in text, (
+        "the rc is not captured, so `set -e` would abort before the warning"
+    )
+
+
+def test_autocd_does_not_destroy_a_symlinked_bashrc(tmp_path):
+    """A ~/.bashrc symlinked into a dotfiles repo must stay a symlink.
+
+    MEASURED before the fix: `os.replace` on the LINK swapped it for a regular
+    file. The dotfiles repo kept the STALE path, the next `stow -R` / `chezmoi
+    apply` reverted or conflicted, and the installer printed success — in the
+    file this module exists to prevent.
+    """
+    real = tmp_path / "dotfiles" / "bashrc"
+    real.parent.mkdir()
+    real.write_text(f"{_AUTOCD_MARK}\n[ -d /old ] && cd /old\nexport KEEPME=1\n")
+    link = tmp_path / ".bashrc"
+    link.symlink_to(real)
+
+    src = tmp_path / "autocd.py"
+    src.write_text(_extract_autocd_rewriter())
+    proc = subprocess.run(
+        [sys.executable, str(src), str(link)],
+        capture_output=True, text=True,
+        env={**os.environ,
+             "GENESIS_AUTOCD_MARK": _AUTOCD_MARK,
+             "GENESIS_AUTOCD_LINE": _shipped_autocd_line("/new/repo")},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert link.is_symlink(), "the symlink was replaced by a regular file"
+    # The edit must land in the REAL file, which is what the dotfiles repo tracks.
+    assert "cd /new/repo" in real.read_text()
+    assert "export KEEPME=1" in real.read_text()
+
+
+@pytest.mark.parametrize(
+    "ch", [" ", " ", "\x85", "\x0c", "\x0b", "\x1c"]
+)
+def test_autocd_does_not_rewrite_line_separators_bash_ignores(tmp_path, ch):
+    """`splitlines()` breaks on characters that do NOT end a line for bash.
+
+    Round-tripping through it turned each into a newline ANYWHERE in the file,
+    including content the rewriter was never asked to touch — and outside a
+    quoted string that splits one command into two, so the user gets
+    `command not found` on every login. `bash -n` passes throughout, so nothing
+    else would have caught it. MEASURED: 6 of 7 such characters mutated.
+    """
+    payload = f'export MSG="a{ch}b"\n'
+    proc, out = _run_autocd(
+        tmp_path,
+        f"{_AUTOCD_MARK}\n[ -d /old ] && cd /old\n{payload}",
+        "/new/repo",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert payload in out, (
+        f"user content was mutated: {ch!r} was rewritten as a newline"
+    )
+
+
+def test_autocd_refuses_when_two_hooks_exist(tmp_path):
+    """bash runs top to bottom, so the LAST hook decides the final cd.
+
+    Rewriting only the first would leave the effective login directory stale
+    while the installer reported success — a false claim in the install log.
+    """
+    body = (f"{_AUTOCD_MARK}\n[ -d /old1 ] && cd /old1\n"
+            f"{_AUTOCD_MARK}\n[ -d /old2 ] && cd /old2\n")
+    proc, out = _run_autocd(tmp_path, body, "/new/repo")
+    assert proc.returncode == 4, proc.stderr
+    assert out == body, "refused, but the file changed anyway"
+
+
+def test_autocd_preserves_file_mode(tmp_path):
+    """mkstemp creates 0600; the rewrite must not silently re-permission a
+    user file it was only asked to edit."""
+    bashrc = tmp_path / ".bashrc"
+    bashrc.write_text(f"{_AUTOCD_MARK}\n[ -d /old ] && cd /old\n")
+    bashrc.chmod(0o644)
+    src = tmp_path / "autocd.py"
+    src.write_text(_extract_autocd_rewriter())
+    proc = subprocess.run(
+        [sys.executable, str(src), str(bashrc)],
+        capture_output=True, text=True,
+        env={**os.environ,
+             "GENESIS_AUTOCD_MARK": _AUTOCD_MARK,
+             "GENESIS_AUTOCD_LINE": _shipped_autocd_line("/new/repo")},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert bashrc.stat().st_mode & 0o777 == 0o644, "the file mode was changed"
+
+
+def test_autocd_handles_an_indented_hook(tmp_path):
+    """The marker is compared stripped, so an indented pair IS recognised —
+    the hook-shape test must strip too, or it is rejected forever."""
+    proc, out = _run_autocd(
+        tmp_path,
+        f"  {_AUTOCD_MARK}\n  [ -d /old ] && cd /old\n",
+        "/new/repo",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "  [ -d /new/repo ] && cd /new/repo" in out, (
+        f"indentation was not preserved:\n{out}"
+    )
