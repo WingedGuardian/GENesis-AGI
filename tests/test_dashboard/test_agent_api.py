@@ -225,7 +225,9 @@ def test_request_is_stamped_with_the_agent_channel():
         )
     kwargs = app.config["GENESIS_CONVERSATION_LOOP"].handle_message.call_args.kwargs
     assert kwargs["channel"] == ChannelType.AGENT
-    assert kwargs["user_id"] == "agent:198.51.100.11"
+    # The session key deliberately does NOT carry the attribution value --
+    # see test_session_key_ignores_attribution_headers for why.
+    assert kwargs["user_id"] == "agent:default"
 
 
 def test_timeout_returns_504_and_releases_the_limiter():
@@ -455,3 +457,160 @@ def test_agent_is_not_granted_owner_origin():
     """Control for the above: enumerating it must not GRANT anything."""
     from genesis.learning.pipeline import _CHANNEL_ORIGIN
     assert _CHANNEL_ORIGIN.get("agent") != "owner"
+# ── Cross-model review findings, each pinned with a control ────────────────
+
+
+def test_session_key_ignores_attribution_headers():
+    """The conversation key must NOT derive from an unverified header.
+
+    Otherwise two unrelated chats from one agent silently share persisted
+    context, and anything reaching the port directly selects a stored session
+    by forging a header. The module claims attribution is logging-only; this
+    is what makes that claim true.
+    """
+    app = _ready_app()
+    fut = MagicMock()
+    fut.result.return_value = "ok"
+    with (
+        _with_token(),
+        patch.object(agent_api.asyncio, "run_coroutine_threadsafe", return_value=fut),
+    ):
+        app.test_client().post(
+            "/v1/agent/chat/completions",
+            headers={
+                **AUTH,
+                "X-Forwarded-For": "198.51.100.11",
+                "Tailscale-User-Login": "someone@example.com",
+            },
+            json={"messages": [{"role": "user", "content": "hi"}]},
+        )
+    kwargs = app.config["GENESIS_CONVERSATION_LOOP"].handle_message.call_args.kwargs
+    assert kwargs["user_id"] == "agent:default"
+    assert "198.51.100.11" not in kwargs["user_id"]
+    assert "someone@example.com" not in kwargs["user_id"]
+
+
+def test_caller_named_conversation_selects_a_distinct_session():
+    """Control for the above: the caller CAN still separate its threads, by
+    naming one deliberately rather than having one inferred."""
+    app = _ready_app()
+    fut = MagicMock()
+    fut.result.return_value = "ok"
+    with (
+        _with_token(),
+        patch.object(agent_api.asyncio, "run_coroutine_threadsafe", return_value=fut),
+    ):
+        app.test_client().post(
+            "/v1/agent/chat/completions",
+            headers={**AUTH, "X-Genesis-Conversation-Id": "errand-7"},
+            json={"messages": [{"role": "user", "content": "hi"}]},
+        )
+    kwargs = app.config["GENESIS_CONVERSATION_LOOP"].handle_message.call_args.kwargs
+    assert kwargs["user_id"] == "agent:errand-7"
+
+
+def test_conversation_id_is_sanitised_and_bounded():
+    app = _ready_app()
+    fut = MagicMock()
+    fut.result.return_value = "ok"
+    with (
+        _with_token(),
+        patch.object(agent_api.asyncio, "run_coroutine_threadsafe", return_value=fut),
+    ):
+        app.test_client().post(
+            "/v1/agent/chat/completions",
+            headers={**AUTH, "X-Genesis-Conversation-Id": "a/b c;" + "z" * 200},
+            json={"messages": [{"role": "user", "content": "hi"}]},
+        )
+    uid = app.config["GENESIS_CONVERSATION_LOOP"].handle_message.call_args.kwargs["user_id"]
+    key = uid.split(":", 1)[1]
+    assert len(key) <= 64
+    assert "/" not in key and " " not in key and ";" not in key
+
+
+@pytest.mark.parametrize("body", ["[1]", '"text"', "42", "null"])
+def test_non_object_json_is_a_client_error_not_a_500(client, body):
+    """Valid JSON that is not a mapping must not reach .get and raise."""
+    with _with_token():
+        resp = client.post(
+            "/v1/agent/chat/completions",
+            headers={**AUTH, "Content-Type": "application/json"},
+            data=body,
+        )
+    assert resp.status_code == 400
+    assert resp.status_code != 500
+
+
+def test_malformed_json_is_a_client_error(client):
+    with _with_token():
+        resp = client.post(
+            "/v1/agent/chat/completions",
+            headers={**AUTH, "Content-Type": "application/json"},
+            data="{not json",
+        )
+    assert resp.status_code == 400
+
+
+def test_oversized_body_is_refused_before_parsing(client):
+    """The message-length check runs far too late: the body is buffered and
+    parsed first, and the app-wide limit is 500 MB."""
+    huge = (
+        b'{"messages":[{"role":"user","content":"'
+        + b"x" * (agent_api._MAX_BODY_BYTES + 10)
+        + b'"}]}'
+    )
+    with _with_token():
+        resp = client.post(
+            "/v1/agent/chat/completions",
+            headers={**AUTH, "Content-Type": "application/json"},
+            data=huge,
+        )
+    assert resp.status_code == 413
+
+
+def test_control_a_normal_body_is_still_accepted():
+    """Without this, a cap that rejected everything would pass above."""
+    app = _ready_app()
+    fut = MagicMock()
+    fut.result.return_value = "ok"
+    with (
+        _with_token(),
+        patch.object(agent_api.asyncio, "run_coroutine_threadsafe", return_value=fut),
+    ):
+        resp = app.test_client().post(
+            "/v1/agent/chat/completions",
+            headers=AUTH,
+            json={"messages": [{"role": "user", "content": "an ordinary question"}]},
+        )
+    assert resp.status_code == 200
+
+
+def test_every_text_block_of_a_multipart_message_is_forwarded():
+    """[text, image, text] -- the trailing block is usually the instruction
+    that follows an attachment, and returning at the first one drops it."""
+    app = _ready_app()
+    fut = MagicMock()
+    fut.result.return_value = "ok"
+    with (
+        _with_token(),
+        patch.object(agent_api.asyncio, "run_coroutine_threadsafe", return_value=fut),
+    ):
+        app.test_client().post(
+            "/v1/agent/chat/completions",
+            headers=AUTH,
+            json={
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "look at this"},
+                            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}},
+                            {"type": "text", "text": "what is wrong with it"},
+                        ],
+                    }
+                ]
+            },
+        )
+    forwarded = app.config["GENESIS_CONVERSATION_LOOP"].handle_message.call_args.args[0]
+    assert "look at this" in forwarded
+    assert "what is wrong with it" in forwarded

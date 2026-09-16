@@ -56,7 +56,9 @@ could forge a header.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 import threading
 import time
 import uuid
@@ -89,9 +91,27 @@ _ANSWER_TIMEOUT_SECONDS = 300.0
 # prompt, and stored.
 _MAX_MESSAGE_CHARS = 32_000
 
-# Attribution is a log field, so it is bounded. An unbounded header value
-# would otherwise reach both the log line and the session key.
+# Attribution is a log field ONLY, so it is bounded purely to keep a log line
+# sane. It deliberately does NOT reach the session key -- see _conversation_id.
 _MAX_CALLER_CHARS = 64
+
+# Hard byte cap applied to the request body BEFORE any parsing. The app-wide
+# MAX_CONTENT_LENGTH is 500 MB (sized for knowledge uploads), so without this
+# an authenticated caller could have multi-megabyte bodies buffered and parsed
+# concurrently -- the _MAX_MESSAGE_CHARS check runs far too late to prevent it,
+# and the semaphore is not held yet either. Derivation: a 32,000-character
+# message is at most ~128 KB in UTF-8, and callers legitimately send prior turns
+# alongside it, so 1 MiB leaves generous room for history while keeping the
+# worst case bounded.
+_MAX_BODY_BYTES = 1024 * 1024
+
+# Conversation key. The caller NAMES its conversation; nothing is inferred from
+# an attribution header, because that would make an unverified value decide
+# which stored session a request resumes.
+_CONVERSATION_HEADER = "X-Genesis-Conversation-Id"
+_DEFAULT_CONVERSATION = "default"
+_CONVERSATION_ID_RE = re.compile(r"[^A-Za-z0-9._-]")
+_MAX_CONVERSATION_CHARS = 64
 
 
 def _caller() -> str:
@@ -111,6 +131,24 @@ def _caller() -> str:
         who = request.remote_addr or "unknown"
     # Newlines would otherwise inject a fabricated line into the log.
     return who.replace("\r", " ").replace("\n", " ")[:_MAX_CALLER_CHARS]
+
+
+def _conversation_id() -> str:
+    """Which stored conversation this request continues.
+
+    Taken from an explicit request header, NEVER from the attribution headers.
+    Deriving it from ``X-Forwarded-For`` or ``Tailscale-User-Login`` would make
+    an unverified value select which persisted session is resumed: two
+    unrelated chats from one agent would silently share context, and anything
+    able to reach the port directly could pick a session by forging a header.
+    The bearer token authenticates ONE principal, so the principal is constant
+    and the caller simply names the thread it wants.
+    """
+    raw = request.headers.get(_CONVERSATION_HEADER, "").strip()
+    if not raw:
+        return _DEFAULT_CONVERSATION
+    safe = _CONVERSATION_ID_RE.sub("-", raw)[:_MAX_CONVERSATION_CHARS]
+    return safe or _DEFAULT_CONVERSATION
 
 
 @agent_api_bp.route("/v1/agent/ping", methods=["GET"])
@@ -151,7 +189,27 @@ def agent_chat_completions():
         return jsonify({"error": msg}), status
 
     caller = _caller()
-    payload = request.get_json(silent=True) or {}
+
+    # Bound the body BEFORE parsing. Reading one byte past the cap is what
+    # distinguishes "at the limit" from "over it" without buffering the rest,
+    # and it works for a chunked request too, where Content-Length is absent
+    # and so cannot be trusted as the check.
+    declared = request.content_length
+    if declared is not None and declared > _MAX_BODY_BYTES:
+        return jsonify({"error": f"request body too large (max {_MAX_BODY_BYTES} bytes)"}), 413
+    raw = request.stream.read(_MAX_BODY_BYTES + 1)
+    if len(raw) > _MAX_BODY_BYTES:
+        return jsonify({"error": f"request body too large (max {_MAX_BODY_BYTES} bytes)"}), 413
+
+    try:
+        payload = json.loads(raw) if raw else {}
+    except (ValueError, UnicodeDecodeError):
+        return jsonify({"error": "request body is not valid JSON"}), 400
+
+    # A bare list, string or number is valid JSON and has no .get, so without
+    # this an authenticated caller turns a client error into a 500 traceback.
+    if not isinstance(payload, dict):
+        return jsonify({"error": "request body must be a JSON object"}), 400
 
     if payload.get("stream"):
         return jsonify({
@@ -186,7 +244,7 @@ def agent_chat_completions():
         future = asyncio.run_coroutine_threadsafe(
             conversation_loop.handle_message(
                 user_message,
-                user_id=f"agent:{caller}",
+                user_id=f"agent:{_conversation_id()}",
                 channel=ChannelType.AGENT,
                 # Never scan an external caller's prose for slash intents.
                 intent_text="",

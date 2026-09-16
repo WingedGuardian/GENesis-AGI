@@ -27,9 +27,18 @@ def extract_last_user_message(messages: object) -> str | None:
         if isinstance(content, str) and content.strip():
             return content
         if isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text = block.get("text", "")
-                    if isinstance(text, str) and text.strip():
-                        return text
+            # JOIN every text block, in order. Returning at the first one
+            # silently drops the rest, and in the common [text, image, text]
+            # shape the trailing block is the actual instruction after an
+            # attachment -- so the model would answer a truncated question
+            # with no indication anything was missing.
+            blocks = [
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+                and block.get("text", "").strip()
+            ]
+            if blocks:
+                return "\n\n".join(blocks)
     return None
