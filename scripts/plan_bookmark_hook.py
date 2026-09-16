@@ -50,11 +50,13 @@ _EXECUTION_PROTOCOL = (
     # "STATE CONFIDENCE - explicit percentages for each part of the plan" used to
     # be step 2 here. It was a PLAN-level instruction delivered at PostToolUse,
     # i.e. after the plan had already been shown and approved - the wrong-moment
-    # bug that plan_confidence_reminder.py exists to fix. It is now asked for BEFORE
-    # the plan is presented, so repeating it here would be a second, weaker copy
-    # of a reminder that arrives too late to act on. Step 3 below is NOT the same
-    # thing and stays: reading the files you are about to edit is implementation
-    # diligence, at a moment where it is still actionable.
+    # bug that scripts/hooks/plan_confidence_reminder.py exists to fix. That hook
+    # now owns the ask, and it fires at the plan-mode boundaries instead: at
+    # EnterPlanMode, where it still reaches the plan being written, and at
+    # ExitPlanMode, where it reaches the revision and the next plan. Repeating it
+    # here would be a second copy arriving strictly later than both. Step 2 below
+    # is NOT the same thing and stays: reading the files you are about to edit is
+    # implementation diligence, at a moment where it is still actionable.
     "2. DUE DILIGENCE — Read every file you plan to modify. Verify functions "
     "and classes exist as expected. Check git log for recent conflicts.\n"
     "3. CONFIRM PLAN VALIDITY — Verify plan is still valid against current "

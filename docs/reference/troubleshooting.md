@@ -463,7 +463,13 @@ Kept the original `nanobot-gateway.service` which has proper dependencies (`Want
 
 ### Root Cause
 
-`qdrant-client` v1.7+ removed the deprecated `search()` method in favor of `query_points()`. The installed version (1.16.2) no longer has `search()`. Code in `episodic.py` was using the old API.
+`qdrant-client` removed the deprecated `search()` method in favor of `query_points()`. The removal landed in the **1.16** line — `search()` is still present, deprecated, through 1.15.x — and the installed version (1.16.2) no longer had it. Code in `episodic.py` was using the old API.
+
+> **Recurred 2026-09-13 in `src/genesis/memory/health.py`** (`near_duplicate_stats`), which had never been migrated. It was unreachable from the running system — no production caller — so it produced no symptoms and no test caught it. Fixed by routing through the shared `qdrant_ops.search()` wrapper, which uses `query_points` internally.
+>
+> The underlying cause was that `qdrant-client` carried **no version pin**, while `scripts/install.sh` *defaults* to installing server 1.14.0 when none is present (`QDRANT_VERSION` is overridable, and an existing server of any version is left alone). A hard-drifting client against a soft server default meant installs landed on clients the server does not support. The client is now pinned to `>=1.15,<1.16` to track it. **Bump both together or not at all** — raising the client past 1.16 without migrating every `search()` call site reintroduces this exact class. That coupling is enforced by `tests/test_scripts/test_dependency_pins.py`, which re-derives the compatibility window from the pin AND from `install.sh` rather than trusting either comment.
+>
+> Separately: `near_duplicate_stats` looks memories up by a `memory_id` PAYLOAD key that most points do not carry (MEASURED 2026-09-13: 42,618 of 47,901 lack it), so it silently examines only a small fraction of the store. The migration above did not change that, and it is tracked on its own.
 
 ### Solution Applied (2026-02-18)
 

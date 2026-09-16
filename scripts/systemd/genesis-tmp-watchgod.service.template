@@ -3,7 +3,14 @@ Description=Genesis /tmp watchgod — dual-zone temp protection
 After=default.target
 
 [Service]
-Type=simple
+# Type=exec, not simple: `simple` considers the unit started as soon as the
+# process is FORKED, so between the fork and a failed exec systemd reports the
+# unit active even though it can never run. That is the 203/EXEC state this unit
+# was installed in for months. `exec` waits for the exec itself to succeed, which
+# makes the window unconstructible rather than merely narrow — it was measured at
+# 0 of 12 immediate samples under `simple`, and "not observed" is not "cannot
+# happen". Needs systemd 240+ (2018); Genesis already requires far newer.
+Type=exec
 ExecStart=__REPO_DIR__/scripts/tmp_watchgod.sh
 Restart=always
 RestartSec=10

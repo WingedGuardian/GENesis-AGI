@@ -107,6 +107,16 @@ class ProviderConfig:
     # mirroring the behaviour for a tripped breaker. Snapshot surfaces
     # this so partially-configured installs see the state on the dashboard.
     has_api_key: bool = True
+    # Provider-side DAILY caps, each in the provider's OWN unit — requests
+    # per UTC day and tokens per UTC day. Never converted between units
+    # A provider may carry either, both, or neither: as shipped, Groq sets
+    # both and Gemini sets neither. None = no daily budget for that unit.
+    # Enforced by DailyBudgetLedger via chain-walk DESELECTION, never a
+    # breaker trip. NOTE: a daily budget is per API key/account — keep one
+    # provider entry per account for daily-limited providers, or one real
+    # budget splits across counters and neither trips.
+    rpd_limit: int | None = None
+    tpd_limit: int | None = None
 
 
 @dataclass(frozen=True)
@@ -157,6 +167,13 @@ class CallResult:
     cost_usd: float = 0.0
     cost_known: bool = True
     retry_after_s: float | None = None
+    # Did the request actually REACH the provider? False only where the
+    # delegate caught an exception carrying no HTTP status — DNS, socket and
+    # TLS failures — which it reports as a synthesized 500 indistinguishable
+    # from a real server error. Anything that consumes a provider's allowance
+    # must not count those: the vendor never saw the request. Defaults True so
+    # every existing construction keeps its meaning (Codex P2, PR #1624).
+    reached_provider: bool = True
 
 
 @dataclass(frozen=True)

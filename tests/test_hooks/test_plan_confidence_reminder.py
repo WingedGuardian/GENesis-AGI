@@ -8,7 +8,10 @@ and every defect two independent reviewers found lived in that apparatus rather
 than in the hook. Nothing here tests a detector, because there is no detector.
 
 What is left to assert is the contract: it emits, it emits EVERY time regardless
-of plan content, it never costs a tool call, and it is scoped to ExitPlanMode.
+of plan content, it never costs a tool call, and it is scoped to the two plan-mode
+boundaries -- EnterPlanMode and ExitPlanMode -- each with wording that is true of
+its own moment. That last clause is a fix, not a flourish: the ExitPlanMode-only
+revision claimed to arrive before the plan was presented, and it does not.
 
 Install-agnostic: synthetic payloads, subprocess isolation, no network, no DB.
 """
@@ -52,10 +55,12 @@ def _run(payload: object) -> subprocess.CompletedProcess:
     )
 
 
-def _payload(plan: object = "# Plan\n\nDo the thing.") -> dict:
+def _payload(
+    plan: object = "# Plan\n\nDo the thing.", tool: str = "ExitPlanMode"
+) -> dict:
     return {
         "hook_event_name": "PreToolUse",
-        "tool_name": "ExitPlanMode",
+        "tool_name": tool,
         "tool_input": {"plan": plan, "planFilePath": "/synthetic/plans/p.md"},
     }
 
@@ -68,14 +73,47 @@ def _emitted(proc: subprocess.CompletedProcess) -> dict:
 # IT FIRES, AND IT ALLOWS.
 # --------------------------------------------------------------------------
 
-def test_it_emits_the_reminder_and_allows_the_tool():
-    proc = _run(_payload())
+@pytest.mark.parametrize("tool", ["EnterPlanMode", "ExitPlanMode"])
+def test_it_emits_the_reminder_and_allows_the_tool(tool):
+    proc = _run(_payload(tool=tool))
     assert proc.returncode == 0
     out = _emitted(proc)
-    assert out["permissionDecision"] == "allow"
     assert out["hookEventName"] == "PreToolUse"
+    # NOT `permissionDecision: "allow"`, which every other advisory hook here
+    # emits. `allow` asserts the permission prompt should be SKIPPED, and
+    # ExitPlanMode's whole purpose is to put a decision in front of the user.
+    # READ from the CC bundle: the field is optional, the permission switch is
+    # gated on its presence, and additionalContext is yielded independently — so
+    # silence delivers the reminder and expresses no opinion.
+    assert "permissionDecision" not in out, (
+        "an advisory hook must express no opinion on whether the user is asked"
+    )
     assert "CONFIDENCE" in out["additionalContext"]
     assert "DUE DILIGENCE" in out["additionalContext"]
+
+
+def test_each_moment_states_what_it_can_still_change():
+    """THE FIX A REVIEWER FORCED, pinned so it cannot be undone by tidying.
+
+    The ExitPlanMode-only revision told the model the reminder arrived "before
+    this plan goes to the user". It does not: the plan is authored before the
+    PreToolUse hook is ever called, and `allow` passes it through unchanged. So
+    the two moments must not share wording — EnterPlanMode can still reach the
+    plan being written, ExitPlanMode can only reach the revision and the next
+    plan, and saying otherwise is the defect rather than a phrasing preference.
+    """
+    early = _emitted(_run(_payload(tool="EnterPlanMode")))["additionalContext"]
+    late = _emitted(_run(_payload(tool="ExitPlanMode")))["additionalContext"]
+
+    assert early != late, "one wording cannot be true of both moments"
+    assert "cannot change it" in late, (
+        "the ExitPlanMode reminder must not imply it reaches this plan"
+    )
+    assert "before you have written a line" in early, (
+        "the EnterPlanMode reminder must say it is actionable now"
+    )
+    # Neither may claim the late path reaches the plan under review.
+    assert "before this plan goes to the user" not in late.lower()
 
 
 @pytest.mark.parametrize(
@@ -125,6 +163,15 @@ def test_it_never_returns_a_blocking_exit_code():
     src = _HOOK.read_text(encoding="utf-8")
     assert "return 2" not in src and "exit(2)" not in src
     assert "\"deny\"" not in src and "'deny'" not in src
+    # Weaker than the behavioural assertions above and kept as a second net: a
+    # source scan catches the field being re-added on a branch those tests do
+    # not reach. It matches the JSON KEY form specifically — `"x":` — because
+    # the docstring discusses `permissionDecision` at length and a bare
+    # substring scan would fail on the prose explaining why it is absent. That
+    # is the anchoring failure this repo has paid for before.
+    assert '"permissionDecision":' not in src, (
+        "permissionDecision was re-introduced into an emitted payload"
+    )
 
 
 def test_a_crash_inside_main_still_exits_zero():
@@ -167,7 +214,7 @@ def test_even_an_unimportable_hook_cannot_block(tmp_path):
 # SCOPE.
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize("tool", ["Bash", "Write", "SomeFutureTool"])
+@pytest.mark.parametrize("tool", ["Bash", "Write", "SomeFutureTool", "EnterWorktree"])
 def test_it_says_nothing_about_other_tools(tool):
     """Scoping is intrinsic, not inherited from the settings matcher."""
     payload = _payload()
@@ -175,6 +222,83 @@ def test_it_says_nothing_about_other_tools(tool):
     proc = _run(payload)
     assert proc.returncode == 0
     assert proc.stdout.strip() == ""
+
+
+def test_a_payload_with_no_tool_name_still_FIRES():
+    """The `is not None` branch exists so a hand-fed payload is not silently a
+    no-op, and until an audit ran four mutations nothing pinned it: the
+    malformed-payload cases assert exit 0 only, which a hook that emits NOTHING
+    also satisfies. Dropping the guard would flip emit to silent with the whole
+    suite green, in the fail direction that costs the reminder."""
+    proc = _run({"hook_event_name": "PreToolUse", "tool_input": {"plan": "x"}})
+    assert proc.returncode == 0
+    out = _emitted(proc)
+    assert "CONFIDENCE" in out["additionalContext"]
+    # The conservative wording: it claims less about what the reminder reaches.
+    assert "cannot change it" in out["additionalContext"]
+
+
+def test_every_scoped_tool_has_wording_of_its_own():
+    """SCOPE is DERIVED from MOMENT, so a tool cannot be in one and not the
+    other. Pinned as behaviour rather than trusted as a definition: a mutation
+    adding a tool to a hand-written SCOPE and not to MOMENT emitted the
+    ExitPlanMode wording for an ENTRY moment, and 25/25 tests stayed green."""
+    assert set(hook.SCOPE) == set(hook.MOMENT)
+    seen = set()
+    for tool in hook.SCOPE:
+        text = _emitted(_run(_payload(tool=tool)))["additionalContext"]
+        assert text not in seen, f"{tool} reuses another moment's wording"
+        seen.add(text)
+
+
+def test_the_emit_goes_THROUGH_the_bounded_writer():
+    """The docstring promises the cap cannot be breached by a later edit that
+    grows the text. Asserting `len(stdout) < CAP` does not pin that — the
+    reminder is a fixed string nowhere near the cap, so a bare
+    `print(json.dumps(...))` passes it too, and so does a `text_keys` naming a
+    field that does not exist. Both of those mutations survived the suite.
+
+    So pin the CALL, with its arguments, by driving `main()` in-process: the
+    payload read and the writer are both replaced, and the recorded arguments
+    have to name the field that actually carries the prose."""
+    # IDENTITY FIRST, and it is not redundant with the call check below. That
+    # check patches the module global, so it pins "main() calls whatever
+    # `print_json_bounded` names" — a mutant that rebinds the name to a bare
+    # print would be masked by the patch itself and survive. This line is what
+    # pins that the name refers to hook_output's bounded writer.
+    # Compare the CODE OBJECT'S FILE, not `__module__`: a module loaded by path
+    # carries its loader's arbitrary name, so `__module__` differs between two
+    # loads of the same file and the assertion fails for a reason that has
+    # nothing to do with the property. (It did, on the first attempt — caught
+    # only because the mutation sweep asserts a GREEN baseline first.)
+    assert (
+        Path(hook.print_json_bounded.__code__.co_filename).resolve()
+        == (_WORKTREE / "scripts" / "hooks" / "hook_output.py").resolve()
+    ), "the name no longer refers to hook_output's bounded writer"
+    assert hook.print_json_bounded.__qualname__ == "print_json_bounded"
+
+    recorded: dict = {}
+
+    def _recorder(payload, **kwargs):
+        recorded["payload"] = payload
+        recorded["kwargs"] = kwargs
+
+    real_read, real_write = hook.read_payload, hook.print_json_bounded
+    hook.read_payload = lambda: _payload(tool="EnterPlanMode")
+    hook.print_json_bounded = _recorder
+    try:
+        assert hook.main() == 0
+    finally:
+        hook.read_payload, hook.print_json_bounded = real_read, real_write
+
+    assert recorded, "main() did not emit through print_json_bounded"
+    assert recorded["kwargs"]["text_keys"] == (
+        "hookSpecificOutput.additionalContext",
+    ), "the trimmable field must be the one carrying the prose, or an oversize " \
+       "payload loses the decision instead of the text"
+    emitted = recorded["payload"]["hookSpecificOutput"]
+    assert "permissionDecision" not in emitted
+    assert emitted["additionalContext"].startswith(hook.MOMENT["EnterPlanMode"])
 
 
 def test_the_reminder_names_both_asks_and_stays_under_the_cap():

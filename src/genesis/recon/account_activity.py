@@ -40,6 +40,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -382,7 +383,12 @@ class AccountActivityMonitor:
                 details.append("notifications: baselined")
             else:
                 nc, items = await self._poll_notifications(
-                    owner, n_since, wm, notif["reasons"], denylist, max_events
+                    owner,
+                    n_since,
+                    wm,
+                    notif["reasons"],
+                    denylist,
+                    steward_cfg.knob_int(cfg, "max_notifications_per_tick"),
                 )
                 for item in items:
                     did = await self._record_notification(item, mode)
@@ -873,6 +879,47 @@ class AccountActivityMonitor:
                 max_events,
             )
         work = candidates[:max_events]
+        over_cap_tie = False
+        if truncated:
+            # Extend through the WHOLE tie group at the boundary. `since` is
+            # exclusive and these timestamps are second-precision, so a cursor can
+            # only advance to a value strictly below the first deferred item; if
+            # every processed item ties that value there is nowhere to advance to,
+            # the cursor holds, and the same slice is re-selected every tick while
+            # dedup hides the repetition — the later tied items never processed at
+            # all. Taking the whole tie group costs a bounded overrun (one second
+            # of notifications) and guarantees forward progress. Reachable in
+            # practice because this lane's cap is deliberately small.
+            boundary_ts = candidates[max_events]["updated"]
+            if all(c["updated"] == boundary_ts for c in work):
+                tie = [c for c in candidates if c["updated"] <= boundary_ts]
+                # Bounded: the extension exists to let the cursor move, not to
+                # let one tick process an unbounded batch. Past the hard cap the
+                # cursor advances PAST the tied second anyway and the remainder
+                # is skipped LOUDLY — a declared loss beats a silent stall, and
+                # beats a tick that outruns its own cadence.
+                hard_cap = max_events * 4
+                if len(tie) > hard_cap:
+                    logger.error(
+                        "github steward: %d notifications tie at %s (hard cap %d) — "
+                        "processing %d and ADVANCING PAST that second; %d tied "
+                        "notifications are skipped and will not be retried",
+                        len(tie),
+                        boundary_ts,
+                        hard_cap,
+                        hard_cap,
+                        len(tie) - hard_cap,
+                    )
+                    tie = tie[:hard_cap]
+                    over_cap_tie = True
+                else:
+                    logger.warning(
+                        "github steward: %d notifications tie at %s across the cap — "
+                        "processing the whole tie group so the cursor can advance",
+                        len(tie),
+                        boundary_ts,
+                    )
+                work = tie
 
         # Per-item failures NEVER hold the account-level cursor (one bad item — a
         # deleted comment, a discussion, a malformed payload — must not freeze the
@@ -894,22 +941,20 @@ class AccountActivityMonitor:
                 # GraphQL-only actor — record for the digest, no ping (follow-up).
                 items.append({**base, "actor": "", "ping": False})
                 continue
-            actor = await self._resolve_notification_actor(subject)
-            if actor is None:
-                items.append({**base, "actor": "", "ping": False})  # unresolved → digest-only
-                continue
-            if actor.lower() == owner.lower():
-                # The owner is the resolved (latest) actor. For author/subscribed
-                # that is self-activity on the owner's own thread → skip entirely.
-                # For a mention it means the owner is merely the latest commenter —
-                # keep the thread (digest-only), don't self-ping, don't drop it.
-                if c["reason"] not in steward_cfg.OWNED_ONLY_NOTIFICATION_REASONS:
-                    items.append({**base, "actor": "", "ping": False})
-                continue
-            auto = await self._is_automation(actor, denylist)
-            if auto is True:
-                continue  # bot / org (None → can't tell → surface rather than drop)
-            items.append({**base, "actor": actor, "ping": True})
+            actor, complete = await self._window_actor(
+                subject, owner, denylist, since=since, until=c["updated"]
+            )
+            if actor:
+                items.append({**base, "actor": actor, "ping": True})
+            elif not complete:
+                # A surface could not be read, so "nobody else acted" is UNPROVEN.
+                # Keep it as a digest row rather than dropping on missing evidence.
+                items.append({**base, "actor": "", "ping": False})
+            else:
+                # Nobody but the owner and/or automation acted in this window.
+                # This is the reported defect: the steward notifying its owner
+                # about the owner's own traffic on their own threads.
+                logger.debug("github steward: dropping self/bot-only update on %s", c["repo"])
 
         # Advance the cursor. Clean sweep → wm. Truncation → the newest processed
         # timestamp STRICTLY BEFORE the first deferred item (tie-safe: advancing to
@@ -918,33 +963,216 @@ class AccountActivityMonitor:
         # re-poll next tick.
         if not truncated:
             return wm, items
-        boundary = candidates[max_events]["updated"]
+        # `work` may have been extended through the boundary tie above, so derive
+        # the deferred boundary from what was actually processed rather than from
+        # the cap index.
+        if over_cap_tie:
+            # The tie was cut short, so nothing before or at that second will be
+            # retried. Advance to it rather than holding: holding re-selects the
+            # same slice forever, which is the stall this block exists to avoid.
+            return work[-1]["updated"], items
+        deferred = [c["updated"] for c in candidates if c not in work]
+        if not deferred:
+            return wm, items  # the extension consumed everything after all
+        # min, not max: `since` is exclusive, so advancing past a deferred item's
+        # timestamp strands it permanently.
+        boundary = min(deferred)
         safe = [c["updated"] for c in work if c["updated"] < boundary]
         return (safe[-1] if safe else since), items
 
-    async def _resolve_notification_actor(self, subject: dict) -> str | None:
-        """Best-effort resolve of the human behind a notification (the feed carries
-        no actor inline). Tries ``latest_comment_url`` then ``subject.url``, reading
-        ``.user.login``; a gh error or malformed JSON on one URL just falls through
-        to the next. Returns the login, or ``None`` if unresolved — it NEVER signals
-        a cursor hold, so a single unresolvable item (deleted comment, discussion,
-        malformed payload) can't freeze the account-level lane. The login is a
-        best-effort label: for a mention it is the notification's latest commenter,
-        which may differ from the exact actor that triggered it."""
-        for key in ("latest_comment_url", "url"):
-            u = subject.get(key)
-            if not u:
+    async def _window_actor(
+        self,
+        subject: dict,
+        owner: str,
+        denylist: set[str],
+        *,
+        since: str,
+        until: str,
+    ) -> tuple[str | None, bool]:
+        """Who, other than the owner and automation, acted on this thread this window.
+
+        This deliberately does NOT ask who wrote the ``@`` text. Attributing a
+        mention means reconstructing GitHub's own rendering rules from raw
+        Markdown, against an API that exposes no mention events and no edit
+        history — escaped literals, code fences, ``@org/team`` handles and edited
+        bodies each defeat it, and every fix for one of those opened another. The
+        question the owner actually asked is narrower and directly answerable:
+        did somebody ELSE do something here.
+
+        Returns ``(login, complete)``:
+        * ``(login, True)``  — a real external human acted; ping-worthy.
+        * ``(None, True)``   — nobody but the owner and/or bots acted; the caller
+          drops it as self-activity, which is the whole point of the change.
+        * ``(None, False)``  — a surface could not be read, so ABSENCE is not
+          established. The caller keeps it as a digest row rather than dropping on
+          missing evidence.
+
+        An event counts as in-window at ``max(created_at, updated_at)``: editing a
+        comment IS acting on the thread, and GitHub bumps the notification for it,
+        so keying on creation alone would silently drop a whole class of update.
+        Capped at ``until`` so an edit landing after this notification cannot
+        retroactively change what the notification was about.
+        """
+        rows, certain = await self._thread_comments(subject)
+        # Scan BEFORE consulting `certain`: certainty is required only for the
+        # NEGATIVE conclusion. Evidence already in hand still proves someone
+        # acted, and returning early would let one flaky call out of five
+        # suppress a real contributor's ping.
+        # A row we cannot place in time is INVISIBLE to the filter below — it can
+        # neither prove nor disprove that somebody acted. Silently vanishing is
+        # how a commit-message mention got dropped, so an unreadable timestamp
+        # becomes uncertainty here rather than an absence downstream.
+        if any(not _has_readable_time(r) and not _is_understood_shape(r) for r in rows):
+            certain = False
+
+        in_window = [(t, r) for r in rows if (t := _in_window_time(r, since, until))]
+        # A commit's only timestamp says when it was AUTHORED, never when it was
+        # PUSHED, and the push is what raised this notification. A cherry-pick, a
+        # rebase or a long-held local branch keeps a date from well before it. So
+        # a commit row landing outside the window has answered nothing, and
+        # dropping on it would assert a negative from a timestamp that never
+        # addressed the question. Digest instead.
+        if any(r.get(_COMMIT_DATE_FLAG) and not _in_window_time(r, since, until) for r in rows):
+            certain = False
+
+        # Newest first, by the timestamp that actually falls inside the window.
+        in_window.sort(key=lambda pair: pair[0], reverse=True)
+        for _, row in in_window:
+            login, understood = _row_actor(row)
+            if not understood:
+                # A shape we have not modelled. Every payload this code has been
+                # wrong about was wrong by reading an unrecognised row as one that
+                # did not happen; unrecognised now means we do not know.
+                certain = False
                 continue
-            ok, out = await run_gh_checked("gh", "api", u, timeout=_GH_TIMEOUT)
+            if not login:
+                continue  # positively known to testify to nobody acting
+            if login.lower() == owner.lower():
+                continue
+            auto = await self._is_automation(login, denylist)
+            if auto is True:
+                continue
+            # auto is None → the human/bot lookup failed. Surface rather than
+            # drop: a classification blip must never silence a contributor.
+            logger.debug("github steward: window actor %s (automation=%s)", login, auto)
+            return login, True
+        # Nothing found. Claiming ABSENCE means asserting a negative, so it is
+        # allowed only when EVERY input was interpretable: every surface read,
+        # every payload parsed, every in-window row attributed. Anything else is
+        # ignorance, and ignorance keeps the digest row.
+        logger.debug("github steward: no external actor in window (certain=%s)", certain)
+        return None, certain
+
+    async def _thread_comments(self, subject: dict) -> tuple[list[dict], bool]:
+        """Every comment on a notification's thread, and whether the read is WHOLE.
+
+        Surfaces are chosen by ``subject.type``, NOT by matching substrings in the
+        URL: a repository (or owner) named ``pulls`` or ``issues`` makes a
+        substring test pick the wrong branch, request an endpoint that does not
+        exist, and mark the whole read incomplete. The type field is what GitHub
+        actually promises.
+
+        A pull request carries THREE disjoint text surfaces — inline review
+        comments under ``/pulls/{n}/comments``, conversation comments under
+        ``/issues/{n}/comments``, and review SUMMARY bodies under
+        ``/pulls/{n}/reviews``. The flagship deep-poll reads only the second
+        (VERIFIED: those two id spaces do not intersect). A commit carries its own
+        ``/commits/{sha}/comments``. Discussions are GraphQL-only and are handled
+        by the caller before reaching here.
+
+        Always ``--paginate``, matching ``_poll_repo``'s own rule: these endpoints
+        return OLDEST first and the conversation surface ignores ``direction``, so
+        a single-page read of a busy thread would silently return the oldest 100.
+
+        Returns ``(rows, complete)``. ``complete`` is False when any surface failed
+        to read, so the caller can decline to conclude ABSENCE from a partial read.
+        The thread itself is included as an event: opening a pull request is an
+        action by its author, and on a freshly-opened thread it is the only one.
+        """
+        subject_url = subject.get("url") or ""
+        stype = subject.get("type") or ""
+        urls: list[str] = []
+        issue_url = _pull_url_to_issue_url(subject_url)
+        if stype == "PullRequest":
+            urls.append(f"{subject_url}/comments")  # inline review comments
+            urls.append(f"{issue_url}/comments")  # conversation comments
+            urls.append(f"{subject_url}/reviews")  # review SUMMARY bodies
+            urls.append(f"{issue_url}/timeline")  # merges, closes, pushes, assigns
+        elif stype == "Issue":
+            urls.append(f"{issue_url}/comments")
+            urls.append(f"{issue_url}/timeline")
+        elif stype == "Commit":
+            urls.append(f"{subject_url}/comments")
+        if not subject_url or not urls:
+            # An unmodelled subject type: we cannot enumerate its surfaces, so we
+            # cannot claim nobody acted. Incomplete, not empty — never "absent".
+            return [], False
+
+        rows: list[dict] = []
+        complete = True
+        # ACCEPTED COST (Codex round 4, P2): `--paginate` walks every page of
+        # every surface before the window filter runs, so a thread with a very
+        # long history costs pages proportional to its whole life rather than to
+        # this window. Not fixed here, for two reasons. It fails SAFE: the shared
+        # timeout returns `ok=False`, which sets `complete=False` and yields a
+        # digest row, never a drop. And the server-side remedy is partial —
+        # `issues/{n}/comments` and `pulls/{n}/comments` accept `since`, but the
+        # timeline and reviews endpoints do not, so two of four surfaces stay
+        # unbounded and the change would buy an inconsistent read for no change
+        # in the failure mode.
+        # Bounded meanwhile by `max_notifications_per_tick` (25) threads a tick.
+        for url in urls:
+            ok, out = await run_gh_checked(
+                "gh", "api", f"{url}?per_page=100", "--paginate", "--slurp", timeout=_GH_TIMEOUT
+            )
             if not ok:
-                continue  # try the next URL — do NOT hold on a per-item error
-            try:
-                login = (json.loads(out).get("user") or {}).get("login")
-            except Exception:
-                login = None
-            if login:
-                return login
-        return None
+                complete = False  # never holds the cursor; only withholds a verdict
+                continue
+            page_rows, parsed = _parse_paged_checked(out)
+            if not parsed:
+                # Exit zero with an unreadable body. An empty list here would be
+                # indistinguishable from a surface that genuinely had nothing.
+                logger.warning("github steward: unreadable payload from %s", url)
+                complete = False
+            rows.extend(page_rows)
+
+        # The thread itself — its author acted when they opened it.
+        ok, out = await run_gh_checked("gh", "api", subject_url, timeout=_GH_TIMEOUT)
+        if not ok:
+            return rows, False
+        try:
+            thread = json.loads(out)
+        except Exception:
+            logger.warning(
+                "github steward: thread object unreadable for %s", subject_url, exc_info=True
+            )
+            return rows, False
+        if isinstance(thread, dict) and stype == "Commit" and not _has_readable_time(thread):
+            # A commit object carries no top-level created_at/updated_at — its
+            # date is at commit.author.date (VERIFIED live). Without this the row
+            # can never enter the window, and an @-mention in a commit MESSAGE is
+            # dropped as though nobody acted.
+            meta = thread.get("commit") or {}
+            # COMMITTER first, author second. A cherry-pick and a rebase both
+            # RESET the committer date to the rewrite, while the author date
+            # survives from the original — so the committer date is wrong in
+            # strictly fewer cases. MEASURED on this repo: the two differ on 6
+            # of the last 200 commits. Neither IS the push time, which the
+            # payload does not carry at all; hence the flag, read by
+            # `_window_actor`. Inside the window it attributes. Outside it, it
+            # testifies to nothing.
+            for field in ("committer", "author"):
+                stamp = (meta.get(field) or {}).get("date")
+                if isinstance(stamp, str) and stamp:
+                    thread = {**thread, "created_at": stamp, _COMMIT_DATE_FLAG: True}
+                    break
+        if not isinstance(thread, dict):
+            # `null` parses fine and is not a dict. Without the author row we
+            # cannot claim nobody acted, so this is incomplete, not empty.
+            logger.warning("github steward: thread object was not an object: %s", subject_url)
+            return rows, False
+        rows.append({**thread, _THREAD_ROW_FLAG: True})
+        return rows, complete
 
     async def _record_notification(self, item: dict, mode: str) -> bool:
         """Record a notification observation; ping immediately in ``live`` mode.
@@ -999,10 +1227,22 @@ class AccountActivityMonitor:
         from genesis.outreach.types import OutreachCategory, OutreachRequest, OutreachStatus
 
         num = f"#{item['number']}" if item["number"] else ""
+        # `actor` is the newest non-owner human who ACTED in this notification's
+        # window, and knowably NOT whoever wrote the @-mention: the resolver was
+        # rewritten to ask the answerable question. GitHub's `reason` is sticky,
+        # so a thread Alice mentioned the owner in still reports `mention` when
+        # Bob merges it a week later. "Bob mentioned you" is then a claim this
+        # lane cannot support; what it measured is that Bob acted.
         if item["reason"] in ("mention", "team_mention"):
-            lead = f"💬 {item['actor']} mentioned you in {item['repo']}{num}"
-        else:  # author — a response to one of the owner's outbound contributions
-            lead = f"📨 {item['actor']} responded on your {item['repo']}{num}"
+            lead = f"💬 {item['actor']} acted on a thread that mentions you in {item['repo']}{num}"
+        elif item["reason"] == "author":
+            lead = f"📨 {item['actor']} acted on your {item['repo']}{num}"
+        else:
+            # `reasons` is an operator-editable allowlist, so a reason this lane
+            # has no wording for can reach here. A bare `else` would claim the
+            # thread is the owner's, which only `author` establishes. Say what
+            # the feed said and name the reason rather than inventing a relation.
+            lead = f"📨 {item['actor']} acted on {item['repo']}{num} ({item['reason']})"
         text = lead
         if item["title"]:
             text += f"\n{item['title']}"
@@ -1049,24 +1289,239 @@ def _parse_json_list(out: str) -> list[dict]:
 
 
 def _parse_paged(out: str) -> list[dict]:
-    """Flatten a ``gh api --paginate --slurp`` payload — an outer array whose
-    elements are each page's array — into a flat list of rows. A plain (single,
-    non-slurped) array is returned as-is, so this is safe on both shapes."""
+    """Flatten a ``gh api --paginate --slurp`` payload into a flat list of rows.
+
+    Kept for callers that only want the rows. Where the difference between "this
+    page was empty" and "this payload could not be read" matters, use
+    :func:`_parse_paged_checked` — conflating the two lets a malformed response
+    that exited zero pass for a successfully-read empty surface.
+    """
+    return _parse_paged_checked(out)[0]
+
+
+def _parse_paged_checked(out: str) -> tuple[list[dict], bool]:
+    """``(rows, ok)``. ``ok`` is False when the payload could not be interpreted.
+
+    An empty string is a legitimately empty read (ok). Anything that fails to
+    parse, or parses to something that is not an array of rows/pages, is NOT —
+    and on the notifications path a silently-empty surface would be read as
+    proof that nobody acted.
+    """
     if not out:
-        return []
+        return [], True
     try:
         data = json.loads(out)
     except Exception:
-        return []
+        return [], False
     if not isinstance(data, list):
-        return []
+        return [], False
     flat: list[dict] = []
     for item in data:
         if isinstance(item, list):
             flat.extend(x for x in item if isinstance(x, dict))
         elif isinstance(item, dict):
             flat.append(item)
-    return flat
+    return flat, True
+
+
+# The timestamps a thread event may carry, by surface: comments and the thread
+# object use created_at/updated_at, a review uses submitted_at, a timeline event
+# uses created_at only.
+_EVENT_TIME_KEYS = ("created_at", "updated_at", "submitted_at")
+# Marks the appended thread object so its `updated_at` — which moves whenever
+# ANYBODY touches the thread — is never credited to the thread's author.
+_THREAD_ROW_FLAG = "__genesis_thread_row__"
+# Marks a thread row whose `created_at` we substituted from the commit's own
+# committer/author date, because a commit object carries no timestamp of its own.
+_COMMIT_DATE_FLAG = "__genesis_commit_date__"
+
+# Timeline events whose `.actor` is the person the event happened TO, not the
+# person who did anything. GitHub emits one per recipient the instant somebody
+# else writes an @-mention, so reading `.actor` here reports the mentioned user
+# as having acted — the owner mentioning a third party would ping that third
+# party about the owner's own comment. MEASURED on a live timeline: a comment by
+# one login at :55, three `mentioned` rows naming three OTHER logins at :56.
+_RECIPIENT_ACTOR_EVENTS = frozenset({"mentioned", "subscribed", "unsubscribed"})
+
+# Timeline events whose `.actor` DID the thing — the closed set we are willing to
+# attribute. Anything outside both sets is a shape we have not modelled, and the
+# rule for an unmodelled shape is uncertainty, never a confident reading.
+# Timeline events we UNDERSTAND and which carry no attributable identity. A
+# `committed` row is a push: MEASURED live it has no `.actor`, no `.created_at`,
+# and an `author` of {name, email, date} carrying no login. Knowing a shape has
+# no identity is NOT the same as never having seen it, and conflating the two is
+# what made the drop unreachable — every one of this install's 9 sampled pull
+# requests carries 2-16 `committed` rows, so treating them as unknown made every
+# pull request permanently uncertain.
+#
+# COST, stated because it is real: an external contributor whose ONLY action in a
+# window is pushing commits is not attributable from this surface, and that
+# window reads as empty. A force-push emits `head_ref_force_pushed`, which does
+# carry `.actor`, so the exposed case is an ordinary push with no comment, review
+# or thread-open in the same window.
+#
+# The SIBLING cost, ruled the other way on purpose. A `Commit` SUBJECT carries an
+# identity but no push time, so `_thread_comments` substitutes the committer date
+# and `_window_actor` treats a substituted date outside the window as UNCERTAIN
+# rather than absent. The two rulings differ because the evidence differs: a
+# `committed` row is positively known to name nobody, whereas a commit subject
+# whose every readable surface falls outside the window leaves the notification
+# itself unexplained, and an unexplained notification is not an empty one.
+# Ruling both UNCERTAIN would make every pull request carrying a `committed` row
+# permanently uncertain and put the drop out of reach, which is the failure this
+# frozenset exists to prevent. Residual exposure: a commit held locally long
+# enough that BOTH its dates predate the window still reads as uncertain, so it
+# yields a digest row rather than a drop. MEASURED 2026-09-10: 0 of 1488
+# notifications in this account's readable feed carry a `Commit` subject at all
+# (`all=true`, 30 pages; GitHub prunes old read rows, so that is the readable
+# feed and not all history).
+_IDENTITY_FREE_EVENTS = frozenset({"committed"})
+
+_DOER_ACTOR_EVENTS = frozenset(
+    {
+        "commented",
+        "reviewed",
+        "merged",
+        "closed",
+        "reopened",
+        "assigned",
+        "unassigned",
+        "labeled",
+        "unlabeled",
+        "milestoned",
+        "demilestoned",
+        "renamed",
+        "locked",
+        "unlocked",
+        "pinned",
+        "unpinned",
+        "transferred",
+        "head_ref_force_pushed",
+        "head_ref_deleted",
+        "head_ref_restored",
+        "base_ref_changed",
+        "ready_for_review",
+        "convert_to_draft",
+        "review_requested",
+        "review_request_removed",
+        "review_dismissed",
+        "referenced",
+        "cross-referenced",
+        "connected",
+        "disconnected",
+        "added_to_project",
+        "removed_from_project",
+        "moved_columns_in_project",
+        "converted_note_to_issue",
+        "marked_as_duplicate",
+        "unmarked_as_duplicate",
+        "user_blocked",
+        "deployed",
+        "auto_merge_enabled",
+        "auto_merge_disabled",
+    }
+)
+
+
+def _row_actor(row: dict) -> tuple[str, bool]:
+    """``(login, understood)`` — who acted, and whether we know that we know.
+
+    Not one field: a comment or review nests the login under ``user``, a timeline
+    event under ``actor``, and a commit or release under ``author`` — with
+    ``user`` present but ``null``. Reading only ``user`` silently scores a real
+    external action as nobody.
+
+    ``understood`` is False whenever the row is a shape we have not modelled: a
+    timeline event outside both the recipient-actor and doer-actor sets, or any
+    row from which no login is readable at all (a deleted account nulls every
+    field). The caller must turn that into UNCERTAINTY rather than treating an
+    unrecognised row as one that did not happen — every payload shape this code
+    has been wrong about so far was wrong in exactly that direction.
+
+    A recipient-actor event returns ``("", True)``: it is positively known to
+    testify to nobody acting, which is different from not being understood.
+    """
+    event = row.get("event")
+    if event is not None:
+        if not isinstance(event, str) or (
+            event not in _DOER_ACTOR_EVENTS
+            and event not in _RECIPIENT_ACTOR_EVENTS
+            and event not in _IDENTITY_FREE_EVENTS
+        ):
+            return "", False  # unmodelled timeline shape
+        if event in _RECIPIENT_ACTOR_EVENTS or event in _IDENTITY_FREE_EVENTS:
+            # Understood, and carrying no login we can attribute. Not uncertainty.
+            return "", True
+    for key in ("user", "actor", "author"):
+        value = row.get(key)
+        if not isinstance(value, dict):
+            continue
+        login = value.get("login")
+        if isinstance(login, str) and login:
+            return login, True
+    return "", False
+
+
+def _event_keys(row: dict) -> tuple[str, ...]:
+    """Which timestamps on this row testify that its actor DID something.
+
+    For a comment, review or timeline event, all of them: creating it and editing
+    it are both acting. For the THREAD object it is ``created_at`` alone — a
+    thread's ``updated_at`` moves whenever anybody touches it, and crediting that
+    to the thread's author would report the person who opened a pull request as
+    the actor behind somebody else's activity on it. That is the original defect
+    wearing a new hat.
+    """
+    return ("created_at",) if row.get(_THREAD_ROW_FLAG) else _EVENT_TIME_KEYS
+
+
+def _in_window_time(row: dict, since: str, until: str) -> str:
+    """The row's newest testifying timestamp INSIDE ``(since, until]``, or "".
+
+    Bounded on purpose, and used for ordering as well as membership: a comment
+    created in-window but edited after ``until`` is still in-window, and must not
+    then outrank someone who genuinely acted later within the window.
+    """
+    inside = [
+        t for k in _event_keys(row) if isinstance(t := row.get(k), str) and since < t <= until
+    ]
+    return max(inside) if inside else ""
+
+
+def _is_understood_shape(row: dict) -> bool:
+    """Is this a row whose shape we have positively classified?
+
+    Distinguishes "we know this carries no timestamp or login" from "we have
+    never seen this". Only the second is uncertainty. Without the distinction a
+    `committed` row — present on every real pull request timeline on this
+    install — makes every pull request permanently uncertain and the self/bot-only
+    drop unreachable, which is the entire behaviour this lane exists to provide.
+    """
+    event = row.get("event")
+    return isinstance(event, str) and (
+        event in _IDENTITY_FREE_EVENTS or event in _RECIPIENT_ACTOR_EVENTS
+    )
+
+
+def _has_readable_time(row: dict) -> bool:
+    """Does this row carry ANY string timestamp we know how to read?
+
+    A row with none is INVISIBLE to the window filter — it can neither prove nor
+    disprove that somebody acted, and silently vanishing is the failure mode that
+    let a commit-message mention be dropped (a commit payload's date lives at
+    ``commit.author.date``, and none of the keys read here exist on it).
+    """
+    return any(isinstance(row.get(k), str) and row.get(k) for k in _EVENT_TIME_KEYS)
+
+
+def _pull_url_to_issue_url(pull_url: str) -> str:
+    """`.../pulls/7` -> `.../issues/7`.
+
+    A pull request's CONVERSATION comments are served from the issues
+    spelling; only its inline REVIEW comments live under `/pulls/`. Anchored
+    to the trailing segment so a repo or owner containing "pulls" is untouched.
+    """
+    return re.sub(r"/pulls/(\d+)$", r"/issues/\1", pull_url)
 
 
 def _issue_num(issue_url: str) -> int | None:
