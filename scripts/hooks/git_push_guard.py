@@ -763,6 +763,36 @@ def _ci_identity(c: dict) -> tuple[str, str] | None:
     return None
 
 
+def _ci_completed_at(entry: dict) -> _dt.datetime | None:
+    """A check-run's ``completedAt`` as an OFFSET-AWARE datetime, or None.
+
+    None on anything that cannot be established: absent, blank, unparseable, or
+    parsed but NAIVE. A NON-STRING value is the one shape that does not return
+    None -- ``.strip()`` raises AttributeError out of this helper, which
+    ``run_guard`` converts to exit 2, a BLOCK. Unreachable from GitHub (the
+    ``DateTime`` scalar is string-or-null) and fail-closed either way, but the
+    enumeration above would otherwise be false. Every caller treats None as "cannot be compared", which on
+    this path means an unparseable SUCCESS supersedes nothing and an unparseable
+    CANCEL is kept — the fail-closed direction.
+
+    Naive is rejected rather than assumed UTC. Comparing a naive datetime against
+    an aware one raises TypeError, and the alternative to rejecting it is guessing
+    a zone, which is exactly the kind of assumption this function exists to stop
+    relying on. GitHub has always sent an offset; if it ever sends a bare value,
+    the gate should get stricter, not luckier.
+    """
+    raw = (entry.get("completedAt") or "").strip()
+    if not raw:
+        return None
+    try:
+        # `fromisoformat` accepts a literal `Z` from 3.11, but normalising first
+        # costs nothing and keeps this readable against older interpreters.
+        parsed = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
 def _drop_superseded_cancels(checks: list) -> list:
     """Return *checks* with superseded ``concurrency: cancel-in-progress`` duplicates
     removed — a CANCELLED CheckRun is dropped ONLY when a SUCCESS of the EXACT same
@@ -811,45 +841,57 @@ def _drop_superseded_cancels(checks: list) -> list:
     * Entries that are not dicts are passed through untouched, so a caller's own
       shape checks still see the payload it was given.
 
-    Comparison is a lexicographic string compare of two ISO-8601 ``completedAt``
-    values, both sides terminal COMPLETED runs that always carry one. This is NOT
-    the pulled #1420 finding-magnet, which sorted the WHOLE set (including QUEUED
-    runs with a null ``startedAt``) to pick a global "latest".
+    Comparison PARSES both ``completedAt`` values and compares datetimes, in both
+    passes. This is NOT the pulled #1420 finding-magnet, which sorted the WHOLE set
+    (including QUEUED runs with a null ``startedAt``) to pick a global "latest".
 
-    THE ASSUMPTION THAT COMPARE RESTS ON, stated so a future reader knows what would
-    invalidate it: GitHub's GraphQL ``completedAt`` is emitted as second-precision
-    UTC with a literal ``Z`` (MEASURED 2017/2017 entries across 122 PR rollups — every
-    one ``Z``-suffixed with no fractional part). That is an OBSERVATION, not a
-    contract: GitHub's schema documents the ``DateTime`` scalar only as "An ISO-8601
-    encoded UTC date string", which constrains neither sub-second precision nor the
-    offset spelling. Lexicographic ordering equals chronological ordering only while
-    EVERY value shares one format. Two shapes would break it — a ``+00:00`` offset
-    instead of ``Z``, and fractional seconds (``'Z'`` sorts ABOVE ``'.'``, so a SUCCESS
-    at ``:00Z`` would compare as later than a cancel at ``:00.9Z`` and wrongly drop
-    it). Neither is observed here. If either ever appears, PARSE both sides and
-    compare datetimes — in BOTH passes; do not patch one, and do not paper over it
-    with more string rules.
+    IT USED TO BE A LEXICOGRAPHIC STRING COMPARE, and the reason it no longer is
+    was written down here before it was acted on. GitHub's GraphQL ``completedAt``
+    is emitted as second-precision UTC with a literal ``Z`` (MEASURED 2017/2017
+    entries across 122 PR rollups — every one ``Z``-suffixed with no fractional
+    part). That is an OBSERVATION, not a contract: the schema documents the
+    ``DateTime`` scalar only as "An ISO-8601 encoded UTC date string", which
+    constrains neither sub-second precision nor the offset spelling. String order
+    equals chronological order only while EVERY value shares one format, and two
+    real shapes break it — a ``+00:00`` offset instead of ``Z``, and fractional
+    seconds (``'Z'`` sorts ABOVE ``'.'``, so a SUCCESS at ``:00Z`` compares as later
+    than a cancel at ``:00.9Z`` and wrongly drops it). The consequence is not
+    cosmetic: `_mechanical_scan_is_green` consumes this, so a reversed ordering
+    drops a real cancellation and carries an old leaks review forward — and under
+    ``# ci-override`` that relief is the only remaining check of the mechanical
+    layer. An observation is not a thing to gate on when parsing costs one call.
+
+    ``_ci_completed_at`` fails CLOSED on anything it cannot parse into an
+    OFFSET-AWARE datetime, including a naive value: an unparseable SUCCESS cannot
+    supersede anything, and an unparseable CANCEL is kept. Naive is excluded rather
+    than assumed-UTC because comparing naive against aware raises, and guessing a
+    zone to avoid that is how a wrong-green gets built.
     """
     # Pass 1: the latest completedAt among SUCCESS runs, per strict identity.
-    success_latest: dict[tuple[str, str], str] = {}
+    success_latest: dict[tuple[str, str], _dt.datetime] = {}
     for c in checks:
         if not isinstance(c, dict) or c.get("conclusion") not in _CI_GREEN:
             continue
         ident = _ci_identity(c)
-        ts = (c.get("completedAt") or "").strip()
-        if ident is None or not ts:
+        ts = _ci_completed_at(c)
+        if ident is None or ts is None:
             continue
-        if ts > success_latest.get(ident, ""):
+        known = success_latest.get(ident)
+        if known is None or ts > known:
             success_latest[ident] = ts
 
-    # Pass 2: drop only the cancels pass 1 proves superseded.
+    # Pass 2: drop only the cancels pass 1 proves superseded. STRICTLY after, so a
+    # tie keeps the cancel: equal second-precision stamps make the ordering
+    # unprovable, and unprovable must not mean droppable.
     kept: list = []
     for c in checks:
         if isinstance(c, dict) and c.get("conclusion") in _CI_CANCEL_CONCLUSIONS:
             ident = _ci_identity(c)
-            cts = (c.get("completedAt") or "").strip()
-            if ident is not None and cts and success_latest.get(ident, "") > cts:
-                continue
+            cts = _ci_completed_at(c)
+            if ident is not None and cts is not None:
+                latest = success_latest.get(ident)
+                if latest is not None and latest > cts:
+                    continue
         kept.append(c)
     return kept
 

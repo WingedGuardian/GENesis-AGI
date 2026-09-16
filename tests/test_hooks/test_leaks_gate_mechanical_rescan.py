@@ -768,6 +768,77 @@ class TestDropSupersededCancelsUnit:
         success = _run("SUCCESS", completed_at=SUCCESS_AT)
         assert _mod._drop_superseded_cancels([cancel, success]) == [success]
 
+    def test_fractional_seconds_do_not_reverse_the_ordering(self):
+        """The shape the old string compare got BACKWARDS, and the reason it is gone.
+
+        ``'Z'`` sorts above ``'.'``, so a SUCCESS at ``:00Z`` string-compares as LATER
+        than a cancel at ``:00.9Z`` — and the cancel is dropped even though it
+        genuinely completed afterwards. The docstring named this as the thing that
+        would invalidate the compare; GitHub's ``DateTime`` scalar is documented only
+        as "An ISO-8601 encoded UTC date string", which constrains neither sub-second
+        precision nor the offset spelling, so the old ordering rested on an
+        observation rather than a contract.
+
+        It is not cosmetic: `_mechanical_scan_is_green` consumes this, so a reversed
+        ordering carries an old leaks review forward, and under `# ci-override` that
+        relief is the only remaining check of the mechanical layer.
+        """
+        cancel = _run("CANCELLED", completed_at="2026-09-09T16:20:00.9Z")
+        success = _run("SUCCESS", completed_at="2026-09-09T16:20:00Z")
+        assert _mod._drop_superseded_cancels([cancel, success]) == [cancel, success], (
+            "a SUCCESS that finished BEFORE the cancel dropped it — string ordering"
+        )
+
+    def test_an_offset_spelling_does_not_reverse_the_ordering(self):
+        """The other shape: ``+00:00`` instead of ``Z``, at the SAME INSTANT.
+
+        The same instant has to be the fixture, and the first version of this test
+        got that wrong — it put the two five seconds apart, so the SECONDS DIGIT
+        decided the string comparison and the pre-fix code reached the same verdict.
+        It passed against the bug it was written to catch.
+
+        The discriminating case is a TIE with different spellings: ``+`` is 0x2B and
+        ``Z`` is 0x5A, so a ``+00:00`` cancel sorts BELOW a ``Z`` success at the same
+        second, and the string compare reads that as "the success came later" and
+        drops a cancellation that did not lose any race. A tie must KEEP.
+        """
+        cancel = _run("CANCELLED", completed_at="2026-09-09T16:20:00+00:00")
+        success = _run("SUCCESS", completed_at="2026-09-09T16:20:00Z")
+        assert _mod._drop_superseded_cancels([cancel, success]) == [cancel, success], (
+            "same instant, two spellings — the offset sorted below Z and dropped a "
+            "cancellation that nothing superseded"
+        )
+
+    def test_mixed_spellings_still_drop_a_genuinely_later_success(self):
+        """CONTROL for both cases above. Parsing must not blind the drop — a success
+        that really is later still supersedes, however either side is spelled."""
+        cancel = _run("CANCELLED", completed_at="2026-09-09T16:20:00.5Z")
+        success = _run("SUCCESS", completed_at="2026-09-09T16:21:00+00:00")
+        assert _mod._drop_superseded_cancels([cancel, success]) == [success]
+
+    def test_an_unparseable_timestamp_keeps_the_cancel(self):
+        """Fail CLOSED on both sides. An unparseable SUCCESS supersedes nothing, and
+        an unparseable CANCEL is kept — a value we cannot order is not evidence."""
+        cancel = _run("CANCELLED", completed_at=CANCEL_AT)
+        bad_success = _run("SUCCESS", completed_at="not-a-timestamp")
+        assert _mod._drop_superseded_cancels([cancel, bad_success]) == [cancel, bad_success]
+
+        bad_cancel = _run("CANCELLED", completed_at="not-a-timestamp")
+        success = _run("SUCCESS", completed_at=SUCCESS_AT)
+        assert _mod._drop_superseded_cancels([bad_cancel, success]) == [bad_cancel, success]
+
+    def test_a_naive_timestamp_is_not_assumed_utc(self):
+        """A value with no offset is rejected, not guessed at.
+
+        Comparing naive against aware raises, and the alternative to rejecting it is
+        picking a zone on the value's behalf — which is the same class of assumption
+        the string compare was removed for. If GitHub ever sends a bare value the gate
+        gets stricter, not luckier.
+        """
+        cancel = _run("CANCELLED", completed_at="2026-09-09T16:20:00")
+        success = _run("SUCCESS", completed_at="2026-09-09T16:21:00Z")
+        assert _mod._drop_superseded_cancels([cancel, success]) == [cancel, success]
+
     def test_decoy_workflow_cannot_supersede(self):
         """Identity is (name, workflowName). Locked AT THE PRIMITIVE, not only at its
         callers: both of them independently filter by workflow, so a name-only
@@ -874,6 +945,90 @@ class TestWorkflowDisplayNameIsUniqueProvenance:
         vacuously true, and this test would then pass while proving nothing."""
         assert self._WORKFLOW_DIR.is_dir(), f"{self._WORKFLOW_DIR} missing"
         assert self._display_names(), "no workflow declares a `name:` — guard is vacuous"
+
+    def _job_display_names(self) -> dict[str, dict[str, list[str]]]:
+        """``{workflow display name: {job display name: [job ids]}}``.
+
+        A job's check-run is published under its `name:` when it declares one, and
+        under its JOB ID otherwise — the same rule GitHub applies to workflows.
+        """
+        import yaml
+
+        out: dict[str, dict[str, list[str]]] = {}
+        for path in sorted(self._WORKFLOW_DIR.glob("*.y*ml")):
+            try:
+                doc = yaml.safe_load(path.read_text()) or {}
+            except yaml.YAMLError as exc:
+                pytest.fail(f"{path.name} is not parseable YAML: {exc}")
+            if not isinstance(doc, dict):
+                continue
+            workflow = doc.get("name")
+            workflow = workflow.strip() if isinstance(workflow, str) and workflow.strip() else path.name
+            jobs = doc.get("jobs")
+            if not isinstance(jobs, dict):
+                continue
+            per_job = out.setdefault(workflow, {})
+            for job_id, job in jobs.items():
+                declared = job.get("name") if isinstance(job, dict) else None
+                display = (
+                    declared.strip()
+                    if isinstance(declared, str) and declared.strip()
+                    else str(job_id)
+                )
+                per_job.setdefault(display, []).append(str(job_id))
+        return out
+
+    def test_no_two_jobs_in_one_workflow_share_a_display_name(self):
+        """The OTHER half of the precondition, and the one the across-files guard
+        below does not cover.
+
+        `_ci_identity` is `(name, workflowName)`. Two workflow FILES sharing a
+        display name collide — that is the test below. But two JOBS inside ONE file
+        produce the identical tuple just as easily, and nothing in GitHub's syntax
+        forbids it: `jobs.<id>.name` has no uniqueness constraint either. If an
+        auxiliary job in `CI` were also displayed as `leak-detector`, its SUCCESS
+        could supersede the real scanner's CANCELLED in `_drop_superseded_cancels`
+        and then satisfy the pin in `_mechanical_scan_is_green` — granting relief
+        from the irreducible leaks gate off a job that never scanned anything.
+
+        Closing the precondition is the cheap complete move for the same reason
+        the class docstring gives for the across-files case: real provenance
+        (`workflowRun.workflow.databaseId`) is not exposed by
+        `gh pr view --json statusCheckRollup`, so binding to it means abandoning
+        that read path entirely.
+
+        NOTE what this does NOT catch: a matrix job publishes one check-run per
+        combination, named `<display> (<values>)`, so a matrix could in principle
+        generate a name equal to another job's. That needs the matrix values to be
+        known statically and is not reachable in this repo today; it is recorded
+        here rather than silently out of scope.
+        """
+        collisions = {
+            workflow: {n: ids for n, ids in jobs.items() if len(ids) > 1}
+            for workflow, jobs in self._job_display_names().items()
+        }
+        collisions = {w: c for w, c in collisions.items() if c}
+        assert not collisions, (
+            "two jobs in one workflow publish the same check-run display name, so "
+            "`(name, workflowName)` no longer identifies a single job and one job's "
+            f"SUCCESS can erase another's CANCELLED: {collisions}"
+        )
+
+    def test_the_job_scan_actually_sees_jobs(self):
+        """Guard-the-guard, matching the one above it: a parse that yielded no jobs
+        would make the collision assertion vacuously true."""
+        found = self._job_display_names()
+        assert found, "no workflow yielded any jobs — the job guard is vacuous"
+        # FILE COVERAGE, not a grand total. MEASURED: 16 job display names across 3
+        # files, but 14 of them come from one — so a total-only floor of 10 would
+        # still pass while silently dropping the other two files (the parse
+        # `continue`s a workflow whose `jobs:` is not a dict), leaving their
+        # collision check vacuous. Counting files catches the miss the total hides.
+        on_disk = {p.name for p in self._WORKFLOW_DIR.glob("*.y*ml")}
+        assert len(found) == len(on_disk), (
+            f"parsed jobs from {len(found)} workflow(s) but {len(on_disk)} are on "
+            f"disk — a file was silently skipped, so its collision check is vacuous"
+        )
 
     def test_no_two_workflow_files_share_a_display_name(self):
         collisions = {n: f for n, f in self._display_names().items() if len(f) > 1}
