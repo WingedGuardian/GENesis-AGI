@@ -175,9 +175,11 @@ list means "none" — so only omit it once you have looked; write
 means the whole file is live.
 
 **`pinned.main` is the field that pays for itself**: it makes
-`git log --oneline <pinned.main>..origin/main` a one-command staleness read, on
-a document whose line numbers and PR heads otherwise go quietly false. A moved
-main means re-verify, never that the plan is wrong.
+`git fetch origin main --quiet && git log --oneline <pinned.main>..origin/main`
+a one-command staleness read, on a document whose line numbers and PR heads
+otherwise go quietly false. The fetch is load-bearing — against an unfetched
+`origin/main` the command prints nothing and reads as "no drift". A moved main
+means re-verify, never that the plan is wrong.
 
 Nothing checks any of this yet — the header is written by hand, and a plan
 missing it fails silently. Rationale field-by-field, what the divider does NOT

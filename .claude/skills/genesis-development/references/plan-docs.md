@@ -9,18 +9,23 @@ modes follow from the difference. The header exists to close these three —
 nothing else. Two are measured on this install; the third is a mechanical
 property, marked as such.
 
-1. **Nothing reads a plan file's COMMITMENTS back.** Three things do enumerate
-   the plan directory — `memory/open_loops._plan_lines()` (which renders the
-   SessionStart in-flight block), `mcp/memory/locate.py`'s `plans` scope, and
-   `scripts/plan_bookmark_hook.py` — so "a plan doc is read by nobody" is
-   false, and an earlier draft of this file said it. What is true is narrower
-   and worse: all three key on **filename and mtime**, and the third opens the
-   file only for its title. None reads what the plan OWES. So a commitment
-   living only in a plan file is enumerated by nothing, which is how finished,
-   tested code sat unpushed for a day and a half on this install
-   (CLAUDE.md, zero-drop rule). The header's tracker ids are the cheap half of
-   the fix: they make the plan→tracker direction navigable. The tracker→plan
-   direction still is not.
+1. **Nothing reads a plan file's COMMITMENTS back.** Several things do read the
+   plan directory — `memory/open_loops._plan_lines()` (which renders the
+   SessionStart in-flight block, by filename and mtime), `mcp/memory/locate.py`'s
+   `plans` scope (which will content-search a plan when given `contains`), and
+   `scripts/plan_bookmark_hook.py` (which takes an explicit path from hook
+   input, falling back to mtime, and opens the file for its title and a task
+   count). So "a plan doc is read by nobody" is false — an earlier draft said
+   that — and so is "they all key on filename and mtime", which is what the
+   first correction replaced it with. Both were too broad.
+
+   What actually holds is narrower: **none of them extracts what the plan
+   OWES.** Enumeration is by path or mtime, the content reads are keyword
+   search and a heading, and nothing maps a plan to the work it has promised.
+   That is how finished, tested code sat unpushed for a day and a half on this
+   install (CLAUDE.md, zero-drop rule). The header's tracker ids are the cheap
+   half of the fix: they make the plan→tracker direction navigable. The
+   tracker→plan direction still is not.
 
 2. **A plan accretes, and the format offers no signal for which part is live.**
    A long-running plan file on this install reached **4,488 lines, of which
@@ -122,10 +127,21 @@ because several plans on this install are neither active nor finished, and
 without a word for that state they stay labelled `active` forever.
 
 **`updated` + `pinned.main`** — together they answer "what was this written
-against?" mechanically: `git log --oneline <pinned.main>..origin/main` is then
-a one-command staleness read. Both are defined against the same event — a
-revision of the LIVE section — so an edit confined to the archaeology zone
-moves neither. A moved main means re-verify, never that the plan is wrong.
+against?" mechanically:
+
+```bash
+git fetch origin main --quiet && git log --oneline <pinned.main>..origin/main
+```
+
+**The fetch is not optional and not decoration.** `origin/main` is a local
+remote-tracking ref: without fetching, a clone that has not synced compares
+against its own stale copy and prints nothing, which reads as "no drift" — the
+exact silent false negative this field exists to prevent. A staleness check that
+can itself be stale is worse than none, because it answers confidently.
+
+Both fields are defined against the same event — a revision of the LIVE
+section — so an edit confined to the archaeology zone moves neither. A moved
+main means re-verify, never that the plan is wrong.
 
 **`decisions` / `ledger` / `issues`** — the plan's handles into the systems
 that are read back. A ledger row says what was agreed in one sentence; the plan
