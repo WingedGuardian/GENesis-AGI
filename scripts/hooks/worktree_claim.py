@@ -242,6 +242,31 @@ def proc_starttime(pid: int) -> int | None:
         return None
 
 
+def proc_is_gone(pid: int) -> bool:
+    """True ONLY when the kernel says this pid does not exist.
+
+    Every other failure is "cannot tell", not "gone": EACCES under ``hidepid``,
+    EMFILE when the caller has exhausted its descriptors, a foreign PID
+    namespace, a hardened or unmounted ``/proc``. ``os.stat`` is deliberate --
+    it consumes no file descriptor, so it still answers in the one case
+    (EMFILE) where the reads above cannot, and a reaper that has run out of
+    descriptors is exactly when this question gets asked wrongly.
+    """
+    try:
+        os.stat(f"/proc/{pid}")
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _liveness_unknown(pid: int) -> bool:
+    """True when ``/proc`` could not answer for ``pid`` AND the kernel has not
+    said it is gone -- i.e. the honest answer is "I cannot tell"."""
+    return _proc_fields(pid) is None and not proc_is_gone(pid)
+
+
 def proc_ppid(pid: int) -> int | None:
     """Field 4 of ``/proc/<pid>/stat`` -- the parent pid."""
     fields = _proc_fields(pid)
@@ -316,16 +341,34 @@ def pid_is_live_session(pid: int | None, start: int | None = None) -> bool:
         # defeats reuse -- which is this module's own argument for recording it.
         # The argv[0] check is deliberately NOT consulted here. It is required on
         # the WRITE path, where claiming as the launcher shell would be wrong,
-        # and harmful on this one: it adds a whole class of false-dead (a
-        # different uid, a PID namespace, a hardened /proc, a renamed launcher)
-        # and every one of those resolves toward RELEASING a live session's
-        # claim. An identity check that must pass to TAKE a claim is not
-        # automatically the right check to RELEASE one.
-        return proc_starttime(pid) == start
+        # and harmful on this one: it adds false-dead cases, and every one of
+        # those resolves toward RELEASING a live session's claim. An identity
+        # check that must pass to TAKE a claim is not automatically the right
+        # check to RELEASE one. BE PRECISE ABOUT WHAT DROPPING IT BUYS: the
+        # renamed launcher, and only that. A different uid, a PID namespace and
+        # a hardened /proc reach `stat` exactly as they reached `cmdline`, so
+        # those three are handled below by the gone/unknown split, not here.
+        #
+        # AN UNREADABLE /proc IS NOT A DEAD PROCESS. `proc_starttime` collapses
+        # every failure to None, and comparing None to a recorded start reported
+        # DEAD -- so a live session's claim was released whenever its stat file
+        # could not be read. MEASURED, against a live pid with its true start
+        # time: EACCES -> "(True, claiming session is gone)", EMFILE -> the same.
+        # The three false-dead classes the comment above lists as the reason for
+        # dropping the argv[0] check reach `stat` exactly as they reached
+        # `cmdline`; only the renamed launcher was actually removed by that
+        # change. What separates gone from unknown is the kernel, below.
+        observed = proc_starttime(pid)
+        if observed is not None:
+            return observed == start
+        return _liveness_unknown(pid)
     # Legacy payloads only: no recorded start, so fall back to "is a session
     # process". Weaker, and it keeps the same false-dead exposure -- which is
-    # why `build_payload` always records a start now.
-    return is_session_process(pid)
+    # why `build_payload` always records a start now. The unknown/gone split
+    # applies here for the same reason: a negative from `is_session_process`
+    # means either "/proc answered and this is not a session" or "/proc did not
+    # answer at all", and only the first may release a claim.
+    return is_session_process(pid) or _liveness_unknown(pid)
 
 
 # --------------------------------------------------------------------------
@@ -411,12 +454,21 @@ def read_lock(root: Path) -> Lock | None:
     ``shutil.move`` rather than ``git worktree remove``, so git's own refusal is
     NOT a backstop for it -- an unknown that reads as None gets reaped.
 
-    A gitdir that cannot be resolved at all still returns None: that is not a
-    worktree we can reason about, and it is the same answer an unlocked plain
-    directory gives.
+    A gitdir that cannot be resolved BECAUSE THERE IS NO ``.git`` FILE returns
+    None: that is not a linked worktree, and it is the same answer an unlocked
+    plain directory gives. A ``.git`` file that EXISTS and could not be read is
+    a different fact -- an unknown -- and takes the same answer as the
+    unreadable ``locked`` file below. Fixing only the second read left the class
+    open: a locked worktree whose ``.git`` pointer is unreadable still read as
+    unclaimed, and therefore reapable.
     """
     gitdir = gitdir_for(root)
     if gitdir is None:
+        try:
+            if (root / ".git").is_file():
+                return Lock(raw="", payload=None, foreign=True)
+        except OSError:
+            return Lock(raw="", payload=None, foreign=True)
         return None
     locked = gitdir / "locked"
     try:
@@ -516,12 +568,30 @@ def lock_worktree(root: Path, payload: dict) -> bool:
     return bool(result and result.returncode == 0)
 
 
-def unlock_worktree(root: Path) -> bool:
-    """Release our lock on ``root``. Refuses to touch a FOREIGN lock."""
+def unlock_worktree(root: Path, *, expect_pid: int | None = None) -> bool:
+    """Release a lock on ``root``.
+
+    Refuses a FOREIGN lock, and refuses a claim a LIVE session still holds
+    unless ``expect_pid`` names that very session -- the owner releasing its own
+    claim on the way out.
+
+    "OURS" IN THIS MODULE MEANS "WRITTEN BY THIS MODULE", which is every
+    session's claim, not this process's. Refusing only `foreign` therefore let
+    any caller release any peer's live claim, while this docstring said it
+    refused to. The single stated invariant -- a live session's claim is never
+    released -- has to hold in the primitive, because the caller it exists for
+    is the reaper, which moves directories with `shutil.move` rather than asking
+    git to remove them, so git's refusal to remove a locked worktree is not a
+    backstop for it. A caller with no pid to offer gets the stale-only
+    behaviour.
+    """
     lock = read_lock(root)
-    if lock is None:
+    if lock is None or lock.foreign:
         return False
-    if lock.foreign:
+    if expect_pid is not None:
+        if (lock.payload or {}).get("pid") != expect_pid:
+            return False
+    elif not is_releasable(lock)[0]:
         return False
     result = _git(root, "worktree", "unlock", str(root))
     return bool(result and result.returncode == 0)

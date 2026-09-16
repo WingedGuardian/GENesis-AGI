@@ -258,13 +258,12 @@ def test_a_recycled_pid_reads_as_dead_when_the_starttime_disagrees(monkeypatch) 
     equivalent to the pid having been recycled, and not reproducible by waiting
     for the kernel to actually recycle one.
 
-    THE EXE CHECK IS PATCHED OPEN ON PURPOSE. ``pid_is_live_session`` tests
-    ``is_session_process`` BEFORE it compares start times, and a stand-in process
-    is not named `claude` -- so without this the function returns False on the
-    exe-name branch and the start-time comparison is never reached. An earlier
-    version of this test did exactly that: it passed, while a mutation deleting
-    the entire start-time check ALSO passed. Verified by re-running that mutation
-    against this version, which now fails.
+    The exe-name patch below is now INERT and kept only as a guard: since the
+    release path stopped consulting ``is_session_process`` when a start time is
+    recorded, this test reaches the start-time comparison whether or not the
+    stand-in process is named `claude`. An earlier version of this test did NOT
+    reach it -- it passed while a mutation deleting the entire start-time check
+    also passed -- so the assertion below is the part that carries the weight.
     """
     monkeypatch.setattr(wc, "is_session_process", lambda pid: True)
     proc = subprocess.Popen(["sleep", "30"])
@@ -585,3 +584,123 @@ def test_values_that_can_never_be_live_are_foreign(repo, worktree, reason) -> No
     lock = wc.read_lock(worktree)
     assert lock is not None
     assert lock.foreign is True
+
+
+# ─── an UNKNOWN liveness answer must never read as DEAD ─────────────────────
+
+
+def test_an_unreadable_proc_keeps_a_live_claim(monkeypatch) -> None:
+    """A /proc that cannot be read is not a dead process.
+
+    ``proc_starttime`` collapses every failure to None, and comparing None to a
+    recorded start time reported DEAD -- so a live session's claim released
+    whenever its stat file could not be read. MEASURED against a live pid
+    carrying its TRUE start time, before the fix:
+        EACCES on /proc/<pid>/stat -> is_releasable (True, 'session is gone')
+        EMFILE                     -> is_releasable (True, 'session is gone')
+    Both are reachable in the consumer this exists for: hidepid, a PID
+    namespace, and a reaper that has exhausted its descriptors part-way through
+    a sweep.
+    """
+    pid = os.getpid()
+    start = wc.proc_starttime(pid)
+    assert start is not None, "precondition: our own start time is readable"
+
+    real_open = open
+
+    def deny(path, *args, **kwargs):
+        if isinstance(path, str) and path.startswith("/proc/") and path.endswith("/stat"):
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", deny)
+    assert wc.pid_is_live_session(pid, start) is True, (
+        "an unreadable /proc reported a LIVE session as dead — the claim releases "
+        "and the reaper moves the directory out from under it"
+    )
+    payload = P(wc.RULE_CLAIM, pid=pid, start=start)
+    lock = wc.Lock(raw=wc.format_reason(payload), payload=payload, foreign=False)
+    assert wc.is_releasable(lock)[0] is False
+
+
+def test_a_pid_the_kernel_says_is_gone_still_releases() -> None:
+    """The control for the direction above. If UNKNOWN kept every claim, a claim
+    would never release at all, which is the pinned-worktree leak from the other
+    side. Only the kernel's own "no such process" may release one."""
+    proc = subprocess.Popen(["sleep", "0.1"])
+    proc.wait()
+    time.sleep(0.05)
+    assert wc.proc_is_gone(proc.pid) is True
+    assert wc.pid_is_live_session(proc.pid, 12345) is False
+    assert wc.proc_is_gone(os.getpid()) is False, "control: we are not gone"
+
+
+def test_unlock_refuses_a_claim_a_live_session_still_holds(repo, worktree) -> None:
+    """"Ours" means "written by this module", which is EVERY session's claim.
+
+    Refusing only foreign locks let any caller release any peer's live claim,
+    while the docstring said it refused to. The reaper trashes with
+    ``shutil.move``, so git's refusal to remove a locked worktree is not a
+    backstop for it: one unlock without a liveness gate silently removes a live
+    session's protection.
+    """
+    pid = os.getpid()
+    start = wc.proc_starttime(pid)
+    assert wc.lock_worktree(worktree, P(wc.RULE_CLAIM, pid=pid, start=start)) is True
+
+    assert wc.unlock_worktree(worktree) is False, (
+        "released a claim held by a LIVE session"
+    )
+    assert wc.read_lock(worktree) is not None, "the lock must still be there"
+
+    assert wc.unlock_worktree(worktree, expect_pid=pid + 1) is False, (
+        "released a claim while naming a DIFFERENT session"
+    )
+    assert wc.unlock_worktree(worktree, expect_pid=pid) is True, (
+        "control: the owner must still be able to release its own claim"
+    )
+    assert wc.read_lock(worktree) is None
+
+
+def test_a_stale_claim_is_still_released_without_a_pid(repo, worktree, monkeypatch) -> None:
+    """The control for the gate above: a claim whose session is gone must still
+    release through the no-pid call, or the reaper can never clean up."""
+    proc = subprocess.Popen(["sleep", "0.1"])
+    proc.wait()
+    time.sleep(0.05)
+    assert wc.lock_worktree(worktree, P(wc.RULE_CLAIM, pid=proc.pid, start=4242)) is True
+    assert wc.unlock_worktree(worktree) is True
+    assert wc.read_lock(worktree) is None
+
+
+def test_an_unreadable_git_pointer_is_foreign_not_absent(repo, worktree, monkeypatch) -> None:
+    """The round-2 fix closed the INSTANCE, not the class.
+
+    ``read_lock`` reaches the ``locked`` file through ``gitdir_for``, which
+    swallowed every OSError on the ``.git`` pointer and returned None -- so a
+    genuinely locked worktree whose pointer could not be read still answered
+    "there is no lock", and the reaper reaps that.
+    """
+    payload = P(wc.RULE_CLAIM, pid=os.getpid(), start=99)
+    assert wc.lock_worktree(worktree, payload) is True
+
+    real_read = pathlib.Path.read_text
+
+    def unreadable(self, *args, **kwargs):
+        if self.name == ".git":
+            raise PermissionError(13, "Permission denied")
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", unreadable)
+    lock = wc.read_lock(worktree)
+    assert lock is not None, "an unreadable .git pointer read as NO LOCK"
+    assert lock.foreign is True
+    assert wc.is_releasable(lock)[0] is False
+
+
+def test_a_directory_with_no_git_file_is_still_no_lock(tmp_path) -> None:
+    """Control: the fix must not turn every plain directory into a foreign lock,
+    which would make the whole tree unreapable."""
+    plain = tmp_path / "not-a-worktree"
+    plain.mkdir()
+    assert wc.read_lock(plain) is None
