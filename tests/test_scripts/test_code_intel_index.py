@@ -21,7 +21,6 @@ import os
 import re
 import stat
 import subprocess
-import tempfile
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -677,7 +676,7 @@ def test_installer_does_not_claim_queue_success_after_writer_failure():
 
 # ── the cap must be bounded by what the INSTALL has, not by a constant ───────
 
-def _headroom_decision(ceiling_gib: int, want: str = "8G") -> tuple[str, str]:
+def _headroom_decision(tmp_path, ceiling_gib: int, want: str = "8G") -> tuple[str, str]:
     """Run the SHIPPED decision block at a given install size.
 
     The block is EXTRACTED from the real script rather than re-typed: a copy
@@ -687,9 +686,12 @@ def _headroom_decision(ceiling_gib: int, want: str = "8G") -> tuple[str, str]:
     start = src.index("_genesis_mem_bytes() {")
     end = src.index("\nfi\n", src.index("GITNEXUS_MEM_REFUSE=")) + len("\nfi\n")
     block = src[start:end]
-    with tempfile.TemporaryDirectory(dir="/home/ubuntu/tmp") as d:
-        blockfile = Path(d) / "block.sh"
-        blockfile.write_text(block)
+    # pytest's tmp_path, NOT a hardcoded directory: an absolute path under a
+    # home directory puts a username in a public repo and breaks the test on
+    # every other machine.
+    blockfile = tmp_path / "block.sh"
+    blockfile.write_text(block)
+    if True:
         out = subprocess.run(
             ["bash", "-c",
              f'source "{blockfile}" >/dev/null 2>&1; '
@@ -705,7 +707,7 @@ def _headroom_decision(ceiling_gib: int, want: str = "8G") -> tuple[str, str]:
     return cap, why
 
 
-def test_a_small_install_refuses_the_rebuild_rather_than_capping_it_uselessly():
+def test_a_small_install_refuses_the_rebuild_rather_than_capping_it_uselessly(tmp_path):
     """A fixed 8G cap is a cap, not a reservation.
 
     On a 4-5 GiB container it is worse than no cap: the child scope never
@@ -718,16 +720,16 @@ def test_a_small_install_refuses_the_rebuild_rather_than_capping_it_uselessly():
     below that a cap cannot bite and the job is refused instead.
     """
     for gib in (4, 5, 6):
-        cap, why = _headroom_decision(gib)
+        cap, why = _headroom_decision(tmp_path, gib)
         assert why, f"a {gib} GiB install was allowed to start a rebuild (cap {cap})"
         assert "total" in why and "rebuild needs" in why, why
 
 
-def test_a_mid_size_install_gets_the_cap_trimmed_to_its_headroom():
+def test_a_mid_size_install_gets_the_cap_trimmed_to_its_headroom(tmp_path):
     """The control that moves in the first direction: not every small-ish box is
     refused. At 8 GiB there IS room once siblings are reserved, so the cap is
     lowered to the headroom rather than left at a value the box cannot honour."""
-    cap, why = _headroom_decision(8)
+    cap, why = _headroom_decision(tmp_path, 8)
     assert not why, f"an 8 GiB install was refused: {why}"
     assert cap.endswith("M"), cap
     trimmed = int(cap[:-1]) * 1024 * 1024
@@ -738,10 +740,10 @@ def test_a_mid_size_install_gets_the_cap_trimmed_to_its_headroom():
     )
 
 
-def test_a_large_install_is_left_alone():
+def test_a_large_install_is_left_alone(tmp_path):
     """The control that moves in the other direction. Without it, a change that
     refused or trimmed everywhere would satisfy both tests above."""
     for gib in (16, 32):
-        cap, why = _headroom_decision(gib)
+        cap, why = _headroom_decision(tmp_path, gib)
         assert not why, f"a {gib} GiB install was refused: {why}"
         assert cap == "8G", f"a {gib} GiB install had its cap changed to {cap}"
