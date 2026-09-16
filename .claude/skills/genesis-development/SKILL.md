@@ -245,21 +245,95 @@ the tool wrapper SIGTERMs the whole call at its own `timeout` param (default
 120000ms → exit 143). To allow longer, set that `timeout` PARAMETER explicitly —
 **but you cannot exceed 600000ms.** A larger value does not buy more time; the
 call still dies at 10 minutes (MEASURED 2026-08-27: `timeout: 1600000` was killed
-at exactly `10m 0s`). Anything that might run past ten minutes therefore has only
-ONE correct form — `run_in_background: true`. Treat "raise the timeout" as a fix
-that tops out, not one that scales.
+at exactly `10m 0s`). Treat "raise the timeout" as a fix that tops out, not one
+that scales.
 
-For long or unbounded work — above all deploys (`scripts/update.sh`,
-`bootstrap.sh`, `host-setup.sh`: container align + guardian redeploy + host
-`update-node`/`update-cc`, run sequentially — routinely exceed 600s and so CANNOT
-be done in the foreground at any timeout value) — run via **`run_in_background: true`**
-(harness-tracked, notifies on completion, no timeout ceiling), NEVER a foreground
-timeout or `nohup … &` (detached but untracked → no completion signal, so you end
-up hand-polling anyway). `update.sh` has SIGTERM/INT rollback traps, so a mid-run
-kill is not a no-op — verify state (server active, no mid-rebase, pin, both CC
-versions) before re-running; it is idempotent. (A non-blocking PreToolUse advisory
-hook, `.claude/hooks/cc-deploy-timeout-guard`, nudges toward this when a deploy is
-run in the foreground.)
+For long or unbounded work generally, use **`run_in_background: true`** —
+harness-tracked, notifies on completion, and it does NOT inherit the 120s default
+(MEASURED 2026-09-16: a 400s background task completed clean, exit 0). Prefer it
+over a foreground timeout or `nohup … &` (detached but untracked → no completion
+signal, so you end up hand-polling anyway).
+
+**DEPLOYS ARE THE EXCEPTION, and this is the one to get right.**
+`scripts/update.sh`, `bootstrap.sh` and `host-setup.sh` must be **DETACHED FROM
+THE SESSION ENTIRELY** — not foregrounded, and not backgrounded.
+
+- Foreground is impossible: MEASURED 2026-09-16, a bare `update.sh` ran **1022s**,
+  1.7× the 600000ms hard ceiling.
+- `run_in_background` is NOT the fix either, despite having no 120s ceiling: it is
+  tied to the SESSION's lifetime, and deploys launched that way were killed mid-run
+  on 2026-07-22 (leaving genesis-server DOWN during bootstrap) and 2026-09-16
+  (during the pre-update backup). The precise kill mechanism is UNRESOLVED — three
+  candidates are eliminated in CC memory `deploy_detach_not_background`, and the
+  successor hypothesis there is hedged, not established. Detachment removes the
+  coupling to this session, which is what every remaining candidate runs through.
+  It is not immunity in general: an OOM kill reaches a systemd unit just as readily.
+
+```bash
+systemd-run --user --collect --unit genesis-deploy-manual \
+  --working-directory=$HOME/genesis --setenv=PATH="$PATH" \
+  /bin/bash -c 'exec ./scripts/update.sh > ~/tmp/deploy-$(date +%Y%m%d-%H%M).log 2>&1'
+```
+
+Wrap **the command you actually ran** — the three scripts are not interchangeable,
+and `host-setup.sh` takes required host-specific options that a canned `update.sh`
+line would silently discard. If you build that wrapper programmatically, quote the
+whole inner script as one unit (`shlex.quote`) rather than interpolating an
+already-quoted command into `bash -c '…'`: MEASURED, the naive form turns
+`--msg 'a b'` into `--msg a` and executes a `$(…)` the user quoted as data.
+
+`--setenv=PATH` is load-bearing: a `--user` unit otherwise gets systemd's default
+PATH, which omits `~/.local/bin`, so bootstrap takes its `uv not found — installing…`
+branch rather than the branch an interactive run takes. The shipped code sidesteps
+this by passing the whole environment (`updates.py::_apply_direct` uses
+`env=os.environ.copy()`).
+
+**Two things that look like detachment and are not.** `systemd-run --user --scope`
+keeps the CALLER'S session id (MEASURED) — cgroup-isolated, still session-held;
+`_apply_direct` gets away with it only because its parent is genesis-server rather
+than a CC session. And **`setsid` is not detachment**: it runs the program in a new
+session but does not background it or stop the caller waiting on it — MEASURED,
+`timeout 1 setsid bash -c 'sleep 4; echo > f'` exits 124 having written no file.
+Use `--unit`, which hands ownership to a service systemd keeps alive.
+
+Then VERIFY it took — `systemctl --user is-active genesis-deploy-manual` must
+print `active`. `systemd-run` does NOT inherit the tool's cwd, so a bare relative
+path resolves under `$HOME`, bash exits instantly, `--collect` reaps the unit, and
+a failed launch is indistinguishable from a successful one. (It also reports
+`inactive` once the deploy has FINISHED, so check promptly and read the log for the
+outcome.) `genesis-server` going `inactive` mid-run is EXPECTED. When the server is
+up, `POST /api/genesis/updates/apply` with `{"supervised": false}` does the same job
+and passes the environment for you.
+
+**A mid-run kill is never a no-op, but what it does depends on the signal and on
+the phase.** Three windows, in order. From `:1253-1254` — where the rollback trap
+arms, which is just BEFORE the merge at `:1257`, not after it — an interrupt runs
+`_on_signal` → `_do_rollback`. Between `:708-709` and there, `_on_signal_prestop`
+restarts the services it stopped and explicitly does not roll back.
+Earlier still — during the pre-update backup at `:245-254` — **no INT/TERM trap is
+installed yet**, so a SIGTERM there runs no handler at all. That last point matters
+for diagnosis: "no trap ran" does NOT identify a kill as SIGKILL, because the
+untrapped window produces the same evidence. Note too that `_do_rollback` disarms
+INT/TERM as it starts, so a second signal lands mid-rollback with default
+disposition, and the rollback has failure exits that report `ROLLBACK INCOMPLETE`.
+Either way: verify state (server active, no mid-rebase, pin, both CC versions)
+before re-running; it is idempotent. (A non-blocking PreToolUse advisory hook,
+`.claude/hooks/cc-deploy-timeout-guard`, nudges toward this on any deploy — it does
+not check whether you already detached, which is tracked in issue #2088.)
+
+**Why this paragraph is worded so defensively:** PR #1221 shipped both this policy
+and that hook on 2026-07-22 prescribing `run_in_background`, from a CC memory
+written two days earlier. An incident that same day refuted it. The correction
+landed only in a second CC memory on 07-23, both public surfaces kept the original,
+and a third deploy was killed by this advice 56 days later. A remedy is only as
+good as the case it was actually executed against.
+
+An earlier draft of this paragraph also claimed #1221 shipped a second, already-stale
+assertion about signal handling. That was **false, and worth recording as the more
+useful lesson**: it was inferred from the CC memory #1221 was written from, rather
+than read out of the commit, which shipped the correct claim. A note is evidence
+about what someone believed when they wrote it — never about what the code says
+now, and never about what some other artifact contains. Open the commit.
 
 ### Verify Outcomes, Not Just Tests
 

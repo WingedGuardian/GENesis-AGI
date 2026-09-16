@@ -1,21 +1,52 @@
 #!/usr/bin/env bash
 # PreToolUse(Bash) ADVISORY — never blocks (always exit 0).
 #
-# Long deploys — scripts/update.sh, bootstrap.sh, host-setup.sh — routinely exceed
-# the Bash TOOL's 120s DEFAULT timeout (container align + guardian redeploy + host
-# update-node/update-cc, run sequentially). An inner `timeout N …` does NOT extend
-# the tool's own timeout, so a FOREGROUND run gets SIGKILLed at 120s (exit 143) and
-# update.sh's SIGTERM traps roll it back mid-deploy. The fix is to run these via
-# `run_in_background: true` (harness-tracked, no timeout ceiling). This hook nudges
-# toward that, only when such a deploy is run in the FOREGROUND.
+# Long deploys — scripts/update.sh, bootstrap.sh, host-setup.sh — must be DETACHED
+# from the CC session. Neither way of holding them in a Bash call works:
 #
-# Non-blocking by contract: EVERY path exits 0. Worst case is a spurious one-line
-# note (e.g. on `cat scripts/update.sh`); it can never stop a legitimate command.
+#   FOREGROUND: the tool's HARD CEILING is 600000ms and a bare update.sh ran 1022s
+#   here (MEASURED 2026-09-16), so no timeout value is enough.
+#
+#   run_in_background: NOT a fix, and this hook used to prescribe exactly that. It
+#   has no 120s ceiling (MEASURED: a 400s background task completed clean, exit 0),
+#   but it is bound to the SESSION's lifetime, and deploys launched that way were
+#   killed mid-run on 2026-07-22 (server left DOWN during bootstrap) and
+#   2026-09-16. The precise kill mechanism is UNRESOLVED; detachment removes the
+#   coupling every remaining candidate runs through.
+#
+# WHY IT FIRES ON BACKGROUNDED DEPLOYS NOW. It used to return early when
+# run_in_background was true, treating it as correct usage — so it was silent on
+# exactly the input that kills deploys, which is why nothing ever contradicted the
+# advice in practice. That early return is gone.
+#
+# HISTORY, because this hook is why a deploy died. PR #1221 shipped it and the
+# skill's Timeout Policy at 23:48 on 2026-07-22, prescribing run_in_background from
+# a CC memory written two days earlier. An incident that same day refuted the
+# remedy; the correction was written on 07-23 into a DIFFERENT CC memory, and
+# neither public surface was ever updated — so this hook taught the wrong remedy
+# for 56 days, until a third deploy was killed by it on 2026-09-16.
+#
+# The durable lesson is narrower than it first looks, and getting it wrong is how
+# this comment was itself rewritten: the remedy was never executed against the case
+# it addressed. A remedy is only as good as the case it was actually run against.
+#
+# SCOPE. This hook decides WHETHER a deploy script is mentioned, not whether it has
+# already been detached — that needs real parsing of both shell and systemd-run
+# option grammar, and is deliberately out of scope here (issue #2088). So it also
+# fires on a correctly-detached launch and on a read of one of these files. An
+# advisory that over-fires costs a line; one that stays silent cost three deploys.
+#
+# Non-blocking by contract: EVERY path exits 0. It can never stop a command.
 # See the genesis-development skill's Timeout Policy and CC memory
-# feedback-bash-tool-timeout-long-deploys.
+# `deploy_detach_not_background`.
 
-IN=$(cat 2>/dev/null)
-CMD=$(printf '%s' "$IN" | jq -r '.tool_input.command // empty' 2>/dev/null)
+# `|| X=""` on both: under an inherited SHELLOPTS=errexit (bash DOES import it, and
+# settings.json spawns this as `bash <path>`), a failing command substitution in an
+# assignment aborts the script before it reaches any of its own guarded code. jq
+# exits non-zero on malformed input and is 127 when absent. MEASURED: without these,
+# errexit + jq-absent exits 127, breaking the always-exit-0 contract.
+IN=$(cat 2>/dev/null) || IN=""
+CMD=$(printf '%s' "$IN" | jq -r '.tool_input.command // empty' 2>/dev/null) || CMD=""
 [ -z "$CMD" ] && exit 0
 
 # Only the long-deploy scripts.
@@ -24,14 +55,37 @@ case "$CMD" in
     *) exit 0 ;;
 esac
 
-# Already backgrounded (correct usage) → nothing to say.
-BG=$(printf '%s' "$IN" | jq -r '.tool_input.run_in_background // false' 2>/dev/null)
-[ "$BG" = "true" ] && exit 0
+# NO run_in_background exemption. It was here, treating backgrounding as correct
+# usage, which made this guard inert in precisely the case it exists to prevent.
+# Both surviving launch paths — foreground and backgrounded — are session-held, so
+# both get the note.
 
 # Surface the nudge via PreToolUse structured stdout (additionalContext) — exit 0
 # + stderr is treated as "no objection" and is NOT shown to the model, which would
 # make this guard invisible in the exact path it protects.
-ADVISORY="ADVISORY: this looks like a long deploy (update.sh / bootstrap.sh / host-setup.sh) in the FOREGROUND. It aligns the container + redeploys the guardian + syncs the host (update-node up to 600s, update-cc up to 300s, sequential) and routinely exceeds the Bash tool's 120s DEFAULT timeout — an inner 'timeout N' does NOT extend it, and a SIGTERM at 120s makes update.sh roll back mid-deploy. Use run_in_background: true — it is harness-tracked, notifies on completion, and has no ceiling. Raising the 'timeout' param does NOT work here: the Bash tool's maximum is 600000ms (10 min), a larger value is not honoured, and these deploys routinely run longer — so there is no foreground timeout value that makes this safe."
+# Quoted delimiter: the text contains $HOME, $PATH and $(date ...) that must reach
+# the reader LITERALLY. `|| true` because `read -d ''` returns non-zero at EOF even
+# though it populates the variable, which would break the always-exit-0 contract
+# under an inherited SHELLOPTS=errexit.
+read -r -d '' ADVISORY <<'ADV' || true
+ADVISORY: this mentions a long deploy (update.sh / bootstrap.sh / host-setup.sh). If you are LAUNCHING one, it must be DETACHED from this session. Neither way of holding it in a Bash call works.
+
+FOREGROUND is impossible: the Bash tool's HARD CEILING is 600000ms (10 min), a larger 'timeout' value is not honoured, and an inner 'timeout N' does not extend it. MEASURED 2026-09-16: a bare update.sh ran 1022s. The SIGTERM at the ceiling is also not a silent truncation -- update.sh traps INT/TERM, and once the rollback trap is armed (just before the merge) an interrupt ROLLS BACK, unwinding a deploy that was going fine. Which phase a ten-minute kill lands in depends on the run, so treat it as "something will be undone", not as a clean stop.
+
+run_in_background is NOT the fix, though this hook used to say so. It has no 120s ceiling (MEASURED: a 400s background task completed clean, exit 0), but it is bound to this SESSION's lifetime, and deploys launched that way were killed mid-run on 2026-07-22 (server left DOWN during bootstrap) and 2026-09-16.
+
+Hand it to systemd instead, wrapping THE COMMAND YOU ACTUALLY RAN -- the example below deploys update.sh, but this hook also fires for bootstrap.sh and host-setup.sh, which are not interchangeable and take their own required arguments:
+
+  systemd-run --user --collect --unit genesis-deploy-manual \
+    --working-directory=$HOME/genesis --setenv=PATH="$PATH" \
+    /bin/bash -c 'exec ./scripts/update.sh > ~/tmp/deploy-$(date +%Y%m%d-%H%M).log 2>&1'
+
+Each flag is load-bearing. --unit is what leaves the session; 'systemd-run --user --scope' does NOT (a scope child keeps the caller's session id), and neither does setsid (it starts a new session but does not stop the caller waiting on it). --working-directory is required because systemd-run does not inherit this cwd. --setenv=PATH is required because a --user unit otherwise runs under systemd's default PATH, which omits ~/.local/bin.
+
+Then VERIFY it took: 'systemctl --user is-active genesis-deploy-manual' must print 'active'. A failed launch is otherwise indistinguishable from a good one -- with a relative path and no --working-directory, bash exits instantly and --collect reaps the unit, leaving no trace. Check promptly (it also reads 'inactive' once the deploy has FINISHED), then poll the log. genesis-server going 'inactive' mid-run is EXPECTED.
+
+This hook does not check whether you already detached, so if you did, ignore it. Rationale, measurements and incident history: the genesis-development skill's Timeout Policy.
+ADV
 # jq builds valid JSON (escapes the message). If jq somehow fails, fall back to
 # stderr so the nudge is at least not lost, and still exit 0 (never block).
 jq -n --arg c "$ADVISORY" '{hookSpecificOutput:{hookEventName:"PreToolUse",additionalContext:$c}}' 2>/dev/null \
