@@ -920,3 +920,166 @@ def test_hook_input_stays_stdlib_only(tmp_path):
             imported.add(node.module.split(".")[0])
     outside = imported - set(sys.stdlib_module_names)
     assert not outside, f"hook_input.py must import only stdlib; found {sorted(outside)}"
+
+
+# --- Leg B: the degraded refusal must not cost the OPERATOR the repair path -----
+#
+# `pretool_check` blocks Write/Edit to CRITICAL paths in AUTONOMOUS sessions only —
+# an interactive session is allowed through by design ("the user is present and
+# sovereign"). Its healthy session test is `os.environ.get("GENESIS_CC_SESSION")`,
+# which needs nothing from `hook_input`. Degraded, it used to exit 2 BEFORE reaching
+# that test, so it blocked the interactive owner from editing ANYTHING — a category
+# it was built never to block, and the one that repairs the tree. With the six Bash
+# guards also refusing, the session could neither run a command nor edit a file: on a
+# headless box, a brick.
+#
+# The four cases below are one 2x2 (dispatched|interactive) x (healthy|degraded).
+# The healthy row is the control that makes the claim "zero security delta" checkable
+# rather than asserted: whatever the guard permits when healthy, it must still permit.
+
+_CRITICAL_WRITE = {"tool_name": "Write", "tool_input": {"file_path": ".claude/settings.json"}}
+
+
+def _pretool(root: Path, home: Path, *, dispatched: bool) -> subprocess.CompletedProcess:
+    """Drive the real pretool_check as a subprocess, with the session stamp controlled.
+
+    GENESIS_CC_SESSION is STRIPPED rather than left to the ambient environment for the
+    interactive arm: a dispatched test runner carries the stamp, which would silently
+    turn the interactive case into a second copy of the dispatched one and make the
+    whole pair vacuous.
+    """
+    env = {k: v for k, v in os.environ.items() if k != "GENESIS_CC_SESSION"}
+    env["HOME"] = str(home)
+    if dispatched:
+        env["GENESIS_CC_SESSION"] = "1"
+    return subprocess.run(
+        [sys.executable, str(root / "scripts" / "pretool_check.py")],
+        input=json.dumps(_CRITICAL_WRITE),
+        capture_output=True,
+        text=True,
+        cwd=str(root),
+        env=env,
+        timeout=90,
+    )
+
+
+def _broken_hook_input(tmp_path: Path, name: str) -> tuple[Path, Path]:
+    """A scripts/ copy whose hook_input raises at import — Leg B's exact condition."""
+    root = _tree(tmp_path, poisoned=False)
+    (root / "scripts" / "hooks" / "hook_input.py").write_text(
+        'raise RuntimeError("poisoned helper")\n'
+    )
+    home = tmp_path / name
+    home.mkdir(parents=True, exist_ok=True)
+    return root, home
+
+
+def test_degraded_pretool_check_still_refuses_a_dispatched_write(tmp_path):
+    """The protection this guard exists for survives the degrade. Unattended, keep refusing.
+
+    This is the arm that must NOT change, and it is why the fix reads the environment
+    instead of simply allowing: a dispatched session has nobody to approve anything.
+    """
+    root, home = _broken_hook_input(tmp_path, "home_legb_dispatched")
+    res = _pretool(root, home, dispatched=True)
+    assert res.returncode == 2, (
+        "a dispatched session must still be refused when hook_input is unimportable; "
+        f"got {res.returncode}. stderr: {res.stderr[:300]}"
+    )
+    assert "GUARD DEGRADED" in res.stderr, "a degraded refusal must say so"
+
+
+def test_degraded_pretool_check_leaves_the_interactive_repair_path_open(tmp_path):
+    """THE REGRESSION THIS LOCKS: the degraded guard must not block the owner's edits.
+
+    Exit 0 here is not a relaxation. A healthy interactive session is ALREADY allowed
+    through this guard unconditionally (see the healthy control below), so refusing one
+    while degraded is strictly MORE than the guard was ever scoped to do — and what it
+    costs is the ability to repair the very file that is broken.
+    """
+    root, home = _broken_hook_input(tmp_path, "home_legb_interactive")
+    res = _pretool(root, home, dispatched=False)
+    assert res.returncode == 0, (
+        "an interactive session must keep its repair path when hook_input is "
+        f"unimportable; got {res.returncode}, which blocks the edit that fixes it. "
+        f"stderr: {res.stderr[:300]}"
+    )
+    # STDOUT, not stderr: Claude Code discards stderr from an exit-0 hook, so a
+    # notice written there would be delivered to nobody and the degraded allow would
+    # be indistinguishable from a healthy one. additionalContext is the exit-0 channel.
+    assert "GUARD DEGRADED" in res.stdout, (
+        "a degraded ALLOW is the one that most needs saying so, and on exit 0 only "
+        f"additionalContext on stdout reaches the model. stdout: {res.stdout[:200]!r}"
+    )
+    assert res.stderr.strip() == "", (
+        "the allow path must not ALSO write stderr: on exit 0 that copy goes nowhere "
+        f"while appearing delivered. stderr: {res.stderr[:200]!r}"
+    )
+    json.loads(res.stdout)  # the hand-rolled literal must be valid JSON
+
+
+def test_healthy_pretool_check_still_refuses_a_dispatched_critical_write(tmp_path):
+    """Control, healthy tree: the guard's actual job, unchanged by this fix."""
+    root = _tree(tmp_path, poisoned=False)
+    home = tmp_path / "home_legb_healthy_dispatched"
+    home.mkdir(parents=True, exist_ok=True)
+    res = _pretool(root, home, dispatched=True)
+    assert res.returncode == 2, (
+        f"healthy dispatched CRITICAL-path write must be refused; got {res.returncode}"
+    )
+
+
+def test_healthy_pretool_check_allows_the_interactive_critical_write(tmp_path):
+    """Control, and the evidence for the zero-security-delta claim.
+
+    Healthy, this guard ALREADY allows an interactive CRITICAL-path write. The degraded
+    branch returning the same verdict therefore surrenders no protection that existed —
+    it stops withholding one that never did. Without this row, "zero delta" would be a
+    sentence in a PR body rather than a measurement.
+    """
+    root = _tree(tmp_path, poisoned=False)
+    home = tmp_path / "home_legb_healthy_interactive"
+    home.mkdir(parents=True, exist_ok=True)
+    res = _pretool(root, home, dispatched=False)
+    assert res.returncode == 0, (
+        "healthy interactive CRITICAL-path write is allowed by design (the user is "
+        f"present and sovereign); got {res.returncode}"
+    )
+    # rc==0 ALONE would also be returned on an unread payload (main() returns 0 when
+    # file_path is empty), so this row — the one cited as the zero-delta measurement —
+    # would pass without the guard ever reaching its scope check. The degraded path is
+    # the only one that writes to stdout, so silence proves the HEALTHY route ran.
+    assert res.stdout.strip() == "", (
+        f"a healthy allow must be silent; stdout means the degraded branch ran: "
+        f"{res.stdout[:200]!r}"
+    )
+
+
+def test_degraded_pretool_check_reads_the_stamp_exactly_as_the_healthy_path_does(tmp_path):
+    """Predicate parity: a non-`"1"` stamp is INTERACTIVE in both paths, or neither.
+
+    The degraded branch re-asks the guard's own scope question, and the whole
+    zero-delta argument rests on it asking the SAME question. `_is_dispatched` tests
+    `== "1"` exactly, so `"true"` is interactive there; if the degraded branch used a
+    looser test (truthiness, or `is not None`) it would REFUSE where the healthy guard
+    ALLOWS — a divergence invisible to every other row here, because they only ever
+    pass the two canonical values.
+    """
+    root, home = _broken_hook_input(tmp_path, "home_legb_parity")
+    env = {k: v for k, v in os.environ.items() if k != "GENESIS_CC_SESSION"}
+    env["HOME"] = str(home)
+    env["GENESIS_CC_SESSION"] = "true"  # set, but not the literal the stamper writes
+    res = subprocess.run(
+        [sys.executable, str(root / "scripts" / "pretool_check.py")],
+        input=json.dumps(_CRITICAL_WRITE),
+        capture_output=True,
+        text=True,
+        cwd=str(root),
+        env=env,
+        timeout=90,
+    )
+    assert res.returncode == 0, (
+        'GENESIS_CC_SESSION="true" is NOT the dispatched stamp (invoker writes the '
+        f"literal \"1\"), so the healthy guard treats it as interactive and the "
+        f"degraded branch must agree; got {res.returncode}"
+    )
