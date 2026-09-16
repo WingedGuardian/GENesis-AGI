@@ -1778,6 +1778,18 @@ _FUNCTION_DEF = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\(\)$")
 # as a filename. The bash set comes from ``bash --help``; the dash/sh set was
 # verified against the installed dash implementation, which also provides
 # ``sh`` on the supported Linux hosts.
+#: Option letters that consume the NEXT argv token as their value. Kept per
+#: interpreter, not as one global set: `-O shopt_option` is Bash-only, and dash
+#: rejects `dash -cxO extglob …` with "Illegal option -O" and runs nothing. A
+#: shared set made Bash-only syntax look valid for every nested shell, so a
+#: command the shell refuses was parsed as though it ran (Codex P2, PR #2112).
+_C_VALUE_TAKING = {
+    "bash": frozenset("oO"),
+    "zsh": frozenset("oO"),
+}
+#: Every other supported interpreter takes `-o option` but not `-O`.
+_C_VALUE_TAKING_DEFAULT = frozenset("o")
+
 _C_BUNDLE_OPTIONS = {
     "bash": frozenset("abcefhiklmnprstuvxBCEHPTD"),
     "sh": frozenset("abcefhilmnprstuvxCEIV"),
@@ -2687,6 +2699,7 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
     ``bash -cz`` is rejected by Bash and does not run a script.
     """
     allowed = _C_BUNDLE_OPTIONS[interpreter]
+    takes_value = _C_VALUE_TAKING.get(interpreter, _C_VALUE_TAKING_DEFAULT)
 
     for i, tok in enumerate(argv[1:], 1):
         if tok in {"-", "--"}:
@@ -2698,64 +2711,75 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
         if "c" not in options:
             continue
 
-        # `o`/`O` ANYWHERE in the bundle consumes the next token as its value,
+        # A value-taking letter ANYWHERE in the bundle consumes the next token,
         # so the script comes after it. Position-independent on purpose: the
-        # previous test only looked one character either side of `c`, so
+        # original test only looked one character either side of `c`, so
         # `-cxo pipefail` and `-oxc pipefail` fell through to the no-value path
         # and `pipefail` was read as the script. MEASURED: bash runs both.
-        value_taking = bool(set(options) & {"o", "O"})
+        has_value = bool(set(options) & takes_value)
+        if not set(options) - takes_value <= allowed:
+            continue
+        start = i + 2 if has_value else i + 1
 
-        if value_taking:
-            option_letters = set(options) - {"o", "O"}
-            if not option_letters <= allowed:
-                continue
-            start = i + 2  # past the option's value
-        else:
-            if not set(options) <= allowed:
-                continue
-            start = i + 1
-
-        script = _first_operand(argv, start, allowed)
-        if script:
+        found, script = _first_operand(argv, start, allowed, takes_value)
+        if found:
             return script
 
     return ""
 
 
-def _first_operand(argv: list[str], start: int, allowed: frozenset[str]) -> str:
-    """The first OPERAND at or after ``start`` — the script, not an option.
+def _first_operand(
+    argv: list[str], start: int, allowed: frozenset[str], takes_value: frozenset[str]
+) -> tuple[bool, str]:
+    """``(found, script)`` for the first OPERAND at or after ``start``.
 
     WHY THIS EXISTS. ``_nested_script`` used to return ``argv[start]`` directly,
-    which is only the script when nothing else sits between. It frequently does:
+    which is the script only when nothing sits between. It frequently does:
     ``bash -c -- 'git push …'`` and ``bash -c -e 'git push …'`` both put an
     option-shaped token there, so the parser handed back ``--`` (or ``-e``) as
-    the script, the real command was never parsed, and the guards that decide
-    from these segments saw nothing to object to. MEASURED before this change:
-    those commands returned exit 0 from git_push_guard, git_discard_guard and
-    full_suite_guard while the same command without the extra token returned 2,
-    and a real shell executes the payload either way.
+    the script and the real command was never parsed. MEASURED through the real
+    hooks before the fix: exit 0 (ALLOW) from git_push_guard for a command it
+    returns 2 for without the extra token.
 
-    Skipping is deliberately GENEROUS rather than exact. Every token we step
-    over is one the parser would otherwise have mistaken for the script, so the
-    failure direction of over-skipping is "we find the real script and the guard
-    sees MORE", while the failure direction of under-skipping is a guard that
-    sees nothing. Only the second one is a bypass.
+    WHY ``found`` IS SEPARATE FROM THE STRING. An empty string is a VALID ``-c``
+    command — ``bash -c '' -c 'git push …'`` runs nothing, exits 0, and the rest
+    becomes ``$0``/``$1``. A truthiness test conflated that with "no operand
+    here" and resumed scanning the positional arguments, reporting a nested
+    ``git push`` for a command that never runs (Codex P2).
 
-    A bundle containing ``o``/``O`` consumes the following token as its value,
-    so both are stepped over together.
+    ACCURACY, NOT GENEROSITY. An earlier version of this skipped every
+    option-shaped token on the theory that over-skipping is the safe direction.
+    It is not free: parsing a command the shell REFUSES makes a guard block
+    something that was never going to run. So each bundle is validated against
+    this interpreter's own ``allowed`` set, and an invocation the shell would
+    reject resolves to no operand.
+
+    The one place generosity is still right is the VALUE of ``-o``/``-O``. Its
+    validity depends on a shell- and version-specific option-name table, and
+    being wrong in the strict direction would hide a real command — a bypass —
+    whereas being wrong in the permissive direction only over-blocks an
+    invocation that fails anyway. So the value token is stepped over without
+    being checked, deliberately.
     """
     j = start
     while j < len(argv):
         tok = argv[j]
         if tok == "--":
+            # END of option processing. The very next token IS the command
+            # string even when it looks like an option: `bash -c -- '-x' CMD`
+            # runs `-x` and makes CMD merely `$0`. Resuming the option scan here
+            # reported CMD as the script and blocked a command that never ran.
             j += 1
-            continue
+            return (True, argv[j]) if j < len(argv) else (False, "")
         if tok.startswith("-") and len(tok) > 1:
             letters = set(tok[1:])
-            j += 2 if letters & {"o", "O"} else 1
+            if not letters - takes_value <= allowed:
+                return (False, "")  # the shell refuses this invocation
+            j += 2 if letters & takes_value else 1
             continue
-        return tok
-    return ""
+        return (True, tok)
+    return (False, "")
+
 
 # ── git-specific helpers ────────────────────────────────────────────────
 

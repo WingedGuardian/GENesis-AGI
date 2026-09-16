@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -1033,6 +1034,22 @@ class TestUvCarrierResolution:
         front-end. Adding tool run must not weaken that."""
         assert self._exe("uv rm -rf /") == "uv"
         assert self._exe("uv pip install requests") == "uv"
+def _shell_oracle_env() -> dict[str, str]:
+    """Environment for a subprocess whose OUTPUT is the ground truth.
+
+    A non-interactive `bash -c` SOURCES $BASH_ENV before the command, and
+    SHELLOPTS/BASHOPTS turn options on in the child and change what it DOES, not
+    merely what it prints. An operator who exports any of them would have their
+    startup file run by this test and could see its output ahead of the marker,
+    so the verdict would describe their machine rather than the command shape.
+    Same channels, same reasoning, as scripts/replay_guard_corpus.py.
+    """
+    env = dict(os.environ)
+    for startup in ("BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "BASH_XTRACEFD"):
+        env.pop(startup, None)
+    return env
+
+
 
 
 # ── `-c` operand resolution ─────────────────────────────────────────────────
@@ -1081,6 +1098,7 @@ def test_a_command_the_shell_really_runs_is_not_invisible(template):
         capture_output=True,
         text=True,
         timeout=30,
+        env=_shell_oracle_env(),
     )
     assert probe.stdout.strip().splitlines()[:1] == ["42"], (
         f"the shell does not execute {template!r}, so this fixture no longer "
@@ -1126,3 +1144,66 @@ def test_a_command_with_no_script_still_yields_nothing():
     assert sp._nested_script(["bash", "file.sh"], "bash") == ""
     # No `-c` at all: an interpreter running a FILE takes no inline script.
     assert sp._nested_script(["bash", "-x", "file.sh"], "bash") == ""
+
+
+# ── shapes the shell REFUSES or neuters, which must not be reported as commands
+# Over-parsing is not free. Reporting a nested command for an invocation the
+# shell rejects makes a guard block something that was never going to run, and
+# each of these was a real false block in the first version of the operand scan
+# (Codex P2s, PR #2112).
+
+def test_the_token_after_a_terminator_is_the_command_even_if_it_looks_like_one():
+    """`--` ENDS option processing. `bash -c -- '-x' CMD` runs `-x` as the
+    command and CMD is merely `$0`, so resuming the option scan past `--`
+    reported CMD as the script and blocked a command that never ran."""
+    # start=2, which is where `_nested_script` begins for `bash -c …`: the token
+    # after the `-c` bundle. That token IS the `--`, and the scan must stop
+    # there and take the next one whole.
+    found, script = sp._first_operand(
+        ["bash", "-c", "--", "-x", "git push origin main"],
+        2,
+        sp._C_BUNDLE_OPTIONS["bash"],
+        sp._C_VALUE_TAKING["bash"],
+    )
+    assert (found, script) == (True, "-x"), (found, script)
+    segments, _ = sp.analyze_checked("bash -c -- '-x' 'git push origin main'")
+    assert "git" not in [seg.exe for seg in segments], (
+        "reported a nested git command for an invocation where the git text is "
+        "only $0 — a false block"
+    )
+
+
+def test_an_option_the_interpreter_rejects_yields_no_script():
+    """`bash -c -z CMD` exits 2 without running CMD. Skipping `-z` as though it
+    were valid made the parser report the command anyway."""
+    segments, _ = sp.analyze_checked("bash -c -z 'git push origin main'")
+    assert "git" not in [seg.exe for seg in segments], "parsed a command bash refuses"
+
+
+def test_value_taking_letters_stay_interpreter_specific():
+    """`-O` is Bash-only. dash rejects `dash -cxO extglob CMD` with
+    'Illegal option -O' and runs nothing, so treating `O` as value-taking
+    everywhere made Bash-only syntax look valid for every nested shell."""
+    assert sp._nested_script(
+        ["bash", "-cxO", "extglob", "git push origin main"], "bash"
+    ) == "git push origin main"
+    assert sp._nested_script(
+        ["dash", "-cxO", "extglob", "git push origin main"], "dash"
+    ) == ""
+
+
+def test_an_empty_script_is_an_operand_not_a_miss():
+    """An empty string is a VALID `-c` command: `bash -c '' -c CMD` runs nothing,
+    exits 0, and CMD becomes a positional argument. A truthiness check treated
+    that as 'no operand found' and kept scanning, reporting CMD as a script."""
+    found, script = sp._first_operand(
+        ["bash", "-c", "", "-c", "git push origin main"],
+        2,
+        sp._C_BUNDLE_OPTIONS["bash"],
+        sp._C_VALUE_TAKING["bash"],
+    )
+    assert (found, script) == (True, ""), (found, script)
+    segments, _ = sp.analyze_checked("bash -c '' -c 'git push origin main'")
+    assert "git" not in [seg.exe for seg in segments], (
+        "an empty -c command was treated as a miss and the scan ran on"
+    )
