@@ -96,16 +96,16 @@ async def test_active_session_pivots_excludes_external_and_null(db):
 # injected into every session. These pin the channel filter.
 
 
-_NOW = datetime.now(UTC).isoformat()
-
-
 async def _insert_session(db, sid, channel, topic):
+    # Read the clock HERE, not at import: a module-level capture makes the
+    # margin the whole suite runtime instead of one test.
+    now = datetime.now(UTC).isoformat()
     await db.execute(
         "INSERT INTO cc_sessions "
         "(id, session_type, model, effort, status, source_tag, channel, topic, "
         " started_at, last_activity_at) "
         "VALUES (?, 'foreground', 'opus', 'high', 'active', 'foreground', ?, ?, ?, ?)",
-        (sid, channel, topic, _NOW, _NOW),
+        (sid, channel, topic, now, now),
     )
     await db.commit()
 
