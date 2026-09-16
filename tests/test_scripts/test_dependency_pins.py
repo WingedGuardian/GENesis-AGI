@@ -148,3 +148,32 @@ def test_the_resolver_pattern_does_not_backtrack_exponentially():
         f"({small * 1000:.3f}ms -> {large * 1000:.3f}ms). The pre-fix pattern "
         "scored roughly 2**n here; a large ratio means the ambiguity is back."
     )
+
+
+def test_installers_still_register_cbm_to_the_launcher_while_disabled():
+    """Registration is not launching, and skipping it preserved real drift.
+
+    When the kill switch is active, skipping the registration block leaves a
+    PRE-EXISTING registration pointing at the bare `codebase-memory-mcp` binary
+    untouched — which bypasses the launcher entirely and starts the uncapped raw
+    server in the next session, then stays uncapped after the sentinel is
+    removed until somebody runs the installer again. That stale registration is
+    precisely the drift `scripts/lib/mcp_register.sh` exists to repair.
+
+    Registering while disabled is safe because the launcher is FAIL-CLOSED on
+    the sentinel, which this test also pins — the argument only holds while that
+    remains true.
+    """
+    launcher = (REPO_ROOT / ".claude" / "mcp" / "run-codebase-memory").read_text()
+    assert "codebase-memory-mcp.disabled" in launcher and "exit 1" in launcher, (
+        "the launcher is no longer fail-closed on the kill switch, so registering "
+        "while disabled is no longer safe and this change must be revisited"
+    )
+
+    for relative in ("scripts/install.sh", "scripts/bootstrap.sh"):
+        text = (REPO_ROOT / relative).read_text()
+        assert "registration skipped (machine kill switch active)" not in text, (
+            f"{relative} still skips registration while disabled, leaving a stale "
+            "direct-binary registration in place"
+        )
+        assert "run-codebase-memory" in text, relative

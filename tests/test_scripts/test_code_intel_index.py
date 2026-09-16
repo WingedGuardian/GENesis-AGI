@@ -21,6 +21,7 @@ import os
 import re
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -672,3 +673,75 @@ def test_installer_does_not_claim_queue_success_after_writer_failure():
     assert "index_marker.py\" write" in queue
     assert "|| true" not in queue
     assert "WARNING: could not queue initial code intelligence index" in queue
+
+
+# ── the cap must be bounded by what the INSTALL has, not by a constant ───────
+
+def _headroom_decision(ceiling_gib: int, want: str = "8G") -> tuple[str, str]:
+    """Run the SHIPPED decision block at a given install size.
+
+    The block is EXTRACTED from the real script rather than re-typed: a copy
+    would drift and leave these assertions describing a version nobody runs.
+    """
+    src = _ENTRYPOINT.read_text()
+    start = src.index("_genesis_mem_bytes() {")
+    end = src.index("\nfi\n", src.index("GITNEXUS_MEM_REFUSE=")) + len("\nfi\n")
+    block = src[start:end]
+    with tempfile.TemporaryDirectory(dir="/home/ubuntu/tmp") as d:
+        blockfile = Path(d) / "block.sh"
+        blockfile.write_text(block)
+        out = subprocess.run(
+            ["bash", "-c",
+             f'source "{blockfile}" >/dev/null 2>&1; '
+             'printf "%s|%s" "$GITNEXUS_MEM_MAX" "$GITNEXUS_MEM_REFUSE"'],
+            capture_output=True, text=True, timeout=60,
+            env={
+                **os.environ,
+                "CODE_INTEL_MEM_CEILING_BYTES": str(ceiling_gib * 1024**3),
+                "GITNEXUS_MEM_MAX": want,
+            },
+        ).stdout
+    cap, _, why = out.partition("|")
+    return cap, why
+
+
+def test_a_small_install_refuses_the_rebuild_rather_than_capping_it_uselessly():
+    """A fixed 8G cap is a cap, not a reservation.
+
+    On a 4-5 GiB container it is worse than no cap: the child scope never
+    reaches its own MemoryMax, so the PARENT cgroup hits its limit first and the
+    kernel picks a victim from everything in it — Genesis, Qdrant, the running
+    session. The pressure watchdog does not cover this; it samples load and I/O
+    wait, neither of which moves early enough on an OOM path.
+
+    MEASURED working set for a full rebuild: 4,874,166,272 bytes (4.65 GiB), so
+    below that a cap cannot bite and the job is refused instead.
+    """
+    for gib in (4, 5, 6):
+        cap, why = _headroom_decision(gib)
+        assert why, f"a {gib} GiB install was allowed to start a rebuild (cap {cap})"
+        assert "total" in why and "rebuild needs" in why, why
+
+
+def test_a_mid_size_install_gets_the_cap_trimmed_to_its_headroom():
+    """The control that moves in the first direction: not every small-ish box is
+    refused. At 8 GiB there IS room once siblings are reserved, so the cap is
+    lowered to the headroom rather than left at a value the box cannot honour."""
+    cap, why = _headroom_decision(8)
+    assert not why, f"an 8 GiB install was refused: {why}"
+    assert cap.endswith("M"), cap
+    trimmed = int(cap[:-1]) * 1024 * 1024
+    assert trimmed < 8 * 1024**3, "the cap was not trimmed to the install's headroom"
+    assert trimmed >= 4874166272, (
+        f"trimmed to {cap}, which is below the measured working set — that is the "
+        "useless cap this change exists to avoid"
+    )
+
+
+def test_a_large_install_is_left_alone():
+    """The control that moves in the other direction. Without it, a change that
+    refused or trimmed everywhere would satisfy both tests above."""
+    for gib in (16, 32):
+        cap, why = _headroom_decision(gib)
+        assert not why, f"a {gib} GiB install was refused: {why}"
+        assert cap == "8G", f"a {gib} GiB install had its cap changed to {cap}"

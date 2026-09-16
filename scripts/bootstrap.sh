@@ -737,14 +737,25 @@ echo "--- Registering code intelligence MCP servers ---"
 if [ -x "$GENESIS_ROOT/.claude/mcp/run-gitnexus" ]; then
     _register_mcp "gitnexus" "user" "$GENESIS_ROOT/.claude/mcp/run-gitnexus" "mcp"
 fi
-if [ -e "$HOME/.genesis/codebase-memory-mcp.disabled" ]; then
-    echo "  codebase-memory-mcp registration skipped (machine kill switch active)"
-elif command -v codebase-memory-mcp &>/dev/null; then
+if command -v codebase-memory-mcp &>/dev/null; then
     # Registered via the repo launcher (NOT the bare binary): the launcher
     # wraps the server in a systemd scope with MemoryMax to contain upstream's
     # unbounded leak (DeusData/codebase-memory-mcp#581). See
     # .claude/mcp/run-codebase-memory for the full rationale.
+    # REGISTERED EVEN WHEN THE KILL SWITCH IS ACTIVE, deliberately. Registration
+    # does not start anything, and the launcher is fail-closed on the sentinel
+    # (.claude/mcp/run-codebase-memory exits 1 with "disabled by <file>"), so
+    # writing the registration while disabled cannot run the server.
+    #
+    # Skipping preserved the exact drift this helper exists to repair: a
+    # PRE-EXISTING registration pointing at the bare `codebase-memory-mcp`
+    # binary survives untouched, bypasses the launcher entirely, and starts the
+    # uncapped raw server in the next session — and stays uncapped after the
+    # sentinel is removed until somebody runs this again.
     _register_mcp "codebase-memory-mcp" "user" "$GENESIS_ROOT/.claude/mcp/run-codebase-memory"
+    if [ -e "$HOME/.genesis/codebase-memory-mcp.disabled" ]; then
+        echo "  codebase-memory-mcp registered to the launcher; the kill switch is active, so it will refuse to start"
+    fi
 fi
 if command -v serena &>/dev/null; then
     # `-s project` writes .mcp.json keyed to the git-root of the CURRENT dir (no
