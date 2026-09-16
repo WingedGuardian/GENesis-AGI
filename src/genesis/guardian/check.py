@@ -533,6 +533,10 @@ async def run_check(config: GuardianConfig | None = None) -> None:
         # published bundle to a host-only dir + WARN if the archived bundle goes
         # stale. Host-side file ops only, independent of the container verdict.
         await _check_repo_bundle_and_alert(config, dispatcher)
+
+        # Last, and deliberately so: it is the only watch that can perform a
+        # write inside the container, and it must not delay a cheaper alert.
+        await _check_guard_layer_and_alert(config, dispatcher)
     finally:
         # Always save state, even on error
         sm.save_state(state_path)
@@ -763,6 +767,21 @@ async def _check_container_git_and_alert(
         await check_container_git_and_alert(config, dispatcher)
     except Exception:
         logger.warning("git-health watch failed", exc_info=True)
+
+
+async def _check_guard_layer_and_alert(
+    config: GuardianConfig, dispatcher: AlertDispatcher,
+) -> None:
+    """Can the agent tooling still EVALUATE? Alert-only, plus one bounded repair.
+
+    Lazy import (cycle avoidance) inside its own try/except, so a crash here can
+    never abort the tick or the watches after it.
+    """
+    try:
+        from genesis.guardian.guard_layer_watch import check_guard_layer_and_alert
+        await check_guard_layer_and_alert(config, dispatcher)
+    except Exception:
+        logger.warning("guard-layer watch failed", exc_info=True)
 
 
 async def _check_repo_bundle_and_alert(
