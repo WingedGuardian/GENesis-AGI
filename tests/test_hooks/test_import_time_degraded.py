@@ -1214,7 +1214,11 @@ def _resolve_bash_hook(command: str) -> tuple[str, str | None, list[str]]:
     # guard: the test would execute the guard directly, see exit 2, and stay green,
     # while Claude Code only echoes and the guard never runs at all. A typo like
     # `/missing-genesis-hook …` has the same shape and the same consequence.
-    if tokens and tokens[0].endswith("genesis-hook") and len(tokens) > 1:
+    # `Path(...).name ==` rather than `endswith`: a launcher named
+    # `fake-genesis-hook` satisfies the suffix test, and the script it names would
+    # then be run directly by this test and pass, while the configured launcher
+    # fails non-blocking in production.
+    if tokens and Path(tokens[0]).name == "genesis-hook" and len(tokens) > 1:
         rel = tokens[1]
         return rel, rel, tokens[2:]
     return command, None, []
