@@ -59,8 +59,46 @@ from fnmatch import fnmatch
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import brace_expand, read_payload, run_guard, tool_input  # noqa: E402
-from shell_parse import analyze_checked  # noqa: E402
+try:
+    from hook_input import (  # noqa: E402
+        brace_expand,
+        degraded_exit,
+        read_payload,
+        run_guard,
+        tool_input,
+    )
+except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must block.
+    if __name__ != "__main__":
+        raise
+    # Reverse version skew: this guard may be newer than hook_input.py. Nothing
+    # imported from that older helper can recover us, so fail closed locally. Do
+    # not render the exception — even __str__ can raise — and use os._exit so a
+    # broken diagnostic stream cannot replace exit 2 during interpreter shutdown.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (protected_paths_guard): shared hook_input is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
+
+# Gated-operation pattern for the DEGRADED path. Defined ABOVE the guarded import
+# ON PURPOSE: it must still be bound when the import below is the one that failed.
+# Deliberately the same two verbs as `_RM_PATTERN` further down — kept as a separate
+# literal rather than shared, because sharing would put the constant after the import
+# it has to survive.
+_DEGRADED_GATED = r"\brm\b|\brmdir\b"
+
+try:
+    from shell_parse import analyze_checked  # noqa: E402
+except Exception as _exc:  # noqa: BLE001 — see degraded_exit: exit 1 is a FAIL-OPEN.
+    if __name__ != "__main__":
+        # A test importing a deliberately broken tree must see the real error, not a
+        # process exit. Only the live hook invocation degrades.
+        raise
+    degraded_exit("protected_paths_guard", gated=_DEGRADED_GATED, exc=_exc)
 
 try:  # noqa: E402
     import discarded_write

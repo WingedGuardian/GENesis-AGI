@@ -135,6 +135,14 @@ async def test_store_with_supersedes_updates_qdrant(store, db):
             "superseded_by": None, "superseded_at": None,
         })
         mock_links.create = AsyncMock(return_value=(old_id, "new"))
+        # The mirror LOCATES the point rather than trusting the metadata
+        # `collection` column (which is unreliable — crud/memory.py:72-73), so
+        # the client must now answer "is it here?" per collection. A bare
+        # MagicMock says yes to both, which no real Qdrant ever does for a
+        # single-collection memory, and the payload would then be written twice.
+        store._qdrant.retrieve = lambda **kw: (
+            [object()] if kw["collection_name"] == "episodic_memory" else []
+        )
 
         new_id = await store.store(
             "new fact",

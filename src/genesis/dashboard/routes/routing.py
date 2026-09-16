@@ -100,12 +100,26 @@ def routing_config_read():
             site_data["cc_position"] = cc_position
         call_sites[name] = site_data
 
+    # Daily-budget view: a daily-exhausted provider reads "closed" in
+    # cb_states while every call skips it (deselection produces no 429s,
+    # trips and observations), so the counters must be visible somewhere
+    # live. Keys carry their unit explicitly — requests and tokens are
+    # never comparable. Only daily-limited providers appear.
+    daily_budget = {}
+    ledger = getattr(rt.router, "_daily_budget", None)
+    if ledger is not None:
+        for name, p_cfg in cfg.providers.items():
+            budget_status = ledger.status(p_cfg)
+            if budget_status is not None:
+                daily_budget[name] = budget_status
+
     return jsonify({
         "providers": providers,
         "cb_states": cb_states,
         "cb_detail": cb_detail,
         "call_sites": call_sites,
         "disabled_providers": dict(cfg.disabled_providers),
+        "daily_budget": daily_budget,
     })
 
 

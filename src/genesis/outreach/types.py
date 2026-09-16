@@ -170,12 +170,22 @@ class OutreachRequest:
     # at delivery; None → the prediction rides the policy_prior lane (a
     # measured base-rate seed, NOT 0.5 — see ledger/writers.py).
     stated_confidence: float | None = None
-    # Origin-targeted TELEGRAM delivery: when set, ``_deliver`` sends this
-    # message to THIS chat + forum topic instead of the category→topic routing.
-    # Used to deliver a background session's result back to the exact
-    # conversation it was requested in. ``target_chat_id`` is a numeric chat id
-    # as a string (a DM user id, or the forum supergroup id); ``target_thread_id``
-    # is the forum topic id (None for a DM). Ignored for non-telegram channels.
+    # Per-request RECIPIENT OVERRIDE. ``_deliver`` resolves
+    # ``validated_recipient or target_chat_id or self._recipients[channel]``
+    # (pipeline.py) — that resolution is CHANNEL-AGNOSTIC, so this field is
+    # meaningful on every channel, not just Telegram. Two live users:
+    #
+    #   TELEGRAM — origin-targeted delivery: a numeric chat id as a string (a DM
+    #   user id, or the forum supergroup id), paired with ``target_thread_id``
+    #   (the forum topic id; None for a DM), so a background session's result
+    #   returns to the exact conversation that asked for it.
+    #
+    #   DISCORD — the SUB-CHANNEL name (``"announcements"``). This is the ONLY
+    #   mechanism carrying it, on BOTH paths: ``outreach_send`` for a live send
+    #   and ``scheduler.py`` for a drained ``pending_outreach`` row. Do not
+    #   "simplify" the resolution in ``_deliver`` to a telegram-only branch —
+    #   that silently reverts PR #1854 and every test still passes, because the
+    #   tests assert on the OutreachRequest rather than on delivery.
     target_chat_id: str | None = None
     target_thread_id: int | None = None
 
