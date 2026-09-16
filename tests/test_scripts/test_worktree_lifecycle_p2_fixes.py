@@ -28,6 +28,44 @@ sys.modules["worktree_lifecycle_p2"] = wl
 _spec.loader.exec_module(wl)
 
 
+def _moved_worktree(trash: Path, prefix: str, unpack_to: Path) -> Path:
+    """The archived worktree under ``trash`` whose name starts with ``prefix``.
+
+    WHY THIS IS NOT ``next(trash.glob(prefix + "*"))``: the reaper writes TWO
+    entries per worktree — ``<name>.tar.gz`` and the ``<name>.meta.json``
+    sidecar — so that glob matches both and ``next()`` takes whichever the
+    filesystem happens to yield first. Directory order is not defined and
+    differs between filesystems, so the same test picks the archive on one box
+    and the sidecar on another; opening the sidecar as a gzip stream fails with
+    ``tarfile.ReadError: not a gzip file``.
+
+    MEASURED: that is precisely how this suite failed in CI while passing
+    locally — 150 local passes, one CI failure, on a run whose log truncated
+    before the failure and named nothing. The production code already selects
+    by suffix (``worktree_lifecycle.ARCHIVE_SUFFIX``); the tests did not.
+
+    Returns the directory to inspect, unpacking the archive when the worktree
+    was archived rather than left as a directory.
+    """
+    matches = sorted(trash.glob(prefix + "*"))
+    assert matches, f"nothing under {trash} matches {prefix!r} — the reaper wrote nothing"
+    directories = [m for m in matches if m.is_dir()]
+    if directories:
+        assert len(directories) == 1, f"ambiguous directories for {prefix!r}: {directories}"
+        return directories[0]
+    archives = [m for m in matches if m.name.endswith(wl.ARCHIVE_SUFFIX)]
+    assert len(archives) == 1, (
+        f"expected exactly one {wl.ARCHIVE_SUFFIX} for {prefix!r}, got {archives} "
+        f"(all matches: {[m.name for m in matches]})"
+    )
+    with tarfile.open(archives[0], "r:gz") as tf:
+        tf.extractall(unpack_to, filter="tar")
+    inner = sorted(p for p in unpack_to.iterdir())
+    assert len(inner) == 1, f"archive for {prefix!r} unpacked to {inner}"
+    return inner[0]
+
+
+
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, timeout=60)
 
@@ -69,11 +107,7 @@ def test_an_existing_dirty_patch_file_is_not_overwritten(
     entry = {"path": str(wt), "branch": "feature/collide", "head": "", "detached": False}
     assert wl._trash_worktree(entry, repo) is True
 
-    moved = next((tmp_path / "trash").glob("wt-collide*"))
-    if moved.is_file():  # archived; unpack to inspect
-        with tarfile.open(moved, "r:gz") as tf:
-            tf.extractall(tmp_path / "unpacked", filter="tar")
-        moved = next((tmp_path / "unpacked").iterdir())
+    moved = _moved_worktree(tmp_path / "trash", "wt-collide", tmp_path / "unpacked")
 
     original = (moved / ".dirty.patch").read_text()
     assert original == "MY OWN FILE — not the reaper's\n", (
@@ -96,11 +130,7 @@ def test_a_worktree_with_no_collision_still_gets_the_plain_name(
     entry = {"path": str(wt), "branch": "feature/plain", "head": "", "detached": False}
     assert wl._trash_worktree(entry, repo) is True
 
-    moved = next((tmp_path / "trash2").glob("wt-plain*"))
-    if moved.is_file():
-        with tarfile.open(moved, "r:gz") as tf:
-            tf.extractall(tmp_path / "unpacked2", filter="tar")
-        moved = next((tmp_path / "unpacked2").iterdir())
+    moved = _moved_worktree(tmp_path / "trash2", "wt-plain", tmp_path / "unpacked2")
     assert (moved / ".dirty.patch").exists()
     assert not list(moved.glob(".dirty.patch.archived-*"))
 

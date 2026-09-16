@@ -38,6 +38,44 @@ sys.modules["worktree_lifecycle_r3"] = wl
 _spec.loader.exec_module(wl)
 
 
+def _moved_worktree(trash: Path, prefix: str, unpack_to: Path) -> Path:
+    """The archived worktree under ``trash`` whose name starts with ``prefix``.
+
+    WHY THIS IS NOT ``next(trash.glob(prefix + "*"))``: the reaper writes TWO
+    entries per worktree — ``<name>.tar.gz`` and the ``<name>.meta.json``
+    sidecar — so that glob matches both and ``next()`` takes whichever the
+    filesystem happens to yield first. Directory order is not defined and
+    differs between filesystems, so the same test picks the archive on one box
+    and the sidecar on another; opening the sidecar as a gzip stream fails with
+    ``tarfile.ReadError: not a gzip file``.
+
+    MEASURED: that is precisely how this suite failed in CI while passing
+    locally — 150 local passes, one CI failure, on a run whose log truncated
+    before the failure and named nothing. The production code already selects
+    by suffix (``worktree_lifecycle.ARCHIVE_SUFFIX``); the tests did not.
+
+    Returns the directory to inspect, unpacking the archive when the worktree
+    was archived rather than left as a directory.
+    """
+    matches = sorted(trash.glob(prefix + "*"))
+    assert matches, f"nothing under {trash} matches {prefix!r} — the reaper wrote nothing"
+    directories = [m for m in matches if m.is_dir()]
+    if directories:
+        assert len(directories) == 1, f"ambiguous directories for {prefix!r}: {directories}"
+        return directories[0]
+    archives = [m for m in matches if m.name.endswith(wl.ARCHIVE_SUFFIX)]
+    assert len(archives) == 1, (
+        f"expected exactly one {wl.ARCHIVE_SUFFIX} for {prefix!r}, got {archives} "
+        f"(all matches: {[m.name for m in matches]})"
+    )
+    with tarfile.open(archives[0], "r:gz") as tf:
+        tf.extractall(unpack_to, filter="tar")
+    inner = sorted(p for p in unpack_to.iterdir())
+    assert len(inner) == 1, f"archive for {prefix!r} unpacked to {inner}"
+    return inner[0]
+
+
+
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, timeout=60)
 
@@ -127,7 +165,7 @@ def test_the_recovery_patch_is_private_even_when_compression_fails(
         entry = {"path": str(wt), "branch": "feature/patch", "head": "", "detached": False}
         assert wl._trash_worktree(entry, repo) is True
 
-        moved = next(trash.glob("wt-patch*"))
+        moved = _moved_worktree(trash, "wt-patch", tmp_path / "unpacked-patch")
         assert moved.is_dir(), "precondition: this entry stayed uncompressed"
         patch = moved / ".dirty.patch"
         assert patch.exists(), "precondition: a recovery patch was written"
