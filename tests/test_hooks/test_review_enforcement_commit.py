@@ -2079,6 +2079,29 @@ def test_depth_hint_says_sigils_bind_per_commit_segment(
     assert reflog.startswith("commit (amend):"), reflog
 
 
+def test_depth_hint_covers_content_staged_after_the_hook_runs(repo: Path, home: Path) -> None:
+    """The hook runs BEFORE any staging segment of the command, so `git add -A &&
+    git commit` commits content the index did not hold when this note was
+    written. `_commit_may_add_content` already recognises that whole family; the
+    guidance has to name it too, or an author inspects the index, sees nothing
+    local, and acks honestly over an edit `git add` is about to bring in."""
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _mark(repo, home)
+    (repo / "f.py").write_text("local tracked edit\n")
+    _begin_merge(repo)
+    res = _run_hook('git add -A && git commit -m "merge main"', repo, home)
+    assert res.returncode == 2
+    for form in ("add", "reset", "restore --staged"):
+        assert form in res.stderr, (
+            f"the inspection guidance does not name {form!r}, a deferred-staging form "
+            "the gate's own predicate recognises"
+        )
+    assert "BEFORE" in res.stderr, (
+        "the guidance does not say the hook runs before the staging segment, which "
+        "is the reason the index is not the thing to inspect"
+    )
+
+
 def test_depth_hint_covers_the_prospective_content_of_dash_a(repo: Path, home: Path) -> None:
     """The note must not license depth-ack after inspecting only the index: -a
     adds tracked working-tree edits at commit time, beyond that snapshot."""
