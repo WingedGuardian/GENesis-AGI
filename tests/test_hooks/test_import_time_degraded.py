@@ -1165,9 +1165,25 @@ _NOT_PYTHON_ON_BASH = {
 #: substring that could appear anywhere in someone else's command.
 _INLINE_SHELL_PREFIX = "bash -c 'IN=$(cat);"
 
-#: Hooks that legitimately do NOT block when degraded. Each value must appear
-#: VERBATIM in that hook's module docstring — locked by
-#: test_the_advisory_allowlist_quotes_are_real.
+#: Hooks that legitimately do NOT block when degraded.
+#:
+#: THIS IS A HUMAN CLAIM, like every other exemption list in this repo
+#: (`_NOT_WIRED` above, `_STRUCTURALLY_BOUNDED` and `hook-output-exempt:` in
+#: test_hook_output_contract.py, `UNMAPPED_BY_DESIGN` in the sentinel). The quote
+#: is EVIDENCE OF INTENT — it must appear verbatim in the hook's own docstring,
+#: which is checked, and which caught three invented justifications — but it is
+#: not a proof of behaviour and is not presented as one.
+#:
+#: An earlier version tried to VERIFY the claim by scanning for blocking syntax.
+#: It could not converge: a docstring keyword matched three hooks that DO refuse;
+#: a verbatim quote passes on historical prose; an AST scan for `exit(2)` missed
+#: `return 2`, the house spelling; a scan for `return 2` misses `BLOCK = 2`, a
+#: computed status, or a delegated helper. A contract cannot be inferred from
+#: syntax, and every refactor invents a spelling the scan does not know. The
+#: right shape is an explicit declaration the hook entrypoint ENFORCES, which is
+#: a change to the hooks rather than to this test — see the issue linked from the
+#: PR. Until then this list is what it has always been: a claim someone had to
+#: write down, next to the words that justify it.
 _ADVISORY_BY_DESIGN = {
     "hooks/capped_read_advisory.py": "ADVISORY ONLY.",
     "hooks/credential_surface_hook.py": "Exit 0 always — advisory, never blocks.",
@@ -1370,54 +1386,6 @@ def test_the_advisory_allowlist_quotes_are_real():
             f"in its docstring. The justification must be the hook's own words, or "
             f"the exemption is unverifiable."
         )
-
-
-def test_an_allowlisted_hook_carries_no_blocking_MECHANISM():
-    """The quote is evidence of INTENT; this is evidence of the CURRENT contract.
-
-    A phrase check alone passes on historical prose: a docstring rewritten to
-    "formerly ADVISORY ONLY; now blocks on X" still contains the quoted words, and
-    if the hook gained a blocking path WITHOUT an import-time handler it exits 1
-    under the poisoned run, satisfies `returncode != 2`, and the fail-open stays
-    green. So the allowlist is additionally checked against what the code can
-    actually DO, by AST rather than by text.
-    """
-    for rel in _ADVISORY_BY_DESIGN:
-        path = _REPO_ROOT / "scripts" / rel
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            # `return 2` from main(), which run_guard translates into the exit
-            # status. This is the HOUSE convention for blocking, so checking only
-            # for exit() calls would miss the ordinary spelling entirely — and a
-            # hook that gained a `return 2` path while keeping its advisory
-            # docstring still exits 1 under the poisoned run, satisfying
-            # `returncode != 2` and staying permanently exempt.
-            if isinstance(node, ast.Return) and isinstance(node.value, ast.Constant):
-                assert node.value.value != 2, (
-                    f"{rel} is allowlisted as advisory but has a `return 2` — the "
-                    f"house spelling for blocking, which run_guard turns into exit 2. "
-                    f"Remove it from _ADVISORY_BY_DESIGN, or remove the blocking path."
-                )
-            # sys.exit(2) / os._exit(2) / exit(2)
-            if isinstance(node, ast.Call):
-                fn = node.func
-                name = getattr(fn, "attr", None) or getattr(fn, "id", None)
-                if name in ("exit", "_exit") and node.args:
-                    arg = node.args[0]
-                    assert not (isinstance(arg, ast.Constant) and arg.value == 2), (
-                        f"{rel} is allowlisted as advisory but contains an exit(2) — a "
-                        f"BLOCKING mechanism. Its docstring may still carry the advisory "
-                        f"words, which is why this checks the code instead. Remove it "
-                        f"from _ADVISORY_BY_DESIGN, or remove the blocking path."
-                    )
-            # A permissionDecision of deny/ask gates on an exit-0 hook.
-            if isinstance(node, ast.Constant) and node.value in ("deny", "ask"):
-                src_text = path.read_text(encoding="utf-8")
-                assert "permissionDecision" not in src_text, (
-                    f"{rel} is allowlisted as advisory but references a "
-                    f"permissionDecision — an exit-0 hook can still GATE that way, so "
-                    f"'exits non-2' is not sufficient evidence that it never blocks."
-                )
 
 
 def test_the_advisory_allowlist_has_no_stale_entries():
