@@ -3330,6 +3330,80 @@ being a review and becomes an unbounded refactor, which is how a two-finding PR
 turns into a six-round loop. The PR is the unit of work. The queue is the place
 the rest of it goes.
 
+### Before reviewing an OLD PR, check it is still work (standing user rule, 2026-09-15)
+
+A review session drains a queue sorted by age, and the older the PR the more
+likely it is no longer work — its content already merged under a different
+number. Observed twice in one session on 2026-09-15 (unquantified: nobody
+counted the old PRs that WERE still work, so treat this as a prompt to check,
+not a base rate).
+
+**Squash merges are why this is not obvious.** A squash rewrites the commits, so
+the branch's own history never becomes an ancestor of `main`. MEASURED on a
+two-commit branch whose work had landed as one squashed commit:
+
+| test | result |
+| --- | --- |
+| `git merge-base --is-ancestor <branch> main` | rc 1 — reads as UNMERGED |
+| `git cherry -v main <branch>` | `+` on BOTH commits — reads as unique |
+| `git diff origin/main..HEAD -- <files>` | **empty — correctly detects it** |
+
+`git cherry` compares patch-ids, so it DOES catch a squash of a single commit —
+and is blind exactly when the squash combined several, which is the common case.
+Do not rely on it.
+
+```bash
+git fetch origin main --quiet     # a stale ref decides this test otherwise
+git diff origin/main..HEAD -- <the files it claims to change>   # empty ⇒ already there
+```
+
+TWO DOTS, not three. `origin/main...HEAD` is merge-base→HEAD: it ignores
+everything that landed on `main` after the fork point, including the squash that
+carries the work, so it is non-empty for a superseded PR every time. It is
+exactly as blind as the ancestry tests above. (Caveat on the two-dot form: a
+RENAME on `main` makes the old path read as a new file, so a renamed-and-merged
+change still looks like work.)
+
+Once you have a commit ON `main` that you suspect carries it, this NAMES the
+successor — note it answers "which PRs contain this commit", so feeding it the
+open PR's own head just returns that PR:
+
+```bash
+gh api repos/<owner>/<repo>/commits/<sha-on-main>/pulls --jq '.[] | "\(.number) \(.state)"'
+```
+
+**A second, separate question: is the tree you are standing in at the PR's
+head?** A worktree created from a branch NAME sits wherever that ref pointed
+when it was created. That check is already specified — with the fetch it needs,
+the `main`-ancestry companion, and the reasons a ref comparison alone is not
+enough — in the `closing-session` skill under *Establish freshness by comparing
+REFS*, and in **Date the code before classifying a red** above. Use those; do
+not re-derive a shorter version here. Note also that `rev-parse HEAD` is blind
+to uncommitted edits, so check `status --porcelain` too.
+
+MEASURED 2026-09-15, one worktree, the cost of skipping it: a tree four commits
+behind its PR head produced a CRITICAL finding, a full adversarial audit, a
+public issue, a commit and review evidence — all describing a defect the branch
+had already fixed in a commit that tree could not see. The same audit declared
+two functions absent from the codebase when both exist at the head, which turned
+a reviewer's correct finding into a rejected one. Every measurement was true of
+the tree it ran in and false about the PR.
+
+**Treat a finding that is too good as a staleness signal first** — a defect that
+would break the feature outright, a symbol a careful author somehow forgot.
+Re-read the head before writing it down, and certainly before filing it
+publicly. That check is cheap and unconditional; the judgement about whether a
+finding is "too good" is not, which is why the action does not depend on it.
+
+**A subagent inherits your staleness silently** — point an audit at a worktree
+path and it will measure that tree with complete confidence. Put the head SHA in
+the dispatch prompt and ask it to verify the match first.
+
+**When a PR IS superseded: name the successor in a comment and LEAVE IT OPEN.**
+Closing it is retiring, which is not the review station's call — see *Never
+RETIRE a PR you are not the one reviving* above. Do not "rebase and revive" it
+either; that is how the same change lands twice.
+
 ## Pre-Merge Gate
 
 > **This is closing-session territory.** A build session's work ends when the PR
