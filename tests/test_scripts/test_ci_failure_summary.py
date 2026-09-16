@@ -140,14 +140,33 @@ def test_an_oversized_run_stays_under_the_cap_and_says_what_it_left_out(tmp_path
         "the list was bounded without saying so, which reads as complete"
     )
     assert "of 12000" in r.stdout, "the shortfall was stated without its denominator"
+    # THE COUNT MUST RECONCILE. This is what separates "stopped listing and kept
+    # counting honestly" from "gave up and blamed everything after the first row
+    # that did not fit" — a bare presence check passes against both, which is
+    # how the first version of this test failed to notice the difference.
+    counted = re.search(r"\*\*(\d+) of (\d+) not listed here\*\*", r.stdout)
+    assert counted, "the omission line is not in the expected shape"
+    omitted_n, total_n = int(counted.group(1)), int(counted.group(2))
+    assert total_n == 12000, f"denominator is {total_n}, not the 12000 that failed"
     assert r.stdout.rstrip().endswith("artifact on this run."), (
         "the closing pointer fell off the end — the reserve did not hold, so "
         "the one line naming where the omitted failures live is gone"
     )
     listed = [ln for ln in r.stdout.splitlines() if ln.startswith("- **")]
     assert listed, "budget consumed everything; no failure is named at all"
-    assert all(ln.endswith(tuple("0123456789")) for ln in listed), (
-        "a row was cut mid-value rather than omitted whole"
+    # Whole rows, never a cut value. Every row ends with the closing fence that
+    # wraps the message, and the value inside it ends with the case number the
+    # fixture generated — so a row cut mid-message would land on a digit that
+    # is not the last one, or lose its fence entirely.
+    for ln in listed:
+        assert ln.rstrip().endswith("`"), f"row lost its closing fence: {ln[-80:]!r}"
+        assert ln.rstrip().rstrip("`").rstrip().endswith(tuple("0123456789")), (
+            f"a row was cut mid-value rather than omitted whole: {ln[-80:]!r}"
+        )
+    assert len(listed) + omitted_n == total_n, (
+        f"listed {len(listed)} + omitted {omitted_n} != {total_n} — the counts do "
+        "not reconcile, so either rows vanished without being counted or the "
+        "omission line is claiming rows that were in fact listed"
     )
 
 
@@ -209,6 +228,16 @@ def test_a_crash_with_no_report_names_the_test_that_was_running(tmp_path, monkey
     assert "tests/test_thing.py::test_that_segfaulted" in out.stdout, (
         f"a crash with no report named nothing — breadcrumb unread: {out.stdout}"
     )
+    # DIRECTION. A crash inside a running test dies wherever the run had got to,
+    # which on a long run is the truncated tail. Sending the reader to the HEAD
+    # of the log here is advice that cannot be followed — it is only true for a
+    # collection crash, which is the control below.
+    assert "truncated tail" in out.stdout, (
+        "a hard crash was not pointed at the tail, where its output actually is"
+    )
+    assert "HEAD of the step log" not in out.stdout, (
+        "a hard crash was sent to the head of the log, where nothing about it is"
+    )
 
 
 def test_a_crash_with_no_breadcrumb_still_says_something_useful(tmp_path, monkeypatch):
@@ -223,6 +252,13 @@ def test_a_crash_with_no_breadcrumb_still_says_something_useful(tmp_path, monkey
     assert "last test to START" not in out.stdout, (
         "claimed an active test when there was no breadcrumb"
     )
+    # The CONTROL for the direction assertion above: no test had started, so
+    # this really is a collection or startup failure and the head of the log
+    # really does hold it.
+    assert "HEAD of the step log" in out.stdout, (
+        "a collection crash was not pointed at the head of the log"
+    )
+    assert "truncated tail" not in out.stdout
 
 
 def test_the_breadcrumb_hook_records_the_node_id(tmp_path, monkeypatch):
@@ -452,3 +488,100 @@ def test_the_narrator_fires_only_when_the_TEST_step_failed():
         "GitHub will AND an implicit success() onto it and the step will never run "
         "after a failure"
     )
+
+
+def test_a_message_that_dwarfs_the_budget_still_names_its_test_and_the_rest(tmp_path):
+    """One pathological message must not erase the whole summary.
+
+    A single `RuntimeError("x" * 2_000_000)` used to make its row exceed the
+    entire 1 MiB budget, and the loop then BROKE — so the first failure being
+    enormous produced a summary naming ZERO tests, discarding every later row
+    that would have fitted. The id and the message are budgeted separately now:
+    the id is the answer to "which test failed", the message is a nicety.
+    """
+    huge = "R" * 2_000_000
+    report = tmp_path / "junit.xml"
+    report.write_text(
+        "<testsuites><testsuite>"
+        f'<testcase classname="tests.test_a" name="test_the_enormous_one">'
+        f'<failure message="RuntimeError: {huge}"/></testcase>'
+        '<testcase classname="tests.test_b" name="test_an_ordinary_one">'
+        '<failure message="AssertionError: ordinary"/></testcase>'
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    r = _run(str(report))
+    assert r.returncode == 0
+    assert len(r.stdout.encode()) <= 1024 * 1024, "summary went over the cap"
+    assert "test_the_enormous_one" in r.stdout, (
+        "the oversized message took its own test id down with it"
+    )
+    assert "test_an_ordinary_one" in r.stdout, (
+        "a later row that would have fitted was discarded behind the big one"
+    )
+    assert "message omitted" in r.stdout, (
+        "the message was dropped without saying so — a bare row reads as a test "
+        "that failed with no message at all"
+    )
+    assert r.stdout.rstrip().endswith("artifact on this run."), "pointer fell off"
+
+
+def test_test_controlled_text_cannot_escape_its_own_row(tmp_path):
+    """Ids and messages are arbitrary test-controlled text, and this repo
+    parametrises over shell payloads, backticks and HTML-like strings by the
+    hundred. Rendered raw, a message ending in an unclosed `<!--` comments out
+    every row below it AND the artifact pointer — the summary then reads as
+    though those failures did not exist."""
+    report = tmp_path / "junit.xml"
+    report.write_text(
+        "<testsuites><testsuite>"
+        '<testcase classname="tests.test_a" name="test_with_a_comment_opener">'
+        '<failure message="AssertionError: trailing &lt;!-- opener"/></testcase>'
+        '<testcase classname="tests.test_b" name="test_with_backticks[`x`-``y``]">'
+        '<failure message="AssertionError: has `backticks` in it"/></testcase>'
+        '<testcase classname="tests.test_c" name="test_after_the_payloads">'
+        '<failure message="AssertionError: must still be visible"/></testcase>'
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    r = _run(str(report))
+    assert r.returncode == 0
+    # The row AFTER the payloads must survive, and so must the pointer.
+    assert "test_after_the_payloads" in r.stdout, (
+        "a payload row swallowed the rows below it"
+    )
+    assert r.stdout.rstrip().endswith("artifact on this run."), (
+        "a payload row swallowed the closing artifact pointer"
+    )
+    listed = [ln for ln in r.stdout.splitlines() if ln.startswith("- **")]
+    assert len(listed) == 3, f"listed {len(listed)} of 3"
+    # A value containing backticks must be fenced by a LONGER run than it holds,
+    # or the code span closes early and the rest of the row renders as markup.
+    backtick_row = next(ln for ln in listed if "test_with_backticks" in ln)
+    assert "```" in backtick_row, (
+        f"a value containing a double backtick was not fenced wider than itself: "
+        f"{backtick_row!r}"
+    )
+
+
+def test_a_node_id_that_is_not_valid_utf8_does_not_abort_pytest(tmp_path, monkeypatch):
+    """The breadcrumb may never be the thing that breaks the suite.
+
+    On POSIX a filename carrying a non-UTF-8 byte reaches the hook as a
+    surrogate, and a strict UTF-8 write raises UnicodeEncodeError — which is not
+    an OSError, so the original handler let it escape and pytest would abort
+    with an internal error BEFORE the test ran. This suite already constructs
+    exactly such a value (`os.fsdecode(b"tests/\xff.py")`).
+    """
+    import tests.conftest as genesis_conftest
+
+    crumb = tmp_path / "active-test.txt"
+    monkeypatch.setenv(genesis_conftest.ACTIVE_TEST_FILE_ENV, str(crumb))
+    monkeypatch.setenv(genesis_conftest.ACTIVE_TEST_OWNER_ENV, str(os.getpid()))
+
+    nodeid = os.fsdecode(b"tests/\xff.py") + "::test_undecodable"
+    genesis_conftest.pytest_runtest_logstart(nodeid, ("x", 1, "y"))  # must not raise
+
+    assert crumb.exists(), "the breadcrumb was not written at all"
+    written = crumb.read_text(encoding="utf-8", errors="surrogateescape").strip()
+    assert written.endswith("::test_undecodable"), written

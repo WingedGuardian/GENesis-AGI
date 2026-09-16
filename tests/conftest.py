@@ -689,9 +689,17 @@ def pytest_runtest_logstart(nodeid, location):
     if not path or not _owns_active_test_breadcrumb():
         return
     try:
-        with open(path, "w", encoding="utf-8") as fh:
+        # surrogateescape, and `except Exception`, because a node id is not
+        # guaranteed to be encodable. On POSIX a filename carrying a non-UTF-8
+        # byte reaches this hook as a surrogate (os.fsdecode(b"tests/\xff.py")),
+        # and a strict write raises UnicodeEncodeError -- which `except OSError`
+        # does NOT catch, so a best-effort diagnostic would abort pytest with an
+        # internal error BEFORE the test ran. The whole point of this hook is to
+        # be readable after a crash; being the crash is the one outcome it may
+        # not have.
+        with open(path, "w", encoding="utf-8", errors="surrogateescape") as fh:
             fh.write(f"{nodeid}\n")
             fh.flush()
             os.fsync(fh.fileno())
-    except OSError:
+    except Exception:  # noqa: BLE001 - see above: this may never fail the suite
         pass

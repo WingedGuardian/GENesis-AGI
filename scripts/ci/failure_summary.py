@@ -81,6 +81,32 @@ _OMISSION_RESERVE = 400
 _ACTIVE_TEST_CEILING = 4096
 
 
+def _fence(text: str) -> str:
+    """Render arbitrary test-controlled text so it cannot escape its own row.
+
+    Test ids and exception messages are whatever a test happens to be named or
+    to raise, and this repository parametrises over shell payloads, backticks
+    and HTML-like strings by the hundred. Interpolated raw into Markdown, a
+    message ending in an unclosed ``<!--`` comments out every row BELOW it and
+    the artifact pointer with it — the summary then reads as though those
+    failures did not exist, which is precisely the silent under-read this whole
+    script was written to stop.
+
+    Backslash-escaping is not enough on its own because an unbalanced backtick
+    also breaks the code span, so the row is rendered inside a fence sized to
+    exceed the longest backtick run the value itself contains.
+    """
+    flat = text.replace("\r", " ").replace("\n", " ")
+    longest = 0
+    run = 0
+    for ch in flat:
+        run = run + 1 if ch == "`" else 0
+        longest = max(longest, run)
+    fence = "`" * (longest + 1)
+    pad = " " if flat.startswith("`") or flat.endswith("`") else ""
+    return f"{fence}{pad}{flat}{pad}{fence}"
+
+
 def _first_line(text: str | None) -> str:
     if not text:
         return ""
@@ -142,16 +168,32 @@ def main(argv: list[str]) -> int:
         # verbosity used to buy.
         active = _active_test()
         where = (
-            f" The last test to START was {active}, so the crash is at or "
+            f" The last test to START was {_fence(active)}, so the crash is at or "
             "immediately after it."
             if active
             else ""
         )
+        # The two causes need DIFFERENT directions, and conflating them sends
+        # the reader to the wrong end of the log. A collection or startup crash
+        # dies before any test runs, so its output really is at the HEAD, which
+        # truncation does not reach. A hard crash INSIDE a test dies wherever
+        # the run had got to -- which on a long run is the truncated tail, the
+        # exact region this whole change exists because nobody can read. There
+        # the breadcrumb IS the evidence, and saying "look at the head" would be
+        # advice that cannot be followed.
+        where_to_look = (
+            "The crash is inside the run, so its output is wherever the run had "
+            "reached — on a long run that is the truncated tail, and the name "
+            "above is the evidence that survives it."
+            if active
+            else "No test had started, so this is a collection or startup "
+            "failure: its output is at the HEAD of the step log, which "
+            "truncation does not reach."
+        )
         print(
             f"{_NOTICE} no report at {report} — pytest died before writing one "
             "(collection crash, runner kill, or a hard crash inside a test)."
-            f"{where} The failure is in the step log BEFORE the test output "
-            "starts, which truncation does not reach."
+            f"{where} {where_to_look}"
         )
         return 0
     try:
@@ -199,22 +241,46 @@ def main(argv: list[str]) -> int:
 
     lines: list[str] = []
     spent = len(header.encode()) + len(trailer.encode()) + _OMISSION_RESERVE
-    for index, (kind, test_id, message) in enumerate(rows):
-        line = f"- **{kind}** `{test_id}`"
+    omitted = 0
+    for kind, test_id, message in rows:
+        # The ID and the MESSAGE are budgeted SEPARATELY, because they are not
+        # equally important and they are not equally bounded. The id is the
+        # answer to "which test failed" and is short; the message is a nicety
+        # and is whatever the test raised. A single
+        # `RuntimeError("x" * 2_000_000)` used to make its row exceed the whole
+        # budget, and the loop then BROKE -- so one pathological first failure
+        # produced a summary naming ZERO tests, with every later row that would
+        # have fitted discarded behind it.
+        id_line = f"- **{kind}** {_fence(test_id)}"
+        id_cost = len(id_line.encode()) + 1
+        if spent + id_cost > _SUMMARY_BUDGET_BYTES:
+            # Only an ID that cannot fit counts as omitted, and we keep going:
+            # a later row may still fit, and the count must be of rows actually
+            # dropped rather than of everything after the first big one.
+            omitted += 1
+            continue
+        line = id_line
+        spent += id_cost
         if message:
-            line += f" — {message}"
-        cost = len(line.encode()) + 1
-        if spent + cost > _SUMMARY_BUDGET_BYTES:
-            omitted = len(rows) - index
-            lines.append(
-                f"\n> **{omitted} of {len(rows)} not listed here** — the step "
-                "summary hit GitHub's 1 MiB cap, and a summary over that cap is "
-                "not rendered at all. Every one of the "
-                f"{len(rows)} is in the artifact below."
-            )
-            break
-        spent += cost
+            addition = f" — {_fence(message)}"
+            add_cost = len(addition.encode())
+            if spent + add_cost <= _SUMMARY_BUDGET_BYTES:
+                line += addition
+                spent += add_cost
+            else:
+                # The id survives without its message. Say so, rather than
+                # letting a bare row read as a test that failed silently.
+                line += " — _(message omitted: it would not fit the summary cap;"
+                line += " it is in the artifact below)_"
+                spent += 96
         lines.append(line)
+    if omitted:
+        lines.append(
+            f"\n> **{omitted} of {len(rows)} not listed here** — the step "
+            "summary hit GitHub's 1 MiB cap, and a summary over that cap is "
+            "not rendered at all. Every one of the "
+            f"{len(rows)} is in the artifact below."
+        )
 
     print(header)
     for line in lines:
