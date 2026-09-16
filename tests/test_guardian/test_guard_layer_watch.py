@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -783,3 +784,31 @@ class TestRound4Regressions:
         assert "bounded repair" not in doc, (
             "the wrapper still describes a repair this watch does not perform"
         )
+
+    def test_the_subprobe_budget_fits_inside_the_outer_timeout(self):
+        """A per-subcheck bound that does not FIT is the same failure wearing a fix.
+
+        An earlier version used 10s across six subchecks - 60s against a 30s outer
+        default - so several wedged commands still consumed the whole budget before
+        the marker printed, the probe parsed as None, and every condition went
+        silent. This asserts the arithmetic rather than the number, so a seventh
+        subcheck fails here instead of silently overcommitting.
+        """
+        script = glw._PROBE_SCRIPT.decode()
+        spec = re.search(r'T="timeout -k (\d+) (\d+)"', script)
+        assert spec, "the probe must bound each subcheck with an explicit kill-after"
+        grace, per_check = int(spec.group(1)), int(spec.group(2))
+        subchecks = script.count("$T ")
+        worst_case = subchecks * (per_check + grace)
+        outer = GuardLayerConfig().check_timeout_s
+        assert worst_case < outer, (
+            f"{subchecks} subchecks x ({per_check}s + {grace}s kill grace) = "
+            f"{worst_case}s, which does not fit inside the {outer}s outer timeout. "
+            f"Wedged commands would consume the budget before the marker prints, the "
+            f"probe would parse as None, and every condition would go silent - the "
+            f"exact failure the per-subcheck bound exists to prevent."
+        )
+
+    def test_the_subcheck_bound_sends_KILL_not_only_TERM(self):
+        """Plain `timeout` sends TERM; a TERM-resistant command is then unbounded."""
+        assert "timeout -k " in glw._PROBE_SCRIPT.decode()

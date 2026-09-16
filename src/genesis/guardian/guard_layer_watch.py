@@ -140,15 +140,24 @@ VENV="$REPO/.venv/bin/python"
 HOOK="$REPO/.claude/hooks/genesis-hook"
 fails=""
 
-# EVERY subcheck is individually bounded. Without this, one hung command - most
-# pointedly `genesis-hook` itself, the exact thing being monitored - runs out the
-# OUTER incus timeout, the marker below is never printed, the probe parses as
-# None, and every container condition becomes inconclusive. A permanently hung
-# launcher would then stay silent forever instead of ever reaching confirm_ticks:
-# the detector going quiet in precisely the failure it exists for. A per-check
-# timeout turns a hang into a REPORTED failure; the outer timeout still covers a
-# genuinely unreachable container.
-T="timeout 10"
+# EVERY subcheck is individually bounded, and the BUDGET MUST FIT inside the outer
+# incus timeout. Without the bound, one hung command - most pointedly `genesis-hook`
+# itself, the exact thing being monitored - runs out the outer timeout, the marker
+# below is never printed, the probe parses as None, and every container condition
+# goes inconclusive: the detector quiet in precisely the failure it exists for.
+#
+# But a bound that does not fit is the same failure wearing a fix. An earlier
+# version used 10s across SIX subchecks - 60s against a 30s outer default - so
+# several wedged commands still consumed the whole budget before the marker ran.
+# The arithmetic is now an asserted invariant (see
+# test_the_subprobe_budget_fits_inside_the_outer_timeout), so a seventh subcheck
+# fails the test instead of silently overcommitting.
+#
+# `-k` because plain `timeout` sends TERM only: a TERM-resistant command would not
+# be bounded at all, which is the case this exists for.
+#   worst case 6 x (3 + 1) = 24s < 30s outer default, leaving margin for the
+#   login shell and the marker itself.
+T="timeout -k 1 3"
 
 # 1. The LAUNCHER. This is what Claude Code actually invokes, and it covers what
 #    a venv check alone cannot: a missing or non-executable script, a broken
