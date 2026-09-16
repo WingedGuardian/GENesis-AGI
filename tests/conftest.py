@@ -38,6 +38,7 @@ if _WORKTREE_SRC.is_dir():
         sys.path.remove(_src_str)
     sys.path.insert(0, _src_str)
 
+import contextlib  # noqa: E402
 import os  # noqa: E402
 
 import aiosqlite  # noqa: E402
@@ -613,6 +614,60 @@ async def empty_db():
     await wrapped.close()
 
 
+#: The breadcrumb's path, and the pid of the pytest session that OWNS it.
+ACTIVE_TEST_FILE_ENV = "GENESIS_ACTIVE_TEST_FILE"
+ACTIVE_TEST_OWNER_ENV = "GENESIS_ACTIVE_TEST_OWNER"
+
+
+def _claim_active_test_breadcrumb():
+    """Take the breadcrumb for THIS process, unless a parent pytest already has it.
+
+    The path arrives through ``os.environ``, and this repo's own suite launches
+    NESTED pytest runs that inherit it -- ``test_pytest_lock`` and
+    ``test_proactive_hook_bounded_output`` both spawn a child with
+    ``{**os.environ, ...}``. Without an owner every one of those children writes
+    ITS node ids over the outer session's file, so after the child exits a hard
+    crash in the still-running outer test is reported under the child's last
+    test: a confident, wrong name, which is worse than no name at all.
+
+    The owner pid is exported, so a child inherits it and sees a value that is
+    not its own pid -- that comparison, not the mere presence of a variable, is
+    what makes a nested run stand down. The idiom already exists here:
+    ``pytest_lock``'s HELD_ENV does the same job for the box-wide lock, and its
+    tests pop it precisely so a child stops mistaking itself for the outer run.
+
+    LIMIT, stated rather than discovered later: under ``pytest-xdist`` every
+    worker is a child that inherits the owner, so all of them stand down and no
+    breadcrumb is written. The suite does not use xdist (it is not a declared
+    dependency), and a wrong name is worse than a missing one, so standing down
+    is the right direction to fail -- but a future ``-n`` would need a
+    per-worker path rather than this claim.
+    """
+    if not os.environ.get(ACTIVE_TEST_FILE_ENV):
+        return
+    if os.environ.get(ACTIVE_TEST_OWNER_ENV):
+        return  # inherited: an outer pytest owns it, and we are nested
+    os.environ[ACTIVE_TEST_OWNER_ENV] = str(os.getpid())
+
+
+def _owns_active_test_breadcrumb():
+    """True only for the process that claimed the breadcrumb.
+
+    Re-read from the environment on every write rather than cached, so a test
+    that manipulates these variables sees the effect it asked for, and so the
+    failure direction is silence rather than a wrong name.
+    """
+    return os.environ.get(ACTIVE_TEST_OWNER_ENV) == str(os.getpid())
+
+
+# Guarded like everything else on this path. The hook below is documented
+# best-effort throughout, and this is the one line that runs at IMPORT time --
+# where a raise is not a failed test, it is a collection error that takes the
+# whole suite down. A breadcrumb is a diagnostic; it never gets to be fatal.
+with contextlib.suppress(Exception):  # see the best-effort note above
+    _claim_active_test_breadcrumb()
+
+
 def pytest_runtest_logstart(nodeid, location):
     """Record the test about to run, for a crash that never writes a report.
 
@@ -625,11 +680,13 @@ def pytest_runtest_logstart(nodeid, location):
     happened in.
 
     INERT unless ``GENESIS_ACTIVE_TEST_FILE`` is set, so a local run pays
-    nothing. Best-effort throughout -- a breadcrumb that could fail the suite it
-    exists to diagnose would be a poor trade.
+    nothing, and inert in a NESTED pytest run that inherited the variable from
+    an outer session (see ``_claim_active_test_breadcrumb``). Best-effort
+    throughout -- a breadcrumb that could fail the suite it exists to diagnose
+    would be a poor trade.
     """
-    path = os.environ.get("GENESIS_ACTIVE_TEST_FILE")
-    if not path:
+    path = os.environ.get(ACTIVE_TEST_FILE_ENV)
+    if not path or not _owns_active_test_breadcrumb():
         return
     try:
         with open(path, "w", encoding="utf-8") as fh:

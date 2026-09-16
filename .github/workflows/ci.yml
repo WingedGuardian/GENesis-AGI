@@ -718,6 +718,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[test]"
       - name: Run tests
+        # The narrator below fires on THIS step's failure, not on the job's.
+        id: tests
         run: |
           # Never measure a stale report: if pytest dies before writing
           # one, the checker must find nothing rather than yesterday's.
@@ -765,8 +767,29 @@ jobs:
       # there is nothing to narrate, and the script's own notice covers the
       # report-never-written case (pytest died in collection) rather than
       # letting a missing file read as a second failure.
+      #
+      # AND scoped to the TEST step, because a job-wide condition is true after
+      # ANY earlier step fails. Checkout, setup-python and the dependency
+      # install all precede this one: unscoped, a broken install makes this say
+      # "pytest died before writing a report" about a pytest that never ran,
+      # and a broken CHECKOUT leaves no script and no interpreter, so the
+      # narrator itself goes red -- a second failure invented by the step whose
+      # entire contract is never to add one. A skipped test step reads
+      # 'skipped', so every pre-pytest failure is silent.
+      #
+      # !cancelled() rather than failure(), and the reason is not style. An
+      # `if` containing NO status-check function gets an implicit success()
+      # AND-ed onto it, so the outcome test ALONE would never run after a
+      # failure -- the condition has to carry one. failure() would work today
+      # but is the wrong one to carry: it is false when a step is marked
+      # continue-on-error, so adding that to the test step later would silently
+      # take this narrator offline while `outcome` still read 'failure'.
+      # !cancelled() survives that, and matches the two sibling steps below.
+      #
+      # `outcome`, not `conclusion`, for the same reason: outcome is the raw
+      # result before continue-on-error rewrites it.
       - name: Name the failures where truncation cannot reach
-        if: ${{ failure() }}
+        if: ${{ !cancelled() && steps.tests.outcome == 'failure' }}
         run: python scripts/ci/failure_summary.py junit.xml >> "$GITHUB_STEP_SUMMARY"
         env:
           GENESIS_ACTIVE_TEST_FILE: active-test.txt
@@ -855,4 +878,4 @@ jobs:
         # The base is deliberately NOT re-derived from the merged tree: this is
         # a FLOOR, so a lagging base is conservative and can only under-catch,
         # never go falsely red.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23280
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23298

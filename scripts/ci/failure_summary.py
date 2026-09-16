@@ -60,6 +60,26 @@ _SUMMARY_BUDGET_BYTES = 1024 * 1024
 #: bounded list that cannot say it was bounded reads as a complete one.
 _OMISSION_RESERVE = 400
 
+#: A ceiling on the breadcrumb, and a RESOURCE guard rather than a preference:
+#: the crash notice shares GitHub's 1 MiB step-summary cap, and a summary over
+#: that cap renders as NOTHING at all — so an unbounded id is a way to lose the
+#: whole summary, not merely a way to make it long.
+#:
+#: MEASURED 2026-09-16 over 26,798 node ids — a LOWER BOUND, not a census: that
+#: is a local collect-only run with CI's ignore set, and CI itself collected
+#: 27,218 at this commit, so ~400 ids were never sampled. Every figure below is
+#: therefore "at least". p50 91, p99 173, p99.9 215; FOUR ids cross this
+#: ceiling (200,105 / 110,106 / 20,105 / 6,993), and the top three are
+#: parametrised cases whose PARAMETER is a large string — a payload, not a
+#: name. 4096 sits far above every id that actually names a test (the
+#: fifth-longest is under 500) and bounds the notice at 4 KiB of the budget.
+#:
+#: The previous bound was 200, which silently cut at least 54 ids (0.2%) across
+#: 18 test files — a truncated id reads as a whole one, so a crash in a long
+#: parametrised case was reported under a name that identified the wrong case.
+#: When this one bites it SAYS so and states the true length.
+_ACTIVE_TEST_CEILING = 4096
+
 
 def _first_line(text: str | None) -> str:
     if not text:
@@ -78,6 +98,9 @@ def _active_test() -> str:
     construction: every failure to read it returns "" and the caller simply says
     less, because a narrator that raises while explaining a failure is worse
     than one that is vague.
+
+    The id comes back WHOLE unless it crosses ``_ACTIVE_TEST_CEILING``, in which
+    case the return value says so and states the true length.
     """
     import os
 
@@ -88,9 +111,20 @@ def _active_test() -> str:
         name = Path(path).read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return ""
-    # Bounded: this lands in a rendered summary, and an unbounded value from a
-    # file is not something to paste in whole.
-    return name.splitlines()[0][:200] if name else ""
+    if not name:
+        return ""
+    first = name.splitlines()[0]
+    if len(first) <= _ACTIVE_TEST_CEILING:
+        return first
+    # DECLARED, never silent. The whole point of this value is to identify one
+    # case, and a cut suffix is exactly the part that distinguishes a
+    # parametrised case from its siblings — so a reader who is handed a short
+    # id must be able to tell it apart from a complete one.
+    return (
+        f"{first[:_ACTIVE_TEST_CEILING]}… [TRUNCATED — the node id is "
+        f"{len(first)} characters, so this names the parametrised case only "
+        "up to its first 4096]"
+    )
 
 
 def main(argv: list[str]) -> int:

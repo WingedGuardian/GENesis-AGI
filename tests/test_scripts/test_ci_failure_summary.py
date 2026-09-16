@@ -21,13 +21,15 @@ the failures). Two properties matter and both are asserted here:
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "ci" / "failure_summary.py"
+_REPO = Path(__file__).resolve().parents[2]
+_SCRIPT = _REPO / "scripts" / "ci" / "failure_summary.py"
 
 _REPORT_WITH_FAILURES = """<?xml version="1.0" encoding="utf-8"?>
 <testsuites>
@@ -229,12 +231,224 @@ def test_the_breadcrumb_hook_records_the_node_id(tmp_path, monkeypatch):
     import tests.conftest as genesis_conftest
 
     crumb = tmp_path / "active-test.txt"
-    monkeypatch.setenv("GENESIS_ACTIVE_TEST_FILE", str(crumb))
+    monkeypatch.setenv(genesis_conftest.ACTIVE_TEST_FILE_ENV, str(crumb))
+    monkeypatch.setenv(genesis_conftest.ACTIVE_TEST_OWNER_ENV, str(os.getpid()))
     genesis_conftest.pytest_runtest_logstart("tests/test_x.py::test_y", ("x", 1, "y"))
     assert crumb.read_text().strip() == "tests/test_x.py::test_y"
 
     # INERT without the variable — a local run must pay nothing.
-    monkeypatch.delenv("GENESIS_ACTIVE_TEST_FILE", raising=False)
+    monkeypatch.delenv(genesis_conftest.ACTIVE_TEST_FILE_ENV, raising=False)
     crumb.unlink()
     genesis_conftest.pytest_runtest_logstart("tests/test_x.py::test_z", ("x", 1, "z"))
     assert not crumb.exists()
+
+
+def test_a_process_that_does_not_own_the_breadcrumb_does_not_write_it(
+    tmp_path, monkeypatch
+):
+    """The predicate, in-process and both ways round.
+
+    A nested pytest run inherits the breadcrumb PATH, so the path alone cannot
+    decide who may write. Ownership is the pid comparison, and this asserts the
+    hook consults it — the subprocess test below proves it in a real nested run,
+    but this one localises a regression to the predicate itself.
+    """
+    import tests.conftest as genesis_conftest
+
+    crumb = tmp_path / "active-test.txt"
+    monkeypatch.setenv(genesis_conftest.ACTIVE_TEST_FILE_ENV, str(crumb))
+    # An owner that is NOT this process: exactly what a child inherits.
+    monkeypatch.setenv(genesis_conftest.ACTIVE_TEST_OWNER_ENV, str(os.getpid() + 1))
+    genesis_conftest.pytest_runtest_logstart("tests/test_x.py::test_nested", ("x", 1, "y"))
+    assert not crumb.exists(), "a non-owner wrote the breadcrumb"
+
+    # CONTROL that moves: same call, ownership taken.
+    monkeypatch.setenv(genesis_conftest.ACTIVE_TEST_OWNER_ENV, str(os.getpid()))
+    genesis_conftest.pytest_runtest_logstart("tests/test_x.py::test_owned", ("x", 1, "y"))
+    assert crumb.read_text().strip() == "tests/test_x.py::test_owned"
+
+
+def test_the_claim_stands_down_when_a_parent_pytest_already_owns_it(tmp_path, monkeypatch):
+    """The claim half: the mechanism that makes a child a non-owner in the first
+    place. Presence of an inherited owner must not be overwritten."""
+    import tests.conftest as genesis_conftest
+
+    monkeypatch.setenv(genesis_conftest.ACTIVE_TEST_FILE_ENV, str(tmp_path / "c.txt"))
+    monkeypatch.delenv(genesis_conftest.ACTIVE_TEST_OWNER_ENV, raising=False)
+
+    # Unclaimed -> this process takes it.
+    genesis_conftest._claim_active_test_breadcrumb()
+    assert os.environ[genesis_conftest.ACTIVE_TEST_OWNER_ENV] == str(os.getpid())
+
+    # Already claimed by someone else -> left alone, so we stay a non-owner.
+    monkeypatch.setenv(genesis_conftest.ACTIVE_TEST_OWNER_ENV, "424242")
+    genesis_conftest._claim_active_test_breadcrumb()
+    assert os.environ[genesis_conftest.ACTIVE_TEST_OWNER_ENV] == "424242"
+    assert not genesis_conftest._owns_active_test_breadcrumb()
+
+    # And no breadcrumb path at all -> nothing is claimed.
+    monkeypatch.delenv(genesis_conftest.ACTIVE_TEST_FILE_ENV, raising=False)
+    monkeypatch.delenv(genesis_conftest.ACTIVE_TEST_OWNER_ENV, raising=False)
+    genesis_conftest._claim_active_test_breadcrumb()
+    assert genesis_conftest.ACTIVE_TEST_OWNER_ENV not in os.environ
+
+
+#: A small, fast module for the nested-run tests to aim a child pytest at. It
+#: only has to make at least one test START, which is what fires the hook.
+_CHILD_TARGET = ["tests/test_env.py", "-k", "timezone or user_timezone"]
+
+
+def _child_pytest(crumb: Path, *, owner: str | None) -> subprocess.CompletedProcess[str]:
+    """A real nested pytest run, exactly as this suite's own tests spawn one.
+
+    GENESIS_PYTEST_LOCK=0 because the box-wide test lock is already held by the
+    run executing this test — the same reason test_pytest_lock gives.
+    """
+    import tests.conftest as genesis_conftest
+
+    env = {
+        **os.environ,
+        genesis_conftest.ACTIVE_TEST_FILE_ENV: str(crumb),
+        "GENESIS_PYTEST_LOCK": "0",
+    }
+    if owner is None:
+        env.pop(genesis_conftest.ACTIVE_TEST_OWNER_ENV, None)
+    else:
+        env[genesis_conftest.ACTIVE_TEST_OWNER_ENV] = owner
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", *_CHILD_TARGET, "-q", "--no-header",
+         "-p", "no:cacheprovider"],
+        cwd=_REPO, env=env, capture_output=True, text=True, timeout=600,
+    )
+
+
+def test_a_nested_pytest_run_does_not_replace_the_outer_breadcrumb(tmp_path):
+    """The defect, replayed. This suite launches child pytest runs with
+    ``{**os.environ, ...}`` (test_pytest_lock, test_proactive_hook_bounded_output),
+    so before ownership the child rewrote the outer session's breadcrumb with its
+    OWN node ids — and a hard crash in the still-running outer test was then
+    reported under the child's last test. A confident wrong name, which is worse
+    than no name, because the notice around it reads identically either way.
+    """
+    crumb = tmp_path / "active-test.txt"
+    outer = "tests/test_outer.py::test_the_one_that_actually_crashed"
+    crumb.write_text(outer + "\n")
+
+    proc = _child_pytest(crumb, owner=str(os.getpid()))
+    # Guard-the-guard: a child that never ran would satisfy the assertion below
+    # vacuously, which is the whole failure mode this test exists to avoid.
+    combined = proc.stdout + proc.stderr
+    assert re.search(r"\d+ (passed|failed|error)", combined), (
+        f"the child pytest produced no result line, so it never ran:\n{combined[-800:]}"
+    )
+
+    assert crumb.read_text().strip() == outer, (
+        "a nested pytest run overwrote the outer session's breadcrumb — a crash "
+        f"in {outer} would now be reported under the child's last test"
+    )
+
+
+def test_an_unclaimed_breadcrumb_is_still_written_by_the_run_that_owns_it(tmp_path):
+    """The control that moves, and the acceptance bar for the feature itself.
+
+    Without this, an implementation that simply never wrote would pass the test
+    above. Same child, same file, one variable different: with no inherited
+    owner the child claims the breadcrumb and records its own node ids.
+    """
+    crumb = tmp_path / "active-test.txt"
+    crumb.write_text("tests/test_outer.py::test_stale\n")
+
+    proc = _child_pytest(crumb, owner=None)
+    combined = proc.stdout + proc.stderr
+    assert re.search(r"\d+ (passed|failed|error)", combined), (
+        f"the child pytest produced no result line, so it never ran:\n{combined[-800:]}"
+    )
+
+    written = crumb.read_text().strip()
+    assert written.startswith("tests/test_env.py::"), (
+        f"the owning run did not record its own node id — breadcrumb says {written!r}"
+    )
+
+
+def test_a_long_node_id_is_named_whole(tmp_path, monkeypatch):
+    """The 200-char bound cut 54 real ids (0.2% of 26,798) across 18 files.
+
+    MEASURED 2026-09-16 on this suite: p50 91, p99 173, p99.9 215. A cut lands
+    in the SUFFIX, which is precisely the part that distinguishes one
+    parametrised case from its siblings — so the summary named a case that was
+    not the case that crashed, and read as though it were whole.
+    """
+    node_id = "tests/test_hooks/test_guard_ansic_fail_closed.py::test_x[" + "p" * 220 + "]"
+    assert len(node_id) > 200, "fixture no longer exercises the old bound"
+    crumb = tmp_path / "active-test.txt"
+    crumb.write_text(node_id + "\n")
+    monkeypatch.setenv("GENESIS_ACTIVE_TEST_FILE", str(crumb))
+
+    out = _run(str(tmp_path / "does-not-exist.xml"))
+    assert out.returncode == 0
+    assert node_id in out.stdout, "the node id was cut — the summary names the wrong case"
+    assert "TRUNCATED" not in out.stdout
+
+
+def test_a_breadcrumb_beyond_the_ceiling_declares_its_cut(tmp_path, monkeypatch):
+    """The ceiling is a RESOURCE guard, and the one case where cutting is right:
+    the longest id this suite collects is 200,105 characters — a parametrised
+    case whose parameter is a 200 KB string, which is a payload, not a name.
+    GitHub renders NOTHING when a step summary passes 1 MiB, so an unbounded
+    paste is a way to lose the whole summary. What must never happen is a SILENT
+    cut, so the notice states the true length.
+    """
+    node_id = "tests/test_hooks/test_hook_output.py::test_big[" + "z" * 9000 + "]"
+    crumb = tmp_path / "active-test.txt"
+    crumb.write_text(node_id + "\n")
+    monkeypatch.setenv("GENESIS_ACTIVE_TEST_FILE", str(crumb))
+
+    out = _run(str(tmp_path / "does-not-exist.xml"))
+    assert out.returncode == 0
+    # The BRACKETED clause, not the bare word: a node id is attacker-adjacent
+    # text here (it is whatever a parametrised case is named), so an id merely
+    # containing "TRUNCATED" must not be able to satisfy this.
+    assert f"[TRUNCATED — the node id is {len(node_id)} characters" in out.stdout, (
+        f"an oversized id was cut with no usable declaration: {out.stdout[-300:]!r}"
+    )
+    assert len(out.stdout) < 20000, "the ceiling did not bound the notice"
+
+
+def test_the_narrator_fires_only_when_the_TEST_step_failed():
+    """Bare ``failure()`` is true after ANY earlier step in the job fails.
+
+    Checkout, setup-python and the dependency install all run before the test
+    step. Unscoped, a broken install makes this narrator announce that pytest
+    died before writing a report about a pytest that never started — and a
+    broken CHECKOUT leaves no script and no interpreter, so the narrator itself
+    goes red: a second failure invented by the one step whose entire contract is
+    that it never adds one.
+    """
+    import yaml
+
+    workflow = yaml.safe_load((_REPO / ".github/workflows/ci.yml").read_text())
+    steps = workflow["jobs"]["test"]["steps"]
+
+    by_name = {s.get("name"): s for s in steps if s.get("name")}
+    narrator = by_name.get("Name the failures where truncation cannot reach")
+    assert narrator is not None, "the narrator step was renamed — re-aim this test"
+
+    tests_step = next((s for s in steps if s.get("id") == "tests"), None)
+    assert tests_step is not None, (
+        "no step carries id: tests, so the narrator cannot be scoped to it"
+    )
+    assert "pytest" in tests_step.get("run", ""), "id: tests is not on the pytest step"
+
+    condition = narrator["if"]
+    assert "steps.tests.outcome" in condition, (
+        f"the narrator is not scoped to the test step's outcome: {condition!r} — it "
+        "will fire on a dependency-install or checkout failure too"
+    )
+    # An `if` with NO status-check function gets an implicit success() AND-ed
+    # onto it, so an outcome test on its own would never run after a failure --
+    # the step would go permanently silent in exactly the case it exists for.
+    assert any(fn in condition for fn in ("cancelled()", "failure()", "always()")), (
+        f"the narrator condition carries no status-check function: {condition!r} — "
+        "GitHub will AND an implicit success() onto it and the step will never run "
+        "after a failure"
+    )
