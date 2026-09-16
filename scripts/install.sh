@@ -1268,10 +1268,22 @@ if [ -f "$SYSTEMD_USER_DIR/genesis-tmp-watchgod.service" ]; then
     # "enabled + started" over a dead watchgod, i.e. the same silence this block
     # was rewritten to end. A HEALTHY Type=simple unit reads `active`
     # immediately (measured too), so no settle window is needed here.
-    if systemctl --user is-active --quiet genesis-tmp-watchgod.service 2>/dev/null; then
+    # BOTH questions, because they can disagree. `enable` can fail (no user
+    # D-Bus, a masked unit) while the service is already running from an earlier
+    # install, so liveness alone would report success on a box where temp
+    # protection will not survive a reboot.
+    _wg_enabled=0; _wg_active=0
+    systemctl --user is-enabled --quiet genesis-tmp-watchgod.service 2>/dev/null && _wg_enabled=1
+    systemctl --user is-active --quiet genesis-tmp-watchgod.service 2>/dev/null && _wg_active=1
+    if [ "$_wg_enabled" = "1" ] && [ "$_wg_active" = "1" ]; then
         echo "    + genesis-tmp-watchgod.service enabled + started"
     else
-        echo "    WARNING: genesis-tmp-watchgod.service is NOT running — temp protection is OFF"
+        if [ "$_wg_active" = "1" ]; then
+            echo "    WARNING: genesis-tmp-watchgod.service is running but NOT enabled —"
+            echo "             temp protection will not come back after a reboot"
+        else
+            echo "    WARNING: genesis-tmp-watchgod.service is NOT running — temp protection is OFF"
+        fi
         # The reason, or the warning is undiagnosable — `enable --now` above
         # discards stderr, so this is the only place the cause surfaces.
         systemctl --user status genesis-tmp-watchgod.service --no-pager -n 5 2>&1 \
