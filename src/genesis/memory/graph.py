@@ -72,16 +72,57 @@ __all__ = [
 # future backend and silently violating the raise-never-return-empty contract.
 _store: GraphStore = NetworkxGraphStore()
 
+# The FalkorDB store, built only if the lever ever selects it. Kept module-level
+# alongside `_store` rather than constructed per call for the same reason
+# `_store` is: NetworkX caches a projection that costs ~5s to rebuild, and the
+# FalkorDB client's constructor does a blocking round-trip. Per-call
+# construction would pay both on every traversal.
+_falkor_store: GraphStore | None = None
+
 
 def _reset_store_for_tests() -> None:
-    """Drop the production store and its pinned connection.
+    """Drop the production stores and their pinned connections.
 
     Mirrors ``memory/health.py::_reset_top_tags_state``. The store holds a
     strong reference to the last connection it built from, which over a long
     test session keeps closed aiosqlite connections (each a Thread) alive.
     """
-    global _store
+    global _store, _falkor_store
     _store = NetworkxGraphStore()
+    _falkor_store = None
+    # The lever's config cache is keyed on file mtimes, and a test that writes a
+    # config then reads it back can move faster than mtime resolves — so the
+    # reset seam has to clear it too, or a test sees the previous test's mode.
+    from genesis.memory.graphstore_config import reset_config_cache
+
+    reset_config_cache()
+
+
+def _traversal_store() -> GraphStore:
+    """The store TRAVERSALS use, per the config lever, read fresh.
+
+    Scoped to traversal on purpose. `centrality_scores` deliberately does NOT
+    consult this: FalkorDB cannot compute betweenness and says so by raising,
+    and `centrality_scores` has no fallback by design — so routing it here
+    would turn a mode flip into a silent shutdown of the importance shield.
+    Betweenness stays on NetworkX whatever this lever says.
+    """
+    global _falkor_store
+    try:
+        from genesis.memory.graphstore_config import effective_mode
+
+        if effective_mode() != "falkordb":
+            return _store
+        if _falkor_store is None:
+            from genesis.memory.graphstore_falkor import FalkorGraphStore
+
+            _falkor_store = FalkorGraphStore()
+        return _falkor_store
+    except Exception:
+        # A broken config or an unimportable client must not take traversal
+        # down — it selects the incumbent, which is the whole degrade rule.
+        logger.warning("graph store selection failed — using %r", _store.name, exc_info=True)
+        return _store
 
 
 def invalidate_graph_cache() -> None:
@@ -89,8 +130,16 @@ def invalidate_graph_cache() -> None:
 
     Called by writers after link creation/deletion. The next query triggers a
     full rebuild from memory_links.
+
+    Reaches EVERY store that exists, not just the selected one: the lever can
+    move between them at any time, and a store that missed invalidations while
+    unselected would serve a stale projection the moment it was chosen again.
+    FalkorDB's is a no-op today (its projection lives in the engine, not in
+    this process), which costs nothing and keeps the rule simple.
     """
     _store.invalidate()
+    if _falkor_store is not None:
+        _falkor_store.invalidate()
 
 
 async def traverse(
@@ -116,40 +165,62 @@ async def traverse(
     """
     start = time.monotonic()
 
+    active = _traversal_store()
     try:
-        nodes = await _store.traverse(
+        nodes = await active.traverse(
             db, root_id, max_depth=max_depth, min_strength=min_strength,
         )
     except GraphUnavailableError as exc:
         # Traversal is an ENRICHMENT path — its readers already treat a thin
-        # result as "no neighbours", so degrading to SQL keeps them working.
+        # result as "no neighbours", so degrading keeps them working.
         # centrality_scores below is the opposite case and must not do this.
         #
-        # LOUD, because this stops being a once-per-process import verdict the
-        # moment a server-backed store lands: a backend that times out would
-        # otherwise route every recall enrichment through SQL while looking
-        # perfectly healthy.
+        # LOUD, because this stopped being a once-per-process import verdict
+        # the moment a server-backed store landed: a backend that times out
+        # would otherwise route every recall enrichment through the fallback
+        # while looking perfectly healthy.
         logger.warning(
-            "Graph store %r unavailable — falling back to the recursive CTE: %s",
-            getattr(_store, "name", "?"), exc, exc_info=True,
+            "Graph store %r unavailable — falling back: %s",
+            getattr(active, "name", "?"), exc, exc_info=True,
         )
-        try:
-            nodes = await _traverse_cte(db, root_id, max_depth, min_strength)
-        except Exception as cte_exc:
-            # The fallback reads the SAME connection the store just failed on,
-            # so every non-transient cause — a closed handle, a missing table, a
-            # corrupt file — fails it identically. Without this, making the
-            # store raise properly only moved the leak one layer: the store's
-            # error was caught here and the CTE's raw one escaped in its place.
-            # MEASURED against this facade on a closed connection: `traverse()`
-            # raised a bare `ValueError: no active connection` at the caller,
-            # after logging a line that said it was falling back.
-            #
-            # The one cause the fallback genuinely rescues is a transient
-            # `database is locked`, which is why it still runs first.
-            raise GraphUnavailableError(
-                f"the graph store and its SQL fallback both failed: {cte_exc}"
-            ) from cte_exc
+        # FalkorDB degrades to NetworkX before SQL. NetworkX answers the same
+        # question with the same visibility predicate, so it is a far smaller
+        # step down than the CTE — which stays the last resort it always was.
+        nodes = None
+        if active is not _store:
+            try:
+                nodes = await _store.traverse(
+                    db, root_id, max_depth=max_depth, min_strength=min_strength,
+                )
+            except GraphUnavailableError as nx_exc:
+                logger.warning(
+                    "NetworkX store also unavailable — falling back to the recursive CTE: %s",
+                    nx_exc, exc_info=True,
+                )
+        if nodes is None:
+            try:
+                nodes = await _traverse_cte(db, root_id, max_depth, min_strength)
+            except Exception as cte_exc:
+                # The fallback reads the SAME connection the store just failed on,
+                # so every non-transient cause — a closed handle, a missing table, a
+                # corrupt file — fails it identically. Without this, making the
+                # store raise properly only moved the leak one layer: the store's
+                # error was caught here and the CTE's raw one escaped in its place.
+                # MEASURED against this facade on a closed connection: `traverse()`
+                # raised a bare `ValueError: no active connection` at the caller,
+                # after logging a line that said it was falling back.
+                #
+                # The one cause the fallback genuinely rescues is a transient
+                # `database is locked`, which is why it still runs first.
+                #
+                # KEPT ACROSS THE RECONCILE ON PURPOSE. This guard and the tiered
+                # chain above it arrived from opposite sides of this merge, and
+                # taking either alone is a silent regression: main's version has
+                # no FalkorDB tier, and this branch's version left the CTE call
+                # bare, which is the exact leak the guard was written to close.
+                raise GraphUnavailableError(
+                    f"the graph store and its SQL fallback both failed: {cte_exc}"
+                ) from cte_exc
 
     elapsed_ms = (time.monotonic() - start) * 1000
 

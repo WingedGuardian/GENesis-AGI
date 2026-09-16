@@ -111,21 +111,54 @@ def _select_executor(sched: DispatchContext, task) -> SurplusExecutor:
 
 async def _handle_failure(
     sched: DispatchContext, task, reason: str, *, emit_event: bool,
+    exc: BaseException | None = None,
 ) -> None:
     """Shared failure path: mark failed, optionally emit, signal autonomy,
     maybe observe.
 
     ASYMMETRY (intentional, preserved from the original inline code): the
-    executor-exception path emits a ``task.failed`` event (``emit_event=True``);
+    executor-exception path emits a ``task.failed`` event (``emit_event=True``,
+    threading the exception through so the payload carries ``error_type``);
     the ``result.success == False`` path does not (``emit_event=False``).
     """
     await sched._queue.mark_failed(task.id, reason=reason)
     if emit_event and sched._event_bus:
+        # Patch-target seam per module docstring — do not hoist.
+        from genesis.observability.failure_details import failure_details
+
         await sched._event_bus.emit(
-            Subsystem.SURPLUS, Severity.WARNING,
+            # The reflex admission contract has TWO axes, and this emit must
+            # satisfy both or the event reaches NOTHING (`task.failed` is
+            # REFLEX-OWNED — `runtime/init/ego.py::_REFLEX_OWNED_EVENT_TYPES` —
+            # so the ego gate refuses it by design and the reflex ingestor is
+            # its only consumer):
+            #   1. SEVERITY ≥ the subscriber floor: ERROR, not WARNING — the
+            #      ingestor subscribes at `min_severity=Severity.ERROR`
+            #      (`reflex/ingest.py`); emitted at WARNING it fell below the
+            #      floor. Raising it only ADDS recipients (the WARNING-floor
+            #      subscribers already received it, and the ego returns
+            #      immediately on the reflex gate).
+            #   2. PAYLOAD carries `error_type`: the ingestor drops any event
+            #      without one (`if not error_type: return` — the lane split
+            #      between exception failures and semantic ones). Built via
+            #      `failure_details(exc=…)`, the established chokepoint every
+            #      other failure emitter uses (`surplus/scheduler.py`,
+            #      `runtime/_job_health.py`) — never hand-rolled, so the
+            #      fingerprint identity basis stays single-sourced.
+            # BOTH axes are pinned by `tests/test_reflex/test_task_failed_funnel.py`,
+            # which drives this emit through a real bus into the real ingestor:
+            # lowering the severity fails it, and removing the `failure_details`
+            # spread fails it. It tests ARRIVAL rather than the shape of this
+            # call, which is why it replaced an AST scanner that graded the shape
+            # and passed an emitter that could raise and emit nothing at all.
+            # `tests/test_reflex/test_reflex_owned_inventory.py` guards the list
+            # of event types the reflex arc owns, not this emit.
+            Subsystem.SURPLUS, Severity.ERROR,
             "task.failed",
             f"Surplus task {task.id} failed with exception",
             task_id=task.id, task_type=str(task.task_type),
+            task_name=str(task.task_type),
+            **failure_details(exc=exc),
         )
     # Signal autonomy correction for background cognitive failure
     try:
@@ -502,9 +535,11 @@ async def dispatch_once(sched: DispatchContext) -> bool:
     try:
         try:
             result = await executor.execute(task)
-        except Exception:
+        except Exception as exc:
             logger.exception("Surplus task %s failed with exception", task.id)
-            await _handle_failure(sched, task, "executor_exception", emit_event=True)
+            await _handle_failure(
+                sched, task, "executor_exception", emit_event=True, exc=exc
+            )
             return False
 
         if not result.success:

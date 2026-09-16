@@ -48,7 +48,86 @@ from pathlib import Path
 # The shared hook-input helper lives in scripts/hooks/; this script runs from
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
-from hook_input import field, read_payload, run_guard  # noqa: E402
+try:
+    from hook_input import field, read_payload, run_guard  # noqa: E402
+except Exception:  # noqa: BLE001 — an unimportable hook_input must not VANISH.
+    if __name__ != "__main__":
+        raise
+    # NOTHING TO FALL BACK ON: hook_input is the module that would recover us —
+    # read_payload and degraded_exit both live there — so nothing imported can help.
+    # An unguarded import here exits 1, which Claude Code reads as NON-BLOCKING, and
+    # the CRITICAL-path Write/Edit gate simply disappears. So this block decides the
+    # verdict itself, using only `os` and `sys`, which are bound at module top and
+    # survive whatever broke.
+    #
+    # THE VERDICT IS THE GUARD'S OWN SCOPE QUESTION, asked with the one input that
+    # cannot fail. This guard blocks CRITICAL-path Write/Edit in AUTONOMOUS sessions
+    # ONLY; an interactive session is allowed through by design (see _is_dispatched
+    # below — the user is present and sovereign). Refusing unconditionally here is
+    # therefore not the conservative choice, it is STRICTLY MORE than this guard was
+    # ever scoped to do: it blocks the interactive owner, whom it would always have
+    # allowed, from editing anything at all.
+    #
+    # That costs the repair path. NINE of the 13 PYTHON hooks that `.claude/settings.json`
+    # wires on matcher `Bash` refuse every command in this same state (MEASURED 2026-09-15
+    # by execution against a poisoned tree; the other 4 are advisory and exit 1). Read that
+    # denominator exactly: that matcher carries 15 hook commands across 14 entries, and the
+    # 2 not counted are shell rather than Python, so they never import `hook_input` and are
+    # structurally unaffected. Nor is the repo the LIVE population: this install's own
+    # `~/.claude/settings.json` wires a 16th on the same matcher (also shell). So an
+    # interactive session that also cannot Edit can neither run a command nor fix the file
+    # that is broken — and note the population trap that produced an earlier "six" here:
+    # `grep degraded_exit(` finds six callers, but this leg is the one where
+    # `degraded_exit` is UNREACHABLE, so all nine refuse from their own import handler;
+    # grep sees only the six that ALSO call it on the other leg. Count the condition,
+    # never the helper — and state what the denominator excludes. This box is headless,
+    # with no
+    # operator at a console. Blocking here does not protect the machine; it bricks it.
+    # Restoring the allow surrenders nothing, because the healthy guard permits exactly
+    # this call (locked by test_healthy_pretool_check_allows_the_interactive_critical_write).
+    #
+    # A DISPATCHED session still refuses: nobody is present to approve, and the
+    # unattended direction is where fail-closed belongs.
+    # Read inside its own guard, defaulting to the REFUSING side. This module's
+    # rule is that nothing here may raise — an escaping exception exits 1, which CC
+    # reads as non-blocking, reintroducing the fail-open this block exists to stop —
+    # and this is the one statement that DECIDES the verdict. No raise is reachable
+    # through `os.environ.get` on a literal ASCII key, so this is defence in depth
+    # rather than a live defect; it costs three lines and removes the question.
+    _dispatched = True  # an unreadable environment is not a waiver
+    try:  # noqa: SIM105 — contextlib would widen this block's imports; see above.
+        _dispatched = os.environ.get("GENESIS_CC_SESSION") == "1"
+    except BaseException:  # noqa: BLE001 — an unreadable env cannot decide a verdict.
+        pass
+    # TWO CHANNELS, because Claude Code DISCARDS stderr from an exit-0 hook: on the
+    # allow path stderr reaches nobody and a degraded guard would look exactly like a
+    # healthy one. hookSpecificOutput.additionalContext on STDOUT is what survives
+    # exit 0. hook_input._degraded_say is the canonical renderer and is unreachable
+    # here by construction, so the JSON is a fixed literal — no serializer, no
+    # interpolation, nothing that needs escaping, and therefore nothing that can fail.
+    # Degrade the renderer, never the verdict.
+    try:
+        if _dispatched:
+            sys.stderr.write(
+                "GUARD DEGRADED (pretool_check): shared hook_input could not be "
+                "imported; BLOCKING this dispatched session until the hook tree is "
+                "repaired.\n"
+            )
+            sys.stderr.flush()
+        else:
+            sys.stdout.write(
+                '{"hookSpecificOutput": {"hookEventName": "PreToolUse", '
+                '"additionalContext": "GUARD DEGRADED (pretool_check): shared '
+                "hook_input could not be imported, so the CRITICAL-path Write/Edit "
+                "check did not run for this call. ALLOWING: this guard only ever "
+                "blocks dispatched sessions, and refusing an interactive one would "
+                "take away the edit that repairs scripts/hooks/hook_input.py. Repair "
+                'the hook tree; Bash stays blocked until you do."}}\n'
+            )
+            sys.stdout.flush()
+    except BaseException:  # noqa: BLE001 — a diagnostic cannot decide a verdict.
+        pass
+    os._exit(2 if _dispatched else 0)
 
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "protected_paths.yaml"
 

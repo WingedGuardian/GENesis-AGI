@@ -154,6 +154,26 @@ class TestBuildMcpConfig:
         servers = set(config.get("mcpServers", {}).keys())
         assert servers == {"genesis-health", "genesis-memory", "genesis-recon"}
 
+    def test_research_recon_boundary_allows_only_github_read_pair(self, builder):
+        from genesis.cc.session_config import (
+            _RESEARCH_RECON_READ_MCP,
+            _registered_mcp_tool_names,
+        )
+
+        registered = set(_registered_mcp_tool_names("genesis.mcp.recon_mcp"))
+        denied = set(builder.build_research_recon_disallowed())
+
+        assert registered - {
+            name.removeprefix("mcp__genesis-recon__") for name in denied
+        } == set(_RESEARCH_RECON_READ_MCP)
+
+    def test_research_recon_boundary_fails_closed(self, builder, monkeypatch):
+        def fail(_modpath):
+            raise RuntimeError("registry unavailable")
+
+        monkeypatch.setattr("genesis.cc.session_config._registered_mcp_tool_names", fail)
+        assert builder.build_research_recon_disallowed() == ["mcp__genesis-recon__*"]
+
 
 class TestGroundworkStubs:
     def test_hook_config_returns_none(self, builder):
