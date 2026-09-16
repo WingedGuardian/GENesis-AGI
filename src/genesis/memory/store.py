@@ -12,6 +12,9 @@ from genesis.db.crud import entities as entities_crud
 from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import memory_links as memory_links_crud
 from genesis.db.crud import pending_embeddings
+from genesis.db.crud._id_resolve import AMBIGUOUS as _AMBIGUOUS
+from genesis.db.crud._id_resolve import NOT_FOUND as _NOT_FOUND
+from genesis.db.crud._id_resolve import PASSTHROUGH as _PASSTHROUGH
 from genesis.memory._locks import memory_id_lock
 from genesis.memory.classification import classify_memory
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
@@ -43,6 +46,10 @@ except ImportError:  # pragma: no cover — safety for minimal installs
 
 logger = logging.getLogger(__name__)
 
+# _id_resolve.resolve_unique_prefix reads with LIMIT 3; a result at that
+# size is a truncated listing, so the candidate set may be incomplete.
+_RESOLVER_MATCH_LIMIT = 3
+
 
 def _strip_kv_prefix(value: str | None, key: str) -> str | None:
     """Strip a leaked ``key=`` / ``key:`` prefix from a taxonomy value.
@@ -67,6 +74,101 @@ _COLLECTION_MAP = {
     "episodic": "episodic_memory",
     "knowledge": "knowledge_base",  # External knowledge → knowledge_base
 }
+
+
+class SupersedeUnresolved(Exception):
+    """A supersede could not be performed on the pair it was given.
+
+    Either a handle named no memory or named several, or the pair cannot express
+    a correction (a memory replacing itself, or a successor that is itself
+    deprecated).
+
+    Raised BEFORE anything is written, so it always describes an operation that
+    did not start rather than one that half-finished. Never guess an ambiguous
+    handle: two memories sharing a prefix are two different corrections, and
+    deprecating the wrong one is unrecoverable without the transcript.
+    """
+
+    def __init__(
+        self,
+        raw_id: str,
+        reason: str,
+        successor_id: str | None = None,
+        candidates: list[str] | None = None,
+        truncated: bool = False,
+        role: str = "supersedes",
+        committed: bool = False,
+    ):
+        self.raw_id = raw_id
+        # "not_found" | "ambiguous" | "self_supersede" | "successor_deprecated"
+        # | "successor_expired" | "successor_vanished" | "successor_deleting"
+        self.reason = reason
+        # Whether a deprecation for this pair had ALREADY committed when this
+        # was raised. The message asserts the durable state, so it must not
+        # claim "no deprecation was performed" on a post-commit raise — that
+        # sentence was hardcoded, and a caller reading it would conclude
+        # nothing happened while the row said otherwise.
+        self.committed = committed
+        # Which parameter the bad handle came from. Without it a caller told
+        # "not_found" about its SUCCESSOR would go looking at its target.
+        self.role = role
+        # The memory that WOULD have become the successor, when one is known.
+        # Deliberately optional: validation now runs BEFORE any write, so on the
+        # ``store()`` path there is usually no successor yet — and nothing
+        # durable at risk, which is why this can be a plain raise.
+        self.successor_id = successor_id
+        self.candidates = candidates or []
+        # The resolver reads with LIMIT 3, so a saturated result is a TRUNCATED
+        # listing, not the complete collision set. Saying "matches: a, b, c"
+        # about ten colliding memories is the repo's own truncated-read trap.
+        self.truncated = truncated
+        more = " (possibly more)" if truncated else ""
+        detail = (
+            f" (matches: {', '.join(self.candidates)}{more})" if self.candidates else ""
+        )
+        # States only what was CHECKED. The old wording claimed the old memory
+        # "is still live in recall", which for `not_found` is exactly the thing
+        # resolution just failed to establish.
+        outcome = (
+            "the deprecation had already committed; its mirror is still outstanding"
+            if committed
+            else "no deprecation was performed"
+        )
+        super().__init__(f"{role}={raw_id!r} is {reason}{detail}; {outcome}")
+
+
+class SupersedeIncomplete(Exception):
+    """The supersession HALF-finished: SQLite committed, a mirror did not.
+
+    Raised only by the standalone ``supersede()`` path (strict propagation).
+    By the time this raises, *old_id* is deprecated in SQLite with
+    ``superseded_by`` recorded — but the named *stage* did not complete:
+
+    * ``"qdrant"`` — the vector payload was not marked deprecated, so vector
+      search can keep surfacing the superseded memory until repaired.
+    * ``"link"`` — the ``succeeded_by`` graph edge was not created.
+
+    Retrying the same ``supersede()`` call is SAFE and is also the repair:
+    the SQLite UPDATE is idempotent, the Qdrant payload write is idempotent,
+    and an already-created link is tolerated. The retry takes ``supersede()``'s
+    REPAIR PATH, which skips successor validation precisely so the guarantee
+    holds even if the successor expired or was deprecated in the meantime —
+    that state cannot un-commit the deprecation that already landed, and
+    rejecting the retry would strand the mirror this exception exists to get
+    repaired. ``store(supersedes=...)`` deliberately stays best-effort — there
+    the new content's fate dominates the outcome and is reported instead of
+    raised.
+    """
+
+    def __init__(self, old_id: str, new_id: str, stage: str):
+        self.old_id = old_id
+        self.new_id = new_id
+        self.stage = stage  # "qdrant" | "link"
+        super().__init__(
+            f"supersede {old_id!r} -> {new_id!r} half-finished: the SQLite "
+            f"deprecation committed, but the {stage} update failed; retrying "
+            "the same call is safe and completes the remainder"
+        )
 
 
 class MemoryStore:
@@ -133,6 +235,7 @@ class MemoryStore:
         assertion_provenance: str | None = None,
         durability: str | None = None,
         expires_at: str | None = None,
+        preference_domain: str | None = None,
     ) -> str:
         """Full store pipeline: embed -> Qdrant -> FTS5 -> auto-link. Returns memory_id.
 
@@ -206,6 +309,16 @@ class MemoryStore:
         is_subsystem_write = source_subsystem is not None
         if is_subsystem_write:
             force_fts5_only = True
+
+        # Resolve the supersede target BEFORE anything is written. An
+        # unresolvable target then costs nothing and leaves nothing behind, and
+        # the raise reaches the caller with no half-done operation attached.
+        # It also has to be before ``create_metadata``: resolving afterwards let
+        # a short prefix match the row this call had just written, deprecating
+        # the new memory as its own successor.
+        resolved_supersedes = (
+            await self._resolve_supersede_target(supersedes) if supersedes else None
+        )
 
         memory_id = str(uuid.uuid4())
         now_iso = datetime.now(UTC).isoformat()
@@ -418,12 +531,14 @@ class MemoryStore:
             # join (as origin_class's FTS fallback is), and a consumer that
             # needs vector-path parity owns adding it to the payload + the
             # re-embed recovery path together.
-            # GROUNDWORK(mw-4-provenance-weight / mw-4-durability-ttl / mw-5-speech-act-protection)
+            # GROUNDWORK(mw-4-provenance-weight / mw-4-durability-ttl
+            # / mw-4-preference-domain / mw-5-speech-act-protection)
             speech_act=speech_act,
             speech_act_confidence=speech_act_confidence,
             assertion_provenance=assertion_provenance,
             durability=durability,
             expires_at=expires_at,
+            preference_domain=preference_domain,
         )
 
         # Mechanical code anchors (entity layer) — regex-only, every write
@@ -477,53 +592,296 @@ class MemoryStore:
         # else: subsystem write — no pending_embeddings, no auto_link
         # (vector wasn't computed; link graph isn't consumed for filtered content)
 
-        # Supersession: mark old memory as deprecated, link to this one
-        if supersedes:
+        # Supersession: mark old memory as deprecated, link to this one. The
+        # target was resolved and confirmed to exist before any of the writes
+        # above, so anything that fails here is an infrastructure fault rather
+        # than a bad handle.
+        if resolved_supersedes:
             try:
-                await self._mark_superseded(supersedes, memory_id, now_iso)
+                await self._mark_superseded(resolved_supersedes, memory_id, now_iso)
             except Exception:
                 logger.warning(
                     "Failed to mark memory %s as superseded by %s",
-                    supersedes, memory_id, exc_info=True,
+                    resolved_supersedes, memory_id, exc_info=True,
                 )
 
         return memory_id
+
+    async def supersede(
+        self,
+        old_handle: str,
+        new_handle: str,
+        *,
+        timestamp: str | None = None,
+    ) -> None:
+        """Deprecate *old_handle*, recording *new_handle* as its correction.
+
+        The supersede as its own operation, rather than a side effect of
+        storing. That distinction is what makes this simple: BOTH ids are named
+        by the caller, so both can be resolved and validated up front, and there
+        is no content being written whose fate has to be reported alongside the
+        outcome. Every REJECTION is a precondition failure — nothing is
+        mutated, and the caller can retry for free — so this raises rather
+        than returning a verdict to interpret.
+
+        The one non-precondition failure is ``SupersedeIncomplete``: the
+        SQLite deprecation committed but a mirror (the Qdrant payload, the
+        ``succeeded_by`` link) did not. This path RAISES it rather than
+        swallowing it the way ``store(supersedes=...)`` must, because here the
+        caller named both ids and retrying the same call is both safe and the
+        repair. Both ids are locked (sorted order) from validation through the
+        mirror writes, so a concurrent delete or supersession of the successor
+        cannot slip between the check and the write.
+
+        A retry takes the REPAIR PATH: when SQLite already records this exact
+        supersession, the successor is NOT re-validated. Validation guards the
+        creation of a supersession, and re-applying it to one that already
+        committed would reject the retry whenever the successor expired or was
+        deprecated in between — leaving the stale mirror in place, which is the
+        opposite of what the retry is for.
+
+        Contrast ``store(supersedes=...)``, where the successor is whatever that
+        call produces: the caller never names it, cannot see it, and a failure
+        after the content lands leaves a genuinely partial outcome.
+        """
+        old_id = await self._resolve_supersede_target(old_handle)
+        try:
+            new_id = await self._resolve_supersede_target(new_handle, role="new_id")
+        except SupersedeUnresolved:
+            # A committed supersession still owes its mirror, and that debt does
+            # NOT depend on the successor still resolving. Resolution runs
+            # before the repair-path check below, so without this the documented
+            # repair is unreachable in exactly the case it exists for: the
+            # successor row disappears between the failed attempt and the retry,
+            # and the retry dies here — stranding the vector permanently, since
+            # `integrity.py` counts `deprecated_divergence` but nothing repairs
+            # it. Recover the successor from the row that already committed.
+            existing = await memory_crud.get_metadata(self._db, old_id)
+            if not (existing and existing["deprecated"] and existing["superseded_by"]):
+                raise
+            new_id = existing["superseded_by"]
+        # Self-check BEFORE the locks: sorted() of an equal pair would acquire
+        # the same asyncio lock twice and deadlock. _validate_supersede_pair
+        # re-checks harmlessly (reads only).
+        if old_id == new_id:
+            raise SupersedeUnresolved(old_id, "self_supersede", new_id)
+        # Both ids, in sorted order — a total acquisition order cannot cycle,
+        # which is the one sanctioned relaxation of _locks.py's
+        # one-lock-per-holder invariant (see that module's docstring). Holding
+        # both through validate + mark closes the validate→mark window: a
+        # delete or supersession of new_id can no longer commit in between and
+        # leave this supersession pointing at a missing/deprecated successor.
+        first, second = sorted((old_id, new_id))
+        async with memory_id_lock(first), memory_id_lock(second):
+            # REPAIR PATH. If this exact supersession already committed in
+            # SQLite, this call is a RETRY after a mirror failure, and
+            # re-validating the successor would strand the very mirror the
+            # retry exists to repair: a successor that expired or was
+            # deprecated since the first attempt cannot un-commit what already
+            # landed, but it WOULD fail validation. The repair guarantee that
+            # SupersedeIncomplete states has to hold unconditionally, or it is
+            # not a guarantee — so the check that guards a NEW supersession is
+            # skipped for one that is merely being completed.
+            existing = await memory_crud.get_metadata(self._db, old_id)
+            resuming = (
+                existing is not None
+                and bool(existing["deprecated"])
+                and existing["superseded_by"] == new_id
+            )
+            if resuming:
+                # Keep the ORIGINAL timestamp: the supersession happened when
+                # it first committed. A retry repairs mirrors; it does not
+                # re-date the event.
+                stamp = existing["superseded_at"] or (
+                    timestamp or datetime.now(UTC).isoformat()
+                )
+            else:
+                await self._validate_supersede_pair(old_id, new_id)
+                stamp = timestamp or datetime.now(UTC).isoformat()
+            await self._mark_superseded(old_id, new_id, stamp, strict=True)
+
+    async def _validate_supersede_pair(self, old_id: str, new_id: str) -> None:
+        """Reject a pair that cannot express a correction. Reads only.
+
+        Both checks are about the SUCCESSOR, and both are pre-write:
+
+        * A memory cannot replace itself. It would deprecate the only copy and
+          record it as its own correction — the content survives in the table
+          but is filtered out of recall, and nothing in the result says so.
+        * The successor cannot itself be deprecated. Normal recall filters
+          deprecated rows, so superseding onto one deprecates the target and
+          leaves the correction unreachable: both halves gone.
+        * The successor cannot already be temporally invalid. Recall's
+          bitemporal filter (``invalid_at IS NULL OR invalid_at > as_of``,
+          crud/memory.py) hides an expired memory exactly like a deprecated
+          one — same unreachable-correction outcome, different column.
+
+        Successor failures are attributed to ``new_id`` (the argument at
+        fault), not to the old handle the caller got right.
+        """
+        if old_id == new_id:
+            raise SupersedeUnresolved(old_id, "self_supersede", new_id)
+        meta = await memory_crud.get_metadata(self._db, new_id)
+        if meta is None:
+            # NOT the same state as deprecated, and it has a different remedy:
+            # the row was resolved before the lock and is gone now, so it
+            # disappeared underneath this call rather than being a bad choice
+            # of successor. Same misattribution class the `role` field fixed.
+            raise SupersedeUnresolved(
+                new_id, "successor_vanished", new_id, role="new_id"
+            )
+        if meta["deprecated"]:
+            raise SupersedeUnresolved(
+                new_id, "successor_deprecated", new_id, role="new_id"
+            )
+        # A successor awaiting a DEFERRED delete passes every column check: the
+        # deferred path returns before `delete_metadata`, leaving the row intact
+        # with deprecated=0 and invalid_at NULL, and only the open tombstone as
+        # the signal. Superseding onto it would deprecate the target and then
+        # lose the successor when the reconcile lane drains — the exact
+        # both-halves-gone harm these checks exist to prevent.
+        # `embedding_recovery` already refuses to act on a tombstoned memory.
+        from genesis.memory.delete_tombstones import has_open_tombstone
+
+        if await has_open_tombstone(self._db, memory_id=new_id):
+            raise SupersedeUnresolved(
+                new_id, "successor_deleting", new_id, role="new_id"
+            )
+        invalid_at = meta["invalid_at"]
+        if invalid_at is not None and invalid_at <= datetime.now(UTC).isoformat():
+            raise SupersedeUnresolved(
+                new_id, "successor_expired", new_id, role="new_id"
+            )
+
+    async def _resolve_supersede_target(
+        self, handle: str, *, role: str = "supersedes"
+    ) -> str:
+        """Resolve a memory handle to exactly one EXISTING memory id.
+
+        *role* names the parameter in the error, so a caller told
+        ``new_id=... is not_found`` is not left thinking its supersede target
+        was the problem.
+
+        Reads only — it writes nothing and must be called BEFORE the store does,
+        so an unresolvable target costs nothing and leaves nothing behind. That
+        ordering is load-bearing twice over:
+
+        * The old code resolved AFTER ``create_metadata`` had written the new
+          row, so a short prefix could match the memory being written and the
+          call would deprecate it as its own successor. Resolving first makes
+          that unrepresentable — the row does not exist yet — rather than
+          needing a guard against it.
+        * Nothing durable is at risk when this raises, so the caller can simply
+          be told, instead of being handed a half-completed operation to
+          reason about.
+
+        The proactive hook prints memories as ``id:<8-char>`` and
+        ``memory_expand`` resolves those on the read side, so the ecosystem
+        teaches the short form; this path used to feed it straight into an
+        exact-match UPDATE that matched nothing.
+        """
+        matches, outcome = await memory_crud.resolve_id(self._db, handle)
+        if outcome == _AMBIGUOUS:
+            raise SupersedeUnresolved(
+                handle, "ambiguous", candidates=matches,
+                truncated=len(matches) >= _RESOLVER_MATCH_LIMIT, role=role,
+            )
+        if outcome == _NOT_FOUND:
+            raise SupersedeUnresolved(handle, "not_found", role=role)
+        resolved = matches[0]
+
+        # PASSTHROUGH ids (full length, or non-hex) are returned unverified by
+        # the shared resolver — it never looked them up. Confirm existence HERE
+        # so every rejection happens before the write; otherwise a full-length
+        # id naming no memory would only be caught by the UPDATE's rowcount,
+        # which is after the new memory has been stored.
+        if outcome == _PASSTHROUGH and await memory_crud.get_metadata(
+            self._db, resolved
+        ) is None:
+            raise SupersedeUnresolved(handle, "not_found", role=role)
+        return resolved
 
     async def _mark_superseded(
         self,
         old_id: str,
         new_id: str,
         timestamp: str,
+        *,
+        strict: bool = False,
     ) -> None:
         """Mark *old_id* as superseded by *new_id* in both SQLite and Qdrant.
+
+        *strict* chooses what a MIRROR failure (Qdrant payload, succeeded_by
+        link) does after the SQLite deprecation has committed: ``False`` (the
+        ``store(supersedes=...)`` path) logs and swallows it — the new
+        content's fate dominates that call's outcome; ``True`` (the standalone
+        ``supersede()`` path) raises ``SupersedeIncomplete``, because there
+        the caller named both ids and a retry of the same call is the repair.
+        Success must not be reported over a stale vector mirror — recall
+        excludes a memory from vector search only through the Qdrant
+        ``deprecated`` payload.
+
+        *old_id* must ALREADY be resolved and known to exist — see
+        ``_resolve_supersede_target``, which the caller runs before any write.
 
         Sets ``deprecated=1``, ``superseded_by``, and ``superseded_at`` in
         SQLite.  Sets ``deprecated=True`` and ``merged_into`` in the Qdrant
         payload.  Creates a ``succeeded_by`` link from old to new.
         """
-        # SQLite: mark deprecated + record successor (via CRUD module)
-        await memory_crud.mark_superseded(self._db, old_id, new_id, timestamp)
+        # SQLite: mark deprecated + record successor (via CRUD module).
+        # The return value says whether the row was FOUND — discarding it was
+        # how an unresolvable id became a silent no-op. `_resolve_supersede_target`
+        # has already established that the row exists, so reaching this branch
+        # means it was deleted in the window between the two — a race, not a bad
+        # handle. Kept because a silent no-op here is the original defect.
+        if not await memory_crud.mark_superseded(self._db, old_id, new_id, timestamp):
+            raise SupersedeUnresolved(old_id, "not_found", new_id)
 
-        # Qdrant: look up collection from metadata, then update payload.
-        # Only touch Qdrant when a vector actually exists (status 'embedded').
+        # Qdrant: LOCATE the point, then update where it actually lives.
+        # Only touch Qdrant when a vector exists at all (status 'embedded').
         # 'fts5_only' (subsystem write), 'pending' (embed queued), and 'failed'
         # (embed gave up) rows have NO point — the old `!= "fts5_only"` form
         # fired a doomed update_payload on 'pending'/'failed' rows every time.
+        #
+        # The metadata `collection` column is UNRELIABLE (crud/memory.py:72-73),
+        # and `delete()` has always known it: it locates the point by id across
+        # both collections rather than trusting the column (see its docstring
+        # and step 1). Trusting it here meant an embedded point living in the
+        # other collection got a set_payload to the stale name, which SUCCEEDS
+        # as a no-op on a nonexistent point — so supersede reported success
+        # while the memory stayed eligible for vector recall. A write that
+        # cannot fail is not evidence that it landed.
         meta = await memory_crud.get_metadata(self._db, old_id)
         if meta and meta["embedding_status"] == "embedded":
             try:
-                await asyncio.to_thread(
-                    update_payload,
-                    self._qdrant,
-                    collection=meta["collection"],
-                    point_id=old_id,
-                    payload={"deprecated": True, "merged_into": new_id},
-                )
-            except Exception:
+                present: list[str] = []
+                for coll in ("episodic_memory", "knowledge_base"):
+                    got = await asyncio.to_thread(
+                        self._qdrant.retrieve,
+                        collection_name=coll,
+                        ids=[old_id],
+                        with_payload=False,
+                        with_vectors=False,
+                    )
+                    if got:
+                        present.append(coll)
+                for coll in present:
+                    await asyncio.to_thread(
+                        update_payload,
+                        self._qdrant,
+                        collection=coll,
+                        point_id=old_id,
+                        payload={"deprecated": True, "merged_into": new_id},
+                    )
+            except Exception as qdrant_exc:
                 logger.warning(
-                    "Qdrant update_payload failed for superseded memory %s",
+                    "Qdrant mirror failed for superseded memory %s",
                     old_id, exc_info=True,
                 )
+                if strict:
+                    raise SupersedeIncomplete(
+                        old_id, new_id, "qdrant"
+                    ) from qdrant_exc
 
         # Create succeeded_by link for graph traversal
         try:
@@ -542,6 +900,26 @@ class MemoryStore:
                     "Failed to create succeeded_by link %s → %s: %s",
                     old_id, new_id, link_exc,
                 )
+                if strict:
+                    raise SupersedeIncomplete(
+                        old_id, new_id, "link"
+                    ) from link_exc
+        else:
+            # The CRUD create does not invalidate (its callers do, by
+            # convention) — and this caller previously didn't either, so every
+            # supersede left the cached graph missing the succeeded_by edge
+            # until some unrelated write invalidated it. One of the two known
+            # invalidation gaps from the graph-store consumer map (issue #1641).
+            # Scope: this flips THIS process's projection (the MCP child, which
+            # hosts the traverse readers most affected); cross-process readers
+            # rebuild on their own invalidations — the DB-generation token that
+            # closes that fully is future seam work (#1641).
+            try:
+                from genesis.memory.graph import invalidate_graph_cache
+
+                invalidate_graph_cache()
+            except ImportError:
+                pass
 
     async def delete(self, memory_id: str) -> dict:
         """Delete a memory from all layers. Returns per-layer status.

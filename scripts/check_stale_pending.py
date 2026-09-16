@@ -7,8 +7,16 @@ Output is injected into the CC session as hook context.
 """
 
 import sqlite3
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
+
+# The shared hook helpers live in scripts/hooks/; this script runs from scripts/
+# (a different sys.path[0]), so add the hooks dir before importing them. Same
+# idiom as the sibling SessionStart hook. Unguarded on purpose: a missing helper
+# is a broken checkout and must be loud, not silently unbounded.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
+from hook_output import BoundedStdout  # noqa: E402
 
 STALE_THRESHOLD_DAYS = 3
 DB_PATH = Path.home() / "genesis" / "data" / "genesis.db"
@@ -76,25 +84,37 @@ def main() -> None:
         elif stripped.startswith("\U0001f7e1"):  # Yellow circle
             yellow_flags.append(stripped)
 
-    print(f"STALE PENDING ITEMS ({age_days} days old — threshold is {STALE_THRESHOLD_DAYS} days)")
-    print(f"Cognitive state last updated: {created_at.strftime('%Y-%m-%d %H:%M')} UTC")
-    print()
-    for item in pending_items:
-        print(f"  {item}")
+    # The directive leads, and the variable-length lists follow it. The harness
+    # keeps the HEAD of an over-cap hook's output and files the rest, so a
+    # directive printed after its list is exactly what disappears — and it
+    # disappears when the list is longest, i.e. when the situation is worst.
+    # Worded without a positional reference ("the following", not "these") so it
+    # reads correctly wherever a truncation lands.
+    body = [
+        f"STALE PENDING ITEMS ({age_days} days old — threshold is {STALE_THRESHOLD_DAYS} days)",
+        f"ACTION REQUIRED: raise the following with the user before starting new "
+        f"work. These items have been pending for over {STALE_THRESHOLD_DAYS} days.",
+        f"Cognitive state last updated: {created_at.strftime('%Y-%m-%d %H:%M')} UTC",
+        "",
+    ]
+    body += [f"  {item}" for item in pending_items]
     if red_flags:
-        print()
-        print("RED FLAGS:")
-        for flag in red_flags:
-            print(f"  {flag}")
+        body += ["", "RED FLAGS:"] + [f"  {flag}" for flag in red_flags]
     if yellow_flags:
-        print()
-        print("YELLOW FLAGS:")
-        for flag in yellow_flags:
-            print(f"  {flag}")
-    print()
-    print(
-        "ACTION REQUIRED: Raise these with the user before starting new work. "
-        "These items have been pending for over 3 days."
+        body += ["", "YELLOW FLAGS:"] + [f"  {flag}" for flag in yellow_flags]
+
+    # `active_context` has no length cap in any of its three writers, so this
+    # list is structurally unbounded even though it is small today (measured:
+    # one row, 421 chars). The writer decides what survives; this hook does not
+    # compute characters.
+    out = BoundedStdout(label="stale-pending")
+    out.emit_or_degrade(
+        "\n".join(body),
+        block="stale-pending",
+        notice=(
+            "\n[stale-pending: {kept} chars kept — the rest was omitted to stay "
+            "under the hook output cap. Full state: cognitive_state.active_context]"
+        ),
     )
 
 

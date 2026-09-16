@@ -7,8 +7,12 @@ already gone. This sampler runs OFF the loop, in a daemon thread, and reads the
 loop-health heartbeat the lag sampler publishes each ~0.5s: when that heartbeat
 goes stale (the on-loop sampler stopped publishing = the loop is stuck right
 now), it snapshots the loop thread's stack via :func:`sys._current_frames` and
-logs it — catching the offending synchronous frame mid-stall. Diagnostic-only;
-it never affects control flow.
+logs it. The stack is EVIDENCE OF WHERE THE LOOP WAS WHEN SAMPLED, not a verdict
+on what caused the stall: a synchronous frame that returned just before the
+snapshot leaves the loop back in ``selectors.select``, indistinguishable from a
+loop that was merely descheduled. This module docstring used to promise it
+"catches the offending synchronous frame mid-stall" — it often does, but it
+cannot certify that it did. Diagnostic-only; it never affects control flow.
 
 Why a custom thread instead of ``faulthandler.dump_traceback_later``: this
 targets the loop thread specifically (not every thread dumped to stderr), routes
@@ -108,9 +112,28 @@ class LoopStallSampler:
                 stack = "<loop thread frame unavailable (loop moved on)>"
             else:
                 stack = "".join(traceback.format_stack(frame))
+            # The stack is EVIDENCE, not a verdict, and this comment has now been
+            # wrong in BOTH directions — which is why the rule is stated as a rule.
+            # The original text called it "the synchronous frame starving the
+            # loop", asserting a blocking cause. The first correction swung to
+            # "idle in selectors.select = descheduled, NOT blocked", asserting the
+            # opposite cause from the same single snapshot. Both are unsound for
+            # the same reason: `_current_frames()` shows only WHERE THE LOOP WAS AT
+            # SNAPSHOT TIME. A synchronous callback that stalled the loop and
+            # returned just before the snapshot leaves the loop back inside
+            # `selectors.select`, indistinguishable from never having blocked.
+            # MEASURED context, not a verdict: 5 of 40 dumps on one host showed a
+            # selector frame — consistent with descheduling AND with a stall that
+            # had just cleared.
+            # THE RULE: report WHAT WAS OBSERVED (a stale heartbeat, and this
+            # stack). Never map a frame to a cause in the message.
             self._log.warning(
                 "event-loop WEDGED %.0fms (no loop-health publish) — executor=%s\n"
-                "loop-thread stack (the synchronous frame starving the loop):\n%s",
+                "loop-thread stack AT SNAPSHOT TIME (this is where the loop was "
+                "when sampled;\nit does not by itself establish what caused the "
+                "stall — a selector frame is\nINCONCLUSIVE, being equally "
+                "consistent with descheduling and with a\nsynchronous stall that "
+                "cleared just before the snapshot):\n%s",
                 age_ms,
                 getattr(sample, "executor", None),
                 stack,

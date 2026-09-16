@@ -1,0 +1,35 @@
+# Which backend answers memory-graph reads — NETWORKX by default.
+#
+# This is a STAGED CUTOVER, not an optional feature. The FalkorDB engine is part
+# of the memory architecture alongside SQLite/FTS5 and Qdrant; the default below
+# says reads have not been moved onto it YET, not that it is a nice-to-have.
+#
+# Read fresh on every call (this file + ~/.genesis/config/graphstore.local.yaml),
+# so a settings_update("graphstore", {...}) or a hand edit takes effect on the
+# next traversal — no restart.
+#
+# Master switch: false pins reads to networkx regardless of `mode` below.
+enabled: true
+
+# Mode: networkx | falkordb
+#   networkx — (default) the in-process NetworkX projection. Depends on nothing
+#              but this process. Rebuilds from memory_links whenever a writer
+#              invalidates it, which is the cost this lever exists to remove.
+#   falkordb — a long-lived FalkorDB server over a unix socket. No rebuild, and
+#              the visibility predicate is re-evaluated per query so a memory
+#              whose invalid_at passes becomes invisible with no write event.
+#              REQUIRES: the engine provisioned and running (provisioning ships
+#              separately and is staged during the cutover; where it is already
+#              installed, `systemctl --user start genesis-falkordb`) and a
+#              projection built (`python -m genesis.memory.graphstore_project`).
+#              Missing any of those, the facade falls back to networkx and logs
+#              loudly rather than answering empty — an empty answer would read
+#              as "no neighbours", and an unbuilt projection makes EVERY root
+#              look neighbourless, so the store raises instead.
+#
+# Anything unreadable, unrecognised, or unset selects networkx. The lever can
+# move reads onto FalkorDB only deliberately, never onto it by accident.
+#
+# Hook/env kill switch (separate lever): GENESIS_FALKORDB_STORE_DISABLED=1
+# pins reads to networkx regardless of this file.
+mode: networkx

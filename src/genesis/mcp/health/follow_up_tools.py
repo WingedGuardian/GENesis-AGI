@@ -139,6 +139,34 @@ async def _impl_follow_up_create(
         if domain is None:
             domain = classify_domain(f"{content} {reason}")
 
+        # Provenance: resolve a truncated session id (the per-turn tag shows 8
+        # chars) to the full one, the same way session_charter_tools does. A
+        # prefix that does not resolve uniquely is stored as NULL, never as the
+        # truncated string — resolve_session_id's own contract: "WRITE callers
+        # must refuse to create rows for unresolved short ids". The create must
+        # not fail over provenance, so the drop is reported, not fatal.
+        source_session_note = None
+        if source_session:
+            from genesis.db.crud import session_charters as _charters
+
+            resolved = await _charters.resolve_session_id(db, source_session)
+            # SHAPE, not length. `resolve_session_id` returns the input
+            # unchanged when it cannot resolve, so a >= 32-char value reaching
+            # here has never been checked against anything — a mistyped UUID or
+            # a 32-char fragment used to pass a length test and be written as
+            # provenance (Codex P2, PR #1622). A valid-shaped id that no store
+            # knows yet is still accepted: this asks what the value IS, not
+            # whether it has been seen.
+            if _charters.is_full_session_id(resolved):
+                source_session = resolved
+            else:
+                source_session_note = (
+                    f"source_session '{source_session}' did not resolve to a "
+                    "unique full session id — stored NULL rather than a "
+                    "truncated or malformed id"
+                )
+                source_session = None
+
         fid = await follow_ups.create(
             db,
             content=content,
@@ -177,7 +205,9 @@ async def _impl_follow_up_create(
             "strategy": strategy,
             "domain": domain,
             "pinned": pinned,
-            "message": lane_msg
+            "source_session": source_session,
+            "message": (f"NOTE: {source_session_note} " if source_session_note else "")
+            + lane_msg
             + (f" Revisit when: {cond}." if cond else "")
             + (f" Domain: {domain}." if domain else "")
             + (" (pinned — ego cannot auto-resolve)" if pinned else ""),
@@ -185,6 +215,85 @@ async def _impl_follow_up_create(
     except Exception as exc:
         logger.error("follow_up_create failed", exc_info=True)
         return {"error": f"Failed to create follow-up: {exc}"}
+
+
+async def _enrich_external_state(db, items: list[dict]) -> dict[str, str]:
+    """Decorate *items* in place with the external state a triage pass needs, and
+    report whether each source could actually be read.
+
+    Two things about a follow-up live outside the ``follow_ups`` row, and neither
+    was reachable from here before:
+
+    ``issue``
+        The GitHub issue Genesis filed for this row. The link is stored in the
+        other direction (``pending_issue_posts.source_ref → follow_ups.id``), so
+        without this a triage pass cannot tell an unfiled row from a filed one and
+        re-files work that is already public.
+    ``pulse_proposal``
+        A repo-pulse annotation proposing that a merged PR completed this row.
+        These are written for ``target_kind='follow_up'`` and rendered NOWHERE —
+        the charter block is ledger-only (correctly: it renders a
+        ``session_ledger_update`` confirm command that cannot resolve a follow_up
+        id, and follow_up proposals are session-agnostic) and the dashboard panel
+        lists ledger only. Any proposal written would therefore go stale unseen.
+        MEASURED on this install: no follow_up annotation has yet been *proposed*
+        (all are ``applied``, which auto-absorbs and needs no surface), so this
+        closes a LATENT gap rather than one currently losing data. It fires on the
+        four branches that propose instead of absorbing — a pinned row, an
+        absorb-miss race, ``propose_only`` mode, and a bare-hex citation.
+
+    Returns a per-source availability map rather than failing the listing. Both
+    sources sit behind migrations (0079, 0084) an older install may not have, and
+    the sources are independent — one being absent must not blank the other.
+
+    The distinction the map exists to preserve: a MISSING key means "looked, found
+    nothing"; ``unavailable`` means "could not look". Collapsing those is how a
+    reader concludes a follow-up has no issue when the truth is nobody asked.
+    """
+    availability = {"issues": "unavailable", "proposals": "unavailable"}
+    by_id = {str(it["id"]): it for it in items if it.get("id")}
+
+    try:
+        from genesis.db.crud import pending_issue_posts
+
+        index = await pending_issue_posts.issue_by_follow_up(db)
+        for follow_up_id, linked in index.items():
+            row = by_id.get(follow_up_id)
+            if row is not None:
+                row["issue"] = linked
+        availability["issues"] = "ok"
+    except Exception:
+        logger.debug("follow_up_list: issue link unavailable", exc_info=True)
+
+    try:
+        from genesis.db.crud import repo_pulse
+
+        if await repo_pulse.tables_available(db):
+            # At most ONE row per requested id, by construction — so there is no
+            # cap to exceed. Filtering a capped listing by item id is not enough:
+            # that bounds WHICH rows are considered, not HOW MANY return, so one
+            # busy item can push another item's proposal past the limit and that
+            # row comes back undecorated — indistinguishable from having nothing
+            # to report, while the map still says the source was read. The query
+            # is made incapable of truncating rather than watched for it.
+            latest = await repo_pulse.latest_annotation_per_item(
+                db, list(by_id), status="proposed", target_kind="follow_up"
+            )
+            for item_id, ann in latest.items():
+                row = by_id.get(item_id)
+                if row is not None:
+                    row["pulse_proposal"] = {
+                        "annotation_id": ann.get("id"),
+                        "pr_number": ann.get("pr_number"),
+                        "pr_title": ann.get("pr_title"),
+                        "confidence": ann.get("confidence"),
+                        "observed_at": ann.get("observed_at"),
+                    }
+            availability["proposals"] = "ok"
+    except Exception:
+        logger.debug("follow_up_list: pulse proposals unavailable", exc_info=True)
+
+    return availability
 
 
 async def _impl_follow_up_list(
@@ -220,10 +329,16 @@ async def _impl_follow_up_list(
 
         counts = await follow_ups.get_summary_counts(db, include_tabled=include_tabled)
 
+        listed = items[:limit]
+        # Enrich only what is RETURNED, not everything fetched — the decoration is
+        # for the reader, and doing it before the slice would query on behalf of
+        # rows nobody sees.
+        external = await _enrich_external_state(db, listed)
         result = {
-            "follow_ups": items[:limit],
+            "follow_ups": listed,
             "counts": counts,
             "total": sum(counts.values()),
+            "external_state": external,
         }
         if not include_tabled:
             # Count each non-follow_up lane DIRECTLY (not by subtraction, which
@@ -490,6 +605,7 @@ async def follow_up_create(
     pinned: bool = False,
     domain: str = "",
     revisit_condition: str = "",
+    source_session: str = "",
 ) -> dict:
     """Create a follow-up in the accountability ledger.
 
@@ -553,6 +669,15 @@ async def follow_up_create(
             life/career/content). Leave empty to let Genesis classify (internal-only);
             note the classifier keyword-matches repo-ish terms, so an empty domain on
             a misrouted repo item will still look correctly filed.
+        source_session: which session this work originated from — pass your own
+            session id. A FOREGROUND session reads it from the per-turn
+            ``[Clock: … | Session: xxxxxxxx]`` tag (the 8-char prefix resolves to
+            the full id); a DISPATCHED session reads it from the ``## This
+            Session`` block at session start, which is where its full id is
+            given (that session never receives the per-turn tag). Recorded as
+            provenance; repo-pulse uses it to attribute completions. A prefix
+            that does not resolve uniquely is stored as NULL, never truncated.
+            Leave empty only when the origin genuinely is not a CC session.
     """
     return await _impl_follow_up_create(
         content,
@@ -564,6 +689,7 @@ async def follow_up_create(
         pinned=pinned,
         domain=domain or None,
         revisit_condition=revisit_condition,
+        source_session=source_session or None,
     )
 
 
@@ -634,6 +760,17 @@ async def follow_up_list(
     By default only the actionable follow_up lane is listed; the response's
     ``tabled_count`` says how many someday/maybe items are shelved. Set
     include_tabled=True to include tabled items in the list itself.
+
+    Each row may carry two keys describing state that lives OUTSIDE the follow-up:
+    ``issue`` (``{number, url, repo}``) when Genesis already filed a GitHub issue
+    for it — check this before filing another — and ``pulse_proposal`` when
+    repo-pulse has proposed that a merged PR completed it.
+
+    ``external_state`` reports whether each source could be READ, and the
+    difference is load-bearing: a row with NO ``issue`` key was checked and has
+    none, but ``external_state.issues == "unavailable"`` means the lookup could
+    not run at all, so absence proves nothing for ANY row in that response. Do not
+    conclude "no issue filed" from a missing key while its source is unavailable.
 
     Args:
         status_filter: Filter by status (pending, scheduled, in_progress, completed, failed, blocked). Empty for all.

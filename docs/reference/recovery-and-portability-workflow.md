@@ -27,8 +27,49 @@ The public repo (`GENesis-AGI`) is the primary repo, so there is no separate
 "strip and stage" step. Leak protection is enforced on every PR by the
 `leak-detector` job in `.github/workflows/ci.yml` (detect-secrets + gitleaks
 with the repo's `.gitleaks.toml` PII/infrastructure rules + portability
-+ email scans). Releases are cut by tagging `vX.Y` on `main` and publishing a
-GitHub Release from the matching `CHANGELOG.md` section.
++ email scans).
+
+Releases are cut on a **release branch**, never on `main` — the pre-commit hook
+rejects direct commits there and branch discipline requires a PR, so the fold
+gets its own branch like any other change:
+
+1. **Branch.** `git checkout -b chore/release-vX.Y`.
+2. **Assemble the changelog.** Run `scripts/assemble_changelog.py`. It folds
+   every `changelog.d/` fragment into the `[Unreleased]` section and deletes
+   the fragments. Skipping this ships a release whose notes are missing every
+   entry merged since the last tag — silently, because the section still reads
+   as complete. `--dry-run` prints the result without touching anything.
+3. **Close the section.** Rename `## [Unreleased]` to `## [vX.Y] - YYYY-MM-DD`
+   and add a fresh empty `## [Unreleased]` above it. A tag does not rewrite
+   `CHANGELOG.md`, so without this there is no section named after the version
+   for step 6 to publish from. Read the section while you are in it — see the
+   `union` caveats below.
+4. **PR and merge.** This is the one PR that may edit `CHANGELOG.md`: its diff
+   there is produced by the assembler and the rename, not hand-written. The
+   fragment-validation CI job recognises the pairing — a fragment may only
+   disappear in a change whose `CHANGELOG.md` diff actually contains its entry.
+
+   **Merge this last, and if anything else landed while it was open: merge the
+   latest `main` into the release branch, re-run step 2, then MOVE the newly
+   folded entries out of `[Unreleased]` into the existing `[vX.Y]` section.**
+   All three, in that order — each alone is insufficient. Re-running the
+   assembler on a stale release branch reassembles the same old tree, because
+   the newly merged fragment only exists on `main`, and its arrival there does
+   not conflict with this branch's deletions, so nothing forces the sync. And
+   re-running step 2 alone is not enough either: the assembler always targets
+   `## [Unreleased]`, which step 3 re-created empty above the version section —
+   so the late entry folds under the NEXT release while `[vX.Y]` stays
+   incomplete, and CI cannot see it because the entry did arrive in the
+   changelog, just under the wrong heading. Do NOT run step 3's rename a second
+   time — a `[vX.Y]` heading already exists, and renaming the repopulated
+   `[Unreleased]` would create a duplicate; moving the entries is the whole
+   fix. Other PRs keep merging while the release PR sits in review; git
+   carries their fragments forward without touching the version section you
+   already generated. Nothing is lost — but misfiled is invisible to every
+   check, so: sync, reassemble, move, then merge is what makes the section
+   match the tag.
+5. **Tag** `vX.Y` on `main` once that PR has merged.
+6. **Publish** the GitHub Release from the matching `CHANGELOG.md` section.
 
 **Read the section before you publish it.** `CHANGELOG.md` merges with git's
 `union` driver (see `.gitattributes`), which resolves same-position insertions

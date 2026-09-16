@@ -27,6 +27,10 @@ from genesis.util.approval_words import phrase_decision, scoped_decision
 if TYPE_CHECKING:
     from genesis.channels.telegram._handler_context import HandlerContext
 
+#: Imported rather than re-spelled: comparing against a copied string is
+#: how the rescue below silently stops firing when the notice is reworded.
+from genesis.cc.conversation import _TRUNCATION_NOTICE
+
 log = logging.getLogger(__name__)
 
 _MAX_VOICE_BYTES = 20 * 1024 * 1024
@@ -258,6 +262,37 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
         else:
             if streamer:
                 streamer.disable()
+            # RESCUE the streamed answer before the notice replaces it.
+            #
+            # A truncated turn returns the notice as an ordinary response, not
+            # an exception, so it takes this branch and never reaches the
+            # accumulated-text rescues in the `except` handlers below. But
+            # `disable()` above has just torn down the ephemeral draft, so the
+            # only durable copy of what the user was reading is
+            # `streamer.accumulated_text` — and sending the notice alone
+            # replaces a completed answer with "Genesis lost this answer"
+            # (Codex P1, PR #1625).
+            #
+            # Prepended, not substituted: the truncation is still true and the
+            # user needs to know the turn ended early, so they get the answer
+            # AND the warning. Guarded on the notice specifically rather than
+            # on any response, because in every other case `response` is the
+            # authoritative final text and the accumulated draft is a prefix of
+            # it — concatenating there would duplicate the answer.
+            if (
+                streamer
+                and streamer.accumulated_text
+                and response
+                and response.strip() == _TRUNCATION_NOTICE
+            ):
+                log.warning(
+                    "Truncation notice would have replaced %d streamed chars "
+                    "for user %s — delivering both",
+                    len(streamer.accumulated_text),
+                    user.id,
+                )
+                response = f"{streamer.accumulated_text}\n\n{response}"
+
             # Always send text first — voice is additional, never a replacement
             if response:
                 response = response.lstrip("\n")
