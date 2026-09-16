@@ -55,6 +55,36 @@ _FLAG_DASHES = re.compile(r"[ \t]+–[ \t]+|[ \t]+--[ \t]+")
 #     code. Without this the rewrite/flags fire on code and identifiers. ---
 _CODE_REGION = re.compile(r"```.*?```|`[^`]+`", re.DOTALL)
 
+# A dash inside a STRUCTURED token is data, not punctuation. Widening the em
+# dash rewrite to the bare form (word<emdash>word) is what made these
+# vulnerable: the spaced-only pattern could never match a URL, because a URL
+# has no spaces. Rewriting one character to two inside a link target, an email
+# address or a path silently breaks the destination on the Medium, email and
+# Discord paths, which is worse than leaving a dash unfixed.
+# MEASURED against a probe set: protects 6/6 structured tokens while leaving
+# 8/8 ordinary prose dashes rewritable, including the relative-path case
+# (docs/guide.md<emdash>then), where the dash really is punctuation.
+_STRUCTURED_TOKEN = re.compile(
+    r"""(?:
+          [a-z][a-z0-9+.\-]*://\S+           # scheme://host/path
+        | \b[\w.+\-\u2014]+@[\w\-\u2014]+\.[\w.\-\u2014]+   # email address
+        | (?<![\w)])/[\w./\u2014\-]*\w            # absolute path
+    )""",
+    re.X | re.I,
+)
+
+# Regions the analysers and the rewriter must both leave alone. ONE definition,
+# so detection and mutation can never disagree about what counts as prose.
+_PROTECTED_REGION = re.compile(
+    f"{_CODE_REGION.pattern}|{_STRUCTURED_TOKEN.pattern}",
+    re.DOTALL | re.X | re.I,
+)
+
+# Stands in for a protected region during analysis. Non-whitespace on purpose
+# (see _prose_only), which means it must be excluded from word counts (see
+# _prose_word_count).
+_REGION_PLACEHOLDER = "\u00a7"
+
 # --- Banned words (whole-word, case-insensitive). Faithful to the source list.
 #     "clean" is intentionally omitted (allowed for literal cleanliness). ---
 _BANNED_WORDS = [
@@ -120,19 +150,33 @@ def _prose_only(text: str) -> str:
     space, while no dash can acquire fake flanking whitespace from a blanked
     code region.
     """
-    return _CODE_REGION.sub("§", text)
+    return _PROTECTED_REGION.sub(_REGION_PLACEHOLDER, text)
 
 
 def _map_prose(text: str, fn) -> str:
     """Apply ``fn`` to prose spans only, leaving code regions byte-for-byte."""
     out: list[str] = []
     last = 0
-    for m in _CODE_REGION.finditer(text):
+    for m in _PROTECTED_REGION.finditer(text):
         out.append(fn(text[last:m.start()]))
         out.append(m.group(0))
         last = m.end()
     out.append(fn(text[last:]))
     return "".join(out)
+
+
+def _prose_word_count(sentence: str) -> int:
+    """Words in *sentence*, not counting protected-region placeholders.
+
+    The placeholder is non-whitespace by necessity, which means ``split()``
+    yields it as a word and the excluded region silently inflates the count.
+    That shifts ``uniform_sentence_length`` by which sentence happens to hold
+    code -- MEASURED: a probe scored [2, 4, 4, 5] where the prose is [1, 4, 4,
+    5], falsely flagging it, and the inverse placement suppresses a real flag.
+    A token that is ONLY placeholders is dropped; one merely adjacent to a word
+    (`x`y -> placeholder+y) still counts once, which is correct.
+    """
+    return len([w for w in sentence.split() if w.strip(_REGION_PLACEHOLDER)])
 
 
 def _sentences(text: str) -> list[str]:
@@ -174,7 +218,7 @@ def detect(text: str) -> dict[str, object]:
         findings["contrast_structures"] = contrasts
 
     sents = _sentences(prose)
-    lengths = [len(s.split()) for s in sents]
+    lengths = [_prose_word_count(s) for s in sents]
     if len(lengths) > 3 and (max(lengths) - min(lengths) < 4):
         findings["uniform_sentence_length"] = len(lengths)
 

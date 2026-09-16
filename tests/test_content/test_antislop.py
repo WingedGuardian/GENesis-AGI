@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from genesis.content.antislop import detect, scrub
 
 EM = "—"  # — em dash
@@ -213,3 +215,78 @@ class TestOutputIsNotSelfFlagged:
         # these green tests prove nothing about the placeholder change.
         r = scrub("run -- foo to pass args")
         assert any("spaced_ambiguous_dash" in f for f in r.flags)
+# ── Findings from the cross-model review of the dash ruling ────────────────
+#
+# Widening the em dash rewrite from the SPACED form to the BARE form changed
+# two properties that the spaced-only pattern had made safe for free:
+#   1. a dash with no surrounding whitespace became rewritable, which is
+#      exactly the shape a dash takes inside a URL, an email or a path;
+#   2. the rewrite began to GROW text (one char to two) where it had only
+#      ever shrunk it (three chars to two).
+# Each test below has a control, so a protection that swallowed everything
+# would fail rather than look correct.
+
+
+class TestStructuredTokensAreNotRewritten:
+    """A dash inside a structured token is data, not punctuation."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "See [notes](https://example.com/foo—bar) now.",
+            "Mail first—last@example.com today.",
+            "The file is /var/log/app—old.log on disk.",
+            "Grab https://ex.io/a—b?q=1#frag now.",
+        ],
+    )
+    def test_structured_token_survives_untouched(self, text):
+        assert scrub(text).cleaned_text == text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Genesis remembers—that is the point.",
+            "alpha — beta gamma.",
+            "word—word and more—text here.",
+            "Read docs/guide.md—then continue.",
+        ],
+    )
+    def test_control_ordinary_prose_is_still_rewritten(self, text):
+        """Without this, a protection matching everything would pass above."""
+        out = scrub(text).cleaned_text
+        assert "—" not in out
+        assert "--" in out
+
+
+class TestPlaceholderIsNotCountedAsAWord:
+    """The protected-region placeholder must not shift sentence lengths."""
+
+    def test_code_span_does_not_inflate_its_sentence(self):
+        from genesis.content.antislop import (
+            _prose_only,
+            _prose_word_count,
+            _sentences,
+        )
+
+        text = "`x` one. a b c d. a b c d. a b c d e."
+        lengths = [_prose_word_count(s) for s in _sentences(_prose_only(text))]
+        assert lengths == [1, 4, 4, 5]
+
+    def test_uniform_sentence_length_not_falsely_flagged(self):
+        text = "`x` one. a b c d. a b c d. a b c d e."
+        assert "uniform_sentence_length" not in detect(text)
+
+    def test_control_genuinely_uniform_text_still_flags(self):
+        """The detector must still be alive after the placeholder change."""
+        text = "a b c d. e f g h. i j k l. m n o p."
+        assert "uniform_sentence_length" in detect(text)
+
+    def test_placeholder_adjacent_to_a_word_still_counts_once(self):
+        from genesis.content.antislop import (
+            _prose_only,
+            _prose_word_count,
+            _sentences,
+        )
+
+        text = "`x`y alone."
+        assert [_prose_word_count(s) for s in _sentences(_prose_only(text))] == [2]
