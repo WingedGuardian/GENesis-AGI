@@ -195,17 +195,44 @@ async def _active_session_pivots(db: aiosqlite.Connection) -> list[str]:
         return []
 
 
+def _owner_attended_channel_values() -> tuple[str, ...]:
+    """Channel values that count as owner-attended, DERIVED from the predicate.
+
+    Never hardcode this set here. L1 Essential Knowledge is injected into every
+    session, so a topic that reaches it is content every future session reads as
+    Genesis's own. A second literal list would silently drift from
+    ``is_owner_attended_channel`` the next time a channel is added -- which is
+    exactly how a gateway channel would slip in.
+    """
+    from genesis.cc.types import ChannelType, is_owner_attended_channel
+
+    return tuple(c.value for c in ChannelType if is_owner_attended_channel(c))
+
+
 async def _recent_session_topics(db: aiosqlite.Connection, days: int = 7) -> list[str]:
-    """Get recent foreground session topics."""
+    """Get recent foreground session topics, owner-attended channels only.
+
+    A NULL channel passes: it is a legacy row written before channels were
+    stamped, and those are the owner's own terminal sessions. Everything that
+    IS stamped must be on the owner-attended list -- a gateway channel carries
+    content an outside party chose, and this query feeds every session.
+    """
+    allowed = _owner_attended_channel_values()
+    # Only "?" characters, one per enum member -- no caller input reaches the
+    # SQL text, and the channel VALUES below are still bound parameters.
+    placeholders = ", ".join("?" for _ in allowed)
+    # S608 is a false positive: the only interpolation is `placeholders`, which
+    # is a run of "?" characters sized by the enum. Every VALUE is bound.
+    sql = (  # noqa: S608
+        "SELECT topic FROM cc_sessions "  # noqa: S608
+        "WHERE source_tag = 'foreground' "
+        "AND topic IS NOT NULL AND topic != '' "
+        f"AND (channel IS NULL OR channel IN ({placeholders})) "
+        "AND started_at > datetime('now', ?) "
+        "ORDER BY started_at DESC LIMIT 10"
+    )
     try:
-        cursor = await db.execute(
-            "SELECT topic FROM cc_sessions "
-            "WHERE source_tag = 'foreground' "
-            "AND topic IS NOT NULL AND topic != '' "
-            "AND started_at > datetime('now', ?) "
-            "ORDER BY started_at DESC LIMIT 10",
-            (f"-{days} days",),
-        )
+        cursor = await db.execute(sql, (*allowed, f"-{days} days"))
         rows = await cursor.fetchall()
         return [row[0][:200] for row in rows if row[0]]
     except Exception:
