@@ -75,6 +75,7 @@ CONDITION_SHELL_PARSE = "shell_parse_broken"
 CONDITION_NODE_DEAD = "node_dead"
 CONDITION_CONTAINER_CC = "container_cc_dead"
 CONDITION_HOST_BRAIN = "host_brain_dead"
+CONDITION_PROBE_TOOLING = "probe_tooling_missing"
 
 _CONTAINER_CONDITIONS = (
     CONDITION_LAUNCHER,
@@ -83,6 +84,7 @@ _CONTAINER_CONDITIONS = (
     CONDITION_SHELL_PARSE,
     CONDITION_NODE_DEAD,
     CONDITION_CONTAINER_CC,
+    CONDITION_PROBE_TOOLING,
 )
 
 # Human-facing one-liners. Each names the repair route, because an alert that says
@@ -118,6 +120,13 @@ _CONDITION_DETAIL = {
         "node, for the same reason the host leg probes its own binary: a dependency "
         "being healthy is not evidence that its consumer is. Heal via "
         "scripts/update.sh, which aligns the container's CC."
+    ),
+    CONDITION_PROBE_TOOLING: (
+        "The probe could not run its own bounded checks, because a tool it depends on "
+        "(`timeout`) is missing in the container. Every OTHER condition is therefore "
+        "UNKNOWN this tick rather than broken - they are suppressed deliberately. "
+        "Without that suppression a missing `timeout` reports all six as failing on a "
+        "perfectly healthy toolchain, which is how a watch earns being ignored."
     ),
     CONDITION_HOST_BRAIN: (
         "The host's configured Claude Code binary (guardian cc.path) does not run or "
@@ -157,6 +166,16 @@ fails=""
 # be bounded at all, which is the case this exists for.
 #   worst case 6 x (3 + 1) = 24s < 30s outer default, leaving margin for the
 #   login shell and the marker itself.
+# The probe must verify its OWN tooling before trusting any verdict it produces.
+# "I could not measure the subject" and "the subject is broken" are different
+# claims, and collapsing them is the ENV class this module kept being caught by.
+# MEASURED: without this, a missing `timeout` makes every bounded subcheck fail
+# and all six conditions report broken on a healthy toolchain.
+if ! command -v timeout >/dev/null 2>&1; then
+  echo "GUARDLAYER probe_tooling_missing"
+  exit 0
+fi
+
 T="timeout -k 1 3"
 
 # 1. The LAUNCHER. This is what Claude Code actually invokes, and it covers what
@@ -429,6 +448,15 @@ async def check_guard_layer_and_alert(config, dispatcher) -> None:
             # Unreachable — the state machine owns "down". No CONTAINER evidence
             # either way, so those conditions are inconclusive rather than healthy.
             inconclusive.update(_CONTAINER_CONDITIONS)
+        elif CONDITION_PROBE_TOOLING in probe["failures"]:
+            # The probe could not run its own bounded checks. Its readings of every
+            # OTHER condition are therefore meaningless, and reporting them would be
+            # six false alarms at once. Report the one thing actually observed.
+            known.append(CONDITION_PROBE_TOOLING)
+            failing.add(CONDITION_PROBE_TOOLING)
+            inconclusive.update(
+                c for c in _CONTAINER_CONDITIONS if c != CONDITION_PROBE_TOOLING
+            )
         else:
             known.extend(_CONTAINER_CONDITIONS)
             failing.update(probe["failures"])

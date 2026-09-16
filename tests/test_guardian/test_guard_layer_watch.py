@@ -812,3 +812,182 @@ class TestRound4Regressions:
     def test_the_subcheck_bound_sends_KILL_not_only_TERM(self):
         """Plain `timeout` sends TERM; a TERM-resistant command is then unbounded."""
         assert "timeout -k " in glw._PROBE_SCRIPT.decode()
+
+
+# ── The SILENT class: every path that produces no signal must be DECLARED ─────
+#
+# Six of the thirteen findings on this module were the same defect wearing
+# different clothes: A PATH THAT PRODUCES NO SIGNAL WHEN IT SHOULD PRODUCE ONE.
+# Not a wrong alert — no alert, which for a detector is indistinguishable from
+# health and is the worst failure available to it.
+#
+#   the host leg skipped when the container was unreachable
+#   a persistent wedge that never escalated
+#   a corrupt state file that wedged the watch forever
+#   the watch queued behind a 3600s `claude -p`
+#   one hung subcheck silencing every condition
+#   a subprobe budget that did not fit inside the outer deadline
+#
+# Each was fixed as an instance. What made them POSSIBLE is that this module has
+# many ways to exit without alerting — early returns, `continue`s, swallowed
+# exceptions, probes that yield None — and NOTHING ENUMERATED THEM. Every one had
+# to be spotted by a reviewer reading the code.
+#
+# So the inventory is explicit and asserted. Adding a silence path changes the
+# count, which fails here with a message telling the author to justify it. That is
+# the same allowlist polarity as the Bash-guard gate: a new path fails by
+# construction rather than waiting for a seventh reviewer to notice it.
+#
+# This does NOT claim every listed silence is correct. It claims each one was
+# written down on purpose, which is the part that was missing.
+_DECLARED_SILENCE = {
+    ("_parse_probe", "return-silence"): (
+        1, "no GUARDLAYER marker means the probe is unreadable; an unreadable probe "
+           "is NO SIGNAL, never a finding — git_watch's rule"),
+    ("probe_guard_layer", "return-silence"): (
+        2, "exec failure and a non-zero rc both mean the container is unreachable, "
+           "which the confirmation state machine owns, not this watch"),
+    ("probe_guard_layer", "except-swallow"): (
+        1, "a timeout or OS error reaching the tick would take down every watch "
+           "after it in run_check"),
+    ("probe_host_brain", "return-silence"): (
+        2, "a wedge is inconclusive rather than dead; the wedge STREAK is what "
+           "escalates, so this silence is bounded by the caller"),
+    ("probe_host_brain", "except-swallow"): (
+        3, "the binary being absent, a timeout, and an unexpected error each reap "
+           "the process group before returning, so none leaks a child"),
+    ("check_guard_layer_and_alert", "return-silence"): (
+        2, "the kill switch, and not being a guardian host at all — neither is a "
+           "condition this watch can report on"),
+    ("check_guard_layer_and_alert", "continue"): (
+        2, "an INCONCLUSIVE condition (no evidence either way) and an episode that "
+           "went healthy before ever alerting (nothing to resolve)"),
+    ("check_guard_layer_and_alert", "except-swallow"): (
+        1, "the tick-level swallow, which logs at WARNING precisely so this silence "
+           "is visible in journald"),
+    ("_load_state", "except-swallow"): (
+        1, "unreadable or malformed state degrades to empty rather than wedging the "
+           "watch — the defect that made every later tick repeat the same exception"),
+    ("_save_state", "except-swallow"): (
+        1, "failing to persist must not lose the alert that was already sent"),
+    ("_send", "except-swallow"): (
+        1, "a dead dispatcher must not abort the remaining conditions"),
+}
+
+
+def _silence_paths() -> dict:
+    """Every (function, kind) that can exit without producing a signal."""
+    tree = ast.parse(Path(glw.__file__).read_text(encoding="utf-8"))
+    found: dict = {}
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for node in ast.walk(fn):
+            kind = None
+            if isinstance(node, ast.Return) and (
+                node.value is None
+                or (isinstance(node.value, ast.Constant) and node.value.value is None)
+            ):
+                kind = "return-silence"
+            elif isinstance(node, ast.Continue):
+                kind = "continue"
+            elif isinstance(node, ast.ExceptHandler) and not any(
+                isinstance(n, ast.Raise) for n in ast.walk(node)
+            ):
+                kind = "except-swallow"
+            if kind:
+                found[(fn.name, kind)] = found.get((fn.name, kind), 0) + 1
+    return found
+
+
+def test_every_silence_path_is_declared():
+    """A new way to produce no signal must be written down, not discovered later."""
+    found = _silence_paths()
+    undeclared = sorted(set(found) - set(_DECLARED_SILENCE))
+    assert not undeclared, (
+        f"undeclared silence path(s): {undeclared}. This module can now exit without "
+        f"producing a signal in a way nobody wrote down — six of the thirteen review "
+        f"findings against it were exactly that. Add an entry to _DECLARED_SILENCE "
+        f"stating WHY no alert is correct there, or make the path alert."
+    )
+    for key, count in sorted(found.items()):
+        expected, reason = _DECLARED_SILENCE[key]
+        assert count == expected, (
+            f"{key} now has {count} silence paths, declared {expected} ({reason}). "
+            f"A silence added to an already-justified function is still a silence "
+            f"nobody justified."
+        )
+
+
+def test_the_silence_inventory_has_no_stale_entries():
+    """Both directions: a declared path that no longer exists must leave the list."""
+    found = _silence_paths()
+    stale = sorted(set(_DECLARED_SILENCE) - set(found))
+    assert not stale, (
+        f"{stale} are declared but no longer present. An exemption for a path that "
+        f"does not exist is debt, and it hides the next one that takes its place."
+    )
+
+
+class TestProbeVerifiesItsOwnTooling:
+    """ENV class: "I cannot measure" and "the subject is broken" are different claims.
+
+    MEASURED before the fix: with `timeout` absent from the container, every bounded
+    subcheck fails and ALL SIX conditions report broken on a perfectly healthy
+    toolchain. Six false alarms at once is how a watch earns being ignored, and it
+    is the opposite polarity of the silent class the other findings were about.
+    """
+
+    def test_the_probe_checks_for_its_own_tooling_before_using_it(self):
+        script = glw._PROBE_SCRIPT.decode()
+        check_at = script.index("command -v timeout")
+        first_use = script.index('T="timeout')
+        assert check_at < first_use, (
+            "the probe uses `timeout` before verifying it exists, so a container "
+            "missing it reports every condition as broken on a healthy toolchain"
+        )
+        assert glw.CONDITION_PROBE_TOOLING in script
+
+    @pytest.mark.asyncio
+    async def test_unmeasurable_conditions_are_suppressed_not_reported_broken(
+        self, tmp_path, monkeypatch
+    ):
+        """One honest condition, not six false ones."""
+        monkeypatch.setattr(
+            glw, "probe_guard_layer",
+            AsyncMock(return_value={"failures": [glw.CONDITION_PROBE_TOOLING]}),
+        )
+        monkeypatch.setattr(glw, "probe_host_brain", AsyncMock(return_value=True))
+        cfg, disp = _Cfg(tmp_path), AsyncMock()
+        for _ in range(cfg.guard_layer.confirm_ticks):
+            await glw.check_guard_layer_and_alert(cfg, disp)
+        titles = [c.args[0].title for c in disp.send.call_args_list]
+        assert len(titles) == 1, f"expected one alert, got {titles}"
+        assert glw.CONDITION_PROBE_TOOLING in titles[0]
+
+    @pytest.mark.asyncio
+    async def test_unmeasurable_does_not_falsely_RESOLVE_a_warned_condition(
+        self, tmp_path, monkeypatch
+    ):
+        """Suppressed must mean inconclusive, not healthy.
+
+        Collapsing those two is the mistake that produced a false "recovered" on an
+        inconclusive host probe; it must not be reintroduced through this path.
+        """
+        monkeypatch.setattr(glw, "probe_host_brain", AsyncMock(return_value=True))
+        monkeypatch.setattr(glw, "probe_guard_layer", AsyncMock(return_value=_failing("venv_dead")))
+        cfg, disp = _Cfg(tmp_path), AsyncMock()
+        for _ in range(cfg.guard_layer.confirm_ticks):
+            await glw.check_guard_layer_and_alert(cfg, disp)
+        disp.reset_mock()
+        monkeypatch.setattr(
+            glw, "probe_guard_layer",
+            AsyncMock(return_value={"failures": [glw.CONDITION_PROBE_TOOLING]}),
+        )
+        await glw.check_guard_layer_and_alert(cfg, disp)
+        titles = [c.args[0].title for c in disp.send.call_args_list]
+        assert not any("recovered: venv_dead" in t for t in titles), (
+            "venv_dead was suppressed as unmeasurable and reported as RECOVERED - "
+            "suppressed means no evidence, never good news"
+        )
+        assert "venv_dead" in glw._load_state(tmp_path / glw._STATE_FILE)
