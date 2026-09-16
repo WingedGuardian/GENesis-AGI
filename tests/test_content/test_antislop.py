@@ -9,27 +9,32 @@ EN = "–"  # – en dash
 
 
 class TestScrubEmDashFix:
-    def test_spaced_em_dash_is_rewritten_to_bare(self):
+    def test_spaced_em_dash_is_rewritten_to_double_hyphen(self):
+        # Owner ruling 2026-09-16: published prose never uses an em dash; the
+        # prescribed dash form is two hyphens closed up (word--word). The true
+        # em dash reads typeset rather than typed. The scrubber therefore fixes
+        # the #1 tell TO the prescribed form, not to a bare em dash.
         r = scrub(f"Genesis remembers {EM} that's the point.")
-        assert r.cleaned_text == f"Genesis remembers{EM}that's the point."
-        assert r.fixes_applied == ["spaced_em_dash:1"]
+        assert r.cleaned_text == "Genesis remembers--that's the point."
+        assert r.fixes_applied == ["em_dash:1"]
 
     def test_counts_multiple_em_dashes(self):
         r = scrub(f"a {EM} b {EM} c")
-        assert r.cleaned_text == f"a{EM}b{EM}c"
-        assert r.fixes_applied == ["spaced_em_dash:2"]
+        assert r.cleaned_text == "a--b--c"
+        assert r.fixes_applied == ["em_dash:2"]
 
-    def test_correctly_set_em_dash_is_left_alone(self):
-        # No flanking spaces -> not a tell, not touched.
-        text = f"word{EM}word"
-        r = scrub(text)
-        assert r.cleaned_text == text
-        assert r.fixes_applied == []
+    def test_bare_em_dash_is_also_rewritten(self):
+        # Published prose never uses an em dash (owner ruling 2026-09-16),
+        # and the superseded guidance actively prescribed this exact form --
+        # so it is the highest-probability residual em dash in real drafts.
+        r = scrub(f"word{EM}word")
+        assert r.cleaned_text == "word--word"
+        assert r.fixes_applied == ["em_dash:1"]
 
     def test_em_dash_fix_applies_even_when_not_voiced(self):
         r = scrub(f"a {EM} b", is_voiced=False)
-        assert r.cleaned_text == f"a{EM}b"
-        assert r.fixes_applied == ["spaced_em_dash:1"]
+        assert r.cleaned_text == "a--b"
+        assert r.fixes_applied == ["em_dash:1"]
         assert r.flags == []
 
 
@@ -72,17 +77,16 @@ class TestCodeRegionsExcluded:
     def test_em_dash_in_prose_fixed_even_with_code_present(self):
         text = f"intro {EM} here\n```\ncode -- block\n```"
         r = scrub(text)
-        assert r.cleaned_text == f"intro{EM}here\n```\ncode -- block\n```"
-        assert r.fixes_applied == ["spaced_em_dash:1"]
+        assert r.cleaned_text == "intro--here\n```\ncode -- block\n```"
+        assert r.fixes_applied == ["em_dash:1"]
 
-    def test_em_dash_abutting_inline_code_not_falsely_reported(self):
-        # An em dash directly against inline code can't be collapsed at the span
-        # boundary; fixes_applied must equal what was actually rewritten (0), not
-        # over-report from a code-blanked count.
-        text = f"see {EM}`x` now"
-        r = scrub(text)
-        assert r.fixes_applied == []
-        assert r.cleaned_text == text
+    def test_em_dash_abutting_inline_code_is_rewritten(self):
+        # The widened rule needs no flanking spaces, so a dash abutting a code
+        # span rewrites within its own prose span; the count comes from the
+        # per-span rewrite, never from a code-blanked view.
+        r = scrub(f"see {EM}`x` now")
+        assert r.cleaned_text == "see--`x` now"
+        assert r.fixes_applied == ["em_dash:1"]
 
     def test_banned_word_inside_code_not_flagged(self):
         r = scrub("call `navigate()` to move", is_voiced=True)
@@ -132,7 +136,7 @@ class TestDetect:
     def test_detect_reports_categories(self):
         text = f"We delve into the landscape {EM} a testament to synergy."
         f = detect(text)
-        assert f["spaced_em_dash"] == 1
+        assert f["em_dash"] == 1
         assert "delve" in f["banned_words"]
         assert "landscape" in f["banned_words"]
 
@@ -153,8 +157,8 @@ class TestRealisticSlopRoundTrip:
         )
         r = scrub(draft, is_voiced=True)
         assert f" {EM} " not in r.cleaned_text
-        assert f"here{EM}not" in r.cleaned_text
-        assert r.fixes_applied == ["spaced_em_dash:1"]
+        assert "here--not" in r.cleaned_text
+        assert r.fixes_applied == ["em_dash:1"]
 
 
 class TestFirstPersonOpenerAllowed:
@@ -173,3 +177,39 @@ class TestFirstPersonOpenerAllowed:
             is_voiced=True,
         )
         assert not any("opens_with_I" in f for f in r.flags)
+
+
+class TestOutputIsNotSelfFlagged:
+    """The rewrite emits ``--``, which IS a member of _FLAG_DASHES.
+
+    It is emitted unspaced, and _prose_only blanks code regions with a
+    NON-WHITESPACE placeholder -- so a code span next to the rewrite can no
+    longer manufacture the flanking whitespace that turned the fixer into a
+    self-flagger (a measured regression in an earlier draft of this change).
+    """
+
+    def test_rewrite_between_code_spans_is_not_self_flagged(self):
+        r = scrub(f"`a` {EM} `b`")
+        assert r.cleaned_text == "`a`--`b`"
+        assert r.fixes_applied == ["em_dash:1"]
+        assert r.flags == []
+
+    def test_human_authored_unspaced_double_hyphen_near_code_not_flagged(self):
+        # Same shape typed by a person: the prescribed form must never flag.
+        r = scrub("`a`--`b` explains it")
+        assert r.fixes_applied == []
+        assert r.flags == []
+
+    def test_scrub_is_idempotent_in_text_fixes_and_flags(self):
+        for src in (f"a {EM} b", f"`a` {EM} `b`", f"x {EM} `c` {EM} y", f"w{EM}w"):
+            first = scrub(src)
+            second = scrub(first.cleaned_text)
+            assert second.cleaned_text == first.cleaned_text
+            assert second.fixes_applied == []
+            assert second.flags == first.flags
+
+    def test_genuine_spaced_double_hyphen_still_flagged(self):
+        # Positive control: the ambiguous-dash detector must still work, or
+        # these green tests prove nothing about the placeholder change.
+        r = scrub("run -- foo to pass args")
+        assert any("spaced_ambiguous_dash" in f for f in r.flags)
