@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # PreToolUse(Bash) ADVISORY — never blocks (always exit 0).
 #
-# Long deploys — scripts/update.sh, bootstrap.sh, host-setup.sh — must be DETACHED
+# Long deploys — scripts/update.sh and bootstrap.sh — must be DETACHED
 # from the CC session. Neither way of holding them in a Bash call works:
 #
 #   FOREGROUND: the tool's HARD CEILING is 600000ms and a bare update.sh ran 1022s
@@ -51,7 +51,7 @@ CMD=$(printf '%s' "$IN" | jq -r '.tool_input.command // empty' 2>/dev/null) || C
 
 # Only the long-deploy scripts.
 case "$CMD" in
-    *update.sh*|*bootstrap.sh*|*host-setup.sh*) : ;;
+    *update.sh*|*bootstrap.sh*) : ;;
     *) exit 0 ;;
 esac
 
@@ -68,19 +68,26 @@ esac
 # though it populates the variable, which would break the always-exit-0 contract
 # under an inherited SHELLOPTS=errexit.
 read -r -d '' ADVISORY <<'ADV' || true
-ADVISORY: this mentions a long deploy (update.sh / bootstrap.sh / host-setup.sh). If you are LAUNCHING one, it must be DETACHED from this session. Neither way of holding it in a Bash call works.
+ADVISORY: this mentions a long deploy (update.sh / bootstrap.sh). If you are LAUNCHING one, it must be DETACHED from this session. Neither way of holding it in a Bash call works.
 
 FOREGROUND is impossible: the Bash tool's HARD CEILING is 600000ms (10 min), a larger 'timeout' value is not honoured, and an inner 'timeout N' does not extend it. MEASURED 2026-09-16: a bare update.sh ran 1022s. The SIGTERM at the ceiling is also not a silent truncation -- update.sh traps INT/TERM, and once the rollback trap is armed (just before the merge) an interrupt ROLLS BACK, unwinding a deploy that was going fine. Which phase a ten-minute kill lands in depends on the run, so treat it as "something will be undone", not as a clean stop.
 
 run_in_background is NOT the fix, though this hook used to say so. It has no 120s ceiling (MEASURED: a 400s background task completed clean, exit 0), but it is bound to this SESSION's lifetime, and deploys launched that way were killed mid-run on 2026-07-22 (server left DOWN during bootstrap) and 2026-09-16.
 
-Hand it to systemd instead, wrapping THE COMMAND YOU ACTUALLY RAN -- the example below deploys update.sh, but this hook also fires for bootstrap.sh and host-setup.sh, which are not interchangeable and take their own required arguments:
+Hand it to systemd instead, wrapping THE COMMAND YOU ACTUALLY RAN -- the example below deploys update.sh, and bootstrap.sh takes its own arguments:
 
+  XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
+  DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" \
   systemd-run --user --collect --unit genesis-deploy-manual \
-    --working-directory=$HOME/genesis --setenv=PATH="$PATH" \
+    --working-directory=$HOME/genesis \
+    --setenv=PATH="$PATH" --setenv=SSH_AUTH_SOCK --setenv=GENESIS_SYNC_PRIVATE_PATTERNS \
     /bin/bash -c 'exec ./scripts/update.sh > ~/tmp/deploy-$(date +%Y%m%d-%H%M).log 2>&1'
 
-Each flag is load-bearing. --unit is what leaves the session; 'systemd-run --user --scope' does NOT (a scope child keeps the caller's session id), and neither does setsid (it starts a new session but does not stop the caller waiting on it). --working-directory is required because systemd-run does not inherit this cwd. --setenv=PATH is required because a --user unit otherwise runs under systemd's default PATH, which omits ~/.local/bin.
+Each part is load-bearing, and the bus variables come FIRST for a reason. A CC session often has no XDG_RUNTIME_DIR, and without it 'systemd-run --user' cannot reach the user manager at all: MEASURED, a scrubbed environment gives "Failed to connect to bus: No medium found" and nothing starts. --setenv configures the prospective UNIT and cannot help the CLIENT connect, so it is no substitute. update.sh seeds exactly these two variables for the same reason.
+
+--unit is what leaves the session; 'systemd-run --user --scope' does NOT (a scope child keeps the caller's session id), and neither does setsid (it starts a new session but does not stop the caller waiting on it). --working-directory is required because systemd-run does not inherit this cwd. --setenv=PATH is required because a --user unit otherwise runs under systemd's default PATH, which omits ~/.local/bin. A transient service gets the user manager's environment, NOT your shell's, so anything else the deploy relies on needs its own --setenv -- SSH_AUTH_SOCK (a private SSH remote will not fetch without it) and GENESIS_SYNC_PRIVATE_PATTERNS (bootstrap branches on it) are forwarded above; naming an unset variable is harmless.
+
+DO NOT apply this to host-setup.sh. It is interactive and runs on the bare host VM, and detaching it removes stdin: at scripts/host-setup.sh:536-538 the recreate prompt treats EOF as the default Y and immediately retires the existing container. This hook deliberately says nothing about host-setup.sh rather than hand you a recipe that would destroy one.
 
 Then VERIFY it took: 'systemctl --user is-active genesis-deploy-manual' must print 'active'. A failed launch is otherwise indistinguishable from a good one -- with a relative path and no --working-directory, bash exits instantly and --collect reaps the unit, leaving no trace. Check promptly (it also reads 'inactive' once the deploy has FINISHED), then poll the log. genesis-server going 'inactive' mid-run is EXPECTED.
 

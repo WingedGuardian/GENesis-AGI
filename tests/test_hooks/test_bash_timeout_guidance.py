@@ -58,12 +58,15 @@ _MS_LITERAL = re.compile(r"\b(\d{6,})\s*ms\b")
 # the flag.
 _PRESCRIBED_CMD = re.compile(r"systemd-run --user --collect --unit")
 
-#: The whole prescribed command, from the launcher to the end of the redirect.
+#: The whole prescribed command, from the bus-variable seeding through the end of
+#: the redirect. It starts at XDG_RUNTIME_DIR on purpose: those assignments are part
+#: of the command, not commentary — without them `systemd-run --user` cannot reach
+#: the user manager from an env-scrubbed CC session at all.
 #: Flag assertions are made against THIS SPAN, not the whole file — both surfaces
 #: also discuss every one of these flags in prose, so a whole-file containment
 #: check stays green after the command itself loses the flag. Measured: deleting
 #: `--setenv=PATH` from the skill's command left all 19 tests passing.
-_PRESCRIBED_SPAN = re.compile(r"systemd-run .*?2>&1'")
+_PRESCRIBED_SPAN = re.compile(r"XDG_RUNTIME_DIR=.*?2>&1'")
 
 
 def _prescribed_span(text: str) -> str:
@@ -174,11 +177,55 @@ class TestDeployAdviceIsDetachment:
         for rel, text in _advice_files():
             span = _prescribed_span(text)
             assert span, f"{rel} no longer contains a complete prescribed command"
-            for flag in ("--unit", "--working-directory", "--setenv=PATH"):
+            for flag in (
+                "XDG_RUNTIME_DIR",
+                "DBUS_SESSION_BUS_ADDRESS",
+                "systemd-run --user",
+                "--unit",
+                "--working-directory",
+                "--setenv=PATH",
+            ):
                 assert flag in span, (
                     f"{rel}'s prescribed command lost {flag} — it may still be "
                     "discussed in prose, but the command a reader copies is wrong"
                 )
+
+    def test_prescribed_command_seeds_the_bus_before_systemd_run(self):
+        """MEASURED 2026-09-16: with XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS
+        both absent — which a CC session frequently is — `systemd-run --user` dies
+        with "Failed to connect to bus: No medium found" and nothing starts.
+
+        ORDER is the invariant, not just presence. `--setenv` configures the
+        prospective UNIT and cannot help the CLIENT connect, so the assignments must
+        precede the systemd-run invocation to have any effect. update.sh:50-54 seeds
+        the same two for the same reason.
+        """
+        for rel, text in _advice_files():
+            span = _prescribed_span(text)
+            assert span, f"{rel} no longer contains a complete prescribed command"
+            bus = span.index("DBUS_SESSION_BUS_ADDRESS")
+            run = span.index("systemd-run")
+            assert bus < run, (
+                f"{rel} seeds the bus variables AFTER systemd-run; they must come "
+                "first or the client cannot reach the user manager at all"
+            )
+
+    def test_no_surface_prescribes_detaching_host_setup(self):
+        """host-setup.sh is interactive and runs on the bare host VM. Detaching it
+        removes stdin, and at host-setup.sh:536-538 the recreate prompt treats EOF
+        as the default Y — it stops and renames the existing container. A recipe
+        saying "wrap the command you actually ran" would destroy one."""
+        for rel, text in _advice_files():
+            lowered = _one_line(text.lower())
+            assert "host-setup.sh" in lowered, (
+                f"{rel} does not mention host-setup.sh at all; the exclusion has to "
+                "be stated, because it is a long deploy script and the obvious "
+                "generalisation is destructive"
+            )
+            assert "default y" in lowered or "retires the existing container" in lowered, (
+                f"{rel} mentions host-setup.sh without naming the destructive EOF "
+                "default that makes detaching it unsafe"
+            )
 
     def test_surfaces_carry_the_verify_step(self):
         """Nothing else distinguishes a launch that took from one that died at
@@ -269,6 +316,19 @@ class TestDeployGuardFires:
 
     def test_silent_on_unrelated_commands(self):
         assert self._run("git status").strip() == ""
+
+    def test_silent_on_host_setup(self):
+        """Deliberate: the only advice this hook has is "detach", and detaching
+        host-setup.sh reaches a prompt whose EOF default retires the container.
+        Saying nothing beats handing over a destructive recipe."""
+        assert self._run("bash scripts/host-setup.sh --host h").strip() == "", (
+            "guard fired on host-setup.sh — its advisory prescribes detachment, "
+            "which for this script means losing stdin at a destructive default"
+        )
+
+    def test_fires_on_bootstrap(self):
+        """Still in scope: bootstrap.sh is long and non-interactive."""
+        assert self._run("bash scripts/bootstrap.sh").strip()
 
     def test_advisory_is_valid_json_in_the_envelope_cc_reads(self):
         """PreToolUse reaches the model ONLY through hookSpecificOutput; a bare

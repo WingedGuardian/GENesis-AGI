@@ -255,8 +255,10 @@ over a foreground timeout or `nohup … &` (detached but untracked → no comple
 signal, so you end up hand-polling anyway).
 
 **DEPLOYS ARE THE EXCEPTION, and this is the one to get right.**
-`scripts/update.sh`, `bootstrap.sh` and `host-setup.sh` must be **DETACHED FROM
-THE SESSION ENTIRELY** — not foregrounded, and not backgrounded.
+`scripts/update.sh` and `bootstrap.sh` must be **DETACHED FROM THE SESSION
+ENTIRELY** — not foregrounded, and not backgrounded. (`host-setup.sh` is a third
+long script but is NOT in this group: it is interactive and runs on the bare host
+VM. See the warning below before reaching for it.)
 
 - Foreground is impossible: MEASURED 2026-09-16, a bare `update.sh` ran **1022s**,
   1.7× the 600000ms hard ceiling.
@@ -270,14 +272,40 @@ THE SESSION ENTIRELY** — not foregrounded, and not backgrounded.
   It is not immunity in general: an OOM kill reaches a systemd unit just as readily.
 
 ```bash
+XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
+DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" \
 systemd-run --user --collect --unit genesis-deploy-manual \
-  --working-directory=$HOME/genesis --setenv=PATH="$PATH" \
+  --working-directory=$HOME/genesis \
+  --setenv=PATH="$PATH" --setenv=SSH_AUTH_SOCK --setenv=GENESIS_SYNC_PRIVATE_PATTERNS \
   /bin/bash -c 'exec ./scripts/update.sh > ~/tmp/deploy-$(date +%Y%m%d-%H%M).log 2>&1'
 ```
 
-Wrap **the command you actually ran** — the three scripts are not interchangeable,
-and `host-setup.sh` takes required host-specific options that a canned `update.sh`
-line would silently discard. If you build that wrapper programmatically, quote the
+**The bus variables come first, and they are not decoration.** A CC session often
+has no `XDG_RUNTIME_DIR`, and without it the `systemd-run --user` CLIENT cannot
+reach the user manager: MEASURED 2026-09-16, a scrubbed environment gives
+`Failed to connect to bus: No medium found` and nothing starts at all. `--setenv`
+configures the prospective *unit* and cannot help the client connect, so it is no
+substitute. `update.sh:50-54` seeds exactly these two for the same reason, and
+`cc/invoker.py` records the same failure as measured on a live install. This one is
+easy to get wrong by testing in a session that happens to have the variables —
+which is how it reached review here.
+
+**A transient service inherits the user manager's environment, not your shell's.**
+Only what you name with `--setenv` crosses over, so a deploy depending on an
+exported variable silently changes behaviour: `SSH_AUTH_SOCK` (a private SSH remote
+will not fetch without it, `update.sh:696`) and `GENESIS_SYNC_PRIVATE_PATTERNS`
+(`bootstrap.sh:647` branches on it) are forwarded above. Naming an unset variable is
+harmless — measured, the unit still starts.
+
+**Never apply this to `host-setup.sh`.** It is interactive and runs on the bare host
+VM, and detaching it removes stdin: at `host-setup.sh:536-538` the recreate prompt
+treats EOF as the default `Y` and immediately retires the existing container. Run it
+in a real terminal. The deploy advisory deliberately does not fire on it rather than
+offer a recipe that would destroy a container.
+
+Wrap **the command you actually ran** — `update.sh` and `bootstrap.sh` are not
+interchangeable and take their own arguments. If you build that wrapper
+programmatically, quote the
 whole inner script as one unit (`shlex.quote`) rather than interpolating an
 already-quoted command into `bash -c '…'`: MEASURED, the naive form turns
 `--msg 'a b'` into `--msg a` and executes a `$(…)` the user quoted as data.
