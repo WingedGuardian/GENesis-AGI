@@ -42,7 +42,9 @@
 # tell "lock held / host-frozen — keep the marker" apart from a real success).
 #
 # Env overrides:
-#   CODE_INTEL_INDEX_MEMORY_MAX   default 2G     (per systemd scope)
+#   CODE_INTEL_INDEX_MEMORY_MAX   legacy override for both tools
+#   CODE_INTEL_CBM_MEMORY_MAX     default 2G     (CBM batch scope)
+#   CODE_INTEL_GITNEXUS_MEMORY_MAX default 8G    (measured GitNexus rebuild)
 #   CODE_INTEL_INDEX_IO_WEIGHT    default 20     (1-10000; low = polite)
 #   CODE_INTEL_INDEX_CPU_QUOTA    default 200%   (2 cores worth)
 #   CODE_INTEL_INDEX_MODE         default fast   (fast|moderate|full; 3rd arg wins)
@@ -66,10 +68,116 @@ REPO_PATH="${1:-}"
 TOOLS="${2:-both}"
 MODE="${3:-${CODE_INTEL_INDEX_MODE:-fast}}"
 
-MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-2G}"
+_LEGACY_MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-}"
+CBM_MEM_MAX="${CODE_INTEL_CBM_MEMORY_MAX:-${_LEGACY_MEM_MAX:-2G}}"
+# Measured 2026-09-16: a forced full rebuild peaked at 4,874,166,272 bytes
+# (4.65 GiB) and completed under an 8 GiB, swapless scope. The old shared 2G
+# cap killed it on the way up. Keep headroom for repository growth; admission
+# control and the pressure watchdog still decide when the job may run.
+GITNEXUS_MEM_MAX="${CODE_INTEL_GITNEXUS_MEMORY_MAX:-${_LEGACY_MEM_MAX:-8G}}"
+
+# ── Bound the cap by what this INSTALL actually has ──────────────────────────
+# A fixed 8G is a cap, not a reservation, and on a large host that is fine. On a
+# 4-5 GiB container it is worse than no cap at all: the child scope never
+# reaches its own MemoryMax, so the PARENT cgroup hits its limit first and the
+# kernel picks a victim from every process in it -- Genesis, Qdrant, the running
+# session. The cap is supposed to make this job safe to run unattended, and at
+# that size it removes the only thing standing between a rebuild and the
+# services around it. The pressure watchdog does not cover this either: it
+# samples load and I/O wait, neither of which moves early enough on an OOM path.
+#
+# So the effective cap is min(configured, what this box can spare), and when
+# what it can spare is below the measured working set the job is REFUSED rather
+# than run with a cap that cannot bite.
+_genesis_mem_bytes() {  # "8G"/"512M"/"1024K"/bytes -> bytes on stdout, or nothing
+    local v="${1:-}"
+    case "$v" in
+        *[Gg]) printf '%s' "$(( ${v%[Gg]} * 1024 * 1024 * 1024 ))" ;;
+        *[Mm]) printf '%s' "$(( ${v%[Mm]} * 1024 * 1024 ))" ;;
+        *[Kk]) printf '%s' "$(( ${v%[Kk]} * 1024 ))" ;;
+        *[0-9]) printf '%s' "$v" ;;
+        *) : ;;
+    esac
+}
+
+# The container's own ceiling. cgroup v2 first (what an LXC/Docker limit shows
+# up as), then v1, then MemTotal. "max" means unlimited, so it is not a ceiling.
+_genesis_mem_ceiling() {
+    local raw=""
+    # A SEAM, not a convenience. Without it the refusal path below is
+    # unreachable on any box big enough to run the job, so the branch that
+    # protects small installs could only ever be verified by owning a small
+    # install. It doubles as the operator override when a container limit is
+    # not discoverable.
+    if [ -n "${CODE_INTEL_MEM_CEILING_BYTES:-}" ]; then
+        printf '%s' "$CODE_INTEL_MEM_CEILING_BYTES"
+        return
+    fi
+    if [ -r /sys/fs/cgroup/memory.max ]; then
+        raw="$(cat /sys/fs/cgroup/memory.max 2>/dev/null)"
+    elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+        raw="$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)"
+    fi
+    if [ -n "$raw" ] && [ "$raw" != "max" ] && [ "$raw" -gt 0 ] 2>/dev/null; then
+        # A v1 "unlimited" is a huge sentinel rather than a word; anything at or
+        # above MemTotal is not a container limit worth honouring.
+        local total_kb total_b
+        total_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
+        total_b=$(( ${total_kb:-0} * 1024 ))
+        if [ "$total_b" -gt 0 ] && [ "$raw" -lt "$total_b" ]; then
+            printf '%s' "$raw"
+            return
+        fi
+        [ "$total_b" -gt 0 ] && { printf '%s' "$total_b"; return; }
+        printf '%s' "$raw"
+        return
+    fi
+    local total_kb
+    total_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
+    [ -n "$total_kb" ] && printf '%s' "$(( total_kb * 1024 ))"
+}
+
+#: Left for everything that is NOT this job -- Genesis, Qdrant, the session that
+#: launched it. Below this the box is not able to host a rebuild safely.
+CODE_INTEL_SIBLING_RESERVE_BYTES="${CODE_INTEL_SIBLING_RESERVE_BYTES:-$(( 2 * 1024 * 1024 * 1024 ))}"
+#: MEASURED 2026-09-16: a forced full rebuild peaked at 4,874,166,272 bytes
+#: (4.65 GiB). A cap below the working set does not protect anything, it just
+#: relocates the kill, so refuse instead of pretending.
+CODE_INTEL_GITNEXUS_MIN_BYTES="${CODE_INTEL_GITNEXUS_MIN_BYTES:-$(( 4874166272 ))}"
+
+_genesis_ceiling_b="$(_genesis_mem_ceiling)"
+_genesis_want_b="$(_genesis_mem_bytes "$GITNEXUS_MEM_MAX")"
+GITNEXUS_MEM_REFUSE=""
+if [ -n "$_genesis_ceiling_b" ] && [ -n "$_genesis_want_b" ]; then
+    _genesis_spare_b=$(( _genesis_ceiling_b - CODE_INTEL_SIBLING_RESERVE_BYTES ))
+    if [ "$_genesis_spare_b" -lt "$CODE_INTEL_GITNEXUS_MIN_BYTES" ]; then
+        GITNEXUS_MEM_REFUSE="this install has $(( _genesis_ceiling_b / 1024 / 1024 ))M total; after reserving $(( CODE_INTEL_SIBLING_RESERVE_BYTES / 1024 / 1024 ))M for the services around it that leaves $(( _genesis_spare_b / 1024 / 1024 ))M, below the $(( CODE_INTEL_GITNEXUS_MIN_BYTES / 1024 / 1024 ))M a measured full rebuild needs"
+    elif [ "$_genesis_spare_b" -lt "$_genesis_want_b" ]; then
+        GITNEXUS_MEM_MAX="$(( _genesis_spare_b / 1024 / 1024 ))M"
+    fi
+fi
+# Probe with the larger supported value; each tool overrides this dynamically
+# when its real scope/rlimit is created below.
+MEM_MAX="$GITNEXUS_MEM_MAX"
 IO_WEIGHT="${CODE_INTEL_INDEX_IO_WEIGHT:-20}"
 CPU_QUOTA="${CODE_INTEL_INDEX_CPU_QUOTA:-200%}"
 PERSISTENCE="${CODE_INTEL_INDEX_PERSISTENCE:-true}"
+CBM_DISABLE_FILE="${CODEBASE_MEMORY_MCP_DISABLE_FILE:-$HOME/.genesis/codebase-memory-mcp.disabled}"
+
+_GITNEXUS_PIN_READY=0
+_gitnexus_pin_file="$(dirname "${BASH_SOURCE[0]}")/gitnexus_version.sh"
+if [ -r "$_gitnexus_pin_file" ]; then
+    # shellcheck source=gitnexus_version.sh
+    if . "$_gitnexus_pin_file"; then
+        if [[ "${GENESIS_GITNEXUS_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            && declare -F genesis_gitnexus_node_supported >/dev/null \
+            && declare -F genesis_gitnexus_resolve_binary >/dev/null \
+            && declare -F genesis_gitnexus_installed_version >/dev/null \
+            && declare -F genesis_gitnexus_installed_is_pinned >/dev/null; then
+            _GITNEXUS_PIN_READY=1
+        fi
+    fi
+fi
 
 _log() { printf '[code-intel-index] %s\n' "$*"; }
 
@@ -288,13 +396,15 @@ RC=0
 MISSING=""  # requested-but-absent tools — makes a no-op run rc=3, not a false success
 
 if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
-    if command -v codebase-memory-mcp >/dev/null 2>&1; then
+    if [ -e "$CBM_DISABLE_FILE" ]; then
+        _log "codebase-memory-mcp disabled by $CBM_DISABLE_FILE — skipped"
+    elif command -v codebase-memory-mcp >/dev/null 2>&1; then
         _log "indexing (codebase-memory-mcp, mode=$MODE): $REPO_PATH"
         # Flag form (cbm >=0.9): --mode selects the pipeline depth (default here is
         # fast — no similarity/semantic edges); --persistence writes the shareable
         # .codebase-memory/graph.db.zst artifact so a wiped cache restores from it
         # instead of a full 0->100 re-index.
-        _run_with_watchdog cbm codebase-memory-mcp cli index_repository \
+        MEM_MAX="$CBM_MEM_MAX" _run_with_watchdog cbm codebase-memory-mcp cli index_repository \
             --repo-path "$REPO_PATH" --mode "$MODE" --persistence "$PERSISTENCE" || RC=$?
     else
         _log "codebase-memory-mcp not on PATH — skipped"
@@ -304,10 +414,14 @@ fi
 
 if [ "$TOOLS" = "gitnexus" ] || [ "$TOOLS" = "both" ]; then
     _GN=""
-    if command -v gitnexus >/dev/null 2>&1; then
-        _GN="gitnexus"
-    elif command -v npx >/dev/null 2>&1; then
-        _GN="npx gitnexus"
+    if [ "$_GITNEXUS_PIN_READY" -ne 1 ]; then
+        _log "GitNexus pin metadata unavailable — refusing dynamic resolver"
+    elif ! genesis_gitnexus_node_supported; then
+        _log "GitNexus ${GENESIS_GITNEXUS_VERSION} does not support Node $(node --version 2>/dev/null || echo unavailable) — refusing index"
+    elif genesis_gitnexus_installed_is_pinned; then
+        _GN="$(genesis_gitnexus_resolve_binary)"
+    elif genesis_gitnexus_resolve_binary >/dev/null; then
+        _log "GitNexus version $(genesis_gitnexus_installed_version 2>/dev/null || echo unknown) does not match expected pinned ${GENESIS_GITNEXUS_VERSION} — refusing index"
     fi
     if [ -n "$_GN" ]; then
         # gitnexus analyze is already incremental (only -f forces a full re-parse)
@@ -316,7 +430,15 @@ if [ "$TOOLS" = "gitnexus" ] || [ "$TOOLS" = "both" ]; then
         # ("error: unknown option '--quiet'" -> rc 1 on EVERY run); it silently
         # broke every entrypoint-driven gitnexus index since #910. Dropped.
         _log "indexing (gitnexus analyze): $REPO_PATH"
-        ( cd "$REPO_PATH" && _run_with_watchdog gitnexus $_GN analyze ) || RC=$?
+        if [ -n "$GITNEXUS_MEM_REFUSE" ]; then
+            # REFUSED, not silently skipped: a cap that cannot bite is worse
+            # than no job, because the parent cgroup takes the kill instead.
+            _log "SKIP gitnexus: $GITNEXUS_MEM_REFUSE"
+            _log "      raise CODE_INTEL_GITNEXUS_MEMORY_MAX / lower CODE_INTEL_SIBLING_RESERVE_BYTES to override"
+            MISSING="${MISSING:+$MISSING }gitnexus"
+        else
+            ( cd "$REPO_PATH" && MEM_MAX="$GITNEXUS_MEM_MAX" _run_with_watchdog gitnexus "$_GN" analyze ) || RC=$?
+        fi
     else
         _log "gitnexus not available — skipped"
         MISSING="${MISSING}gitnexus "

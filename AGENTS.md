@@ -108,8 +108,9 @@ This repo is indexed by GitNexus. The MCP tools (`impact`, `query`,
 and execution-flow answers that grep can't. Use them when they fit the
 question — **none is a mandatory pre-edit gate** (see CLAUDE.md → Code
 Intelligence for the tool-selection matrix; Serena is the live-symbol
-default, GitNexus is snapshot-based so run `node .gitnexus/run.cjs analyze`
-first when freshness matters).
+default, GitNexus is snapshot-based. From the main checkout, run
+`scripts/lib/code_intel_index.sh "$PWD" gitnexus fast` when freshness matters;
+linked worktrees deliberately skip indexing, so use Serena for live branch truth).
 
 Useful entry points:
 

@@ -49,11 +49,22 @@ def _make_repo(tmp_path: Path, *, worktree: bool = False) -> Path:
 def _fake_tools(bindir: Path, log: Path, *, sleep: float = 0) -> None:
     """Fake codebase-memory-mcp + gitnexus that record args and ulimit -v."""
     bindir.mkdir(exist_ok=True)
+    _write_exec(
+        bindir / "node",
+        '#!/usr/bin/env bash\necho "${FAKE_NODE_VERSION:-v22.22.2}"\n',
+    )
     for name in ("codebase-memory-mcp", "gitnexus"):
+        version_guard = (
+            'if [ "${1:-}" = "--version" ]; then '
+            'echo "${FAKE_GITNEXUS_VERSION:-1.6.12}"; exit 0; fi\n'
+            if name == "gitnexus"
+            else ""
+        )
         _write_exec(
             bindir / name,
             "#!/usr/bin/env bash\n"
-            f'echo "{name} ARGS:$*" >> "{log}"\n'
+            + version_guard
+            + f'echo "{name} ARGS:$*" >> "{log}"\n'
             f'echo "{name} ULIMIT_V:$(ulimit -v)" >> "{log}"\n'
             + (f"sleep {sleep}\n" if sleep else ""),
         )
@@ -184,6 +195,43 @@ def test_tool_selection_cbm_only(tmp_path):
     assert "gitnexus ARGS:" not in out
 
 
+def test_cbm_disable_sentinel_blocks_index_spawn(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    disable_file = tmp_path / "codebase-memory-mcp.disabled"
+    disable_file.write_text("incident freeze\n")
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODEBASE_MEMORY_MCP_DISABLE_FILE": str(disable_file)},
+    )
+    assert res.returncode == 0
+    assert f"disabled by {disable_file}" in res.stdout
+    assert not log.exists()
+
+
+def test_cbm_disable_does_not_poison_successful_gitnexus_leg(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    disable_file = tmp_path / "codebase-memory-mcp.disabled"
+    disable_file.write_text("incident freeze\n")
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "both",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODEBASE_MEMORY_MCP_DISABLE_FILE": str(disable_file)},
+    )
+    assert res.returncode == 0, res.stderr
+    out = log.read_text()
+    assert "codebase-memory-mcp ARGS:" not in out
+    assert "gitnexus ARGS:analyze" in out
+
+
 def test_tool_selection_gitnexus_only(tmp_path):
     fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
     _fake_tools(fakebin, log)
@@ -206,6 +254,66 @@ def test_missing_requested_tools_return_rc3(tmp_path):
     assert "codebase-memory-mcp not on PATH" in res.stdout
     assert "gitnexus not available" in res.stdout
     assert "missing from PATH" in res.stdout
+
+
+def test_wrong_gitnexus_version_is_refused(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "gitnexus",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"FAKE_GITNEXUS_VERSION": "1.6.8"},
+    )
+    assert res.returncode == 3
+    assert "expected pinned 1.6.12" in res.stdout
+    assert not log.exists()
+
+
+def test_unsupported_node_version_refuses_gitnexus(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "gitnexus",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"FAKE_NODE_VERSION": "v23.11.1"},
+    )
+    assert res.returncode == 3
+    assert "does not support Node v23.11.1" in res.stdout
+    assert not log.exists()
+
+
+def test_gitnexus_runs_from_npm_prefix_when_prefix_is_not_on_path(tmp_path):
+    path_bin = tmp_path / "path-bin"
+    prefix_bin = tmp_path / "npm-prefix" / "bin"
+    path_bin.mkdir()
+    prefix_bin.mkdir(parents=True)
+    log = tmp_path / "tools.log"
+    _write_exec(path_bin / "node", "#!/bin/sh\necho v22.22.2\n")
+    _write_exec(
+        path_bin / "npm",
+        f'#!/bin/sh\necho "{tmp_path / "npm-prefix"}"\n',
+    )
+    _write_exec(
+        prefix_bin / "gitnexus",
+        "#!/bin/sh\n"
+        'if [ "${1:-}" = --version ]; then echo 1.6.12; exit 0; fi\n'
+        f'echo "gitnexus ARGS:$*" > "{log}"\n',
+    )
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "gitnexus",
+        path=f"{path_bin}:{_SYSTEM_PATH}",
+    )
+    assert res.returncode == 0, res.stderr
+    assert log.read_text() == "gitnexus ARGS:analyze\n"
 
 
 def test_mode_arg_reaches_cbm(tmp_path):
@@ -351,6 +459,18 @@ def test_scope_path_passes_all_properties(tmp_path):
     assert "CPUQuota=200%" in calls
     assert "--scope" in calls
     assert "codebase-memory-mcp ARGS:" in log.read_text()  # tool actually ran
+
+
+def test_gitnexus_scope_uses_measured_8g_cap(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog, probe_ok=True)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "gitnexus", path=f"{fakebin}:{_SYSTEM_PATH}")
+    assert res.returncode == 0, res.stderr
+    assert "MemoryMax=8G" in slog.read_text()
+    assert "gitnexus ARGS:analyze" in log.read_text()
 
 
 def test_env_overrides_reach_scope(tmp_path):
@@ -552,3 +672,78 @@ def test_installer_does_not_claim_queue_success_after_writer_failure():
     assert "index_marker.py\" write" in queue
     assert "|| true" not in queue
     assert "WARNING: could not queue initial code intelligence index" in queue
+
+
+# ── the cap must be bounded by what the INSTALL has, not by a constant ───────
+
+def _headroom_decision(tmp_path, ceiling_gib: int, want: str = "8G") -> tuple[str, str]:
+    """Run the SHIPPED decision block at a given install size.
+
+    The block is EXTRACTED from the real script rather than re-typed: a copy
+    would drift and leave these assertions describing a version nobody runs.
+    """
+    src = _ENTRYPOINT.read_text()
+    start = src.index("_genesis_mem_bytes() {")
+    end = src.index("\nfi\n", src.index("GITNEXUS_MEM_REFUSE=")) + len("\nfi\n")
+    block = src[start:end]
+    # pytest's tmp_path, NOT a hardcoded directory: an absolute path under a
+    # home directory puts a username in a public repo and breaks the test on
+    # every other machine.
+    blockfile = tmp_path / "block.sh"
+    blockfile.write_text(block)
+    if True:
+        out = subprocess.run(
+            ["bash", "-c",
+             f'source "{blockfile}" >/dev/null 2>&1; '
+             'printf "%s|%s" "$GITNEXUS_MEM_MAX" "$GITNEXUS_MEM_REFUSE"'],
+            capture_output=True, text=True, timeout=60,
+            env={
+                **os.environ,
+                "CODE_INTEL_MEM_CEILING_BYTES": str(ceiling_gib * 1024**3),
+                "GITNEXUS_MEM_MAX": want,
+            },
+        ).stdout
+    cap, _, why = out.partition("|")
+    return cap, why
+
+
+def test_a_small_install_refuses_the_rebuild_rather_than_capping_it_uselessly(tmp_path):
+    """A fixed 8G cap is a cap, not a reservation.
+
+    On a 4-5 GiB container it is worse than no cap: the child scope never
+    reaches its own MemoryMax, so the PARENT cgroup hits its limit first and the
+    kernel picks a victim from everything in it — Genesis, Qdrant, the running
+    session. The pressure watchdog does not cover this; it samples load and I/O
+    wait, neither of which moves early enough on an OOM path.
+
+    MEASURED working set for a full rebuild: 4,874,166,272 bytes (4.65 GiB), so
+    below that a cap cannot bite and the job is refused instead.
+    """
+    for gib in (4, 5, 6):
+        cap, why = _headroom_decision(tmp_path, gib)
+        assert why, f"a {gib} GiB install was allowed to start a rebuild (cap {cap})"
+        assert "total" in why and "rebuild needs" in why, why
+
+
+def test_a_mid_size_install_gets_the_cap_trimmed_to_its_headroom(tmp_path):
+    """The control that moves in the first direction: not every small-ish box is
+    refused. At 8 GiB there IS room once siblings are reserved, so the cap is
+    lowered to the headroom rather than left at a value the box cannot honour."""
+    cap, why = _headroom_decision(tmp_path, 8)
+    assert not why, f"an 8 GiB install was refused: {why}"
+    assert cap.endswith("M"), cap
+    trimmed = int(cap[:-1]) * 1024 * 1024
+    assert trimmed < 8 * 1024**3, "the cap was not trimmed to the install's headroom"
+    assert trimmed >= 4874166272, (
+        f"trimmed to {cap}, which is below the measured working set — that is the "
+        "useless cap this change exists to avoid"
+    )
+
+
+def test_a_large_install_is_left_alone(tmp_path):
+    """The control that moves in the other direction. Without it, a change that
+    refused or trimmed everywhere would satisfy both tests above."""
+    for gib in (16, 32):
+        cap, why = _headroom_decision(tmp_path, gib)
+        assert not why, f"a {gib} GiB install was refused: {why}"
+        assert cap == "8G", f"a {gib} GiB install had its cap changed to {cap}"

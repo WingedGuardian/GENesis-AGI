@@ -271,7 +271,7 @@ else
     echo "  Git identity: $(git -C "$GENESIS_ROOT" config user.name) <$(git -C "$GENESIS_ROOT" config user.email)>"
 fi
 
-# Node.js >= 20 (required for Claude Code)
+# Node.js >= 22 (required by the pinned Claude Code release)
 _node_version_ok() {
     command -v node &>/dev/null || return 1
     local ver
@@ -281,25 +281,25 @@ _node_version_ok() {
     # `if _node_version_ok`), which is exactly how this class hides.
     ver=$(node --version 2>/dev/null | sed 's/^v//') || ver=""
     local major="${ver%%.*}"
-    [[ "$major" -ge 20 ]] 2>/dev/null
+    [[ "$major" -ge 22 ]] 2>/dev/null
 }
 if ! _node_version_ok; then
     if command -v node &>/dev/null; then
-        echo "  Node.js $(node --version) is too old (need >= 20) — upgrading..."
+        echo "  Node.js $(node --version) is too old (need >= 22) — upgrading..."
     else
         echo "  Node.js not found — installing..."
     fi
     install_pkg nodejs || true
     if ! _node_version_ok; then
-        echo "  WARNING: Node.js >= 20 not available. Claude Code will not work."
-        echo "           Install via: curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -"
+        echo "  WARNING: Node.js >= 22 not available. Claude Code will not work."
+        echo "           Install via: curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -"
         echo "                        sudo apt-get install -y nodejs"
     fi
 fi
 if _node_version_ok; then
     echo "  Node: $(node --version)"
 else
-    echo "  Node: $(node --version 2>/dev/null || echo 'not available') (needs >= 20)"
+    echo "  Node: $(node --version 2>/dev/null || echo 'not available') (needs >= 22)"
 fi
 
 # --- Claude Code version pin (install or align to the pinned version) ---
@@ -368,38 +368,75 @@ echo "--- Installing code intelligence tools ---"
 # --skip-config: the installer's own agent-config step registers the RAW binary
 # in ~/.claude/.mcp.json, bypassing our 2G-capped launcher. We register the
 # capped wrapper below via _register_mcp, so the installer must NOT self-register.
-echo "  codebase-memory-mcp: installing/upgrading..."
-# Download-to-temp before executing: `curl … | bash` runs bytes as they stream,
-# so a mid-transfer connection drop executes a truncated script. -f fails the
-# download on a partial transfer; running from a file executes only a fully
-# downloaded installer. B9.
-_cbm_installer=$(mktemp 2>/dev/null) || _cbm_installer=""
-if [[ -n "$_cbm_installer" ]] \
-    && curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh -o "$_cbm_installer" 2>/dev/null; then
-    bash "$_cbm_installer" --ui --skip-config \
-        || echo "  WARNING: codebase-memory-mcp install/upgrade failed (non-critical)"
+if [ -e "$HOME/.genesis/codebase-memory-mcp.disabled" ]; then
+    echo "  codebase-memory-mcp: install/upgrade skipped (machine kill switch active)"
 else
-    echo "  WARNING: codebase-memory-mcp installer download failed (non-critical)"
+    echo "  codebase-memory-mcp: installing/upgrading..."
+    # Download fully before executing so a transfer failure cannot run a
+    # truncated installer.
+    _cbm_installer=$(mktemp 2>/dev/null) || _cbm_installer=""
+    if [[ -n "$_cbm_installer" ]] \
+        && curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh -o "$_cbm_installer" 2>/dev/null; then
+        bash "$_cbm_installer" --ui --skip-config \
+            || echo "  WARNING: codebase-memory-mcp install/upgrade failed (non-critical)"
+    else
+        echo "  WARNING: codebase-memory-mcp installer download failed (non-critical)"
+    fi
+    [[ -n "$_cbm_installer" ]] && rm -f "$_cbm_installer"
 fi
-[[ -n "$_cbm_installer" ]] && rm -f "$_cbm_installer"
-if command -v codebase-memory-mcp &>/dev/null; then
+if [ -e "$HOME/.genesis/codebase-memory-mcp.disabled" ]; then
+    echo "  codebase-memory-mcp status probe skipped (machine kill switch active)"
+elif command -v codebase-memory-mcp &>/dev/null; then
     echo "  codebase-memory-mcp: $(codebase-memory-mcp --version 2>/dev/null || echo 'installed')"
 fi
 
 # GitNexus (blast radius, impact analysis, execution flows)
-# Exact pin to 1.6.8 — only ship versions we've actually verified. 1.6.8 (stable):
-# `analyze` works; FTS degrades gracefully when the extension is absent. The prior
-# 1.6.4-rc line crashed `analyze` silently. Re-verify before bumping further.
-if _node_version_ok; then
-    if ! command -v gitnexus &>/dev/null; then
-        echo "  GitNexus not found — installing..."
-        npm install -g gitnexus@1.6.8 2>/dev/null || echo "  WARNING: GitNexus install failed (non-critical)"
-    else
-        echo "  GitNexus: ensuring pin..."
-        npm install -g gitnexus@1.6.8 2>/dev/null || echo "  WARNING: GitNexus upgrade failed (non-critical)"
+# Exact, shared pin — GitNexus index storage formats can change between
+# releases. Installing an older binary after a newer rebuild makes the
+# otherwise-healthy index unreadable. Bump only after index + query E2E.
+_GITNEXUS_PIN_READY=0
+_gitnexus_pin_file="$SCRIPT_DIR/lib/gitnexus_version.sh"
+if [ -r "$_gitnexus_pin_file" ]; then
+    # shellcheck source=lib/gitnexus_version.sh
+    if source "$_gitnexus_pin_file"; then
+        if [[ "${GENESIS_GITNEXUS_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            && declare -F genesis_gitnexus_node_supported >/dev/null \
+            && declare -F genesis_gitnexus_resolve_binary >/dev/null \
+            && declare -F genesis_gitnexus_installed_version >/dev/null \
+            && declare -F genesis_gitnexus_installed_is_pinned >/dev/null \
+            && declare -F genesis_gitnexus_ensure_pin >/dev/null; then
+            _GITNEXUS_PIN_READY=1
+        fi
     fi
-    if command -v gitnexus &>/dev/null; then
-        echo "  GitNexus: $(gitnexus --version 2>/dev/null)"
+fi
+if [ "$_GITNEXUS_PIN_READY" -ne 1 ]; then
+    echo "  WARNING: GitNexus pin metadata unavailable — GitNexus skipped (non-critical)"
+elif ! genesis_gitnexus_node_supported; then
+    echo "  WARNING: GitNexus ${GENESIS_GITNEXUS_VERSION} requires Node ^22.18.0 or >=24.11.0; found $(node --version 2>/dev/null || echo unavailable) — skipped"
+else
+    if ! genesis_gitnexus_resolve_binary >/dev/null; then
+        echo "  GitNexus not found — installing reviewed pin..."
+    else
+        echo "  GitNexus: checking reviewed pin..."
+    fi
+    if genesis_gitnexus_ensure_pin; then
+        :
+    else
+        _gitnexus_rc=$?
+        if [ "$_gitnexus_rc" -eq 2 ]; then
+            echo "  WARNING: newer GitNexus $(genesis_gitnexus_installed_version 2>/dev/null || echo unknown) left installed; refusing automatic downgrade to ${GENESIS_GITNEXUS_VERSION}"
+        elif [ "$_gitnexus_rc" -eq 3 ]; then
+            echo "  WARNING: unrecognized GitNexus version output left installed; refusing unsafe replacement with ${GENESIS_GITNEXUS_VERSION}"
+        else
+            echo "  WARNING: GitNexus install/upgrade failed (non-critical)"
+        fi
+    fi
+    if genesis_gitnexus_resolve_binary >/dev/null; then
+        if genesis_gitnexus_installed_is_pinned; then
+            echo "  GitNexus: $(genesis_gitnexus_installed_version 2>/dev/null)"
+        else
+            echo "  WARNING: stale GitNexus $(genesis_gitnexus_installed_version 2>/dev/null || echo unknown) remains on disk but will not be registered or indexed"
+        fi
     fi
 fi
 
@@ -697,15 +734,28 @@ echo "--- Registering code intelligence MCP servers ---"
 # shellcheck source=lib/mcp_register.sh
 . "$SCRIPT_DIR/lib/mcp_register.sh"
 
-if command -v gitnexus &>/dev/null; then
-    _register_mcp "gitnexus" "user" "gitnexus" "mcp"
+if [ -x "$GENESIS_ROOT/.claude/mcp/run-gitnexus" ]; then
+    _register_mcp "gitnexus" "user" "$GENESIS_ROOT/.claude/mcp/run-gitnexus" "mcp"
 fi
 if command -v codebase-memory-mcp &>/dev/null; then
     # Registered via the repo launcher (NOT the bare binary): the launcher
     # wraps the server in a systemd scope with MemoryMax to contain upstream's
     # unbounded leak (DeusData/codebase-memory-mcp#581). See
     # .claude/mcp/run-codebase-memory for the full rationale.
+    # REGISTERED EVEN WHEN THE KILL SWITCH IS ACTIVE, deliberately. Registration
+    # does not start anything, and the launcher is fail-closed on the sentinel
+    # (.claude/mcp/run-codebase-memory exits 1 with "disabled by <file>"), so
+    # writing the registration while disabled cannot run the server.
+    #
+    # Skipping preserved the exact drift this helper exists to repair: a
+    # PRE-EXISTING registration pointing at the bare `codebase-memory-mcp`
+    # binary survives untouched, bypasses the launcher entirely, and starts the
+    # uncapped raw server in the next session — and stays uncapped after the
+    # sentinel is removed until somebody runs this again.
     _register_mcp "codebase-memory-mcp" "user" "$GENESIS_ROOT/.claude/mcp/run-codebase-memory"
+    if [ -e "$HOME/.genesis/codebase-memory-mcp.disabled" ]; then
+        echo "  codebase-memory-mcp registered to the launcher; the kill switch is active, so it will refuse to start"
+    fi
 fi
 if command -v serena &>/dev/null; then
     # `-s project` writes .mcp.json keyed to the git-root of the CURRENT dir (no
