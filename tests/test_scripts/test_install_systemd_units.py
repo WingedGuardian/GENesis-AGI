@@ -179,3 +179,26 @@ def test_the_allowlist_actually_rejects_the_original_defect():
     assert guardian.startswith(_ALLOWED_ROOT_PREFIXES), "guardian units rejected"
     # systemd's ignore-failure prefix must not smuggle a bad root past the check.
     assert _first_path_token("-%h/genesis/x.sh") == "%h/genesis/x.sh"
+
+
+def test_watchgod_uses_Type_exec_so_a_failed_exec_cannot_read_active():
+    """`Type=simple` reports a unit started at FORK, before exec can fail.
+
+    That is the window this whole PR is about: the installer asks systemd
+    whether the service is alive, and under `simple` a unit whose ExecStart
+    does not exist can answer `active` in the moment between the fork and the
+    failed exec. MEASURED at 0 of 12 immediate samples, which makes it narrow
+    and does NOT make it impossible — a null result is a lead, not a clearance.
+    `Type=exec` waits for the exec to succeed, so the state is unconstructible
+    rather than unlikely, and a healthy unit still reads `active` immediately
+    (measured).
+
+    Pinned because reverting one word here would silently reopen it.
+    """
+    template = TEMPLATE_DIR / "genesis-tmp-watchgod.service.template"
+    body = template.read_text()
+    assert "\nType=exec\n" in body, (
+        "genesis-tmp-watchgod must be Type=exec; under Type=simple the "
+        "installer's liveness check can read `active` for a unit that never ran"
+    )
+    assert "\nType=simple\n" not in body
