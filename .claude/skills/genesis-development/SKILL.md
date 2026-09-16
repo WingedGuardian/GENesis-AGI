@@ -297,25 +297,37 @@ honestly which are real signal and which are noise; a "false-positive rate" that
 turns out to be mostly true positives is a fire rate, and saying so is part of
 the result.
 
-**For a Bash GUARD's predicate specifically, the corpus already exists and there
-is a tool for it:** `python3 scripts/replay_guard_corpus.py --guard <name>`
-replays this install's own recorded `(command, cwd)` pairs through the guard and
-prints `blocked k/N`. Read `--list` first — a guard is REFUSED for replay until
-someone declares what running it a few hundred thousand times does to the
-machine, and three of the six are refused today for exactly that reason. That
-declaration is machine-checked rather than prose, and the tool enforces it
-itself — every path verifies the declarations against source first and REFUSES
-on a mismatch, so a stale one cannot be replayed against your whole command
-history while you wait for CI. `--list` prints each guard's facts
-(env/argv/network/spawn/write, from a transitive AST walk), its citations, the
-spelling set behind them, and the three blind spots that remain, so a `False` is
-a bounded claim and not a proof of purity. Two limits travel with the number: it is stamped UNCLASSIFIED because the
-corpus contains dangerous commands too, so it is one side of the tradeoff and
-needs the positive control the bullet above demands; and there is **no way to
-print the blocked command lines** — the `--show` flag that used to do it was
-removed, because those lines are real commands that contain secrets passed in
-argv (issue #2007 tracks what a correct version owes). The count and the verdict
-are what go public.
+**For a Bash GUARD's predicate there is a corpus of this install's own recorded
+`(command, cwd)` pairs, and `scripts/replay_guard_corpus.py` builds it — but
+REPLAY IS CURRENTLY UNAVAILABLE.** Every guard is refused; `--guard <name>` and
+`--all` exit 2. So the `blocked k/N` measurement this bullet wants has to be
+taken another way for now — by hand, which is how it was always taken: MEASURED
+2026-09-16, `git log origin/main --pretty='%s%n%b' | grep -icE "real commands"`
+returns 23 against 1,656 merged-PR commits, of which 121 are `fix(hooks)` or
+`feat(hooks)`. Roughly one hook PR in five already does this sweep by hand.
+
+The permission was withdrawn rather than lost. It used to rest on a declared
+claim that a guard performs no writes, spawns or network calls, re-derived by
+walking its imports — and that claim cannot be established by reading: the
+spelling set is open, and four review rounds each surfaced the next round's
+miss, including three fail-opens inside the checks themselves. Issue #2036
+restores replay the other way round, by running it where the effects are
+impossible, so nothing has to be proved about the guard at all.
+
+What the tool still does is check that each declaration's prose still points at
+code that exists: `--list` resolves every `Cite(module, symbol, fragment)`
+against the symbol's executable source (comments stripped, so a fragment cannot
+go on passing from inside one) and refuses on a mismatch. That is worth running
+after editing a guard — six citations in this table went stale within five days,
+one onto a comment about an unrelated timeout. It tells you nothing about what
+the guard DOES; `--list` prints its own limits.
+
+Two limits will travel with the number when replay returns: it is stamped
+UNCLASSIFIED because the corpus contains dangerous commands too, so it is one
+side of the tradeoff and needs the positive control the bullet above demands;
+and there is **no way to print the blocked command lines**, because those are
+real commands containing secrets passed in argv (issue #2007 tracks what a
+correct version owes). The count and the verdict are what go public.
 
 The measurement is a GATE, not a footnote. Decide the acceptable threshold
 BEFORE measuring, and if the number misses it, tighten and re-measure rather

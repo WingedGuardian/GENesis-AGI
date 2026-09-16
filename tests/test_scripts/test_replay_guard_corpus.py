@@ -18,7 +18,6 @@ the tool announces is read back off the file rather than asserted.
 
 from __future__ import annotations
 
-import ast
 import contextlib
 import dataclasses
 import importlib.util
@@ -77,20 +76,22 @@ def _mode(path: Path) -> int:
 def _double_safe(rgc, why: str = "a test double"):
     """A replay-safe declaration for a guard that exists only inside one test.
 
-    `replay_safe` requires `evidence` and has no default, which is the point: a
-    declaration with nothing behind it is exactly what the record replaced. So a
-    double has to supply some, and the honest form is ShEvidence over its own
-    empty source — there is no module to walk, the guard is a lambda defined
-    three lines up, and it delegates to nothing. Were the verifier to see one it
-    would pass on the merits rather than on an exemption, which is why there is
-    no test-only branch in the production type.
+    Built through `ReplaySafety` directly, because there is no longer a
+    constructor that returns `safe=True`: replay permission is withheld for the
+    whole shipped table pending #2036. That withhold is a statement about which
+    guards in `GUARDS` may run; it is not a claim that the replay MACHINERY is
+    broken, and these doubles are what exercise that machinery — pool fan-out,
+    crash disclosure, timeouts, argv pinning. #2036 needs all of it working.
+
+    So the record still carries a `safe` field and `replay()` still honours it;
+    what no longer exists is a way for a SHIPPED declaration to set it.
     """
-    return rgc.replay_safe(why, evidence=_double_evidence(rgc))
+    return rgc.ReplaySafety(safe=True, why=why)
 
 
 def _double_unsafe(rgc, why: str = "a test double"):
     """The refusing sibling of `_double_safe`, same reasoning."""
-    return rgc.not_replay_safe(why, evidence=_double_evidence(rgc))
+    return rgc.not_replay_safe(why)
 
 
 def _list_sections(out: str) -> dict[str, str]:
@@ -114,29 +115,6 @@ def _list_sections(out: str) -> dict[str, str]:
         elif line and not line.startswith(" "):
             current = None
     return sections
-
-
-def _double_source() -> str:
-    """The double's shell text, as a NAMED function.
-
-    `verify_declarations` compares `Guard.sh_source_of` against
-    `ShEvidence.source` BY IDENTITY, so a double has to hand the same object to
-    both — two lambdas with identical bodies are two objects and are correctly
-    refused. Non-empty on purpose too: an empty source made the delegation scan
-    read nothing and assert nothing, which is how a vacuous declaration used to
-    pass. This is real shell that genuinely delegates to nothing, so a double
-    passes on the merits rather than by exemption.
-    """
-    return "# a test double: no delegates, no programs\n:\n"
-
-
-def _double_evidence(rgc):
-    return rgc.ShEvidence(
-        source=_double_source,
-        label="a test double",
-        references_scripts=(),
-        references_programs=(),
-    )
 
 
 def test_rebuild_over_a_world_readable_cache_tightens_the_inode(cache, rgc):
@@ -318,7 +296,7 @@ def test_the_pool_asks_for_fork_explicitly(cache, rgc, monkeypatch):
         "fake",
         lambda c, w: False,
         spawns_process=True,
-        safety=_double_safe(rgc,"a test double; it touches nothing"),
+        safety=_double_safe(rgc, "a test double; it touches nothing"),
     ):
         rgc.replay("fake", [("echo hi", "/tmp")] * 4, jobs=4)
 
@@ -345,7 +323,7 @@ def test_the_substitution_notice_is_actually_printed(cache, rgc, capsys, jobs):
         "fake",
         lambda c, w: bool(rgc._effective_cwd(w) and False),
         spawns_process=jobs > 1,
-        safety=_double_safe(rgc,"a test double; it touches nothing"),
+        safety=_double_safe(rgc, "a test double; it touches nothing"),
     ):
         rgc.replay("fake", corpus, jobs=jobs)
 
@@ -374,7 +352,7 @@ def test_a_guard_that_only_crashes_cannot_report_a_clean_rate(cache, rgc, capsys
         "boom",
         boom,
         spawns_process=jobs > 1,
-        safety=_double_safe(rgc,"a test double; it only raises"),
+        safety=_double_safe(rgc, "a test double; it only raises"),
     ):
         rgc.replay("boom", corpus, jobs=jobs)
 
@@ -609,10 +587,7 @@ def fake_guard(rgc, name, fn, *, spawns_process=False, safety=_UNSET, **extra):
     test below, so the default here must stay "argument omitted" rather than
     "declared unsafe".
     """
-    # Doubles bind sh_source_of to the same object their evidence uses, so the
-    # runner/evidence identity check passes for the right reason.
-    kwargs = {"run": fn, "spawns_process": spawns_process,
-              "sh_source_of": _double_source, **extra}
+    kwargs = {"run": fn, "spawns_process": spawns_process, **extra}
     if safety is not _UNSET:
         kwargs["safety"] = safety
     rgc.GUARDS[name] = rgc.Guard(**kwargs)
@@ -691,7 +666,7 @@ def test_replay_refuses_an_unsafe_guard_even_when_called_directly(rgc):
     needs no flag is still a bypass."""
     with (
         fake_guard(
-            rgc, "nope", lambda c, w: True, safety=_double_unsafe(rgc,"writes to a live repo")
+            rgc, "nope", lambda c, w: True, safety=_double_unsafe(rgc, "writes to a live repo")
         ),
         pytest.raises(RuntimeError, match="not replay-safe"),
     ):
@@ -733,7 +708,7 @@ def test_an_in_process_guard_that_crashes_is_disclosed_not_scored(rgc, capsys):
             rgc,
             "crashy",
             lambda c, w: rgc._run_python_guard("crashy", c, w),
-            safety=_double_safe(rgc,"a test double"),
+            safety=_double_safe(rgc, "a test double"),
         ),
     ):
         rgc.replay("crashy", corpus, jobs=1)
@@ -789,7 +764,7 @@ def test_a_timed_out_guard_is_disclosed_and_still_counted(rgc, capsys, jobs):
 
     corpus = [("echo hi", "/tmp")] * 4
     with fake_guard(
-        rgc, "hang", hang, spawns_process=jobs > 1, safety=_double_safe(rgc,"a test double")
+        rgc, "hang", hang, spawns_process=jobs > 1, safety=_double_safe(rgc, "a test double")
     ):
         rgc.replay("hang", corpus, jobs=jobs)
 
@@ -847,18 +822,43 @@ def test_a_second_rebuild_starting_mid_write_cannot_corrupt_the_first(cache, rgc
     assert _mode(cache) == 0o600
 
 
-def test_list_shows_a_refused_guard_with_its_reason(rgc, monkeypatch, capsys):
+def test_list_shows_every_guard_with_its_reason(rgc, monkeypatch, capsys):
     """A refused guard vanishing from --list is the absence-as-exclusion pattern
     this design replaced: absence teaches nothing, and nothing then reminds the
-    next reader why."""
+    next reader why.
+
+    Asserted through `_list_sections`, which keys on the HEADER LINE, rather
+    than by searching the whole output for a word. The bare-substring version
+    went VACUOUS the moment no guard was replayable: `assert "replayable" in
+    out` kept passing on the word's appearance inside a BLIND_SPOTS sentence,
+    and mutating the header literal to garbage left every test green. An
+    assertion that cannot tell the header from the prose was not checking the
+    header.
+    """
     monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--list"])
 
     assert rgc.main() == 0
 
     out = capsys.readouterr().out
-    assert "bash_safety" in out and "REFUSED" in out
-    assert "git stash create" in out
-    assert "protected_paths" in out and "replayable" in out
+    sections = _list_sections(out)
+    assert set(sections) == set(rgc.GUARDS), (
+        f"--list must show every guard; missing {set(rgc.GUARDS) - set(sections)}"
+    )
+    # The header carries the verdict, and with the permission withheld every
+    # verdict is REFUSED. `_list_sections` only matches `<name> replayable` or
+    # `<name> REFUSED`, so reaching this line already proves a real header.
+    for name in rgc.GUARDS:
+        assert f"{name:16s} REFUSED" in out, f"{name} has no REFUSED header line"
+    assert "git stash create" in sections["git_discard"], "the refusal lost its reason"
+
+    # Re-homed from a deleted test. The blind spots come from ONE list so the
+    # prose and the output cannot disagree, and that claim is made in the module
+    # docstring and in SKILL.md — but the only assertion pinning it lived inside
+    # a test removed whole for its OTHER half. MEASURED: with the pin gone,
+    # deleting the print loop entirely left all 66 tests green, so the tool's
+    # published limits could stop being published in silence.
+    for spot in rgc.BLIND_SPOTS:
+        assert spot.split(".")[0] in out, f"--list stopped printing a blind spot: {spot[:60]}"
 
 
 def test_all_runs_the_safe_guards_and_names_the_refused_ones(rgc, monkeypatch, capsys):
@@ -869,12 +869,10 @@ def test_all_runs_the_safe_guards_and_names_the_refused_ones(rgc, monkeypatch, c
         {
             "safe_one": rgc.Guard(
                 run=lambda c, w: bool(ran.append("safe_one")),
-                sh_source_of=_double_source,
                 safety=_double_safe(rgc, "a test double"),
             ),
             "refused_one": rgc.Guard(
                 run=lambda c, w: bool(ran.append("refused_one")) or True,
-                sh_source_of=_double_source,
                 safety=_double_unsafe(rgc, "writes into a live repository"),
             ),
         },
@@ -895,8 +893,7 @@ def test_all_with_nothing_safe_exits_2(rgc, monkeypatch):
     monkeypatch.setattr(
         rgc,
         "GUARDS",
-        {"refused_one": rgc.Guard(run=lambda c, w: True, sh_source_of=_double_source,
-                                  safety=_double_unsafe(rgc, "writes"))},
+        {"refused_one": rgc.Guard(run=lambda c, w: True, safety=_double_unsafe(rgc, "writes"))},
     )
     monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--all"])
     monkeypatch.setattr(
@@ -927,7 +924,6 @@ def test_an_empty_corpus_exits_2_instead_of_printing_a_clean_zero(rgc, monkeypat
         {
             "safe_one": rgc.Guard(
                 run=lambda c, w: ran.append((c, w)) or False,
-                sh_source_of=_double_source,
                 safety=_double_safe(rgc, "a test double"),
             )
         },
@@ -1009,9 +1005,14 @@ def test_the_protected_paths_declaration_does_not_deny_reading_the_environment(
     protected = _list_sections(out)["protected_paths"]
     assert "no environment reads" not in protected
     assert "expandvars" in protected or "environment" in protected
-    # The prose claim now has a machine-checked twin printed beside it. Both are
-    # asserted: the sentence a human reads, and the fact a walk produced.
-    assert "reads_env=True" in protected
+    # There used to be a third assertion here, on a machine-derived
+    # `reads_env=True` printed beside the prose. The walk that produced it is
+    # gone — it decided an open-set question by reading — so what pins this
+    # declaration now is the CITATION check: the prose above quotes
+    # `os.path.expanduser(os.path.expandvars(token))` from `_expand`, and
+    # `verify_declarations` re-resolves that fragment against the executable
+    # source. The claim is anchored; it is just anchored to something checkable.
+    assert "cites:" in protected, "the corrected prose must still be citation-anchored"
 
 
 def test_the_module_docstring_does_not_call_the_rate_benign(rgc):
@@ -1069,7 +1070,6 @@ def test_one_malformed_transcript_record_does_not_abort_the_whole_walk(rgc, monk
     assert rgc._extract_commands() == [("echo ok", "/tmp")]
 
 
-
 def test_a_run_with_no_valid_measurement_exits_2(rgc, monkeypatch, capsys):
     """A guard that crashed on every row still prints a number, and main()
     discarded replay()'s result and returned 0 — so a wrapper saw success while
@@ -1082,8 +1082,7 @@ def test_a_run_with_no_valid_measurement_exits_2(rgc, monkeypatch, capsys):
     monkeypatch.setattr(
         rgc,
         "GUARDS",
-        {"boom": rgc.Guard(run=boom, sh_source_of=_double_source,
-                            safety=_double_safe(rgc, "a test double"))},
+        {"boom": rgc.Guard(run=boom, safety=_double_safe(rgc, "a test double"))},
     )
     monkeypatch.setattr(rgc, "load_corpus", lambda **kw: [("echo hi", "/tmp")])
     monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--all"])
@@ -1092,7 +1091,6 @@ def test_a_run_with_no_valid_measurement_exits_2(rgc, monkeypatch, capsys):
 
     err = capsys.readouterr().err
     assert "no valid measurement" in err
-
 
 
 # ── round 2: findings from the adversarial audit of this session's fixes ──────
@@ -1129,7 +1127,6 @@ def test_rebuild_with_list_says_it_is_doing_nothing(rgc, monkeypatch, capsys):
     assert rgc.main() == 0
 
     assert "--rebuild has no effect with --list" in capsys.readouterr().err
-
 
 
 def test_importing_the_module_survives_a_settings_file_with_no_inline_blob(tmp_path):
@@ -1203,7 +1200,7 @@ def test_a_guard_that_exits_in_a_pool_worker_does_not_hang_the_run(cache, rgc, c
         "exiter",
         exits_instead_of_returning,
         spawns_process=True,
-        safety=_double_safe(rgc,"a test double"),
+        safety=_double_safe(rgc, "a test double"),
     ):
         result = rgc.replay("exiter", corpus, jobs=4)
 
@@ -1229,7 +1226,7 @@ def test_a_guards_resource_is_resolved_in_the_parent_before_the_fan_out(cache, r
         "prepared",
         lambda c, w: False,
         spawns_process=True,
-        safety=_double_safe(rgc,"a test double"),
+        safety=_double_safe(rgc, "a test double"),
         prepare=lambda: calls.append(1),
     ):
         rgc.replay("prepared", [("echo hi", "/tmp")] * 8, jobs=4)
@@ -1319,6 +1316,8 @@ def test_a_dependency_from_another_checkout_is_refused_not_worked_around(rgc, mo
     assert "another/checkout" in str(excinfo.value), (
         "the refusal did not name where the foreign module came from"
     )
+
+
 # ── the declarations are verified, not just written ──────────────────────────
 #
 # Every ReplaySafety record carries prose that a human wrote and nobody checked.
@@ -1368,190 +1367,12 @@ def _swap_guard(rgc, name, replacement):
         rgc.GUARDS[name] = real
 
 
-@contextlib.contextmanager
-def _fake_repo_scripts(rgc, names: set[str]):
-    """Swap the tracked-script inventory for one test, and put it back.
-
-    `repo_script_names()` is `functools.cache`d and shells out to git, so a test
-    that needs a synthetic delegate has to replace it AND clear the cache on both
-    sides — otherwise the fake leaks into every later test in the module, which
-    is the same process-global-memo hazard `fake_loaded` exists for.
-    """
-    real = rgc.repo_script_names
-    rgc.repo_script_names = lambda: frozenset(names)
-    try:
-        yield
-    finally:
-        rgc.repo_script_names = real
-        real.cache_clear()
-
-
-def _module_using(spelling: str) -> str | None:
-    """A throwaway module that really uses `spelling`, or None if it is a prose row.
-
-    Turning the published list into compilable code is what makes it a CLAIM the
-    matcher has to honour rather than a paragraph beside it. The two non-code
-    rows — the `open(..., mode with …)` descriptions — are rendered by
-    `fact_coverage()` for humans and are exercised by their own dedicated cases
-    below rather than skipped silently.
-    """
-    if "mode with any of" in spelling:
-        name = spelling.split("(")[0]
-        if name == ".open":
-            return "import pathlib\n\n\ndef f():\n    return pathlib.Path('/x').open('w')\n"
-        if name == "open":
-            return "def f():\n    return open('/x', 'w')\n"
-        root = name.split(".")[0]
-        first = "3" if name == "os.fdopen" else "'/x'"
-        return f"import {root}\n\n\ndef f():\n    return {name}({first}, 'w')\n"
-    if spelling.startswith("."):
-        method = spelling[1:-2]
-        return f"import pathlib\n\n\ndef f():\n    return pathlib.Path('/x').{method}()\n"
-    root = spelling.split(".")[0]
-    return f"import {root}\n\n\ndef f():\n    return {spelling}\n"
-
-
 def _write_guard(hooks: Path, name: str, body: str) -> None:
     hooks.mkdir(parents=True, exist_ok=True)
     (hooks / f"{name}.py").write_text(body)
 
 
 # ── the checks themselves ────────────────────────────────────────────────────
-
-
-def test_every_guard_declares_evidence_of_the_kind_its_mechanism_needs(rgc):
-    """ALLOWLIST polarity — and the earlier version of this test did NOT have it.
-
-    It asserted only that an evidence OBJECT was present. That is satisfied by
-    whichever type is cheapest to fake, and the two verifiers are disjoint: the
-    fact walk iterates PyEvidence, the shell scan iterates ShEvidence. So a
-    PYTHON guard carrying an ShEvidence over an empty string is checked by
-    neither.
-
-    MEASURED, by execution: `git_discard` — refused because `git stash create`
-    writes objects into whatever live repository each row was recorded in — was
-    re-declared `replay_safe(...)` with `ShEvidence(source=lambda: "")` and
-    passed all four checkers, arriving at `safe=True`. Four green, zero
-    verification, on the most dangerous guard in the table. Requiring `evidence`
-    at the constructor is not polarity; binding its KIND to the mechanism is.
-    """
-    problems = []
-    for name, guard in sorted(rgc.GUARDS.items()):
-        evidence = guard.safety.evidence
-        if not isinstance(evidence, rgc.PyEvidence | rgc.ShEvidence):
-            problems.append(f"{name}: no machine-checkable evidence at all")
-        elif guard.py_module is not None:
-            if not isinstance(evidence, rgc.PyEvidence):
-                problems.append(
-                    f"{name} runs the Python guard {guard.py_module!r} but declares "
-                    f"{type(evidence).__name__}, which the fact walk never looks at. "
-                    "Shell evidence on a Python guard is an unchecked declaration "
-                    "wearing a checked one's clothes."
-                )
-            elif evidence.module != guard.py_module:
-                problems.append(
-                    f"{name} runs {guard.py_module!r} but its evidence describes "
-                    f"{evidence.module!r} — the declaration is about a different "
-                    "artifact from the one that will be replayed."
-                )
-        elif not isinstance(evidence, rgc.ShEvidence):
-            # The mirror of the case above, and it used to CRASH here with
-            # `AttributeError: 'PyEvidence' object has no attribute 'source'`
-            # instead of reporting — a red for the wrong reason, which is a red
-            # you have not earned. Found by the mutation sweep, not by reading.
-            problems.append(
-                f"{name} is a shell guard (no py_module) but declares "
-                f"{type(evidence).__name__}, whose module the fact walk would "
-                "look for under scripts/hooks/ and never find."
-            )
-        elif not evidence.source().strip():
-            problems.append(
-                f"{name}: ShEvidence.source() is empty, so the delegation scan "
-                "reads nothing and asserts nothing. Point it at the real text."
-            )
-    assert not problems, "\n".join(problems)
-
-
-def test_every_published_spelling_is_actually_detected(rgc, tmp_path):
-    """Bind the published coverage to the matcher, so the list cannot over-claim.
-
-    This is the fix for the CLASS the review found, not for one instance of it.
-    Every finding was the same generator: a claim written to describe intended
-    semantics, an implementation that was narrower, and nothing holding them
-    together. `--list` published `subprocess.run` while the matcher compared
-    literal text, so `import subprocess as sp` walked straight through — MEASURED
-    at ten realistic spellings missed out of ten, against two controls detected.
-
-    Here the published list is EXECUTABLE: each spelling is compiled into a
-    throwaway module and the walk must find it. A spelling that goes in the list
-    without the matcher seeing it now fails immediately, in both directions.
-    """
-    hooks = tmp_path / "hooks"
-    hooks.mkdir()
-    undetected: list[str] = []
-    for fact, spellings in rgc.fact_coverage().items():
-        for spelling in spellings:
-            body = _module_using(spelling)
-            if body is None:
-                continue
-            for stale in hooks.glob("*.py"):
-                stale.unlink()
-            (hooks / "probe.py").write_text(body)
-            if not rgc.walk_facts("probe", hooks)[fact]:
-                undetected.append(f"{fact}: {spelling!r} is published but not matched")
-    assert not undetected, "\n".join(undetected)
-
-
-def test_a_bare_method_name_is_unambiguous_by_construction(rgc):
-    """The eligibility rule for `_FACT_METHODS`, derived from the stdlib.
-
-    Naming `.replace`, `.write` and `.truncate` as forbidden is a three-name
-    DENYLIST — it cannot see `.read`, `.close`, `.seek`, `.flush` or `.pop`, and
-    the next ambiguous name added would pass. A bare name is matched on ANY
-    receiver, so the property that makes one safe is that pathlib carries it and
-    the common non-filesystem receivers do not. Asserting THAT is allowlist
-    polarity; listing three exclusions is not.
-    """
-    import io
-
-    # io.IOBase alone is not enough: it declares `truncate` but NOT `write`,
-    # which lives on the Raw/Buffered/Text subclasses. Checking only the base
-    # would have let `.write` through the very invariant added to exclude it.
-    others = (str, bytes, list, dict, io.IOBase, io.RawIOBase, io.BufferedIOBase, io.TextIOBase)
-
-    ambiguous = []
-    for name in sorted(set().union(*rgc._FACT_METHODS.values())):
-        carriers = [t.__name__ for t in others if hasattr(t, name)]
-        if not hasattr(Path, name):
-            ambiguous.append(f"{name!r} is not a pathlib.Path method at all")
-        elif carriers:
-            ambiguous.append(f"{name!r} is also carried by {', '.join(carriers)}")
-    assert not ambiguous, "\n".join(ambiguous)
-    # Guard-the-guard: the invariant must actually REJECT the three names that
-    # motivated it, or it is passing for the wrong reason.
-    for known_bad in ("replace", "write", "truncate"):
-        carriers = [t.__name__ for t in others if hasattr(t, known_bad)]
-        assert carriers, f"{known_bad!r} was expected to be ambiguous and is not"
-
-
-def test_the_declared_facts_match_a_transitive_walk_of_the_guards_imports(rgc):
-    """The fact half, bidirectional, over every Python guard.
-
-    This would have caught two of the four historical defects: protected_paths
-    declaring "no environment reads" while `_expand` runs `os.path.expandvars`,
-    and worktree_cwd omitting the `sys.argv` branch that decides which classifier
-    a row goes through.
-
-    It is bidirectional deliberately. A declared-but-untrue fact is the rot
-    direction nobody inspects, because an over-cautious declaration still reads
-    as careful.
-    """
-    problems: list[str] = []
-    for name, guard in sorted(rgc.GUARDS.items()):
-        evidence = guard.safety.evidence
-        if isinstance(evidence, rgc.PyEvidence):
-            problems += rgc._check_facts(name, evidence, _hooks(rgc))
-    assert not problems, "\n".join(problems)
 
 
 def test_every_citation_still_resolves(rgc):
@@ -1584,132 +1405,16 @@ def test_every_citation_still_resolves(rgc):
                 )
     assert not problems, "\n".join(problems)
 
-
-def test_a_shell_guard_acknowledges_every_program_and_script_it_names(rgc):
-    """The half that reaches the case the other two miss by construction.
-
-    `bash_safety` has no Python module: its delegation to git_discard_guard is a
-    shell pipe, so no import walk can see it. MEASURED when this check was first
-    run against the tree — the file references SIX guards and its declaration
-    named ONE. Three are invoked (destructive_command_guard and
-    protected_paths_guard through one loop, git_discard_guard through the pipe);
-    the other three are an existence test and two comments.
-
-    The scan proves OCCURRENCE, never invocation. That is the honest claim a
-    closed-set cross-reference can make, and it is enough: the obligation it
-    creates is to say in `why` what each name is doing there.
-    """
-    problems: list[str] = []
-    for name, guard in sorted(rgc.GUARDS.items()):
-        evidence = guard.safety.evidence
-        if not isinstance(evidence, rgc.ShEvidence):
-            continue
-        self_name = Path(evidence.label).name
-        try:
-            text = evidence.source()
-        except BaseException as exc:  # noqa: BLE001 - SystemExit is the live case
-            # `_inline_blob` locates the blob by CONTENT, so a reword in
-            # .claude/settings.json raises SystemExit out of source(). Seven open
-            # PRs touch that file. Unwrapped it surfaces as an unhandled
-            # BaseException with no hint of the cause.
-            problems.append(
-                f"{name}: could not read {evidence.label} ({exc!r}). If this is the "
-                "inline blob, it was probably reworded — `_inline_blob` finds it by "
-                "matching its text, so the locator needs updating, not the scan."
-            )
-            continue
-        scripts, programs = rgc.scan_shell(text, self_name)
-        for kind, actual, declared in (
-            ("script", scripts, set(evidence.references_scripts)),
-            ("program", programs, set(evidence.references_programs)),
-        ):
-            for extra in sorted(actual - declared):
-                problems.append(
-                    f"{name}: {evidence.label} references {kind} {extra!r}, which "
-                    "the declaration does not acknowledge. Say what it is doing "
-                    "there — a delegation whose side effects belong in `why`, or "
-                    "message text that only looks like one."
-                )
-            for stale in sorted(declared - actual):
-                problems.append(
-                    f"{name}: declares {kind} {stale!r}, which no longer occurs in "
-                    f"{evidence.label}. The prose about it is now describing "
-                    "something that is not there."
-                )
-    assert not problems, "\n".join(problems)
-
-
-def test_the_published_coverage_excludes_the_names_that_over_report(rgc):
-    """`--list` prints the coverage set, so the set is a published claim.
-
-    `.replace` and `.write` are the load-bearing absences and this pins them. A
-    first cut of the walk matched bare attribute names on any receiver and
-    reported writes_fs=True for protected_paths from
-    `prot.replace(home, "~", 1)` — a STRING replace in
-    `_legacy_substring_block`. An over-reporting checker is not the safe kind of
-    wrong: it forces a pure argv classifier to declare a filesystem write, which
-    is the declaration lying in the other direction, and a reader who catches it
-    once stops believing any of the facts.
-    """
-    every_method = set().union(*rgc._FACT_METHODS.values())
-    assert "replace" not in every_method
-    assert "write" not in every_method
-    assert "truncate" not in every_method
-    # Still bounded, and the honesty is in saying so rather than in the size.
-    for fact, spellings in rgc.fact_coverage().items():
-        assert spellings, f"{fact} is checked against nothing, so False means nothing"
+    # And again through the PRODUCTION path, which is the assertion that
+    # actually pins the shipped checker. The loop above re-implements the
+    # fragment test to produce a per-citation message, and a re-implementation
+    # grades its own copy: MEASURED — deleting the real `cite.fragment not in
+    # haystack` branch from `_verify_one` left this test green, because nothing
+    # in it had called `_verify_one`.
+    assert rgc.verify_declarations() == [], "the shipped verifier disagrees with the loop above"
 
 
 # ── acceptance bar: three arms, each verified RED before this shipped ─────────
-
-
-def test_arm1_deleting_a_declared_fact_turns_the_check_red(rgc):
-    """Issue #1946 arm 1, run against the real declaration rather than a stand-in.
-
-    worktree_cwd's `sys.argv` read is a real one: main() branches on
-    `"--enter-worktree" in sys.argv`, and an inherited flag put every row through
-    the Enter/ExitWorktree classifier. Deleting the fact must fail.
-    """
-    real = rgc.GUARDS["worktree_cwd"].safety.evidence
-    understated = real._replace(reads_argv=False)
-    problems = rgc._check_facts("worktree_cwd", understated, _hooks(rgc))
-    assert problems, "removing a TRUE fact from the declaration was not noticed"
-    assert any("reads_argv" in p and "sys.argv" in p for p in problems), problems
-
-
-def test_arm2_a_guard_that_gains_a_subprocess_turns_the_check_red(rgc, tmp_path):
-    """Issue #1946 arm 2 — the drift a citation checker cannot see.
-
-    Built as a throwaway hooks tree rather than by mutating a real guard: the
-    check must fail because of what the code DOES, and pointing it at a directory
-    of our own is the only way to be sure the fixture created the shape it claims.
-    """
-    hooks = tmp_path / "hooks"
-    _write_guard(
-        hooks, "pure_guard", "import helper\n\n\ndef main() -> int:\n    return helper.n\n"
-    )
-    _write_guard(hooks, "helper", "n = 0\n")
-    declared_pure = rgc.PyEvidence(
-        module="pure_guard",
-        reads_env=False,
-        reads_argv=False,
-        network=False,
-        spawns=False,
-        writes_fs=False,
-    )
-    # Guard-the-guard: the fixture must be clean BEFORE the mutation, or a red
-    # below proves nothing about the subprocess we are about to add.
-    assert not rgc._check_facts("pure_guard", declared_pure, hooks)
-
-    # The spawn arrives TRANSITIVELY, through the imported helper — which is the
-    # shape that matters. A subprocess in the guard's own file would be caught by
-    # reading it; this one would not.
-    _write_guard(
-        hooks, "helper", "import subprocess\n\nn = 0\n\n\ndef go():\n    subprocess.run(['true'])\n"
-    )
-    problems = rgc._check_facts("pure_guard", declared_pure, hooks)
-    assert problems, "a guard that gained a transitive subprocess.run was not noticed"
-    assert any("spawns" in p and "subprocess.run" in p for p in problems), problems
 
 
 def test_arm3_editing_or_renaming_a_cited_construct_turns_the_check_red(rgc, tmp_path):
@@ -1761,53 +1466,32 @@ def test_arm3_editing_or_renaming_a_cited_construct_turns_the_check_red(rgc, tmp
     assert "@staticmethod" in segment
 
 
-def test_a_shell_guard_that_gains_a_delegation_turns_the_check_red(rgc):
-    """The fourth arm, for the third half — the historical defect #2 replay.
+def test_a_rotted_citation_is_reported_by_the_shipped_verifier(rgc):
+    """Arm 3 through `verify_declarations`, which is what actually runs.
 
-    Not in the issue's list because the issue believed the AST walk covered this
-    case. It does not, so the arm belongs with the others: dropping
-    git_discard_guard.py from bash_safety's acknowledged set must fail, because
-    that omission IS the defect that shipped twice.
+    Every assertion in the arm above calls `cite_source` directly, so all of
+    them pass while the branch in `_verify_one` that turns a non-matching
+    fragment into a problem string is DELETED. MEASURED: replacing that branch's
+    condition with `False` left the whole suite green — the resolver was pinned
+    and the shipped check was not.
+
+    The fragment here cannot occur in any real source, so a green result means
+    the check did not run rather than that the citation held.
     """
-    evidence = rgc.GUARDS["bash_safety"].safety.evidence
-    understated = evidence._replace(
-        references_scripts=tuple(
-            s for s in evidence.references_scripts if s != "git_discard_guard.py"
-        )
+    real = rgc.GUARDS["protected_paths"]
+    rotted = dataclasses.replace(
+        real,
+        safety=dataclasses.replace(
+            real.safety,
+            cites=(rgc.Cite("protected_paths_guard", "main", "NO_SUCH_FRAGMENT_EVER_ZZZ"),),
+        ),
     )
-    scripts, _ = rgc.scan_shell(understated.source(), Path(understated.label).name)
-    assert "git_discard_guard.py" in scripts - set(understated.references_scripts), (
-        "dropping the delegate from the declaration went unnoticed — this is "
-        "exactly the omission that got past prose review twice"
-    )
+    with _swap_guard(rgc, "protected_paths", rotted):
+        problems = rgc.verify_declarations()
+    assert problems, "a fragment that occurs nowhere was reported as fine"
+    assert any("NO_SUCH_FRAGMENT_EVER_ZZZ" in p for p in problems), problems
 
 
-def test_list_prints_the_facts_and_says_what_a_false_means(rgc, monkeypatch, capsys):
-    """The coverage line is not decoration: it is what stops `spawns=False` being
-    read as proof of purity. --list is the surface every rate-reader passes
-    through, so the qualifier travels with the claim."""
-    monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--list"])
-    assert rgc.main() == 0
-    out = capsys.readouterr().out
-    assert "facts (protected_paths_guard, transitive): reads_env=True" in out
-    assert "shell (scripts/bash_safety_hook.sh)" in out
-    assert "a False fact means none of these spellings were found" in out
-    # The published set must be the REAL one. `--list` used to say "every tracked
-    # repo script name" while the scan used a non-recursive, suffix-filtered
-    # filesystem glob holding 180 of 236 names.
-    assert f"plus {len(rgc.repo_script_names())} tracked script basenames" in out
-    # Every uncovered case is NAMED rather than silently omitted — the
-    # UNSCANNED_ROOTS convention, applied to claims instead of directories. All
-    # three, because listing only the comfortable one is the same overclaim in
-    # miniature.
-    assert "Not covered, and named rather than left silent" in out
-    uncovered = out.split("Not covered, and named rather than left silent")[1]
-    # Derived from ONE list now, so the count cannot drift from the content —
-    # the previous text hardcoded "the three blind spots" and was already wrong.
-    assert "getattr" in uncovered, "the runtime-rebinding blind spot is unstated"
-    assert "$_guard" in uncovered, "the variable-built delegation path is unstated"
-    assert "REFUTED, never confirmed" in uncovered, "the narrowing itself is unstated"
-    assert "#2036" in uncovered, "the successor issue is unnamed"
 # ── external review round 1: one arm per finding ─────────────────────────────
 #
 # Six P2s, all verified by execution before anything was changed. Four of them
@@ -1823,53 +1507,6 @@ def test_the_tool_verifies_its_own_declarations(rgc):
     table passes the shipped verifier. Everything below tests that individual
     checks BITE; this tests that they are satisfied by what we actually ship."""
     assert rgc.verify_declarations() == []
-
-
-def test_an_unaliased_dotted_import_binds_its_first_component(rgc, tmp_path):
-    """Round 1, finding 2 — a fail-open introduced BY the fix for a fail-open.
-
-    `import os.path` binds the name `os`, not `os.path`. Recording `os ->
-    os.path` turned `os.path.expandvars` into `os.path.path.expandvars`, so a
-    guard written in that style kept `reads_env=False` while reading the
-    environment on every operand — and the bidirectional check stayed green.
-    Caught by the external reviewer, not by this file's own tests, which is the
-    reason it gets an arm rather than a comment.
-    """
-    hooks = tmp_path / "hooks"
-    hooks.mkdir()
-    for label, body in (
-        ("import os.path", "import os.path\n\n\ndef f(t):\n    return os.path.expandvars(t)\n"),
-        ("import os", "import os\n\n\ndef f(t):\n    return os.path.expandvars(t)\n"),
-        ("aliased", "import os.path as p\n\n\ndef f(t):\n    return p.expandvars(t)\n"),
-    ):
-        (hooks / "probe.py").write_text(body)
-        found = rgc.walk_facts("probe", hooks)
-        assert found["reads_env"], f"{label}: the environment read went undetected"
-
-
-def test_a_network_call_is_a_declared_fact(rgc, tmp_path):
-    """Round 1, finding 3 — the record's own docstring defines replay safety as
-    whether repeated invocation "writes, spawns, or calls out", and the
-    undeclared-guard message demands network effects be stated, but nothing
-    checked one. A guard could add an HTTP call per corpus row and stay green.
-
-    `urllib.parse` is the negative control and it is not incidental: push_allowlist
-    imports it for URL string parsing, so counting it would force git_push to
-    declare a network call it does not make.
-    """
-    hooks = tmp_path / "hooks"
-    hooks.mkdir()
-    (hooks / "probe.py").write_text(
-        "import urllib.request\n\n\ndef f(u):\n    return urllib.request.urlopen(u)\n"
-    )
-    assert rgc.walk_facts("probe", hooks)["network"]
-
-    (hooks / "probe.py").write_text(
-        "import urllib.parse\n\n\ndef f(u):\n    return urllib.parse.urlsplit(u)\n"
-    )
-    assert not rgc.walk_facts("probe", hooks)["network"], (
-        "URL parsing is pure string work and must not read as a network call"
-    )
 
 
 def test_a_fragment_surviving_only_in_a_comment_does_not_resolve(rgc, tmp_path):
@@ -1906,67 +1543,6 @@ def test_a_fragment_surviving_only_in_a_comment_does_not_resolve(rgc, tmp_path):
     assert cite.fragment in haystack, "comment stripping ate a live construct"
 
 
-def test_a_shell_guards_delegates_have_their_facts_checked(rgc, tmp_path):
-    """Round 1, finding 5 — the sharpest of the six.
-
-    `bash_safety`'s declaration asserts its two extra delegates are "pure
-    argv/string classifiers ... neither spawns nor writes". That was verified by
-    hand with a throwaway probe and by NOTHING shipped: MEASURED, both
-    destructive_command_guard and shell_parse were referenced by the declaration
-    and fact-walked by no check at all. A prose claim nobody checks, committed
-    inside the mechanism built to end prose claims nobody checks.
-    """
-    hooks = tmp_path / "hooks"
-    hooks.mkdir()
-    _write_guard(hooks, "delegate", "def main() -> int:\n    return 0\n")
-    pure = rgc.PyEvidence(
-        module="delegate",
-        reads_env=False,
-        reads_argv=False,
-        network=False,
-        spawns=False,
-        writes_fs=False,
-    )
-    # Drive the REAL seam. An earlier version of this test called _check_facts
-    # directly, and a mutation sweep proved that vacuous: deleting the delegate
-    # walk from _check_shell entirely left it GREEN, because the integration
-    # point — the thing the finding was actually about — was never exercised.
-    evidence = rgc.ShEvidence(
-        source=lambda: '"$_py" "$SCRIPT_DIR/hooks/delegate.py"\n',
-        label="fake_hook.sh",
-        references_scripts=("delegate.py",),
-        # Nothing declared here that the fake text does not contain — the
-        # guard-the-guard below is what caught an earlier version declaring
-        # "python3" against source that never mentions it.
-        references_programs=(),
-        invokes=(pure,),
-    )
-    with _fake_repo_scripts(rgc, {"delegate.py"}):
-        # Guard-the-guard: clean before the mutation, or the RED proves nothing.
-        assert not rgc._check_shell("fake", evidence, hooks)
-
-        _write_guard(
-            hooks,
-            "delegate",
-            "import subprocess\n\n\ndef main() -> int:\n"
-            "    subprocess.run(['true'])\n    return 0\n",
-        )
-        problems = rgc._check_shell("fake", evidence, hooks)
-    assert problems, "a delegate that gained a subprocess was not noticed"
-    assert any("spawns" in p for p in problems), problems
-
-    # And a delegate the shell text does not even mention is refused, because
-    # "invokes" is the author's claim and it has to be a claim about this file.
-    stray = rgc.ShEvidence(
-        source=lambda: "echo hi\n",
-        label="fake_hook.sh",
-        references_scripts=(),
-        references_programs=(),
-        invokes=(pure,),
-    )
-    assert any("does not occur" in p for p in rgc._check_shell("fake", stray, hooks))
-
-
 def test_the_cli_refuses_to_replay_on_a_stale_declaration(rgc, monkeypatch, capsys):
     """Round 1, finding 6 — and the reason the checkers moved out of this file.
 
@@ -1991,27 +1567,6 @@ def test_the_cli_refuses_to_replay_on_a_stale_declaration(rgc, monkeypatch, caps
         assert "no --force" in err
 
 
-def test_a_quoted_path_cannot_fall_out_of_the_script_name_set(rgc, monkeypatch):
-    """Round 1, finding 1 — git QUOTES a path containing whitespace, so a plain
-    split() mangles it and the real basename silently leaves the set. An
-    under-reporting delegation scan reads exactly like a clean one."""
-    import subprocess as sp
-
-    captured: dict[str, list[str]] = {}
-
-    def fake_run(argv, **kw):
-        captured["argv"] = argv
-        return sp.CompletedProcess(argv, 0, "scripts/a b.sh\0scripts/hooks/pre-push\0", "")
-
-    monkeypatch.setattr(rgc.subprocess, "run", fake_run)
-    rgc.repo_script_names.cache_clear()
-    try:
-        names = rgc.repo_script_names()
-    finally:
-        rgc.repo_script_names.cache_clear()
-    assert "-z" in captured["argv"], "NUL-delimited output was not requested"
-    assert "a b.sh" in names, "a path with a space did not survive as a basename"
-    assert "pre-push" in names
 # ── external review round 2 + the mandated whole-diff audit ──────────────────
 #
 # Round 2 returned five P2s and three of them lived in code written to answer
@@ -2026,101 +1581,26 @@ def test_a_quoted_path_cannot_fall_out_of_the_script_name_set(rgc, monkeypatch):
 # Root B was invisible while everyone argued about spellings. These arms pin it.
 
 
-def test_safe_must_be_earned_from_the_facts(rgc):
-    """BLOCKER: `safe` was a free boolean that no checker read.
-
-    MEASURED — flipping `git_push.safe` to True, with its own evidence saying
-    `spawns=True writes_fs=True`, left all four checkers green and made the most
-    expensive guard in the table replayable. Four checks verified the facts while
-    the value that decides whether a guard RUNS went unverified.
-
-    This is also what makes refute-only sound. Declaring a fact True now COSTS
-    the permission, so the all-True declaration that would otherwise be
-    unrefutable-by-construction refuses itself instead of silencing the checker.
-    """
-    real = rgc.GUARDS["git_push"]
-    assert not real.safety.safe
-    flipped = dataclasses.replace(real, safety=dataclasses.replace(real.safety, safe=True))
-    with _swap_guard(rgc, "git_push", flipped):
-        problems = rgc.verify_declarations()
-    assert problems, "a refused guard was made replayable and nothing objected"
-    assert any("declared replay_safe" in p and "spawns=True" in p for p in problems), problems
-
-    # Guard-the-guard: the three genuinely-safe guards must still pass, or this
-    # is just a check that forbids everything.
-    assert rgc.verify_declarations() == []
-
-
-def test_an_all_true_declaration_refuses_itself(rgc):
-    """The narrowing's own hazard, closed by the derivation above.
-
-    Under refute-only an all-True declaration cannot be refuted — no fact is
-    denied, so nothing contradicts anything. MEASURED before the derivation: the
-    bidirectional check caught 4 problems on an all-True protected_paths and
-    refute-only caught 0. It was a universal silencer.
-    """
-    real = rgc.GUARDS["protected_paths"]
-    assert real.safety.safe
-    alltrue = real.safety.evidence._replace(
-        reads_env=True, reads_argv=True, network=True, spawns=True, writes_fs=True
-    )
-    poisoned = dataclasses.replace(real, safety=dataclasses.replace(real.safety, evidence=alltrue))
-    with _swap_guard(rgc, "protected_paths", poisoned):
-        problems = rgc.verify_declarations()
-    assert problems, "an all-True declaration silenced the checker"
-    assert any("declared replay_safe" in p for p in problems), problems
-
-
-def test_a_shell_guard_runs_the_artifact_its_evidence_inspects(rgc):
-    """BLOCKER: nothing tied `Guard.run`'s argv to `ShEvidence.source`.
-
-    MEASURED — repointing `inline_blob.run` at `bash -c 'printf hi > "$HOME/probe"'`
-    while leaving its evidence alone left `verify_declarations()` CLEAN with
-    `safe=True`: a per-row write to the operator's home directory, fully
-    verified. `python_guard()` had bound the Python side since round 1; the shell
-    side had no equivalent.
-    """
-    real = rgc.GUARDS["inline_blob"]
-    repointed = dataclasses.replace(
-        real,
-        run=lambda c, w: rgc._run_shell_guard(["bash", "-c", 'printf hi > "$HOME/x"'], c, w),
-        sh_source_of=None,
-    )
-    with _swap_guard(rgc, "inline_blob", repointed):
-        problems = rgc.verify_declarations()
-    assert problems, "the executed artifact diverged from the inspected one, unnoticed"
-    assert any("RUNS" in p and "INSPECTS" in p for p in problems), problems
-
-
 def test_a_declaration_that_cannot_be_checked_is_not_a_pass(rgc, tmp_path):
     """COULD-NOT-CHECK is a third state, not silence.
 
-    Two ways to end up unable to look, both MEASURED: an evidence module that no
-    longer resolves (the closure came back empty and an all-False declaration
-    about a deleted artifact sailed through five empty fact sets), and a module
-    in the closure that will not parse.
+    The way to end up unable to look, now that the fact walk is gone: a CITED
+    module that no longer resolves. Silence there would be the same defect the
+    deleted walk had — a declaration about a deleted artifact sailing through
+    because nothing could be found to contradict it.
     """
     hooks = tmp_path / "hooks"
     hooks.mkdir()
-    ghost = rgc.PyEvidence(
-        module="module_that_was_deleted",
-        reads_env=False,
-        reads_argv=False,
-        network=False,
-        spawns=False,
-        writes_fs=False,
-    )
-    with pytest.raises(rgc.DeclarationError, match="does not resolve"):
-        rgc.walk_facts(ghost.module, hooks)
+    ghost = rgc.Cite("module_that_was_deleted", "some_symbol", "a fragment")
+    with pytest.raises(rgc.DeclarationError):
+        rgc.cite_source(ghost, hooks)
 
     # And it surfaces as a problem string rather than an escaping exception.
     real = rgc.GUARDS["protected_paths"]
-    broken = dataclasses.replace(
-        real, safety=dataclasses.replace(real.safety, evidence=ghost), py_module=ghost.module
-    )
+    broken = dataclasses.replace(real, safety=dataclasses.replace(real.safety, cites=(ghost,)))
     with _swap_guard(rgc, "protected_paths", broken):
         problems = rgc.verify_declarations()
-    assert any("COULD NOT CHECK" in p for p in problems), problems
+    assert problems, "a citation that cannot be resolved must not pass in silence"
 
 
 def test_a_broken_module_in_the_closure_does_not_take_list_down(rgc, monkeypatch, capsys):
@@ -2128,16 +1608,22 @@ def test_a_broken_module_in_the_closure_does_not_take_list_down(rgc, monkeypatch
     worse than one that runs — and --list, whose whole job is explaining
     refusals, was the first casualty.
 
-    A syntax error in any module of any guard's closure used to escape `main()`
-    as an uncaught traceback and exit 1. The PR touches a surface 17 open PRs
-    also touch, so a developer mid-edit on `shell_parse.py` could not run the
-    tool at all.
+    A syntax error in a module the checker reads used to escape `main()` as an
+    uncaught traceback and exit 1. The PR touches a surface many open PRs also
+    touch, so a developer mid-edit on `shell_parse.py` could not run the tool
+    at all.
+
+    Retargeted from the deleted fact walk onto `cite_source`, which is now the
+    only checker that reads another file and therefore the only one that can
+    crash this way. The property is unchanged and is the reason it survived the
+    deletion: the crash boundary is about the TOOL staying usable, not about
+    which checker happened to fail.
     """
 
-    def exploding_walk(module, hooks=None):
+    def exploding_cite(cite, hooks=None):
         raise SyntaxError("invalid syntax (shell_parse.py, line 2447)")
 
-    monkeypatch.setattr(rgc, "walk_facts", exploding_walk)
+    monkeypatch.setattr(rgc, "cite_source", exploding_cite)
     monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--list"])
     assert rgc.main() == 2, "a crashing checker must refuse in the tool's voice, not traceback"
     err = capsys.readouterr().err
@@ -2157,29 +1643,15 @@ def test_the_bare_dep_set_is_derived_not_hardcoded(rgc):
     # bash_safety's `invokes` — so this cannot be satisfied by the delegate loop
     # alone. A first cut of this test could be, and a mutation survived it.
     assert "push_allowlist" in deps, "the py_module closure contributed nothing"
+    # The mirror of the line above, and it was missing: reachable ONLY through
+    # bash_safety's `invokes`, never through any py_module closure. Without it a
+    # mutation that emptied the delegate loop left this test GREEN — MEASURED —
+    # so the test proved the closure walk ran and said nothing about the half
+    # that exists because no Python walk can reach a shell guard's delegates.
+    assert "destructive_command_guard" in deps, "the delegate loop contributed nothing"
     assert {"hook_input", "shell_parse"} <= deps
     # Entry modules are loaded BY PATH, so they are not what the refusal is about.
     assert not deps & {g.py_module for g in rgc.GUARDS.values() if g.py_module}
-
-
-def test_an_alias_bound_two_ways_is_unchecked_not_guessed(rgc, tmp_path):
-    """Round 2, finding 1. `ast.walk` flattens scopes, so a name bound
-    differently in two functions collapsed and the last one won — MEASURED, a
-    module-level `import subprocess as x` plus a local `import json as x` gave
-    {'x': 'json'} and hid `x.run(...)`.
-
-    Resolving scopes properly is a Python-semantics project and would be the
-    loop again. Refusing to resolve the name is closed-set and honest.
-    """
-    src = (
-        "import subprocess as x\n\n\n"
-        "def a():\n    return x.run(['true'])\n\n\n"
-        "def b():\n    import json as x\n    return x.dumps({})\n"
-    )
-    aliases = rgc._alias_map(ast.parse(src))
-    assert "x" not in aliases, "a conflicting alias was resolved to one meaning anyway"
-    # The unambiguous case still resolves, or this is just blindness.
-    assert rgc._alias_map(ast.parse("import subprocess as sp\n"))["sp"] == "subprocess"
 
 
 def test_a_decorated_method_in_a_class_still_strips_comments(rgc, tmp_path):
@@ -2219,18 +1691,3 @@ def test_an_unparsable_cited_file_raises_instead_of_returning_raw_text(rgc, tmp_
     (hooks / "cited.py").write_text("def target(:\n    this is not python\n")
     with pytest.raises(rgc.DeclarationError):
         rgc.cite_source(rgc.Cite("cited", None, "anything"), hooks)
-
-
-def test_list_prints_the_check_state_of_every_fact(rgc, monkeypatch, capsys):
-    """The narrowing is invisible on the surface everyone reads unless the state
-    travels with the value. `spawns=False` now means "not refuted", which is a
-    weaker thing than a bare boolean under the word `replayable` implies."""
-    monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--list"])
-    assert rgc.main() == 0
-    out = capsys.readouterr().out
-    assert "[corroborated]" in out, "a fact the walk confirmed is unlabelled"
-    assert "[not refuted]" in out, "a fact the walk said nothing about is unlabelled"
-    # The blind spots come from ONE list, so the prose and the output cannot
-    # disagree — the previous text said "the three blind spots" and was wrong.
-    for spot in rgc.BLIND_SPOTS:
-        assert spot.split(".")[0] in out
