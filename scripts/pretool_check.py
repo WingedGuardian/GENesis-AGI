@@ -48,7 +48,29 @@ from pathlib import Path
 # The shared hook-input helper lives in scripts/hooks/; this script runs from
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
-from hook_input import field, read_payload, run_guard  # noqa: E402
+try:
+    from hook_input import field, read_payload, run_guard  # noqa: E402
+except Exception:  # noqa: BLE001 — an unimportable hook_input must BLOCK, not vanish.
+    if __name__ != "__main__":
+        raise
+    # NOTHING TO FALL BACK ON: hook_input is the module that would recover us —
+    # read_payload and degraded_exit both live there — so this guard refuses outright.
+    # Its only verdicts are BLOCK and ALLOW, and the alternative to blocking is
+    # permitting. An unguarded import here exits 1, which Claude Code reads as
+    # NON-BLOCKING, and the CRITICAL-path Write/Edit gate simply disappears.
+    #
+    # The exception is not rendered (even __str__ can raise) and the exit uses
+    # os._exit, because sys.exit lets the interpreter retry a failed stream flush
+    # during shutdown and replace the status with 120 — which is not 2.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (pretool_check): shared hook_input could not be imported; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
 
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "protected_paths.yaml"
 

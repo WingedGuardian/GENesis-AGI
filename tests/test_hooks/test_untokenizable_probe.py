@@ -338,41 +338,12 @@ class TestCommitGuardFailsClosedOnCrash:
             f"got {r.returncode}\n{r.stdout}{r.stderr}"
         )
 
-    def test_import_time_failure_is_a_documented_gap(self, tmp_path):
-        """The wrap covers main(), NOT module import. Measured, and locked.
-
-        `run_guard` is called at the bottom of the module, so an exception
-        raised while the module is still importing — a broken dependency, a
-        syntax error in a helper — never reaches it. MEASURED: the guard exits 1
-        in that case, which CC treats as non-blocking, i.e. it still fails OPEN.
-
-        This is pinned rather than hidden so the wrap is not read as a stronger
-        guarantee than it is. Closing it needs the import itself guarded, which
-        is a different change; what this PR fixes is every crash from main()
-        onward, which is where the gate's own logic lives.
-        """
-        scripts = tmp_path / "scripts"
-        hooks = scripts / "hooks"
-        hooks.mkdir(parents=True)
-        (scripts / _COMMIT_GUARD.name).write_text(_COMMIT_GUARD.read_text())
-        (hooks / "hook_input.py").write_text((_HOOKS_DIR / "hook_input.py").read_text())
-        (hooks / "shell_parse.py").write_text("raise RuntimeError('broken at import')\n")
-        r = subprocess.run(
-            [_PY, str(scripts / _COMMIT_GUARD.name)],
-            input=json.dumps(
-                {"tool_name": "Bash", "tool_input": {"command": f"git {COMMIT} -m x"}}
-            ),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=_child_env(),
-            cwd=str(tmp_path),
-        )
-        assert r.returncode == 1, (
-            "documented gap changed — an import-time failure now exits "
-            f"{r.returncode}. If this is now 2 the gap is CLOSED: delete this "
-            "test and say so, rather than loosening it."
-        )
+    # test_import_time_failure_is_a_documented_gap was DELETED here, on that test's
+    # own written instruction: it asserted exit 1 and said "If this is now 2 the gap
+    # is CLOSED: delete this test and say so, rather than loosening it." The gap is
+    # closed by hook_input.degraded_exit; the replacement locks live in
+    # tests/test_hooks/test_import_time_degraded.py, which asserts BOTH directions
+    # (gated mention blocks, benign command still runs) across all four guards.
 
     def test_ordinary_commit_still_reaches_a_verdict(self, tmp_path):
         """CONTROL — the wrap must not turn every command into a block.
