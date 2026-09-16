@@ -1,6 +1,6 @@
 ---
 name: browser-automation
-description: Web automation with 4-layer escalation (Fetch, Genesis Browser, On-Demand MCP, Computer Use), anti-detection, and persistent profiles
+description: Web and desktop automation with layered escalation (Fetch, Genesis Browser, Remote CDP, On-Demand MCP, Desktop), anti-detection, and persistent profiles
 consumer: cc_background_task
 phase: 7
 skill_type: workflow
@@ -17,8 +17,9 @@ and safety gates. Loaded when Genesis performs browser-based tasks.
 
 ## Browser Layers
 
-Genesis has four layers of browser interaction. Choose the lightest layer
-that can accomplish the task. **Token cost increases with each layer.**
+Genesis has five rungs of interaction — 1, 2, 3, 3b and 4. Choose the lightest
+one that can accomplish the task. **Token cost increases as you climb.** Layer 4
+leaves the browser entirely and is the only rung that reaches a non-web window.
 
 ### Layer 1: Web Fetch (read-only, public data — zero browser tokens)
 - Tools: `WebFetch`, Firecrawl, `genesis.web` (SearXNG + Brave)
@@ -69,24 +70,52 @@ that can accomplish the task. **Token cost increases with each layer.**
 - Use when you need network inspection, Lighthouse, or performance tracing
   beyond what the built-in Genesis browser tools provide
 
-### Layer 4: Computer Use — the operator's whole desktop, not just a browser
-- Reaches what no browser layer can: native applications, OS dialogs, and any
-  window that is not a web page. Also drives a browser when the point is to
-  drive it *as the operator sees it*.
-- **Perceive leg is live.** `scripts/capture_desktop.sh` triggers a capture on
-  the operator's machine and returns the image. Window-scoped by default;
-  full-screen exists but is never the default and is never inherited from a
-  window grant (it discloses every open window at once).
-- **Act leg — mouse, keyboard, drag — is NOT live**, and is gated behind an
-  approval design. Do not attempt to construct it ad hoc.
-- Mechanism, and it is not obvious: an SSH login on Windows lands in
-  SessionId 0 while the desktop is SessionId 1, so **nothing run over SSH can
-  see or touch the desktop**. Work reaches the desktop only via a scheduled
-  task registered with an Interactive logon type.
-  Full detail: `docs/reference/windows-remote-execution.md`.
-- Cost is a screenshot per observation, so prefer a lower layer whenever the
-  target is reachable by one. A browser task is almost always cheaper at
-  Layer 2 or 3.
+### Layer 4: Desktop — the operator's whole machine, not just a browser
+Reaches what no browser layer can: native applications, OS dialogs, and any
+window that is not a web page.
+
+**Nothing here is live today, on either leg.** Genesis holds no desktop
+capture code and no input-injection code — verified against the tree, not
+assumed. What exists is a deliberate build order for ACTUATION: the gate
+(`src/genesis/autonomy/desktop_gate.py`, `config/desktop_takeover.yaml`) ships
+first and alone, defaulting to refuse, needing two keys plus an out-of-band
+grant to arm; the device-side actuator, the loop, the transport and the MCP
+tool follow behind it. An actuator with a caller and no gate IS the ungated
+capability, which is why the order is that way round.
+
+So there are two routes to a desktop, and they are at different stages:
+
+- **Ask a resident agent.** If the operator's machine already runs something in
+  its interactive session that exposes capture or control, that is reachable
+  NOW, needs no new Genesis code, and is the cheaper answer for perception.
+- **Genesis's own actuator**, behind the gate above. In flight, inert, and not
+  callable yet by design.
+
+**What you must not do is build a third one.** No ad-hoc injector, no
+hand-rolled capture path, nothing that reaches the desktop outside the gate.
+That is the rule the deleted capture script carried and it still holds: the one
+real advantage of wiring a desktop route as a tool is that Genesis could then
+fire it autonomously, and that is the single property this capability should
+not have yet.
+
+**The mechanism, because it is not obvious and it decides the design.** An SSH
+login on Windows lands in session 0 while the desktop lives in session 1 or
+higher, so nothing run over SSH can see or touch the desktop — and it fails
+*silently*, returning an empty well-formed result rather than an error. But the
+boundary isolates window stations, **not sockets**: a session-0 process can
+reach a loopback service in the desktop session perfectly well. That is the
+whole reason asking beats driving. Full detail, including the empty-success
+failure table: `docs/reference/windows-remote-execution.md`.
+
+**Keep it un-callable.** The one real advantage of wiring a desktop route as a
+tool is that Genesis could then fire it autonomously, and that is the single
+property this capability should not have yet. A route reachable only from a
+foreground session, through an operator-authenticated login, is the posture to
+preserve until the gate covers the leg you want.
+
+Cost is a screenshot per observation, so prefer a lower layer whenever the
+target is reachable by one. A browser task is almost always cheaper at Layer 2
+or 3.
 
 ### Layer Selection Guide
 | Need | Layer | Why |
@@ -100,8 +129,8 @@ that can accomplish the task. **Token cost increases with each layer.**
 | Submit on user's logged-in site | Remote CDP | User's sessions |
 | Network inspection / Lighthouse | On-Demand MCP | Chrome DevTools |
 | Take action in user's banking app | Remote CDP | MUST confirm |
-| Native app / OS dialog / non-web window | Computer Use | No browser layer can reach it |
-| See what is actually on the operator's screen | Computer Use | Capture, not a page |
+| Native app / OS dialog / non-web window | Desktop | No browser layer can reach it |
+| See what is actually on the operator's screen | Desktop | Ask the resident agent; a capture, not a page |
 
 ## When to Use
 
@@ -171,14 +200,20 @@ button:has-text("Add to Cart")
 
 ## Coordinate Safety
 
-Applies to every layer that computes a position rather than naming an element,
-and to the desktop layer especially. Two of these were live bugs in this
-codebase, found 2026-09-06.
+Applies to every layer that computes a position rather than naming an element.
 
-**Prefer a selector to a coordinate.** `browser_click` resolves the element
-through Playwright, so there is no coordinate to get wrong. A computed
-coordinate can be wrong for reasons the computation cannot see. Reach for
-coordinates only when nothing else can hit the target.
+Provenance, since it decides how much to trust each rule: the browser rules
+below are checked against `mcp/health/browser.py` in this repo. The `SendInput`
+and DPI-awareness material comes from a Windows spike whose code never landed
+on main — it is retained because the semantics are Win32's, not ours, but
+nothing here exercises it, so treat it as a specification to build against
+rather than as described behaviour.
+
+**Prefer a selector to a coordinate — but know which path you are on.**
+Playwright's own click resolves the element, hit-tests the point it is about to
+press, and *refuses* if something else is on top (`intercepts pointer events`).
+That is the guarantee worth having. The catch is that stealth mode is the
+DEFAULT in this codebase, and it does not take that path.
 
 **Never mix coordinate spaces.** The recurring defect is arithmetic that adds
 two numbers from different spaces:
@@ -186,8 +221,25 @@ two numbers from different spaces:
 | space | comes from |
 |---|---|
 | CSS pixels | `getBoundingClientRect()`, `outerHeight - innerHeight` |
-| physical screen pixels | `xdotool` window geometry, `SendInput` absolute mode |
+| physical screen pixels | `xdotool` window geometry, a screen capture taken while DPI-aware |
 | DPI-virtualised pixels | any Windows API read by a process that has not called `SetProcessDPIAware()` |
+| normalised 0–65,535 | `SendInput` in absolute mode — see below |
+
+**`SendInput` absolute mode is its own space, and it is not pixels.** With
+`MOUSEEVENTF_ABSOLUTE`, `MOUSEINPUT.dx`/`.dy` are normalised to 0–65,535 — and
+**which rectangle they normalise across is the part that bites.** Alone, the
+flag maps that range onto the PRIMARY MONITOR only. Combined with
+`MOUSEEVENTF_VIRTUALDESK` it maps onto the whole virtual desktop, whose origin
+(`SM_XVIRTUALSCREEN`) can be NEGATIVE when a second display sits left of or
+above the primary. A correct conversion therefore subtracts the virtual origin
+before scaling by `SM_CXVIRTUALSCREEN` / `SM_CYVIRTUALSCREEN`:
+`dx = (x - SM_XVIRTUALSCREEN) * 65535 / (SM_CXVIRTUALSCREEN - 1)`.
+
+Get it wrong and the pointer lands correctly on the primary display and
+silently wrong on every other one — the classic single-monitor-dev-machine
+bug. And passing a pixel value through unconverted scales it by roughly
+`65535 / width`: on a 1920-wide display a target at x=1000 lands about 29px
+from the left edge, which reads as a near-miss rather than a unit error.
 
 They coincide **only at `devicePixelRatio == 1` and 100% display scaling**,
 which is why this class of bug sits dormant on an unscaled dev machine and
@@ -204,15 +256,30 @@ intended. This converts every coordinate error — scaling, stale bounds, a
 window that moved between measuring and acting — from a wrong click into a
 refusal.
 
-⚠ **Genesis's own VNC fallback CANNOT do this, so do not assume the guarantee
-holds behind these tools.** `vncdo` drives raw pixel coordinates and has no
-concept of an element, so the fallback path moves and clicks and checks only
-whether the subprocess succeeded (`mcp/health/browser.py`). A wrong active
-window or stale bounds still produces a click there, not a refusal. Treat a
-VNC-fallback click as UNVERIFIED: confirm the outcome afterwards by screenshot
-or by a subsequent read, rather than trusting that a failed aim would have been
-caught. The readback rule above is achievable on the CDP/Playwright path, where
-elements exist to be read.
+⚠ **Which paths actually do that, in `mcp/health/browser.py`:**
+
+| click path | hit-tests the target? | reads back where it landed? |
+|---|---|---|
+| `page.click(selector)` — non-stealth `browser_click`, and every fallback | **yes** — Playwright refuses with `intercepts pointer events` | n/a, no coordinate |
+| stealth `browser_click` (Camoufox, the DEFAULT) | no — `bounding_box()` then `mouse.move`/`down`/`up` | no |
+| Turnstile widget click (`page.mouse.click(x, y)`) | no — raw coordinate input | no |
+| shadow-DOM fallback (`el.click()`) | no — dispatches a DOM click, no coordinate | n/a |
+| VNC input bridge (turnstile only) | no — `vncdo` has no concept of an element | **yes** — pointer position, drift vs intent, warns past 3px, then clicks anyway |
+
+Read that as: **the guarantee exists, and the default path is not the one that
+has it.** Stealth clicking trades the hit-test for a human-looking mouse
+trail. It is not unchecked — an ambiguity guard runs on `text=` selectors and
+the element must be visible first — but between reading the box and pressing
+the button, nothing re-checks what is now under the point.
+
+The VNC row is the subtle one: it verifies DELIVERY, not IDENTITY. It will tell
+you the pointer arrived where you aimed. It cannot tell you the right thing was
+there, and it clicks regardless, deliberately — refusing on drift would break
+more than it saves.
+
+So: treat any coordinate-driven click as UNVERIFIED, and confirm the outcome
+afterwards by screenshot or a subsequent read, rather than trusting that a
+failed aim would have been caught.
 
 **Log where it actually landed, not where you aimed.** Intent is a
 computation; a computation cannot notice that it is wrong. Record actual
