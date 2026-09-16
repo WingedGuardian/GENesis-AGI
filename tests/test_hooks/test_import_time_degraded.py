@@ -1147,12 +1147,23 @@ def test_degraded_pretool_check_reads_the_stamp_exactly_as_the_healthy_path_does
 # justification cannot drift into invention.
 
 #: Hooks that can fire on Bash but are not Python-via-launcher, so they never
-#: import `hook_input` and cannot degrade with it. EXEMPT BY NAME, never invisible:
-#: keyed on a distinctive substring of the wired command.
+#: import `hook_input` and cannot degrade with it. EXEMPT BY NAME, never invisible.
+#:
+#: Keyed on the EXACT normalised command, not a substring. A substring key is an
+#: exemption with a wildcard on the end: a newly wired
+#: `python3 scripts/cc-deploy-timeout-guard.py` would inherit the shell hook's
+#: waiver and never be executed, which is precisely the "a new guard fails by
+#: construction" guarantee this gate exists to make.
 _NOT_PYTHON_ON_BASH = {
-    "cc-deploy-timeout-guard": "shell script; never imports hook_input",
-    "jq -r .tool_input.command": "inline bash -c guard; never imports hook_input",
+    "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cc-deploy-timeout-guard":
+        "shell script; never imports hook_input",
 }
+
+#: The inline `bash -c` guard is exempted by its own exact text, which is long and
+#: contains quoting, so it is matched after whitespace normalisation rather than
+#: pasted here in full. The PREFIX is still an exact command opening, not a
+#: substring that could appear anywhere in someone else's command.
+_INLINE_SHELL_PREFIX = "bash -c 'IN=$(cat);"
 
 #: Hooks that legitimately do NOT block when degraded. Each value must appear
 #: VERBATIM in that hook's module docstring — locked by
@@ -1197,10 +1208,15 @@ def _resolve_bash_hook(command: str) -> tuple[str, str | None, list[str]]:
     (``worktree_cwd_guard`` is already wired three ways, two of them flagged).
     """
     tokens = command.split()
-    for i, tok in enumerate(tokens):
-        if tok.endswith("genesis-hook") and i + 1 < len(tokens):
-            rel = tokens[i + 1]
-            return rel, rel, tokens[i + 2:]
+    # The launcher must be the command being EXECUTED — token 0 — not a path that
+    # merely appears somewhere in the line. Accepting a suffix at any position
+    # resolves `echo .../genesis-hook hooks/full_suite_guard.py` as if it ran the
+    # guard: the test would execute the guard directly, see exit 2, and stay green,
+    # while Claude Code only echoes and the guard never runs at all. A typo like
+    # `/missing-genesis-hook …` has the same shape and the same consequence.
+    if tokens and tokens[0].endswith("genesis-hook") and len(tokens) > 1:
+        rel = tokens[1]
+        return rel, rel, tokens[2:]
     return command, None, []
 
 
@@ -1236,7 +1252,8 @@ def test_every_bash_hook_declares_its_degrade_direction(tmp_path, display, rel, 
     looks identical to one that examined the command and approved it.
     """
     if rel is None:
-        exempt = [why for marker, why in _NOT_PYTHON_ON_BASH.items() if marker in display]
+        norm = " ".join(display.split())
+        exempt = norm in _NOT_PYTHON_ON_BASH or norm.startswith(_INLINE_SHELL_PREFIX)
         assert exempt, (
             f"cannot resolve the wired command {display!r} to a script, and it is not "
             f"named in _NOT_PYTHON_ON_BASH. An unresolvable hook is exactly what an "
@@ -1319,6 +1336,42 @@ def test_the_advisory_allowlist_quotes_are_real():
             f"in its docstring. The justification must be the hook's own words, or "
             f"the exemption is unverifiable."
         )
+
+
+def test_an_allowlisted_hook_carries_no_blocking_MECHANISM():
+    """The quote is evidence of INTENT; this is evidence of the CURRENT contract.
+
+    A phrase check alone passes on historical prose: a docstring rewritten to
+    "formerly ADVISORY ONLY; now blocks on X" still contains the quoted words, and
+    if the hook gained a blocking path WITHOUT an import-time handler it exits 1
+    under the poisoned run, satisfies `returncode != 2`, and the fail-open stays
+    green. So the allowlist is additionally checked against what the code can
+    actually DO, by AST rather than by text.
+    """
+    for rel in _ADVISORY_BY_DESIGN:
+        path = _REPO_ROOT / "scripts" / rel
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            # sys.exit(2) / os._exit(2) / exit(2)
+            if isinstance(node, ast.Call):
+                fn = node.func
+                name = getattr(fn, "attr", None) or getattr(fn, "id", None)
+                if name in ("exit", "_exit") and node.args:
+                    arg = node.args[0]
+                    assert not (isinstance(arg, ast.Constant) and arg.value == 2), (
+                        f"{rel} is allowlisted as advisory but contains an exit(2) — a "
+                        f"BLOCKING mechanism. Its docstring may still carry the advisory "
+                        f"words, which is why this checks the code instead. Remove it "
+                        f"from _ADVISORY_BY_DESIGN, or remove the blocking path."
+                    )
+            # A permissionDecision of deny/ask gates on an exit-0 hook.
+            if isinstance(node, ast.Constant) and node.value in ("deny", "ask"):
+                src_text = path.read_text(encoding="utf-8")
+                assert "permissionDecision" not in src_text, (
+                    f"{rel} is allowlisted as advisory but references a "
+                    f"permissionDecision — an exit-0 hook can still GATE that way, so "
+                    f"'exits non-2' is not sufficient evidence that it never blocks."
+                )
 
 
 def test_the_advisory_allowlist_has_no_stale_entries():
