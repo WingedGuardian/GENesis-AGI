@@ -24,7 +24,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "ci_failure_summary.py"
+_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "ci" / "failure_summary.py"
 
 _REPORT_WITH_FAILURES = """<?xml version="1.0" encoding="utf-8"?>
 <testsuites>

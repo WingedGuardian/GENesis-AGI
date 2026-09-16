@@ -763,7 +763,7 @@ jobs:
       # letting a missing file read as a second failure.
       - name: Name the failures where truncation cannot reach
         if: ${{ failure() }}
-        run: python scripts/ci_failure_summary.py junit.xml >> "$GITHUB_STEP_SUMMARY"
+        run: python scripts/ci/failure_summary.py junit.xml >> "$GITHUB_STEP_SUMMARY"
       # The junit report holds every traceback in full and was previously
       # DISCARDED with the runner — the dormancy guard parsed it, then it
       # died with the VM while the truncated log held ~44% of the run.

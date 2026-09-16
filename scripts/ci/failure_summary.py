@@ -72,7 +72,7 @@ def _first_line(text: str | None) -> str:
 
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
-        print(f"{_NOTICE} usage: ci_failure_summary.py <junit.xml>")
+        print(f"{_NOTICE} usage: failure_summary.py <junit.xml>")
         return 0
     report = Path(argv[1])
     if not report.is_file():
