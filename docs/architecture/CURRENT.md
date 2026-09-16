@@ -1099,7 +1099,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: d0627c854 2026-09-11
+verified: a81851746 2026-09-16
 ```
 
 - **channels/**: adapter framework. Telegram (`bridge.py` =
@@ -1142,7 +1142,11 @@ verified: d0627c854 2026-09-11
   live runtime (stale-but-functional).
 - **hosting/**: the OUTER layer that calls the runtime. `standalone.py` is the
   default (`python -m genesis serve`; also hosts the OpenClaw
-  `/v1/chat/completions` endpoint); Agent Zero adapter optional.
+  `/v1/chat/completions` endpoint and the bearer-gated agent-to-agent
+  connector at `/v1/agent/*`, published through a path-scoped tailnet
+  listener rather than by opening the dashboard port -- that port also
+  carries the OpenClaw route, which has no auth of its own); Agent Zero
+  adapter optional.
 - **browser/**: profile/state layer only (persistent
   `~/.genesis/browser-profile`, `BrowserLayer` enum, pgrep patterns as the
   single source of process detection). The automation TOOLS live in
