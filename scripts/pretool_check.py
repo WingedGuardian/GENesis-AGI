@@ -68,19 +68,19 @@ except Exception:  # noqa: BLE001 — an unimportable hook_input must not VANISH
     # ever scoped to do: it blocks the interactive owner, whom it would always have
     # allowed, from editing anything at all.
     #
-    # That costs the repair path. NINE of the 13 PYTHON hooks that `.claude/settings.json`
-    # wires on matcher `Bash` refuse every command in this same state (MEASURED 2026-09-15
-    # by execution against a poisoned tree; the other 4 are advisory and exit 1). Read that
-    # denominator exactly: that matcher carries 15 hook commands across 14 entries, and the
-    # 2 not counted are shell rather than Python, so they never import `hook_input` and are
-    # structurally unaffected. Nor is the repo the LIVE population: this install's own
-    # `~/.claude/settings.json` wires a 16th on the same matcher (also shell). So an
-    # interactive session that also cannot Edit can neither run a command nor fix the file
-    # that is broken — and note the population trap that produced an earlier "six" here:
-    # `grep degraded_exit(` finds six callers, but this leg is the one where
-    # `degraded_exit` is UNREACHABLE, so all nine refuse from their own import handler;
-    # grep sees only the six that ALSO call it on the other leg. Count the condition,
-    # never the helper — and state what the denominator excludes. This box is headless,
+    # That costs the repair path. Every Bash-firing guard that is not declared advisory
+    # refuses every command in this same state, so an interactive session that also
+    # cannot Edit can neither run a command nor fix the file that is broken.
+    #
+    # The SIZE of that refusal is deliberately not written here. Four hand-written
+    # copies of it existed across this repo and every one of them went wrong: three by
+    # miscounting (`grep degraded_exit(` counts the HELPER, not the condition — on this
+    # leg `degraded_exit` is unreachable and each guard refuses from its own import
+    # handler), and the fourth by going stale when someone wired one more Bash hook,
+    # with nobody being wrong at all. It is now derived on every test run by
+    # tests/test_hooks/test_import_time_degraded.py::
+    # test_every_bash_hook_declares_its_degrade_direction, which also fails if a guard
+    # is ever wired in a spelling that enumeration cannot resolve. This box is headless,
     # with no
     # operator at a console. Blocking here does not protect the machine; it bricks it.
     # Restoring the allow surrenders nothing, because the healthy guard permits exactly

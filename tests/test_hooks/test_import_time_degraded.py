@@ -29,8 +29,10 @@ does at module load, which no in-process fake reproduces.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -929,13 +931,13 @@ def test_hook_input_stays_stdlib_only(tmp_path):
 # sovereign"). Its healthy session test is `os.environ.get("GENESIS_CC_SESSION")`,
 # which needs nothing from `hook_input`. Degraded, it used to exit 2 BEFORE reaching
 # that test, so it blocked the interactive owner from editing ANYTHING — a category
-# it was built never to block, and the one that repairs the tree. With 9 of the 13 PYTHON
-# hooks wired on matcher `Bash` also refusing (MEASURED 2026-09-15 by execution; that
-# matcher carries 15 hook commands in all, the other 2 being shell hooks that never
-# import `hook_input`, plus a 16th wired install-locally), the session could neither
-# run a command nor edit a file: on a headless
-# box, a brick. Not by `grep degraded_exit(`, which finds six callers — on THIS leg
-# `degraded_exit` is unreachable and all nine refuse from their own import handler.
+# it was built never to block, and the one that repairs the tree. With every Bash guard
+# that is not declared advisory ALSO refusing, the session could neither run a command
+# nor edit a file: on a headless box, a brick. The size of that refusal is deliberately
+# not written here — see `test_every_bash_hook_declares_its_degrade_direction` below,
+# which derives it from the settings on every run. A figure in a comment is a figure
+# that goes stale the next time anyone wires a hook, which is exactly what happened to
+# the three that preceded this sentence.
 #
 # FIVE cases follow. The first four are one 2x2 (dispatched|interactive) x
 # (healthy|degraded); the healthy row is the control that makes the claim "zero security
@@ -1089,4 +1091,245 @@ def test_degraded_pretool_check_reads_the_stamp_exactly_as_the_healthy_path_does
         'GENESIS_CC_SESSION="true" is NOT the dispatched stamp (invoker writes the '
         f"literal \"1\"), so the healthy guard treats it as interactive and the "
         f"degraded branch must agree; got {res.returncode}"
+    )
+
+
+# ── Every hook that can fire on Bash must DECLARE its degrade direction ────────
+#
+# WHY THIS EXISTS, and why it is an allowlist rather than a count.
+#
+# The doctrine used to carry a hand-written figure ("six guards", then "9 of 13")
+# for how much of the Bash surface refuses when `hook_input` is unimportable. That
+# number was wrong three times running, and then went stale a fourth time WITHOUT
+# anyone being wrong: another PR wired one more hook on matcher `Bash`, and a
+# denominator written in prose cannot notice that. A number maintained by hand in
+# four places is not a measurement, it is four chances to be out of date.
+#
+# So the number is no longer written down. It is DERIVED here, on every run, from
+# `.claude/settings.json` — parsed, never grepped — and what is asserted is the
+# RULE the number was only ever evidence for.
+#
+# THE RULE, derived by execution rather than assumed. The first hypothesis, "a hook
+# that imports hook_input blocks", was REFUTED: every hook that can fire on Bash
+# imports it at module scope, including every non-blocker. The real split is whether
+# the module carries a degraded HANDLER:
+#
+#   A hook that can fire on Bash either
+#     (a) carries a degraded handler, emits `GUARD DEGRADED` and exits 2, or
+#     (b) is NAMED below - in _ADVISORY_BY_DESIGN with the words from its own
+#         docstring, or in _NOT_PYTHON_ON_BASH because it never imports the module.
+#
+# Category (b) is a SILENT FAIL-OPEN: Claude Code treats a non-2 exit as a
+# non-blocking error WHEN THE HOOK EMITS NO `permissionDecision`, so a guard that
+# dies on its import traceback exits 1 and the tool call proceeds. That is correct
+# for a hook whose contract is advisory, and a latent hole for anything else.
+#
+# THE POPULATION FILTER IS WHERE THE FAIL-OPEN LIVES, so it gets the care the
+# assertion gets. An earlier version of this gate compared `matcher != "Bash"` —
+# an exact-string test against a field Claude Code treats as a REGEX. Measured
+# against mutated copies of the real settings, that version could not see a hook
+# wired `"Bash|Edit"` or `".*"`, and silently DROPPED an existing blocker respelled
+# as a bare `python3 .../guard.py`, leaving the suite green with one fewer guard
+# under test. `procedure_advisor.py` is wired on `".*"` in this very repo, so that
+# was not a hypothetical future gap — it was a live one.
+#
+# Two consequences, both deliberate: the matcher is evaluated as a regex, and a
+# command that cannot be resolved to a script is a FAILING row rather than a
+# skipped one. An unparseable hook is exactly what an allowlist must not wave
+# through (the same rule, and the same resolver shape, as
+# tests/test_scripts/test_hook_output_contract.py::_resolve).
+#
+# Deliberately NOT keyed on a docstring keyword scan: that was tried and it
+# over-matches — "advisory" also appears in git_discard_guard, git_push_guard and
+# repo_routing_guard, all of which DO refuse. An automatic oracle that misclassifies
+# three of nine is worse than an explicit list someone had to think about. The
+# quotes below are verified VERBATIM against each docstring by a test, so the
+# justification cannot drift into invention.
+
+#: Hooks that can fire on Bash but are not Python-via-launcher, so they never
+#: import `hook_input` and cannot degrade with it. EXEMPT BY NAME, never invisible:
+#: keyed on a distinctive substring of the wired command.
+_NOT_PYTHON_ON_BASH = {
+    "cc-deploy-timeout-guard": "shell script; never imports hook_input",
+    "jq -r .tool_input.command": "inline bash -c guard; never imports hook_input",
+}
+
+#: Hooks that legitimately do NOT block when degraded. Each value must appear
+#: VERBATIM in that hook's module docstring — locked by
+#: test_the_advisory_allowlist_quotes_are_real.
+_ADVISORY_BY_DESIGN = {
+    "hooks/capped_read_advisory.py": "ADVISORY ONLY.",
+    "hooks/credential_surface_hook.py": "Exit 0 always — advisory, never blocks.",
+    "hooks/pipe_status_guard.py": "ADVISORY, never blocking:",
+    "hooks/pre_push_privacy_review.py": "NON-BLOCKING.",
+    "hooks/tmux_kill_server_guard.py": "which is exactly why this is ADVISORY, never a block",
+    "procedure_advisor.py": "surfaces relevant procedures as advisory context.",
+}
+
+#: A tripwire, not a count. If the enumeration collapses — a renamed key, a
+#: reshaped settings file — pytest reports an EMPTY parametrize list as SKIPPED,
+#: not failed, and this gate would silently cover nothing.
+_MIN_EXPECTED_BASH_HOOKS = 12
+
+
+def _fires_on_bash(matcher: str | None) -> bool:
+    """Does this entry's matcher fire on a Bash tool call?
+
+    The field is a REGEX, not a literal: the repo wires `"Read|Grep|Glob"`,
+    `"Write|Edit"` and `".*"`. An absent/empty matcher means every tool. An
+    invalid regex is treated as FIRING, so a malformed entry is examined rather
+    than skipped — the conservative direction for an allowlist.
+    """
+    if not matcher:
+        return True
+    try:
+        return re.search(matcher, "Bash") is not None
+    except re.error:
+        return True
+
+
+def _resolve_bash_hook(command: str) -> tuple[str, str | None, list[str]]:
+    """(display, script-relative-to-scripts/, extra argv) for one wired command.
+
+    Returns ``(display, None, [])`` when the command cannot be resolved, so the
+    caller FAILS on it instead of dropping it. Extra argv is carried because a
+    hook run without its flags can produce a verdict production never produces
+    (``worktree_cwd_guard`` is already wired three ways, two of them flagged).
+    """
+    tokens = command.split()
+    for i, tok in enumerate(tokens):
+        if tok.endswith("genesis-hook") and i + 1 < len(tokens):
+            rel = tokens[i + 1]
+            return rel, rel, tokens[i + 2:]
+    return command, None, []
+
+
+def _bash_hook_entries() -> list[tuple[str, str | None, list[str]]]:
+    """Every PreToolUse hook whose matcher can fire on Bash, from the settings.
+
+    Scoped to the REPO settings. A user-level `~/.claude/settings.json` can wire
+    more hooks on the same matcher and is invisible here by construction — stated
+    rather than silently assumed away. MEASURED on one install: it wires a shell
+    hook on `Grep|Glob|Bash`, which this enumeration cannot see.
+    """
+    cfg = json.loads((_REPO_ROOT / ".claude" / "settings.json").read_text())
+    out: list[tuple[str, str | None, list[str]]] = []
+    for entry in cfg.get("hooks", {}).get("PreToolUse", []):
+        if not _fires_on_bash(entry.get("matcher")):
+            continue
+        for hook in entry.get("hooks", []):
+            out.append(_resolve_bash_hook(hook.get("command", "")))
+    return sorted(out, key=lambda row: row[0])
+
+
+def _ids(rows):
+    return [row[0] for row in rows]
+
+
+@pytest.mark.parametrize("display,rel,argv", _bash_hook_entries(), ids=_ids(_bash_hook_entries()))
+def test_every_bash_hook_declares_its_degrade_direction(tmp_path, display, rel, argv):
+    """A hook that can fire on Bash either refuses when `hook_input` dies, or is NAMED.
+
+    The failure this prevents is invisible in production: a guard whose shared
+    import breaks exits 1 on the traceback, Claude Code reads a bare non-2 exit as
+    a non-blocking error, and the command runs. Nothing reports it, and the guard
+    looks identical to one that examined the command and approved it.
+    """
+    if rel is None:
+        exempt = [why for marker, why in _NOT_PYTHON_ON_BASH.items() if marker in display]
+        assert exempt, (
+            f"cannot resolve the wired command {display!r} to a script, and it is not "
+            f"named in _NOT_PYTHON_ON_BASH. An unresolvable hook is exactly what an "
+            f"allowlist must not wave through — a guard could be respelled out of this "
+            f"gate's sight and the suite would stay green. Either wire it through "
+            f"genesis-hook, or name it with the reason it cannot degrade."
+        )
+        return
+
+    root, home = _broken_hook_input(tmp_path, f"home_contract_{abs(hash(display)) % 10**8}")
+    res = subprocess.run(
+        [sys.executable, str(root / "scripts" / rel), *argv],
+        input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "echo hello"}}),
+        capture_output=True,
+        text=True,
+        cwd=str(root),
+        env={**os.environ, "HOME": str(home)},
+        timeout=90,
+    )
+
+    if rel in _ADVISORY_BY_DESIGN:
+        assert res.returncode != 2, (
+            f"{rel} is listed as advisory-by-design but REFUSED (exit 2) while "
+            f"degraded. If it became a blocking guard, remove it from "
+            f"_ADVISORY_BY_DESIGN; the list is not a waiver."
+        )
+        return
+
+    assert res.returncode == 2, (
+        f"{rel} can fire on Bash and did NOT refuse when hook_input was unimportable "
+        f"(exit {res.returncode}). Claude Code treats a bare non-2 exit as NON-BLOCKING, "
+        f"so this guard silently stops guarding whenever a shared module breaks — "
+        f"indistinguishable from having approved the command.\n\n"
+        f"Either give it a degraded handler that exits 2 (see full_suite_guard.py), or, "
+        f"if it is advisory by contract, add it to _ADVISORY_BY_DESIGN with the words "
+        f"from its own docstring that say so.\n\nstderr: {res.stderr[:300]}"
+    )
+    assert "GUARD DEGRADED" in res.stderr, (
+        f"{rel} refused while degraded but did not SAY it was degraded. A silent "
+        f"refusal is indistinguishable from a real finding, which is the whole reason "
+        f"the degraded path speaks."
+    )
+
+
+def test_the_bash_hook_enumeration_is_not_vacuous():
+    """pytest reports an EMPTY parametrize list as SKIPPED, not failed.
+
+    So without this, a collapsed enumeration — a renamed settings key, a reshaped
+    file — would report success while covering nothing. The floor is a tripwire,
+    not a count: it must never be edited to match a shrinking population.
+    """
+    rows = _bash_hook_entries()
+    assert len(rows) >= _MIN_EXPECTED_BASH_HOOKS, (
+        f"only {len(rows)} hooks resolved as able to fire on Bash — the enumeration "
+        f"has collapsed, and an empty parametrize list is reported as SKIPPED rather "
+        f"than failed. Fix the enumeration; do not lower the floor."
+    )
+    resolved = {rel for _d, rel, _a in rows if rel}
+    for anchor in ("hooks/full_suite_guard.py", "review_enforcement_commit.py"):
+        assert anchor in resolved, (
+            f"{anchor} is a known blocking guard wired on Bash and did not appear in "
+            f"the enumeration — a silent DROP, which is the failure mode this gate "
+            f"exists to make impossible."
+        )
+
+
+def test_the_advisory_allowlist_quotes_are_real():
+    """An exemption justified by an invented quote is prose, not evidence.
+
+    Three of the first draft's five quotes were paraphrases that appeared nowhere
+    in the hook they excused. Nothing checked them, so the allowlist's only
+    substance was a sentence someone could have made up.
+    """
+    for rel, quote in _ADVISORY_BY_DESIGN.items():
+        path = _REPO_ROOT / "scripts" / rel
+        doc = ast.get_docstring(ast.parse(path.read_text(encoding="utf-8"))) or ""
+        flat = " ".join(doc.split())
+        assert " ".join(quote.split()) in flat, (
+            f"_ADVISORY_BY_DESIGN quotes {quote!r} for {rel}, which does not appear "
+            f"in its docstring. The justification must be the hook's own words, or "
+            f"the exemption is unverifiable."
+        )
+
+
+def test_the_advisory_allowlist_has_no_stale_entries():
+    """Both directions: a listed hook that is no longer wired must leave the list.
+
+    Without this, a hook could be removed from the Bash surface and its entry would
+    sit here forever, quietly widening the exemption for a file nobody runs.
+    """
+    wired = {rel for _d, rel, _a in _bash_hook_entries() if rel}
+    stale = sorted(set(_ADVISORY_BY_DESIGN) - wired)
+    assert not stale, (
+        f"{stale} are in _ADVISORY_BY_DESIGN but no longer fire on Bash. Remove them — "
+        f"an exemption for a hook nobody runs is debt, not safety."
     )
