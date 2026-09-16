@@ -49,6 +49,68 @@ shift
 # Extra claude args exist only in manual mode (SSH RemoteCommand passes %n only).
 CLAUDE_EXTRA_ARGS=("$@")
 
+# --- EPHEMERAL subcommands never get a slot ----------------------------------
+# An ephemeral `claude <subcommand>` prints something and exits. A slot is wrong
+# for it on three counts — it consumes a capacity slot the operator wanted for a
+# session, it leaves a tmux session behind after the command exited, and the
+# pane's scrollback is captured to disk when it does. `setup-token` prints a
+# long-lived CREDENTIAL, so that last one is why this exists rather than being
+# filed as tidiness.
+#
+# DEFENCE IN DEPTH, not the control. cc_exit_capture.sh already scrubs the pane
+# tail through secret_scrub and WITHHOLDS it when the scrubber cannot run
+# (MEASURED against four synthetic token shapes: all redacted, ordinary text
+# unchanged). This keeps the credential out of the captured region entirely
+# rather than relying on redaction to take it out afterwards.
+#
+# THE SPLIT IS BY LIFETIME, NOT BY "is it a subcommand". Being listed under
+# `Commands:` in --help does not make something short-lived, and three of them
+# are exactly what the slot exists for — losing them to a dropped SSH is the
+# failure this launcher prevents:
+#   gateway      "Run the enterprise auth/telemetry gateway"  — a daemon
+#   agents       the interactive agent view; its own --help says --json is the
+#                variant that "does not require a TTY", so the default does
+#   ultrareview  a cloud multi-agent review over the current branch — minutes
+# Those KEEP the slot. _CC_KEEPS_A_SLOT records that as a decision rather than
+# an omission, so the drift test can demand every new subcommand be classified
+# into one list or the other instead of defaulting into the bypass.
+#
+# Matched against $1 ONLY. Deciding it from anywhere else means modelling which
+# global options consume a value, and this repo has paid for hand-rolled argv
+# parsing before. Stated honestly, because the miss is wider than one example:
+# MEASURED on 2.1.246, a global option BEFORE the subcommand still routes to it
+# in 3 of 5 spellings tried (`--ax-screen-reader`, `--model opus`, `--settings {}`
+# route; `--debug` and `--add-dir /tmp` swallow it). So `claude --model opus
+# setup-token` is NOT recognised here and still takes a slot. That is an accepted
+# limit rather than a hole: the capture is scrubbed either way, and the failure
+# direction is the safe one — a missed bypass costs a slot, while a FALSE bypass
+# would drop an interactive session on SSH disconnect.
+_CC_EPHEMERAL=(auth auto-mode doctor import install mcp plugin plugins project setup-token update upgrade)
+_CC_KEEPS_A_SLOT=(agents gateway ultrareview)
+if [ "$MODE_ARG" = "manual" ] && [ "${#CLAUDE_EXTRA_ARGS[@]}" -gt 0 ]; then
+    for _sub in "${_CC_EPHEMERAL[@]}"; do
+        [ "${CLAUDE_EXTRA_ARGS[0]}" = "$_sub" ] || continue
+        command -v claude >/dev/null 2>&1 || {
+            echo "cc-slot: claude is not on PATH — cannot run '$_sub'." >&2
+            exit 127
+        }
+        # Match the slot path's cwd (`cd ${GENESIS_ROOT} && claude`, below).
+        # mcp scope, project state and doctor's settings read are all keyed on
+        # the working directory, so bypassing in the caller's cwd would silently
+        # retarget them — an SSH login shell starts in $HOME, not the repo.
+        # `|| true` because a missing repo must not turn a working `claude
+        # update` into a hard failure; the slot path needs the repo for its exit
+        # capture and so has the opposite polarity.
+        cd "$GENESIS_ROOT" 2>/dev/null || true
+        # The door resolves a persistent TMPDIR further down, which the bypass
+        # skips. Without this, `install`/`update` unpack into the ambient temp —
+        # typically /tmp, which this install keeps deliberately small.
+        [ -n "${TMPDIR:-}" ] || [ ! -d "${HOME}/tmp" ] || export TMPDIR="${HOME}/tmp"
+        exec claude "${CLAUDE_EXTRA_ARGS[@]}"
+    done
+    unset _sub
+fi
+
 # Liveness verdict for the cosmetic slot map: ALIVE | POISONED | UNKNOWN |
 # TIMEOUT (empty on any failure). The map is purely informational and runs once
 # per listed slot on the interactive login path, so it must never be what makes
