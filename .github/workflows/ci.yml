@@ -806,4 +806,4 @@ jobs:
         # The base is deliberately NOT re-derived from the merged tree: this is
         # a FLOOR, so a lagging base is conservative and can only under-catch,
         # never go falsely red.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23280
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23296
