@@ -23,8 +23,15 @@ name: Runner benchmark
 #
 # WHY both arms in ONE run rather than comparing against historical medians:
 # a median over 30 days mixes commits, dependency sets and queue conditions.
-# Running both arms on the same ref at the same moment controls all three, so
-# the difference that remains is the runner.
+# Running both arms on the same ref at the same moment controls the first two
+# outright, and the third only PARTLY — which is a correction to what this
+# comment used to claim. One run fixes when the RUN starts, not when each arm
+# is handed a machine; a capacity-constrained provider can make its arm wait
+# and the phase tables below, which begin after allocation, would never show
+# it. So allocation delay is measured per arm and reported beside the phases
+# rather than folded into them, and the compare job states the exclusion on
+# every run. The difference that remains inside the phases is the runner; the
+# end-to-end difference is that plus the allocation line.
 #
 # WHY run it TWICE to draw a conclusion: the vendor's own guidance is that the
 # first run shows hardware and the second shows cache. A single run measures
@@ -153,9 +160,32 @@ jobs:
             exit 1
           fi
 
+      # Every phase below is measured from HERE — which is AFTER a machine was
+      # allocated and after the size assertion above. Queue and startup time
+      # therefore sits outside every number this workflow prints, so a
+      # capacity-constrained provider can post the faster TABLE while delivering
+      # slower CI end to end. Putting both arms in one workflow equalises when
+      # the run STARTS; it does not equalise when each arm gets a machine.
+      #
+      # Measured rather than argued away: `github.run_started_at` is the run's
+      # own start, identical for both arms, so t0 minus that IS this arm's
+      # allocation delay. It is reported beside the phases and is deliberately
+      # NOT folded into them — the phase split answers "which part is faster",
+      # and allocation is not a part, it is the cost of getting to the parts.
       - name: Record start
         id: t0
-        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+        env:
+          RUN_STARTED_AT: ${{ github.run_started_at }}
+        run: |
+          set -u
+          now=$(date +%s)
+          echo "epoch=$now" >> "$GITHUB_OUTPUT"
+          # An unparseable timestamp records nothing rather than a zero: zero
+          # would compare equal to the other arm's zero and read as "neither
+          # queued", which is the agreement-from-absence failure this whole
+          # file exists to refuse.
+          started=$(date -u -d "$RUN_STARTED_AT" +%s 2>/dev/null || true)
+          printf 'alloc=%s\n' "${started:+$(( now - started ))}" >> "$GITHUB_OUTPUT"
 
       # fetch-depth: 0 mirrors CI's `test` job, where it is load-bearing —
       # measurement tests derive a rate from this repository's commit history
@@ -267,12 +297,14 @@ jobs:
         if: ${{ always() }}
         env:
           ARM: ${{ matrix.arm.label }}
+          ALLOC: ${{ steps.t0.outputs.alloc }}
         run: |
           set -eu
           python3 - <<'PY'
           import hashlib, json, os, pathlib, subprocess, sys
           import xml.etree.ElementTree as ET
           arm = os.environ["ARM"]
+          alloc = os.environ.get("ALLOC") or ""
           p = pathlib.Path("junit.xml")
           if not p.is_file():
               # No report at all — record that rather than a zero, which would
@@ -295,6 +327,39 @@ jobs:
                   "errors": sum(int(s.get("errors", 0)) for s in suites),
               }
               pop["executed"] = pop["collected"] - pop["skipped"]
+              # THE AXES ABOVE ARE COUNTS, AND COUNTS ARE ANONYMOUS. If one arm
+              # skips test X while the other skips test Y — plausible, since
+              # this suite's skips key on the environment (root, GPG, Node,
+              # systemd tooling) — every counter above stays equal while the
+              # arms ran different tests. Two rounds of review tightened the
+              # counters and the hole survived both, because it is not a
+              # counting bug: no aggregate can distinguish "same work" from
+              # "same amount of different work".
+              #
+              # So identity, not arithmetic: each case's file::class::name with
+              # its outcome, sorted, digested. Same digest means the two arms
+              # ran the same tests and reached the same verdicts. The per-case
+              # list is written beside it so a mismatch is diffable rather than
+              # merely reported.
+              def _status(case):
+                  for tag in ("failure", "error", "skipped"):
+                      if case.find(tag) is not None:
+                          return tag
+                  return "passed"
+              cases = sorted(
+                  "{}::{}::{}".format(
+                      c.get("file") or "", c.get("classname") or "", c.get("name") or ""
+                  )
+                  + " " + _status(c)
+                  for s in suites
+                  for c in s.iter("testcase")
+              )
+              pop["cases_count"] = len(cases)
+              pop["cases_sha256"] = hashlib.sha256(
+                  "\n".join(cases).encode()
+              ).hexdigest()[:16]
+              pathlib.Path(f"cases-{arm}.txt").write_text("\n".join(cases) + "\n")
+          pop["alloc_delay_s"] = int(alloc) if alloc.lstrip("-").isdigit() else None
           # Dependency identity. `pip install -e ".[test]"` resolves RANGES, and
           # pip's default upgrade strategy is `only-if-needed` — so a package
           # already present in a runner image that satisfies the range is KEPT.
@@ -306,6 +371,20 @@ jobs:
           try:
               freeze = subprocess.run([sys.executable, "-m", "pip", "freeze"],
                                       capture_output=True, text=True, timeout=120)
+              # A NONZERO EXIT IS NOT A MANIFEST. `check=True` was absent, so a
+              # pip that died on malformed installed-package metadata returned
+              # normally and whatever partial — often empty — stdout it had
+              # produced got hashed. Two arms failing the same way then hash
+              # IDENTICALLY, and the comparison below reports matching
+              # dependency sets on the strength of two failures. That is the
+              # same shape as the missing-junit case, and it is why the round-2
+              # claim that this job "fails when a manifest could not be captured
+              # at all" was false: it only caught the exception path.
+              if freeze.returncode != 0:
+                  raise RuntimeError(
+                      f"pip freeze exited {freeze.returncode}: "
+                      f"{(freeze.stderr or '').strip()[:160]}"
+                  )
               pkgs = sorted(l.strip() for l in freeze.stdout.splitlines() if l.strip())
               pop["deps_count"] = len(pkgs)
               pop["deps_sha256"] = hashlib.sha256("\n".join(pkgs).encode()).hexdigest()[:16]
@@ -326,6 +405,7 @@ jobs:
           path: |
             population-${{ matrix.arm.label }}.json
             deps-${{ matrix.arm.label }}.txt
+            cases-${{ matrix.arm.label }}.txt
           if-no-files-found: error
 
       # A single total cannot tell a cache win from a CPU win, and those have
@@ -395,14 +475,19 @@ jobs:
           pops = [json.loads(f.read_text()) for f in files]
           cols = ("collected", "skipped", "failures", "errors", "executed")
           lines = ["## Test population across arms\n",
-                   "| arm | " + " | ".join(cols) + " | deps |",
-                   "|---|" + "---|" * (len(cols) + 1)]
+                   "| arm | " + " | ".join(cols) + " | cases | deps | alloc |",
+                   "|---|" + "---|" * (len(cols) + 3)]
           for p in pops:
               if p.get("readable"):
                   cells = " | ".join(str(p.get(c, "?")) for c in cols)
-                  lines.append(f"| {p['arm']} | {cells} | {p.get('deps_sha256') or 'n/a'} |")
+                  alloc = p.get("alloc_delay_s")
+                  lines.append(
+                      f"| {p['arm']} | {cells} | {p.get('cases_sha256') or 'n/a'} | "
+                      f"{p.get('deps_sha256') or 'n/a'} | "
+                      f"{'not measured' if alloc is None else str(alloc) + 's'} |"
+                  )
               else:
-                  lines.append(f"| {p['arm']} |" + " no report |" * (len(cols) + 1))
+                  lines.append(f"| {p['arm']} |" + " no report |" * (len(cols) + 3))
           problems = []
           if len(pops) < 2:
               problems.append(f"only {len(pops)} arm(s) reported a population; "
@@ -421,6 +506,20 @@ jobs:
                                   "they did not do the same work")
           # Dependency identity: pip resolves ranges against whatever the image
           # already has, so one command can yield two dependency sets.
+          # Identity, above the counters. Equal counters with unequal digests is
+          # precisely the case no aggregate can see: the same AMOUNT of
+          # different work. Reported as its own problem so the summary says
+          # which kind of disagreement happened.
+          case_shas = {p.get("cases_sha256") for p in readable}
+          if None in case_shas:
+              problems.append("a per-testcase digest could not be computed, so "
+                              "the arms cannot be shown to have run the same tests")
+          elif len(case_shas) > 1:
+              problems.append("arms ran DIFFERENT tests or reached different "
+                              f"verdicts {sorted(s for s in case_shas if s)} — "
+                              "diff the cases-*.txt artifacts; equal counters "
+                              "here would have meant the same amount of "
+                              "different work, not the same work")
           shas = {p.get("deps_sha256") for p in readable}
           if None in shas:
               problems.append("a dependency manifest could not be captured, so "
@@ -435,6 +534,29 @@ jobs:
           lines.append("**comparable: NO**" if problems else "**comparable: yes**")
           for p in problems:
               lines.append(f"- {p}")
+          # SCOPE THE CONCLUSION, do not fail on it. A queue difference is a
+          # real property of a provider rather than a defect in the
+          # measurement, so it must not turn the job red — but the phase tables
+          # start after allocation, so leaving it unsaid lets a provider that
+          # is slower END TO END post the faster table. Stating it is what
+          # keeps "comparable: yes" a claim about the phases it measured.
+          allocs = {p["arm"]: p.get("alloc_delay_s") for p in pops}
+          known = {a: v for a, v in allocs.items() if v is not None}
+          lines.append("")
+          if len(known) < len(allocs) or not known:
+              lines.append("- NOTE: allocation delay was not measured on every "
+                           "arm, so the phase tables exclude an unknown amount "
+                           "of queue time on at least one of them.")
+          else:
+              spread = max(known.values()) - min(known.values())
+              lines.append(
+                  "- NOTE: every phase above is measured from AFTER a machine "
+                  "was allocated. Allocation delay was "
+                  + ", ".join(f"{a} {v}s" for a, v in sorted(known.items()))
+                  + f" (spread {spread}s), and is EXCLUDED from those phases. "
+                  "A conclusion about end-to-end CI has to add it back; a "
+                  "conclusion about the machines themselves should not."
+              )
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
               fh.write("\n".join(lines) + "\n")
           for p in problems:
