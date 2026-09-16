@@ -20,6 +20,10 @@ async def test_all_tools_registered():
         "outreach_digest",
         "outreach_send_and_wait",
         "provision_grow",
+        # Queue controls (#1911). Listed here because this assertion is the only
+        # thing that notices a tool silently failing to register.
+        "outreach_pending",
+        "outreach_cancel",
     ]:
         assert name in tools, f"Missing tool: {name}"
 
@@ -225,7 +229,14 @@ async def test_outreach_poll_no_webhook():
         )
     data = json.loads(result)
     assert "error" in data
-    assert "No webhook URL" in data["error"]
+    # The message changed when the silent default-webhook fallback was removed:
+    # it now names the channel AND the exact setting to configure, instead of
+    # the generic "No webhook URL found". The INTENT this test pins — an
+    # unconfigured channel is refused rather than posted somewhere else — is
+    # unchanged and is asserted more strictly than before.
+    assert "announcements" in data["error"], data["error"]
+    assert "DISCORD_WEBHOOK_ANNOUNCEMENTS" in data["error"], data["error"]
+    assert data.get("status") != "created"
 
 
 @pytest.mark.asyncio
@@ -741,3 +752,128 @@ async def test_outreach_pending_pages_with_a_denominator(tmp_path):
             assert after["total"] == 59
         finally:
             mcp_mod._pipeline, mcp_mod._db = old_pipeline, old_db
+
+
+class TestPollRefusesUnconfiguredChannel:
+    """The LIVE poll path, which kept its own copy of the silent fallback.
+
+    The adapter's `send_poll` has ZERO production callers (`grep -rn "send_poll"
+    src/` returns only its definition), so hardening it guarded nothing. The
+    reachable path is this MCP tool, which resolved
+    `os.environ.get(env_key) or os.environ.get("DISCORD_WEBHOOK_URL")` and then
+    returned `{"status": "created", "channel": "bug-reports"}` — the requested
+    name, on a post that went to the default channel. For a poll that is worse
+    than a misdirected message: it collects the wrong audience's votes.
+    """
+
+    @staticmethod
+    def _env(monkeypatch, **overrides):
+        """Only the vars this path reads, so a real local env cannot leak in."""
+        for var in (
+            "DISCORD_WEBHOOK_URL",
+            "DISCORD_WEBHOOK_BUG_REPORTS",
+            "DISCORD_WEBHOOK_ANNOUNCEMENTS",
+            "OUTREACH_RECIPIENT_DISCORD",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        for k, v in overrides.items():
+            monkeypatch.setenv(k, v)
+
+    async def test_unconfigured_named_channel_is_refused(self, monkeypatch):
+        self._env(monkeypatch, DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/0/default")
+        tools = await mcp.get_tools()
+        out = json.loads(
+            await tools["outreach_poll"].fn(
+                channel="bug-reports", question="Ship it?", answers=["Yes", "No"],
+            )
+        )
+        assert "error" in out, out
+        assert "bug-reports" in out["error"]
+        assert "DISCORD_WEBHOOK_BUG_REPORTS" in out["error"], (
+            "the refusal must name the exact setting to add"
+        )
+        assert out.get("status") != "created"
+
+    async def test_a_configured_channel_still_resolves(self, monkeypatch):
+        """Guard the other direction: the refusal must not break a channel that
+        IS configured."""
+        self._env(
+            monkeypatch,
+            DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/0/default",
+            DISCORD_WEBHOOK_ANNOUNCEMENTS="https://discord.com/api/webhooks/1/ann",
+        )
+        tools = await mcp.get_tools()
+        with patch("genesis.mcp.outreach_mcp.httpx.AsyncClient") as mock_cls:
+            client = AsyncMock()
+            client.post.return_value = AsyncMock(
+                status_code=200, json=lambda: {"id": "poll-1"},
+            )
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            out = json.loads(
+                await tools["outreach_poll"].fn(
+                    channel="announcements", question="Ship it?", answers=["Yes", "No"],
+                )
+            )
+        assert "error" not in out, out
+        assert "1/ann" in client.post.call_args[0][0], client.post.call_args
+
+    async def test_the_default_channel_still_falls_back(self, monkeypatch):
+        """'The default channel' IS whatever DISCORD_WEBHOOK_URL points at, so it
+        need not appear in the per-channel map. This is the case a too-broad
+        refusal would break first."""
+        self._env(
+            monkeypatch,
+            DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/0/default",
+            OUTREACH_RECIPIENT_DISCORD="dev-discussion",
+        )
+        tools = await mcp.get_tools()
+        with patch("genesis.mcp.outreach_mcp.httpx.AsyncClient") as mock_cls:
+            client = AsyncMock()
+            client.post.return_value = AsyncMock(
+                status_code=200, json=lambda: {"id": "poll-2"},
+            )
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            out = json.loads(
+                await tools["outreach_poll"].fn(
+                    channel="dev-discussion", question="Ship it?", answers=["Yes", "No"],
+                )
+            )
+        assert "error" not in out, out
+        assert "0/default" in client.post.call_args[0][0]
+
+    @pytest.mark.parametrize("name", ["url", "URL", "Url"])
+    async def test_the_reserved_default_name_is_not_a_channel(self, monkeypatch, name):
+        """`url` names the DEFAULT webhook's VARIABLE, not a channel.
+
+        The env-naming rule inverts `url` — in any letter case, and `URL` via
+        the `-`→`_` rule too — onto `DISCORD_WEBHOOK_URL`, while the discovery
+        loop deliberately EXCLUDES that variable from the per-channel map. So no
+        channel owns it, yet a direct lookup SUCCEEDED: it short-circuited the
+        default-channel test above and posted to the default channel while
+        reporting the requested name back as `url`. Same undetectable redirect
+        this class exists to remove, through the one name nobody thinks to test.
+
+        The control for this is `test_the_default_channel_still_falls_back`
+        directly above — a fix that simply refused anything resolving to that
+        variable would break every default-channel poll.
+        """
+        self._env(
+            monkeypatch,
+            DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/0/default",
+            OUTREACH_RECIPIENT_DISCORD="dev-discussion",
+        )
+        tools = await mcp.get_tools()
+        with patch("genesis.mcp.outreach_mcp.httpx.AsyncClient") as mock_cls:
+            client = AsyncMock()
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            out = json.loads(
+                await tools["outreach_poll"].fn(
+                    channel=name, question="Where did this land?", answers=["A", "B"],
+                )
+            )
+        assert "error" in out, f"the reserved name must be refused, got {out}"
+        client.post.assert_not_called()
+
