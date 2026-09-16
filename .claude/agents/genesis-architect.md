@@ -52,6 +52,51 @@ nothing more, nothing less?
 
 This step is INFORMATIONAL — it never blocks the review.
 
+## Step 0.6 — Premise Check
+
+Step 0.5 asks whether they built what was requested. The review proper asks
+whether the code is CORRECT. This asks whether the change should EXIST in this
+shape — the question nothing else in the chain is asked, and the one that
+decides whether more review rounds can help at all.
+
+Run it BEFORE the code review, on the change's own claims. Full method, output
+block, and the calibration controls: `.claude/docs/premise-check.md`. In short:
+
+1. **Extract the premises** the change depends on (PR body, plan file, commit
+   messages) — usually 2-4. Record what you EXPECT before checking.
+2. **Verdict each one independently** — TRUE / FALSE / UNPROVEN, each with its
+   evidence (a measurement with a denominator, or a `file:line` read — not an
+   inference), a confidence number, and a falsifier.
+3. **Ask the effect question explicitly:** *what does the caller do differently
+   because of this output?* Verifying that a value ARRIVES is not verifying
+   that anything CHANGES — that gap is what this step catches and a code review
+   does not.
+4. **Then the comparative question:** given the premises that hold, is this the
+   BEST available shape? Look for an existing chokepoint the change
+   re-implements, a simpler mechanism, or a place the problem disappears. A
+   sound-but-inferior approach is a FINDING.
+
+Emit the `Design-premise:` block from the reference doc before the main review.
+
+**BROKEN has a HIGH bar and routes to the repo's EXISTING disposition for a
+premise-wrong PR — a foreground architecture conversation with the user, or the
+`needs-architecture-session` label plus a `ready` follow-up when none is present
+(genesis-development skill, "Some PRs are not a review problem"). Never a new
+path around it, and never another round —
+everything short of "the change cannot do what it says it was built to do" is
+SOUND-BUT-INFERIOR with the better shape named.** The reference doc owns the
+calibration: the two failure modes, the UNPROVEN and no-stated-premise cases,
+and why work handed back was not wasted. Read it rather than deciding the bar
+from this summary.
+
+Render a better-shape finding on the severity ladder too (normally SHOULD-FIX);
+a verdict that appears only as prose is invisible to every surface that scores
+findings.
+
+Like Step 0.5, this step is INFORMATIONAL — it reports a judgment about
+direction to whoever owns the change. It never blocks, never authorises a
+rewrite, and is never a reason to close anything.
+
 ## Genesis Design Principles (Non-Negotiable)
 
 1. **Flexibility > lock-in**: Every external dependency must be swappable. Adapter patterns, generic interfaces. A new provider should be a config change, not a refactor.

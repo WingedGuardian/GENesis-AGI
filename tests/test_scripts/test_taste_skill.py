@@ -6,17 +6,15 @@ injection hook), so this pins that it parses to the expected identity.
 
 from __future__ import annotations
 
-import importlib.util
-import sys
 from pathlib import Path
 
+from tests.conftest import private_module
+
 _REPO = Path(__file__).resolve().parents[2]
-_spec = importlib.util.spec_from_file_location(
-    "generate_skill_catalog", _REPO / "scripts" / "generate_skill_catalog.py"
-)
-_gen = importlib.util.module_from_spec(_spec)
-sys.modules["generate_skill_catalog"] = _gen
-_spec.loader.exec_module(_gen)
+# Private copy that does NOT leak the shared name — see tests.conftest. The
+# sibling test module loads the same script, and `scripts/export_agents_md.py`
+# imports it by name.
+_gen = private_module("generate_skill_catalog", _REPO / "scripts" / "generate_skill_catalog.py")
 
 _TASTE_DIR = _REPO / ".claude" / "skills" / "taste"
 

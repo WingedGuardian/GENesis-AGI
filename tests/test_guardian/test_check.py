@@ -521,6 +521,152 @@ def _alert_titles(mock_dispatcher: MagicMock) -> list[str]:
     return [call.args[0].title for call in mock_dispatcher.send.call_args_list]
 
 
+class TestBootAwareEpisodeReset:
+    """`run_check` must actually CALL the reboot reset, and the "Genesis
+    recovered" ping must key on the latch rather than on which rung we came from.
+
+    Both were built-but-unverified-as-wired: deleting the call site left 304
+    tests green, and re-adding the `old_state == CONFIRMED_DEAD` gate left 120
+    green, because every existing test seeds `current_state="confirmed_dead"`.
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_check_resets_the_episode_after_a_host_reboot(
+        self, config: GuardianConfig,
+    ) -> None:
+        state_path = _seed_state(
+            config,
+            current_state="confirmed_dead",
+            first_failure_at="2020-01-01T00:00:00+00:00",   # long expired
+            recovery_attempts=2,
+            boot_id="1a2b3c4d-0000-4111-8000-000000000001",
+        )
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.send = AsyncMock()
+
+        with (
+            patch(
+                "genesis.guardian.check.collect_all_signals",
+                AsyncMock(return_value=_dead_snapshot()),
+            ),
+            patch("genesis.guardian.check._build_dispatcher", return_value=mock_dispatcher),
+            patch("genesis.guardian.check._write_guardian_heartbeat", AsyncMock()),
+            patch("genesis.guardian.check.load_secrets", return_value={}),
+            patch(
+                "genesis.guardian.check.read_boot_id",
+                return_value="9f9f9f9f-0000-4222-8000-000000000002",
+            ),
+        ):
+            await run_check(config)
+
+        import json
+
+        saved = json.loads(state_path.read_text())
+        assert saved["boot_id"] == "9f9f9f9f-0000-4222-8000-000000000002"
+        assert saved["current_state"] != "confirmed_dead", (
+            "the ladder must restart from HEALTHY, not resume mid-climb"
+        )
+        assert saved["recovery_attempts"] == 2, (
+            "the escalation budget must survive — refunding it on every reboot "
+            "turns a bounded ladder into an unbounded loop"
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_check_leaves_state_alone_within_one_boot(
+        self, config: GuardianConfig,
+    ) -> None:
+        state_path = _seed_state(
+            config,
+            current_state="confirmed_dead",
+            down_alert_sent=True,
+            first_failure_at=_now_iso(),
+            boot_id="1a2b3c4d-0000-4111-8000-000000000001",
+        )
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.send = AsyncMock()
+
+        with (
+            patch(
+                "genesis.guardian.check.collect_all_signals",
+                AsyncMock(return_value=_dead_snapshot()),
+            ),
+            patch("genesis.guardian.check._build_dispatcher", return_value=mock_dispatcher),
+            patch("genesis.guardian.check._write_guardian_heartbeat", AsyncMock()),
+            patch("genesis.guardian.check.load_secrets", return_value={}),
+            patch(
+                "genesis.guardian.check.read_boot_id",
+                return_value="1a2b3c4d-0000-4111-8000-000000000001",
+            ),
+        ):
+            await run_check(config)
+
+        import json
+
+        saved = json.loads(state_path.read_text())
+        assert saved["current_state"] == "confirmed_dead", (
+            "same boot — an in-flight episode must not be discarded"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "predecessor", ["awaiting_self_heal", "contacting_genesis", "recovered"],
+    )
+    async def test_restored_ping_fires_from_any_predecessor(
+        self, config: GuardianConfig, predecessor: str,
+    ) -> None:
+        """The latch is the predicate, not the rung. Before this, an episode that
+        ended from any state other than CONFIRMED_DEAD left `down_alert_sent`
+        stuck True — muting every LATER down-alert, permanently."""
+        _seed_state(
+            config,
+            current_state=predecessor,
+            down_alert_sent=True,
+            first_failure_at=_now_iso(),
+        )
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.send = AsyncMock()
+
+        with (
+            patch(
+                "genesis.guardian.check.collect_all_signals",
+                AsyncMock(return_value=_healthy_snapshot()),
+            ),
+            patch("genesis.guardian.check._build_dispatcher", return_value=mock_dispatcher),
+            patch("genesis.guardian.check._handle_healthy", AsyncMock()),
+            patch("genesis.guardian.check._write_guardian_heartbeat", AsyncMock()),
+            patch("genesis.guardian.check.load_secrets", return_value={}),
+        ):
+            await run_check(config)
+
+        titles = _alert_titles(mock_dispatcher)
+        restored = [t for t in titles if "recovered" in t.lower() or "restored" in t.lower()]
+        assert len(restored) == 1, f"expected one close-out ping, got {titles}"
+
+    @pytest.mark.asyncio
+    async def test_no_ping_when_no_down_alert_was_sent(
+        self, config: GuardianConfig,
+    ) -> None:
+        """The negative twin — the flag, not the state, is what gates it."""
+        _seed_state(config, current_state="recovered", down_alert_sent=False)
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.send = AsyncMock()
+
+        with (
+            patch(
+                "genesis.guardian.check.collect_all_signals",
+                AsyncMock(return_value=_healthy_snapshot()),
+            ),
+            patch("genesis.guardian.check._build_dispatcher", return_value=mock_dispatcher),
+            patch("genesis.guardian.check._handle_healthy", AsyncMock()),
+            patch("genesis.guardian.check._write_guardian_heartbeat", AsyncMock()),
+            patch("genesis.guardian.check.load_secrets", return_value={}),
+        ):
+            await run_check(config)
+
+        titles = _alert_titles(mock_dispatcher)
+        assert not [t for t in titles if "recovered" in t.lower()], titles
+
+
 class TestGuardianAlertOnce:
     """GUARD-R2-01 — alert once per down-episode + a single 'restored' ping.
 

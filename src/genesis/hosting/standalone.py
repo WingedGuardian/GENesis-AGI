@@ -113,7 +113,8 @@ class StandaloneAdapter:
         # MEASURE a stall after it clears, so it never captures the synchronous
         # frame that blocked the loop. This daemon thread reads the loop-health
         # heartbeat and, when it goes stale (loop wedged NOW), snapshots the loop
-        # thread's stack — catching the offending frame mid-stall. Diagnostic-only.
+        # thread's stack. The stack shows where the loop WAS when sampled; it is
+        # evidence, not a verdict on the cause. Diagnostic-only.
         stall_stop_event = None
         if os.environ.get("GENESIS_LOOP_STALL_SAMPLER", "1").lower() not in (
             "0",
@@ -241,15 +242,19 @@ class StandaloneAdapter:
 
         Sleeps a fixed interval and measures how much longer than the interval
         the wake-up actually took — that excess is time the loop spent unable to
-        schedule ready callbacks (blocked in synchronous work on some task).
-        When drift exceeds the threshold we log at WARNING so the stall is
-        timestamp-correlatable with awareness-tick / dispatch / bundle log lines,
-        naming what starves the recall coroutine behind the route 503s.
+        schedule ready callbacks. Drift alone does NOT say why: a synchronous
+        frame, a VM pause, a SIGSTOP and cgroup CPU starvation all delay
+        ``asyncio.sleep`` identically. When drift exceeds the threshold we log at
+        WARNING so the stall is timestamp-correlatable with awareness-tick /
+        dispatch / bundle log lines; establishing the CAUSE is the off-loop stack
+        sampler's job (util/loop_stall.py). This docstring previously claimed the
+        warning names what starves the recall coroutine behind route 503s — it
+        cannot, and that claim misdirected a real investigation.
 
         The WARN also carries ``executor=`` — the default-executor pending depth
-        (PR-2c). A lag episode with a deep executor queue means ``to_thread`` work
-        (Qdrant recall, awareness-tick git) is saturating the thread pool, which
-        loop drift alone cannot distinguish from pure loop starvation.
+        (PR-2c). Read ``pending`` and ONLY ``pending``: a sustained non-zero value
+        means ``to_thread`` work is backing up. ``workers`` is NOT an occupancy
+        gauge (see util/loop_diag.py) and says nothing about saturation.
 
         Debounced per stall EPISODE: one WARNING when drift first crosses the
         threshold, one INFO with the peak drift when it clears. A sustained
@@ -284,12 +289,46 @@ class StandaloneAdapter:
                         # Entering a stall episode — warn once, then suppress
                         # per-sample noise until it clears.
                         lagging = True
+                        # Report the MEASUREMENT ONLY. This line used to assert
+                        # "background work is starving the loop; recall 503s
+                        # correlate here" on every episode. Nothing measured that
+                        # correlation, and it fires at a 250ms default threshold —
+                        # an order of magnitude under the 4.5s recall budget — so
+                        # it named a cause it could not have observed. It cost a
+                        # real investigation: the claim was taken as evidence, and
+                        # recall timeouts turned out to be read-pool checkout
+                        # contention, unrelated to loop lag.
+                        #
+                        # Drift measures only that callbacks could not be
+                        # scheduled. It does NOT establish that a synchronous
+                        # frame was responsible: a VM pause, SIGSTOP, cgroup CPU
+                        # starvation or plain descheduling delay asyncio.sleep()
+                        # identically. MEASURED — of 40 wedge dumps on one host, 5
+                        # caught the loop idle in `selectors.select`, i.e. not
+                        # blocked at all. Establishing a blocking frame is the
+                        # off-loop stack sampler's job (util/loop_stall.py), which
+                        # prints the actual stack; this line must not pre-empt it
+                        # with a guess, which is the very error above.
+                        #
+                        # `workers` is len(executor._threads) — threads ever
+                        # CREATED, which never shrinks. It is NOT an occupancy
+                        # gauge, and once the pool has touched its cap it reads
+                        # cap-forever, identically at rest and under load.
+                        # `pending` is the only saturation signal, so label it
+                        # rather than dumping a dict a reader will misread.
+                        pending = (executor or {}).get("pending")
                         logger.warning(
-                            "event-loop lag %.0fms (interval %.0fms) — background "
-                            "work is starving the loop; recall 503s correlate here; "
-                            "executor=%s (further lag suppressed until it clears)",
+                            "event-loop lag %.0fms (interval %.0fms) — the loop "
+                            "could not schedule callbacks (cause NOT established "
+                            "here; see the loop-stall stack dump); executor "
+                            "queue-depth(pending)=%s of max_workers=%s "
+                            "[pending>0 means to_thread work is backing up; "
+                            "workers= is threads-ever-created, not busy count] "
+                            "%s (further lag suppressed until it clears)",
                             drift_ms,
                             interval * 1000,
+                            "unknown" if pending is None else pending,
+                            (executor or {}).get("max_workers", "unknown"),
                             executor,
                         )
                 elif lagging:

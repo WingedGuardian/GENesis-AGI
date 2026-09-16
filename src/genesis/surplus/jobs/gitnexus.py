@@ -84,6 +84,7 @@ async def run_gitnexus_reindex() -> None:
         )
         return
     try:
+        import asyncio
         import sys
 
         lib = str((repo_root / "scripts" / "lib").resolve())
@@ -91,7 +92,9 @@ async def run_gitnexus_reindex() -> None:
             sys.path.insert(0, lib)
         import index_marker  # stdlib-only
 
-        index_marker.write_marker(str(repo_root), tools="gitnexus", mode="fast")
+        await asyncio.to_thread(
+            index_marker.write_marker, str(repo_root), tools="gitnexus", mode="fast"
+        )
         logger.info("GitNexus reindex request queued for the idle runner")
         with contextlib.suppress(Exception):
             GenesisRuntime.instance().record_job_success("gitnexus_reindex")
