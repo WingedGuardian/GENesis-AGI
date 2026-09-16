@@ -1639,6 +1639,26 @@ def _restore_from_dir(trash_path: Path, repo_root: Path) -> bool:
     # rc=0 on a still-registered missing path, with a working checkout after.
     _run_git(repo_root, ["worktree", "unlock", original_path], timeout=10)
 
+    def _relock() -> None:
+        """Put the history anchor back after a FAILED recovery.
+
+        THE LOCK IS WHAT KEEPS THE ARCHIVED COMMITS REACHABLE. Unlocking above is
+        only safe because `git worktree add --force` is about to take the path
+        over; if that does not happen, an unlocked registration is one
+        `git worktree prune` or `git gc` away from being removed, and the
+        archive's commits become collectable with the tarball still sitting in
+        the trash. Every failure path below therefore restores it before
+        returning, and the reason says why it is back.
+        """
+        _run_git(
+            repo_root,
+            ["worktree", "lock", "--reason",
+             f"archived by the reaper -> {trash_path.name}; recovery did not "
+             "complete, still recoverable with --recover",
+             original_path],
+            timeout=15,
+        )
+
     # Recreate the worktree: detached at its commit, or checked out on its branch.
     if detached or not branch:
         add_cmd = ["git", "worktree", "add", "--force", "--detach", original_path, commit]
@@ -1713,13 +1733,20 @@ def _restore_from_dir(trash_path: Path, repo_root: Path) -> bool:
                     "nesting the archive inside it.",
                     file=sys.stderr,
                 )
+                _relock()
                 return False
             try:
                 shutil.rmtree(original_path)
-                subprocess.run(
-                    ["git", "worktree", "prune"], capture_output=True,
-                    cwd=str(repo_root), timeout=30, env=_git_env(),
-                )
+                # NO `git worktree prune` HERE. It is repo-wide, and while every
+                # OTHER archive's registration survives it (locked registrations
+                # are not pruned -- measured), THIS path's registration was
+                # unlocked a few lines above precisely so `worktree add` could
+                # take it over. Pruning now would remove the one anchor that is
+                # currently unprotected, and the fallback move below would then
+                # restore a directory whose commits nothing keeps reachable.
+                # Leaving the registration in place also means the move below
+                # restores a worktree git still knows about, rather than a plain
+                # directory with a dangling pointer.
                 print(
                     f"cleared the empty directory {original_path} that the failed "
                     "worktree add left behind",
@@ -1727,6 +1754,7 @@ def _restore_from_dir(trash_path: Path, repo_root: Path) -> bool:
                 )
             except OSError as e:
                 print(f"Could not clear {original_path}: {e}", file=sys.stderr)
+                _relock()
                 return False
 
         print(f"Moving trash contents back to {original_path}...", file=sys.stderr)
@@ -1736,6 +1764,8 @@ def _restore_from_dir(trash_path: Path, repo_root: Path) -> bool:
             return True
         except (OSError, shutil.Error) as e:
             print(f"Failed to move: {e}", file=sys.stderr)
+            # The archive is still in the trash and still needs its anchor.
+            _relock()
             return False
 
     # Restore UNTRACKED files/symlinks that were in the trash but not recreated by

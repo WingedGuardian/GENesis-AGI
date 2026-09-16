@@ -1075,3 +1075,91 @@ def test_the_patch_write_refuses_to_follow_a_symlink_the_check_missed(
     assert ".dirty.patch" in members and members[".dirty.patch"].issym(), (
         "the user's symlink must still be the entry the write refused to follow"
     )
+
+
+def _is_locked(repo, wt_path) -> bool:
+    """True when git still holds a lock on this worktree's registration."""
+    out = _git(repo, "worktree", "list", "--porcelain")
+    block, found = [], False
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            if found:
+                break
+            block, found = [], line[len("worktree "):] == str(wt_path)
+        if found:
+            block.append(line)
+    return any(ln == "locked" or ln.startswith("locked ") for ln in block)
+
+
+def test_a_failed_recovery_leaves_the_history_anchor_in_place(
+    reaper_repo, tmp_path, monkeypatch,
+):
+    """Recovery unlocks the registration, and that lock IS the anchor.
+
+    Archiving locks the worktree's registration, and the lock is the only thing
+    keeping the archived commits reachable -- `git worktree prune` and `git gc`
+    both leave a LOCKED registration alone and both remove an unlocked one.
+    Recovery has to release it so `git worktree add --force` can take the path
+    over. When everything after that fails, an earlier version returned with the
+    registration still unlocked, so the tarball sat in the trash pointing at
+    commits the next gc could collect.
+
+    The same path also ran a repo-wide `git worktree prune`, which is harmless to
+    every OTHER archive -- theirs are locked -- and fatal to this one, whose lock
+    had just been released.
+
+    REACHING THE PATH IS THE HARD PART, and the first version of this test did
+    not: occupying the destination trips an "already exists" check that returns
+    BEFORE the unlock, so the lock was still held for trivial reasons and the
+    test passed against a `_relock` that did nothing. Both the checkout and the
+    fallback move have to fail, with the destination free, to land on a return
+    that the unlock precedes.
+    """
+    trash = tmp_path / "trash"
+    trash.mkdir()
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
+
+    wt = reaper_repo.wt_branch_merged
+    wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo)
+    assert not wt.exists()
+    assert _is_locked(reaper_repo.repo, wt), "precondition: archiving locks the anchor"
+
+    real_run = subprocess.run
+
+    def _add_always_fails(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd[:3] == ["git", "worktree", "add"]:
+            return subprocess.CompletedProcess(cmd, 1, "", "simulated add failure")
+        return real_run(cmd, *args, **kwargs)
+
+    def _move_always_fails(*_a, **_k):
+        raise OSError("simulated move failure")
+
+    monkeypatch.setattr(subprocess, "run", _add_always_fails)
+    monkeypatch.setattr(wl.shutil, "move", _move_always_fails)
+
+    assert wl._recover("wt_branch_merged", reaper_repo.repo) is False
+
+    assert _is_locked(reaper_repo.repo, wt), (
+        "recovery failed and left the registration UNLOCKED — the archive's "
+        "commits are now one prune or gc away from being collectable"
+    )
+
+
+def test_a_successful_recovery_still_works(reaper_repo, tmp_path, monkeypatch):
+    """The control that moves. A re-lock on every failure path is worthless if it
+    also fires on success, or if dropping the repo-wide prune broke recovery."""
+    trash = tmp_path / "trash"
+    trash.mkdir()
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
+
+    wt = reaper_repo.wt_branch_merged
+    (wt / "scratch.txt").write_text("untracked scratch\n")
+    wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo)
+
+    assert wl._recover("wt_branch_merged", reaper_repo.repo) is True
+    assert (wt / "scratch.txt").read_text() == "untracked scratch\n"
+    assert not _is_locked(reaper_repo.repo, wt), (
+        "a SUCCESSFUL recovery must leave a normal, unlocked worktree"
+    )
