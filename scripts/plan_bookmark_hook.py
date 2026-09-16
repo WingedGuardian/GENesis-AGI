@@ -47,13 +47,21 @@ _EXECUTION_PROTOCOL = (
     "writing any code:\n"
     "1. CREATE WORKTREE — git worktree add .claude/worktrees/<scope>-<desc> "
     "-b <scope>/<desc>. Work inside the worktree. NEVER commit to main.\n"
-    "2. STATE CONFIDENCE — Explicit percentages for each part of the plan. "
-    "Anything below 90% needs investigation first.\n"
-    "3. DUE DILIGENCE — Read every file you plan to modify. Verify functions "
+    # "STATE CONFIDENCE - explicit percentages for each part of the plan" used to
+    # be step 2 here. It was a PLAN-level instruction delivered at PostToolUse,
+    # i.e. after the plan had already been shown and approved - the wrong-moment
+    # bug that scripts/hooks/plan_confidence_reminder.py exists to fix. That hook
+    # now owns the ask, and it fires at the plan-mode boundaries instead: at
+    # EnterPlanMode, where it still reaches the plan being written, and at
+    # ExitPlanMode, where it reaches the revision and the next plan. Repeating it
+    # here would be a second copy arriving strictly later than both. Step 2 below
+    # is NOT the same thing and stays: reading the files you are about to edit is
+    # implementation diligence, at a moment where it is still actionable.
+    "2. DUE DILIGENCE — Read every file you plan to modify. Verify functions "
     "and classes exist as expected. Check git log for recent conflicts.\n"
-    "4. CONFIRM PLAN VALIDITY — Verify plan is still valid against current "
+    "3. CONFIRM PLAN VALIDITY — Verify plan is still valid against current "
     "code. If anything changed since planning, update the plan first.\n"
-    "5. WORK THE PLAN IN ORDER — one step at a time, verifying each before the "
+    "4. WORK THE PLAN IN ORDER — one step at a time, verifying each before the "
     "next; dispatch subagents for work that would bloat this context. The "
     "`superpowers` plugin's executing-plans / subagent-driven-development skills "
     "do this well where the install has it (optional; not present everywhere).\n\n"

@@ -1,0 +1,706 @@
+"""Tests for the worktree ownership lever (scripts/hooks/worktree_claim.py).
+
+The design rests on two claims about things this repo does not own -- that a
+``git worktree lock`` stops the reaper, and that it stops ``git worktree
+remove``. Both are exercised here against REAL git repositories rather than
+mocks, because a mock of git would only prove that the mock agrees with the
+belief being tested.
+
+Every liveness test uses a CONTROL THAT MOVES. Asserting "a locked worktree was
+skipped" on its own passes just as happily against a reaper that reaps nothing,
+so each case runs the same worktree through the same command twice and differs
+only by the lock.
+
+The one thing deliberately NOT tested by spawning a real Claude Code session is
+``session_pid_from_ancestry``. It is exercised against the live process tree
+instead (the test process is itself a descendant of something), plus synthetic
+``/proc`` readings, because spawning a session inside CI is neither available
+nor reproducible.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+_ROOT = Path(__file__).resolve().parents[2]
+_SCRIPT = _ROOT / "scripts" / "hooks" / "worktree_claim.py"
+_spec = importlib.util.spec_from_file_location("worktree_claim", _SCRIPT)
+wc = importlib.util.module_from_spec(_spec)
+sys.modules["worktree_claim"] = wc
+_spec.loader.exec_module(wc)
+
+
+# ─── helpers ────────────────────────────────────────────────────────────────
+
+
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, timeout=60)
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> Path:
+    """A real repository with one commit on ``main``."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init", "--quiet", "-b", "main")
+    _git(root, "config", "user.email", "probe@example.invalid")
+    _git(root, "config", "user.name", "Probe")
+    (root / "README.md").write_text("seed\n")
+    _git(root, "add", "README.md")
+    _git(root, "commit", "--quiet", "-m", "seed")
+    return root
+
+
+@pytest.fixture
+def worktree(repo: Path, tmp_path: Path) -> Path:
+    """A linked worktree on a branch already merged into ``main``."""
+    _git(repo, "checkout", "--quiet", "-b", "feature/done")
+    (repo / "f.txt").write_text("work\n")
+    _git(repo, "add", "f.txt")
+    _git(repo, "commit", "--quiet", "-m", "work")
+    _git(repo, "checkout", "--quiet", "main")
+    _git(repo, "merge", "--quiet", "--no-edit", "feature/done")
+    path = tmp_path / "wt-done"
+    _git(repo, "worktree", "add", "--quiet", str(path), "feature/done")
+    return path
+
+
+def P(rule: str, **extra) -> dict:
+    """A well-formed ownership payload.
+
+    Built from the module's OWN namespace constant rather than a literal, so a
+    change to that constant cannot leave these tests quietly asserting a format
+    nothing writes any more.
+    """
+    return {"ns": wc.PAYLOAD_NAMESPACE, "v": 1, "rule": rule, **extra}
+
+
+def _lock(repo: Path, path: Path, reason: str) -> None:
+    result = _git(repo, "worktree", "lock", "--reason", reason, str(path))
+    assert result.returncode == 0, result.stderr
+
+
+# ─── geometry ───────────────────────────────────────────────────────────────
+
+
+def test_worktree_root_is_found_for_a_path_inside_a_linked_worktree(worktree: Path) -> None:
+    nested = worktree / "a" / "b"
+    nested.mkdir(parents=True)
+    assert wc.worktree_root_for(nested) == worktree.resolve()
+
+
+def test_the_main_checkout_is_not_a_worktree(repo: Path) -> None:
+    """The main tree is never claimed or reaped, and falls out of the geometry.
+
+    A linked worktree's ``.git`` is a FILE holding a gitdir pointer; the main
+    checkout's is a directory. So this is a property of git's own layout rather
+    than a name check that a rename could defeat.
+    """
+    assert wc.worktree_root_for(repo) is None
+    assert wc.worktree_root_for(repo / "README.md") is None
+
+
+def test_gitdir_resolves_to_the_admin_directory_holding_the_lock(worktree: Path) -> None:
+    gitdir = wc.gitdir_for(worktree)
+    assert gitdir is not None
+    assert gitdir.name == worktree.name
+    assert gitdir.parent.name == "worktrees"
+
+
+# ─── lock payload parsing ───────────────────────────────────────────────────
+
+
+def test_a_lock_we_wrote_round_trips(repo: Path, worktree: Path) -> None:
+    payload = P("claim", pid=4242, start=99, sid="abc")
+    _lock(repo, worktree, wc.format_reason(payload))
+    lock = wc.read_lock(worktree)
+    assert lock is not None
+    assert lock.foreign is False
+    assert lock.payload == payload
+    assert lock.rule == "claim"
+
+
+def test_the_reason_leads_with_a_sentence_before_the_json() -> None:
+    """git echoes this verbatim when it refuses a removal, so a human reads it.
+
+    The assertion is on ORDER, not on the presence of both halves: a reason that
+    put the JSON first would still contain a sentence, and would still be
+    unreadable at the moment it is shown.
+    """
+    reason = wc.format_reason(P("claim", pid=7, start=1))
+    assert reason.index("{") > 20
+    assert reason.startswith("Claimed by a live Claude Code session (pid 7)")
+    assert json.loads(reason[reason.index("{") :])["pid"] == 7
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "do not touch",
+        "migrating this by hand {not json}",
+        '{"v": 999, "rule": "claim"}',
+        '{"v": 1, "rule": "something-else", "pid": 4242}',
+        '{"v": 1}',
+        '["v", 1]',
+        # The case that made the namespace necessary. `v` and `rule` are ordinary
+        # words; an operator or another tool can write them by accident, and
+        # without a namespace this parsed as OURS and became eligible for
+        # auto-release -- silently breaking the one invariant this module rests
+        # on. Found in review, not by the suite, which is why it is pinned here.
+        'manual hold {"v": 1, "rule": "claim", "pid": 4242}',
+        'do not touch {"v": 1, "rule": "claim", "pid": 4242, "start": 1}',
+        # Right namespace, malformed body: a claim with no usable pid has no
+        # release condition, and treating it as ours would release it instantly.
+        '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim"}',
+        '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": "4242"}',
+        '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": 1}',
+        '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": 9, "start": "x"}',
+        # `start` values that pass an isinstance(int) check but cannot be a real
+        # process start time. A JSON boolean is the one that surprises: bool
+        # subclasses int, so `true` reads as 1. Each would make
+        # `pid_is_live_session` mismatch against /proc and report a LIVE session
+        # dead, releasing a lock we do not own the right to release.
+        '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": 9, "start": true}',
+        '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": 9, "start": 0}',
+        '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": 9, "start": -1}',
+        '{"ns": "genesis.other-thing", "v": 1, "rule": "claim", "pid": 4242}',
+    ],
+)
+def test_a_reason_that_is_not_ours_is_foreign(repo: Path, worktree: Path, reason: str) -> None:
+    """Anything we cannot fully validate is someone else's lock, not a repairable one.
+
+    Covers every way a payload can be almost-ours -- wrong version, unknown rule,
+    missing rule, valid JSON of the wrong TYPE, generic JSON with no namespace,
+    a different namespace, and a correctly-namespaced claim whose body is
+    unusable. Misreading any of these as ours is the single error that would
+    auto-release work we do not own.
+    """
+    _lock(repo, worktree, reason)
+    lock = wc.read_lock(worktree)
+    assert lock is not None
+    assert lock.foreign is True
+    assert lock.payload is None
+
+
+def test_an_unlocked_worktree_reads_as_no_lock(worktree: Path) -> None:
+    assert wc.read_lock(worktree) is None
+
+
+def test_claude_code_agent_locks_are_named_but_still_foreign(repo: Path, worktree: Path) -> None:
+    """Claude Code's own worktree-isolated subagents lock what they create.
+
+    Observed on a live install: ``claude agent agent-<id> (pid N start M)`` --
+    the same pid+starttime identity this module uses. Recognising it improves the
+    report and nothing else: it stays foreign, so nothing here ever releases it.
+    """
+    _lock(repo, worktree, "claude agent agent-a1ea091e2a88 (pid 425484 start 1362340)")
+    lock = wc.read_lock(worktree)
+    assert lock is not None
+    assert lock.foreign is True
+    assert wc.describe_foreign(lock.raw) == "claude agent"
+    assert wc.is_releasable(lock)[0] is False
+
+
+# ─── process identity ───────────────────────────────────────────────────────
+
+
+def test_the_launcher_shell_is_not_mistaken_for_the_session(tmp_path: Path) -> None:
+    """argv[0]'s basename decides, not a substring of the whole command line.
+
+    A session is launched as ``bash -c cd <repo> && claude ...``, so the WRAPPER's
+    cmdline also contains "claude". Recording the wrapper's pid would produce a
+    claim that still reads as live after the session inside it exited. Uses a real
+    process because the distinction is a property of /proc, not of a string.
+    """
+    # `sleep 30; :` rather than a bare `sleep 30`: bash EXECS a lone final simple
+    # command, replacing itself, and the wrapper's cmdline would then be plain
+    # `sleep 30` -- no longer the shape under test. The precondition below is
+    # what caught that, so it stays.
+    proc = subprocess.Popen(["bash", "-c", "sleep 30; :", "claude-session-wrapper"])
+    try:
+        time.sleep(0.2)
+        raw = Path(f"/proc/{proc.pid}/cmdline").read_bytes().replace(b"\x00", b" ")
+        assert b"claude" in raw, "precondition: the wrapper's cmdline mentions claude"
+        assert wc.is_session_process(proc.pid) is False
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def test_starttime_and_ppid_are_readable_for_a_live_process() -> None:
+    assert wc.proc_starttime(os.getpid()) is not None
+    assert wc.proc_ppid(os.getpid()) == os.getppid()
+
+
+def test_a_dead_pid_is_not_a_live_session() -> None:
+    proc = subprocess.Popen(["sleep", "30"])
+    pid, start = proc.pid, wc.proc_starttime(proc.pid)
+    proc.kill()
+    proc.wait(timeout=10)
+    assert wc.pid_is_live_session(pid, start) is False
+    assert wc.pid_is_live_session(None, None) is False
+    assert wc.pid_is_live_session(1, None) is False
+
+
+def test_a_recycled_pid_reads_as_dead_when_the_starttime_disagrees(monkeypatch) -> None:
+    """The pid alone cannot establish identity, which is why start time is stored.
+
+    Simulated by recording a live process under a start time it does not have --
+    equivalent to the pid having been recycled, and not reproducible by waiting
+    for the kernel to actually recycle one.
+
+    The exe-name patch below is now INERT and kept only as a guard: since the
+    release path stopped consulting ``is_session_process`` when a start time is
+    recorded, this test reaches the start-time comparison whether or not the
+    stand-in process is named `claude`. An earlier version of this test did NOT
+    reach it -- it passed while a mutation deleting the entire start-time check
+    also passed -- so the assertion below is the part that carries the weight.
+    """
+    monkeypatch.setattr(wc, "is_session_process", lambda pid: True)
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        real = wc.proc_starttime(proc.pid)
+        assert real is not None
+        assert wc.pid_is_live_session(proc.pid, real) is True, "control: the true start matches"
+        assert wc.pid_is_live_session(proc.pid, real + 1) is False
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def test_ancestry_returns_none_rather_than_guessing_when_no_session_is_above() -> None:
+    """init is not a session, so a walk that starts there must fail, not improvise.
+
+    Every caller treats None as "no claim can be made". Returning some other pid
+    would silently attach the claim to an unrelated process.
+    """
+    assert wc.session_pid_from_ancestry(start_pid=1) is None
+    assert wc.session_pid_from_ancestry(start_pid=os.getpid(), max_hops=0) is None
+
+
+def test_a_claim_without_a_resolvable_session_is_refused(monkeypatch) -> None:
+    """No pid means no release condition, and a lock with no release condition
+    is indistinguishable from a leak. Refusing to write one is the mechanism that
+    keeps this from degenerating into a blanket lock on every worktree."""
+    monkeypatch.setattr(wc, "session_pid_from_ancestry", lambda *a, **k: None)
+    assert wc.build_payload(wc.RULE_CLAIM) is None
+    assert wc.build_payload("not-a-rule") is None
+
+
+# ─── release rules ──────────────────────────────────────────────────────────
+
+
+def test_a_claim_is_kept_while_its_session_lives_and_released_once_it_is_gone(
+    repo: Path, worktree: Path, monkeypatch
+) -> None:
+    """The load-bearing pair. Same lock, same worktree; only liveness moves.
+
+    A real session process cannot be spawned here, so a `sleep` stands in and the
+    exe-name half of the identity check is patched to accept it. Only the
+    LIVENESS transition is under test. The exe-name half is proven separately, by
+    test_the_launcher_shell_is_not_mistaken_for_the_session, against a real
+    process -- patching it here would otherwise leave it covered nowhere.
+    """
+    proc = subprocess.Popen(["sleep", "30"])
+    start = wc.proc_starttime(proc.pid)
+    payload = P("claim", pid=proc.pid, start=start)
+    _lock(repo, worktree, wc.format_reason(payload))
+    lock = wc.read_lock(worktree)
+    assert lock is not None
+
+    monkeypatch.setattr(wc, "is_session_process", lambda pid: Path(f"/proc/{pid}").exists())
+    try:
+        kept, why = wc.is_releasable(lock)
+        assert kept is False, why
+
+        proc.kill()
+        proc.wait(timeout=10)
+
+        released, why = wc.is_releasable(lock)
+        assert released is True, why
+        assert "gone" in why
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+# ─── the Archon seam ────────────────────────────────────────────────────────
+
+
+# ─── git's own behaviour, which the whole design rests on ───────────────────
+
+
+def test_a_lock_stops_git_worktree_remove_and_unlocking_lets_it_through(
+    repo: Path, worktree: Path
+) -> None:
+    """MEASURED rather than read from git's usage string.
+
+    Both halves matter. The refusal alone would also be produced by a worktree
+    that could not be removed for some unrelated reason, so the unlocked removal
+    is what shows the lock is the cause.
+    """
+    _lock(repo, worktree, wc.format_reason(P("claim", pid=7, start=1)))
+    blocked = _git(repo, "worktree", "remove", str(worktree))
+    assert blocked.returncode != 0
+    assert "locked" in blocked.stderr.lower()
+
+    _git(repo, "worktree", "unlock", str(worktree))
+    allowed = _git(repo, "worktree", "remove", str(worktree))
+    assert allowed.returncode == 0, allowed.stderr
+
+
+def test_git_echoes_our_reason_when_it_refuses(repo: Path, worktree: Path) -> None:
+    """Why the reason leads with a sentence: this text is what a blocked reader sees."""
+    _lock(repo, worktree, wc.format_reason(P("claim", pid=7, start=1)))
+    blocked = _git(repo, "worktree", "remove", str(worktree))
+    assert blocked.returncode != 0
+    assert "Claimed by a live Claude Code session" in blocked.stderr
+
+
+def test_lock_and_unlock_round_trip(repo: Path, worktree: Path) -> None:
+    assert wc.lock_worktree(worktree, P("claim", pid=4242, start=99)) is True
+    assert wc.read_lock(worktree).rule == "claim"
+    assert wc.unlock_worktree(worktree) is True
+    assert wc.read_lock(worktree) is None
+    assert wc.unlock_worktree(worktree) is False
+
+
+def test_an_existing_lock_is_not_even_offered_to_git(
+    repo: Path, worktree: Path, monkeypatch
+) -> None:
+    """A second lock attempt must not reach git at all, and the spy IS the test.
+
+    Asserting only "returns False, lock unchanged" is VACUOUS here: git itself
+    refuses to lock an already-locked worktree, so deleting this guard entirely
+    leaves that assertion passing. Measured -- a mutation removing the guard kept
+    the whole suite green until this spy existed.
+
+    Which also settles what the guard is FOR, and it is not what the old name
+    claimed. git is the enforcement. This guard is what makes the answer
+    deterministic without spending a subprocess, and keeps the decision in this
+    module rather than in git's exit codes.
+    """
+    assert wc.lock_worktree(worktree, P("claim", pid=4242, start=99)) is True
+
+    calls: list[tuple] = []
+    real_git = wc._git
+
+    def spy(root, *args):
+        calls.append(args)
+        return real_git(root, *args)
+
+    monkeypatch.setattr(wc, "_git", spy)
+    assert wc.lock_worktree(worktree, P("claim", pid=9999, start=1)) is False
+    assert calls == [], f"a second lock attempt shelled out to git: {calls}"
+    assert wc.read_lock(worktree).rule == "claim"
+
+
+def test_a_foreign_lock_is_never_unlocked_by_us(repo: Path, worktree: Path) -> None:
+    _lock(repo, worktree, "do not touch")
+    assert wc.unlock_worktree(worktree) is False
+    assert wc.read_lock(worktree) is not None
+
+
+# ─── config ─────────────────────────────────────────────────────────────────
+
+
+def test_the_env_kill_switch_forces_off(monkeypatch) -> None:
+    monkeypatch.setenv("GENESIS_WORKTREE_OWNERSHIP", "1")
+    assert wc.effective_mode() == "off"
+
+
+def test_disabling_the_master_switch_is_equivalent_to_off(monkeypatch) -> None:
+    monkeypatch.delenv("GENESIS_WORKTREE_OWNERSHIP", raising=False)
+    monkeypatch.setattr(wc, "load_config", lambda: {"enabled": False, "mode": "advisory"})
+    assert wc.effective_mode() == "off"
+
+
+@pytest.mark.parametrize("bad", ["block", "", None, 3, "ADVISORY"])
+def test_an_invalid_mode_degrades_to_advisory_not_off(monkeypatch, bad) -> None:
+    """Degrades toward keeping protection. Every surface here is non-blocking --
+    a lock the reaper already honours, and a hook that writes to stderr and exits
+    0 -- so failing toward `off` would drop protection to avoid no risk at all."""
+    monkeypatch.delenv("GENESIS_WORKTREE_OWNERSHIP", raising=False)
+    monkeypatch.setattr(wc, "load_config", lambda: {"enabled": True, "mode": bad})
+    assert wc.effective_mode() == "advisory"
+
+
+def test_an_unquoted_yaml_off_is_honoured(monkeypatch) -> None:
+    """`mode: off` unquoted parses as a YAML 1.1 boolean, not the string 'off'.
+
+    Without this branch a hand-edited config would read as an invalid mode and
+    degrade to advisory -- silently doing the opposite of what was written.
+    """
+    monkeypatch.delenv("GENESIS_WORKTREE_OWNERSHIP", raising=False)
+    monkeypatch.setattr(wc, "load_config", lambda: {"enabled": True, "mode": False})
+    assert wc.effective_mode() == "off"
+
+
+def test_the_overlay_precedence_matches_the_canonical_resolver(monkeypatch, tmp_path) -> None:
+    """The user-config overlay wins, exactly as genesis._config_overlay does.
+
+    This is not a preference. The settings API writes overrides to
+    ``~/.genesis/config/<stem>.local.yaml`` on purpose, so user config never
+    lands in a PR. A loader reading only the repo's ``config/`` directory makes
+    ``settings_update`` report success, ``settings_get`` show the override, and
+    the sweeper go on using the default -- a lever that looks live and is inert.
+    Found in review; pinned here so the two resolvers cannot drift apart.
+    """
+    home = tmp_path / "home"
+    (home / ".genesis" / "config").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+    # No user overlay yet -> falls back to the repo-adjacent sibling.
+    assert wc._overlay_path() == wc._config_path().with_suffix(".local.yaml")
+
+    user_overlay = home / ".genesis" / "config" / "worktree_ownership.local.yaml"
+    user_overlay.write_text("enabled: false\n")
+    assert wc._overlay_path() == user_overlay
+
+    monkeypatch.delenv("GENESIS_WORKTREE_OWNERSHIP", raising=False)
+    assert wc.load_config()["enabled"] is False
+    assert wc.effective_mode() == "off", "a user-set override must actually take effect"
+
+
+def test_the_shipped_config_is_valid(monkeypatch) -> None:
+    monkeypatch.delenv("GENESIS_WORKTREE_OWNERSHIP", raising=False)
+    cfg = wc.load_config()
+    assert cfg["mode"] in wc.MODES
+    assert isinstance(cfg["enabled"], bool)
+
+
+# ─── the write path and the read path are ONE contract ──────────────────────
+
+
+def test_we_never_write_a_lock_we_could_not_read_back_as_ours(repo, worktree) -> None:
+    """A writer that accepts what its reader rejects produces an UNRELEASABLE lock.
+
+    MEASURED before the guard existed, with `start: 0` — a value `build_payload`
+    itself could produce if `proc_starttime` ever returned 0:
+        lock_worktree      -> True      (written)
+        read_lock          -> foreign   (not ours)
+        unlock_worktree    -> False     (refused: we do not touch foreign locks)
+        git worktree remove-> rc 128    (refused: locked)
+    The worktree is then pinned permanently — which is exactly the leak
+    `build_payload` cites as its reason for rejecting blanket claims, reached
+    through the one door that had no guard on it.
+    """
+    bad = {"ns": wc.PAYLOAD_NAMESPACE, "v": 1, "rule": "claim", "pid": 4242, "start": 0}
+    assert wc.lock_worktree(worktree, bad) is False, (
+        "wrote a lock this module cannot read back as its own"
+    )
+    assert wc.read_lock(worktree) is None, "a refused write must leave no lock"
+
+
+def test_a_well_formed_payload_is_still_written(repo, worktree) -> None:
+    """The control. A validation guard that refuses everything would pass the
+    test above while silently disabling the whole mechanism."""
+    good = {"ns": wc.PAYLOAD_NAMESPACE, "v": 1, "rule": wc.RULE_CLAIM,
+            "pid": 4242, "start": 99}
+    assert wc.lock_worktree(worktree, good) is True
+    lock = wc.read_lock(worktree)
+    assert lock is not None and lock.foreign is False
+
+
+def test_an_unreadable_lock_is_foreign_not_absent(repo, worktree, monkeypatch) -> None:
+    """None means "no lock" and nothing else.
+
+    An unreadable `locked` file used to return None, identical to an unlocked
+    worktree — and the consumer this module is built for is the reaper, which
+    trashes with `shutil.move` rather than `git worktree remove`, so git's own
+    refusal is NOT a backstop for it. An unknown that reads as None gets reaped.
+    """
+    payload = {"ns": wc.PAYLOAD_NAMESPACE, "v": 1, "rule": wc.RULE_CLAIM,
+               "pid": 4242, "start": 99}
+    assert wc.lock_worktree(worktree, payload) is True
+
+    real_read = pathlib.Path.read_text
+
+    def unreadable(self, *a, **k):
+        if self.name == "locked":
+            raise PermissionError(13, "Permission denied")
+        return real_read(self, *a, **k)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", unreadable)
+    lock = wc.read_lock(worktree)
+    assert lock is not None, "an unreadable lock read as NO LOCK — the reaper would reap it"
+    assert lock.foreign is True
+    assert wc.is_releasable(lock)[0] is False
+
+
+def test_a_live_session_keeps_its_claim_when_argv0_is_unrecognisable(monkeypatch) -> None:
+    """Every liveness UNKNOWN must resolve toward KEEPING the claim.
+
+    The recorded start time already defeats pid reuse — a recycled pid
+    necessarily starts later — so consulting argv[0] here adds nothing on the
+    release path while adding a whole class of false-dead: a different uid, a PID
+    namespace, a hardened /proc, a renamed launcher. Every one of those resolves
+    toward RELEASING a live session's claim, which is the one direction that
+    loses someone's work.
+    """
+    monkeypatch.setattr(wc, "proc_starttime", lambda pid: 12345)
+    monkeypatch.setattr(wc, "is_session_process", lambda pid: False)
+    assert wc.pid_is_live_session(4242, 12345) is True, (
+        "a live session with a matching start time was reported dead because "
+        "argv[0] was not recognised"
+    )
+
+
+def test_a_recycled_pid_is_still_dead(monkeypatch) -> None:
+    """The control for the direction above: the start time must still be able to
+    say 'gone', or the claim would never release at all."""
+    monkeypatch.setattr(wc, "proc_starttime", lambda pid: 999999)
+    monkeypatch.setattr(wc, "is_session_process", lambda pid: True)
+    assert wc.pid_is_live_session(4242, 12345) is False
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        # pid above the kernel ceiling: as unusable a release condition as pid 1,
+        # which the same predicate already rejects.
+        '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": 99999999999999}',
+        # start beyond any plausible uptime: can never MATCH /proc, so it reads
+        # as a dead session and releases.
+        '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": 9, '
+        '"start": 99999999999999999999}',
+    ],
+)
+def test_values_that_can_never_be_live_are_foreign(repo, worktree, reason) -> None:
+    """Bounded at BOTH ends. A value that cannot possibly match a running
+    process is not a claim we can release safely — it is one whose release
+    condition is permanently "gone"."""
+    _lock(repo, worktree, reason)
+    lock = wc.read_lock(worktree)
+    assert lock is not None
+    assert lock.foreign is True
+
+
+# ─── an UNKNOWN liveness answer must never read as DEAD ─────────────────────
+
+
+def test_an_unreadable_proc_keeps_a_live_claim(monkeypatch) -> None:
+    """A /proc that cannot be read is not a dead process.
+
+    ``proc_starttime`` collapses every failure to None, and comparing None to a
+    recorded start time reported DEAD -- so a live session's claim released
+    whenever its stat file could not be read. MEASURED against a live pid
+    carrying its TRUE start time, before the fix:
+        EACCES on /proc/<pid>/stat -> is_releasable (True, 'session is gone')
+        EMFILE                     -> is_releasable (True, 'session is gone')
+    Both are reachable in the consumer this exists for: hidepid, a PID
+    namespace, and a reaper that has exhausted its descriptors part-way through
+    a sweep.
+    """
+    pid = os.getpid()
+    start = wc.proc_starttime(pid)
+    assert start is not None, "precondition: our own start time is readable"
+
+    real_open = open
+
+    def deny(path, *args, **kwargs):
+        if isinstance(path, str) and path.startswith("/proc/") and path.endswith("/stat"):
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", deny)
+    assert wc.pid_is_live_session(pid, start) is True, (
+        "an unreadable /proc reported a LIVE session as dead — the claim releases "
+        "and the reaper moves the directory out from under it"
+    )
+    payload = P(wc.RULE_CLAIM, pid=pid, start=start)
+    lock = wc.Lock(raw=wc.format_reason(payload), payload=payload, foreign=False)
+    assert wc.is_releasable(lock)[0] is False
+
+
+def test_a_pid_the_kernel_says_is_gone_still_releases() -> None:
+    """The control for the direction above. If UNKNOWN kept every claim, a claim
+    would never release at all, which is the pinned-worktree leak from the other
+    side. Only the kernel's own "no such process" may release one."""
+    proc = subprocess.Popen(["sleep", "0.1"])
+    proc.wait()
+    time.sleep(0.05)
+    assert wc.proc_is_gone(proc.pid) is True
+    assert wc.pid_is_live_session(proc.pid, 12345) is False
+    assert wc.proc_is_gone(os.getpid()) is False, "control: we are not gone"
+
+
+def test_unlock_refuses_a_claim_a_live_session_still_holds(repo, worktree) -> None:
+    """"Ours" means "written by this module", which is EVERY session's claim.
+
+    Refusing only foreign locks let any caller release any peer's live claim,
+    while the docstring said it refused to. The reaper trashes with
+    ``shutil.move``, so git's refusal to remove a locked worktree is not a
+    backstop for it: one unlock without a liveness gate silently removes a live
+    session's protection.
+    """
+    pid = os.getpid()
+    start = wc.proc_starttime(pid)
+    assert wc.lock_worktree(worktree, P(wc.RULE_CLAIM, pid=pid, start=start)) is True
+
+    assert wc.unlock_worktree(worktree) is False, (
+        "released a claim held by a LIVE session"
+    )
+    assert wc.read_lock(worktree) is not None, "the lock must still be there"
+
+    assert wc.unlock_worktree(worktree, expect_pid=pid + 1) is False, (
+        "released a claim while naming a DIFFERENT session"
+    )
+    assert wc.unlock_worktree(worktree, expect_pid=pid) is True, (
+        "control: the owner must still be able to release its own claim"
+    )
+    assert wc.read_lock(worktree) is None
+
+
+def test_a_stale_claim_is_still_released_without_a_pid(repo, worktree, monkeypatch) -> None:
+    """The control for the gate above: a claim whose session is gone must still
+    release through the no-pid call, or the reaper can never clean up."""
+    proc = subprocess.Popen(["sleep", "0.1"])
+    proc.wait()
+    time.sleep(0.05)
+    assert wc.lock_worktree(worktree, P(wc.RULE_CLAIM, pid=proc.pid, start=4242)) is True
+    assert wc.unlock_worktree(worktree) is True
+    assert wc.read_lock(worktree) is None
+
+
+def test_an_unreadable_git_pointer_is_foreign_not_absent(repo, worktree, monkeypatch) -> None:
+    """The round-2 fix closed the INSTANCE, not the class.
+
+    ``read_lock`` reaches the ``locked`` file through ``gitdir_for``, which
+    swallowed every OSError on the ``.git`` pointer and returned None -- so a
+    genuinely locked worktree whose pointer could not be read still answered
+    "there is no lock", and the reaper reaps that.
+    """
+    payload = P(wc.RULE_CLAIM, pid=os.getpid(), start=99)
+    assert wc.lock_worktree(worktree, payload) is True
+
+    real_read = pathlib.Path.read_text
+
+    def unreadable(self, *args, **kwargs):
+        if self.name == ".git":
+            raise PermissionError(13, "Permission denied")
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", unreadable)
+    lock = wc.read_lock(worktree)
+    assert lock is not None, "an unreadable .git pointer read as NO LOCK"
+    assert lock.foreign is True
+    assert wc.is_releasable(lock)[0] is False
+
+
+def test_a_directory_with_no_git_file_is_still_no_lock(tmp_path) -> None:
+    """Control: the fix must not turn every plain directory into a foreign lock,
+    which would make the whole tree unreapable."""
+    plain = tmp_path / "not-a-worktree"
+    plain.mkdir()
+    assert wc.read_lock(plain) is None

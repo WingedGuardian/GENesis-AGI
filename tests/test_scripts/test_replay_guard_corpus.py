@@ -19,9 +19,11 @@ the tool announces is read back off the file rather than asserted.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import importlib.util
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -69,6 +71,50 @@ def cache(tmp_path, rgc, monkeypatch):
 
 def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
+
+
+def _double_safe(rgc, why: str = "a test double"):
+    """A replay-safe declaration for a guard that exists only inside one test.
+
+    Built through `ReplaySafety` directly, because there is no longer a
+    constructor that returns `safe=True`: replay permission is withheld for the
+    whole shipped table pending #2036. That withhold is a statement about which
+    guards in `GUARDS` may run; it is not a claim that the replay MACHINERY is
+    broken, and these doubles are what exercise that machinery — pool fan-out,
+    crash disclosure, timeouts, argv pinning. #2036 needs all of it working.
+
+    So the record still carries a `safe` field and `replay()` still honours it;
+    what no longer exists is a way for a SHIPPED declaration to set it.
+    """
+    return rgc.ReplaySafety(safe=True, why=why)
+
+
+def _double_unsafe(rgc, why: str = "a test double"):
+    """The refusing sibling of `_double_safe`, same reasoning."""
+    return rgc.not_replay_safe(why)
+
+
+def _list_sections(out: str) -> dict[str, str]:
+    """Split `--list` output into one block per guard, keyed by name.
+
+    Keyed on the HEADER LINE (`<name>` at column 0, then `replayable`/`REFUSED`)
+    rather than on a bare substring search. The substring version broke the
+    moment a declaration legitimately mentioned another guard's module — and it
+    broke SILENTLY, handing the assertion a slice of the wrong guard's text,
+    which is the failure shape this file exists to catch elsewhere.
+    """
+    sections: dict[str, str] = {}
+    current: str | None = None
+    for line in out.splitlines():
+        header = re.fullmatch(r"(\S+)\s+(replayable|REFUSED)", line)
+        if header:
+            current = header.group(1)
+            sections[current] = ""
+        elif current and line.startswith("    "):
+            sections[current] += line + "\n"
+        elif line and not line.startswith(" "):
+            current = None
+    return sections
 
 
 def test_rebuild_over_a_world_readable_cache_tightens_the_inode(cache, rgc):
@@ -250,7 +296,7 @@ def test_the_pool_asks_for_fork_explicitly(cache, rgc, monkeypatch):
         "fake",
         lambda c, w: False,
         spawns_process=True,
-        safety=rgc.replay_safe("a test double; it touches nothing"),
+        safety=_double_safe(rgc, "a test double; it touches nothing"),
     ):
         rgc.replay("fake", [("echo hi", "/tmp")] * 4, jobs=4)
 
@@ -277,7 +323,7 @@ def test_the_substitution_notice_is_actually_printed(cache, rgc, capsys, jobs):
         "fake",
         lambda c, w: bool(rgc._effective_cwd(w) and False),
         spawns_process=jobs > 1,
-        safety=rgc.replay_safe("a test double; it touches nothing"),
+        safety=_double_safe(rgc, "a test double; it touches nothing"),
     ):
         rgc.replay("fake", corpus, jobs=jobs)
 
@@ -306,7 +352,7 @@ def test_a_guard_that_only_crashes_cannot_report_a_clean_rate(cache, rgc, capsys
         "boom",
         boom,
         spawns_process=jobs > 1,
-        safety=rgc.replay_safe("a test double; it only raises"),
+        safety=_double_safe(rgc, "a test double; it only raises"),
     ):
         rgc.replay("boom", corpus, jobs=jobs)
 
@@ -620,7 +666,7 @@ def test_replay_refuses_an_unsafe_guard_even_when_called_directly(rgc):
     needs no flag is still a bypass."""
     with (
         fake_guard(
-            rgc, "nope", lambda c, w: True, safety=rgc.not_replay_safe("writes to a live repo")
+            rgc, "nope", lambda c, w: True, safety=_double_unsafe(rgc, "writes to a live repo")
         ),
         pytest.raises(RuntimeError, match="not replay-safe"),
     ):
@@ -662,7 +708,7 @@ def test_an_in_process_guard_that_crashes_is_disclosed_not_scored(rgc, capsys):
             rgc,
             "crashy",
             lambda c, w: rgc._run_python_guard("crashy", c, w),
-            safety=rgc.replay_safe("a test double"),
+            safety=_double_safe(rgc, "a test double"),
         ),
     ):
         rgc.replay("crashy", corpus, jobs=1)
@@ -718,7 +764,7 @@ def test_a_timed_out_guard_is_disclosed_and_still_counted(rgc, capsys, jobs):
 
     corpus = [("echo hi", "/tmp")] * 4
     with fake_guard(
-        rgc, "hang", hang, spawns_process=jobs > 1, safety=rgc.replay_safe("a test double")
+        rgc, "hang", hang, spawns_process=jobs > 1, safety=_double_safe(rgc, "a test double")
     ):
         rgc.replay("hang", corpus, jobs=jobs)
 
@@ -776,18 +822,43 @@ def test_a_second_rebuild_starting_mid_write_cannot_corrupt_the_first(cache, rgc
     assert _mode(cache) == 0o600
 
 
-def test_list_shows_a_refused_guard_with_its_reason(rgc, monkeypatch, capsys):
+def test_list_shows_every_guard_with_its_reason(rgc, monkeypatch, capsys):
     """A refused guard vanishing from --list is the absence-as-exclusion pattern
     this design replaced: absence teaches nothing, and nothing then reminds the
-    next reader why."""
+    next reader why.
+
+    Asserted through `_list_sections`, which keys on the HEADER LINE, rather
+    than by searching the whole output for a word. The bare-substring version
+    went VACUOUS the moment no guard was replayable: `assert "replayable" in
+    out` kept passing on the word's appearance inside a BLIND_SPOTS sentence,
+    and mutating the header literal to garbage left every test green. An
+    assertion that cannot tell the header from the prose was not checking the
+    header.
+    """
     monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--list"])
 
     assert rgc.main() == 0
 
     out = capsys.readouterr().out
-    assert "bash_safety" in out and "REFUSED" in out
-    assert "git stash create" in out
-    assert "protected_paths" in out and "replayable" in out
+    sections = _list_sections(out)
+    assert set(sections) == set(rgc.GUARDS), (
+        f"--list must show every guard; missing {set(rgc.GUARDS) - set(sections)}"
+    )
+    # The header carries the verdict, and with the permission withheld every
+    # verdict is REFUSED. `_list_sections` only matches `<name> replayable` or
+    # `<name> REFUSED`, so reaching this line already proves a real header.
+    for name in rgc.GUARDS:
+        assert f"{name:16s} REFUSED" in out, f"{name} has no REFUSED header line"
+    assert "git stash create" in sections["git_discard"], "the refusal lost its reason"
+
+    # Re-homed from a deleted test. The blind spots come from ONE list so the
+    # prose and the output cannot disagree, and that claim is made in the module
+    # docstring and in SKILL.md — but the only assertion pinning it lived inside
+    # a test removed whole for its OTHER half. MEASURED: with the pin gone,
+    # deleting the print loop entirely left all 66 tests green, so the tool's
+    # published limits could stop being published in silence.
+    for spot in rgc.BLIND_SPOTS:
+        assert spot.split(".")[0] in out, f"--list stopped printing a blind spot: {spot[:60]}"
 
 
 def test_all_runs_the_safe_guards_and_names_the_refused_ones(rgc, monkeypatch, capsys):
@@ -798,11 +869,11 @@ def test_all_runs_the_safe_guards_and_names_the_refused_ones(rgc, monkeypatch, c
         {
             "safe_one": rgc.Guard(
                 run=lambda c, w: bool(ran.append("safe_one")),
-                safety=rgc.replay_safe("a test double"),
+                safety=_double_safe(rgc, "a test double"),
             ),
             "refused_one": rgc.Guard(
                 run=lambda c, w: bool(ran.append("refused_one")) or True,
-                safety=rgc.not_replay_safe("writes into a live repository"),
+                safety=_double_unsafe(rgc, "writes into a live repository"),
             ),
         },
     )
@@ -822,7 +893,7 @@ def test_all_with_nothing_safe_exits_2(rgc, monkeypatch):
     monkeypatch.setattr(
         rgc,
         "GUARDS",
-        {"refused_one": rgc.Guard(run=lambda c, w: True, safety=rgc.not_replay_safe("writes"))},
+        {"refused_one": rgc.Guard(run=lambda c, w: True, safety=_double_unsafe(rgc, "writes"))},
     )
     monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--all"])
     monkeypatch.setattr(
@@ -853,7 +924,7 @@ def test_an_empty_corpus_exits_2_instead_of_printing_a_clean_zero(rgc, monkeypat
         {
             "safe_one": rgc.Guard(
                 run=lambda c, w: ran.append((c, w)) or False,
-                safety=rgc.replay_safe("a test double"),
+                safety=_double_safe(rgc, "a test double"),
             )
         },
     )
@@ -867,6 +938,24 @@ def test_an_empty_corpus_exits_2_instead_of_printing_a_clean_zero(rgc, monkeypat
     assert "0/0" not in out.out, "a 0/0 rate was printed for an empty corpus"
     assert not ran, "a guard was replayed against an empty corpus"
     assert "REFUSED" in out.err
+
+
+def test_rebuild_alone_is_a_reachable_path(rgc, monkeypatch, capsys, cache):
+    """The corpus build must stay reachable now that every guard is refused.
+
+    `--guard` and `--all` return BEFORE `load_corpus()` on the refusal path, so
+    once nothing is replayable they can no longer build the cache — and
+    `--rebuild --list` used to send the operator to exactly those two modes.
+    That left no path at all, while the module help still advertised the corpus
+    build. Advertising an operation no code path can perform is this file's own
+    named failure, committed inside it.
+    """
+    monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--rebuild"])
+
+    assert rgc.main() == 0, "--rebuild alone must not be refused"
+
+    assert cache.exists() and cache.read_text().strip(), "the cache was not built"
+    assert "corpus rebuilt" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
@@ -931,9 +1020,17 @@ def test_the_protected_paths_declaration_does_not_deny_reading_the_environment(
     rgc.main()
 
     out = capsys.readouterr().out
-    protected = out.split("protected_paths")[1].split("worktree_cwd")[0]
+    protected = _list_sections(out)["protected_paths"]
     assert "no environment reads" not in protected
     assert "expandvars" in protected or "environment" in protected
+    # There used to be a third assertion here, on a machine-derived
+    # `reads_env=True` printed beside the prose. The walk that produced it is
+    # gone — it decided an open-set question by reading — so what pins this
+    # declaration now is the CITATION check: the prose above quotes
+    # `os.path.expanduser(os.path.expandvars(token))` from `_expand`, and
+    # `verify_declarations` re-resolves that fragment against the executable
+    # source. The claim is anchored; it is just anchored to something checkable.
+    assert "cites:" in protected, "the corrected prose must still be citation-anchored"
 
 
 def test_the_module_docstring_does_not_call_the_rate_benign(rgc):
@@ -991,7 +1088,6 @@ def test_one_malformed_transcript_record_does_not_abort_the_whole_walk(rgc, monk
     assert rgc._extract_commands() == [("echo ok", "/tmp")]
 
 
-
 def test_a_run_with_no_valid_measurement_exits_2(rgc, monkeypatch, capsys):
     """A guard that crashed on every row still prints a number, and main()
     discarded replay()'s result and returned 0 — so a wrapper saw success while
@@ -1004,7 +1100,7 @@ def test_a_run_with_no_valid_measurement_exits_2(rgc, monkeypatch, capsys):
     monkeypatch.setattr(
         rgc,
         "GUARDS",
-        {"boom": rgc.Guard(run=boom, safety=rgc.replay_safe("a test double"))},
+        {"boom": rgc.Guard(run=boom, safety=_double_safe(rgc, "a test double"))},
     )
     monkeypatch.setattr(rgc, "load_corpus", lambda **kw: [("echo hi", "/tmp")])
     monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--all"])
@@ -1013,7 +1109,6 @@ def test_a_run_with_no_valid_measurement_exits_2(rgc, monkeypatch, capsys):
 
     err = capsys.readouterr().err
     assert "no valid measurement" in err
-
 
 
 # ── round 2: findings from the adversarial audit of this session's fixes ──────
@@ -1050,7 +1145,6 @@ def test_rebuild_with_list_says_it_is_doing_nothing(rgc, monkeypatch, capsys):
     assert rgc.main() == 0
 
     assert "--rebuild has no effect with --list" in capsys.readouterr().err
-
 
 
 def test_importing_the_module_survives_a_settings_file_with_no_inline_blob(tmp_path):
@@ -1124,7 +1218,7 @@ def test_a_guard_that_exits_in_a_pool_worker_does_not_hang_the_run(cache, rgc, c
         "exiter",
         exits_instead_of_returning,
         spawns_process=True,
-        safety=rgc.replay_safe("a test double"),
+        safety=_double_safe(rgc, "a test double"),
     ):
         result = rgc.replay("exiter", corpus, jobs=4)
 
@@ -1150,7 +1244,7 @@ def test_a_guards_resource_is_resolved_in_the_parent_before_the_fan_out(cache, r
         "prepared",
         lambda c, w: False,
         spawns_process=True,
-        safety=rgc.replay_safe("a test double"),
+        safety=_double_safe(rgc, "a test double"),
         prepare=lambda: calls.append(1),
     ):
         rgc.replay("prepared", [("echo hi", "/tmp")] * 8, jobs=4)
@@ -1240,3 +1334,418 @@ def test_a_dependency_from_another_checkout_is_refused_not_worked_around(rgc, mo
     assert "another/checkout" in str(excinfo.value), (
         "the refusal did not name where the foreign module came from"
     )
+
+
+# ── the declarations are verified, not just written ──────────────────────────
+#
+# Every ReplaySafety record carries prose that a human wrote and nobody checked.
+# It has been wrong four times: an early protected_paths entry denied reading the
+# environment; bash_safety's side effect arrives through a caller and was missed
+# twice; worktree_cwd omitted its sys.argv reads; and all six line-number
+# citations went stale within five days, one landing on a comment about an
+# unrelated cap.
+#
+# ONE half now, and the arithmetic of which defects that leaves uncovered is the
+# point rather than a footnote. Of the four historical defects above, the
+# citation checker catches the stale-citation class — #4, six instances, the only
+# one that recurred. It does NOT catch #1 or #3 (a declaration denying an effect
+# the guard has) or #2 (an unmentioned shell delegation).
+#
+# Those three were covered by an AST fact walk and a shell delegation scan, both
+# deleted: establishing "this program has no side effects" by reading it is an
+# open-set claim, and four review rounds each closed one spelling and surfaced
+# the next. What replaces them is not another checker — it is that no guard is
+# replayable, so a wrong claim about a guard's effects no longer authorises
+# anything. #2036 restores the permission by confinement instead.
+#
+# So the tests below pin the citation class only, and the declarations' effect
+# claims are unverified prose that `--list` labels as such:
+# there is one set, not two.
+
+
+def _hooks(rgc) -> Path:
+    """The guards directory the tool itself resolves. The checkers now live in
+    the SCRIPT — these tests call the same functions `main()` does, which is the
+    property that made moving them worth the churn."""
+    return Path(rgc._HOOKS)
+
+
+@contextlib.contextmanager
+def _swap_guard(rgc, name, replacement):
+    """Swap one GUARDS entry for a test and put the real one back.
+
+    GUARDS is a process-global the module-scoped `rgc` fixture shares, so a
+    leaked entry is visible to every later test — the same hazard `fake_loaded`
+    exists for, and worse here because these tests deliberately install
+    DANGEROUS declarations.
+    """
+    real = rgc.GUARDS[name]
+    rgc.GUARDS[name] = replacement
+    try:
+        yield
+    finally:
+        rgc.GUARDS[name] = real
+
+
+def _write_guard(hooks: Path, name: str, body: str) -> None:
+    hooks.mkdir(parents=True, exist_ok=True)
+    (hooks / f"{name}.py").write_text(body)
+
+
+# ── the checks themselves ────────────────────────────────────────────────────
+
+
+def test_every_citation_still_resolves(rgc):
+    """The whole of what is checked, and the reason it is what survived.
+
+    All six declarations once cited line numbers, and every one had drifted
+    within five days; one landed on a comment about an unrelated cap while the
+    prose around it still read as verified. Symbol + verbatim fragment moves the
+    claim somewhere a machine can go and look.
+    """
+    problems: list[str] = []
+    for name, guard in sorted(rgc.GUARDS.items()):
+        for cite in guard.safety.cites:
+            try:
+                haystack, where = rgc.cite_source(cite, _hooks(rgc))
+            except rgc.DeclarationError as exc:
+                problems.append(f"{name}: {exc}")
+                continue
+            # An empty fragment is a deliberate symbol-existence citation; getting
+            # here already proved the symbol resolves, and asserting `"" in x`
+            # would be the vacuous assertion this file bans.
+            if cite.fragment and cite.fragment not in haystack:
+                problems.append(
+                    f"{name}: the fragment cited from {where} is no longer there —\n"
+                    f"    {cite.fragment!r}\n"
+                    "  It was edited, reflowed, or moved to another symbol. Re-read "
+                    "the source and restate the evidence; do NOT relax the fragment "
+                    "until it matches, which would keep the citation green while the "
+                    "claim it supports has quietly changed."
+                )
+    assert not problems, "\n".join(problems)
+
+    # And again through the PRODUCTION path, which is the assertion that
+    # actually pins the shipped checker. The loop above re-implements the
+    # fragment test to produce a per-citation message, and a re-implementation
+    # grades its own copy: MEASURED — deleting the real `cite.fragment not in
+    # haystack` branch from `_verify_one` left this test green, because nothing
+    # in it had called `_verify_one`.
+    assert rgc.verify_declarations() == [], "the shipped verifier disagrees with the loop above"
+
+
+# ── acceptance bar: three arms, each verified RED before this shipped ─────────
+
+
+def test_arm3_editing_or_renaming_a_cited_construct_turns_the_check_red(rgc, tmp_path):
+    """Issue #1946 arm 3 — the arm that would have caught the ACTUAL drift.
+
+    Three ways a citation rots, and all three must fail: the fragment is edited,
+    the symbol is renamed, and the file is gone. Editing is the quiet one — the
+    symbol still resolves, so anything checking only for existence stays green.
+    """
+    hooks = tmp_path / "hooks"
+    _write_guard(hooks, "cited", 'def target():\n    return os.path.expanduser("~")\n')
+    good = rgc.Cite("cited", "target", 'os.path.expanduser("~")')
+    haystack, where = rgc.cite_source(good, hooks)
+    assert good.fragment in haystack and where == "cited.target"
+
+    # (a) the construct is EDITED in place — symbol still resolves
+    _write_guard(hooks, "cited", 'def target():\n    return os.path.expanduser("$HOME")\n')
+    haystack, _ = rgc.cite_source(good, hooks)
+    assert good.fragment not in haystack, "an edited fragment still matched"
+
+    # (b) the symbol is RENAMED
+    _write_guard(hooks, "cited", 'def renamed():\n    return os.path.expanduser("~")\n')
+    with pytest.raises(rgc.DeclarationError, match="no longer exists"):
+        rgc.cite_source(good, hooks)
+
+    # (c) the file is gone entirely
+    (hooks / "cited.py").unlink()
+    with pytest.raises(rgc.DeclarationError, match="cited file no longer exists"):
+        rgc.cite_source(good, hooks)
+
+    # (d) the name is DEFINED TWICE — refuse rather than silently resolve. Not a
+    # live case today (14 cited symbols, 0 duplicates across 188 defs), but
+    # `ast.walk` is breadth-first, so among a redefinition pair it returns the
+    # shallower — for an ImportError fallback, the DEAD one.
+    _write_guard(
+        hooks,
+        "cited",
+        'def target():\n    return os.path.expanduser("~")\n\n\n'
+        'def target():\n    return "shadowed"\n',
+    )
+    with pytest.raises(rgc.DeclarationError, match="is defined 2x"):
+        rgc.cite_source(good, hooks)
+
+    # (e) a DECORATED symbol: ast.get_source_segment drops the decorator lines,
+    # so a fragment living in one would read as "no longer there" — a true
+    # failure with a false cause.
+    _write_guard(hooks, "cited", "@staticmethod\ndef target():\n    return 1\n")
+    segment, _ = rgc.cite_source(rgc.Cite("cited", "target", "@staticmethod"), hooks)
+    assert "@staticmethod" in segment
+
+
+def test_a_rotted_citation_is_reported_by_the_shipped_verifier(rgc):
+    """Arm 3 through `verify_declarations`, which is what actually runs.
+
+    Every assertion in the arm above calls `cite_source` directly, so all of
+    them pass while the branch in `_verify_one` that turns a non-matching
+    fragment into a problem string is DELETED. MEASURED: replacing that branch's
+    condition with `False` left the whole suite green — the resolver was pinned
+    and the shipped check was not.
+
+    The fragment here cannot occur in any real source, so a green result means
+    the check did not run rather than that the citation held.
+    """
+    real = rgc.GUARDS["protected_paths"]
+    rotted = dataclasses.replace(
+        real,
+        safety=dataclasses.replace(
+            real.safety,
+            cites=(rgc.Cite("protected_paths_guard", "main", "NO_SUCH_FRAGMENT_EVER_ZZZ"),),
+        ),
+    )
+    with _swap_guard(rgc, "protected_paths", rotted):
+        problems = rgc.verify_declarations()
+    assert problems, "a fragment that occurs nowhere was reported as fine"
+    assert any("NO_SUCH_FRAGMENT_EVER_ZZZ" in p for p in problems), problems
+
+
+# ── external review round 1: one arm per finding ─────────────────────────────
+#
+# Six P2s, all verified by execution before anything was changed. Four of them
+# were one class — a published claim broader than the implementation — and the
+# generator was structural: the checkers lived in THIS file, so "the
+# declarations are checked" held only while CI ran this module, while the
+# script, --list and the PR body said it unconditionally. The checkers now live
+# in the script and `main()` enforces them; these arms pin each fix.
+
+
+def test_the_tool_verifies_its_own_declarations(rgc):
+    """The end-to-end property, and the one worth stating plainly: the shipped
+    table passes the shipped verifier. Everything below tests that individual
+    checks BITE; this tests that they are satisfied by what we actually ship."""
+    assert rgc.verify_declarations() == []
+
+
+def test_code_sharing_a_line_with_a_docstring_survives_stripping(rgc, tmp_path):
+    """Stripping a docstring must remove the STRING, not its physical lines.
+
+    A docstring followed on the SAME LINE by `; subprocess.run(...)` is valid
+    Python, and the AST marks only the string expression as the docstring —
+    `Expr(Constant(str))`. Blanking `lineno..end_lineno` therefore
+    destroyed the executable call sharing that line, and the checker reported a
+    still-valid citation as stale. Because `verify_declarations()` gates every
+    CLI path, one citation of that shape made the whole tool refuse — a false
+    REFUSAL, which is the expensive direction for a measurement tool.
+
+    The multi-line case is checked too, on its CLOSING line. There is no
+    "code before the opening quotes" case to check: a docstring is by definition
+    `body[0]`, so anything preceding it on the line would make the string the
+    SECOND statement and not a docstring at all — which an earlier version of
+    this test got wrong and the fix correctly refused to strip.
+    """
+    hooks = tmp_path / "hooks"
+    _write_guard(
+        hooks,
+        "shared",
+        'import subprocess\n\n\ndef f():\n    """documentation"""; subprocess.run(["x"])\n',
+    )
+    seg, _ = rgc.cite_source(rgc.Cite("shared", "f", "subprocess.run"), hooks)
+    assert "subprocess.run" in seg, f"code on the docstring's line was destroyed: {seg!r}"
+    assert "documentation" not in seg, "the docstring itself must still be stripped"
+
+    _write_guard(
+        hooks,
+        "shared",
+        'import subprocess\n\n\ndef f():\n    """line one\n    line two"""; subprocess.run(["y"])\n',
+    )
+    seg, _ = rgc.cite_source(rgc.Cite("shared", "f", "subprocess.run"), hooks)
+    assert "subprocess.run" in seg, f"code AFTER a multi-line docstring was destroyed: {seg!r}"
+    assert "line one" not in seg, "the multi-line docstring body must still be stripped"
+    assert "line two" not in seg, "the docstring's closing line was not stripped"
+
+
+def test_a_fragment_surviving_only_in_a_comment_does_not_resolve(rgc, tmp_path):
+    """Round 1, finding 4 — a citation is supposed to anchor BEHAVIOUR.
+
+    Matching raw text let a fragment live on in a comment after the
+    implementation it described was deleted: the citation stayed green while the
+    thing it vouched for was gone. That is this record's own failure mode, one
+    level in.
+    """
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    cite = rgc.Cite("cited", "target", 'os.path.expanduser("~")')
+
+    (hooks / "cited.py").write_text(
+        "def target():\n"
+        '    # historical: used to call os.path.expanduser("~") before the rewrite\n'
+        '    return "no longer does it"\n'
+    )
+    haystack, _ = rgc.cite_source(cite, hooks)
+    assert cite.fragment not in haystack, "a comment-only fragment still resolved"
+
+    # A docstring is the same hazard with different syntax.
+    (hooks / "cited.py").write_text(
+        'def target():\n    """Once called os.path.expanduser("~")."""\n    return 1\n'
+    )
+    haystack, _ = rgc.cite_source(cite, hooks)
+    assert cite.fragment not in haystack, "a docstring-only fragment still resolved"
+
+    # Guard-the-guard: the real construct must still match, or the strip is just
+    # deleting evidence.
+    (hooks / "cited.py").write_text('def target():\n    return os.path.expanduser("~")\n')
+    haystack, _ = rgc.cite_source(cite, hooks)
+    assert cite.fragment in haystack, "comment stripping ate a live construct"
+
+
+def test_the_cli_refuses_to_replay_on_a_stale_declaration(rgc, monkeypatch, capsys):
+    """Round 1, finding 6 — and the reason the checkers moved out of this file.
+
+    A developer who edits a guard and follows the documented --list-then-replay
+    workflow used to get no protection at all: `replay()` trusted `safety.safe`,
+    and the verifier only ran when CI ran this module. The window between the
+    edit and CI is exactly when a declaration is most likely to be stale.
+    """
+    monkeypatch.setattr(
+        rgc, "verify_declarations", lambda *a, **k: ["worktree_cwd: reads_argv is stale"]
+    )
+    monkeypatch.setattr(
+        rgc,
+        "load_corpus",
+        lambda **kw: pytest.fail("the corpus was built despite a stale declaration"),
+    )
+    for argv in (["--list"], ["--guard", "protected_paths"], ["--all"]):
+        monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", *argv])
+        assert rgc.main() == 2, f"{argv} did not refuse"
+        err = capsys.readouterr().err
+        assert "REFUSED" in err and "reads_argv is stale" in err
+        assert "no --force" in err
+
+
+# ── external review round 2 + the mandated whole-diff audit ──────────────────
+#
+# Round 2 returned five P2s and three of them lived in code written to answer
+# round 1. That is the fix-churn signature, and the mode-switch audit it
+# triggered found the reason: TWO roots wore one symptom.
+#
+#   Root A — proving absence by reading. Open-set, non-convergent, and what both
+#            rounds argued about.
+#   Root B — the verification was not BOUND to the decision. Closed-set, three
+#            instances, and where the actual replay-permission fail-opens were.
+#
+# Root B was invisible while everyone argued about spellings. These arms pin it.
+
+
+def test_a_declaration_that_cannot_be_checked_is_not_a_pass(rgc, tmp_path):
+    """COULD-NOT-CHECK is a third state, not silence.
+
+    The way to end up unable to look, now that the fact walk is gone: a CITED
+    module that no longer resolves. Silence there would be the same defect the
+    deleted walk had — a declaration about a deleted artifact sailing through
+    because nothing could be found to contradict it.
+    """
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    ghost = rgc.Cite("module_that_was_deleted", "some_symbol", "a fragment")
+    with pytest.raises(rgc.DeclarationError):
+        rgc.cite_source(ghost, hooks)
+
+    # And it surfaces as a problem string rather than an escaping exception.
+    real = rgc.GUARDS["protected_paths"]
+    broken = dataclasses.replace(real, safety=dataclasses.replace(real.safety, cites=(ghost,)))
+    with _swap_guard(rgc, "protected_paths", broken):
+        problems = rgc.verify_declarations()
+    assert problems, "a citation that cannot be resolved must not pass in silence"
+
+
+def test_a_broken_module_in_the_closure_does_not_take_list_down(rgc, monkeypatch, capsys):
+    """The wedge. A measurement tool that dies because its own checker crashed is
+    worse than one that runs — and --list, whose whole job is explaining
+    refusals, was the first casualty.
+
+    A syntax error in a module the checker reads used to escape `main()` as an
+    uncaught traceback and exit 1. The PR touches a surface many open PRs also
+    touch, so a developer mid-edit on `shell_parse.py` could not run the tool
+    at all.
+
+    Retargeted from the deleted fact walk onto `cite_source`, which is now the
+    only checker that reads another file and therefore the only one that can
+    crash this way. The property is unchanged and is the reason it survived the
+    deletion: the crash boundary is about the TOOL staying usable, not about
+    which checker happened to fail.
+    """
+
+    def exploding_cite(cite, hooks=None):
+        raise SyntaxError("invalid syntax (shell_parse.py, line 2447)")
+
+    monkeypatch.setattr(rgc, "cite_source", exploding_cite)
+    monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--list"])
+    assert rgc.main() == 2, "a crashing checker must refuse in the tool's voice, not traceback"
+    err = capsys.readouterr().err
+    assert "COULD NOT CHECK" in err
+    assert "invalid syntax" in err, "the cause must survive into the message"
+
+
+def test_the_bare_dep_set_is_derived_not_hardcoded(rgc):
+    """The literal claimed to be the same boundary the closure walk derives, and
+    was not. MEASURED: it held {hook_input, shell_parse} while the real closures
+    also contain discarded_write, audit_jsonl, hook_output and push_allowlist —
+    and protected_paths_guard imports discarded_write BY BARE NAME, the exact
+    spelling `_load_guard_from_this_checkout`'s refusal keys on."""
+    deps = set(rgc._guard_bare_deps())
+    assert "discarded_write" in deps, "the module the hardcoded list missed"
+    # Reachable ONLY through a py_module closure (git_push_guard), never through
+    # bash_safety's `invokes` — so this cannot be satisfied by the delegate loop
+    # alone. A first cut of this test could be, and a mutation survived it.
+    assert "push_allowlist" in deps, "the py_module closure contributed nothing"
+    # The mirror of the line above, and it was missing: reachable ONLY through
+    # bash_safety's `invokes`, never through any py_module closure. Without it a
+    # mutation that emptied the delegate loop left this test GREEN — MEASURED —
+    # so the test proved the closure walk ran and said nothing about the half
+    # that exists because no Python walk can reach a shell guard's delegates.
+    assert "destructive_command_guard" in deps, "the delegate loop contributed nothing"
+    assert {"hook_input", "shell_parse"} <= deps
+    # Entry modules are loaded BY PATH, so they are not what the refusal is about.
+    assert not deps & {g.py_module for g in rgc.GUARDS.values() if g.py_module}
+
+
+def test_a_decorated_method_in_a_class_still_strips_comments(rgc, tmp_path):
+    """Round 2, finding 2. `get_source_segment` starts the `def` at column 0
+    while the decorator lines keep their class indentation, so the segment had
+    mixed indentation, `_executable_source` raised IndentationError, and the
+    except handler returned RAW source — a comment-only fragment then resolved.
+    The shipped test used a module-level function, the one shape that works.
+    """
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    (hooks / "cited.py").write_text(
+        "import functools\n\n\n"
+        "class C:\n"
+        "    @functools.cache\n"
+        "    def target(self):\n"
+        '        # historical: used to call os.path.expanduser("~")\n'
+        '        return "gone"\n'
+    )
+    cite = rgc.Cite("cited", "target", 'os.path.expanduser("~")')
+    haystack, _ = rgc.cite_source(cite, hooks)
+    assert cite.fragment not in haystack, "a comment-only fragment resolved in a class method"
+    assert "@functools.cache" in haystack, "the decorator was lost from the span"
+
+
+def test_an_unparsable_cited_file_raises_instead_of_returning_raw_text(rgc, tmp_path):
+    """The other half of the same defect: both fallbacks in `_executable_source`
+    silently returned comment-INCLUSIVE text from a function contracted to strip
+    comments. A soundness bug that reports nothing is worse than one that
+    raises."""
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    (hooks / "cited.py").write_text("def target():\n    return 1\n")
+    ok = rgc.cite_source(rgc.Cite("cited", "target", "return 1"), hooks)
+    assert "return 1" in ok[0]
+
+    (hooks / "cited.py").write_text("def target(:\n    this is not python\n")
+    with pytest.raises(rgc.DeclarationError):
+        rgc.cite_source(rgc.Cite("cited", None, "anything"), hooks)

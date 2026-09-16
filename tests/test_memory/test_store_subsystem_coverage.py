@@ -81,6 +81,18 @@ USER_CONTEXT_ALLOWLIST: dict[str, str] = {
 }
 
 
+#: Every public entry point that performs a MemoryStore write.
+#:
+#: `store()` is a thin wrapper over `store_reporting_creation()`, and a caller
+#: may use EITHER. Matching only the wrapper name blinded this detector the
+#: moment one caller moved to the implementation — `knowledge/orchestrator.py`
+#: dropped out of the scan silently, and any future writer using the longer
+#: name would escape subsystem tagging entirely. Widened rather than
+#: allowlisted, because an allowlist row would have hidden the hole instead of
+#: closing it (PR #1653 merge audit).
+_STORE_METHODS = ("store", "store_reporting_creation")
+
+
 def _enclosing(funcs: list[tuple[int, int, str]], lineno: int) -> str:
     best, name = -1, "<module>"
     for start, end, fname in funcs:
@@ -116,7 +128,7 @@ def _discover_store_sites() -> tuple[set[str], set[str], set[str]]:
             if not (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "store"
+                and node.func.attr in _STORE_METHODS
             ):
                 continue
             kwargs = {k.arg for k in node.keywords if k.arg}
