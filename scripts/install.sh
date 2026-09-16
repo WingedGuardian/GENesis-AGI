@@ -1024,13 +1024,17 @@ fi
 # the idle-gated runner (genesis-code-intel.timer) instead of spawning an
 # indexer inline. A fire-and-forget full-mode index at setup helped storm the
 # container (D-state I/O); a guardrail test bans raw spawns. The runner does the
-# first (full, no .last-full) rebuild at its first idle window, under watchdog.
+# first (full, no recorded full success) rebuild at its first idle window, under watchdog.
 CI_LOG="$HOME/.genesis/code-intelligence-setup.log"
 mkdir -p "$(dirname "$CI_LOG")"
 if [ -f "$REPO_DIR/scripts/lib/index_marker.py" ]; then
-    python3 "$REPO_DIR/scripts/lib/index_marker.py" write \
-        --repo "$REPO_DIR" --tools both --mode fast >> "$CI_LOG" 2>&1 || true
-    echo "    + code intelligence: initial index queued (idle-gated runner)"
+    if python3 "$REPO_DIR/scripts/lib/index_marker.py" write \
+        --repo "$REPO_DIR" --tools both --mode fast >> "$CI_LOG" 2>&1; then
+        echo "    + code intelligence: initial index queued (idle-gated runner)"
+    else
+        echo "    WARNING: could not queue initial code intelligence index (see $CI_LOG)"
+        SETUP_WARNINGS=1
+    fi
 fi
 
 
@@ -1157,7 +1161,15 @@ RestartSec=5
 # 25% of container RAM (scales with the box); live qdrant RSS is ~0.3G.
 MemoryMax=25%
 LimitNOFILE=65536
-OOMScoreAdjust=-500
+# 100, not -500: a systemd USER manager cannot apply a negative oom_score_adj
+# (lowering below the inherited oom_score_adj_min of 0 needs CAP_SYS_RESOURCE),
+# and the write fails SILENTLY — the value reads back correct from
+# \`systemctl show\` while the kernel ignores it. Qdrant is a HARD dependency of
+# genesis-server, so a kill order that does not match what every configuration
+# surface claims is worth getting right. 100 matches genesis-server: both are
+# core, both restartable, both below unset units (systemd's 200) and above the
+# CC session (0). See genesis-server.service.template for the full note.
+OOMScoreAdjust=100
 StandardOutput=journal
 StandardError=journal
 NoNewPrivileges=yes
@@ -1171,11 +1183,28 @@ QDSERVICE
 elif [ -f "$SYSTEMD_USER_DIR/qdrant.service" ]; then
     # Migrate the legacy hardcoded cap to the portable percentage in place.
     # Only the exact old default is touched, so a custom value is never clobbered.
+    _qd_migrated=0
     if grep -q '^MemoryMax=4G$' "$SYSTEMD_USER_DIR/qdrant.service"; then
         sed -i 's/^MemoryMax=4G$/MemoryMax=25%/' "$SYSTEMD_USER_DIR/qdrant.service"
+        echo "    ~ qdrant.service MemoryMax 4G -> 25% (portable)"
+        _qd_migrated=1
+    fi
+    # Same in-place shape for the dead OOM score. Qdrant is NOT a template, so
+    # bootstrap.sh's template-sync cannot heal it the way it heals genesis-server
+    # and agent-zero — without this, every existing install keeps a declaration
+    # the user manager silently refuses. Only the exact old default is touched,
+    # so a custom value is never clobbered.
+    if grep -q '^OOMScoreAdjust=-500$' "$SYSTEMD_USER_DIR/qdrant.service"; then
+        sed -i 's/^OOMScoreAdjust=-500$/OOMScoreAdjust=100/' "$SYSTEMD_USER_DIR/qdrant.service"
+        echo "    ~ qdrant.service OOMScoreAdjust -500 -> 100 (the -500 never applied)"
+        _qd_migrated=1
+    fi
+    if [ "$_qd_migrated" = "1" ]; then
+        # OOMScoreAdjust is an EXEC-time property: daemon-reload alone does NOT
+        # re-apply it to the running process, so the restart is what makes the
+        # new value take effect.
         systemctl --user daemon-reload 2>/dev/null || true
         systemctl --user try-restart qdrant.service 2>/dev/null || true
-        echo "    ~ qdrant.service MemoryMax 4G -> 25% (portable)"
     else
         echo "    . qdrant.service already exists"
     fi
@@ -1267,13 +1296,61 @@ if [ -f "$SYSTEMD_USER_DIR/genesis-cc-tmp-align.service" ]; then
         echo "    + genesis-cc-tmp-align.service enabled (cold-start cc-tmp apply)" || true
 fi
 
-# Enable AND start tmp watchgod (OS-level temp protection)
-WATCHGOD_SRC="$REPO_DIR/config/genesis-tmp-watchgod.service"
-if [ -f "$WATCHGOD_SRC" ]; then
-    cp "$WATCHGOD_SRC" "$SYSTEMD_USER_DIR/"
-    systemctl --user daemon-reload 2>/dev/null || true
-    systemctl --user enable --now genesis-tmp-watchgod.service 2>/dev/null && \
-        echo "    + genesis-tmp-watchgod.service enabled + started" || true
+# Enable AND start tmp watchgod (OS-level temp protection).
+# The unit is the one Step 7's loop rendered from
+# scripts/systemd/genesis-tmp-watchgod.service.template — do NOT copy a second
+# copy over it. A checked-in config/genesis-tmp-watchgod.service used to be
+# copied here, and because the copy ran last it silently replaced the rendered
+# unit with one hardcoding ExecStart=%h/genesis/..., so every install whose repo
+# is not at ~/genesis got 203/EXEC behind this block's `|| true`.
+#
+# No daemon-reload here: the unconditional one above covers this block, and
+# nothing writes into $SYSTEMD_USER_DIR between the two.
+#
+# Failing to arm this is SURFACED rather than skipped in silence. cc-tmp filling
+# is what kills CC sessions and this unit is what watches it, so an install that
+# quietly ends with temp protection off is the failure mode worth shouting about
+# — and it is how the bug above stayed hidden. This is also the only place in
+# the repo that enables this unit, so nothing retries a failure here.
+if [ -f "$SYSTEMD_USER_DIR/genesis-tmp-watchgod.service" ]; then
+    # An earlier install can have left this unit failed; while its restart limit
+    # is tripped it will not start again, and the liveness check below would
+    # report yesterday's failure. Clearing it makes a re-run self-healing.
+    systemctl --user reset-failed genesis-tmp-watchgod.service 2>/dev/null || true
+    systemctl --user enable --now genesis-tmp-watchgod.service 2>/dev/null || true
+    # Ask for LIVENESS, not the exit code. MEASURED on systemd 255: `enable
+    # --now` exits 0 for a unit whose ExecStart does not exist, because
+    # Type=simple + Restart=always parks it in `activating (auto-restart)`
+    # rather than `failed` — which is precisely the state the duplicate
+    # produced, 203/EXEC and all. Keying on the exit status would have printed
+    # "enabled + started" over a dead watchgod, i.e. the same silence this block
+    # was rewritten to end. A HEALTHY Type=simple unit reads `active`
+    # immediately (measured too), so no settle window is needed here.
+    # BOTH questions, because they can disagree. `enable` can fail (no user
+    # D-Bus, a masked unit) while the service is already running from an earlier
+    # install, so liveness alone would report success on a box where temp
+    # protection will not survive a reboot.
+    _wg_enabled=0; _wg_active=0
+    systemctl --user is-enabled --quiet genesis-tmp-watchgod.service 2>/dev/null && _wg_enabled=1
+    systemctl --user is-active --quiet genesis-tmp-watchgod.service 2>/dev/null && _wg_active=1
+    if [ "$_wg_enabled" = "1" ] && [ "$_wg_active" = "1" ]; then
+        echo "    + genesis-tmp-watchgod.service enabled + started"
+    else
+        if [ "$_wg_active" = "1" ]; then
+            echo "    WARNING: genesis-tmp-watchgod.service is running but NOT enabled —"
+            echo "             temp protection will not come back after a reboot"
+        else
+            echo "    WARNING: genesis-tmp-watchgod.service is NOT running — temp protection is OFF"
+        fi
+        # The reason, or the warning is undiagnosable — `enable --now` above
+        # discards stderr, so this is the only place the cause surfaces.
+        systemctl --user status genesis-tmp-watchgod.service --no-pager -n 5 2>&1 \
+            | sed 's/^/      /' || true
+        SETUP_WARNINGS=1
+    fi
+else
+    echo "    WARNING: genesis-tmp-watchgod.service was not rendered — temp protection is OFF"
+    SETUP_WARNINGS=1
 fi
 
 # Enable AND start genesis-server (standalone)

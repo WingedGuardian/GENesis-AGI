@@ -227,7 +227,7 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
         from qdrant_client import QdrantClient
 
         from genesis.db.connection import ReadConnectionPool, get_db
-        from genesis.env import recall_read_pool_off, recall_read_pool_size
+        from genesis.env import recall_read_pool_off, session_read_pool_size
         from genesis.mcp.memory_mcp import init
         from genesis.memory.embeddings import EmbeddingProvider
         from genesis.memory.reranker import VoyageReranker
@@ -245,7 +245,11 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
         read_pool = None
         if not recall_read_pool_off():
             try:
-                pool = ReadConnectionPool(_DEFAULT_DB, size=recall_read_pool_size())
+                # session_read_pool_size, NOT recall_read_pool_size: this process
+                # is one MCP child PER CC SESSION, so a host-derived size is
+                # multiplied by the number of live sessions. The server's pool is
+                # the one that carries every session's per-prompt recall.
+                pool = ReadConnectionPool(_DEFAULT_DB, size=session_read_pool_size())
                 await pool.open()
                 read_pool = pool
             except Exception:
@@ -544,7 +548,13 @@ def main(argv: list[str] | None = None) -> None:
         # Recall read-pool knobs — _bootstrap_memory honors the same kill
         # switch + size as the server runtime, so a secrets.env-configured
         # value must reach the child too (Codex P2 on #1302)
-        "GENESIS_RECALL_READ_POOL_OFF", "GENESIS_RECALL_READ_POOL_SIZE",
+        # GENESIS_SESSION_READ_POOL_SIZE is the one _bootstrap_memory actually
+        # reads now (this process is a per-session child, not the server) —
+        # without it here the documented lever is INERT, which is the third
+        # instance of this class in this list after #1302 and #1587.
+        "GENESIS_RECALL_READ_POOL_OFF",
+        "GENESIS_RECALL_READ_POOL_SIZE",
+        "GENESIS_SESSION_READ_POOL_SIZE",
         # deliberate() (Model Fusion) timeout budget — the health MCP server hosts the
         # `deliberate` tool, so a secrets.env-set override must reach this child or the
         # documented knob is inert and every call silently stays at the 1000s default

@@ -1255,3 +1255,83 @@ async def test_callback_unknown_action_ignored(handlers_with_gate):
 
     gate.resolve_request.assert_not_called()
     gate.approve_all_pending.assert_not_called()
+
+
+# ── Truncation notice must not replace a streamed answer ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_truncation_notice_does_not_discard_the_streamed_answer(
+    handlers, mock_loop, monkeypatch
+):
+    """A truncated turn returns the notice as an ORDINARY response, so it
+    takes the normal delivery branch and never reaches the accumulated-text
+    rescues in the exception handlers.
+
+    `disable()` has just torn down the ephemeral draft by then, so
+    `streamer.accumulated_text` is the only durable copy of what the user was
+    reading — and sending the notice alone replaces a completed answer with
+    "Genesis lost this answer" (Codex P1, PR #1625).
+    """
+    from genesis.cc.conversation import _TRUNCATION_NOTICE
+
+    streamed_answer = "Here is the complete answer the user was reading."
+
+    fake_streamer = MagicMock()
+    fake_streamer.accumulated_text = streamed_answer
+    fake_streamer._prefix = ""
+    fake_streamer.disable = MagicMock()
+    fake_streamer.flush = AsyncMock()
+
+    monkeypatch.setattr(
+        "genesis.channels.telegram._handler_messages._make_streamer",
+        AsyncMock(return_value=fake_streamer),
+    )
+    mock_loop.handle_message_streaming = AsyncMock(return_value=_TRUNCATION_NOTICE)
+
+    update = _make_update(text="a question whose answer got truncated")
+    ctx = _make_context()
+    await handlers["text"](update, ctx)
+
+    sent = "\n".join(
+        str(c[0][0]) for c in update.message.reply_text.call_args_list if c[0]
+    )
+    assert streamed_answer in sent, (
+        "the streamed answer was discarded and replaced by the truncation "
+        f"notice — the user lost a completed answer. Sent: {sent!r}"
+    )
+    assert "lost this answer" in sent, (
+        "the truncation warning was dropped; the turn really did end early "
+        "and the user must be told"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_response_is_not_concatenated_with_the_draft(
+    handlers, mock_loop, monkeypatch
+):
+    """CONTROL. In every non-truncated case the returned response IS the
+    authoritative final text and the accumulated draft is a prefix of it, so
+    a rescue that fired unconditionally would deliver the answer twice."""
+    fake_streamer = MagicMock()
+    fake_streamer.accumulated_text = "Partial ans"
+    fake_streamer._prefix = ""
+    fake_streamer.disable = MagicMock()
+    fake_streamer.flush = AsyncMock()
+
+    monkeypatch.setattr(
+        "genesis.channels.telegram._handler_messages._make_streamer",
+        AsyncMock(return_value=fake_streamer),
+    )
+    mock_loop.handle_message_streaming = AsyncMock(return_value="Partial answer, completed.")
+
+    update = _make_update(text="an ordinary question")
+    ctx = _make_context()
+    await handlers["text"](update, ctx)
+
+    sent = "\n".join(
+        str(c[0][0]) for c in update.message.reply_text.call_args_list if c[0]
+    )
+    assert sent.count("Partial ans") == 1, (
+        f"the draft was concatenated onto the final answer, duplicating it: {sent!r}"
+    )

@@ -184,6 +184,27 @@ class TestGitPushGuardCrashFailsClosed:
 
     @pytest.fixture
     def crashing_wrapper(self, tmp_path):
+        """Crash EVERY parse entrypoint the guard could route through.
+
+        The injection used to name `analyze` alone, and when `main()` moved to
+        `analyze_checked` the patch stopped being reached: the guard ran normally,
+        emitted its ordinary push-approval `ask`, and the test failed at exit 0 with
+        a message about crashes. That is the "mutation silently failed to apply"
+        shape — the assertion was never wrong, it was simply testing nothing.
+
+        Patching BOTH names removes the coupling to which one `main()` happens to
+        call today. Deliberately not narrowed to the one live call site: this
+        fixture's job is to guarantee a crash somewhere in the orchestration, not to
+        pin where the orchestration parses.
+
+        WHAT CATCHES A RECURRENCE IS THE STDERR ASSERTION, NOT THE `hasattr` PROBE.
+        The probe only fires when a rename REMOVES one of these names; the realistic
+        repeat of this very bug — `main()` moving to some third entrypoint while both
+        of these still exist — sails straight past it. It is the test's
+        "simulated orchestration bug" assertion that goes red there, because the
+        injected crash never reaches `main()`. The probe is kept for the cheaper
+        rename case, where it names the cause instead of leaving a bare exit 0.
+        """
         wrapper = tmp_path / "wrapper.py"
         wrapper.write_text(
             f"""
@@ -196,9 +217,18 @@ spec = importlib.util.spec_from_file_location(
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 
-def boom(cmd):
+_PARSE_ENTRYPOINTS = ("analyze", "analyze_checked")
+missing = [n for n in _PARSE_ENTRYPOINTS if not hasattr(mod, n)]
+if missing:
+    raise SystemExit(
+        "FIXTURE STALE: git_push_guard has no " + ", ".join(missing) + " to crash. "
+        "A renamed parse entrypoint makes this injection a no-op — repoint it."
+    )
+
+def boom(*_a, **_k):
     raise RuntimeError("simulated orchestration bug")
-mod.analyze = boom
+for _name in _PARSE_ENTRYPOINTS:
+    setattr(mod, _name, boom)
 
 from hook_input import run_guard
 run_guard(mod.main, "git_push_guard")
@@ -219,6 +249,14 @@ run_guard(mod.main, "git_push_guard")
             f"crash during push analysis must BLOCK, got {result.returncode}: {result.stderr}"
         )
         assert "GUARD ERROR" in result.stderr
+        # Name the INJECTED exception, not just "a guard error". Exit 2 plus a generic
+        # banner is also what an unrelated failure produces (a stale fixture, an import
+        # error), so without this the test could go green while the crash it claims to
+        # inject never reached `main()` at all.
+        assert "simulated orchestration bug" in result.stderr, (
+            "exit 2 must come from the INJECTED crash, not from some other refusal: "
+            f"{result.stderr}"
+        )
 
     def test_malformed_payload_still_fails_open(self):
         """The DOCUMENTED parse-ambiguity fail-open is preserved: garbage stdin
