@@ -371,19 +371,30 @@ def _advisory(group: str, sub: str, cap: int, *, redundant: bool) -> str:
       thirteen rows. It does not hold for the five ``search`` rows, whose
       --limit is refused above :data:`_SEARCH_CEILING` -- so they get their own
       escape rather than advice gh will reject.
-    * "the honest form is 'at least N'" was stated UNCONDITIONALLY. It is only
-      true of a SATURATED read: a repository with five open PRs returns five,
-      which is exactly five and not "at least thirty". A short result is the
-      true count, and saying otherwise teaches a false hedge.
+    * "the honest form is 'at least N'" was stated UNCONDITIONALLY, when it is
+      true only of a SATURATED read. Correct as far as it went -- but the
+      correction that followed it, "a short result is the TRUE count", was
+      itself FALSE and is the premise this text no longer makes. The saturated
+      half survives; the short half does not.
 
-    THE STANDARD THAT REPLACES "executed against the live tool", which is what
-    the removed sentence claimed while only one subcommand had ever been tried:
+    THE CLAIM THAT WAS DELETED, and why no carve-out replaced it. A short read is
+    not proof of completeness, because GitHub shortens a response for reasons the
+    command cannot see: a FILTERED ``gh run list`` is served by the workflow-runs
+    endpoint (at most 1,000 results for such a search); ``gh pr list --search``
+    and ``gh issue list --search`` route through GitHub search and stop at 1,000;
+    and a TIMED-OUT ``gh search`` returns fewer rows than asked for with
+    ``incomplete_results: true``. Three consecutive review rounds each found
+    another family where one sentence failed, so the sentence went rather than
+    gaining a fourth exception.
+
+    THE STANDARD THAT REPLACES "executed against the live tool", which is what an
+    earlier docstring claimed while only one subcommand had ever been tried:
     every branch of this text is executed against EVERY family it addresses.
-    MEASURED on gh 2.98.0, 2026-09-15 -- ``gh search prs --limit 1000`` returns
-    exactly 1000 (saturated) and ``--limit 1001`` is refused, so the generic
-    remedy is unfollowable there; and the escape this text prescribes instead
-    was RUN, three ``--created`` date slices each returning short of its own
-    limit and therefore provably complete.
+    Note what that standard could NOT catch, recorded because it is the honest
+    limit: the date-slice escape was RUN, and each slice came back short of its
+    own limit -- which was then read as "provably complete". Executing a remedy
+    shows it does not ERROR. It does not show the INFERENCE drawn from its output
+    is sound, and here the inference was the defect.
     """
     if redundant:
         lead = (
@@ -416,9 +427,10 @@ def _advisory(group: str, sub: str, cap: int, *, redundant: bool) -> str:
         "per-endpoint ceilings, the search ceiling, and a timed-out search that reports "
         "`incomplete_results` -- so a SHORT read is equally consistent with "
         '"that is all of them" and "the server stopped early".' + escape + "\n"
-        "If the exact count matters, take it from something that reports a TOTAL "
-        "(`gh api` search endpoints return `total_count`), not from the length of a "
-        "list you asked for.\n"
+        "If the exact count matters, take it from a source that reports a TOTAL rather "
+        "than from the length of a list you asked for -- and check that total is not "
+        "itself partial: `gh api` search endpoints return `total_count` NEXT TO "
+        "`incomplete_results`, and the count is exact only when that flag is false.\n"
         "For a quick look, ignore this."
     )
 

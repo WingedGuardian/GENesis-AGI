@@ -1067,17 +1067,29 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   nothing in the command hints a cap is in force. `scripts/hooks/capped_read_advisory.py`
   now says so pre-flight, and a drift test re-reads `--help` so this table fails loudly
   when gh moves a number rather than quietly naming a cap that no longer exists — treat
-  the numbers above as the reading at that version, not as durable facts. To get the
-  whole set, pass `--limit N` ABOVE your expected count and re-read until the result
-  comes back SHORT of it — a result of EXACTLY the limit means there may be more, while
-  a SHORTER one is the true count. `--paginate` is a `gh api` flag and MEASURED on gh
-  2.98.0 every one of these subcommands rejects it with `unknown flag: --paginate`.
-  **`gh search` is the exception and the raise-the-limit remedy does not work there:**
-  the API caps results at 1,000 and gh refuses a larger flag client-side (MEASURED,
-  `gh search prs --limit 1001` → `` `--limit` must be between 1 and 1000 ``), so
-  exactly 1,000 back is an incomplete read you cannot widen. Narrow the query instead
-  — `--created`/`--merged-at` date slices, `--owner`, `--repo` — and sum the slices,
-  each verified complete by coming back short of its own limit.
+  the numbers above as the reading at that version, not as durable facts. Raising
+  `--limit` gets you MORE ROWS, and `--paginate` is a `gh api` flag every one of these
+  subcommands rejects (MEASURED on gh 2.98.0: `unknown flag: --paginate`).
+
+  **A SHORT read is NOT proof of completeness, and an earlier version of this very
+  bullet said it was.** "Re-read until the result comes back short of your limit" is
+  the intuitive rule and it is false, because GitHub shortens a response on its own
+  for reasons the command cannot see. MEASURED, three independent ways: a FILTERED
+  `gh run list` (`--branch`/`--created`/`--event`/`--status`/`--user`) is served by the
+  workflow-runs endpoint, which returns at most 1,000 results for such a search;
+  `gh pr list --search` and `gh issue list --search` route through GitHub search and
+  stop at 1,000 (`gh pr list --help` advertises `-S, --search`); and any `gh search`
+  whose query TIMED OUT returns fewer rows than asked for with
+  `incomplete_results: true`. Each is short, and none is complete. `gh search` also
+  refuses a limit above 1,000 outright (`` `--limit` must be between 1 and 1000 ``),
+  so you cannot widen past it at all.
+
+  So: a SATURATED read supports "at least N" and never "N" — that much still holds.
+  For an exact count, use a source that reports a TOTAL rather than the length of a
+  list you asked for, and check that total is not itself partial: the Search API
+  returns `total_count` alongside `incomplete_results`, and the count is exact only
+  when that flag is `false`. Date-slicing a query is still the way to get under a
+  ceiling; just do not treat a short slice as self-certifying.
 
 - **Fail-closed data access.** A data-access boundary must RAISE (or return a
   clearly-typed "unknown/unavailable") on missing scope or an unavailable

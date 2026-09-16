@@ -457,7 +457,18 @@ def test_a_short_read_is_never_claimed_as_proof_of_completeness(tmp_path: Path) 
     assert "does not establish COMPLETENESS" in ctx
     assert "the server stopped early" in ctx
     assert "TRUE count" not in ctx
-    assert "is exact" not in ctx
+    # NOT a blunt ban on the word "exact": the remedy legitimately says a
+    # total_count is exact WHEN incomplete_results is false. What must be absent
+    # is the claim about a SHORT READ, so pin that, and require the qualifier
+    # that makes the surviving use of "exact" true.
+    assert "fewer than 30 is exact" not in ctx
+    # And the ONE source it does point at must carry its own qualifier: a
+    # timed-out search returns total_count NEXT TO incomplete_results: true, so
+    # an unqualified "read total_count" is the same defect one level down.
+    # Asserting `"incomplete_results" in ctx` was NOT enough -- the word also
+    # appears earlier in the warning paragraph, so that assertion passed for the
+    # wrong reason and a mutation removing the qualifier survived.
+    assert "only when that flag is false" in ctx
 
 
 def test_the_json_envelope_survives_the_worst_case_output(tmp_path: Path) -> None:
