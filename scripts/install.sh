@@ -1255,10 +1255,27 @@ fi
 # — and it is how the bug above stayed hidden. This is also the only place in
 # the repo that enables this unit, so nothing retries a failure here.
 if [ -f "$SYSTEMD_USER_DIR/genesis-tmp-watchgod.service" ]; then
-    if systemctl --user enable --now genesis-tmp-watchgod.service 2>/dev/null; then
+    # An earlier install can have left this unit failed; while its restart limit
+    # is tripped it will not start again, and the liveness check below would
+    # report yesterday's failure. Clearing it makes a re-run self-healing.
+    systemctl --user reset-failed genesis-tmp-watchgod.service 2>/dev/null || true
+    systemctl --user enable --now genesis-tmp-watchgod.service 2>/dev/null || true
+    # Ask for LIVENESS, not the exit code. MEASURED on systemd 255: `enable
+    # --now` exits 0 for a unit whose ExecStart does not exist, because
+    # Type=simple + Restart=always parks it in `activating (auto-restart)`
+    # rather than `failed` — which is precisely the state the duplicate
+    # produced, 203/EXEC and all. Keying on the exit status would have printed
+    # "enabled + started" over a dead watchgod, i.e. the same silence this block
+    # was rewritten to end. A HEALTHY Type=simple unit reads `active`
+    # immediately (measured too), so no settle window is needed here.
+    if systemctl --user is-active --quiet genesis-tmp-watchgod.service 2>/dev/null; then
         echo "    + genesis-tmp-watchgod.service enabled + started"
     else
-        echo "    WARNING: could not enable genesis-tmp-watchgod.service — temp protection is OFF"
+        echo "    WARNING: genesis-tmp-watchgod.service is NOT running — temp protection is OFF"
+        # The reason, or the warning is undiagnosable — `enable --now` above
+        # discards stderr, so this is the only place the cause surfaces.
+        systemctl --user status genesis-tmp-watchgod.service --no-pager -n 5 2>&1 \
+            | sed 's/^/      /' || true
         SETUP_WARNINGS=1
     fi
 else
