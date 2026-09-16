@@ -151,15 +151,32 @@ def test_project_config_exposes_only_the_read_oriented_pilot_tools() -> None:
     root = Path(__file__).resolve().parents[2]
     config = tomllib.loads((root / ".codex" / "config.toml").read_text())
 
-    assert config["mcp_optional_startup_grace_ms"] == 0
+    # No top-level keys at all. `mcp_optional_startup_grace_ms` was set here and
+    # is now GONE: it is not a recognised Codex configuration field — a 0.144
+    # run under `--strict-config` refuses to start on it, and the 0.125 CLI
+    # installed on this box has no `--strict-config` to refuse with — so it
+    # never produced the startup behaviour its comment claimed. The supported
+    # knob is per-server `startup_timeout_sec`, asserted below. Pinning the
+    # ABSENCE keeps an unrecognised field from drifting back in as a plausible
+    # fix for a startup race.
+    assert not [k for k in config if k != "mcp_servers"], (
+        "an unrecognised top-level key can refuse to start a strict Codex run"
+    )
 
     servers = config["mcp_servers"]
 
     assert set(servers) == {"genesis-health", "genesis-memory"}
+    assert servers["genesis-health"]["startup_timeout_sec"] == 30
+    # `health_errors` and `health_alerts` are deliberately ABSENT. The floor for
+    # this surface is not only "no caller-requestable write" but "a tool means
+    # what its schema says", and in the STANDALONE server these two silently
+    # omit the failures they promise: `StandaloneHealthDataService` leaves
+    # `_dead_letter`, `_breakers` and `_routing_config` as None, so the
+    # dead-letter query and the open-breaker loop are skipped, and the
+    # reconstructed call-site states never reach down/degraded. A blind tool
+    # answering cleanly reads as "no failures", which is worse than absence.
     assert servers["genesis-health"]["enabled_tools"] == [
         "health_status",
-        "health_errors",
-        "health_alerts",
         "bootstrap_manifest",
         "subsystem_heartbeats",
         "job_health",

@@ -2,10 +2,6 @@
 # read-oriented; expand it only after a separately reviewed capability decision.
 # The launcher strips Genesis/Claude session identity before starting a server.
 
-# Genesis servers are optional. Wait for their configured startup timeout so a
-# fresh Codex turn receives their tool schemas before planning its response.
-mcp_optional_startup_grace_ms = 0
-
 [mcp_servers.genesis-health]
 command = "python3"
 args = ["scripts/codex_external_mcp.py", "--server", "health"]
@@ -13,13 +9,24 @@ cwd = "."
 startup_timeout_sec = 30
 enabled_tools = [
   "health_status",
-  "health_errors",
-  "health_alerts",
   "bootstrap_manifest",
   "subsystem_heartbeats",
   "job_health",
   "provider_activity",
 ]
+# NOT here: `health_errors` and `health_alerts`. Both are real tools, but in the
+# STANDALONE server this config starts they cannot honour the schemas they
+# advertise. `StandaloneHealthDataService` leaves `_dead_letter`, `_breakers`
+# and `_routing_config` as None, so `health_errors` skips both its pending
+# dead-letter query and its open-circuit-breaker loop; and its reconstructed
+# call-site states are only active/idle/stale/unknown, so `health_alerts` can
+# never reach the down/degraded branches that report a provider outage.
+#
+# A tool that silently omits the failures it promises to report is worse than an
+# absent one: absence is visible, and a clean answer from a blind tool is read
+# as "no failures". The floor for this surface is that a tool means what its
+# schema says. Restoring them means wiring those three sources into the
+# standalone service, not re-adding these lines.
 # NOT here: `infrastructure_profile`. An allowlist grants the TOOL, not its
 # ARGUMENTS, and `refresh=true` persists profile files, emits DB drift
 # observations and renders shared documents — so admitting it would put the one
