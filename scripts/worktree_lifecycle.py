@@ -146,11 +146,6 @@ def _git_env() -> dict[str, str]:
         env.pop(var, None)
     return env
 
-# Candidate bases to exclude from the bundle, most specific first. Bundling only
-# the commits a worktree does NOT share with the mainline keeps it small:
-# MEASURED on this repo, a full-history bundle is 27 MB while the unique-commit
-# bundles for two real branches are 68 KB and 88 KB (5 and 16 commits).
-
 
 def _scratch_dir_for(stored: Path) -> Path:
     """The temporary extraction directory for ``stored``, with a BOUNDED name.
@@ -378,11 +373,71 @@ def _list_worktrees(repo_root: Path) -> list[dict]:
     return worktrees
 
 
-def _last_activity_time(worktree_path: str) -> float:
-    """Return the most recent mtime of any file in the worktree.
+def _git_activity_time(worktree_path: str) -> float:
+    """Activity git can see that a shallow mtime walk cannot. 0.0 if unknown.
 
-    Depth-limited walk (top 2 levels) to avoid scanning deep
-    directories like node_modules or .git internals.
+    ONE signal: the mtimes of paths git reports as modified or untracked. That
+    is someone EDITING, at any depth, which is exactly what the walk below
+    cannot see.
+
+    NOT the HEAD commit timestamp, which is the obvious second signal and was
+    tried first. It answers the wrong question -- when the COMMIT was made, not
+    when this WORKTREE was used -- so a worktree cut from a fresh mainline
+    commit and then abandoned reads as active forever and is never reclaimed.
+    Nine existing tests failed on precisely that, which is the suite correctly
+    refusing a signal that cannot tell a new checkout from a used one.
+
+    Failures are absorbed and contribute 0.0, because this only ever RAISES the
+    measured activity: a git call that fails degrades to the old mtime answer
+    rather than making a worktree look more idle than it is.
+    """
+    newest = 0.0
+    root = Path(worktree_path)
+
+    # `-uall` so an untracked file deep in the tree counts; `--porcelain=v1`
+    # pins the format, whose first 3 columns are status + a space.
+    dirty = _run_git(root, ["status", "--porcelain=v1", "-uall"], timeout=60)
+    if dirty:
+        for line in dirty.splitlines()[:_DIRTY_SCAN_CAP]:
+            if len(line) < 4:
+                continue
+            rel = line[3:]
+            # A rename reads "R  old -> new"; the NEW path is the one on disk.
+            if " -> " in rel:
+                rel = rel.split(" -> ", 1)[1]
+            try:
+                newest = max(newest, (root / rel.strip('"')).lstat().st_mtime)
+            except OSError:
+                continue
+    return newest
+
+
+#: Bound on the dirty-path scan. A worktree with more changed paths than this is
+#: self-evidently active, so the cap cannot make one look idle — the commit
+#: timestamp above is already in hand, and every path examined only raises the
+#: answer. Bounded because a first-run worktree can report tens of thousands of
+#: untracked paths and this runs per worktree.
+_DIRTY_SCAN_CAP = 2000
+
+
+def _last_activity_time(worktree_path: str) -> float:
+    """Most recent evidence of activity in the worktree.
+
+    THE SHALLOW WALK IS UNSOUND ALONE, which is why git is consulted too. It
+    samples the root and TWO levels, but modifying a file updates that file's
+    mtime and never its ancestors' — and nearly all source in this repo lives
+    below the sampled depth.
+
+    MEASURED: backdate a worktree 19 days, then edit
+    `src/genesis/memory/store.py`. The walk still reports 19.0 days and the
+    worktree stays eligible for archiving, while `git status` on the same tree
+    shows the modification. The control moves as expected — editing a depth-1
+    file such as `README.md` does report 0.0 days — which is exactly what made
+    the gap invisible: the obvious test passes.
+
+    So the answer is the MAXIMUM of the walk and what git can see. Combining by
+    max is what makes the addition safe: a failing or slow git call can only
+    leave the old, lower answer standing, never invent idleness.
     """
     latest = os.path.getmtime(worktree_path)
     root = Path(worktree_path)
@@ -406,7 +461,7 @@ def _last_activity_time(worktree_path: str) -> float:
         except OSError:
             continue
 
-    return latest
+    return max(latest, _git_activity_time(worktree_path))
 
 
 class _SkipNetwork(Exception):

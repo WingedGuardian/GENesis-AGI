@@ -49,18 +49,28 @@ def _git(repo: Path, *args: str) -> str:
 
 
 def _age_path(path: Path, days: float) -> None:
-    """Backdate mtimes of a worktree (dir + top-2 levels) past the stale gate.
+    """Backdate every entry in a worktree past the stale gate.
 
-    Mirrors what ``_last_activity_time`` walks (dir + children, one level deep,
-    skipping ``.git``), so the worktree reads as inactive.
+    RECURSIVE, and `follow_symlinks=False`. Both matter, and the second was a
+    silent hole: `os.utime` FOLLOWS a symlink by default, so a link with an
+    absolute or dangling target raised OSError, got swallowed by the suppress,
+    and kept its original mtime while this helper reported success. The worktree
+    then read as ACTIVE through a channel the old depth-limited activity walk
+    never sampled, so nothing noticed until `_last_activity_time` started
+    consulting git for edits at any depth.
+
+    The docstring also used to say "dir + top-2 levels" and mirror the walk's
+    sampling. That description was already wrong -- the loop below is `rglob` --
+    and pinning a test helper to the shape of the thing under test is how a
+    fixture stops being able to express the case that breaks it.
     """
     old = time.time() - days * 86400
     os.utime(path, (old, old))
     for item in path.rglob("*"):
         if ".git" in item.parts:
             continue
-        with contextlib.suppress(OSError):
-            os.utime(item, (old, old))
+        with contextlib.suppress(OSError, NotImplementedError):
+            os.utime(item, (old, old), follow_symlinks=False)
 
 
 # Every module path the reaper WRITES to. Each is redirected below; the guard
@@ -1162,4 +1172,59 @@ def test_a_successful_recovery_still_works(reaper_repo, tmp_path, monkeypatch):
     assert (wt / "scratch.txt").read_text() == "untracked scratch\n"
     assert not _is_locked(reaper_repo.repo, wt), (
         "a SUCCESSFUL recovery must leave a normal, unlocked worktree"
+    )
+
+
+def test_an_edit_below_the_sampled_depth_counts_as_activity(reaper_repo, tmp_path):
+    """A worktree being actively edited must not read as idle.
+
+    `_last_activity_time` walks the root and TWO levels. Modifying a file
+    updates that file's mtime and NEVER its ancestors', and nearly all source in
+    this repo lives below the sampled depth — so an actively developed worktree
+    reported as weeks idle and became eligible for archiving.
+
+    MEASURED against the pre-fix helper: backdate a worktree 19 days, edit
+    `src/genesis/memory/store.py`, and it still reports 19.0 days. The control
+    is what hid it — editing a depth-1 file like `README.md` always reported
+    0.0, so the obvious test passed.
+    """
+    wt = reaper_repo.wt_branch_merged
+    deep = wt / "src" / "genesis" / "memory"
+    deep.mkdir(parents=True, exist_ok=True)
+    (deep / "store.py").write_text("original\n")
+    _age_path(wt, 19)
+
+    # Precondition: the shallow walk alone must still call this idle, otherwise
+    # the fixture is not exercising the gap and the assertion below is vacuous.
+    assert (time.time() - os.path.getmtime(wt)) / 86400 > 10
+
+    (deep / "store.py").write_text("EDITED\n")
+    now = time.time()
+    os.utime(deep / "store.py", (now, now))
+    # Ancestors stay backdated, which is what a real edit looks like.
+    for ancestor in (deep, deep.parent, deep.parent.parent, wt):
+        os.utime(ancestor, (now - 19 * 86400, now - 19 * 86400))
+
+    age_days = (time.time() - wl._last_activity_time(str(wt))) / 86400
+    assert age_days < 1, (
+        f"an edit at depth 3 left the worktree reading as {age_days:.1f} days "
+        "idle — it would be archived while someone is working in it"
+    )
+
+
+def test_an_untouched_worktree_still_reads_as_idle(reaper_repo, tmp_path):
+    """The control that moves, and the reason the commit timestamp was rejected.
+
+    Consulting git must not make everything look busy. An aged worktree with a
+    clean tree stays idle — including one whose HEAD commit is recent, which is
+    every worktree freshly cut from the mainline. Keying on the commit time
+    instead of on edits made exactly those read as active forever, and nine
+    tests failed on it.
+    """
+    wt = reaper_repo.wt_branch_merged
+    _age_path(wt, 19)
+    age_days = (time.time() - wl._last_activity_time(str(wt))) / 86400
+    assert age_days > 10, (
+        f"a clean, aged worktree reported {age_days:.1f} days — consulting git "
+        "made an idle worktree look active, so nothing would ever be reclaimed"
     )
