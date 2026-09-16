@@ -309,6 +309,16 @@ async def probe_host_brain(config) -> bool | None:
         kill_process_group(proc)
         await reap_bounded(proc)
         return None  # a wedge is not proof of death
+    except asyncio.CancelledError:
+        # CancelledError is BaseException on 3.12, so it does NOT reach the
+        # `except Exception` below. The child was started in its own session, so a
+        # cancelled guardian task would otherwise leave the whole claude/node tree
+        # running with nothing left to reap it. DiagnosisEngine handles this
+        # explicitly for the same binary; this mirrors it. Re-raised, because
+        # cancellation is not a verdict about the host brain.
+        kill_process_group(proc)
+        await reap_bounded(proc)
+        raise
     except Exception:
         kill_process_group(proc)
         await reap_bounded(proc)
@@ -339,8 +349,14 @@ def host_brain_state(config, brain_ok: bool | None, episode: dict | None) -> str
         return "healthy"
     if brain_ok is False:
         return "failing"
-    streak = (episode or {}).get("wedged", 0)
-    if streak >= config.guard_layer.confirm_ticks:
+    # A single wedge is genuinely weaker evidence than a definite negative, so it
+    # stays INCONCLUSIVE — but the streak that follows must not be confirmed TWICE.
+    # Returning "failing" at the threshold and then letting the generic ladder start
+    # its own `consecutive` from one puts the WARN at 2 * confirm_ticks - 1 timeouts
+    # instead of the configured threshold. The orchestrator therefore SEEDS the
+    # ladder from the wedge streak (see where CONDITION_HOST_BRAIN is resolved), so
+    # the streak is carried into the decision rather than re-earned.
+    if (episode or {}).get("wedged", 0) >= config.guard_layer.confirm_ticks:
         return "failing"
     return "inconclusive"
 
@@ -397,7 +413,29 @@ def _load_state(path: Path) -> dict:
     episodes = data.get("episodes")
     if not isinstance(episodes, dict):
         return {}
-    return {k: v for k, v in episodes.items() if isinstance(v, dict)}
+    return {k: _sane_episode(v) for k, v in episodes.items() if isinstance(v, dict)}
+
+
+#: Counter fields are arithmetic targets and timestamp fields are parsed. A value
+#: of the wrong TYPE in either passes an isinstance check on the episode itself and
+#: then raises one frame deeper — which the outer swallow logs while leaving the
+#: file in place, so every later tick wedges identically. Checking the container
+#: and not the contents is the same scope error one level down.
+_EPISODE_COUNTERS = ("consecutive", "wedged")
+_EPISODE_STAMPS = ("first_seen", "warned_at", "last_alert_at")
+
+
+def _sane_episode(episode: dict) -> dict:
+    """Drop fields whose type would raise when used, rather than trusting them."""
+    clean = dict(episode)
+    for field in _EPISODE_COUNTERS:
+        value = clean.get(field)
+        if field in clean and (isinstance(value, bool) or not isinstance(value, int)):
+            clean.pop(field)
+    for field in _EPISODE_STAMPS:
+        if field in clean and not isinstance(clean[field], str):
+            clean.pop(field)
+    return clean
 
 
 def _save_state(path: Path, episodes: dict) -> None:
@@ -479,6 +517,15 @@ async def check_guard_layer_and_alert(config, dispatcher) -> None:
             known.append(CONDITION_HOST_BRAIN)
             if brain_state == "failing":
                 failing.add(CONDITION_HOST_BRAIN)
+                # CARRY the wedge streak into the ladder rather than re-earning it.
+                # Those ticks already WERE the confirmation; making `consecutive`
+                # start from one again would put the WARN at 2 * confirm_ticks - 1
+                # timeouts instead of the configured threshold.
+                wedged = (brain_episode or {}).get("wedged", 0)
+                if wedged and brain_episode is not None:
+                    brain_episode["consecutive"] = max(
+                        brain_episode.get("consecutive", 0), wedged - 1
+                    )
 
         for condition in sorted(set(known) | set(episodes)):
             # An INCONCLUSIVE condition has no evidence in either direction. Without
@@ -514,10 +561,17 @@ async def check_guard_layer_and_alert(config, dispatcher) -> None:
                 # agent tooling can evaluate again" would tell the operator the
                 # tooling is usable while another condition is still warned - the
                 # most expensive kind of wrong, because it is an all-clear.
+                # Derived from THIS TICK's evidence, not from loop mutation order.
+                # Reading `episodes` mid-loop treats a condition that also recovered
+                # this tick but has not been processed yet as still degraded, so two
+                # simultaneous recoveries produce one alert saying STILL DEGRADED and
+                # a later one saying everything is healthy — from the same invocation.
                 remaining = sorted(
                     c
                     for c in episodes
-                    if c != condition and episodes.get(c, {}).get("warned_at")
+                    if c != condition
+                    and c in failing
+                    and episodes.get(c, {}).get("warned_at")
                 )
                 if remaining:
                     tail = f" STILL DEGRADED: {', '.join(remaining)}."

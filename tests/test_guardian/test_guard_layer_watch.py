@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -991,3 +992,169 @@ class TestProbeVerifiesItsOwnTooling:
             "suppressed means no evidence, never good news"
         )
         assert "venv_dead" in glw._load_state(tmp_path / glw._STATE_FILE)
+
+
+class TestFourFindingsIHadNotRead:
+    """Four findings that sat unanswered for two rounds because I grepped the gate.
+
+    Recorded together because the grouping is the lesson: each is an instance of a
+    class already named on this PR, which is the argument for the class inventory
+    over any individual fix.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_wedge_warns_at_confirm_ticks_not_twice_that(
+        self, tmp_path, monkeypatch
+    ):
+        """The streak IS the confirmation; confirming it again doubles the delay.
+
+        host_brain_state held "inconclusive" until the wedge streak reached
+        confirm_ticks, and then the generic ladder started its own `consecutive`
+        from one -- so the WARN landed at 2 * confirm_ticks - 1 timeouts instead of
+        the configured threshold. A single wedge is still inconclusive, because one
+        timeout is genuinely weaker evidence than a definite negative; the streak is
+        now carried into the ladder rather than re-earned.
+        """
+        monkeypatch.setattr(glw, "probe_guard_layer", AsyncMock(return_value=_healthy()))
+        monkeypatch.setattr(glw, "probe_host_brain", AsyncMock(return_value=None))
+        cfg, disp = _Cfg(tmp_path), AsyncMock()
+        ticks = cfg.guard_layer.confirm_ticks
+        for _ in range(ticks):
+            await glw.check_guard_layer_and_alert(cfg, disp)
+        assert disp.send.call_count == 1, (
+            f"a wedge must WARN at confirm_ticks ({ticks}) timeouts; got "
+            f"{disp.send.call_count} alerts, which means the streak is being "
+            f"confirmed twice"
+        )
+        assert "host_brain_dead" in disp.send.call_args.args[0].title
+
+    @pytest.mark.asyncio
+    async def test_one_wedge_alone_still_says_nothing(self, tmp_path, monkeypatch):
+        """The other half: carrying the streak must not make a transient alert."""
+        monkeypatch.setattr(glw, "probe_guard_layer", AsyncMock(return_value=_healthy()))
+        monkeypatch.setattr(glw, "probe_host_brain", AsyncMock(return_value=None))
+        cfg, disp = _Cfg(tmp_path), AsyncMock()
+        await glw.check_guard_layer_and_alert(cfg, disp)
+        disp.send.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "episode",
+        [
+            {"consecutive": "bad"},
+            {"consecutive": None},
+            {"consecutive": True},
+            {"wedged": []},
+            {"warned_at": 12345},
+            {"first_seen": {"nested": "thing"}},
+            {"last_alert_at": []},
+        ],
+    )
+    def test_malformed_episode_FIELDS_are_dropped_not_trusted(self, tmp_path, episode):
+        """Checking the container and not the contents is the same scope error deeper.
+
+        `{"consecutive": "bad"}` passes an isinstance check on the episode, then
+        raises one frame later while incrementing -- which the outer swallow logs
+        while leaving the file in place, so every later tick wedges identically.
+        """
+        (tmp_path / glw._STATE_FILE).write_text(
+            json.dumps({"version": 1, "episodes": {"venv_dead": episode}})
+        )
+        loaded = glw._load_state(tmp_path / glw._STATE_FILE)["venv_dead"]
+        for field in ("consecutive", "wedged"):
+            assert not isinstance(loaded.get(field), bool)
+            assert loaded.get(field) is None or isinstance(loaded[field], int)
+        for field in ("first_seen", "warned_at", "last_alert_at"):
+            assert loaded.get(field) is None or isinstance(loaded[field], str)
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_counter_does_not_wedge_the_watch(
+        self, tmp_path, monkeypatch
+    ):
+        (tmp_path / glw._STATE_FILE).write_text(
+            json.dumps({"version": 1, "episodes": {"venv_dead": {"consecutive": "bad"}}})
+        )
+        monkeypatch.setattr(glw, "probe_guard_layer", AsyncMock(return_value=_failing("venv_dead")))
+        monkeypatch.setattr(glw, "probe_host_brain", AsyncMock(return_value=True))
+        cfg, disp = _Cfg(tmp_path), AsyncMock()
+        for _ in range(cfg.guard_layer.confirm_ticks):
+            await glw.check_guard_layer_and_alert(cfg, disp)
+        assert disp.send.call_count == 1, (
+            "a malformed counter wedged the watch: it raised while incrementing, the "
+            "outer swallow logged it, the file stayed put, and no condition was ever "
+            "processed again"
+        )
+
+    @pytest.mark.asyncio
+    async def test_two_simultaneous_recoveries_do_not_contradict_each_other(
+        self, tmp_path, monkeypatch
+    ):
+        """Recovery status must come from THIS TICK's evidence, not loop order.
+
+        Reading `episodes` mid-loop treats a condition that also recovered this tick
+        but has not been processed yet as still degraded -- so the first INFO says
+        STILL DEGRADED about something the second INFO then declares healthy, from
+        the same invocation.
+        """
+        monkeypatch.setattr(glw, "probe_host_brain", AsyncMock(return_value=True))
+        monkeypatch.setattr(
+            glw, "probe_guard_layer",
+            AsyncMock(return_value=_failing("node_dead", "venv_dead")),
+        )
+        cfg, disp = _Cfg(tmp_path), AsyncMock()
+        for _ in range(cfg.guard_layer.confirm_ticks):
+            await glw.check_guard_layer_and_alert(cfg, disp)
+        disp.reset_mock()
+
+        monkeypatch.setattr(glw, "probe_guard_layer", AsyncMock(return_value=_healthy()))
+        await glw.check_guard_layer_and_alert(cfg, disp)
+        bodies = [c.args[0].body for c in disp.send.call_args_list]
+        assert len(bodies) == 2, f"both should recover; got {bodies}"
+        assert not any("STILL DEGRADED" in b for b in bodies), (
+            f"a recovery notice claimed another condition was still degraded while "
+            f"it recovered in the same tick: {bodies}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancellation_reaps_the_host_probe_and_re_raises(self, tmp_path):
+        """CancelledError is BaseException on 3.12, so `except Exception` misses it.
+
+        The child is started in its own session, so a cancelled guardian task would
+        otherwise leave the whole claude/node tree running with nothing to reap it.
+        DiagnosisEngine handles this explicitly for the same binary.
+        """
+        cfg = _Cfg(tmp_path)
+        cfg.guard_layer = GuardLayerConfig(check_timeout_s=30)
+        script = tmp_path / "hang"
+        script.write_text("#!/bin/sh" + chr(10) + "sleep 60" + chr(10))
+        script.chmod(0o755)
+        cfg.cc = type("C", (), {"path": str(script), "enabled": True})()
+
+        task = asyncio.create_task(glw.probe_host_brain(cfg))
+        await asyncio.sleep(0.4)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    def test_the_cancellation_handler_exists_and_re_raises(self):
+        """Locked structurally too: the runtime test cannot prove the child was reaped.
+
+        Cancellation is not a verdict about the host brain, so the handler must
+        RE-RAISE rather than swallow into a None.
+        """
+        tree = ast.parse(Path(glw.__file__).read_text())
+        fn = next(
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.AsyncFunctionDef) and n.name == "probe_host_brain"
+        )
+        handlers = [h for h in ast.walk(fn) if isinstance(h, ast.ExceptHandler)]
+        cancelled = [
+            h for h in handlers
+            if h.type is not None and "CancelledError" in ast.unparse(h.type)
+        ]
+        assert cancelled, "probe_host_brain has no CancelledError handler"
+        body = ast.unparse(cancelled[0])
+        assert "kill_process_group" in body and "reap_bounded" in body
+        assert any(isinstance(n, ast.Raise) for n in ast.walk(cancelled[0])), (
+            "the cancellation handler must re-raise; cancellation is not evidence "
+            "about the host brain"
+        )
