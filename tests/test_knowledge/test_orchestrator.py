@@ -1,5 +1,6 @@
 """Tests for knowledge ingestion orchestrator."""
 
+import asyncio
 import contextlib
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -773,3 +774,126 @@ async def test_a_deferred_compensation_is_reported_not_swallowed(tmp_path: Path)
         await orch.ingest_source(str(file), project_type="test")
 
     assert mock_store.delete.await_count == 1
+
+
+async def test_compensation_survives_a_cancel_scope_that_redelivers(tmp_path):
+    """The cancellation that actually happens is not a single ``task.cancel()``.
+
+    Every MCP request runs inside an anyio cancel scope, and anyio RE-DELIVERS
+    ``CancelledError`` at every checkpoint once that scope is cancelled. So
+    widening the handler to ``BaseException`` is necessary and NOT sufficient:
+    ``_compensate`` delegates to ``MemoryStore.delete()``, which is awaits all
+    the way down, so it would raise on its first checkpoint and compensate
+    nothing — in exactly the case the widening was for. Reordering cannot help;
+    only running the work outside the cancelled scope can.
+
+    A single ``task.cancel()`` CANNOT tell the two designs apart, because it
+    delivers once and every later await in the handler runs normally. Neither
+    can an ``AsyncMock`` raising ``CancelledError`` from a ``side_effect``, which
+    is a synchronous raise with nothing ever suspended. This test uses the shape
+    that can.
+    """
+    import anyio
+
+    units = [
+        KnowledgeUnit(
+            domain="test", concept=f"concept_{i}", body=f"body {i}",
+            tags=["t"], confidence=0.9,
+        )
+        for i in range(3)
+    ]
+    orch = _make_orchestrator(tmp_path, mock_distill_result=units)
+
+    mock_own = AsyncMock()
+
+    # A REAL checkpoint. A bare AsyncMock await never yields to the event loop,
+    # so anyio would have nothing to re-deliver at and this test would pass
+    # against both designs. A real rollback does I/O and therefore does yield.
+    async def _rollback_that_yields(*_a, **_k):
+        await anyio.sleep(0)
+
+    mock_own.rollback = AsyncMock(side_effect=_rollback_that_yields)
+
+    @contextlib.asynccontextmanager
+    async def _fake_get_raw_db(_path):
+        yield mock_own
+
+    parked = anyio.Event()
+    deleted: list[str] = []
+    compensated = anyio.Event()
+
+    async def _delete_that_yields(memory_id, *_a, **_k):
+        # A real checkpoint, so the compensation must survive being SUSPENDED --
+        # the property under test. asyncio.sleep rather than anyio.sleep: anyio's
+        # own sleep consults the current cancel scope, so it would measure anyio's
+        # bookkeeping instead of the shield.
+        await asyncio.sleep(0)
+        # Also a real checkpoint: the compensation must survive being suspended,
+        # which is the whole property under test. asyncio.sleep, NOT anyio.sleep
+        # — anyio's own sleep consults the CURRENT cancel scope, which this
+        # detached task inherits from the frame that created it, so using it here
+        # would measure anyio's bookkeeping rather than the shield.
+        await asyncio.sleep(0)
+        deleted.append(memory_id)
+        if len(deleted) == 3:
+            compensated.set()
+        # A DICT, because `_compensate` reads `result.get("deferred")` OUTSIDE its
+        # try block. Returning a bare True made that raise AttributeError and kill
+        # the compensation task after one id -- which looked exactly like the
+        # cancellation this test exists to rule out.
+        return {"deferred": False}
+
+    mock_store = MagicMock()
+    mock_store.store_reporting_creation = AsyncMock(
+        side_effect=[("qid-0", True), ("qid-1", True), ("qid-2", True)]
+    )
+    mock_store.store = AsyncMock(side_effect=["qid-0", "qid-1", "qid-2"])
+    # Assigned DIRECTLY, not wrapped in AsyncMock: with an async side_effect the
+    # wrapper recorded three awaits while the body never ran, so the assertion
+    # below saw an empty list and the test lied about which half had failed.
+    mock_store.delete = _delete_that_yields
+    mock_store._qdrant = MagicMock()
+    mock_store.qdrant_client = MagicMock()
+    mock_store._embeddings = MagicMock(model_name="test-model")
+
+    calls = {"n": 0}
+
+    async def _upsert_then_park(conn, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            parked.set()
+            await anyio.sleep_forever()
+        return kwargs["id"], True
+
+    mock_knowledge = MagicMock()
+    mock_knowledge.find_by_unique_key = AsyncMock(return_value=None)
+    mock_knowledge.upsert = _upsert_then_park
+
+    with patch("genesis.mcp.memory_mcp._require_init"), \
+         patch("genesis.mcp.memory_mcp._store", mock_store), \
+         patch("genesis.mcp.memory_mcp.knowledge", mock_knowledge), \
+         patch("genesis.db.connection.get_raw_db", _fake_get_raw_db), \
+         patch("genesis.qdrant.collections.delete_point"):
+
+        file = tmp_path / "test.txt"
+        file.write_text("some content")
+
+        async with anyio.create_task_group() as tg:
+
+            async def _run():
+                with contextlib.suppress(BaseException):
+                    await orch.ingest_source(str(file), project_type="test")
+
+            tg.start_soon(_run)
+            await parked.wait()
+            tg.cancel_scope.cancel()
+
+        # The wait was cancelled; the compensation itself was not. Give the
+        # shielded task the loop time it needs to finish.
+        with anyio.fail_after(5):
+            await compensated.wait()
+
+    assert sorted(deleted) == ["qid-0", "qid-1", "qid-2"], (
+        "the compensation did not survive a re-delivering cancel scope — the "
+        f"vectors this batch created are orphaned (deleted={deleted})"
+    )

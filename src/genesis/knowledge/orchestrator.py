@@ -23,6 +23,13 @@ from genesis.security.sanitizer import ContentSanitizer, ContentSource
 
 logger = logging.getLogger(__name__)
 
+#: Strong references to compensation tasks that outlived the turn that started
+#: them. The event loop holds only WEAK references to tasks, so a shielded
+#: compensation dropped here could be garbage-collected mid-flight — which would
+#: silently reintroduce the orphaned vectors it exists to remove. Each task
+#: removes itself on completion, so this never grows.
+_BACKGROUND_COMPENSATIONS: set[asyncio.Task] = set()
+
 # Module-level singleton (load_default_patterns() does filesystem I/O).
 _SANITIZER = ContentSanitizer()
 
@@ -684,7 +691,13 @@ class KnowledgeOrchestrator:
                 # pointed at one is durably pointing at its replacement.
                 _drop_vectors(stale_ids, "superseded")
 
-            except Exception:
+            except BaseException:
+                # BaseException, not Exception. `asyncio.CancelledError` is a
+                # BaseException, so `except Exception` never saw a cancellation —
+                # and a cancellation is the one failure where compensation matters
+                # MOST, because `store()` upserts to Qdrant BEFORE its SQLite
+                # write. Cancelled mid-batch, the vectors exist, the batch rolls
+                # back, and nothing is left that knows their ids.
                 logger.error(
                     "Batch storage failed after %d/%d units (%d qdrant vectors) from %s — rolling back",
                     len(unit_ids),
@@ -696,13 +709,50 @@ class KnowledgeOrchestrator:
                 # Roll back the OWNED SQLite txn to release the write lock eagerly (the
                 # connection close would also discard it). Owned conn → this can never
                 # discard another coroutine's uncommitted writes.
-                with contextlib.suppress(Exception):
+                # Suppressing BaseException here, not Exception: under a cancel
+                # scope this await is itself a checkpoint and raises again (see
+                # below). Losing the eager release is harmless — closing the
+                # connection discards the txn and frees the lock anyway — but
+                # letting it escape would skip the compensation below, which is
+                # not harmless.
+                with contextlib.suppress(BaseException):
                     await own.rollback()
 
                 # Compensate: delete the vectors this batch wrote. `stale_ids` is
                 # deliberately NOT touched — those points are still the live ones
                 # for rows the rollback has just restored.
-                await _compensate(created_ids, "batch rollback")
+                #
+                # SHIELDED, and widening the handler without this would have been
+                # cosmetic. An MCP tool call runs inside a cancel scope that
+                # RE-DELIVERS CancelledError at every checkpoint once cancelled, so
+                # `await _compensate(...)` would raise on its first await and
+                # compensate nothing — in exactly the case the widening was for.
+                # Reordering cannot fix it either: `_compensate` delegates to
+                # `MemoryStore.delete()`, so it is awaits all the way down.
+                #
+                # The task therefore runs OUTSIDE the cancelled scope and is
+                # shielded from it. We cannot wait for it — waiting is the thing
+                # that was just cancelled — so on the cancelling path it finishes
+                # in the background and the strong reference below is what keeps
+                # it from being garbage-collected mid-flight. On every ordinary
+                # failure the shield is transparent and this awaits normally.
+                compensation = asyncio.ensure_future(
+                    _compensate(created_ids, "batch rollback")
+                )
+                _BACKGROUND_COMPENSATIONS.add(compensation)
+                compensation.add_done_callback(_BACKGROUND_COMPENSATIONS.discard)
+                try:
+                    await asyncio.shield(compensation)
+                except BaseException:
+                    # Only the WAIT was cancelled. Say so, because "compensation
+                    # started" and "compensation finished" are different facts and
+                    # this path can only assert the first.
+                    logger.warning(
+                        "compensation for %d vector(s) from %s continues in the "
+                        "background after cancellation",
+                        len(created_ids),
+                        source,
+                    )
 
                 raise
 
