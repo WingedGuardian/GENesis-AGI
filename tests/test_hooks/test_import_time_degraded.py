@@ -1177,6 +1177,12 @@ _ADVISORY_BY_DESIGN = {
     "procedure_advisor.py": "surfaces relevant procedures as advisory context.",
 }
 
+#: The one supported launcher invocation. Compared literally: a path that merely
+#: ENDS in `genesis-hook`, or is named that but points somewhere else, is a command
+#: production cannot run, and resolving it would have this test exercise a guard the
+#: real configuration never reaches.
+_LAUNCHER = "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook"
+
 #: A tripwire, not a count. If the enumeration collapses — a renamed key, a
 #: reshaped settings file — pytest reports an EMPTY parametrize list as SKIPPED,
 #: not failed, and this gate would silently cover nothing.
@@ -1186,17 +1192,31 @@ _MIN_EXPECTED_BASH_HOOKS = 12
 def _fires_on_bash(matcher: str | None) -> bool:
     """Does this entry's matcher fire on a Bash tool call?
 
-    The field is a REGEX, not a literal: the repo wires `"Read|Grep|Glob"`,
-    `"Write|Edit"` and `".*"`. An absent/empty matcher means every tool. An
-    invalid regex is treated as FIRING, so a malformed entry is examined rather
-    than skipped — the conservative direction for an allowlist.
+    THREE spellings, and missing any one of them silently shrinks the population:
+
+    * REGEX, not a literal — the repo wires `"Read|Grep|Glob"`, `"Write|Edit"`
+      and `".*"`.
+    * COMMA-SEPARATED alternatives. `docs/reference/cc-compatibility.md` records
+      "comma-separated matchers never firing" as a FIX landed at 2.1.191, and the
+      pinned version is well past that, so `"Bash,Edit"` fires on Bash in
+      production while `re.search("Bash,Edit", "Bash")` finds nothing. None is
+      wired today, which is exactly what makes it the case an allowlist is for.
+    * ABSENT/EMPTY — every tool.
+
+    An INVALID regex is treated as FIRING: a malformed entry gets examined rather
+    than skipped, which is the conservative direction here.
     """
     if not matcher:
         return True
-    try:
-        return re.search(matcher, "Bash") is not None
-    except re.error:
-        return True
+    for part in (p.strip() for p in matcher.split(",")):
+        if not part:
+            return True  # a trailing/empty alternative means "unconstrained"
+        try:
+            if re.search(part, "Bash"):
+                return True
+        except re.error:
+            return True
+    return False
 
 
 def _resolve_bash_hook(command: str) -> tuple[str, str | None, list[str]]:
@@ -1214,11 +1234,21 @@ def _resolve_bash_hook(command: str) -> tuple[str, str | None, list[str]]:
     # guard: the test would execute the guard directly, see exit 2, and stay green,
     # while Claude Code only echoes and the guard never runs at all. A typo like
     # `/missing-genesis-hook …` has the same shape and the same consequence.
-    # `Path(...).name ==` rather than `endswith`: a launcher named
-    # `fake-genesis-hook` satisfies the suffix test, and the script it names would
-    # then be run directly by this test and pass, while the configured launcher
-    # fails non-blocking in production.
-    if tokens and Path(tokens[0]).name == "genesis-hook" and len(tokens) > 1:
+    # The SUPPORTED invocation, exactly. Three progressively tighter versions of
+    # this check were each defeated in review, so the reasoning is recorded rather
+    # than the conclusion alone:
+    #   `endswith("genesis-hook")` anywhere  -> `echo .../genesis-hook guard.py`
+    #                                           resolved, and the test ran the guard
+    #                                           directly while production only echoed.
+    #   token 0 + `endswith`                 -> `./fake-genesis-hook guard.py` resolved.
+    #   token 0 + basename equality          -> `/missing/genesis-hook guard.py`
+    #                                           resolved: a config TYPO that production
+    #                                           cannot execute at all, while the test
+    #                                           ran the guard and passed.
+    # Every one of those failure modes is the same shape: the test exercised a guard
+    # the configured command would never reach. So the launcher must be the path the
+    # settings actually support; anything else is unresolvable and FAILS.
+    if len(tokens) > 1 and tokens[0] == _LAUNCHER:
         rel = tokens[1]
         return rel, rel, tokens[2:]
     return command, None, []
@@ -1356,6 +1386,18 @@ def test_an_allowlisted_hook_carries_no_blocking_MECHANISM():
         path = _REPO_ROOT / "scripts" / rel
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
+            # `return 2` from main(), which run_guard translates into the exit
+            # status. This is the HOUSE convention for blocking, so checking only
+            # for exit() calls would miss the ordinary spelling entirely — and a
+            # hook that gained a `return 2` path while keeping its advisory
+            # docstring still exits 1 under the poisoned run, satisfying
+            # `returncode != 2` and staying permanently exempt.
+            if isinstance(node, ast.Return) and isinstance(node.value, ast.Constant):
+                assert node.value.value != 2, (
+                    f"{rel} is allowlisted as advisory but has a `return 2` — the "
+                    f"house spelling for blocking, which run_guard turns into exit 2. "
+                    f"Remove it from _ADVISORY_BY_DESIGN, or remove the blocking path."
+                )
             # sys.exit(2) / os._exit(2) / exit(2)
             if isinstance(node, ast.Call):
                 fn = node.func
