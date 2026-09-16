@@ -42,7 +42,9 @@
 # tell "lock held / host-frozen — keep the marker" apart from a real success).
 #
 # Env overrides:
-#   CODE_INTEL_INDEX_MEMORY_MAX   default 2G     (per systemd scope)
+#   CODE_INTEL_INDEX_MEMORY_MAX   legacy override for both tools
+#   CODE_INTEL_CBM_MEMORY_MAX     default 2G     (CBM batch scope)
+#   CODE_INTEL_GITNEXUS_MEMORY_MAX default 8G    (measured GitNexus rebuild)
 #   CODE_INTEL_INDEX_IO_WEIGHT    default 20     (1-10000; low = polite)
 #   CODE_INTEL_INDEX_CPU_QUOTA    default 200%   (2 cores worth)
 #   CODE_INTEL_INDEX_MODE         default fast   (fast|moderate|full; 3rd arg wins)
@@ -66,10 +68,35 @@ REPO_PATH="${1:-}"
 TOOLS="${2:-both}"
 MODE="${3:-${CODE_INTEL_INDEX_MODE:-fast}}"
 
-MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-2G}"
+_LEGACY_MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-}"
+CBM_MEM_MAX="${CODE_INTEL_CBM_MEMORY_MAX:-${_LEGACY_MEM_MAX:-2G}}"
+# Measured 2026-09-16: a forced full rebuild peaked at 4,874,166,272 bytes
+# (4.65 GiB) and completed under an 8 GiB, swapless scope. The old shared 2G
+# cap killed it on the way up. Keep headroom for repository growth; admission
+# control and the pressure watchdog still decide when the job may run.
+GITNEXUS_MEM_MAX="${CODE_INTEL_GITNEXUS_MEMORY_MAX:-${_LEGACY_MEM_MAX:-8G}}"
+# Probe with the larger supported value; each tool overrides this dynamically
+# when its real scope/rlimit is created below.
+MEM_MAX="$GITNEXUS_MEM_MAX"
 IO_WEIGHT="${CODE_INTEL_INDEX_IO_WEIGHT:-20}"
 CPU_QUOTA="${CODE_INTEL_INDEX_CPU_QUOTA:-200%}"
 PERSISTENCE="${CODE_INTEL_INDEX_PERSISTENCE:-true}"
+CBM_DISABLE_FILE="${CODEBASE_MEMORY_MCP_DISABLE_FILE:-$HOME/.genesis/codebase-memory-mcp.disabled}"
+
+_GITNEXUS_PIN_READY=0
+_gitnexus_pin_file="$(dirname "${BASH_SOURCE[0]}")/gitnexus_version.sh"
+if [ -r "$_gitnexus_pin_file" ]; then
+    # shellcheck source=gitnexus_version.sh
+    if . "$_gitnexus_pin_file"; then
+        if [[ "${GENESIS_GITNEXUS_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            && declare -F genesis_gitnexus_node_supported >/dev/null \
+            && declare -F genesis_gitnexus_resolve_binary >/dev/null \
+            && declare -F genesis_gitnexus_installed_version >/dev/null \
+            && declare -F genesis_gitnexus_installed_is_pinned >/dev/null; then
+            _GITNEXUS_PIN_READY=1
+        fi
+    fi
+fi
 
 _log() { printf '[code-intel-index] %s\n' "$*"; }
 
@@ -288,13 +315,15 @@ RC=0
 MISSING=""  # requested-but-absent tools — makes a no-op run rc=3, not a false success
 
 if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
-    if command -v codebase-memory-mcp >/dev/null 2>&1; then
+    if [ -e "$CBM_DISABLE_FILE" ]; then
+        _log "codebase-memory-mcp disabled by $CBM_DISABLE_FILE — skipped"
+    elif command -v codebase-memory-mcp >/dev/null 2>&1; then
         _log "indexing (codebase-memory-mcp, mode=$MODE): $REPO_PATH"
         # Flag form (cbm >=0.9): --mode selects the pipeline depth (default here is
         # fast — no similarity/semantic edges); --persistence writes the shareable
         # .codebase-memory/graph.db.zst artifact so a wiped cache restores from it
         # instead of a full 0->100 re-index.
-        _run_with_watchdog cbm codebase-memory-mcp cli index_repository \
+        MEM_MAX="$CBM_MEM_MAX" _run_with_watchdog cbm codebase-memory-mcp cli index_repository \
             --repo-path "$REPO_PATH" --mode "$MODE" --persistence "$PERSISTENCE" || RC=$?
     else
         _log "codebase-memory-mcp not on PATH — skipped"
@@ -304,10 +333,14 @@ fi
 
 if [ "$TOOLS" = "gitnexus" ] || [ "$TOOLS" = "both" ]; then
     _GN=""
-    if command -v gitnexus >/dev/null 2>&1; then
-        _GN="gitnexus"
-    elif command -v npx >/dev/null 2>&1; then
-        _GN="npx gitnexus"
+    if [ "$_GITNEXUS_PIN_READY" -ne 1 ]; then
+        _log "GitNexus pin metadata unavailable — refusing dynamic resolver"
+    elif ! genesis_gitnexus_node_supported; then
+        _log "GitNexus ${GENESIS_GITNEXUS_VERSION} does not support Node $(node --version 2>/dev/null || echo unavailable) — refusing index"
+    elif genesis_gitnexus_installed_is_pinned; then
+        _GN="$(genesis_gitnexus_resolve_binary)"
+    elif genesis_gitnexus_resolve_binary >/dev/null; then
+        _log "GitNexus version $(genesis_gitnexus_installed_version 2>/dev/null || echo unknown) does not match expected pinned ${GENESIS_GITNEXUS_VERSION} — refusing index"
     fi
     if [ -n "$_GN" ]; then
         # gitnexus analyze is already incremental (only -f forces a full re-parse)
@@ -316,7 +349,7 @@ if [ "$TOOLS" = "gitnexus" ] || [ "$TOOLS" = "both" ]; then
         # ("error: unknown option '--quiet'" -> rc 1 on EVERY run); it silently
         # broke every entrypoint-driven gitnexus index since #910. Dropped.
         _log "indexing (gitnexus analyze): $REPO_PATH"
-        ( cd "$REPO_PATH" && _run_with_watchdog gitnexus $_GN analyze ) || RC=$?
+        ( cd "$REPO_PATH" && MEM_MAX="$GITNEXUS_MEM_MAX" _run_with_watchdog gitnexus "$_GN" analyze ) || RC=$?
     else
         _log "gitnexus not available — skipped"
         MISSING="${MISSING}gitnexus "

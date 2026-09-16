@@ -49,11 +49,22 @@ def _make_repo(tmp_path: Path, *, worktree: bool = False) -> Path:
 def _fake_tools(bindir: Path, log: Path, *, sleep: float = 0) -> None:
     """Fake codebase-memory-mcp + gitnexus that record args and ulimit -v."""
     bindir.mkdir(exist_ok=True)
+    _write_exec(
+        bindir / "node",
+        '#!/usr/bin/env bash\necho "${FAKE_NODE_VERSION:-v22.22.2}"\n',
+    )
     for name in ("codebase-memory-mcp", "gitnexus"):
+        version_guard = (
+            'if [ "${1:-}" = "--version" ]; then '
+            'echo "${FAKE_GITNEXUS_VERSION:-1.6.12}"; exit 0; fi\n'
+            if name == "gitnexus"
+            else ""
+        )
         _write_exec(
             bindir / name,
             "#!/usr/bin/env bash\n"
-            f'echo "{name} ARGS:$*" >> "{log}"\n'
+            + version_guard
+            + f'echo "{name} ARGS:$*" >> "{log}"\n'
             f'echo "{name} ULIMIT_V:$(ulimit -v)" >> "{log}"\n'
             + (f"sleep {sleep}\n" if sleep else ""),
         )
@@ -184,6 +195,43 @@ def test_tool_selection_cbm_only(tmp_path):
     assert "gitnexus ARGS:" not in out
 
 
+def test_cbm_disable_sentinel_blocks_index_spawn(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    disable_file = tmp_path / "codebase-memory-mcp.disabled"
+    disable_file.write_text("incident freeze\n")
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODEBASE_MEMORY_MCP_DISABLE_FILE": str(disable_file)},
+    )
+    assert res.returncode == 0
+    assert f"disabled by {disable_file}" in res.stdout
+    assert not log.exists()
+
+
+def test_cbm_disable_does_not_poison_successful_gitnexus_leg(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    disable_file = tmp_path / "codebase-memory-mcp.disabled"
+    disable_file.write_text("incident freeze\n")
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "both",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODEBASE_MEMORY_MCP_DISABLE_FILE": str(disable_file)},
+    )
+    assert res.returncode == 0, res.stderr
+    out = log.read_text()
+    assert "codebase-memory-mcp ARGS:" not in out
+    assert "gitnexus ARGS:analyze" in out
+
+
 def test_tool_selection_gitnexus_only(tmp_path):
     fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
     _fake_tools(fakebin, log)
@@ -206,6 +254,66 @@ def test_missing_requested_tools_return_rc3(tmp_path):
     assert "codebase-memory-mcp not on PATH" in res.stdout
     assert "gitnexus not available" in res.stdout
     assert "missing from PATH" in res.stdout
+
+
+def test_wrong_gitnexus_version_is_refused(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "gitnexus",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"FAKE_GITNEXUS_VERSION": "1.6.8"},
+    )
+    assert res.returncode == 3
+    assert "expected pinned 1.6.12" in res.stdout
+    assert not log.exists()
+
+
+def test_unsupported_node_version_refuses_gitnexus(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "gitnexus",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"FAKE_NODE_VERSION": "v23.11.1"},
+    )
+    assert res.returncode == 3
+    assert "does not support Node v23.11.1" in res.stdout
+    assert not log.exists()
+
+
+def test_gitnexus_runs_from_npm_prefix_when_prefix_is_not_on_path(tmp_path):
+    path_bin = tmp_path / "path-bin"
+    prefix_bin = tmp_path / "npm-prefix" / "bin"
+    path_bin.mkdir()
+    prefix_bin.mkdir(parents=True)
+    log = tmp_path / "tools.log"
+    _write_exec(path_bin / "node", "#!/bin/sh\necho v22.22.2\n")
+    _write_exec(
+        path_bin / "npm",
+        f'#!/bin/sh\necho "{tmp_path / "npm-prefix"}"\n',
+    )
+    _write_exec(
+        prefix_bin / "gitnexus",
+        "#!/bin/sh\n"
+        'if [ "${1:-}" = --version ]; then echo 1.6.12; exit 0; fi\n'
+        f'echo "gitnexus ARGS:$*" > "{log}"\n',
+    )
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "gitnexus",
+        path=f"{path_bin}:{_SYSTEM_PATH}",
+    )
+    assert res.returncode == 0, res.stderr
+    assert log.read_text() == "gitnexus ARGS:analyze\n"
 
 
 def test_mode_arg_reaches_cbm(tmp_path):
@@ -351,6 +459,18 @@ def test_scope_path_passes_all_properties(tmp_path):
     assert "CPUQuota=200%" in calls
     assert "--scope" in calls
     assert "codebase-memory-mcp ARGS:" in log.read_text()  # tool actually ran
+
+
+def test_gitnexus_scope_uses_measured_8g_cap(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog, probe_ok=True)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "gitnexus", path=f"{fakebin}:{_SYSTEM_PATH}")
+    assert res.returncode == 0, res.stderr
+    assert "MemoryMax=8G" in slog.read_text()
+    assert "gitnexus ARGS:analyze" in log.read_text()
 
 
 def test_env_overrides_reach_scope(tmp_path):

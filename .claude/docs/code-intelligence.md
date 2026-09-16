@@ -81,11 +81,13 @@ mid-session, the instance likely hit the cap and was killed — run `/mcp` to
 reconnect a fresh one; Serena/GitNexus/Grep are unaffected. Cap override:
 `CODEBASE_MEMORY_MCP_MEMORY_MAX` (e.g. `4G`).
 
-**GitNexus** — LadybugDB graph (v1.6.8). Snapshot-based: correct only when the
+**GitNexus** — LadybugDB graph (v1.6.12). Snapshot-based: correct only when the
 index matches the working tree. Its reindex fires on local commit, **not** on
 `git pull` of merged PRs, so the index silently drifts after merges — a stale
-`impact` is confidently wrong exactly mid-change. **Reindex (`gitnexus analyze`)
-when you reach for it** for something load-bearing, and prefer Serena for live
+`impact` is confidently wrong exactly mid-change. **Reindex through
+`scripts/lib/code_intel_index.sh "$PWD" gitnexus fast`
+when you reach for it from the main checkout** for something load-bearing.
+Linked worktrees intentionally skip indexing; use Serena for live branch
 blast-radius. `query` (FTS) may be unavailable depending on the LadybugDB
 extension — it degrades gracefully (skips FTS, no crash).
 

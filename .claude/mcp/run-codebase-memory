@@ -17,6 +17,28 @@
 # Install the tool first:
 #   curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui
 
+# Machine-local kill switch. Registrations can survive process termination and
+# bootstrap can drift-heal them later, so the launcher itself must enforce the
+# disabled state. This is absent by default on new installations.
+_user_home="${HOME:-}"
+if [[ -z "$_user_home" ]]; then
+    while IFS=: read -r _name _password _uid _gid _gecos _home _shell; do
+        if [[ "$_uid" == "$EUID" ]]; then
+            _user_home="$_home"
+            break
+        fi
+    done < /etc/passwd
+fi
+_disable_file="${CODEBASE_MEMORY_MCP_DISABLE_FILE:-${_user_home:+${_user_home}/.genesis/codebase-memory-mcp.disabled}}"
+if [[ -z "$_disable_file" ]]; then
+    printf 'run-codebase-memory: cannot resolve disable-state path; refusing to start\n' >&2
+    exit 1
+fi
+if [[ -e "$_disable_file" ]]; then
+    printf 'run-codebase-memory: disabled by %s\n' "$_disable_file" >&2
+    exit 1
+fi
+
 # Locate the binary WITHOUT depending on $HOME: some MCP clients
 # spawn servers with a scrubbed environment (no HOME/USER/XDG_RUNTIME_DIR),
 # where ${HOME}/.local/bin/... would collapse to /.local/bin/... and fail the

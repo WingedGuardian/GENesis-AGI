@@ -9,6 +9,7 @@ it breaks, so the next person to bump either number is told.
 from __future__ import annotations
 
 import re
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -17,6 +18,285 @@ from packaging.requirements import Requirement
 from packaging.version import Version
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_gitnexus_pin_is_single_sourced_and_current():
+    """Install and update paths must not silently downgrade the indexed DB.
+
+    GitNexus storage formats move with releases.  On 2026-09-16 a successful
+    1.6.12 rebuild (storage v42) was made unreadable when bootstrap reinstalled
+    the older 1.6.8 pin (storage v41).  Keep one reviewed pin and require both
+    install paths to consume it.
+    """
+    version_file = REPO_ROOT / "scripts" / "lib" / "gitnexus_version.sh"
+    version_text = version_file.read_text()
+    matches = re.findall(
+        r'^GENESIS_GITNEXUS_VERSION="([0-9]+\.[0-9]+\.[0-9]+)"$',
+        version_text,
+        re.MULTILINE,
+    )
+    match = matches[0] if len(matches) == 1 else None
+    assert match, "gitnexus_version.sh must contain one exact semantic-version pin"
+    assert match == "1.6.12"
+
+    for relative in ("scripts/install.sh", "scripts/bootstrap.sh"):
+        text = (REPO_ROOT / relative).read_text()
+        source = 'source "$_gitnexus_pin_file"'
+        assert source in text
+        assert text.index('if [ -r "$_gitnexus_pin_file" ]; then') < text.index(source)
+        assert text.index(source) < text.index("if genesis_gitnexus_ensure_pin;")
+        assert "genesis_gitnexus_ensure_pin" in text
+        assert not re.search(r"gitnexus@[0-9]+\.[0-9]+\.[0-9]+", text), (
+            f"{relative} carries a second GitNexus version literal"
+        )
+
+    bootstrap = (REPO_ROOT / "scripts" / "bootstrap.sh").read_text()
+    assert bootstrap.index("UPDATE_STATE=") < bootstrap.index(
+        'source "$_gitnexus_pin_file"'
+    ), "an optional pin helper must not preempt interrupted-update recovery"
+
+
+def test_installers_enforce_the_declared_node_22_floor():
+    install = (REPO_ROOT / "scripts" / "install.sh").read_text()
+    bootstrap = (REPO_ROOT / "scripts" / "bootstrap.sh").read_text()
+    assert 'NODE_MAJOR="${NODE_MAJOR:-22}"' in install
+    assert '[ "${ver:-0}" -ge 22 ]' in install
+    assert '[[ "$major" -ge 22 ]]' in bootstrap
+
+
+def test_installers_do_not_run_cbm_installer_while_kill_switch_is_active():
+    for relative in ("scripts/install.sh", "scripts/bootstrap.sh"):
+        text = (REPO_ROOT / relative).read_text()
+        sentinel = 'if [ -e "$HOME/.genesis/codebase-memory-mcp.disabled" ]; then'
+        installer = "https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/"
+        assert text.index(sentinel) < text.index(installer), relative
+
+
+def test_every_gitnexus_package_resolver_uses_the_shared_pin():
+    """No install/index path may float to an npm tag or range."""
+    dynamic_resolver = re.compile(
+        r"\b(?:"
+        r"npx(?:\s+--?[A-Za-z-]+)*|"
+        r"npm\s+(?:exec|x)(?:\s+--[A-Za-z-]+)*|"
+        r"pnpm\s+dlx|yarn\s+dlx|bunx"
+        r")\s+(?:--\s+)?gitnexus(?:@|\s|$)"
+    )
+    for mutation in (
+        "npx gitnexus",
+        "npx -y gitnexus",
+        "npx --yes gitnexus",
+        "npm exec gitnexus",
+        "npm exec -- gitnexus",
+        "npm x gitnexus",
+        "pnpm dlx gitnexus",
+        "yarn dlx gitnexus",
+        "bunx gitnexus",
+    ):
+        assert dynamic_resolver.search(mutation), mutation
+
+    resolvers: list[tuple[str, str]] = []
+    for path in (REPO_ROOT / "scripts").rglob("*.sh"):
+        for line in path.read_text().splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            if re.search(r"\bnpm\s+install\b.*\bgitnexus(?:@|\s|$)", line):
+                resolvers.append((str(path.relative_to(REPO_ROOT)), line.strip()))
+            assert not dynamic_resolver.search(line), (
+                f"{path.relative_to(REPO_ROOT)} has a dynamic GitNexus resolver: {line}"
+            )
+
+    assert len(resolvers) == 1
+    for path, line in resolvers:
+        assert '"gitnexus@${GENESIS_GITNEXUS_VERSION}"' in line, (
+            f"{path} bypasses the shared exact pin: {line}"
+        )
+        assert "--engine-strict" in line
+
+    instruction_files = list((REPO_ROOT / ".claude" / "skills").rglob("*.md"))
+    for path in instruction_files:
+        assert not dynamic_resolver.search(path.read_text()), (
+            f"{path.relative_to(REPO_ROOT)} instructs an unpinned resolver"
+        )
+
+    managed_instruction_files = [
+        REPO_ROOT / "CLAUDE.md",
+        REPO_ROOT / "AGENTS.md",
+        *(REPO_ROOT / ".claude" / "skills").rglob("*.md"),
+        *(REPO_ROOT / ".claude" / "docs").rglob("*.md"),
+    ]
+    raw_parts = ["git" + "nexus", "ana" + "lyze"]
+    raw_analyze = "`" + " ".join(raw_parts) + "`"
+    wrapper_parts = ["node", ".git" + "nexus/run.cjs", "ana" + "lyze"]
+    raw_wrapper_analyze = "`" + " ".join(wrapper_parts) + "`"
+    for path in managed_instruction_files:
+        text = path.read_text()
+        assert raw_analyze not in text, path.relative_to(REPO_ROOT)
+        assert raw_wrapper_analyze not in text, path.relative_to(REPO_ROOT)
+
+
+def test_gitnexus_node_engine_contract_matches_upstream_boundaries():
+    """The local predicate must match ``^22.18.0 || >=24.11.0``."""
+    helper = REPO_ROOT / "scripts" / "lib" / "gitnexus_version.sh"
+    expected = {
+        "v20.20.2": False,
+        "v21.7.3": False,
+        "v22.17.9": False,
+        "v22.18.0": True,
+        "v22.99.0": True,
+        "v23.11.1": False,
+        "v24.10.9": False,
+        "v24.11.0": True,
+        "v25.0.0": True,
+    }
+    for version, supported in expected.items():
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; genesis_gitnexus_node_version_supported "$2"',
+                "bash",
+                str(helper),
+                version,
+            ],
+            check=False,
+        )
+        assert (result.returncode == 0) is supported, version
+
+
+def test_gitnexus_unreviewed_version_is_never_automatically_replaced(tmp_path):
+    helper = REPO_ROOT / "scripts" / "lib" / "gitnexus_version.sh"
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    npm_log = tmp_path / "npm.log"
+    gitnexus = fakebin / "gitnexus"
+    version_file = tmp_path / "version"
+    version_file.write_text("1.6.13\n")
+    gitnexus.write_text(f'#!/bin/sh\ncat "{version_file}"\n')
+    gitnexus.chmod(0o755)
+    npm = fakebin / "npm"
+    npm.write_text(
+        "#!/bin/sh\n"
+        'if [ "${1:-}" = config ]; then exit 0; fi\n'
+        f'echo called > "{npm_log}"\n'
+    )
+    npm.chmod(0o755)
+    for version, expected_rc in (
+        ("1.6.13", 2),
+        ("1.7.0-rc.1", 2),
+        ("not-semver", 3),
+    ):
+        version_file.write_text(f"{version}\n")
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; genesis_gitnexus_ensure_pin',
+                "bash",
+                str(helper),
+            ],
+            env={"PATH": f"{fakebin}:/usr/bin:/bin"},
+            check=False,
+        )
+        assert result.returncode == expected_rc, version
+        assert not npm_log.exists(), version
+
+
+def test_gitnexus_ensure_pin_install_upgrade_and_postconditions(tmp_path):
+    helper = REPO_ROOT / "scripts" / "lib" / "gitnexus_version.sh"
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    gitnexus = fakebin / "gitnexus"
+    version_file = tmp_path / "version"
+    npm_log = tmp_path / "npm.log"
+    npm_result = tmp_path / "npm-result"
+    gitnexus.write_text(f'#!/bin/sh\ncat "{version_file}"\n')
+    npm = fakebin / "npm"
+    npm.write_text(
+        "#!/bin/sh\n"
+        'if [ "${1:-}" = config ]; then exit 0; fi\n'
+        f'printf "%s\\n" "$*" > "{npm_log}"\n'
+        f'cat "{npm_result}" > "{version_file}"\n'
+        f'chmod +x "{gitnexus}"\n'
+    )
+    npm.chmod(0o755)
+    env = {"PATH": f"{fakebin}:/usr/bin:/bin"}
+    command = [
+        "bash",
+        "-c",
+        'source "$1"; genesis_gitnexus_ensure_pin',
+        "bash",
+        str(helper),
+    ]
+
+    for initial, installed, expected_rc, npm_called in (
+        (None, "1.6.12", 0, True),
+        ("1.6.8", "1.6.12", 0, True),
+        ("1.6.12", "1.6.12", 0, False),
+        ("1.6.8", "1.6.9", 1, True),
+    ):
+        npm_log.unlink(missing_ok=True)
+        npm_result.write_text(f"{installed}\n")
+        version_file.write_text(f"{initial or 'absent'}\n")
+        gitnexus.chmod(0o755 if initial is not None else 0o644)
+        result = subprocess.run(command, env=env, check=False)
+        assert result.returncode == expected_rc, (initial, installed)
+        assert npm_log.exists() is npm_called, (initial, installed)
+        if npm_called:
+            assert npm_log.read_text() == (
+                "install -g --engine-strict gitnexus@1.6.12\n"
+            )
+
+
+def test_gitnexus_resolver_finds_npm_prefix_outside_path(tmp_path):
+    helper = REPO_ROOT / "scripts" / "lib" / "gitnexus_version.sh"
+    path_bin = tmp_path / "path-bin"
+    prefix_bin = tmp_path / "prefix" / "bin"
+    path_bin.mkdir()
+    prefix_bin.mkdir(parents=True)
+    gitnexus = prefix_bin / "gitnexus"
+    gitnexus.write_text("#!/bin/sh\necho 1.6.12\n")
+    gitnexus.chmod(0o755)
+    npm = path_bin / "npm"
+    npm.write_text(f'#!/bin/sh\necho "{tmp_path / "prefix"}"\n')
+    npm.chmod(0o755)
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; genesis_gitnexus_resolve_binary; '
+            "genesis_gitnexus_installed_is_pinned",
+            "bash",
+            str(helper),
+        ],
+        env={"PATH": f"{path_bin}:/usr/bin:/bin", "HOME": str(tmp_path / "home")},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == str(gitnexus)
+
+
+def test_gitnexus_callers_preserve_ensure_pin_status():
+    for relative in ("scripts/install.sh", "scripts/bootstrap.sh"):
+        text = (REPO_ROOT / relative).read_text()
+        assert "if ! genesis_gitnexus_ensure_pin" not in text
+        assert re.search(
+            r"if genesis_gitnexus_ensure_pin; then.*?else\s+_gitnexus_rc=\$\?",
+            text,
+            re.DOTALL,
+        ), relative
+
+
+def test_gitnexus_registration_always_drift_heals_to_fail_closed_launcher():
+    for relative in ("scripts/install.sh", "scripts/bootstrap.sh"):
+        text = (REPO_ROOT / relative).read_text()
+        registration = '_register_mcp "gitnexus" "user"'
+        assert registration in text
+        registration_block = text[text.rfind("if ", 0, text.index(registration)) :]
+        assert '-x "$' in registration_block
+        assert ".claude/mcp/run-gitnexus" in registration_block
+        assert "_GITNEXUS_PIN_READY" not in registration_block
 
 
 def _qdrant_client_requirement() -> Requirement:
