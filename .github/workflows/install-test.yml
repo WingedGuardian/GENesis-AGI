@@ -98,6 +98,16 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
+        with:
+          # This job EXECUTES the checked-out tree — `scripts/install.sh` is run
+          # two steps down, from the pull request's own code. checkout@v7
+          # defaults to persist-credentials: true, which writes the GITHUB_TOKEN
+          # into .git/config as an auth header and leaves it there until the
+          # post-job cleanup, i.e. for the entire duration of the installer run.
+          # So the read-only token granted above would be readable by code a
+          # contributor wrote, which is a strictly worse position than the
+          # read-only jobs in ci.yml that already set this.
+          persist-credentials: false
 
       - name: Provision a user systemd session
         # Hosted runners execute steps via a system unit with no logind session
