@@ -43,7 +43,17 @@ NAMED GAPS, so this is not read as covering more than it does:
     clients, which is the noise risk, not a claim that the semantics differ.
   * A ``gh`` call inside ``python -c`` or another embedded string is invisible
     here -- the limit is not in argv.
-  * A subcommand with no entry in the defaults table is silent, never guessed.
+  * A subcommand with no entry in the defaults table is silent, never guessed --
+    and THE TABLE IS INCOMPLETE, which is the largest open gap here. MEASURED on
+    gh 2.98.0: ``label list``, ``org list``, ``project list``, ``project
+    item-list``, ``ruleset list`` and ``codespace list`` all advertise
+    ``--limit int ... (default 30)`` and are absent from the table, so
+    ``gh label list`` can produce exactly the false count this hook exists to
+    prevent. Hand-listing the rest would be a second copy that drifts the same
+    way the first did; the fix is to DERIVE the inventory from ``gh help
+    reference`` so the drift test detects a newly capped command instead of only
+    re-checking rows already present. Tracked as issue #2064 rather than done
+    here, because it changes the drift test rather than the table.
   * A value-taking flag placed BEFORE the leaf subcommand is a miss.
     CONFIRMED against gh 2.98.0: ``gh pr --state open list`` runs, and resolves
     here to the target ``("pr", "open")``, which has no table entry, so the hook
@@ -198,7 +208,7 @@ _MAX_FIRES_PER_SESSION = len(_GH_DEFAULT_LIMITS) + 1
 #: table plus this one, and a collision would require adding a literal
 #: ("parse", "incomplete") row to the table.
 #:
-#: ONE key for all four BlindSpot causes, deliberately: an early untokenizable
+#: ONE key for all FIVE BlindSpot causes, deliberately: an early untokenizable
 #: apostrophe therefore spends the slot a later bounds-induced blind spot would
 #: have used. MEASURED over 177,949 commands, 0 were bounds-induced, so the cost
 #: is nil today -- recorded as a decision rather than left as an oversight.
@@ -409,7 +419,36 @@ def _blind_advisory(blind: BlindSpot, *, found_any: bool) -> str:
     even report the condition, which is why importing it is refused by
     ``test_untokenizable_probe.TestNoConsumerCanSkipTheChokepoint``.
 
-    ``found_any`` is not cosmetic. Two of the four blind causes return segments
+    THIS BRANCH RESOLVED NO TARGET, so it PRESCRIBES NO MECHANISM. It names the
+    ways a gh read can be bounded as WARNINGS, and hands the reader the one check
+    that holds for all of them -- fewer rows than you asked for -- rather than a
+    remedy it cannot verify applies.
+
+    That shape was arrived at the expensive way. The same root cause -- a remedy
+    generalised past the family it was executed against -- produced FIVE defects
+    on this file, the last two of them inside the fix for the one before:
+
+    1. ``--paginate`` prescribed; all 13 table subcommands reject it.
+    2. ``gh search`` refuses ``--limit`` above :data:`_SEARCH_CEILING`, so "raise
+       the limit until the result is short" is unfollowable there.
+    3. This branch asserted "every gh listing is capped by default" and
+       prescribed ``--limit``. MEASURED: ``gh secret list --limit 100`` answers
+       ``unknown flag: --limit``, likewise variable/alias/ssh-key/gpg-key list.
+    4. Its replacement said a command with no ``--limit`` line is not capped.
+       MEASURED: ``gh api repos/cli/cli/issues --jq length`` returns **30** with
+       no such flag -- one PAGE. That sentence certified a capped read as
+       complete, which is worse than silence and is the precise failure this
+       hook exists to prevent.
+    5. Its replacement routed the reader to the command's own ``--help``.
+       MEASURED: ``gh search prs --help`` advertises
+       ``--limit int ... (default 30)`` and does not mention the 1000 ceiling
+       ANYWHERE, so that route hands defect 2 straight back.
+
+    Every one of the five is a branch with no resolved target prescribing a
+    mechanism. Naming no mechanism is what makes the class unreachable rather
+    than merely fixed again.
+
+    ``found_any`` is not cosmetic. Three of the five blind causes return segments
     alongside the blind spot, so this block and a per-target block are emitted
     TOGETHER -- and saying "I could not check whether it contains a gh listing"
     directly beneath a block that just named one and stated its cap is a message
@@ -418,12 +457,16 @@ def _blind_advisory(blind: BlindSpot, *, found_any: bool) -> str:
     """
     scope = "another `gh` listing" if found_any else "a `gh` listing"
     return (
-        f"[capped read] This command {blind.cause}, so I could not check whether it "
-        f"contains {scope} -- and every gh listing is capped by default "
-        f"({_cap_summary()}).\n"
-        f"If you will state a count or an absence from its output, pass an explicit "
-        f"--limit ABOVE the number you expect and treat a result of exactly that "
-        f"limit as incomplete.\n"
+        f"[capped read] Part of this command could not be read ({blind.cause}), so I "
+        f"may have missed {scope} in it.\n"
+        f"gh bounds a read in several unrelated ways and I cannot tell you which "
+        f"applies here: a default --limit ({_cap_summary()}); a hard ceiling that "
+        f"REFUSES a bigger one (`gh search`, {_SEARCH_CEILING}); and a single PAGE "
+        f"for commands with no --limit at all (`gh api` returns 30 without "
+        f"`per_page=` or `--paginate`).\n"
+        f"So if you will state a count or an absence from this output, establish it "
+        f"from the RESULT -- fewer rows than you asked for -- and never from a flag "
+        f"being absent.\n"
         f"For a quick look, ignore this."
     )
 
@@ -503,23 +546,51 @@ def _process(payload: dict) -> None:
     # than losing one target's cap reminder, and it is the cheapest block there
     # is. Whatever does not fit is simply not recorded, so a later command
     # carrying the same target still gets its advisory.
-    overhead = emit_cost(json.dumps(_envelope("")))
-    room = DEFAULT_BUDGET - overhead - (emit_cost(blind_block[1]) + 2 if blind_block else 0)
+    # Measure the SERIALISED payload, never a sum of raw block lengths.
+    # json.dumps escapes every newline and quote, and these blocks are full of
+    # both, so per-block arithmetic UNDER-counts and the joined result overruns
+    # anyway -- which is the same trim-mid-block defect one layer further in.
+    # Caught by its own test rather than by reasoning. Bounded work: at most
+    # len(_GH_DEFAULT_LIMITS) + 1 serialisations of a payload under the cap.
+    reserved = [blind_block[1]] if blind_block is not None else []
+
+    def _fits(texts: list[str]) -> bool:
+        return emit_cost(json.dumps(_envelope("\n\n".join(texts)))) <= DEFAULT_BUDGET
+
     kept: list[tuple[str, str]] = []
     for key, text in pending:
-        cost = emit_cost(text) + 2
-        if cost > room:
+        if not _fits([t for _k, t in kept] + [text] + reserved):
             break
-        room -= cost
         kept.append((key, text))
-    if blind_block is not None:
+    # The reserved block is fits-CHECKED too, not appended on faith. Exempting it
+    # would reintroduce this very defect in the one block the loop exists to
+    # protect: an oversized blind block would be trimmed mid-value while its key
+    # was recorded, and the session would go permanently silent on blind parses.
+    # MEASURED: the blind block alone serialises to 778 against a 9,800 budget,
+    # and NEITHER of its two inputs is command-controlled -- blind.cause is a
+    # fixed constant in shell_parse and _cap_summary derives from a 13-row table
+    # -- so this guard is unreachable BY CONSTRUCTION today and no mutation of it
+    # can be made to bite. Recorded rather than dropped, because "unreachable"
+    # has a live expiry date: _cap_summary grows with the defaults table, and
+    # issue #2064 proposes roughly doubling it.
+    if blind_block is not None and _fits([t for _k, t in kept] + [blind_block[1]]):
         kept.append(blind_block)
+    if not kept:
+        return
 
-    print_json_bounded(
+    # RECORD ONLY ON A DELIVERED EMIT. print_json_bounded returns whether it fit
+    # WITHOUT trimming, and hook_output is explicit that a caller needing the
+    # guarantee must check it. This caller needs it: an unchecked trim plus an
+    # unconditional record is exactly the permanent per-key silence above. The
+    # selection loop should already make a trim impossible -- so if it ever
+    # happens, recording nothing means the next command re-advises rather than
+    # the keys being spent on text nobody read.
+    delivered = print_json_bounded(
         _envelope("\n\n".join(text for _key, text in kept)),
         text_keys=("hookSpecificOutput.additionalContext",),
     )
-    _record(sid, [key for key, _text in kept])
+    if delivered:
+        _record(sid, [key for key, _text in kept])
 
 
 def main() -> int:

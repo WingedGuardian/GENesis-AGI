@@ -316,9 +316,10 @@ def test_a_bound_that_blinds_the_parser_still_advises(tmp_path: Path) -> None:
 def test_the_blind_advisory_claims_only_what_it_knows(tmp_path: Path) -> None:
     """It must not assert a listing IS present -- it could not check."""
     ctx = _context(_run("gh pr list " + "#" * 60_000, tmp_path))
-    assert "could not check" in ctx
-    # And it still has to be actionable, or it is just noise.
-    assert "--limit" in ctx
+    assert "could not be read" in ctx
+    assert "may have missed" in ctx
+    # Still actionable -- but the action is a CHECK, never a prescribed flag.
+    assert "from the RESULT" in ctx
 
 
 def test_a_blind_parse_is_reported_even_when_a_listing_was_found(
@@ -332,7 +333,7 @@ def test_a_blind_parse_is_reported_even_when_a_listing_was_found(
     """
     ctx = _context(_run('gh pr list --search "unbalanced', tmp_path))
     assert "gh pr list" in ctx
-    assert "could not check" in ctx
+    assert "could not be read" in ctx
 
 
 # --------------------------------------------------------------------------
@@ -515,13 +516,13 @@ def test_the_blind_block_is_reserved_against_the_budget(tmp_path: Path) -> None:
 
     command = "; ".join(f"gh {g} {s}" for g, s in _GH_DEFAULT_LIMITS) + ' --search "unbalanced'
     ctx = _context(_run(command, tmp_path))
-    assert "could not check" in ctx
+    assert "could not be read" in ctx
     # And nothing was cut mid-block -- whole blocks in, whole blocks out.
     assert "truncated" not in ctx
 
 
 def test_the_blind_block_does_not_contradict_a_named_listing(tmp_path: Path) -> None:
-    """Two of the four blind causes return segments, so both blocks co-emit.
+    """Three of the five blind causes return segments, so both blocks co-emit.
 
     Saying "I could not check whether it contains a gh listing" directly under a
     block that just named one and stated its cap is a message contradicting
@@ -529,14 +530,14 @@ def test_the_blind_block_does_not_contradict_a_named_listing(tmp_path: Path) -> 
     """
     ctx = _context(_run('gh pr list --search "unbalanced', tmp_path))
     assert "`gh pr list`" in ctx
-    assert "another `gh` listing" in ctx
-    assert "contains a `gh` listing" not in ctx
+    assert "missed another `gh` listing" in ctx
+    assert "missed a `gh` listing" not in ctx
 
 
 def test_the_blind_block_says_a_listing_when_none_was_found(tmp_path: Path) -> None:
     """The other side of the same word -- a bound yields NO segments at all."""
     ctx = _context(_run("gh pr list " + "#" * 60_000, tmp_path))
-    assert "contains a `gh` listing" in ctx
+    assert "missed a `gh` listing" in ctx
     assert "another" not in ctx
 
 
@@ -553,3 +554,35 @@ def test_the_cap_summary_is_derived_from_the_table(tmp_path: Path) -> None:
     for (group, _sub), cap in _GH_DEFAULT_LIMITS.items():
         assert group in summary, f"{group} missing from the derived cap summary"
         assert str(cap) in summary, f"cap {cap} missing from the derived cap summary"
+
+
+def test_the_blind_block_never_prescribes_a_flag_it_cannot_know_exists(
+    tmp_path: Path,
+) -> None:
+    """A branch that resolved NO target must prescribe NO mechanism.
+
+    FIVE defects on this file share one root cause -- a remedy generalised past
+    the family it was executed against -- and the last three were each inside the
+    fix for the one before. MEASURED on gh 2.98.0:
+      * `gh secret list --limit 100` -> `unknown flag: --limit` (so "pass --limit"
+        is unfollowable there), AND
+      * `gh api repos/cli/cli/issues --jq length` -> 30 with NO --limit flag at
+        all (so "no --limit line means uncapped" certifies a capped read as
+        complete -- worse than silence), AND
+      * `gh search prs --help` advertises `--limit int ... (default 30)` and never
+        mentions the 1000 ceiling (so "read its --help" hands the search defect
+        straight back).
+    The text now names the bounding shapes as WARNINGS and hands over the one
+    check true of all of them. Mutation (restore any prescribed remedy) -> BITES.
+    """
+    ctx = _context(_run("gh secret list " + "#" * 60_000, tmp_path))
+    assert "could not be read" in ctx
+    # The three bounding shapes are named, so none is silently assumed away.
+    assert "gh api" in ctx and "per_page" in ctx
+    assert "gh search" in ctx and "1000" in ctx
+    # The invariant that holds for all of them, and the one the reader gets.
+    assert "from the RESULT" in ctx
+    assert "never from a flag being absent" in ctx
+    # The three false sentences, pinned OUT by name.
+    assert "no client-side limit is capping the read" not in ctx
+    assert "every gh listing is capped" not in ctx
