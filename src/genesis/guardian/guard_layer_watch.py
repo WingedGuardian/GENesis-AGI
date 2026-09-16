@@ -110,9 +110,11 @@ _CONDITION_DETAIL = {
         "exists to repair anything from the inside. Heal via scripts/update.sh."
     ),
     CONDITION_HOST_BRAIN: (
-        "The host's configured Claude Code binary (guardian cc.path) does not run, so "
-        "the Guardian's own recovery brain cannot start. cc_align_host.sh repairs this "
-        "nightly via the gateway's update-node/update-cc; run it now to not wait."
+        "The host's configured Claude Code binary (guardian cc.path) does not run or "
+        "never answers, so the Guardian's own recovery brain cannot start. "
+        "cc_align_host.sh repairs this nightly via the gateway's update-node/update-cc; "
+        "run it now to not wait. (A binary that consistently exceeds its probe timeout "
+        "is reported here too: unavailable in practice is unavailable.)"
     ),
 }
 
@@ -225,6 +227,34 @@ async def probe_host_brain(config) -> bool | None:
     return (proc.returncode or 0) == 0
 
 
+def host_brain_state(config, brain_ok: bool | None, episode: dict | None) -> str:
+    """Resolve the host leg to failing / healthy / inconclusive.
+
+    Three inputs collapse to three outcomes, and each collapse is a decision:
+
+    * CC diagnosis DISABLED (``config.cc.enabled`` false) ⇒ inconclusive, forever.
+      That is a supported configuration — ``scripts/install_guardian.sh`` writes it
+      when Claude is absent, and ``DiagnosisEngine`` skips CC for the same reason —
+      so alerting on it would be a recurring false alarm about a component nobody
+      wants running.
+    * A PERSISTENT wedge ⇒ failing. One timeout says nothing, but a binary that
+      never answers within its timeout is operationally unavailable whether or not
+      it is technically dead, and treating every wedge as inconclusive left that
+      state silent forever.
+    * Anything else ⇒ what the probe said.
+    """
+    if not getattr(getattr(config, "cc", None), "enabled", True):
+        return "inconclusive"
+    if brain_ok is True:
+        return "healthy"
+    if brain_ok is False:
+        return "failing"
+    streak = (episode or {}).get("wedged", 0)
+    if streak >= config.guard_layer.confirm_ticks:
+        return "failing"
+    return "inconclusive"
+
+
 def decide(
     condition: str, is_failing: bool, episode: dict | None, now: datetime, cfg
 ) -> EpisodeDecision:
@@ -256,13 +286,28 @@ def decide(
 
 
 def _load_state(path: Path) -> dict:
+    """Load the episode map, degrading to empty on ANY structural problem.
+
+    Valid JSON of the wrong SHAPE (`[]`, `null`, a string) is the case that bites:
+    `.get` on a non-mapping raises AttributeError, which is not a JSONDecodeError,
+    so it escaped the old handler and reached the orchestrator's outer swallow.
+    That logged and moved on WITHOUT rewriting the file, so every later tick hit
+    the same exception after paying for the probe, and no condition was ever
+    processed again. Each episode is checked too — a non-mapping entry would raise
+    the same way deeper in.
+    """
     if not path.exists():
         return {}
     try:
-        episodes = json.loads(path.read_text()).get("episodes", {})
-        return episodes if isinstance(episodes, dict) else {}
-    except (json.JSONDecodeError, OSError):
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError, ValueError):
         return {}
+    if not isinstance(data, dict):
+        return {}
+    episodes = data.get("episodes")
+    if not isinstance(episodes, dict):
+        return {}
+    return {k: v for k, v in episodes.items() if isinstance(v, dict)}
 
 
 def _save_state(path: Path, episodes: dict) -> None:
@@ -292,28 +337,47 @@ async def check_guard_layer_and_alert(config, dispatcher) -> None:
         if not getattr(cfg, "enabled", True):
             return
 
+        # The container probe and the host probe are INDEPENDENT, and the host leg
+        # is host-local. Returning early on an unreachable container would suppress
+        # the recovery brain's own failure at exactly the moment it matters most —
+        # the container being down is when that brain is what fixes things.
         probe = await probe_guard_layer(config)
-        if probe is None:
-            return  # unreachable — the state machine owns "down"
-
-        failing = set(probe["failures"])
-
-        # The host leg is a SEPARATE probe with three outcomes, and the third must
-        # not be collapsed into either of the others.
-        brain_ok = await probe_host_brain(config)
-        inconclusive: set[str] = set()
-        known = list(_CONTAINER_CONDITIONS)
-        if brain_ok is None:
-            inconclusive.add(CONDITION_HOST_BRAIN)
-        else:
-            known.append(CONDITION_HOST_BRAIN)
-            if brain_ok is False:
-                failing.add(CONDITION_HOST_BRAIN)
 
         state_file = config.state_path / _STATE_FILE
         episodes = _load_state(state_file)
         now = datetime.now(UTC)
         now_iso = now.isoformat()
+
+        failing: set[str] = set()
+        inconclusive: set[str] = set()
+        known: list[str] = []
+
+        if probe is None:
+            # Unreachable — the state machine owns "down". No CONTAINER evidence
+            # either way, so those conditions are inconclusive rather than healthy.
+            inconclusive.update(_CONTAINER_CONDITIONS)
+        else:
+            known.extend(_CONTAINER_CONDITIONS)
+            failing.update(probe["failures"])
+
+        brain_ok = await probe_host_brain(config)
+        brain_episode = episodes.get(CONDITION_HOST_BRAIN)
+        # Track the wedge streak BEFORE resolving, so a persistent timeout can
+        # escalate rather than staying inconclusive forever.
+        if brain_ok is None:
+            brain_episode = brain_episode or {}
+            brain_episode["wedged"] = brain_episode.get("wedged", 0) + 1
+            episodes[CONDITION_HOST_BRAIN] = brain_episode
+        elif brain_episode:
+            brain_episode.pop("wedged", None)
+
+        brain_state = host_brain_state(config, brain_ok, brain_episode)
+        if brain_state == "inconclusive":
+            inconclusive.add(CONDITION_HOST_BRAIN)
+        else:
+            known.append(CONDITION_HOST_BRAIN)
+            if brain_state == "failing":
+                failing.add(CONDITION_HOST_BRAIN)
 
         for condition in sorted(set(known) | set(episodes)):
             # An INCONCLUSIVE condition has no evidence in either direction. Without

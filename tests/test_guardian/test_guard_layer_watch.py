@@ -418,3 +418,136 @@ def test_the_probe_covers_every_condition_it_can_report():
         assert condition in script, f"{condition} is declared but the probe never emits it"
         assert condition in glw._CONDITION_DETAIL, f"{condition} has no operator-facing detail"
     assert glw.CONDITION_HOST_BRAIN in glw._CONDITION_DETAIL
+
+
+# ── Regressions for the four Codex P2s (#2092) ───────────────────────────────
+
+
+class TestHostLegIndependence:
+    """The host probe is host-local; the container's reachability must not gate it."""
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_container_does_not_suppress_the_host_brain(
+        self, tmp_path, monkeypatch
+    ):
+        """P2-1. This is the moment the recovery brain matters MOST.
+
+        The old early-return on an unreachable container skipped the host leg
+        entirely, so a container that is down WHILE the configured Claude binary is
+        broken reported nothing about the second failure — the one that would have
+        fixed the first.
+        """
+        monkeypatch.setattr(glw, "probe_guard_layer", AsyncMock(return_value=None))
+        monkeypatch.setattr(glw, "probe_host_brain", AsyncMock(return_value=False))
+        cfg, disp = _Cfg(tmp_path), AsyncMock()
+        for _ in range(cfg.guard_layer.confirm_ticks):
+            await glw.check_guard_layer_and_alert(cfg, disp)
+        assert disp.send.call_count == 1
+        assert "host_brain_dead" in disp.send.call_args.args[0].title
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_container_never_resolves_a_container_condition(
+        self, tmp_path, monkeypatch
+    ):
+        """No container evidence is INCONCLUSIVE, not healthy.
+
+        Otherwise a down container would emit a false "recovered" for every
+        container condition that was mid-ladder.
+        """
+        monkeypatch.setattr(glw, "probe_host_brain", AsyncMock(return_value=True))
+        monkeypatch.setattr(glw, "probe_guard_layer", AsyncMock(return_value=_failing("venv_dead")))
+        cfg, disp = _Cfg(tmp_path), AsyncMock()
+        for _ in range(cfg.guard_layer.confirm_ticks):
+            await glw.check_guard_layer_and_alert(cfg, disp)
+        disp.reset_mock()
+        monkeypatch.setattr(glw, "probe_guard_layer", AsyncMock(return_value=None))
+        await glw.check_guard_layer_and_alert(cfg, disp)
+        disp.send.assert_not_called()
+        assert "venv_dead" in glw._load_state(tmp_path / glw._STATE_FILE)
+
+
+class TestHostBrainStateResolution:
+    def test_a_disabled_cc_is_inconclusive_forever(self, tmp_path):
+        """P2-3. `cc.enabled: false` is a SUPPORTED configuration, not a fault.
+
+        install_guardian.sh writes it when Claude is absent and DiagnosisEngine
+        skips CC for the same reason, so alerting would be a recurring false alarm
+        about a component nobody wants running.
+        """
+        cfg = _Cfg(tmp_path)
+        cfg.cc = type("C", (), {"path": "claude", "enabled": False})()
+        assert glw.host_brain_state(cfg, False, None) == "inconclusive"
+        assert glw.host_brain_state(cfg, None, {"wedged": 99}) == "inconclusive"
+
+    def test_one_wedge_is_inconclusive(self, tmp_path):
+        cfg = _Cfg(tmp_path)
+        assert glw.host_brain_state(cfg, None, {"wedged": 1}) == "inconclusive"
+
+    def test_a_PERSISTENT_wedge_escalates(self, tmp_path):
+        """P2-2. Unavailable in practice is unavailable.
+
+        A binary that never answers within its timeout leaves the recovery brain
+        operationally dead; treating every wedge as inconclusive left that state
+        silent forever.
+        """
+        cfg = _Cfg(tmp_path)
+        assert glw.host_brain_state(cfg, None, {"wedged": cfg.guard_layer.confirm_ticks}) == "failing"
+
+    def test_a_definite_answer_outranks_any_streak(self, tmp_path):
+        cfg = _Cfg(tmp_path)
+        assert glw.host_brain_state(cfg, True, {"wedged": 99}) == "healthy"
+        assert glw.host_brain_state(cfg, False, {"wedged": 0}) == "failing"
+
+    @pytest.mark.asyncio
+    async def test_a_persistent_wedge_reaches_an_ALERT_end_to_end(self, tmp_path, monkeypatch):
+        """The unit rule above is only useful if the orchestrator carries the streak."""
+        monkeypatch.setattr(glw, "probe_guard_layer", AsyncMock(return_value=_healthy()))
+        monkeypatch.setattr(glw, "probe_host_brain", AsyncMock(return_value=None))
+        cfg, disp = _Cfg(tmp_path), AsyncMock()
+        for _ in range(cfg.guard_layer.confirm_ticks * 2 + 1):
+            await glw.check_guard_layer_and_alert(cfg, disp)
+        assert disp.send.call_count >= 1, "a permanently wedged host brain must not stay silent"
+        assert "host_brain_dead" in disp.send.call_args.args[0].title
+
+    @pytest.mark.asyncio
+    async def test_a_recovered_probe_clears_the_wedge_streak(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(glw, "probe_guard_layer", AsyncMock(return_value=_healthy()))
+        monkeypatch.setattr(glw, "probe_host_brain", AsyncMock(return_value=None))
+        cfg, disp = _Cfg(tmp_path), AsyncMock()
+        await glw.check_guard_layer_and_alert(cfg, disp)
+        assert glw._load_state(tmp_path / glw._STATE_FILE)["host_brain_dead"]["wedged"] == 1
+        monkeypatch.setattr(glw, "probe_host_brain", AsyncMock(return_value=True))
+        await glw.check_guard_layer_and_alert(cfg, disp)
+        ep = glw._load_state(tmp_path / glw._STATE_FILE).get("host_brain_dead", {})
+        assert "wedged" not in ep
+
+
+class TestCorruptState:
+    """P2-4. Valid JSON of the WRONG SHAPE used to wedge the watch permanently."""
+
+    @pytest.mark.parametrize("payload", ["[]", "null", '"a string"', "42", '{"episodes": []}',
+                                         '{"episodes": {"x": "not a dict"}}'])
+    def test_structurally_wrong_state_degrades_to_empty(self, tmp_path, payload):
+        (tmp_path / glw._STATE_FILE).write_text(payload)
+        assert glw._load_state(tmp_path / glw._STATE_FILE) == {} or all(
+            isinstance(v, dict) for v in glw._load_state(tmp_path / glw._STATE_FILE).values()
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_wrong_shaped_state_file_does_not_wedge_the_watch(
+        self, tmp_path, monkeypatch
+    ):
+        """The old `.get` on a list raised AttributeError, which `_load_state` did not
+        catch. The outer swallow logged it and left the file in place, so EVERY later
+        tick repeated the exception after paying for the probe and no condition was
+        ever processed again.
+        """
+        (tmp_path / glw._STATE_FILE).write_text("[]")
+        monkeypatch.setattr(glw, "probe_guard_layer", AsyncMock(return_value=_failing("node_dead")))
+        monkeypatch.setattr(glw, "probe_host_brain", AsyncMock(return_value=True))
+        cfg, disp = _Cfg(tmp_path), AsyncMock()
+        for _ in range(cfg.guard_layer.confirm_ticks):
+            await glw.check_guard_layer_and_alert(cfg, disp)
+        assert disp.send.call_count == 1, (
+            "a structurally corrupt state file must not stop the watch from alerting"
+        )
