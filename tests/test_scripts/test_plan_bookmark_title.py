@@ -224,3 +224,60 @@ def test_an_unterminated_fence_does_not_swallow_the_file(hook, tmp_path):
     plan_path, title = _info(hook, tmp_path, body)
     assert plan_path  # the file was found
     assert title == ""  # no heading within the window — but no crash, either
+
+
+def test_paired_thematic_rules_do_not_hide_the_title(hook, tmp_path):
+    """A matched pair of column-zero rules is not automatically frontmatter.
+
+    A plan that opens with a thematic break and uses another later has the same
+    SHAPE as frontmatter, and no lexical rule separates them — so the block is
+    parsed. Markdown prose does not load as a YAML mapping, so it is not
+    treated as a header and the title survives.
+    """
+    body = "---\n# Actual title\n\nsome body text\n\n---\n\nmore\n"
+    _, title = _info(hook, tmp_path, body)
+    assert title == "Actual title", (
+        "a pair of thematic rules was mistaken for frontmatter, so the scan "
+        f"skipped the real title and returned {title!r}"
+    )
+
+
+def test_a_real_header_between_the_same_fences_is_still_skipped(hook, tmp_path):
+    """Control for the case above — the discriminator must still admit YAML.
+
+    Without this, 'do not skip between paired rules' is equally satisfied by
+    never skipping at all, which reinstates the empty-title bug this module
+    exists to fix.
+    """
+    _, title = _info(hook, tmp_path, HEADER + "\n# PR-flow work — build plan\n")
+    assert title == "PR-flow work — build plan"
+
+
+def test_a_fenced_example_of_the_divider_does_not_truncate(hook, tmp_path):
+    """A plan documents a convention by SHOWING it.
+
+    The reference doc for this very convention contains the divider inside a
+    fenced block. Matching that would make a plan truncate itself at its own
+    illustration and classify ten live tasks as a small plan.
+    """
+    plan = tmp_path / "p.md"
+    plan.write_text(
+        "# Plan\n\nThe divider looks like this:\n\n"
+        "```\n## ═══ SUPERSEDED BELOW ═══\n```\n\n"
+        + ("### Task n\n- [ ] x\n" * 10),
+    )
+    assert hook._classify_plan_complexity(str(plan)) == "large", (
+        "a fenced EXAMPLE of the divider truncated the document, so ten live "
+        "tasks were not counted"
+    )
+
+
+def test_a_real_divider_after_a_fenced_example_still_divides(hook, tmp_path):
+    """Control: fence-awareness must not disable the divider entirely."""
+    plan = tmp_path / "p.md"
+    plan.write_text(
+        "# Plan\n\n```\n## ═══ SUPERSEDED BELOW ═══\n```\n\n"
+        "### Task one\n- [ ] a\n"
+        "## ═══ SUPERSEDED BELOW ═══\n" + ("### Task old\n- [ ] x\n" * 10),
+    )
+    assert hook._classify_plan_complexity(str(plan)) == "small"

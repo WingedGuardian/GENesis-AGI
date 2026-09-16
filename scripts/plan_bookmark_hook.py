@@ -71,6 +71,34 @@ _GENESIS_DIR = Path.home() / ".genesis"
 _PENDING_FILE = _GENESIS_DIR / "plan_bookmark_pending.json"
 
 
+def _outside_fences(lines: list[str]):
+    """Yield `(index, line)` for lines that are NOT inside a fenced block.
+
+    A plan documents a convention by SHOWING it, so the divider and the title
+    heading both appear inside ``` examples in perfectly ordinary plans — this
+    repo's own reference doc does exactly that. Matching those is how a plan
+    truncates itself at its own illustration.
+
+    Fence detection is the CommonMark-ish subset that markdown writers actually
+    use: a line whose first non-space run is three or more backticks or tildes
+    toggles the state. The info string is ignored, and a closing fence of a
+    different character does not close — ``` inside a ~~~ block is content.
+    """
+    fence_char = ""
+    for idx, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped[:3] in ("```", "~~~"):
+            char = stripped[0]
+            if not fence_char:
+                fence_char = char
+                continue
+            if char == fence_char:
+                fence_char = ""
+            continue
+        if not fence_char:
+            yield idx, line
+
+
 def _live_half(content: str) -> str:
     """The part of a plan above its superseded-content divider.
 
@@ -83,12 +111,15 @@ def _live_half(content: str) -> str:
     Matched on the WORDS at a heading line, not on the decorative rule the
     template draws around them — the box characters are ornament and a plan
     that omits them still means it. Anchored at column zero on a `#` heading so
-    the phrase quoted inside a paragraph (this docstring included, were it in a
-    plan) cannot truncate the document.
+    the phrase quoted inside a paragraph cannot truncate the document, and
+    skipped inside FENCED blocks so a plan that documents the convention by
+    showing it — which is how anyone would document it, and how the reference
+    doc does — does not truncate itself at its own example.
     """
-    for idx, line in enumerate(content.splitlines()):
+    lines = content.splitlines()
+    for idx, line in _outside_fences(lines):
         if line.startswith("#") and "SUPERSEDED BELOW" in line:
-            return "\n".join(content.splitlines()[:idx])
+            return "\n".join(lines[:idx])
     return content
 
 
@@ -203,14 +234,45 @@ def _title_candidate_lines(text: str) -> list[str]:
     function exists to fix the moment a header grows past it — and the header's
     id lists are documented as growing — while buying nothing: the lines are
     already in memory, so the scan is a walk over a list we have.
+
+    And a matched PAIR of column-zero rules is still not enough on its own: a
+    plan that opens with a thematic break and uses another later has the same
+    shape as frontmatter, and skipping between them loses a real title. There is
+    no lexical tell that separates the two — so the block is PARSED. Frontmatter
+    is YAML by definition, so content that does not load as a YAML MAPPING is
+    not frontmatter, whatever it is fenced by. That replaces a fourth heuristic
+    with the actual definition; the three heuristics above were each wrong in a
+    different direction before this.
     """
     lines = text.splitlines()
     if lines and lines[0] == "---":
         for idx in range(1, len(lines)):
             if lines[idx] == "---":
-                lines = lines[idx + 1 :]
+                if _is_yaml_mapping("\n".join(lines[1:idx])):
+                    lines = lines[idx + 1 :]
                 break
     return [line.strip() for line in lines[:10]]
+
+
+def _is_yaml_mapping(block: str) -> bool:
+    """Whether `block` loads as a YAML mapping — i.e. is really frontmatter.
+
+    Degrades to TRUE when PyYAML is unavailable, which keeps the previous
+    paired-fence behaviour rather than newly treating every header as prose. A
+    plan whose header stops being skipped would lose its title again, the exact
+    regression this module exists to fix; a plan whose thematic rules are
+    wrongly skipped loses a title it never reliably had. Fail toward the
+    behaviour that is already shipped and tested.
+    """
+    try:
+        import yaml
+    except ImportError:
+        return True
+    try:
+        return isinstance(yaml.safe_load(block), dict)
+    except yaml.YAMLError:
+        # Unparseable is a positive answer to "is this frontmatter?": no.
+        return False
 
 
 def _guess_session_id() -> str:
