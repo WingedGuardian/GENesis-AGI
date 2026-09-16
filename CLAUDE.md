@@ -188,6 +188,17 @@ Applies to every assertion — in conversation, and doubly in anything written t
   it.** When you have only the count, say "not found in K of N", never "absent". This
   failure is silent and confident: an under-read is indistinguishable from a clean result,
   so nothing prompts you to check.
+- **Do not set a limit you cannot justify — the failure starts at the WRITE end.** The
+  moment you pass `--limit 30` the answer is decided, and no later vigilance recovers it.
+  Default to **no limit** on an enumeration you will draw a count or an absence from; pass
+  one only when you can name the budget it protects, and then treat a saturated read
+  (`n >= limit`) as truncated without waiting to be reminded. **An UNFLAGGED listing may
+  already be capped by a tool default you never chose** — the absence of a limit in the
+  command is not evidence of a complete read, and that is the version of this you cannot
+  feel. A preview is exempt (`| head`, a top-N sample): that is a selection you are not
+  counting. The house pattern is `src/genesis/session_awareness/repo_pulse_gh.py`, which records
+  `limit_hit` and is loud rather than silent. Reporting your own limit back as a total
+  has happened.
 - **Evidence tiers.** Every stated fact is one of: **MEASURED** (number + denominator),
   **READ** (artifact + location, e.g. file:line / PR / live query), **INFERRED** (must be
   hedged out loud — "I think", "unverified, but"), or **ASSUMED** (say so). An unmarked
@@ -286,7 +297,8 @@ the rule below used to fire so rarely. Three concrete triggers:
    X is not what its name suggests. Especially when you went looking for X
    expecting it to be absent.
 3. **You CORRECTED a belief** — your own, a prior session's, or a written note's.
-   Use `supersedes` to link the correction to what it replaces. This is the
+   Use `supersedes` to link the correction to what it replaces, or
+   `memory_supersede(old_id, new_id)` when both memories already exist. This is the
    highest-value trigger and the easiest to skip, because being wrong does not
    feel like a finding. It is the one that stops the next session paying for the
    same mistake.
@@ -479,8 +491,11 @@ class of prompt. Detail lives with the code, in
 
 Three limits, so it is not read as total coverage. Hooks wired in a user-level
 `~/.claude/settings.json` or a `settings.local.json` are outside the repo and
-invisible to it. An EXEMPTION SKIPS SCANNING ENTIRELY, so a row is only as good
-as its last read — which is why the table stays small. And the detector's
+invisible to it. An exemption still skips the PRINT SCAN — every row now carries
+a checker, but it re-runs a NECESSARY CONDITION of the row's claim, never a
+verification of it: a checker shows a constant or pattern still EXISTS, not that
+it still BINDS the output. Which is why the table stays small and why ROUTING a
+hook through the writer still beats adding a row. And the detector's
 enumeration is bounded, not total: it covers `print`, `builtins.print`,
 `file=None`, `file=sys.stdout`/`__stdout__`, and `sys.stdout[.buffer].write`,
 but NOT `os.write(1, …)`, an aliased handle, a rebound `print`, or a subprocess
