@@ -471,6 +471,16 @@ async def run_check(config: GuardianConfig | None = None) -> None:
     # failures this tick re-enqueue behind it. Best-effort; never blocks a check.
     await _drain_host_alert_queue(config, dispatcher)
 
+    # BEFORE the cycle, deliberately. _check_cycle can invoke DiagnosisEngine,
+    # which runs the host's `claude -p` with cc.timeout_s (default 3600s) — the
+    # SAME binary the guard-layer watch's host leg probes. Sequencing the watch
+    # after it would queue the detector behind the very operation whose failure it
+    # exists to detect: with the container down and that binary wedged, each
+    # observation the confirmation ladder needs could take an hour, so the alert
+    # arrives late or never in the exact outage it was built for. The watch takes
+    # no action and never touches the state machine, so running it first is free.
+    await _check_guard_layer_and_alert(config, dispatcher)
+
     try:
         await _check_cycle(config, sm, dispatcher, snapshots, diagnosis_engine, recovery_engine)
         # Snapshot lifecycle maintenance runs regardless of resulting state —
@@ -533,10 +543,6 @@ async def run_check(config: GuardianConfig | None = None) -> None:
         # published bundle to a host-only dir + WARN if the archived bundle goes
         # stale. Host-side file ops only, independent of the container verdict.
         await _check_repo_bundle_and_alert(config, dispatcher)
-
-        # Last, and deliberately so: it is the only watch that can perform a
-        # write inside the container, and it must not delay a cheaper alert.
-        await _check_guard_layer_and_alert(config, dispatcher)
     finally:
         # Always save state, even on error
         sm.save_state(state_path)

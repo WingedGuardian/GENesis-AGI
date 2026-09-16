@@ -130,28 +130,49 @@ VENV="$REPO/.venv/bin/python"
 HOOK="$REPO/.claude/hooks/genesis-hook"
 fails=""
 
-# 1. The LAUNCHER, end to end. This is what Claude Code actually invokes, and it
-#    covers what a venv check alone cannot: a missing or non-executable script, a
-#    broken shebang, and the launcher's own `set -euo pipefail` SIGPIPE trap
-#    (exit 141, no stderr). A launcher that cannot run makes every guard silently
-#    advisory, which is the failure this whole module exists to notice.
-if [ -x "$HOOK" ] && echo '{}' | "$HOOK" hooks/hook_input.py >/dev/null 2>&1; then :
-else fails="$fails hook_launcher_dead"; fi
+# EVERY subcheck is individually bounded. Without this, one hung command - most
+# pointedly `genesis-hook` itself, the exact thing being monitored - runs out the
+# OUTER incus timeout, the marker below is never printed, the probe parses as
+# None, and every container condition becomes inconclusive. A permanently hung
+# launcher would then stay silent forever instead of ever reaching confirm_ticks:
+# the detector going quiet in precisely the failure it exists for. A per-check
+# timeout turns a hang into a REPORTED failure; the outer timeout still covers a
+# genuinely unreachable container.
+T="timeout 10"
+
+# 1. The LAUNCHER. This is what Claude Code actually invokes, and it covers what
+#    a venv check alone cannot: a missing or non-executable script, a broken
+#    shebang, and the launcher's own `set -euo pipefail` SIGPIPE trap (exit 141,
+#    no stderr). A launcher that cannot run makes every guard silently advisory.
+#
+#    Probed with a script name that does NOT exist, so launcher health is not
+#    coupled to any condition measured separately. A working launcher reaches its
+#    own error handling and says so; a broken one produces neither marker. Running
+#    it against hooks/hook_input.py instead would report BOTH hook_launcher_dead
+#    and hook_input_broken for a single broken import - and the launcher alert
+#    says "the guards are silently off", which is the wrong polarity for that
+#    failure, since a broken hook_input fails CLOSED.
+launcher_out=$($T "$HOOK" __guard_layer_probe_nonexistent__.py </dev/null 2>&1 || true)
+case "$launcher_out" in
+  *"Hook script not found"*|*"Genesis venv not found"*) ;;
+  *) fails="$fails hook_launcher_dead" ;;
+esac
+[ -x "$HOOK" ] || case "$fails" in *hook_launcher_dead*) ;; *) fails="$fails hook_launcher_dead";; esac
 
 # 2. Does the interpreter run at all? The other half of the silent fail-open.
-if [ -x "$VENV" ] && "$VENV" -c "" >/dev/null 2>&1; then :; else fails="$fails venv_dead"; fi
+if [ -x "$VENV" ] && $T "$VENV" -c "" >/dev/null 2>&1; then :; else fails="$fails venv_dead"; fi
 
 # 3+4. The two shared modules guards import at module scope. `python -c` puts the
 #      cwd on sys.path, so a subshell cd is enough - no path interpolation.
 if [ -x "$VENV" ]; then
-  ( cd "$REPO/scripts/hooks" && "$VENV" -c "import hook_input" ) >/dev/null 2>&1 \
+  ( cd "$REPO/scripts/hooks" && $T "$VENV" -c "import hook_input" ) >/dev/null 2>&1 \
     || fails="$fails hook_input_broken"
-  ( cd "$REPO/scripts/hooks" && "$VENV" -c "import shell_parse" ) >/dev/null 2>&1 \
+  ( cd "$REPO/scripts/hooks" && $T "$VENV" -c "import shell_parse" ) >/dev/null 2>&1 \
     || fails="$fails shell_parse_broken"
 fi
 
 # 5. Claude Code is a Node program; without node there is no session at all.
-node --version >/dev/null 2>&1 || fails="$fails node_dead"
+$T node --version >/dev/null 2>&1 || fails="$fails node_dead"
 
 fails="${fails# }"
 echo "GUARDLAYER ${fails:-ok}"
@@ -408,11 +429,30 @@ async def check_guard_layer_and_alert(config, dispatcher) -> None:
             detail = _CONDITION_DETAIL.get(condition, "")
 
             if decision.action == "resolved":
+                # SCOPED to the condition that cleared. Several can fail together,
+                # and others may be inconclusive right now, so an unqualified "the
+                # agent tooling can evaluate again" would tell the operator the
+                # tooling is usable while another condition is still warned - the
+                # most expensive kind of wrong, because it is an all-clear.
+                remaining = sorted(
+                    c
+                    for c in episodes
+                    if c != condition and episodes.get(c, {}).get("warned_at")
+                )
+                if remaining:
+                    tail = f" STILL DEGRADED: {', '.join(remaining)}."
+                elif inconclusive:
+                    tail = (
+                        " Other conditions were not observed this tick, so this is "
+                        "not an all-clear."
+                    )
+                else:
+                    tail = " Everything this watch tracks is healthy again."
                 await _send(
                     dispatcher,
                     AlertSeverity.INFO,
                     f"Guard layer recovered: {condition}",
-                    f"{condition} cleared. The agent tooling can evaluate again.",
+                    f"{condition} cleared.{tail}",
                 )
                 episodes.pop(condition, None)
             elif decision.action in ("warn", "realert"):

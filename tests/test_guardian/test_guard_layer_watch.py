@@ -551,3 +551,129 @@ class TestCorruptState:
         assert disp.send.call_count == 1, (
             "a structurally corrupt state file must not stop the watch from alerting"
         )
+
+
+# ── Regressions for the round-3 findings (two P1s + a P2) ────────────────────
+
+
+def test_the_watch_runs_BEFORE_the_diagnosis_cycle():
+    """P1. The host leg must not queue behind the operation it monitors.
+
+    `_check_cycle` can invoke DiagnosisEngine, which runs the host's `claude -p`
+    with `cc.timeout_s` (default 3600s) — the SAME binary this watch's host leg
+    probes. Sequenced after it, each observation the confirmation ladder needs
+    could take an hour, so with the container down and that binary wedged the
+    alert arrives late or never: silent in the exact outage it exists for.
+
+    Asserted over source ORDER rather than by mocking, because the failure is a
+    call being moved, which no behavioural test in this file would notice.
+    """
+    text = Path(check_mod.__file__).read_text()
+    watch_at = text.index("await _check_guard_layer_and_alert(config, dispatcher)")
+    cycle_at = text.index("await _check_cycle(config, sm, dispatcher")
+    assert watch_at < cycle_at, (
+        "the guard-layer watch is sequenced AFTER _check_cycle, which can block for "
+        "cc.timeout_s inside the very binary the host leg probes. Move it before."
+    )
+
+
+def test_every_subcheck_in_the_probe_is_individually_bounded():
+    """P1. One hung command must not silence every condition.
+
+    The marker line is printed only after all subchecks finish, so an unbounded
+    hang — most pointedly in `genesis-hook`, the thing being monitored — runs out
+    the OUTER incus timeout, the probe parses as None, and every container
+    condition becomes inconclusive forever rather than reaching confirm_ticks.
+    """
+    script = glw._PROBE_SCRIPT.decode()
+    assert "timeout " in script, "no per-subcheck timeout wrapper in the probe"
+    # Each executable subcheck must be wrapped. Counted rather than eyeballed:
+    # the wrapper is defined once as $T and must be applied to every command that
+    # can hang.
+    body = script.split('T="timeout', 1)[1]
+    for command in ('"$HOOK"', '"$VENV" -c ""', 'import hook_input',
+                    'import shell_parse', "node --version"):
+        line = next(ln for ln in body.splitlines() if command in ln)
+        assert "$T" in line, (
+            f"the subcheck running {command} is not wrapped in $T, so a hang there "
+            f"kills the whole probe and silences every other condition"
+        )
+
+
+def test_the_launcher_probe_is_decoupled_from_the_conditions_it_is_not_measuring():
+    """P2. Launcher health must not be inferred from a dependency's health.
+
+    Probing the launcher by running `hooks/hook_input.py` through it meant a broken
+    hook_input reported BOTH hook_launcher_dead and hook_input_broken — and the
+    launcher alert says "the guards are silently off", which is the WRONG POLARITY
+    for that failure: a broken hook_input fails CLOSED.
+    """
+    script = glw._PROBE_SCRIPT.decode()
+    launcher_line = next(ln for ln in script.splitlines() if '"$HOOK"' in ln and "$T" in ln)
+    assert "hook_input.py" not in launcher_line, (
+        "the launcher probe runs hook_input.py, so a broken import is misreported as "
+        "a dead launcher — with an alert whose polarity is wrong for that failure"
+    )
+    assert "nonexistent" in launcher_line, (
+        "the launcher probe should use a script name that cannot exist, so what it "
+        "measures is whether the LAUNCHER reached its own error handling"
+    )
+
+
+class TestScopedRecovery:
+    """P2. A recovery notice must never read as an all-clear it has not earned."""
+
+    @pytest.mark.asyncio
+    async def test_recovery_names_what_is_still_degraded(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(glw, "probe_host_brain", AsyncMock(return_value=True))
+        monkeypatch.setattr(
+            glw, "probe_guard_layer",
+            AsyncMock(return_value=_failing("node_dead", "hook_input_broken")),
+        )
+        cfg, disp = _Cfg(tmp_path), AsyncMock()
+        for _ in range(cfg.guard_layer.confirm_ticks):
+            await glw.check_guard_layer_and_alert(cfg, disp)
+        disp.reset_mock()
+
+        # node recovers; hook_input does not.
+        monkeypatch.setattr(
+            glw, "probe_guard_layer", AsyncMock(return_value=_failing("hook_input_broken"))
+        )
+        await glw.check_guard_layer_and_alert(cfg, disp)
+        bodies = [c.args[0].body for c in disp.send.call_args_list]
+        recovery = [b for b in bodies if "cleared" in b]
+        assert recovery, "node_dead clearing should send a recovery notice"
+        assert "STILL DEGRADED" in recovery[0], (
+            "a recovery notice sent while another condition is still warned must say "
+            "so — an unqualified all-clear is the most expensive kind of wrong here"
+        )
+        assert "hook_input_broken" in recovery[0]
+
+    @pytest.mark.asyncio
+    async def test_a_true_all_clear_says_so(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(glw, "probe_host_brain", AsyncMock(return_value=True))
+        monkeypatch.setattr(glw, "probe_guard_layer", AsyncMock(return_value=_failing("node_dead")))
+        cfg, disp = _Cfg(tmp_path), AsyncMock()
+        for _ in range(cfg.guard_layer.confirm_ticks):
+            await glw.check_guard_layer_and_alert(cfg, disp)
+        disp.reset_mock()
+        monkeypatch.setattr(glw, "probe_guard_layer", AsyncMock(return_value=_healthy()))
+        await glw.check_guard_layer_and_alert(cfg, disp)
+        assert "healthy again" in disp.send.call_args.args[0].body
+
+    @pytest.mark.asyncio
+    async def test_recovery_during_an_inconclusive_tick_is_not_an_all_clear(
+        self, tmp_path, monkeypatch
+    ):
+        """Nothing was observed about the host leg, so nothing may be claimed."""
+        monkeypatch.setattr(glw, "probe_host_brain", AsyncMock(return_value=True))
+        monkeypatch.setattr(glw, "probe_guard_layer", AsyncMock(return_value=_failing("node_dead")))
+        cfg, disp = _Cfg(tmp_path), AsyncMock()
+        for _ in range(cfg.guard_layer.confirm_ticks):
+            await glw.check_guard_layer_and_alert(cfg, disp)
+        disp.reset_mock()
+        monkeypatch.setattr(glw, "probe_guard_layer", AsyncMock(return_value=_healthy()))
+        monkeypatch.setattr(glw, "probe_host_brain", AsyncMock(return_value=None))
+        await glw.check_guard_layer_and_alert(cfg, disp)
+        body = disp.send.call_args.args[0].body
+        assert "not an all-clear" in body
