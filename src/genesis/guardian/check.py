@@ -778,7 +778,7 @@ async def _check_container_git_and_alert(
 async def _check_guard_layer_and_alert(
     config: GuardianConfig, dispatcher: AlertDispatcher,
 ) -> None:
-    """Can the agent tooling still EVALUATE? Alert-only, plus one bounded repair.
+    """Can the agent tooling still EVALUATE? ALERT-ONLY - this watch takes no action.
 
     Lazy import (cycle avoidance) inside its own try/except, so a crash here can
     never abort the tick or the watches after it.

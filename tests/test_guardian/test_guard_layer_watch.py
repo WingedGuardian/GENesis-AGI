@@ -12,6 +12,7 @@ orchestrator. No test touches a real container, matching every other watch here.
 from __future__ import annotations
 
 import ast
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -36,6 +37,18 @@ class _Cfg:
     @property
     def state_path(self):
         return self._sp
+
+
+@pytest.fixture(autouse=True)
+def _on_a_guardian_host(monkeypatch):
+    """Every test here runs as though `incus` is present.
+
+    The watch is gated on being a guardian host, and the suite runs in the
+    CONTAINER, which has no `incus` — so without this every orchestrator test
+    would return early and pass vacuously. TestNotAGuardianHost overrides it
+    deliberately, which is the only place the absence is the subject.
+    """
+    monkeypatch.setattr(glw.shutil, "which", lambda name: f"/usr/bin/{name}")
 
 
 def _now():
@@ -677,3 +690,96 @@ class TestScopedRecovery:
         await glw.check_guard_layer_and_alert(cfg, disp)
         body = disp.send.call_args.args[0].body
         assert "not an all-clear" in body
+
+
+class TestNotAGuardianHost:
+    """`incus` absent is categorically different from `incus exec` failing.
+
+    CI caught this and no local run could: removing the early-return so the host
+    leg survives an unreachable container ALSO made the watch active on machines
+    with no `incus` at all — a developer box, a CI runner — where it looked for the
+    recovery brain, did not find it, and alerted. Two unrelated run_check tests
+    started counting an extra alert.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_incus_means_the_watch_is_inapplicable(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(glw.shutil, "which", lambda name: None)
+        probe = AsyncMock(return_value=_failing("venv_dead"))
+        brain = AsyncMock(return_value=False)
+        monkeypatch.setattr(glw, "probe_guard_layer", probe)
+        monkeypatch.setattr(glw, "probe_host_brain", brain)
+        cfg, disp = _Cfg(tmp_path), AsyncMock()
+        for _ in range(cfg.guard_layer.confirm_ticks + 1):
+            await glw.check_guard_layer_and_alert(cfg, disp)
+        probe.assert_not_called()
+        brain.assert_not_called()
+        disp.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_incus_present_but_exec_failing_STILL_runs_the_host_leg(
+        self, tmp_path, monkeypatch
+    ):
+        """The distinction has to cut both ways, or the P1 fix is undone.
+
+        A failing `incus exec` means the container is DOWN, which is exactly when
+        the recovery brain matters most — so the host leg must still run there.
+        """
+        monkeypatch.setattr(glw.shutil, "which", lambda name: "/usr/bin/incus")
+        monkeypatch.setattr(glw, "probe_guard_layer", AsyncMock(return_value=None))
+        monkeypatch.setattr(glw, "probe_host_brain", AsyncMock(return_value=False))
+        cfg, disp = _Cfg(tmp_path), AsyncMock()
+        for _ in range(cfg.guard_layer.confirm_ticks):
+            await glw.check_guard_layer_and_alert(cfg, disp)
+        assert disp.send.call_count == 1
+        assert "host_brain_dead" in disp.send.call_args.args[0].title
+
+
+class TestRound4Regressions:
+    def test_the_probe_runs_as_the_CONFIGURED_container_user(self, monkeypatch):
+        """`container_user` is a supported setting the other collectors honour.
+
+        Every path in the payload is $HOME-relative, so probing as the wrong user
+        reports a healthy toolchain as broken, persistently, on any install that
+        configures another user.
+        """
+        seen = {}
+
+        async def _fake(container, cmd, stdin, timeout, user="ubuntu"):
+            seen["user"] = user
+            return 0, "GUARDLAYER ok"
+
+        monkeypatch.setattr(glw, "_incus_exec_stdin", _fake)
+
+        class _C(_Cfg):
+            def __init__(self):
+                super().__init__(Path("/tmp"))
+                self.container_user = "someone-else"
+
+        asyncio.run(glw.probe_guard_layer(_C()))
+        assert seen["user"] == "someone-else", (
+            "the probe hardcoded `ubuntu` instead of the configured container user"
+        )
+
+    def test_the_container_leg_probes_CC_not_just_node(self):
+        """node being healthy is not evidence that Claude Code can start.
+
+        The host leg makes exactly this argument for itself; the container leg was
+        still inferring from a dependency, which is the same false-positive shape.
+        """
+        script = glw._PROBE_SCRIPT.decode()
+        assert "claude --version" in script, (
+            "the container leg infers CC startability from node, the dependency-proxy "
+            "mistake the host leg explicitly avoids"
+        )
+        assert glw.CONDITION_CONTAINER_CC in script
+        assert glw.CONDITION_CONTAINER_CC in glw._CONDITION_DETAIL
+
+    def test_the_wrapper_no_longer_advertises_a_repair(self):
+        """The contract in check.py must not promise behaviour that was removed."""
+        src = Path(check_mod.__file__).read_text()
+        start = src.index("async def _check_guard_layer_and_alert")
+        doc = src[start:start + 600]
+        assert "bounded repair" not in doc, (
+            "the wrapper still describes a repair this watch does not perform"
+        )

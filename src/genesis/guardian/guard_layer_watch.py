@@ -53,6 +53,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -72,6 +73,7 @@ CONDITION_VENV_DEAD = "venv_dead"
 CONDITION_HOOK_INPUT = "hook_input_broken"
 CONDITION_SHELL_PARSE = "shell_parse_broken"
 CONDITION_NODE_DEAD = "node_dead"
+CONDITION_CONTAINER_CC = "container_cc_dead"
 CONDITION_HOST_BRAIN = "host_brain_dead"
 
 _CONTAINER_CONDITIONS = (
@@ -80,6 +82,7 @@ _CONTAINER_CONDITIONS = (
     CONDITION_HOOK_INPUT,
     CONDITION_SHELL_PARSE,
     CONDITION_NODE_DEAD,
+    CONDITION_CONTAINER_CC,
 )
 
 # Human-facing one-liners. Each names the repair route, because an alert that says
@@ -108,6 +111,13 @@ _CONDITION_DETAIL = {
     CONDITION_NODE_DEAD: (
         "node does not run in the container. Claude Code cannot start, so no session "
         "exists to repair anything from the inside. Heal via scripts/update.sh."
+    ),
+    CONDITION_CONTAINER_CC: (
+        "The container's `claude` does not run, so no agent session can start there "
+        "even though node itself is fine. Probed directly rather than inferred from "
+        "node, for the same reason the host leg probes its own binary: a dependency "
+        "being healthy is not evidence that its consumer is. Heal via "
+        "scripts/update.sh, which aligns the container's CC."
     ),
     CONDITION_HOST_BRAIN: (
         "The host's configured Claude Code binary (guardian cc.path) does not run or "
@@ -174,9 +184,33 @@ fi
 # 5. Claude Code is a Node program; without node there is no session at all.
 $T node --version >/dev/null 2>&1 || fails="$fails node_dead"
 
+# 6. And node being healthy is NOT evidence that Claude Code can start - the same
+#    dependency-proxy mistake the host leg deliberately avoids. Probe the consumer.
+$T claude --version >/dev/null 2>&1 || fails="$fails container_cc_dead"
+
 fails="${fails# }"
 echo "GUARDLAYER ${fails:-ok}"
 """
+
+
+def on_a_guardian_host() -> bool:
+    """Is this a machine the guardian actually manages?
+
+    `incus` ABSENT is categorically different from `incus exec` FAILING, and
+    collapsing them is what made this watch fire on machines it does not apply to:
+    a developer box or a CI runner has no `incus`, so the container probe fails,
+    and — since the host leg deliberately survives an unreachable container — the
+    watch went on to look for the recovery brain, not find it, and alert.
+
+    A failing `incus exec` still means the container is down, which is precisely
+    when the host leg matters most. A missing `incus` means there is no container
+    and no guardian, so there is nothing here to report on.
+
+    Not a fail-open worth worrying about: if `incus` vanished from a REAL guardian
+    host, every probe in `collect_all_signals` fails too and the state machine owns
+    that outage — it is not this watch's to detect.
+    """
+    return shutil.which("incus") is not None
 
 
 def _parse_probe(stdout: str) -> dict | None:
@@ -198,7 +232,14 @@ async def probe_guard_layer(config) -> dict | None:
     cfg = config.guard_layer
     try:
         rc, out = await _incus_exec_stdin(
-            config.container_name, "bash -s", _PROBE_SCRIPT, cfg.check_timeout_s
+            config.container_name,
+            "bash -s",
+            _PROBE_SCRIPT,
+            cfg.check_timeout_s,
+            # EVERY path in the payload is $HOME-relative, so probing as the wrong
+            # user reports a healthy toolchain as broken, persistently, on any
+            # install that configures another user.
+            user=getattr(config, "container_user", "ubuntu"),
         )
     except (TimeoutError, OSError):
         logger.warning("guard_layer_watch probe exec failed", exc_info=True)
@@ -356,6 +397,8 @@ async def check_guard_layer_and_alert(config, dispatcher) -> None:
     try:
         cfg = config.guard_layer
         if not getattr(cfg, "enabled", True):
+            return
+        if not on_a_guardian_host():
             return
 
         # The container probe and the host probe are INDEPENDENT, and the host leg
