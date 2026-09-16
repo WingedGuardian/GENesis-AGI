@@ -1186,23 +1186,66 @@ which is the clearest worked example in the repo, so apply the test to both:
   costs. Repair path open ⇒ **PARTIAL**, and fail-closed is licensed.
 - **`degraded_exit`'s unconditional leg** — `hook_input` ITSELF is unimportable
   or version-skewed, so nothing the guard could import can recover it and each
-  guard `os._exit(2)`s with no payload read and no predicate consulted. MEASURED
-  from source: six guards carry that block on matcher `Bash`, and
-  `scripts/pretool_check.py` carries it on `Write|Edit`. So the session can
-  neither run a command nor edit a file. Repair path CLOSED ⇒ **SYSTEMIC** by
-  this test, and the shipped code nevertheless fails closed there, deliberately
-  (PR #2042: *"nothing the guard could import can recover it… so it refuses
-  locally"*).
+  guard `os._exit(2)`s with no payload read and no predicate consulted.
+  **MEASURED 2026-09-15 by execution, not by grep: 9 of the 13 PYTHON hooks that
+  `.claude/settings.json` wires on matcher `Bash` exit 2** against a poisoned
+  `hook_input` (the other 4 are advisory and exit 1, which is correct for them).
+  So every shell command is refused with no predicate at all.
 
-**That divergence is real and is not resolved here.** The doctrine reports what
-its own test returns rather than bending the test to match the code; the shipped
-behaviour is tracked separately. Two things keep it from being a total brick
-today, and neither is a design: an MCP editing tool is matched by neither `Bash`
-nor `Write|Edit`, and the host Guardian can `REVERT_CODE` from outside the
-container — but nothing currently WAKES the Guardian for this, because the
-container is up and `genesis-server` never imports `hook_input`. Treat it as the
-standing illustration that a fail-closed leg needs its out-of-band repair route
-named and WIRED, not merely available in principle.
+  **Read that denominator exactly, because it is restricted and the restriction
+  is the point.** That matcher carries 15 hook commands across 14 entries; the 2
+  not counted are shell rather than Python, never import `hook_input`, and so
+  cannot be affected — and one of them is itself a blocking guard, so the
+  omission is not cosmetic. A repo-only enumeration is also not the LIVE
+  population: MEASURED on this install, `~/.claude/settings.json` wires a 16th
+  hook on the same matcher, invisible to any count taken from the repo alone.
+
+  Two population traps sit on top of each other here, and the second is the one
+  that survived a round of review. First: `grep degraded_exit(` finds six callers
+  and an earlier draft reported "six guards" — but this leg is precisely the one
+  where `degraded_exit` is UNREACHABLE, so all NINE refuse from their own import
+  handler and grep sees only the six that ALSO call it on the other leg. Count
+  the condition, never the helper. Second: correcting the number left the
+  denominator silently narrowed to the subset that was actually executed. **A
+  corrected figure written as "N of M things wired on X" has to re-enumerate X's
+  full population programmatically — parse the config, never grep — or it ships
+  one unstated restriction copied verbatim into four surfaces.** Naming what M
+  excludes is the fix; adjusting M is not. **Bash alone is not the question the test asks** — what
+  matters is whether ANY route to repair survives, and Write/Edit is one.
+
+**THIS TEST FOUND A REAL BRICK ON ITS FIRST APPLICATION, and the fix is the
+worked example of what it is for.** `scripts/pretool_check.py` carried the same
+unconditional block on `Write|Edit`, so the session could neither run a command
+NOR edit a file: repair path CLOSED, SYSTEMIC, on a headless box. And that
+refusal was a strict OVER-block rather than a conservative one — this guard
+blocks CRITICAL-path writes in DISPATCHED sessions only, an interactive session
+is allowed through by design, and its healthy session test
+(`os.environ.get("GENESIS_CC_SESSION")`) needs nothing from `hook_input`. It was
+refusing a category it was built never to refuse, and that category is the one
+that performs repairs.
+
+So the degraded block now asks the guard's own scope question with the one input
+that cannot fail: a DISPATCHED session still refuses (nobody is present to
+approve), an INTERACTIVE one is allowed with a loud notice. The security delta
+is ZERO and is locked by a test rather than asserted — the healthy guard already
+permits exactly that call, so restoring it surrenders no protection that existed.
+Bash stays refused, which is the point: fail-closed keeps everything it was
+protecting, and the session keeps the edit that repairs the tree.
+
+**A DISPATCHED session remains SYSTEMIC by this same test** — Bash and Write/Edit
+both refused, repair path closed — and that is the intended direction rather than
+an oversight: an unattended session is not who should be self-repairing a broken
+guard tree, and its repair route is a human interactive session, which is exactly
+what this change makes usable again.
+
+**The general rule, which is why this sits in the doctrine and not only in a
+changelog:** when a fail-closed leg has no predicate, do not ask whether the
+refusal is severe — ask which repair routes it closes, and leave one open on
+purpose. Two other routes exist here and NEITHER is a design: an MCP editing
+tool is matched by neither matcher, and the host Guardian can `REVERT_CODE` from
+outside the container, but nothing currently WAKES it, because the container is
+up and `genesis-server` never imports `hook_input`. A repair route that survives
+by accident is not a repair route; name it and WIRE it.
 
 **PARTIAL failure means a usable predicate survives**, and fail-CLOSED stays
 correct there — `run_guard` is the other merged instance (an uncaught crash in
