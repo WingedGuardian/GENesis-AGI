@@ -1871,7 +1871,7 @@ def test_depth_denial_carries_the_merge_hint(repo: Path, home: Path) -> None:
     res = _run_hook('git commit -m "merge main"', repo, home)
     assert res.returncode == 2
     assert "review depth" in res.stderr.lower()
-    assert "sequencer sentinel is present" in res.stderr
+    assert "git integration sentinel is present" in res.stderr
 
 
 def test_depth_hint_describes_the_DEPTH_failure_not_the_round_counter(
@@ -1910,7 +1910,7 @@ def test_depth_hint_does_not_call_a_local_delta_somebody_elses_work(repo: Path, 
     (repo / ".git" / "CHERRY_PICK_HEAD").write_text("0" * 40 + "\n")
     res = _run_hook('git commit -m "cherry-pick"', repo, home)
     assert res.returncode == 2
-    assert "sequencer sentinel is present" in res.stderr
+    assert "git integration sentinel is present" in res.stderr
     assert "cherry-pick" in res.stderr
     assert "conflict resolution" in res.stderr
     assert "NOT an exemption" in res.stderr
@@ -1937,7 +1937,7 @@ def test_no_merge_hint_when_no_merge_in_flight(repo: Path, home: Path) -> None:
     _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
     res = _run_hook('git commit -m "prompt"', repo, home)
     assert res.returncode == 2
-    assert "sequencer sentinel is present" not in res.stderr
+    assert "git integration sentinel is present" not in res.stderr
 
 
 def test_merge_sentinel_does_not_become_an_exemption(repo: Path, home: Path) -> None:
@@ -1992,10 +1992,13 @@ def test_depth_hint_says_sigils_bind_per_commit_segment(
     single commit and wrong for the supported chained shape
     (`git commit … && git commit --amend …`), where it binds only the last.
 
-    MEASURED: chained with one trailing comment -> rc=2; the same multi-line
-    command with the sigil run repeated on each segment -> rc=0.  A comment
-    ends at the physical line, so putting ``&&`` after one would never execute
-    the second command in Bash.
+    MEASURED: chained with one trailing comment -> rc=2.  A comment ends at the
+    physical line, so ``&&`` cannot follow one, which means the only way to put
+    a sigil on every segment of a chain is a NEWLINE between them — and a
+    newline is not ``&&``.  The note therefore prescribes separate commands
+    rather than that multi-line shape, and this test holds it to that: the
+    multi-line form is exercised here only to show what it costs, never as the
+    advertised route.
     """
     _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
     _begin_merge(repo)
@@ -2011,31 +2014,69 @@ def test_depth_hint_says_sigils_bind_per_commit_segment(
         "one trailing comment on a chain must NOT clear the gate"
     )
 
-    per_segment = (
-        'git commit -m "merge main"  # depth-ack review-override\n'
-        "git commit --amend --no-edit  # depth-ack review-override"
+    # SEPARATE COMMANDS are the route the note prescribes, and each clears the
+    # gate on its own.  Nothing about one invocation can leave the other
+    # half-done, which is the whole reason this is what gets advertised.
+    assert (
+        _run_hook('git commit -m "merge main"  # depth-ack review-override', repo, home).returncode
+        == 0
+    ), "a single commit carrying the sigil must clear the gate"
+    assert (
+        _run_hook("git commit --amend --no-edit  # depth-ack review-override", repo, home).returncode
+        == 0
+    ), "the amend, run as its own command, must clear the gate too"
+
+    # And the note must NOT send anyone down the multi-line road.  The parser
+    # accepts that shape — the hazard is in bash, not in the hook — so the
+    # guard here is on what the message ADVERTISES.
+    # POSITIVE assertions, because a denylist cannot tell PRESCRIBING a shape
+    # from WARNING about it — the note has to name the multi-line form in order
+    # to steer the reader off it, and a bare "multi-line" ban fired on exactly
+    # that sentence.
+    assert "OWN command" in res.stderr, (
+        "the note no longer tells the reader to run each commit separately"
     )
-    assert _run_hook(per_segment, repo, home).returncode == 0, (
-        "the shape the note now prescribes must actually work"
+    assert "Do not reach for a multi-line command" in res.stderr, (
+        "the note no longer steers the reader away from the multi-line form"
+    )
+    assert "a newline is not `&&`" in res.stderr, (
+        "the note names the shape but not the reason it is unsafe — without the "
+        "short-circuit point a reader has no cause to prefer separate commands"
+    )
+    # This one IS prescription-only wording, so banning it is sound: it survives
+    # in no warning, only in the advice this finding removed.
+    assert "repeated on each segment" not in res.stderr, (
+        "the note still prescribes running the sigil on each segment of a chain"
     )
 
-    # Independent oracle: Bash executes BOTH lines.  The hook parser accepting
-    # the string alone cannot establish that, because a `# ... &&` form would
-    # silently comment out the second command in a real shell.
+    # The hazard itself, demonstrated in a real shell rather than asserted in
+    # prose: with a newline the second command runs even though the first
+    # FAILED, and `--amend` then rewrites the PREVIOUS commit while the whole
+    # thing exits 0.  This is why the shape is not advertised.
     (repo / ".git" / "MERGE_HEAD").unlink()
+    before = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    newline_form = "false\ngit commit --amend --no-edit"
     actual = subprocess.run(
-        ["bash", "-c", per_segment], cwd=repo, capture_output=True, text=True, timeout=30
+        ["bash", "-c", newline_form], cwd=repo, capture_output=True, text=True, timeout=30
     )
-    assert actual.returncode == 0, actual.stdout + actual.stderr
+    assert actual.returncode == 0, (
+        "the newline form should have swallowed the failure and exited 0 — if this "
+        "assertion fails the hazard has changed and the note can be revisited"
+    )
+    after = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    assert after != before, "the amend did not rewrite the previous commit"
     reflog = subprocess.run(
-        ["git", "reflog", "-2", "--format=%gs"],
+        ["git", "reflog", "-1", "--format=%gs"],
         cwd=repo,
         capture_output=True,
         text=True,
         check=True,
-    ).stdout.splitlines()
-    assert reflog[0].startswith("commit (amend):")
-    assert reflog[1].startswith("commit:")
+    ).stdout.strip()
+    assert reflog.startswith("commit (amend):"), reflog
 
 
 def test_depth_hint_covers_the_prospective_content_of_dash_a(repo: Path, home: Path) -> None:
