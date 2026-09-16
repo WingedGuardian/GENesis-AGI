@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from genesis.autonomy.executor.types import TaskPhase
+from genesis.autonomy.task_unblock_config import TASK_UNBLOCK_ACTION_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +133,63 @@ class TaskDispatcher:
                     self._executor._semaphore_released.discard(task_id)
         finally:
             self._dispatch_inflight.discard(task_id)
+
+    async def _resume_claimed(self, task_id: str, claimed: str) -> bool:
+        """Execute a resume whose approval has ALREADY been claimed, loudly.
+
+        Claiming spends the human's answer BEFORE the dispatch runs (see
+        ``approval_requests.claim_approved_for_task``), which is the house
+        ordering — ``dispatch_router``, ``build_lane`` and ``awareness/loop``
+        all consume before acting. But every one of those pairs it with a
+        failure record, and without one this ordering is strictly worse than
+        no consumption at all on the failure path: before, a failed resume
+        was retried on the next 120s poll; now the approval is gone, nothing
+        re-claims, and the task sits BLOCKED forever with no trace beyond
+        ``tracked_task``'s generic "background task failed".
+
+        So a spent claim that did not resume is reported here — with the task
+        and the approval named — rather than disappearing. Re-ASKING is not
+        done here on purpose: nothing produces a ``task_unblock`` approval yet,
+        and inventing a re-ask path with no producer would be a second
+        unreviewed mechanism. The contract this establishes, which the producer
+        must honour: **a claim is spent whether or not the dispatch
+        succeeds, and the producer owns re-asking.**
+        """
+        ok = False
+        try:
+            ok = await self._guarded_execute(task_id)
+        except Exception:
+            logger.error(
+                "Resume of blocked task %s FAILED after claiming approval %s — "
+                "the approval is spent and the task remains BLOCKED; it will "
+                "not be retried without a new approval",
+                task_id, claimed, exc_info=True,
+            )
+        else:
+            if not ok:
+                logger.error(
+                    "Resume of blocked task %s returned failure after claiming "
+                    "approval %s — the approval is spent and the task remains "
+                    "BLOCKED; it will not be retried without a new approval",
+                    task_id, claimed,
+                )
+        if not ok and self._event_bus:
+            try:
+                from genesis.observability.types import Severity, Subsystem
+
+                await self._event_bus.emit(
+                    Subsystem.AUTONOMY,
+                    Severity.ERROR,
+                    "task.resume_failed",
+                    f"Task {task_id} stayed blocked after spending approval {claimed}",
+                    task_id=task_id,
+                    approval_request_id=claimed,
+                )
+            except Exception:
+                logger.error(
+                    "Failed to emit task.resume_failed event", exc_info=True,
+                )
+        return ok
 
     async def submit(
         self,
@@ -254,6 +312,7 @@ class TaskDispatcher:
 
         Returns the count of newly dispatched tasks.
         """
+        from genesis.db.crud import approval_requests as ar_crud
         from genesis.db.crud import observations, task_states
         from genesis.util.tasks import tracked_task
 
@@ -313,16 +372,16 @@ class TaskDispatcher:
             if task_id in self._dispatch_inflight:
                 continue
 
-            # Check if there's an approved-but-unconsumed approval for this task
+            # CLAIM (find + consume atomically) an approved resume approval.
+            # Consuming BEFORE dispatch is load-bearing: an unconsumed approval
+            # would still be sitting there at the task's NEXT block, resuming it
+            # on a human decision that answered an earlier question.
             try:
-                cursor = await self._db.execute(
-                    """SELECT id FROM approval_requests
-                       WHERE status = 'approved' AND consumed_at IS NULL
-                         AND context LIKE ?
-                       LIMIT 1""",
-                    (f'%"task_id": "{task_id}"%',),
+                claimed = await ar_crud.claim_approved_for_task(
+                    self._db,
+                    task_id=task_id,
+                    action_type=TASK_UNBLOCK_ACTION_TYPE,
                 )
-                row = await cursor.fetchone()
             except Exception:
                 logger.error(
                     "Failed to check approvals for blocked task %s",
@@ -330,16 +389,16 @@ class TaskDispatcher:
                 )
                 continue
 
-            if row is None:
+            if claimed is None:
                 continue
 
             logger.info(
-                "Resuming blocked task %s (approved approval found)",
-                task_id,
+                "Resuming blocked task %s (claimed approval %s)",
+                task_id, claimed,
             )
             self._dispatched.add(task_id)
             tracked_task(
-                self._guarded_execute(task_id),
+                self._resume_claimed(task_id, claimed),
                 name=f"task-{task_id}-resume",
             )
             dispatched += 1
@@ -434,6 +493,7 @@ class TaskDispatcher:
 
         Returns the count of recovered tasks.
         """
+        from genesis.db.crud import approval_requests as ar_crud
         from genesis.db.crud import task_states
         from genesis.util.tasks import tracked_task
 
@@ -468,32 +528,30 @@ class TaskDispatcher:
                 continue
 
             if phase == TaskPhase.BLOCKED.value:
-                # Check if there's an approved-but-unconsumed approval
+                # CLAIM (find + consume atomically) — same contract as the
+                # dispatch_cycle path above; see claim_approved_for_task.
                 try:
-                    cursor = await self._db.execute(
-                        """SELECT id FROM approval_requests
-                           WHERE status = 'approved' AND consumed_at IS NULL
-                             AND context LIKE ?
-                           LIMIT 1""",
-                        (f'%"task_id": "{task_id}"%',),
+                    claimed = await ar_crud.claim_approved_for_task(
+                        self._db,
+                        task_id=task_id,
+                        action_type=TASK_UNBLOCK_ACTION_TYPE,
                     )
-                    approved_row = await cursor.fetchone()
                 except Exception:
                     logger.error(
                         "Failed to check approvals for blocked task %s",
                         task_id, exc_info=True,
                     )
-                    approved_row = None
+                    claimed = None
 
-                if approved_row:
+                if claimed:
                     # Approval granted — re-dispatch for execution
                     logger.info(
-                        "Resuming blocked task %s (approved approval found)",
-                        task_id,
+                        "Resuming blocked task %s (claimed approval %s)",
+                        task_id, claimed,
                     )
                     self._dispatched.add(task_id)
                     tracked_task(
-                        self._guarded_execute(task_id),
+                        self._resume_claimed(task_id, claimed),
                         name=f"task-resume-{task_id}",
                     )
                     recovered += 1
