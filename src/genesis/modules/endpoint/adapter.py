@@ -44,6 +44,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import contextvars
 import ipaddress
 import json
 import logging
@@ -71,15 +72,52 @@ _CMD_LINE_MAX = 8191 - 32
 # A floor for the sanity check below, not a budget.
 _MIN_USABLE_PAYLOAD = 256
 
+def _cmd_units(command: str) -> int:
+    """Length of a remote command in the unit cmd.exe actually bills: UTF-16.
+
+    ``len()`` counts code POINTS and cmd.exe receives UTF-16, where anything
+    outside the BMP — an emoji in a path, most obviously — occupies a surrogate
+    PAIR. Measuring in the wrong unit does not loosen the bound, it SKIPS it: a
+    state_dir near the limit passes here and produces a command the machine
+    cannot run. Same mismatch, same direction, as the one this repository
+    already learned about hook output.
+
+    Not total: a lone surrogate raises rather than returning a count. That is
+    the right direction — such a string cannot survive the transport either —
+    and the constructor's caller reports it as a construction failure.
+    """
+    return len(command.encode("utf-16-le")) // 2
+
+
+#: How long the reachability gate may spend resolving a hostname. The gate runs
+#: AHEAD of the SSH probe and only the probe carried a budget, so a dead
+#: resolver stalled the dashboard's serial per-module render before the health
+#: timeout even started. util/netclass.py bounds the same operation at 1.0s;
+#: this is deliberately looser, not a match — it sits ahead of a 30s probe
+#: inside a 60s cache TTL, so 2s is invisible against a render that already
+#: budgets thirty.
+_RESOLVE_TIMEOUT = 2.0
+
 # Tailscale's v4 space is RFC 6598 CGNAT, checked explicitly because
-# `is_private`'s treatment of 100.64/10 is version-dependent. Its v6 space is a
-# ULA (fc00::/7), which `is_private` already covers.
+# `is_private`'s treatment of 100.64/10 is version-dependent. Its v6 space is
+# NOT covered by anything generic — see _TAILNET_NET6 below, which is the whole
+# point of naming it.
 #
 # genesis.cc.session_cap.classify_origin makes the same distinction for a
 # DIFFERENT question — which network an inbound sshd client arrived from. Kept
 # separate because the inputs and failure directions differ, but the v6-mapping
-# and loopback handling are borrowed from it rather than re-derived.
+# and loopback handling are borrowed from it rather than re-derived. NOTE that
+# session_cap and util/netclass both still carry the "ULA is covered" claim
+# this file had to unlearn; benign there (both collapse lan+tailnet into one
+# class) and tracked separately rather than changed from here.
 _TAILNET_NET = ipaddress.ip_network("100.64.0.0/10")
+#: Tailscale's native IPv6 range. It is a ULA, so without naming it the address
+#: falls through to ``is_private`` and classifies as LAN — reversing the boundary
+#: in BOTH directions: ``allowed_networks: [tailnet]`` would refuse a real
+#: tailnet endpoint, and ``[lan]`` would admit one the operator excluded.
+#: (``util/netclass.py`` lumps both into "local" on purpose — it answers a
+#: coarser question, local-vs-wan, and cannot be reused for this one.)
+_TAILNET_NET6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
 
 # Characters that must never appear in a value we embed in a remote
 # cmd.exe -> PowerShell single-quoted literal. Each one MEASURED on hardware
@@ -147,7 +185,28 @@ class _NetworkGatedIPC:
     def __init__(self, inner, gate) -> None:
         self._inner = inner
         self._gate = gate
-        self._held = None
+        # A ContextVar, not an attribute. Two overlapping dispatches on one
+        # adapter share the instance, so an attribute-based save/restore can
+        # interleave: A stores None, B stores A's verdict, A restores None, B
+        # restores A's — leaving a non-None verdict behind permanently, after
+        # which every health check and inherited operation SKIPS the gate. A
+        # concurrency bug that disables a security check is the worst shape
+        # available, so the held value lives in the CONTEXT, where the
+        # interleaving cannot happen.
+        #
+        # Per-context is not quite per-task, and the difference is worth
+        # stating rather than discovering: a task created INSIDE a scope copies
+        # the context and inherits the held verdict, and the parent's reset
+        # does not reach it. For a child that finishes inside the scope that is
+        # the intended reading — it is part of the same logical operation. For
+        # a fire-and-forget task OUTLIVING the scope it would mean a verdict
+        # held forever. MEASURED: no such task exists on any path here —
+        # _dispatch_locked is four sequential awaits with no create_task, and
+        # the SSH transport spawns a subprocess rather than re-entering this
+        # proxy — so the shape is documented, not defended against.
+        self._held: contextvars.ContextVar = contextvars.ContextVar(
+            f"endpoint_network_verdict_{id(self)}", default=None
+        )
 
     @contextlib.asynccontextmanager
     async def one_verdict(self):
@@ -161,14 +220,14 @@ class _NetworkGatedIPC:
         promises it: before any I/O.
         """
         verdict = await self._gate()
-        prev, self._held = self._held, verdict
+        token = self._held.set(verdict)
         try:
             yield verdict
         finally:
-            self._held = prev
+            self._held.reset(token)
 
     async def _check(self):
-        if self._held is None:
+        if self._held.get() is None:
             await self._gate()
 
     async def send(self, *args, **kwargs):
@@ -198,6 +257,29 @@ class WindowsEndpointAdapter(ExternalProgramAdapter):
     network. A non-Windows endpoint is a different dialect and would need its
     own adapter — hence the explicit name.
     """
+
+    #: Has THIS adapter ever run a real probe? Class-level, because the base
+    #: __init__ assigns ``_healthy`` and the property below reads this.
+    _probed_once = False
+
+    @property
+    def _healthy(self) -> bool:
+        """False until this adapter has actually probed the machine.
+
+        Gating the FIELD rather than one reader, because the fabricated verdict
+        reaches more paths than the cached-health one. Inherited ``register()``
+        sets healthy WITHOUT probing when no ``health_check:`` block is
+        configured — the shape the endpoint template ships — and
+        ``execute_operation``, ``handle_opportunity`` and ``record_outcome``
+        all read this field DIRECTLY, never through ``check_health_cached``.
+        Patching the cached path alone left those three trusting a verdict
+        nobody produced, and left the next reader unguarded by default.
+        """
+        return self._probed_once and self._health_probe_result
+
+    @_healthy.setter
+    def _healthy(self, value: bool) -> None:
+        self._health_probe_result = bool(value)
 
     def __init__(self, config: ProgramConfig) -> None:
         super().__init__(config)
@@ -249,11 +331,11 @@ class WindowsEndpointAdapter(ExternalProgramAdapter):
             ("prepare", self._prepare_command()),
             ("read-result", self._read_result_command()),
         ):
-            if len(cmd) > _CMD_LINE_MAX:
+            if _cmd_units(cmd) > _CMD_LINE_MAX:
                 raise ValueError(
                     f"module '{config.name}': endpoint.state_dir is too long — the "
-                    f"{label} command is {len(cmd)} characters against a "
-                    f"{_CMD_LINE_MAX} limit before any payload is added"
+                    f"{label} command is {_cmd_units(cmd)} UTF-16 code units against "
+                    f"a {_CMD_LINE_MAX} limit before any payload is added"
                 )
         # BACKSTOP, and currently UNREACHABLE — said plainly rather than left to
         # look like live cover. MEASURED against the exact command strings in
@@ -267,7 +349,7 @@ class WindowsEndpointAdapter(ExternalProgramAdapter):
         if self.payload_budget() < _MIN_USABLE_PAYLOAD:  # pragma: no cover
             raise ValueError(
                 f"module '{config.name}': endpoint.state_dir leaves only "
-                f"{self.payload_budget()} payload bytes of the {_CMD_LINE_MAX}-character "
+                f"{self.payload_budget()} payload bytes of the {_CMD_LINE_MAX}-unit "
                 f"remote command line (minimum {_MIN_USABLE_PAYLOAD}); shorten it"
             )
 
@@ -285,7 +367,12 @@ class WindowsEndpointAdapter(ExternalProgramAdapter):
 
     # ── reachability ────────────────────────────────────────────────────────
     def _host_address(self) -> str:
-        return (self._config.ipc.ssh_host or "").split("@", 1)[-1]
+        # The LAST at-sign, matching ssh itself. A UPN-style Windows account
+        # (`user@example.com@host`) is ordinary on domain-joined machines, and
+        # splitting at the FIRST one made `example.com@host` the hostname and
+        # refused the endpoint as unresolvable. `ssh -G user@example.com@host`
+        # reports user=user@example.com, hostname=host.
+        return (self._config.ipc.ssh_host or "").rsplit("@", 1)[-1]
 
     @staticmethod
     def _classify(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str | None:
@@ -296,7 +383,9 @@ class WindowsEndpointAdapter(ExternalProgramAdapter):
         # network object), so a mapped tailnet endpoint would read as public.
         if getattr(ip, "ipv4_mapped", None) is not None:
             ip = ip.ipv4_mapped  # type: ignore[union-attr]
-        if ip in _TAILNET_NET:
+        if (ip.version == 4 and ip in _TAILNET_NET) or (
+            ip.version == 6 and ip in _TAILNET_NET6
+        ):
             return "tailnet"
         # Loopback counts as LAN: it is the one address that cannot be remote.
         if ip.is_loopback or ip.is_private:
@@ -330,9 +419,20 @@ class WindowsEndpointAdapter(ExternalProgramAdapter):
             ip = ipaddress.ip_address(addr)
         except ValueError:
             try:
-                infos = await asyncio.get_running_loop().getaddrinfo(
-                    addr, None, proto=socket.IPPROTO_TCP
+                # BOUNDED: expiry is a refusal, like every other way this method
+                # fails. Unbounded, a slow resolver parked the dashboard render
+                # before the health budget began.
+                infos = await asyncio.wait_for(
+                    asyncio.get_running_loop().getaddrinfo(
+                        addr, None, proto=socket.IPPROTO_TCP
+                    ),
+                    timeout=_RESOLVE_TIMEOUT,
                 )
+            except TimeoutError as exc:
+                raise EndpointNotReachable(
+                    f"module '{self._config.name}': resolving '{addr}' exceeded "
+                    f"{_RESOLVE_TIMEOUT}s"
+                ) from exc
             except OSError as exc:
                 raise EndpointNotReachable(
                     f"module '{self._config.name}': cannot resolve '{addr}': {exc}"
@@ -386,6 +486,9 @@ class WindowsEndpointAdapter(ExternalProgramAdapter):
         deleted; no faked transport can produce it, because a fake answers every
         probe the same way.
         """
+        # This method IS the real probe, so it owns the flag — set BEFORE any
+        # assignment to _healthy, whose getter reads it.
+        self._probed_once = True
         probe = 'powershell -NoProfile -Command "exit 0"'
         try:
             # Its OWN short budget, not the module's work timeout. Without this
@@ -420,6 +523,16 @@ class WindowsEndpointAdapter(ExternalProgramAdapter):
         drift apart.
         """
         now = datetime.now(UTC)
+        # A verdict this adapter never produced does not get to be cached.
+        # Inherited register() marks the endpoint healthy and stamps
+        # _last_health_check_at WITHOUT probing when no health_check block is
+        # configured — which is the shape the template ships — so the first 60
+        # seconds of every boot served a fabricated "healthy" to the dashboard
+        # and to dispatch. The first real probe now always runs.
+        if not self._probed_once:
+            healthy = await self.check_health()
+            self._last_health_check_at = datetime.now(UTC)
+            return healthy
         if (
             self._last_health_check_at is not None
             and (now - self._last_health_check_at).total_seconds() < _HEALTH_CACHE_TTL_S
@@ -428,6 +541,41 @@ class WindowsEndpointAdapter(ExternalProgramAdapter):
         healthy = await self.check_health()
         self._last_health_check_at = now
         return healthy
+
+    async def _verified_healthy(self) -> str | None:
+        """Obtain a REAL verdict, or say why there isn't one.
+
+        The gated ``_healthy`` property refuses to report a verdict this
+        adapter never produced — that is what stops the inherited paths
+        trusting register()'s fabricated one. But refusing is only half an
+        answer: on its own it leaves those paths permanently inert, because
+        nothing on them ever probes. So they probe here, the same way
+        ``dispatch_mission`` already does, and the refusal carries the reason
+        rather than a bare "not healthy".
+        """
+        if await self.check_health_cached():
+            return None
+        return self._last_health_error or "endpoint did not pass its health check"
+
+    async def execute_operation(self, operation_name: str, params: dict | None = None) -> dict:
+        """Refresh before trusting health — the base reads ``_healthy`` directly."""
+        if self._enabled and operation_name in self._config.operations:
+            reason = await self._verified_healthy()
+            if reason is not None:
+                return {"error": f"Module '{self.name}' is not healthy: {reason}"}
+        return await super().execute_operation(operation_name, params)
+
+    async def handle_opportunity(self, opportunity: dict) -> dict | None:
+        """Same refresh. Delegation decides; this only makes the flag truthful."""
+        if self._enabled:
+            await self.check_health_cached()
+        return await super().handle_opportunity(opportunity)
+
+    async def record_outcome(self, outcome: dict) -> None:
+        """Same refresh, same reason."""
+        if self._enabled:
+            await self.check_health_cached()
+        await super().record_outcome(outcome)
 
     # ── payload budget ──────────────────────────────────────────────────────
     def _write_command(self, b64: str) -> str:
@@ -440,7 +588,13 @@ class WindowsEndpointAdapter(ExternalProgramAdapter):
 
     def payload_budget(self) -> int:
         """Largest RAW payload (bytes) that fits, derived from the real command."""
-        room = _CMD_LINE_MAX - len(self._write_command(""))
+        # _cmd_units, NOT len(). The constructor check was converted and this
+        # was not, which left the half that matters counting the wrong unit: a
+        # non-BMP character in state_dir is one code point and TWO billed units,
+        # so this over-reported the room and dispatch_mission accepted a mission
+        # whose command cmd.exe refuses. MEASURED before the fix: a 200-astral
+        # state_dir produced an 8358-unit command against the 8191 cap.
+        room = _CMD_LINE_MAX - _cmd_units(self._write_command(""))
         return max(0, (room // 4) * 3)
 
     # ── mission dispatch ────────────────────────────────────────────────────
@@ -479,8 +633,9 @@ class WindowsEndpointAdapter(ExternalProgramAdapter):
         if len(raw) > budget:
             raise MissionTooLarge(
                 f"module '{self._config.name}': mission payload is {len(raw)} bytes but "
-                f"only {budget} fit in the remote command line ({_CMD_LINE_MAX}-char "
-                "cmd.exe limit, measured). Refusing rather than truncating — a clipped "
+                f"only {budget} fit in the remote command line ({_CMD_LINE_MAX} "
+                "UTF-16 code units, the unit cmd.exe bills). Refusing rather than "
+                "truncating — a clipped "
                 "mission descriptor would ask for something other than what was requested."
             )
 

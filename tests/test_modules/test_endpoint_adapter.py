@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import json
+import re
+from datetime import UTC, datetime
 
 import pytest
 
@@ -240,13 +243,48 @@ async def test_a_module_whose_machine_fails_its_probe_does_not_dispatch():
     assert not any("FromBase64String" in c for c in ipc.calls), "no payload was written"
 
 
+async def test_a_fabricated_healthy_flag_never_reads_as_a_verdict():
+    """register() sets _healthy True unprobed. No reader may believe it.
+
+    Stronger than "dispatch refreshes it": the flag is gated at the FIELD, so
+    the three inherited paths that read ``_healthy`` directly — and any future
+    reader — see False until this adapter has actually probed the machine.
+    """
+    a = _adapter(ipc=FakeIPC(result={"ok": True}), healthy=True)
+    assert a.healthy is False, "a verdict nobody produced was served as one"
+    assert a._probed_once is False
+
+
 async def test_a_stale_healthy_flag_is_refreshed_rather_than_trusted():
-    """register() sets _healthy True unprobed; dispatch must not rely on it."""
+    """And dispatch obtains a REAL verdict rather than leaving the module inert."""
     ipc = FakeIPC(exit_code_on='Command "exit 0"')
     a = _adapter(ipc=ipc, healthy=True)
-    assert a.healthy is True
     await a.dispatch_mission({"a": 1})
+    assert a._probed_once is True, "dispatch never probed"
     assert a.healthy is False, "the gate read a stale flag instead of refreshing"
+
+
+async def test_the_inherited_paths_obtain_a_verdict_instead_of_going_inert():
+    """The other half of gating the field.
+
+    Refusing to serve a fabricated verdict is only half an answer — on its own
+    it would leave execute_operation/handle_opportunity/record_outcome
+    permanently unhealthy, because nothing on those paths probes. They must
+    probe, and the refusal must say why.
+    """
+    ipc = FakeIPC(result={"ok": True})
+    cfg = _cfg(operations={"ping": {"method": "SHELL", "path": "exit 0"}})
+    a = _adapter(cfg, ipc=ipc, healthy=True)
+    res = await a.execute_operation("ping")
+    assert a._probed_once is True, "execute_operation trusted the flag without probing"
+    assert "error" not in res, res
+
+    b = _adapter(cfg, ipc=FakeIPC(exit_code_on='Command "exit 0"'), healthy=True)
+    res = await b.execute_operation("ping")
+    assert "not healthy" in res.get("error", ""), res
+    assert res["error"] != f"Module '{b.name}' is not healthy", (
+        "the refusal dropped the reason the base class never had"
+    )
 
 
 async def test_a_forbidden_network_is_refused_before_touching_the_device():
@@ -738,3 +776,200 @@ async def test_one_verdict_holds_for_the_span_of_a_dispatch():
         "resolve is another chance to refuse a mission that already ran"
     )
     assert ipc.calls, "the dispatch did not reach the transport at all"
+
+
+# ── Review round 3 ──────────────────────────────────────────────────────────
+
+
+async def test_overlapping_dispatches_do_not_leak_a_held_verdict():
+    """The held verdict must be TASK-local, not shared on the instance.
+
+    An attribute-based save/restore interleaves under concurrency: A stores
+    None, B stores A's verdict, A restores None, B restores A's — and the
+    instance is left holding a verdict forever, after which every health check
+    and inherited operation SKIPS the gate. A concurrency bug that disables a
+    security check is the worst shape available, so this pins the fix.
+    """
+    gate_calls = {"n": 0}
+
+    async def _gate():
+        gate_calls["n"] += 1
+        await asyncio.sleep(0)  # force interleaving
+        return "tailnet"
+
+    proxy = _NetworkGatedIPC(FakeIPC(result={"ok": True}), _gate)
+
+    async def _hold():
+        async with proxy.one_verdict():
+            await asyncio.sleep(0)
+
+    await asyncio.gather(_hold(), _hold(), _hold())
+
+    assert proxy._held.get() is None, (
+        "a verdict outlived its operation — the gate is now skipped for every "
+        "later call on this adapter"
+    )
+    # And a send afterwards must resolve again rather than ride a stale verdict.
+    before = gate_calls["n"]
+    await proxy.send("x")
+    assert gate_calls["n"] == before + 1, "the gate did not run after the scopes closed"
+
+
+async def test_a_native_tailscale_ipv6_address_is_tailnet_not_lan():
+    """Tailscale v6 is a ULA, so the generic private branch called it LAN.
+
+    That reverses the operator's boundary in BOTH directions: `[tailnet]`
+    refuses a real tailnet endpoint, and `[lan]` admits one they excluded.
+    """
+    classify = WindowsEndpointAdapter._classify
+    assert classify(ipaddress.ip_address("fd7a:115c:a1e0::1")) == "tailnet"
+    # A non-Tailscale ULA is still LAN, and the v4 range is unchanged.
+    assert classify(ipaddress.ip_address("fd00::1")) == "lan"
+    assert classify(ipaddress.ip_address("100.64.0.1")) == "tailnet"
+    assert classify(ipaddress.ip_address("192.168.1.1")) == "lan"
+    assert classify(ipaddress.ip_address("8.8.8.8")) is None
+
+
+def test_a_upn_style_username_does_not_swallow_the_hostname():
+    """`user@example.com@host` is an ordinary domain-joined Windows account.
+
+    Splitting at the FIRST at-sign made `example.com@host` the hostname and
+    refused the endpoint as unresolvable, disagreeing with the ssh command the
+    check is supposed to guard.
+    """
+    a = _adapter(_cfg(ssh_host="user@example.com@10.0.0.5"))
+    assert a._host_address() == "10.0.0.5"
+
+
+def test_the_command_budget_counts_utf16_code_units():
+    """cmd.exe bills UTF-16; len() counts code points.
+
+    A non-BMP character occupies a surrogate pair, so a state_dir near the limit
+    passes a code-point check and produces a command the machine cannot run.
+    """
+    from genesis.modules.endpoint.adapter import _cmd_units
+
+    assert _cmd_units("abc") == 3
+    assert _cmd_units("\U0001f600") == 2, "an astral character is two UTF-16 units"
+    assert _cmd_units("a\U0001f600b") == 4
+
+
+def test_the_constructor_refuses_a_state_dir_that_is_long_only_in_utf16():
+    """BINDS the guard, not the helper.
+
+    The helper test above stays green with the CALL SITE reverted to ``len()``
+    — which is exactly how the conversion shipped applied to the constructor
+    and not to ``payload_budget``. This one needs a state_dir inside the band
+    where the two units disagree: the prepare command embeds state_dir about
+    three times, so at 1500 astral characters it measures 4791 code points
+    (under the 8159 limit, so ``len()`` raises NOTHING) and 9291 UTF-16 units
+    (over it). Picking a value outside that band is the trap this test fell
+    into once already: at 4200 characters BOTH units exceed the limit, the
+    mutation still raises, and the test passes while binding nothing.
+    """
+    astral = "\U0001f600" * 1500
+    with pytest.raises(ValueError, match="UTF-16 code units") as exc:
+        WindowsEndpointAdapter(_cfg(endpoint={"state_dir": "C:\\g" + astral}))
+    reported = int(re.search(r"is (\d+) UTF-16", str(exc.value)).group(1))
+    assert reported > 8159, str(exc.value)
+    assert reported > 2 * len(astral) // 2, "the count reported is not the billed one"
+
+
+def _cmd_units_for_test(v: str) -> int:
+    return len(v.encode("utf-16-le")) // 2
+
+
+def test_the_payload_budget_counts_utf16_code_units():
+    """The RUNTIME refusal path, which the constructor fix did not reach.
+
+    MEASURED before the fix: a 200-astral state_dir constructed fine, reported
+    a 5886-byte budget, and let dispatch_mission build a 8358-unit command
+    against cmd.exe's 8191 cap. The budget must shrink by the surrogate cost.
+    """
+    plain = WindowsEndpointAdapter(_cfg(endpoint={"state_dir": "C:\\g" + "a" * 200}))
+    astral = WindowsEndpointAdapter(_cfg(endpoint={"state_dir": "C:\\g" + "\U0001f600" * 200}))
+    # Same code-point length; the astral one costs 200 extra billed units.
+    assert astral.payload_budget() == plain.payload_budget() - 150, (
+        "payload_budget is still counting code points"
+    )
+    cmd = astral._write_command(
+        base64.b64encode(b"x" * astral.payload_budget()).decode()
+    )
+    assert _cmd_units_for_test(cmd) <= 8191, "the largest accepted mission overflows cmd.exe"
+
+
+async def test_the_reachability_resolve_is_bounded():
+    """The gate runs AHEAD of the bounded SSH probe, so it needs its own budget.
+
+    Unbounded, a dead resolver parked the dashboard's serial per-module render
+    before the health timeout began. Expiry is a refusal like any other.
+    """
+    from genesis.modules.endpoint import adapter as mod
+
+    async def _never(*a, **k):
+        await asyncio.sleep(3600)
+
+    a = _adapter(_cfg(ssh_host="u@stalls.invalid"))
+
+    class _Loop:
+        def getaddrinfo(self, *args, **kwargs):
+            return _never()
+
+    orig = asyncio.get_running_loop
+    asyncio.get_running_loop = lambda: _Loop()  # type: ignore[assignment]
+    mod._RESOLVE_TIMEOUT, saved = 0.05, mod._RESOLVE_TIMEOUT
+    try:
+        with pytest.raises(EndpointNotReachable, match="exceeded"):
+            await a.resolve_network()
+    finally:
+        asyncio.get_running_loop = orig  # type: ignore[assignment]
+        mod._RESOLVE_TIMEOUT = saved
+
+
+def test_allowed_networks_refuses_every_shape_that_is_not_a_list_of_known_names():
+    """Fail-closed on SHAPE. A mapping tests KEYS; a string matches substrings."""
+    for bad in ({"lan": False}, "lan", ("lan",), 7, ["LAN"], ["lan", "wan"]):
+        with pytest.raises(ValueError, match="allowed_networks"):
+            _cfg(endpoint={"allowed_networks": bad})
+
+
+async def test_an_empty_allowed_networks_denies_rather_than_deleting_the_module():
+    """`[]` is a valid list meaning "deny all", not a config the loader drops.
+
+    Raising on it removed the endpoint from module_list entirely, because both
+    from_dict callers swallow the raise into a log warning — so a typo read as
+    "not configured" rather than "not available here".
+    """
+    cfg = _cfg(endpoint={"allowed_networks": []})  # must not raise
+    ipc = FakeIPC(result={"ok": True})
+    a = _adapter(cfg, ipc=ipc)
+    with pytest.raises(EndpointNotReachable):
+        await a.check_network_allowed()
+    assert ipc.calls == [], "a denied host was contacted anyway"
+
+
+def test_each_adapter_holds_its_own_verdict():
+    """Per-INSTANCE, not a module-level ContextVar shared by every endpoint.
+
+    A shared one passes every other test in this file: they use one adapter.
+    Two endpoints on different networks must not inherit each other's verdict.
+    """
+    a, b = _adapter(_cfg()), _adapter(_cfg())
+    assert a._ipc._held is not b._ipc._held
+    a._ipc._held.set("lan")
+    assert b._ipc._held.get() is None, "one endpoint's verdict leaked into another's"
+
+
+async def test_the_first_health_check_always_probes():
+    """register() can mark an endpoint healthy WITHOUT probing.
+
+    With no health_check block — the shape the template ships — that synthetic
+    verdict was then cached for the TTL, so the first minute of every boot
+    served a fabricated "healthy" to the dashboard and to dispatch.
+    """
+    ipc = FakeIPC(exit_code_on=_HEALTH_PROBE)
+    a = _adapter(ipc=ipc, healthy=True)
+    a._last_health_check_at = datetime.now(UTC)  # as register() leaves it
+
+    assert await a.check_health_cached() is False, "the synthetic verdict was trusted"
+    assert ipc.calls, "no probe was made"

@@ -49,6 +49,33 @@ class LifecycleConfig:
     logs_cmd: str | None = None
 
 
+_KNOWN_NETWORKS = ("lan", "tailnet")
+
+
+def _validated_networks(raw):
+    """Refuse any allowed_networks shape that is not a list of known names."""
+    # SHAPE is fail-closed; EMPTINESS is not an error. `[]` is a valid list
+    # meaning "deny every network", which the gate already enforces with a
+    # readable EndpointNotReachable. Raising on it instead deleted the module:
+    # both callers wrap from_dict in `except Exception: logger.warning`, so a
+    # typo removed the endpoint from module_list and the dashboard entirely —
+    # the exact outcome mcp/health/module_ops.py's own comment says to avoid,
+    # because "not configured" and "not available here" read differently to
+    # whoever is debugging.
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"endpoint.allowed_networks must be a list of "
+            f"{list(_KNOWN_NETWORKS)}, got {raw!r}"
+        )
+    unknown = [n for n in raw if n not in _KNOWN_NETWORKS]
+    if unknown:
+        raise ValueError(
+            f"endpoint.allowed_networks contains unknown entries {unknown}; "
+            f"valid values are {list(_KNOWN_NETWORKS)}"
+        )
+    return list(raw)
+
+
 @dataclass
 class EndpointConfig:
     """An endpoint is a MACHINE Genesis operates on, not a service it calls.
@@ -150,6 +177,11 @@ class ProgramConfig:
                 logs_cmd=lc_data.get("logs_cmd"),
             )
 
+        # A dict or a bare string passes an `in` test with entirely different
+        # semantics: `allowed_networks: {lan: false}` makes `"lan" in allowed`
+        # test KEYS and admit the network the operator just disabled, and a
+        # string admits by substring. Fail closed on any shape that is not a
+        # list of known names.
         ep_data = data.get("endpoint")
         endpoint = None
         if ep_data:
@@ -157,7 +189,9 @@ class ProgramConfig:
                 state_dir=ep_data.get("state_dir"),
                 mission_command=ep_data.get("mission_command"),
                 machine_id=ep_data.get("machine_id"),
-                allowed_networks=ep_data.get("allowed_networks", ["lan", "tailnet"]),
+                allowed_networks=_validated_networks(
+                    ep_data.get("allowed_networks", ["lan", "tailnet"])
+                ),
             )
 
         # Config fields: prefer new typed schema, fall back to legacy configurable dict

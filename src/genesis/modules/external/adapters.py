@@ -43,7 +43,30 @@ def build_adapter(data: dict, filename: str, config: Any) -> Any | None:
     """
     from genesis.modules.external.adapter import ExternalProgramAdapter
 
+    # `in` rather than truthiness: a PRESENT but falsy selector (`adapter: ""`,
+    # `adapter: false`, `adapter: 0`) is a mistyped config, not an omitted
+    # field, and treating it as omitted built a plain external module that
+    # registers, reports healthy, appears in listings and cannot dispatch —
+    # the failure this factory exists to refuse.
+    has_selector = "adapter" in data
     adapter_name = data.get("adapter")
+    if has_selector and adapter_name and not isinstance(adapter_name, str):
+        # `adapter: [x]` / `adapter: {a: b}` reached known.get() and raised
+        # TypeError: unhashable — escaping this function's "or return None"
+        # contract. Both callers happen to catch it, so the outcome matched
+        # minus the log line that says what was wrong.
+        logger.error(
+            "Module '%s' (%s) declares a non-string adapter selector (%r) — refusing "
+            "to load it.", data.get("name"), filename, adapter_name,
+        )
+        return None
+    if has_selector and not adapter_name:
+        logger.error(
+            "Module '%s' (%s) declares an empty adapter selector (%r) — refusing "
+            "to load it. Remove the key to use the plain external adapter.",
+            data.get("name"), filename, adapter_name,
+        )
+        return None
     if adapter_name:
         known = adapter_classes()
         adapter_cls = known.get(adapter_name)

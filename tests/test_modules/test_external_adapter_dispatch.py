@@ -57,6 +57,28 @@ def test_unknown_adapter_is_refused_rather_than_falling_back(caplog):
     assert "unknown adapter" in caplog.text
 
 
+def test_a_present_but_falsy_adapter_selector_is_refused(caplog):
+    """An omitted key and a mistyped one are different configs.
+
+    Treating `adapter: ""` as absent built a plain external module that
+    registers, reports healthy, appears in listings and cannot dispatch — the
+    least debuggable failure available, since every surface says it is fine.
+    """
+    for falsy in ("", None, False, 0, []):
+        caplog.clear()
+        assert _load_external_module(_data(adapter=falsy), "empty.yaml") is None, falsy
+        assert "empty adapter selector" in caplog.text, falsy
+
+
+def test_a_non_string_adapter_selector_is_refused_rather_than_raising(caplog):
+    """`adapter: [x]` reached dict.get() and raised TypeError: unhashable —
+    escaping this factory's documented "or return None" contract."""
+    for bad in (["windows-endpoint"], {"a": "b"}, 7):
+        caplog.clear()
+        assert _load_external_module(_data(adapter=bad), "shape.yaml") is None, bad
+        assert "non-string adapter selector" in caplog.text, bad
+
+
 def test_a_construction_failure_refuses_the_module(caplog):
     d = _data(adapter="windows-endpoint")
     del d["endpoint"]

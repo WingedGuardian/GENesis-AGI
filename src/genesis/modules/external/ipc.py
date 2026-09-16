@@ -399,7 +399,35 @@ class SshIPCAdapter:
         # error with no hint that its own setting had been ignored.
         # A health probe passes its own short budget rather than inheriting the
         # work one — see _HEALTH_PROBE_TIMEOUT.
-        timeout_s = min(timeout_override or self._timeout, _MAX_TIMEOUT_CEILING)
+        # Same normalization the CC path applies, which the comment above
+        # claimed parity with and did not have: `timeout_s: true` became a
+        # one-second budget (bool is an int), a negative killed the process
+        # immediately, and a string raised TypeError inside min() before any
+        # transport error handling could shape it. Invalid falls back to the
+        # module default, exactly as _send_cc does.
+        if (
+            isinstance(timeout_override, (int, float))
+            and not isinstance(timeout_override, bool)
+            and timeout_override > 0
+        ):
+            timeout_s = min(timeout_override, _MAX_TIMEOUT_CEILING)
+            # _send_cc warns when it CLAMPS a legitimate over-ceiling value, and
+            # "exactly as _send_cc does" has to include that or the comment is
+            # the same overclaim this round was filed against.
+            if timeout_override > _MAX_TIMEOUT_CEILING:
+                logger.warning(
+                    "SSH SHELL dispatch: timeout_s=%s exceeds the adapter ceiling %d "
+                    "— clamping", timeout_override, _MAX_TIMEOUT_CEILING,
+                )
+        else:
+            timeout_s = min(self._timeout, _MAX_TIMEOUT_CEILING)
+            if timeout_override is not None:
+                # Report the value actually used, not self._timeout — they
+                # differ whenever the module default is itself over the ceiling.
+                logger.warning(
+                    "SSH SHELL dispatch: ignoring invalid timeout_s=%r — using %s",
+                    timeout_override, timeout_s,
+                )
 
         ssh_args = self._build_ssh_args(command)
         try:

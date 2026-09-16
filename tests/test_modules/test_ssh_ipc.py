@@ -537,6 +537,45 @@ class TestShellTimeoutAndEncoding:
         assert result["stderr"] is not None
 
     @pytest.mark.asyncio
+    async def test_shell_refuses_an_invalid_timeout_instead_of_using_it(self):
+        """`timeout_s: true` became a ONE-SECOND budget — bool is an int.
+
+        The comment claimed parity with the CC path, which validates; this one
+        did not, so a negative killed the process immediately and a string
+        raised TypeError inside min() before any transport handling shaped it.
+        Invalid falls back to the module default, exactly as _send_cc does.
+        """
+        adapter = SshIPCAdapter(IPCConfig(method="ssh", ssh_host="u@h", timeout=300))
+        for bad in (True, False, -1, 0, "30", None, [5]):
+            seen = {}
+
+            async def fake_wait_for(coro, timeout, _s=seen):
+                _s["timeout"] = timeout
+                coro.close()
+                raise TimeoutError
+
+            with patch("genesis.modules.external.ipc.asyncio.create_subprocess_exec",
+                       return_value=AsyncMock()), \
+                 patch("genesis.modules.external.ipc.asyncio.wait_for", fake_wait_for):
+                await adapter.send("echo hi", data={"timeout_s": bad}, method="SHELL")
+            assert seen["timeout"] == 300, f"timeout_s={bad!r} was honoured as a budget"
+
+    async def test_shell_clamps_and_says_so(self):
+        """_send_cc warns when it clamps; "exactly as _send_cc does" must too."""
+        adapter = SshIPCAdapter(IPCConfig(method="ssh", ssh_host="u@h", timeout=300))
+        seen = {}
+
+        async def fake_wait_for(coro, timeout):
+            seen["timeout"] = timeout
+            coro.close()
+            raise TimeoutError
+
+        with patch("genesis.modules.external.ipc.asyncio.create_subprocess_exec",
+                   return_value=AsyncMock()), \
+             patch("genesis.modules.external.ipc.asyncio.wait_for", fake_wait_for):
+            await adapter.send("echo hi", data={"timeout_s": 10**9}, method="SHELL")
+        assert seen["timeout"] < 10**9, "an unbounded caller budget was honoured"
+
     async def test_a_shell_caller_can_pass_its_own_budget(self):
         """The transport must HONOUR data["timeout_s"], not merely accept it.
 
