@@ -1077,6 +1077,13 @@ class CCSessionExecutor:
                 strategy="ego_judgment",
                 reason=content,
                 domain="internal",
+                # The research CC session that hit this challenge — already in
+                # scope (recorded into the blocker payload above) and dropped
+                # here until now. Deterministic pass-through, never a guess;
+                # absent -> honest NULL.
+                source_session=(
+                    getattr(research_result, "session_id", None) if research_result else None
+                ),
             )
         except Exception:
             logger.exception("Failed to create challenge follow-up")

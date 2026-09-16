@@ -139,17 +139,40 @@ def _audit_line(
     )
 
 
+def _audit_line_minimal(part: str, where: str) -> str:
+    """The counters-dropped fallback for :func:`_audit_line`'s cut form.
+
+    Emitted by ``emit_final`` only when the full cut line will not fit its
+    reserve. It keeps the two load-bearing parts — the part id and the mirror
+    pointer (``where``) — and drops the unbounded counters, which is the
+    'select, don't amputate' answer to a line that must shrink: omit the
+    volatile field explicitly rather than let a right-clip eat the pointer.
+    The widened reserve below makes this path unreachable for any real part;
+    it is the STRUCTURAL guarantee behind that arithmetic, not a substitute.
+    """
+    return f"\n_[ctx {part}: audit counts omitted for size{where}]_"
+
+
 # Room reserved for the trailing `_[ctx <part>: …]_` self-audit line — DERIVED
 # from the renderer above at its realistic worst case, not a round number.
-# Pinned by test_the_audit_reserve_fits_the_line_it_reserves_for, which rebuilds
-# this same worst case, so the two cannot drift.
+# The load-bearing invariant is that `_AUDIT_WORST_COUNTER` exceeds any counter a
+# real part can render (checked by test_the_audit_worst_counter_exceeds_any_real_part,
+# which asserts that margin directly — not by rebuilding the line, which would be
+# tautological against a reserve derived from the same figure); the pointer-safe
+# fallback in `_finish_part` is the structural backstop past even that.
+# 12-digit worst-case counters (999_999_999_999 ≈ 1 TB): `intended`/`dropped`
+# are unbounded, and the earlier 5-digit 99_999 under-reserved for any part that
+# renders a 6+-digit count — a right-clip would then eat the trailing mirror
+# pointer. 12 digits covers any real payload with room to spare; the fallback in
+# `_finish_part` is the structural backstop past even that.
+_AUDIT_WORST_COUNTER = 999_999_999_999
 _AUDIT_LINE_RESERVE = (
     len(
         _audit_line(
             "identity-user",
-            99_999,
-            99_999,
-            cut=("x" * _AUDIT_BLOCK_LABEL_MAX, 99_999),
+            _AUDIT_WORST_COUNTER,
+            _AUDIT_WORST_COUNTER,
+            cut=("x" * _AUDIT_BLOCK_LABEL_MAX, _AUDIT_WORST_COUNTER),
             where=(
                 f" — full text: {Path.home()}/.genesis/sessions/{'0' * 36}/context-identity-user.md"
             ),
@@ -179,7 +202,11 @@ def _audit_reserve(part: str, mirror: Path | None) -> int:
     """
     where = f" — full text: {mirror}" if mirror is not None else " — MIRROR UNAVAILABLE"
     worst = _audit_line(
-        part, 99_999, 99_999, cut=("x" * _AUDIT_BLOCK_LABEL_MAX, 99_999), where=where
+        part,
+        _AUDIT_WORST_COUNTER,
+        _AUDIT_WORST_COUNTER,
+        cut=("x" * _AUDIT_BLOCK_LABEL_MAX, _AUDIT_WORST_COUNTER),
+        where=where,
     )
     return max(_AUDIT_LINE_RESERVE, emit_cost(worst))
 
@@ -634,7 +661,13 @@ def _emit_body() -> tuple[str, str, str] | None:
             _probe = None
         if _probe is not None:
             _ch = "é" if os.environ.get("GENESIS_CTX_PROBE_MODE") == "multibyte" else "A"
-            sys.stdout.write("PROBE-START " + _ch * _n + " PROBE-END")
+            # This IS the probe that measures the harness cap, so it must emit a
+            # caller-chosen byte count verbatim — bounding it would destroy the
+            # only instrument that can re-derive the constant after a CC bump.
+            # Gated behind GENESIS_CTX_PROBE_BYTES, unset in normal operation.
+            sys.stdout.write(  # hook-output-exempt: this is the cap probe itself
+                "PROBE-START " + _ch * _n + " PROBE-END"
+            )
             sys.stdout.flush()
             return
 
@@ -941,6 +974,46 @@ def _emit_body() -> tuple[str, str, str] | None:
     last_session_data = _load_last_session_data()
 
     if is_genesis_session:
+        # 1.9. THE SESSION'S OWN ID. A foreground session learns it from the
+        # per-turn `[Clock: … | Session: xxxxxxxx]` tag, which
+        # `genesis_urgent_alerts` writes — and that hook returns immediately for
+        # a dispatched session (GENESIS_CC_SESSION=1). So a dispatched session
+        # had no way to know its own id, and every provenance field it wrote was
+        # NULL by construction: not a bug in the writer, an input it was never
+        # given (Codex P2, PR #1622).
+        #
+        # Emitted once at session start rather than per turn: this is a
+        # session-lifetime constant, and the per-turn tag exists for the clock
+        # beside it, not for the id.
+        #
+        # GATED ON THE PART, and "once" is why. settings.json wires FOUR
+        # SessionStart invocations of this script, one per --part; an ungated
+        # block inside `is_genesis_session` therefore ran in every part that
+        # reaches here, which MEASURED as two copies (charter and knowledge) —
+        # so the sentence above was false of the code beneath it (Codex P2).
+        # Charter is the right home: it is the identity part, it renders first,
+        # and the knowledge part is the one under a tight character budget,
+        # where a duplicate would push out later capability and MCP-crash
+        # warnings.
+        if _in("charter") and _hook_session_id:
+            if not first:
+                _emit("\n\n---\n\n")
+            # The argument NAME differs per tool and the difference is not
+            # cosmetic: `session_ledger_add`'s parameter is `session_id`, and an
+            # invocation using `source_session` is rejected before the handler
+            # runs — so instructing one name for both would lose the ledger row
+            # entirely, which is worse than the NULL this block exists to fix
+            # (Codex P2, PR #1622). Spell each call out.
+            _emit(
+                "## This Session\n\n"
+                f"- **CC session id**: `{_hook_session_id}`\n\n"
+                "Pass it when a tool asks which session work came from — the "
+                "argument is named per tool: `follow_up_create(source_session=…)`, "
+                "`session_ledger_add(session_id=…)`. Without it the row records no "
+                "origin, and nothing downstream can attribute the work back here.\n"
+            )
+            first = False
+
         # 2. Cognitive state from DB — for ego/background sessions only.
         # Foreground sessions get essential knowledge instead (see below).
         # Charter part (the dispatched session's highest-salience block).
@@ -1027,7 +1100,7 @@ def _emit_body() -> tuple[str, str, str] | None:
         # The helper is fail-open end-to-end; pulse must never block session
         # start. Charter part (it feeds the charter's proposal sub-block).
         if _in("charter"):
-            _spawn_repo_pulse_worker(_hook_source)
+            _spawn_boundary_workers(_hook_source)
 
         # Critical-only alert: surface genuinely user-blocking issues (DB down, etc.)
         _status_file = Path.home() / ".genesis" / "status.json"
@@ -1406,7 +1479,8 @@ def _finish_part(part: str, session_id: str, miswired: str = "") -> None:
         block, dropped = cut
         where = f" — full text: {mirror}" if wrote_mirror else " — MIRROR UNAVAILABLE"
         out.emit_final(
-            _audit_line(part, out.intended_chars, out.emitted_chars, cut=cut, where=where)
+            _audit_line(part, out.intended_chars, out.emitted_chars, cut=cut, where=where),
+            fallback=_audit_line_minimal(part, where),
         )
     else:
         out.emit_final(_audit_line(part, out.emitted_chars, out.emitted_chars))
@@ -1660,6 +1734,83 @@ def _spawn_repo_pulse_worker(source: str) -> None:
             )
     except Exception:
         pass  # fail-open: pulse is advisory, session start is not
+
+
+def _spawn_boundary_workers(source: str) -> None:
+    """Every detached worker this session boundary starts — in ONE place.
+
+    A test that drives the emission path must neutralise these, or it forks
+    real background processes against the live repo. When each spawn was
+    called directly from that path, neutralising them was a CONVENTION every
+    such test had to remember for every spawn — and the second one broke it
+    immediately: `test_context_injection_budget` patched the repo-pulse spawn
+    (its comment even records why: "a side effect a budget test has no
+    business having, and one that only shows up as flakiness under load") and
+    then forked the zero-drop worker for real, which does a live `git
+    ls-remote` and a 2000-PR `gh pr list`.
+
+    Add new detached spawns HERE, never at the call site. That the emission
+    path calls this and nothing else is locked by
+    `test_session_context_zero_drop`, which asks the AST which `_spawn_*` names
+    `_emit_body` calls rather than checking a hardcoded list — so a third spawn
+    added at the call site fails that test without anyone updating it.
+
+    Not a guarantee, and worth saying so precisely: this makes ONE thing to
+    stub instead of N, for a test that drives the emission path IN-PROCESS. A
+    test that invokes this hook as a SUBPROCESS is not covered by any stub —
+    the durable answer there is a spawn-only kill switch, which does not exist
+    (`GENESIS_*_DISABLED` is overloaded: the workers read the same variables to
+    disable THEMSELVES, so arming them suite-wide breaks the worker tests —
+    MEASURED, 42 of them). Today the exposure is nil: only one test file drives
+    `main()`, and it stubs this function.
+    """
+    _spawn_repo_pulse_worker(source)
+    _spawn_zero_drop_worker(source)
+
+
+def _spawn_zero_drop_worker(source: str) -> None:
+    """Fire-and-forget the detached zero-drop stranded-work detector.
+
+    GLOBAL, not per-session: the sweep enumerates every branch and worktree of
+    the install, so one run serves all sessions; its 60-minute debounce makes
+    redundant spawns exit in ~100ms (the repo-pulse spawn posture, one Popen of
+    cost to this hook). Never on clear (/clear is a fresh start), and fail-open
+    end-to-end — a detector cannot be allowed to block session start. The sweep
+    itself (a gh round-trip plus ~160 worktree stats, MEASURED ~19s) is orders
+    of magnitude past this hook's 5s budget, which is why it is detached rather
+    than inline.
+    """
+    import subprocess
+
+    try:
+        if os.environ.get("GENESIS_ZERO_DROP_DISABLED") == "1":
+            return
+        if source == "clear":
+            return
+        script = Path(__file__).resolve().parent / "zero_drop_worker.py"
+        err_log = Path.home() / ".genesis" / "session_awareness" / "zero_drop_err.log"
+        err_log.parent.mkdir(parents=True, exist_ok=True)
+        with err_log.open("ab") as err_fh:
+            subprocess.Popen(  # noqa: S603 — fixed argv, sys.executable
+                [
+                    sys.executable,
+                    str(script),
+                    "--trigger",
+                    "session_start",
+                    # Same home-anchored resolution as the pulse spawn: a
+                    # worktree session's worker must not fall back to
+                    # genesis.env's repo-anchored default (worktree/data/ is a
+                    # void — silent no-op coverage loss).
+                    "--db-path",
+                    str(_charter_db_path()),
+                ],
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=err_fh,
+            )
+    except Exception:
+        pass  # fail-open: the detector is advisory, session start is not
 
 
 def _pulse_floor() -> float:
@@ -1951,7 +2102,14 @@ def _load_charter_db(session_id: str, db_path: Path | None) -> tuple[dict | None
                     # ledger id. follow_up-target proposals (target_kind added by
                     # migration 0084) are session-agnostic and get their own
                     # global surface — never surface them here with a confirm
-                    # command that can't find them. Pre-0084 DBs lack the column;
+                    # command that can't find them. That surface is the
+                    # `follow_up_list` MCP tool, which decorates each row with any
+                    # pending proposal (mcp/health/follow_up_tools.py,
+                    # _enrich_external_state). It was promised here for a long time
+                    # before it existed — during which any follow_up proposal would
+                    # have gone stale unseen; measured, none had yet been proposed
+                    # (they auto-absorb in live mode), so the gap was latent, not
+                    # lossy. Pre-0084 DBs lack the column;
                     # the enclosing try/except then renders the block empty (same
                     # graceful degradation as the pre-0062 no-tables case).
                     cur = await db.execute(

@@ -202,11 +202,14 @@ def _direct_part(monkeypatch, capsys, identity_dir: Path, part: str) -> str:
     monkeypatch.setattr(_ctx, "_mirror_path", lambda sid, part: identity_dir / f"{sid}-{part}.md")
     # A test must not rewrite the developer's / CI's real git hooks (F13c).
     monkeypatch.setattr(_ctx, "_sync_genesis_hooks", lambda: None)
-    # …nor spawn the repo-pulse worker. `main()` starts it for real on the
-    # charter path, so `--part all` forked a background subprocess against the
+    # …nor spawn the boundary workers. `main()` starts them for real on the
+    # charter path, so `--part all` forked background subprocesses against the
     # live repo on every run of this file — a side effect a budget test has no
     # business having, and one that only shows up as flakiness under load.
-    monkeypatch.setattr(_ctx, "_spawn_repo_pulse_worker", lambda *a, **k: None)
+    # Patching the ONE chokepoint covers every spawn: this line used to name
+    # the repo-pulse spawn specifically, and when a second detached worker was
+    # added beside it the patch silently stopped covering the path.
+    monkeypatch.setattr(_ctx, "_spawn_boundary_workers", lambda *a, **k: None)
     monkeypatch.setattr(_ctx.sys, "argv", ["x", "--part", part])
     monkeypatch.setattr(_ctx.sys, "stdin", __import__("io").StringIO("{}"))
     _ctx._OUT = None
@@ -524,7 +527,30 @@ def test_unreadable_essential_knowledge_is_loud_like_an_identity_file(
 #: Every script that writes model-facing stdout through `BoundedStdout`. The
 #: lock below covers ALL of them: it used to read one, while this same branch
 #: created a second emitter — so the class was half-locked and read as locked.
-_EMITTERS = ("genesis_session_context.py", "genesis_urgent_alerts.py")
+def _emitters(root: Path | None = None) -> tuple[str, ...]:
+    """Every script that constructs a `BoundedStdout`, DERIVED not listed.
+
+    This was a hardcoded pair, and the branch that added two more emitters did
+    not extend it -- so the lock covered half of them while its own docstring
+    asserted it covered all: "half-locked and read as locked", which is exactly
+    the trap that docstring was written to prevent. Caught by a cross-model
+    reviewer, not by the suite.
+
+    A hand-maintained inventory of "everything that does X" goes stale on the
+    first change that does X, and its staleness is invisible because the test
+    still passes. Deriving it means a new emitter is covered the moment it
+    exists. The empty case is an ERROR, not a pass: a derivation that finds
+    nothing is indistinguishable from a lock that checks nothing.
+    """
+    base = root or _SCRIPTS_DIR
+    writer = base / "hooks" / "hook_output.py"
+    found = tuple(sorted(
+        str(p.relative_to(base)) for p in base.rglob("*.py")
+        if p.resolve() != writer.resolve()
+        and "BoundedStdout(" in p.read_text(encoding="utf-8")
+    ))
+    assert found, "no BoundedStdout emitters found -- the derivation is broken"
+    return found
 
 #: Names that denote a BUDGET. Subtracting from one of these is a caller
 #: computing "how much room is left" — the re-derivation the chokepoint deletes.
@@ -588,7 +614,7 @@ def test_no_budget_arithmetic_outside_the_writer():
     what happened is not the defect; branching on how much space remains is.
     """
     offenders: list[str] = []
-    for name in _EMITTERS:
+    for name in _emitters():
         offenders += [f"{name} {o}" for o in _budget_offenders((_SCRIPTS_DIR / name).read_text())]
     assert not offenders, (
         "budget arithmetic leaked back into an emitter: "
@@ -628,28 +654,33 @@ def test_the_budget_lock_can_itself_fail():
         assert not _budget_offenders(sample), f"false positive on: {label}"
 
 
-def test_the_audit_reserve_fits_the_line_it_reserves_for(tmp_path):
-    """The reserve is DERIVED from the renderer, and must stay ahead of it.
+def test_the_audit_worst_counter_exceeds_any_real_part(tmp_path):
+    """The reserve's counter width must dominate any counter a real part emits.
 
-    Rebuilds the same worst case `_AUDIT_LINE_RESERVE` is computed from, so the
-    constant and the line cannot drift. This is the pin the old round number
-    lacked: 120 was chosen once and the line grew past it, and because
-    `_cut_here` fills the ceiling by construction, `room` at `emit_final` time
-    is ALWAYS exactly the reserve — so being short by any amount truncates
-    deterministically rather than occasionally.
+    The reserve is DERIVED from ``_audit_line(... _AUDIT_WORST_COUNTER ...)``, so
+    "the reserve fits a line built from _AUDIT_WORST_COUNTER" is a tautology and
+    cannot catch the original defect (a 5-digit reserve while a 6+-digit
+    `intended` clipped the mirror pointer). The NON-tautological invariant is the
+    one that actually protects the pointer: ``_AUDIT_WORST_COUNTER`` is larger
+    than any counter a real part can render.
+
+    ``intended``/``emitted``/``dropped`` are CHARACTER counts of a single hook
+    part. Even a pathological multi-MB identity file is well under 10**8 chars;
+    10**9 is a 10x margin past that. Assert the constant clears that ceiling — a
+    constant shrunk back toward 5 digits fails HERE, independently of how the
+    reserve is derived from it. The impossible beyond-constant case is the
+    structural backstop's job (the pointer-preserving fallback, proven in
+    test_emit_final_prefers_a_pointer_fallback_over_clipping_the_tail).
     """
-    worst = _ctx._audit_line(
-        "identity-user",
-        99_999,
-        99_999,
-        cut=("x" * _ctx._AUDIT_BLOCK_LABEL_MAX, 99_999),
-        where=(
-            f" — full text: {Path.home()}/.genesis/sessions/{'0' * 36}/context-identity-user.md"
-        ),
+    realistic_max_part_chars = 10**9  # 1 GB in one hook part — absurd, deliberately
+    assert realistic_max_part_chars <= _ctx._AUDIT_WORST_COUNTER, (
+        f"_AUDIT_WORST_COUNTER ({_ctx._AUDIT_WORST_COUNTER}) is not comfortably "
+        "above the largest counter a real part can render — a large part would "
+        "clip the audit line's mirror pointer"
     )
-    assert len(worst) + 1 <= _ctx._AUDIT_LINE_RESERVE, (
-        f"reserve {_ctx._AUDIT_LINE_RESERVE} < worst-case audit line {len(worst)} + newline"
-    )
+    # And the reserve derived from it is a positive, sane size (guards against a
+    # derivation that silently collapsed to the +16 slack alone).
+    assert _ctx._AUDIT_LINE_RESERVE > 100, _ctx._AUDIT_LINE_RESERVE
 
 
 def test_the_block_label_in_an_audit_line_is_bounded(tmp_path, monkeypatch, capsys):
@@ -795,3 +826,30 @@ def test_a_malformed_probe_value_does_not_silence_the_injection(tmp_path):
     assert "_[ctx charter:" in r.stdout, "a malformed probe value silenced the whole part"
     assert "PROBE" in r.stderr, "the malformed value must be reported, not ignored"
     assert "PROBE-START" not in r.stdout, "probe mode must not engage on garbage"
+
+
+def test_the_emitter_derivation_reaches_NESTED_scripts(tmp_path) -> None:
+    """`scripts/hooks/` is the established hook location, and a non-recursive
+    glob omitted it.
+
+    This needs a FIXTURE, not the live tree: no emitter lives under `scripts/`
+    today, so recursive and non-recursive derivations return the same four names
+    and a mutation between them is behaviourally null. Measured — the `rglob`
+    mutation survived a full run before this test existed. A latent gap needs a
+    constructed case or it is not pinned at all.
+    """
+    (tmp_path / "hooks").mkdir()
+    (tmp_path / "top.py").write_text("BoundedStdout(label='a')\n", encoding="utf-8")
+    (tmp_path / "hooks" / "nested.py").write_text(
+        "BoundedStdout(label='b')\n", encoding="utf-8"
+    )
+    (tmp_path / "hooks" / "hook_output.py").write_text(
+        "class BoundedStdout(...)\n", encoding="utf-8"
+    )
+    (tmp_path / "unrelated.py").write_text("print('x')\n", encoding="utf-8")
+
+    found = _emitters(tmp_path)
+    assert "top.py" in found
+    assert "hooks/nested.py" in found, "a nested emitter is invisible to the lock"
+    assert not any("hook_output" in f for f in found), "the writer excludes itself"
+    assert "unrelated.py" not in found

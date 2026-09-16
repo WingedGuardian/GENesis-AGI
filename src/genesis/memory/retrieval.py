@@ -15,6 +15,7 @@ from qdrant_client import QdrantClient
 from genesis.db.connection import ReadConnectionPool, ReadPoolClosed
 from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import memory_links, observations
+from genesis.db.crud._fts import fts5_term
 from genesis.memory.activation import compute_activation
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
 from genesis.memory.intent import (
@@ -1364,11 +1365,19 @@ class HybridRetriever:
         ``extra_fts_terms`` (proactive hook's file-context keywords) are
         OR-appended so a memory can surface on a recent-file term alone —
         preserving the old subprocess hook's file-keyword lane. FTS-only:
-        they never touch the embedding or intent. Appended in boolean form;
-        ``search_ranked``'s ``_prepare_fts5(boolean=True)`` re-sanitizes, so
-        raw terms can't cause an FTS5 syntax error. When they're present the
-        result differs from ``query`` and the caller's ``fts_is_boolean`` flag
-        flips on automatically.
+        they never touch the embedding or intent. Appended in boolean form.
+        When they're present the result differs from ``query`` and the caller's
+        ``fts_is_boolean`` flag flips on automatically.
+
+        Each extra term is sanitised through ``fts5_term`` and dropped if nothing
+        survives. This docstring previously claimed that ``search_ranked``'s
+        ``_prepare_fts5(boolean=True)`` "re-sanitizes, so raw terms can't cause
+        an FTS5 syntax error" — that was FALSE. Sanitising the finished
+        expression reduces a punctuation-only term to whitespace and leaves
+        ``(retrieval py OR  )``, which is parenthesis-balanced (so it passes the
+        only structural check there) and then fails in FTS5 with ``syntax error
+        near ")"``. These terms are FILE keywords, so punctuation is routine and
+        the old ``if t`` filter caught only the empty string, not ``"---"``.
         """
         fts_query = query
         if expand_query_terms:
@@ -1382,7 +1391,8 @@ class HybridRetriever:
             except Exception:
                 logger.warning("Query expansion failed, using original", exc_info=True)
         if extra_fts_terms:
-            extra = " OR ".join(str(t) for t in extra_fts_terms if t)
+            safe_terms = [t for t in (fts5_term(t) for t in extra_fts_terms) if t]
+            extra = " OR ".join(safe_terms)
             if extra:
                 fts_query = f"({fts_query}) OR ({extra})"
         return fts_query

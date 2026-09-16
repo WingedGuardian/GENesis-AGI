@@ -21,5 +21,25 @@ Closes #
 
 - [ ] `ruff check .` passes
 - [ ] `pytest -v` passes
-- [ ] Tested end-to-end (describe how)
 - [ ] `docs/architecture/CURRENT.md` updated (entry prose + `verified:` stamp) if subsystem capabilities changed
+
+<!-- OPTIONAL but worth 10 seconds: declare the POST-MERGE end-to-end
+     verification this change needs. Replace the line below with one of:
+
+       E2E: <one-line plan for the post-merge verification>
+       E2E: none — <reason there is no runtime surface to verify>
+
+     `none` is a legitimate answer for a docs/prose PR. Leaving the line empty
+     does not block the merge — but nothing else records the decision yet either:
+     the per-merge verification row that will carry this automatically is not
+     built (issue #1718), so today this line is the only record. Once it exists,
+     declaring here pre-fills that row with what YOU know instead of leaving a
+     validator to reverse-engineer it from the diff days later. (This guidance
+     lives inside a comment on purpose: comments are stripped before the line is
+     read, so the template can never fill itself in.)
+
+     The marker is NOT pre-printed below. A bare `E2E:` parses as *present but
+     empty*, which is reported as undeclared — so shipping one in the template
+     would fire the advisory, with its full remedy block, on every PR whose
+     author simply left the template alone. An advisory that fires on everything
+     is one nobody reads. Type the whole line, or type nothing. -->

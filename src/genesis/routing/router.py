@@ -14,6 +14,7 @@ from genesis.observability.spans import SpanKind, start_span
 from genesis.observability.types import Severity, Subsystem
 from genesis.routing.circuit_breaker import CircuitBreakerRegistry
 from genesis.routing.cost_tracker import CostTracker
+from genesis.routing.daily_budget import DailyBudgetLedger
 from genesis.routing.dead_letter import DeadLetterQueue
 from genesis.routing.degradation import DegradationTracker
 from genesis.routing.rate_gate import RateGateRegistry
@@ -94,6 +95,7 @@ class Router:
         delegate: CallDelegate,
         event_bus: GenesisEventBus | None = None,
         dead_letter: DeadLetterQueue | None = None,
+        daily_budget: DailyBudgetLedger | None = None,
     ) -> None:
         self.config = config
         self.breakers = breakers
@@ -102,6 +104,7 @@ class Router:
         self.delegate = delegate
         self._event_bus = event_bus
         self._dead_letter = dead_letter
+        self._daily_budget = daily_budget
         self._activity_tracker: ProviderActivityTracker | None = None
         self._rate_gates = self._build_rate_gates(config)
 
@@ -348,6 +351,24 @@ class Router:
                 skipped.append((provider_name, "breaker open"))
                 continue
 
+            # Skip a provider whose provider-side DAILY budget (rpd/tpd) is
+            # spent — deselection, not a breaker trip (budget is not a
+            # health signal), checked before the rate gate so we never sleep
+            # for a provider we will not call. Limits come from the live
+            # config, so a dashboard reload takes effect immediately.
+            if self._daily_budget is not None and self._daily_budget.exhausted(
+                provider_cfg
+            ):
+                failed_providers.append(provider_name)
+                # `skipped` is what the journal renders, and the paid-budget
+                # branch below already feeds it. Without this entry an
+                # all-exhausted walk produced "0 attempted of N walkable" with
+                # no provider named and no reason given — the one message this
+                # codebase relies on to diagnose why nothing was called
+                # (Codex P2, PR #1624).
+                skipped.append((provider_name, "daily budget spent"))
+                continue
+
             # Skip paid providers if budget exceeded (unless override)
             if (
                 not provider_cfg.is_free
@@ -361,6 +382,23 @@ class Router:
             # Rate gate — pace requests per provider RPM limit
             await self._rate_gates.acquire(provider_name)
 
+            # RECHECK after the gate. The check above happened BEFORE a sleep
+            # that can last seconds, and `acquire` queues concurrent callers —
+            # so several can pass a not-yet-exhausted budget, queue, and each
+            # resume into the delegate after an earlier one has already crossed
+            # the limit. The first check is still worth having (it avoids
+            # sleeping for a provider we will not call); it is simply not the
+            # last word, because its answer can change while we wait
+            # (Codex P2, PR #1624).
+            if self._daily_budget is not None and self._daily_budget.exhausted(
+                provider_cfg
+            ):
+                failed_providers.append(provider_name)
+                # Same reason as the pre-gate branch: a provider deselected
+                # here is a SKIP with a cause, not an anonymous failure.
+                skipped.append((provider_name, "daily budget spent (after rate gate)"))
+                continue
+
             # Try with retry (timed for activity tracking)
             t0 = time.monotonic()
             result = await self._try_with_retry(
@@ -369,6 +407,46 @@ class Router:
             )
             latency_ms = (time.monotonic() - t0) * 1000
             attempts += 1
+
+            # Count the visit against the provider's daily budget (requests/
+            # tokens, undercount-biased — see daily_budget.py). On the
+            # not-exhausted -> exhausted crossing, say so once.
+            if self._daily_budget is not None:
+                try:
+                    crossed = self._daily_budget.record(provider_cfg, result)
+                except Exception:
+                    logger.warning(
+                        "Daily budget record failed for %s", provider_name,
+                        exc_info=True,
+                    )
+                else:
+                    if crossed and self._event_bus:
+                        # Own try/except: the call already succeeded and
+                        # spent tokens — an emit failure must not fail it.
+                        try:
+                            budget_now = self._daily_budget.status(provider_cfg) or {}
+                            spent = [
+                                f"{label} {budget_now.get(used)}/{budget_now.get(limit)}"
+                                for label, used, limit in (
+                                    ("requests", "requests_used", "rpd_limit"),
+                                    ("tokens", "tokens_used", "tpd_limit"),
+                                )
+                                if budget_now.get(limit) is not None
+                            ]
+                            await self._event_bus.emit(
+                                Subsystem.ROUTING, Severity.WARNING,
+                                "provider.budget_exhausted",
+                                f"{provider_name} daily budget spent — "
+                                f"deselected until the next UTC day "
+                                f"({', '.join(spent)})",
+                                provider=provider_name,
+                                **budget_now,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "budget_exhausted emit failed for %s",
+                                provider_name, exc_info=True,
+                            )
 
             # Record to activity tracker (fire-and-forget, never breaks caller)
             if self._activity_tracker:
@@ -509,10 +587,15 @@ class Router:
                 failed_providers=tuple(failed_providers),
                 # The WALKABLE chain: post-`_filter_chain`, so a `never_pays`
                 # site does not count paid entries it was never going to try.
-                # That is the only length `attempts` can be reconciled against
-                # — but it is NOT the length a reader counts in
-                # `model_routing.yaml`, and the two currently differ on three
-                # of this install's nine `never_pays` sites.
+                # That is the only length `attempts` can be reconciled against,
+                # and it is not necessarily the length a reader counts in
+                # `model_routing.yaml`. As of 2026-09-07 the two AGREE on all
+                # nine `never_pays` sites — the three that used to differ did so
+                # because both Mistral rungs were `free: false`, and flipping
+                # them to `free: true` made every never_pays chain fully
+                # walkable. Do not read that agreement as an invariant: it is a
+                # property of the current config, and adding one non-free
+                # provider to a never_pays chain re-opens the gap.
                 chain_size=len(chain),
             )
 
@@ -567,7 +650,14 @@ class Router:
         *, deadline: float | None = None, **kwargs,
     ) -> CallResult:
         """Try calling a provider with retries. Returns last result."""
-        last_result = CallResult(success=False, error="no attempts made")
+        # reached_provider=False: nothing was called yet. Unreachable at the
+        # ledger today (attempt 0 always runs, so any escape has already been
+        # overwritten by a real result, and status_code=None gates it anyway) —
+        # set so the flag means the same thing at every site that builds a
+        # result the provider never saw.
+        last_result = CallResult(
+            success=False, error="no attempts made", reached_provider=False
+        )
         max_attempts = policy.max_retries + 1
 
         for attempt in range(max_attempts):
@@ -596,9 +686,23 @@ class Router:
             #    burning more of this provider's rate quota.
             #  - BAD_REQUEST: a 400/422 is deterministic (our payload) — the
             #    same provider with the same payload fails identically.
+            #  - NOT_ENTITLED: a 403 on account tier is deterministic — the
+            #    same credential and model fail identically on every retry.
+            #  - QUOTA_EXHAUSTED: an exhausted allowance is a BILLING state, not
+            #    a timing one. Unlike a 429 it cannot clear inside a backoff
+            #    window, and the limit is usually account-global rather than
+            #    per-model — one OpenRouter key limit covers every openrouter
+            #    entry in the chain — so retrying pays the same toll repeatedly
+            #    within a single walk. MEASURED 2026-09-05 on this install:
+            #    4.1-6.8s average per exposure (n=22) spent sleeping on a
+            #    provider whose answer could not change.
+            # Both were previously retried, which is the inversion this fixes:
+            # RATE_LIMITED — the one 4xx that genuinely might clear — already
+            # fails fast, while the two that certainly will not did not.
             if category in (
                 ErrorCategory.PERMANENT, ErrorCategory.TIMEOUT,
                 ErrorCategory.RATE_LIMITED, ErrorCategory.BAD_REQUEST,
+                ErrorCategory.NOT_ENTITLED, ErrorCategory.QUOTA_EXHAUSTED,
             ):
                 return result
 

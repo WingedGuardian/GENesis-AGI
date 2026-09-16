@@ -14,7 +14,6 @@ Exit codes:
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import subprocess
@@ -24,15 +23,60 @@ from pathlib import Path
 # The shared hook-input helper lives in scripts/hooks/; this script runs from
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks"))
-from hook_input import field, read_payload, run_guard  # noqa: E402
-from shell_parse import (  # noqa: E402
-    analyze,
-    commit_skips_hooks,
-    git_subcommand,
-    has_trailing_override,
-    split_segments,
-    untokenizable,
-)
+try:
+    from hook_input import degraded_exit, field, read_payload, run_guard  # noqa: E402
+except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must block.
+    if __name__ != "__main__":
+        raise
+    # Reverse version skew: this guard may be newer than hook_input.py. Nothing
+    # imported from that older helper can recover us, so fail closed locally. Do
+    # not render the exception — even __str__ can raise — and use os._exit so a
+    # broken diagnostic stream cannot replace exit 2 during interpreter shutdown.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (review_enforcement_commit): shared hook_input is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
+
+# DEGRADED-path mention set, defined ABOVE the guarded import so it survives that
+# import failing. Same single verb as `_COMMIT_PATTERN` further down; kept separate
+# because sharing would put the constant after the import it has to outlive. The
+# scope is broad on purpose — every gate in this file (unreviewed commit, commit to
+# main, --no-verify) hangs off a commit, so a mention of one is the whole trigger.
+_DEGRADED_GATED = r"\bcommit\b"
+
+try:
+    from shell_parse import (  # noqa: E402
+        analyze_checked,
+        commit_skips_hooks,
+        git_subcommand,
+        has_trailing_override,
+        split_segments,
+    )
+except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
+    if __name__ != "__main__":
+        raise
+    # `review-override` is NOT honoured on this path. An earlier version honoured it,
+    # on the reasoning that refusing a recoverable local commit would strand an operator
+    # mid-repair — but the check was a bare substring, and MEASURED on a poisoned tree
+    # it waived this gate from a sigil sitting inside a QUOTED STRING in an unrelated
+    # segment. Binding a sigil to the segment it waives needs the shared parser, whose
+    # absence is why this path runs at all. Nothing about a broken sibling module
+    # requires a commit to repair, so the operator is not in fact stranded.
+    degraded_exit("review_enforcement_commit", gated=_DEGRADED_GATED, exc=_exc)
+
+try:  # noqa: E402
+    import discarded_write
+except Exception:  # noqa: BLE001 — GUARDED ON PURPOSE. An unguarded import that
+    # failed would abort this module's load → exit 1 → which CC reads as a
+    # NON-blocking error → the commit RUNS. A cosmetic note must never be able to
+    # fail this gate open. Sentinel + null-check is the house pattern
+    # (git_push_guard.py's push_allowlist).
+    discarded_write = None  # type: ignore[assignment]
 
 # Sentinel: the commit's effective cwd cannot be confidently resolved (a cd into
 # a variable/command-substitution, a subshell, or a commit nested at depth>0).
@@ -363,8 +407,22 @@ def _staged_files(cwd: str | None) -> list[str] | None:
 # pathspec, and `git add app.py && git commit` stages code in a prior segment.
 # The docs-only skip may fire ONLY for a "pure" bare commit that provably cannot
 # add or select content beyond the current --cached snapshot.
+# MEASURED against the installed binary, never `git -h` (which omits
+# `--attr-source` while git accepts it). Locked identical to the copies in
+# shell_parse / git_push_guard / pre_push_privacy_review by
+# tests/test_hooks/test_value_flag_consistency.py.
 _GIT_GLOBAL_VALUE_FLAGS = frozenset(
-    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"}
+    {
+        "-C",
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--super-prefix",
+        "--config-env",
+        "--attr-source",
+        "--shallow-file",
+    }
 )
 # git commit long flags that CONSUME a following value token (so the value is not
 # misread as a pathspec).
@@ -677,82 +735,39 @@ def main() -> None:
     # Parse tool input
     payload = read_payload()
     command = field(payload, "command")
+    # Hand the command over ONCE, here, where it is already extracted: stdin is
+    # consumed by read_payload, so nothing further down can read it again.
+    if discarded_write is not None:
+        discarded_write.remember(command)
     if not _COMMIT_PATTERN.search(command):
         sys.exit(0)  # Not a commit, allow
 
     # Parse the command into the segments it actually executes (through
     # wrappers, bash -c, command substitutions). Reused for Rule 0, the
     # add-chain detection, and the override binding.
-    segs = analyze(command)
+    #
+    # `blind` is the same parse telling us whether it could read ALL of the command
+    # — an empty result means "found no commit" only when it is not also "stopped
+    # looking". One call answers both, so the two can never disagree.
+    segs, blind = analyze_checked(command)
 
     # The cheap _COMMIT_PATTERN early-out can match "git commit" mentioned in a
     # string (a reply body, an echo). Confirm a REAL executed commit segment
     # before applying the branch/review rules, else allow.
     if not any(git_subcommand(s.argv) == "commit" for s in segs):
-        # ── Blind-spot net: unverifiable → ASK the human ────────────────────
-        # "No commit segment" is a trustworthy verdict only when the command was
-        # PARSEABLE. The parser can mis-segment a command and DROP the real
-        # commit segment, so this very early-out is what lets a commit-to-main
-        # / --no-verify / unreviewed commit through. Reproduced against a
-        # shimmed binary, so the proof was execution rather than a parse
-        # reading. When the word "commit" appears (guaranteed past the
-        # _COMMIT_PATTERN early-out above) but the command is un-parseable, the
-        # empty parse is not evidence of absence.
-        #
-        # The outcome is an approval PROMPT, not a refusal. A hard block here has
-        # to be surgically precise about which un-parseable commands are real
-        # commits — and precision is exactly what an unreliable parse cannot
-        # deliver: every narrowing conjunct became a new way to starve the trigger,
-        # while over-blocking broke benign shapes (`git status # don't commit yet`).
-        # Asking inverts those costs: a false positive is one confirmation, a miss
-        # is the pre-existing status quo.
-        #
-        # The probe reads the command RAW — the normalizer that used to
-        # pre-process it is deleted, so an ordinary contraction inside quoted
-        # multi-line input DOES reach this branch. It still does not prompt, but
-        # for a different reason than this comment used to give: analyze()
-        # resolves the segment, and the net only fires where it found none.
-        try:
-            if untokenizable(command):
-                # EXACT "1", never truthiness. `cc/invoker.py` stamps the marker as
-                # "1" and every other consumer compares to it exactly
-                # (git_push_guard._is_dispatched, pretool_check, genesis_stop_hook,
-                # outcome_verification_hook). A truthiness test also treats
-                # GENESIS_CC_SESSION=0 — an operator explicitly turning it OFF — as
-                # dispatched, and would then HARD-BLOCK a benign unparseable
-                # mention such as `echo $'don\\'t commit this'` that the interactive
-                # path is meant to merely ask about. Over-blocking is the failure
-                # direction this whole design was chosen to avoid.
-                if os.environ.get("GENESIS_CC_SESSION") == "1":
-                    # No human present to answer a prompt in a dispatched session.
-                    _deny(
-                        "BLOCKED: this command cannot be parsed safely (e.g. "
-                        "ANSI-C $'...' quoting) and mentions a commit. Autonomous "
-                        "sessions cannot proceed on an unverifiable command.\n"
-                        "To proceed: if you are WRITING TEXT (a commit message, "
-                        "a plan, review notes) whose content merely mentions a "
-                        "commit, use the Write tool instead of a here-doc — an "
-                        "apostrophe in ordinary prose is what makes this "
-                        "unparseable, and re-quoting the here-doc cannot fix "
-                        "that. If you are RUNNING a git command, rewrite it in "
-                        "a directly-parseable form (plain quotes, or "
-                        "`git commit -F <file>`)."
-                        # The way OUT belongs here more than on the ask below:
-                        # an interactive session can ask a human what it did
-                        # wrong, an unattended one cannot. A refusal it cannot
-                        # act on is a wall; with the rewrite named it is a cost.
-                    )
-                _ask(
-                    "This command could not be parsed safely (e.g. ANSI-C $'...' "
-                    "quoting) and mentions a commit, so review enforcement cannot "
-                    "verify what it would actually run. Approve only if you are "
-                    "sure. To avoid the prompt, rewrite it in a directly-parseable "
-                    "form (plain quotes, or `git commit -F <file>`)."
-                )
-        except Exception:  # noqa: BLE001 — never crash into a silent allow
-            _ask(
-                "The commit-guard parseability probe failed, so this command could "
-                "not be verified. Approve only if you are sure."
+        # A missing segment is not proof of absence when the same checked
+        # parse reports blindness. Refuse in every session type: user ruling
+        # 2026-09-08 prices a false positive in an agent rewrite, not a human
+        # approval. Keep main's bounds refusal and its cause-specific remedy.
+        if blind is not None:
+            _deny(
+                f"BLOCKED: this command {blind.cause} and mentions a commit, so "
+                "review enforcement cannot verify what it would actually run.\n"
+                f"To proceed: {blind.hint}. If you are WRITING TEXT (a commit "
+                "message, a plan, review notes) whose content merely mentions "
+                "a commit, use the Write tool instead of a here-doc. If you are "
+                "RUNNING a git command, rewrite it in a directly-parseable "
+                "form (plain quotes, or `git commit -F <file>`)."
             )
         sys.exit(0)
 
@@ -1095,11 +1110,36 @@ def main() -> None:
                 "not counted). The cross-model review→fix loop has run long — the "
                 "round-2 mode-switch audit did NOT converge, which means the DESIGN or "
                 "the problem statement is likely wrong, not just this fix. STOP and get "
-                "a FRESH user decision on how to proceed (robust-by-construction "
-                "redesign / narrow scope / shelve), then "
-                "acknowledge that decision with a trailing shell comment (outside any "
-                "quotes):\n"
-                '  git commit -m "your message"  # escalation-ack' + _merge_note(cwd)
+                "a FRESH user decision. The options, the one this gate could not "
+                "previously name first:\n"
+                "  (a) HAND IT BACK through the ESTABLISHED disposition — a foreground "
+                "architecture conversation with the user, or the "
+                "`needs-architecture-session` label plus a `ready` follow-up naming the "
+                "PR and the decision it awaits when nobody is present — and stop "
+                "reviewing. Not a new path around that one. Three "
+                "rounds that each found something NEW after a class-level audit is the "
+                "strongest evidence available that the premise — not the code — is what "
+                "is wrong, and no further round can fix that. The work so far bought "
+                "the understanding of why this shape does not hold; it is the input to "
+                "the next attempt, not waste.\n"
+                "  (b) REDESIGN robust-by-construction — make the defect class "
+                "unconstructible rather than tested-for.\n"
+                "  (c) NARROW the scope to the part that is converging.\n"
+                "  (d) SHELVE it.\n"
+                "Bring evidence to the choice rather than a feeling: the premise check "
+                "(`.claude/docs/premise-check.md`) verdicts each claim the change rests "
+                "on, independently, with a falsifier.\n\n"
+                "THE EXIT DEPENDS ON WHICH OPTION THE USER CHOSE, and (a) has none.\n"
+                "  Chose (b), (c) or (d) — acknowledge the decision with a trailing "
+                "shell comment (outside any quotes):\n"
+                '        git commit -m "your message"  # escalation-ack\n'
+                "  Chose (a) HAND IT BACK — do NOT run that command. The index still "
+                "holds the design just judged premise-broken and its review marker is "
+                "current, so the sigil would permit exactly that commit AND reset the "
+                "streak — landing the work and erasing the evidence that stopped it. "
+                "Hand the branch off with the premise-check writeup instead. The streak "
+                "is per-branch, so whoever picks up the SAME branch inherits it: say so "
+                "in the handoff." + _merge_note(cwd)
             )
             return
         # Acked = a fresh decision to continue → reset the round budget so the next
@@ -1128,24 +1168,52 @@ def main() -> None:
             _deny(
                 f"BLOCKED (mode-switch): {round_n} consecutive EXTERNAL cross-model "
                 f"review rounds each surfaced NEW defects (cap {ESCALATION_ROUND_CAP}; "
-                "internal self/subagent audits are not counted). You are fixing the "
-                "INSTANCE the reviewer named, not the CLASS — a third external round is "
-                "how the loop runs away. Do NOT commit another one-line patch. STOP and "
-                "switch approach:\n"
-                "  1. Dispatch a FRESH-CONTEXT adversarial reviewer (a subagent with "
+                "internal self/subagent audits are not counted). Two rounds of NEW "
+                "defects means one of two things, and they have OPPOSITE remedies. "
+                "Decide WHICH before writing another line of fix-code:\n\n"
+                "  (A) The PREMISE is wrong — the change cannot do what it claims, or "
+                "rests on something untrue. More rounds cannot help: every fix creates "
+                "the surface for the next finding, which is why the loop reads like bad "
+                "luck. Hand it back to a BUILDER session with the evidence and stop "
+                "here. The code written so far is what bought the understanding of why "
+                "this shape does not work — that is what it was for, and sunk cost is "
+                "not a reason to keep patching.\n"
+                "  (B) The premise holds and you are fixing the INSTANCE the reviewer "
+                "named, not the CLASS. A third external round is how THAT loop runs "
+                "away, and the remedy is one class-level commit:\n"
+                "      1. Dispatch a FRESH-CONTEXT adversarial reviewer (a subagent with "
                 "clean context) over the ENTIRE diff — tell it to exhaustively "
                 "enumerate every edge/boundary/sentinel/hierarchy/error case, "
                 "independent of what the bot flagged. (This audit is INTERNAL — mark it "
                 "`--source internal` or plainly; it does NOT advance the cap, so it can "
                 "never be the round that blocks you — that was the bug this fixes.)\n"
-                "  2. For any domain semantics in play (cgroup, systemd, SQLite, async, "
-                "timezones, …), READ the authoritative docs/source — do not reason from "
-                "assumption; assumption is what produced the serial defects.\n"
-                "  3. Fix the WHOLE enumerated class in ONE commit — not just the named "
-                "case.\n"
-                "Then acknowledge you did the audit (not another blind patch) with a "
-                "trailing shell comment (outside any quotes):\n"
-                '  git commit -m "your message"  # audit-ack' + _merge_note(cwd)
+                "      2. For any domain semantics in play (cgroup, systemd, SQLite, "
+                "async, timezones, …), READ the authoritative docs/source — do not "
+                "reason from assumption; assumption is what produced the serial "
+                "defects.\n"
+                "      3. Fix the WHOLE enumerated class in ONE commit — not just the "
+                "named case.\n\n"
+                "(A) NEEDS TWO OR MORE of these signals, which is the bar the review "
+                "mandate already sets and this message must not undercut: findings "
+                "CONCENTRATING in one file/function; a finding landing on a line THIS "
+                "change added in an earlier round; the diff GROWING across rounds "
+                "instead of shrinking. ONE alone is an ordinary local defect wearing "
+                "the shape of an architectural one — findings concentrate in any large "
+                "parser, and that on its own says nothing. Short of two it is (B) — the "
+                "ordinary case is a sound design "
+                "carrying defects, and handing back a change that only needed polish "
+                "costs more than the extra round. Handing one back WRONGLY costs more "
+                "than either. The premise check (`.claude/docs/premise-check.md`, "
+                "genesis-architect Step 0.6) is how to decide with evidence rather than "
+                "by feel.\n"
+                "If you chose (B), acknowledge you did the audit (not another blind "
+                "patch) with a trailing shell comment (outside any quotes):\n"
+                '  git commit -m "your message"  # audit-ack\n'
+                "If you chose (A), do NOT commit past this block. `# audit-ack` "
+                "ATTESTS that the class-level audit happened — appending it because "
+                "you want to land something is falsifying it. Hand the branch off "
+                "with the evidence instead. (The streak is per-branch, so a builder "
+                "picking up the SAME branch inherits it: say so in the handoff.)" + _merge_note(cwd)
             )
             return
 
@@ -1300,32 +1368,19 @@ def main() -> None:
 
 
 def _deny(message: str) -> None:
-    """Output denial message and block the tool via exit code 2."""
-    print(message, file=sys.stderr)
-    sys.exit(2)
+    """Output denial message and block the tool via exit code 2.
 
-
-def _ask(reason: str) -> None:
-    """Emit a PreToolUse ``ask`` decision — a native approve/deny dialog.
-
-    For the UNVERIFIABLE path only: a command the parser cannot resolve is not
-    evidence of wrongdoing, so it earns a human decision rather than a refusal.
-    Claude Code runs the tool only on explicit approval, which the agent cannot
-    self-satisfy. Mirrors ``git_push_guard._ask``. Exits 0 with the decision on
-    stdout (the hook JSON carries the verdict; the exit code must NOT be 2).
+    Every refusal in this file funnels through here, so the discarded-command
+    note is emitted once, at the single chokepoint, rather than at its 14 call
+    sites. (It was 15 when this was written; the blind-spot net's own refusal was
+    removed upstream in the interval, which is the ordinary fate of a count kept
+    in prose — the load-bearing claim is "sole chokepoint", and that is checked:
+    this file has exactly one ``sys.exit(2)``, the one below.)
     """
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "ask",
-                    "permissionDecisionReason": reason,
-                }
-            }
-        )
-    )
-    sys.exit(0)
+    print(message, file=sys.stderr)
+    if discarded_write is not None:
+        discarded_write.warn()
+    sys.exit(2)
 
 
 if __name__ == "__main__":
