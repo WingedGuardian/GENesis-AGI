@@ -594,3 +594,207 @@ def test_chunked_body_over_the_cap_is_REFUSED(app):
 
     assert status.startswith("413"), f"got {status}: {b''.join(body)[:200]!r}"
     spawn.assert_not_called()
+
+# ── Review round 2: the eight P2 findings ─────────────────────────────────────
+
+
+class _CountingStream:
+    """A WSGI input stream that reports how much was actually pulled from it.
+
+    The point of the test below is the SIZE OF THE READ, and only a stream can
+    report that — a body handed to the test client as bytes is already
+    materialised before the endpoint sees it, so it could never distinguish a
+    bounded read from an unbounded one.
+    """
+
+    def __init__(self, total: int):
+        self.remaining = total
+        self.read_bytes = 0
+
+    def read(self, size=-1):
+        if self.remaining <= 0:
+            return b""
+        take = self.remaining if size is None or size < 0 else min(size, self.remaining)
+        self.remaining -= take
+        self.read_bytes += take
+        return b"x" * take
+
+    def readline(self, size=-1):
+        return self.read(size)
+
+
+def test_chunked_body_is_BOUNDED_not_merely_refused(client):
+    """413 is not the property under test — the ALLOCATION is.
+
+    The first version of this cap called ``request.get_data()``, which
+    materialises the whole stream and only then compares its length. That
+    refuses an oversized body while having already held it in memory, so the cap
+    bounded nothing: on a chunked request the only live ceiling was the app-wide
+    500 MiB. A test that asserted 413 passed against that code, which is why
+    this one measures the read instead.
+    """
+    from genesis.dashboard.routes.desk_api import _MAX_BODY_BYTES
+
+    total = 8 * 1024 * 1024
+    stream = _CountingStream(total)
+
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch("genesis.dashboard.routes.desk_api.asyncio.run_coroutine_threadsafe") as spawn,
+    ):
+        MockRT.instance.return_value = MagicMock()
+        resp = client.post(
+            "/v1/desk/chat/completions",
+            content_type="application/json",
+            environ_overrides={
+                # No CONTENT_LENGTH: this is the chunked shape, where the header
+                # check cannot help and the read is the only bound.
+                "wsgi.input": stream,
+                "CONTENT_LENGTH": "",
+                "HTTP_TRANSFER_ENCODING": "chunked",
+                # Werkzeug refuses to read a chunked stream unless the server
+                # says it has already de-chunked it. Without this the route is
+                # handed an EMPTY body and the test passes for the wrong reason
+                # — which is how a bound-check quietly measures nothing.
+                "wsgi.input_terminated": True,
+            },
+        )
+
+    assert resp.status_code == 413
+    spawn.assert_not_called()
+    assert stream.read_bytes <= _MAX_BODY_BYTES * 2, (
+        f"pulled {stream.read_bytes} bytes for a {_MAX_BODY_BYTES}-byte cap — "
+        "the body was materialised before being measured"
+    )
+    assert stream.read_bytes < total, "the entire oversized body was consumed"
+
+
+@pytest.mark.parametrize("body", [[], [{"role": "user"}], "a string", 42, True])
+def test_non_object_json_is_400_and_says_so(client, body):
+    """A list or scalar top level used to become {} and then be reported as a
+    missing messages array — an accurate-sounding error about the wrong thing."""
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = MagicMock()
+        resp = client.post("/v1/desk/chat/completions", json=body)
+    assert resp.status_code == 400
+    assert "JSON object" in resp.get_json()["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"type": "text", "text": 1},  # reached str.join and raised a 500
+        {"type": "text", "text": None},
+        {"text": "no type at all"},  # silently DISCARDED, prompt left incomplete
+        "a bare string",  # likewise
+        42,
+    ],
+)
+def test_every_content_block_is_validated_before_flattening(client, block):
+    """Two of these used to be dropped in silence and one used to be a 500.
+
+    Dropping is the worse failure: the request succeeded and routed a prompt
+    that was missing material the caller sent.
+    """
+    payload = {"messages": [{"role": "user", "content": [block]}]}
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch("genesis.dashboard.routes.desk_api.asyncio.run_coroutine_threadsafe") as spawn,
+    ):
+        MockRT.instance.return_value = MagicMock()
+        resp = client.post("/v1/desk/chat/completions", json=payload)
+    assert resp.status_code == 400, f"{block!r} was not refused"
+    spawn.assert_not_called()
+
+
+def test_a_valid_text_block_array_still_flattens(client):
+    """The acceptance bar for the validation above: it must not have broken the
+    shape it exists to accept."""
+    resp, cap = _post(
+        client,
+        body={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "one"},
+                        {"type": "text", "text": "two"},
+                    ],
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    assert cap["messages"][-1]["content"] == "one two"
+
+
+@pytest.mark.parametrize("value", [True, False, 4.5, "4", 0.1])
+def test_non_integral_token_limits_are_refused(client, value):
+    """``bool`` is a subclass of ``int``, so True would otherwise arrive as 1 —
+    a nonsense value silently accepted rather than refused. A fraction and a
+    numeric string both survive ``int()`` too, and both mean the caller asked
+    for something it did not get."""
+    payload = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": value}
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch("genesis.dashboard.routes.desk_api.asyncio.run_coroutine_threadsafe") as spawn,
+    ):
+        MockRT.instance.return_value = MagicMock()
+        resp = client.post("/v1/desk/chat/completions", json=payload)
+    assert resp.status_code == 400, f"max_tokens={value!r} was accepted"
+    spawn.assert_not_called()
+    # Assert the REASON, not just the refusal. False and 0.1 were already 400
+    # before this fix — they fall through int() to 0 and trip the pre-existing
+    # "at least 1" floor — so a status-only assertion says nothing about the
+    # type guard for two of these five values.
+    message = resp.get_json()["error"]["message"]
+    assert "integer" in message or "whole number" in message, message
+
+
+def test_a_whole_number_float_is_still_accepted(client):
+    """4.0 is a token count expressed as a float, not a fractional request."""
+    resp, cap = _post(
+        client,
+        body={"messages": [{"role": "user", "content": "hi"}], "max_tokens": 64.0},
+    )
+    assert resp.status_code == 200
+    assert cap["kwargs"]["max_tokens"] == 64
+
+
+def test_loop_closing_during_submission_is_a_structured_503(app):
+    """The loop can close between the readiness check and the submission.
+
+    ``run_coroutine_threadsafe`` then raises BEFORE the handler that turns
+    router failures into structured errors, so the authenticated caller got
+    Flask's unstructured 500 — and the coroutine it had just created was never
+    awaited.
+    """
+    client = app.test_client()
+    client.environ_base["HTTP_AUTHORIZATION"] = f"Bearer {_TOKEN}"
+    rt = MagicMock()
+    rt.is_bootstrapped = True
+    rt.router = MagicMock()
+
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch(
+            "genesis.dashboard.routes.desk_api.asyncio.run_coroutine_threadsafe",
+            side_effect=RuntimeError("Event loop is closed"),
+        ),
+    ):
+        MockRT.instance.return_value = rt
+        resp = client.post(
+            "/v1/desk/chat/completions",
+            json={"messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert resp.status_code == 503
+    payload = resp.get_json()
+    assert "choices" not in payload, "a refusal must never carry a completion shape"
+    assert payload["error"]["type"] == "server_error"
+    # The other half of the fix, which the status code cannot see: the coroutine
+    # was created before the submission raised, so something has to close it or
+    # it is left un-awaited.
+    assert rt.router.route_call.return_value.close.called, (
+        "the orphaned coroutine was not closed"
+    )

@@ -931,7 +931,7 @@ call_sites:
     - glm51
     - openrouter-sonnet
     default_paid: true
-    retry_profile: user_facing
+    retry_profile: desk_interactive
     dispatch: api
     description: "Desktop assistant \u2014 the conversational brain behind a local
       OpenAI-compatible client (/v1/desk/chat/completions). CAPABLE first, not
@@ -946,7 +946,7 @@ call_sites:
     - openrouter-deepseek-v4-flash
     - gemini-free
     default_paid: true
-    retry_profile: user_facing
+    retry_profile: desk_interactive
     dispatch: api
     description: "Desktop assistant, PHONE lane \u2014 briefings and hotline answers
       composed while a call is live, where latency is heard directly. Upstream
@@ -1034,6 +1034,22 @@ retry:
     base_delay_ms: 300
     max_delay_ms: 5000
     max_total_s: 180
+  # An interactive desk turn answers a client that gives up at 120s, and the
+  # endpoint holds a 110s wall so the client gets a parseable error instead of a
+  # dead socket. Inside that wall a retry and a fallback compete for the same
+  # seconds. A timed-out attempt is not the threat — TIMEOUT fails fast and is
+  # never retried — but a provider failing SLOWLY without timing out (a 503 at
+  # ~25s) is TRANSIENT, and user_facing gives it three goes before the chain
+  # advances. The next provider is worth more than another attempt at the one
+  # that just failed, so this profile buys fallback instead of retry:
+  # 3 providers x 1 attempt x 30s = 90s, inside the wall. max_total_s is the
+  # router's own belt, set under the endpoint's budget so whichever bound trips
+  # first, the caller still gets a structured answer.
+  desk_interactive:
+    max_retries: 0
+    base_delay_ms: 300
+    max_delay_ms: 5000
+    max_total_s: 100
   background:
     max_retries: 4
     base_delay_ms: 1000

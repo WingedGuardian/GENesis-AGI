@@ -39,6 +39,7 @@ something never seen, which is worse than an error.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -67,9 +68,33 @@ _ROUTER_TIMEOUT_SECONDS = 110.0
 # The delegate's per-attempt default is 120s — LONGER than this endpoint's whole
 # budget, so one slow provider would consume the wall and the 2nd and 3rd links
 # of the chain would never be tried. Fallback resilience is the entire reason
-# for routing through ModelRouter rather than calling a provider directly, so
-# the per-attempt bound is set here to let all three fit: 3 x 30s < 110s.
+# for routing through ModelRouter rather than calling a provider directly.
+#
+# "3 x 30s < 110s" is the arithmetic for three ATTEMPTS, and a retry profile
+# multiplies attempts per provider — so the bound has to hold for the retried
+# case, not the happy one.
+#
+# Note what does NOT threaten it, because the obvious worry is the wrong one: a
+# per-attempt TIMEOUT is classified TIMEOUT and fails fast without retrying
+# (routing/router.py, the fast-fail category set), precisely so a timeout cannot
+# be multiplied. The case that does spend the budget is a provider failing
+# SLOWLY without timing out — a 503 returned at ~25s is TRANSIENT, and under
+# ``user_facing`` (max_retries: 2) that is three goes at the same dead provider
+# before the chain advances.
+#
+# Both desk call sites therefore use ``desk_interactive``, which drops the
+# transient retry too: for an interactive turn the next provider is worth more
+# than another go at the one that just failed, and the budget can buy one or the
+# other. The walk is then bounded by chain length alone —
+# 3 providers x 1 attempt x 30s = 90s, inside 110s, with the remainder absorbing
+# the router's own overhead and any rate-gate wait.
 _PER_ATTEMPT_TIMEOUT_SECONDS = 30.0
+
+# How long to wait before re-checking that the loop is still alive. Short enough
+# that a shutdown answers in about a second rather than at the far end of the
+# wall; long enough to cost nothing on the happy path, where the future is
+# pending at this point regardless.
+_LIVENESS_RECHECK_SECONDS = 1.0
 
 # Reject, never truncate. The largest legitimate request is a call-context answer
 # (~9KB of material plus prompts) carried with conversation history; 256KB is
@@ -147,18 +172,30 @@ def _messages_from(data: dict) -> tuple[list[dict], str | None]:
             # must not kill an unrelated question.
             content = ""
         if isinstance(content, list):
-            if any(isinstance(b, dict) and b.get("type") not in ("text", None) for b in content):
-                return [], (
-                    "image and other non-text content is not supported on this "
-                    "endpoint — Genesis's routing layer is text-only, and "
-                    "answering from the text alone would describe something "
-                    "never seen"
-                )
-            content = " ".join(
-                b.get("text", "")
-                for b in content
-                if isinstance(b, dict) and b.get("type") == "text"
-            ).strip()
+            # Validate EVERY block before flattening any of it. The earlier
+            # predicate let two shapes through silently: a block with no `type`
+            # at all, and a scalar — neither matched the rejection test, and
+            # neither matched the join filter either, so both were DISCARDED
+            # and a materially incomplete prompt was routed as though whole.
+            # A third shape, {"type": "text", "text": 1}, passed both and then
+            # raised inside str.join as a 500 on a parseable request.
+            parts: list[str] = []
+            for b in content:
+                if not isinstance(b, dict):
+                    return [], "each content block must be an object"
+                kind = b.get("type")
+                if kind != "text":
+                    return [], (
+                        "image and other non-text content is not supported on "
+                        "this endpoint — Genesis's routing layer is text-only, "
+                        "and answering from the text alone would describe "
+                        "something never seen"
+                    )
+                text = b.get("text")
+                if not isinstance(text, str):
+                    return [], "a text block's 'text' must be a string"
+                parts.append(text)
+            content = " ".join(parts).strip()
         if not isinstance(content, str):
             return [], "message content must be a string or a text block array"
         clean.append({"role": role, "content": content})
@@ -181,9 +218,20 @@ def _sampling_from(data: dict) -> tuple[dict, str | None]:
         raw = data.get("max_completion_tokens")
     if raw is None:
         raw = _DEFAULT_MAX_TOKENS
+    # bool is a subclass of int, so True would otherwise arrive as 1 — a
+    # silently accepted nonsense value rather than a refused one. Strings and
+    # fractions are refused for the same reason: int("4") and int(4.7) both
+    # succeed and both mean the caller asked for something it did not get.
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return {}, "max_tokens must be an integer"
+    if isinstance(raw, float) and not raw.is_integer():
+        return {}, "max_tokens must be a whole number"
     try:
-        # OverflowError too: int(float("inf")) raises neither of the other two,
-        # and an uncaught one here is a 500 where a 400 belongs.
+        # A backstop only, now that the guards above run first: inf and nan are
+        # both non-integral floats and are refused there, so nothing that could
+        # raise OverflowError reaches int() any more. Kept because an uncaught
+        # one here would be a 500 where a 400 belongs, and the guards above are
+        # easier to loosen than this is to remember.
         max_tokens = int(raw)
     except (TypeError, ValueError, OverflowError):
         return {}, "max_tokens must be an integer"
@@ -207,12 +255,32 @@ def desk_chat_completions():
         message, status = denied
         return _err(message, status)
 
-    # The MATERIALISED body, not the advertised header: content_length is None
-    # under Transfer-Encoding: chunked, and `or 0` would compare 0 > cap and wave
-    # an arbitrarily large body straight through.
-    if (request.content_length or 0) > _MAX_BODY_BYTES or len(
-        request.get_data(cache=True)
-    ) > _MAX_BODY_BYTES:
+    # Two checks, and the second is the one that actually bounds memory.
+    #
+    # The header is advisory: content_length is None under
+    # Transfer-Encoding: chunked, and `or 0` would compare 0 > cap and wave an
+    # arbitrarily large body straight through. So it is only a cheap early
+    # refusal for a caller that declares an oversized body honestly.
+    #
+    # The real bound is the READ. An earlier version called
+    # request.get_data(), which MATERIALISES the whole stream and only then
+    # compares its length — so a chunked body was held in memory in full before
+    # being rejected, and the only live ceiling was the app-wide 500 MiB
+    # MAX_CONTENT_LENGTH. Several concurrent authenticated requests could each
+    # allocate toward that and exhaust the process that also serves the
+    # dashboard. Reading cap+1 bytes bounds the allocation itself: enough to
+    # know the body is too big, never more.
+    #
+    # The trade, stated because this endpoint otherwise promises a parseable
+    # error over a dead socket: leaving an oversized CHUNKED body undrained can
+    # surface to the client as a connection reset instead of the 413 (Werkzeug
+    # documents this for the limited stream). Memory is worth more than the
+    # status code on a request already being refused, and a caller sending
+    # megabytes to a 256KB endpoint learns the same thing either way.
+    if (request.content_length or 0) > _MAX_BODY_BYTES:
+        return _err(f"request body exceeds {_MAX_BODY_BYTES} bytes", 413)
+    body = request.stream.read(_MAX_BODY_BYTES + 1)
+    if len(body) > _MAX_BODY_BYTES:
         return _err(f"request body exceeds {_MAX_BODY_BYTES} bytes", 413)
 
     from genesis.runtime import GenesisRuntime
@@ -226,7 +294,17 @@ def desk_chat_completions():
     if event_loop is None or not event_loop.is_running():
         return _err("Event loop not available", 503, "server_error")
 
-    data = request.get_json(force=True, silent=True) or {}
+    # Parsed from the bounded read above, not from request.get_json(): the
+    # stream has already been consumed, and re-reading it would yield nothing.
+    try:
+        data = json.loads(body) if body.strip() else {}
+    except ValueError:
+        return _err("request body is not valid JSON", 400)
+    # A list or a bare scalar used to become {} here, and the caller was then
+    # told its messages array was missing — an accurate-sounding error about
+    # the wrong thing. Say what is actually wrong.
+    if not isinstance(data, dict):
+        return _err("request body must be a JSON object", 400)
     if data.get("stream"):
         return _err("streaming is not supported on this endpoint", 400)
 
@@ -244,23 +322,55 @@ def desk_chat_completions():
         return _err("server busy, try again shortly", 503, "server_error")
     start = time.monotonic()
     try:
-        future = asyncio.run_coroutine_threadsafe(
-            router.route_call(
-                call_site_id=call_site,
-                messages=messages,
-                suppress_dead_letter=True,
-                timeout=_PER_ATTEMPT_TIMEOUT_SECONDS,
-                **sampling,
-            ),
-            event_loop,
+        coro = router.route_call(
+            call_site_id=call_site,
+            messages=messages,
+            suppress_dead_letter=True,
+            timeout=_PER_ATTEMPT_TIMEOUT_SECONDS,
+            **sampling,
         )
         try:
-            result = future.result(timeout=_ROUTER_TIMEOUT_SECONDS)
+            future = asyncio.run_coroutine_threadsafe(coro, event_loop)
+        except RuntimeError:
+            # The loop was running at the readiness check and is closed by the
+            # time we submit — an ordinary shutdown race. run_coroutine_threadsafe
+            # raises BEFORE the handler below, so without this the caller gets
+            # Flask's unstructured 500 and the coroutine is never awaited.
+            # Close it explicitly: an un-awaited coroutine is a warning at best
+            # and a leak at worst.
+            coro.close()
+            logger.warning("Desk %s lane: event loop closed during submission", lane)
+            return _err("Event loop not available", 503, "server_error")
+        # Wait in two steps, because a STOPPED loop is indistinguishable from a
+        # slow provider if you only wait once. `run_coroutine_threadsafe`
+        # succeeds against a stopped-but-not-closed loop and returns a future
+        # that will never resolve, so a single 110s wait hangs the request for
+        # the whole wall, holds a semaphore slot and a Flask thread the entire
+        # time, and then blames the router in a 504. A short first wait costs
+        # nothing on the happy path (the future is pending either way) and turns
+        # a shutdown into a 1s structured 503 instead of a 110s lie.
+        try:
+            result = future.result(timeout=_LIVENESS_RECHECK_SECONDS)
         except TimeoutError:
-            future.cancel()
-            elapsed = time.monotonic() - start
-            logger.error("Desk %s lane timed out after %.1fs", lane, elapsed)
-            return _err(f"router timed out after {elapsed:.0f}s", 504, "server_error")
+            if not event_loop.is_running():
+                future.cancel()
+                logger.warning("Desk %s lane: event loop stopped mid-request", lane)
+                return _err("Event loop not available", 503, "server_error")
+            try:
+                remaining = _ROUTER_TIMEOUT_SECONDS - _LIVENESS_RECHECK_SECONDS
+                result = future.result(timeout=remaining)
+            except TimeoutError:
+                future.cancel()
+                elapsed = time.monotonic() - start
+                # Re-check once more: the loop can stop during the long wait too.
+                if not event_loop.is_running():
+                    logger.warning("Desk %s lane: event loop stopped mid-request", lane)
+                    return _err("Event loop not available", 503, "server_error")
+                logger.error("Desk %s lane timed out after %.1fs", lane, elapsed)
+                return _err(f"router timed out after {elapsed:.0f}s", 504, "server_error")
+            except Exception:
+                logger.error("Desk %s lane raised", lane, exc_info=True)
+                return _err("router call failed", 500, "server_error")
         except Exception:
             logger.error("Desk %s lane raised", lane, exc_info=True)
             return _err("router call failed", 500, "server_error")

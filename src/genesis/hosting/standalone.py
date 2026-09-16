@@ -747,12 +747,17 @@ class StandaloneAdapter:
                 app.register_blueprint(voice_api_bp)
                 logger.info("Voice API blueprint registered")
             if not os.environ.get("GENESIS_MCP_HTTP_TOKEN"):
-                # Names BOTH surfaces: the token now also gates the OpenClaw
-                # completions endpoint, so a warning naming only voice sends an
-                # operator to the wrong subsystem while OpenClaw is dark too.
+                # Names EVERY surface the token gates. A warning that lists
+                # some of them is worse than one that lists none: an operator
+                # who configured the desk endpoint and sees only voice and
+                # OpenClaw named concludes their own surface is fine and goes
+                # looking somewhere else for the 503. Anything added to this
+                # token's consumers belongs in this string and in
+                # secrets.env.example, which carries the same list.
                 logger.warning(
                     "GENESIS_MCP_HTTP_TOKEN not configured — all /v1/voice/* "
-                    "routes AND /v1/chat/completions (OpenClaw) answer 503 "
+                    "routes, /v1/chat/completions (OpenClaw) AND "
+                    "/v1/desk/chat/completions (desk brain) answer 503 "
                     "(fail-closed; set the token in secrets.env to enable them)"
                 )
         except Exception:
