@@ -119,6 +119,35 @@ of guessing.
 Full method, including how to split a space where the question stops being
 well-posed: `references/high-stakes-verification.md` section 9.
 
+**And where you cannot measure, READ THE AUTHORITATIVE SOURCE — never your own
+recollection of it.** Measurement is the top of the ladder; this is the rung
+below, and the one most often skipped because recall feels like knowledge. For
+any claim about how something OUTSIDE this repo behaves — a flag's semantics, an
+exit code's meaning, an API's contract, a shell builtin's edge case — the order
+is MEASURE > the authoritative document (the vendor's own reference, the man
+page, the spec) > everything else. Pretraining recall is not a source. It is a
+hypothesis phrased confidently, and it is wrong most often exactly where a
+flag's NAME supports the assumption everyone makes about it.
+
+READ, from an external audit of a sibling toolkit (2026-09): its CI documented
+`uv --frozen` as the check that fails when the lockfile has drifted from the
+project file. It is not. Per the vendor's own reference — uv docs, "Locking and
+syncing", consulted 2026-09-15 — `--frozen` uses the lockfile as the source of
+truth *instead of* checking whether it is up to date, while `--locked` is the
+flag that "requires that the lockfile is up-to-date" and errors when it is not.
+(That citation is this passage obeying its own rule: an earlier draft asserted
+the same thing from recall and cited nothing, which an adversarial review
+caught.) The claim was plausible, the flag name invites the misreading, and
+nothing in that pipeline could ever have contradicted it — the verification
+everyone believed was running simply was not, and a green run said so every
+time.
+
+The habit that prevents it costs one lookup: when you write an instruction, a
+CI step, or a code comment that names an external tool's flag, open that tool's
+documentation in the same minute, and cite what you consulted so the next reader
+re-checks rather than re-derives. "I am fairly sure that flag means X" is the
+sentence to catch yourself in.
+
 **A new SKILL has its own version of this, and it is easy to miss.** Dropping a
 `SKILL.md` into `.claude/skills/` gets it INDEXED automatically (the catalog
 generator scans the directory — no registry to update), which looks like done.
@@ -1055,6 +1084,158 @@ every edit" mandate — that just gates work behind a tool that's stale-by-desig
 Full syntax and Cypher examples: `.claude/docs/code-intelligence-guide.md`;
 tool-selection decision matrix: `.claude/docs/code-intelligence.md`
 
+### Guard failure semantics — the third option is fail OPEN, LOUDLY
+
+Every guard has TWO INDEPENDENT axes when it cannot evaluate, and collapsing
+them into a single "fail-open or fail-closed" choice is what produces the bad
+design:
+
+- **DIRECTION** — what happens to the DECISION: open (the action proceeds) or
+  closed (it is refused). Decided per boundary, by consequence.
+- **VISIBILITY** — what happens to the FAILURE: silent, or recorded where a
+  later reader will actually find it. **Silent is never correct, in either
+  direction.**
+
+The third option is the one that gets forgotten: not open, not closed, but
+**open and LOUD** — the action proceeds AND the guard's inability to evaluate
+becomes a durable record plus an alert.
+
+**THE TEST IS THE REPAIR PATH, and it is measurable — do not reach for a
+judgement about severity.** Ask: with this failure present, can the session
+still REPAIR the failure? Name the operations repair needs — read a file, edit
+it, restore it, restart a unit — and check whether your refusal predicate
+matches any of them. If the repair path survives, fail-closed is available. If
+it does not, fail-closed is not "safer", it is a BRICK, and the answer is
+open-loud however severe the thing you wanted to stop.
+
+The test has a worked precedent, and it is worth reading for the SHAPE of the
+argument rather than as a verdict. PR #2042's body justifies its fail-closed leg
+by naming what survives — *"Read/Edit/Grep are ungated and `git checkout --
+<file>` matches none of the matchers"* — which is exactly this question, asked
+and answered with a measurement. (The quote is from the PR BODY; the function's
+own docstring makes a related but weaker claim, so cite the PR, not the symbol.)
+
+Two cautions travel with that precedent, both MEASURED, and they are why the
+test is a question you re-ask rather than a conclusion you inherit. First, an
+ungated repair verb is not automatically a SAFE one: in that same degraded state
+`git_discard_guard` no longer takes its recovery snapshot, and its own
+`also_lost` notice says so — *"a discard run now is not recoverable from it"* —
+so `git checkout` being unmatched means it RUNS, not that it is safe to run
+broadly. Second, the precedent covers only ONE of that helper's two failure
+legs; the other is the worked example below of the test returning the opposite
+answer.
+
+**SYSTEMIC failure means no usable predicate survives**, so any refusal would be
+TOTAL and the repair path closes with everything else — typically because the
+machinery that runs guards is dead (the wrapper, the interpreter, the venv), or
+because one missing dependency hits every guard at once. **There the default is
+open-loud** (standing owner ruling, 2026-09-15). Genesis runs headless: the
+interactive session IS the repair path, and the host Guardian is the
+repair-of-the-repair. A guard layer that fails closed at that level does not
+protect the machine, it bricks it, with nobody at a console to type the fix. A
+messy action Genesis can clean up afterwards beats a system that can no longer
+act at all.
+
+Note what does NOT decide this: "how bad was the cause". A single missing
+dependency produces EITHER regime, and the same helper contains one of each —
+which is the clearest worked example in the repo, so apply the test to both:
+
+- **`degraded_exit`'s predicate-gated leg** — a shared sibling (`shell_parse`)
+  is unimportable, so the guard refuses only what its degraded MATCHER names.
+  Read/Edit survive, `git checkout` is unmatched, the rates below are what it
+  costs. Repair path open ⇒ **PARTIAL**, and fail-closed is licensed.
+- **`degraded_exit`'s unconditional leg** — `hook_input` ITSELF is unimportable
+  or version-skewed, so nothing the guard could import can recover it and each
+  guard `os._exit(2)`s with no payload read and no predicate consulted. MEASURED
+  from source: six guards carry that block on matcher `Bash`, and
+  `scripts/pretool_check.py` carries it on `Write|Edit`. So the session can
+  neither run a command nor edit a file. Repair path CLOSED ⇒ **SYSTEMIC** by
+  this test, and the shipped code nevertheless fails closed there, deliberately
+  (PR #2042: *"nothing the guard could import can recover it… so it refuses
+  locally"*).
+
+**That divergence is real and is not resolved here.** The doctrine reports what
+its own test returns rather than bending the test to match the code; the shipped
+behaviour is tracked separately. Two things keep it from being a total brick
+today, and neither is a design: an MCP editing tool is matched by neither `Bash`
+nor `Write|Edit`, and the host Guardian can `REVERT_CODE` from outside the
+container — but nothing currently WAKES the Guardian for this, because the
+container is up and `genesis-server` never imports `hook_input`. Treat it as the
+standing illustration that a fail-closed leg needs its out-of-band repair route
+named and WIRED, not merely available in principle.
+
+**PARTIAL failure means a usable predicate survives**, and fail-CLOSED stays
+correct there — `run_guard` is the other merged instance (an uncaught crash in
+an irreversible-action guard exits 2 instead of the exit 1 CC treats as
+non-blocking). What licenses them is MEASURED. Six guards are wired to
+`degraded_exit`, and their predicate-gated matchers refuse between **1.90% and
+21.47%** of 74,282 unique real commands individually; PR #2042 measures the
+UNION of four of them at **28.80%**, which it headlines as "roughly 29% of
+ordinary work is refused while the tree is broken".
+
+Read that union as the shape of an operability budget, NOT as its value: the
+other two wired guards are outside it, so the real six-guard figure is unmeasured
+and strictly higher. A seventh guard does not get to add its rate to 28.80% and
+call the result the cost — that arithmetic is the population error this file
+keeps catching. Measure the union you actually have. What each protects earns its
+share: irreversible for `worktree_cwd_guard`, merely heavy for
+`full_suite_guard` — a distinction taken from PR #2042's own table rather than
+assumed, and a reminder that "what it protects" is a mixed bag even inside one
+wired set.
+
+`background_pipe_guard` is the one that was deliberately NOT wired: its degraded
+matcher would refuse **70.30%** of that same corpus, and a guard refusing the
+majority of ordinary work does not make the broken state safe — it makes it
+unrepairable, which is the brick again by another route.
+
+**Ambiguity about WHICH REGIME you are in resolves toward OPEN-LOUD**, because
+that direction's worst case is a recorded mess and the other's is a system
+nobody can reach.
+
+**This section decides the REGIME; it does not decide the direction within
+one.** Once you have established PARTIAL, the per-boundary mandate under "Never
+hand-roll `gh`/bash/CLI argv parsing" and its corollaries (a)/(b)/(c) govern
+which way that guard fails — and corollary (c) settles the unattended-session
+case in the direction of REFUSING, after three narrowing rounds on one
+predicate. Nothing here loosens it. What this section adds is the prior
+question those corollaries assume has already been answered: whether a usable
+predicate exists at all.
+
+Four rules follow, each cheap:
+
+1. **"Could not evaluate" is its own state.** Never render it as allow, clean,
+   healthy, or no-finding. A check reports exactly one of four things:
+   CHECKED-CLEAN, FINDINGS, COULD-NOT-CHECK, OUT-OF-SCOPE. The merge gate
+   already works this way where it prints an unrecognised reviewer's comment
+   rather than scoring it silently; `InjectionHealth.errors` does it by emitting
+   a DEGRADED finding instead of resolving healthy.
+2. **Write the degraded marker BEFORE the early return, with ZERO dependency on
+   the component that failed.** A refusal path that records its reason only
+   after the check it could not run has recorded nothing. READ, a sibling
+   toolkit's 2026-09 incident: its blocking hooks refused every command for 30
+   minutes while its own liveness canary reported OK — the dependency-missing
+   branch printed its refusal and exited BEFORE the line that writes the
+   heartbeat. The canary asked "did it receive a payload", never "could it
+   evaluate one", so a guard refusing everything left exactly the trace a guard
+   nobody called leaves.
+3. **Degrade the RENDERER, never the VERDICT.** When the thing that failed is
+   how you SPEAK — a serializer, a formatter, a size budget — the decision
+   itself must still land. `print_json_bounded` is the in-repo instance: an
+   oversized advisory loses prose, never its `permissionDecision`. **It also
+   tells you when it could not keep that promise** — it returns False and emits
+   ANYWAY when the envelope alone exceeds the budget or no named text key was
+   trimmable, and CC discards an exit-0 hook's stderr, so that return value is
+   the only signal a caller gets. Check it: "something was trimmed" is not "the
+   decision landed". Another install's toolkit reaches the identical rule from
+   the other side, rendering verdicts through a fallback chain after a broken
+   serializer turned every refusal into empty stdout — which the harness reads
+   as ALLOW.
+4. **The watcher must detect COULD-NOT-EVALUATE, not merely DID-NOT-RUN.** A
+   liveness check keyed on "is the timer active" or "did a heartbeat arrive"
+   cannot see a guard that ran, refused everything, and wrote nothing. Ask what
+   your watcher would report if the guard were evaluating nothing at all; if the
+   answer is "healthy", it is measuring the wrong thing.
+
 ### Common Traps
 
 - **Fail-closed data access.** A data-access boundary must RAISE (or return a
@@ -1068,6 +1249,19 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   `batch_retrieve_vectors`-swallows split exists for exactly this). Origin: the
   home-anchored-DB reads that silently returned no data from an empty worktree
   path, and the memory-integrity checker (2026-07).
+- **Never replace a runtime the CURRENT session depends on — that is a HANDOFF,
+  not a repair.** Upgrading, downgrading, reinstalling or removing the
+  interpreter, Node, the CC binary, or the venv that the ACTIVE session (or its
+  hooks, MCP servers, or test runner) is running on kills the thing performing
+  the repair, mid-repair — and the second half of the procedure, the half that
+  puts the replacement in place, never runs. The safe sequence is side-by-side:
+  install the replacement ALONGSIDE, verify it works, switch the pointer, and
+  only then remove the old one; and run the whole procedure from OUTSIDE the
+  dependent session (a separate shell, a systemd unit, the host Guardian).
+  READ, a sibling install's 2026-09 incident: a rollback script uninstalled the
+  running Node before installing the intended version, the uninstall terminated
+  the agent session executing it, and the machine was left with neither. Before
+  touching any runtime, inventory what is running on it.
 - **Ego sessions are ACTIVE.** `src/genesis/ego/` is live (v3.0a11).
   Two egos: user ego (CEO, Opus) and Genesis ego (COO, Sonnet). Both
   run on adaptive cadence via the awareness loop. Changes here are
@@ -1148,7 +1342,11 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   shared parser must DEGRADE gracefully (fail-open, never crash — that is
   `shell_parse.py`'s stated contract), while each security-critical caller
   (merge/push authorization) treats an unparseable command as a block (fail-closed
-  THERE). A parser-wide absolute fail-closed is wrong — it would deny legitimate
+  THERE). This bullet and its corollaries decide the DIRECTION for one guard's
+  degraded path, and they assume a usable predicate still exists. "Guard failure
+  semantics" above decides the prior question — whether one does — and when none
+  does (wrapper, interpreter or venv dead, or one dependency taking every guard
+  at once) its repair-path test governs instead of this bullet. A parser-wide absolute fail-closed is wrong — it would deny legitimate
   uncommon commands without closing evasion paths. Same family as the
   canonical-parser lesson (regex→yaml, #1393). Loci today:
   `scripts/hooks/shell_parse.py` + `scripts/hooks/git_push_guard.py`.
@@ -1768,6 +1966,31 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   filed as ordinary work rather than held as a release blocker. "It pre-dates
   the release" is otherwise just a new spelling of the rationalization that
   counter exists to kill.
+
+- **A pre-existing defect the change RECRUITS FOR is IN-arc — FOR A RELEASE
+  REVIEW.** The bullet above splits findings into "this release's" and
+  "pre-dating it", and there is a third bucket between them that neither
+  catches: a defect that already existed and which THIS change newly leads
+  people INTO — because it adds the documentation that sends them down that
+  path, flips the default that reaches it, or ships the feature whose obvious
+  next step lands on it. It is not in the diff, and the RELEASE is still
+  answerable for it, because the release is what made it reachable. Ask of every
+  pre-existing finding: *did we just build the road to it?* If yes, it gates
+  **the release**. (Adopted from a sibling toolkit's release-review protocol,
+  which carries a dated case of exactly this shape: a latent defect in an
+  install path that was harmless until a release's own docs began recommending
+  that path.)
+
+  **This does NOT override "Keep the PR the PR"** (standing user rule,
+  2026-09-09, further down this file). On an individual PR the routing question
+  is unchanged — *does the PR work without this fixed?* — and for a recruited
+  defect the answer is USUALLY yes, so it is FILED as an issue while the PR
+  merges. Run the question anyway rather than assuming the answer: a change that
+  flips a DEFAULT onto the latent path fails it, and a PR that breaks on first
+  use is not a merge. What this bullet changes is the RELEASE's answerability,
+  not whether a PR waits. Holding a PR for a recruited defect is the exact
+  friction the owner removed, so if you find yourself about to, you have
+  mis-scoped this bullet.
 
 - **A review's findings are a SAMPLE, not a to-do list.** This is the single
   highest-value habit in this section, and the one most often skipped. CLAUDE.md
