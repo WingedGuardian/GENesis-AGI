@@ -447,6 +447,30 @@ _COMMIT_SELECT_LONG = frozenset(
 )
 _COMMIT_ARG_SHORT = "mFCct"  # short flags consuming a value (t = --template)
 _COMMIT_SELECT_SHORT = "aiop"  # -a --all, -i --include, -o --only, -p --patch
+# Staging subcommands that put content in the index AFTER this hook has read it.
+# Named here rather than inline so the depth note can DERIVE its warning from the
+# same set the predicate decides on — see _content_selecting_forms().
+_STAGING_SUBCOMMANDS = ("add", "rm", "mv", "reset")
+
+
+def _content_selecting_forms() -> str:
+    """The forms that can put content in a commit beyond what ``--cached`` shows.
+
+    DERIVED from the predicate's own constants, never typed alongside them. The
+    depth note tells an author what to inspect before writing ``# depth-ack``,
+    and three separate review findings have now been the same defect: the NOTE
+    was narrower than the PREDICATE, so the gate permitted a form the advice
+    never warned about and the careful reader was the one who got caught. Adding
+    the missing form each time is predicate #4; deriving the sentence closes the
+    class, because a form added to `_COMMIT_SELECT_*` or `_STAGING_SUBCOMMANDS`
+    now appears in the warning automatically.
+    """
+    selectors = sorted(_COMMIT_SELECT_LONG) + [f"-{c}" for c in sorted(_COMMIT_SELECT_SHORT)]
+    staging = [f"git {v}" for v in _STAGING_SUBCOMMANDS] + ["git restore --staged"]
+    return (
+        f"{', '.join(selectors)} or a pathspec on the commit itself; "
+        f"{', '.join(staging)} earlier in the chain"
+    )
 
 
 def _commit_can_select_content(argv: list[str]) -> bool:
@@ -511,7 +535,7 @@ def _commit_may_add_content(segs: list) -> bool:
         if s is commit_seg:
             continue
         sub = git_subcommand(s.argv)
-        if sub in ("add", "rm", "mv", "reset"):
+        if sub in _STAGING_SUBCOMMANDS:
             return True
         if sub == "restore" and "--staged" in s.argv:
             return True
@@ -709,15 +733,15 @@ def _merge_note(cwd: str | None, *, gate: str = "round") -> str:
             "only content that arrived already reviewed on its own PR is somebody "
             "else's audited work. A cherry-pick, a revert, and every conflict "
             "resolution are YOURS and still need the audit — ack only once you "
-            "have inspected the prospective commit for local content: the staged "
-            "set for an index-only commit, plus tracked working-tree changes selected "
-            "by -a and any pathspec-selected content — and, when the command STAGES "
-            "before it commits (git add/rm/mv/reset/restore --staged ahead of the "
-            "commit), whatever that staging will add, which the index does not show "
-            "yet because this hook runs BEFORE it. That list is the same set of "
-            "deferred-staging forms the gate itself recognises, so the inspection has "
-            "to cover every one of them or the ack is honest about the wrong "
-            "content.\n"
+            "have inspected the PROSPECTIVE commit, which is not the same thing as "
+            "the index. For a plain index-only commit the staged set is the whole "
+            "story. Every one of these can add more, and this hook runs BEFORE any "
+            "of them, so none of it shows in `git diff --cached` yet:\n"
+            f"  {_content_selecting_forms()}\n"
+            "That list is GENERATED from the same constants the gate decides on, so "
+            "it cannot drift narrower than what the gate actually permits — which it "
+            "did three times, each time letting an honest ack cover content the "
+            "prescribed check never showed.\n"
             "The ack clears THIS gate only. If the operation also left the review "
             "marker no longer binding the staged diff — usual for a merge, but NOT "
             "if you re-marked afterwards — the review-current gate blocks next and "
@@ -729,11 +753,13 @@ def _merge_note(cwd: str | None, *, gate: str = "round") -> str:
             "reach for a multi-line command to get a sigil onto each one — run each "
             "commit as its OWN command instead. A shell comment ends at the physical "
             "line, so the only way to carry a sigil per segment is a newline between "
-            "them, and a newline is not `&&`: the second commit then runs even when "
-            "the first one FAILED. With `git commit … && git commit --amend`, a "
-            "commit-msg rejection on the first leaves --amend rewriting the PREVIOUS "
-            "commit with this staged content, and the whole command still exits 0. "
-            "Separate commands keep each failure visible and each sigil bound."
+            "them — and a newline is not `&&`. `&&` short-circuits correctly; a "
+            "NEWLINE does not, so the second commit runs even when the first one "
+            "FAILED. Put `git commit -m …` and `git commit --amend --no-edit` on "
+            "two lines and a commit-msg rejection on the first leaves --amend "
+            "rewriting the PREVIOUS commit with this staged content, while the "
+            "whole command still exits 0. Separate commands keep each failure "
+            "visible and each sigil bound."
         )
     return (
         "\n\nNOTE: a merge/rebase appears to be in progress. The round counter "

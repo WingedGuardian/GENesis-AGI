@@ -2079,6 +2079,88 @@ def test_depth_hint_says_sigils_bind_per_commit_segment(
     assert reflog.startswith("commit (amend):"), reflog
 
 
+def test_depth_hint_names_every_form_the_gate_itself_accepts(repo: Path, home: Path) -> None:
+    """The class fix. Three separate review findings were the same defect: the
+    NOTE was narrower than the PREDICATE, so the gate permitted a form the advice
+    never warned about — and the reader who followed the advice carefully was the
+    one who acked over content they were never told to look at.
+
+    Adding the missing form each round is predicate #4. This asserts the
+    relationship instead: EVERY selector the gate decides on must appear in the
+    text it prints. DERIVED from the module's own constants, so a form added to
+    `_COMMIT_SELECT_LONG` / `_COMMIT_SELECT_SHORT` / `_STAGING_SUBCOMMANDS` next
+    year fails here until the note carries it. The note builds its sentence from
+    the same constants, so this passes by construction today — which is the
+    point: it is now impossible to widen the gate and leave the advice behind.
+    """
+    import review_enforcement_commit as mod
+
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _mark(repo, home)
+    (repo / "f.py").write_text("local tracked edit\n")
+    _begin_merge(repo)
+    res = _run_hook('git commit -m "merge main"', repo, home)
+    assert res.returncode == 2
+
+    missing = [flag for flag in sorted(mod._COMMIT_SELECT_LONG) if flag not in res.stderr]
+    assert not missing, (
+        f"the gate accepts {missing} but the depth note never names them — an author "
+        "following the note would ack over content those forms bring in"
+    )
+    missing_short = [
+        f"-{ch}" for ch in sorted(mod._COMMIT_SELECT_SHORT) if f"-{ch}" not in res.stderr
+    ]
+    assert not missing_short, (
+        f"the gate accepts {missing_short} but the depth note never names them"
+    )
+    missing_staging = [
+        f"git {verb}" for verb in mod._STAGING_SUBCOMMANDS if f"git {verb}" not in res.stderr
+    ]
+    assert not missing_staging, (
+        f"the gate treats {missing_staging} as content-adding but the note omits them"
+    )
+    assert "git restore --staged" in res.stderr, (
+        "restore --staged is handled by the predicate but absent from the note"
+    )
+    # Guard-the-guard: a note that printed nothing, or constants that were empty,
+    # would satisfy every assertion above vacuously.
+    assert len(mod._COMMIT_SELECT_LONG) >= 5 and len(mod._COMMIT_SELECT_SHORT) >= 4, (
+        "the selector constants look empty — this test would pass against a note "
+        "that named nothing at all"
+    )
+
+
+def test_the_newline_hazard_is_attributed_to_the_newline_not_to_and_and(
+    repo: Path, home: Path
+) -> None:
+    """`&&` short-circuits correctly. MEASURED: `false && echo X` runs nothing and
+    exits 1; `false` NEWLINE `echo X` runs X and exits 0. An earlier version of
+    this note blamed the `&&` form, which is a false technical claim in the one
+    place an author is being told how to be careful."""
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _begin_merge(repo)
+    res = _run_hook('git commit -m "merge main"', repo, home)
+    assert res.returncode == 2
+    assert "`&&` short-circuits correctly" in res.stderr, (
+        "the note no longer states that && is the SAFE form — without it the "
+        "reader cannot tell which construct actually carries the hazard"
+    )
+
+    # Ground truth for both halves of that claim, in a real shell.
+    amp = subprocess.run(
+        ["bash", "-c", "false && echo RAN"], capture_output=True, text=True, timeout=30
+    )
+    assert amp.returncode == 1 and "RAN" not in amp.stdout, (
+        f"&& no longer short-circuits; the note's claim needs revisiting: {amp!r}"
+    )
+    nl = subprocess.run(
+        ["bash", "-c", "false\necho RAN"], capture_output=True, text=True, timeout=30
+    )
+    assert nl.returncode == 0 and "RAN" in nl.stdout, (
+        f"the newline form no longer swallows the failure: {nl!r}"
+    )
+
+
 def test_depth_hint_covers_content_staged_after_the_hook_runs(repo: Path, home: Path) -> None:
     """The hook runs BEFORE any staging segment of the command, so `git add -A &&
     git commit` commits content the index did not hold when this note was
@@ -2111,8 +2193,17 @@ def test_depth_hint_covers_the_prospective_content_of_dash_a(repo: Path, home: P
     _begin_merge(repo)
     res = _run_hook('git commit -a -m "merge main"', repo, home)
     assert res.returncode == 2
-    assert "prospective commit" in res.stderr
-    assert "tracked working-tree changes selected by -a" in res.stderr
+    # Case-insensitive: the note SHOUTS "PROSPECTIVE" deliberately, and this
+    # assertion is about the concept being present, not about its casing.
+    assert "prospective commit" in res.stderr.lower()
+    # The -a form specifically must still be named, which is now derived rather
+    # than hand-written -- see test_depth_hint_names_every_form_the_gate_accepts.
+    assert "-a" in res.stderr
+    # The old hand-written prose ("tracked working-tree changes selected by -a")
+    # is gone on purpose: the note now DERIVES its form list from the gate's own
+    # constants, so `-a` and `--all` both appear because the predicate accepts
+    # them, not because someone remembered to type them.
+    assert "--all" in res.stderr and "-a" in res.stderr
 
 
 def test_depth_hint_covers_a_squash_merge(repo: Path, home: Path) -> None:
