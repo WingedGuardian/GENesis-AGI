@@ -940,6 +940,24 @@ def test_an_empty_corpus_exits_2_instead_of_printing_a_clean_zero(rgc, monkeypat
     assert "REFUSED" in out.err
 
 
+def test_rebuild_alone_is_a_reachable_path(rgc, monkeypatch, capsys, cache):
+    """The corpus build must stay reachable now that every guard is refused.
+
+    `--guard` and `--all` return BEFORE `load_corpus()` on the refusal path, so
+    once nothing is replayable they can no longer build the cache — and
+    `--rebuild --list` used to send the operator to exactly those two modes.
+    That left no path at all, while the module help still advertised the corpus
+    build. Advertising an operation no code path can perform is this file's own
+    named failure, committed inside it.
+    """
+    monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--rebuild"])
+
+    assert rgc.main() == 0, "--rebuild alone must not be refused"
+
+    assert cache.exists() and cache.read_text().strip(), "the cache was not built"
+    assert "corpus rebuilt" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(
     "argv",
     [
@@ -1327,19 +1345,21 @@ def test_a_dependency_from_another_checkout_is_refused_not_worked_around(rgc, mo
 # citations went stale within five days, one landing on a comment about an
 # unrelated cap.
 #
-# Two halves, because neither catches the other's class. An AST fact-checker
-# would have caught NONE of the six stale citations. A citation checker would not
-# notice a guard that quietly gains a subprocess.run.
+# ONE half now, and the arithmetic of which defects that leaves uncovered is the
+# point rather than a footnote. Of the four historical defects above, the
+# citation checker catches the stale-citation class — #4, six instances, the only
+# one that recurred. It does NOT catch #1 or #3 (a declaration denying an effect
+# the guard has) or #2 (an unmentioned shell delegation).
 #
-# And a third, because the first two together still miss the case that motivated
-# the issue: `bash_safety` has no Python module at all, and its delegation to
-# git_discard_guard is a SHELL PIPE. A Python import-closure walk cannot reach it
-# by construction. Replaying the four historical defects: the facts catch #1 and
-# #3, the citations catch #4, and only the shell scan catches #2 — the one that
-# got past prose review twice.
+# Those three were covered by an AST fact walk and a shell delegation scan, both
+# deleted: establishing "this program has no side effects" by reading it is an
+# open-set claim, and four review rounds each closed one spelling and surfaced
+# the next. What replaces them is not another checker — it is that no guard is
+# replayable, so a wrong claim about a guard's effects no longer authorises
+# anything. #2036 restores the permission by confinement instead.
 #
-# All matchers come from the module's own published constants, so the coverage
-# `--list` advertises and the coverage this checker applies cannot drift apart:
+# So the tests below pin the citation class only, and the declarations' effect
+# claims are unverified prose that `--list` labels as such:
 # there is one set, not two.
 
 
@@ -1376,7 +1396,7 @@ def _write_guard(hooks: Path, name: str, body: str) -> None:
 
 
 def test_every_citation_still_resolves(rgc):
-    """The citation half — the one an AST fact-checker cannot do.
+    """The whole of what is checked, and the reason it is what survived.
 
     All six declarations once cited line numbers, and every one had drifted
     within five days; one landed on a comment about an unrelated cap while the
@@ -1507,6 +1527,44 @@ def test_the_tool_verifies_its_own_declarations(rgc):
     table passes the shipped verifier. Everything below tests that individual
     checks BITE; this tests that they are satisfied by what we actually ship."""
     assert rgc.verify_declarations() == []
+
+
+def test_code_sharing_a_line_with_a_docstring_survives_stripping(rgc, tmp_path):
+    """Stripping a docstring must remove the STRING, not its physical lines.
+
+    A docstring followed on the SAME LINE by `; subprocess.run(...)` is valid
+    Python, and the AST marks only the string expression as the docstring —
+    `Expr(Constant(str))`. Blanking `lineno..end_lineno` therefore
+    destroyed the executable call sharing that line, and the checker reported a
+    still-valid citation as stale. Because `verify_declarations()` gates every
+    CLI path, one citation of that shape made the whole tool refuse — a false
+    REFUSAL, which is the expensive direction for a measurement tool.
+
+    The multi-line case is checked too, on its CLOSING line. There is no
+    "code before the opening quotes" case to check: a docstring is by definition
+    `body[0]`, so anything preceding it on the line would make the string the
+    SECOND statement and not a docstring at all — which an earlier version of
+    this test got wrong and the fix correctly refused to strip.
+    """
+    hooks = tmp_path / "hooks"
+    _write_guard(
+        hooks,
+        "shared",
+        'import subprocess\n\n\ndef f():\n    """documentation"""; subprocess.run(["x"])\n',
+    )
+    seg, _ = rgc.cite_source(rgc.Cite("shared", "f", "subprocess.run"), hooks)
+    assert "subprocess.run" in seg, f"code on the docstring's line was destroyed: {seg!r}"
+    assert "documentation" not in seg, "the docstring itself must still be stripped"
+
+    _write_guard(
+        hooks,
+        "shared",
+        'import subprocess\n\n\ndef f():\n    """line one\n    line two"""; subprocess.run(["y"])\n',
+    )
+    seg, _ = rgc.cite_source(rgc.Cite("shared", "f", "subprocess.run"), hooks)
+    assert "subprocess.run" in seg, f"code AFTER a multi-line docstring was destroyed: {seg!r}"
+    assert "line one" not in seg, "the multi-line docstring body must still be stripped"
+    assert "line two" not in seg, "the docstring's closing line was not stripped"
 
 
 def test_a_fragment_surviving_only_in_a_comment_does_not_resolve(rgc, tmp_path):

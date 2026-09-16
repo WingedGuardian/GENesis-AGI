@@ -598,8 +598,12 @@ class ReplaySafety:
     # with the number, because the number is what gets pasted into a PR body.
     caveat: str = ""
     # The machine-checkable half: which constructs the prose above is standing
-    # on. Keyword-only and un-defaulted at the constructor, so a guard added
-    # later cannot arrive with unanchored prose.
+    # on. NOT enforced: `cites` defaults to `()` here and at
+    # `not_replay_safe`, and `inline_blob` uses that unanchored form today — so
+    # a guard CAN arrive with prose nothing checks. An earlier revision of this
+    # comment claimed the constructor prevented it; it does not. `--list` prints
+    # `cites: NONE` for such a guard, which is disclosure rather than
+    # enforcement, and BLIND_SPOTS says so.
     #
     # There used to be an `evidence` field beside this one, carrying declared
     # side-effect FACTS that an AST walk re-derived. It is gone, with the walk:
@@ -1037,7 +1041,8 @@ GUARDS: dict[str, Guard] = {
     "git_push": python_guard(
         "git_push_guard",
         safety=not_replay_safe(
-            "read-only on the filesystem, but it shells out to `gh repo view` / "
+            "NOT read-only, and an earlier revision of this line said it was. It "
+            "shells out to `gh repo view` / "
             "`gh pr view` and to git at classify time, and a large fraction of "
             "the corpus is exactly the shape that reaches those calls. MEASURED "
             "on this install 2026-09-10: 2,371 push-shaped rows and 2,587 "
@@ -1142,23 +1147,37 @@ def _executable_source(src: str, path: Path) -> str:
         # function contracted to strip comments, silently — so a fragment
         # surviving only in a comment resolved and the citation stayed green.
         raise DeclarationError(f"cannot parse {path} to strip comments: {exc}") from exc
-    # Docstrings are ordinary Expr/Constant statements; blank their spans.
-    lines = src.splitlines()
-    drop: set[int] = set()
+    # Docstrings are ordinary Expr/Constant statements. Blank the STRING'S SPAN,
+    # not its physical lines: a docstring may share a line with executable code
+    # (`"…"; subprocess.run(...)` is valid), and blanking whole lines destroyed
+    # that code — so a still-valid citation was reported stale, and because
+    # verify_declarations() gates every CLI path, ONE citation of that shape made
+    # the tool refuse every mode. A false refusal is the expensive direction.
+    #
+    # Spaces rather than deletion, and sliced on BYTES: ast column offsets are
+    # UTF-8 byte offsets, and this file is full of non-ASCII prose, so slicing
+    # the str would mis-cut. Equal-length replacement also keeps every later
+    # offset on the same line valid.
+    raw = [line.encode() for line in src.splitlines()]
     for node in ast.walk(tree):
         body = getattr(node, "body", None)
         if not isinstance(body, list) or not body:
             continue
         first = body[0]
-        if (
+        if not (
             isinstance(first, ast.Expr)
             and isinstance(first.value, ast.Constant)
             and isinstance(first.value.value, str)
             and first.end_lineno is not None
+            and first.end_col_offset is not None
         ):
-            drop.update(range(first.lineno, first.end_lineno + 1))
-    kept = [("" if n in drop else line) for n, line in enumerate(lines, 1)]
-    stripped = "\n".join(kept)
+            continue
+        for n in range(first.lineno, first.end_lineno + 1):
+            line = raw[n - 1]
+            start = first.col_offset if n == first.lineno else 0
+            end = first.end_col_offset if n == first.end_lineno else len(line)
+            raw[n - 1] = line[:start] + b" " * (end - start) + line[end:]
+    stripped = "\n".join(line.decode() for line in raw)
     try:
         toks = tokenize.generate_tokens(io.StringIO(stripped).readline)
         out_lines = stripped.splitlines()
@@ -1636,7 +1655,9 @@ def main() -> int:
             # quietly, and an operator who passed it is waiting for a rebuild.
             print(
                 "note: --rebuild has no effect with --list (nothing reads the "
-                "corpus on this path); run it with --guard or --all.",
+                "corpus on this path); run `--rebuild` on its own to rebuild "
+                "the cache. It used to say 'run it with --guard or --all', "
+                "which now always refuse.",
                 file=sys.stderr,
             )
         # Every guard, INCLUDING the refused ones. A refused guard vanishing from
@@ -1660,8 +1681,18 @@ def main() -> int:
         for spot in BLIND_SPOTS:
             print(f"  - {spot}")
         return 0
+    if args.rebuild and not args.guard and not args.all:
+        # `--rebuild` ALONE rebuilds the cache and stops. It has to be reachable
+        # on its own now: with every guard refused, `--guard` and `--all` return
+        # before load_corpus(), so the only two paths that used to build the
+        # corpus can no longer reach it — and this tool's own help promised the
+        # corpus build still worked. Advertising an operation no code path can
+        # perform is the failure this file exists to stop doing.
+        rows = load_corpus(rebuild=True)
+        print(f"corpus rebuilt: {len(rows)} rows -> {_CACHE}")
+        return 0
     if not args.guard and not args.all:
-        ap.error("pass --guard <name>, --all, or --list")
+        ap.error("pass --guard <name>, --all, --list, or --rebuild")
 
     # Refuse BEFORE load_corpus: the corpus build walks the whole transcript
     # tree, and a refusal

@@ -316,8 +316,11 @@ impossible, so nothing has to be proved about the guard at all.
 
 What the tool still does is check that each declaration's prose still points at
 code that exists: `--list` resolves every `Cite(module, symbol, fragment)`
-against the symbol's executable source (comments stripped, so a fragment cannot
-go on passing from inside one) and refuses on a mismatch. That is worth running
+against the symbol's source and refuses on a mismatch. Comment stripping is
+complete for PYTHON, which is tokenized; a non-Python file loses only full-line
+comments, so a fragment cited from a shell file can still match from inside a
+trailing one — and a citation with no symbol matches the whole file, unscoped.
+`--list` publishes both limits. That is worth running
 after editing a guard — six citations in this table went stale within five days,
 one onto a comment about an unrelated timeout. It tells you nothing about what
 the guard DOES; `--list` prints its own limits.
