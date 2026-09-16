@@ -75,15 +75,22 @@ jobs:
       fail-fast: false
       matrix:
         arm:
-          - label: github-2vcpu
+          - label: github-4vcpu
             runs-on: ubuntu-latest
-          # Deliberately the 2-vCPU size: it is what `avrea-ubuntu-latest`
-          # resolves to and what GitHub's default provides, so this pair
-          # isolates the HARDWARE and leaves machine size out of it. A larger
-          # arm answers a different question ("what would paying buy?") and
-          # belongs in a separate run, not mixed into this one.
-          - label: avrea-2vcpu
-            runs-on: avrea-ubuntu-latest
+            expect_cpus: 4
+          # 4 vCPU on BOTH sides, and the earlier version of this file got it
+          # wrong in the flattering direction. It paired `ubuntu-latest` with
+          # `avrea-ubuntu-latest` (2 vCPU / 8 GB) and claimed the pair "isolates
+          # the HARDWARE and leaves machine size out of it". It does not:
+          # GitHub's standard `ubuntu-latest` is 4 CPU / 16 GB on PUBLIC
+          # repositories and 2 CPU / 8 GB only on private ones (GitHub's
+          # runners reference, read 2026-09-16). This repo is public, so that
+          # pairing handed the control arm twice the CPU and twice the RAM
+          # while asserting the sizes matched — the result would have been a
+          # real number measuring the wrong thing.
+          - label: avrea-4vcpu
+            runs-on: avrea-ubuntu-latest-4-vcpu
+            expect_cpus: 4
     runs-on: ${{ matrix.arm.runs-on }}
     # Bounds the blast radius of a single benchmark rather than the suite's
     # legitimate worst case — CI's `test` job carries 180 for that reason and
@@ -92,6 +99,33 @@ jobs:
     # double the observed max and caps what one misbehaving run can spend.
     timeout-minutes: 60
     steps:
+      # The size match is VERIFIED here, not assumed from the label. A label is
+      # a request; this is what the provider actually handed us, and the two
+      # have already disagreed once — see the matrix comment. Refusing outright
+      # rather than warning, because a mismatched pair produces a real-looking
+      # number that answers a question nobody asked.
+      - name: Assert the runner is the size this arm claims
+        env:
+          EXPECT_CPUS: ${{ matrix.arm.expect_cpus }}
+          ARM: ${{ matrix.arm.label }}
+        run: |
+          set -eu
+          cpus=$(nproc)
+          mem_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+          mem_gb=$(( mem_kb / 1024 / 1024 ))
+          printf '%s: %s vCPU, %s GB RAM\n' "$ARM" "$cpus" "$mem_gb"
+          {
+            printf '### %s runner\n\n' "$ARM"
+            printf -- '- detected: **%s vCPU**, **%s GB RAM**\n' "$cpus" "$mem_gb"
+            printf -- '- expected: %s vCPU\n\n' "$EXPECT_CPUS"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$cpus" -ne "$EXPECT_CPUS" ]; then
+            echo "::error::$ARM expected ${EXPECT_CPUS} vCPU, got ${cpus}." \
+                 "The arms are no longer comparable; fix the labels before" \
+                 "treating any timing from this run as a measurement."
+            exit 1
+          fi
+
       - name: Record start
         id: t0
         run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
@@ -126,6 +160,31 @@ jobs:
       - name: Record post-install
         id: t2
         run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      # The input is whitespace-separated simple arguments and nothing else.
+      # Constraining the FORMAT rather than parsing shell quoting is the
+      # deliberate choice: `-k 'foo or bar'` unquoted splits into fragments,
+      # pytest exits with a usage error in about a second, and — because the
+      # run step is continue-on-error — that near-instant exit would be
+      # reported as a timing. A benchmark that can present a usage error as a
+      # fast result is the failure mode this whole file is trying to avoid, so
+      # the input is refused up front instead.
+      - name: Validate extra pytest args
+        env:
+          PYTEST_ARGS: ${{ inputs.pytest_args }}
+        run: |
+          set -eu
+          case "$PYTEST_ARGS" in
+            *\'*|*\"*|*\\*|*\$*|*\`*)
+              echo "::error::pytest_args must be whitespace-separated simple" \
+                   "arguments — no quotes, backslashes, \$ or backticks." \
+                   "Quoted expressions like -k 'a or b' fragment on expansion" \
+                   "and pytest exits with a usage error that would be recorded" \
+                   "as a fast run. Pass -k a_or_b style selectors, or edit this" \
+                   "workflow to build a real argument array."
+              exit 1
+              ;;
+          esac
 
       - name: Run tests
         id: pytest
@@ -168,6 +227,50 @@ jobs:
         if: ${{ always() }}
         run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
 
+      # Two arms are only comparable if they ran the SAME TESTS, and this suite
+      # has skip conditions keyed on the environment — root, GPG, Node, systemd
+      # tooling. A third-party image missing one of those turns those tests into
+      # SUCCESSFUL SKIPS, so the arm runs less work, finishes sooner, and stays
+      # green. "Faster" would then be measuring a smaller suite.
+      #
+      # ci.yml already guards its own suite against exactly this (the dormancy
+      # guard, two axes: collected and skipped). The benchmark wrote junit.xml
+      # and never opened it, which is the same omission one layer over.
+      - name: Capture test population
+        if: ${{ always() }}
+        env:
+          ARM: ${{ matrix.arm.label }}
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import json, os, pathlib, xml.etree.ElementTree as ET
+          arm = os.environ["ARM"]
+          p = pathlib.Path("junit.xml")
+          if not p.is_file():
+              # No report at all — record that rather than a zero, which would
+              # compare equal to another missing report and read as agreement.
+              pop = {"arm": arm, "readable": False}
+          else:
+              root = ET.parse(p).getroot()
+              suites = [root] if root.tag == "testsuite" else list(root)
+              total = sum(int(s.get("tests", 0)) for s in suites)
+              skipped = sum(int(s.get("skipped", 0)) for s in suites)
+              pop = {"arm": arm, "readable": True,
+                     "collected": total, "skipped": skipped,
+                     "executed": total - skipped}
+          pathlib.Path(f"population-{arm}.json").write_text(json.dumps(pop))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write(f"\npopulation: `{json.dumps(pop)}`\n")
+          PY
+
+      - name: Upload population
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: population-${{ matrix.arm.label }}
+          path: population-${{ matrix.arm.label }}.json
+          if-no-files-found: error
+
       # A single total cannot tell a cache win from a CPU win, and those have
       # different consequences: a cache win shrinks with a warm GitHub cache
       # too, while a CPU win does not. The phase split is what makes the
@@ -204,3 +307,60 @@ jobs:
             phase 'pytest' "$T2" "$T3"
             phase 'total' "$T0" "$T3"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Whether the two timings are COMPARABLE is a separate question from whether
+  # the suite passed, and the two get opposite treatment on purpose.
+  #
+  # A red suite does not fail the bench job (`continue-on-error` on the run
+  # step): the tests failing is a fact about the code, not a defect in the
+  # measurement, and a red job would reach a PR rollup the merge gate reads.
+  #
+  # A population MISMATCH does fail this job, loudly. It means the arms ran
+  # different amounts of work, so any speed conclusion drawn from them is
+  # wrong — and a benchmark that reports an invalid measurement as valid is
+  # the one outcome worse than reporting nothing.
+  compare:
+    needs: bench
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: population-*
+          merge-multiple: true
+
+      - name: Compare test populations
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+          files = sorted(pathlib.Path().glob("population-*.json"))
+          pops = [json.loads(f.read_text()) for f in files]
+          lines = ["## Test population across arms\n",
+                   "| arm | collected | skipped | executed |", "|---|---|---|---|"]
+          for p in pops:
+              if p.get("readable"):
+                  lines.append("| {arm} | {collected} | {skipped} | {executed} |".format(**p))
+              else:
+                  lines.append(f"| {p['arm']} | no report | no report | no report |")
+          problems = []
+          if len(pops) < 2:
+              problems.append(f"only {len(pops)} arm(s) reported a population; "
+                              "a comparison needs both")
+          unreadable = [p["arm"] for p in pops if not p.get("readable")]
+          if unreadable:
+              problems.append("no junit report from: " + ", ".join(unreadable))
+          executed = {p["executed"] for p in pops if p.get("readable")}
+          if len(executed) > 1:
+              problems.append(f"arms executed DIFFERENT test counts {sorted(executed)} — "
+                              "timings are not comparable")
+          lines.append("")
+          lines.append("**comparable: NO**" if problems else "**comparable: yes**")
+          for p in problems:
+              lines.append(f"- {p}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write("\n".join(lines) + "\n")
+          for p in problems:
+              print(f"::error::{p}")
+          sys.exit(1 if problems else 0)
+          PY
