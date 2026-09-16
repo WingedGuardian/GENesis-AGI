@@ -425,10 +425,16 @@ def test_install_test_covers_every_enable_site():
 
     # Literal unit names on `systemctl --user enable [--now] <name>` lines.
     enabled = set()
-    for m in re.finditer(r"systemctl --user enable (?:--now )?([A-Za-z0-9_.@-]+)", install):
+    for m in re.finditer(r"systemctl --user enable (?:--now )?([A-Za-z0-9_.@$\"-]+)", install):
         name = m.group(1)
-        if name.startswith("$"):
-            continue  # the generic timer loop — covered by its own assertion
+        if name.startswith(("$", '"', "-")):
+            # `$`/`"` are the generic timer loop, covered by its own assertion
+            # above. `-` is the optional `--now ` group backtracking and
+            # capturing the FLAG as the unit name — reachable when nothing
+            # class-matching follows it. Harmless while the membership test
+            # searched the whole file, since `--now` appears in it; it names a
+            # nonexistent unit the moment that test is scoped.
+            continue
         enabled.add(name if "." in name else f"{name}.service")
 
     assert enabled, "no enable sites parsed from install.sh — extraction is stale"
@@ -448,7 +454,72 @@ def test_install_test_covers_every_enable_site():
         "and a new timer template would be rendered-but-dead with nothing noticing"
     )
 
-    missing = sorted(n for n in enabled if n.split(".")[0] not in wf)
+    # Compare against the units the workflow ASSERTS ON, not against the whole
+    # file. `stem not in wf` is satisfied by any mention anywhere — a comment, or
+    # the placeholder-scan glob, which iterates the same unit paths without ever
+    # asking whether anything started. MEASURED: deleting `qdrant.service` from
+    # the liveness loop left this test GREEN, because the word survives on the
+    # glob line and in a comment. The scoping mistake is the one the `liveness`
+    # check above already fixed for itself, made again on the next line.
+    # Strip comments before matching, WHOLE-LINE and TRAILING both. A trailing
+    # `# qdrant.service is checked elsewhere` on a real assertion line would
+    # otherwise satisfy this check with a remark, which is the same defect one
+    # layer down.
+    body = "\n".join(
+        re.sub(r"\s#.*$", "", ln) for ln in wf.splitlines()
+        if not ln.lstrip().startswith("#")
+    )
+    stems = {n.rsplit(".", 1)[0]: n for n in enabled}
+
+    def _units(text: str) -> set[str]:
+        """Tokens in `text` that NAME a unit install.sh enables.
+
+        Asking "does this token name one of the units we are looking for?"
+        rather than "does this token look like a unit?" is what removes the
+        hardcoded prefix list this test used to carry — a hand-synced list
+        inside a test whose entire purpose is to replace hand-syncing. It can
+        no longer miss a name (`agent-zero` was the live example: rendered,
+        named in the workflow, and dropped by a `genesis`/`qdrant` prefix
+        filter) and it cannot invent one.
+
+        Both spellings resolve, since the workflow writes
+        `is-active --quiet genesis-server` bare and `qdrant.service` suffixed
+        while `enabled` has already normalised everything to `.service`.
+        """
+        found = set()
+        for tok in re.split(r"[\s;]+", text):
+            tok = tok.strip("\"'")
+            if tok in enabled:
+                found.add(tok)
+            elif tok in stems:
+                found.add(stems[tok])
+        return found
+
+    asserted = set()
+    for line in body.splitlines():
+        if re.search(r"systemctl --user is-(?:enabled|active)", line):
+            asserted |= _units(line)
+    # ...plus `for _x in <names>; do` loops, where the names sit on the `for`
+    # line rather than on the assertion. Bind the head to an assertion naming
+    # its LOOP VARIABLE, not to a slice ending at the next `done`: an ordinary
+    # retry loop nested in the body re-pairs that `done` and the head silently
+    # loses its assertion. Requiring the variable also stops a loop being
+    # credited for units its body never checks.
+    for m in re.finditer(r"for (\w+) in ([^\n;]+); do", body):
+        var, head = m.group(1), m.group(2)
+        if re.search(
+            rf"systemctl --user is-(?:enabled|active)[^\n]*\$\{{?{var}\b",
+            body[m.end():],
+        ):
+            asserted |= _units(head)
+
+    # Computed before the staleness assert so a workflow that dropped its
+    # assertions reports WHICH units lost cover, rather than the blunter
+    # "extraction is stale".
+    missing = sorted(n for n in enabled if n not in asserted)
+    assert asserted or not missing, (
+        "no unit-state assertions parsed from the workflow — extraction is stale"
+    )
     assert not missing, (
         f"install.sh enables {missing} but the install test never checks whether "
         "they came up. The enable is suppressed with `|| true`, so this is the "
