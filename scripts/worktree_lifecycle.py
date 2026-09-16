@@ -1281,22 +1281,45 @@ def _trash_worktree(
         # recovery locates an entry BY that name — including the archives already
         # on disk. So the worktree's own file is the one moved aside, and the log
         # says where it went rather than leaving it to be discovered.
+        # LEXISTS, not exists(): a DANGLING symlink named `.trash_meta.json` is
+        # a real directory entry that `Path.exists()` reports as absent (it
+        # resolves the link), so the collision check missed it entirely and
+        # `rename` then replaced the user's entry. `os.path.lexists` asks about
+        # the entry, which is the question being asked here.
         final_meta = trash_path / ".trash_meta.json"
-        if final_meta.exists():
+        if os.path.lexists(final_meta):
             preserved = None
             for n in range(1, 1000):
                 candidate = trash_path / f".trash_meta.json.from-worktree-{n}"
-                if not candidate.exists():
+                if not os.path.lexists(candidate):
                     preserved = candidate
                     break
+            renamed = False
             if preserved is not None:
-                with contextlib.suppress(OSError):
+                try:
                     final_meta.rename(preserved)
+                    renamed = True
+                except OSError as e:
+                    _log(f"  WARN {trash_path.name}: could not move its own "
+                         f".trash_meta.json aside ({e})")
+            if renamed:
                 _log(f"  NOTE {trash_path.name} contained its own .trash_meta.json — "
                      f"kept as {preserved.name} so it survives in the archive")
             else:
-                _log(f"  WARN {trash_path.name} contains a .trash_meta.json and no free "
-                     "name was available to preserve it; it will be REPLACED")
+                # SAY WHAT ACTUALLY HAPPENS. An earlier version of this branch
+                # refused to take the name when preservation failed, on the
+                # reasoning that a destroyed file is worse than an entry
+                # `--recover` cannot find. That reasoning was right and the
+                # implementation did not deliver it: the metadata is rewritten
+                # at this same path further down, unconditionally and with
+                # `write_text`, which FOLLOWS a symlink -- so refusing here
+                # destroyed the file anyway, and for a dangling symlink it wrote
+                # OUTSIDE the tree, which is the hole the `.dirty.patch` guard
+                # above exists to close. Doing it properly means preserving
+                # BEFORE the worktree is moved and skipping the reap when that
+                # cannot be done, which is a larger change than this one.
+                _log(f"  WARN {trash_path.name} contains a .trash_meta.json that could "
+                     "not be preserved; it is being REPLACED")
         staging_meta.rename(final_meta)
 
         if patch_text:
@@ -1311,11 +1334,17 @@ def _trash_worktree(
             # For a module whose contract is that it deletes nothing, silently
             # replacing a user's file is the contract breaking, not a detail.
             # Falling back to a suffixed name keeps both.
+            # LEXISTS for the same reason as the metadata above, and with a
+            # sharper consequence: a DANGLING `.dirty.patch` symlink read as
+            # absent, so no alternative name was chosen, and the `os.open` below
+            # FOLLOWED the link -- creating (or truncating) its target, which can
+            # sit anywhere on the filesystem. MEASURED: `Path.exists()` False,
+            # `os.path.lexists` True, and the open created the outside file.
             target = trash_path / ".dirty.patch"
-            if target.exists():
+            if os.path.lexists(target):
                 for n in range(1, 1000):
                     alt = trash_path / f".dirty.patch.archived-{n}"
-                    if not alt.exists():
+                    if not os.path.lexists(alt):
                         target = alt
                         break
                 else:
@@ -1335,9 +1364,15 @@ def _trash_worktree(
                     # yet committed. It also SURVIVES a failed compression, when
                     # it sits in a plain directory rather than inside the
                     # archive, which is exactly when its mode is what protects it.
+                    # O_NOFOLLOW is the guard AT THE WRITE, independent of the
+                    # collision check above: the check answers "is this name
+                    # taken", and this answers "am I about to write through
+                    # somebody's symlink". A dangling link raises ELOOP here and
+                    # the patch is reported unwritten rather than landing outside
+                    # the tree.
                     fd = os.open(
                         str(target),
-                        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
                         _PRIVATE_FILE_MODE,
                     )
                     with os.fdopen(fd, "wb") as fh:

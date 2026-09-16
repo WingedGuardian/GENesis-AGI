@@ -922,3 +922,156 @@ def test_archiving_leaves_the_registration_and_recovery_clears_it(
         "add` refused the still-registered path, so nothing cleared it"
     )
     assert (wt / ".git").exists(), "recovery produced no .git at all"
+
+
+def test_a_dangling_internal_name_symlink_is_not_written_through(
+    reaper_repo, tmp_path, monkeypatch,
+):
+    """A DANGLING symlink is a directory entry that `Path.exists()` calls absent.
+
+    `.dirty.patch` is not a reserved name, so the archive path already avoided
+    overwriting a real one. It resolved the collision with `Path.exists()`, which
+    follows the link -- so a DANGLING `.dirty.patch` symlink read as "no
+    collision", the canonical name was kept, and the `os.open(O_CREAT)` below
+    FOLLOWED the link and created its target, which can sit anywhere on the
+    filesystem. MEASURED before the fix, in a scratch tree:
+        os.path.lexists -> True, Path.exists -> False
+        os.open(..., O_CREAT|O_TRUNC) created the outside file
+    For a module whose contract is that it deletes nothing, writing a file
+    OUTSIDE the tree it was handed is the contract breaking in the other
+    direction.
+    """
+    repo = reaper_repo.repo
+    trash = tmp_path / "trash"
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "TOMBSTONE_INDEX", trash / "tomb.jsonl")
+    trash.mkdir(parents=True, exist_ok=True)
+
+    wt = reaper_repo.wt_branch_merged
+    # Uncommitted tracked work, so a recovery patch is actually produced.
+    (wt / "a.txt").write_text("locally modified\n")
+
+    outside = tmp_path / "OUTSIDE_TARGET.txt"
+    os.symlink(str(outside), str(wt / ".dirty.patch"))
+    assert not outside.exists(), "precondition: the symlink target does not exist"
+    _age_path(wt, 20)
+
+    worktrees = wl._list_worktrees(repo)
+    entry = next(w for w in worktrees if Path(w["path"]) == wt)
+    cls = wl._classify(entry, worktrees, repo)
+    wl._trash_worktree(cls, repo, lane="merged", merge_method=cls["merge_method"])
+
+    assert not outside.exists(), (
+        "the recovery patch was written THROUGH a dangling symlink and landed "
+        f"outside the worktree at {outside}"
+    )
+
+    import tarfile as _tf
+
+    # THE COLLISION CHECK ITSELF must have seen the dangling entry. Asserting
+    # only "the outside file was not created" is BLIND: the O_NOFOLLOW guard at
+    # the write closes that hole on its own, so the assertion above passes with
+    # this check reverted. MEASURED by mutation -- the test stayed green until
+    # this line existed. The two guards answer different questions and each needs
+    # its own witness.
+    # (asserted against the archive's members below, once it is opened)
+
+    archives = sorted(trash.glob("*.tar.gz"))
+    assert archives, "the worktree should still have been archived"
+    with _tf.open(archives[0], "r:gz") as fh:
+        members = {m.name.split("/", 1)[-1]: m for m in fh.getmembers()}
+    assert ".dirty.patch" in members, "the user's own entry must survive in the archive"
+    assert members[".dirty.patch"].issym(), "and it must still be their symlink"
+    assert ".dirty.patch.archived-1" in members, (
+        "the collision check did not see the dangling .dirty.patch symlink, so the "
+        "recovery patch claimed the canonical name"
+    )
+
+
+def test_a_dangling_trash_meta_symlink_is_preserved(reaper_repo, tmp_path, monkeypatch):
+    """Same class, other name. A dangling `.trash_meta.json` symlink read as
+    absent, so `rename` replaced the user's entry instead of moving it aside."""
+    repo = reaper_repo.repo
+    trash = tmp_path / "trash"
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "TOMBSTONE_INDEX", trash / "tomb.jsonl")
+    trash.mkdir(parents=True, exist_ok=True)
+
+    wt = reaper_repo.wt_det_merged
+    os.symlink(str(tmp_path / "NOWHERE.json"), str(wt / ".trash_meta.json"))
+    _age_path(wt, 20)
+
+    worktrees = wl._list_worktrees(repo)
+    entry = next(w for w in worktrees if Path(w["path"]) == wt)
+    cls = wl._classify(entry, worktrees, repo)
+    wl._trash_worktree(cls, repo, lane="merged", merge_method=cls["merge_method"])
+
+    import tarfile as _tf
+
+    archives = sorted(trash.glob("*.tar.gz"))
+    assert archives, "the worktree should still have been archived"
+    with _tf.open(archives[0], "r:gz") as fh:
+        names = {m.name.split("/", 1)[-1] for m in fh.getmembers()}
+    assert ".trash_meta.json.from-worktree-1" in names, (
+        "the user's own .trash_meta.json was destroyed rather than kept aside"
+    )
+    assert ".trash_meta.json" in names, "and ours must take the canonical name"
+
+
+def test_the_patch_write_refuses_to_follow_a_symlink_the_check_missed(
+    reaper_repo, tmp_path, monkeypatch,
+):
+    """The second guard, tested ALONE.
+
+    The collision check answers "is this name taken"; the open answers "am I
+    about to write through somebody's symlink". They are not the same question,
+    and the gap between them is a real window -- the entry can appear between the
+    check and the write. Here the check is forced blind so only O_NOFOLLOW is
+    left standing.
+    """
+    repo = reaper_repo.repo
+    trash = tmp_path / "trash"
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "TOMBSTONE_INDEX", trash / "tomb.jsonl")
+    trash.mkdir(parents=True, exist_ok=True)
+
+    wt = reaper_repo.wt_branch_merged
+    (wt / "a.txt").write_text("locally modified\n")
+    outside = tmp_path / "OUTSIDE_TARGET_2.txt"
+    os.symlink(str(outside), str(wt / ".dirty.patch"))
+    _age_path(wt, 20)
+
+    real_lexists = os.path.lexists
+    monkeypatch.setattr(
+        os.path,
+        "lexists",
+        lambda q: False if str(q).endswith(".dirty.patch") else real_lexists(q),
+    )
+
+    worktrees = wl._list_worktrees(repo)
+    entry = next(w for w in worktrees if Path(w["path"]) == wt)
+    cls = wl._classify(entry, worktrees, repo)
+    wl._trash_worktree(cls, repo, lane="merged", merge_method=cls["merge_method"])
+
+    assert not outside.exists(), (
+        "with the collision check blind, the open FOLLOWED the symlink and "
+        f"created {outside} outside the tree"
+    )
+
+    # POSITIVE WITNESSES. "No outside file appeared" passes vacuously for any
+    # change that never reaches the write at all -- a reap that skipped, or an
+    # empty patch. MEASURED: with the patch text forced empty, the assertion
+    # above still passed. So prove the write was REACHED and that it refused.
+    import tarfile as _tf
+
+    archives = sorted(trash.glob("*.tar.gz"))
+    assert archives, "the worktree was not archived at all, so nothing was written"
+    with _tf.open(archives[0], "r:gz") as fh:
+        members = {m.name.split("/", 1)[-1]: m for m in fh.getmembers()}
+    assert ".dirty.patch.archived-1" not in members, (
+        "the collision check was not actually blinded, so this test is measuring "
+        "the other guard"
+    )
+    assert ".dirty.patch" in members and members[".dirty.patch"].issym(), (
+        "the user's symlink must still be the entry the write refused to follow"
+    )
