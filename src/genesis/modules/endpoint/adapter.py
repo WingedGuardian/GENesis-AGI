@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import ipaddress
 import json
 import logging
@@ -106,6 +107,89 @@ class MissionTooLarge(ValueError):
     """The mission payload exceeds what the remote command line can carry."""
 
 
+#: Transport methods that provably do not reach the network. Everything NOT
+#: here is refused by ``_NetworkGatedIPC`` rather than passed through — see the
+#: polarity note in that class. Adding a name here is a claim that the method
+#: cannot put bytes on the wire, and it needs to be true.
+_INERT_TRANSPORT_METHODS = frozenset({"needs_start", "start", "stop"})
+
+
+class _NetworkGatedIPC:
+    """Wraps an IPC adapter so no byte leaves without passing the network gate.
+
+    The gate used to be called from ``dispatch_mission`` alone. Everything else
+    that talks to the machine — the health probe the dashboard runs on every
+    render, and the inherited ``execute_operation`` — went straight to the wire,
+    so a host resolving to a public or disallowed network was contacted anyway
+    by the very adapter whose docstring promised to refuse it before any I/O.
+
+    **The polarity is an ALLOWLIST, and the first version of this class got that
+    wrong.** It gated ``send``/``health_check`` and passed everything else
+    through ``__getattr__``, which is a denylist wearing structural language:
+    MEASURED, ``_send_shell`` and ``_send_cc`` — the private methods ``send``
+    itself delegates to, and which are reachable straight off the proxy —
+    contacted a forbidden host with the gate in place. A file-transfer method is
+    named in this module's own docstring as a future step, and it would have
+    arrived ungated by construction while the comment promised otherwise.
+
+    So anything not in :data:`_INERT_TRANSPORT_METHODS` raises instead of
+    forwarding. A new transport method fails loudly the first time it is used,
+    which is the only version of "structural" worth the word.
+
+    The verdict is not cached ACROSS operations: a cached one is a window in
+    which a host that has moved to a disallowed address is still contacted.
+    Within a single operation it is held — see :meth:`one_verdict` — because
+    re-resolving between the steps of one dispatch buys a worse failure than it
+    prevents (a transient resolver blip after the mission has already run
+    reports the success as unreachable, and strands the reply).
+    """
+
+    def __init__(self, inner, gate) -> None:
+        self._inner = inner
+        self._gate = gate
+        self._held = None
+
+    @contextlib.asynccontextmanager
+    async def one_verdict(self):
+        """Resolve once and hold it for the span of one logical operation.
+
+        A mission dispatch is six wire steps. Gating each independently means a
+        single ``getaddrinfo`` hiccup at step five raises EndpointNotReachable —
+        whose contract says the host is not permitted — AFTER the mission has
+        run on the remote machine, with no exit code and no sign anything
+        happened. One verdict per operation keeps the refusal where the contract
+        promises it: before any I/O.
+        """
+        verdict = await self._gate()
+        prev, self._held = self._held, verdict
+        try:
+            yield verdict
+        finally:
+            self._held = prev
+
+    async def _check(self):
+        if self._held is None:
+            await self._gate()
+
+    async def send(self, *args, **kwargs):
+        await self._check()
+        return await self._inner.send(*args, **kwargs)
+
+    async def health_check(self, *args, **kwargs):
+        await self._check()
+        return await self._inner.health_check(*args, **kwargs)
+
+    def __getattr__(self, name):
+        if name in _INERT_TRANSPORT_METHODS:
+            return getattr(self._inner, name)
+        raise AttributeError(
+            f"{name!r} is not gated and not on _INERT_TRANSPORT_METHODS. Every "
+            "transport method that can reach the wire must be gated explicitly "
+            "(like send / health_check); add it there, or to the inert set with "
+            "a stated reason it cannot put bytes on the wire."
+        )
+
+
 class WindowsEndpointAdapter(ExternalProgramAdapter):
     """One Windows machine, addressed over the existing SSH SHELL transport.
 
@@ -150,6 +234,12 @@ class WindowsEndpointAdapter(ExternalProgramAdapter):
             )
 
         self._ep = ep
+
+        # Gate the TRANSPORT, not each caller. Placed AFTER self._ep is set,
+        # because the bound gate reads it — today it resolves lazily and nothing
+        # in between calls through, but ordering that depends on that is a
+        # latent AttributeError waiting on the next constructor line.
+        self._ipc = _NetworkGatedIPC(self._ipc, self.check_network_allowed)
 
         # Every command this adapter builds embeds state_dir, and the prepare
         # command embeds it TWICE — so its length is a CONFIG property, and a
@@ -397,20 +487,27 @@ class WindowsEndpointAdapter(ExternalProgramAdapter):
         # Then CONFIG: the network check is a refusal to contact this host AT
         # ALL, so it precedes the health probe — otherwise the probe reaches out
         # to a machine the config has already ruled out.
-        await self.check_network_allowed()
+        #
+        # ONE verdict for the whole dispatch, rather than one per wire step. The
+        # transport gates every send, but re-resolving between the six steps of
+        # a dispatch means a transient resolver failure at step five raises
+        # "host is not permitted" AFTER the mission has already run on the
+        # remote machine — a worse lie than the one the gate prevents. Resolving
+        # here and holding it keeps the refusal where this method's contract
+        # says it is: before any I/O.
+        async with self._ipc.one_verdict():
+            # Then LIVE state. With no health_check block configured (the shape
+            # the template ships) register() sets _healthy True WITHOUT probing,
+            # and nothing else on this path revises it — so without this refresh
+            # the gate would only reflect a verdict some unrelated dashboard
+            # render happened to collect, which reads as live and is not. Cached
+            # (60s TTL) and bounded at _HEALTH_PROBE_TIMEOUT.
+            await self.check_health_cached()
+            if not self._healthy:
+                return {"error": f"Module '{self.name}' is not healthy"}
 
-        # Then LIVE state. With no health_check block configured (the shape the
-        # template ships) register() sets _healthy True WITHOUT probing, and
-        # nothing else on this path revises it — so without this refresh the gate
-        # would only reflect a verdict some unrelated dashboard render happened
-        # to collect, which reads as live and is not. Cached (60s TTL) and
-        # bounded at _HEALTH_PROBE_TIMEOUT.
-        await self.check_health_cached()
-        if not self._healthy:
-            return {"error": f"Module '{self.name}' is not healthy"}
-
-        async with self._dispatch_lock:
-            return await self._dispatch_locked(raw, mission_id)
+            async with self._dispatch_lock:
+                return await self._dispatch_locked(raw, mission_id)
 
     async def _dispatch_locked(self, raw: bytes, mission_id: str) -> dict[str, Any]:
         # Prepare FIRST: create the state dir and drop any previous reply.

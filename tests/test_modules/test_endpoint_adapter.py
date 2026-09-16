@@ -21,6 +21,7 @@ from genesis.modules.endpoint.adapter import (
     EndpointNotReachable,
     MissionTooLarge,
     WindowsEndpointAdapter,
+    _NetworkGatedIPC,
 )
 from genesis.modules.external.config import ProgramConfig
 
@@ -78,8 +79,26 @@ class FakeIPC:
 
 
 def _adapter(cfg=None, ipc=None, *, enabled=True, healthy=True, result=None):
+    """Build an adapter with a fake transport, wrapped the way production wraps it.
+
+    The wrapper matters: the constructor puts the allowed-networks gate ON the
+    transport, so assigning a bare fake to ``_ipc`` would hand every test an
+    UNGATED adapter — the one configuration the shipped code never runs. That is
+    how a gate passes its own tests while the live path skips it.
+
+    """
     a = WindowsEndpointAdapter(cfg or _cfg())
-    a._ipc = ipc or FakeIPC(result=result if result is not None else {"ok": True})
+    fake = ipc or FakeIPC(result=result if result is not None else {"ok": True})
+    # Swap the INNER transport and keep whatever the constructor wrapped it in.
+    # Re-wrapping here instead would re-apply the gate from the test side, so
+    # every behavioural assertion below would still pass with the constructor's
+    # wrapper deleted — testing this helper rather than the shipped wiring.
+    # MEASURED: with the wrapper removed, that version left 3 of 4 gate tests
+    # green.
+    if isinstance(a._ipc, _NetworkGatedIPC):
+        a._ipc._inner = fake
+    else:
+        a._ipc = fake
     a._enabled = enabled
     a._healthy = healthy
     return a
@@ -561,3 +580,161 @@ def test_the_prepare_step_distinguishes_a_permission_failure():
     assert "$ErrorActionPreference='Stop'" in cmd
     assert "catch { exit 2 }" in cmd
     assert "CreateDirectory" in cmd, "New-Item has no -LiteralPath on PS 5.1"
+
+# ── the gate is on the TRANSPORT, so every path inherits it ─────────────────
+
+
+async def test_the_health_probe_refuses_a_forbidden_network():
+    """The finding that produced the transport gate.
+
+    The dashboard runs this probe on every render, and it went straight to the
+    wire — contacting a host that ``dispatch_mission`` had already promised to
+    refuse before any I/O. A gate on one path is a gate someone remembered.
+    """
+    ipc = FakeIPC(result={"exit_code": 0})
+    a = _adapter(
+        _cfg(ssh_host="u@192.168.1.10", endpoint={"allowed_networks": ["tailnet"]}), ipc=ipc
+    )
+    assert await a.check_health() is False
+    assert ipc.calls == [], "a forbidden host was probed anyway"
+    assert "allowed_networks" in (a._last_health_error or "")
+
+
+async def test_execute_operation_refuses_a_forbidden_network():
+    """The INHERITED path. It is not overridden here, so nothing in this file
+    gates it — only the transport does."""
+    ipc = FakeIPC(result={"ok": True})
+    cfg = _cfg(
+        ssh_host="u@192.168.1.10",
+        endpoint={"allowed_networks": ["tailnet"]},
+        operations={"ping": {"method": "SHELL", "path": "exit 0"}},
+    )
+    a = _adapter(cfg, ipc=ipc)
+    # The inherited path CATCHES and reports rather than raising, so the
+    # refusal arrives as an error payload. What matters is the same either way:
+    # the caller is refused and the device is never contacted.
+    res = await a.execute_operation("ping")
+    assert "error" in res and "allowed_networks" in res["error"], res
+    assert ipc.calls == [], "a forbidden host was contacted by the inherited path"
+
+
+async def test_an_allowed_network_still_reaches_the_device():
+    """The acceptance bar: the gate must not have broken the permitted case."""
+    ipc = FakeIPC(result={"ok": True})
+    a = _adapter(
+        _cfg(ssh_host="u@192.168.1.10", endpoint={"allowed_networks": ["lan"]}), ipc=ipc
+    )
+    assert await a.check_health() is True
+    assert ipc.calls, "an allowed host was refused"
+
+
+def test_the_constructor_puts_the_gate_on_the_transport():
+    """A fast-fail marker, not a structural proof.
+
+    The behavioural tests above already die if the wrapper is removed, so this
+    earns its place only by naming the cause in one line instead of leaving two
+    confusing "the device was contacted anyway" failures. What makes a FUTURE
+    path safe is the allowlist below, not this.
+    """
+    a = WindowsEndpointAdapter(_cfg())
+    assert isinstance(a._ipc, _NetworkGatedIPC), (
+        "the transport is not gated — every I/O path is only as safe as the "
+        "call site that remembered to check"
+    )
+
+
+async def test_passthrough_methods_are_not_gated():
+    """Lifecycle calls must not pay a DNS resolve or refuse on a bad network —
+    only the methods that put bytes on the wire are gated."""
+
+    class _Inner:
+        def __init__(self):
+            self.started = False
+
+        async def start(self):
+            self.started = True
+
+    inner = _Inner()
+
+    async def _never():
+        raise AssertionError("the gate ran on a non-I/O method")
+
+    proxy = _NetworkGatedIPC(inner, _never)
+    await proxy.start()
+    assert inner.started is True
+
+async def test_an_ungated_transport_method_is_REFUSED_not_passed_through():
+    """The polarity, locked. This is the finding the first version got wrong.
+
+    That version gated ``send``/``health_check`` and forwarded everything else
+    through ``__getattr__`` — a denylist wearing structural language. MEASURED
+    at the time: ``_send_shell`` (the private method ``send`` itself delegates
+    to) and a hypothetical ``send_file`` both reached a forbidden host with the
+    gate "in place". The module docstring names a file transport as a future
+    step, so that second one was not hypothetical for long.
+
+    An allowlist inverts who pays for the mistake: a new transport method fails
+    the first time anyone calls it, instead of quietly shipping ungated.
+    """
+
+    class _Transport:
+        async def send(self, *a, **k):
+            return {}
+
+        async def health_check(self, *a, **k):
+            return True
+
+        async def _send_shell(self, *a, **k):
+            return {}
+
+        async def send_file(self, *a, **k):
+            return {}
+
+        def needs_start(self):
+            return False
+
+        async def start(self):
+            pass
+
+        async def stop(self):
+            pass
+
+    async def _gate():
+        return "lan"
+
+    proxy = _NetworkGatedIPC(_Transport(), _gate)
+
+    for inert in ("needs_start", "start", "stop"):
+        getattr(proxy, inert)  # lifecycle: must pass through untouched
+
+    for wire in ("_send_shell", "send_file"):
+        with pytest.raises(AttributeError, match="not gated"):
+            getattr(proxy, wire)
+
+
+async def test_one_verdict_holds_for_the_span_of_a_dispatch():
+    """A refusal must not arrive after the mission has already run.
+
+    Six wire steps, each resolving independently, means one transient resolver
+    failure at step five raises "host is not permitted" AFTER the remote machine
+    has executed the mission — with no exit code and no sign anything happened.
+    That is a worse lie than the one the gate prevents, so the dispatch holds a
+    single verdict.
+    """
+    calls = {"n": 0}
+
+    async def _gate():
+        calls["n"] += 1
+        return "tailnet"
+
+    ipc = FakeIPC(result={"ok": True})
+    a = _adapter(ipc=ipc)
+    a._ipc = _NetworkGatedIPC(ipc, _gate)
+
+    await a.dispatch_mission({"a": 1})
+
+    assert calls["n"] == 1, (
+        f"the gate resolved {calls['n']} times for one dispatch — each extra "
+        "resolve is another chance to refuse a mission that already ran"
+    )
+    assert ipc.calls, "the dispatch did not reach the transport at all"

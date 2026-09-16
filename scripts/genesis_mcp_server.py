@@ -202,6 +202,24 @@ def _bootstrap_health(transport_kwargs: dict) -> None:
                     exc_info=True,
                 )
 
+            # Wire user job tools with DB-only access, same split as campaigns.
+            # Registering them without this leaves _db as None and every one of
+            # the four answers "Database not initialized" — a tool that is
+            # present and broken, which is only marginally better than the dead
+            # tool the import was added to fix. With the DB: user_job_list and
+            # user_job_history work here. user_job_create and user_job_control
+            # need the live scheduler, which exists only in the server process,
+            # and say so.
+            try:
+                from genesis.mcp.health.user_job_tools import init_user_job_tools
+
+                init_user_job_tools(db=db, scheduler=None)
+            except Exception:
+                logger.warning(
+                    "User job tools not available in standalone MCP",
+                    exc_info=True,
+                )
+
             clear_mcp_crash("health")
             yield
         finally:

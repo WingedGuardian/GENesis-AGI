@@ -50,7 +50,11 @@ async def user_job_create(
     if _db is None:
         return {"error": "Database not initialized"}
     if _scheduler is None:
-        return {"error": "User job scheduler not initialized"}
+        return {
+            "error": "User job scheduling requires the running Genesis server "
+            "(the scheduler lives in that process); this MCP is in standalone "
+            "mode. user_job_list and user_job_history work here."
+        }
 
     # Validate inputs before persisting. Use the live profile registry
     # (VALID_PROFILES, incl. any install-local overlay profiles) rather than a
@@ -152,8 +156,19 @@ async def user_job_control(
         job_id: The job ID to control
         action: One of: pause, resume, run_now, delete
     """
+    # DB first, deliberately. The scheduler message below ends "user_job_list
+    # and user_job_history work here", which is TRUE in standalone mode and
+    # FALSE when no DB was wired either (the no-DB branch of the standalone
+    # server). Checking the scheduler first would advertise two tools that are
+    # equally dark.
+    if _db is None:
+        return {"error": "Database not initialized"}
     if _scheduler is None:
-        return {"error": "User job scheduler not initialized"}
+        return {
+            "error": "User job control requires the running Genesis server "
+            "(the scheduler lives in that process); this MCP is in standalone "
+            "mode. user_job_list and user_job_history work here."
+        }
 
     valid_actions = ("pause", "resume", "run_now", "delete")
     if action not in valid_actions:
