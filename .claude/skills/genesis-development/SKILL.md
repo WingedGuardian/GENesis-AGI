@@ -146,6 +146,44 @@ changes), dispatch a `genesis-architect` subagent before implementation
 to check dependencies, edge cases, and DRY violations. Small targeted
 changes skip this.
 
+### Plan documents carry a structured header
+
+A plan doc that outlives one session (`~/.claude/plans/<name>.md`) opens with
+YAML frontmatter naming what it commits to and what it was written against:
+
+```yaml
+---
+plan: <slug>          # matches the filename
+status: active        # active | stalled | superseded | done
+updated: 2026-09-15   # last revision of the LIVE section
+pinned:
+  main: <12-hex>      # origin/main as of the `updated` date above
+binds: "<one line — what adopting this plan commits us to>"
+prevents: "<one line — what it forecloses, or nothing>"
+---
+```
+
+Quote `binds` and `prevents` — they are prose, and unquoted, a `": "` makes the
+whole header unparseable while a `" #"` **silently truncates** the value
+(`binds: PR #2046 ships first` loads as `"PR"`).
+
+Optional `decisions:` / `ledger:` / `issues:` lists name the trackers this plan
+executes, in FULL ids, so a reader of either end can find the other. An absent
+list means "none" — so only omit it once you have looked; write
+`issues: unchecked` if you have not. In the body,
+`## ═══ SUPERSEDED BELOW ═══` divides live content from archaeology; no divider
+means the whole file is live.
+
+**`pinned.main` is the field that pays for itself**: it makes
+`git log --oneline <pinned.main>..origin/main` a one-command staleness read, on
+a document whose line numbers and PR heads otherwise go quietly false. A moved
+main means re-verify, never that the plan is wrong.
+
+Nothing checks any of this yet — the header is written by hand, and a plan
+missing it fails silently. Rationale field-by-field, what the divider does NOT
+do for a grepper, and what was and was not carried across from the upstream
+schema: `references/plan-docs.md`.
+
 ### Timeout Policy
 
 The burden of proof is on you to justify why a timeout should exist.
@@ -3554,6 +3592,7 @@ references on every trigger.
 | Phase 6 contribution pipeline, sanitizer | `references/contribution.md` |
 | Pending work, active incidents, subsystem status | `references/build-state.md` |
 | Auditing/deep-reviewing AI-generated code (failure taxonomy, audit passes) | `references/ai-code-audit.md` |
+| Writing or revising a multi-session plan document | `references/plan-docs.md` |
 | Pre-release review, bug hunt, guard/gate change — verification method | `references/high-stakes-verification.md` |
 | Choosing a command/value/procedure by reasoning about an external tool | same, section 9 |
 | Which code tool to use (CBM vs Serena vs GitNexus vs Grep) | `.claude/docs/code-intelligence.md` |
