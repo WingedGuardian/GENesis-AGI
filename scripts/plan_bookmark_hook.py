@@ -70,11 +70,26 @@ _EXECUTION_PROTOCOL = (
 _GENESIS_DIR = Path.home() / ".genesis"
 _PENDING_FILE = _GENESIS_DIR / "plan_bookmark_pending.json"
 
-# How far to look for frontmatter's CLOSING fence. Generous against the
-# documented plan header (13 lines) so a plan that grows an id list still
-# parses, and bounded so a `---` thematic break in a long document cannot
-# make the scan swallow the file looking for a partner that is not there.
-_FRONTMATTER_MAX_LINES = 60
+
+def _live_half(content: str) -> str:
+    """The part of a plan above its superseded-content divider.
+
+    The convention is documented in the genesis-development skill
+    (`references/plan-docs.md`): a heading containing SUPERSEDED BELOW divides
+    live plan content from archaeology kept for provenance. No divider means
+    the whole document is live, which is also the correct reading for every
+    plan written before the convention existed.
+
+    Matched on the WORDS at a heading line, not on the decorative rule the
+    template draws around them — the box characters are ornament and a plan
+    that omits them still means it. Anchored at column zero on a `#` heading so
+    the phrase quoted inside a paragraph (this docstring included, were it in a
+    plan) cannot truncate the document.
+    """
+    for idx, line in enumerate(content.splitlines()):
+        if line.startswith("#") and "SUPERSEDED BELOW" in line:
+            return "\n".join(content.splitlines()[:idx])
+    return content
 
 
 def _classify_plan_complexity(plan_path: str) -> str:
@@ -86,7 +101,13 @@ def _classify_plan_complexity(plan_path: str) -> str:
     except OSError:
         return "unknown"
 
-    # Count tasks (### Task headers) and steps (- [ ] checkboxes)
+    # Count tasks (### Task headers) and steps (- [ ] checkboxes) in the LIVE
+    # half only. A long-running plan keeps superseded sections below a
+    # divider for provenance; counting those makes a small current plan
+    # classify as `large`, and `_plan_instructions` then injects the full
+    # planning pipeline on the strength of work that is already done. The
+    # archaeology grows without bound, so this only ever gets worse.
+    content = _live_half(content)
     task_count = content.count("### Task")
     step_count = content.count("- [ ]")
 
@@ -165,14 +186,28 @@ def _title_candidate_lines(text: str) -> list[str]:
     document's title. Ten lines is kept from the original — the point of this
     change is where the window STARTS, not how wide it is.
 
-    A leading `---` only opens frontmatter if a closing fence follows within
-    the search bound; otherwise it is a thematic break and the text is scanned
-    as-is.
+    A leading `---` only opens frontmatter if a closing fence is actually
+    found; otherwise it is a thematic break and the text is scanned as-is.
+
+    BOTH fences are matched at COLUMN ZERO, without stripping, because that is
+    what YAML frontmatter is — and `.strip()` gets all three cases wrong:
+      - an INDENTED thematic break (` ---`) would read as an opener, so
+        `` ---\\n# Actual title\\n…\\n---`` loses the title it used to find;
+      - an indented `  ---` inside a block scalar would read as the closing
+        fence, starting the scan window inside the YAML;
+      - and there is no third spelling to be lenient toward: the delimiter is
+        exactly three hyphens at column zero.
+
+    The closing fence is searched for across the whole document rather than a
+    fixed number of lines. An arbitrary bound reintroduces the very bug this
+    function exists to fix the moment a header grows past it — and the header's
+    id lists are documented as growing — while buying nothing: the lines are
+    already in memory, so the scan is a walk over a list we have.
     """
     lines = text.splitlines()
-    if lines and lines[0].strip() == "---":
-        for idx in range(1, min(len(lines), _FRONTMATTER_MAX_LINES)):
-            if lines[idx].strip() == "---":
+    if lines and lines[0] == "---":
+        for idx in range(1, len(lines)):
+            if lines[idx] == "---":
                 lines = lines[idx + 1 :]
                 break
     return [line.strip() for line in lines[:10]]

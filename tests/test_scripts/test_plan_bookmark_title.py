@@ -114,6 +114,105 @@ def test_a_heading_far_below_the_header_is_not_the_title(hook, tmp_path):
     assert title == "", "a heading 40 lines below the header is not the document title"
 
 
+def test_an_indented_thematic_break_does_not_open_frontmatter(hook, tmp_path):
+    """A frontmatter delimiter is three hyphens at COLUMN ZERO.
+
+    The concrete regression: with a leniently-stripped opener, ` ---` reads as
+    a frontmatter fence, the later real `---` closes it, and everything between
+    — including the title — is skipped. This file used to yield its title and
+    must keep doing so.
+    """
+    body = " ---\n# Actual title\n\nbody\n---\n"
+    _, title = _info(hook, tmp_path, body)
+    assert title == "Actual title", (
+        "an INDENTED thematic break was treated as a frontmatter opener, so "
+        "the scan skipped past the real title"
+    )
+
+
+def test_frontmatter_longer_than_any_fixed_bound_still_yields_its_title(hook, tmp_path):
+    """The closing-fence search must not be capped at an invented line count.
+
+    The header's id lists are documented as growing. A fixed bound reinstates
+    the empty-title bug the moment a real header crosses it — silently, and on
+    exactly the long-lived plans this convention targets.
+    """
+    header = "---\n" + "".join(f"key{i}: value\n" for i in range(70)) + "---\n"
+    _, title = _info(hook, tmp_path, header + "# Title after a long header\n")
+    assert title == "Title after a long header"
+
+
+def test_an_indented_fence_inside_a_block_scalar_does_not_close_frontmatter(
+    hook,
+    tmp_path,
+):
+    """A `---` indented inside a YAML block scalar is DATA, not the terminator.
+
+    Closing on it starts the scan window inside the YAML, where the next `#`
+    line is a YAML comment rather than a markdown heading — so the bookmark
+    gets named after a comment, which is worse than being named nothing.
+    """
+    body = (
+        "---\n"
+        "note: |\n"
+        "  ---\n"
+        "  # this is a YAML comment, not a heading\n"
+        "status: active\n"
+        "---\n"
+        "# Real Title\n"
+    )
+    _, title = _info(hook, tmp_path, body)
+    assert title == "Real Title", (
+        "an indented `---` inside a block scalar closed the frontmatter, so "
+        f"the scan started inside the YAML and produced {title!r}"
+    )
+
+
+def test_archaeology_below_the_divider_does_not_inflate_complexity(hook, tmp_path):
+    """Superseded sections must not classify a small live plan as large.
+
+    `_plan_instructions` injects the full planning pipeline for a `large`
+    plan. Counting archaeology means that decision is made on work already
+    finished — and the archaeology only grows, so it never self-corrects.
+    """
+    live = "# Plan\n\n### Task one\n- [ ] a\n"
+    dead = "## ═══ SUPERSEDED BELOW ═══\n" + ("### Task old\n- [ ] x\n" * 10)
+    plan = tmp_path / "p.md"
+    plan.write_text(live + dead)
+
+    assert hook._classify_plan_complexity(str(plan)) == "small", (
+        "ten archived tasks below the divider were counted, so a one-task "
+        "live plan classifies as large"
+    )
+
+
+def test_without_a_divider_the_whole_plan_counts(hook, tmp_path):
+    """Control: no divider means everything is live.
+
+    Without this, "stop at the divider" is equally satisfied by a bug that
+    truncates at some other point — or by counting nothing at all.
+    """
+    plan = tmp_path / "p.md"
+    plan.write_text("# Plan\n\n" + ("### Task n\n- [ ] x\n" * 10))
+
+    assert hook._classify_plan_complexity(str(plan)) == "large"
+
+
+def test_the_divider_phrase_in_prose_does_not_truncate(hook, tmp_path):
+    """Only a HEADING divides. A mention in a paragraph is just words.
+
+    A plan discussing the convention — this repo's own plan does — would
+    otherwise truncate itself at the sentence describing it.
+    """
+    plan = tmp_path / "p.md"
+    plan.write_text(
+        "# Plan\n\nWe use a SUPERSEDED BELOW divider for archaeology.\n\n"
+        + ("### Task n\n- [ ] x\n" * 10),
+    )
+
+    assert hook._classify_plan_complexity(str(plan)) == "large"
+
+
 def test_an_unterminated_fence_does_not_swallow_the_file(hook, tmp_path):
     """A `---` whose partner never comes must not blank the title.
 
