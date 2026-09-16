@@ -797,13 +797,13 @@ jobs:
         # because a test that silently no-ops when its tool is absent is the
         # dormancy this ceiling exists to catch. If this line ever goes red at
         # 100, that is the cause and the fix is one number.
-        # RE-COUNTED after the confirming round that stopped the blind branch
-        # prescribing a flag it cannot know exists: this suite is now 51
-        # collected (+1 in the advisory-channel net) = +52 over the 23217 base,
-        # so 23269. Counted by --collect-only AFTER the last test-adding edit,
-        # per the comment above -- which has now caught a stale number THREE
-        # times on this branch, every one from counting an edit too early.
+        # RE-COUNTED after the round that deleted the completeness claim and
+        # closed three silences: this suite is now 62 collected (+1 in the
+        # advisory-channel net) = +63 over the 23217 base, so 23280. Counted by
+        # --collect-only AFTER the last test-adding edit, per the comment above
+        # -- which has now caught a stale number FOUR times on this branch,
+        # every one from counting an edit too early.
         # The base is deliberately NOT re-derived from the merged tree: this is
         # a FLOOR, so a lagging base is conservative and can only under-catch,
         # never go falsely red.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23269
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23280

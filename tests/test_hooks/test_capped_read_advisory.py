@@ -318,8 +318,10 @@ def test_the_blind_advisory_claims_only_what_it_knows(tmp_path: Path) -> None:
     ctx = _context(_run("gh pr list " + "#" * 60_000, tmp_path))
     assert "could not be read" in ctx
     assert "may have missed" in ctx
-    # Still actionable -- but the action is a CHECK, never a prescribed flag.
-    assert "from the RESULT" in ctx
+    # Still actionable -- but the action is a CHECK, never a prescribed flag,
+    # and never "a short result proves it".
+    assert "reports a TOTAL" in ctx
+    assert "do NOT take a short result as proof" in ctx
 
 
 def test_a_blind_parse_is_reported_even_when_a_listing_was_found(
@@ -429,14 +431,33 @@ def test_search_names_the_api_ceiling_instead_of_a_bigger_limit(
     assert "narrow the query" in ctx
 
 
-def test_the_short_result_form_is_conditional_not_blanket(tmp_path: Path) -> None:
-    """A short read is the TRUE count -- five open PRs is five, not "at least 30".
+def test_a_short_read_is_never_claimed_as_proof_of_completeness(tmp_path: Path) -> None:
+    """THE PREMISE FIX. This test previously asserted the false claim by name.
 
-    The old text asserted the hedge unconditionally, which teaches a false one.
+    "A result SHORTER than the limit you passed is the TRUE count" was the hook's
+    central sentence and it is FALSE in at least three measured ways: a filtered
+    `gh run list` stops at the workflow-runs endpoint's 1,000 ceiling; `gh pr
+    list --search` / `issue list --search` route through GitHub search and stop
+    at 1,000; and any `gh search` that timed out reports `incomplete_results`
+    while returning fewer rows than asked for. Each is a SHORT read that is not
+    complete, so no amount of raising --limit establishes a count.
+
+    Three consecutive review rounds each found another family where it failed.
+    That is a premise defect, not a coverage gap, so the claim is DELETED rather
+    than carved out a fourth time. What the hook can still say is true: the cap
+    exists, and a SATURATED read is not a count.
+
+    Mutation (restore any "short result is the true count" wording) -> BITES.
     """
     ctx = _context(_run("gh pr list", tmp_path))
-    assert "exact" in ctx
-    assert "SHORTER than the limit" in ctx
+    # What it may still claim.
+    assert 'supports "at least 30", never "30"' in ctx
+    assert "MORE ROWS" in ctx
+    # What it must never claim again.
+    assert "does not establish COMPLETENESS" in ctx
+    assert "the server stopped early" in ctx
+    assert "TRUE count" not in ctx
+    assert "is exact" not in ctx
 
 
 def test_the_json_envelope_survives_the_worst_case_output(tmp_path: Path) -> None:
@@ -468,9 +489,12 @@ def test_the_json_envelope_survives_the_worst_case_output(tmp_path: Path) -> Non
     # and the key for it would have been recorded as delivered.
     assert ctx.count("[capped read]") > 1
     for block in ctx.split("\n\n"):
-        assert block.rstrip().endswith("ignore this."), (
-            f"a block was cut mid-value rather than dropped whole: ...{block[-80:]!r}"
+        # Every advisory block ends with its dismissal; the omission line is the
+        # one block that does not, and it is a whole line either way.
+        whole = block.rstrip().endswith("ignore this.") or block.rstrip().endswith(
+            "will describe it."
         )
+        assert whole, f"a block was cut mid-value rather than dropped whole: ...{block[-80:]!r}"
 
 
 # --------------------------------------------------------------------------
@@ -581,8 +605,106 @@ def test_the_blind_block_never_prescribes_a_flag_it_cannot_know_exists(
     assert "gh api" in ctx and "per_page" in ctx
     assert "gh search" in ctx and "1000" in ctx
     # The invariant that holds for all of them, and the one the reader gets.
-    assert "from the RESULT" in ctx
-    assert "never from a flag being absent" in ctx
+    assert "reports a TOTAL" in ctx
+    assert "do NOT take a short result as proof" in ctx
     # The three false sentences, pinned OUT by name.
     assert "no client-side limit is capping the read" not in ctx
     assert "every gh listing is capped" not in ctx
+
+
+# --------------------------------------------------------------------------
+# Round 4: fail LOUDLY. Three silences closed.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("group", ["pr", "issue", "run", "release", "repo", "gist", "cache"])
+def test_ghs_builtin_ls_alias_is_not_a_silent_miss(group: str, tmp_path: Path) -> None:
+    """gh ships `ls` as a BUILT-IN alias of `list`, carrying the same cap.
+
+    Distinct from the documented one-word user-alias gap: `gh pr ls` is two
+    words, so the walker resolves ("pr", "ls"), finds no row, and a command
+    people actually type goes silent at its real cap.
+
+    Mutation (drop the ls normalisation) -> BITES.
+    """
+    sys.path.insert(0, str(REPO / "scripts/hooks"))
+    from capped_read_advisory import _GH_DEFAULT_LIMITS
+
+    cap = _GH_DEFAULT_LIMITS[(group, "list")]
+    ctx = _context(_run(f"gh {group} ls", tmp_path, session=f"ls-{group}"))
+    assert str(cap) in ctx
+
+
+def test_ls_is_not_normalised_for_a_group_with_no_list_row(tmp_path: Path) -> None:
+    """The normalisation is scoped to table groups, so it invents no coverage.
+
+    `gh secret list` has no measured default and is deliberately silent; `gh
+    secret ls` must not become a fabricated hit. Mutation (normalise `ls`
+    unconditionally) -> still silent here, so this pins the SCOPE rather than
+    the rewrite: it is the control for the test above.
+    """
+    assert _run("gh secret ls", tmp_path) is None
+
+
+def test_listings_dropped_for_budget_are_announced(tmp_path: Path) -> None:
+    """A deferral across commands is invisible WITHIN one, so say it out loud.
+
+    Given caps for 9 of 13 listings with no cue that 4 went unmentioned, a reader
+    can state a count from one of the four and never know a block existed.
+
+    Mutation (drop the omission line) -> BITES.
+    """
+    sys.path.insert(0, str(REPO / "scripts/hooks"))
+    from capped_read_advisory import _GH_DEFAULT_LIMITS
+
+    command = "; ".join(f"gh {g} {s}" for g, s in _GH_DEFAULT_LIMITS) + ' --search "unbalanced'
+    ctx = _context(_run(command, tmp_path))
+    assert "NOT described above" in ctx
+    assert "output budget" in ctx
+    # And it tells the reader the omission is recoverable, not a loss.
+    assert "will describe it" in ctx
+
+
+def test_a_dropped_listing_is_not_recorded_as_advised(tmp_path: Path) -> None:
+    """The omission line's own claim has to be TRUE, not reassuring."""
+    sys.path.insert(0, str(REPO / "scripts/hooks"))
+    from capped_read_advisory import _GH_DEFAULT_LIMITS
+
+    targets = list(_GH_DEFAULT_LIMITS)
+    command = "; ".join(f"gh {g} {s}" for g, s in targets) + ' --search "unbalanced'
+    ctx = _context(_run(command, tmp_path))
+    dropped = [(g, s) for g, s in targets if f"`gh {g} {s}`" not in ctx]
+    assert dropped, "expected the budget to drop at least one listing"
+    for group, sub in dropped:
+        again = _context(_run(f"gh {group} {sub}", tmp_path))
+        assert f"`gh {group} {sub}`" in again, f"{group} {sub} was announced but IS lost"
+
+
+def test_a_crash_is_reported_on_stderr_not_swallowed(monkeypatch, capsys) -> None:
+    """Fail open, but LOUDLY.
+
+    A bare `contextlib.suppress(Exception)` made a crash indistinguishable from
+    "no gh listing here" -- the hook reproducing, in its own error path, the
+    silence it exists to break. stderr on an exit-0 PreToolUse hook is not shown
+    to the model, so this costs the session nothing and still lands in the log.
+
+    Driven through the REAL main() with a fault injected at its one entry point,
+    because the obvious trigger does not work: malformed stdin does NOT raise --
+    read_payload handles it and warns on its own, so a test built on that would
+    have gone red for the wrong reason while proving nothing about this contract.
+
+    Mutation (restore the bare suppress) -> BITES.
+    """
+    sys.path.insert(0, str(REPO / "scripts/hooks"))
+    import capped_read_advisory as cra
+
+    def _boom():
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr(cra, "read_payload", _boom)
+    rc = cra.main()
+    captured = capsys.readouterr()
+    assert rc == 0, "an advisory must never block, even on its own bug"
+    assert "capped_read_advisory:" in captured.err
+    assert "RuntimeError" in captured.err and "injected" in captured.err
+    assert captured.out.strip() == "", "a crash must not emit a half-built advisory"

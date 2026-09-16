@@ -279,7 +279,17 @@ def _listing_target(argv: list[str]) -> tuple[str, str] | None:
             break
     if len(words) < 2:
         return None
-    return words[0], words[1]
+    group, leaf = words[0], words[1]
+    # gh ships `ls` as a BUILT-IN alias of `list` for every non-search list family
+    # in the table, and those invocations carry the identical default cap. Without
+    # this the walker resolves ("pr", "ls"), finds no row, and `gh pr ls` -- a
+    # spelling people actually type -- goes SILENT. Distinct from the documented
+    # user-alias gap, which is one word and cannot resolve a (group, sub) pair at
+    # all. Scoped to groups already in the table, so it invents no coverage: if a
+    # group has no `list` row, normalising its `ls` changes nothing.
+    if leaf == "ls" and (group, "list") in _GH_DEFAULT_LIMITS:
+        leaf = "list"
+    return group, leaf
 
 
 def _state_path(sid: str):
@@ -388,27 +398,50 @@ def _advisory(group: str, sub: str, cap: int, *, redundant: bool) -> str:
         )
     if group == "search":
         escape = (
-            f"`gh search` cannot be widened past {_SEARCH_CEILING}: the API caps results "
-            f"there and gh REFUSES a larger flag outright (\"`--limit` must be between 1 "
-            f"and {_SEARCH_CEILING}\"). So exactly {_SEARCH_CEILING} back means INCOMPLETE "
-            f"with no larger limit available -- narrow the query (by date range, owner or "
-            f"repo) and sum the slices."
+            f" `gh search` additionally REFUSES a limit above {_SEARCH_CEILING} "
+            f"(\"`--limit` must be between 1 and {_SEARCH_CEILING}\"), so you cannot "
+            f"widen past it at all -- narrow the query (by date range, owner or repo) "
+            f"and sum the slices."
         )
     else:
         escape = (
-            "gh pages internally, so a limit you choose is honoured; --paginate is a "
+            " gh pages internally, so a limit you choose is honoured; --paginate is a "
             "`gh api` flag that these subcommands reject."
         )
     return (
         lead + "\n"
-        "If you will state a count or an absence from this result, re-run with an "
-        "explicit --limit ABOVE the number you expect. A result SHORTER than the limit "
-        "you passed is the TRUE count; a result of exactly the limit means there may be "
-        "more, so raise it and read again. " + escape + "\n"
-        f"Reading exactly {cap} back from THIS command therefore supports "
-        f'"at least {cap}", never "{cap}"; fewer than {cap} is exact.\n'
-        f"For a quick look, ignore this."
+        f'So reading exactly {cap} back supports "at least {cap}", never "{cap}".\n'
+        "Raising --limit gets you MORE ROWS. It does not establish COMPLETENESS, and "
+        "nothing in this command can: GitHub shortens a response on its own too -- "
+        "per-endpoint ceilings, the search ceiling, and a timed-out search that reports "
+        "`incomplete_results` -- so a SHORT read is equally consistent with "
+        '"that is all of them" and "the server stopped early".' + escape + "\n"
+        "If the exact count matters, take it from something that reports a TOTAL "
+        "(`gh api` search endpoints return `total_count`), not from the length of a "
+        "list you asked for.\n"
+        "For a quick look, ignore this."
     )
+
+def _omission_line(dropped: int) -> str:
+    """Said when the output budget cut listings out of THIS advisory.
+
+    Dropping a block is a deferral across commands -- an unrecorded key advises
+    again next time -- but the reader only sees THIS one, and a reader handed
+    caps for 9 of 13 listings with no cue that 4 went unmentioned can state a
+    count from one of the four and never know a block existed. So the omission is
+    LOUD. The sibling ``git_discard_guard._fit_whole_notes`` reserves room for
+    exactly this line, for exactly this reason.
+
+    Its length is bounded by construction -- one integer no larger than the key
+    space -- which is what lets the caller reserve room for it up front instead
+    of appending it afterwards and overrunning.
+    """
+    return (
+        f"[capped read] {dropped} more capped listing(s) in this command are NOT "
+        f"described above -- this advisory hit its output budget. They were not "
+        f"recorded as advised, so running one on its own will describe it."
+    )
+
 
 def _blind_advisory(blind: BlindSpot, *, found_any: bool) -> str:
     """Said when the parse could not see the whole command.
@@ -464,9 +497,10 @@ def _blind_advisory(blind: BlindSpot, *, found_any: bool) -> str:
         f"REFUSES a bigger one (`gh search`, {_SEARCH_CEILING}); and a single PAGE "
         f"for commands with no --limit at all (`gh api` returns 30 without "
         f"`per_page=` or `--paginate`).\n"
-        f"So if you will state a count or an absence from this output, establish it "
-        f"from the RESULT -- fewer rows than you asked for -- and never from a flag "
-        f"being absent.\n"
+        f"So if you will state a count or an absence from this output, do NOT take a "
+        f"short result as proof -- GitHub shortens responses on its own too -- and do "
+        f"not take a missing --limit flag as proof either. Get the count from something "
+        f"that reports a TOTAL.\n"
         f"For a quick look, ignore this."
     )
 
@@ -552,10 +586,18 @@ def _process(payload: dict) -> None:
     # anyway -- which is the same trim-mid-block defect one layer further in.
     # Caught by its own test rather than by reasoning. Bounded work: at most
     # len(_GH_DEFAULT_LIMITS) + 1 serialisations of a payload under the cap.
-    reserved = [blind_block[1]] if blind_block is not None else []
-
     def _fits(texts: list[str]) -> bool:
         return emit_cost(json.dumps(_envelope("\n\n".join(texts)))) <= DEFAULT_BUDGET
+
+    # Room is reserved for BOTH things that get appended after the loop: the
+    # blind block, and the omission line that has to be emittable the moment the
+    # loop drops anything. Reserving the omission line unconditionally costs at
+    # most one target block in the maximal case and makes "say what was dropped"
+    # a guarantee rather than a hope -- appending it afterwards could push the
+    # payload over budget and reintroduce the trim it exists to explain.
+    reserved = [_omission_line(len(pending))]
+    if blind_block is not None:
+        reserved.append(blind_block[1])
 
     kept: list[tuple[str, str]] = []
     for key, text in pending:
@@ -578,6 +620,14 @@ def _process(payload: dict) -> None:
     if not kept:
         return
 
+    # SAY WHAT WAS DROPPED, and keep it OUT of the recorded keys -- it describes
+    # an omission rather than advising a target, so recording it would spend a
+    # dedup slot on nothing.
+    blocks = [text for _key, text in kept]
+    dropped = len(pending) - sum(1 for key, _text in kept if key != _BLIND_KEY)
+    if dropped > 0:
+        blocks.append(_omission_line(dropped))
+
     # RECORD ONLY ON A DELIVERED EMIT. print_json_bounded returns whether it fit
     # WITHOUT trimming, and hook_output is explicit that a caller needing the
     # guarantee must check it. This caller needs it: an unchecked trim plus an
@@ -586,7 +636,7 @@ def _process(payload: dict) -> None:
     # happens, recording nothing means the next command re-advises rather than
     # the keys being spent on text nobody read.
     delivered = print_json_bounded(
-        _envelope("\n\n".join(text for _key, text in kept)),
+        _envelope("\n\n".join(blocks)),
         text_keys=("hookSpecificOutput.additionalContext",),
     )
     if delivered:
@@ -596,8 +646,20 @@ def _process(payload: dict) -> None:
 def main() -> int:
     # Advisory: fail OPEN, always exit 0. Never run_guard (that is fail-CLOSED,
     # for irreversible guards only, and its own docstring forbids advisory use).
-    with contextlib.suppress(Exception):
+    #
+    # FAIL OPEN, BUT LOUDLY. A bare suppress made a crash indistinguishable from
+    # "no gh listing here" -- which is the silence this whole hook exists to
+    # break, reproduced in the hook's own error path. The exception goes to
+    # stderr, which a PreToolUse hook that exits 0 does NOT show the model, so it
+    # costs the session nothing and still lands in the harness log where a human
+    # debugging a quiet hook will find it.
+    try:
         _process(read_payload())
+    except Exception as exc:  # noqa: BLE001 -- advisory: never block on our own bug
+        print(
+            f"capped_read_advisory: suppressed {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
     return 0
 
 
