@@ -60,6 +60,19 @@ def test_agent_tool_guidance_wrapped(tmp_path: Path) -> None:
     _assert_wrapped(out, "PreToolUse")
 
 
+def test_capped_read_advisory_wrapped(tmp_path: Path) -> None:
+    out = _run(
+        "scripts/hooks/capped_read_advisory.py",
+        {
+            "tool_name": "Bash",
+            "tool_input": {"command": "gh pr list --state open"},
+            "session_id": "s5",
+        },
+        tmp_path,
+    )
+    _assert_wrapped(out, "PreToolUse")
+
+
 def test_stealth_skill_nudge_wrapped(tmp_path: Path) -> None:
     out = _run(
         "scripts/hooks/stealth_skill_nudge.py",

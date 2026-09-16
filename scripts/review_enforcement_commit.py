@@ -23,14 +23,51 @@ from pathlib import Path
 # The shared hook-input helper lives in scripts/hooks/; this script runs from
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks"))
-from hook_input import field, read_payload, run_guard  # noqa: E402
-from shell_parse import (  # noqa: E402
-    analyze_checked,
-    commit_skips_hooks,
-    git_subcommand,
-    has_trailing_override,
-    split_segments,
-)
+try:
+    from hook_input import degraded_exit, field, read_payload, run_guard  # noqa: E402
+except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must block.
+    if __name__ != "__main__":
+        raise
+    # Reverse version skew: this guard may be newer than hook_input.py. Nothing
+    # imported from that older helper can recover us, so fail closed locally. Do
+    # not render the exception — even __str__ can raise — and use os._exit so a
+    # broken diagnostic stream cannot replace exit 2 during interpreter shutdown.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (review_enforcement_commit): shared hook_input is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
+
+# DEGRADED-path mention set, defined ABOVE the guarded import so it survives that
+# import failing. Same single verb as `_COMMIT_PATTERN` further down; kept separate
+# because sharing would put the constant after the import it has to outlive. The
+# scope is broad on purpose — every gate in this file (unreviewed commit, commit to
+# main, --no-verify) hangs off a commit, so a mention of one is the whole trigger.
+_DEGRADED_GATED = r"\bcommit\b"
+
+try:
+    from shell_parse import (  # noqa: E402
+        analyze_checked,
+        commit_skips_hooks,
+        git_subcommand,
+        has_trailing_override,
+        split_segments,
+    )
+except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
+    if __name__ != "__main__":
+        raise
+    # `review-override` is NOT honoured on this path. An earlier version honoured it,
+    # on the reasoning that refusing a recoverable local commit would strand an operator
+    # mid-repair — but the check was a bare substring, and MEASURED on a poisoned tree
+    # it waived this gate from a sigil sitting inside a QUOTED STRING in an unrelated
+    # segment. Binding a sigil to the segment it waives needs the shared parser, whose
+    # absence is why this path runs at all. Nothing about a broken sibling module
+    # requires a commit to repair, so the operator is not in fact stranded.
+    degraded_exit("review_enforcement_commit", gated=_DEGRADED_GATED, exc=_exc)
 
 try:  # noqa: E402
     import discarded_write

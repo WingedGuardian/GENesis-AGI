@@ -24,15 +24,27 @@ matches ``print`` and ``sys.stdout.write``/``writelines``; it does NOT catch
 inherits stdout — nor output produced by a helper module the hook imports, since
 only the hook's own source is parsed.
 
-AND AN EXEMPTION SKIPS SCANNING ENTIRELY — measured by adding an unbounded
-``sys.stdout.write`` to an exempted hook and watching this suite stay green. That
-is the design, not an oversight: the gate's job is to force the claim to be MADE
-and STATED next to the code, not to re-verify it forever. It is also the
-weakness to know about, because it is how an exemption rots. Two consequences
-follow. A row here is only as good as its last read, so an exemption is a review
-surface, not a settled fact. And the table stays SMALL on purpose — every row is
-a place the gate stops looking, which is why routing a hook through the writer
-is always preferred over adding it here.
+AN EXEMPTION STILL SKIPS THE PRINT SCAN — measured by adding an unbounded
+``sys.stdout.write`` to an exempted hook and watching that scan stay green. What
+changed is that every row now carries a CHECKER re-running a NECESSARY CONDITION
+of its claim against the current file (see the block at the bottom), so a row
+cannot drift silently from the code while nobody re-reads it.
+
+A necessary condition, NOT a verification, and the difference is the whole
+honesty of this block. A checker establishes that a constant or a pattern still
+EXISTS; none of them proves it still BINDS the output. Cross-model review made
+that concrete on all four: a structural clamp can be named and dead while the
+raw config value flows past it; declared ceilings can multiply under the cap
+while nothing applies them to a line; a shell file can contain no ``$`` and
+still pipe bulk output to stdout. Proving the binding needs dataflow analysis,
+pathological inputs driven through the real entry point, or a synthetic process
+ancestry — weighed and declined as a test suite per row for five small files.
+
+So the table still stays SMALL on purpose — every row is a place the print scan
+stops looking — and ROUTING a hook through the writer is strictly preferred over
+adding a row, because routing enforces the bound at the write instead of
+asserting anything about it. ``scripts/contribution_offer_hook.py`` was a row
+here and is not any more, for exactly that reason.
 
 SCOPE. Only ``SessionStart``, ``UserPromptSubmit`` and ``UserPromptExpansion``
 put a hook's BARE STDOUT in front of the model. ``_BARE_STDOUT_EVENTS`` is
@@ -58,7 +70,9 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -89,20 +103,106 @@ def _load_bare_stdout_events() -> tuple[str, ...]:
     notice a fourth event. So the list now genuinely lives in one file.
     """
     src = (_REPO / "scripts" / "hooks" / "hook_output.py").read_text(encoding="utf-8")
-    for node in ast.walk(ast.parse(src)):
-        if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "BARE_STDOUT_EVENTS"
-            for t in node.targets
+    # Module body, not ast.walk, for the reason spelled out in _int_constants:
+    # walking would accept a same-named local left behind in a function after the
+    # real declaration was deleted, and derive the allowlist -- the one whose
+    # whole guarantee is that an unlisted event fails by construction -- from it.
+    #
+    # FIRST module-level declaration wins, where _int_constants lets the LAST one
+    # win. The asymmetry is deliberate rather than overlooked: accumulating a dict
+    # has no first, and here an early return is what keeps a re-declaration from
+    # quietly WIDENING the derived set. It does mean a later re-declaration, an
+    # augmented assignment, or a conditional re-assign is not seen -- all of which
+    # scope the gate NARROWER than the writer's real constant, and none of which
+    # the containment test downstream can notice, since a subset satisfies it.
+    # Named here because that is a real hole, pre-dating this reader.
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            # AnnAssign for genuine parity with _int_constants, which the comment
+            # above now sends the reader to. Without it an annotated declaration
+            # raises "no longer declares BARE_STDOUT_EVENTS" -- fail-loud, but the
+            # message is FALSE, which is the failure mode this module exists over.
+            targets = [node.target]
+        else:
+            continue
+        if not any(
+            isinstance(t, ast.Name) and t.id == "BARE_STDOUT_EVENTS" for t in targets
         ):
-            return tuple(
-                e.value
-                for e in node.value.elts
-                if isinstance(e, ast.Constant) and isinstance(e.value, str)
+            continue
+        value = node.value
+        if not isinstance(value, (ast.Tuple, ast.List)):
+            # A name, a call, a concatenation: this reader cannot derive the set
+            # from it, and must say THAT rather than raise AttributeError on
+            # `.elts` or claim the declaration is gone.
+            raise AssertionError(
+                "hook_output.py declares BARE_STDOUT_EVENTS as something other "
+                f"than a tuple/list literal ({type(value).__name__}); this reader "
+                "derives the gated set from the literal and cannot follow that"
             )
+        return tuple(
+            e.value
+            for e in value.elts
+            if isinstance(e, ast.Constant) and isinstance(e.value, str)
+        )
     raise AssertionError("hook_output.py no longer declares BARE_STDOUT_EVENTS")
 
 
 _BARE_STDOUT_EVENTS = _load_bare_stdout_events()
+
+
+def _int_constants(path: Path) -> dict[str, int]:
+    """Module-level ``NAME = <int>`` assignments in ``path``, read by AST.
+
+    Shared because the comprehension was written out twice and the two copies
+    are exactly the kind that drift apart — one gains a case the other does not.
+    ``ast.AnnAssign`` is handled as well as ``ast.Assign``: tests/test_hooks/
+    test_shell_parse.py records a version of this that handled only the first
+    and silently missed an annotated constant, which reads as "the constant is
+    gone" rather than as a gap in the reader.
+
+    MODULE SCOPE IS THE CONTRACT, so this iterates the parsed module's own body
+    rather than ``ast.walk``. Walking descends into function and class bodies,
+    where an ordinary local of the same name shadows the real constant — and the
+    direction that matters is the silent one: delete the module constant, leave a
+    nested literal behind, and a caller asserting a ceiling still reads a number
+    and still passes, with the ceiling it names gone. Measured on the two files
+    read here: walking additionally collected ``matches``, ``named`` and
+    ``total``, all function locals, and none of them a constant of any kind.
+
+    IT IS A TRADE, NOT A PURE WIN, and saying otherwise here would be this file's
+    own recurring defect wearing the opposite polarity. Narrowing gives up the one
+    case the wide scan caught: a ``global`` rebind inside a function, where the
+    module literal stays honest and the runtime ceiling is something else.
+    MEASURED — module ``_MAX_NUDGE_LINE = 400`` left in place, a ``global`` rebind
+    to 50_000 added inside a function: ``ast.walk`` went RED, this reader stays
+    GREEN, with the hook's real ceiling 125x over the cap. Taken deliberately on
+    three grounds. The wide scan caught it BY ACCIDENT and only in one direction —
+    a rebind to a SMALLER number passes either way. A leftover local after a
+    deleted constant is the common refactor; a ``global`` rebind of a ceiling is
+    not. And the caller most exposed to it already declares itself a necessary,
+    not sufficient, condition. Proving the ceiling actually binds needs dataflow,
+    which is the row's standing open alternative rather than this reader's job.
+
+    By AST, never by import: these constants are version-volatile by design, and
+    importing the hook would execute it.
+    """
+    consts: dict[str, int] = {}
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        else:
+            continue
+        value = node.value
+        if not (isinstance(value, ast.Constant) and isinstance(value.value, int)):
+            continue
+        for t in targets:
+            if isinstance(t, ast.Name):
+                consts[t.id] = value.value
+    return consts
 
 #: Hooks whose model-facing output CANNOT reach the cap by construction, so how
 #: they print does not matter.
@@ -152,10 +252,11 @@ _STRUCTURALLY_BOUNDED = {
         "nowhere. Identifiers are emitted whole or the line degrades to a form "
         "carrying none"
     ),
-    "scripts/contribution_offer_hook.py": (
-        "one fixed f-string; sha[:12] and subject[:200] (:63) are its only "
-        "inputs, both sliced in code"
-    ),
+    # scripts/contribution_offer_hook.py was here and is NOT any more: it now
+    # routes through hook_output.print_bounded, so the bound is enforced at the
+    # write rather than asserted about it, and the gate scans the file again.
+    # That is the preferred direction for every row below — an exemption is a
+    # place this gate stops looking, so removing one beats testing one.
     "scripts/hooks/session_activity_touch.sh": (
         "scripts/hooks/session_activity_touch.sh writes 0 bytes to fd 1 — it "
         "touches a marker file and exits; its 2 `cat` calls are command "
@@ -696,15 +797,7 @@ def test_the_skill_exemption_bounds_the_line_not_the_identifiers() -> None:
         encoding="utf-8"
     )
     tree = _ast.parse(src)
-    consts = {
-        t.id: n.value.value
-        for n in _ast.walk(tree)
-        if isinstance(n, _ast.Assign)
-        and isinstance(n.value, _ast.Constant)
-        and isinstance(n.value.value, int)
-        for t in n.targets
-        if isinstance(t, _ast.Name)
-    }
+    consts = _int_constants(_REPO / "scripts" / "hooks" / "skill_injection_hook.py")
     per_line = consts.get("_MAX_NUDGE_LINE")
     nudges = consts.get("_MAX_CATALOG_NUDGES")
     assert per_line, "the per-line ceiling is gone"
@@ -723,18 +816,7 @@ def test_the_skill_exemption_bounds_the_line_not_the_identifiers() -> None:
     # Read the cap from its single home rather than restating it, and by AST
     # rather than by import: this file already avoids mutating sys.path where it
     # can, and the constant is version-volatile by design.
-    cap_src = (_REPO / "scripts" / "hooks" / "hook_output.py").read_text(
-        encoding="utf-8"
-    )
-    hook_caps = {
-        t.id: n.value.value
-        for n in _ast.walk(_ast.parse(cap_src))
-        if isinstance(n, _ast.Assign)
-        and isinstance(n.value, _ast.Constant)
-        and isinstance(n.value.value, int)
-        for t in n.targets
-        if isinstance(t, _ast.Name)
-    }
+    hook_caps = _int_constants(_REPO / "scripts" / "hooks" / "hook_output.py")
     HOOK_STDOUT_CAP = hook_caps.get("HOOK_STDOUT_CAP")
     assert HOOK_STDOUT_CAP, "hook_output.py no longer defines HOOK_STDOUT_CAP"
 
@@ -790,3 +872,247 @@ def test_the_skill_exemption_bounds_the_line_not_the_identifiers() -> None:
                 "nudge state must be keyed on the whole name; a sliced key can "
                 "never match the unsliced name the candidate filter tests"
             )
+
+
+# ---------------------------------------------------------------------------
+# Every structural exemption is MACHINE-CHECKED
+# ---------------------------------------------------------------------------
+# An exemption makes this gate skip the file entirely — that is the design, and
+# it is also how a row rots: the claim is prose, nobody re-reads it, and the code
+# drifts out from under it. Before this block, 3 of 6 rows had a test that read
+# the bound they claimed; the other 3 were prose alone.
+#
+# Each checker re-derives its row's claim from the CURRENT file. A row with no
+# checker fails `test_every_structural_exemption_has_a_checker`, so the pairing
+# is enforced rather than remembered.
+#
+# WHAT A CHECKER IS, AND WHAT IT IS NOT. Every one below tests a NECESSARY
+# condition for its row's claim, never a sufficient one, and each is named for
+# the condition it actually tests rather than for the row it serves. That
+# distinction is not pedantry — the first revision named them for the rows
+# (`_check_cbm_session_reminder`), which reads as "this row is verified", and
+# cross-model review returned four findings saying exactly that: the checks
+# establish that a constant or a pattern EXISTS, not that it BINDS the output.
+# All four were correct. A structural clamp can be named and dead; constants can
+# multiply under the cap and no longer constrain any line; a file can contain no
+# `$` and still pipe a large command into stdout.
+#
+# Proving the binding needs real machinery — assignment-to-call dataflow,
+# pathological inputs driven through the hook, a synthetic process ancestry.
+# That was weighed and declined: it is a test suite per row for five small
+# files. So these stay cheap, and the NAMES and docstrings carry the honest
+# scope instead. Each one below says what it cannot catch.
+#
+# Two dicts rather than one `path -> (reason, checker)` mapping, deliberately:
+# the reason table sits at the top of this file where it is read, and the
+# checkers need helpers defined further down. Keeping them separate and
+# asserting the key sets are EQUAL gives the same guarantee — an unpaired entry
+# on either side fails — without hoisting 120 lines of checker above the table.
+
+
+def _check_surfacing_clamp_still_names_the_constant(tmp_path: Path) -> None:
+    """A `min()` naming the cap CONSTANT still exists in each surfacing hook.
+
+    NECESSARY, NOT SUFFICIENT. This does not prove the clamp's RESULT is what
+    reaches `select_to_surface`: a regression passing `knob_int(cfg,
+    "max_surface")` straight through, while leaving the `min(...)` assignment
+    dead above it, keeps this green — and an overlay of `max_surface: 5000`
+    would then restore the oversized output the row exists to prevent. Catching
+    that needs assignment-to-call dataflow, or driving the hook with an over-cap
+    config; both were weighed and declined as disproportionate for this row.
+
+    What it DOES catch is the regression that actually happened here once: the
+    clamp reverting to a bare literal while a comment kept naming the constant.
+    """
+    for script, const_name in (
+        ("surface_pr_updates.py", "MAX_SURFACE_CAP"),
+        ("surface_open_prs.py", "OPEN_PR_MAX_SURFACE_CAP"),
+    ):
+        tree = ast.parse((_REPO / "scripts" / script).read_text(encoding="utf-8"))
+        clamps = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "min"
+        ]
+        assert clamps, f"{script} no longer clamps max_surface at all"
+        assert [
+            c
+            for c in clamps
+            if any(isinstance(a, ast.Attribute) and a.attr == const_name for a in c.args)
+        ], f"{script} min() no longer names {const_name}"
+
+
+def _check_skill_constants_still_multiply_under_the_cap(tmp_path: Path) -> None:
+    """The declared ceilings still multiply to less than the harness cap.
+
+    NECESSARY, NOT SUFFICIENT. It does not prove `skill_injection_hook.py` still
+    USES `_MAX_NUDGE_LINE` to constrain what it emits: a refactor dropping the
+    `len(line) > _MAX_NUDGE_LINE` degradation branches while leaving the
+    constants in place passes this — and passes the print scan too, since the
+    hook is exempt — after which user-authored catalog names and paths can push
+    the line over the cap again. Proving otherwise means driving pathological
+    catalog entries through the real `main()`, which the row's own history shows
+    is possible (~46,000 combinations were brute-forced once) and which is more
+    machinery than this cheap re-check is meant to be.
+
+    What it DOES catch is the regression its own row records: an audit raising
+    the per-line ceiling 125x with the whole suite still green.
+    """
+    consts = _int_constants(_REPO / "scripts" / "hooks" / "skill_injection_hook.py")
+    per_line = consts.get("_MAX_NUDGE_LINE")
+    nudges = consts.get("_MAX_CATALOG_NUDGES")
+    cap = _int_constants(_REPO / "scripts" / "hooks" / "hook_output.py").get(
+        "HOOK_STDOUT_CAP"
+    )
+    assert per_line and nudges and cap, "a ceiling this row depends on is gone"
+    assert per_line * nudges < cap, (
+        f"{nudges} nudges x {per_line} chars = {per_line * nudges} is no longer "
+        f"under the {cap}-char cap this row claims it cannot reach"
+    )
+
+
+def _check_cbm_reminder_is_small_and_interpolates_nothing(tmp_path: Path) -> None:
+    """Size, no `$` anywhere, and no UNQUOTED heredoc.
+
+    Three checks rather than one because any single one is satisfiable by a file
+    that breaks the others — an unquoted delimiter re-enables expansion even
+    with no `$` present today.
+
+    NECESSARY, NOT SUFFICIENT, and this is the row where the gap is widest: none
+    of the three establishes that the quoted heredoc is the ONLY thing writing
+    to stdout. A perfectly ordinary added line — a pipeline producing bulk
+    output — carries no `$`, adds no heredoc, keeps the file under 1 KB, and
+    still blows past the cap. Closing that means executing the script and
+    measuring fd 1, or structurally proving the heredoc is the sole output
+    command; both were weighed and declined here.
+    """
+    path = _REPO / ".claude" / "hooks" / "cbm-session-reminder.sh"
+    src = path.read_text(encoding="utf-8")
+    assert len(src) <= 1024, (
+        f"{path.name} is {len(src)} bytes; the row claims its SIZE is the output "
+        "ceiling, so a bigger file silently raises the bound"
+    )
+    assert "$" not in src, (
+        f"{path.name} now contains '$' — the row claims zero interpolation, so "
+        "its size is no longer an output ceiling"
+    )
+    unquoted = re.findall(r"<<-?\s*([A-Za-z_][A-Za-z0-9_]*)\s*$", src, re.MULTILINE)
+    assert not unquoted, (
+        f"{path.name} has an UNQUOTED heredoc ({unquoted}) — expansion is back on "
+        "even though no '$' is present today"
+    )
+
+
+def _check_touch_script_has_no_output_command_and_is_silent_when_run(
+    tmp_path: Path,
+) -> None:
+    """Two passes, because running it ALONE is environment-dependent.
+
+    The run was the whole checker first, and review caught why that is not
+    enough: the script walks its ancestry for a process named `claude` and exits
+    if it finds none. Under pytest on a developer box inside a CC session that
+    ancestor EXISTS, so the marker branch runs and an `echo` added there is
+    caught. On a CI runner it does not, the branch never executes, and the same
+    `echo` sails through while the checker reports empty stdout — passing for a
+    reason that has nothing to do with the claim. MEASURED here: an `echo`
+    injected into that branch failed this checker locally, which is precisely
+    what hid the problem.
+
+    So the static pass carries the part that must hold everywhere, and the run
+    keeps catching anything at the top level that executes unconditionally.
+
+    NECESSARY, NOT SUFFICIENT. The static pass is a denylist over shell syntax
+    and cannot be complete; a controlled `claude`-named ancestor, or an
+    injectable proc root, is what would actually exercise the model-facing path.
+
+    Safe to run: the script reads /proc and its only writes are `mkdir -p` and
+    `touch` under $HOME, so HOME=tmp_path sandboxes every side effect — read,
+    not assumed.
+    """
+    path = _REPO / "scripts" / "hooks" / "session_activity_touch.sh"
+    src = path.read_text(encoding="utf-8")
+
+    # Pass 1 — STATIC, so it holds on a CI runner with no `claude` ancestor.
+    # Commands that write to fd 1 unless redirected. `cat` is excluded: this
+    # script uses it only inside `$(...)` substitutions, which capture rather
+    # than emit, and banning it outright would flag correct code.
+    for line in src.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        for cmd in ("echo ", "printf ", "echo\t", "printf\t"):
+            assert cmd not in stripped or ">" in stripped, (
+                f"{path.name} has an unredirected `{cmd.strip()}` ({stripped[:80]!r}). "
+                "The row claims zero bytes to fd 1, and this line may execute on a "
+                "path the run below does not reach."
+            )
+
+    # Pass 2 — RUN it. Catches anything unconditional that the denylist missed.
+    proc = subprocess.run(
+        ["bash", str(path)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "HOME": str(tmp_path)},
+        timeout=30,
+    )
+    assert proc.returncode == 0, (
+        f"{path.name} exited {proc.returncode}; its contract is to never fail a "
+        f"session. stderr: {proc.stderr[:200]}"
+    )
+    assert proc.stdout == "", (
+        f"{path.name} wrote {len(proc.stdout)} bytes to stdout, but its exemption "
+        f"claims zero: {proc.stdout[:200]!r}"
+    )
+
+
+#: path -> the checker re-running a NECESSARY condition of that row's claim.
+#: Key set must equal _STRUCTURALLY_BOUNDED's; see the test below. The checkers
+#: are named for what they TEST, not for the row they serve, so that reading
+#: this mapping does not leave the impression each row is verified — none of
+#: them proves its constant or pattern actually BINDS the output.
+_EXEMPTION_CHECKERS = {
+    "scripts/surface_pr_updates.py": _check_surfacing_clamp_still_names_the_constant,
+    "scripts/surface_open_prs.py": _check_surfacing_clamp_still_names_the_constant,
+    ".claude/hooks/cbm-session-reminder.sh": (
+        _check_cbm_reminder_is_small_and_interpolates_nothing
+    ),
+    "scripts/hooks/skill_injection_hook.py": (
+        _check_skill_constants_still_multiply_under_the_cap
+    ),
+    "scripts/hooks/session_activity_touch.sh": (
+        _check_touch_script_has_no_output_command_and_is_silent_when_run
+    ),
+}
+
+
+def test_every_structural_exemption_has_a_checker() -> None:
+    """Bidirectional, so neither side can grow alone.
+
+    A new exemption with no checker is a prose row — the thing this block
+    exists to end. A checker whose row is gone is dead weight that reads as
+    coverage.
+    """
+    unchecked = sorted(set(_STRUCTURALLY_BOUNDED) - set(_EXEMPTION_CHECKERS))
+    orphaned = sorted(set(_EXEMPTION_CHECKERS) - set(_STRUCTURALLY_BOUNDED))
+    assert not unchecked, (
+        f"structural exemptions with no checker: {unchecked}. Add one that "
+        "re-derives the claim from the file, or route the hook through "
+        "hook_output and drop the row (preferred)."
+    )
+    assert not orphaned, f"checkers for rows that no longer exist: {orphaned}"
+
+
+@pytest.mark.parametrize("path", sorted(_EXEMPTION_CHECKERS))
+def test_a_necessary_condition_of_each_exemption_still_holds(
+    path: str, tmp_path: Path
+) -> None:
+    """Re-run a NECESSARY condition of each row's claim, against the CURRENT file.
+
+    Named for what it does. The first spelling was
+    `test_the_structural_exemption_still_holds`, which claims far more than any
+    of these checkers delivers — see the block header for the four ways a row can
+    be false while its checker is green.
+    """
+    _EXEMPTION_CHECKERS[path](tmp_path)
