@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import subprocess
 import sys
 from pathlib import Path
 
@@ -1032,3 +1033,96 @@ class TestUvCarrierResolution:
         front-end. Adding tool run must not weaken that."""
         assert self._exe("uv rm -rf /") == "uv"
         assert self._exe("uv pip install requests") == "uv"
+
+
+# ── `-c` operand resolution ─────────────────────────────────────────────────
+# `_nested_script` used to return the token immediately after the `-c` bundle.
+# That is the script only when nothing sits between, and something frequently
+# does: an end-of-options `--`, a further short option, or the VALUE of an
+# option elsewhere in the bundle. The parser then handed back `--`/`-e`/
+# `pipefail` as the "script", the real command was never parsed, and the guards
+# that decide from these segments had nothing to object to.
+#
+# MEASURED before the fix, end to end through the real hooks: `git_push_guard`
+# returned exit 0 (ALLOW) for `bash -c -- 'git push --force origin main'` while
+# returning 2 (BLOCK) for the same command without the `--`. A real shell runs
+# both.
+
+#: Each entry is a shape a REAL SHELL EXECUTES. That is the part that makes it a
+#: bypass rather than a curiosity, and it is asserted below rather than assumed —
+#: a shape bash refuses is not a hole, and treating one as such would be a test
+#: that fails for the wrong reason the day bash changes.
+_EXECUTING_C_SHAPES = [
+    "bash -c 'PAYLOAD'",
+    "bash -c -- 'PAYLOAD'",
+    "bash -c -e 'PAYLOAD'",
+    "bash -c -x 'PAYLOAD'",
+    "bash -c -e -x 'PAYLOAD'",
+    "bash -co pipefail 'PAYLOAD'",
+    "bash -cxo pipefail 'PAYLOAD'",
+    "bash -oxc pipefail 'PAYLOAD'",
+    "bash -c -o pipefail 'PAYLOAD'",
+    "sh -c -- 'PAYLOAD'",
+]
+
+
+@pytest.mark.parametrize("template", _EXECUTING_C_SHAPES)
+def test_a_command_the_shell_really_runs_is_not_invisible(template):
+    """The bypass, closed. For every shape a real shell executes, the embedded
+    command must be VISIBLE to the parser — otherwise every guard downstream
+    decides from a segment list that does not contain it."""
+    # Guard-the-guard, and the reason this suite is trustworthy: prove the shell
+    # ACTUALLY runs the payload. An output-distinct marker, not an echoed word —
+    # bash's `invalid option name` diagnostic quotes the script text back, so a
+    # substring check on a word reports a false positive. This exact mistake
+    # turned a real finding into a non-finding once already.
+    probe = subprocess.run(
+        ["bash", "-c", template.replace("PAYLOAD", "echo $((6*7))")],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert probe.stdout.strip().splitlines()[:1] == ["42"], (
+        f"the shell does not execute {template!r}, so this fixture no longer "
+        f"describes a bypass: {probe.stdout!r} {probe.stderr[:200]!r}"
+    )
+
+    command = template.replace("PAYLOAD", "git push origin main")
+    segments, _blind = sp.analyze_checked(command)
+    assert "git" in [seg.exe for seg in segments], (
+        f"{command!r} hides its command from the parser — a real shell runs it, "
+        "so every guard that searches these segments is blind to it"
+    )
+
+
+def test_an_option_shaped_token_is_not_mistaken_for_the_script():
+    """The unit beneath the parametrised cases above, so a regression localises.
+
+    `--` ends option processing; the script is the OPERAND after it, never the
+    marker itself."""
+    assert sp._nested_script(
+        ["bash", "-c", "--", "git push origin main"], "bash"
+    ) == "git push origin main"
+    assert sp._nested_script(
+        ["bash", "-c", "-e", "git push origin main"], "bash"
+    ) == "git push origin main"
+    # An `o`/`O` ANYWHERE in the bundle consumes the next token as its value,
+    # not only when adjacent to `c` — which is what let `-cxo pipefail` read
+    # `pipefail` as the script.
+    assert sp._nested_script(
+        ["bash", "-cxo", "pipefail", "git push origin main"], "bash"
+    ) == "git push origin main"
+    assert sp._nested_script(
+        ["bash", "-oxc", "pipefail", "git push origin main"], "bash"
+    ) == "git push origin main"
+
+
+def test_a_command_with_no_script_still_yields_nothing():
+    """The control that moves. Without it, a helper that returned the last token
+    unconditionally would satisfy every assertion above while inventing scripts
+    out of ordinary arguments."""
+    assert sp._nested_script(["bash", "-c"], "bash") == ""
+    assert sp._nested_script(["bash", "-c", "--"], "bash") == ""
+    assert sp._nested_script(["bash", "file.sh"], "bash") == ""
+    # No `-c` at all: an interpreter running a FILE takes no inline script.
+    assert sp._nested_script(["bash", "-x", "file.sh"], "bash") == ""

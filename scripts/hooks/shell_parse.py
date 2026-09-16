@@ -2698,29 +2698,63 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
         if "c" not in options:
             continue
 
-        pos = tok.find("c")
-
-        # `-co` / `-Oc`: `o` / `O` consumes the next token as its value,
-        # so the script is the token after that value.
-        value_taking = (
-            (pos + 1 < len(tok) and tok[pos + 1] in {"o", "O"})
-            or (pos > 0 and tok[pos - 1] in {"o", "O"})
-        )
+        # `o`/`O` ANYWHERE in the bundle consumes the next token as its value,
+        # so the script comes after it. Position-independent on purpose: the
+        # previous test only looked one character either side of `c`, so
+        # `-cxo pipefail` and `-oxc pipefail` fell through to the no-value path
+        # and `pipefail` was read as the script. MEASURED: bash runs both.
+        value_taking = bool(set(options) & {"o", "O"})
 
         if value_taking:
             option_letters = set(options) - {"o", "O"}
             if not option_letters <= allowed:
                 continue
-            if i + 2 < len(argv):
-                return argv[i + 2]
+            start = i + 2  # past the option's value
+        else:
+            if not set(options) <= allowed:
+                continue
+            start = i + 1
+
+        script = _first_operand(argv, start, allowed)
+        if script:
+            return script
+
+    return ""
+
+
+def _first_operand(argv: list[str], start: int, allowed: frozenset[str]) -> str:
+    """The first OPERAND at or after ``start`` — the script, not an option.
+
+    WHY THIS EXISTS. ``_nested_script`` used to return ``argv[start]`` directly,
+    which is only the script when nothing else sits between. It frequently does:
+    ``bash -c -- 'git push …'`` and ``bash -c -e 'git push …'`` both put an
+    option-shaped token there, so the parser handed back ``--`` (or ``-e``) as
+    the script, the real command was never parsed, and the guards that decide
+    from these segments saw nothing to object to. MEASURED before this change:
+    those commands returned exit 0 from git_push_guard, git_discard_guard and
+    full_suite_guard while the same command without the extra token returned 2,
+    and a real shell executes the payload either way.
+
+    Skipping is deliberately GENEROUS rather than exact. Every token we step
+    over is one the parser would otherwise have mistaken for the script, so the
+    failure direction of over-skipping is "we find the real script and the guard
+    sees MORE", while the failure direction of under-skipping is a guard that
+    sees nothing. Only the second one is a bypass.
+
+    A bundle containing ``o``/``O`` consumes the following token as its value,
+    so both are stepped over together.
+    """
+    j = start
+    while j < len(argv):
+        tok = argv[j]
+        if tok == "--":
+            j += 1
             continue
-
-        if not set(options) <= allowed:
+        if tok.startswith("-") and len(tok) > 1:
+            letters = set(tok[1:])
+            j += 2 if letters & {"o", "O"} else 1
             continue
-
-        if i + 1 < len(argv):
-            return argv[i + 1]
-
+        return tok
     return ""
 
 # ── git-specific helpers ────────────────────────────────────────────────
