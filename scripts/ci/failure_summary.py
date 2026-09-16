@@ -70,16 +70,54 @@ def _first_line(text: str | None) -> str:
     return ""
 
 
+def _active_test() -> str:
+    """The node id of the last test to START, or "" if unavailable.
+
+    Written by the conftest hook before each test and fsynced, so it survives a
+    process death that never reaches pytest's own reporting. Best-effort by
+    construction: every failure to read it returns "" and the caller simply says
+    less, because a narrator that raises while explaining a failure is worse
+    than one that is vague.
+    """
+    import os
+
+    path = os.environ.get("GENESIS_ACTIVE_TEST_FILE", "")
+    if not path:
+        return ""
+    try:
+        name = Path(path).read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    # Bounded: this lands in a rendered summary, and an unbounded value from a
+    # file is not something to paste in whole.
+    return name.splitlines()[0][:200] if name else ""
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(f"{_NOTICE} usage: failure_summary.py <junit.xml>")
         return 0
     report = Path(argv[1])
     if not report.is_file():
+        # A HARD CRASH inside a running test -- a segfault, an OOM kill,
+        # `os._exit` -- never writes the report, and dropping `-v` means the log
+        # no longer names the test that was running either. So the name comes
+        # from a channel that survives the crash: the active-test breadcrumb the
+        # conftest rewrites before each test and fsyncs. Without it this notice
+        # can only say "something died", which is exactly the diagnosability the
+        # verbosity used to buy.
+        active = _active_test()
+        where = (
+            f" The last test to START was {active}, so the crash is at or "
+            "immediately after it."
+            if active
+            else ""
+        )
         print(
             f"{_NOTICE} no report at {report} — pytest died before writing one "
-            "(collection crash, runner kill). The failure is in the step log "
-            "BEFORE the test output starts, which truncation does not reach."
+            "(collection crash, runner kill, or a hard crash inside a test)."
+            f"{where} The failure is in the step log BEFORE the test output "
+            "starts, which truncation does not reach."
         )
         return 0
     try:
@@ -90,6 +128,17 @@ def main(argv: list[str]) -> int:
         root = ElementTree.parse(report).getroot()  # noqa: S314
     except ElementTree.ParseError as exc:
         print(f"{_NOTICE} unparseable report at {report}: {exc}")
+        return 0
+    except OSError as exc:
+        # A SEPARATE handler, and a separate word, because these are different
+        # facts: unparseable means pytest wrote a damaged document, unreadable
+        # means we could not get at an intact one (a permission fault, a runner
+        # filesystem error). `parse` raises OSError for the second, which a
+        # handler catching only ParseError let escape -- and this narrator runs
+        # in a step that fires BECAUSE something already failed, so exiting
+        # non-zero here adds a second red herring to the one it exists to
+        # explain. `check_skip_ceiling.py` already catches both on this file.
+        print(f"{_NOTICE} unreadable report at {report}: {exc}")
         return 0
 
     rows: list[tuple[str, str, str]] = []  # (kind, test id, first message line)

@@ -20,9 +20,12 @@ the failures). Two properties matter and both are asserted here:
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "ci" / "failure_summary.py"
 
@@ -159,3 +162,79 @@ def test_an_ordinary_run_lists_everything_and_declares_no_omission(tmp_path):
     )
     listed = [ln for ln in r.stdout.splitlines() if ln.startswith("- **")]
     assert len(listed) == 40, f"listed {len(listed)} of 40"
+
+
+def test_an_unreadable_report_does_not_fail_the_narrator(tmp_path):
+    """A report that EXISTS but cannot be READ raises OSError, not ParseError.
+
+    `ElementTree.parse` raises `PermissionError` on a permission fault, so a
+    handler catching only `ParseError` let it escape — and this script runs in a
+    step that fires BECAUSE something already failed, so exiting non-zero there
+    adds a second red herring to the one it exists to explain. Its whole
+    contract is that it never fails itself.
+
+    The file is made genuinely unreadable rather than patched, because `_run`
+    spawns a SUBPROCESS: a monkeypatched parser in this process would never
+    reach the code under test, and the test would pass against any behaviour.
+    """
+    report = tmp_path / "junit.xml"
+    report.write_text("<testsuite/>")
+    os.chmod(report, 0o000)
+    if os.access(report, os.R_OK):
+        pytest.skip("this user ignores file modes (root), so the fault cannot be staged")
+
+    out = _run(str(report))
+    assert out.returncode == 0, (
+        f"the narrator exited {out.returncode} on an unreadable report: {out.stderr}"
+    )
+    assert "unreadable report" in out.stdout
+
+
+def test_a_crash_with_no_report_names_the_test_that_was_running(tmp_path, monkeypatch):
+    """The case dropping `-v` made worse, and the reason the breadcrumb exists.
+
+    A segfault, an OOM kill or `os._exit` inside a test never writes junit.xml.
+    With `-v` the log at least named the running test; without it the log shows
+    progress characters only. The conftest hook rewrites this file before every
+    test and fsyncs it, so the last successful write names where the crash was.
+    """
+    crumb = tmp_path / "active-test.txt"
+    crumb.write_text("tests/test_thing.py::test_that_segfaulted\n")
+    monkeypatch.setenv("GENESIS_ACTIVE_TEST_FILE", str(crumb))
+
+    out = _run(str(tmp_path / "does-not-exist.xml"))
+    assert out.returncode == 0
+    assert "tests/test_thing.py::test_that_segfaulted" in out.stdout, (
+        f"a crash with no report named nothing — breadcrumb unread: {out.stdout}"
+    )
+
+
+def test_a_crash_with_no_breadcrumb_still_says_something_useful(tmp_path, monkeypatch):
+    """The control that moves. A collection crash dies before any test starts, so
+    there is no breadcrumb — the notice must still render and must NOT claim a
+    test that never ran."""
+    monkeypatch.delenv("GENESIS_ACTIVE_TEST_FILE", raising=False)
+
+    out = _run(str(tmp_path / "does-not-exist.xml"))
+    assert out.returncode == 0
+    assert "no report at" in out.stdout
+    assert "last test to START" not in out.stdout, (
+        "claimed an active test when there was no breadcrumb"
+    )
+
+
+def test_the_breadcrumb_hook_records_the_node_id(tmp_path, monkeypatch):
+    """The writer half. Without this, the reader tests above would pass against a
+    hook that never wrote anything."""
+    import tests.conftest as genesis_conftest
+
+    crumb = tmp_path / "active-test.txt"
+    monkeypatch.setenv("GENESIS_ACTIVE_TEST_FILE", str(crumb))
+    genesis_conftest.pytest_runtest_logstart("tests/test_x.py::test_y", ("x", 1, "y"))
+    assert crumb.read_text().strip() == "tests/test_x.py::test_y"
+
+    # INERT without the variable — a local run must pay nothing.
+    monkeypatch.delenv("GENESIS_ACTIVE_TEST_FILE", raising=False)
+    crumb.unlink()
+    genesis_conftest.pytest_runtest_logstart("tests/test_x.py::test_z", ("x", 1, "z"))
+    assert not crumb.exists()

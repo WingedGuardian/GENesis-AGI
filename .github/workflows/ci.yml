@@ -754,6 +754,10 @@ jobs:
             --junit-xml=junit.xml
         env:
           GENESIS_TESTING: "1"
+          # The breadcrumb the conftest rewrites before every test and fsyncs.
+          # It is the ONLY channel that survives a hard crash inside a test --
+          # no report is written and, without -v, the log names nothing either.
+          GENESIS_ACTIVE_TEST_FILE: active-test.txt
       # The step log's tail is where pytest names the failures, and the tail
       # is what GitHub's log cap drops (measurement above). The step summary
       # is rendered by the Actions UI OUTSIDE the log, so it survives however
@@ -764,6 +768,8 @@ jobs:
       - name: Name the failures where truncation cannot reach
         if: ${{ failure() }}
         run: python scripts/ci/failure_summary.py junit.xml >> "$GITHUB_STEP_SUMMARY"
+        env:
+          GENESIS_ACTIVE_TEST_FILE: active-test.txt
       # The junit report holds every traceback in full and was previously
       # DISCARDED with the runner — the dormancy guard parsed it, then it
       # died with the VM while the truncated log held ~44% of the run.

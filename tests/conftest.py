@@ -611,3 +611,30 @@ async def empty_db():
     wrapped = SerializedConnection(conn)
     yield wrapped
     await wrapped.close()
+
+
+def pytest_runtest_logstart(nodeid, location):
+    """Record the test about to run, for a crash that never writes a report.
+
+    CI drops ``-v`` because one line per test truncated the step log at ~44% of
+    the suite, which left a red run naming no failing test at all. The junit
+    report carries the names instead -- except when pytest never gets to write
+    it, which is exactly what a segfault, an OOM kill or ``os._exit`` inside a
+    test does. This is the channel that survives that: rewritten before every
+    test and fsynced, so the last successful write names the test the crash
+    happened in.
+
+    INERT unless ``GENESIS_ACTIVE_TEST_FILE`` is set, so a local run pays
+    nothing. Best-effort throughout -- a breadcrumb that could fail the suite it
+    exists to diagnose would be a poor trade.
+    """
+    path = os.environ.get("GENESIS_ACTIVE_TEST_FILE")
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(f"{nodeid}\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError:
+        pass
