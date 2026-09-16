@@ -793,120 +793,9 @@ echo "    + CC temp: ${CC_TMP_DIR} (budget: 500MB, sacred: 150MB)"
 # repo directory, so a path-based guard would append a duplicate on every re-run
 # of an install that lives anywhere but ~/genesis. The comment is also what
 # existing installs already have, so this stays idempotent for them.
-_AUTOCD_MARK='# Auto-cd to Genesis project on login'
-_AUTOCD_LINE="[ -d $(printf '%q' "$REPO_DIR") ] && cd $(printf '%q' "$REPO_DIR")"
-# -x: WHOLE-LINE match, the same predicate the program below uses. A plain
-# -F matched a file that merely MENTIONS the marker inside another command,
-# which then took the rewrite branch, failed, warned, and never reached the
-# append branch — so the hook was never installed at all.
-if grep -qxF "$_AUTOCD_MARK" "$HOME/.bashrc" 2>/dev/null; then
-    # The marker is already there, so the old `! grep` guard SKIPPED — which
-    # meant an existing install never received the repo-path fix above. Its
-    # login hook kept pointing at wherever the repo used to be (or at a
-    # hardcoded ~/genesis), and `cd`-ing into a directory that may not exist is
-    # the exact defect this block was changed to prevent.
-    #
-    # Rewrite the line AFTER the marker, in place and atomically: temp file in
-    # the same directory, then rename. ~/.bashrc is sourced by every
-    # interactive shell, so a partial write is not a cosmetic failure.
-    # The value crosses via the ENVIRONMENT, never interpolated into the
-    # program text — the same shape bootstrap.sh uses for its tmux-wrap block,
-    # and the reason a repo path containing a quote cannot reach the source.
-    _ac_rc=0
-    GENESIS_AUTOCD_MARK="$_AUTOCD_MARK" GENESIS_AUTOCD_LINE="$_AUTOCD_LINE" \
-        python3 - "$HOME/.bashrc" <<'PYEOF' || _ac_rc=$?
-import os
-import sys
-import tempfile
-
-# RESOLVE the link before touching anything. A ~/.bashrc symlinked into a
-# dotfiles repo (stow, chezmoi, yadm, a plain clone) is the ordinary case, and
-# os.replace on the LINK silently swaps it for a regular file: the repo copy
-# keeps the stale path, the next `stow -R` reverts or conflicts, and the
-# installer reports success either way. MEASURED — it destroyed the link.
-# realpath also makes dirname() the target's own directory, which os.replace
-# requires: writing the temp beside the LINK can land on another filesystem.
-path = os.path.realpath(sys.argv[1])
-mark = os.environ["GENESIS_AUTOCD_MARK"]
-want = os.environ["GENESIS_AUTOCD_LINE"]
-
-with open(path, encoding="utf-8", errors="surrogateescape") as fh:
-    # split("\n"), NOT splitlines(). splitlines() also breaks on \v \f \x1c
-    # \x1d \x1e \x85     — none of which end a line for bash — and the
-    # round trip would rewrite every one of them as a newline ANYWHERE in the
-    # file, including lines this program was never asked to touch. MEASURED: 6 of
-    # 7 such characters mutated user content, and outside a quoted string that
-    # turns one command into two. `bash -n` passes throughout, so nothing else
-    # would have caught it.
-    raw = fh.read()
-lines = raw.split("\n")
-trailing_newline = bool(lines) and lines[-1] == ""
-if trailing_newline:
-    lines.pop()
-
-hits = [n for n, line in enumerate(lines) if line.strip() == mark]
-if not hits:
-    # The shell guard matched but no line EQUALS the marker — most often the
-    # file merely mentions the marker text inside another command.
-    sys.exit(3)
-if len(hits) > 1:
-    # More than one hook. bash runs the file top to bottom, so the LAST one
-    # decides the final cd; rewriting the first would leave the effective
-    # directory stale while reporting success. Refuse and let the caller warn.
-    sys.exit(4)
-i = hits[0]
-
-# The marker must be followed by the hook line. If it is the last line, or the
-# next line is something else, this is not a shape we wrote — leave it alone
-# rather than guessing which line to overwrite.
-if i + 1 >= len(lines):
-    sys.exit(4)
-original = lines[i + 1]
-stripped = original.strip()
-if not (stripped.startswith("[ -d ") and " && cd " in stripped):
-    sys.exit(4)
-if stripped == want:
-    sys.exit(10)  # already correct — nothing to do
-
-# Preserve the hook's own indentation: the marker is compared stripped, so an
-# indented pair is recognised, and rewriting it flush-left would be an edit the
-# operator did not ask for.
-indent = original[: len(original) - len(original.lstrip())]
-lines[i + 1] = indent + want
-
-directory = os.path.dirname(path) or "."
-fd, tmp = tempfile.mkstemp(dir=directory, prefix=".bashrc.genesis-autocd-")
-try:
-    with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as fh:
-        fh.write("\n".join(lines) + ("\n" if trailing_newline else ""))
-        fh.flush()
-        os.fsync(fh.fileno())
-    # mkstemp creates 0600. Carry the file's existing mode across so the rewrite
-    # is not also a silent permission change to a user file.
-    os.chmod(tmp, os.stat(path).st_mode & 0o7777)
-    os.replace(tmp, path)
-except Exception:
-    try:
-        os.unlink(tmp)
-    except OSError:
-        pass
-    raise
-PYEOF
-    case "$_ac_rc" in
-        0)  echo "    + Auto-cd updated to $REPO_DIR" ;;
-        10) : ;;  # already correct; say nothing
-        3|4)
-            echo "    WARNING: ~/.bashrc has an Auto-cd marker in a shape this installer did not write — leaving it alone"
-            setup_warn "~/.bashrc Auto-cd hook left unchanged (unrecognised shape); it may still point at an old repo path"
-            ;;
-        *)
-            echo "    WARNING: could not update the Auto-cd hook in ~/.bashrc (rc=$_ac_rc)"
-            setup_warn "~/.bashrc Auto-cd hook could not be updated (rc=$_ac_rc)"
-            ;;
-    esac
-else
+if ! grep -q '# Auto-cd to Genesis project on login' "$HOME/.bashrc" 2>/dev/null; then
     echo '' >> "$HOME/.bashrc"
-    echo "$_AUTOCD_MARK" >> "$HOME/.bashrc"
+    echo '# Auto-cd to Genesis project on login' >> "$HOME/.bashrc"
     # $REPO_DIR, not a hardcoded ~/genesis: the installer already knows where it
     # was cloned, and a clone anywhere else got a login hook pointing at a
     # directory that does not exist.
@@ -915,7 +804,7 @@ else
     # END the quoted string early, and the line would silently target a DIFFERENT
     # directory (or fail to parse) with nothing to indicate it. %q produces a
     # form the shell re-reads as exactly this path, whatever is in it.
-    echo "$_AUTOCD_LINE" >> "$HOME/.bashrc"
+    echo "[ -d $(printf '%q' "$REPO_DIR") ] && cd $(printf '%q' "$REPO_DIR")" >> "$HOME/.bashrc"
     echo "    + Auto-cd to $REPO_DIR on login"
 fi
 
@@ -1581,26 +1470,7 @@ cc_shadow_scan || true
 
 # Genesis wrapper — lets users type 'genesis' from anywhere inside the container
 # to launch Claude Code in the right directory with all hooks/MCP active.
-# Regenerate when the wrapper is OURS, rather than only creating it. The guard
-# used to be `[ ! -f ]`, so an install that already had a wrapper never received
-# the repo-path fix above — the exact defect this block exists to fix stayed on
-# every existing install. The marker is what makes overwriting safe: a file of
-# the same name that we did not write is left alone and reported, rather than
-# being clobbered on the assumption that it must be ours.
-_GENESIS_WRAPPER_MARK='# managed by Genesis install.sh — regenerated on install'
-# The marker alone is chicken-and-egg: it is written only by the regenerate
-# branch, and that branch was gated on the marker already being there, so no
-# PRE-EXISTING install could ever acquire it — the repair would have reached
-# exactly nobody while emitting a permanent warning. The wrapper shipped before
-# the marker is a known fixed line, so recognise that too; it is the entire
-# population this block exists to fix.
-_GENESIS_WRAPPER_LEGACY='cd ~/genesis 2>/dev/null || { echo "Genesis repo not found at ~/genesis"; exit 1; }'
-if [ -f /usr/local/bin/genesis ] \
-   && ! grep -qF "$_GENESIS_WRAPPER_MARK" /usr/local/bin/genesis 2>/dev/null \
-   && ! grep -qF "$_GENESIS_WRAPPER_LEGACY" /usr/local/bin/genesis 2>/dev/null; then
-    echo "    WARNING: /usr/local/bin/genesis exists and was not written by this installer — leaving it alone"
-    setup_warn "/usr/local/bin/genesis is not installer-owned; the genesis command may point at the wrong repo"
-else
+if [ ! -f /usr/local/bin/genesis ]; then
     # Unquoted heredoc so $REPO_DIR is baked in at install time — the previous
     # quoted form hardcoded ~/genesis, so on any clone elsewhere the `genesis`
     # command was installed dead and every assertion about it still passed.
@@ -1624,7 +1494,6 @@ else
     _repo_q="$(printf '%q' "$REPO_DIR")"
     sudo tee /usr/local/bin/genesis >/dev/null <<WRAPPER
 #!/bin/bash
-$_GENESIS_WRAPPER_MARK
 repo=$_repo_q
 cd "\$repo" 2>/dev/null || { echo "Genesis repo not found at \$repo"; exit 1; }
 exec claude "\$@"

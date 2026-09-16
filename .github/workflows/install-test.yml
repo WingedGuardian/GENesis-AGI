@@ -24,6 +24,29 @@ on:
       - "scripts/install.sh"
       - "scripts/lib/**"
       - "scripts/systemd/**"
+      # The templates above are only half of a unit: systemd runs an ExecStart,
+      # and every one of these is a repo script the rendered units invoke. A PR
+      # touching only `scripts/tmp_watchgod.sh` could break the temp-protection
+      # service this job asserts is ACTIVE, without the job ever running.
+      # Read out of the templates' own ExecStart directives at the time of
+      # writing. Note the entrypoint is usually an ARGUMENT rather than the
+      # program — the house pattern is
+      # `ExecStart=/bin/bash __REPO_DIR__/scripts/X.sh`.
+      #
+      # NOT enforced: nothing fails when a new template ships a ninth
+      # entrypoint and this list does not catch up. A test to keep the two in
+      # step is issue #2117, which also records why the obvious version of that
+      # test is harder than it looks — it must compare by glob coverage rather
+      # than string identity, or a later `scripts/*.sh` consolidation reds every
+      # PR.
+      - "scripts/backup.sh"
+      - "scripts/cc_align_host.sh"
+      - "scripts/cc_settings_align.sh"
+      - "scripts/cc_tmp_align_host.sh"
+      - "scripts/code_intel_freeze.sh"
+      - "scripts/code_intel_runner.sh"
+      - "scripts/disk_hygiene.sh"
+      - "scripts/tmp_watchgod.sh"
       - "scripts/hooks/pre-commit"
       - "scripts/hooks/pre-push"
       # config/** rather than the two files install.sh itself renders. The
@@ -114,6 +137,21 @@ jobs:
           # asserting the file exists cannot tell those apart, which is a green
           # install test over a dead server.
           systemctl --user is-active --quiet genesis-server
+
+          # ...and ENABLED, which is a different claim: is-active only says the
+          # unit is running NOW, and install.sh starts it in a step separate
+          # from the enable, so a unit that never enabled still reads active and
+          # simply does not come back after a reboot. This catches `disabled`
+          # (the enable failed — install.sh discards its stderr, and its own
+          # note at :1342 gives the real causes as no user D-Bus or a masked
+          # unit), `masked`, and a missing unit file.
+          #
+          # It does NOT catch a template that lost its [Install] section.
+          # MEASURED on systemd 255: such a unit enables with exit 0 and
+          # is-enabled reports `static`, also exit 0. A control unit that HAS
+          # [Install] and was never enabled reports `disabled`, exit 1 — which
+          # is the case this assertion is for.
+          systemctl --user is-enabled --quiet genesis-server
 
           # EVERY rendered unit, not just genesis-server. The installer renders all
           # templates through one loop, so a placeholder introduced in any other
