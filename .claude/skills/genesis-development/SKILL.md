@@ -255,10 +255,9 @@ over a foreground timeout or `nohup … &` (detached but untracked → no comple
 signal, so you end up hand-polling anyway).
 
 **DEPLOYS ARE THE EXCEPTION, and this is the one to get right.**
-`scripts/update.sh` and `bootstrap.sh` must be **DETACHED FROM THE SESSION
-ENTIRELY** — not foregrounded, and not backgrounded. (`host-setup.sh` is a third
-long script but is NOT in this group: it is interactive and runs on the bare host
-VM. See the warning below before reaching for it.)
+`scripts/update.sh` must be **DETACHED FROM THE SESSION ENTIRELY** — not
+foregrounded, and not backgrounded. (`bootstrap.sh` and `host-setup.sh` are long
+too but are NOT in this group; see the warning below before reaching for either.)
 
 - Foreground is impossible: MEASURED 2026-09-16, a bare `update.sh` ran **1022s**,
   1.7× the 600000ms hard ceiling.
@@ -277,8 +276,15 @@ DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -
 systemd-run --user --collect --unit genesis-deploy-manual \
   --working-directory=$HOME/genesis \
   --setenv=PATH="$PATH" --setenv=SSH_AUTH_SOCK --setenv=GENESIS_SYNC_PRIVATE_PATTERNS \
-  /bin/bash -c 'exec ./scripts/update.sh > ~/tmp/deploy-$(date +%Y%m%d-%H%M).log 2>&1'
+  /bin/bash -c 'mkdir -p ~/tmp; exec ./scripts/update.sh > ~/tmp/deploy-$(date +%Y%m%d-%H%M).log 2>&1'
 ```
+
+**`mkdir -p ~/tmp` is part of the command, not tidiness.** `~/tmp` is not
+guaranteed — `install.sh` and `bootstrap.sh` create it only when `/tmp` is small —
+and the shell opens the redirect *before* exec'ing `update.sh`, so a missing
+directory kills the unit instantly, before the deploy's own `mkdir` at
+`update.sh:38` can run. With `--collect` that leaves nothing behind to diagnose,
+which is the same invisible failure the verify step below exists for.
 
 **The bus variables come first, and they are not decoration.** A CC session often
 has no `XDG_RUNTIME_DIR`, and without it the `systemd-run --user` CLIENT cannot
@@ -297,11 +303,16 @@ will not fetch without it, `update.sh:696`) and `GENESIS_SYNC_PRIVATE_PATTERNS`
 (`bootstrap.sh:647` branches on it) are forwarded above. Naming an unset variable is
 harmless — measured, the unit still starts.
 
-**Never apply this to `host-setup.sh`.** It is interactive and runs on the bare host
-VM, and detaching it removes stdin: at `host-setup.sh:536-538` the recreate prompt
-treats EOF as the default `Y` and immediately retires the existing container. Run it
-in a real terminal. The deploy advisory deliberately does not fire on it rather than
-offer a recipe that would destroy a container.
+**Never apply this to `bootstrap.sh` or `host-setup.sh`.** Both need a channel a
+detached service does not have. `bootstrap.sh` calls `sudo` unconditionally
+(`:165`) and its bare `sudo mkdir` at `:813` is fatal under `set -e`, so wherever
+sudo prompts it aborts partway through configuring the machine — and "sudo is
+passwordless here" is a fact about one box, not about the recipe. `host-setup.sh` is
+worse: interactive, run on the bare host VM, and at `:536-538` the recreate prompt
+treats EOF as the default `Y`, so detaching it stops and renames the existing
+container. `update.sh` is the only script in this family with **no sudo calls at
+all**, which is why it is the only one covered. Run the other two in a real terminal;
+the advisory no longer fires on them rather than offer a recipe that breaks them.
 
 Wrap **the command you actually ran** — `update.sh` and `bootstrap.sh` are not
 interchangeable and take their own arguments. If you build that wrapper

@@ -217,14 +217,20 @@ class TestDeployAdviceIsDetachment:
         saying "wrap the command you actually ran" would destroy one."""
         for rel, text in _advice_files():
             lowered = _one_line(text.lower())
+            assert "bootstrap.sh" in lowered, (
+                f"{rel} does not state why bootstrap.sh is excluded"
+            )
             assert "host-setup.sh" in lowered, (
                 f"{rel} does not mention host-setup.sh at all; the exclusion has to "
                 "be stated, because it is a long deploy script and the obvious "
                 "generalisation is destructive"
             )
-            assert "default y" in lowered or "retires the existing container" in lowered, (
+            # NOT "default Y": the skill writes it as `Y` in backticks, so a bare
+            # phrase match fails on formatting rather than on meaning. Pin an
+            # unformatted phrase both surfaces share.
+            assert "stops and renames" in lowered, (
                 f"{rel} mentions host-setup.sh without naming the destructive EOF "
-                "default that makes detaching it unsafe"
+                "outcome that makes detaching it unsafe"
             )
 
     def test_surfaces_carry_the_verify_step(self):
@@ -317,6 +323,19 @@ class TestDeployGuardFires:
     def test_silent_on_unrelated_commands(self):
         assert self._run("git status").strip() == ""
 
+    def test_prescribed_command_creates_its_log_directory(self):
+        """`~/tmp` is NOT guaranteed: install.sh and bootstrap.sh create it only when
+        /tmp is small. The shell opens the redirect BEFORE exec'ing update.sh, so a
+        missing directory kills the unit instantly — and --collect then leaves no
+        trace, which is the exact invisible failure this advisory warns about."""
+        ctx = json.loads(self._run(self.DEPLOY))["hookSpecificOutput"][
+            "additionalContext"
+        ]
+        assert "mkdir -p ~/tmp" in ctx, (
+            "prescribed command does not create its log directory; if ~/tmp is "
+            "absent the unit dies on the redirect and leaves nothing to diagnose"
+        )
+
     def test_silent_on_host_setup(self):
         """Deliberate: the only advice this hook has is "detach", and detaching
         host-setup.sh reaches a prompt whose EOF default retires the container.
@@ -326,9 +345,15 @@ class TestDeployGuardFires:
             "which for this script means losing stdin at a destructive default"
         )
 
-    def test_fires_on_bootstrap(self):
-        """Still in scope: bootstrap.sh is long and non-interactive."""
-        assert self._run("bash scripts/bootstrap.sh").strip()
+    def test_silent_on_bootstrap(self):
+        """bootstrap.sh calls sudo unconditionally (:165) and its bare `sudo mkdir`
+        at :813 is fatal under `set -e`. Detached it has no auth channel, so on any
+        install where sudo prompts it aborts partway through configuring the machine.
+        `update.sh` has NO sudo calls, which is why it is the only script covered."""
+        assert self._run("bash scripts/bootstrap.sh").strip() == "", (
+            "guard fired on bootstrap.sh — its only advice is detachment, which "
+            "removes the authentication channel bootstrap needs"
+        )
 
     def test_advisory_is_valid_json_in_the_envelope_cc_reads(self):
         """PreToolUse reaches the model ONLY through hookSpecificOutput; a bare

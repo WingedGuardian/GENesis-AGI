@@ -8,7 +8,16 @@
   was being ignored.
 
   Both surfaces now prescribe handing the deploy to systemd as a detached unit, and
-  the advisory fires on any deploy it sees, foreground or backgrounded.
+  the advisory fires whether the deploy was foregrounded or backgrounded.
+
+  The advice is also narrower than it was, and deliberately so. It covers
+  `update.sh` only. `bootstrap.sh` and `host-setup.sh` both need a channel a
+  detached service does not have — bootstrap calls `sudo` unconditionally, and
+  host-setup is interactive with a recreate prompt whose no-input default stops and
+  renames the existing container. `update.sh` is the only one of the three with no
+  `sudo` calls at all, and the only one actually exercised this way end to end. The
+  advisory no longer mentions the other two rather than offer a recipe that breaks
+  or destroys something.
 
   One thing measured while fixing it, which our own notes had stated the other way
   round: backgrounding has no ten-minute ceiling — a 400-second task completed
