@@ -52,10 +52,12 @@ def _production_blueprints() -> tuple[list, list, list]:
     an adapter that registers its own (``OpenClawAdapter().register_blueprints``),
     which is how the OpenClaw completions endpoint arrives.
 
-    A blueprint whose import fails is SKIPPED rather than fatal — an optional
-    subsystem absent from a test environment must not break the contract for the
-    ones that are present. The guard test below is what stops that skipping from
-    hollowing the suite out.
+    Every failure to reach a registration target — import, construction, or the
+    registration call itself — is FATAL here, naming what it could not load. A
+    skipped target is indistinguishable from an absent one, and the named-path
+    checks below would pass straight around the hole. The test is deliberately
+    stricter than production, which logs and continues: production degrading is
+    correct, a contract test degrading proves nothing.
     """
     import ast
     import importlib
@@ -124,16 +126,27 @@ def _production_blueprints() -> tuple[list, list, list]:
         f"silently skip whatever they register: {unresolved}"
     )
 
+    # An IMPORT failure is as invisible as a registration failure, and the
+    # first version of this fix made only the latter fatal — so a /v1 blueprint
+    # whose module could not import still vanished silently, with the named-path
+    # checks passing around the hole.
+    unimportable: list[str] = []
+
     def _load(entries):
         out = []
         for module_name, attr in entries:
             try:
                 out.append(getattr(importlib.import_module(module_name), attr))
-            except Exception:  # optional subsystem, or unimportable in this env
-                continue
+            except Exception as exc:
+                unimportable.append(f"{module_name}.{attr}: {type(exc).__name__}: {exc}")
         return out
 
-    return _load(blueprints), adapters, _load(helpers)
+    loaded_bp, loaded_helpers = _load(blueprints), _load(helpers)
+    assert not unimportable, (
+        "a production registration target could not be imported, so any /v1 "
+        f"routes it contributes are NOT covered by this contract: {unimportable}"
+    )
+    return loaded_bp, adapters, loaded_helpers
 
 
 @pytest.fixture()
@@ -151,21 +164,33 @@ def app_with_every_v1_blueprint(monkeypatch):
     # wrapper — a bare app gets the raw stream, so a body-bound test on a bare
     # app exercises code the server never runs.
     app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
+
+    # A registration that FAILS is not a registration that is absent. Swallowing
+    # it drops the whole surface while the named-path checks below still pass,
+    # so an unauthenticated new route stays invisible — the same shape as the
+    # hand-written list this discovery replaced. Collect and fail instead.
+    skipped: list[str] = []
     for bp in blueprints:
         try:
             app.register_blueprint(bp)
-        except Exception:  # noqa: PERF203 - one bad blueprint must not hide the rest
-            continue
+        except Exception as exc:  # noqa: PERF203 - reported below, not swallowed
+            skipped.append(f"{getattr(bp, 'name', bp)}: {type(exc).__name__}: {exc}")
     for module_name, attr in adapters:
         try:
             getattr(importlib.import_module(module_name), attr)().register_blueprints(app)
-        except Exception:
-            continue
+        except Exception as exc:
+            skipped.append(f"{module_name}.{attr}: {type(exc).__name__}: {exc}")
     for fn in helpers:
         try:
             fn(app)
-        except Exception:
-            continue
+        except Exception as exc:
+            skipped.append(f"{getattr(fn, '__name__', fn)}: {type(exc).__name__}: {exc}")
+
+    assert not skipped, (
+        "a production registration failed in this app, so any /v1 routes it "
+        "contributes are NOT covered by the assertions below — which would pass "
+        f"anyway: {skipped}"
+    )
     return app
 
 
@@ -250,3 +275,35 @@ def test_a_valid_token_is_not_refused_by_the_auth_layer(app_with_every_v1_bluepr
         "these routes refused a VALID token, so the check above proves nothing: "
         + "; ".join(still_refusing)
     )
+
+
+def test_an_unimportable_registration_target_fails_this_contract(monkeypatch):
+    """The fail-closed assert must be able to FIRE, not just exist.
+
+    Converting a silent `continue` into a collected failure is only worth
+    anything if something proves the collection is reachable. Without this, a
+    refactor that makes the list unreachable turns the assert into a
+    permanently-true no-op and nothing notices — which is the exact shape this
+    module's own docstring says has "now been wrong twice".
+    """
+    import sys
+    import types
+
+    target = "genesis.dashboard.routes.desk_api"
+    saved = sys.modules.get(target)
+    # Present but missing its blueprint attribute: getattr raises, which is the
+    # same failure class as an unimportable module and takes the same branch.
+    sys.modules[target] = types.ModuleType(target)
+    try:
+        with pytest.raises(AssertionError, match="could not be imported"):
+            _production_blueprints()
+    finally:
+        if saved is not None:
+            sys.modules[target] = saved
+        else:
+            sys.modules.pop(target, None)
+
+    # CONTROL: with the poison removed the contract passes again, so the test
+    # above proves the assert fires rather than that the suite is broken.
+    blueprints, _adapters, _helpers = _production_blueprints()
+    assert blueprints, "the control did not recover — the poison leaked"

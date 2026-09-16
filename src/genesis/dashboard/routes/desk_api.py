@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import threading
 import time
 import uuid
@@ -137,7 +138,12 @@ def _lane_call_site(data: dict) -> tuple[str, str]:
     would degrade instruction-following with no error anywhere, which is the
     failure that is hardest to notice from the desktop side.
     """
-    model = (data.get("model") or "").strip().lower()
+    # `or ""` handles a missing/None model, but a TRUTHY non-string — 1, true,
+    # [1], {"name": "fast"} — reached .strip() and became an unstructured 500.
+    # A malformed field is a 400's job; here it simply does not select a lane,
+    # and the header (or the capable default) decides.
+    raw_model = data.get("model")
+    model = raw_model.strip().lower() if isinstance(raw_model, str) else ""
     for name in _LANES:
         if model == name or model.endswith(f"-{name}"):
             return name, _LANES[name]
@@ -166,10 +172,15 @@ def _messages_from(data: dict) -> tuple[list[dict], str | None]:
             return [], f"unsupported message role: {role!r}"
         content = m.get("content")
         if content is None:
-            # The ordinary shape of an assistant turn that only carried
-            # tool_calls. Degrade it to an empty turn rather than 400 the whole
-            # request: the caller sends full history, and one such turn in it
-            # must not kill an unrelated question.
+            # ASSISTANT only. A null-content assistant turn is the ordinary
+            # shape of one that carried only tool_calls, and the caller sends
+            # full history, so one such turn must not kill an unrelated
+            # question. A null-content USER turn is different: nothing produces
+            # it legitimately, and degrading it to "" spends a routed completion
+            # on an empty question — which the non-system-role check downstream
+            # then accepts as a real turn.
+            if role != "assistant":
+                return [], f"{role} message content must not be null"
             content = ""
         if isinstance(content, list):
             # Validate EVERY block before flattening any of it. The earlier
@@ -243,8 +254,86 @@ def _sampling_from(data: dict) -> tuple[dict, str | None]:
     if temperature is not None:
         if not isinstance(temperature, (int, float)) or isinstance(temperature, bool):
             return {}, "temperature must be a number"
-        kwargs["temperature"] = float(temperature)
+        # The same class of defect max_tokens had, and missed here the first
+        # time: a 400-digit JSON integer passes the isinstance check and then
+        # raises OverflowError inside float(), and Python's JSON decoder accepts
+        # NaN/Infinity, which no provider will take. Both are 400s, not 500s.
+        try:
+            as_float = float(temperature)
+        except (OverflowError, ValueError):
+            return {}, "temperature is out of range"
+        if not math.isfinite(as_float):
+            return {}, "temperature must be a finite number"
+        kwargs["temperature"] = as_float
     return kwargs, None
+
+
+def _route_and_wait(
+    router,
+    call_site: str,
+    messages: list[dict],
+    sampling: dict,
+    event_loop,
+    lane: str,
+    start: float,
+):
+    """Submit one ``route_call`` onto the runtime loop and wait for it.
+
+    Returns ``(result, failure_response)`` — exactly one of which is meaningful.
+    Extracted for the loop-liveness handling below, which is the fiddly part and
+    reads far worse inlined in the request handler.
+    """
+    coro = router.route_call(
+        call_site_id=call_site,
+        messages=messages,
+        suppress_dead_letter=True,
+        timeout=_PER_ATTEMPT_TIMEOUT_SECONDS,
+        **sampling,
+    )
+    try:
+        future = asyncio.run_coroutine_threadsafe(coro, event_loop)
+    except RuntimeError:
+        # The loop was running at the readiness check and is closed by the time
+        # we submit — an ordinary shutdown race. run_coroutine_threadsafe raises
+        # BEFORE the handler below, so without this the caller gets Flask's
+        # unstructured 500 and the coroutine is never awaited. Close it
+        # explicitly: an un-awaited coroutine is a warning at best, a leak at
+        # worst.
+        coro.close()
+        logger.warning("Desk %s lane: event loop closed during submission", lane)
+        return None, _err("Event loop not available", 503, "server_error")
+
+    # Wait in two steps, because a STOPPED loop is indistinguishable from a slow
+    # provider if you only wait once. `run_coroutine_threadsafe` succeeds
+    # against a stopped-but-not-closed loop and returns a future that will never
+    # resolve, so a single full-wall wait hangs the request the whole time,
+    # holding a semaphore slot and a Flask thread, and then blames the router in
+    # a 504. A short first wait costs nothing on the happy path (the future is
+    # pending either way) and turns a shutdown into a 1s structured 503.
+    try:
+        return future.result(timeout=_LIVENESS_RECHECK_SECONDS), None
+    except TimeoutError:
+        if not event_loop.is_running():
+            future.cancel()
+            logger.warning("Desk %s lane: event loop stopped mid-request", lane)
+            return None, _err("Event loop not available", 503, "server_error")
+        try:
+            return future.result(timeout=_ROUTER_TIMEOUT_SECONDS - _LIVENESS_RECHECK_SECONDS), None
+        except TimeoutError:
+            future.cancel()
+            elapsed = time.monotonic() - start
+            # Re-check once more: the loop can stop during the long wait too.
+            if not event_loop.is_running():
+                logger.warning("Desk %s lane: event loop stopped mid-request", lane)
+                return None, _err("Event loop not available", 503, "server_error")
+            logger.error("Desk %s lane timed out after %.1fs", lane, elapsed)
+            return None, _err(f"router timed out after {elapsed:.0f}s", 504, "server_error")
+        except Exception:
+            logger.error("Desk %s lane raised", lane, exc_info=True)
+            return None, _err("router call failed", 500, "server_error")
+    except Exception:
+        logger.error("Desk %s lane raised", lane, exc_info=True)
+        return None, _err("router call failed", 500, "server_error")
 
 
 @desk_api_bp.route("/v1/desk/chat/completions", methods=["POST"])
@@ -307,6 +396,37 @@ def desk_chat_completions():
         return _err("request body must be a JSON object", 400)
     if data.get("stream"):
         return _err("streaming is not supported on this endpoint", 400)
+    # Tool-ROLE messages are already refused; the top-level fields were not, so
+    # a caller asking for a tool call got an ordinary text completion and no
+    # indication its request had been ignored. Refusing is the honest answer:
+    # this endpoint carries no tool protocol, and a silently text-only reply to
+    # a tool request is harder to diagnose than a 400.
+    # DEFINITIONS are refused whatever tool_choice says. This endpoint does not
+    # forward them, and a model that never saw them can answer differently from
+    # one that did — even under `tool_choice: "none"`, which forbids CALLING a
+    # tool but not knowing it exists. Dropping them silently and answering
+    # anyway is the failure this check exists for.
+    for field in ("tools", "functions"):
+        if data.get(field):
+            return _err(
+                f"'{field}' is not supported on this endpoint — it routes text "
+                "completions and carries no tool protocol",
+                400,
+            )
+    # With no definitions present, a tool_choice is a NO-OP and must be
+    # accepted. "auto" is OpenAI's default and several compatible wrappers emit
+    # it unconditionally, so refusing it would 400 every turn such a client ever
+    # sends — the integration would be dead on arrival rather than degraded.
+    # Nothing is dropped in that case: there are no tools to drop. Only a choice
+    # that DEMANDS a call we cannot make is refused — a specific
+    # `{"type": "function", …}`, or "required".
+    for field in ("tool_choice", "function_call"):
+        if data.get(field) not in (None, "none", "auto"):
+            return _err(
+                f"'{field}' is not supported on this endpoint — it routes text "
+                "completions and carries no tool protocol",
+                400,
+            )
 
     messages, err = _messages_from(data)
     if err:
@@ -322,65 +442,30 @@ def desk_chat_completions():
         return _err("server busy, try again shortly", 503, "server_error")
     start = time.monotonic()
     try:
-        coro = router.route_call(
-            call_site_id=call_site,
-            messages=messages,
-            suppress_dead_letter=True,
-            timeout=_PER_ATTEMPT_TIMEOUT_SECONDS,
-            **sampling,
+        result, failure = _route_and_wait(
+            router, call_site, messages, sampling, event_loop, lane, start
         )
-        try:
-            future = asyncio.run_coroutine_threadsafe(coro, event_loop)
-        except RuntimeError:
-            # The loop was running at the readiness check and is closed by the
-            # time we submit — an ordinary shutdown race. run_coroutine_threadsafe
-            # raises BEFORE the handler below, so without this the caller gets
-            # Flask's unstructured 500 and the coroutine is never awaited.
-            # Close it explicitly: an un-awaited coroutine is a warning at best
-            # and a leak at worst.
-            coro.close()
-            logger.warning("Desk %s lane: event loop closed during submission", lane)
-            return _err("Event loop not available", 503, "server_error")
-        # Wait in two steps, because a STOPPED loop is indistinguishable from a
-        # slow provider if you only wait once. `run_coroutine_threadsafe`
-        # succeeds against a stopped-but-not-closed loop and returns a future
-        # that will never resolve, so a single 110s wait hangs the request for
-        # the whole wall, holds a semaphore slot and a Flask thread the entire
-        # time, and then blames the router in a 504. A short first wait costs
-        # nothing on the happy path (the future is pending either way) and turns
-        # a shutdown into a 1s structured 503 instead of a 110s lie.
-        try:
-            result = future.result(timeout=_LIVENESS_RECHECK_SECONDS)
-        except TimeoutError:
-            if not event_loop.is_running():
-                future.cancel()
-                logger.warning("Desk %s lane: event loop stopped mid-request", lane)
-                return _err("Event loop not available", 503, "server_error")
-            try:
-                remaining = _ROUTER_TIMEOUT_SECONDS - _LIVENESS_RECHECK_SECONDS
-                result = future.result(timeout=remaining)
-            except TimeoutError:
-                future.cancel()
-                elapsed = time.monotonic() - start
-                # Re-check once more: the loop can stop during the long wait too.
-                if not event_loop.is_running():
-                    logger.warning("Desk %s lane: event loop stopped mid-request", lane)
-                    return _err("Event loop not available", 503, "server_error")
-                logger.error("Desk %s lane timed out after %.1fs", lane, elapsed)
-                return _err(f"router timed out after {elapsed:.0f}s", 504, "server_error")
-            except Exception:
-                logger.error("Desk %s lane raised", lane, exc_info=True)
-                return _err("router call failed", 500, "server_error")
-        except Exception:
-            logger.error("Desk %s lane raised", lane, exc_info=True)
-            return _err("router call failed", 500, "server_error")
+        if failure is not None:
+            return failure
     finally:
         _semaphore.release()
 
     # EMPTY content is a failure too, not a short answer. A provider can return
     # success with content None or "" — a refusal, a content filter, or a
     # reasoning model that spent the whole budget thinking — and the caller would
-    # speak that as silence rather than retrying or saying anything.
+    # speak that as silence rather than saying anything.
+    #
+    # Note what this endpoint does NOT do: retry. ModelRouter returns on its
+    # first success INCLUDING an empty one (router.py:466 is the only success
+    # predicate), so links two and three were never tried and there is nothing
+    # here to recover from — the chain walk already ended upstream. Re-entering
+    # it from this handler was tried and removed: `chain_offset` ROTATES the
+    # chain rather than skipping forward, so it can re-call the provider that
+    # just answered empty, and a second walk also tells the circuit breaker that
+    # provider is healthy while suppressing the fallback event. The fix is one
+    # predicate at the router, opt-in per call site, and belongs to every caller
+    # rather than this one — issue #2107. Until then an empty completion is an
+    # honest 502: the client can retry, which silence does not let it do.
     content = (result.content or "").strip() if result.success else ""
     if not result.success or not content:
         logger.error(

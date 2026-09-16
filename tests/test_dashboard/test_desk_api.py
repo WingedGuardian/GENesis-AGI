@@ -798,3 +798,146 @@ def test_loop_closing_during_submission_is_a_structured_503(app):
     assert rt.router.route_call.return_value.close.called, (
         "the orphaned coroutine was not closed"
     )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"tools": [{"type": "function", "function": {"name": "f"}}]},
+        {"functions": [{"name": "f"}]},
+        {"tool_choice": {"type": "function", "function": {"name": "f"}}},
+        {"function_call": {"name": "f"}},
+    ],
+)
+def test_a_request_that_asks_for_a_tool_call_is_refused(client, payload):
+    """Refusing is the honest answer: a text-only reply to a tool request is
+    harder to diagnose than a 400.
+
+    `tool_choice: "auto"` was removed from this list in round 4. It is OpenAI's
+    DEFAULT rather than a request for anything, and refusing it contradicted the
+    comment on the check itself — see
+    test_an_auto_tool_choice_with_no_tools_is_ACCEPTED.
+    """
+    body = dict(BODY)
+    body.update(payload)
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch("genesis.dashboard.routes.desk_api.asyncio.run_coroutine_threadsafe") as spawn,
+    ):
+        MockRT.instance.return_value = MagicMock()
+        resp = client.post("/v1/desk/chat/completions", json=body)
+    assert resp.status_code == 400, resp.get_json()
+    spawn.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"tools": []},
+        {"functions": []},
+        {"tool_choice": "none"},
+        {"function_call": "none"},
+    ],
+)
+def test_the_no_op_tool_forms_are_ACCEPTED(client, payload):
+    """These assert the OPPOSITE of a tool request.
+
+    An empty `tools` array is a client saying it has none, and
+    `tool_choice: "none"` means do not call tools. Several OpenAI-compatible
+    wrappers emit them unconditionally, so refusing turns a request this
+    endpoint serves perfectly into a 400 the caller cannot recover from.
+    """
+    body = dict(BODY)
+    body.update(payload)
+    resp, _ = _post(client, body=body)
+    assert resp.status_code == 200, resp.get_json()
+
+
+# ── Round 4: mechanisms that shipped without a test that binds them ──────────
+# Each of the four below survived DELETION with the suite green. The parameter
+# values that existed reached an EARLIER guard and never the one under test —
+# the shape this repo calls "your own battery is the mutations you thought of".
+
+
+@pytest.mark.parametrize("bad", [10**400, float("inf"), float("-inf"), float("nan")])
+def test_a_temperature_that_is_numeric_but_unusable_is_400(client, bad):
+    """BINDS the overflow/finiteness checks, which isinstance never reaches.
+
+    The pre-existing negative params ("hot", True, [0.5]) are all caught by the
+    isinstance test above those checks, so both of them could be deleted with
+    the suite still green. These four are numeric: 10**400 raises OverflowError
+    inside float(), and the three IEEE specials pass float() and fail isfinite.
+    """
+    resp, _ = _post(client, body={**BODY, "temperature": bad})
+    assert resp.status_code == 400, resp.get_json()
+
+
+@pytest.mark.parametrize("role", ["user", "system"])
+def test_null_content_on_a_non_assistant_turn_is_refused(client, role):
+    """BINDS the role half of the null-content guard.
+
+    The only `content: None` case in this file is an ASSISTANT turn — the
+    branch that legitimately degrades to "" for a tool-call-only message. So
+    the guard could be reverted to degrading EVERY role and nothing would fail.
+    """
+    resp, _ = _post(
+        client,
+        body={"messages": [{"role": "user", "content": "hi"}, {"role": role, "content": None}]},
+    )
+    assert resp.status_code == 400, resp.get_json()
+    assert "null" in resp.get_json()["error"]["message"]
+
+
+@pytest.mark.parametrize("model", [1, True, [1], {"name": "fast"}, 2.5])
+def test_a_non_string_model_does_not_500(client, model):
+    """BINDS the isinstance in _lane_call_site.
+
+    Every `model` in this file is a string, so reverting to
+    `(data.get("model") or "").strip()` keeps the suite green while a truthy
+    non-string 500s on .strip(). The lane must still come from the header.
+    """
+    resp, cap = _post(
+        client, body={**BODY, "model": model}, headers={"X-Genesis-Lane": "fast"}
+    )
+    assert resp.status_code == 200, resp.get_json()
+    assert cap["call_site_id"] == "desk_fast"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"tool_choice": "auto"},
+        {"tools": [], "tool_choice": "auto"},
+        {"function_call": "auto"},
+    ],
+)
+def test_an_auto_tool_choice_with_no_tools_is_ACCEPTED(client, payload):
+    """"auto" is OpenAI's default, and several wrappers emit it unconditionally.
+
+    Refusing it 400s every turn such a client sends — the integration is dead on
+    arrival rather than degraded. With no definitions present there is nothing
+    to drop, so the choice is a no-op. Found by review: the comment above the
+    check already argued for this and the code did the opposite.
+    """
+    resp, _ = _post(client, body={**BODY, **payload})
+    assert resp.status_code == 200, resp.get_json()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"tool_choice": "required"},
+        {"tool_choice": {"type": "function", "function": {"name": "f"}}},
+        {"function_call": {"name": "f"}},
+        {"tools": [{"type": "function", "function": {"name": "f"}}], "tool_choice": "none"},
+    ],
+)
+def test_a_choice_that_demands_a_call_is_still_refused(client, payload):
+    """The other side of the same boundary, so widening it did not open it.
+
+    The last case carries DEFINITIONS: `tool_choice: "none"` forbids calling a
+    tool, not knowing one exists, and this endpoint does not forward them — so
+    answering anyway would silently drop context the model was meant to have.
+    """
+    resp, _ = _post(client, body={**BODY, **payload})
+    assert resp.status_code == 400, resp.get_json()

@@ -746,7 +746,12 @@ class StandaloneAdapter:
             if "voice_api" not in app.blueprints:
                 app.register_blueprint(voice_api_bp)
                 logger.info("Voice API blueprint registered")
-            if not os.environ.get("GENESIS_MCP_HTTP_TOKEN"):
+            # .strip() to match check_bearer_token, which treats a quoted
+            # whitespace-only token as unconfigured. Without it the two
+            # disagree in exactly the case the warning exists for: every /v1
+            # surface answers 503 while boot stays silent, because the raw
+            # value is truthy.
+            if not os.environ.get("GENESIS_MCP_HTTP_TOKEN", "").strip():
                 # Names EVERY surface the token gates. A warning that lists
                 # some of them is worse than one that lists none: an operator
                 # who configured the desk endpoint and sees only voice and

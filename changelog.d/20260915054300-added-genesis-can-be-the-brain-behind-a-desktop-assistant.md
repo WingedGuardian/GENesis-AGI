@@ -25,6 +25,14 @@
   `choices` key, so a client parsing the completion raises rather than speaking
   the error aloud as if it were the answer.
 
+  A provider that answers with no content at all is one of those refusals, not
+  an empty reply passed through: the endpoint returns 502 rather than handing
+  back a blank turn for the desktop to speak as silence. Note the limitation
+  that sits behind it — the router stops its fallback walk on the first
+  success, and a blank answer counts as one, so the later links in the chain
+  are not tried. Fixing that belongs to the router and every caller it serves
+  rather than to this endpoint, and is tracked separately.
+
 - **Every `/v1` route is now checked for authentication by a test, not a
   convention.** The suite enumerates them from the live route map and asserts
   each refuses an anonymous caller, so a surface added later is covered without
