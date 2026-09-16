@@ -78,6 +78,7 @@ jobs:
           - label: github-4vcpu
             runs-on: ubuntu-latest
             expect_cpus: 4
+            expect_mem_gb: 16
           # 4 vCPU on BOTH sides, and the earlier version of this file got it
           # wrong in the flattering direction. It paired `ubuntu-latest` with
           # `avrea-ubuntu-latest` (2 vCPU / 8 GB) and claimed the pair "isolates
@@ -91,6 +92,7 @@ jobs:
           - label: avrea-4vcpu
             runs-on: avrea-ubuntu-latest-4-vcpu
             expect_cpus: 4
+            expect_mem_gb: 16
     runs-on: ${{ matrix.arm.runs-on }}
     # Bounds the blast radius of a single benchmark rather than the suite's
     # legitimate worst case — CI's `test` job carries 180 for that reason and
@@ -107,6 +109,7 @@ jobs:
       - name: Assert the runner is the size this arm claims
         env:
           EXPECT_CPUS: ${{ matrix.arm.expect_cpus }}
+          EXPECT_MEM_GB: ${{ matrix.arm.expect_mem_gb }}
           ARM: ${{ matrix.arm.label }}
         run: |
           set -eu
@@ -117,12 +120,36 @@ jobs:
           {
             printf '### %s runner\n\n' "$ARM"
             printf -- '- detected: **%s vCPU**, **%s GB RAM**\n' "$cpus" "$mem_gb"
-            printf -- '- expected: %s vCPU\n\n' "$EXPECT_CPUS"
+            printf -- '- expected: %s vCPU, ~%s GB\n\n' "$EXPECT_CPUS" "$EXPECT_MEM_GB"
           } >> "$GITHUB_STEP_SUMMARY"
+          fail=0
           if [ "$cpus" -ne "$EXPECT_CPUS" ]; then
-            echo "::error::$ARM expected ${EXPECT_CPUS} vCPU, got ${cpus}." \
-                 "The arms are no longer comparable; fix the labels before" \
-                 "treating any timing from this run as a measurement."
+            echo "::error::$ARM expected ${EXPECT_CPUS} vCPU, got ${cpus}."
+            fail=1
+          fi
+          # MEMORY IS ASSERTED TOO. An earlier version measured RAM, PRINTED it,
+          # and checked only the CPU count while the comment above claimed the
+          # machine-size match was verified — the same shape as the defect that
+          # produced this step (a claim of verification that verified less than
+          # it said). Memory pressure changes cache behaviour and therefore the
+          # thing being measured, so an unequal-RAM pair is not comparable even
+          # at equal CPU.
+          #
+          # A TOLERANCE, not equality: MemTotal reports usable RAM after the
+          # kernel's own reservations, so a nominal 16 GB box reports somewhat
+          # less and the exact shortfall differs by kernel and hypervisor. 2 GB
+          # absorbs that without admitting a genuinely different tier — the
+          # sizes above and below in both catalogues are 8 and 32.
+          low=$(( EXPECT_MEM_GB - 2 ))
+          if [ "$mem_gb" -lt "$low" ] || [ "$mem_gb" -gt "$EXPECT_MEM_GB" ]; then
+            echo "::error::$ARM expected ~${EXPECT_MEM_GB} GB RAM" \
+                 "(tolerating ${low}-${EXPECT_MEM_GB}), got ${mem_gb}."
+            fail=1
+          fi
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::The arms are not the same size, so any timing from" \
+                 "this run measures something other than the provider. Fix the" \
+                 "labels before treating it as a measurement."
             exit 1
           fi
 
@@ -243,7 +270,8 @@ jobs:
         run: |
           set -eu
           python3 - <<'PY'
-          import json, os, pathlib, xml.etree.ElementTree as ET
+          import hashlib, json, os, pathlib, subprocess, sys
+          import xml.etree.ElementTree as ET
           arm = os.environ["ARM"]
           p = pathlib.Path("junit.xml")
           if not p.is_file():
@@ -253,11 +281,38 @@ jobs:
           else:
               root = ET.parse(p).getroot()
               suites = [root] if root.tag == "testsuite" else list(root)
-              total = sum(int(s.get("tests", 0)) for s in suites)
-              skipped = sum(int(s.get("skipped", 0)) for s in suites)
-              pop = {"arm": arm, "readable": True,
-                     "collected": total, "skipped": skipped,
-                     "executed": total - skipped}
+              # EVERY axis independently, not a single derived total. An earlier
+              # version compared only `collected - skipped`, which two arms can
+              # match while doing different work: environment-specific skips can
+              # offset, and a fast ERROR on one arm where the other PASSES leaves
+              # the executed count identical. A derived number hides exactly the
+              # disagreements it is being used to detect.
+              pop = {
+                  "arm": arm, "readable": True,
+                  "collected": sum(int(s.get("tests", 0)) for s in suites),
+                  "skipped": sum(int(s.get("skipped", 0)) for s in suites),
+                  "failures": sum(int(s.get("failures", 0)) for s in suites),
+                  "errors": sum(int(s.get("errors", 0)) for s in suites),
+              }
+              pop["executed"] = pop["collected"] - pop["skipped"]
+          # Dependency identity. `pip install -e ".[test]"` resolves RANGES, and
+          # pip's default upgrade strategy is `only-if-needed` — so a package
+          # already present in a runner image that satisfies the range is KEPT.
+          # Two images therefore produce two dependency sets from one command,
+          # and a version difference in anything hot is a performance difference
+          # attributed to the provider. Captured rather than enforced: a lock
+          # file would change what CI measures, while a manifest lets the
+          # comparison say whether the sets actually matched.
+          try:
+              freeze = subprocess.run([sys.executable, "-m", "pip", "freeze"],
+                                      capture_output=True, text=True, timeout=120)
+              pkgs = sorted(l.strip() for l in freeze.stdout.splitlines() if l.strip())
+              pop["deps_count"] = len(pkgs)
+              pop["deps_sha256"] = hashlib.sha256("\n".join(pkgs).encode()).hexdigest()[:16]
+              pathlib.Path(f"deps-{arm}.txt").write_text("\n".join(pkgs) + "\n")
+          except Exception as exc:  # noqa: BLE001
+              pop["deps_sha256"] = None
+              pop["deps_error"] = str(exc)[:200]
           pathlib.Path(f"population-{arm}.json").write_text(json.dumps(pop))
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
               fh.write(f"\npopulation: `{json.dumps(pop)}`\n")
@@ -268,7 +323,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: population-${{ matrix.arm.label }}
-          path: population-${{ matrix.arm.label }}.json
+          path: |
+            population-${{ matrix.arm.label }}.json
+            deps-${{ matrix.arm.label }}.txt
           if-no-files-found: error
 
       # A single total cannot tell a cache win from a CPU win, and those have
@@ -336,13 +393,16 @@ jobs:
           import json, os, pathlib, sys
           files = sorted(pathlib.Path().glob("population-*.json"))
           pops = [json.loads(f.read_text()) for f in files]
+          cols = ("collected", "skipped", "failures", "errors", "executed")
           lines = ["## Test population across arms\n",
-                   "| arm | collected | skipped | executed |", "|---|---|---|---|"]
+                   "| arm | " + " | ".join(cols) + " | deps |",
+                   "|---|" + "---|" * (len(cols) + 1)]
           for p in pops:
               if p.get("readable"):
-                  lines.append("| {arm} | {collected} | {skipped} | {executed} |".format(**p))
+                  cells = " | ".join(str(p.get(c, "?")) for c in cols)
+                  lines.append(f"| {p['arm']} | {cells} | {p.get('deps_sha256') or 'n/a'} |")
               else:
-                  lines.append(f"| {p['arm']} | no report | no report | no report |")
+                  lines.append(f"| {p['arm']} |" + " no report |" * (len(cols) + 1))
           problems = []
           if len(pops) < 2:
               problems.append(f"only {len(pops)} arm(s) reported a population; "
@@ -350,10 +410,27 @@ jobs:
           unreadable = [p["arm"] for p in pops if not p.get("readable")]
           if unreadable:
               problems.append("no junit report from: " + ", ".join(unreadable))
-          executed = {p["executed"] for p in pops if p.get("readable")}
-          if len(executed) > 1:
-              problems.append(f"arms executed DIFFERENT test counts {sorted(executed)} — "
-                              "timings are not comparable")
+          # EVERY axis independently. Comparing only the derived `executed`
+          # count lets offsetting skips, or an ERROR on one arm against a PASS
+          # on the other, report "comparable" while the arms did different work.
+          readable = [p for p in pops if p.get("readable")]
+          for col in cols:
+              vals = {p.get(col) for p in readable}
+              if len(vals) > 1:
+                  problems.append(f"arms disagree on `{col}` {sorted(vals)} — "
+                                  "they did not do the same work")
+          # Dependency identity: pip resolves ranges against whatever the image
+          # already has, so one command can yield two dependency sets.
+          shas = {p.get("deps_sha256") for p in readable}
+          if None in shas:
+              problems.append("a dependency manifest could not be captured, so "
+                              "the sets cannot be shown to match")
+          elif len(shas) > 1:
+              problems.append("arms installed DIFFERENT dependency versions "
+                              f"{sorted(s for s in shas if s)} — compare the "
+                              "deps-*.txt artifacts; a version difference in "
+                              "anything hot is a speed difference this run "
+                              "would otherwise credit to the provider")
           lines.append("")
           lines.append("**comparable: NO**" if problems else "**comparable: yes**")
           for p in problems:
