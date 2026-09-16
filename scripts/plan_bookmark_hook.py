@@ -70,6 +70,12 @@ _EXECUTION_PROTOCOL = (
 _GENESIS_DIR = Path.home() / ".genesis"
 _PENDING_FILE = _GENESIS_DIR / "plan_bookmark_pending.json"
 
+# How far to look for frontmatter's CLOSING fence. Generous against the
+# documented plan header (13 lines) so a plan that grows an id list still
+# parses, and bounded so a `---` thematic break in a long document cannot
+# make the scan swallow the file looking for a partner that is not there.
+_FRONTMATTER_MAX_LINES = 60
+
 
 def _classify_plan_complexity(plan_path: str) -> str:
     """Classify plan as small/medium/large based on task and step count."""
@@ -135,8 +141,7 @@ def _extract_plan_info(hook_input: dict) -> tuple[str, str]:
         try:
             path = Path(plan_path)
             if path.exists():
-                for line in path.read_text().splitlines()[:10]:
-                    line = line.strip()
+                for line in _title_candidate_lines(path.read_text()):
                     if line.startswith("#") and not line.startswith("<!--"):
                         title = line.lstrip("#").strip()
                         break
@@ -144,6 +149,33 @@ def _extract_plan_info(hook_input: dict) -> tuple[str, str]:
             pass
 
     return plan_path, title
+
+
+def _title_candidate_lines(text: str) -> list[str]:
+    """The lines a plan's `# ` title can plausibly be on, stripped.
+
+    YAML frontmatter is skipped first. Without that, a plan carrying the
+    structured header (13 lines including both fences) pushes its heading past
+    the scan window, `title` stays empty, and the bookmark becomes unfindable
+    by keyword — silently, since nothing raises and nothing logs. MEASURED
+    2026-09-15 against a real headered plan: extracted title was ``''``.
+
+    The window stays bounded rather than scanning the file: a plan doc runs to
+    thousands of lines, and a `# ` heading that far down is a section, not the
+    document's title. Ten lines is kept from the original — the point of this
+    change is where the window STARTS, not how wide it is.
+
+    A leading `---` only opens frontmatter if a closing fence follows within
+    the search bound; otherwise it is a thematic break and the text is scanned
+    as-is.
+    """
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "---":
+        for idx in range(1, min(len(lines), _FRONTMATTER_MAX_LINES)):
+            if lines[idx].strip() == "---":
+                lines = lines[idx + 1 :]
+                break
+    return [line.strip() for line in lines[:10]]
 
 
 def _guess_session_id() -> str:
