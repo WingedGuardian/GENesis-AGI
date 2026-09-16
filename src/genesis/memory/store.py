@@ -276,6 +276,7 @@ class MemoryStore:
         # seeded by default ("CC" -> "Claude Code",
         # entity_resolution._SEED_ALIASES), so this was not a configured-only
         # hazard.
+        raw_content = content
         try:
             from genesis.memory.entity_resolution import normalize_content
 
@@ -283,14 +284,45 @@ class MemoryStore:
         except Exception:
             pass  # best-effort — never block a store on normalization failure
 
-        # Dedup: skip if exact content already stored (any collection)
+        # Dedup: skip if exact content already stored (any collection).
+        #
+        # BOTH forms are checked, because memory_fts can legitimately hold
+        # either. `load_aliases()` is mtime-driven and explicitly best-effort,
+        # so an alias added AFTER a row was written — or a normalization that
+        # failed once and later recovered — leaves the RAW text in the index.
+        # Querying only the normalized form would miss that row and mint the
+        # very duplicate normalizing-first exists to prevent.
         try:
             existing = await memory_crud.find_exact_duplicate(
                 self._db, content=content,
             )
+            if not existing and raw_content != content:
+                existing = await memory_crud.find_exact_duplicate(
+                    self._db, content=raw_content,
+                )
             if existing:
+                # A duplicate does NOT discharge the supersession. The caller
+                # asked for two things — store this, deprecate that — and only
+                # the first is already satisfied. Returning bare here dropped
+                # the second silently, leaving the stale memory live while the
+                # API reported success. Supersede onto the row that already
+                # carries this content.
+                #
+                # Resolution happens HERE rather than reusing the block below,
+                # which runs after this early return. It raises on an
+                # unresolvable handle exactly as the normal path does, and
+                # nothing has been written at this point either.
+                if supersedes:
+                    resolved = await self._resolve_supersede_target(supersedes)
+                    await self._mark_superseded(
+                        resolved, existing, datetime.now(UTC).isoformat(),
+                    )
                 logger.debug("Skipping duplicate memory store: %s", existing)
                 return existing
+        except SupersedeUnresolved:
+            # A bad supersede handle is the caller's error and must reach them,
+            # not be swallowed by the best-effort dedup guard below.
+            raise
         except Exception:
             # Dedup check is best-effort — never block a store on lookup failure
             logger.warning("Dedup check failed, proceeding with store", exc_info=True)

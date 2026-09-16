@@ -93,25 +93,50 @@ async def find_exact_duplicate(
     *,
     content: str,
 ) -> str | None:
-    """Return memory_id if exact content already exists (any collection).
+    """Return memory_id if exact content already exists and is RECALLABLE.
 
     FTS5 does not support equality (=) on content columns, so we use a
     length + substr pre-filter followed by Python exact match.
 
     Collection-agnostic: the FTS ``collection`` column is unreliable
     (uniformly ``episodic_memory`` regardless of actual Qdrant placement).
+
+    **Only rows a normal recall could return count as duplicates.** This
+    result SUPPRESSES a write — the caller skips creating the memory and hands
+    back the id found here — so matching a row the user can never retrieve
+    turns a successful-looking store into a silent loss: the content is not
+    stored, and the id returned names something invisible to them. The three
+    exclusions mirror what ordinary recall already applies:
+
+    * ``source_subsystem IS NOT NULL`` — automated ego/triage/reflection
+      writes, excluded from user-facing recall by default (``retrieval.py``).
+    * ``deprecated`` — superseded rows, filtered by every read path.
+    * ``invalid_at`` in the past — the bitemporal filter (``search()`` below).
+
+    A row missing its metadata is treated as VISIBLE, which keeps the dedup
+    working on legacy rows rather than letting a metadata gap mint duplicates.
     """
     if not content:
         return None
 
-    # Pre-filter: match on length and first 200 chars to narrow candidates
+    # Pre-filter: match on length and first 200 chars to narrow candidates.
+    # LEFT JOIN, not an inner one: a row whose metadata is absent must still
+    # be dedup-able, so its NULL columns have to survive to the predicate.
+    from datetime import UTC
+    from datetime import datetime as _dt
+
+    as_of = _dt.now(UTC).isoformat()  # same spelling `search()` uses below
     prefix = content[:200]
     rows = await db.execute_fetchall(
-        "SELECT memory_id, content FROM memory_fts "
-        "WHERE length(content) = ? "
-        "AND substr(content, 1, 200) = ? "
+        "SELECT f.memory_id, f.content FROM memory_fts f "
+        "LEFT JOIN memory_metadata m ON m.memory_id = f.memory_id "
+        "WHERE length(f.content) = ? "
+        "AND substr(f.content, 1, 200) = ? "
+        "AND m.source_subsystem IS NULL "
+        "AND (m.deprecated IS NULL OR m.deprecated = 0) "
+        "AND (m.invalid_at IS NULL OR m.invalid_at > ?) "
         "LIMIT 200",
-        (len(content), prefix),
+        (len(content), prefix, as_of),
     )
     for row in rows:
         if row[1] == content:
