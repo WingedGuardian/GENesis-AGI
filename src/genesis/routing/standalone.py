@@ -86,6 +86,8 @@ def _build_standalone_router() -> Router | None:
         degradation = DegradationTracker(resilience_state=None)
         cost_tracker = NullCostTracker()
 
+        from genesis.routing.daily_budget import DailyBudgetLedger
+
         return Router(
             config=config,
             breakers=breakers,
@@ -94,6 +96,13 @@ def _build_standalone_router() -> Router | None:
             delegate=delegate,
             event_bus=None,
             dead_letter=None,
+            # Read-only, like the breakers above: MCP children load a
+            # SNAPSHOT of the server's daily-budget counters at process
+            # start (a provider exhausted later in the day is still called
+            # from long-lived children) and never write the shared state
+            # file — WS-3c. Their own usage also goes uncounted. Both are
+            # the undercount side, backstopped by the provider's 429s.
+            daily_budget=DailyBudgetLedger(persist=False),
         )
     except Exception:
         logger.warning(

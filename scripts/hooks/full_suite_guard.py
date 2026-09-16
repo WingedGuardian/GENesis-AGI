@@ -31,15 +31,53 @@ import sys
 # Self-locate so the sibling imports resolve whether CC runs this as a script or
 # it is imported as a module for tests.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import field, read_payload  # noqa: E402
-from shell_parse import (  # noqa: E402
-    _RUN_CARRIER_VALUE_FLAGS,
-    Segment,
-    _basename,
-    analyze_checked,
-    has_trailing_override,
-    is_pytest_invocation,
-)
+try:
+    from hook_input import degraded_exit, field, read_payload  # noqa: E402
+except Exception:  # noqa: BLE001 — a missing NEW helper must block.
+    if __name__ != "__main__":
+        raise
+    # REVERSE version skew: this guard may be newer than hook_input.py, in which case
+    # nothing it could import can recover it — degraded_exit is the thing that is
+    # missing. So fail closed locally. The exception is not rendered (even __str__ can
+    # raise) and os._exit is used so a broken diagnostic stream cannot replace exit 2
+    # during interpreter shutdown.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (full_suite_guard): shared hook_input is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
+
+# DEGRADED-path mention set, defined ABOVE the guarded import so it survives that
+# import failing. This guard exited 1 — NON-blocking — on a poisoned tree until now,
+# and what it protects is a shared box: its own refusal message records that an
+# untargeted run has repeatedly OOM-killed the suite and starved the live services.
+#
+# PRICE, stated rather than discovered: MEASURED over 74,282 real commands, 7,906
+# (10.64%) mention pytest, and while the tree is broken every one of them is refused —
+# including the TARGETED runs this guard normally allows. That is heavy, and it is
+# still the right direction here: the refusal is loud and one repair away, where the
+# fail-open is a box-wide stall. It is also why the background-pipe guard is NOT wired
+# the same way: its only usable token is the pipe character, at 70.30%, which would
+# leave the broken state unrepairable rather than merely inconvenient.
+_DEGRADED_GATED = r"\bpytest\b"
+
+try:
+    from shell_parse import (  # noqa: E402
+        _RUN_CARRIER_VALUE_FLAGS,
+        Segment,
+        _basename,
+        analyze_checked,
+        has_trailing_override,
+        is_pytest_invocation,
+    )
+except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
+    if __name__ != "__main__":
+        raise
+    degraded_exit("full_suite_guard", gated=_DEGRADED_GATED, exc=_exc)
 
 try:  # noqa: E402
     import discarded_write

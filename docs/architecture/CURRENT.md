@@ -1299,7 +1299,7 @@ verified: 84c7259d 2026-08-31
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
-  systemd timer; `check.py` runs 5 parallel probes → 6-state machine → act;
+  systemd timer; `check.py` runs 6 parallel probes → 6-state machine → act;
   Proxmox disk/RAM provisioning verbs) and container side (`watchdog.py`
   monitors the host Guardian every awareness tick, incl. git-SHA code-drift
   detection). Config `~/.genesis/guardian_remote.yaml`; missing → silently
@@ -2274,7 +2274,22 @@ verified: ee9ebf85c 2026-09-05
 
 - **routing/**: `config/model_routing.yaml` defines 61 numbered call sites,
   each a free-first → paid-last chain; `never_pays` sites are filtered to
-  free-only. Per-provider circuit breaker (3 failures, exponential backoff
+  free-only. **Daily free-tier budgets** (`daily_budget.py`,
+  `DailyBudgetLedger`): providers may carry `rpd_limit` / `tpd_limit`, each in
+  the provider's OWN unit and never converted between them. As SHIPPED today:
+  Groq carries both (`rpd_limit: 1000`, `tpd_limit: 200000`, the latter read
+  off Groq's own 429 text), and Gemini carries NEITHER — a daily cap for it is
+  inferred from a live 429 but not measured, and a wrong shipped cap would
+  deselect the provider on every install. When spent, the chain walk DESELECTS
+  the provider until the next
+  UTC day — no breaker trip (budget is not a health signal), one WARNING
+  `provider.budget_exhausted` event at the crossing, counters visible in the
+  routing config route (`daily_budget` map). Counters are router-observed and
+  undercount-biased by design (429s/timeouts never counted; the provider's own
+  429s backstop any undercount, while an overcount would deselect with no
+  correcting signal); state persists to `~/.genesis/routing_budget_state.json`,
+  server-only writer (WS-3c, like the breaker file), kill switch
+  `GENESIS_DAILY_BUDGET_DISABLED`. Per-provider circuit breaker (3 failures, exponential backoff
   capped 30 min — 4h for QUOTA_EXHAUSTED and NOT_ENTITLED; 429 = backpressure,
   NOT a breaker failure; state persisted cross-process to
   `~/.genesis/circuit_breaker_state.json`). **Probe/call evidence symmetry** —

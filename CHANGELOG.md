@@ -511,7 +511,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   saved timer schedules for real: that was the one step in the uninstall that
   ignored dry-run, and it can change whether a missed scheduled run replays
   after a later reinstall.
-
 - **Telegram ping when someone replies to a marketing pitch.** When a real person
   replies to one of Genesis's cold marketing emails, you now get one brief
   Telegram notification — the sender and the first line of their reply.

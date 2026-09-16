@@ -119,6 +119,35 @@ of guessing.
 Full method, including how to split a space where the question stops being
 well-posed: `references/high-stakes-verification.md` section 9.
 
+**And where you cannot measure, READ THE AUTHORITATIVE SOURCE — never your own
+recollection of it.** Measurement is the top of the ladder; this is the rung
+below, and the one most often skipped because recall feels like knowledge. For
+any claim about how something OUTSIDE this repo behaves — a flag's semantics, an
+exit code's meaning, an API's contract, a shell builtin's edge case — the order
+is MEASURE > the authoritative document (the vendor's own reference, the man
+page, the spec) > everything else. Pretraining recall is not a source. It is a
+hypothesis phrased confidently, and it is wrong most often exactly where a
+flag's NAME supports the assumption everyone makes about it.
+
+READ, from an external audit of a sibling toolkit (2026-09): its CI documented
+`uv --frozen` as the check that fails when the lockfile has drifted from the
+project file. It is not. Per the vendor's own reference — uv docs, "Locking and
+syncing", consulted 2026-09-15 — `--frozen` uses the lockfile as the source of
+truth *instead of* checking whether it is up to date, while `--locked` is the
+flag that "requires that the lockfile is up-to-date" and errors when it is not.
+(That citation is this passage obeying its own rule: an earlier draft asserted
+the same thing from recall and cited nothing, which an adversarial review
+caught.) The claim was plausible, the flag name invites the misreading, and
+nothing in that pipeline could ever have contradicted it — the verification
+everyone believed was running simply was not, and a green run said so every
+time.
+
+The habit that prevents it costs one lookup: when you write an instruction, a
+CI step, or a code comment that names an external tool's flag, open that tool's
+documentation in the same minute, and cite what you consulted so the next reader
+re-checks rather than re-derives. "I am fairly sure that flag means X" is the
+sentence to catch yourself in.
+
 **A new SKILL has its own version of this, and it is easy to miss.** Dropping a
 `SKILL.md` into `.claude/skills/` gets it INDEXED automatically (the catalog
 generator scans the directory — no registry to update), which looks like done.
@@ -145,6 +174,46 @@ For medium-to-large Genesis work (3+ files, new components, wiring
 changes), dispatch a `genesis-architect` subagent before implementation
 to check dependencies, edge cases, and DRY violations. Small targeted
 changes skip this.
+
+### Plan documents carry a structured header
+
+A plan doc that outlives one session (`~/.claude/plans/<name>.md`) opens with
+YAML frontmatter naming what it commits to and what it was written against:
+
+```yaml
+---
+plan: <slug>          # matches the filename
+status: active        # active | stalled | superseded | done
+updated: 2026-09-15   # last revision of the LIVE section
+pinned:
+  main: <12-hex>      # origin/main as of the `updated` date above
+binds: "<one line — what adopting this plan commits us to>"
+prevents: "<one line — what it forecloses, or nothing>"
+---
+```
+
+Quote `binds` and `prevents` — they are prose, and unquoted, a `": "` makes the
+whole header unparseable while a `" #"` **silently truncates** the value
+(`binds: PR #2046 ships first` loads as `"PR"`).
+
+Optional `decisions:` / `ledger:` / `issues:` lists name the trackers this plan
+executes, in FULL ids, so a reader of either end can find the other. An absent
+list means "none" — so only omit it once you have looked; write
+`issues: unchecked` if you have not. In the body,
+`## ═══ SUPERSEDED BELOW ═══` divides live content from archaeology; no divider
+means the whole file is live.
+
+**`pinned.main` is the field that pays for itself**: it makes
+`git fetch origin main --quiet && git log --oneline <pinned.main>..origin/main`
+a one-command staleness read, on a document whose line numbers and PR heads
+otherwise go quietly false. The fetch is load-bearing — against an unfetched
+`origin/main` the command prints nothing and reads as "no drift". A moved main
+means re-verify, never that the plan is wrong.
+
+Nothing checks any of this yet — the header is written by hand, and a plan
+missing it fails silently. Rationale field-by-field, what the divider does NOT
+do for a grepper, and what was and was not carried across from the upstream
+schema: `references/plan-docs.md`.
 
 ### Timeout Policy
 
@@ -1055,7 +1124,236 @@ every edit" mandate — that just gates work behind a tool that's stale-by-desig
 Full syntax and Cypher examples: `.claude/docs/code-intelligence-guide.md`;
 tool-selection decision matrix: `.claude/docs/code-intelligence.md`
 
+### Guard failure semantics — the third option is fail OPEN, LOUDLY
+
+Every guard has TWO INDEPENDENT axes when it cannot evaluate, and collapsing
+them into a single "fail-open or fail-closed" choice is what produces the bad
+design:
+
+- **DIRECTION** — what happens to the DECISION: open (the action proceeds) or
+  closed (it is refused). Decided per boundary, by consequence.
+- **VISIBILITY** — what happens to the FAILURE: silent, or recorded where a
+  later reader will actually find it. **Silent is never correct, in either
+  direction.**
+
+The third option is the one that gets forgotten: not open, not closed, but
+**open and LOUD** — the action proceeds AND the guard's inability to evaluate
+becomes a durable record plus an alert.
+
+**THE TEST IS THE REPAIR PATH, and it is measurable — do not reach for a
+judgement about severity.** Ask: with this failure present, can the session
+still REPAIR the failure? Name the operations repair needs — read a file, edit
+it, restore it, restart a unit — and check whether your refusal predicate
+matches any of them. If the repair path survives, fail-closed is available. If
+it does not, fail-closed is not "safer", it is a BRICK, and the answer is
+open-loud however severe the thing you wanted to stop.
+
+The test has a worked precedent, and it is worth reading for the SHAPE of the
+argument rather than as a verdict. PR #2042's body justifies its fail-closed leg
+by naming what survives — *"Read/Edit/Grep are ungated and `git checkout --
+<file>` matches none of the matchers"* — which is exactly this question, asked
+and answered with a measurement. (The quote is from the PR BODY; the function's
+own docstring makes a related but weaker claim, so cite the PR, not the symbol.)
+
+Two cautions travel with that precedent, both MEASURED, and they are why the
+test is a question you re-ask rather than a conclusion you inherit. First, an
+ungated repair verb is not automatically a SAFE one: in that same degraded state
+`git_discard_guard` no longer takes its recovery snapshot, and its own
+`also_lost` notice says so — *"a discard run now is not recoverable from it"* —
+so `git checkout` being unmatched means it RUNS, not that it is safe to run
+broadly. Second, the precedent covers only ONE of that helper's two failure
+legs; the other is the worked example below of the test returning the opposite
+answer.
+
+**SYSTEMIC failure means no usable predicate survives**, so any refusal would be
+TOTAL and the repair path closes with everything else — typically because the
+machinery that runs guards is dead (the wrapper, the interpreter, the venv), or
+because one missing dependency hits every guard at once. **There the default is
+open-loud** (standing owner ruling, 2026-09-15). Genesis runs headless: the
+interactive session IS the repair path, and the host Guardian is the
+repair-of-the-repair. A guard layer that fails closed at that level does not
+protect the machine, it bricks it, with nobody at a console to type the fix. A
+messy action Genesis can clean up afterwards beats a system that can no longer
+act at all.
+
+Note what does NOT decide this: "how bad was the cause". A single missing
+dependency produces EITHER regime, and the same helper contains one of each —
+which is the clearest worked example in the repo, so apply the test to both:
+
+- **`degraded_exit`'s predicate-gated leg** — a shared sibling (`shell_parse`)
+  is unimportable, so the guard refuses only what its degraded MATCHER names.
+  Read/Edit survive, `git checkout` is unmatched, the rates below are what it
+  costs. Repair path open ⇒ **PARTIAL**, and fail-closed is licensed.
+- **`degraded_exit`'s unconditional leg** — `hook_input` ITSELF is unimportable
+  or version-skewed, so nothing the guard could import can recover it and each
+  guard `os._exit(2)`s with no payload read and no predicate consulted.
+  **MEASURED 2026-09-15 by execution, not by grep: 9 of the 13 PYTHON hooks that
+  `.claude/settings.json` wires on matcher `Bash` exit 2** against a poisoned
+  `hook_input` (the other 4 are advisory and exit 1, which is correct for them).
+  So every shell command is refused with no predicate at all.
+
+  **Read that denominator exactly, because it is restricted and the restriction
+  is the point.** That matcher carries 15 hook commands across 14 entries; the 2
+  not counted are shell rather than Python, never import `hook_input`, and so
+  cannot be affected — and one of them is itself a blocking guard, so the
+  omission is not cosmetic. A repo-only enumeration is also not the LIVE
+  population: MEASURED on this install, `~/.claude/settings.json` wires a 16th
+  hook on the same matcher, invisible to any count taken from the repo alone.
+
+  Two population traps sit on top of each other here, and the second is the one
+  that survived a round of review. First: `grep degraded_exit(` finds six callers
+  and an earlier draft reported "six guards" — but this leg is precisely the one
+  where `degraded_exit` is UNREACHABLE, so all NINE refuse from their own import
+  handler and grep sees only the six that ALSO call it on the other leg. Count
+  the condition, never the helper. Second: correcting the number left the
+  denominator silently narrowed to the subset that was actually executed. **A
+  corrected figure written as "N of M things wired on X" has to re-enumerate X's
+  full population programmatically — parse the config, never grep — or it ships
+  one unstated restriction copied verbatim into four surfaces.** Naming what M
+  excludes is the fix; adjusting M is not. **Bash alone is not the question the test asks** — what
+  matters is whether ANY route to repair survives, and Write/Edit is one.
+
+**THIS TEST FOUND A REAL BRICK ON ITS FIRST APPLICATION, and the fix is the
+worked example of what it is for.** `scripts/pretool_check.py` carried the same
+unconditional block on `Write|Edit`, so the session could neither run a command
+NOR edit a file: repair path CLOSED, SYSTEMIC, on a headless box. And that
+refusal was a strict OVER-block rather than a conservative one — this guard
+blocks CRITICAL-path writes in DISPATCHED sessions only, an interactive session
+is allowed through by design, and its healthy session test
+(`os.environ.get("GENESIS_CC_SESSION")`) needs nothing from `hook_input`. It was
+refusing a category it was built never to refuse, and that category is the one
+that performs repairs.
+
+So the degraded block now asks the guard's own scope question with the one input
+that cannot fail: a DISPATCHED session still refuses (nobody is present to
+approve), an INTERACTIVE one is allowed with a loud notice. The security delta
+is ZERO and is locked by a test rather than asserted — the healthy guard already
+permits exactly that call, so restoring it surrenders no protection that existed.
+Bash stays refused, which is the point: fail-closed keeps everything it was
+protecting, and the session keeps the edit that repairs the tree.
+
+**A DISPATCHED session remains SYSTEMIC by this same test** — Bash and Write/Edit
+both refused, repair path closed — and that is the intended direction rather than
+an oversight: an unattended session is not who should be self-repairing a broken
+guard tree, and its repair route is a human interactive session, which is exactly
+what this change makes usable again.
+
+**The general rule, which is why this sits in the doctrine and not only in a
+changelog:** when a fail-closed leg has no predicate, do not ask whether the
+refusal is severe — ask which repair routes it closes, and leave one open on
+purpose. Two other routes exist here and NEITHER is a design: an MCP editing
+tool is matched by neither matcher, and the host Guardian can `REVERT_CODE` from
+outside the container, but nothing currently WAKES it, because the container is
+up and `genesis-server` never imports `hook_input`. A repair route that survives
+by accident is not a repair route; name it and WIRE it.
+
+**PARTIAL failure means a usable predicate survives**, and fail-CLOSED stays
+correct there — `run_guard` is the other merged instance (an uncaught crash in
+an irreversible-action guard exits 2 instead of the exit 1 CC treats as
+non-blocking). What licenses them is MEASURED. Six guards are wired to
+`degraded_exit`, and their predicate-gated matchers refuse between **1.90% and
+21.47%** of 74,282 unique real commands individually; PR #2042 measures the
+UNION of four of them at **28.80%**, which it headlines as "roughly 29% of
+ordinary work is refused while the tree is broken".
+
+Read that union as the shape of an operability budget, NOT as its value: the
+other two wired guards are outside it, so the real six-guard figure is unmeasured
+and strictly higher. A seventh guard does not get to add its rate to 28.80% and
+call the result the cost — that arithmetic is the population error this file
+keeps catching. Measure the union you actually have. What each protects earns its
+share: irreversible for `worktree_cwd_guard`, merely heavy for
+`full_suite_guard` — a distinction taken from PR #2042's own table rather than
+assumed, and a reminder that "what it protects" is a mixed bag even inside one
+wired set.
+
+`background_pipe_guard` is the one that was deliberately NOT wired: its degraded
+matcher would refuse **70.30%** of that same corpus, and a guard refusing the
+majority of ordinary work does not make the broken state safe — it makes it
+unrepairable, which is the brick again by another route.
+
+**Ambiguity about WHICH REGIME you are in resolves toward OPEN-LOUD**, because
+that direction's worst case is a recorded mess and the other's is a system
+nobody can reach.
+
+**This section decides the REGIME; it does not decide the direction within
+one.** Once you have established PARTIAL, the per-boundary mandate under "Never
+hand-roll `gh`/bash/CLI argv parsing" and its corollaries (a)/(b)/(c) govern
+which way that guard fails — and corollary (c) settles the unattended-session
+case in the direction of REFUSING, after three narrowing rounds on one
+predicate. Nothing here loosens it. What this section adds is the prior
+question those corollaries assume has already been answered: whether a usable
+predicate exists at all.
+
+Four rules follow, each cheap:
+
+1. **"Could not evaluate" is its own state.** Never render it as allow, clean,
+   healthy, or no-finding. A check reports exactly one of four things:
+   CHECKED-CLEAN, FINDINGS, COULD-NOT-CHECK, OUT-OF-SCOPE. The merge gate
+   already works this way where it prints an unrecognised reviewer's comment
+   rather than scoring it silently; `InjectionHealth.errors` does it by emitting
+   a DEGRADED finding instead of resolving healthy.
+2. **Write the degraded marker BEFORE the early return, with ZERO dependency on
+   the component that failed.** A refusal path that records its reason only
+   after the check it could not run has recorded nothing. READ, a sibling
+   toolkit's 2026-09 incident: its blocking hooks refused every command for 30
+   minutes while its own liveness canary reported OK — the dependency-missing
+   branch printed its refusal and exited BEFORE the line that writes the
+   heartbeat. The canary asked "did it receive a payload", never "could it
+   evaluate one", so a guard refusing everything left exactly the trace a guard
+   nobody called leaves.
+3. **Degrade the RENDERER, never the VERDICT.** When the thing that failed is
+   how you SPEAK — a serializer, a formatter, a size budget — the decision
+   itself must still land. `print_json_bounded` is the in-repo instance: an
+   oversized advisory loses prose, never its `permissionDecision`. **It also
+   tells you when it could not keep that promise** — it returns False and emits
+   ANYWAY when the envelope alone exceeds the budget or no named text key was
+   trimmable, and CC discards an exit-0 hook's stderr, so that return value is
+   the only signal a caller gets. Check it: "something was trimmed" is not "the
+   decision landed". Another install's toolkit reaches the identical rule from
+   the other side, rendering verdicts through a fallback chain after a broken
+   serializer turned every refusal into empty stdout — which the harness reads
+   as ALLOW.
+4. **The watcher must detect COULD-NOT-EVALUATE, not merely DID-NOT-RUN.** A
+   liveness check keyed on "is the timer active" or "did a heartbeat arrive"
+   cannot see a guard that ran, refused everything, and wrote nothing. Ask what
+   your watcher would report if the guard were evaluating nothing at all; if the
+   answer is "healthy", it is measuring the wrong thing.
+
 ### Common Traps
+
+- **A `gh` listing is ALREADY capped before you pass a flag, and the caps are not
+  uniform.** MEASURED by reading `--help` on gh 2.98.0 (2026-08-20): `pr list` 30 ·
+  `issue list` 30 · `run list` **20** · `workflow list` **50** · `gist list` **10** ·
+  `release list` 30 · `repo list` 30 · `cache list` 30 · every `search` subcommand 30.
+  So `gh pr list --limit 30` is behaviourally identical to passing nothing, and a
+  session once reported its own cap back as the repo's open-PR count (said 30, the
+  real number was 78). The unflagged form is the dangerous one precisely because
+  nothing in the command hints a cap is in force. `scripts/hooks/capped_read_advisory.py`
+  now says so pre-flight, and a drift test re-reads `--help` so this table fails loudly
+  when gh moves a number rather than quietly naming a cap that no longer exists — treat
+  the numbers above as the reading at that version, not as durable facts. Raising
+  `--limit` gets you MORE ROWS, and `--paginate` is a `gh api` flag every one of these
+  subcommands rejects (MEASURED on gh 2.98.0: `unknown flag: --paginate`).
+
+  **A SHORT read is NOT proof of completeness, and an earlier version of this very
+  bullet said it was.** "Re-read until the result comes back short of your limit" is
+  the intuitive rule and it is false, because GitHub shortens a response on its own
+  for reasons the command cannot see. MEASURED, three independent ways: a FILTERED
+  `gh run list` (`--branch`/`--created`/`--event`/`--status`/`--user`) is served by the
+  workflow-runs endpoint, which returns at most 1,000 results for such a search;
+  `gh pr list --search` and `gh issue list --search` route through GitHub search and
+  stop at 1,000 (`gh pr list --help` advertises `-S, --search`); and any `gh search`
+  whose query TIMED OUT returns fewer rows than asked for with
+  `incomplete_results: true`. Each is short, and none is complete. `gh search` also
+  refuses a limit above 1,000 outright (`` `--limit` must be between 1 and 1000 ``),
+  so you cannot widen past it at all.
+
+  So: a SATURATED read supports "at least N" and never "N" — that much still holds.
+  For an exact count, use a source that reports a TOTAL rather than the length of a
+  list you asked for, and check that total is not itself partial: the Search API
+  returns `total_count` alongside `incomplete_results`, and the count is exact only
+  when that flag is `false`. Date-slicing a query is still the way to get under a
+  ceiling; just do not treat a short slice as self-certifying.
 
 - **Fail-closed data access.** A data-access boundary must RAISE (or return a
   clearly-typed "unknown/unavailable") on missing scope or an unavailable
@@ -1068,6 +1366,19 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   `batch_retrieve_vectors`-swallows split exists for exactly this). Origin: the
   home-anchored-DB reads that silently returned no data from an empty worktree
   path, and the memory-integrity checker (2026-07).
+- **Never replace a runtime the CURRENT session depends on — that is a HANDOFF,
+  not a repair.** Upgrading, downgrading, reinstalling or removing the
+  interpreter, Node, the CC binary, or the venv that the ACTIVE session (or its
+  hooks, MCP servers, or test runner) is running on kills the thing performing
+  the repair, mid-repair — and the second half of the procedure, the half that
+  puts the replacement in place, never runs. The safe sequence is side-by-side:
+  install the replacement ALONGSIDE, verify it works, switch the pointer, and
+  only then remove the old one; and run the whole procedure from OUTSIDE the
+  dependent session (a separate shell, a systemd unit, the host Guardian).
+  READ, a sibling install's 2026-09 incident: a rollback script uninstalled the
+  running Node before installing the intended version, the uninstall terminated
+  the agent session executing it, and the machine was left with neither. Before
+  touching any runtime, inventory what is running on it.
 - **Ego sessions are ACTIVE.** `src/genesis/ego/` is live (v3.0a11).
   Two egos: user ego (CEO, Opus) and Genesis ego (COO, Sonnet). Both
   run on adaptive cadence via the awareness loop. Changes here are
@@ -1148,7 +1459,11 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   shared parser must DEGRADE gracefully (fail-open, never crash — that is
   `shell_parse.py`'s stated contract), while each security-critical caller
   (merge/push authorization) treats an unparseable command as a block (fail-closed
-  THERE). A parser-wide absolute fail-closed is wrong — it would deny legitimate
+  THERE). This bullet and its corollaries decide the DIRECTION for one guard's
+  degraded path, and they assume a usable predicate still exists. "Guard failure
+  semantics" above decides the prior question — whether one does — and when none
+  does (wrapper, interpreter or venv dead, or one dependency taking every guard
+  at once) its repair-path test governs instead of this bullet. A parser-wide absolute fail-closed is wrong — it would deny legitimate
   uncommon commands without closing evasion paths. Same family as the
   canonical-parser lesson (regex→yaml, #1393). Loci today:
   `scripts/hooks/shell_parse.py` + `scripts/hooks/git_push_guard.py`.
@@ -1768,6 +2083,31 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   filed as ordinary work rather than held as a release blocker. "It pre-dates
   the release" is otherwise just a new spelling of the rationalization that
   counter exists to kill.
+
+- **A pre-existing defect the change RECRUITS FOR is IN-arc — FOR A RELEASE
+  REVIEW.** The bullet above splits findings into "this release's" and
+  "pre-dating it", and there is a third bucket between them that neither
+  catches: a defect that already existed and which THIS change newly leads
+  people INTO — because it adds the documentation that sends them down that
+  path, flips the default that reaches it, or ships the feature whose obvious
+  next step lands on it. It is not in the diff, and the RELEASE is still
+  answerable for it, because the release is what made it reachable. Ask of every
+  pre-existing finding: *did we just build the road to it?* If yes, it gates
+  **the release**. (Adopted from a sibling toolkit's release-review protocol,
+  which carries a dated case of exactly this shape: a latent defect in an
+  install path that was harmless until a release's own docs began recommending
+  that path.)
+
+  **This does NOT override "Keep the PR the PR"** (standing user rule,
+  2026-09-09, further down this file). On an individual PR the routing question
+  is unchanged — *does the PR work without this fixed?* — and for a recruited
+  defect the answer is USUALLY yes, so it is FILED as an issue while the PR
+  merges. Run the question anyway rather than assuming the answer: a change that
+  flips a DEFAULT onto the latent path fails it, and a PR that breaks on first
+  use is not a merge. What this bullet changes is the RELEASE's answerability,
+  not whether a PR waits. Holding a PR for a recruited defect is the exact
+  friction the owner removed, so if you find yourself about to, you have
+  mis-scoped this bullet.
 
 - **A review's findings are a SAMPLE, not a to-do list.** This is the single
   highest-value habit in this section, and the one most often skipped. CLAUDE.md
@@ -3107,6 +3447,80 @@ being a review and becomes an unbounded refactor, which is how a two-finding PR
 turns into a six-round loop. The PR is the unit of work. The queue is the place
 the rest of it goes.
 
+### Before reviewing an OLD PR, check it is still work (standing user rule, 2026-09-15)
+
+A review session drains a queue sorted by age, and the older the PR the more
+likely it is no longer work — its content already merged under a different
+number. Observed twice in one session on 2026-09-15 (unquantified: nobody
+counted the old PRs that WERE still work, so treat this as a prompt to check,
+not a base rate).
+
+**Squash merges are why this is not obvious.** A squash rewrites the commits, so
+the branch's own history never becomes an ancestor of `main`. MEASURED on a
+two-commit branch whose work had landed as one squashed commit:
+
+| test | result |
+| --- | --- |
+| `git merge-base --is-ancestor <branch> main` | rc 1 — reads as UNMERGED |
+| `git cherry -v main <branch>` | `+` on BOTH commits — reads as unique |
+| `git diff origin/main..HEAD -- <files>` | **empty — correctly detects it** |
+
+`git cherry` compares patch-ids, so it DOES catch a squash of a single commit —
+and is blind exactly when the squash combined several, which is the common case.
+Do not rely on it.
+
+```bash
+git fetch origin main --quiet     # a stale ref decides this test otherwise
+git diff origin/main..HEAD -- <the files it claims to change>   # empty ⇒ already there
+```
+
+TWO DOTS, not three. `origin/main...HEAD` is merge-base→HEAD: it ignores
+everything that landed on `main` after the fork point, including the squash that
+carries the work, so it is non-empty for a superseded PR every time. It is
+exactly as blind as the ancestry tests above. (Caveat on the two-dot form: a
+RENAME on `main` makes the old path read as a new file, so a renamed-and-merged
+change still looks like work.)
+
+Once you have a commit ON `main` that you suspect carries it, this NAMES the
+successor — note it answers "which PRs contain this commit", so feeding it the
+open PR's own head just returns that PR:
+
+```bash
+gh api repos/<owner>/<repo>/commits/<sha-on-main>/pulls --jq '.[] | "\(.number) \(.state)"'
+```
+
+**A second, separate question: is the tree you are standing in at the PR's
+head?** A worktree created from a branch NAME sits wherever that ref pointed
+when it was created. That check is already specified — with the fetch it needs,
+the `main`-ancestry companion, and the reasons a ref comparison alone is not
+enough — in the `closing-session` skill under *Establish freshness by comparing
+REFS*, and in **Date the code before classifying a red** above. Use those; do
+not re-derive a shorter version here. Note also that `rev-parse HEAD` is blind
+to uncommitted edits, so check `status --porcelain` too.
+
+MEASURED 2026-09-15, one worktree, the cost of skipping it: a tree four commits
+behind its PR head produced a CRITICAL finding, a full adversarial audit, a
+public issue, a commit and review evidence — all describing a defect the branch
+had already fixed in a commit that tree could not see. The same audit declared
+two functions absent from the codebase when both exist at the head, which turned
+a reviewer's correct finding into a rejected one. Every measurement was true of
+the tree it ran in and false about the PR.
+
+**Treat a finding that is too good as a staleness signal first** — a defect that
+would break the feature outright, a symbol a careful author somehow forgot.
+Re-read the head before writing it down, and certainly before filing it
+publicly. That check is cheap and unconditional; the judgement about whether a
+finding is "too good" is not, which is why the action does not depend on it.
+
+**A subagent inherits your staleness silently** — point an audit at a worktree
+path and it will measure that tree with complete confidence. Put the head SHA in
+the dispatch prompt and ask it to verify the match first.
+
+**When a PR IS superseded: name the successor in a comment and LEAVE IT OPEN.**
+Closing it is retiring, which is not the review station's call — see *Never
+RETIRE a PR you are not the one reviving* above. Do not "rebase and revive" it
+either; that is how the same change lands twice.
+
 ## Pre-Merge Gate
 
 > **This is closing-session territory.** A build session's work ends when the PR
@@ -3554,6 +3968,7 @@ references on every trigger.
 | Phase 6 contribution pipeline, sanitizer | `references/contribution.md` |
 | Pending work, active incidents, subsystem status | `references/build-state.md` |
 | Auditing/deep-reviewing AI-generated code (failure taxonomy, audit passes) | `references/ai-code-audit.md` |
+| Writing or revising a multi-session plan document | `references/plan-docs.md` |
 | Pre-release review, bug hunt, guard/gate change — verification method | `references/high-stakes-verification.md` |
 | Choosing a command/value/procedure by reasoning about an external tool | same, section 9 |
 | Which code tool to use (CBM vs Serena vs GitNexus vs Grep) | `.claude/docs/code-intelligence.md` |

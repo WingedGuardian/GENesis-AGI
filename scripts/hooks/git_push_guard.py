@@ -120,7 +120,24 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # scripts/ (parent dir) for review_state — the shared escalation-cap constant, so
 # the Codex-round gate below and the commit gate's Rule 3 stop at the same N.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from hook_input import field, read_payload, run_guard  # noqa: E402
+try:
+    from hook_input import degraded_exit, field, read_payload, run_guard  # noqa: E402
+except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must block.
+    if __name__ != "__main__" or sys.argv[1:2] == ["--check-pr"]:
+        raise
+    # Reverse version skew: this guard may be newer than hook_input.py. Nothing
+    # imported from that older helper can recover us, so fail closed locally. Do
+    # not render the exception — even __str__ can raise — and use os._exit so a
+    # broken diagnostic stream cannot replace exit 2 during interpreter shutdown.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (git_push_guard): shared hook_input is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
 
 # SOFT dependency (mirrors review_enforcement_commit.py's guard for the SAME
 # import): an unimportable review_state must degrade ONLY the round-escalation
@@ -146,16 +163,52 @@ try:
 except Exception:  # noqa: BLE001 — see above: a load failure exits 1 = non-blocking.
     audit_jsonl = None
 
-from shell_parse import (  # noqa: E402
-    _KNOWN_SIGILS,
-    analyze,
-    analyze_checked,
-    commit_skips_hooks,
-    gh_pr_subcommand,
-    git_subcommand,
-    has_trailing_override,
-    split_segments,
+# DEGRADED-path mention set, defined ABOVE the guarded import so it survives that
+# import failing. It mirrors `_GATED_MENTION` below (same verbs and flags, same
+# deliberate breadth, same reasoning) and adds `gh` and `sqlite3`, because on this
+# path there is no parse to narrow with at all. Kept as its own literal rather than
+# shared: sharing would place the constant after the import it has to outlive.
+# Word-boundary rather than a trailing separator class, for the reason spelled out at
+# `_GATED_MENTION`: the anchor was a narrowing conjunct and every ordinary shell
+# separator starved it. Both copies carried it, so both were corrected — fixing the
+# degraded one alone would have left the LIVE net starved while the comment claimed
+# the class was closed.
+_DEGRADED_GATED = (
+    r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b"
+    r"|\b(?:push|merge)\b|\bgh\b|\bsqlite3\b"
 )
+
+try:
+    from shell_parse import (  # noqa: E402
+        _KNOWN_SIGILS,
+        analyze,
+        analyze_checked,
+        commit_skips_hooks,
+        gh_pr_subcommand,
+        git_subcommand,
+        has_trailing_override,
+        split_segments,
+    )
+except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
+    if __name__ != "__main__" or (len(sys.argv) >= 3 and sys.argv[1] == "--check-pr"):
+        # Two cases that must NOT degrade. A test importing a broken tree needs the
+        # real error. And `--check-pr` is a HUMAN-run CLI read that takes no stdin:
+        # degrading there would block on a terminal read and then exit 2 at someone
+        # who only asked a question. Let both see the traceback.
+        #
+        # The arity matches the REAL dispatch (`len(sys.argv) >= 3` at the bottom of
+        # this file), not just the flag. An earlier form tested the flag alone, so a
+        # bare `--check-pr` with no PR number took the CLI carve-out on a broken tree
+        # and the hook path on a healthy one — a carve-out whose boundary did not
+        # match the thing it was carving out.
+        raise
+    # No sigil is honoured on this path. That is now true of every caller — see
+    # degraded_exit, whose substring-based waiver was measured allowing two decoys —
+    # but it was decided FIRST here and for a stronger reason worth keeping: this
+    # file's sigils (stale-review-override, ci-override, merge-to-main-override …)
+    # authorise a PUBLISH past review gates, so honouring one with every gate in this
+    # file already proven absent is the precise combination the net exists to prevent.
+    degraded_exit("git_push_guard", gated=_DEGRADED_GATED, exc=_exc)
 
 # Mentions of a GATED operation, consulted ONLY on the un-parseable path where
 # analyze() has gone blind. Deliberately BROAD — both the gated verbs and the
@@ -169,8 +222,16 @@ from shell_parse import (  # noqa: E402
 # flag-only, hard-block version had to be surgically precise, and precision is
 # exactly what an unreliable parse cannot deliver: every narrowing conjunct
 # became a new way to starve the trigger (measured).
+# THE TRAILING ANCHOR WAS ITSELF A NARROWING CONJUNCT — the exact thing the paragraph
+# above forbids, sitting inside the pattern it forbids it in. `(?:\s|=|$)` requires
+# whitespace, `=` or end-of-string AFTER the flag, so every ordinary shell separator
+# starved it. MEASURED on the literal pattern: `git commit --no-verify -m x` matched,
+# while `--no-verify;`, `--no-verify&`, `--no-verify|cat` and `(… --no-verify)` did
+# NOT. A word boundary asks the one thing that was meant — that the flag is a whole
+# token — without naming the characters that may follow it. MEASURED cost of the
+# widening over 74,282 real commands: 15,945 -> 15,995, i.e. +50 (+0.07%).
 _GATED_MENTION = re.compile(
-    r"(?:^|\s)(?:--force(?:-with-lease)?|--no-verify|--admin)(?:\s|=|$)|\b(?:push|merge)\b"
+    r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b|\b(?:push|merge)\b"
 )
 
 # `gh pr create` is the FOURTH gated operation (it can push or fork the branch —
@@ -535,8 +596,12 @@ _MERGE_GATE_BUDGET_S = 45.0
 # Shared merge-path deadline (a monotonic() instant). main() sets it once before the
 # gh-pr-merge gates; every merge-path gh call reads it via _gh_timeout so the AGGREGATE
 # finishes with headroom under the hook's ~60s wall-clock. A module global is safe:
-# this PreToolUse hook is a SINGLE-SHOT process (one command, no concurrency), and it
-# stays None on every other path (push, the --check-pr report) → those use full caps.
+# this PreToolUse hook is a SINGLE-SHOT process, so one deadline per
+# invocation is the whole lifecycle. ARMED AT THE TOP OF
+# `_run_merge_and_push_gates` for EVERY path it guards — the push path
+# included, which used to inherit it only as a side effect of the escalation
+# gate. It stays None on the `--check-pr` reporting path, which is not a hook
+# invocation and has no registration to overrun, so that one uses full caps.
 _merge_deadline: float | None = None
 
 
@@ -750,8 +815,10 @@ _CI_PENDING_STATES = {"PENDING", "EXPECTED"}
 # almost always by a `concurrency: cancel-in-progress` supersession, which leaves
 # the cancelled dup attached to the head commit. It is red BY DEFAULT (it is also
 # in _CI_RED_CONCLUSIONS), and dropped ONLY when a check of the SAME identity
-# (name + workflowName, see _ci_identity) concluded SUCCESS at-or-after it on this
-# head (so a SUCCESS-then-cancel re-run on an unchanged head still blocks).
+# (name + workflowName, see _ci_identity) concluded SUCCESS STRICTLY AFTER it on this
+# head (so a SUCCESS-then-cancel re-run on an unchanged head still blocks, and so does
+# an EQUAL second-precision timestamp, which orders nothing — see
+# _drop_superseded_cancels for why an unprovable ordering fails closed).
 # Deliberately scoped to CANCELLED alone: FAILURE/TIMED_OUT/ACTION_REQUIRED/
 # STARTUP_FAILURE carry real verdicts and always block, even with a success sibling.
 _CI_CANCEL_CONCLUSIONS = {"CANCELLED"}
@@ -796,18 +863,152 @@ def _ci_identity(c: dict) -> tuple[str, str] | None:
     return None
 
 
+def _ci_completed_at(entry: dict) -> _dt.datetime | None:
+    """A check-run's ``completedAt`` as an OFFSET-AWARE datetime, or None.
+
+    None on anything that cannot be established: absent, blank, unparseable, or
+    parsed but NAIVE. A NON-STRING value is the one shape that does not return
+    None -- ``.strip()`` raises AttributeError out of this helper, which
+    ``run_guard`` converts to exit 2, a BLOCK. Unreachable from GitHub (the
+    ``DateTime`` scalar is string-or-null) and fail-closed either way, but the
+    enumeration above would otherwise be false. Every caller treats None as "cannot be compared", which on
+    this path means an unparseable SUCCESS supersedes nothing and an unparseable
+    CANCEL is kept — the fail-closed direction.
+
+    Naive is rejected rather than assumed UTC. Comparing a naive datetime against
+    an aware one raises TypeError, and the alternative to rejecting it is guessing
+    a zone, which is exactly the kind of assumption this function exists to stop
+    relying on. GitHub has always sent an offset; if it ever sends a bare value,
+    the gate should get stricter, not luckier.
+    """
+    raw = (entry.get("completedAt") or "").strip()
+    if not raw:
+        return None
+    try:
+        # `fromisoformat` accepts a literal `Z` from 3.11, but normalising first
+        # costs nothing and keeps this readable against older interpreters.
+        parsed = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _drop_superseded_cancels(checks: list) -> list:
+    """Return *checks* with superseded ``concurrency: cancel-in-progress`` duplicates
+    removed — a CANCELLED CheckRun is dropped ONLY when a SUCCESS of the EXACT same
+    ``(name, workflowName)`` identity completed STRICTLY AFTER it; every other entry is
+    returned unchanged, in order.
+
+    STRICTLY after, not at-or-after. ``completedAt`` is second-precision, so an EQUAL
+    timestamp does not order the two runs at all — it says only that they finished in
+    the same second, which is not evidence that the success came second. On a
+    supersession the successful run STARTS when the cancel fires and finishes a whole
+    job later, so a tie is not even the shape this drop exists to recognise; a tie is
+    far likelier to be two unrelated runs, or a genuinely-cancelled latest attempt.
+    An unprovable ordering therefore fails CLOSED, like every other unresolvable case
+    below. MEASURED before tightening (the Actions runs API over 400 runs / 2 days,
+    30 real cancelled jobs on 25 shas): 18/30 had a strictly-later success, 12/30 had
+    none, and **0/30 turned on a tie** — so this costs nothing observed, and 30 is a
+    small denominator, which is precisely why the direction matters more than the
+    rate: being wrong here over-blocks, it cannot wrong-green.
+
+    THE ONE home of that rule. It had two: ``_pr_ci_status`` (which has always
+    applied it) and ``_mechanical_scan_is_green`` (added later, which re-derived a
+    naive ``all(c == "SUCCESS")`` and never handled a cancel at all). A doubled
+    workflow dispatch — two ``pull_request`` runs for one sha, leaving EVERY
+    check-run as a success+cancelled pair — made the two disagree about one payload
+    inside ONE process: ``ci: green`` alongside "'leak-detector' is not green at
+    this head", a message that sends the reader to inspect a job that is green.
+    Deterministic for as long as that head stands, not a flake. Any FUTURE consumer
+    of check-run conclusions calls this rather than re-deriving it a third time.
+
+    Every condition below fails CLOSED — a cancel that cannot be PROVEN superseded
+    is returned, and the caller's own red/not-green logic then sees it:
+
+    * Only GitHub Actions CheckRuns with a resolvable identity AND a ``completedAt``
+      may serve as the superseding sibling (``_ci_identity`` → None for a legacy
+      StatusContext or a non-Actions check; a timestampless SUCCESS is skipped). So
+      a StatusContext SUCCESS can never drop a same-named CheckRun cancel.
+    * A cancel with no identity, no ``completedAt``, or no qualifying success STAYS.
+      That includes SUCCESS-then-cancel on an unchanged head: the latest attempt
+      never passed, so nothing supersedes the cancel.
+    * ONLY ``_CI_CANCEL_CONCLUSIONS`` (deliberately ``{"CANCELLED"}`` alone) is
+      droppable. FAILURE / TIMED_OUT / ACTION_REQUIRED / STARTUP_FAILURE / STALE
+      carry real verdicts and are never dropped, whatever completed beside them —
+      so this can never widen into "ignore anything that is not SUCCESS".
+    * Non-terminal entries (an in-flight re-run) are not conclusions and are never
+      touched; the caller still counts them PENDING.
+    * Entries that are not dicts are passed through untouched, so a caller's own
+      shape checks still see the payload it was given.
+
+    Comparison PARSES both ``completedAt`` values and compares datetimes, in both
+    passes. This is NOT the pulled #1420 finding-magnet, which sorted the WHOLE set
+    (including QUEUED runs with a null ``startedAt``) to pick a global "latest".
+
+    IT USED TO BE A LEXICOGRAPHIC STRING COMPARE, and the reason it no longer is
+    was written down here before it was acted on. GitHub's GraphQL ``completedAt``
+    is emitted as second-precision UTC with a literal ``Z`` (MEASURED 2017/2017
+    entries across 122 PR rollups — every one ``Z``-suffixed with no fractional
+    part). That is an OBSERVATION, not a contract: the schema documents the
+    ``DateTime`` scalar only as "An ISO-8601 encoded UTC date string", which
+    constrains neither sub-second precision nor the offset spelling. String order
+    equals chronological order only while EVERY value shares one format, and two
+    real shapes break it — a ``+00:00`` offset instead of ``Z``, and fractional
+    seconds (``'Z'`` sorts ABOVE ``'.'``, so a SUCCESS at ``:00Z`` compares as later
+    than a cancel at ``:00.9Z`` and wrongly drops it). The consequence is not
+    cosmetic: `_mechanical_scan_is_green` consumes this, so a reversed ordering
+    drops a real cancellation and carries an old leaks review forward — and under
+    ``# ci-override`` that relief is the only remaining check of the mechanical
+    layer. An observation is not a thing to gate on when parsing costs one call.
+
+    ``_ci_completed_at`` fails CLOSED on anything it cannot parse into an
+    OFFSET-AWARE datetime, including a naive value: an unparseable SUCCESS cannot
+    supersede anything, and an unparseable CANCEL is kept. Naive is excluded rather
+    than assumed-UTC because comparing naive against aware raises, and guessing a
+    zone to avoid that is how a wrong-green gets built.
+    """
+    # Pass 1: the latest completedAt among SUCCESS runs, per strict identity.
+    success_latest: dict[tuple[str, str], _dt.datetime] = {}
+    for c in checks:
+        if not isinstance(c, dict) or c.get("conclusion") not in _CI_GREEN:
+            continue
+        ident = _ci_identity(c)
+        ts = _ci_completed_at(c)
+        if ident is None or ts is None:
+            continue
+        known = success_latest.get(ident)
+        if known is None or ts > known:
+            success_latest[ident] = ts
+
+    # Pass 2: drop only the cancels pass 1 proves superseded. STRICTLY after, so a
+    # tie keeps the cancel: equal second-precision stamps make the ordering
+    # unprovable, and unprovable must not mean droppable.
+    kept: list = []
+    for c in checks:
+        if isinstance(c, dict) and c.get("conclusion") in _CI_CANCEL_CONCLUSIONS:
+            ident = _ci_identity(c)
+            cts = _ci_completed_at(c)
+            if ident is not None and cts is not None:
+                latest = success_latest.get(ident)
+                if latest is not None and latest > cts:
+                    continue
+        kept.append(c)
+    return kept
+
+
 def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]:
     """Classify a PR's CI check-runs.
 
     Returns ``(state, problem_checks)`` where state is one of:
       * ``"green"``   — every non-skipped check concluded SUCCESS
       * ``"red"``     — at least one check failed/timed-out, or was cancelled
-                        with NO same-identity SUCCESS completing at-or-after it.
+                        with NO same-identity SUCCESS completing STRICTLY AFTER it.
                         A CANCELLED CheckRun that a same (name, workflowName)
-                        SUCCESS completed at-or-after is a superseded
+                        SUCCESS completed strictly after is a superseded
                         `concurrency: cancel-in-progress` duplicate and is dropped
-                        (see _ci_identity + success_latest) — strict identity,
-                        terminal completedAt comparison only, fail-closed.
+                        by the SHARED _drop_superseded_cancels helper (see
+                        _ci_identity) — strict identity, terminal completedAt
+                        comparison only, fail-closed.
       * ``"pending"`` — a check is still queued/running (and none are red)
       * ``"absent"``  — a READABLE but genuinely EMPTY rollup (``[]``): zero checks
                         exist, i.e. CI has NOT run. A DEFINITE fact, not a read
@@ -877,26 +1078,21 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         # never fired (e.g. a conflicting branch suppresses the whole suite).
         return "absent", []
 
-    # First pass: for each strict identity (name, workflowName), the latest
-    # `completedAt` among its SUCCESS CheckRuns on this head. A CANCELLED entry is
-    # a superseded concurrency-cancel duplicate ONLY if a SUCCESS of the same
-    # identity completed AT OR AFTER it (see the drop branch). Only GitHub Actions
-    # CheckRuns with a resolvable identity AND a completedAt contribute; legacy
-    # StatusContexts, non-Actions checks, and timestampless successes never serve
-    # as siblings. This is NOT the #1420 finding-magnet: that sorted the WHOLE set
-    # (incl. QUEUED runs with null startedAt) to pick a global "latest"; here both
-    # sides of the comparison are terminal COMPLETED runs that always carry a
-    # completedAt, and every unresolvable case fails CLOSED (stays red).
-    success_latest: dict[tuple[str, str], str] = {}
-    for c in checks:
-        if not isinstance(c, dict) or c.get("conclusion") not in _CI_GREEN:
-            continue
-        ident = _ci_identity(c)
-        ts = (c.get("completedAt") or "").strip()
-        if ident is None or not ts:
-            continue
-        if ts > success_latest.get(ident, ""):
-            success_latest[ident] = ts
+    # Drop superseded `concurrency: cancel-in-progress` duplicates via the SHARED
+    # primitive (_drop_superseded_cancels — read its docstring for the strict
+    # identity + strictly-after rule and every fail-closed case). Filtering here rather
+    # than branching inside the classify loop is behaviour-identical: a drop implies
+    # a same-identity SUCCESS in this very list, and that sibling sets
+    # `saw_recognized` and contributes the same casefolded `workflowName` to
+    # `workflows_ran` on its own. A cancel that is NOT dropped falls through to the
+    # red branch below, because CANCELLED is also in _CI_RED_CONCLUSIONS.
+    #
+    # Deliberately AFTER the empty-rollup "absent" return above, which reads the
+    # RAW payload: "zero checks exist" must stay a fact about what GitHub reported,
+    # never an artefact of our own filtering. (The filter cannot empty a non-empty
+    # list anyway — a drop requires a surviving SUCCESS sibling — but the ordering
+    # makes that independent of this helper's behaviour.)
+    checks = _drop_superseded_cancels(checks)
 
     red: list[str] = []
     pending: list[str] = []
@@ -918,30 +1114,16 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         if conclusion in _CI_SKIP_CONCLUSIONS:
             saw_recognized = True
             continue
-        if conclusion in _CI_CANCEL_CONCLUSIONS:
-            ident = _ci_identity(c)
-            cts = (c.get("completedAt") or "").strip()
-            if ident is not None and cts and success_latest.get(ident, "") >= cts:
-                # Superseded concurrency-cancel duplicate: a SUCCESS of this EXACT
-                # identity (name + workflowName) completed AT OR AFTER this cancel,
-                # so the cancelled entry is a `cancel-in-progress` leftover with no
-                # verdict of its own — drop it. Wrong-green-impossible:
-                # FAILURE/TIMED_OUT are not in _CI_CANCEL_CONCLUSIONS (still red);
-                # an in-flight re-run is a non-terminal entry that still counts
-                # pending below; and a cancel with no identity, no completedAt, or
-                # NO same-identity success at-or-after it (e.g. SUCCESS-then-cancel
-                # on an unchanged head) falls through and stays red.
-                saw_recognized = True
-                # A superseded duplicate implies a same-identity SUCCESS exists on
-                # this head, so the workflow demonstrably ran.
-                workflows_ran.add(wf_key)
-                continue
+        # Any CANCELLED entry still present here was NOT superseded (the shared
+        # filter above proved it, or could not) and falls through to the red branch,
+        # because CANCELLED is in _CI_RED_CONCLUSIONS. The dropped ones need no arm
+        # of their own: each implies a same-identity SUCCESS in this list, which
+        # sets saw_recognized and adds the identical workflowName to workflows_ran.
         if conclusion in _CI_RED_CONCLUSIONS or state in _CI_RED_STATES:
             saw_recognized = True
             red.append(name)
         elif conclusion in _CI_GREEN or state in _CI_GREEN:
-            # The ONLY branch (besides the superseded-cancel drop above, which implies
-            # a green sibling) that feeds workflows_ran: the required-identity check
+            # The ONLY branch that feeds workflows_ran: the required-identity check
             # runs only when nothing is red/pending (those return first, and already
             # block), so only PASSING verdicts can vouch that a required workflow ran.
             # A COMPLETED run with a null conclusion (the benign ignore below) carries
@@ -5192,6 +5374,25 @@ _IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
 # travel with a clone rather than describing one install. A suite named differently
 # simply finds no match, and no match means NO RELIEF -- the pre-relief behaviour, so
 # the failure direction of a wrong pin is a missing convenience, never a weaker gate.
+#
+# THE WORKFLOW HALF IS A DISPLAY NAME, AND A DISPLAY NAME IS NOT UNIQUE PROVENANCE.
+# GitHub does not require `name:` to be unique across workflow files (its workflow-syntax
+# reference states no such constraint; an OMITTED name falls back to the file path, which
+# is unique — an explicit one is not). So a second file declaring `name: CI` with a job
+# named `leak-detector` would share this tuple, and its SUCCESS could both supersede the
+# real scanner's CANCELLED in _drop_superseded_cancels and satisfy the pin below.
+# Real provenance exists in GraphQL (checkSuite.workflowRun.workflow.databaseId, or
+# checkSuite.workflowRun.file.path) but `gh pr view --json statusCheckRollup` does NOT
+# expose it — a rollup entry carries only __typename/completedAt/conclusion/detailsUrl/
+# name/startedAt/status/workflowName, and detailsUrl's RUN id cannot separate a decoy
+# from a legitimate re-run of the same file. Pinning on provenance therefore means
+# replacing this gate's read path with a raw GraphQL query.
+# Until then the PRECONDITION is closed instead of the consequence:
+# TestWorkflowDisplayNameIsUniqueProvenance fails CI if two workflow files ever share a
+# display name, or if this pin stops resolving to exactly one file. That is complete for
+# the reachable case — workflowName is populated only for Actions check-runs, and those
+# come from this repo's own workflow files; a non-Actions check-run has no workflowName,
+# so _ci_identity returns None and it is never a sibling.
 _MECHANICAL_RESCAN_BY_KIND = {"leaks": ("leak-detector", "CI")}
 # Every kind an install is ALLOWED to name in config. A configured kind outside this set
 # (a typo, a wrong type, a stale routine name) can never be satisfied by a real marker, so
@@ -5892,9 +6093,13 @@ def _mechanical_scan_is_green(
     class this file already documents at _ci_identity, and the whole point of
     this relief is that the mechanical layer really ran.
 
+    Superseded ``concurrency: cancel-in-progress`` duplicates are dropped first, by
+    the SHARED ``_drop_superseded_cancels`` — the same primitive ``_pr_ci_status``
+    uses, so the two gates cannot disagree about one rollup.
+
     Returns False on ANY doubt: a gh error, an unparseable payload, a head that
-    does not match, no entry with that identity, or any conclusion other than
-    SUCCESS. This feeds a merge gate that forces --admin, so an unreadable or
+    does not match, no entry with that identity, or any surviving conclusion other
+    than SUCCESS. This feeds a merge gate that forces --admin, so an unreadable or
     ambiguous scan must never read as a pass.
 
     Tests inject via ``_TEST_GH_ROLLUP_WITH_HEAD`` (a JSON object with
@@ -5945,6 +6150,20 @@ def _mechanical_scan_is_green(
     wanted_workflow = (workflow or "").strip().lower()
     if not wanted_workflow:
         return False  # an unpinned kind can never be established -> fail closed
+    # Drop superseded `concurrency: cancel-in-progress` duplicates FIRST, through the
+    # SAME primitive the CI gate uses (_drop_superseded_cancels — strict
+    # (name, workflowName) identity, a SUCCESS completing STRICTLY AFTER, fail-closed on
+    # every unresolvable case). This path used to have no cancel handling at all, so a
+    # doubled workflow dispatch — which leaves every check-run as a success+cancelled
+    # pair — made ONE `--check-pr` run report `ci: green` and, on the same rollup,
+    # "'leak-detector' is not green at this head", pointing the reader at a green job
+    # while relief stayed unreachable for as long as that head stood.
+    #
+    # Note what the drop does NOT do, because this is where it would be dangerous: it
+    # removes ONLY cancels proven superseded. FAILURE/TIMED_OUT/STALE and an
+    # unsuperseded cancel all survive into `conclusions` and still contradict SUCCESS,
+    # so the guarantee below is intact.
+    rollup = _drop_superseded_cancels(rollup)
     # Collect EVERY same-identity entry, never the first match. One head can carry
     # several runs of one job (a re-run after a ruleset change, a superseded
     # concurrency sibling), and rollup ORDER is not a guarantee -- _pr_ci_status
@@ -7725,6 +7944,92 @@ def _push_config_is_simple(remote: str | None, cwd: str | None = None) -> bool:
     return not (rc == 0 and out == "true")
 
 
+def _push_is_dry_run(seg) -> bool:
+    """Whether this ``git push`` segment only SIMULATES the push.
+
+    `-n` / `--dry-run` publish nothing, so none of the states the adjacency
+    prompt reports can result from them. `-n` also travels inside a short
+    bundle (`-un`), which is why this reads the letters rather than the token.
+    """
+    argv = getattr(seg, "argv", None) or []
+    for t in argv[1:]:
+        if t == "--dry-run" or t.split("=", 1)[0] == "--dry-run":
+            return True
+        if t.startswith("-") and not t.startswith("--") and len(t) > 1:
+            for ch in t[1:]:
+                if ch == "o":
+                    break
+                if ch == "n":
+                    return True
+    return False
+
+
+def _push_ref_positionals(argv: list[str]) -> list[str] | None:
+    """The positional tokens of a ``git push`` segment, or None if it is not a
+    plain ref-set-neutral push.
+
+    Separated from ``_push_targets_current_branch`` so the SCAN and the VERDICT
+    are not the same function: the scan answers "which tokens are refspecs", the
+    caller decides what that means. It was extracted for a second caller — the
+    duplicate-name enrichment — which has since been removed from this PR and
+    refiled; the separation is kept because a parser that returns data is worth
+    more than one that returns a verdict, and because the enrichment will need
+    it again.
+
+    None means "a flag here changes the ref set" (``--all``, ``--tags``,
+    ``--delete``, ``--mirror``, ``--stdin``, ``--repo``, a ``+refspec`` force
+    shorthand, or anything unknown). Both callers treat None as a refusal.
+    """
+    # Advance past git global options to the `push` token.
+    i = 1
+    while i < len(argv):
+        t = argv[i]
+        if t in _GIT_GLOBAL_VALUE_FLAGS:
+            i += 2
+            continue
+        if t.startswith("-"):
+            i += 1
+            continue
+        break
+    if i >= len(argv) or argv[i] != "push":
+        return None
+    i += 1
+    positionals: list[str] = []
+    while i < len(argv):
+        t = argv[i]
+        if t in _PUSH_SAFE_VALUE_FLAGS:
+            i += 2  # ref-neutral value flag: skip the flag and its value token
+            continue
+        if t.startswith("--"):
+            base = t.split("=", 1)[0]
+            if "=" in t and base in _PUSH_SAFE_VALUE_FLAGS:
+                i += 1  # --push-option=value etc.
+                continue
+            if "=" not in t and base in _PUSH_SAFE_LONG_FLAGS:
+                i += 1
+                continue
+            return None  # unknown/broadening long flag (or a =form of a no-value flag)
+        if t.startswith("+"):
+            return None  # +<refspec> force shorthand
+        if t.startswith("-") and len(t) > 1:
+            # Short single/bundle — every letter must be ref-neutral. An `o` starts a
+            # glued push-option value, so the rest of the token is that value.
+            safe = True
+            for ch in t[1:]:
+                if ch == "o":
+                    break
+                if ch not in _PUSH_SAFE_SHORT_LETTERS:
+                    safe = False
+                    break
+            if not safe:
+                return None
+            i += 1
+            continue
+        positionals.append(t)
+        i += 1
+    return positionals
+
+
 def _push_targets_current_branch(
     seg, cur: str | None, remote: str | None, cwd: str | None = None
 ) -> bool:
@@ -7751,54 +8056,9 @@ def _push_targets_current_branch(
     """
     if not cur:
         return False
-    argv = getattr(seg, "argv", None) or []
-    # Advance past git global options to the `push` token.
-    i = 1
-    while i < len(argv):
-        t = argv[i]
-        if t in _GIT_GLOBAL_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-"):
-            i += 1
-            continue
-        break
-    if i >= len(argv) or argv[i] != "push":
+    positionals = _push_ref_positionals(getattr(seg, "argv", None) or [])
+    if positionals is None:
         return False
-    i += 1
-    positionals: list[str] = []
-    while i < len(argv):
-        t = argv[i]
-        if t in _PUSH_SAFE_VALUE_FLAGS:
-            i += 2  # ref-neutral value flag: skip the flag and its value token
-            continue
-        if t.startswith("--"):
-            base = t.split("=", 1)[0]
-            if "=" in t and base in _PUSH_SAFE_VALUE_FLAGS:
-                i += 1  # --push-option=value etc.
-                continue
-            if "=" not in t and base in _PUSH_SAFE_LONG_FLAGS:
-                i += 1
-                continue
-            return False  # unknown/broadening long flag (or a =form of a no-value flag)
-        if t.startswith("+"):
-            return False  # +<refspec> force shorthand
-        if t.startswith("-") and len(t) > 1:
-            # Short single/bundle — every letter must be ref-neutral. An `o` starts a
-            # glued push-option value, so the rest of the token is that value.
-            safe = True
-            for ch in t[1:]:
-                if ch == "o":
-                    break
-                if ch not in _PUSH_SAFE_SHORT_LETTERS:
-                    safe = False
-                    break
-            if not safe:
-                return False
-            i += 1
-            continue
-        positionals.append(t)
-        i += 1
     if len(positionals) >= 3:
         return False  # multiple refspecs → not a single plain current-branch update
     if len(positionals) == 2:
@@ -7919,12 +8179,22 @@ def _remote_branch_sha(remote: str, branch: str, cwd: str | None = None) -> str 
     ref, which goes stale the moment a remote branch is deleted). Accepts only the
     line whose ref path is EXACTLY ``refs/heads/<branch>`` — a bare pattern
     tail-matches namespaced refs. Fail-safe: None on rc!=0 / timeout / any error /
-    absent branch — callers treat None as "not confirmed present". Bounded by a 10s
-    timeout inside the hook's 60s budget.
+    absent branch — callers treat None as "not confirmed present". Bounded by the
+    SHARED hook deadline (10s cap, less once the budget has drained), because the
+    aggregate across sequential probes is what overruns the registration, not any
+    single call.
     """
     try:
         args = ["git"] + (["-C", cwd] if cwd else []) + ["ls-remote", "--heads", remote, branch]
-        result = subprocess.run(args, capture_output=True, text=True, timeout=10)
+        # Under the SHARED deadline, like every other probe on this path. This
+        # is a NETWORK call sitting immediately upstream of them, and a flat cap
+        # here is what the arming comment cannot compensate for: the AGGREGATE
+        # is what overruns the hook's registration, and a SIGKILLed PreToolUse
+        # hook fails OPEN. `_gh_timeout` returns the full cap when no deadline
+        # is armed, so the --check-pr reporting path is unaffected.
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=_gh_timeout(10.0)
+        )
         if result.returncode != 0:
             return None
         target_ref = f"refs/heads/{branch}"
@@ -7951,6 +8221,169 @@ def _push_is_republish(remote: str | None, branch: str | None, cwd: str | None =
     if not remote or not branch:
         return False
     return _remote_branch_sha(remote, branch, cwd=cwd) is not None
+
+
+def _open_pr_count_for_branch(
+    branch: str, cwd: str | None = None, push_urls: set[str] | None = None
+) -> int | None:
+    """How many OPEN PRs have ``branch`` as their head, or None if unknowable.
+
+    Distinguishing 0 from None is the point of the return type: 0 is a measured
+    "this public branch has no PR" — the state where CI and the leak-detector
+    never run, since ci.yml triggers on pull_request — while None is "the
+    question could not be answered" (no gh, no network, no auth). Callers treat
+    None as the status quo, never as 0: this feeds a HYGIENE prompt, not a
+    security verdict, and the first-push approval it modulates already happened.
+
+    COUNTS ONLY PRs TARGETING THE DEFAULT BRANCH, because the question is "does
+    CI run on this branch" and `ci.yml` triggers on `pull_request` filtered to
+    `main`. A PR onto a non-default base contributes no CI and no leak scan at
+    all (issue #2035), so counting it would silence the prompt in exactly the
+    state the prompt exists to report.
+
+    AND ONLY PRs FROM THIS REPOSITORY. `gh pr list --head` matches a bare branch
+    NAME and documents no `owner:branch` form, so a fork's PR from an
+    identically-named branch would otherwise answer for ours.
+
+    Subprocess timeout comes from ``_gh_timeout`` so these probes share the
+    push-path deadline rather than each holding an independent 10s — the
+    aggregate is what SIGKILLs a hook, and a killed PreToolUse hook fails OPEN.
+    """
+    try:
+        args = ["gh", "pr", "list", "--head", branch, "--state", "open",
+                "--json", "number,baseRefName,headRepositoryOwner,isCrossRepository",
+                "--limit", str(_PR_LIST_WINDOW)]
+        result = subprocess.run(
+            args, capture_output=True, text=True,
+            timeout=_gh_timeout(10.0), cwd=cwd or None,
+        )
+        if result.returncode != 0:
+            return None
+        rows = json.loads(result.stdout)
+        if not isinstance(rows, list):
+            return None
+        # DESTINATION FIRST, and before the empty-list shortcut. `gh pr list`
+        # asked the repo GH RESOLVES; if that is not where this push goes, the
+        # answer describes a different repository and an EMPTY result is not
+        # evidence of anything — least of all the measured 0 that turns a silent
+        # allow into an ask.
+        identity = None
+        if push_urls is not None:
+            identity = _base_repo_identity(cwd=cwd)
+            if identity is None or not _urls_name_repo(push_urls, identity[2]):
+                return None
+        # Now an empty list IS a measured 0, and needs no further lookup: no
+        # request has this head, whatever the default branch is called. When the
+        # caller passed no URLs there is nothing to verify against, so the
+        # shortcut still skips the second gh call — which matters because
+        # `_gh_timeout` floors at 1.0s once the budget drains, making that call
+        # the likelier of the two to fail.
+        if not rows:
+            return 0
+        # A response that FILLS the window is a truncated read, not a complete
+        # one: the qualifying request may sit past the cap, and the filters
+        # below would then sum to a confident 0 — the answer that downgrades
+        # the allow to an ask. Refuse to infer absence from it.
+        if len(rows) >= _PR_LIST_WINDOW:
+            return None
+        if identity is None:
+            identity = _base_repo_identity(cwd=cwd)
+            if identity is None:
+                return None
+        default, base_owner, _canonical = identity
+        return sum(
+            1
+            for pr in rows
+            if isinstance(pr, dict)
+            and pr.get("baseRefName") == default
+            # Filter by the head repo's OWNER, not `isCrossRepository`. The
+            # concern is SOMEONE ELSE'S fork answering for us, because
+            # `gh pr list --head` matches a bare branch name. `isCrossRepository`
+            # is true for any head-repo != base-repo, which in a fork-based
+            # clone is EVERY legitimate PR the contributor opens — the count
+            # would read 0 forever and the prompt would fire on every re-push
+            # while telling the user something false, since a fork PR onto the
+            # default branch does run CI.
+            and (pr.get("headRepositoryOwner") or {}).get("login") == base_owner
+        )
+    except Exception:
+        return None
+
+
+_PR_LIST_WINDOW = 100
+"""Rows requested from ``gh pr list``. A FULL window is treated as unanswerable
+rather than counted — see ``_open_pr_count_for_branch``."""
+
+
+def _repo_identity_from_url(url: str) -> tuple[str, str] | None:
+    """``(host, owner/repo)`` for a git remote URL, or None if it has neither.
+
+    Normalises the spellings of one remote so they compare equal: `https://`,
+    bare `git@host:owner/repo`, `ssh://git@host/owner/repo`, and a trailing
+    `.git` or `/` all reduce to the same pair. Any userinfo before the host is
+    dropped, since `git@` is not part of the destination's identity.
+    """
+    raw = url.strip().lower().rstrip("/")
+    raw = raw.removesuffix(".git")
+    if "://" in raw:
+        raw = raw.split("://", 1)[1]
+    elif ":" in raw and "/" not in raw.split(":", 1)[0]:
+        raw = raw.replace(":", "/", 1)            # git@host:owner/repo
+    if "@" in raw.split("/", 1)[0]:
+        raw = raw.split("@", 1)[1]                # strip userinfo
+    parts = [x for x in raw.split("/") if x]
+    if len(parts) < 3:
+        return None
+    host = parts[0].split(":", 1)[0]              # drop any :port
+    return host, "/".join(parts[-2:])
+
+
+def _urls_name_repo(urls: set[str], canonical: str) -> bool:
+    """Whether every URL in ``urls`` names the SAME repository as ``canonical``.
+
+    HOST IS PART OF THE IDENTITY. Comparing only the `owner/repo` tail would
+    make a remote on any other host — an enterprise instance, a mirror, or a
+    look-alike — compare equal to the repository gh answered about, and the
+    count would then be trusted for a destination it never described.
+
+    Deliberately ALL rather than ANY: a push that fans out to several remotes is
+    only answerable by one count if every destination is the same repository.
+    """
+    want = _repo_identity_from_url(canonical)
+    if not urls or want is None:
+        return False
+    return all(_repo_identity_from_url(u) == want for u in urls)
+
+
+def _base_repo_identity(cwd: str | None = None) -> tuple[str, str, str] | None:
+    """``(default_branch, owner_login, canonical_url)`` for the repo gh resolves, or None.
+
+    Both facts come from ONE round-trip. They are needed together and each is a
+    serialized subprocess on the push path, where the aggregate — not any single
+    call — is what overruns the hook's registration.
+
+    None is propagated rather than defaulted to "main": the caller's contract is
+    that an unanswerable question keeps the status quo, and guessing the base
+    name here would turn a failed lookup into a confident count.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "repo", "view", "--json", "defaultBranchRef,nameWithOwner,url",
+             "-q", ".defaultBranchRef.name + \"\\n\" + .nameWithOwner + \"\\n\" + .url"],
+            capture_output=True, text=True,
+            timeout=_gh_timeout(10.0), cwd=cwd or None,
+        )
+        if result.returncode != 0:
+            return None
+        parts = result.stdout.strip().split("\n")
+        if len(parts) != 3:
+            return None
+        branch, slug, url = (x.strip() for x in parts)
+        if not branch or "/" not in slug or not url:
+            return None
+        return branch, slug.split("/", 1)[0], url
+    except Exception:
+        return None
 
 
 def _ask(reason: str) -> int:
@@ -8295,6 +8728,19 @@ def _run_merge_and_push_gates() -> int:
         # step-back (triage / mechanism / state-space) before round N+1.
         # Fail-open inside the check; '# escalation-ack' is the conscious
         # continue after a fresh user decision.
+        # ARM THE SHARED SUBPROCESS DEADLINE, once, for every gate below.
+        # It was previously armed only as a SIDE EFFECT of the escalation gate,
+        # which is documented fail-open, wraps its whole body in `except
+        # Exception: return`, and has already once had a top-of-function
+        # short-circuit that returned before the arming. The push path's
+        # wall-clock safety must not depend on another gate's internals: without
+        # a deadline the probes below are five sequential 10s caps plus an
+        # ls-remote, over the hook's registration — and a SIGKILLed PreToolUse
+        # hook fails OPEN, disengaging every gate in the stack.
+        global _merge_deadline
+        if _merge_deadline is None:
+            _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
+
         esc_block, esc_msg = _check_codex_round_escalation(segs)
         if esc_block:
             print(esc_msg, file=sys.stderr)
@@ -8445,6 +8891,54 @@ def _run_merge_and_push_gates() -> int:
                             f"git push needs your approval before publishing externally "
                             f"(target: {branch or 'default'})."
                         )
+                    # A RE-PUSH earns its silence by having been approved at
+                    # first publication — but a public branch with NO OPEN PR is
+                    # outside CI and the leak-detector (ci.yml triggers on
+                    # pull_request), so its silence is the state this repo's
+                    # standing rule forbids: published, unchecked, and quietly
+                    # growing. Downgrade the silent allow to an ASK naming the
+                    # gap. A lookup that cannot answer (None) keeps the status
+                    # quo — this is a hygiene prompt on an already-approved
+                    # branch, not a security boundary, so an unanswerable
+                    # question must not manufacture prompts on every network
+                    # blip.
+                    # An earlier segment that CLOSES a PR invalidates the state
+                    # this allow is read from. The hook runs before any of the
+                    # command executes, so `gh pr close <n> && git push` sees the
+                    # PR still open, keeps the silent allow, and then publishes
+                    # into exactly the PR-less state the ask exists to report.
+                    # The count cannot see a close that has not happened yet, so
+                    # the command's own shape has to.
+                    closes_pr = any(
+                        gh_pr_subcommand(s.argv) == "close" for s in segs
+                    )
+                    if push_allow_reason and closes_pr:
+                        push_allow_reason = None
+                        ask_reason = (
+                            f"re-push to '{cur}': an earlier step in this command "
+                            f"CLOSES a pull request, so the push that follows may "
+                            f"land on a branch with no open PR — outside CI and "
+                            f"the leak scan. Run the close and the push as "
+                            f"separate commands so each is judged on the state it "
+                            f"actually runs in."
+                        )
+                    # A DRY RUN publishes nothing, so it cannot create the
+                    # unchecked-branch state this prompt reports. `-n` and
+                    # `--dry-run` are both accepted by the predicate above, so
+                    # they reach here; asking about them is pure friction on an
+                    # inspection command.
+                    elif (
+                        push_allow_reason
+                        and not _push_is_dry_run(push_segs[0])
+                        and _open_pr_count_for_branch(cur, cwd=pcwd, push_urls=urls) == 0
+                    ):
+                        push_allow_reason = None
+                        ask_reason = (
+                            f"re-push to '{cur}': this branch is PUBLIC but has "
+                            f"NO OPEN PR, so CI and the leak scan never run on "
+                            f"it. Approve to push, then open its PR "
+                            f"(gh pr create) — or close the branch out."
+                        )
                 else:
                     ask_reason = (
                         f"git push needs your approval before publishing externally "
@@ -8522,7 +9016,8 @@ def _run_merge_and_push_gates() -> int:
             # Idempotent: the escalation gate may have already armed it for the same
             # command (round-6 P1) — reuse that deadline so the two gates share ONE
             # aggregate budget, never re-extend it here.
-            global _merge_deadline
+            # (armed at the top of this function; kept idempotent here so the
+            # merge path still works if it is ever reached another way)
             if _merge_deadline is None:
                 _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
             merge_repo = _merge_target_repo(merge_seg.argv, merge_seg.raw)
