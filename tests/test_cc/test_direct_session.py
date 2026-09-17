@@ -895,3 +895,179 @@ async def test_verification_failure_memory_stamps_origin_and_class(db, tmp_path)
     assert len(vf) == 1
     assert vf[0].get("origin_class") == "external_untrusted"
     assert vf[0].get("memory_class") == "fact"
+
+
+# ── Incomplete stream telemetry must not certify an audit (PR #1625) ────
+
+
+async def _run_ego_session_with(db, *, dropped: int):
+    """Run one ego-dispatch session whose stream dropped `dropped` lines, and
+    return the kwargs the protected-path auditor was called with."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from genesis.cc.session_manager import SessionManager
+    from genesis.cc.types import (
+        CCInvocation,
+        CCModel,
+        CCOutput,
+        EffortLevel,
+        SessionType,
+        StreamEvent,
+    )
+
+    async def _run_streaming(inv, on_event=None):
+        if on_event:
+            # A small tool DID survive — that is what makes tools_summary
+            # truthy, which is the precondition for the pre-filter to fire.
+            await on_event(StreamEvent(event_type="tool_use", tool_name="Read"))
+        return CCOutput(
+            session_id="cc-1", text="done", model_used="sonnet", cost_usd=0.0,
+            input_tokens=1, output_tokens=1, duration_ms=1, exit_code=0,
+            is_error=False, stream_lines_dropped=dropped,
+        )
+
+    sm = SessionManager(db=db, invoker=AsyncMock(), day_boundary_hour=0)
+    invoker = AsyncMock()
+    invoker.run_streaming = _run_streaming
+    runner = DirectSessionRunner(
+        invoker=invoker,
+        session_manager=sm,
+        config_builder=AsyncMock(),
+        runtime=SimpleNamespace(_db=db),
+    )
+    runner._build_invocation = lambda _req, _sid: CCInvocation(prompt="x")
+    runner._record_proposal_outcome = AsyncMock()
+    auditor = MagicMock(audit_session=AsyncMock())
+    runner.set_auditor(auditor)
+    sess = await sm.create_background(
+        session_type=SessionType.BACKGROUND_TASK,
+        model=CCModel.SONNET,
+        effort=EffortLevel.MEDIUM,
+    )
+    await runner._run_session(
+        DirectSessionRequest(prompt="t", caller_context="ego_proposal:p1"),
+        sess["id"],
+    )
+    auditor.audit_session.assert_awaited_once()
+    return auditor.audit_session.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_stream_line_forces_the_auditor_to_read_the_transcript(db):
+    """A dropped over-limit line can have carried a Write's `tool_use` event
+    while the CLI still executed the Write.
+
+    `on_event` only sees what the reader parsed, so `tools_summary` becomes a
+    floor rather than an inventory. The auditor's pre-filter skips transcript
+    parsing — and records a CLEAN audit — when a TRUTHY summary contains no
+    Write/Edit, so one surviving small tool is enough to certify a
+    protected-path mutation as audit-clean.
+
+    Withholding the summary hands the auditor the "I cannot pre-filter" signal
+    it already understands, and routes it to the CC transcript on disk — a
+    source that does not depend on our reading of the stream.
+    """
+    kwargs = await _run_ego_session_with(db, dropped=1)
+    assert kwargs["tools_summary"] is None, (
+        "an incomplete tool inventory was handed to the audit pre-filter"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_clean_stream_still_gets_the_cheap_audit_pre_filter(db):
+    """CLAUSE COVER for the drop check at the audit call.
+
+    With nothing dropped the summary IS an inventory, and the pre-filter is a
+    real saving. Withholding it unconditionally would parse a transcript on
+    every ego dispatch for no reason.
+    """
+    kwargs = await _run_ego_session_with(db, dropped=0)
+    assert kwargs["tools_summary"] == {"Read": 1}, (
+        f"the complete inventory was withheld: {kwargs['tools_summary']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_both_mcp_projections_qualify_an_incomplete_tool_summary(db, monkeypatch):
+    """The audit is not the only reader of `tools_summary`.
+
+    `direct_session_status` and `direct_session_list` hand the same summary to a
+    human (and to a model reading MCP output), and a dropped `tool_use` event
+    makes it a floor rather than an inventory. Persisting the drop count into
+    session metadata is not enough on its own — a projection that omits it
+    presents an undercounted inventory as complete (Codex P2, PR #1625 round 4).
+
+    Both projections, in one test on purpose: the defect was that ONE of them
+    carried the qualifier, and a per-projection test goes green while the other
+    still lies.
+    """
+    import json as _json
+
+    from genesis.cc.session_manager import SessionManager
+    from genesis.cc.types import CCModel, EffortLevel, SessionType
+    from genesis.db.crud import cc_sessions as cs
+    from genesis.mcp.health import direct_session_tools as dst
+
+    sm = SessionManager(db=db, invoker=AsyncMock(), day_boundary_hour=0)
+    sess = await sm.create_background(
+        session_type=SessionType.BACKGROUND_TASK,
+        model=CCModel.SONNET,
+        effort=EffortLevel.MEDIUM,
+    )
+    await cs.merge_metadata(db, sess["id"], {
+        "tools_summary": {"Read": 1},          # truthy, and missing the Write
+        "stream_lines_dropped": 1,             # ...because a line was dropped
+    })
+    # The list projection filters on source_tag; the status one does not.
+    await db.execute(
+        "UPDATE cc_sessions SET source_tag = 'direct_session' WHERE id = ?",
+        (sess["id"],),
+    )
+    await db.commit()
+    monkeypatch.setattr(dst, "_db", db)
+
+    status = await dst._impl_direct_session_status(sess["id"])
+    listing = await dst._impl_direct_session_list()
+    row = next(s for s in listing["sessions"] if s["session_id"] == sess["id"])
+
+    for name, proj in (("status", status), ("list", row)):
+        assert proj["tools_summary"] == {"Read": 1}
+        assert proj.get("stream_lines_dropped") == 1, (
+            f"the {name} projection presented a partial tool inventory as "
+            f"complete: {_json.dumps(proj, default=str)[:400]}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_clean_session_reports_zero_dropped_lines_in_both_projections(
+    db, monkeypatch,
+):
+    """The other direction: the qualifier must read 0 on an intact run, not be
+    absent. A missing key and a zero are the same to a careless reader, but only
+    the zero is a positive statement that the inventory is complete."""
+    from genesis.cc.session_manager import SessionManager
+    from genesis.cc.types import CCModel, EffortLevel, SessionType
+    from genesis.db.crud import cc_sessions as cs
+    from genesis.mcp.health import direct_session_tools as dst
+
+    sm = SessionManager(db=db, invoker=AsyncMock(), day_boundary_hour=0)
+    sess = await sm.create_background(
+        session_type=SessionType.BACKGROUND_TASK,
+        model=CCModel.SONNET,
+        effort=EffortLevel.MEDIUM,
+    )
+    await cs.merge_metadata(db, sess["id"], {"tools_summary": {"Read": 1}})
+    await db.execute(
+        "UPDATE cc_sessions SET source_tag = 'direct_session' WHERE id = ?",
+        (sess["id"],),
+    )
+    await db.commit()
+    monkeypatch.setattr(dst, "_db", db)
+
+    status = await dst._impl_direct_session_status(sess["id"])
+    listing = await dst._impl_direct_session_list()
+    row = next(s for s in listing["sessions"] if s["session_id"] == sess["id"])
+
+    assert status["stream_lines_dropped"] == 0
+    assert row["stream_lines_dropped"] == 0

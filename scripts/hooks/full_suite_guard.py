@@ -31,13 +31,53 @@ import sys
 # Self-locate so the sibling imports resolve whether CC runs this as a script or
 # it is imported as a module for tests.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import field, read_payload  # noqa: E402
-from shell_parse import (  # noqa: E402
-    Segment,
-    analyze_checked,
-    has_trailing_override,
-    is_pytest_invocation,
-)
+try:
+    from hook_input import degraded_exit, field, read_payload  # noqa: E402
+except Exception:  # noqa: BLE001 — a missing NEW helper must block.
+    if __name__ != "__main__":
+        raise
+    # REVERSE version skew: this guard may be newer than hook_input.py, in which case
+    # nothing it could import can recover it — degraded_exit is the thing that is
+    # missing. So fail closed locally. The exception is not rendered (even __str__ can
+    # raise) and os._exit is used so a broken diagnostic stream cannot replace exit 2
+    # during interpreter shutdown.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (full_suite_guard): shared hook_input is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
+
+# DEGRADED-path mention set, defined ABOVE the guarded import so it survives that
+# import failing. This guard exited 1 — NON-blocking — on a poisoned tree until now,
+# and what it protects is a shared box: its own refusal message records that an
+# untargeted run has repeatedly OOM-killed the suite and starved the live services.
+#
+# PRICE, stated rather than discovered: MEASURED over 74,282 real commands, 7,906
+# (10.64%) mention pytest, and while the tree is broken every one of them is refused —
+# including the TARGETED runs this guard normally allows. That is heavy, and it is
+# still the right direction here: the refusal is loud and one repair away, where the
+# fail-open is a box-wide stall. It is also why the background-pipe guard is NOT wired
+# the same way: its only usable token is the pipe character, at 70.30%, which would
+# leave the broken state unrepairable rather than merely inconvenient.
+_DEGRADED_GATED = r"\bpytest\b"
+
+try:
+    from shell_parse import (  # noqa: E402
+        _RUN_CARRIER_VALUE_FLAGS,
+        Segment,
+        _basename,
+        analyze_checked,
+        has_trailing_override,
+        is_pytest_invocation,
+    )
+except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
+    if __name__ != "__main__":
+        raise
+    degraded_exit("full_suite_guard", gated=_DEGRADED_GATED, exc=_exc)
 
 try:  # noqa: E402
     import discarded_write
@@ -114,7 +154,11 @@ def _targets_specific_test(args: list[str]) -> bool:
         arg = args[i]
         if arg.startswith("-"):
             # a -k/-m selector (separate value, =form, or glued) narrows the run
-            if arg in ("-k", "-m") or arg.startswith(("-k", "-m", "--keyword")) or arg == "--pyargs":
+            if (
+                arg in ("-k", "-m")
+                or arg.startswith(("-k", "-m", "--keyword"))
+                or arg == "--pyargs"
+            ):
                 has_selector = True
             elif arg in _VALUE_FLAGS:
                 i += 2  # skip the flag AND its value
@@ -129,6 +173,119 @@ def _targets_specific_test(args: list[str]) -> bool:
             has_dir = True  # a bare directory / non-file positional path
         i += 1
     return has_selector or (has_file and not has_dir)
+
+
+#: Front-ends that can carry another command. If the resolver could not see PAST
+#: one of these, the segment is UNRESOLVED — which is not the same as clean.
+_CARRIER_EXES = frozenset({"uv", "uvx", "poetry", "hatch", "pdm", "pipenv", "rye"})
+
+
+def _carried_pytest_args(seg: Segment) -> list[str] | None:
+    """Args after a carried pytest executable inside an UNRESOLVED carrier, else None.
+
+    The resolver models uv's option grammar to find the carried command, and that
+    grammar is an OPEN set: a value-taking flag before `run` swallows `run`
+    itself, so the carrier stays opaque and the segment resolves to `uv`.
+    MEASURED: `uv --color always run pytest` was ALLOWED where `uv run pytest`
+    blocks. Four such gaps were reported on this PR alone, which is the signature
+    of enumerating someone else's CLI rather than a list that was merely short.
+
+    So this does not extend the grammar. It identifies the first command token
+    after the literal ``run`` and hands its following tokens to the SAME
+    `_targets_specific_test` used on a resolved run. Scanning every later token
+    is incorrect: ``uv --color always run echo pytest`` runs ``echo``, while
+    ``pytest`` is only its argument.
+
+    The scan starts AFTER the `run` literal, because a `pytest` token ahead of it
+    is a package NAME, not an invocation. MEASURED on this PR's own tree: scanning
+    the whole argv blocked 18 install/inspect commands — `uv pip install pytest`,
+    `uv add pytest`, `poetry add pytest`, `pipenv install pytest`, `pdm remove
+    pytest`, `uv pip show pytest` — with a message telling the user to target a
+    specific file, advice that means nothing for an install. Requiring the literal
+    keeps the whole fail-open set closed: `uv --color always run pytest` and
+    `uv --cache-dir /tmp/c run pytest` both carry `run` AHEAD of the token, which
+    is exactly why the closed question beats modelling the flag grammar. `uvx`
+    takes the command directly and has no subcommand to require.
+
+    Both walks skip a value-flag's VALUE, using the SAME list the resolver walks
+    with. That is one grammar dependency back, taken deliberately, because the
+    unlisted-flag direction of this list is the safe one: a missing entry costs an
+    extra token read (an over-block, overridable), while the list's one dangerous
+    direction — a BOOLEAN flag wrongly listed — is the failure `--isolated` already
+    taught this module, and is guarded there. Without the skip, a package NAME
+    passed to a flag was read as the command: MEASURED, `uv --color always run
+    --with pytest ruff check .` (a ruff run) and `uv --color always run --with
+    pytest pytest tests/foo.py` (a correctly TARGETED run) both blocked.
+
+    SECOND KNOWN RESIDUAL, also safe direction, and it is the price of the
+    confidence rule below: once the walk meets an option it cannot size, it stops
+    claiming to know which bare word is the command and looks for a `pytest`
+    token among the rest. So `uvx --allow-insecure-host h echo pytest` — which
+    runs `echo` — is refused. That is the same over-read the docstring above
+    rejects for the CONFIDENT case, accepted here only because confidence is
+    gone: the alternative is committing to the flag's value and allowing the
+    whole-suite run this function exists to stop. It costs a refusal
+    `# full-suite-ok` clears.
+
+    It is narrower than it first looks, and the narrowing was MEASURED rather
+    than assumed — the first example written here was wrong and a test caught it.
+    The option must be unknown to BOTH this list and the resolver's `uvx` wrapper
+    spec. A flag only the resolver lacks (`--directory`) leaves the segment on
+    the carrier, but THIS walk still sizes it, stays confident, and reads `echo`
+    as the command exactly as before.
+
+    KNOWN RESIDUAL, safe direction: the `run` walk skips only flags it knows, so a
+    literal `run` reached as an unlisted flag's value still ends the walk —
+    `uv pip install --target run pytest` over-blocks. It is an install into a
+    directory named `run`, it is refused rather than allowed, and `# full-suite-ok`
+    clears it. Closing it needs pip's grammar, which is the open set this function
+    exists to avoid.
+
+    Returns None when the segment is not a carrier, carries no `run` subcommand,
+    or carries a command other than pytest — `uv pip install requests` must stay
+    allowed.
+    """
+    if _basename(seg.exe) not in _CARRIER_EXES:
+        return None  # resolved to a real command (or not a carrier at all)
+    argv = seg.argv
+    i = 1
+    if _basename(seg.exe) != "uvx":
+        # `uv pip install pytest` installs pytest, it does not run it — only a
+        # `run` subcommand carries a command. (`uvx` takes the command directly.)
+        while i < len(argv):
+            tok = argv[i]
+            if tok in _RUN_CARRIER_VALUE_FLAGS and "=" not in tok:
+                i += 2  # a flag's value is never the subcommand
+                continue
+            if tok == "run":
+                i += 1
+                break
+            i += 1
+        else:
+            return None
+    confident = True
+    while i < len(argv):
+        tok = argv[i]
+        if tok in _RUN_CARRIER_VALUE_FLAGS and "=" not in tok:
+            i += 2  # `--with pytest` names a DEPENDENCY, not the command being run
+            continue
+        if tok.startswith("-"):
+            # An option of unknown arity. From here the walk can no longer say
+            # WHICH bare word is the command, because the next one may be this
+            # flag's value — so it stops treating the first bare word as the
+            # answer. Committing to it is the fail-OPEN reading: MEASURED,
+            # `uvx --directory /tmp pytest` resolved `tmp`, concluded "not
+            # pytest" and exited 0 where `uvx pytest` exits 2.
+            confident = confident and "=" in tok
+            i += 1
+            continue
+        if _basename(tok).split("@", 1)[0] != "pytest":  # uv permits `pytest@8.3.5`
+            if confident:
+                return None  # the command is known, and it is not pytest
+            i += 1  # unsure which token is the command — keep looking for one
+            continue
+        return argv[i + 1 :]
+    return None
 
 
 def main() -> None:
@@ -175,13 +332,17 @@ def main() -> None:
         sys.exit(2)
 
     pytest_segs = [s for s in segments if is_pytest_invocation(s)]
-    if not pytest_segs:
+    # Unresolved carriers are evaluated on the same rule, not waved through.
+    carried = [a for a in (_carried_pytest_args(s) for s in segments) if a is not None]
+    if not pytest_segs and not carried:
         return
     if any(has_trailing_override(s.raw, _OVERRIDE) for s in segments):
         return  # explicit opt-in to a local full/dir run
 
-    # Block if ANY pytest segment is a non-targeted (bare or directory) run.
-    if all(_targets_specific_test(_pytest_args(s)) for s in pytest_segs):
+    # Block if ANY pytest run — resolved or carried — is non-targeted.
+    resolved_ok = all(_targets_specific_test(_pytest_args(s)) for s in pytest_segs)
+    carried_ok = all(_targets_specific_test(a) for a in carried)
+    if resolved_ok and carried_ok:
         return
 
     print(

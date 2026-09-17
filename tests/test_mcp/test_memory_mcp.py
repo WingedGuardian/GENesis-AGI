@@ -15,7 +15,8 @@ async def _get_tools():
 async def test_all_tools_registered():
     tools = await _get_tools()
     expected = [
-        "memory_recall", "memory_store", "memory_extract", "memory_proactive",
+        "memory_recall", "memory_store", "memory_supersede",
+        "memory_extract", "memory_proactive",
         "memory_synthesize",
         "memory_core_facts", "memory_stats",
         "observation_write", "observation_query", "observation_resolve",

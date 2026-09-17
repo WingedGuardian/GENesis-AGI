@@ -20,6 +20,22 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def _transcript_readable(path: str) -> bool:
+    """Is there actually a transcript to inspect?
+
+    An empty path and a path naming a file that does not exist are the same
+    thing here: no evidence. `_parse_transcript` treats a missing file as "no
+    files touched", which is indistinguishable from "touched nothing" — fine
+    when a summary corroborates it, dangerous when it is the only source.
+    """
+    if not path:
+        return False
+    try:
+        return Path(path).is_file()
+    except OSError:
+        return False
+
+
 @dataclass
 class AuditResult:
     """Outcome of auditing a completed session."""
@@ -56,6 +72,7 @@ class PostExecutionAuditor:
         tools_summary: dict | None = None,
         session_success: bool = True,
         caller_context: str = "",
+        stream_incomplete: bool = False,
     ) -> AuditResult:
         """Audit a completed session and feed signals to AutonomyManager.
 
@@ -71,7 +88,33 @@ class PostExecutionAuditor:
             Whether the session completed without error.
         caller_context:
             E.g. "ego_proposal:abc123" — identifies what triggered this session.
+        stream_incomplete:
+            The caller could not read the whole event stream, so
+            ``tools_summary`` is not a trustworthy account of what ran. The
+            transcript on disk becomes the only evidence — and if that is
+            missing too, the session is UNAUDITABLE and is recorded as a
+            correction rather than a pass.
         """
+        # UNAUDITABLE: no trustworthy summary AND no transcript to fall back
+        # on. Checked FIRST because every later branch reads as evidence of
+        # innocence when it is really evidence of absence — with
+        # `tools_summary=None` the pre-filter is skipped, an empty
+        # `files_touched` finds no violations, and a successful session then
+        # takes the clean-pass branch. An oversized protected-path Write is
+        # certified clean on exactly that route (Codex P1, PR #1625).
+        #
+        # Fail toward inspection: this is the same rule the caller already
+        # invokes when it withholds the summary, extended to the case where
+        # inspection turns out to be impossible.
+        if stream_incomplete and not _transcript_readable(transcript_path):
+            await self._record_correction("unauditable_session")
+            await self._emit_event(
+                "autonomy.audit.unauditable",
+                session_id=session_id,
+                caller_context=caller_context,
+                transcript_path=transcript_path,
+            )
+            return AuditResult(success=False)
         # Quick pre-filter: if no Write/Edit in tools_summary, skip parsing
         if tools_summary and not any(
             t in tools_summary for t in ("Write", "Edit")

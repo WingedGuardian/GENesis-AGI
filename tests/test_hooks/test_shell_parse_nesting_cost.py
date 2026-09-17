@@ -136,6 +136,185 @@ def test_an_adversarial_command_stays_inside_the_guard_budget():
     assert elapsed < 1.0, f"took {elapsed:.2f}s against a 5s budget shared by three guards"
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# THE VERB-WORD SCANS — a second cost axis, on the same fail-open.
+#
+# `_has_brace_expansion` runs per WORD rather than per command, so it is not
+# bounded by MAX_COMMAND_CHARS or MAX_SUBSTITUTION_DEPTH. Its first version
+# restarted an inner walk at every `{`, which is O(n^2): MEASURED 0.014s at 500
+# characters, 5.5s at 8,000, 173s at the command cap — against guards registered
+# at 10s. A hook that runs out of clock does not refuse, it PERMITS, and this
+# module feeds nine of them, so one crafted word disengaged all of them at once.
+#
+# A correctness test cannot see this class: the quadratic scan returned the RIGHT
+# answer, just far too late. These are the tests that would have caught it.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _brace_cost(n: int, reps: int = 5) -> float:
+    """Median seconds to scan a word of *n* unterminated brace openers.
+
+    The median rather than a single sample: this box runs live services, and one
+    scheduling hiccup in a sub-millisecond measurement is the difference between
+    a green suite and a flaky one.
+    """
+    word = "{" * n
+    samples = []
+    for _ in range(reps):
+        started = time.monotonic()
+        sp._has_brace_expansion(word)
+        samples.append(time.monotonic() - started)
+    return sorted(samples)[len(samples) // 2]
+
+
+#: Brace forms with bash's own verdict, MEASURED through a shim that prints its
+#: argv. Kept as data because the interesting rows are the ones nobody would
+#: guess: `{1..2..0}` expands, `{1..a}` does not, `{A..c}` yields 35 words.
+_BRACE_EXPANDS = [
+    "{a..c}", "{1..3}", "{3..1}", "{a..a}", "{01..03}", "{-2..0}", "{+1..3}",
+    "{1..+3}", "{A..c}", "{z..x}", "{1..9..2}", "{a..e..2}", "{1..3..-1}",
+    "{1..3..01}", "{1..2..0}", "{a,b}", "{{a,b}}", "{a..{b,c}}", "pus{h..h}",
+    "pu{s,s}h",
+]
+_BRACE_LITERAL = [
+    "{foo..bar}", "{ab..cd}", "{a..bb}", "{1..a}", "{a..1}", "{..}", "{1..}",
+    "{..3}", "{1..2..x}", "{1..2..}", "{a}", "{}", "plain", "{unclosed", "a{b}c",
+]
+
+#: Bash's character ranges are ASCII; Python's ``str.isalpha`` is Unicode-wide.
+#: Graded against bash under both ``C`` and ``C.UTF-8`` — it leaves every one of
+#: these literal, while the first implementation called all of them ranges and
+#: refused the command. Kept as its own list rather than folded into
+#: ``_BRACE_LITERAL`` so that deleting the ASCII test fails a test whose NAME says
+#: what broke.
+_BRACE_NON_ASCII = ["{é..ê}", "{α..γ}", "{é..é}", "{à..ÿ}", "{Α..Ω}"]
+
+
+@pytest.mark.parametrize("word", _BRACE_EXPANDS)
+def test_a_word_bash_expands_is_reported(word):
+    """The half a narrowing fix can silently destroy. Without these, a change
+    that stopped reporting everything would satisfy the over-block finding and
+    delete the rule it belongs to."""
+    assert sp._has_brace_expansion(word) is True, word
+
+
+@pytest.mark.parametrize("word", _BRACE_LITERAL)
+def test_a_word_bash_leaves_literal_is_not_reported(word):
+    """The over-block this closes: any top-level `..` used to count as a range,
+    so `git {foo..bar}` — which bash passes through untouched — was routed to the
+    blind-spot net and refused."""
+    assert sp._has_brace_expansion(word) is False, word
+
+
+@pytest.mark.parametrize("word", _BRACE_NON_ASCII)
+def test_a_non_ascii_range_is_not_a_bash_range(word):
+    """`str.isalpha` is Unicode-wide and bash's character ranges are not.
+
+    MEASURED: bash leaves each of these literal under both `C` and `C.UTF-8`, so
+    reporting them as expansions routes an ordinary verb to the blind-spot net and
+    refuses a command bash would have run unexpanded. Replacing `_ASCII_ALPHA` with
+    `str.isalpha` fails every case here.
+    """
+    assert sp._has_brace_expansion(word) is False, word
+
+
+def test_the_brace_scan_cost_is_linear_in_word_length():
+    """The durable property is the SHAPE, so this asserts a ratio, not a constant.
+
+    Quadrupling the length must roughly quadruple the cost. A quadratic scan
+    SIXTEENS it, so the bound sits between: 8x passes linear with room for load
+    noise and fails quadratic by a factor of two. MEASURED on this box after the
+    rewrite: 4.17x. Before it: ~16x.
+    """
+    small, large = _brace_cost(8_000), _brace_cost(32_000)
+    assert large < small * 8.0, (
+        f"4x the length cost {large / max(small, 1e-9):.1f}x the time "
+        f"({small:.5f}s -> {large:.5f}s) — the scan is superlinear again, which "
+        "is a fail-open: a guard killed by its wall clock permits"
+    )
+
+
+def test_the_brace_scan_absorbs_the_worst_word_the_parser_can_hold():
+    """The absolute number, on the SCAN ITSELF rather than through a caller.
+
+    MEASURED 0.006s at MAX_COMMAND_CHARS after the rewrite and 173s before it, so
+    a 2s bound clears linear by ~300x and fails a reintroduced quadratic scan by
+    ~85x. That budget is the 5s `bash_safety_hook.sh` shares across the three
+    guards it delegates to.
+
+    CALLS THE FUNCTION DIRECTLY, and the two failed attempts that preceded this
+    are the reason. Through `analyze_checked` the payload never reaches the scan:
+    a word of MAX_COMMAND_CHARS braces puts the whole COMMAND over the length
+    bound, which refuses in microseconds; and sizing the word just under that
+    bound instead hits `_MAX_VERB_WORD_CHARS`, which short-circuits before the
+    scan for the same reason it exists. Both versions passed against the very
+    quadratic scan they were written to catch. The caller is armoured twice over —
+    which the test below pins — so the only way to time the scan is to call it.
+    """
+    word = "{" * sp.MAX_COMMAND_CHARS
+    started = time.monotonic()
+    sp._has_brace_expansion(word)
+    elapsed = time.monotonic() - started
+    assert elapsed < 2.0, (
+        f"one crafted word cost {elapsed:.2f}s to scan, against a 5s budget shared "
+        "by three guards. A hook SIGKILLed mid-gate does not block the tool call — "
+        "it permits, on all nine guards this module feeds"
+    )
+
+
+def test_the_verb_word_cap_keeps_a_long_word_out_of_the_scan_entirely():
+    """Defence in depth, asserted rather than assumed — and its DIRECTION.
+
+    The scan is linear now, so this cap is the belt to that pair of braces: it
+    stops an over-long word before any scanning at all, so a future edit that
+    reintroduces a slow scan cannot reach a guard through this path. Pinning it
+    matters because it is invisible in ordinary runs and would be easy to delete
+    as redundant.
+
+    The payload is deliberately UNDER the command-length bound and OVER the word
+    cap, so it is the cap that fires and not the bound — asserted, because those
+    two refusals are indistinguishable from a timing alone, and mistaking one for
+    the other is what made two earlier versions of the test above vacuous.
+    """
+    word_len = sp._MAX_VERB_WORD_CHARS * 2
+    cmd = "git " + "{" * word_len + " origin main"
+    assert len(cmd) < sp.MAX_COMMAND_CHARS, "payload must stay UNDER the length bound"
+    started = time.monotonic()
+    _segs, blind = sp.analyze_checked(cmd)
+    elapsed = time.monotonic() - started
+    assert blind is sp._BLIND_UNRESOLVED_VERB, (
+        "an over-long verb word must be reported UNRESOLVED — the fail-closed "
+        f"direction — and by the word cap rather than a bound: {blind}"
+    )
+    assert elapsed < 1.0, f"the cap took {elapsed:.2f}s, so it is not short-circuiting"
+
+
+def test_an_unreadable_verb_word_fails_CLOSED():
+    """The cap's DIRECTION, which is the half a length bound usually gets wrong.
+
+    Declining to read a word is not evidence the word is harmless, so an
+    over-long word is reported not-literal — the same verdict this module gives
+    any verb it cannot establish. Asserting the direction rather than the number:
+    a cap that answered "literal" would be a silent allow at a length the
+    attacker picks.
+
+    The pair is the point. At the cap the answer is still LITERAL, so the test
+    fails if the bound is ever moved to where it would swallow ordinary words —
+    MEASURED, the longest word ever reaching this function across 129,179 real
+    commands is 3,176 characters.
+    """
+    at_cap = "a" * sp._MAX_VERB_WORD_CHARS
+    over_cap = "a" * (sp._MAX_VERB_WORD_CHARS + 1)
+    assert sp._word_is_literal(at_cap) is True, (
+        "a word AT the cap must still be read — otherwise the cap is cutting into "
+        "ordinary traffic rather than bounding an attack"
+    )
+    assert sp._word_is_literal(over_cap) is False, (
+        "an over-long word was reported LITERAL, so a guard would treat a word "
+        "this module never read as established. The cap must fail closed"
+    )
+
+
 @pytest.mark.parametrize("depth", [16, 48, 128])
 def test_a_truncated_parse_reports_itself(depth):
     """The half that makes the bound safe rather than a different fail-open.
