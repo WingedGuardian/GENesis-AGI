@@ -33,6 +33,13 @@ _PERMANENT_TYPES: frozenset[str] = frozenset(
         "genesis_version_baseline",  # Single reference point, replaced on next version
         "cc_version_baseline",  # Single reference point, replaced on next version
         "execution_challenge",  # Task failure post-mortem — resolved manually
+        # A milestone crossing is a one-time historical fact, and the
+        # observation IS the wake-up for work parked behind that number.
+        # Under the 14-day default it would expire before anyone acted on
+        # it, which turns the watcher that wrote it into a no-op nobody
+        # notices — the exact silent-miss this whole mechanism exists to
+        # prevent. Permanent, and resolved by hand like the rows above.
+        "repo_milestone_reached",
     }
 )
 
