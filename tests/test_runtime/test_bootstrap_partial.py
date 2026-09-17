@@ -1,5 +1,6 @@
 """Tests for partial bootstrap behavior."""
 import json
+import os
 
 import pytest
 
@@ -49,6 +50,11 @@ def test_write_bootstrap_manifest_file_round_trips(tmp_path, monkeypatch):
     assert written["bootstrapped"] is True
     assert written["manifest"] == rt._bootstrap_manifest  # no lossy mapping
     assert written["persisted_at"]
+    # The writer's pid. This file is user-global and the server is not its only
+    # writer (bridge, interactive terminal), so a reader that needs THE SERVER'S
+    # manifest binds on this against the unit's MainPID — recency cannot establish
+    # ownership. scripts/update.sh's post-deploy subsystem check is that reader.
+    assert written["pid"] == os.getpid()
 
 
 def test_write_bootstrap_manifest_file_skips_readonly(tmp_path, monkeypatch):

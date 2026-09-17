@@ -1032,10 +1032,15 @@
                            :style="`color: ${$store.genesisDashboard.keyHealthColor(info.key_health)}`"
                            :title="info.error || info.cb_reason || ''">
                         <span class="status-dot" :style="`background: ${$store.genesisDashboard.keyHealthColor(info.key_health)}`"></span>
+                        <!-- cb_label comes from the backend (api_keys.py
+                             _CB_SHORT_LABEL), which is exhaustive over
+                             ErrorCategory and test-locked. This template used to
+                             re-derive it with its own quota_exhausted ternary —
+                             a second copy of the mapping that silently rendered
+                             every newly-added category as "API down". -->
                         <span x-text="name + ' (' + (
                           info.status === 'missing' ? 'key missing'
-                          : info.cb_reason === 'quota_exhausted' ? 'out of credits'
-                          : info.cb_state === 'open' ? 'API down'
+                          : info.cb_label ? info.cb_label
                           : info.error ? info.error.substring(0, 40)
                           : info.status
                         ) + ')'"></span>

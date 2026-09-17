@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -292,3 +293,48 @@ def test_the_real_migrations_directories_are_discoverable():
     assert len(data) >= 11
     assert [m for m, _, _ in schema] == sorted(m for m, _, _ in schema)
     assert [m for m, _, _ in data] == sorted(m for m, _, _ in data)
+
+
+def test_every_migration_module_named_in_tests_still_exists():
+    """A stale migration import in ANY test file zeroes the whole suite.
+
+    Migration tests address their module by its exact id
+    (``importlib.import_module("genesis.db.migrations.<id>")``) — 85+ such
+    references across ``tests/``. When #1678's legacy-numeric freeze renamed a
+    migration, one of them kept the dead name, and pytest's response to an
+    ImportError during COLLECTION is to interrupt: MEASURED on PR #1616's CI,
+    ``22352 items / 1 error`` and exit 2 — zero tests ran, from one stale string
+    in one file. There is no ``-x`` involved; that is the default.
+
+    So this walks the source text rather than importing anything: a rename that
+    misses a reference fails HERE, naming the file and the id, instead of taking
+    every other test down with it.
+    """
+    import re
+
+    tests_root = Path(__file__).resolve().parents[1]
+    pattern = re.compile(r"genesis\.db\.(data_migrations|migrations)\.([A-Za-z0-9_]+)")
+    repo_root = tests_root.parent
+
+    referenced: list[tuple[Path, str, str]] = []
+    for path in tests_root.rglob("*.py"):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for package, module in pattern.findall(text):
+            if module in {"runner", "__init__"}:
+                continue
+            referenced.append((path, package, module))
+
+    assert referenced, "found no migration module references — the pattern has drifted"
+
+    missing = [
+        f"{path.relative_to(repo_root)} -> genesis.db.{package}.{module}"
+        for path, package, module in referenced
+        if not (repo_root / "src" / "genesis" / "db" / package / f"{module}.py").exists()
+    ]
+    assert not missing, (
+        "test files reference migration modules that do not exist; each one "
+        "interrupts pytest collection and runs ZERO tests:\n  " + "\n  ".join(missing)
+    )

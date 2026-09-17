@@ -15,10 +15,8 @@ its own token check using ``GENESIS_MCP_HTTP_TOKEN``).
 from __future__ import annotations
 
 import asyncio
-import hmac
 import json
 import logging
-import os
 import time
 import uuid
 from datetime import UTC, datetime
@@ -27,6 +25,7 @@ from flask import Blueprint, current_app, jsonify, request
 
 from genesis.channels.voice.graduation import validate_envelope
 from genesis.channels.voice.transcript_writer import validate_conversation
+from genesis.dashboard.auth import check_bearer_token
 
 logger = logging.getLogger("genesis.dashboard.voice_api")
 
@@ -39,25 +38,11 @@ _FUTURE_TIMEOUT_SECONDS = 8.0
 def _check_voice_token() -> tuple[str, int] | None:
     """Validate Bearer token. Returns (error message, http status) or None if OK.
 
-    Fail-closed: when ``GENESIS_MCP_HTTP_TOKEN`` is not set, every
-    ``/v1/voice/*`` route answers 503 — a write surface (``/v1/voice/graduate``)
-    shares this token model, so open-by-default is not acceptable even on a
-    trusted network. Set the token in ``secrets.env`` to enable the voice API
-    (the standalone host logs a boot-time warning when it is missing).
+    Thin wrapper over the shared ``/v1/*`` bearer check so every machine-caller
+    surface enforces one implementation; the wrapper is kept because this
+    module's six routes call it by name.
     """
-    token = os.environ.get("GENESIS_MCP_HTTP_TOKEN", "")
-    if not token:
-        return ("voice API disabled: GENESIS_MCP_HTTP_TOKEN not configured", 503)
-
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return ("Missing or invalid Authorization header", 401)
-
-    request_token = auth_header[7:]
-    if not hmac.compare_digest(request_token, token):
-        return ("Invalid bearer token", 401)
-
-    return None
+    return check_bearer_token("voice API")
 
 
 @voice_api_bp.route("/v1/voice/chat/completions", methods=["POST"])

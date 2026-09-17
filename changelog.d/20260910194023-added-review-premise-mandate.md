@@ -1,0 +1,1 @@
+- The cross-model reviewer is now asked whether the approach is right, not only whether the code is. It was previously told to hunt defects and nothing else, so a solution that was wrong in shape produced round after round of real findings with nobody ever saying why they kept coming.

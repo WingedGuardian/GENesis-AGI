@@ -24,16 +24,29 @@ is closed by the delete-intent tombstones (PR-2), not this lock. A crash
 window covered by the reconcile lane.
 
 Covers the delete-vs-{re-embed, reconcile-requeue} triad — the paths that can
-RESURRECT a deleted vector. ``MemoryStore._mark_superseded`` also writes the same
-``memory_id`` across both stores but is deliberately NOT wrapped here: it cannot
-resurrect a vector (a ``set_payload`` on a missing point is a no-op), and its one
-residual race — a dangling ``succeeded_by`` link for a concurrently-deleted
-memory — needs an existence-guard on the link insert, not just this lock (tracked
-separately, pre-existing).
+RESURRECT a deleted vector — plus the standalone ``MemoryStore.supersede()``,
+which holds BOTH its ids from validation through the mirror writes so a
+concurrent delete or supersession of the successor cannot commit between its
+check and its write. The ``store(supersedes=...)`` path's ``_mark_superseded``
+remains deliberately NOT wrapped: it cannot resurrect a vector (a
+``set_payload`` on a missing point is a no-op), and its one residual race — a
+dangling ``succeeded_by`` link for a concurrently-deleted memory — needs an
+existence-guard on the link insert, not just this lock (tracked separately,
+pre-existing).
 
-Deadlock-free by construction: every holder takes at most ONE id-lock at a time
-and never nests, ``store()`` takes no lock, and the slow embed happens OUTSIDE
-the worker's locked section — so no lock is ever held across an unbounded wait.
+Deadlock-free by construction: every holder takes at most ONE id-lock at a
+time and never nests — with a single sanctioned exception: ``supersede()``
+takes exactly TWO, always acquired in sorted-id order, and a fixed total
+acquisition order cannot form a cycle (it also rejects an equal pair before
+locking, so it never nests the SAME lock). ``store()`` takes no lock, and the
+slow embed happens OUTSIDE the worker's locked section.
+
+What a lock IS held across is the Qdrant mirror call — ``delete()`` has always
+done this (retrieve + delete inside its lock) and ``supersede()`` now does it
+holding two. That is bounded by the client timeout rather than unbounded, but
+it is not free: a hung Qdrant blocks deletes of both ids for that long. An
+earlier version of this paragraph claimed no lock was ever held across an
+unbounded wait, which read as a guarantee that neither function kept.
 """
 
 from __future__ import annotations
