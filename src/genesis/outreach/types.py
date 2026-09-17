@@ -24,6 +24,14 @@ class OutreachCategory(StrEnum):
     # Routed through the outreach pipeline with governance (dedup, rate limit,
     # quiet hours) but no approval gate. Added in PR #530.
     NOTIFICATION = "notification"
+    # Marketing campaign updates — the campaign's tick digest / reply pings.
+    # Routed to a dedicated "Marketing" supergroup topic (never the shared
+    # Morning Reports topic that 'digest' lands in). Must match the DB CHECK
+    # constraint on outreach_history (see db/schema/_migrations.py — the
+    # 'marketing' table-rebuild block) AND carry a delivery threshold (see
+    # config/outreach.yaml thresholds.marketing) so an owner-facing digest is
+    # never dropped by the default salience gate.
+    MARKETING = "marketing"
 
 
 class OutreachStatus(StrEnum):
@@ -162,12 +170,22 @@ class OutreachRequest:
     # at delivery; None → the prediction rides the policy_prior lane (a
     # measured base-rate seed, NOT 0.5 — see ledger/writers.py).
     stated_confidence: float | None = None
-    # Origin-targeted TELEGRAM delivery: when set, ``_deliver`` sends this
-    # message to THIS chat + forum topic instead of the category→topic routing.
-    # Used to deliver a background session's result back to the exact
-    # conversation it was requested in. ``target_chat_id`` is a numeric chat id
-    # as a string (a DM user id, or the forum supergroup id); ``target_thread_id``
-    # is the forum topic id (None for a DM). Ignored for non-telegram channels.
+    # Per-request RECIPIENT OVERRIDE. ``_deliver`` resolves
+    # ``validated_recipient or target_chat_id or self._recipients[channel]``
+    # (pipeline.py) — that resolution is CHANNEL-AGNOSTIC, so this field is
+    # meaningful on every channel, not just Telegram. Two live users:
+    #
+    #   TELEGRAM — origin-targeted delivery: a numeric chat id as a string (a DM
+    #   user id, or the forum supergroup id), paired with ``target_thread_id``
+    #   (the forum topic id; None for a DM), so a background session's result
+    #   returns to the exact conversation that asked for it.
+    #
+    #   DISCORD — the SUB-CHANNEL name (``"announcements"``). This is the ONLY
+    #   mechanism carrying it, on BOTH paths: ``outreach_send`` for a live send
+    #   and ``scheduler.py`` for a drained ``pending_outreach`` row. Do not
+    #   "simplify" the resolution in ``_deliver`` to a telegram-only branch —
+    #   that silently reverts PR #1854 and every test still passes, because the
+    #   tests assert on the OutreachRequest rather than on delivery.
     target_chat_id: str | None = None
     target_thread_id: int | None = None
 
@@ -201,3 +219,33 @@ class FreshEyesResult:
     score: float
     reason: str
     model_used: str
+
+
+#: Discord SUB-CHANNEL names. The outreach pipeline routes by ADAPTER name
+#: ("discord"); which channel inside the server a message lands in is the
+#: *recipient*, and for the webhook adapter a recipient is a webhook name whose
+#: env-var naming rule lives in `runtime/init/outreach.py` — spelled out ONLY
+#: there, because `check_external_io.py` line-greps those names and this module
+#: is not an egress door.
+#:
+#: Lives here rather than in scheduler.py because it now has two readers — the
+#: campaign scheduler and `outreach_send` — and two copies of a list like this
+#: is a defect waiting for someone to add a channel to one of them.
+#:
+#: Adding a name here is not enough on its own: with no per-channel webhook for
+#: it the adapter falls back to the DEFAULT webhook, which posts to the DEFAULT
+#: channel rather than failing — the reason a caller can believe it targeted one
+#: channel and hit another.
+DISCORD_CHANNELS: frozenset[str] = frozenset(
+    {
+        "announcements",
+        "dev-discussion",
+        "general",
+        "showcase",
+        "getting-started",
+        "design",
+        "bug-reports",
+        "feature-requests",
+        "troubleshooting",
+    }
+)

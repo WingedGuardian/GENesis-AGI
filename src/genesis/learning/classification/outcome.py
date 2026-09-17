@@ -8,6 +8,11 @@ import logging
 import re
 from typing import Any, Protocol
 
+from genesis.learning.response_context import (
+    request_lines,
+    response_lines,
+    tool_lines,
+)
 from genesis.learning.types import InteractionSummary, OutcomeClass
 
 logger = logging.getLogger(__name__)
@@ -22,6 +27,8 @@ class _Router(Protocol):
 # 31_outcome_classification — per-outcome success/partial/failure classification.
 # Feeds the learning pipeline and the executor retrospective. See _call_site_meta.py.
 _CALL_SITE = "31_outcome_classification"
+
+
 
 
 class OutcomeClassifier:
@@ -121,9 +128,9 @@ class OutcomeClassifier:
             "## Interaction",
             f"Session: {summary.session_id}",
             f"Channel: {summary.channel}",
-            f"Tools used: {', '.join(summary.tool_calls) or 'none'}",
-            f"User: {summary.user_text}",
-            f"Response: {summary.response_text}",
+            *tool_lines(summary),
+            *request_lines(summary),
+            *response_lines(summary),
             "",
             "Respond with JSON:",
             '{"goals_identified": ["goal1", "goal2"],'

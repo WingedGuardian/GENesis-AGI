@@ -252,3 +252,109 @@ async def test_prune_deletes_old_runs_and_events(db):
 @pytest.mark.asyncio
 async def test_prune_noops_pre_migration(db):
     assert await crud.prune_session_ledger_shadow(db, now="2026-07-14T00:00:00+00:00") == 0
+
+
+@pytest.mark.asyncio
+async def test_prune_exempts_promoted_events_and_their_runs(db):
+    """Promoted events are the leak invariant's attribution record — deleting
+    them by age turned a legitimate 46-day-old promotion into an
+    'unattributed leak' and the report into a permanent false VIOLATED.
+    They and their runs survive retention, unbounded by owner decision
+    (2026-09-05); unpromoted neighbours in the same window still prune.
+    Requires the ambient-extractor migration (the column the exemption keys
+    on); the untouched sibling test above pins the pre-column fallback."""
+    M95 = importlib.import_module(
+        "genesis.db.migrations.20260904231054_session_ledger_ambient_extractor"
+    )
+    await M59.up(db)
+    await M95.up(db)
+    await crud.record_run(
+        db,
+        **_run_kwargs(run_id="old-promoted", started_at="2026-05-01T00:00:00+00:00"),
+        events=[_event(id="e-promoted", observed_at="2026-05-01T00:00:10+00:00")],
+    )
+    await crud.record_run(
+        db,
+        **_run_kwargs(run_id="old-plain", started_at="2026-05-01T01:00:00+00:00"),
+        events=[_event(id="e-plain", observed_at="2026-05-01T01:00:10+00:00")],
+    )
+    await db.execute(
+        "UPDATE session_ledger_shadow_events SET promoted_item_id = 'L1' "
+        "WHERE id = 'e-promoted'"
+    )
+    await db.commit()
+
+    deleted = await crud.prune_session_ledger_shadow(
+        db, older_than_days=45, now="2026-07-14T00:00:00+00:00"
+    )
+    assert deleted == 2, "exactly the unpromoted event and its run"
+    assert [e["id"] for e in await crud.list_events(db)] == ["e-promoted"]
+    assert [r["run_id"] for r in await crud.list_runs(db)] == ["old-promoted"], (
+        "the run is the mode half of the attribution and must survive with it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_promoted_events_with_runs_is_complete_and_paired(db):
+    """The attribution read: every promoted event + its run, by key.
+
+    This is the seam the report's leak verdict stands on — a windowed read
+    here recreates the decays-with-age hole the function exists to close.
+    Unpromoted events must not ride along; the promoted event's run must
+    arrive even though nothing else references it."""
+    M95 = importlib.import_module(
+        "genesis.db.migrations.20260904231054_session_ledger_ambient_extractor"
+    )
+    await M59.up(db)
+    await M95.up(db)
+    await crud.record_run(
+        db,
+        **_run_kwargs(run_id="r-promoted", started_at="2026-05-01T00:00:00+00:00"),
+        events=[_event(id="e-promoted", observed_at="2026-05-01T00:00:10+00:00")],
+    )
+    await crud.record_run(
+        db,
+        **_run_kwargs(run_id="r-plain", started_at="2026-06-01T00:00:00+00:00"),
+        events=[_event(id="e-plain", observed_at="2026-06-01T00:00:10+00:00")],
+    )
+    await db.execute(
+        "UPDATE session_ledger_shadow_events SET promoted_item_id = 'L1' "
+        "WHERE id = 'e-promoted'"
+    )
+    await db.commit()
+
+    events, runs = await crud.list_promoted_events_with_runs(db)
+    assert [e["id"] for e in events] == ["e-promoted"]
+    assert [r["run_id"] for r in runs] == ["r-promoted"]
+
+
+@pytest.mark.asyncio
+async def test_list_promoted_events_with_runs_noops_pre_migration(db):
+    assert await crud.list_promoted_events_with_runs(db) == ([], [])
+
+
+@pytest.mark.asyncio
+async def test_list_events_for_runs_is_one_joined_window(db):
+    """Events selected BY the run window — never an independent cap.
+
+    Two independent newest-N caps stop covering the same span once runs carry
+    more proposals than the caps' ratio; a run whose events fell off then
+    reads as swept-with-no-proposals and its foreground rows are charged as
+    false negatives. Selecting by run id makes the mismatch impossible."""
+    await M59.up(db)
+    await crud.record_run(
+        db,
+        **_run_kwargs(run_id="r-in", started_at="2026-07-01T00:00:00+00:00"),
+        events=[_event(id="e-in-1", observed_at="2026-07-01T00:00:10+00:00"),
+                _event(id="e-in-2", observed_at="2026-07-01T00:00:05+00:00")],
+    )
+    await crud.record_run(
+        db,
+        **_run_kwargs(run_id="r-out", started_at="2026-07-02T00:00:00+00:00"),
+        events=[_event(id="e-out", observed_at="2026-07-02T00:00:10+00:00")],
+    )
+    events = await crud.list_events_for_runs(db, ["r-in"])
+    assert [e["id"] for e in events] == ["e-in-2", "e-in-1"], (
+        "wrong membership or ordering — oldest first, selected runs only"
+    )
+    assert await crud.list_events_for_runs(db, []) == []

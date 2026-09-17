@@ -3,14 +3,26 @@
 import tempfile
 from pathlib import Path
 
-from genesis.outreach.config import OutreachConfig, QuietHours, load_outreach_config
+from genesis.outreach.config import (
+    QUIET_HOURS_DISABLED,
+    OutreachConfig,
+    QuietHours,
+    load_outreach_config,
+)
 
 
 def test_default_config():
     config = load_outreach_config(Path("/nonexistent"))
     assert isinstance(config, OutreachConfig)
-    assert config.quiet_hours.start == "22:00"
-    assert config.quiet_hours.end == "07:00"
+    # Quiet hours ship DISABLED as a zero-width window (owner ruling 2026-09-10).
+    # This assertion used to pin 22:00/07:00; that default held an explicitly
+    # scheduled 01:30 owner reminder until 07:00, and the feature had no off
+    # switch. Full default-path coverage (no file / file without the key /
+    # shipped yaml) lives in test_governance.py, which also asserts the value
+    # actually READS as disabled — the half this assertion cannot see.
+    assert config.quiet_hours.start == QUIET_HOURS_DISABLED.start
+    assert config.quiet_hours.end == QUIET_HOURS_DISABLED.end
+    assert config.quiet_hours.start == config.quiet_hours.end, "zero-width = off"
     assert config.max_daily == 5
     assert config.surplus_daily == 1
 
@@ -64,3 +76,38 @@ def test_quiet_hours_dataclass():
     qh = QuietHours(start="22:00", end="07:00")
     assert qh.start == "22:00"
     assert qh.end == "07:00"
+
+
+def test_marketing_defaults_survive_a_pre_marketing_saved_config():
+    """A config saved BEFORE the marketing category existed carries thresholds/
+    channel_preferences/delivery_routing maps that lack a 'marketing' key. The
+    loader must merge the shipped defaults UNDER those maps so marketing still
+    resolves to its shipped values (always-deliver threshold, telegram, the
+    dedicated supergroup topic) instead of falling back to generic defaults."""
+    yaml_content = """
+channel_preferences:
+  default: discord
+  blocker: telegram
+thresholds:
+  blocker: 0.0
+  digest: 0.0
+delivery_routing:
+  default: dm
+  approval: supergroup
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+        f.write(yaml_content)
+        path = Path(f.name)
+    try:
+        config = load_outreach_config(path)
+        # marketing threshold present despite the saved thresholds block omitting it
+        assert config.thresholds["marketing"] == 0.0
+        # user overrides still win (they set blocker/digest, default channel discord)
+        assert config.channel_preferences["default"] == "discord"
+        # marketing routes to telegram + the supergroup topic even though the saved
+        # config's default channel is discord and default routing is dm
+        assert config.channel_preferences["marketing"] == "telegram"
+        assert config.delivery_routing["marketing"] == "supergroup"
+        assert config.delivery_routing["default"] == "dm"  # user override preserved
+    finally:
+        path.unlink()

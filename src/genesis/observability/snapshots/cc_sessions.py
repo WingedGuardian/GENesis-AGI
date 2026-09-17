@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sqlite3
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -38,6 +40,65 @@ def _fallback_snapshot() -> dict:
         return {"is_fallback": False, "original": "", "fallback": "", "reason": "", "since": ""}
 
 
+async def _peer_availability_snapshot() -> list[dict]:
+    """LAST-OBSERVED availability of each failover peer. Never raises.
+
+    Answers a question no other field in this snapshot can: is the STANDBY
+    usable? ``fallback`` above reports whether we are currently degraded, and the
+    roster admits a peer purely on credential presence — so without this a
+    quota-blocked backup looks identical to a healthy one everywhere Genesis
+    reports on itself.
+
+    NOT CURRENT STATE. A record refreshes only when a failover actually runs,
+    which happens only while the home model is down — so a peer whose provider
+    quota reset an hour ago is still reported blocked here. ``age_seconds`` is
+    included precisely so a reader can distinguish a fresh observation from a
+    stale one; a consumer must render this as "last seen …", never as "is down".
+
+    Advisory: nothing consumes this to route or gate. Ordered blocked-first so
+    the surface that matters is not buried behind healthy peers.
+
+    Carries NO free text by construction — every field is a closed set. This
+    payload is JSON-dumped whole into an LLM context by the health MCP tool and
+    by ``sentinel/monitor.py``, so a field that could hold provider prose would
+    be a field that holds provider prose in a prompt.
+    """
+    try:
+        import asyncio
+
+        from genesis.cc.peer_availability import read as read_peers
+
+        # OFF the event loop: read() stats, reads and json-parses a file that
+        # may legitimately be near its 1MB cap, and this snapshot runs inside
+        # health_data's gather precisely so independent probes overlap — a
+        # synchronous read here stalls every gathered coroutine, not just this
+        # section. Same pattern as the neighbouring file-backed snapshots.
+        peers = await asyncio.to_thread(read_peers)
+
+        now = datetime.now(UTC)
+        rows: list[dict] = []
+        for st in peers.values():
+            age: int | None = None
+            # Unparseable/missing stamp → age stays None (unknown), never 0,
+            # which would read as "just observed".
+            with contextlib.suppress(ValueError, TypeError):
+                age = int((now - datetime.fromisoformat(st.observed_at)).total_seconds())
+            rows.append({
+                "peer": st.peer,
+                "available": st.available,
+                "reason": st.reason,
+                "observed_at": st.observed_at,
+                "age_seconds": age,
+                "reset_at": st.reset_at,
+                "limit_kind": st.limit_kind,
+            })
+        rows.sort(key=lambda r: (r["available"], r["peer"]))
+        return rows
+    except Exception:
+        logger.debug("peer availability read failed", exc_info=True)
+        return []
+
+
 async def cc_sessions(
     db: aiosqlite.Connection | None,
     cc_budget: CCBudgetTracker | None,
@@ -48,6 +109,7 @@ async def cc_sessions(
             "foreground": {"status": "unknown"},
             "background": {"status": "unknown"},
             "fallback": _fallback_snapshot(),
+            "peer_availability": await _peer_availability_snapshot(),
         }
 
     try:
@@ -203,4 +265,5 @@ async def cc_sessions(
         "rate_limited_24h": rate_limited_24h,
         "realtime_status": cc_realtime_status,
         "fallback": _fallback_snapshot(),
+        "peer_availability": await _peer_availability_snapshot(),
     }

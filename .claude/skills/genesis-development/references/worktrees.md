@@ -119,7 +119,16 @@ over.
   permission prompt doesn't re-fire for the (non-allow-listed) command — so a
   `git push && gh pr create` prompts once (for the push) and the create rides
   along, and a standalone create on pushed code doesn't prompt at all.
-- `git merge` into main/master — **hard-blocked** (use the PR workflow).
+- `git merge` into main/master — **hard-blocked** (use the PR workflow). A
+  `# merge-to-main-override` trailing comment is the conscious escape, honoured
+  per-segment; it is a registered sigil (`shell_parse._KNOWN_SIGILS`), not an
+  undocumented hole. Reach for the PR workflow first — this exists for a local
+  reconciliation you have decided to make, not as a way around review.
+  Note the guard matches on parsed COMMAND SEGMENTS, so it also fires when the
+  blocked form BEGINS a segment inside a heredoc or a script — a heredoc line
+  starting `git merge …` fires; the same words mid-sentence, or inside
+  `echo '…'`, do not. Use an editor tool for the write rather than reasoning
+  about which shape is safe.
 - `gh pr merge` without `--admin`, or with unresolved review findings —
   **hard-blocked** (a `# review-override` trailing comment acknowledges
   intentionally-accepted findings on the *merge* command only).

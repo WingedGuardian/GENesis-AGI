@@ -338,8 +338,11 @@ def test_untokenizable_gh_close_is_not_a_silent_allow(repo):
     cmd = "echo $'a\\'b)c' && gh pr close 1680"
     bg = _run(cmd, repo, dispatched="1")
     assert _verdict(bg) == "block", f"dispatched {_verdict(bg)}: {bg.stdout}{bg.stderr}"
+    # USER RULING 2026-09-08 (landed on main while this PR was open): an
+    # unparseable gated mention is now a hard BLOCK in every session type —
+    # foreground is refused with an actionable rewrite, not asked.
     fg = _run(cmd, repo, dispatched=None)
-    assert _verdict(fg) == "ask", f"foreground {_verdict(fg)}: {fg.stdout}{fg.stderr}"
+    assert _verdict(fg) == "block", f"foreground {_verdict(fg)}: {fg.stdout}{fg.stderr}"
 
 
 # ── the WIDER gh api close surface (review Finding 1) ─────────────────────

@@ -119,6 +119,42 @@ class TestNesting:
     def test_bash_lc_bundle(self):
         assert _commit_nv("bash -lc 'git commit -n -m wip'")
 
+    def test_bash_ce_bundle(self):
+        assert any(s.exe == "echo" for s in sp.analyze("bash -ce 'echo hello'"))
+
+    def test_zsh_Gc_bundle_recurse(self):
+        assert any(
+            s.exe == "git" and sp.git_subcommand(s.argv) == "push"
+           for s in sp.analyze("zsh -Gc 'git push origin main'")
+        )
+
+    def test_bash_cl_bundle(self):
+        assert any(s.exe == "echo" for s in sp.analyze("bash -cl 'echo hello'"))
+
+    def test_bash_co_value_taking_option_bundle(self):
+        assert any(s.exe == "echo" for s in sp.analyze("bash -co pipefail 'echo hello'"))
+
+    def test_bash_Oc_value_taking_option_bundle(self):assert any(s.exe == "echo" for s in sp.analyze("bash -Oc extglob 'echo hello'"))
+
+    def test_bash_ec_bundle_still_works(self):
+        assert any(s.exe == "echo" for s in sp.analyze("bash -ec 'echo hello'"))
+
+    @pytest.mark.parametrize("interpreter", ["dash", "sh"])
+    @pytest.mark.parametrize("options", ["cC", "Cc", "cE", "Ec", "cI", "Ic", "cV", "Vc"])
+    def test_dash_valid_uppercase_c_bundles_recurse(self, interpreter, options):
+        assert any(s.exe == "echo" for s in sp.analyze(f"{interpreter} -{options} 'echo hello'"))
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "bash -- -ce 'echo hidden'",
+            "bash - -ce 'echo hidden'",
+            "bash -cz 'echo hidden'",
+        ],
+    )
+    def test_interpreter_non_options_and_invalid_bundles_do_not_recurse(self, command):
+        assert not any(s.exe == "echo" for s in sp.analyze(command))
+
     def test_command_substitution(self):
         assert _push_blocked('echo "$(git push origin main)"')
 
@@ -297,6 +333,13 @@ class TestCommandPositionStrip:
     def test_subshell_spaced(self):
         assert self._detects("( git clean -f )", "git", "clean")
 
+    def test_case_selector_ending_in_paren(self):
+        assert self._detects(
+            'case "$(printf b)" in b) git push origin main ;; esac',
+            "git",
+            "push",
+        )
+
     def test_subshell_glued(self):
         assert self._detects("(git clean -f)", "git", "clean")
 
@@ -313,6 +356,85 @@ class TestCommandPositionStrip:
     def test_while_do_done(self):
         assert self._detects("while :; do git push --force origin main; done", "git", "push")
 
+    def test_case_pattern_command(self):
+        assert self._detects("case x in y) echo hello ;; esac", "echo")
+
+    def test_case_multiple_pattern_commands(self):
+        command = "case x in a) echo first ;; b) echo second ;; esac"
+        segments = sp.analyze(command)
+
+        assert sum(s.exe == "echo" for s in segments) == 2
+
+    def test_case_parenthesized_later_pattern_command(self):
+        assert self._detects(
+            "case b in a) : ;; (b) git push origin main ;; esac",
+            "git",
+            "push",
+        )
+
+    def test_function_body_command(self):
+        assert self._detects("f() { echo hello; }", "echo")
+
+    def test_function_body_command_with_spaced_parens(self):
+        assert self._detects("f () { echo hello; }", "echo")
+
+    def test_function_body_git_push_with_spaced_parens(self):
+        assert self._detects("f () { git push origin main; }", "git", "push")
+
+    def test_function_keyword_body_command(self):
+        assert self._detects("function f { echo hello; }", "echo")
+
+    def test_function_keyword_with_optional_parens_body_command(self):
+        assert self._detects(
+            "function f () { git push origin main; }",
+            "git",
+            "push",
+        )
+
+    def test_function_keyword_if_body_command(self):
+        assert self._detects(
+            "function f if git push origin main; then :; fi",
+            "git",
+            "push",
+        )
+
+    def test_function_keyword_while_body_command(self):
+        assert self._detects(
+            "function f while git push origin main; do :; done",
+            "git",
+            "push",
+        )
+
+    def test_function_keyword_case_body_command(self):
+        assert self._detects(
+           "function f case x in x) git push origin main ;; esac",
+           "git",
+           "push",
+        )
+
+    def test_coproc_command(self):
+        assert self._detects("coproc echo hello", "echo")
+
+    def test_named_coproc_compound_body_command(self):
+        assert self._detects("coproc worker { rm -rf /tmp/scratch; }", "rm")
+
+    @pytest.mark.parametrize(
+       "opener, closer",
+       [("(", ")"), ("if true; then", "fi"), ("while false; do", "done")],
+    )
+
+    def test_named_coproc_other_compound_body_command(self, opener, closer):
+       assert self._detects(
+          f"coproc worker {opener} rm -rf /tmp/scratch; {closer}",
+          "rm",
+       )
+
+    def test_coproc_named_subshell_command(self):
+       assert self._detects(
+          "coproc worker (git push origin main)",
+          "git",
+          "push",
+       )
     def test_glued_rm(self):
         assert self._detects("(rm -rf ~)", "rm")
 
@@ -841,3 +963,72 @@ class TestSigilRunRegression:
         # token into _KNOWN_SIGILS left all 146 tests in this file passing.
         unqueried = sorted(set(sp._KNOWN_SIGILS) - set(queried))
         assert not unqueried, f"declared in _KNOWN_SIGILS but no guard queries it: {unqueried}"
+
+
+class TestUvCarrierResolution:
+    """The RESOLVER's own contract, pinned independently of any one guard.
+
+    full_suite_guard now has a fail-closed leg for an unresolved carrier, so it
+    blocks these shapes whether or not the parse is right — which means a guard
+    test cannot distinguish a correct parse from a caught one. Measured: with the
+    leg in place, reverting the --isolated and tool-run fixes left the guard tests
+    GREEN. analyze() feeds every other consumer too (the destructive and routing
+    guards read the resolved exe), so the resolution is asserted here on its own
+    terms rather than through a caller that has its own safety net.
+    """
+
+    def _exe(self, cmd: str) -> str:
+        return [s for s in sp.analyze(cmd) if s.depth == 0][0].exe
+
+    def test_isolated_is_boolean_and_does_not_eat_the_command(self):
+        """--isolated is valueless in uv run. Listing it as value-taking made the
+        parser consume the command word as its value and resolve the path after."""
+        assert self._exe("uv run --isolated pytest tests/") == "pytest"
+
+    def test_uv_tool_run_resolves_like_uvx(self):
+        """uv documents them as identical: uvx is an alias for uv tool run."""
+        assert self._exe("uv tool run pytest tests/") == "pytest"
+        assert self._exe("uvx pytest tests/") == "pytest"
+
+    def test_a_versioned_tool_name_normalises(self):
+        """uv permits package@version; unnormalised it matches no gate."""
+        assert self._exe("uvx pytest@8.3.5 tests/") == "pytest"
+        assert self._exe("uv tool run ruff@0.3.0 check .") == "ruff"
+
+    def test_a_front_end_flag_before_tool_run_still_normalises_the_version(self):
+        """The `tool run` fact comes from the RESOLVER, never from a fixed offset.
+
+        The resolver consumes the front-end's own value flags before matching the
+        subcommand, so `tool run` does not sit at argv[1:3] once any of them is
+        present. Reading it off that offset left `uv --directory v tool run
+        pytest@8.3.5` resolving to the exe `pytest@8.3.5` — a name that matches no
+        gate, so full_suite_guard ALLOWED it where the unflagged spelling blocks.
+        Every flag asserted here is already in _RUN_CARRIER_VALUE_FLAGS, so these
+        are reachable spellings, not hypotheticals.
+        """
+        for flag in ("--directory", "--project", "--python", "-C"):
+            cmd = f"uv {flag} /x tool run pytest@8.3.5 tests/"
+            assert self._exe(cmd) == "pytest", cmd
+
+    def test_an_at_inside_a_directory_is_not_a_version_suffix(self):
+        """Split the NAME, not the whole token.
+
+        `python@3.12` is Homebrew's real keg layout, so a path carrying an `@` is
+        an ordinary shape. Splitting the whole token resolved
+        `uvx /opt/homebrew/opt/python@3.12/bin/pytest` to `python` and
+        `uvx /nix/store/abc@1/bin/rm` to `abc` — the HIDE direction, in the one
+        place this resolver exists to reveal.
+        """
+        assert self._exe("uvx /opt/homebrew/opt/python@3.12/bin/pytest tests/") == "pytest"
+        assert self._exe("uv tool run /nix/store/abc@1/bin/rm -rf /x") == "rm"
+
+    def test_a_version_suffix_is_only_stripped_for_uv_tool_runners(self):
+        """Scoped on purpose — @ is uv's spelling, not a universal one, and
+        stripping it everywhere would invent syntax for tools that lack it."""
+        assert self._exe("some-cmd@1.2.3 arg") == "some-cmd@1.2.3"
+
+    def test_a_non_run_uv_subcommand_still_resolves_to_uv(self):
+        """The run literal is what keeps uv rm -rf / from hiding rm behind the
+        front-end. Adding tool run must not weaken that."""
+        assert self._exe("uv rm -rf /") == "uv"
+        assert self._exe("uv pip install requests") == "uv"

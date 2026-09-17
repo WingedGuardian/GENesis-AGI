@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 
+from genesis.db.crud.events import MSG_GROUP_PREFIX_LEN
 from genesis.observability.call_site_recorder import record_last_run
 from genesis.observability.events import GenesisEventBus
 from genesis.observability.provider_activity import ProviderActivityTracker
@@ -13,6 +14,7 @@ from genesis.observability.spans import SpanKind, start_span
 from genesis.observability.types import Severity, Subsystem
 from genesis.routing.circuit_breaker import CircuitBreakerRegistry
 from genesis.routing.cost_tracker import CostTracker
+from genesis.routing.daily_budget import DailyBudgetLedger
 from genesis.routing.dead_letter import DeadLetterQueue
 from genesis.routing.degradation import DegradationTracker
 from genesis.routing.rate_gate import RateGateRegistry
@@ -36,6 +38,50 @@ logger = logging.getLogger(__name__)
 # dead_letter.redispatch() and the matching test.
 UNKNOWN_CALL_SITE_ERROR_PREFIX = "Unknown call site:"
 
+# How many provider names an exhaustion line names before it summarises. A
+# chain is single digits today, so this never trims in practice — it is here so
+# that a future long chain cannot turn one ERROR line into a paragraph in
+# `journalctl`, which is where this message is read. Applied per clause
+# (`failed:` and `skipped:` each), so the line stays bounded either way.
+_FAILED_NAMES_IN_MESSAGE = 8
+
+
+def _bounded_names(names: list[str]) -> str:
+    shown = names[:_FAILED_NAMES_IN_MESSAGE]
+    listed = ", ".join(shown)
+    if len(names) > len(shown):
+        listed += f", +{len(names) - len(shown)} more"
+    return listed
+
+
+def _exhaustion_clause(
+    called_failed: list[str], skipped: list[tuple[str, str]]
+) -> str:
+    """The `; failed: a, b; skipped: c (breaker open)` tail of an exhaustion
+    message, or '' when the walk recorded nothing.
+
+    `failed` lists only providers that were actually CALLED and returned a
+    failure. A provider passed over before any call is listed under `skipped`
+    with its reason — an open breaker, a missing API key, an exceeded budget —
+    because printing it as `failed` reads as an outage where there may be
+    none: partial API-key configuration is the NORMAL state of a fresh
+    install, and a budget gate is a decision, not a fault.
+
+    EMPTY IS A REAL STATE AND IT SAYS SOMETHING: only the aggregate deadline
+    abandons the walk while recording nothing, and `failed: ` or `skipped: `
+    with nothing after it would read as a formatting bug — the
+    `N attempted of M walkable` counts carry that case on their own; 0 of 7
+    is the whole story there.
+    """
+    parts = []
+    if called_failed:
+        parts.append(f"; failed: {_bounded_names(called_failed)}")
+    if skipped:
+        parts.append(
+            f"; skipped: {_bounded_names([f'{n} ({r})' for n, r in skipped])}"
+        )
+    return "".join(parts)
+
 
 class Router:
     """Routes LLM calls through provider fallback chains with resilience."""
@@ -49,6 +95,7 @@ class Router:
         delegate: CallDelegate,
         event_bus: GenesisEventBus | None = None,
         dead_letter: DeadLetterQueue | None = None,
+        daily_budget: DailyBudgetLedger | None = None,
     ) -> None:
         self.config = config
         self.breakers = breakers
@@ -57,6 +104,7 @@ class Router:
         self.delegate = delegate
         self._event_bus = event_bus
         self._dead_letter = dead_letter
+        self._daily_budget = daily_budget
         self._activity_tracker: ProviderActivityTracker | None = None
         self._rate_gates = self._build_rate_gates(config)
 
@@ -261,6 +309,13 @@ class Router:
         attempts = 0
         first_provider = chain[0]
         failed_providers: list[str] = []
+        # The exhaustion MESSAGE splits the combined list above: providers
+        # whose call actually failed vs providers passed over before any call.
+        # `failed_providers` itself keeps the combined meaning — it feeds
+        # `RoutingResult.failed_providers` and the event details, whose
+        # consumers predate the split.
+        called_failed: list[str] = []
+        skipped: list[tuple[str, str]] = []
 
         # Aggregate wall-clock deadline across the whole chain walk (retries x
         # chain length). A GATE only — checked between providers/attempts, never
@@ -286,12 +341,32 @@ class Router:
             # normal install state on freshly-installed systems.
             if not provider_cfg.has_api_key:
                 failed_providers.append(provider_name)
+                skipped.append((provider_name, "no API key"))
                 continue
 
             # Skip if circuit breaker is open
             cb = self.breakers.get(provider_name)
             if not cb.is_available():
                 failed_providers.append(provider_name)
+                skipped.append((provider_name, "breaker open"))
+                continue
+
+            # Skip a provider whose provider-side DAILY budget (rpd/tpd) is
+            # spent — deselection, not a breaker trip (budget is not a
+            # health signal), checked before the rate gate so we never sleep
+            # for a provider we will not call. Limits come from the live
+            # config, so a dashboard reload takes effect immediately.
+            if self._daily_budget is not None and self._daily_budget.exhausted(
+                provider_cfg
+            ):
+                failed_providers.append(provider_name)
+                # `skipped` is what the journal renders, and the paid-budget
+                # branch below already feeds it. Without this entry an
+                # all-exhausted walk produced "0 attempted of N walkable" with
+                # no provider named and no reason given — the one message this
+                # codebase relies on to diagnose why nothing was called
+                # (Codex P2, PR #1624).
+                skipped.append((provider_name, "daily budget spent"))
                 continue
 
             # Skip paid providers if budget exceeded (unless override)
@@ -301,10 +376,28 @@ class Router:
                 and budget_status == BudgetStatus.EXCEEDED
             ):
                 failed_providers.append(provider_name)
+                skipped.append((provider_name, "budget exceeded"))
                 continue
 
             # Rate gate — pace requests per provider RPM limit
             await self._rate_gates.acquire(provider_name)
+
+            # RECHECK after the gate. The check above happened BEFORE a sleep
+            # that can last seconds, and `acquire` queues concurrent callers —
+            # so several can pass a not-yet-exhausted budget, queue, and each
+            # resume into the delegate after an earlier one has already crossed
+            # the limit. The first check is still worth having (it avoids
+            # sleeping for a provider we will not call); it is simply not the
+            # last word, because its answer can change while we wait
+            # (Codex P2, PR #1624).
+            if self._daily_budget is not None and self._daily_budget.exhausted(
+                provider_cfg
+            ):
+                failed_providers.append(provider_name)
+                # Same reason as the pre-gate branch: a provider deselected
+                # here is a SKIP with a cause, not an anonymous failure.
+                skipped.append((provider_name, "daily budget spent (after rate gate)"))
+                continue
 
             # Try with retry (timed for activity tracking)
             t0 = time.monotonic()
@@ -314,6 +407,46 @@ class Router:
             )
             latency_ms = (time.monotonic() - t0) * 1000
             attempts += 1
+
+            # Count the visit against the provider's daily budget (requests/
+            # tokens, undercount-biased — see daily_budget.py). On the
+            # not-exhausted -> exhausted crossing, say so once.
+            if self._daily_budget is not None:
+                try:
+                    crossed = self._daily_budget.record(provider_cfg, result)
+                except Exception:
+                    logger.warning(
+                        "Daily budget record failed for %s", provider_name,
+                        exc_info=True,
+                    )
+                else:
+                    if crossed and self._event_bus:
+                        # Own try/except: the call already succeeded and
+                        # spent tokens — an emit failure must not fail it.
+                        try:
+                            budget_now = self._daily_budget.status(provider_cfg) or {}
+                            spent = [
+                                f"{label} {budget_now.get(used)}/{budget_now.get(limit)}"
+                                for label, used, limit in (
+                                    ("requests", "requests_used", "rpd_limit"),
+                                    ("tokens", "tokens_used", "tpd_limit"),
+                                )
+                                if budget_now.get(limit) is not None
+                            ]
+                            await self._event_bus.emit(
+                                Subsystem.ROUTING, Severity.WARNING,
+                                "provider.budget_exhausted",
+                                f"{provider_name} daily budget spent — "
+                                f"deselected until the next UTC day "
+                                f"({', '.join(spent)})",
+                                provider=provider_name,
+                                **budget_now,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "budget_exhausted emit failed for %s",
+                                provider_name, exc_info=True,
+                            )
 
             # Record to activity tracker (fire-and-forget, never breaks caller)
             if self._activity_tracker:
@@ -395,6 +528,7 @@ class Router:
                 )
             else:
                 failed_providers.append(provider_name)
+                called_failed.append(provider_name)
                 category = classify_error(result.status_code, result.error or "")
                 # RATE_LIMITED (429) and BAD_REQUEST (400/422) are NOT provider-
                 # health signals: a 429 is expected backpressure (the rate gate
@@ -417,12 +551,52 @@ class Router:
 
         # All exhausted
         if self._event_bus:
+            # `attempts` alone is not readable. A provider skipped for an open
+            # breaker, a missing key or an exceeded budget costs no attempt, so
+            # "attempts: 2" on a seven-provider chain looks exactly like a
+            # two-provider chain that was fully tried. Carrying the names AND
+            # the chain length lets a reader reconcile the two — and makes the
+            # aggregate-deadline `break` above legible, which is the one exit
+            # that abandons the walk while recording nothing at all.
+            #
+            # THE NAMES GO IN THE MESSAGE, not only in the details. `emit()`
+            # logs `subsystem=… event=… msg=…` and nothing else
+            # (observability/events.py), so details reach the persisted event
+            # and the dashboard but never `journalctl` — and the runbook for
+            # this failure sends the reader to the systemd log. Details-only
+            # would have left that surface byte-identical to the behaviour this
+            # change exists to fix. The sibling `provider.fallback` event above
+            # already names its providers in the message; this one now matches.
+            # The Errors dashboard groups events by the first
+            # MSG_GROUP_PREFIX_LEN characters of the message and keys manual
+            # resolutions off that prefix — so the head (stable per call site)
+            # is padded past the grouping window before the per-occurrence
+            # diagnostics start. Without the pad, every breaker/key/budget
+            # permutation of ONE recurring outage becomes its own group, and
+            # a resolved group resurrects under a new key.
             await self._event_bus.emit(
                 Subsystem.ROUTING, Severity.ERROR,
                 "all_exhausted",
-                f"All providers exhausted for {call_site_id}",
+                f"All providers exhausted for {call_site_id} ".ljust(
+                    MSG_GROUP_PREFIX_LEN
+                )
+                + f"({attempts} attempted of {len(chain)} walkable"
+                f"{_exhaustion_clause(called_failed, skipped)})",
                 call_site=call_site_id,
                 attempts=attempts,
+                failed_providers=tuple(failed_providers),
+                # The WALKABLE chain: post-`_filter_chain`, so a `never_pays`
+                # site does not count paid entries it was never going to try.
+                # That is the only length `attempts` can be reconciled against,
+                # and it is not necessarily the length a reader counts in
+                # `model_routing.yaml`. As of 2026-09-07 the two AGREE on all
+                # nine `never_pays` sites — the three that used to differ did so
+                # because both Mistral rungs were `free: false`, and flipping
+                # them to `free: true` made every never_pays chain fully
+                # walkable. Do not read that agreement as an invariant: it is a
+                # property of the current config, and adding one non-free
+                # provider to a never_pays chain re-opens the gap.
+                chain_size=len(chain),
             )
 
         # Record failure for neural monitor visibility
@@ -456,6 +630,11 @@ class Router:
             success=False,
             call_site_id=call_site_id,
             attempts=attempts,
+            # The success path has always returned this (see above); the
+            # exhaustion path accumulated the same list and then dropped it, so
+            # the one result whose reader most needs to know which providers
+            # were involved was the only one that said nothing.
+            failed_providers=tuple(failed_providers),
             error="All providers exhausted",
             dead_lettered=dead_lettered,
         )
@@ -471,7 +650,14 @@ class Router:
         *, deadline: float | None = None, **kwargs,
     ) -> CallResult:
         """Try calling a provider with retries. Returns last result."""
-        last_result = CallResult(success=False, error="no attempts made")
+        # reached_provider=False: nothing was called yet. Unreachable at the
+        # ledger today (attempt 0 always runs, so any escape has already been
+        # overwritten by a real result, and status_code=None gates it anyway) —
+        # set so the flag means the same thing at every site that builds a
+        # result the provider never saw.
+        last_result = CallResult(
+            success=False, error="no attempts made", reached_provider=False
+        )
         max_attempts = policy.max_retries + 1
 
         for attempt in range(max_attempts):
@@ -500,9 +686,23 @@ class Router:
             #    burning more of this provider's rate quota.
             #  - BAD_REQUEST: a 400/422 is deterministic (our payload) — the
             #    same provider with the same payload fails identically.
+            #  - NOT_ENTITLED: a 403 on account tier is deterministic — the
+            #    same credential and model fail identically on every retry.
+            #  - QUOTA_EXHAUSTED: an exhausted allowance is a BILLING state, not
+            #    a timing one. Unlike a 429 it cannot clear inside a backoff
+            #    window, and the limit is usually account-global rather than
+            #    per-model — one OpenRouter key limit covers every openrouter
+            #    entry in the chain — so retrying pays the same toll repeatedly
+            #    within a single walk. MEASURED 2026-09-05 on this install:
+            #    4.1-6.8s average per exposure (n=22) spent sleeping on a
+            #    provider whose answer could not change.
+            # Both were previously retried, which is the inversion this fixes:
+            # RATE_LIMITED — the one 4xx that genuinely might clear — already
+            # fails fast, while the two that certainly will not did not.
             if category in (
                 ErrorCategory.PERMANENT, ErrorCategory.TIMEOUT,
                 ErrorCategory.RATE_LIMITED, ErrorCategory.BAD_REQUEST,
+                ErrorCategory.NOT_ENTITLED, ErrorCategory.QUOTA_EXHAUSTED,
             ):
                 return result
 
