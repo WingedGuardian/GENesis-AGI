@@ -72,6 +72,36 @@ async def test_record_delivery_nonexistent(db):
     assert await outreach.record_delivery(db, "nope", delivered_at="x") is False
 
 
+async def test_delivered_topic_exists_true_only_after_delivery(db):
+    # The UNWINDOWED delivered-already probe: a created-but-undelivered row must NOT
+    # count (delivered_at IS NULL), and the same row must count once delivered.
+    await outreach.create(db, id="oh_dt1", **{**_COMMON, "signal_type": "pt", "topic": "T1"})
+    assert await outreach.delivered_topic_exists(db, signal_type="pt", topic="T1") is False
+    await outreach.record_delivery(db, "oh_dt1", delivered_at="2026-01-02T00:00:00+00:00")
+    assert await outreach.delivered_topic_exists(db, signal_type="pt", topic="T1") is True
+
+
+async def test_delivered_topic_exists_is_exact_on_both_keys(db):
+    # signal_type AND topic must both match — a near-miss on either is not this event.
+    await outreach.create(db, id="oh_dt2", **{**_COMMON, "signal_type": "pt", "topic": "T2"})
+    await outreach.record_delivery(db, "oh_dt2", delivered_at="2026-01-02T00:00:00+00:00")
+    assert await outreach.delivered_topic_exists(db, signal_type="pt", topic="T2") is True
+    assert await outreach.delivered_topic_exists(db, signal_type="other", topic="T2") is False
+    assert await outreach.delivered_topic_exists(db, signal_type="pt", topic="T2 ") is False
+
+
+async def test_delivered_topic_exists_ignores_the_dedup_window(db):
+    # The point of this helper vs governance._is_duplicate: NO time window. A delivery
+    # far outside any dedup window still reports True.
+    await outreach.create(
+        db,
+        id="oh_dt3",
+        **{**_COMMON, "signal_type": "pt", "topic": "T3", "created_at": "2020-01-01T00:00:00"},
+    )
+    await outreach.record_delivery(db, "oh_dt3", delivered_at="2020-01-01T00:00:00+00:00")
+    assert await outreach.delivered_topic_exists(db, signal_type="pt", topic="T3") is True
+
+
 async def test_delete(db):
     await outreach.create(db, id="oh6", **_COMMON)
     assert await outreach.delete(db, "oh6") is True

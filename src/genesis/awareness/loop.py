@@ -543,6 +543,20 @@ _INFRA_POSTURE_DETAIL = {
         "(lib/memory_resilience.sh's pid_budget_apply lays a user-.slice "
         "TasksMax=60% drop-in), or raise TasksMax manually if resources permit"
     ),
+    "oom_adj_declaration_not_applied": (
+        "a genesis unit's DECLARED OOMScoreAdjust is not the value the kernel is "
+        "actually using — the manager's write was refused and failed SILENTLY (no "
+        "journal entry, no start failure), so `systemctl show` and the unit file "
+        "still agree with each other while the kernel disagrees with both. The "
+        "usual cause is a negative value: a user manager cannot lower "
+        "oom_score_adj below the oom_score_adj_min of 0 it inherits from init "
+        "without CAP_SYS_RESOURCE. Until it matches, that unit's place in the OOM "
+        "kill order is not what the unit file says. Compare "
+        "`systemctl --user show <unit> -p OOMScoreAdjust` against "
+        "`/proc/$(systemctl --user show <unit> -p MainPID --value)/oom_score_adj`, "
+        "then set an ACHIEVABLE value — note deleting the line lands on systemd's "
+        "unset default of 200, which is more killable, not less"
+    ),
     "host_swap_absent": (
         "the host has no swap — the container's swap allowance has nowhere to "
         "spill, so it is protection on paper only. Add host swap "
@@ -644,6 +658,14 @@ def _infra_missing_protections(profile: dict) -> list[str]:
     # None/absent (unreadable / no container cap) stays silent.
     if memory.get("pid_ceiling_effective_ok") is False:
         missing.append("pid_ceiling_unprovisioned")
+    # A unit whose DECLARED OOMScoreAdjust is not what the kernel applied. Explicit
+    # False only: the collector returns None when the question does not apply (not
+    # under a genesis systemd unit, nothing declared) or cannot be answered, and
+    # None stays silent. This is the generalised form of a defect that sat unnoticed
+    # for as long as the declaration existed, because the failed write is silent on
+    # every surface EXCEPT a direct /proc read.
+    if memory.get("oom_score_adj_declared_ok") is False:
+        missing.append("oom_adj_declaration_not_applied")
     # host_system comes from the guardian host plane; absent = no guardian =
     # no signal. NOT memory.facts.swap_total — that reads 0 on a HEALTHY
     # container (meminfo swap isn't virtualized; verified live 2026-07-16).
@@ -1370,6 +1392,102 @@ _FU_WATCHDOG_SOURCE = "follow_up_watchdog"
 _FU_WATCHDOG_COOLDOWN_S = 6 * 3600  # same-state re-alerts at most every 6h
 _last_fu_watchdog_alert_at: float = 0.0
 _last_fu_watchdog_alert_key: str = ""
+
+_CTX_INJECTION_SUPERSEDED_NOTE = "superseded by current context-injection state"
+
+
+async def _check_context_injection_health(db) -> None:
+    """Alert when the harness has FILED a hook's stdout instead of injecting it.
+
+    The ground-truth watcher for the silent-context-loss class: a fresh
+    ``hook-*-stdout.txt`` under a session's tool-results dir IS the harness
+    saying "I withheld a hook's output from the model" — independent of every
+    assumption in the emitter (whose budget constant is version-volatile: it
+    dropped ~3x in one CC update and tripled the filing rate overnight). This
+    check never reads that constant, which is what keeps it correct when the
+    constant is not. Priority defaults to critical: the ~5-minute Telegram
+    path, because this class ran unnoticed for a MONTH on this install.
+
+    Best-effort — the whole body is guarded and never raises into the tick.
+    """
+    if db is None:
+        return
+    try:
+        from genesis.awareness import context_injection_watch_config as _cfg_mod
+        from genesis.observability.snapshots.context_injection import (
+            alert_identity,
+            context_injection,
+            derive_findings,
+        )
+
+        if not _cfg_mod.is_enabled():
+            # Resolve on the way out: an operator who DISABLES the watcher must
+            # not be left with its last critical alert standing forever on the
+            # health and outreach surfaces. Same posture as the follow-up
+            # watchdog, which resolves on this exact transition.
+            await observations.resolve_by_source_and_type(
+                db,
+                source="context_injection_monitor",
+                type="infrastructure_alert",
+                resolved_at=datetime.now(UTC).isoformat(),
+                resolution_notes="context-injection watcher disabled",
+            )
+            return
+        cfg = _cfg_mod.load_config()
+        health = await context_injection(
+            lookback_hours=float(_cfg_mod.knob_int(cfg, "lookback_hours"))
+        )
+        findings = derive_findings(health, max_listed=_cfg_mod.knob_int(cfg, "max_listed"))
+        if not findings:
+            await observations.resolve_by_source_and_type(
+                db,
+                source="context_injection_monitor",
+                type="infrastructure_alert",
+                resolved_at=datetime.now(UTC).isoformat(),
+                resolution_notes="no fresh hook-stdout filings; injection within budget",
+            )
+            return
+
+        # The identity is owned by the module that owns the state. Assembling it
+        # here meant this call site had to name every field, and it silently
+        # missed one (mis-wires): a fresh mis-wire beside an unchanged filing
+        # count hashed the same, so supersede_except_hash kept the OLD alert and
+        # skip_if_duplicate dropped the new content — the alert looked live while
+        # never reporting the condition or its remedy.
+        alert_key = alert_identity(health)
+        content_hash = hashlib.sha256(f"context_injection:{alert_key}".encode()).hexdigest()
+        await observations.supersede_except_hash(
+            db,
+            source="context_injection_monitor",
+            type="infrastructure_alert",
+            keep_content_hash=content_hash,
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes=_CTX_INJECTION_SUPERSEDED_NOTE,
+        )
+        await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="context_injection_monitor",
+            type="infrastructure_alert",
+            content=(
+                "SESSION CONTEXT IS BEING SILENTLY LOST — " + " | ".join(findings) + " "
+                "Recovery: check the per-part sizes in scripts/genesis_session_context.py "
+                "(each SessionStart hook entry has its own ~10,000-char harness cap, "
+                "measured per docs/reference/cc-compatibility.md; re-measure with "
+                "GENESIS_CTX_PROBE_BYTES after any CC update)."
+            ),
+            priority=_cfg_mod.alert_priority(cfg),
+            created_at=datetime.now(UTC).isoformat(),
+            content_hash=content_hash,
+            skip_if_duplicate=True,
+        )
+    except Exception:
+        # WARNING, not debug. This check is the only ground-truth witness for
+        # the silent-context-loss class, and a crash here is indistinguishable
+        # from "nothing to report" on every surface the operator can see. At
+        # debug level the watcher can stop running indefinitely with no trace —
+        # the failure mode it exists to catch, applied to itself.
+        logger.warning("Failed context-injection health check", exc_info=True)
 
 
 def _created_before(row: dict, cutoff: datetime) -> bool:
@@ -3177,6 +3295,7 @@ class AwarenessLoop:
                     # Day-scale lifecycle signal → hourly; self-resolves when
                     # rows gain a trigger or close.
                     await _check_follow_up_watchdog(self._db)
+                    await _check_context_injection_health(self._db)
                     # Ego liveness: an ego completing NO real cycle well past its
                     # cadence (job_health.last_success gap), NOT the is_running /
                     # heartbeat proxies that stay green while deadlocked.

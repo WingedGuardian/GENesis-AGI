@@ -38,6 +38,7 @@ if _WORKTREE_SRC.is_dir():
         sys.path.remove(_src_str)
     sys.path.insert(0, _src_str)
 
+import contextlib  # noqa: E402
 import os  # noqa: E402
 
 import aiosqlite  # noqa: E402
@@ -251,6 +252,47 @@ def _isolate_alert_queue(tmp_path):
     mp.undo()
 
 
+# ── Safety: prevent tests from writing REAL merge-override audit rows ───────
+@pytest.fixture(autouse=True)
+def _isolate_override_log(tmp_path):
+    """Redirect the merge gate's override STORE to tmp for ALL tests.
+
+    Any test that drives ``git_push_guard`` with an override sigil in the command
+    now produces a durable audit row, and the default path is the live log the
+    operator reads. MEASURED before this existed: four rows describing a PR that
+    does not exist — one blocked command retried during development — reached the
+    real store and had to be removed by hand. A store nobody isolated records
+    fiction before it records anything true.
+
+    Repo-wide rather than under ``tests/test_hooks/``: ``tests/test_scripts/``
+    also drives these hooks (some as subprocesses), and a bare local
+    ``git merge x  # merge-to-main-override`` is enough to write a row — no PR,
+    no network. Set on the environment so subprocess-launched hooks inherit it.
+
+    Uses a fixture-OWNED ``MonkeyPatch`` (not the shared ``monkeypatch``
+    fixture) so a test that calls ``monkeypatch.undo()`` mid-body cannot revert
+    this suite-isolation patch and re-expose the real log — mirrors
+    ``_isolate_alert_queue``.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setenv("GENESIS_MERGE_OVERRIDE_DIR", str(tmp_path / "merge_overrides"))
+    # The discard guard's recovery store, for the SAME reason and by the same
+    # argument: tests/test_scripts/ drives that hook too, some as subprocesses, and
+    # its live default is ~/.genesis/git_discard_snapshots. Today only
+    # test_git_discard_guard.py sets it locally, so nothing leaks — this is here so
+    # the NEXT test that drives that guard cannot write to the operator's real
+    # recovery store. Isolating one of two sibling stores was the gap.
+    mp.setenv("GENESIS_DISCARD_SNAPSHOT_DIR", str(tmp_path / "git_discard_snapshots"))
+    # And the SUPERSEDED knob, which is config the operator may still carry. It no
+    # longer steers the store, but setting it now makes the guard print a migration
+    # notice — so leaving it inherited means the suite's stderr depends on the
+    # developer's environment. Same gap as the sibling store above, one level up:
+    # isolating the store but not the config that talks about it.
+    mp.delenv("GENESIS_DISCARD_SNAPSHOT_LOG", raising=False)
+    yield
+    mp.undo()
+
+
 # ── Safety: prevent tests from writing to the REAL genesis.db ────────────────
 @pytest.fixture(autouse=True)
 def _isolate_genesis_db_path(tmp_path):
@@ -441,6 +483,121 @@ def _guard_db_crud_not_mocked():
         )
 
 
+def private_module(name: str, path):
+    """Load ``path`` as a PRIVATE module without leaking ``name`` to everyone.
+
+    A test wanting its own instance of a script registers it in ``sys.modules``
+    before ``exec_module`` so that anything the module imports BY ITS OWN NAME
+    during exec resolves to THIS copy rather than a previously-registered one
+    (measured: a self-importing module sees the private instance). The trap is
+    leaving it registered afterwards.
+
+    Registering BEFORE exec is also what lets a ``@dataclass`` decorate at all,
+    when the module carries ``from __future__ import annotations``:
+    ``dataclasses._is_type`` dereferences ``sys.modules.get(cls.__module__)``,
+    which is ``None`` for an unregistered module. Do not take that on trust from
+    this docstring — ``tests/test_private_module.py`` locks it, and deleting the
+    ``sys.modules[name] = mod`` line below fails there.
+
+    Leaving the name registered is the leak this exists to prevent: pytest
+    imports every test module at COLLECTION, so the last registration wins for
+    the session, and a ``monkeypatch.setattr`` can then land on a different
+    object than a call-time ``from <name> import ...`` resolves. Two locks in
+    ``tests/test_hooks/test_escalation_cap.py`` assert exactly that for
+    ``review_state`` and ``review_scope``.
+
+    Prefer this over hand-rolling register/exec/restore: N call sites each
+    remembering to restore is a convention, and conventions break one instance
+    at a time.
+
+    LIMIT, and it is real, because the instruction to prefer this helper routes
+    you into it. A class defined in the loaded module resolves its string
+    annotations against whatever ``sys.modules`` holds AFTER the restore, and the
+    restore has TWO branches with different — and differently dangerous —
+    outcomes for an annotation naming a module-level symbol:
+
+    * name previously UNBOUND -> the entry is popped, and
+      ``typing.get_type_hints`` (plus anything built on it: pydantic,
+      ``inspect.signature(eval_str=True)``) raises ``NameError``. Loud.
+    * name previously BOUND -> the PREVIOUS object is put back, so resolution
+      SUCCEEDS against the canonical module and returns a same-named class from
+      a different module object. Silent, and worse for that reason.
+
+    ``dataclasses.fields`` is unaffected in both. Documented rather than locked,
+    deliberately: the test that once pinned these two branches had to exec every
+    carrier under ``scripts/`` to find them, which pulled a module-level
+    ``load_dotenv(override=True)`` into the test process and replaced environment
+    variables for everything collected after it — a worse defect than the caveat
+    it was verifying. An earlier revision of this paragraph also asserted the
+    first outcome unconditionally, which is wrong about the second — and the
+    second is the SILENT one, which is why it is written down here.
+
+    So if the script under test needs late annotation resolution, it is not a
+    private-module candidate. (An earlier revision also claimed the opposite of
+    the limit entirely — "5/5, no failures" — from four modules picked by hand
+    for being easy to exec rather than from the population. Recorded because the
+    convenience sample IS the failure mode, and it becomes invisible the moment
+    it is written as a number.)
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - real files always resolve
+        raise ImportError(f"cannot load {name} from {path}")
+    mod = importlib.util.module_from_spec(spec)
+    sentinel = object()
+    previous = sys.modules.get(name, sentinel)
+    sys.modules[name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        # Restore in BOTH directions: put back what was there, or remove the
+        # entry entirely if the name was previously unbound. Leaving our copy
+        # registered when nothing was there before is the same leak, one step
+        # removed — the next importer would silently get this private instance.
+        if previous is sentinel:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
+    return mod
+
+
+def require_access_denied(path) -> None:
+    """Skip unless THIS process is actually stopped by ``path``'s mode bits.
+
+    Probes the path that was chmod'd, not some writable neighbour of it — a
+    probe aimed at the wrong path reports "denied" from a directory nobody
+    restricted, which skips every run and pins nothing. Directories are probed
+    by listing, files by opening, because those are the operations the callers
+    rely on being refused.
+
+    Any test that chmods a directory or file and then asserts on the failure is
+    resting on a premise the environment can void: root and anything holding
+    CAP_DAC_OVERRIDE write straight through mode bits, and CI containers
+    routinely run as root. There the operation SUCCEEDS, and the test either
+    fails for an unrelated reason or — worse — passes vacuously, having
+    asserted that nothing went wrong in a run where nothing was ever blocked.
+
+    Shared rather than repeated: the same premise underpins several chmod-based
+    tests across the suite, and a lesson applied only where it was learned
+    leaves the rest of the population exactly as it was.
+
+    Restores nothing and mutates nothing — call it AFTER chmod, before the
+    assertions, and let the caller's own ``finally`` restore the mode.
+    """
+    import pathlib
+
+    p = pathlib.Path(path)
+    try:
+        if p.is_dir():
+            list(p.iterdir())
+        else:
+            p.open("rb").close()
+    except OSError:
+        return  # genuinely denied — the premise holds
+    pytest.skip(f"this process reads through mode bits on {p} (root / CAP_DAC_OVERRIDE)")
+
+
 @pytest.fixture
 async def empty_db():
     """In-memory SQLite database with tables but no seed data."""
@@ -455,3 +612,94 @@ async def empty_db():
     wrapped = SerializedConnection(conn)
     yield wrapped
     await wrapped.close()
+
+
+#: The breadcrumb's path, and the pid of the pytest session that OWNS it.
+ACTIVE_TEST_FILE_ENV = "GENESIS_ACTIVE_TEST_FILE"
+ACTIVE_TEST_OWNER_ENV = "GENESIS_ACTIVE_TEST_OWNER"
+
+
+def _claim_active_test_breadcrumb():
+    """Take the breadcrumb for THIS process, unless a parent pytest already has it.
+
+    The path arrives through ``os.environ``, and this repo's own suite launches
+    NESTED pytest runs that inherit it -- ``test_pytest_lock`` and
+    ``test_proactive_hook_bounded_output`` both spawn a child with
+    ``{**os.environ, ...}``. Without an owner every one of those children writes
+    ITS node ids over the outer session's file, so after the child exits a hard
+    crash in the still-running outer test is reported under the child's last
+    test: a confident, wrong name, which is worse than no name at all.
+
+    The owner pid is exported, so a child inherits it and sees a value that is
+    not its own pid -- that comparison, not the mere presence of a variable, is
+    what makes a nested run stand down. The idiom already exists here:
+    ``pytest_lock``'s HELD_ENV does the same job for the box-wide lock, and its
+    tests pop it precisely so a child stops mistaking itself for the outer run.
+
+    LIMIT, stated rather than discovered later: under ``pytest-xdist`` every
+    worker is a child that inherits the owner, so all of them stand down and no
+    breadcrumb is written. The suite does not use xdist (it is not a declared
+    dependency), and a wrong name is worse than a missing one, so standing down
+    is the right direction to fail -- but a future ``-n`` would need a
+    per-worker path rather than this claim.
+    """
+    if not os.environ.get(ACTIVE_TEST_FILE_ENV):
+        return
+    if os.environ.get(ACTIVE_TEST_OWNER_ENV):
+        return  # inherited: an outer pytest owns it, and we are nested
+    os.environ[ACTIVE_TEST_OWNER_ENV] = str(os.getpid())
+
+
+def _owns_active_test_breadcrumb():
+    """True only for the process that claimed the breadcrumb.
+
+    Re-read from the environment on every write rather than cached, so a test
+    that manipulates these variables sees the effect it asked for, and so the
+    failure direction is silence rather than a wrong name.
+    """
+    return os.environ.get(ACTIVE_TEST_OWNER_ENV) == str(os.getpid())
+
+
+# Guarded like everything else on this path. The hook below is documented
+# best-effort throughout, and this is the one line that runs at IMPORT time --
+# where a raise is not a failed test, it is a collection error that takes the
+# whole suite down. A breadcrumb is a diagnostic; it never gets to be fatal.
+with contextlib.suppress(Exception):  # see the best-effort note above
+    _claim_active_test_breadcrumb()
+
+
+def pytest_runtest_logstart(nodeid, location):
+    """Record the test about to run, for a crash that never writes a report.
+
+    CI drops ``-v`` because one line per test truncated the step log at ~44% of
+    the suite, which left a red run naming no failing test at all. The junit
+    report carries the names instead -- except when pytest never gets to write
+    it, which is exactly what a segfault, an OOM kill or ``os._exit`` inside a
+    test does. This is the channel that survives that: rewritten before every
+    test and fsynced, so the last successful write names the test the crash
+    happened in.
+
+    INERT unless ``GENESIS_ACTIVE_TEST_FILE`` is set, so a local run pays
+    nothing, and inert in a NESTED pytest run that inherited the variable from
+    an outer session (see ``_claim_active_test_breadcrumb``). Best-effort
+    throughout -- a breadcrumb that could fail the suite it exists to diagnose
+    would be a poor trade.
+    """
+    path = os.environ.get(ACTIVE_TEST_FILE_ENV)
+    if not path or not _owns_active_test_breadcrumb():
+        return
+    try:
+        # surrogateescape, and `except Exception`, because a node id is not
+        # guaranteed to be encodable. On POSIX a filename carrying a non-UTF-8
+        # byte reaches this hook as a surrogate (os.fsdecode(b"tests/\xff.py")),
+        # and a strict write raises UnicodeEncodeError -- which `except OSError`
+        # does NOT catch, so a best-effort diagnostic would abort pytest with an
+        # internal error BEFORE the test ran. The whole point of this hook is to
+        # be readable after a crash; being the crash is the one outcome it may
+        # not have.
+        with open(path, "w", encoding="utf-8", errors="surrogateescape") as fh:
+            fh.write(f"{nodeid}\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    except Exception:  # noqa: BLE001 - see above: this may never fail the suite
+        pass

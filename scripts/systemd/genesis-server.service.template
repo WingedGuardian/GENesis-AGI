@@ -22,7 +22,29 @@ Environment=TMPDIR=__HOME__/.genesis/cc-tmp
 Environment=PATH=__VENV__/bin:__CC_BIN_DIR__:__HOME__/.npm-global/bin:__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin
 MemoryMax=80%
 LimitNOFILE=65536
-OOMScoreAdjust=-500
+# 100, not a negative value, and REPLACING the old -500 rather than deleting it.
+#
+# MEASURED 2026-09-08: this unit declared OOMScoreAdjust=-500 while the live
+# process ran at oom_score_adj=100. The write FAILED SILENTLY — no journal entry —
+# and had done so since the line was written. A user manager cannot set a negative
+# value: lowering below oom_score_adj_min (0, inherited from init) needs
+# CAP_SYS_RESOURCE, and the manager holds only CAP_WAKE_ALARM. Verified via
+# transient units: 500->500, 0->0, but -1->100 and -500->100. Raising always
+# works; lowering never does. So -500 was decoration, not protection.
+#
+# DELETING the line would be WORSE than leaving it. `systemctl --user show`
+# reports 200 for any unit that does not set OOMScoreAdjust — systemd's own
+# default, not configuration — so removing it moves the server from an effective
+# 100 to 200, i.e. MORE killable. The opposite of the intent.
+#
+# 100 is therefore both achievable and deliberate. It places the server BELOW
+# other genesis units (which sit at systemd's 200 and so die first) and ABOVE the
+# CC session and its tools (0, most protected). That order is intentional per the
+# owner's ruling: a killed session loses in-flight work while a killed server
+# restarts, so the server is the correct victim first. On a 32 GiB host each 100
+# of adj is worth ~3.2 GB of oom_badness, so these rungs are decisive rather than
+# cosmetic.
+OOMScoreAdjust=100
 # systemd-oomd counterpart of OOMScoreAdjust: when the per-user manager's
 # pressure monitor picks a kill candidate, prefer the greedy CC/MCP tree over
 # the server. (Effective for the user@N monitor — same-UID cgroup owner — but

@@ -7,6 +7,11 @@ import json
 import re
 from typing import Any, Protocol
 
+from genesis.learning.response_context import (
+    request_lines,
+    response_lines,
+    tool_lines,
+)
 from genesis.learning.types import (
     DeltaClassification,
     DiscoveryAttribution,
@@ -24,6 +29,8 @@ class _Router(Protocol):
 
 # 32_delta_assessment — daily delta classification between cognitive-state snapshots.
 _CALL_SITE = "32_delta_assessment"
+
+
 
 
 class DeltaAssessor:
@@ -63,9 +70,9 @@ class DeltaAssessor:
             "",
             "## Interaction",
             f"Session: {summary.session_id}",
-            f"User: {summary.user_text}",
-            f"Response: {summary.response_text}",
-            f"Tools used: {', '.join(summary.tool_calls) or 'none'}",
+            *request_lines(summary),
+            *response_lines(summary),
+            *tool_lines(summary),
             "",
             "Respond with JSON:",
             '{',

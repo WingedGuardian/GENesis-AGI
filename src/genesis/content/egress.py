@@ -10,8 +10,8 @@ Fires when either:
   before external publishing (so the version the user approves is already
   scrubbed).
 
-Anti-slop (:func:`genesis.content.antislop.scrub`): the spaced em dash is
-auto-fixed; the rest is flagged, never deleted. PII (:func:`scan_outbound`):
+Anti-slop (:func:`genesis.content.antislop.scrub`): an em dash (spaced or bare) is
+auto-fixed to the published `--` form; the rest is flagged, never deleted. PII (:func:`scan_outbound`):
 scanned only for external-DELIVERY channels — a ``content`` review copy headed
 to the user is scrubbed for slop but not PII-blocked (it isn't a delivery).
 """

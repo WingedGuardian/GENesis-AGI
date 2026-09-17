@@ -45,8 +45,167 @@ fi
 
 MODE_ARG="$1"
 shift
+
 # Extra claude args exist only in manual mode (SSH RemoteCommand passes %n only).
 CLAUDE_EXTRA_ARGS=("$@")
+
+# --- EPHEMERAL subcommands never get a slot ----------------------------------
+# An ephemeral `claude <subcommand>` prints something and exits. A slot is wrong
+# for it on three counts — it consumes a capacity slot the operator wanted for a
+# session, it leaves a tmux session behind after the command exited, and the
+# pane's scrollback is captured to disk when it does. `setup-token` prints a
+# long-lived CREDENTIAL, so that last one is why this exists rather than being
+# filed as tidiness.
+#
+# DEFENCE IN DEPTH, not the control. cc_exit_capture.sh already scrubs the pane
+# tail through secret_scrub and WITHHOLDS it when the scrubber cannot run
+# (MEASURED against four synthetic token shapes: all redacted, ordinary text
+# unchanged). This keeps the credential out of the captured region entirely
+# rather than relying on redaction to take it out afterwards.
+#
+# THE SPLIT IS BY LIFETIME, NOT BY "is it a subcommand". Being listed under
+# `Commands:` in --help does not make something short-lived, and three of them
+# are exactly what the slot exists for — losing them to a dropped SSH is the
+# failure this launcher prevents:
+#   gateway      "Run the enterprise auth/telemetry gateway"  — a daemon
+#   agents       the interactive agent view; its own --help says --json is the
+#                variant that "does not require a TTY", so the default does
+#   ultrareview  a cloud multi-agent review over the current branch — minutes
+# Those KEEP the slot. _CC_KEEPS_A_SLOT records that as a decision rather than
+# an omission, so the drift test can demand every new subcommand be classified
+# into one list or the other instead of defaulting into the bypass.
+#
+# Matched against $1 ONLY. Deciding it from anywhere else means modelling which
+# global options consume a value, and this repo has paid for hand-rolled argv
+# parsing before. Stated honestly, because the miss is wider than one example:
+# MEASURED on 2.1.246, a global option BEFORE the subcommand still routes to it
+# in 3 of 5 spellings tried (`--ax-screen-reader`, `--model opus`, `--settings {}`
+# route; `--debug` and `--add-dir /tmp` swallow it). So `claude --model opus
+# setup-token` is NOT recognised here and still takes a slot. That is an accepted
+# limit rather than a hole: the capture is scrubbed either way, and the failure
+# direction is the safe one — a missed bypass costs a slot, while a FALSE bypass
+# would drop an interactive session on SSH disconnect.
+_CC_EPHEMERAL=(auth auto-mode doctor import install mcp plugin plugins project setup-token update upgrade)
+_CC_KEEPS_A_SLOT=(agents gateway ultrareview)
+
+# Resolve a USABLE temp directory into an exported TMPDIR, or leave both names
+# genuinely unset. Returns 0 when a candidate was accepted, 1 when none was.
+#
+# ONE temp-dir policy, called from both the subcommand bypass below and the slot
+# launch further down. It used to be two: the bypass tested `-d "$HOME/tmp"` and
+# exported it, which accepts a root-owned directory left by an earlier sudo run
+# and puts CC temp state somewhere this script never established is private.
+#
+# CREATING a directory does not make it USABLE: `mkdir -p` returns SUCCESS for
+# one that already exists, including one owned by someone else. So each
+# candidate must be created AND writable AND privatisable before it is
+# accepted. `-w` alone passes on a group/world-writable directory owned by
+# another user, where `chmod` then fails — swallowing that would leave session
+# temp state readable by others, so a failed chmod REJECTS the candidate.
+#
+# ACCEPTED RESIDUAL: the tests come before the repair, so a directory we DO own
+# whose mode already lacks u+w (reachable only under a pathological umask at
+# creation time) is rejected rather than repaired. Deliberate — ordering the
+# repair first would make the rejection path unreachable for any directory this
+# user owns, which is exactly the path the security case needs to keep.
+#
+# ~/tmp is a DEGRADED fallback (disk_hygiene.sh prunes it at 7 days), never an
+# equal one. Callers decide what to say about that; this function stays silent.
+_cc_resolve_tmpdir() {
+    local _cand
+    for _cand in "$HOME/.genesis/cc-tmp" "$HOME/tmp"; do
+        mkdir -p "$_cand" 2>/dev/null || continue
+        [ -w "$_cand" ] || continue
+        chmod 700 "$_cand" 2>/dev/null || continue
+        TMPDIR="$_cand"
+        export TMPDIR
+        return 0
+    done
+    # UNSET, never TMPDIR="". Blanking an ALREADY-EXPORTED variable keeps the
+    # export attribute, so a child would receive a literal `TMPDIR=`.
+    unset TMPDIR CLAUDE_CODE_TMPDIR
+    return 1
+}
+if [ "$MODE_ARG" = "manual" ] && [ "${#CLAUDE_EXTRA_ARGS[@]}" -gt 0 ]; then
+    for _sub in "${_CC_EPHEMERAL[@]}"; do
+        [ "${CLAUDE_EXTRA_ARGS[0]}" = "$_sub" ] || continue
+        command -v claude >/dev/null 2>&1 || {
+            echo "cc-slot: claude is not on PATH — cannot run '$_sub'." >&2
+            exit 127
+        }
+        # Match the slot path's cwd (`cd ${GENESIS_ROOT} && claude`, below).
+        # mcp scope, project state and doctor's settings read are all keyed on
+        # the working directory, so bypassing in the caller's cwd would silently
+        # retarget them — an SSH login shell starts in $HOME, not the repo.
+        # `|| true` because a missing repo must not turn a working `claude
+        # update` into a hard failure; the slot path needs the repo for its exit
+        # capture and so has the opposite polarity.
+        cd "$GENESIS_ROOT" 2>/dev/null || true
+        # The door resolves a persistent TMPDIR further down, which the bypass
+        # skips. Without one, `install`/`update` unpack into the ambient temp —
+        # typically /tmp, which this install keeps deliberately small. An
+        # explicit TMPDIR from the caller is theirs and is left alone; when we
+        # resolve one OURSELVES it goes through the same validation the slot
+        # path uses. NOT full parity, deliberately, and worth stating rather
+        # than blurring: the slot path unsets an inherited TMPDIR and re-resolves
+        # unconditionally, so a caller's value never survives it. Here it does,
+        # unvalidated — an operator who exported TMPDIR chose it, and this is a
+        # one-shot command rather than a long-lived session whose value gets
+        # pinned into a tmux server.
+        #
+        # `|| true` is load-bearing: without it `set -e` aborts before
+        # `exec claude` when no candidate is usable.
+        if [ -z "${TMPDIR:-}" ] && ! _cc_resolve_tmpdir; then
+            # The slot path says this out loud; the bypass used to exec in
+            # silence, which made the very case this block exists for —
+            # `install`/`update` unpacking into a small ambient temp —
+            # the one that fails undiagnosably.
+            echo "cc-slot: no usable temp dir (${HOME}/.genesis/cc-tmp or ${HOME}/tmp) —" >&2
+            echo "cc-slot: running '$_sub' on the system default temp." >&2
+        fi
+        exec claude "${CLAUDE_EXTRA_ARGS[@]}"
+    done
+    unset _sub
+fi
+
+# Liveness verdict for the cosmetic slot map: ALIVE | POISONED | UNKNOWN |
+# TIMEOUT (empty on any failure). The map is purely informational and runs once
+# per listed slot on the interactive login path, so it must never be what makes
+# a login feel slow. Two budgets bound it: a short per-probe leash and a
+# WHOLE-MAP wall-clock ceiling. Defined here — above the manual-mode map that is
+# its only caller — because bash resolves a function only once its definition has
+# RUN; GENESIS_ROOT is set above. An unavailable probe prints nothing, and the
+# caller treats that as "no verdict".
+_MAP_PROBE_BUDGET=3
+_MAP_PROBE_GAVE_UP=0
+# A WHOLE-MAP wall-clock ceiling, not a per-probe one: N slots that each finish
+# just under the per-probe budget would otherwise delay a login by N x budget.
+# `SECONDS` is inherited by the `$(...)` subshell the probe runs in, so an
+# ABSOLUTE deadline is readable there even though a variable set inside it can
+# never travel back out.
+_MAP_TOTAL_BUDGET=6
+_MAP_DEADLINE=0
+_map_verdict() {
+    local out="" rc=0
+    [ -x "${GENESIS_ROOT}/.venv/bin/python" ] || { printf '%s' ""; return 0; }
+    [ "$_MAP_PROBE_GAVE_UP" = "1" ] && { printf '%s' ""; return 0; }
+    local _budget="$_MAP_PROBE_BUDGET" _rem
+    if [ "$_MAP_DEADLINE" -gt 0 ]; then
+        _rem=$(( _MAP_DEADLINE - SECONDS ))
+        # The map is COSMETIC; it must never be what makes a login feel slow.
+        [ "$_rem" -le 0 ] && { printf '%s' "TIMEOUT"; return 0; }
+        [ "$_rem" -lt "$_budget" ] && _budget="$_rem"
+    fi
+    # `-k`: plain `timeout` sends only TERM, so an interpreter that ignores or
+    # delays it blocks past the budget this line exists to enforce. The map is
+    # COSMETIC and must never be what makes a login feel slow, so follow with
+    # KILL 2s later. Same omission was in the login-path probe below.
+    out=$(timeout -k 2 "$_budget" "${GENESIS_ROOT}/.venv/bin/python" \
+        -m genesis.cc.slot_liveness "$@" 2>/dev/null | sed -n '1p') || rc=$?
+    # 124 is timeout(1)'s "deadline expired".
+    [ "$rc" = "124" ] && { printf '%s' "TIMEOUT"; return 0; }
+    printf '%s' "$out"
+}
 
 if [[ "$MODE_ARG" == "manual" ]]; then
     # Manual/dashboard door. Show what already exists so reattach is the
@@ -58,10 +217,71 @@ if [[ "$MODE_ARG" == "manual" ]]; then
         2>/dev/null | grep "^${SESSION_PREFIX}-" || true)
     if [[ -n "$slot_map" ]]; then
         echo "Existing slots (reattach: tmux attach -t <name>):" >&2
+        # Arm the whole-map deadline HERE, immediately before the only loop that
+        # probes: every probe below shares it, so the map costs at most
+        # _MAP_TOTAL_BUDGET no matter how many slots exist.
+        _MAP_DEADLINE=$(( SECONDS + _MAP_TOTAL_BUDGET ))
         while IFS='|' read -r name attached activity; do
             state="detached"
             [[ "$attached" -ge 1 ]] && state="attached"
-            echo "  ${name}  ${state}  (last activity: ${activity})" >&2
+            # Say when a slot is alive but running NO claude, AND name an action
+            # that actually rebuilds it. Since the hostname door gained the
+            # consented kill-and-recreate below, re-entering THROUGH THE DOOR is
+            # that action: it detects the bare slot, discloses what it found,
+            # and rebuilds the pane with the slot's full environment on a yes.
+            # (This advice was deliberately DIFFERENT while the door could not
+            # heal — pointing at a door that silently re-attaches to the bare
+            # shell would loop the operator to the same prompt, which is the
+            # defect the whole slot-door effort exists to close.) One probe per
+            # listed slot; anything other than an explicit POISONED prints
+            # nothing, so an unavailable probe never renders as a verdict.
+            note=""
+            # `|| true` is load-bearing: under `set -euo pipefail` a
+            # `var=$(tmux ... | tr ...)` whose FIRST component fails takes the
+            # whole door down with no message (pipefail promotes it past `tr`,
+            # `set -e` exits). A listed session going away before it is inspected
+            # is ordinary — the tmux server shuts down the moment the last slot's
+            # claude exits, and `list-panes` on a missing session exits 1 — and on
+            # the manual door that would drop the operator at a bare prompt.
+            # BOUNDED, and charged to the SAME whole-map deadline as the probe
+            # below. A budget that covers only the probe is not a budget: this
+            # `list-panes` is a blocking round-trip to the tmux server, runs once
+            # per listed slot on the interactive login path, and a wedged server
+            # would hang the login here — before the launch — in a feature this
+            # code calls COSMETIC.
+            # Once the budget is SPENT, stop calling tmux altogether — do not
+            # substitute a shorter timeout. Every remaining slot would otherwise
+            # still pay a fresh round-trip (plus the -k grace), so the "whole-map
+            # ceiling" would not be a ceiling at all; it would just be a slower
+            # per-slot one. Skipping is also less code than the arithmetic it
+            # replaces, and it is bounded BY CONSTRUCTION: after exhaustion the
+            # loop makes zero further calls, so the map costs at most the budget
+            # plus the one call that overran it.
+            _map_v=""
+            if [ "$_MAP_PROBE_GAVE_UP" = "0" ]; then
+                _map_t="$_MAP_PROBE_BUDGET"
+                if [ "$_MAP_DEADLINE" -gt 0 ]; then
+                    _map_rem=$(( _MAP_DEADLINE - SECONDS ))
+                    if [ "$_map_rem" -le 0 ]; then
+                        _MAP_PROBE_GAVE_UP=1
+                    elif [ "$_map_rem" -lt "$_map_t" ]; then
+                        _map_t="$_map_rem"
+                    fi
+                fi
+            fi
+            if [ "$_MAP_PROBE_GAVE_UP" = "0" ]; then
+                # `-k` because timeout sends SIGTERM and then WAITS, which a
+                # process stuck in uninterruptible I/O outlives.
+                _map_pids=$(timeout -k 2 "$_map_t" tmux list-panes -s -t "=${name}" \
+                    -F '#{pane_pid}' 2>/dev/null | tr '\n' ' ' || true)
+                [ -n "$_map_pids" ] && _map_v=$(_map_verdict $_map_pids)
+            fi
+            # Set in the LOOP's shell, not inside the substitution above.
+            [ "$_map_v" = "TIMEOUT" ] && _MAP_PROBE_GAVE_UP=1
+            if [[ "$_map_v" == "POISONED" ]]; then
+                note="  (no claude running — re-enter through this slot's door to rebuild it)"
+            fi
+            echo "  ${name}  ${state}  (last activity: ${activity})${note}" >&2
         done <<<"$slot_map"
     fi
     SLOT=1
@@ -91,18 +311,50 @@ unset TMUX
 # (GENESIS_CC_PERMISSION_MODE) and the OAuth-durability lever
 # (GENESIS_CC_SLOT_OAUTH), both consumed later. `|| echo` keeps a malformed file
 # from aborting the login under `set -e`.
-if [ -f "${HOME}/.genesis/cc-slot.env" ]; then
-    . "${HOME}/.genesis/cc-slot.env" \
-        || echo "cc-slot: warning: ~/.genesis/cc-slot.env sourced with errors (continuing)" >&2
-fi
-# A sourced var is a shell var, NOT exported — EXPORT the cap levers so the Python
-# gate subprocess inherits them. Only export those actually set (an empty export
-# would still read as unset → default, but keep the env clean).
-for _lever in GENESIS_CC_SYSTEM_RESERVE_MB GENESIS_CC_PER_SESSION_MB \
-              GENESIS_CC_OOM_FLOOR_MB GENESIS_CC_EMERGENCY_SLOTS; do
-    [ -n "${!_lever:-}" ] && export "$_lever"
+# Every lever this file may set. Named in ONE place because the consent-rebuild
+# path re-reads the file later and must be able to reproduce "the file's view"
+# exactly — including a lever the operator DELETED, which a bare `.` can never
+# express (sourcing only ever overlays).
+_CC_LEVERS="GENESIS_CC_SYSTEM_RESERVE_MB GENESIS_CC_PER_SESSION_MB \
+GENESIS_CC_OOM_FLOOR_MB GENESIS_CC_EMERGENCY_SLOTS \
+GENESIS_CC_PERMISSION_MODE GENESIS_CC_SLOT_OAUTH"
+
+# The pre-source environment, so a re-read can restore this exact baseline
+# instead of whatever the previous read left behind. Normally EMPTY: an SSH
+# RemoteCommand carries no arbitrary env (sshd's AcceptEnv is LANG/LC_* by
+# default), so in practice the file is the only source. Captured anyway, so the
+# re-read cannot silently drop a value that did arrive this way.
+_CC_ENV_BASELINE=""
+for _lever in $_CC_LEVERS; do
+    [ -n "${!_lever+set}" ] && _CC_ENV_BASELINE="${_CC_ENV_BASELINE}${_lever}=${!_lever}
+"
 done
 unset _lever
+
+# Load (or RE-load) the levers from the file, discarding anything a previous
+# read left in the shell. `unset` first is what makes a DELETED assignment take
+# effect: without it a removed `GENESIS_CC_PERMISSION_MODE=bypass` survives in
+# the shell and the rebuilt pane still launches --dangerously-skip-permissions,
+# moments after the operator removed exactly that line.
+_cc_load_levers() {
+    local _l _k _v
+    for _l in $_CC_LEVERS; do unset "$_l"; done
+    while IFS='=' read -r _k _v; do
+        [ -n "$_k" ] && export "$_k=$_v"
+    done <<< "$_CC_ENV_BASELINE"
+    if [ -f "${HOME}/.genesis/cc-slot.env" ]; then
+        . "${HOME}/.genesis/cc-slot.env" \
+            || echo "cc-slot: warning: ~/.genesis/cc-slot.env sourced with errors (continuing)" >&2
+    fi
+    # A sourced var is a shell var, NOT exported — EXPORT the levers so the
+    # Python gate subprocess inherits them. Only those actually set (an empty
+    # export still reads as unset → default, but keep the env clean).
+    for _l in $_CC_LEVERS; do
+        [ -n "${!_l:-}" ] && export "$_l"
+    done
+    return 0
+}
+_cc_load_levers
 
 # --- Session cap (capacity model; decision delegated to genesis.cc.session_cap) ---
 # The launcher only GATHERS inputs and EXECUTES the returned action; the pure,
@@ -337,6 +589,287 @@ _cap_fail_open() {
     exit 1
 }
 
+
+# ═══ Consent kill-and-recreate ═══════════════════════════════════════════════
+# A slot can exist as a BARE SHELL (its claude exited, or it was born bare) and
+# `new-session -A` below would silently attach to it, discarding the launch
+# command — the operator lands at a prompt instead of claude, every time, which
+# is the founding defect of the slot-door work. This block detects that state,
+# DISCLOSES it, and — only on an explicit yes at a real terminal — kills the
+# session BY ID so the untouched create path below rebuilds it properly.
+#
+# Placed ABOVE every latch and gate ON PURPOSE: `existing`, `_SESSION_EXISTS`,
+# the capacity gate, the OAuth gate and the exec all take their first and only
+# read AFTER this block — the staleness class that killed the predecessor design
+# (7 review rounds) is retired by construction, not by re-checking.
+#
+# ONE deliberate exception, and it is bounded rather than hidden: the rebuild
+# path asks the capacity engine about the post-kill RAM floor before it kills,
+# because that gate can otherwise refuse AFTER the pane is gone. It sits ahead
+# of the final state snapshot, never between it and the kill, so it cannot
+# lengthen the interval the design is built to keep short. See "ADMIT BEFORE
+# DESTROYING" below for why the RAM floor is the only check that qualifies.
+#
+# Manual/dashboard mode reaches here too but allocated a slot with NO existing
+# session, so the has-session guard makes this a structural no-op there — only
+# the hostname door (which targets a FIXED name) can meet an existing session.
+#
+# Safety rests on three MEASURED properties (tmux 3.4, scratch -L server):
+#   1. Within one server, session ids are never reused ($1 killed, recreate ->
+#      $2), and killing a stale id is a refused no-op that cannot touch a
+#      same-named successor — kill-by-id is a compare-and-swap.
+#   2. Across server GENERATIONS the id counter restarts at $0 — measured by
+#      falsifying the naive design: a stale $0 on a fresh server killed an
+#      innocent same-named session. The server-PID compare below is what makes
+#      that impossible here, and it is load-bearing, not belt-and-braces.
+#   3. One `list-panes -s` call is one round-trip to the single-threaded
+#      server = one consistent state. The human wait sits BETWEEN two such
+#      snapshots, never between a read and the kill.
+# Set only when the consent rebuild actually destroyed a slot, and read by the
+# capacity gate far below. A rebuild is NET-ZERO by construction — this slot was
+# counted before and is counted again after — so the count gate has nothing to
+# decide, and the RAM floor was already answered by the preflight.
+_CC_REBUILT=0
+_S2_SNAP_FMT='#{pid}|#{session_id}|#{session_attached}|#{pane_pid}|#{pane_current_command}'
+_s2_snapshot() {
+    # Bounded like the slot-map probe and for the same reason: a blocking
+    # round-trip to a possibly-wedged server on the LOGIN path. `-k` because
+    # timeout SIGTERMs and then waits, which uninterruptible I/O outlives.
+    #
+    # A PARTIAL read must never pass as a snapshot. `|| true` alone kept
+    # whatever tmux had already written before it timed out or the socket went
+    # away AND reported success, so a multi-pane session could be projected
+    # without the pane running claude: both reads see the same visible subset,
+    # both probe POISONED, the projections compare EQUAL, and a live session is
+    # destroyed. Take the status separately and emit nothing unless tmux exited
+    # clean. Empty is already this block's "no verdict", which attaches — the
+    # fail direction the whole block is built around.
+    local _out _rc=0
+    _out=$(timeout -k 2 3 tmux list-panes -s -t "=${SESSION_NAME}" -F "$_S2_SNAP_FMT" 2>/dev/null) || _rc=$?
+    [ "$_rc" -eq 0 ] || return 0
+    [ -n "$_out" ] && printf '%s\n' "$_out"
+    return 0
+}
+_s2_liveness() {
+    # slot_liveness verdict over a snapshot's pane pids; EMPTY on any failure —
+    # and empty is treated as "no verdict", which attaches. Fail toward attach.
+    #
+    # The 5s bound (vs the cosmetic map's 3s) names a specific failure mode: the
+    # probe walks /proc reading comm/cmdline, and a process wedged in
+    # uninterruptible I/O can stall that read — on the LOGIN path, before the
+    # launch. It is deliberately LONGER than the map's because a premature empty
+    # here costs a real capability (the operator loses the rebuild offer and
+    # lands back at the bare prompt), where the map only loses an annotation.
+    # It is bounded at all because the fail direction is safe: timing out yields
+    # "" -> no verdict -> attach, never a kill. NOT a reflexive default — a
+    # /proc walk over a handful of pids returns in milliseconds, so reaching 5s
+    # at all means something is genuinely stuck.
+    local _pids
+    _pids=$(printf '%s\n' "$1" | cut -d'|' -f4 | tr '\n' ' ') || true
+    [ -n "${_pids// /}" ] || { return 0; }
+    [ -x "${GENESIS_ROOT}/.venv/bin/python" ] || { return 0; }
+    # `-k`: without it this is a TERM-only deadline, so the claimed 5s ceiling
+    # on the LOGIN path is not enforced against a probe wedged in uninterruptible
+    # I/O — which is the exact condition the bound was added for.
+    timeout -k 2 5 "${GENESIS_ROOT}/.venv/bin/python" \
+        -m genesis.cc.slot_liveness $_pids 2>/dev/null | sed -n '1p' || true
+    return 0
+}
+# HOSTNAME MODE ONLY. In manual mode SESSION_NAME was chosen above as a slot with
+# no live session, so reaching this branch at all means something created it in
+# between — a concurrent manual launch. Relying on that earlier availability probe
+# still being true is a TOCTOU, and the window is not small: sourcing cc-slot.env
+# sits between the two points. The consequence is the bad one — a concurrent
+# session that is still starting has no claude child yet, so it probes POISONED,
+# and an affirmative answer KILLS a session someone just created. Gate on the mode
+# explicitly rather than on a stale probe; manual mode falls through to `-A`, which
+# simply attaches to whatever is there.
+if [[ "$MODE_ARG" != "manual" ]] && tmux has-session -t "=${SESSION_NAME}" 2>/dev/null; then
+    _s2_snap1=$(_s2_snapshot)
+    _s2_verdict=$(_s2_liveness "$_s2_snap1")
+    _s2_srv1=$(printf '%s\n' "$_s2_snap1" | sed -n '1p' | cut -d'|' -f1)
+    _s2_sid1=$(printf '%s\n' "$_s2_snap1" | sed -n '1p' | cut -d'|' -f2)
+    # Only the literal verdict POISONED plus a sane `$N` session id may enter;
+    # ALIVE, UNKNOWN, empty, garbage, or a malformed id all mean plain attach.
+    # ANCHORED: a tmux session id is `$` followed by digits and NOTHING else.
+    # The obvious `case "$sid" in '$'[0-9]*)` is too loose — its trailing `*`
+    # also accepts a value with a semicolon and a command after the digit. Not
+    # exploitable (the value is quoted into `kill-session -t`, so there is no
+    # shell injection, and tmux would simply not match such a target), but a
+    # value we cannot fully account for must never reach the kill: this block's
+    # whole contract is that anything unrecognised falls through to attach.
+    _s2_sid_ok=0
+    [[ "$_s2_sid1" =~ ^\$[0-9]+$ ]] && _s2_sid_ok=1
+    if [ "$_s2_verdict" = "POISONED" ] && [ "$_s2_sid_ok" = "1" ]; then
+        # Detect-and-tell FIRST, so a decliner (or a no-tty entry) keeps the
+        # facts and the manual repair even though nothing is touched.
+        _s2_cmds=$(printf '%s\n' "$_s2_snap1" | cut -d'|' -f5 | sort -u | tr '\n' ' ') || true
+        echo "cc-slot: ${SESSION_NAME} exists but runs NO claude (pane: ${_s2_cmds:-unknown})." >&2
+        echo "cc-slot: rebuilding it ends whatever is in that pane; manual route: tmux attach -t ${SESSION_NAME}, then run claude yourself." >&2
+        if printf '%s\n' "$_s2_snap1" | cut -d'|' -f3 | grep -q '[1-9]'; then
+            echo "cc-slot: WARNING: another client is ATTACHED to it right now." >&2
+        fi
+        # No controlling terminal -> report-only (a dispatched/piped entry has
+        # nobody to consent). The subshell probe is the measured no-ctty shape.
+        if ( : >/dev/tty ) 2>/dev/null; then
+            printf 'cc-slot: rebuild %s now? This ENDS whatever is in that pane [y/N] ' "${SESSION_NAME}" >&2
+            _s2_ans=""
+            # Bounded read — a DELIBERATE divergence from _cap_reclaim's
+            # unbounded confirms: an automated caller that reaches this door
+            # WITH a tty but no operator would otherwise hang the login here
+            # forever; 120s converts that hang into a plain attach. A missed
+            # prompt costs one more login, never a kill (default is No).
+            IFS= read -r -t 120 _s2_ans < /dev/tty || true
+            if [ "$_s2_ans" = "y" ] || [ "$_s2_ans" = "Y" ]; then
+                # Consent was given for the DISCLOSED state, not for the slot:
+                # re-snapshot and require the server generation (#1), the id,
+                # and the consent projection — attachment + every pane's
+                # command, fields 3 on — to be STRING-IDENTICAL, and the slot
+                # to still probe POISONED. Anything moved -> stand down; the
+                # `-A` attach below absorbs every interleaving.
+                # RE-READ the launch levers before acting on consent. They
+                # were sourced at the top of this script, and the prompt above
+                # can sit for up to 120s — during which the operator may well be
+                # in another terminal editing exactly this file, because the
+                # message they just read is what sent them there. The levers
+                # decide the capacity model, the OAuth behaviour and the
+                # PERMISSION MODE, so a stale read can rebuild the slot
+                # --dangerously-skip-permissions moments after the operator
+                # switched it to auto. Consent was given for the disclosed
+                # state; the configuration is part of that state.
+                # Same loader as the initial read, so a lever the operator
+                # DELETED during the prompt actually reverts to its default
+                # rather than lingering from the first source.
+                _cc_load_levers
+
+                # ADMIT BEFORE DESTROYING — the one precondition read that
+                # belongs before the kill, and deliberately the ONLY one.
+                #
+                # Everything else in this script reads AFTER the destructive
+                # action on purpose (see the header above) so no precondition
+                # can go stale. But the capacity gate below can REFUSE after
+                # the slot is already gone: `_cap_reclaim` has six `exit 1`
+                # paths (no cc-N to trade under an OOM floor; no tty; an empty
+                # answer at the prompt; an invalid selection; declining the
+                # attached-victim confirm; a failed victim kill) and every one
+                # of them runs post-kill. The likeliest is not exotic: consent,
+                # kill, gate says RECLAIM, operator presses Enter to cancel —
+                # pane and scrollback gone, no replacement.
+                #
+                # Only the RAM floor can legitimately refuse a REBUILD. The
+                # COUNT check cannot: this slot is counted now and is counted
+                # again after, so a rebuild is net-zero (reattach already
+                # bypasses the cap for the same reason, below). So model the
+                # POST-KILL world — existing minus this slot — and let the
+                # shipped decision engine answer; `ram_ok` there does not
+                # depend on `existing` at all, so that framing isolates the
+                # floor rather than reimplementing it here.
+                #
+                # It runs HERE, ahead of the final snapshot, and the ordering is
+                # the point: this probe can spend seconds (a cold import behind
+                # a 15s+2s bound), and anything between the last state read and
+                # the kill is a window in which the operator's disclosed state
+                # can change underneath them. Sequenced after the compare it
+                # re-opened, inside this very block, the staleness class the
+                # design exists to retire. RAM staleness costs the opposite and
+                # far less: a rebuild admitted against a reading a few seconds
+                # old simply meets the post-kill gate, which is what happened
+                # before this probe existed.
+                #
+                # FAIL-OPEN, stated rather than hidden: if the probe cannot
+                # run we proceed to the kill, which is exactly today's
+                # behaviour. This NARROWS the window; it does not close it,
+                # and the post-kill gate keeps its own fail-open fallback.
+                _s2_rebuild_ok=1
+                if [ -x "${GENESIS_ROOT}/.venv/bin/python" ]; then
+                    _s2_live=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
+                               | grep -cE "^${SESSION_PREFIX}-[0-9]+$" || true)
+                    [ -n "$_s2_live" ] || _s2_live=0
+                    [ "$_s2_live" -gt 0 ] && _s2_live=$((_s2_live - 1))
+                    _s2_cap=$(timeout -k 2 15 "${GENESIS_ROOT}/.venv/bin/python" \
+                        -m genesis.cc.session_cap --existing "$_s2_live" 2>/dev/null || true)
+                    _s2_cap_action=$(printf '%s\n' "$_s2_cap" | sed -n '1p')
+                    _s2_cap_reason=$(printf '%s\n' "$_s2_cap" | sed -n '3p')
+                    # Refuse on ANY verdict that is not ALLOW, not merely the RAM
+                    # floor. The earlier "a rebuild is net-zero so the COUNT gate
+                    # cannot refuse it" was right about the DELTA and wrong about
+                    # the ABSOLUTE: if the population ALREADY exceeds the cap —
+                    # the operator lowered it, or an older build seeded more slots
+                    # — then post-kill `existing` is still over, and the gate
+                    # answers DENY or RECLAIM. RECLAIM is not a safe "yes" either;
+                    # declining its prompt exits 1 with the pane already gone.
+                    #
+                    # An EMPTY action is the probe failing to run, which stays
+                    # FAIL-OPEN (see below). Only a verdict we actually read may
+                    # refuse, or an unreadable probe would become a hard block on
+                    # every rebuild.
+                    if [ -n "$_s2_cap_action" ] && [ "$_s2_cap_action" != "ALLOW" ]; then
+                        _s2_rebuild_ok=0
+                        if [ "$_s2_cap_reason" = "oom_floor" ]; then
+                            echo "cc-slot: NOT rebuilding ${SESSION_NAME} — RAM is below the floor, so the" >&2
+                            echo "cc-slot: replacement could not start and you would lose the pane for nothing." >&2
+                        else
+                            echo "cc-slot: NOT rebuilding ${SESSION_NAME} — the replacement would not be" >&2
+                            echo "cc-slot: admitted (${_s2_cap_reason:-capacity}), so you would lose the pane for nothing." >&2
+                        fi
+                        echo "cc-slot: $(printf '%s\n' "$_s2_cap" | sed -n '2p')" >&2
+                        echo "cc-slot: free memory (or end another slot) and reconnect; attaching as-is." >&2
+                    fi
+                fi
+
+                if [ "$_s2_rebuild_ok" = "0" ]; then
+                    # Refused above, with the reason already printed. Fall
+                    # through to the `-A` attach — nothing was touched.
+                    :
+                else
+                    # Consent was given for the DISCLOSED state, not for the
+                    # slot: re-snapshot and require the server generation (#1),
+                    # the id, and the consent projection — attachment + every
+                    # pane's command, fields 3 on — to be STRING-IDENTICAL, and
+                    # the slot to still probe POISONED. Anything moved -> stand
+                    # down; the `-A` attach below absorbs every interleaving.
+                    #
+                    # This is the LAST read before the kill, and nothing may be
+                    # inserted between the two.
+                    _s2_snap2=$(_s2_snapshot)
+                    _s2_srv2=$(printf '%s\n' "$_s2_snap2" | sed -n '1p' | cut -d'|' -f1)
+                    _s2_sid2=$(printf '%s\n' "$_s2_snap2" | sed -n '1p' | cut -d'|' -f2)
+                    _s2_proj1=$(printf '%s\n' "$_s2_snap1" | cut -d'|' -f3-)
+                    _s2_proj2=$(printf '%s\n' "$_s2_snap2" | cut -d'|' -f3-)
+                    _s2_verdict2=$(_s2_liveness "$_s2_snap2")
+                    if [ -n "$_s2_snap2" ] \
+                        && [ "$_s2_srv2" = "$_s2_srv1" ] \
+                        && [ "$_s2_sid2" = "$_s2_sid1" ] \
+                        && [ "$_s2_proj2" = "$_s2_proj1" ] \
+                        && [ "$_s2_verdict2" = "POISONED" ]; then
+                        if tmux kill-session -t "$_s2_sid1" 2>/dev/null; then
+                            # CARRY the admission past the destructive act. The
+                            # preflight above said this rebuild is admissible;
+                            # re-asking afterwards reintroduces exactly the
+                            # failure the preflight exists to prevent, because
+                            # the second answer can be DENY or RECLAIM and the
+                            # pane is already gone by then. A sampled precondition
+                            # that does not survive the action it guards is not a
+                            # guard. See the bypass at the capacity gate below.
+                            _CC_REBUILT=1
+                            echo "cc-slot: ${SESSION_NAME} ended — rebuilding it fresh." >&2
+                        else
+                            echo "cc-slot: could not end ${SESSION_NAME} (it may have just changed) — attaching instead." >&2
+                        fi
+                    else
+                        echo "cc-slot: ${SESSION_NAME} changed while you decided — leaving it alone and attaching." >&2
+                    fi
+                fi
+            else
+                echo "cc-slot: leaving ${SESSION_NAME} as it is." >&2
+            fi
+        fi
+    fi
+    unset _s2_snap1 _s2_snap2 _s2_verdict _s2_verdict2 _s2_srv1 _s2_srv2 \
+          _s2_sid1 _s2_sid2 _s2_sid_ok _s2_proj1 _s2_proj2 _s2_cmds _s2_ans \
+          _s2_rebuild_ok _s2_live _s2_cap _s2_cap_action _s2_cap_reason 2>/dev/null || true
+fi
+
 # Numeric slots only: retired cc-manual-<ts>-<pid> sessions from the old wrapper
 # (and any other cc-* stray) must not consume cap headroom — manual allocation
 # can only ever probe/create cc-<N>. This count is a point-in-time snapshot: two
@@ -352,6 +885,20 @@ if tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
     _SESSION_EXISTS=1  # bypass cap check; also skips the OAuth gate below —
                        # attach does NOT re-run the pane command, so any token
                        # injection would be moot (and would waste a probe).
+elif [ "$_CC_REBUILT" = "1" ]; then
+    # A CONSENTED REBUILD BYPASSES THE CAP, for the same reason a reattach does
+    # and stated in the same terms: the slot was counted a moment ago and will
+    # be counted again in a moment, so the count gate has nothing to decide.
+    # What it CAN do is refuse — `_cap_reclaim` alone has six `exit 1` paths —
+    # and every one of them now runs with the operator's pane already destroyed.
+    # The preflight answered the one question that is genuinely open (the RAM
+    # floor) BEFORE anything was touched; asking a second, differently-timed,
+    # fallible question afterwards can only take the answer away.
+    #
+    # Note this is NOT a narrowed window: re-asking is removed, not shortened.
+    # Deliberately unlike `_SESSION_EXISTS`, the OAuth gate below still runs —
+    # this path DOES re-run the pane command, so its token work is not moot.
+    echo "cc-slot: rebuilding ${SESSION_NAME} (admitted before the rebuild; cap not re-checked)." >&2
 else
     # New session → consult the capacity gate (SSH_CONNECTION classifies origin
     # inside the Python helper). `timeout` bounds a hung import; trailing
@@ -359,7 +906,11 @@ else
     _cap_py="${GENESIS_ROOT}/.venv/bin/python"
     _cap_out=""
     if [ -x "$_cap_py" ]; then
-        _cap_out=$(timeout 15 "$_cap_py" -m genesis.cc.session_cap --existing "$existing" 2>/dev/null || true)
+        # `-k`: plain `timeout` sends TERM and then WAITS. This gate can run
+        # AFTER the consent rebuild already killed the slot, so a probe that
+        # ignores TERM leaves the operator with neither the old pane nor the
+        # replacement. Every bounded call on this path carries a kill deadline.
+        _cap_out=$(timeout -k 2 15 "$_cap_py" -m genesis.cc.session_cap --existing "$existing" 2>/dev/null || true)
     fi
     # Protocol: line 1 = action, line 2 = human message, line 3 = machine reason.
     _cap_action=$(printf '%s\n' "$_cap_out" | sed -n '1p')
@@ -377,15 +928,56 @@ fi
 # the gate/fallback message above carries the cap itself.
 echo "→ Slot ${SLOT} (session: ${SESSION_NAME}, live: ${existing})" >&2
 
-# Redirect CC temp to dedicated directory (keeps /tmp clean)
-export TMPDIR="$HOME/.genesis/cc-tmp"
-mkdir -p "$TMPDIR"
-chmod 700 "$TMPDIR"
+# Redirect CC temp to a dedicated directory (keeps /tmp clean).
+#
+# CREATING a directory does not make it USABLE: `mkdir -p` returns SUCCESS for
+# one that already exists, including a root-owned one left by an earlier sudo
+# run. The old form also ran `mkdir`/`chmod` UNGUARDED under `set -euo pipefail`,
+# so a failing chmod killed the whole door — and since this value is now pinned
+# into the session with `-e TMPDIR=` below, an unusable path would be propagated
+# to every slot rather than staying local to this script. So each candidate must
+# be created AND writable before it is accepted, in a loop no future candidate
+# can be added without. ~/tmp is a DEGRADED fallback (disk_hygiene.sh prunes it
+# at 7 days), never an equal one.
+# UNSET, never TMPDIR="". Blanking an ALREADY-EXPORTED variable keeps the
+# export attribute, so the child would receive a literal `TMPDIR=` — and this
+# script ends in `exec tmux`, which STARTS the server when none is running, so
+# an empty value would be inherited by that server and (per the MEASURED note
+# at the exec below) by every slot created on it afterwards. That would defeat
+# the conditional `-e` pin further down via the ambient environment, on this
+# very path, and make the "system default" message a lie.
+unset TMPDIR CLAUDE_CODE_TMPDIR
+# The candidate loop itself lives in _cc_resolve_tmpdir near the top, because
+# the subcommand bypass needs the identical validation and a second, weaker
+# copy of it was exactly the defect that moved it here.
+#
+# There used to be a TWIN note here claiming the in-tmux wrapper in
+# scripts/bootstrap.sh carries the same loop and must be hand-synced. It does
+# not, and has not since the note was written: that wrap block dispatches to
+# this script and contains no TMPDIR handling at all. Repo-wide this loop
+# exists only here. Removed rather than corrected — a comment inviting a third
+# hand-synced copy, four lines under the text explaining that a second copy was
+# the defect, is exactly how the next drift starts.
+if _cc_resolve_tmpdir; then
+    [ "$TMPDIR" = "$HOME/.genesis/cc-tmp" ] \
+        || echo "cc-slot: ${HOME}/.genesis/cc-tmp is unusable — using ${TMPDIR} instead." >&2
+else
+    # Make the message TRUE: leave BOTH names genuinely unset so CC resolves the
+    # system default, rather than an exported empty string.
+    unset TMPDIR CLAUDE_CODE_TMPDIR
+    echo "cc-slot: no usable temp dir (${HOME}/.genesis/cc-tmp or ${HOME}/tmp) —" >&2
+    echo "cc-slot: leaving CC on the system default (check disk space/permissions)." >&2
+fi
 
 # Move CC's Bash sandbox off volatile /tmp onto persistent disk.
 # CC uses CLAUDE_CODE_TMPDIR for its sandbox root (/claude-<uid>/<cwd>/).
 # Without this, intermittent ENOENT failures on /tmp break the Bash tool.
-export CLAUDE_CODE_TMPDIR="$HOME/.genesis/cc-tmp"
+# Same resolved directory as TMPDIR above — never a second, unchecked path, and
+# left UNSET (not empty) when there is none, for the same export-attribute
+# reason documented at the loop.
+if [ -n "${TMPDIR:-}" ]; then
+    export CLAUDE_CODE_TMPDIR="$TMPDIR"
+fi
 
 # Permission mode for this interactive dev console. Default: auto — auto-approves
 # common ops but still prompts on deny/ask rules, which the operator answers in
@@ -448,7 +1040,10 @@ if [ "$_SESSION_EXISTS" = "0" ] && [ "$_slot_oauth_mode" != "off" ] && [ "$_HAS_
     # a hung probe. `env` hands the resolved mode across (a plain
     # `GENESIS_CC_SLOT_OAUTH=always` in ~/.genesis/cc-slot.env is a non-exported
     # shell var the subprocess would otherwise never see).
-    if _oauth_notice=$(timeout 30 env GENESIS_CC_SLOT_OAUTH="$_slot_oauth_mode" \
+    # `-k` for the same reason as the capacity gate above: TERM-only is not a
+    # deadline against a probe wedged in uninterruptible I/O, and this one also
+    # runs after a consent rebuild has already destroyed the slot.
+    if _oauth_notice=$(timeout -k 2 30 env GENESIS_CC_SLOT_OAUTH="$_slot_oauth_mode" \
             "${GENESIS_ROOT}/.venv/bin/python" -m genesis.cc.login_gate); then
         # %q so the notice cannot break out of the pane command string (any
         # future notice edit is injection-proof by construction, not by luck).
@@ -485,9 +1080,49 @@ fi
 # python path, home-anchored token file), and if the repo is gone that python is too
 # → the read silently no-ops before cd fails. Do NOT move it after the `&&`
 # (test_cd_guard_skips_claude_on_bad_cd).
+#
+# The two extra `-e` pins below are each a MEASURED gap, not a guess. `tmux
+# new-session` builds a new session's env from the tmux SERVER's environment,
+# updated by the client only for `update-environment` vars (SSH_*, DISPLAY, …).
+# MEASURED on tmux 3.4, a new session on a server someone else started:
+#   TMPDIR                 -> SERVER's value  (gap: pin it, or CC temp lands on
+#                             the ambient/foreign dir, often /tmp this repo avoids)
+#   GENESIS_CC_SLOT_OAUTH  -> SERVER's value  (gap: pin the RESOLVED lever so a
+#                             hand-relaunch via the in-tmux bashrc wrapper honours
+#                             the operator's always/off, not the default conditional)
+#   PATH                   -> CLIENT's value  (NO gap: the door's PATH already
+#                             propagates, so it is deliberately NOT pinned here.
+#                             Do not "helpfully" add it — measured unnecessary.)
+# CLAUDE_CODE_TMPDIR was already pinned for the same server-env reason.
+# LANG stays LAST — a doors test parses the create line from its final -e.
+#
+# The temp pins are built as an ARRAY because they are conditional: when no
+# usable temp dir was found above, pinning `TMPDIR=` would push an EMPTY value
+# into the session, which is worse than not pinning it (CC would resolve an
+# empty TMPDIR rather than fall back to the system default).
+_TMPDIR_PIN=()
+_TMPDIR_UNSET=""
+if [ -n "${TMPDIR:-}" ]; then
+    _TMPDIR_PIN=(-e "CLAUDE_CODE_TMPDIR=$CLAUDE_CODE_TMPDIR" -e "TMPDIR=$TMPDIR")
+else
+    # OMITTING the pins is not the same as having no value. A new session takes
+    # its environment from the tmux SERVER (the inheritance measured above), so
+    # with no pin the pane silently gets whatever that server holds — including a
+    # stale `~/.genesis/cc-tmp` that we just rejected as unusable. The only way
+    # to actually leave CC on the system default is to unset both names INSIDE
+    # the pane. Joined with `&&`, not `;`, so a failed `cd` still skips claude
+    # (test_cd_guard_skips_claude_on_bad_cd); `unset` cannot fail, so it never
+    # blocks the launch. With these two branches the pane's temp environment is
+    # explicitly determined in BOTH directions — there is no third case.
+    # (Referenced as ${_TMPDIR_UNSET:-} below: the launch line is extracted
+    # and evaluated under `set -u` by the oauth tests, where a bare
+    # ${_TMPDIR_UNSET} would be unbound.)
+    _TMPDIR_UNSET="unset TMPDIR CLAUDE_CODE_TMPDIR && "
+fi
 exec tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
     -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \
-    -e "CLAUDE_CODE_TMPDIR=$CLAUDE_CODE_TMPDIR" \
+    "${_TMPDIR_PIN[@]}" \
+    -e "GENESIS_CC_SLOT_OAUTH=${_slot_oauth_mode}" \
     -e "LANG=$LANG" \
-    "${_OAUTH_SRC}cd ${GENESIS_ROOT} && claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${GENESIS_ROOT}/scripts/cc_exit_capture.sh ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"
+    "${_OAUTH_SRC}cd ${GENESIS_ROOT} && ${_TMPDIR_UNSET:-}claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${GENESIS_ROOT}/scripts/cc_exit_capture.sh ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"

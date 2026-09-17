@@ -133,7 +133,9 @@ def test_load_full_yaml(monkeypatch):
     # unwired openrouter-qwen3coder (delisted qwen/qwen3-coder:free slug).
     # 2026-08-19: 26 → 25 after removing dead nvidia-nim-kimi (moonshotai/kimi-k2.6
     # 404-for-account on NIM); nvidia-nim-deepseek repointed v4-pro → v4-flash-0731.
-    assert len(cfg.providers) == 25
+    # 2026-09-05: 25 -> 26 with mistral-medium-free — the in-family rung
+    # directly below Large (presumptive free tier; see model_routing.yaml).
+    assert len(cfg.providers) == 26
     assert "lmstudio-30b" not in cfg.providers
     assert "github-o3mini" not in cfg.providers
     assert "openrouter-deepseek-r1" not in cfg.providers  # removed from config
@@ -169,8 +171,13 @@ def test_load_full_yaml(monkeypatch):
     # added (entity-node merge-vs-distinct drainer).
     # 2026-08-07: 59 → 60 after 41_reflection_json_salvage added (deep-reflection
     # prose-output salvage retry).
-    assert len(cfg.call_sites) == 61
+    # 2026-09-15: 61 → 63 after desk_primary + desk_fast added (the desktop
+    # assistant's two lanes behind /v1/desk/chat/completions — capable for
+    # control-tag turns, fast for turns composed during a live call).
+    assert len(cfg.call_sites) == 63
     assert "dream_cycle_relationship_classify" in cfg.call_sites  # MW-2 classifier (2026-08-10)
+    assert "desk_primary" in cfg.call_sites  # desktop assistant, capable lane (2026-09-15)
+    assert "desk_fast" in cfg.call_sites  # desktop assistant, fast phone lane (2026-09-15)
     assert "41_reflection_json_salvage" in cfg.call_sites  # deep-reflection salvage (2026-08-07)
     assert cfg.call_sites["repo_pulse"].dispatch == "cli"
     assert cfg.call_sites["repo_pulse"].chain == []
@@ -222,23 +229,51 @@ def test_load_full_yaml(monkeypatch):
     assert cfg.call_sites["29_retrospective_triage"].chain == [
         "groq-free",
         "mistral-large-free",
+        "mistral-medium-free",
         "openrouter-nemo",
     ]
     assert cfg.call_sites["30_triage_calibration"].default_paid is True
-    # lmstudio-30b filtered out, only mistral-large-free remains
-    assert cfg.call_sites["30_triage_calibration"].chain == ["mistral-large-free"]
+    # lmstudio-30b filtered out; the Mistral family rungs remain (Large, then
+    # Medium directly below it — the in-family fallback added 2026-09-05).
+    assert cfg.call_sites["30_triage_calibration"].chain == [
+        "mistral-large-free",
+        "mistral-medium-free",
+    ]
     assert cfg.call_sites["31_outcome_classification"].chain == [
         "glm51",
         "mistral-large-free",
+        "mistral-medium-free",
     ]
 
     # mistral-large-free provider (consolidated from mistral-free + mistral-large).
-    # free: false since 2026-09: Mistral removed Large from free-tier entitlement
-    # (403 tier_not_allowed, measured on two independent free-tier accounts), so
-    # cost is tracked at paid rates and never_pays chains exclude it.
+    #
+    # `free: true` since 2026-09-07, reverting a one-day `false`. The flag answers
+    # MARGINAL COST ("does a successful call add to the bill?") and nothing else —
+    # every consumer reads it that way (litellm_delegate sets cost=0.0 on it,
+    # router.py's budget gate, _filter_chain's never_pays filter). Mistral's tier
+    # is $0 per call under its rate limits, and the 403 tier_not_allowed this
+    # account gets is an ENTITLEMENT refusal, so it costs no MONEY — the call
+    # DOES happen and fails, on the three never_pays sites `free: true` re-admits
+    # Large to. (An earlier draft said "costs nothing precisely because the call
+    # never happens". That sentence was retracted in model_routing.yaml by this
+    # same change and left standing here — the copy outliving its correction,
+    # which is the instance-patching signature this PR is otherwise about.)
+    # Entitlement now lives in the profile's `entitlement:` block, where it can
+    # be stated without corrupting the budget.
     ml = cfg.providers["mistral-large-free"]
-    assert ml.is_free is False
+    assert ml.is_free is True
     assert ml.model_id == "mistral-large-latest"
+
+    # Daily budgets (2026-09): groq ships both caps, each in Groq's OWN unit
+    # (tpd measured from Groq's 429 text, rpd from its documented free tier);
+    # gemini deliberately ships NEITHER (its per-day cap is inferred, not
+    # proven). Pinning both directions keeps a wrong shipped cap loud.
+    gq = cfg.providers["groq-free"]
+    assert gq.rpd_limit == 1000
+    assert gq.tpd_limit == 200000
+    gm = cfg.providers["gemini-free"]
+    assert gm.rpd_limit is None
+    assert gm.tpd_limit is None
 
     # groq-free provider — MIGRATED 2026-08-06: Groq deprecated
     # llama-3.3-70b-versatile (shutdown 2026-08-16) → openai/gpt-oss-120b, its
@@ -720,3 +755,46 @@ def test_detect_mislabeled_free_openrouter_flags_paid_slug_marked_free():
     # (substring checks collide: "or-paid" is inside "or-paid-as-free").
     flagged_names = {f.split(":", 1)[0] for f in flagged}
     assert flagged_names == {"or-paid-as-free", "or-curated-bad"}, flagged
+
+
+class TestDailyLimitValuesAreRejectedNotCoerced:
+    """`int(value)` is not integer validation, and the parser's docstring said it
+    was. YAML gives `1.9` as a float and `true` as a bool, and both survive it:
+    1.9 truncates to 1, and `True` IS 1. So a typo in a user overlay silently
+    becomes a ONE-REQUEST daily limit that deselects the provider after a single
+    call, with no correction until the UTC day rolls over (Codex P2, PR #1624).
+
+    Booleans matter twice over: `isinstance(True, int)` is True, so a type check
+    placed AFTER coercion would let them through.
+    """
+
+    @staticmethod
+    def _yaml(value: str) -> str:
+        return f"""
+providers:
+  p:
+    type: groq
+    model: m
+    free: true
+    rpd_limit: {value}
+call_sites:
+  s:
+    chain: [p]
+"""
+
+    @pytest.mark.parametrize("bad", ["1.9", "0.5", "true", "false", '"abc"', "[1]"])
+    def test_a_non_integer_limit_is_refused(self, bad):
+        with pytest.raises(ValueError, match="must be an integer|must be positive"):
+            load_config_from_string(self._yaml(bad))
+
+    @pytest.mark.parametrize("good", ["1", "1000"])
+    def test_an_integer_limit_still_loads(self, good):
+        """CONTROL: rejecting more must not reject the valid shape — and a
+        quoted integer string stays acceptable, which is why the check admits
+        `str` rather than demanding `int`."""
+        cfg = load_config_from_string(self._yaml(good))
+        assert cfg.providers["p"].rpd_limit == int(good)
+
+    def test_a_quoted_integer_string_is_accepted(self):
+        cfg = load_config_from_string(self._yaml('"250"'))
+        assert cfg.providers["p"].rpd_limit == 250

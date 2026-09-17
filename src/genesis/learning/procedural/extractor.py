@@ -59,6 +59,28 @@ NOVELTY_THRESHOLD = 0.85
 # "is the new procedure redundant with any of these?". Precision-first (the dedup
 # spike found 0 false-merges on S-tier); fail-open (any error → treat as novel).
 _NOVELTY_CALL_SITE = "38a_procedure_novelty_llm"
+
+# Only a model whose FALSE-MERGE rate has actually been MEASURED may return a
+# SUPPRESSING verdict. A `redundant_with` answer destroys the new procedure — it
+# is never stored, and nothing surfaces that — so the precision this call site
+# names as its safety property cannot rest on tier parity.
+#
+# The PAIR is checked, and that is the whole point of this being a mapping.
+# `RouteResult.provider_used` carries the CHAIN ALIAS (`provider_used=
+# provider_name`, routing/router.py) and `model_id` carries the provider's own
+# model string (`p["model"]`, routing/config.py). Neither alone is sufficient:
+#   - alias alone is a MUTABLE handle. A local overlay is deep-merged into the
+#     provider definitions (`_deep_merge` in routing/config.py, and
+#     `_sanitize_local_overlay` filters only stale call-site chain entries — it
+#     does not protect a provider's `model:`), so repointing this alias at
+#     another model keeps the alias and silently transfers the measured model's
+#     authority to delete procedures to one nobody measured;
+#   - model alone would accept the right model reached through a call site whose
+#     cost and policy we never evaluated.
+#
+# Adding an entry requires running the same zero-false-merge evaluation that put
+# deepseek-v4 in it; matching S-tier is not that evidence.
+_NOVELTY_VALIDATED_MODELS = {"openrouter-deepseek-v4": "deepseek/deepseek-v4-pro"}
 CROSS_TYPE_PREFILTER = 0.62  # cosine floor for candidates (spike found dups @0.66)
 CROSS_TYPE_TOPK = 10  # cap candidates sent to the LLM (bounds cost)
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
@@ -184,6 +206,25 @@ async def _cross_type_duplicate(
         data = json.loads(match.group(1) if match else (result.content or ""))
         rw = data.get("redundant_with")
         if isinstance(rw, int) and 1 <= rw <= len(top):
+            # A suppressing verdict is only as trustworthy as the provider that
+            # produced it, and only one of them has been measured. An unknown or
+            # missing provider lands here too and is treated the same way —
+            # which fails toward STORING, the direction this call site is
+            # already documented to prefer (a paraphrase duplicate stored beats
+            # a real procedure destroyed).
+            answered_by = getattr(result, "provider_used", None) or ""
+            answered_with = getattr(result, "model_id", None) or ""
+            if _NOVELTY_VALIDATED_MODELS.get(answered_by) != answered_with:
+                logger.info(
+                    "Cross-type dedup: %s (model %s) judged the new '%s' "
+                    "procedure redundant, but that alias/model pair's "
+                    "false-merge rate is unmeasured — treating as novel and "
+                    "storing it. Only a validated pair may suppress.",
+                    answered_by or "<unknown provider>",
+                    answered_with or "<unknown model>",
+                    task_type,
+                )
+                return False, max_cross_sim
             dup = top[rw - 1][1]
             logger.info(
                 "Cross-type duplicate: new '%s' ~ existing '%s' (cosine=%.3f): %s",
@@ -573,12 +614,15 @@ async def extract_procedure(
             gate_result.adjusted_confidence,
         )
 
-        # WS-3 B1 gate-1 (procedure): NOT gated here — this legacy path has no
-        # reliable source-session tool signal. The only origin candidates are
-        # data["tools_used"] (the extractor LLM's proposed REPLAY tools, not
-        # source provenance) and summary.tool_calls (a heuristic, hyphen-
-        # truncating prose scrape from the summarizer). Gating on either would
-        # undercount silently. Deferred with the path's own removal (follow-up
+        # WS-3 B1 gate-1 (procedure): NOT gated here. The premise USED to be
+        # that this legacy path has no reliable source-session tool signal —
+        # data["tools_used"] is the extractor LLM's proposed REPLAY tools
+        # rather than source provenance, and summary.tool_calls was a prose
+        # scrape. That is now only half true: `InteractionSummary` carries
+        # `tool_calls_from_runtime`, and where it is set the names come from the
+        # runtime's own tool_use events. It is NOT set on the non-streaming
+        # paths, so gating here would still undercount silently — the same
+        # conclusion, for a narrower reason. Deferred with the path's own removal (follow-up
         # 3558802740d5); the primary judge path (extraction_job) IS gated on the
         # real transcript spine.
 

@@ -204,16 +204,19 @@ class GenesisEgoContextBuilder:
         queues = snap.get("queues", {})
         if queues:
             lines.append("\n### Queues")
-            deferred = queues.get("deferred_work_queue", {})
-            dead_letter = queues.get("dead_letter_queue", {})
-            if isinstance(deferred, dict):
-                lines.append(
-                    f"- Deferred work: {deferred.get('pending', 0)} pending"
-                )
-            if isinstance(dead_letter, dict):
-                lines.append(
-                    f"- Dead letter: {dead_letter.get('count', 0)} items"
-                )
+            # A FAILED queue query leaves the producer's value None while the
+            # KEY stays present, so `.get(name, 0)` never defaults — rendering
+            # it raw puts the token "None" in this context, and defaulting it
+            # to 0 states "nothing pending" for a depth nobody measured. Say
+            # unknown; the snapshot's `errors` list carries the reason.
+            deferred = queues.get("deferred_work")
+            dead = queues.get("dead_letters")
+            lines.append(
+                f"- Deferred work: {'unknown' if deferred is None else deferred} pending"
+            )
+            lines.append(
+                f"- Dead letter: {'unknown' if dead is None else dead} items"
+            )
 
         # Surplus
         surplus = snap.get("surplus", {})
