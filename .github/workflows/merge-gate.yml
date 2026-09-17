@@ -84,8 +84,8 @@ jobs:
           set -euo pipefail
           echo "number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
           gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
-            --json baseRefOid,headRefOid \
-            -q '"base=" + .baseRefOid, "head=" + .headRefOid' >> "$GITHUB_OUTPUT"
+            --json baseRefOid,headRefOid,isCrossRepository \
+            -q '"base=" + .baseRefOid, "head=" + .headRefOid, "fork=" + (.isCrossRepository | tostring)' >> "$GITHUB_OUTPUT"
 
       - name: Checkout the base's gate
         uses: actions/checkout@v7
@@ -156,8 +156,24 @@ jobs:
           GATE_RC: ${{ steps.gate.outputs.rc }}
           HEAD_SHA: ${{ steps.pr.outputs.head }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
+          IS_FORK: ${{ steps.pr.outputs.fork }}
         run: |
           set -euo pipefail
+          # GitHub downgrades GITHUB_TOKEN to read-only for
+          # pull_request_review[_comment] events on FORK PRs, so the
+          # check-runs write below would 403. Skip it: the head keeps its
+          # last verdict until the next privileged event (issue_comment,
+          # workflow_run, pull_request — all base-context). Publishing to a
+          # fork head the trusted way needs a second workflow_run stage;
+          # this repo has no fork PRs today, so the warning is the
+          # proportionate fix.
+          case "$GITHUB_EVENT_NAME" in
+            pull_request_review|pull_request_review_comment)
+              if [ "$IS_FORK" = "true" ]; then
+                echo "::warning::Fork-PR $GITHUB_EVENT_NAME runs under a read-only token; check run on head stays at its last verdict until a privileged event refreshes it."
+                exit 0
+              fi ;;
+          esac
           if [ "$GATE_RC" = "0" ]; then
             concl=success; title="merge gate: all gates pass"
           else
