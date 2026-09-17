@@ -188,6 +188,17 @@ Applies to every assertion — in conversation, and doubly in anything written t
   it.** When you have only the count, say "not found in K of N", never "absent". This
   failure is silent and confident: an under-read is indistinguishable from a clean result,
   so nothing prompts you to check.
+- **Do not set a limit you cannot justify — the failure starts at the WRITE end.** The
+  moment you pass `--limit 30` the answer is decided, and no later vigilance recovers it.
+  Default to **no limit** on an enumeration you will draw a count or an absence from; pass
+  one only when you can name the budget it protects, and then treat a saturated read
+  (`n >= limit`) as truncated without waiting to be reminded. **An UNFLAGGED listing may
+  already be capped by a tool default you never chose** — the absence of a limit in the
+  command is not evidence of a complete read, and that is the version of this you cannot
+  feel. A preview is exempt (`| head`, a top-N sample): that is a selection you are not
+  counting. The house pattern is `src/genesis/session_awareness/repo_pulse_gh.py`, which records
+  `limit_hit` and is loud rather than silent. Reporting your own limit back as a total
+  has happened.
 - **Evidence tiers.** Every stated fact is one of: **MEASURED** (number + denominator),
   **READ** (artifact + location, e.g. file:line / PR / live query), **INFERRED** (must be
   hedged out loud — "I think", "unverified, but"), or **ASSUMED** (say so). An unmarked
@@ -286,7 +297,8 @@ the rule below used to fire so rarely. Three concrete triggers:
    X is not what its name suggests. Especially when you went looking for X
    expecting it to be absent.
 3. **You CORRECTED a belief** — your own, a prior session's, or a written note's.
-   Use `supersedes` to link the correction to what it replaces. This is the
+   Use `supersedes` to link the correction to what it replaces, or
+   `memory_supersede(old_id, new_id)` when both memories already exist. This is the
    highest-value trigger and the easiest to skip, because being wrong does not
    feel like a finding. It is the one that stops the next session paying for the
    same mistake.
@@ -458,18 +470,32 @@ not do. A STRUCTURAL exemption may only cite a bound **configuration cannot
 change** — a hardcoded slice or an in-code clamp, never a config DEFAULT, since a
 `.local.yaml` overlay can raise a default.
 
-There is a SECOND, weaker category, named here because describing only the first
-overstates the gate: `_MEASURED_PENDING_ROUTING` holds a hook that is NOT
-structurally bounded and has simply never been observed filing, with its routing
-tracked in a follow-up. `proactive_memory_hook.py` is its only member and its own
-reason concedes the peer loop is unbounded — so it CAN reach the cap. That is
-debt with a date on it, not a proof, and the two categories are kept separate so
-the debt stays visible rather than laundered into "bounded".
+There is a SECOND, weaker category, kept so that describing only the first does
+not overstate the gate: `_MEASURED_PENDING_ROUTING` is for a hook that is NOT
+structurally bounded and has simply never been observed filing. It is **empty** —
+its only ever member now routes through the writer and bounds each surface by
+meaning. The category stays because the next hook with that shape needs a
+labelled place to sit; a row filed under "structurally bounded" is a false claim
+rather than visible debt.
+
+Two rules from that work, because both are the kind you get wrong while
+believing otherwise. **A size bound must be measured in the unit the harness
+bills** (UTF-16 code units, via `utf16_len`/`clip_to_cost`) — mixing units does
+not loosen a bound, it SKIPS it, and the extremes hide that, so sweep a range
+rather than trying one huge value. A bound on MEANING (is this token a word?)
+stays in codepoints; say which you are writing. And **a bound must not decide
+eligibility** — filtering what gets rendered is not a judgement about whether the
+work is worth doing, and conflating them silently skipped recall for a whole
+class of prompt. Detail lives with the code, in
+`.claude/docs/proactive-memory-hook.md`.
 
 Three limits, so it is not read as total coverage. Hooks wired in a user-level
 `~/.claude/settings.json` or a `settings.local.json` are outside the repo and
-invisible to it. An EXEMPTION SKIPS SCANNING ENTIRELY, so a row is only as good
-as its last read — which is why the table stays small. And the detector's
+invisible to it. An exemption still skips the PRINT SCAN — every row now carries
+a checker, but it re-runs a NECESSARY CONDITION of the row's claim, never a
+verification of it: a checker shows a constant or pattern still EXISTS, not that
+it still BINDS the output. Which is why the table stays small and why ROUTING a
+hook through the writer still beats adding a row. And the detector's
 enumeration is bounded, not total: it covers `print`, `builtins.print`,
 `file=None`, `file=sys.stdout`/`__stdout__`, and `sys.stdout[.buffer].write`,
 but NOT `os.write(1, …)`, an aliased handle, a rebound `print`, or a subprocess
@@ -587,7 +613,12 @@ behind the writer, and 7 were a guard since removed.
   calls. Always pass ≥2 questions; if only one is real, add a trivial/filler
   second question to satisfy the tool. Every time, no exceptions.
 - **Plan mode by default** for any task with 3+ steps or architectural
-  decisions. If something goes sideways — STOP and re-plan.
+  decisions. If something goes sideways — STOP and re-plan. A plan-mode
+  document under `~/.claude/plans/` that will outlive one session opens with
+  the structured header (status, `pinned.main`, `binds`/`prevents`, and the
+  trackers it executes) — format and rationale in the genesis-development
+  skill, `references/plan-docs.md`. Task-executor plans (`/task`,
+  `TASK_INTAKE.md`) keep their own section contract and are out of scope.
 - **Use subagents** to keep main context clean. One concern per subagent.
   **A MANDATED subagent is already the request** — when a gate's block message
   tells you to dispatch one, dispatch it; don't stop to ask. Ask only for

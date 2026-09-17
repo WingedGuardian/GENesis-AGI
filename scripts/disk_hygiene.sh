@@ -41,6 +41,9 @@
 #  14. External-review runner stores: size trim of the dispatch rows (>5MB, same
 #      one-file-per-flush shape) and a 30d file-age prune of the run logs, which
 #      the size trim cannot see because it counts *.jsonl only
+#  15. Retention prune of ~/.genesis/output/guard-corpus.jsonl (>45d)
+#      (the guard replay corpus and any temp an interrupted rebuild left; it is
+#      regenerable, and it holds verbatim command lines — see prune_guard_corpus)
 #
 # Note: run under a hardened systemd sandbox (NoNewPrivileges, ProtectSystem=
 # strict), so disk_reclaim's --system (/var, sudo) path is intentionally NOT
@@ -149,7 +152,32 @@ prune_external_review_logs() {
     return 0
 }
 
+prune_guard_corpus() {
+    # scripts/replay_guard_corpus.py caches every distinct Bash (command, cwd)
+    # pair from this install's transcripts so it can replay them through a guard.
+    # That cache is REGENERABLE — a missing one costs a rebuild, nothing else —
+    # and it holds verbatim command lines, which demonstrably include secrets
+    # passed in argv. It is written 0600 for that reason. Left alone it is a
+    # tens-of-megabytes file that no longer has a reader between measurements, so
+    # it ages out here rather than living forever by default. Size is stated
+    # relatively because it tracks the transcript tree, which only grows:
+    # MEASURED 2026-09-10 it was 67.6 MB for 140,293 rows, against the ~30 MB
+    # this comment claimed five days earlier.
+    #
+    # The temps are swept too, and that is not incidental: the rebuild writes
+    # through mkstemp (guard-corpus.jsonl.XXXXXX.tmp) and unlinks its own temp on
+    # failure, but a SIGKILL mid-write leaves one behind holding the same
+    # commands with none of the value.
+    local out_dir="${1:-$HOME/.genesis/output}"
+    [ -d "$out_dir" ] || return 0
+    find "$out_dir" -maxdepth 1 -type f \
+        \( -name 'guard-corpus.jsonl' -o -name 'guard-corpus.jsonl.*.tmp' \) \
+        -mtime +45 -delete 2>/dev/null \
+        || echo "guard-corpus prune exited $?"
+}
+
 main() {
+    local disk_reclaim_rc=0
     if [ -z "$VENV_PY" ]; then
         echo "disk_hygiene: no python interpreter found" >&2
         exit 1
@@ -174,7 +202,11 @@ main() {
     "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" || echo "worktree_lifecycle exited $?"
 
     echo "--- cache reclamation ---"
-    "$VENV_PY" "$REPO_DIR/scripts/disk_reclaim.py" --apply --if-above 90 || echo "disk_reclaim exited $?"
+    "$VENV_PY" "$REPO_DIR/scripts/disk_reclaim.py" --apply --if-above 90 \
+        --fail-above 95 || disk_reclaim_rc=$?
+    if [ "$disk_reclaim_rc" -ne 0 ]; then
+        echo "disk_reclaim exited $disk_reclaim_rc"
+    fi
 
     # Reap orphaned per-session background-CC sandboxes (~/tmp/bg-cc-sessions/<id>).
     # direct_session._run_session removes these in a finally on normal completion;
@@ -364,7 +396,13 @@ main() {
         prune_external_review_logs "$_EXTREVIEW_STORE/logs" 200000000
     fi
 
+    # 15. Guard replay corpus: age prune of a regenerable cache that holds
+    #     verbatim command lines (see prune_guard_corpus).
+    echo "--- guard replay corpus retention prune (>45d) ---"
+    prune_guard_corpus "$HOME/.genesis/output"
+
     echo "=== genesis-disk-hygiene done ==="
+    return "$disk_reclaim_rc"
 }
 
 # Run main only when executed directly — lets tests `source` this file to call a

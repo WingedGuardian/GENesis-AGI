@@ -150,28 +150,62 @@ def upsert_sync(
         logger.debug("session heartbeat upsert failed", exc_info=True)
 
 
+def _active_filter(exclude_session: str | None) -> tuple[str, list]:
+    """The "currently active" predicate, in ONE place.
+
+    Shared by the row read and the count so the two cannot drift. A count that
+    applies a different cutoff or forgets the self-exclusion does not report a
+    smaller number — it reports a WRONG one, while looking like a denominator.
+    """
+    cutoff = (datetime.now(UTC) - _STALE_THRESHOLD).isoformat()
+    sql = " FROM session_heartbeats WHERE updated_at > ?"
+    params: list = [cutoff]
+    if exclude_session:
+        sql += " AND cc_session_id != ?"
+        params.append(exclude_session)
+    return sql, params
+
+
 def get_active_sync(
     db_path: str,
     *,
     exclude_session: str | None = None,
     timeout: float = 1.0,
+    limit: int | None = None,
 ) -> list[dict]:
-    """Sync read of active heartbeats for hooks. Returns [] on any error."""
+    """Sync read of active heartbeats for hooks. Returns [] on any error.
+
+    ``limit`` bounds the row count AT THE QUERY. The bound belongs here rather
+    than at the caller because there is exactly one caller — the proactive
+    memory hook's peer-awareness block (verified with Serena
+    ``find_referencing_symbols`` 2026-09-10; the two other files mentioning this
+    function do so in comments) — so query and consumer have identical blast
+    radius, and a row read only to be discarded is work nobody wants.
+
+    A caller that limits MUST report what it dropped, because ``ORDER BY
+    updated_at DESC`` keeps the most recent peers and a silently short list reads
+    exactly like "few concurrent sessions" — the same invisible failure the
+    empty-list comment below is about. Get that number from
+    :func:`count_active_sync`, NOT by reading one row past the limit: a read
+    whose result count equals its limit is truncated, so "how many more" derived
+    from it saturates at one and states a precise, wrong total.
+    """
     try:
-        cutoff = (datetime.now(UTC) - _STALE_THRESHOLD).isoformat()
         conn = sqlite3.connect(db_path, timeout=timeout)
         conn.row_factory = sqlite3.Row
         try:
+            where, params = _active_filter(exclude_session)
             sql = (
                 "SELECT cc_session_id, source_tag, model, topic, "
-                "user_summary, genesis_summary, updated_at "
-                "FROM session_heartbeats WHERE updated_at > ?"
+                "user_summary, genesis_summary, updated_at" + where + " ORDER BY updated_at DESC"
             )
-            params: list = [cutoff]
-            if exclude_session:
-                sql += " AND cc_session_id != ?"
-                params.append(exclude_session)
-            sql += " ORDER BY updated_at DESC"
+            if limit is not None:
+                # `max(0, ...)`, never `if limit >= 0` — treating a negative
+                # limit as "no limit" is fail-OPEN in the one parameter whose
+                # entire purpose is to impose a bound, and it fails silently:
+                # the caller asked to be bounded and is handed every row.
+                sql += " LIMIT ?"
+                params.append(max(0, limit))
 
             cursor = conn.execute(sql, params)
             return [dict(row) for row in cursor.fetchall()]
@@ -182,3 +216,30 @@ def get_active_sync(
         # like "no concurrent sessions", so a broken read is invisible.
         logger.debug("session heartbeat read failed", exc_info=True)
         return []
+
+
+def count_active_sync(
+    db_path: str,
+    *,
+    exclude_session: str | None = None,
+    timeout: float = 1.0,
+) -> int | None:
+    """How many peers :func:`get_active_sync` would return UNLIMITED.
+
+    Returns ``None`` — not 0 — when the count cannot be taken. A caller uses this
+    to say how many rows its limit hid, and 0 there would claim "nothing hidden"
+    on a failed read, which is the fail-open direction: it would under-report
+    exactly when something is wrong. ``None`` lets the caller say "some" instead
+    of a number it does not have.
+    """
+    try:
+        conn = sqlite3.connect(db_path, timeout=timeout)
+        try:
+            where, params = _active_filter(exclude_session)
+            row = conn.execute("SELECT COUNT(*)" + where, params).fetchone()
+            return int(row[0]) if row else None
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("session heartbeat count failed", exc_info=True)
+        return None

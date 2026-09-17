@@ -5,9 +5,52 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _fresh_proactive_writer():
+    """Give every test its own BoundedStdout for the proactive memory hook.
+
+    That hook holds its writer in a module-level singleton, which is right in
+    PRODUCTION (one hook invocation per process) and wrong under pytest, where
+    one module is imported once and every test would then share — and slowly
+    spend — a single 9,800-character budget. The failure is the nastiest kind:
+    the test that happens to run when the budget runs out sees its output CUT
+    and fails for a reason that has nothing to do with what it asserts, and
+    which test that is depends on collection order.
+
+    Reset rather than reconstruct, so a test asserting on ``_writer()`` state
+    (emitted totals, whether a cut happened) starts from zero.
+
+    READS ``sys.modules``; DOES NOT IMPORT. An autouse fixture runs for every
+    test in this directory, and importing the hook is not free: the module is an
+    executable script whose import-time body calls ``load_dotenv`` on the real
+    ``secrets.env`` and then ``sys.exit(0)`` when ``GENESIS_CC_SESSION=1``.
+    MEASURED: with that variable set — which is exactly what a dispatched
+    background session exports — importing here turned
+    ``tests/test_hooks/test_file_context_hook.py`` from 5 passed into 5 ERRORS,
+    in a file that has nothing to do with this hook. ``SystemExit`` does not
+    inherit from ``Exception``, so no plausible ``except`` around the import
+    would have contained it either.
+
+    Looking the module up instead is not a weaker version of the same thing: a
+    test module that needs the writer has already imported it AT COLLECTION,
+    which happens before any fixture runs, so the lookup finds it whenever it
+    matters. When it is absent there is no writer to reset and nothing to warn
+    about — the previous revision warned on that path, which was noise for every
+    test in this directory that legitimately never touches the hook.
+    """
+    pmh = sys.modules.get("proactive_memory_hook")
+    if pmh is None:
+        yield
+        return
+    pmh._OUT = None
+    yield
+    pmh._OUT = None
 
 
 @pytest.fixture(autouse=True)

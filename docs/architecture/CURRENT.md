@@ -344,6 +344,31 @@ modules: [cc]
 verified: d0627c854 2026-09-11
 ```
 
+- **The slot door heals a bare slot — by CONSENT, never silently**
+  (`scripts/cc-slot.sh`, the block above every latch; probe:
+  `cc/slot_liveness.py`, a /proc walk for a live claude under any pane pid —
+  never `#{pane_current_command}`, which reports `bash` for the canonical
+  launch WHILE claude runs). A slot existing as a bare shell made
+  `new-session -A` silently attach and discard the launch command — the
+  operator landed at a prompt, every time, for weeks. The door now probes,
+  DISCLOSES what it found (a no-tty entry gets the report and the manual
+  route, nothing more), and on an explicit `[y/N]`-default-no at a real
+  terminal kills the session BY ID so the untouched create path rebuilds it.
+  Safety is three MEASURED tmux-3.4 properties: within one server, session
+  ids are never reused (kill-by-id is a compare-and-swap; a stale id is a
+  refused no-op); across server GENERATIONS the id counter RESTARTS at $0 —
+  measured by falsifying the naive design — which is why the server-PID
+  compare is load-bearing; and one `list-panes -s` call is one consistent
+  state, so the human wait sits between two snapshots, never between a read
+  and the kill. Consent binds to the DISCLOSED state: server pid, session id,
+  the attachment+pane-command projection, and a fresh POISONED verdict must
+  all re-derive identically after the yes, or the door stands down and `-A`
+  absorbs the interleaving. Every failure direction lands on ATTACH. The
+  block sits ABOVE `existing`/`_SESSION_EXISTS`/the capacity and OAuth gates
+  so each reads post-kill reality on its only read — the staleness class that
+  took the predecessor design through 7 review rounds is retired by
+  construction. Forbidden mechanisms are test-pinned (no send-keys /
+  respawn-pane / set-environment; exactly one new-session invocation).
 - **Roster peer availability is OBSERVATION, never a gate** (`cc/peer_availability.py`,
   recorded from the failover loop in `cc/conversation.py`). `roster.failover_chain`
   admits a peer on CREDENTIAL PRESENCE — "is `auth_env` set" — so a quota-blocked
@@ -673,10 +698,19 @@ Every autonomous action on the outside world funnels through deterministic
 in-code gates. Owner-facing delivery (Telegram/voice/email-to-owner) is NEVER
 gated — that contract is one-directional.
 
+**"Never gated" is about APPROVAL, not about timing.** Owner-facing delivery is
+never held for permission, but `outreach/governance.py` can still DELAY it: the
+quiet-hours window deferred every non-`ALERT`/`BLOCKER` category, which held an
+explicitly-scheduled 01:30 reminder until 07:00. Quiet hours now ship DISABLED
+(a zero-width `00:00`/`00:00` window in `config/outreach.yaml`; `_in_quiet_hours`
+treats `start == end` as off, matching `ego/cadence.py`), so nothing delays an
+owner-facing send by default. The salience thresholds and the shared daily cap
+are the other timing/volume controls on that path.
+
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: 5808e7cd 2026-09-03
+verified: d6edbcc6 2026-09-11
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
@@ -929,14 +963,30 @@ verified: d0627c854 2026-09-11
   (`knowledge_ingest_source` MCP) requires explicit user confirmation —
   contrast the intake bypass in entry 4.
 - **inbox/**: file-drop monitor with approval-gated dispatch; phase order
-  resume → detect → create → dispatch; `approval_key_stable=True` (ONE
+  recover pending → resume approval → detect → create → dispatch;
+  `approval_key_stable=True` (ONE
   site-level approval key). The refresh path folds parked files into the
   batch so approvals fire once (#914). A pending approval is HELD until the
   user resolves it (no re-ask, no age-based cancel) and is auto-cancelled only
   when *orphaned* — no live inbox row (`awaiting_approval:`/`dispatching:`)
   still references it (`count_live_rows_for_approval`); this replaced the old
-  4h staleness cancel that re-detected unchanged files and nagged. Coherence +
-  URL-failure heuristics gate dispatch.
+  4h staleness cancel that re-detected unchanged files and nagged. Three checks
+  sit between a response and the baseline: a coherence check (annotates, never
+  blocks), a give-up-LANGUAGE URL-failure check, and a URL-COVERAGE check
+  requiring every scanner-recognized input URL's parsed identity to appear in
+  the response — that last one catches SILENT omission, which the language
+  check cannot see by construction. Scheme and host case plus one leading
+  `www.` are presentation variants; authority, path, query, and fragment
+  identity remain exact. Coverage
+  ships in SHADOW (`url_coverage_mode`, `config/inbox_monitor.yaml`): it computes
+  its verdict and logs only stable opaque URL ids, acting on nothing until
+  compliance under the `**Source:**` prompt has been measured. Follow-up and
+  build-lane durable writes finish before the completed baseline commits, so a
+  cancellation cannot permanently hide their absence. On restart every
+  pre-dispatch `pending` row is atomically returned to the bounded retry lane;
+  complete outstanding work is re-derived from the current source and completed
+  baseline, so a crash during multi-row creation cannot silently lose the
+  never-created tail or leave pending rows suppressing the file forever.
 - **recon/**: scheduled intelligence jobs (release watch, model intelligence
   Sun 8am, models.md synthesis Sun 10am, GitHub discovery, skill-security scan
   via external NVIDIA SkillSpector). Emits findings for triage
@@ -1101,7 +1151,13 @@ verified: d0627c854 2026-09-11
   live runtime (stale-but-functional).
 - **hosting/**: the OUTER layer that calls the runtime. `standalone.py` is the
   default (`python -m genesis serve`; also hosts the OpenClaw
-  `/v1/chat/completions` endpoint); Agent Zero adapter optional.
+  `/v1/chat/completions` endpoint, and registers the desk brain at
+  `/v1/desk/chat/completions` — `dashboard/routes/desk_api.py`, an
+  OpenAI-compatible surface that routes each turn through `ModelRouter` on two
+  lanes rather than spawning a CC subprocess, so a desktop client holds no model
+  credential. Bearer-authed with `GENESIS_MCP_HTTP_TOKEN`; text-only, and an
+  empty completion is a 502 rather than a blank turn); Agent Zero adapter
+  optional.
 - **browser/**: profile/state layer only (persistent
   `~/.genesis/browser-profile`, `BrowserLayer` enum, pgrep patterns as the
   single source of process detection). The automation TOOLS live in
@@ -1258,11 +1314,36 @@ verified: 84c7259d 2026-08-31
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
-  systemd timer; `check.py` runs 5 parallel probes → 6-state machine → act;
+  systemd timer; `check.py` runs 6 parallel probes → 6-state machine → act;
   Proxmox disk/RAM provisioning verbs) and container side (`watchdog.py`
   monitors the host Guardian every awareness tick, incl. git-SHA code-drift
   detection). Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
+- **guard-layer watch** (`guardian/guard_layer_watch.py`, a SIDE-watch in
+  `run_check`, not a `probe_*`): asks whether the AGENT TOOLING can still
+  evaluate — the `genesis-hook` LAUNCHER end to end, the container venv
+  interpreter, `hook_input` / `shell_parse` importability, container `node`, and
+  the host's own `cc.path` binary (probed as the CONSUMER `diagnosis.py` launches,
+  not as `node --version`, so a PATH failure is a true positive rather than a
+  false one). Host-side by necessity: a broken guard layer bricks CC sessions, and
+  the container-side Sentinel is itself a CC call site, so it would dispatch into
+  the same broken tooling (`sentinel/remediation_map.py` `UNMAPPED_BY_DESIGN`
+  encodes that reasoning independently). Deliberately NOT a `probe_*`:
+  `SignalResult` carries no severity, so every probe feeds the confirmation ladder
+  into `RecoveryEngine.execute` — a broken hook file must never be able to trigger
+  `RESTART_CONTAINER`. Two polarities motivate it: an unimportable `hook_input`
+  fails CLOSED (Bash refused, loud), while a dead launcher or venv makes
+  `genesis-hook` exit non-2, which Claude Code treats as non-blocking, so every
+  guard is silently OFF while Bash keeps working — the quiet one nothing else
+  reports. **ALERT-ONLY, by decision rather than omission.** A draft carried one
+  automatic repair verb; an adversarial audit REPRODUCED two ways it destroyed
+  work (`git checkout HEAD -- <file>` overwrites the index, losing staged content
+  recoverable only via `git fsck`; mid-merge it clears the conflict stages and
+  silently resolves to ours while `MERGE_HEAD` remains) and showed its dirty/clean
+  signal failed OPEN, since `git diff --quiet` is tri-state and both error codes
+  read as the value that authorised the write. Detection shipped alone; the repair
+  verb is tracked separately. A test asserts the module defines no repair function
+  and no executed payload carries a mutating git verb.
 - **autonomy zombie-scheduler watchdog** (`autonomy/watchdog.py`, run out-of-process
   by `genesis-watchdog.timer` every 300s via `watchdog_runner.py`; distinct from the
   container `watchdog.py` above): reads `~/.genesis/status.json` (written by the runtime's
@@ -1933,7 +2014,15 @@ verified: 788dd9a9 2026-09-06
   comes from ONE read of it, so two sections of a board cannot disagree about
   the same population (`follow_ups.get_lane_counts` returns per-status
   actionable counts and the deferred remainder together; the remainder is a
-  COMPLEMENT, so a `kind` added later is absorbed rather than dropped). Both accounting surfaces
+  COMPLEMENT, so a `kind` added later is absorbed rather than dropped). The same
+  withholding rule reaches one axis further out, into the TAB's own TRANSPORT:
+  when a refresh starts failing after a board has loaded, the header badge drops
+  its number for a named warning rather than presenting the last board as
+  current, and it names every fault that holds at once instead of ranking them,
+  so fixing one does not hide the next. The predicate is the outstanding FAULT —
+  the last completed attempt failed and a board had loaded before it — never the
+  transport's current phase, which returns to "refreshing" for the duration of
+  every retry. Both accounting surfaces
   (`GET /api/genesis/zero-drop` + the Zero-Drop tab, and the morning report's
   Ground-Truth line) call that one assembler so they cannot disagree; the
   morning-report line is COUNTS ONLY, never a branch name, because that
@@ -2225,7 +2314,22 @@ verified: ee9ebf85c 2026-09-05
 
 - **routing/**: `config/model_routing.yaml` defines 61 numbered call sites,
   each a free-first → paid-last chain; `never_pays` sites are filtered to
-  free-only. Per-provider circuit breaker (3 failures, exponential backoff
+  free-only. **Daily free-tier budgets** (`daily_budget.py`,
+  `DailyBudgetLedger`): providers may carry `rpd_limit` / `tpd_limit`, each in
+  the provider's OWN unit and never converted between them. As SHIPPED today:
+  Groq carries both (`rpd_limit: 1000`, `tpd_limit: 200000`, the latter read
+  off Groq's own 429 text), and Gemini carries NEITHER — a daily cap for it is
+  inferred from a live 429 but not measured, and a wrong shipped cap would
+  deselect the provider on every install. When spent, the chain walk DESELECTS
+  the provider until the next
+  UTC day — no breaker trip (budget is not a health signal), one WARNING
+  `provider.budget_exhausted` event at the crossing, counters visible in the
+  routing config route (`daily_budget` map). Counters are router-observed and
+  undercount-biased by design (429s/timeouts never counted; the provider's own
+  429s backstop any undercount, while an overcount would deselect with no
+  correcting signal); state persists to `~/.genesis/routing_budget_state.json`,
+  server-only writer (WS-3c, like the breaker file), kill switch
+  `GENESIS_DAILY_BUDGET_DISABLED`. Per-provider circuit breaker (3 failures, exponential backoff
   capped 30 min — 4h for QUOTA_EXHAUSTED and NOT_ENTITLED; 429 = backpressure,
   NOT a breaker failure; state persisted cross-process to
   `~/.genesis/circuit_breaker_state.json`). **Probe/call evidence symmetry** —

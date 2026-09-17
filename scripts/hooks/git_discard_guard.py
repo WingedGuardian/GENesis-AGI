@@ -122,12 +122,76 @@ try:
 except Exception:  # noqa: BLE001 — logging must never disarm the clean block.
     audit_jsonl = None
 
-from hook_input import field, read_payload  # noqa: E402
-from shell_parse import (  # noqa: E402
-    analyze_checked,
-    git_subcommand_index,
-    has_trailing_override,
-)
+try:
+    from hook_input import degraded_exit, field, read_payload  # noqa: E402
+except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must block.
+    if __name__ != "__main__":
+        raise
+    # Reverse version skew: this guard may be newer than hook_input.py. Nothing
+    # imported from that older helper can recover us, so fail closed locally. Do
+    # not render the exception — even __str__ can raise — and use os._exit so a
+    # broken diagnostic stream cannot replace exit 2 during interpreter shutdown.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (git_discard_guard): shared hook_input is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
+
+# Gated-operation pattern for the DEGRADED path, defined ABOVE the guarded import so it
+# survives that import failing. Scoped to this guard's BLOCK cases only — `git clean`
+# and the submodule-recursive forms. The snapshot verbs (checkout/restore/switch) are
+# advisory here and exit 0, so a degraded run has nothing to protect there and must not
+# start blocking work it never blocked.
+#
+# SINGLE-TOKEN ALTERNATION, matching every other degraded matcher in this repo
+# (``protected_paths_guard._RM_PATTERN``, ``review_enforcement_commit._COMMIT_PATTERN``,
+# ``git_push_guard._GATED_MENTION``). It deliberately does NOT require the word `git` to
+# sit near `clean`. An ADJACENCY form can be starved: put between the two words anything
+# the pattern will not cross and it matches nothing, while the degraded path — which by
+# definition has no parser — cannot tell that the two words are still one command. #1861
+# measured exactly this on the repo's other blind-spot net and stated the general rule:
+# every narrowing conjunct was measured to starve the trigger. A single token has nothing
+# to narrow, so there is nothing to starve. MEASURED here before the change.
+#
+# The cost is real and intended: `make clean`, `npm run clean` and the bare word "clean"
+# in a quoted string all over-block — but ONLY while the hook tree is broken, where a
+# loud overridable refusal is the direction this whole path exists to take. Normalising
+# the text before matching was considered and REJECTED: normalisation ahead of a
+# blind-spot check is a pattern this repo has been bitten by before, and it would leave
+# an adjacency construct whose behaviour could be argued but not proven.
+_DEGRADED_GATED = r"\bclean\b|--recurse-submodules|submodule\.recurse"
+
+try:
+    from shell_parse import (  # noqa: E402
+        analyze_checked,
+        git_subcommand_index,
+        has_trailing_override,
+    )
+except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
+    if __name__ != "__main__":
+        raise
+    # `discard-override` is NOT honoured on this path — see degraded_exit, which used
+    # to accept a sigil as a bare substring and was MEASURED allowing an unrecoverable
+    # `git clean` because a later segment named a file whose name contained the word.
+    degraded_exit(
+        "git_discard_guard",
+        gated=_DEGRADED_GATED,
+        # This guard is not only a gate, and the allow path has to say so: its main
+        # job is the recovery SNAPSHOT taken before a discarding verb. MEASURED on a
+        # poisoned tree, `git checkout -- .` exits 0 here and no snapshot is written,
+        # so uncommitted work goes unrecoverably — under a notice that otherwise
+        # mentions only gates.
+        also_lost=(
+            "NOTE this guard also takes the worktree RECOVERY SNAPSHOT before a "
+            "discarding verb (checkout/restore/switch/reset), and it did not take one "
+            "— a discard run now is not recoverable from it."
+        ),
+        exc=_exc,
+    )
 
 try:  # noqa: E402
     import discarded_write
