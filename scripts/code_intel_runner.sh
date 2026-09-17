@@ -256,10 +256,11 @@ for line in "${_MARKERS[@]}"; do
                 _finish_outcome "$hash" restore "$claim_id" >/dev/null || exit 76
             elif [ "$run_mode" = "full" ]; then
                 _finish_outcome "$hash" consume_full "$claim_id" >/dev/null || exit 76
+                _log "cbm indexed; gitnexus leg did not complete (rc=4) — consumed cbm (full stamp), requeued gitnexus: $repo"
             else
                 _finish_outcome "$hash" consume "$claim_id" >/dev/null || exit 76
+                _log "cbm indexed; gitnexus leg did not complete (rc=4) — consumed cbm, requeued gitnexus: $repo"
             fi
-            _log "cbm indexed; gitnexus leg did not complete (rc=4) — consumed cbm, requeued gitnexus: $repo"
             ;;
         5)
             # gitnexus leg completed; the cbm leg did not (missing, kill-switch-
@@ -275,8 +276,8 @@ for line in "${_MARKERS[@]}"; do
                 _finish_outcome "$hash" restore "$claim_id" >/dev/null || exit 76
             else
                 _finish_outcome "$hash" consume "$claim_id" >/dev/null || exit 76
+                _log "gitnexus indexed; cbm leg did not complete (rc=5) — consumed gitnexus, requeued cbm, no full stamp: $repo"
             fi
-            _log "gitnexus indexed; cbm leg did not complete (rc=5) — consumed gitnexus, requeued cbm, no full stamp: $repo"
             ;;
         *)
             if [ "$run_mode" = "full" ] && [ "$mode" != "full" ]; then
