@@ -68,12 +68,57 @@ def failure_details(
     if exc is not None:
         return {
             "error_type": type(exc).__name__,
-            "error": str(exc)[:_MAX_ERROR_CHARS],
-            "error_frames": normalized_frames(exc),
+            "error": _safe_text(exc),
+            "error_frames": _safe_frames(exc),
         }
+    # `reason` is a str by contract at every call site, so its truthiness is
+    # str.__bool__ — a C slot that cannot be overridden and cannot raise. A
+    # round of this PR widened the annotation to `object` and then spent two
+    # more rounds containing the hazard that widening invented; both call sites
+    # pass `str | None` and already evaluate `bool(error)` themselves one line
+    # earlier, so the containment guarded a gate the caller had walked through.
+    # Reverted rather than hardened further. Widening belongs at the CALLERS'
+    # signatures if it is ever wanted, not at this leaf.
     if reason:
-        return {"error_reason": str(reason)[:_MAX_ERROR_CHARS]}
+        return {"error_reason": _safe_text(reason)}
     return {}
+
+
+def _safe_text(value: object) -> str:
+    """``str(value)``, capped, that cannot raise into a failure path.
+
+    This module's contract is that a missing payload DEGRADES an event and
+    never breaks it — but rendering is the one step here that runs arbitrary
+    user code: ``str(exc)`` calls the exception's own ``__str__``, and an
+    exception whose ``__str__`` itself raises would propagate out of the very
+    helper built to contain it. Every caller is on a failure path where that
+    escape costs more than the text: in ``surplus/dispatch.py`` it would skip
+    the task's own ``return False``, its autonomy correction and its
+    observation, converting one task failure into a dispatch-loop failure and
+    losing the reflex signal for the original exception (Codex P2, #1941).
+    """
+    try:
+        return str(value)[:_MAX_ERROR_CHARS]
+    except Exception:  # noqa: BLE001 - a diagnostic must never raise into a failure path
+        # behavioral-lint: ignore no-hide-problems — the TYPE still ships in
+        # error_type, which is the field the reflex arc keys on; only the
+        # unrenderable message is lost, and it is named as unrenderable.
+        return "<unrenderable>"
+
+
+def _safe_frames(exc: BaseException) -> list[str]:
+    """``normalized_frames(exc)`` that cannot raise into a failure path.
+
+    Same contract as :func:`_safe_text`. Traceback walking touches frame
+    objects whose ``repr`` can also be user code, so the fingerprint basis is
+    worth protecting rather than assuming.
+    """
+    try:
+        return normalized_frames(exc)
+    except Exception:  # noqa: BLE001 - see _safe_text
+        # behavioral-lint: ignore no-hide-problems — an empty frame list is a
+        # WEAKER fingerprint, never a wrong one; the alternative is no event.
+        return []
 
 
 def error_summary(exc: BaseException | None, fallback: str | None = None) -> str | None:
@@ -84,5 +129,8 @@ def error_summary(exc: BaseException | None, fallback: str | None = None) -> str
     there is no exception.
     """
     if exc is not None:
-        return f"{type(exc).__name__}: {exc}"[:_MAX_ERROR_CHARS]
+        # Same fail-safe rendering as failure_details: this is written to
+        # job_health.last_error on a failure path, and a raising __str__ here
+        # would escape into the caller's own error handler.
+        return f"{type(exc).__name__}: {_safe_text(exc)}"[:_MAX_ERROR_CHARS]
     return fallback[:_MAX_ERROR_CHARS] if fallback else fallback

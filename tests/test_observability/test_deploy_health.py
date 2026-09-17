@@ -11,6 +11,7 @@ shells out to git, so a fake would test nothing.
 
 from __future__ import annotations
 
+import importlib
 import json
 import subprocess
 from datetime import UTC, datetime, timedelta
@@ -28,6 +29,7 @@ from genesis.observability.snapshots.deploy_health import (
     collect_tier2_pending,
     derive_findings,
     last_success_update,
+    resolve_commit,
 )
 
 
@@ -320,3 +322,233 @@ def test_stale_update_requires_both_axes():
     assert derive_findings(**common, commits_behind=5, update_age_days=30.0) == []
     # Unknown age (no update_history yet): never fabricates staleness.
     assert derive_findings(**common, commits_behind=25, update_age_days=None) == []
+
+
+# ── resolve_commit: the short-SHA adapter, with one home ─────────────
+#
+# update_history.new_commit and the guardian state file both store ABBREVIATED
+# commit names. Three places in this repo expanded them independently; two of
+# them are now routed here. Every test drives a real throwaway repo, because
+# the defects being pinned are git's behaviour, not ours, and a fake would
+# return whatever the test author already believed.
+
+
+@pytest.fixture
+def linear_repo(tmp_path):
+    """Three commits on a line. Returns (path, first, middle, tip)."""
+    r = tmp_path / "linear"
+    r.mkdir()
+    _git(r, "init", "-q", "-b", "main")
+    shas = []
+    for name in ("first", "middle", "tip"):
+        (r / f"{name}.txt").write_text(name)
+        _git(r, "add", f"{name}.txt")
+        _git(r, "commit", "-qm", name)
+        shas.append(_git(r, "rev-parse", "HEAD"))
+    return r, shas[0], shas[1], shas[2]
+
+
+def test_resolve_expands_an_abbreviation(linear_repo):
+    repo, _first, middle, _tip = linear_repo
+    resolved, reason = resolve_commit(repo, middle[:8])
+    assert resolved == middle, reason
+
+
+def test_resolve_ignores_a_branch_that_shadows_the_abbreviation(linear_repo):
+    """MEASURED on git 2.43.0, and the reason this is not a bare rev-parse.
+
+    With a branch named after an 8-hex prefix of a DIFFERENT commit,
+    `rev-parse --verify --quiet '<prefix>^{commit}'` returns the BRANCH's
+    commit at exit 0 with EMPTY stderr — a confident, silently wrong SHA.
+    `--disambiguate` reads only the object store, so no ref can shadow it.
+    """
+    repo, first, _middle, tip = linear_repo
+    short = first[:8]
+    _git(repo, "branch", short, tip)
+    # Guard-the-guard: the shadowing ref must really exist, or this passes for
+    # the ordinary reason and proves nothing about the ref namespace.
+    assert _git(repo, "rev-parse", f"refs/heads/{short}") == tip
+
+    resolved, reason = resolve_commit(repo, short)
+    assert resolved == first, f"a refname shadowed the object name: {reason}"
+    assert resolved != tip
+
+
+def test_resolve_ignores_a_tag_that_shadows_the_abbreviation(linear_repo):
+    """A tag shadows exactly as a branch does — same namespace lookup."""
+    repo, first, _middle, tip = linear_repo
+    short = first[:8]
+    _git(repo, "tag", short, tip)
+    assert _git(repo, "rev-parse", f"refs/tags/{short}") == tip
+
+    resolved, reason = resolve_commit(repo, short)
+    assert resolved == first, f"a tag shadowed the object name: {reason}"
+
+
+def test_resolve_refuses_an_ambiguous_prefix(tmp_path):
+    """Two objects, one prefix. Picking either would hand an ancestry check a
+    coin flip as if it were a fact.
+
+    This mechanism survived a mutation sweep (`if len(names) > 1` -> `if False`)
+    because nothing constructed the collision.
+    """
+    r = tmp_path / "collide"
+    r.mkdir()
+    _git(r, "init", "-q", "-b", "main")
+    seen: dict[str, str] = {}
+    prefix = None
+    # Hash blobs until two share a 4-hex prefix. Birthday bound on 16**4 makes
+    # this a few hundred iterations; the loop is capped so a failure is a
+    # readable skip rather than a hang.
+    for i in range(20000):
+        sha = subprocess.run(
+            ["git", "-C", str(r), "hash-object", "-w", "--stdin"],
+            input=f"blob-{i}\n",
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        head4 = sha[:4]
+        if head4 in seen and seen[head4] != sha:
+            prefix = head4
+            break
+        seen[head4] = sha
+    assert prefix, "could not construct a 4-hex collision"
+
+    resolved, reason = resolve_commit(r, prefix)
+    assert resolved is None
+    assert "ambiguous" in reason
+
+
+def test_resolve_accepts_gits_real_minimum_abbreviation(linear_repo):
+    """The floor is 4, not the 8 this install happens to store.
+
+    MEASURED on git 2.43.0: `core.abbrev=4` emits a 4-hex name and
+    `core.abbrev=3` errors. An install configured that way would have every
+    stored commit refused by a higher floor — the same permanent-unanswerable
+    this resolver exists to prevent. Survived a `{4,40}` -> `{8,40}` mutation
+    until this test existed.
+    """
+    repo, _first, _middle, tip = linear_repo
+    resolved, reason = resolve_commit(repo, tip[:4])
+    assert resolved == tip, reason
+
+
+def test_resolve_refuses_an_option_shaped_name(linear_repo):
+    """A stored value is still an argv input, and a ref name is not a commit
+    name — `HEAD` and `main` are refused by shape, before git sees them."""
+    repo, _first, _middle, _tip = linear_repo
+    for hostile in ("--upload-pack=x", "-c core.pager=x", "--help", "", "HEAD", "main", "ABCDEF12"):
+        resolved, reason = resolve_commit(repo, hostile)
+        assert resolved is None, f"{hostile!r} should not resolve"
+        assert "not a commit name" in reason
+
+
+def test_resolve_refuses_a_non_string(linear_repo):
+    repo, _first, _middle, _tip = linear_repo
+    resolved, reason = resolve_commit(repo, None)
+    assert resolved is None and "not a commit name" in reason
+
+
+def test_resolve_refuses_a_blob_whose_name_is_hex(linear_repo):
+    """`--disambiguate` returns blobs and trees too, so "resolved" must not be
+    allowed to mean merely "exists"."""
+    repo, _first, _middle, _tip = linear_repo
+    blob = subprocess.run(
+        ["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+        input="not a commit\n",
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert _git(repo, "cat-file", "-t", blob) == "blob", "fixture did not make a blob"
+
+    resolved, reason = resolve_commit(repo, blob)
+    assert resolved is None
+    assert "not a commit" in reason
+
+
+def test_resolve_reports_an_absent_commit(linear_repo):
+    """`--disambiguate` reports an absent object as rc=0 with EMPTY output, not
+    a non-zero rc — so the emptiness check is what catches this, not the rc."""
+    repo, _first, _middle, _tip = linear_repo
+    resolved, reason = resolve_commit(repo, "0" * 40)
+    assert resolved is None
+    assert "no object in this clone" in reason
+
+
+def test_a_git_failure_is_reported_as_unchecked_not_as_absent(linear_repo, monkeypatch):
+    """ "I could not look" and "it is not here" have different remedies.
+
+    _run_git returns rc=-1 on timeout and -2 on exec failure. Folding those
+    into the absent branch would tell an operator to fetch a commit that is
+    sitting right there.
+    """
+    # importlib, not a plain import: snapshots/__init__.py re-exports the
+    # `deploy_health` FUNCTION under the same name as its module, so
+    # `import ...snapshots.deploy_health as dh` binds the function and
+    # monkeypatch then fails on a missing attribute.
+    dh = importlib.import_module("genesis.observability.snapshots.deploy_health")
+
+    repo, _first, _middle, tip = linear_repo
+    for rc, word in ((-1, "timed out"), (-2, "failed")):
+        monkeypatch.setattr(dh, "_run_git", lambda *a, _rc=rc, **k: (_rc, "", ""))
+        resolved, reason = dh.resolve_commit(repo, tip[:8])
+        assert resolved is None
+        assert word in reason, reason
+        assert "no object in this clone" not in reason
+
+
+def test_a_non_sha_from_disambiguate_is_refused(linear_repo, monkeypatch):
+    """Guard on the value git hands back, not just on what we sent it.
+
+    Survived a mutation (`if not _FULL_SHA.match(resolved)` -> `if False`)
+    because nothing fed the resolver a malformed success.
+    """
+    # importlib, not a plain import: snapshots/__init__.py re-exports the
+    # `deploy_health` FUNCTION under the same name as its module, so
+    # `import ...snapshots.deploy_health as dh` binds the function and
+    # monkeypatch then fails on a missing attribute.
+    dh = importlib.import_module("genesis.observability.snapshots.deploy_health")
+
+    repo, _first, _middle, tip = linear_repo
+    monkeypatch.setattr(dh, "_run_git", lambda *a, **k: (0, "not-a-sha\n", ""))
+    resolved, reason = dh.resolve_commit(repo, tip[:8])
+    assert resolved is None
+    assert "not a SHA" in reason
+
+
+# ── the call sites routed onto it ────────────────────────────────────
+
+
+def test_tier2_pending_still_works_through_the_shared_resolver(linear_repo):
+    repo, first, _middle, _tip = linear_repo
+    (repo / "pyproject.toml").write_text("[tool]\n")
+    _git(repo, "add", "pyproject.toml")
+    _git(repo, "commit", "-qm", "tier2 change")
+    assert collect_tier2_pending(repo, first[:8]) == ["pyproject.toml"]
+    assert collect_tier2_pending(repo, None) is None
+    assert collect_tier2_pending(repo, "0" * 8) is None
+
+
+def test_tier2_pending_is_not_fooled_by_a_shadowing_branch(linear_repo):
+    """The behavioural payoff of the refactor: before it, a branch named after
+    the stored abbreviation silently changed which range was diffed."""
+    repo, first, _middle, _tip = linear_repo
+    (repo / "pyproject.toml").write_text("[tool]\n")
+    _git(repo, "add", "pyproject.toml")
+    _git(repo, "commit", "-qm", "tier2 change")
+    head = _git(repo, "rev-parse", "HEAD")
+    # The shadowing branch must point at HEAD, not at an earlier commit. An
+    # earlier one still has the tier-2 change in its `..HEAD` range, so both the
+    # correct and the shadowed path return it and the test binds NOTHING — which
+    # is exactly what a mutation sweep caught it doing.
+    _git(repo, "branch", first[:8], head)
+    # Guard-the-guard: the ref must really shadow, and the two ranges must
+    # really disagree.
+    assert _git(repo, "rev-parse", f"refs/heads/{first[:8]}") == head
+    assert collect_tier2_pending(repo, head) == []
+
+    # Resolved against the object store, `first..HEAD` carries the change.
+    # Resolved as a refname it becomes `HEAD..HEAD`, which is empty.
+    assert collect_tier2_pending(repo, first[:8]) == ["pyproject.toml"]

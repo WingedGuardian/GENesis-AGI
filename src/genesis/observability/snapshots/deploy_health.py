@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -239,6 +240,77 @@ def collect_stale_units(
         return None
 
 
+
+#: A commit name as ``scripts/update.sh`` writes it into
+#: ``update_history.new_commit`` — ``git rev-parse --short``, i.e. ABBREVIATED
+#: (8-9 hex on every row of this install, MEASURED 2026-09-16 across 91 rows).
+#: The floor is 4 because that is git's own minimum: MEASURED on git 2.43.0,
+#: ``core.abbrev=4`` prints a 4-hex name while ``core.abbrev=3`` errors with
+#: "abbrev length out of range". Do not raise it to the length this install
+#: happens to use — an install with a lower ``core.abbrev`` would then have
+#: every stored commit refused.
+_ABBREV_SHA = re.compile(r"^[0-9a-f]{4,40}$")
+_FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+
+
+def resolve_commit(repo: Path, name: str | None) -> tuple[str | None, str]:
+    """Expand a stored (abbreviated) commit name to its full 40-hex SHA.
+
+    Returns ``(sha, reason)``; ``sha`` is None when the name does not name a
+    commit in this clone, and ``reason`` always says why.
+
+    **Resolved against the OBJECT STORE only, never the ref namespace**, and
+    that is the whole reason this is not a one-line ``rev-parse --verify``.
+    MEASURED on git 2.43.0: with a branch named after an 8-hex prefix of a
+    DIFFERENT commit, ``git rev-parse --verify --quiet '<prefix>^{commit}'``
+    returns the BRANCH's commit, exit 0, **stderr empty** — the refname wins
+    over the object name and ``--quiet`` suppresses the ambiguity warning
+    entirely, so a caller gets a confident, silently wrong SHA. A tag shadows
+    it the same way. ``--disambiguate`` consults only the object store, so no
+    ref can reach it, and it LISTS every match, making a genuinely ambiguous
+    prefix an error rather than a silent pick.
+
+    ``cat-file -t`` is load-bearing rather than belt-and-braces:
+    ``--disambiguate`` happily returns blobs and trees, and a 40-hex name can
+    be either, so "resolved" must not be allowed to mean merely "exists".
+
+    Note ``--disambiguate`` reports an absent object as rc=0 with EMPTY output
+    rather than a non-zero rc — the ``not names`` half of the check below is
+    what catches that, not the ``rc != 0`` half.
+
+    The name is shape-validated before it reaches argv even though it comes
+    from our own database or state files — a value like ``--upload-pack=…``
+    arriving at a subprocess is a different class of problem than a wrong
+    verdict.
+    """
+    if not isinstance(name, str) or not _ABBREV_SHA.match(name.strip()):
+        return None, f"not a commit name: {name!r}"
+    candidate = name.strip()
+    rc, out, err = _run_git(
+        repo, "rev-parse", f"--disambiguate={candidate}", timeout=_CHEAP_TIMEOUT_S
+    )
+    if rc in (-1, -2):
+        # _run_git's own sentinels: -1 timeout, -2 exec failure. "I could not
+        # check" and "it is not here" have different remedies, so they must not
+        # share a message.
+        return None, f"could not check {candidate} (git {'timed out' if rc == -1 else 'failed'})"
+    names = [line.strip() for line in out.splitlines() if line.strip()]
+    if rc != 0 or not names:
+        return (
+            None,
+            f"{candidate} names no object in this clone ({err.strip()[:200] or f'rc={rc}'})",
+        )
+    if len(names) > 1:
+        return None, f"{candidate} is ambiguous — it matches {len(names)} objects"
+    resolved = names[0]
+    if not _FULL_SHA.match(resolved):
+        return None, f"{candidate} resolved to something that is not a SHA: {resolved!r}"
+    rc, kind, _ = _run_git(repo, "cat-file", "-t", resolved, timeout=_CHEAP_TIMEOUT_S)
+    if rc != 0 or kind.strip() != "commit":
+        return None, f"{candidate} names a {kind.strip() or 'missing'} object, not a commit"
+    return resolved, f"{candidate} resolved to {resolved}"
+
+
 def collect_tier2_pending(repo: Path, since_commit: str | None) -> list[str] | None:
     """Tier-2 files changed since the last successful update.sh commit.
 
@@ -247,17 +319,19 @@ def collect_tier2_pending(repo: Path, since_commit: str | None) -> list[str] | N
     or its commit no longer resolves after a rebase/gc)."""
     if not since_commit:
         return None
+    # Through the shared resolver: this was one of three copies of the same
+    # short-SHA adapter (the third is scripts/update.sh, in shell). One home
+    # means the shadowing-ref defect documented above is fixed everywhere at
+    # once rather than in whichever copy someone happens to open.
+    resolved, _ = resolve_commit(repo, since_commit)
+    if resolved is None:
+        return None
     try:
-        rc, _, _ = _run_git(
-            repo, "cat-file", "-e", f"{since_commit}^{{commit}}", timeout=_CHEAP_TIMEOUT_S
-        )
-        if rc != 0:
-            return None
         rc, out, _ = _run_git(
             repo,
             "diff",
             "--name-only",
-            f"{since_commit}..HEAD",
+            f"{resolved}..HEAD",
             "--",
             *TIER2_PATHS,
             timeout=_CHEAP_TIMEOUT_S,
@@ -303,17 +377,19 @@ def collect_host_gateway(repo: Path, state_path: Path, now: datetime | None = No
         if not deployed or deployed == "unknown":
             out["status"] = "unknown_commit"
             return out
-        rc, _, _ = _run_git(
-            repo, "cat-file", "-e", f"{deployed}^{{commit}}", timeout=_CHEAP_TIMEOUT_S
-        )
-        if rc != 0:
+        # Through the shared resolver, and it matters most HERE: `deployed` is
+        # read from a state file the guardian writes, so it is the least trusted
+        # of the adapter's inputs. resolve_commit shape-checks it before it
+        # reaches argv as well as refusing a shadowing refname.
+        resolved_deployed, _ = resolve_commit(repo, deployed)
+        if resolved_deployed is None:
             out["status"] = "unknown_commit"
             return out
         rc, diff_out, _ = _run_git(
             repo,
             "diff",
             "--name-only",
-            f"{deployed}..HEAD",
+            f"{resolved_deployed}..HEAD",
             "--",
             *GUARDIAN_HOST_PATHS,
             timeout=_CHEAP_TIMEOUT_S,

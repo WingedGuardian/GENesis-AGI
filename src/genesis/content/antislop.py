@@ -8,9 +8,13 @@ repo, and adds *fix* logic. Two entry points:
 - :func:`detect` — report AI-tell findings without mutating. Code regions
   (fenced blocks + inline code) are excluded so technical text is not
   false-flagged.
-- :func:`scrub` — auto-FIX the one safe, unambiguous, fully-mechanical tell: a
-  *spaced em dash* (``word — word``, the #1 AI punctuation tell) rewritten to a
-  bare em dash (``word—word``). Everything else — banned words/phrases, cadence,
+- :func:`scrub` — auto-FIX the one safe, unambiguous, fully-mechanical tell:
+  an *em dash*, spaced (``word — word``, the #1 AI punctuation tell) or bare
+  (``word—word``), rewritten to the prescribed published form, two hyphens
+  closed up (``word--word``; owner ruling 2026-09-16 — published prose never
+  uses an em dash, which reads typeset rather than typed; conversational
+  surfaces keep their em dash and are not scrubbed). Everything else — banned
+  words/phrases, cadence,
   and the *ambiguous* dashes (en dash, spaced ``--``, which also occur in number
   ranges, tables, and CLI flags) — is FLAGGED, never rewritten. Removing a word
   or guessing at an ambiguous dash would mangle meaning; real fixing needs
@@ -32,11 +36,15 @@ import re
 import sys
 from dataclasses import dataclass, field
 
-# --- Auto-fixable: a spaced EM dash (U+2014) flanked by horizontal whitespace.
-#     Unambiguous (always a dash) and safe to collapse to a bare em dash.
-#     Horizontal whitespace only — never merge across line breaks; a correctly
-#     set em dash (no flanking spaces) is left alone. ---
-_FIX_EMDASH = re.compile(r"[ \t]+—[ \t]+")
+# --- Auto-fixable: an EM dash (U+2014), spaced OR bare. Published prose never
+#     uses an em dash (owner ruling 2026-09-16): the prescribed form is two
+#     hyphens closed up, so BOTH ``word — word`` and ``word—word`` rewrite to
+#     ``word--word``. Flanking whitespace, when present, is consumed;
+#     horizontal only — never join text across line breaks. The bare form is
+#     included deliberately: the guidance in force before the ruling actively
+#     prescribed ``word—word``, so it is the highest-probability residual em
+#     dash in real drafts. The EN dash (ranges, "5–10") is untouched. ---
+_FIX_EMDASH = re.compile(r"[ \t]*—[ \t]*")
 
 # --- Flag-only: ambiguous spaced dashes (en dash U+2013, or ``--``). These also
 #     appear as number ranges ("5 – 10"), table rules ("| -- |"), and CLI
@@ -46,6 +54,36 @@ _FLAG_DASHES = re.compile(r"[ \t]+–[ \t]+|[ \t]+--[ \t]+")
 # --- Code regions excluded from analysis + rewrite: fenced blocks and inline
 #     code. Without this the rewrite/flags fire on code and identifiers. ---
 _CODE_REGION = re.compile(r"```.*?```|`[^`]+`", re.DOTALL)
+
+# A dash inside a STRUCTURED token is data, not punctuation. Widening the em
+# dash rewrite to the bare form (word<emdash>word) is what made these
+# vulnerable: the spaced-only pattern could never match a URL, because a URL
+# has no spaces. Rewriting one character to two inside a link target, an email
+# address or a path silently breaks the destination on the Medium, email and
+# Discord paths, which is worse than leaving a dash unfixed.
+# MEASURED against a probe set: protects 6/6 structured tokens while leaving
+# 8/8 ordinary prose dashes rewritable, including the relative-path case
+# (docs/guide.md<emdash>then), where the dash really is punctuation.
+_STRUCTURED_TOKEN = re.compile(
+    r"""(?:
+          [a-z][a-z0-9+.\-]*://\S+           # scheme://host/path
+        | \b[\w.+\-\u2014]+@[\w\-\u2014]+\.[\w.\-\u2014]+   # email address
+        | (?<![\w)])/[\w./\u2014\-]*\w            # absolute path
+    )""",
+    re.X | re.I,
+)
+
+# Regions the analysers and the rewriter must both leave alone. ONE definition,
+# so detection and mutation can never disagree about what counts as prose.
+_PROTECTED_REGION = re.compile(
+    f"{_CODE_REGION.pattern}|{_STRUCTURED_TOKEN.pattern}",
+    re.DOTALL | re.X | re.I,
+)
+
+# Stands in for a protected region during analysis. Non-whitespace on purpose
+# (see _prose_only), which means it must be excluded from word counts (see
+# _prose_word_count).
+_REGION_PLACEHOLDER = "\u00a7"
 
 # --- Banned words (whole-word, case-insensitive). Faithful to the source list.
 #     "clean" is intentionally omitted (allowed for literal cleanliness). ---
@@ -84,7 +122,7 @@ _CONTRAST_STRUCTURES = re.compile(
 class ScrubResult:
     """Outcome of :func:`scrub`.
 
-    ``cleaned_text`` has the spaced-em-dash fix applied (and nothing else
+    ``cleaned_text`` has the em-dash fix applied (and nothing else
     mutated). ``fixes_applied`` records mechanical rewrites actually made.
     ``flags`` are non-fixable tells surfaced for observability — populated only
     when ``is_voiced`` is True; never acted on automatically.
@@ -100,20 +138,45 @@ class ScrubResult:
 
 
 def _prose_only(text: str) -> str:
-    """Return ``text`` with code regions blanked, for analysis."""
-    return _CODE_REGION.sub(" ", text)
+    """Return ``text`` with code regions blanked, for analysis.
+
+    The placeholder is deliberately NON-WHITESPACE. Blanking with a space
+    manufactures flanking whitespace that the region's neighbours never had,
+    and ``_FLAG_DASHES`` keys on flanking whitespace — so an em dash between
+    two inline code spans was rewritten to ``--`` and then flagged as a
+    spaced ambiguous dash BY THE SCRUBBER'S OWN DETECTOR (measured: a sticky
+    false flag on every technical draft with inline code). ``§`` is non-word
+    and non-whitespace, so word boundaries behave exactly as they did with a
+    space, while no dash can acquire fake flanking whitespace from a blanked
+    code region.
+    """
+    return _PROTECTED_REGION.sub(_REGION_PLACEHOLDER, text)
 
 
 def _map_prose(text: str, fn) -> str:
     """Apply ``fn`` to prose spans only, leaving code regions byte-for-byte."""
     out: list[str] = []
     last = 0
-    for m in _CODE_REGION.finditer(text):
+    for m in _PROTECTED_REGION.finditer(text):
         out.append(fn(text[last:m.start()]))
         out.append(m.group(0))
         last = m.end()
     out.append(fn(text[last:]))
     return "".join(out)
+
+
+def _prose_word_count(sentence: str) -> int:
+    """Words in *sentence*, not counting protected-region placeholders.
+
+    The placeholder is non-whitespace by necessity, which means ``split()``
+    yields it as a word and the excluded region silently inflates the count.
+    That shifts ``uniform_sentence_length`` by which sentence happens to hold
+    code -- MEASURED: a probe scored [2, 4, 4, 5] where the prose is [1, 4, 4,
+    5], falsely flagging it, and the inverse placement suppresses a real flag.
+    A token that is ONLY placeholders is dropped; one merely adjacent to a word
+    (`x`y -> placeholder+y) still counts once, which is correct.
+    """
+    return len([w for w in sentence.split() if w.strip(_REGION_PLACEHOLDER)])
 
 
 def _sentences(text: str) -> list[str]:
@@ -131,7 +194,7 @@ def detect(text: str) -> dict[str, object]:
 
     em = _FIX_EMDASH.findall(prose)
     if em:
-        findings["spaced_em_dash"] = len(em)
+        findings["em_dash"] = len(em)
 
     other = _FLAG_DASHES.findall(prose)
     if other:
@@ -155,7 +218,7 @@ def detect(text: str) -> dict[str, object]:
         findings["contrast_structures"] = contrasts
 
     sents = _sentences(prose)
-    lengths = [len(s.split()) for s in sents]
+    lengths = [_prose_word_count(s) for s in sents]
     if len(lengths) > 3 and (max(lengths) - min(lengths) < 4):
         findings["uniform_sentence_length"] = len(lengths)
 
@@ -163,7 +226,7 @@ def detect(text: str) -> dict[str, object]:
 
 
 def scrub(text: str, *, is_voiced: bool = True) -> ScrubResult:
-    """Auto-fix the spaced em-dash tell; flag the rest (when ``is_voiced``).
+    """Auto-fix the em-dash tell (spaced or bare); flag the rest (when ``is_voiced``).
 
     The em-dash rewrite is applied unconditionally (zero information loss, safe
     even for system text). ``flags`` — the non-fixable / ambiguous tells — are
@@ -178,13 +241,13 @@ def scrub(text: str, *, is_voiced: bool = True) -> ScrubResult:
         # was actually changed (counting on _prose_only would over-report em
         # dashes that abut code-region boundaries and never get rewritten).
         nonlocal em_count
-        new, n = _FIX_EMDASH.subn("—", span)
+        new, n = _FIX_EMDASH.subn("--", span)
         em_count += n
         return new
 
     cleaned = _map_prose(text, _fix_dashes)
     if em_count:
-        fixes.append(f"spaced_em_dash:{em_count}")
+        fixes.append(f"em_dash:{em_count}")
 
     flags: list[str] = []
     if is_voiced:
