@@ -11,8 +11,10 @@ Usage — add to ~/.openclaw/openclaw.json:
         mode: "merge",
         providers: {
           genesis: {
-            baseUrl: "http://127.0.0.1:5001/v1",
-            apiKey: "genesis-local",  // pragma: allowlist secret
+            baseUrl: "http://127.0.0.1:5000/v1",
+            // The endpoint requires a bearer token: paste the value of
+            // GENESIS_MCP_HTTP_TOKEN from secrets.env. Any other value is a 401.
+            apiKey: "<GENESIS_MCP_HTTP_TOKEN>",  // pragma: allowlist secret
             api: "openai-completions",
             models: [{
               id: "genesis", name: "Genesis",

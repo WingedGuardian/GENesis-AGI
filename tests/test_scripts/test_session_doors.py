@@ -167,6 +167,9 @@ _FAKE_CLAUDE = """#!/usr/bin/env bash
 # match it, because mcp scope, project state and doctor's settings read are all
 # cwd-keyed. Recording pwd is the only way to assert that from outside.
 [[ -n "${FAKE_CLAUDE_CWD:-}" ]] && pwd > "$FAKE_CLAUDE_CWD"
+# Distinguish UNSET from empty: an exported-but-empty TMPDIR is a different
+# (worse) bug than no TMPDIR, and `${TMPDIR:-}` would conflate them.
+[[ -n "${FAKE_CLAUDE_ENV:-}" ]] && printf 'TMPDIR=[%s]\n' "${TMPDIR-<unset>}" > "$FAKE_CLAUDE_ENV"
 exit 0
 """
 
@@ -209,6 +212,7 @@ def door(tmp_path):
     cap_log = tmp_path / "cap_calls.txt"
     claude_log = tmp_path / "claude.log"
     claude_cwd = tmp_path / "claude_cwd.txt"
+    claude_env = tmp_path / "claude_env.txt"
 
     def _env() -> dict:
         return {
@@ -231,6 +235,7 @@ def door(tmp_path):
             "FAKE_TMUX_SNAP_N": str(tmp_path / "snap_calls.txt"),
             "FAKE_CLAUDE_LOG": str(claude_log),
             "FAKE_CLAUDE_CWD": str(claude_cwd),
+            "FAKE_CLAUDE_ENV": str(claude_env),
             "FAKE_TMUX_KILLLOG": str(killlog),
             "FAKE_TMUX_KILL_RC": os.environ.get("_TEST_FAKE_KILL_RC", "0"),
             # Pre-kill admission probe: "" = unavailable (fail-open),
@@ -273,6 +278,7 @@ def door(tmp_path):
     run.cap_log = cap_log  # argv of each pre-kill admission probe
     run.claude_log = claude_log  # argv of a claude the door exec'd DIRECTLY
     run.claude_cwd = claude_cwd  # cwd that claude inherited from the bypass
+    run.claude_env = claude_env  # TMPDIR claude inherited (unset vs empty)
     run.home = home  # so a test can make the temp-dir candidates unusable
     return run, log, sessions, listing, panes
 
@@ -1489,4 +1495,100 @@ class TestSubcommandBypass:
             "claude ships subcommands this door has not classified. Decide per "
             "entry: prints-and-exits -> _CC_EPHEMERAL; daemon / TUI / "
             f"long-running -> _CC_KEEPS_A_SLOT. Unclassified: {sorted(unclassified)}"
+        )
+
+
+class TestBypassTempDirIsValidatedNotAssumed:
+    """The bypass must apply the SAME temp-dir validation as the slot path.
+
+    It used to test `-d "$HOME/tmp"` and export it. `-d` says a directory
+    exists, not that it is ours, writable, or private — so a root-owned
+    leftover from an earlier `sudo` run was accepted, and `claude install` /
+    `claude update` would unpack state into a directory this script never
+    established anyone else could not read. The slot path a few hundred lines
+    down creates the candidate, checks writability, and requires `chmod 700`.
+
+    Both now call one `_cc_resolve_tmpdir`, so there is a single policy rather
+    than two that can drift — which is what let the weaker copy exist at all.
+    """
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the mode bit")
+    def test_an_unusable_candidate_is_not_exported_to_a_bypassed_subcommand(
+        self, door
+    ):
+        """Unusable candidates must leave TMPDIR unset, never pointed at them."""
+        run, _log, _sessions, _listing, _panes = door
+        home = Path(run.home)
+        for cand in (home / ".genesis" / "cc-tmp", home / "tmp"):
+            cand.mkdir(parents=True, exist_ok=True)
+            # 0500 fails the WRITABILITY test, so `continue` fires before the
+            # chmod is ever attempted. The chmod-rejection branch needs a
+            # foreign-owned world-writable directory and is NOT covered here.
+            cand.chmod(0o500)
+        try:
+            proc = run("manual", "update")
+        finally:
+            for cand in (home / ".genesis" / "cc-tmp", home / "tmp"):
+                cand.chmod(0o700)  # so tmp_path teardown can clean up
+        assert proc.returncode == 0, proc.stderr
+        assert run.claude_env.exists(), "claude was never reached"
+        observed = run.claude_env.read_text().strip()
+        assert observed == "TMPDIR=[<unset>]", (
+            "the bypass exported a temp dir it had not validated; the slot path "
+            f"rejects this same directory. Got: {observed}"
+        )
+
+    def test_a_usable_candidate_IS_exported_to_a_bypassed_subcommand(self, door):
+        """Negative control: without it the test above passes on a broken bypass.
+
+        A bypass that simply never set TMPDIR would satisfy the unusable case
+        while losing the reason the resolution exists — `install`/`update`
+        unpacking into the small ambient temp.
+        """
+        run, _log, _sessions, _listing, _panes = door
+        home = Path(run.home)
+        (home / ".genesis" / "cc-tmp").mkdir(parents=True, exist_ok=True)
+        proc = run("manual", "update")
+        assert proc.returncode == 0, proc.stderr
+        observed = run.claude_env.read_text().strip()
+        assert observed == f"TMPDIR=[{home / '.genesis' / 'cc-tmp'}]", (
+            f"a usable candidate was not exported to the bypass. Got: {observed}"
+        )
+
+    def test_an_explicit_caller_TMPDIR_is_left_alone(self, door):
+        """An operator who exported TMPDIR chose it; do not second-guess them."""
+        run, _log, _sessions, _listing, _panes = door
+        home = Path(run.home)
+        (home / ".genesis" / "cc-tmp").mkdir(parents=True, exist_ok=True)
+        os.environ["_TEST_INHERITED_TMPDIR"] = "/inherited/from/parent"
+        try:
+            proc = run("manual", "update")
+        finally:
+            os.environ.pop("_TEST_INHERITED_TMPDIR", None)
+        assert proc.returncode == 0, proc.stderr
+        observed = run.claude_env.read_text().strip()
+        assert observed == "TMPDIR=[/inherited/from/parent]", (
+            f"the bypass overrode a TMPDIR the caller had set. Got: {observed}"
+        )
+
+    def test_one_resolution_function_serves_both_paths(self):
+        """Guard-the-guard: the duplication must not quietly come back.
+
+        The defect was two temp-dir policies, one weaker. If a future edit
+        reintroduces a second candidate loop, the tests above still pass while
+        the drift they exist to prevent is back.
+        """
+        body = _CC_SLOT.read_text()
+        assert body.count("_cc_resolve_tmpdir()") == 1, "more than one definition"
+        assert body.count('for _cand in "$HOME/.genesis/cc-tmp"') == 1, (
+            "a second candidate loop exists outside _cc_resolve_tmpdir"
+        )
+        # NOT a `count(...) >= 3` check: there are four mentions and one is
+        # prose, so deleting a real call site still satisfies it. Assert the
+        # call sites themselves, which is what could actually regress.
+        assert "|| _cc_resolve_tmpdir\n" in body or "! _cc_resolve_tmpdir" in body, (
+            "the bypass no longer calls the shared resolution"
+        )
+        assert "if _cc_resolve_tmpdir; then" in body, (
+            "the slot path no longer calls the shared resolution"
         )
