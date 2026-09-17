@@ -89,15 +89,32 @@ GITNEXUS_MEM_MAX="${CODE_INTEL_GITNEXUS_MEMORY_MAX:-${_LEGACY_MEM_MAX:-8G}}"
 # So the effective cap is min(configured, what this box can spare), and when
 # what it can spare is below the measured working set the job is REFUSED rather
 # than run with a cap that cannot bite.
-_genesis_mem_bytes() {  # "8G"/"512M"/"1024K"/bytes -> bytes on stdout, or nothing
-    local v="${1:-}"
+# FRACTIONS ARE VALID. systemd accepts `5.5G`, and this script's own rlimit
+# fallback parser already matched `^([0-9]+)(\.[0-9]+)?([Gg])$`. Bash arithmetic
+# does not do decimals, so `$(( 5.5 * ... ))` ERRORS and the caller used to get
+# an empty string -- which skipped admission control entirely while `5.5G` was
+# still handed to MemoryMax. Silently defeating the check on a valid value is
+# the worst of the three outcomes, so the integer and fractional parts are
+# multiplied separately.
+_genesis_mem_bytes() {  # "8G"/"5.5G"/"512M"/"1024K"/bytes -> bytes, or nothing
+    local v="${1:-}" unit="" num="" whole="" frac=""
     case "$v" in
-        *[Gg]) printf '%s' "$(( ${v%[Gg]} * 1024 * 1024 * 1024 ))" ;;
-        *[Mm]) printf '%s' "$(( ${v%[Mm]} * 1024 * 1024 ))" ;;
-        *[Kk]) printf '%s' "$(( ${v%[Kk]} * 1024 ))" ;;
-        *[0-9]) printf '%s' "$v" ;;
-        *) : ;;
+        *[Gg]) unit=$(( 1024 * 1024 * 1024 )); num="${v%[Gg]}" ;;
+        *[Mm]) unit=$(( 1024 * 1024 )); num="${v%[Mm]}" ;;
+        *[Kk]) unit=1024; num="${v%[Kk]}" ;;
+        *[0-9]) printf '%s' "$v"; return ;;
+        *) return ;;
     esac
+    case "$num" in
+        *.*) whole="${num%%.*}"; frac="${num#*.}" ;;
+        *)   whole="$num"; frac="" ;;
+    esac
+    # Reject anything that is not digits: a malformed value must yield NOTHING,
+    # which the caller treats as "cannot decide" rather than as a number.
+    case "${whole}${frac}" in ''|*[!0-9]*) return ;; esac
+    # Scale the fraction to three places so 5.5G and 5.005G both land exactly.
+    frac="$(printf '%-3s' "${frac:0:3}" | tr ' ' '0')"
+    printf '%s' "$(( whole * unit + (10#$frac * unit) / 1000 ))"
 }
 
 # The container's own ceiling. cgroup v2 first (what an LXC/Docker limit shows
@@ -148,7 +165,15 @@ CODE_INTEL_GITNEXUS_MIN_BYTES="${CODE_INTEL_GITNEXUS_MIN_BYTES:-$(( 4874166272 )
 _genesis_ceiling_b="$(_genesis_mem_ceiling)"
 _genesis_want_b="$(_genesis_mem_bytes "$GITNEXUS_MEM_MAX")"
 GITNEXUS_MEM_REFUSE=""
-if [ -n "$_genesis_ceiling_b" ] && [ -n "$_genesis_want_b" ]; then
+# A CONFIGURED cap below the working set is refused on ANY host, however large.
+# The legacy `CODE_INTEL_INDEX_MEMORY_MAX=2G` override is documented and still
+# present on existing installs; it feeds this default. Comparing only the host's
+# SPARE memory against the minimum let a big host run the rebuild under a 2 GiB
+# cgroup cap, where it is killed predictably -- and the runner then retries it
+# forever. The cap the job will actually get is what has to clear the bar.
+if [ -n "$_genesis_want_b" ] && [ "$_genesis_want_b" -lt "$CODE_INTEL_GITNEXUS_MIN_BYTES" ]; then
+    GITNEXUS_MEM_REFUSE="the configured cap $GITNEXUS_MEM_MAX is below the $(( CODE_INTEL_GITNEXUS_MIN_BYTES / 1024 / 1024 ))M a measured full rebuild needs, so the job would be killed rather than capped"
+elif [ -n "$_genesis_ceiling_b" ] && [ -n "$_genesis_want_b" ]; then
     _genesis_spare_b=$(( _genesis_ceiling_b - CODE_INTEL_SIBLING_RESERVE_BYTES ))
     if [ "$_genesis_spare_b" -lt "$CODE_INTEL_GITNEXUS_MIN_BYTES" ]; then
         GITNEXUS_MEM_REFUSE="this install has $(( _genesis_ceiling_b / 1024 / 1024 ))M total; after reserving $(( CODE_INTEL_SIBLING_RESERVE_BYTES / 1024 / 1024 ))M for the services around it that leaves $(( _genesis_spare_b / 1024 / 1024 ))M, below the $(( CODE_INTEL_GITNEXUS_MIN_BYTES / 1024 / 1024 ))M a measured full rebuild needs"
@@ -433,9 +458,23 @@ if [ "$TOOLS" = "gitnexus" ] || [ "$TOOLS" = "both" ]; then
         if [ -n "$GITNEXUS_MEM_REFUSE" ]; then
             # REFUSED, not silently skipped: a cap that cannot bite is worse
             # than no job, because the parent cgroup takes the kill instead.
-            _log "SKIP gitnexus: $GITNEXUS_MEM_REFUSE"
+            #
+            # DELIBERATELY NOT `MISSING`. That yields rc 3, which the runner
+            # reads as "a requested tool is absent from PATH" — a TRANSIENT
+            # misconfiguration it keeps the marker for, with no attempts
+            # penalty, and retries at every idle tick. This refusal is
+            # PERMANENT: the machine's memory does not change between ticks, so
+            # the retry can never succeed, and because `tools=both` markers run
+            # the CBM leg first, the effect is CBM rebuilding forever on a box
+            # that can never admit gitnexus.
+            #
+            # So the run reports what it actually did. The marker is consumed,
+            # the refusal is logged with the override that lifts it, and the
+            # next index request says the same thing again rather than spinning
+            # between requests.
+            _log "REFUSED gitnexus: $GITNEXUS_MEM_REFUSE"
+            _log "      this is permanent on this machine, so the request is NOT retried;"
             _log "      raise CODE_INTEL_GITNEXUS_MEMORY_MAX / lower CODE_INTEL_SIBLING_RESERVE_BYTES to override"
-            MISSING="${MISSING:+$MISSING }gitnexus"
         else
             ( cd "$REPO_PATH" && MEM_MAX="$GITNEXUS_MEM_MAX" _run_with_watchdog gitnexus "$_GN" analyze ) || RC=$?
         fi
