@@ -1,5 +1,3 @@
-## Added
-
 - The merge gate now runs as an advisory GitHub check (`genesis-merge-gate`,
   workflow `merge-gate`) on every pull request, review, and comment, producing
   the same `git_push_guard.py --check-pr` report installs run at merge time —
