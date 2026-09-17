@@ -161,16 +161,20 @@ jobs:
           set -euo pipefail
           # GitHub downgrades GITHUB_TOKEN to read-only for
           # pull_request_review[_comment] events on FORK PRs, so the
-          # check-runs write below would 403. Skip it: the head keeps its
-          # last verdict until the next privileged event (issue_comment,
-          # workflow_run, pull_request — all base-context). Publishing to a
-          # fork head the trusted way needs a second workflow_run stage;
-          # this repo has no fork PRs today, so the warning is the
-          # proportionate fix.
+          # check-runs write below would 403. Hand off instead: emit a
+          # `merge-gate-verdict` artifact carrying the PR number, which the
+          # trusted `merge-gate-publish` workflow (workflow_run on this
+          # workflow's completion) picks up and publishes under a
+          # write-capable token. The artifact carries NO verdict — the
+          # publisher re-evaluates the gate itself, so untrusted-context
+          # output never writes to the head directly.
           case "$GITHUB_EVENT_NAME" in
             pull_request_review|pull_request_review_comment)
               if [ "$IS_FORK" = "true" ]; then
-                echo "::warning::Fork-PR $GITHUB_EVENT_NAME runs under a read-only token; check run on head stays at its last verdict until a privileged event refreshes it."
+                echo "::notice::Fork-PR $GITHUB_EVENT_NAME runs under a read-only token; handing off to merge-gate-publish."
+                mkdir -p verdict
+                printf '{"pr":%s}\n' "$PR_NUMBER" > verdict/merge-gate-verdict.json
+                echo "fork_pending=true" >> "$GITHUB_OUTPUT"
                 exit 0
               fi ;;
           esac
@@ -193,6 +197,20 @@ jobs:
             -f "output[title]=$title" \
             -f "output[summary]=Advisory merge-gate re-evaluation of PR #${PR_NUMBER}, triggered by ${GITHUB_EVENT_NAME}. The full gate report is in this run's 'Run the merge gate' step log." \
             -f "details_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+      # Only present for fork review events. upload-artifact uses
+      # ACTIONS_RUNTIME_TOKEN, which is unaffected by the read-only
+      # GITHUB_TOKEN downgrade — this is the standard trusted-publisher
+      # handoff channel. 1-day retention: the publisher consumes it within
+      # minutes and the data is just a PR number.
+      - name: Hand off verdict to the trusted publisher
+        if: steps.publish.outputs.fork_pending == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: merge-gate-verdict
+          path: verdict/
+          retention-days: 1
+          if-no-files-found: error
 
 # Promotion to a required check (phase 2 of #1670 — NOT this PR):
 #   1. Run advisory until the false-block rate is measurable: target >=14 days
