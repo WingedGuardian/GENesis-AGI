@@ -970,17 +970,23 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
     # can't spawn CC regardless; a later bootstrap.sh re-renders the units with
     # the correct path once CC is present.
     _cc_path="$(command -v claude 2>/dev/null || true)"
+    # The npm prefix is needed in BOTH branches: it is the bin dir that actually
+    # receives `npm install -g` (gitnexus, and claude itself when cc_ensure_local
+    # installs it). When _install_node fell back to nvm, that prefix is the nvm
+    # bin — while a pinned claude already on PATH (e.g. /usr/local/bin) answers
+    # `command -v` first, and rendering only claude's dir leaves GitNexus
+    # invisible to the units forever. (guarded so a missing npm can't abort
+    # under set -e)
+    _cc_prefix="$(npm config get prefix 2>/dev/null || true)"
+    [ -n "$_cc_prefix" ] || _cc_prefix="/usr/local"
+    [ "$_cc_prefix" = "/usr" ] && _cc_prefix="/usr/local"
     if [ -n "$_cc_path" ]; then
         CC_BIN_DIR="$(dirname "$_cc_path")"
     else
-        # Installed above but not on this (non-interactive) shell's PATH — a user
-        # npm prefix whose PATH export only fires in interactive shells. Resolve
-        # where npm placed it, matching cc_ensure_local's own target (guarded so
-        # a missing npm can't abort under set -e).
-        _cc_prefix="$(npm config get prefix 2>/dev/null || true)"
-        [ -n "$_cc_prefix" ] || _cc_prefix="/usr/local"
-        [ "$_cc_prefix" = "/usr" ] && _cc_prefix="/usr/local"
         CC_BIN_DIR="$_cc_prefix/bin"
+    fi
+    if [ "$_cc_prefix/bin" != "$CC_BIN_DIR" ]; then
+        CC_BIN_DIR="$CC_BIN_DIR:$_cc_prefix/bin"
     fi
 
     for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do

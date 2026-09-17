@@ -34,14 +34,21 @@ genesis_gitnexus_node_supported() {
 # launcher silently pick different binaries (and different storage formats).
 _genesis_gitnexus_candidates() {
     local candidate="" prefix=""
-    local -a found=()
+    local -a found=() found_inos=()
     _genesis_gitnexus_add() {
         [ -n "$1" ] && [ -x "$1" ] || return 0
-        local existing
-        for existing in ${found[@]+"${found[@]}"}; do
-            [ "$existing" = "$1" ] && return 0
+        # Dedupe by resolved file, not spelling: a symlink, hardlink, or
+        # bind-mounted alias pointing at a copy already listed is ONE
+        # installation — string-only comparison counts it as two and the shadow
+        # scan then refuses a "conflict" between a binary and itself.
+        local existing canon ino
+        canon="$(readlink -f "$1" 2>/dev/null || printf '%s' "$1")"
+        ino="$(stat -c %d:%i "$canon" 2>/dev/null || printf '?:%s' "$canon")"
+        for existing in ${found_inos[@]+"${found_inos[@]}"}; do
+            [ "$existing" = "$ino" ] && return 0
         done
-        found+=("$1")
+        found_inos+=("$ino")
+        found+=("$canon")
     }
     _genesis_gitnexus_add "${GITNEXUS_BIN:-}"
     if command -v npm >/dev/null 2>&1; then
@@ -244,6 +251,9 @@ genesis_gitnexus_ensure_pin() {
         if command -v npm >/dev/null 2>&1; then
             _pfx="$(npm config get prefix 2>/dev/null || true)"
             [[ "$_pfx" = /* ]] && _prefix_bin="${_pfx%/}/bin/gitnexus"
+            # Candidates are stored canonicalized; match the same form here so
+            # a prefix reached through a symlink isn't misread as "outside".
+            [ -n "$_prefix_bin" ] && _prefix_bin="$(readlink -f "$_prefix_bin" 2>/dev/null || printf '%s' "$_prefix_bin")"
         fi
         if [ -n "$_prefix_bin" ] && [ "${_copies[0]}" != "$_prefix_bin" ]; then
             printf 'gitnexus: %s is outside the npm prefix (%s) — upgrading would leave it as a stale shadow; remove it first\n' \

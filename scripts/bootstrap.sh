@@ -1109,18 +1109,23 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
     # exits 0 when claude isn't on PATH yet, so split the pipeline and resolve
     # the real npm prefix explicitly.
     _cc_path="$(command -v claude 2>/dev/null || true)"
+    # Needed in both branches: the npm prefix's bin is where `npm install -g`
+    # (gitnexus, and claude via cc_ensure_local in scripts/lib/cc_version.sh)
+    # actually lands — nvm's bin after an nvm fallback, ~/.npm-global, or a
+    # system prefix. A pinned claude already on PATH (e.g. /usr/local/bin)
+    # resolves `command -v` while GitNexus lands in the nvm bin; rendering only
+    # claude's dir would leave it invisible to the units. Same empty/`/usr`
+    # guards as install.sh; hardcoding ~/.npm-global would miss nvm.
+    _cc_prefix="$(npm config get prefix 2>/dev/null || true)"
+    [ -n "$_cc_prefix" ] || _cc_prefix="/usr/local"
+    [ "$_cc_prefix" = "/usr" ] && _cc_prefix="/usr/local"
     if [[ -n "$_cc_path" ]]; then
         CC_BIN_DIR="$(dirname "$_cc_path")"
     else
-        # claude not yet on PATH (units render before CC installs). Point at
-        # wherever cc_ensure_local (scripts/lib/cc_version.sh) will `npm install
-        # -g` it: its target is `$(npm config get prefix)/bin` (nvm bin,
-        # ~/.npm-global, or a system prefix) with the same empty/`/usr` guards.
-        # Hardcoding ~/.npm-global would miss an nvm-based Node install.
-        _cc_prefix="$(npm config get prefix 2>/dev/null || true)"
-        [ -n "$_cc_prefix" ] || _cc_prefix="/usr/local"
-        [ "$_cc_prefix" = "/usr" ] && _cc_prefix="/usr/local"
         CC_BIN_DIR="$_cc_prefix/bin"
+    fi
+    if [[ "$_cc_prefix/bin" != "$CC_BIN_DIR" ]]; then
+        CC_BIN_DIR="$CC_BIN_DIR:$_cc_prefix/bin"
     fi
 
     for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do

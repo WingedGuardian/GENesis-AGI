@@ -97,6 +97,12 @@ def _run_entry(tmp_path: Path, *args, path: str, env_extra=None, **popen_kw):
         "CODE_INTEL_WATCHDOG_WARMUP_S": "0",
         "CODE_INTEL_FAKE_LOADAVG": "0",
         "CODE_INTEL_FAKE_IOWAIT": "0",
+        # Deterministic admission-control seams: without them the entrypoint
+        # reads the TEST HOST's cgroup ceiling and live usage, so a small CI
+        # container refuses gitnexus legs (rc 3) or trims caps differently than
+        # the tests assert. Generous defaults; tests override via env_extra.
+        "CODE_INTEL_MEM_CEILING_BYTES": str(64 * 1024**3),
+        "CODE_INTEL_MEM_CURRENT_BYTES": str(512 * 1024**2),
         **(env_extra or {}),
     }
     return subprocess.run(

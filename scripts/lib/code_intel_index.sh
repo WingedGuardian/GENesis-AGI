@@ -99,9 +99,15 @@ _genesis_mem_bytes() {  # "8G"/"512M"/"1024K"/"5.5G"/bytes -> bytes on stdout, o
         # `%.0f`, not `%d`: mawk implements %d through a signed 32-bit int and
         # clamps 8 GiB to 2147483647, which reads as "below the working set"
         # and refuses every run. %f goes through double, exact past 2^32.
-        *[Gg]) awk -v n="${v%[Gg]}" 'BEGIN{printf "%.0f", n * 1073741824}' ;;
-        *[Mm]) awk -v n="${v%[Mm]}" 'BEGIN{printf "%.0f", n * 1048576}' ;;
-        *[Kk]) awk -v n="${v%[Kk]}" 'BEGIN{printf "%.0f", n * 1024}' ;;
+        # awk is only reached for FRACTIONAL values — integer mantissas use
+        # Bash's 64-bit arithmetic so minimal environments without awk
+        # (the rlimit fallback's whole reason to exist) still get a cap.
+        *[Gg]) [[ "${v%[Gg]}" == *.* ]] && awk -v n="${v%[Gg]}" 'BEGIN{printf "%.0f", n * 1073741824}' \
+                || printf '%s' "$(( ${v%[Gg]} * 1073741824 ))" ;;
+        *[Mm]) [[ "${v%[Mm]}" == *.* ]] && awk -v n="${v%[Mm]}" 'BEGIN{printf "%.0f", n * 1048576}' \
+                || printf '%s' "$(( ${v%[Mm]} * 1048576 ))" ;;
+        *[Kk]) [[ "${v%[Kk]}" == *.* ]] && awk -v n="${v%[Kk]}" 'BEGIN{printf "%.0f", n * 1024}' \
+                || printf '%s' "$(( ${v%[Kk]} * 1024 ))" ;;
         *) printf '%s' "$v" ;;
     esac
 }
@@ -352,11 +358,10 @@ _run_capped() {
         # Fallback: polite scheduling + soft address-space cap. Mirrors the
         # run-codebase-memory launcher's degradation (never block on missing
         # systemd — CI and minimal containers must still work).
-        local mem_kb=""
-        if [[ "$MEM_MAX" =~ ^([0-9]+)(\.[0-9]+)?([Gg])$ ]]; then
-            mem_kb=$(( ${BASH_REMATCH[1]} * 1024 * 1024 ))
-        elif [[ "$MEM_MAX" =~ ^([0-9]+)(\.[0-9]+)?([Mm])$ ]]; then
-            mem_kb=$(( ${BASH_REMATCH[1]} * 1024 ))
+        local mem_kb="" mem_b=""
+        mem_b="$(_genesis_mem_bytes "$MEM_MAX" 2>/dev/null || true)"
+        if [ -n "$mem_b" ]; then
+            mem_kb=$(( (mem_b + 1023) / 1024 ))
         else
             _log "WARNING: cannot parse '$MEM_MAX' for the rlimit fallback — running memory-uncapped (nice/ionice only)"
         fi
@@ -467,6 +472,19 @@ MISSING=""  # requested-but-absent tools — makes a no-op run rc=3, not a false
 CBM_RAN=0
 GN_RAN=0
 
+# A tool's RAW exit status must never reach the runner: the runner reads
+# 3/4/5/75 as OUTCOME PROTOCOL codes (missing / leg-incomplete / lock-held),
+# so a leg that happens to fail with one of them is silently misclassified —
+# rc 4 after a cbm failure would CONSUME the failed leg's request and even
+# stamp the shared full clock. Remap those statuses to 111 at capture; the
+# classification below then sees a genuine "ran and failed" either way.
+_leg_failed() {
+    RC=$?
+    case "$RC" in
+        3|4|5|75) RC=111 ;;
+    esac
+}
+
 if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
     if [ -n "$CBM_DISABLE_UNRESOLVED" ]; then
         _log "cbm kill-switch path unresolvable — refusing cbm leg (fail closed)"
@@ -482,7 +500,7 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
         # instead of a full 0->100 re-index.
         MEM_MAX="$CBM_MEM_MAX" _run_with_watchdog cbm codebase-memory-mcp cli index_repository \
             --repo-path "$REPO_PATH" --mode "$MODE" --persistence "$PERSISTENCE" \
-            && CBM_RAN=1 || RC=$?
+            && CBM_RAN=1 || _leg_failed
     else
         _log "codebase-memory-mcp not on PATH — skipped"
         MISSING="${MISSING}cbm "
@@ -515,7 +533,7 @@ if [ "$TOOLS" = "gitnexus" ] || [ "$TOOLS" = "both" ]; then
             MISSING="${MISSING:+$MISSING }gitnexus"
         else
             ( cd "$REPO_PATH" && MEM_MAX="$GITNEXUS_MEM_MAX" _run_with_watchdog gitnexus "$_GN" analyze ) \
-                && GN_RAN=1 || RC=$?
+                && GN_RAN=1 || _leg_failed
         fi
     else
         _log "gitnexus not available — skipped"
