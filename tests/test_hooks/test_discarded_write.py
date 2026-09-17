@@ -226,9 +226,11 @@ def _settings_bash_hooks() -> tuple[list[Path], list[str], list[str], list[Path]
     right for the refusal-note lock and WRONG for the ask-note lock: a hook that
     emits only an `ask` and never a hard refusal would be filtered out by
     construction, and that is precisely the hook most in need of the prompt note,
-    since it is all dialog. Measured today: 4 of 13 configured python Bash hooks
-    are excluded by the blocker filter, and none of them emits an ask — so the
-    hole is latent, not live. Inheriting the wrong filter is how it would stop
+    since it is all dialog. The advisory hooks excluded by the blocker filter are
+    enumerated and executed by
+    `test_import_time_degraded.py::test_every_bash_hook_declares_its_degrade_direction`
+    rather than counted here; none of them emits an ask — so the hole is latent,
+    not live. Inheriting the wrong filter is how it would stop
     being latent without anything failing.
     """
     settings = json.loads((_REPO / ".claude" / "settings.json").read_text())

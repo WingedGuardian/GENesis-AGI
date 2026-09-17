@@ -1209,31 +1209,70 @@ which is the clearest worked example in the repo, so apply the test to both:
 - **`degraded_exit`'s unconditional leg** — `hook_input` ITSELF is unimportable
   or version-skewed, so nothing the guard could import can recover it and each
   guard `os._exit(2)`s with no payload read and no predicate consulted.
-  **MEASURED 2026-09-15 by execution, not by grep: 9 of the 13 PYTHON hooks that
-  `.claude/settings.json` wires on matcher `Bash` exit 2** against a poisoned
-  `hook_input` (the other 4 are advisory and exit 1, which is correct for them).
-  So every shell command is refused with no predicate at all.
+  **The size of that refusal is no longer written down here, and that is the
+  point.** It is DERIVED on every test run by
+  `tests/test_hooks/test_import_time_degraded.py::test_every_bash_hook_declares_its_degrade_direction`,
+  which parses `.claude/settings.json` (never greps it), runs every hook whose
+  matcher can fire on Bash against a poisoned `hook_input`, and asserts the RULE
+  the number was only ever evidence for:
 
-  **Read that denominator exactly, because it is restricted and the restriction
-  is the point.** That matcher carries 15 hook commands across 14 entries; the 2
-  not counted are shell rather than Python, never import `hook_input`, and so
-  cannot be affected — and one of them is itself a blocking guard, so the
-  omission is not cosmetic. A repo-only enumeration is also not the LIVE
-  population: MEASURED on this install, `~/.claude/settings.json` wires a 16th
-  hook on the same matcher, invisible to any count taken from the repo alone.
+  > A hook that can fire on Bash either carries a degraded handler — emits `GUARD
+  > DEGRADED`, exits 2 — or is NAMED: in `_ADVISORY_BY_DESIGN` with words verified
+  > verbatim against its own docstring, or in `_NOT_PYTHON_ON_BASH` because it
+  > never imports the module. There is no third bucket.
 
-  Two population traps sit on top of each other here, and the second is the one
-  that survived a round of review. First: `grep degraded_exit(` finds six callers
-  and an earlier draft reported "six guards" — but this leg is precisely the one
-  where `degraded_exit` is UNREACHABLE, so all NINE refuse from their own import
-  handler and grep sees only the six that ALSO call it on the other leg. Count
-  the condition, never the helper. Second: correcting the number left the
-  denominator silently narrowed to the subset that was actually executed. **A
-  corrected figure written as "N of M things wired on X" has to re-enumerate X's
-  full population programmatically — parse the config, never grep — or it ships
-  one unstated restriction copied verbatim into four surfaces.** Naming what M
-  excludes is the fix; adjusting M is not. **Bash alone is not the question the test asks** — what
-  matters is whether ANY route to repair survives, and Write/Edit is one.
+  Polarity is ALLOWLIST, so a guard wired next year that forgets its handler fails
+  by construction instead of quietly ceasing to guard. That matters because the
+  omission is invisible in production: Claude Code treats a non-2 exit as a
+  non-blocking error **when the hook emits no `permissionDecision`**, so a guard
+  that dies on its import traceback exits 1, the command runs, and nothing
+  distinguishes it from a guard that looked and approved. (The qualifier is not
+  pedantry: an exit-0 hook carrying `permissionDecision: "ask"` does gate, and
+  this repo has one — so "non-2 means non-blocking" is true of the degraded leg,
+  where that channel is unreachable, and not of hooks in general.)
+
+  **THE POPULATION FILTER IS WHERE THIS KIND OF GATE FAILS, not the assertion**,
+  and the first version of this one proved it. It compared `matcher != "Bash"` —
+  an exact-string test against a field Claude Code treats as a REGEX — and
+  discarded any command its narrow pattern could not parse. An adversarial audit
+  broke it four ways against mutated copies of the real settings: a hook wired
+  `"Bash|Edit"` was invisible, `".*"` was invisible, and an EXISTING blocker
+  respelled as a bare `python3 …/guard.py` silently left the population with the
+  suite still green. `procedure_advisor.py` is wired on `".*"` in this repo, so
+  that was a live gap, not a future one. An enumerator that silently drops what it
+  cannot parse is a DENYLIST one level up. The fix is the shape
+  `test_hook_output_contract.py::_resolve` already uses: evaluate the matcher as a
+  regex, and make an unresolvable command a FAILING row rather than a skipped one.
+
+  Two limits remain, stated rather than assumed away: the enumeration is scoped to
+  the REPO settings, so a user-level `~/.claude/settings.json` can wire more on the
+  same matcher invisibly (MEASURED on one install: it wires a shell hook on
+  `Grep|Glob|Bash`); and shell hooks on the matcher never import `hook_input`, so
+  they are exempted BY NAME rather than left unseen.
+
+  **Why a count became a rule — four failures, and only three were mistakes.**
+  `grep degraded_exit(` finds six callers, and an early draft therefore said "six
+  guards"; but this leg is precisely the one where `degraded_exit` is UNREACHABLE,
+  so every refusing guard refuses from its own import handler and grep sees only
+  those that ALSO call it on the other leg. Count the condition, never the helper.
+  Correcting it to nine then left the denominator silently narrowed to the subset
+  actually executed — **a figure written as "N of M things wired on X" has to
+  re-enumerate X's full population programmatically or it ships one unstated
+  restriction copied verbatim into every surface that quotes it.** Naming what M
+  excludes is the fix; adjusting M is not.
+
+  And then the fourth: the corrected figure went stale within a day with nobody
+  being wrong at all, because another PR wired one more hook on the same matcher.
+  A denominator maintained by hand in four places is not a measurement, it is four
+  chances to be out of date — which is why the rule is asserted and the number is
+  computed. **Two limits stay stated rather than assumed away:** the enumeration is
+  scoped to the REPO settings, so a user-level `~/.claude/settings.json` can wire
+  more on the same matcher invisibly; and the matcher also carries shell hooks,
+  which never import `hook_input` and so cannot be affected — one of which is
+  itself a blocking guard.
+
+  **Bash alone is not the question the test asks** — what matters is whether ANY
+  route to repair survives, and Write/Edit is one.
 
 **THIS TEST FOUND A REAL BRICK ON ITS FIRST APPLICATION, and the fix is the
 worked example of what it is for.** `scripts/pretool_check.py` carried the same
@@ -2535,13 +2574,16 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   `_required_ci_workflows` / `_required_scheduled_review_kinds` / `_doc_findings_mode`
   all share, and all three then discard your configured value and take their DEFAULT.
   Say "default", not "fail closed" — the directions differ, which is the whole reason
-  it matters, and they differ two-to-one rather than the other way round. Only
-  `_required_scheduled_review_kinds` defaults to its MAXIMAL set, so a discard there
-  TIGHTENS. The other two can LOOSEN: `_doc_findings_mode` defaults to `skip`
-  (`_DEFAULT_DOC_FINDINGS_MODE`; cite the SYMBOL — the line this used to name now holds a sibling constant), scoring fewer findings and saying nothing about it; and
+  it matters, and all three can now LOOSEN: `_doc_findings_mode` defaults to `skip`
+  (`_DEFAULT_DOC_FINDINGS_MODE`; cite the SYMBOL — the line this used to name now holds a sibling constant), scoring fewer findings and saying nothing about it;
   `_required_ci_workflows` falls back to the shipped `("CI",)`, which is NARROWER than
   any larger required set an install declared — it does print a NOTE, so that one is
-  loud rather than silent, but it is still a relaxation (Codex P2, #1903). The rule below
+  loud rather than silent, but it is still a relaxation (Codex P2, #1903); and
+  `_required_scheduled_review_kinds` now defaults to the MINIMAL set `("leaks",)`
+  (⚠ it defaulted to the maximal `code-review` + `leaks` until the default was
+  narrowed, so a discard there TIGHTENED — it now narrows instead, and likewise
+  prints a NOTE when the key was visibly declared). The floor survives every
+  discard: `leaks` is irreducible. The rule below
   keys on this:
   - **`--source internal` (the default)** — a same-model self / genesis-architect /
     genesis-security / any-subagent review. It is free and shares the author-model's
@@ -2876,12 +2918,14 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   hook-surface PR (verified: CHANGELOG-only → `inline`; a 1-line guard change →
   `substantial`). So it costs zero CODEX rounds — but not zero blocks, and the
   difference matters when you are budgeting the follow-up. On the canonical
-  public repo the SCHEDULED-review gate is head-pinned per kind, and only
-  `leaks` has ancestor relief (`_MECHANICAL_RESCAN_BY_KIND`); `code-review` has
-  none. So the push moves the head, the earlier `code-review` marker stops
-  counting, and that gate blocks until a fresh scheduled review lands at the new
-  head. Budget the follow-up as: one commit, no Codex round, one scheduled
-  `code-review` at the new head.
+  public repo the SCHEDULED-review gate is head-pinned per kind, and `leaks` —
+  the only kind required by default — has ancestor relief
+  (`_MECHANICAL_RESCAN_BY_KIND`): the carried marker still satisfies the gate
+  once `leak-detector` is green at the new head. Budget the follow-up as: one
+  commit, no Codex round, no new scheduled review. An install that has ADDED
+  `code-review` back via `merge_gate.required_scheduled_reviews` budgets one
+  more: that kind has no ancestor relief, so the push invalidates its marker and
+  the gate blocks until a fresh scheduled review lands at the new head.
   So: read every finding the report prints, fix the cheap ones, then merge.
   The read is what the standing merge-when-green policy is buying — a gate
   verdict of `ok` is not a report that there is nothing there.
@@ -3593,9 +3637,13 @@ findings below, a gated `gh pr merge`:
   must carry a marker `<!-- genesis-scheduled-review: head=<full-40-hex-sha> kind=<name> -->`
   naming the exact head it reviewed AND which routine it is (`kind`). The gate blocks
   unless an owner-authored marker for EVERY effective required kind
-  (`_required_scheduled_review_kinds()` — DEFAULT `code-review` + `leaks`; the leak/secret
-  scanner is irreducible and always required; an install may relax the OPTIONAL kinds to
-  ADVISORY via `merge_gate.required_scheduled_reviews: [<kinds>]` in local `genesis.yaml`)
+  (`_required_scheduled_review_kinds()` — DEFAULT `leaks` ALONE, which is also the
+  irreducible leak/secret scanner, so the default set and the floor coincide;
+  `code-review` is ADVISORY by default because no routine emits its marker — measured
+  2026-09-16, zero `code-review` markers across all 51 open non-draft PRs and the 40
+  most recently merged ones, against 47 and 31 `leaks` markers — and an install that
+  DOES run one re-arms it by naming a LARGER set in
+  `merge_gate.required_scheduled_reviews: [code-review, leaks]` in local `genesis.yaml`)
   names the PR's current head — so if any required routine never ran, ran on a stale
   commit, or was rate-limited, the merge blocks (naming the missing kinds). An ADVISORY
   routine still posts its review on the PR to be read/addressed, but its absence does not
