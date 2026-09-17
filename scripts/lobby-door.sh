@@ -66,6 +66,37 @@ WORKSPACE="lobby"
 tmux has-session -t "=${WORKSPACE}" 2>/dev/null \
     || tmux new-session -d -s "$WORKSPACE" 2>/dev/null
 
+# Record the fleet's pane-MODE state before the picker opens. Purely
+# observational — it changes nothing and decides nothing, so the destroys-
+# nothing guarantee above is untouched.
+#
+# The door fixed fact 1 for the LOBBY pane by making the picker per-connection.
+# It does not reach the panes the picker SELECTS: a `cc-*` slot left in a mode
+# (an operator pressed `Ctrl-b s` and disconnected) still holds it, and
+# selecting that slot lands the next connection inside a stale chooser. That is
+# the remaining path into the "frozen session with the yellow line", and it has
+# never been captured live. See scripts/fleet_entry_capture.sh for the measured
+# mechanism and for why no programmatic clear exists.
+#
+# Resolved from THIS script's own location, never "${HOME}/genesis" — the door
+# must keep working on a clone that lives anywhere else.
+#
+# SYNCHRONOUS on purpose. Backgrounding would race the picker and record a
+# snapshot of a fleet that had already moved, and an accurate snapshot is the
+# entire value here. The cost is bounded: every tmux read inside carries a 5s
+# belt, the typical cost is a sub-100ms local socket query, and the only state
+# that could spend that belt — a wedged tmux server — would already have hung
+# the `has-session` call three lines above. Failures are silent by construction.
+# Split rather than inlined, and with an explicit `|| _fc_dir=""`: this door
+# runs under `set -uo pipefail` today, but its sibling cc-slot.sh adds `-e`,
+# where an assignment whose command substitution fails aborts before the `exec`
+# and locks the operator out. Written the safe way in both, so the two doors
+# cannot diverge on it later.
+_fc_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || _fc_dir=""
+if [ -n "$_fc_dir" ] && [ -x "${_fc_dir}/fleet_entry_capture.sh" ]; then
+    "${_fc_dir}/fleet_entry_capture.sh" lobby >/dev/null 2>&1 || true
+fi
+
 # The PICKER is per-connection, so two live windows can never meet: one pid
 # cannot open two doors. Concurrency is not the only way a name can be taken,
 # though — a STALE `lobby-<pid>` can outlive its door if the chain below was

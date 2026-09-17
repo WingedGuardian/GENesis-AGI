@@ -1119,6 +1119,37 @@ else
     # ${_TMPDIR_UNSET} would be unbound.)
     _TMPDIR_UNSET="unset TMPDIR CLAUDE_CODE_TMPDIR && "
 fi
+
+# Record the fleet's pane-MODE state before attaching. The numeric-slot door
+# reaches the same exposure as the lobby picker: `new-session -A` ATTACHES to an
+# existing slot, and if that slot's pane is holding a mode (an operator pressed
+# `Ctrl-b s` and disconnected) the connection lands inside a stale chooser —
+# the "frozen session with the yellow line". Capturing on BOTH entries is
+# deliberate: the operator reports it via the picker, but the direct-slot path
+# is the same class and would otherwise go unobserved.
+#
+# Resolved from this script's own location rather than ${GENESIS_ROOT}, which is
+# hardcoded to ${HOME}/genesis above and is wrong on a clone living elsewhere.
+#
+# SYNCHRONOUS, for the same reason as the lobby door: a backgrounded capture
+# would race `new-session -A` and describe a fleet that had already changed.
+# Bounded by the 5s belt on each tmux read inside. With no server running this
+# costs nothing and starts nothing — `list-panes` does not spawn a server, so
+# the capture returns empty and exits silently, leaving the `exec` below to
+# start it exactly as before.
+# This file runs under `set -euo pipefail` (line 17), and an assignment whose
+# command substitution FAILS aborts the script — MEASURED: a failing `cd` inside
+# `_F="$(cd … && pwd)/x"` exits 1 and the next line never runs. On this path
+# "the next line" is the `exec tmux` below, so the operator would be locked out
+# of the box by a diagnostic. Split, with an explicit `|| _fc_dir=""`, so the
+# failure degrades to "skip the capture" instead of "skip the login".
+# (`[ -x … ] && cmd` as a standalone statement is separately MEASURED as
+# errexit-safe, so the guard itself was never the hazard.)
+_fc_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || _fc_dir=""
+if [ -n "$_fc_dir" ] && [ -x "${_fc_dir}/fleet_entry_capture.sh" ]; then
+    "${_fc_dir}/fleet_entry_capture.sh" "slot-${SLOT}" >/dev/null 2>&1 || true
+fi
+
 exec tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
     -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \

@@ -33,6 +33,33 @@ ssh <host>-lobby    # the session picker → pick any live slot
 Windows one-click: make a shortcut whose target is `wt.exe ssh <host>-lobby`
 (or `ssh.exe <host>-lobby`) and pin it to the taskbar.
 
+## "It dropped me into a frozen session with a yellow line"
+
+The session is almost certainly not frozen. Yellow is tmux's `mode-style`
+(default `bg=yellow`), not the status line — so the pane is **in a MODE**,
+normally the `choose-tree` picker or `copy-mode`, and the keys you type are
+being read as that mode's keys rather than by a shell.
+
+It happens because a pane mode belongs to the **pane**, not to the client, so it
+outlives a disconnect. Press `Ctrl-b s` in a slot to look around, close the
+window without leaving the chooser, and that slot keeps the mode. The next
+connection that selects it lands straight back inside the chooser. MEASURED on
+tmux 3.4: no programmatic clear works — `send-keys -X cancel` answers *"not in a
+mode"* while `pane_in_mode` still reads 1, with or without a client attached.
+
+Try `q` first, then `Escape`. If neither returns you to a shell, note which slot
+it was before you kill the window — that detail is what the fix needs.
+
+Every connection through either door records the fleet's pane-mode state to
+`~/.genesis/logs/fleet_entry_<date>.log` (owner-only, pruned after 45 days). A
+slot found holding a mode is written as a greppable line, so after it happens:
+
+```bash
+grep ANOMALY ~/.genesis/logs/fleet_entry_*.log
+```
+
+The capture only observes — it changes no pane and blocks no entry.
+
 ## The session cap and the operator emergency slot
 
 New slots are capped by the box's **capacity**, derived from its TOTAL RAM —
