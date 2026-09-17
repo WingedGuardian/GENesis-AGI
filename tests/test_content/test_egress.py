@@ -34,20 +34,20 @@ class TestGateFiring:
     def test_em_dash_fixed_on_email(self):
         r = gate(f"Hi there {EM} quick note.", channel="email", category="surplus")
         assert r.applied is True
-        assert r.text == "Hi there—quick note."
-        assert r.fixes_applied == ["spaced_em_dash:1"]
+        assert r.text == "Hi there--quick note."
+        assert r.fixes_applied == ["em_dash:1"]
 
     def test_em_dash_fixed_on_discord(self):
         r = gate(f"ship it {EM} now", channel="discord", category="notification")
         assert r.applied is True
-        assert "—" in r.text and f" {EM} " not in r.text
+        assert "--" in r.text and f" {EM} " not in r.text
 
     def test_content_draft_to_telegram_is_scrubbed(self):
         # The Medium drafting-side check: a CONTENT review copy on telegram
         # still gets anti-slop scrubbed even though telegram is user-facing.
         r = gate(f"Draft body {EM} here", channel="telegram", category="content")
         assert r.applied is True
-        assert r.text == "Draft body—here"
+        assert r.text == "Draft body--here"
 
 
 class TestPIIScan:

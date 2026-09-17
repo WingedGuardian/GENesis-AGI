@@ -115,6 +115,38 @@ class TestBashBlockAll:
         assert result.returncode == 2
         assert "BLOCKED" in result.stderr
 
+    def test_removal_past_the_depth_bound_still_blocks(self, guard_cmd: str) -> None:
+        """A removal nested past shell_parse's depth bound must NOT slip through.
+
+        This is the fail-open the bare-`analyze` chokepoint exists to catch. A
+        bounded parse returns NO segments — deliberately, so a searching guard
+        cannot read "stopped looking" as "nothing found" — and this guard decides
+        by searching. Before the blind-spot branch that meant zero targets and a
+        silent allow, on a guard whose entire job is blocking.
+        """
+        deep = "git worktree remove /tmp/nonexistent-worktree-xyz"
+        for _ in range(8):  # comfortably past MAX_SUBSTITUTION_DEPTH (5)
+            deep = f"echo $({deep})"
+        result = _run_guard(guard_cmd, {"command": deep})
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert "BLOCKED" in result.stderr
+
+    def test_deep_nesting_without_a_removal_is_still_allowed(
+        self, guard_cmd: str
+    ) -> None:
+        """Negative control for the test above.
+
+        Without it, a fallback that simply blocked every unreadable command
+        naming the subcommand would pass the acceptance test while being
+        useless — the "a matcher that finds nothing is indistinguishable from a
+        matcher that looks at nothing" failure, in its blocking direction.
+        """
+        deep = "git worktree list"
+        for _ in range(8):
+            deep = f"echo $({deep})"
+        result = _run_guard(guard_cmd, {"command": deep})
+        assert result.returncode == 0, result.stdout + result.stderr
+
     def test_block_message_mentions_lifecycle(self, guard_cmd: str) -> None:
         result = _run_guard(
             guard_cmd,
@@ -656,3 +688,56 @@ class TestCommandCarriersAreNotAHole:
         inner = f"echo /tmp/wt-x | xargs {_PHRASE}"
         result = _run_guard(guard_cmd, {"command": inner})
         assert result.returncode == 0, result.stdout + result.stderr
+
+
+# ---------------------------------------------------------------------------
+# A NON-TRUNCATING blind spot must not swap the parse for the raw-text regex
+# ---------------------------------------------------------------------------
+
+_WT = "work" + "tree"
+_RM = "rem" + "ove"
+
+
+class TestBlindSpotDoesNotDegradeToProse:
+    """The legacy extractor reads RAW TEXT, so it cannot tell a command from a
+    sentence. It is the right fallback for a cause that leaves NO segments — a
+    bound — and the wrong one for a cause that leaves the segments complete.
+
+    MEASURED when this guard degraded on any blind spot: a `gh pr` whose verb
+    was a variable, with a --body whose prose merely mentions removing a
+    worktree, went ALLOW -> hard BLOCK. Sessions write that PR body constantly;
+    this PR's own body does.
+    """
+
+    def test_prose_in_a_pr_body_is_not_blocked(self, guard_cmd: str) -> None:
+        cmd = f'gh pr "$ACTION" 123 --body "docs about {_WT} {_RM} semantics"'
+        result = _run_guard(guard_cmd, {"command": cmd})
+        assert result.returncode == 0, (
+            "prose describing a worktree removal was BLOCKED because the command "
+            f"also carried a blind spot.\n{result.stderr}"
+        )
+
+    def test_the_same_prose_with_a_readable_verb_is_the_control(
+        self, guard_cmd: str
+    ) -> None:
+        """CONTROL: identical text, verb spelled out. If this blocked too, the
+        test above would be measuring the prose rule and not the blind path."""
+        cmd = f'gh pr edit 123 --body "docs about {_WT} {_RM} semantics"'
+        result = _run_guard(guard_cmd, {"command": cmd})
+        assert result.returncode == 0, result.stderr
+
+    def test_a_real_removal_alongside_a_blind_spot_still_blocks(
+        self, guard_cmd: str
+    ) -> None:
+        """The other direction, so this is not a licence to stop looking: an
+        ACTUAL removal must still be refused when a blind spot is present."""
+        # Path carries NO machine identity: this repository is public, and a
+        # home path embedding a username is on the never-leak list alongside IPs
+        # and hostnames — fixtures included, which is where it keeps slipping
+        # through. The test needs a worktree-SHAPED argument and nothing more;
+        # it never creates or resolves the path.
+        cmd = f"git pus{{h..h}} origin main && git {_WT} {_RM} /tmp/wt/x"
+        result = _run_guard(guard_cmd, {"command": cmd})
+        assert result.returncode == 2, (
+            f"a real worktree removal was allowed.\n{result.stdout}{result.stderr}"
+        )

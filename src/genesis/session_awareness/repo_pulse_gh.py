@@ -1,4 +1,10 @@
-"""Merged-PR enumeration for the repo-pulse worker (gh CLI, injectable).
+"""PR enumeration over the gh CLI (injectable runner).
+
+Home of three listings: merged PRs (the repo-pulse cursor lane), open PRs (the
+age-stale SessionStart surface), and — for the zero-drop detector's head-ref
+history join — the full ``--state all`` listing. All three share the live slug
+resolution, the timeout and the loud-cap discipline below. The import is
+one-way (``zero_drop`` reads this module; nothing here knows about it).
 
 Clone of the ``pr_review_harvest`` gh pattern with two pulse-specific
 hardenings, both live-verified during PR-4 due diligence:
@@ -167,7 +173,95 @@ async def list_merged_prs(
         and pr["mergedAt"]
     ]
     prs.sort(key=lambda p: p["mergedAt"])
-    return {"repo": repo, "prs": prs, "limit_hit": len(raw) >= limit}
+    # A DROPPED row makes this listing INCOMPLETE, and saying so is the whole
+    # point: the filter above silently discards a merged PR whose `number` or
+    # `mergedAt` is missing or malformed, and a caller that advances a watermark
+    # over the survivors would move it PAST the dropped merge, which then never
+    # receives its row. Reporting the count lets the caller treat the window as
+    # incomplete instead of trusting a listing that quietly lost something
+    # (Codex P2, PR #1836).
+    return {
+        "repo": repo,
+        "prs": prs,
+        "limit_hit": len(raw) >= limit,
+        "dropped": len(raw) - len(prs),
+    }
+
+
+# GitHub caps pulls/N/files at 3000 entries; at the cap the listing MAY be
+# incomplete, and an incomplete file list must read as unreadable, never as
+# "these are all the files" (a docs-only verdict over a truncated list would
+# silently exempt code). Ported from git_push_guard._pr_changed_files, which
+# carries the same constant for the same reason.
+_PR_FILES_API_CAP = 3000
+
+
+async def list_pr_files(
+    pr_number: int,
+    *,
+    repo: str,
+    runner: Runner | None = None,
+) -> dict:
+    """Every filename a merged PR touches, or ``{"error": ...}`` — never raises.
+
+    Returns ``{"files": [path, ...]}``. The verification lane's docs-only
+    exemption rides on this being COMPLETE, so the three fail-closed rules from
+    ``git_push_guard._pr_changed_files`` are ported verbatim in spirit:
+
+    1. Rename SOURCES count: a row's ``previous_filename`` is a path the PR
+       touched (a file renamed out of code into docs must not read docs-only).
+    2. Strict record shape: any unparseable line, non-dict row, or null/empty
+       filename makes the WHOLE read an error — a partial list that looks
+       complete is the failure mode, not the remedy.
+    3. The 3000-row API cap: ``rows >= cap`` → error (see ``_PR_FILES_API_CAP``).
+
+    The caller's fail direction: an error here means the PR is NOT classified
+    docs-only, so its obligation row stays open — a validator look is the cost
+    of an unreadable list; a silent exemption would be the defect. ``--jq``
+    emits one JSON object per line (the hook's idiom), which also sidesteps the
+    ``--paginate`` concatenated-arrays parse trap ``pr_review_harvest`` handles
+    with raw_decode.
+    """
+    run = runner or _default_runner
+    rc, out, err = await run(
+        [
+            "gh",
+            "api",
+            f"repos/{repo}/pulls/{pr_number}/files",
+            "--paginate",
+            "--jq",
+            ".[] | {filename: .filename, previous_filename: .previous_filename}",
+        ]
+    )
+    if rc != 0:
+        return {"error": f"pr files failed (rc={rc}): {err.strip()[:400]}"}
+    files: list[str] = []
+    rows = 0
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        rows += 1
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError as exc:
+            return {"error": f"pr files line unparseable: {exc}"}
+        if not isinstance(obj, dict):
+            return {"error": "pr files row is not an object"}
+        name = obj.get("filename")
+        if not isinstance(name, str) or not name:
+            return {"error": "pr files row missing filename"}
+        files.append(name)
+        prev = obj.get("previous_filename")
+        if prev is not None:
+            if not isinstance(prev, str) or not prev:
+                return {"error": "pr files row has malformed previous_filename"}
+            files.append(prev)
+    if rows >= _PR_FILES_API_CAP:
+        return {
+            "error": f"pr files hit the {_PR_FILES_API_CAP}-row API cap — list may be incomplete"
+        }
+    return {"files": files}
 
 
 # Open-PR lane fields (session-manager PR-4c). Deliberately NOT PR_FIELDS
@@ -233,4 +327,96 @@ async def list_open_prs(
     if not isinstance(raw, list):
         return {"error": "open pr list returned a non-list payload"}
     prs = [pr for pr in raw if isinstance(pr, dict) and isinstance(pr.get("number"), int)]
+    return {"repo": repo, "prs": prs, "limit_hit": len(raw) >= limit}
+
+
+# Full-history fields for the zero-drop branch join (session-awareness
+# zero_drop). Deliberately NOT PR_FIELDS: the join reads identity, state and
+# timing only — never title or body, so no PR prose can reach a model prompt
+# through this path.
+#
+# `headRefOid` is the load-bearing one and it costs nothing extra: it is the
+# head SHA as of the merge or close, so `headRefOid == local tip` is PROOF the
+# PR contained exactly this commit, where the head-ref NAME is only a
+# heuristic. MEASURED 2026-09-06 on this repo (1665 PRs): every PR carries it,
+# and it is a SNAPSHOT rather than a live pointer — 4 of 4 PRs whose branch
+# moved after merge/close still report the old SHA, 0 counterexamples in the 28
+# cases where the head branch still exists. That snapshot property is what
+# makes it evidence about the merge instead of evidence about the branch now.
+# `closedAt` gives the CLOSED verdict the same time guard `mergedAt` gives the
+# merged one, and `headRepositoryOwner` scopes the join to this repo so a fork
+# PR cannot cover a local branch that merely shares its name.
+ALL_PR_FIELDS = "number,headRefName,headRefOid,state,mergedAt,closedAt,url,headRepositoryOwner"
+
+
+async def list_all_prs(
+    *,
+    limit: int = 2000,
+    repo: str | None = None,
+    runner: Runner | None = None,
+) -> dict:
+    """Enumerate PRs in EVERY state for a head-ref-name history join.
+
+    Returns ``{"repo", "prs", "limit_hit"}`` or ``{"error": ...}`` without
+    raising. Rows missing an int ``number`` or a string ``headRefName`` are
+    dropped (gh contract violation, not a crash). Slug resolves LIVE, the same
+    stale-config hardening as the merged/open enumerations.
+
+    The whole history is the point: the consumer classifies a local branch by
+    what EVER happened to its name, so a windowed fetch would silently
+    reclassify old branches as never-PR'd. ``limit_hit`` is therefore not a
+    nicety — the consumer must FREEZE (skip its branch classes for that run)
+    when the window caps, because a truncated history turns a merged branch
+    into a false "stranded" finding. MEASURED 2026-09-05: 1651 PRs in one
+    ~6s call at the default limit.
+    """
+    run = runner or _default_runner
+    if repo is None:
+        repo = await resolve_repo(run)
+        if repo is None:
+            return {"error": "repo slug resolve failed"}
+    rc, out, err = await run(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "all",
+            "--json",
+            ALL_PR_FIELDS,
+            "--limit",
+            str(limit),
+        ]
+    )
+    if rc != 0:
+        return {"error": f"all pr list failed (rc={rc}): {err.strip()[:400]}"}
+    try:
+        raw = json.loads(out)
+    except json.JSONDecodeError as exc:
+        return {"error": f"all pr list returned invalid JSON: {exc}"}
+    if not isinstance(raw, list):
+        return {"error": "all pr list returned a non-list payload"}
+    prs = []
+    for pr in raw:
+        if not (
+            isinstance(pr, dict)
+            and isinstance(pr.get("number"), int)
+            and isinstance(pr.get("headRefName"), str)
+            and pr["headRefName"]
+        ):
+            continue
+        # Flatten the owner to its LOGIN and drop the rest of the object. gh
+        # returns `{id, name, login}` and `name` is the account holder's real
+        # name — which would otherwise ride into the findings store, the logs
+        # and an MCP response read by a model, for a join that only ever needs
+        # to answer "is this head ref in our own repo?". Narrowing it here
+        # keeps that value out of everything downstream by construction rather
+        # than by every consumer remembering not to read it.
+        owner = pr.get("headRepositoryOwner")
+        login = owner.get("login") if isinstance(owner, dict) else None
+        pr = {k: v for k, v in pr.items() if k != "headRepositoryOwner"}
+        pr["headRepositoryOwnerLogin"] = login if isinstance(login, str) else None
+        prs.append(pr)
     return {"repo": repo, "prs": prs, "limit_hit": len(raw) >= limit}

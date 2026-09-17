@@ -1,0 +1,332 @@
+name: Install Test
+
+# Fresh-machine install verification. Replaces the retired EC2 install-test
+# harness (removed in #623): a clean GitHub-hosted runner clones the repo and
+# runs the public installer end-to-end, so the PR that breaks a fresh install
+# fails here instead of on a user's machine weeks later.
+#
+# Coverage notes: GitHub-hosted runners are full Ubuntu VMs (systemd present),
+# so this exercises the real install path. Not covered: arbitrary cloud images
+# and the LXC/Incus container-install variant — run a manual VM install before
+# a release when those matter.
+#
+# Do NOT add this workflow to required status checks: it is path-filtered, so
+# PRs touching none of the filtered paths report no status and would wait on
+# "Expected" forever.
+
+on:
+  pull_request:
+    branches: [main]
+    # The filter mirrors what install.sh actually CONSUMES (sourced libs,
+    # rendered templates, seed files, the dependency set) — not what merely
+    # sounds install-related. Derived by enumerating install.sh's inputs.
+    paths:
+      - "scripts/install.sh"
+      - "scripts/lib/**"
+      - "scripts/systemd/**"
+      # The templates above are only half of a unit: systemd runs an ExecStart,
+      # and every one of these is a repo script the rendered units invoke. A PR
+      # touching only `scripts/tmp_watchgod.sh` could break the temp-protection
+      # service this job asserts is ACTIVE, without the job ever running.
+      # Read out of the templates' own ExecStart directives at the time of
+      # writing. Note the entrypoint is usually an ARGUMENT rather than the
+      # program — the house pattern is
+      # `ExecStart=/bin/bash __REPO_DIR__/scripts/X.sh`.
+      #
+      # NOT enforced: nothing fails when a new template ships a ninth
+      # entrypoint and this list does not catch up. A test to keep the two in
+      # step is issue #2117, which also records why the obvious version of that
+      # test is harder than it looks — it must compare by glob coverage rather
+      # than string identity, or a later `scripts/*.sh` consolidation reds every
+      # PR.
+      - "scripts/backup.sh"
+      - "scripts/cc_align_host.sh"
+      - "scripts/cc_settings_align.sh"
+      - "scripts/cc_tmp_align_host.sh"
+      - "scripts/code_intel_freeze.sh"
+      - "scripts/code_intel_runner.sh"
+      - "scripts/disk_hygiene.sh"
+      - "scripts/tmp_watchgod.sh"
+      - "scripts/hooks/pre-commit"
+      - "scripts/hooks/pre-push"
+      # config/** rather than the two files install.sh itself renders. The
+      # filter's rule is "what the verified OUTCOME depends on", and this job's
+      # smoke test STARTS the installed server — which reads config/ at boot,
+      # not just at install time. `router` is in `_CRITICAL_SUBSYSTEMS`
+      # (runtime/_core.py:172) and `runtime/init/router.py` loads
+      # config/model_routing.yaml, so a malformed routing config makes the
+      # freshly installed server fail to bootstrap while this check never runs.
+      # ENUMERATED: runtime init reads autonomy, inbox_monitor, mail_monitor,
+      # model_profiles, model_routing, observability and reflex yaml plus
+      # config/modules — NONE of which were filtered. Listing seven paths that
+      # will grow is worse than the directory.
+      - "config/**"
+      - "pyproject.toml"
+      - "secrets.env.example"
+      - "src/genesis/identity/*.example"
+      - ".claude/mcp/run-codebase-memory"
+      - ".github/workflows/install-test.yml"
+      # The installer installs the source tree and imports GenesisRuntime
+      # (scripts/lib/venv_setup.sh), and treats .claude/settings.json as a
+      # smoke-test requirement — so both are genuine inputs. The first filter
+      # omitted them, which meant a PR could break a clean install without ever
+      # running this check. Including src/genesis/** makes this run on most PRs;
+      # that is the honest cost of the claim, and the job is a few minutes.
+      - "src/genesis/**"
+      - ".claude/settings.json"
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * 1"  # weekly Mon 07:00 UTC — catch drift even without install-path commits
+
+concurrency:
+  # Key on the PR NUMBER, not the branch name. Two forked PRs whose source
+  # branches share a name — `main` is the common case — collide on head_ref, so
+  # one contributor's push would cancel another contributor's unrelated run.
+  group: install-test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  fresh-install:
+    runs-on: ubuntu-latest
+    # A healthy full install measures in the tens of minutes (apt + Node +
+    # Qdrant + venv + Claude Code). The failure mode bounded here is a hung
+    # network fetch or apt lock burning the 6h default job budget on a weekly
+    # schedule; 60 min is ~2-3x a healthy run.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # This job EXECUTES the checked-out tree — `scripts/install.sh` is run
+          # two steps down, from the pull request's own code. checkout@v7
+          # defaults to persist-credentials: true, which writes the GITHUB_TOKEN
+          # into .git/config as an auth header and leaves it there until the
+          # post-job cleanup, i.e. for the entire duration of the installer run.
+          # So the read-only token granted above would be readable by code a
+          # contributor wrote, which is a strictly worse position than the
+          # read-only jobs in ci.yml that already set this.
+          persist-credentials: false
+
+      - name: Provision a user systemd session
+        # Hosted runners execute steps via a system unit with no logind session
+        # and no XDG_RUNTIME_DIR, so `systemctl --user` cannot reach a user bus
+        # — and Qdrant's only start path in install.sh is a user unit. Linger
+        # gives the runner user a manager; the final line makes "still no user
+        # bus" a legible failure of THIS step instead of an unexplained Qdrant
+        # timeout deep in the install log. No-op where a manager already runs.
+        run: |
+          set -euo pipefail
+          sudo loginctl enable-linger "$USER"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          for _ in $(seq 1 20); do
+            systemctl --user is-system-running >/dev/null 2>&1 && break
+            sleep 1
+          done
+          systemctl --user show-environment >/dev/null
+
+      - name: Run installer (non-interactive, strict)
+        env:
+          GENESIS_INSTALL_STRICT: "1"
+        run: ./scripts/install.sh --non-interactive
+
+      - name: Verify install outcome
+        run: |
+          set -euo pipefail
+          # Deliberately NOT a re-run of the installer's own smoke test (that
+          # already gates via strict mode): assert artifacts the installer only
+          # WARNs about, plus rendered-template integrity it never checks.
+          test -f ~/.config/systemd/user/genesis-server.service
+          grep -q "$PWD" ~/.config/systemd/user/genesis-server.service
+
+          # The primary service must be RUNNING, not merely rendered. A unit with a
+          # bad ExecStart or a missing runtime dep renders fine and fails to start;
+          # asserting the file exists cannot tell those apart, which is a green
+          # install test over a dead server.
+          systemctl --user is-active --quiet genesis-server
+
+          # ...and ENABLED, which is a different claim: is-active only says the
+          # unit is running NOW, and install.sh starts it in a step separate
+          # from the enable, so a unit that never enabled still reads active and
+          # simply does not come back after a reboot. This catches `disabled`
+          # (the enable failed — install.sh discards its stderr, and its own
+          # note at :1342 gives the real causes as no user D-Bus or a masked
+          # unit), `masked`, and a missing unit file.
+          #
+          # It does NOT catch a template that lost its [Install] section.
+          # MEASURED on systemd 255: such a unit enables with exit 0 and
+          # is-enabled reports `static`, also exit 0. A control unit that HAS
+          # [Install] and was never enabled reports `disabled`, exit 1 — which
+          # is the case this assertion is for.
+          systemctl --user is-enabled --quiet genesis-server
+
+          # EVERY rendered unit, not just genesis-server. The installer renders all
+          # templates through one loop, so a placeholder introduced in any other
+          # template shipped a broken unit that a genesis-server-only check
+          # accepted — which is exactly how agent-zero.service went out with a
+          # literal __AZ_ROOT__ (fixed in this PR).
+          for _unit in ~/.config/systemd/user/genesis-*.service \
+                       ~/.config/systemd/user/genesis-*.timer \
+                       ~/.config/systemd/user/agent-zero.service \
+                       ~/.config/systemd/user/qdrant.service; do
+            [ -f "$_unit" ] || continue
+            if grep -q '__[A-Z_]*__' "$_unit"; then
+              echo "::error::unsubstituted placeholder in $_unit:"
+              grep -n '__[A-Z_]*__' "$_unit"
+              exit 1
+            fi
+          done
+
+          # THE DENOMINATOR COMES FROM THE REPO, not from what the installer
+          # happened to render. Every state check below iterates a glob over
+          # ~/.config/systemd/user and skips anything absent, so if install.sh
+          # ever stopped rendering templates the globs match nothing, every
+          # iteration is skipped, and the job passes having checked NOTHING.
+          # A loop over zero units cannot fail. install.sh:930 renders every
+          # *.service.template and *.timer.template unconditionally, so the
+          # shipped templates are the correct expected set — and deriving it
+          # from the repo means a new template is covered the moment it lands.
+          # Counted INSIDE the walk, not with `ls … | wc -l`. The step runs
+          # `set -euo pipefail`, bash does not set nullglob, so an unmatched
+          # pattern reaches `ls` literally, `ls` exits 2, pipefail propagates it
+          # and errexit kills the step AT THE ASSIGNMENT — the guard below never
+          # runs and prints nothing. MEASURED, and it fires when only ONE of the
+          # two globs is unmatched, so a repo with service templates and no
+          # timer template would die on every run with no message. `[ -f ]`
+          # inside the loop already handles the literal-pattern case.
+          _unrendered=""
+          _tpl_count=0
+          for _tpl in scripts/systemd/*.service.template scripts/systemd/*.timer.template; do
+            [ -f "$_tpl" ] || continue
+            _tpl_count=$((_tpl_count + 1))
+            _want=$(basename "$_tpl" .template)
+            [ -f ~/.config/systemd/user/"$_want" ] || _unrendered="$_unrendered $_want"
+          done
+          if [ -n "$_unrendered" ]; then
+            echo "::error::templates shipped but never rendered:$_unrendered"
+            exit 1
+          fi
+          # The set must be non-empty, or everything above passes vacuously.
+          if [ "$_tpl_count" -lt 1 ]; then
+            echo "::error::no unit templates found under scripts/systemd — this check would pass vacuously"
+            exit 1
+          fi
+          echo "  $_tpl_count shipped unit template(s), all rendered"
+
+          # AUTO-STARTED units must actually be RUNNING, for the same reason
+          # genesis-server is checked above and for a sharper one: the installer
+          # SUPPRESSES these failures. Both `enable --now` call sites end in
+          # `|| true` (install.sh, the timer loop and the watchgod block), so a
+          # timer with an invalid directive or a watchgod with a bad ExecStart
+          # installs "successfully" and is simply dead. The placeholder loop
+          # above cannot catch that — a unit can be fully substituted and still
+          # refuse to start.
+          #
+          # The skip rule MIRRORS the installer's own (genesis-backup.timer is
+          # a deliberate setup step it passes over by name) rather than being a
+          # restated list, so a newly added timer template is covered here
+          # automatically — which is the gap that once left genesis-cc-align
+          # rendered-but-dead.
+          for _t in ~/.config/systemd/user/genesis-*.timer; do
+            [ -f "$_t" ] || continue
+            _n=$(basename "$_t")
+            [ "$_n" = "genesis-backup.timer" ] && continue
+            # BOTH questions. is-enabled catches "never armed"; is-active
+            # catches an `enable --now` whose START leg failed — the triggered
+            # .service missing or unloadable — which install.sh swallows with
+            # `2>/dev/null ... || true`.
+            #
+            # Deliberately NOT the watchgod rationale: that one is about a
+            # Type=simple + Restart=always SERVICE parked in `activating
+            # (auto-restart)`, and a [Timer] unit has no ExecStart and no
+            # Restart=, so it cannot reach that state. Same assertion, different
+            # reason — worth saying, so nobody trusts a measurement that does
+            # not apply here.
+            #
+            # No legitimate enabled-but-inactive state exists for these
+            # templates: none sets RemainAfterElapse=no (default yes), so a
+            # far-future OnCalendar, a Persistent= catch-up, an already-fired
+            # one-shot and a timer whose service is running all read active.
+            # Measured 7/7 active on a live install.
+            if ! systemctl --user is-enabled --quiet "$_n"; then
+              echo "::error::$_n rendered but NOT enabled — the installer's enable --now failed silently"
+              systemctl --user status "$_n" --no-pager -l || true
+              exit 1
+            fi
+            if ! systemctl --user is-active --quiet "$_n"; then
+              echo "::error::$_n is enabled but NOT active — enable --now reported success on a dead unit"
+              systemctl --user status "$_n" --no-pager -l || true
+              exit 1
+            fi
+          done
+
+          # Temp protection is not optional on this install: cc-tmp filling is
+          # what kills CC sessions, and this unit is the thing that watches it.
+          if [ -f ~/.config/systemd/user/genesis-tmp-watchgod.service ]; then
+            if ! systemctl --user is-active --quiet genesis-tmp-watchgod.service; then
+              echo "::error::genesis-tmp-watchgod.service rendered but NOT active"
+              systemctl --user status genesis-tmp-watchgod.service --no-pager -l || true
+              exit 1
+            fi
+          fi
+
+          # The ENABLE-ONLY units. These are deliberately not started now —
+          # cc-tmp-align fires in the CC-quiet cold-start window before
+          # genesis-server, and qdrant is started separately — so `is-active`
+          # would be the wrong question and `is-enabled` is the right one.
+          # Their enable calls are suppressed with `|| true` exactly like the
+          # others, so the same silent-death applies.
+          #
+          # REQUIRED, not skipped-if-absent. The old `|| continue` was there so a
+          # variant install that never renders one would not be failed for it —
+          # but this job is a single known configuration doing a full install, so
+          # "variant" cannot apply and the skip only ever hid a regression: stop
+          # rendering the unit and the loop passes having checked nothing.
+          # genesis-cc-tmp-align is caught by the template denominator above;
+          # qdrant.service is NOT template-derived, so without this it has no
+          # existence check anywhere in the job.
+          #
+          # Kept in step with install.sh by
+          # test_install_test_covers_every_enable_site, which parses the enable
+          # sites out of the installer — this list is derived, not remembered.
+          for _svc in genesis-cc-tmp-align.service qdrant.service; do
+            if [ ! -f ~/.config/systemd/user/"$_svc" ]; then
+              echo "::error::$_svc was never rendered — install.sh enables it, so a full install must produce it"
+              exit 1
+            fi
+            if ! systemctl --user is-enabled --quiet "$_svc"; then
+              echo "::error::$_svc rendered but NOT enabled — its enable failed silently"
+              systemctl --user status "$_svc" --no-pager -l || true
+              exit 1
+            fi
+          done
+
+          # The user-facing artifacts that hardcoded ~/genesis until this PR: both
+          # must point at where the repo ACTUALLY is, or they are installed dead on
+          # any clone that is not at ~/genesis.
+          grep -qF "$PWD" /usr/local/bin/genesis
+          grep -qF "$PWD" ~/.bashrc
+
+          test -f .mcp.json
+          # An explicit conditional, NOT `! grep -q`: bash exempts a
+          # negated command from errexit, and this is not the last line
+          # of the step, so the old form could never fail it. A rendered
+          # placeholder would have sailed through — and it stays valid
+          # JSON inside a string, so the parse check below cannot catch
+          # it either.
+          if grep -q '{{' .mcp.json; then
+            echo "::error::unsubstituted placeholder in .mcp.json"
+            exit 1
+          fi
+          # PARSE it. Placeholder-free is not the same as valid: a trailing comma
+          # in the template renders clean and Claude Code then rejects the file,
+          # leaving every MCP server unavailable behind a green install.
+          python3 -c "import json,sys; json.load(open('.mcp.json'))"
+
+          command -v claude
+          . scripts/lib/cc_version.sh
+          claude --version | grep -q "$CC_VERSION"
+          .venv/bin/python -c "import genesis, sys; print(genesis.__file__)"

@@ -43,6 +43,20 @@ from typing import Any
 #: The measured harness threshold. Output STRICTLY ABOVE this is persisted.
 HOOK_STDOUT_CAP = 10_000
 
+#: The events whose BARE STDOUT the model reads, per the module docstring above.
+#: Lives here, next to the cap, because this module is the single home of the
+#: contract and the gate that enforces it must DERIVE the set rather than restate
+#: it -- an allowlist whose whole guarantee is "a newly wired model-facing hook
+#: fails by construction" cannot be built on a hand-maintained copy of the list.
+#:
+#: ``PostModelSwitch`` is deliberately ABSENT. The published hooks reference names
+#: it alongside these three; the bundle read that produced this list does not, and
+#: nothing in .claude/settings.json is wired to it. It is excluded on the weaker
+#: evidence rather than included on the stronger, because a wrong entry here makes
+#: the gate demand exemptions for hooks that cannot reach the model. If a hook is
+#: ever wired to it, add it here and the gate picks it up with no other change.
+BARE_STDOUT_EVENTS = ("SessionStart", "UserPromptSubmit", "UserPromptExpansion")
+
 #: What a section divider costs: the emitters write "\n\n---\n\n" (7) and
 #: ``print`` adds its newline. Under-counting here makes ``fits()`` slightly
 #: optimistic, which the chokepoint then has to correct with a cut.
@@ -358,18 +372,32 @@ class BoundedStdout:
             return
         self._cut_here(text, block=block, room=room)
 
-    def emit_final(self, text: str) -> None:
+    def emit_final(self, text: str, fallback: str | None = None) -> None:
         """Write a closing line using the reserved headroom.
 
         Bypasses ``reserve`` (that is what it was reserved for) but never the
         budget, and is emitted even after a cut — the audit line reporting the
         cut is the one thing that must always land.
+
+        ``fallback`` is a SHORTER form of the same line to emit WHOLE when the
+        full text will not fit the remaining room. The writer chooses (the
+        caller supplies candidates, never arithmetic): full if it fits, else a
+        fitting fallback, else a raw clip as the genuine last resort. The clip
+        cuts from the RIGHT, so a line whose tail is load-bearing — the audit
+        line's ``— full text: <mirror>]_`` pointer — loses exactly the part the
+        reader needs; the fallback exists so that outcome requires BOTH the full
+        line AND its own shorter form to overflow, not merely the full line.
         """
         self._intended.append(text)
         room = self._budget - self._emitted
         if room <= 0:
             return
-        self._write(text if emit_cost(text) <= room else clip_to_cost(text, max(0, room - 1)))
+        if emit_cost(text) <= room:
+            self._write(text)
+        elif fallback is not None and emit_cost(fallback) <= room:
+            self._write(fallback)
+        else:
+            self._write(clip_to_cost(text, max(0, room - 1)))
 
     # ── internals ──────────────────────────────────────────────────────
     def _write(self, text: str) -> None:
@@ -516,13 +544,20 @@ def print_json_bounded(
     # wrong direction for a size check, since it says "fine" about the one
     # outcome this module exists to prevent.
     #
-    # No longer latent: `scripts/genesis_stop_hook.py` is the first production
-    # caller, emitting the Stop event's `additionalContext`. (This comment said
-    # "no caller outside its tests" while that was true; it is recorded here
-    # because the off-by-one below was fixed BEFORE any adopter existed, which
-    # is the only reason the first one did not inherit it.) The default budget
-    # still sits 200 chars under the cap, so the off-by-one only ever bit a
-    # caller passing budget=HOOK_STDOUT_CAP.
+    # The off-by-one only bites a caller passing budget=HOOK_STDOUT_CAP, since the
+    # default budget sits 200 chars under the cap. It was fixed while still latent,
+    # because an off-by-one in a size guarantee is not something to hand an adopter.
+    #
+    # Callers outside tests, ENUMERATED rather than counted from memory
+    # (`grep -rn print_json_bounded scripts/ src/`, no limit): capped_read_advisory
+    # (checks the return value), git_discard_guard (envelope backstop behind its own
+    # whole-note selection), plan_confidence_reminder (defence-in-depth — a fixed
+    # string far under budget), genesis_stop_hook (the Stop event's
+    # additionalContext). This sentence has now been wrong twice in the same
+    # direction: it first read "no caller outside its tests", then named one of
+    # three. Both times an adopting change falsified a status claim living in a file
+    # the adopter never edits, which is exactly the kind of staleness a grep cannot
+    # catch. If you add a caller, this line is part of the change.
     for _ in range(4 * max(1, len(text_keys))):
         blob = json.dumps(payload)
         if emit_cost(blob) <= budget:
