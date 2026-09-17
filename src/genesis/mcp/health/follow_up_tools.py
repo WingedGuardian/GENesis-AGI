@@ -139,6 +139,34 @@ async def _impl_follow_up_create(
         if domain is None:
             domain = classify_domain(f"{content} {reason}")
 
+        # Provenance: resolve a truncated session id (the per-turn tag shows 8
+        # chars) to the full one, the same way session_charter_tools does. A
+        # prefix that does not resolve uniquely is stored as NULL, never as the
+        # truncated string — resolve_session_id's own contract: "WRITE callers
+        # must refuse to create rows for unresolved short ids". The create must
+        # not fail over provenance, so the drop is reported, not fatal.
+        source_session_note = None
+        if source_session:
+            from genesis.db.crud import session_charters as _charters
+
+            resolved = await _charters.resolve_session_id(db, source_session)
+            # SHAPE, not length. `resolve_session_id` returns the input
+            # unchanged when it cannot resolve, so a >= 32-char value reaching
+            # here has never been checked against anything — a mistyped UUID or
+            # a 32-char fragment used to pass a length test and be written as
+            # provenance (Codex P2, PR #1622). A valid-shaped id that no store
+            # knows yet is still accepted: this asks what the value IS, not
+            # whether it has been seen.
+            if _charters.is_full_session_id(resolved):
+                source_session = resolved
+            else:
+                source_session_note = (
+                    f"source_session '{source_session}' did not resolve to a "
+                    "unique full session id — stored NULL rather than a "
+                    "truncated or malformed id"
+                )
+                source_session = None
+
         fid = await follow_ups.create(
             db,
             content=content,
@@ -177,7 +205,9 @@ async def _impl_follow_up_create(
             "strategy": strategy,
             "domain": domain,
             "pinned": pinned,
-            "message": lane_msg
+            "source_session": source_session,
+            "message": (f"NOTE: {source_session_note} " if source_session_note else "")
+            + lane_msg
             + (f" Revisit when: {cond}." if cond else "")
             + (f" Domain: {domain}." if domain else "")
             + (" (pinned — ego cannot auto-resolve)" if pinned else ""),
@@ -575,6 +605,7 @@ async def follow_up_create(
     pinned: bool = False,
     domain: str = "",
     revisit_condition: str = "",
+    source_session: str = "",
 ) -> dict:
     """Create a follow-up in the accountability ledger.
 
@@ -638,6 +669,15 @@ async def follow_up_create(
             life/career/content). Leave empty to let Genesis classify (internal-only);
             note the classifier keyword-matches repo-ish terms, so an empty domain on
             a misrouted repo item will still look correctly filed.
+        source_session: which session this work originated from — pass your own
+            session id. A FOREGROUND session reads it from the per-turn
+            ``[Clock: … | Session: xxxxxxxx]`` tag (the 8-char prefix resolves to
+            the full id); a DISPATCHED session reads it from the ``## This
+            Session`` block at session start, which is where its full id is
+            given (that session never receives the per-turn tag). Recorded as
+            provenance; repo-pulse uses it to attribute completions. A prefix
+            that does not resolve uniquely is stored as NULL, never truncated.
+            Leave empty only when the origin genuinely is not a CC session.
     """
     return await _impl_follow_up_create(
         content,
@@ -649,6 +689,7 @@ async def follow_up_create(
         pinned=pinned,
         domain=domain or None,
         revisit_condition=revisit_condition,
+        source_session=source_session or None,
     )
 
 

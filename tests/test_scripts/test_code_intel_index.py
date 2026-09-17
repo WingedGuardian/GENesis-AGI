@@ -542,3 +542,13 @@ def test_triggers_enqueue_markers_and_do_not_spawn():
         assert "code_intel_index.sh" not in text, (
             f"{rel} must NOT spawn the entrypoint directly — enqueue a marker"
         )
+
+
+def test_installer_does_not_claim_queue_success_after_writer_failure():
+    text = (_REPO_ROOT / "scripts/install.sh").read_text()
+    queue = text.split("# Queue initial code intelligence indexing", 1)[1].split(
+        "# ═", 1
+    )[0]
+    assert "index_marker.py\" write" in queue
+    assert "|| true" not in queue
+    assert "WARNING: could not queue initial code intelligence index" in queue

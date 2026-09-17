@@ -124,8 +124,10 @@ curate) × **whose voice** (user's [default] / stealth, see Stealth Mode).
    `references/anti-slop.md` (the Universal section plus the current-medium
    section) and Tier-1 words in `references/ai-vocabulary.md`. **Em-dash hard
    rule:** a spaced em dash (` — `) is the #1 AI tell — if it appears anywhere,
-   the audit FAILED; never spaced, max 1-2 per page, prefer a comma / period /
-   colon. Also check specificity (one concrete detail that couldn't apply to
+   the audit FAILED. Published prose never uses an em dash at all (owner
+   ruling 2026-09-16): prefer a comma / period / colon, and when a dash is
+   genuinely earned write two hyphens closed up (`word--word`), max 1-2 per
+   page. Also check specificity (one concrete detail that couldn't apply to
    any topic) and natural sentence-length variation. On failure, revise with
    specific feedback; max 2 passes, then surface the best version with
    remaining flags noted. Final gut check — read it aloud: if it sounds like a

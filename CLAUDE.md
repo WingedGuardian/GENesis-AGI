@@ -188,6 +188,17 @@ Applies to every assertion — in conversation, and doubly in anything written t
   it.** When you have only the count, say "not found in K of N", never "absent". This
   failure is silent and confident: an under-read is indistinguishable from a clean result,
   so nothing prompts you to check.
+- **Do not set a limit you cannot justify — the failure starts at the WRITE end.** The
+  moment you pass `--limit 30` the answer is decided, and no later vigilance recovers it.
+  Default to **no limit** on an enumeration you will draw a count or an absence from; pass
+  one only when you can name the budget it protects, and then treat a saturated read
+  (`n >= limit`) as truncated without waiting to be reminded. **An UNFLAGGED listing may
+  already be capped by a tool default you never chose** — the absence of a limit in the
+  command is not evidence of a complete read, and that is the version of this you cannot
+  feel. A preview is exempt (`| head`, a top-N sample): that is a selection you are not
+  counting. The house pattern is `src/genesis/session_awareness/repo_pulse_gh.py`, which records
+  `limit_hit` and is loud rather than silent. Reporting your own limit back as a total
+  has happened.
 - **Evidence tiers.** Every stated fact is one of: **MEASURED** (number + denominator),
   **READ** (artifact + location, e.g. file:line / PR / live query), **INFERRED** (must be
   hedged out loud — "I think", "unverified, but"), or **ASSUMED** (say so). An unmarked
@@ -286,7 +297,8 @@ the rule below used to fire so rarely. Three concrete triggers:
    X is not what its name suggests. Especially when you went looking for X
    expecting it to be absent.
 3. **You CORRECTED a belief** — your own, a prior session's, or a written note's.
-   Use `supersedes` to link the correction to what it replaces. This is the
+   Use `supersedes` to link the correction to what it replaces, or
+   `memory_supersede(old_id, new_id)` when both memories already exist. This is the
    highest-value trigger and the easiest to skip, because being wrong does not
    feel like a finding. It is the one that stops the next session paying for the
    same mistake.
@@ -383,20 +395,22 @@ mission via `session_charter_update` when the session's purpose
 crystallizes or pivots — the tag prints `mission: UNSET after N compactions`
 until you do, because an unset mission falls back to the raw origin prompt and
 reads as noise. You are the first line of defense; ambient
-extraction (session-manager PR-3) is only the safety net. Plan files stay
+extraction is only the safety net. Plan files stay
 the working documents — ledger rows are the durable index, not a duplicate.
 
-**PR-body convention — `E2E:` (required, merge-gated):** every PR body declares
+**PR-body convention — `E2E:` (encouraged, advisory):** a PR body may declare
 the POST-MERGE end-to-end verification its change needs, on its own line:
 `E2E: <one-line plan>` or `E2E: none — <reason there is no runtime surface>`.
-The merge gate blocks a PR that declares neither — and a `none` carrying no real
-reason (a bare `none`, a placeholder, or a refusal word like TBD). Merge time
-only, never on push. PRs created before the convention are exempt; if the PR's
-creation date cannot be READ, the gate blocks rather than assuming the
-exemption. `none` is a fine answer for a docs PR; what is refused is leaving the
-decision unmade. It does NOT release
-the validator, which assumes every merged PR has an E2E and hunts for one anyway
-— the line is its first lead, not a boundary.
+This does NOT gate the merge — the merge gate prints an advisory NOTE when a
+body declares neither, and proceeds.
+
+**Write it whether or not anything reads it back.** The obligation belongs after
+the merge, and the line in the body is the author's own lead on it: one sentence
+from the person who knew, instead of a judgment someone reverse-engineers from
+the diff days later. That value does not depend on what consumes it — which is
+why the convention is worth the ten seconds even where nothing forces you, and
+why a bare `E2E: none` on a code PR is the weak form: it costs a round-trip to
+recover exactly the judgment you were closest to.
 
 **PR-body convention:** a PR that completes a ledger item cites
 `Ledger: <item-id>` (the 32-hex row id) on its own line in the PR body —
@@ -442,12 +456,63 @@ because the preview reads as ordinary furniture at the top of a window.
 
 The size threshold is undocumented and **moves between CC versions** — treat
 the wrapper itself as the signal, never a byte count.
-`scripts/hooks/hook_output.py` is the single home of the measured cap and
-bounds the two hooks that carry the most to the model (the SessionStart
-injection and the per-prompt session-state tags); **route any new model-facing
-stdout through it** — the other hooks are not bounded yet. The hourly
-`context_injection_monitor` watches the harness's own filings independently of
-every emitter's arithmetic, so this class cannot go quiet again.
+`scripts/hooks/hook_output.py` is the single home of the measured cap;
+**route any new model-facing stdout through it.** That instruction is now
+ENFORCED rather than advisory: `tests/test_scripts/test_hook_output_contract.py`
+enumerates every hook wired **in `.claude/settings.json`** to `SessionStart` /
+`UserPromptSubmit` / `UserPromptExpansion` — the three events whose bare stdout
+the model reads, DERIVED by AST from `hook_output.py`'s own `BARE_STDOUT_EVENTS`
+so the gate keeps no copy to drift — and fails
+unless each one either routes through the writer or carries a stated, measured
+reason it cannot reach the cap. Polarity is ALLOWLIST: a hook wired next year
+with unbounded output fails by construction, which a known-bad-pattern scan could
+not do. A STRUCTURAL exemption may only cite a bound **configuration cannot
+change** — a hardcoded slice or an in-code clamp, never a config DEFAULT, since a
+`.local.yaml` overlay can raise a default.
+
+There is a SECOND, weaker category, kept so that describing only the first does
+not overstate the gate: `_MEASURED_PENDING_ROUTING` is for a hook that is NOT
+structurally bounded and has simply never been observed filing. It is **empty** —
+its only ever member now routes through the writer and bounds each surface by
+meaning. The category stays because the next hook with that shape needs a
+labelled place to sit; a row filed under "structurally bounded" is a false claim
+rather than visible debt.
+
+Two rules from that work, because both are the kind you get wrong while
+believing otherwise. **A size bound must be measured in the unit the harness
+bills** (UTF-16 code units, via `utf16_len`/`clip_to_cost`) — mixing units does
+not loosen a bound, it SKIPS it, and the extremes hide that, so sweep a range
+rather than trying one huge value. A bound on MEANING (is this token a word?)
+stays in codepoints; say which you are writing. And **a bound must not decide
+eligibility** — filtering what gets rendered is not a judgement about whether the
+work is worth doing, and conflating them silently skipped recall for a whole
+class of prompt. Detail lives with the code, in
+`.claude/docs/proactive-memory-hook.md`.
+
+Three limits, so it is not read as total coverage. Hooks wired in a user-level
+`~/.claude/settings.json` or a `settings.local.json` are outside the repo and
+invisible to it. An exemption still skips the PRINT SCAN — every row now carries
+a checker, but it re-runs a NECESSARY CONDITION of the row's claim, never a
+verification of it: a checker shows a constant or pattern still EXISTS, not that
+it still BINDS the output. Which is why the table stays small and why ROUTING a
+hook through the writer still beats adding a row. And the detector's
+enumeration is bounded, not total: it covers `print`, `builtins.print`,
+`file=None`, `file=sys.stdout`/`__stdout__`, and `sys.stdout[.buffer].write`,
+but NOT `os.write(1, …)`, an aliased handle, a rebound `print`, or a subprocess
+inheriting stdout. That list grew four times under review; treat it as the
+spellings checked so far rather than a closed set.
+
+Hooks on the OTHER events reach the model through JSON `additionalContext`, the
+same persistence path with a different failure mode — an oversized advisory must
+lose prose, never its `permissionDecision`, which is what `print_json_bounded`
+protects. They are out of the gate's scope today, deliberately, rather than
+exempted in bulk.
+
+The hourly `context_injection_monitor` watches the harness's own filings
+independently of every emitter's arithmetic, so this class cannot go quiet
+again — and its record is the evidence that the chokepoint works: of 849 filings
+on this install, 842 were one emitter that stopped filing the day it was moved
+behind the writer, and 7 were a guard since removed.
 
 ## Traps
 
@@ -478,8 +543,39 @@ every emitter's arithmetic, so this class cannot go quiet again.
   Default floor: 2 hours (7200s). Full policy in genesis-development skill.
 - **Verify outcomes, not just tests.** "If the system restarts now, will
   this work?" Built ≠ wired ≠ verified. Details in genesis-development skill.
-- **Code review after code changes.** Codex will review your output.
-  Protocol in genesis-development skill.
+- **Code review after code changes.** Codex reviews your output — but only
+  AUTOMATICALLY WHEN THE PR OPENS. A later push triggers nothing: after any push you
+  want reviewed, comment `@codex review`, or the PR waits forever on a review nobody
+  requested. **Verify rather than remember** — that trigger is an owner-tunable
+  setting which has flipped more than once, so a session that recalls it from prose
+  will eventually be wrong. `python3 scripts/hooks/git_push_guard.py --check-pr <N>`
+  reports `codex-at-head`, which settles whether a review EXISTS at this head — not
+  whether one was requested. It reads published reviews only, so "never triggered"
+  and "triggered, still running" are the SAME output; if you have not just requested
+  one, request one rather than reading that line as proof nobody did.
+  **Codex is not the only reviewer that can block you.** CodeRabbit reviews on its
+  own schedule, and an unresolved **Critical or Major** inline finding on a file in
+  the PR diff blocks a merge by itself — the always-fix floor, which stops a Codex
+  **P1** the same way, in EVERY lane, before any score is consulted. Unless the
+  configured documentation-path exclusion applies.
+  Maintainer-replied findings and findings on files outside the PR diff do not
+  score; under the shipped `doc_findings: skip`, documentation findings do not
+  score either. Until 2026-09-10 CodeRabbit was
+  named in no instruction file in this repo, so sessions read `codex-at-head: ok` as
+  "review is clear" and were surprised by the score. Read the `inline-findings` row,
+  not just the Codex row.
+  **Below the floor, how much a change can afford depends on its LANE** — a
+  consequence class computed from the diff, not chosen by the author. Two P2s
+  block a `critical` change (enforcement hooks, `.github/**`, api/migration
+  paths); ordinary code takes four; prose-and-tests-only takes six — config is
+  NOT prose, so a `.yaml`/`.toml` change is ordinary. The gate prints the
+  lane and its threshold whenever a non-zero score passes under one, so "it did
+  not block" never has to be guessed at. Table and rationale: genesis-development
+  skill, Pre-Merge Gate.
+  A PR whose diff touches the
+  enforcement-hook surface additionally runs the **gate-fix lane** — wider round 1, and
+  a hard stop at 2 rounds that is doctrine you keep, not a gate that stops you. Both
+  protocols: genesis-development skill.
 - **Commit continuously**: uncommitted = invisible = lost.
 - **Bias toward closing open work before opening new — softly (≈51/49).** Not a
   gate: parallel work and multiple in-flight PRs are fine, and you needn't finish
@@ -499,6 +595,11 @@ every emitter's arithmetic, so this class cannot go quiet again.
   3 silently discards steps 1 and 2 while the error text mentions only step 3.
   Never chain a state-changing step (`cd`, heredoc, file write,
   restore-from-backup) with one a guard can block (test run, commit, push).
+  Most guards now append a note saying the whole command went whenever the
+  command had more than one step — a REMINDER, never a report: it names nothing
+  and cannot tell you which step mattered, so it does not replace the check. The
+  shell blockers (`bash_safety_hook.sh` and the inline `settings.json` one) do
+  NOT carry it yet, so its ABSENCE never means the command was single-step.
   After any block, run `pwd` and re-check the file you believed you wrote —
   never assume the earlier half ran. Prefer `git -C <literal path>` and
   `$ROOT/scripts/…` over a persistent `cd`, so a lost `cd` cannot silently
@@ -512,7 +613,12 @@ every emitter's arithmetic, so this class cannot go quiet again.
   calls. Always pass ≥2 questions; if only one is real, add a trivial/filler
   second question to satisfy the tool. Every time, no exceptions.
 - **Plan mode by default** for any task with 3+ steps or architectural
-  decisions. If something goes sideways — STOP and re-plan.
+  decisions. If something goes sideways — STOP and re-plan. A plan-mode
+  document under `~/.claude/plans/` that will outlive one session opens with
+  the structured header (status, `pinned.main`, `binds`/`prevents`, and the
+  trackers it executes) — format and rationale in the genesis-development
+  skill, `references/plan-docs.md`. Task-executor plans (`/task`,
+  `TASK_INTAKE.md`) keep their own section contract and are out of scope.
 - **Use subagents** to keep main context clean. One concern per subagent.
   **A MANDATED subagent is already the request** — when a gate's block message
   tells you to dispatch one, dispatch it; don't stop to ask. Ask only for
@@ -568,8 +674,8 @@ every emitter's arithmetic, so this class cannot go quiet again.
   approval, or a designed hard stop is finishing correctly, not dropping
   work. When something genuinely cannot finish this turn, every unfinished
   piece becomes a tracked row BEFORE stopping: ledger or follow-up — or an
-  issue, which keeps its per-instance approval gate from "Where deferred
-  work goes" below, this rule waives nothing. Where none of those trackers
+  issue, which still owes the privacy scrub from "Where deferred work goes"
+  below — this rule waives nothing. Where none of those trackers
   is reachable — a non-Genesis client (Codex, Cursor) reads this file with no
   ledger or follow-up tool — the fallback is a structured handoff that NAMES
   every unfinished piece in your final message; a named remainder is tracked,
@@ -585,7 +691,24 @@ every emitter's arithmetic, so this class cannot go quiet again.
   what was learned. If it's not committed, it doesn't exist.
 - **Where deferred work goes.** Bias = FIX NOW; defer only if the work is (1) blocked
   on an unmet precondition (incl. an unmade design decision), (2) gated on time/data,
-  or (3) big enough to derail the session — or the user directs it. Route by OWNER:
+  or (3) big enough to derail the session — or the user directs it.
+
+  **FILING IS NOT DEFERRING, and the two decisions are separate.** Everything below
+  answers WHERE a record lives. It never answers WHETHER the work waits — that is the
+  bias above, and it is decided FIRST. An issue is a public RECORD, not a disposal:
+  in-scope work gets filed *and* done, often in the same session, and the issue is
+  then simply where someone else could have found it. Treating "I filed it" as a
+  disposition is how a tracked item becomes an untracked drop wearing a ticket
+  number.
+
+  So before routing anything, answer in this order: **is it in scope for what this
+  session is doing?** If yes, it gets addressed here — file it too if that helps
+  someone else, but the filing is in addition, never instead. Only when it is
+  genuinely out of scope, or one of the three deferral tests above actually holds,
+  does the routing question below become the whole answer. Naming the OWNER of a
+  piece of work is a classification, and a classification is not a decision.
+
+  Route by OWNER:
   **Genesis-repo work** (code, tests, docs, infra — anything that would live in the
   public repo, even when hit locally) → a **GitHub issue**, so anyone can pick it up.
   **User-owned work** (a deliverable, an errand, anything asked for and unfinished),
@@ -594,14 +717,19 @@ every emitter's arithmetic, so this class cannot go quiet again.
   far-off direction) → **tabled** (`work_state="deferred_cold"`) — a private record,
   never dispatched, surfaced, or filed as an issue, because we don't want it picked
   up. `work_state` DERIVES the lane, so priority never picks it. ONE record per item.
-  Two hard limits on the issue route, both non-negotiable: a public post is
-  IRREVERSIBLE, so it needs the user's **explicit approval every time** (no standing
-  approval carries forward, and a channel-driven session has no confirmation step of
-  its own); and a **security** defect — an unpatched bypass, a credential exposure,
-  anything exploitable — is NEVER filed publicly before it is fixed, no matter who
-  owns it. Everything else — who may file, the command, labels, dispatched sessions,
-  the time-gated case — is in `.claude/docs/mcp-tools-guide.md` ("Where Deferred Work
-  Goes"). Read it before filing your first.
+  A public post is IRREVERSIBLE and PUBLIC — so the gate on the issue route is WHAT
+  GOES IN IT, not permission to file. **Scan every issue for personal or identifying
+  detail** — names, hosts, IPs, paths embedding a username, anything about the user's
+  real-world life — and strip it; an issue carries technical detail only. Borderline,
+  either way? Ask. Filing itself needs no per-instance approval: a bug you found while
+  reviewing a PR, that does not block that PR, is the ordinary case — file it and keep
+  the PR moving (discriminator + bounds: genesis-development, "Keep the PR the PR").
+  One limit stays absolute: a **security** defect — an unpatched bypass, a
+  credential exposure, anything exploitable — is NEVER filed publicly before it
+  is fixed, no matter who owns it. Everything else — who may file, the command,
+  labels, dispatched sessions, the time-gated case — is in
+  `.claude/docs/mcp-tools-guide.md` ("Where Deferred Work Goes"). Read it before
+  filing your first.
 - **No laziness.** Find root causes. No temporary fixes. No shortcuts.
   Don't EVER mute the symptom — fix the problem.
 - **Read before writing.** Never modify code you haven't fully read.

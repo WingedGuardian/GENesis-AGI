@@ -159,6 +159,17 @@ This section documents the mechanism for debugging only. The VNC
 protocol injects real input events, bypassing detection of synthetic
 events (XTest, CDP, Playwright mouse).
 
+**Coordinate correctness is NOT this skill's subject, and the rules live in
+one place.** This path is the only one in the codebase that mixes coordinate
+spaces — DOM coordinates in CSS pixels against a window origin in physical
+screen pixels — and it got that wrong until #1828 (2026-09-09) by measuring
+`devicePixelRatio` and never applying it. That fix also added a pointer
+readback, so the path now reports where the pointer actually landed; it still
+cannot tell what is under it. Anti-detection and hitting the right
+pixel are orthogonal concerns; see **Coordinate Safety** in the
+`browser-automation` skill rather than re-deriving it here, so the two cannot
+drift apart.
+
 ### Why It Works
 
 x11vnc injects input through the VNC protocol, adding network-realistic
@@ -262,7 +273,10 @@ dwell period >2s), the cursor must not be dead-still.
 - Emit 1-3 mousemove events every 1-2s during all dwell periods
 - Displacement: ±1-3px from current position (random, not oscillating)
 - Do NOT jitter during active movement (only during stillness)
-- Implemented in `_idle_jitter()` in browser.py
+- `_idle_jitter()` exists in browser.py but **has no call site** — verified
+  against the current tree. Nothing emits this jitter on your behalf, so a
+  dwell is genuinely dead-still unless something invokes it. Treat this as a
+  rule with a helper available, not a behaviour you already have.
 
 ### Keystroke Hold Time (keydown-to-keyup gap)
 
@@ -273,7 +287,10 @@ Real keys are held briefly before release. Each keypress fires
 - Calibration: median ~86ms (p5=48ms, p95=149ms) per CMU Keystroke dataset
 - Vary per keystroke -- NOT uniform across all keys
 - Flight time (key-up to next key-down): existing 50-200ms IKI still applies
-- Implemented in `_human_type()` in browser.py
+- Implemented in `_human_type()` in browser.py and wired: `browser_fill` calls
+  it whenever Camoufox or remote CDP is active, which is this skill's whole
+  scope. On plain Chromium it falls back to an atomic `page.fill()`, so the
+  per-keystroke timing is a property of the stealth path, not of every fill.
 
 ### Navigation Graph Depth
 
@@ -304,7 +321,9 @@ content boundaries.
 - Decelerate scroll to zero over 200-400ms at end of each gesture
 - Add "scroll past then back" pattern when targeting form fields (p=0.3)
 - Scroll delta variance: 20-100px per event (never constant)
-- Implemented in `_human_scroll()` in browser.py
+- `_human_scroll()` exists in browser.py but **has no call site** — verified
+  against the current tree. Scrolling done any other way has none of the
+  properties above.
 
 ### Pre-Form Element Interaction
 
