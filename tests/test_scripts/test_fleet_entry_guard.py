@@ -729,6 +729,176 @@ def test_enabling_lever_values_keep_the_clear(tmp_path, value):
     assert "CLEARED %9" in body, f"value={value!r}: {body}"
 
 
+def test_an_explicitly_empty_lever_disables_rather_than_reading_as_unset(tmp_path):
+    """`GENESIS_FLEET_GUARD_CLEAR=` is SET, so it must disable.
+
+    `${VAR:-}` collapses set-but-empty into the same state as unset, which left
+    clearing ENABLED — the exact inverse of the declared fail-closed semantics.
+    A blank line in a config template or a half-finished edit produces this.
+    Found by external review.
+    """
+    _, body = _run_with_stub(
+        tmp_path, _stub_tmux(tmp_path, clears=True), GENESIS_FLEET_GUARD_CLEAR=""
+    )
+    assert "CLEAR-SKIPPED" in body, body
+    assert "CLEARED" not in body, body
+
+
+def test_an_empty_lever_in_the_config_file_also_disables(tmp_path):
+    """Same rule through the file path: the KEY being present is what counts."""
+    home = tmp_path / "home"
+    (home / ".genesis").mkdir(parents=True)
+    (home / ".genesis" / "cc-slot.env").write_text("GENESIS_FLEET_GUARD_CLEAR=\n")
+    bin_dir = _stub_tmux(tmp_path, clears=True)
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["HOME"] = str(home)
+    env.pop("TMUX", None)
+    env.pop("GENESIS_FLEET_GUARD_CLEAR", None)
+    env.pop("GENESIS_FLEET_GUARD_PANES_FILE", None)
+    subprocess.run(["bash", str(GUARD), "lobby"], env=env, check=True, timeout=60)
+    logs = sorted((home / ".genesis" / "logs").glob("fleet_entry_*.log"))
+    body = logs[0].read_text() if logs else ""
+    assert "CLEAR-SKIPPED" in body, body
+    assert "CLEARED" not in body, body
+
+
+def test_the_seam_works_on_a_runner_with_no_tmux_at_all(tmp_path):
+    """The no-tmux portability contract, actually exercised.
+
+    The tmux requirement used to sit ABOVE the seam check, so on a runner
+    without tmux the script exited before reading the injected pane file and
+    every "runs anywhere" classification test silently got no log — the tests
+    passed for the wrong reason, proving nothing. Found by external review.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    panes_file = tmp_path / "panes.txt"
+    panes_file.write_text(_pane("cc-3", 1, "tree-mode") + "\n")
+    empty_bin = tmp_path / "emptybin"
+    empty_bin.mkdir()
+    for tool in (
+        "bash",
+        "date",
+        "mkdir",
+        "cat",
+        "grep",
+        "sed",
+        "chmod",
+        "tr",
+        "printf",
+        "getent",
+        "id",
+        "tail",
+        "command",
+        "flock",
+    ):
+        src = shutil.which(tool)
+        if src:
+            (empty_bin / tool).symlink_to(src)
+
+    env = dict(os.environ)
+    env["PATH"] = str(empty_bin)  # no tmux on PATH at all
+    env["HOME"] = str(home)
+    env["GENESIS_FLEET_GUARD_PANES_FILE"] = str(panes_file)
+    env.pop("TMUX", None)
+    assert shutil.which("tmux", path=str(empty_bin)) is None, "fixture still has tmux"
+
+    proc = subprocess.run(
+        ["bash", str(GUARD), "lobby"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    logs = sorted((home / ".genesis" / "logs").glob("fleet_entry_*.log"))
+    assert logs, f"no log written on a tmux-less runner: {proc.stderr!r}"
+    assert "ANOMALY moded-destination cc-3:1.0" in logs[0].read_text()
+
+
+def test_a_failed_pane_read_is_not_treated_as_a_complete_inventory(tmp_path):
+    """A truncated read must be DISCARDED, not used.
+
+    Every nonzero tmux result used to be swallowed, so stdout emitted before a
+    connection error was accepted as a full inventory. If that partial output
+    holds a linked pane's unattached row but omits its attached one, the
+    aggregation calls the pane stranded and clears a mode a live client is
+    using. Found by external review; this is the safety boundary, not tidiness.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub = bin_dir / "tmux"
+    # Emits a plausible stranded row, then FAILS — the shape of a server that
+    # died partway through writing its answer.
+    stub.write_text(
+        "#!/bin/sh\n"
+        'for a in "$@"; do\n'
+        '  case "$a" in\n'
+        "    *kind=*) "
+        'echo "in_mode=1 kind=dest pane=%9 attached=0 cc-9:1.0 '
+        'mode=tree-mode pid=1 cmd=bash"; exit 1 ;;\n'
+        "  esac\n"
+        "done\n"
+        "exit 1\n"
+    )
+    stub.chmod(0o755)
+    _, body = _run_with_stub(tmp_path, bin_dir)
+    assert "CLEARED" not in body, body
+    assert "ANOMALY" not in body, (
+        "a failed read was accepted as an inventory and drove a decision:\n" + body
+    )
+
+
+def test_a_failed_verification_read_is_recorded_not_assumed_clear(tmp_path):
+    """If the verification read fails, nothing knows whether the clear took.
+
+    Claiming success from a read that did not happen is the confident lie the
+    verification step exists to prevent, and the accounting invariant says
+    every stranded pane gets a disposition.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub = bin_dir / "tmux"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'case "$1" in if-shell|copy-mode) exit 0 ;; esac\n'
+        'for a in "$@"; do\n'
+        '  case "$a" in\n'
+        "    *kind=*) "
+        'echo "in_mode=1 kind=dest pane=%9 attached=0 cc-9:1.0 '
+        'mode=tree-mode pid=1 cmd=bash"; exit 0 ;;\n'
+        "    pane=*in_mode*) exit 1 ;;\n"  # verification read FAILS
+        "  esac\n"
+        "done\n"
+        "exit 0\n"
+    )
+    stub.chmod(0o755)
+    _, body = _run_with_stub(tmp_path, bin_dir)
+    assert "CLEARED %9" not in body, body
+    assert "CLEAR-INCOMPLETE" in body, body
+    assert "%9" in body, body
+
+
+def test_the_tmux_timeout_carries_a_kill_after_bound(tmp_path):
+    """A caught SIGTERM must not outlive the advertised deadline.
+
+    GNU timeout's own documentation notes TERM may be caught or ignored, in
+    which case a plain `timeout` waits past its deadline — and here that holds
+    BOTH ssh entry paths open. cc-slot.sh's login-path probes already carry
+    --kill-after for the same reason.
+    """
+    text = GUARD.read_text()
+    timeout_lines = [
+        ln
+        for ln in text.splitlines()
+        if "timeout " in ln and "command -v" not in ln and not ln.lstrip().startswith("#")
+    ]
+    assert timeout_lines, "no timeout invocation found at all"
+    for ln in timeout_lines:
+        assert "--kill-after" in ln, f"unbounded timeout invocation: {ln!r}"
+
+
 def test_the_lever_can_be_set_in_the_file_the_doors_actually_read(tmp_path):
     """THE BLOCKER: a lever nobody can pull is not a lever.
 

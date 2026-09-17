@@ -96,7 +96,12 @@ if [ -z "${HOME:-}" ]; then
 fi
 [ -n "${HOME:-}" ] || exit 0
 
-command -v tmux >/dev/null 2>&1 || exit 0
+# NOTE: the tmux binary is required only on the real path. The check used to
+# sit here, ABOVE the injected seam, so on a runner without tmux the script
+# exited before reading the seam at all and every "runs on any runner"
+# classification test silently received no log — defeating the no-tmux
+# portability contract those tests are written to prove. The requirement now
+# lives in the non-seamed branch.
 
 log_dir="${HOME}/.genesis/logs"
 mkdir -p "$log_dir" 2>/dev/null || exit 0
@@ -123,18 +128,57 @@ _guard_start="$(date +%s)"
 _have_timeout=""
 command -v timeout >/dev/null 2>&1 && _have_timeout=1
 
-_tmux_do() {
-    local remaining
-    remaining=$(( _GUARD_BUDGET_S - ( $(date +%s) - _guard_start ) ))
-    [ "$remaining" -gt 0 ] || return 0
+# READS and MUTATIONS get different failure treatment, and conflating them was
+# a real hazard. A single best-effort helper swallowed every nonzero result, so
+# stdout emitted BEFORE a connection error or a server exit was accepted as a
+# complete `list-panes` inventory. A partial inventory that happens to contain
+# a linked pane's unattached row while omitting its attached one makes the
+# aggregation conclude the pane is stranded — and clears a mode a live client
+# is using. A truncated read must therefore be discarded, not used.
+#
+# `--kill-after` matters on both: GNU timeout's own documentation notes TERM
+# may be caught or ignored, in which case a plain `timeout` waits past the
+# advertised deadline and holds BOTH ssh entry paths open. cc-slot.sh's
+# login-path probes already carry this for the same reason.
+_TMUX_KILL_AFTER=2
+
+_tmux_remaining() {
+    local r
+    r=$(( _GUARD_BUDGET_S - ( $(date +%s) - _guard_start ) ))
+    [ "$r" -gt 0 ] || return 1
+    printf '%s' "$r"
+}
+
+# Emits the command's stdout ONLY when it completed successfully. On timeout,
+# error, or an exhausted budget it emits nothing and returns non-zero, so a
+# caller can tell "read nothing" from "could not read".
+_tmux_read() {
+    local remaining out rc
+    remaining="$(_tmux_remaining)" || return 1
     if [ -n "$_have_timeout" ]; then
-        timeout "$remaining" tmux "$@" 2>/dev/null || true
+        out="$(timeout --kill-after="$_TMUX_KILL_AFTER" "$remaining" \
+            tmux "$@" 2>/dev/null)"; rc=$?
     else
         # No `timeout` binary: the call is unbounded. Degrading to "do nothing"
         # would be worse — it would silently disable this on any install
         # lacking coreutils' timeout, which is the install least likely to
         # notice.
-        tmux "$@" 2>/dev/null || true
+        out="$(tmux "$@" 2>/dev/null)"; rc=$?
+    fi
+    [ "$rc" -eq 0 ] || return 1
+    printf '%s' "$out"
+}
+
+# Best-effort by design: a mutation that fails changes nothing, and the
+# verification read below is what decides whether it took.
+_tmux_mutate() {
+    local remaining
+    remaining="$(_tmux_remaining)" || return 0
+    if [ -n "$_have_timeout" ]; then
+        timeout --kill-after="$_TMUX_KILL_AFTER" "$remaining" \
+            tmux "$@" >/dev/null 2>&1 || true
+    else
+        tmux "$@" >/dev/null 2>&1 || true
     fi
 }
 
@@ -168,10 +212,17 @@ if [ -n "${GENESIS_FLEET_GUARD_PANES_FILE:-}" ] \
     clients=""
     _seamed=1
 else
-    panes="$(_tmux_do list-panes -a -F "$_PANE_FORMAT")"
-    sessions="$(_tmux_do list-sessions -F \
-        '#{session_name} created=#{session_created} attached=#{session_attached}')"
-    clients="$(_tmux_do list-clients -F '#{client_tty} session=#{client_session}')"
+    # tmux is required only here — see the note above the log paths.
+    command -v tmux >/dev/null 2>&1 || exit 0
+    # A FAILED read yields nothing. Accepting whatever stdout arrived before an
+    # error would let a truncated inventory drive the clear decision, and a
+    # truncated inventory is exactly how a linked pane loses its attached row.
+    panes="$(_tmux_read list-panes -a -F "$_PANE_FORMAT")" || panes=""
+    sessions="$(_tmux_read list-sessions -F \
+        '#{session_name} created=#{session_created} attached=#{session_attached}')" \
+        || sessions=""
+    clients="$(_tmux_read list-clients -F \
+        '#{client_tty} session=#{client_session}')" || clients=""
 fi
 
 # No server, or every read timed out: nothing to say. A cold first connection
@@ -255,8 +306,19 @@ incomplete=""
 # READ, never sourced. Sourcing executes the file on the login path; grepping
 # one key cannot. That is the shape disk_hygiene.sh's `_load_store_knob` uses,
 # for the same reason. Last assignment wins, as systemd reads these files.
-_clear_lever="${GENESIS_FLEET_GUARD_CLEAR:-}"
-if [ -z "$_clear_lever" ] && [ -f "${HOME}/.genesis/cc-slot.env" ]; then
+# `${VAR:-}` collapses an explicitly-SET-but-empty value into the same state as
+# an unset one, so `GENESIS_FLEET_GUARD_CLEAR=` — a blank template line, or a
+# half-finished edit — would have read as "unset" and left clearing ENABLED.
+# That is the exact inverse of the fail-closed semantics declared below. Test
+# whether the name is set with `${VAR+set}` and keep the value separately, so a
+# blank value is what it looks like: set, unrecognised, and therefore off.
+_clear_lever=""
+_clear_lever_set=""
+if [ -n "${GENESIS_FLEET_GUARD_CLEAR+set}" ]; then
+    _clear_lever="${GENESIS_FLEET_GUARD_CLEAR}"
+    _clear_lever_set=1
+fi
+if [ -z "$_clear_lever_set" ] && [ -f "${HOME}/.genesis/cc-slot.env" ]; then
     _line="$(grep -aE '^[[:space:]]*(export[[:space:]]+)?GENESIS_FLEET_GUARD_CLEAR=' \
         "${HOME}/.genesis/cc-slot.env" 2>/dev/null | tail -1)" || _line=""
     if [ -n "$_line" ]; then
@@ -265,6 +327,9 @@ if [ -z "$_clear_lever" ] && [ -f "${HOME}/.genesis/cc-slot.env" ]; then
             \"*\") _clear_lever="${_clear_lever#\"}"; _clear_lever="${_clear_lever%\"}" ;;
             \'*\') _clear_lever="${_clear_lever#\'}"; _clear_lever="${_clear_lever%\'}" ;;
         esac
+        # The KEY was present in the file, so the lever is set — even if the
+        # value is blank. Same reasoning as the `${VAR+set}` test above.
+        _clear_lever_set=1
     fi
     unset _line
 fi
@@ -276,13 +341,13 @@ fi
 # silently permitting it, and `0`/`false`/`no` all disable as an operator would
 # expect. Only exact-string "off" used to disable, which was the inverse.
 _clear_enabled=1
-if [ -n "$_clear_lever" ]; then
+if [ -n "$_clear_lever_set" ]; then
     case "$(printf '%s' "$_clear_lever" | tr '[:upper:]' '[:lower:]')" in
         on|1|true|yes) _clear_enabled=1 ;;
         *) _clear_enabled="" ;;
     esac
 fi
-unset _clear_lever
+unset _clear_lever _clear_lever_set
 
 # Under the test seam the pane ids name nothing real, so no tmux command may be
 # issued against whatever happens to be running.
@@ -294,7 +359,7 @@ _budget_left() {
 }
 
 if [ -n "$_clear_enabled" ] && [ -n "$stranded_ids" ]; then
-    # Track what was actually ATTEMPTED. `_tmux_do` returns silently once the
+    # Track what was actually ATTEMPTED. `_tmux_mutate` returns silently once the
     # budget is spent, so without this a run that ran out of time mid-loop
     # reported nothing at all about the panes it never reached — three ANOMALY
     # lines and no CLEARED, CLEAR-FAILED or CLEAR-SKIPPED, which reads as "we
@@ -320,14 +385,20 @@ if [ -n "$_clear_enabled" ] && [ -n "$stranded_ids" ]; then
         # clear a pane a live client was viewing), but that is an observation of
         # tmux's target resolution, not a guarantee it owes us — so it is the
         # atomicity layer, never the only check.
-        _tmux_do if-shell -t "$_id" -F '#{==:#{session_attached},0}' \
+        _tmux_mutate if-shell -t "$_id" -F '#{==:#{session_attached},0}' \
             "copy-mode -q -t $_id"
         attempted="${attempted}${_id} "
     done
     unset _id
 
-    if [ -n "$attempted" ] && _budget_left; then
-        _after="$(_tmux_do list-panes -a -F 'pane=#{pane_id} in_mode=#{pane_in_mode}')"
+    _after=""
+    _after_ok=""
+    if [ -n "$attempted" ]; then
+        _after="$(_tmux_read list-panes -a -F \
+            'pane=#{pane_id} in_mode=#{pane_in_mode}')" && _after_ok=1
+    fi
+
+    if [ -n "$_after_ok" ]; then
         for _id in $attempted; do
             # The SPACE before `in_mode` is load-bearing: without it `%1` would
             # prefix-match `%10`. MEASURED both ways — with the space, %1 finds
@@ -335,21 +406,36 @@ if [ -n "$_clear_enabled" ] && [ -n "$stranded_ids" ]; then
             case "$_after" in
                 *"pane=${_id} in_mode=1"*) still_stuck="${still_stuck}${_id} " ;;
                 *"pane=${_id} in_mode=0"*) cleared="${cleared}${_id} " ;;
-                # Neither: the pane vanished between the sweep and the re-read.
-                # Not a clear and not a failure to clear — say nothing rather
-                # than guess.
+                # The verification read SUCCEEDED but names no row for this
+                # pane, so the pane is gone. Recorded as incomplete rather than
+                # passed over: the accounting invariant is that every stranded
+                # pane gets a disposition, and silence here is exactly what
+                # makes a still-stranded operator invisible in the log.
+                *) incomplete="${incomplete}${_id} " ;;
             esac
         done
-        unset _id _after
-    else
-        # Cleared them but could not afford to look. Claiming success here is
-        # exactly the confident lie the verification exists to prevent.
+        unset _id
+    elif [ -n "$attempted" ]; then
+        # The verification read FAILED or the budget ran out before it. The
+        # clears may well have worked, but nothing here knows — and claiming
+        # success from a read that did not happen is the confident lie this
+        # whole verification step exists to prevent.
         incomplete="${incomplete}${attempted}"
     fi
+    unset _after _after_ok
+
     unset attempted
 fi
 
-{
+# RENDER THE WHOLE RECORD FIRST, then append it in ONE operation.
+#
+# The block below used to write straight to the log, which is several separate
+# writes to a file two doors share. Two simultaneous logins — the exact
+# multi-window case this guard exists for — interleaved their headers, findings
+# and pane inventories, producing records whose panes belonged to a different
+# entry than the header above them. Diagnostic evidence that cannot be trusted
+# to group correctly is worse than none, because it reads as if it can.
+_record="$(
     echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) entry=${label} pid=$$"
     if [ -n "$stranded" ]; then
         # Greppable: this is the line to search for after an operator reports a
@@ -374,7 +460,24 @@ fi
     echo "$panes" | sed 's/^/  pane /'
     [ -n "$sessions" ] && echo "$sessions" | sed 's/^/  sess /'
     [ -n "$clients" ] && echo "$clients" | sed 's/^/  client /'
-} >>"$log_file" 2>/dev/null || exit 0
+    true
+)" || _record=""
+
+[ -n "$_record" ] || exit 0
+
+# `flock` where it exists, which is the only thing that actually serialises two
+# processes here — a single append is atomic only under PIPE_BUF (4096 bytes)
+# and a full inventory exceeds that on any real fleet. Without flock the
+# single-write form is still strictly better than the many-writes form it
+# replaces, so its absence degrades rather than breaks.
+if command -v flock >/dev/null 2>&1; then
+    (
+        flock -w 5 9 2>/dev/null || true
+        printf '%s\n' "$_record" >&9
+    ) 9>>"$log_file" 2>/dev/null || exit 0
+else
+    printf '%s\n' "$_record" >>"$log_file" 2>/dev/null || exit 0
+fi
 
 chmod 600 "$log_file" 2>/dev/null || true
 
