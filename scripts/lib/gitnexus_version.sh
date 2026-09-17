@@ -166,8 +166,10 @@ genesis_gitnexus_resolve_binary() {
 }
 
 genesis_gitnexus_installed_version() {
-    local binary
-    binary="$(genesis_gitnexus_resolve_binary)" || return 1
+    local binary="${1:-}"
+    if [ -z "$binary" ]; then
+        binary="$(genesis_gitnexus_resolve_binary)" || return 1
+    fi
     # Same reasoning as the shadow scan: a stubbed `node` would otherwise make
     # this report the stub's output as GitNexus's version, and this value gates
     # the pin check.
@@ -176,7 +178,7 @@ genesis_gitnexus_installed_version() {
 
 genesis_gitnexus_installed_is_pinned() {
     local version
-    version="$(genesis_gitnexus_installed_version)" || return 1
+    version="$(genesis_gitnexus_installed_version "${1:-}")" || return 1
     [[ "${version#v}" == "$GENESIS_GITNEXUS_VERSION" ]]
 }
 

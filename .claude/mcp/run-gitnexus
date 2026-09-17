@@ -19,6 +19,7 @@ if ! source "$PIN_FILE" \
     || [[ ! "${GENESIS_GITNEXUS_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
     || ! declare -F genesis_gitnexus_node_supported >/dev/null \
     || ! declare -F genesis_gitnexus_resolve_binary >/dev/null \
+    || ! declare -F genesis_gitnexus_installed_version >/dev/null \
     || ! declare -F genesis_gitnexus_installed_is_pinned >/dev/null; then
     printf 'run-gitnexus: invalid pin metadata; refusing to start\n' >&2
     exit 1
@@ -47,8 +48,13 @@ if ! genesis_gitnexus_node_supported; then
     exit 1
 fi
 
-actual="$("$BINARY" --version 2>/dev/null || true)"
-if [ "${actual#v}" != "$GENESIS_GITNEXUS_VERSION" ]; then
+# Check the ALREADY-RESOLVED binary, not a fresh resolution and not its
+# `--version` output: GitNexus is a Node script, so executing it runs whatever
+# `node` is first on PATH, and a wrapped or stubbed node answers for it (the
+# same failure the shadow scan's package.json read exists to avoid). Passing
+# $BINARY also skips a second resolve, whose candidate set could differ.
+if ! genesis_gitnexus_installed_is_pinned "$BINARY"; then
+    actual="$(genesis_gitnexus_installed_version "$BINARY" 2>/dev/null || true)"
     printf 'run-gitnexus: refusing unpinned GitNexus %s; expected %s\n' \
         "${actual:-unknown}" "$GENESIS_GITNEXUS_VERSION" >&2
     exit 1
