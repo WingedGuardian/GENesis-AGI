@@ -468,12 +468,18 @@ if ! command -v jq &>/dev/null; then
     echo "    + jq installed"
 fi
 
-# Node.js version check — returns 0 if installed version >= 22, the floor of
-# the pinned Claude Code release (see scripts/lib/cc_version.sh).
+# Node.js version check — the floor of the pinned Claude Code release (>= 22,
+# see scripts/lib/cc_version.sh) raised to the pinned GitNexus engine range
+# (^22.18.0 || >=24.11.0, see scripts/lib/gitnexus_version.sh) so an install does
+# not strand GitNexus on a Node its pin refuses.
 _node_version_ok() {
     command -v node &>/dev/null || return 1
-    local ver; ver=$(node --version 2>/dev/null | grep -oP '(?<=v)\d+' | head -1)
-    [ "${ver:-0}" -ge 22 ] 2>/dev/null
+    local ver; ver=$(node --version 2>/dev/null | sed 's/^v//') || ver=""
+    local major="${ver%%.*}" minor="${ver#*.}"; minor="${minor%%.*}"
+    [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+    { [[ "$major" -eq 22 && "$minor" -ge 18 ]] \
+        || [[ "$major" -eq 24 && "$minor" -ge 11 ]] \
+        || [[ "$major" -gt 24 ]]; } 2>/dev/null
 }
 
 # Install Node.js with full fallback chain: pkg-mgr → NodeSource → nvm

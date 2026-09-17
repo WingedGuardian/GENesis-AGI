@@ -226,10 +226,25 @@ def test_cbm_disable_does_not_poison_successful_gitnexus_leg(tmp_path):
         path=f"{fakebin}:{_SYSTEM_PATH}",
         env_extra={"CODEBASE_MEMORY_MCP_DISABLE_FILE": str(disable_file)},
     )
-    assert res.returncode == 0, res.stderr
+    # rc 5: gitnexus leg done, cbm leg skipped — the runner must consume the
+    # marker WITHOUT stamping cbm's shared full-success clock.
+    assert res.returncode == 5, res.stderr
     out = log.read_text()
     assert "codebase-memory-mcp ARGS:" not in out
     assert "gitnexus ARGS:analyze" in out
+
+
+def test_cbm_done_gitnexus_refused_is_partial_rc4(tmp_path):
+    """cbm done + gitnexus refused must NOT be rc 3: the runner restores an
+    rc-3 marker without penalty, which rebuilt the completed cbm leg on every
+    idle tick forever. rc 4 says 'consume what ran'."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    (fakebin / "gitnexus").unlink()  # cbm present, gitnexus absent
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "both", path=f"{fakebin}:{_SYSTEM_PATH}")
+    assert res.returncode == 4, res.stderr
+    assert "codebase-memory-mcp ARGS:" in log.read_text()
 
 
 def test_tool_selection_gitnexus_only(tmp_path):
@@ -253,7 +268,7 @@ def test_missing_requested_tools_return_rc3(tmp_path):
     assert res.returncode == 3, res.stderr
     assert "codebase-memory-mcp not on PATH" in res.stdout
     assert "gitnexus not available" in res.stdout
-    assert "missing from PATH" in res.stdout
+    assert "missing or refused" in res.stdout
 
 
 def test_wrong_gitnexus_version_is_refused(tmp_path):
@@ -314,6 +329,65 @@ def test_gitnexus_runs_from_npm_prefix_when_prefix_is_not_on_path(tmp_path):
     )
     assert res.returncode == 0, res.stderr
     assert log.read_text() == "gitnexus ARGS:analyze\n"
+
+
+def test_shadow_gitnexus_installations_conflict_is_refused(tmp_path):
+    """Two installed copies at DIFFERENT versions must refuse, not pick one.
+
+    The service's PATH and an interactive client's PATH can order copies
+    differently — canonical-order resolution plus a shadow scan keeps a second
+    install that already wrote a different storage format from being trusted.
+    """
+    path_bin = tmp_path / "path-bin"
+    shadow_bin = tmp_path / ".npm-global" / "bin"
+    path_bin.mkdir()
+    shadow_bin.mkdir(parents=True)
+    log = tmp_path / "tools.log"
+    _write_exec(path_bin / "node", "#!/bin/sh\necho v22.22.2\n")
+    body = (
+        "#!/bin/sh\n"
+        'if [ "${1:-}" = --version ]; then echo %s; exit 0; fi\n'
+        f'echo "gitnexus ARGS:$*" >> "{log}"\n'
+    )
+    _write_exec(shadow_bin / "gitnexus", body % "1.6.8")
+    _write_exec(path_bin / "gitnexus", body % "1.6.12")
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "gitnexus",
+        path=f"{path_bin}:{_SYSTEM_PATH}",
+    )
+    assert res.returncode == 3, res.stderr
+    assert "gitnexus not available" in res.stdout
+    assert not log.exists()
+
+
+def test_shadow_gitnexus_installations_same_version_resolves(tmp_path):
+    """The control case: two copies at the SAME version are not a conflict —
+    refusing those would break the common reinstall-into-second-prefix shape."""
+    path_bin = tmp_path / "path-bin"
+    shadow_bin = tmp_path / ".npm-global" / "bin"
+    path_bin.mkdir()
+    shadow_bin.mkdir(parents=True)
+    log = tmp_path / "tools.log"
+    _write_exec(path_bin / "node", "#!/bin/sh\necho v22.22.2\n")
+    body = (
+        "#!/bin/sh\n"
+        'if [ "${1:-}" = --version ]; then echo 1.6.12; exit 0; fi\n'
+        f'echo "gitnexus ARGS:$*" >> "{log}"\n'
+    )
+    _write_exec(shadow_bin / "gitnexus", body)
+    _write_exec(path_bin / "gitnexus", body)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "gitnexus",
+        path=f"{path_bin}:{_SYSTEM_PATH}",
+    )
+    assert res.returncode == 0, res.stderr
+    assert "gitnexus ARGS:analyze" in log.read_text()
 
 
 def test_mode_arg_reaches_cbm(tmp_path):
@@ -747,3 +821,26 @@ def test_a_large_install_is_left_alone(tmp_path):
         cap, why = _headroom_decision(tmp_path, gib)
         assert not why, f"a {gib} GiB install was refused: {why}"
         assert cap == "8G", f"a {gib} GiB install had its cap changed to {cap}"
+
+
+def test_a_configured_cap_below_the_working_set_is_refused(tmp_path):
+    """An operator override (or the legacy shared CODE_INTEL_INDEX_MEMORY_MAX=2G)
+    below the measured 4.65 GiB working set cannot bite: on a large host the
+    rebuild would still run and be killed by its own cgroup. Refuse instead."""
+    for want in ("2G", "4G", "4096M"):
+        cap, why = _headroom_decision(tmp_path, 32, want=want)
+        assert why, f"cap {want} on a 32 GiB install was allowed to run"
+        assert "below" in why and "rebuild needs" in why, why
+
+
+def test_fractional_and_malformed_caps(tmp_path):
+    """systemd accepts fractional MemoryMax (5.5G); Bash arithmetic is integer-
+    only. Fractional values must PARSE (5.5G is fine headroom on a big box),
+    and malformed values must refuse rather than run unbounded."""
+    cap, why = _headroom_decision(tmp_path, 32, want="5.5G")
+    assert not why, f"a valid fractional cap was refused: {why}"
+    assert cap == "5.5G", cap
+    for bad in ("banana", "5.5", "G", ""):
+        cap, why = _headroom_decision(tmp_path, 32, want=bad)
+        assert why, f"malformed cap {bad!r} was allowed to run"
+        assert "not a parseable" in why, why

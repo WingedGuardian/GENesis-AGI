@@ -89,32 +89,18 @@ GITNEXUS_MEM_MAX="${CODE_INTEL_GITNEXUS_MEMORY_MAX:-${_LEGACY_MEM_MAX:-8G}}"
 # So the effective cap is min(configured, what this box can spare), and when
 # what it can spare is below the measured working set the job is REFUSED rather
 # than run with a cap that cannot bite.
-# FRACTIONS ARE VALID. systemd accepts `5.5G`, and this script's own rlimit
-# fallback parser already matched `^([0-9]+)(\.[0-9]+)?([Gg])$`. Bash arithmetic
-# does not do decimals, so `$(( 5.5 * ... ))` ERRORS and the caller used to get
-# an empty string -- which skipped admission control entirely while `5.5G` was
-# still handed to MemoryMax. Silently defeating the check on a valid value is
-# the worst of the three outcomes, so the integer and fractional parts are
-# multiplied separately.
-_genesis_mem_bytes() {  # "8G"/"5.5G"/"512M"/"1024K"/bytes -> bytes, or nothing
-    local v="${1:-}" unit="" num="" whole="" frac=""
+_genesis_mem_bytes() {  # "8G"/"512M"/"1024K"/"5.5G"/bytes -> bytes on stdout, or nothing
+    local v="${1:-}"
+    # Fractional values are legal systemd (MemoryMax=5.5G); Bash arithmetic is
+    # integer-only, so the multiply goes through awk. A bare number must be an
+    # integer byte count — a unitless "5.5" is malformed, not 5.5 bytes.
+    [[ "$v" =~ ^([0-9]+(\.[0-9]+)?)([GgMmKk])$ || "$v" =~ ^[0-9]+$ ]] || return 1
     case "$v" in
-        *[Gg]) unit=$(( 1024 * 1024 * 1024 )); num="${v%[Gg]}" ;;
-        *[Mm]) unit=$(( 1024 * 1024 )); num="${v%[Mm]}" ;;
-        *[Kk]) unit=1024; num="${v%[Kk]}" ;;
-        *[0-9]) printf '%s' "$v"; return ;;
-        *) return ;;
+        *[Gg]) awk -v n="${v%[Gg]}" 'BEGIN{printf "%d", n * 1073741824}' ;;
+        *[Mm]) awk -v n="${v%[Mm]}" 'BEGIN{printf "%d", n * 1048576}' ;;
+        *[Kk]) awk -v n="${v%[Kk]}" 'BEGIN{printf "%d", n * 1024}' ;;
+        *) printf '%s' "$v" ;;
     esac
-    case "$num" in
-        *.*) whole="${num%%.*}"; frac="${num#*.}" ;;
-        *)   whole="$num"; frac="" ;;
-    esac
-    # Reject anything that is not digits: a malformed value must yield NOTHING,
-    # which the caller treats as "cannot decide" rather than as a number.
-    case "${whole}${frac}" in ''|*[!0-9]*) return ;; esac
-    # Scale the fraction to three places so 5.5G and 5.005G both land exactly.
-    frac="$(printf '%-3s' "${frac:0:3}" | tr ' ' '0')"
-    printf '%s' "$(( whole * unit + (10#$frac * unit) / 1000 ))"
 }
 
 # The container's own ceiling. cgroup v2 first (what an LXC/Docker limit shows
@@ -165,15 +151,16 @@ CODE_INTEL_GITNEXUS_MIN_BYTES="${CODE_INTEL_GITNEXUS_MIN_BYTES:-$(( 4874166272 )
 _genesis_ceiling_b="$(_genesis_mem_ceiling)"
 _genesis_want_b="$(_genesis_mem_bytes "$GITNEXUS_MEM_MAX")"
 GITNEXUS_MEM_REFUSE=""
-# A CONFIGURED cap below the working set is refused on ANY host, however large.
-# The legacy `CODE_INTEL_INDEX_MEMORY_MAX=2G` override is documented and still
-# present on existing installs; it feeds this default. Comparing only the host's
-# SPARE memory against the minimum let a big host run the rebuild under a 2 GiB
-# cgroup cap, where it is killed predictably -- and the runner then retries it
-# forever. The cap the job will actually get is what has to clear the bar.
-if [ -n "$_genesis_want_b" ] && [ "$_genesis_want_b" -lt "$CODE_INTEL_GITNEXUS_MIN_BYTES" ]; then
-    GITNEXUS_MEM_REFUSE="the configured cap $GITNEXUS_MEM_MAX is below the $(( CODE_INTEL_GITNEXUS_MIN_BYTES / 1024 / 1024 ))M a measured full rebuild needs, so the job would be killed rather than capped"
-elif [ -n "$_genesis_ceiling_b" ] && [ -n "$_genesis_want_b" ]; then
+if [ -z "$_genesis_want_b" ]; then
+    # Fail closed: an unparseable cap must not reach MemoryMax, and skipping the
+    # admission check silently would run the job unbounded.
+    GITNEXUS_MEM_REFUSE="CODE_INTEL_GITNEXUS_MEMORY_MAX='${GITNEXUS_MEM_MAX}' is not a parseable memory value — refusing rather than running unbounded"
+elif [ "$_genesis_want_b" -lt "$CODE_INTEL_GITNEXUS_MIN_BYTES" ]; then
+    # A configured cap below the measured working set cannot bite: on a large
+    # host the rebuild would still run and be killed by its own cgroup, which
+    # reads as a flaky index failure instead of the refusal it should be.
+    GITNEXUS_MEM_REFUSE="configured cap ${GITNEXUS_MEM_MAX} is below the $(( CODE_INTEL_GITNEXUS_MIN_BYTES / 1024 / 1024 ))M a measured full rebuild needs — a cap that cannot bite only relocates the kill"
+elif [ -n "$_genesis_ceiling_b" ]; then
     _genesis_spare_b=$(( _genesis_ceiling_b - CODE_INTEL_SIBLING_RESERVE_BYTES ))
     if [ "$_genesis_spare_b" -lt "$CODE_INTEL_GITNEXUS_MIN_BYTES" ]; then
         GITNEXUS_MEM_REFUSE="this install has $(( _genesis_ceiling_b / 1024 / 1024 ))M total; after reserving $(( CODE_INTEL_SIBLING_RESERVE_BYTES / 1024 / 1024 ))M for the services around it that leaves $(( _genesis_spare_b / 1024 / 1024 ))M, below the $(( CODE_INTEL_GITNEXUS_MIN_BYTES / 1024 / 1024 ))M a measured full rebuild needs"
@@ -419,6 +406,8 @@ _run_with_watchdog() {
 
 RC=0
 MISSING=""  # requested-but-absent tools — makes a no-op run rc=3, not a false success
+CBM_RAN=0
+GN_RAN=0
 
 if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
     if [ -e "$CBM_DISABLE_FILE" ]; then
@@ -430,7 +419,8 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
         # .codebase-memory/graph.db.zst artifact so a wiped cache restores from it
         # instead of a full 0->100 re-index.
         MEM_MAX="$CBM_MEM_MAX" _run_with_watchdog cbm codebase-memory-mcp cli index_repository \
-            --repo-path "$REPO_PATH" --mode "$MODE" --persistence "$PERSISTENCE" || RC=$?
+            --repo-path "$REPO_PATH" --mode "$MODE" --persistence "$PERSISTENCE" \
+            && CBM_RAN=1 || RC=$?
     else
         _log "codebase-memory-mcp not on PATH — skipped"
         MISSING="${MISSING}cbm "
@@ -458,25 +448,12 @@ if [ "$TOOLS" = "gitnexus" ] || [ "$TOOLS" = "both" ]; then
         if [ -n "$GITNEXUS_MEM_REFUSE" ]; then
             # REFUSED, not silently skipped: a cap that cannot bite is worse
             # than no job, because the parent cgroup takes the kill instead.
-            #
-            # DELIBERATELY NOT `MISSING`. That yields rc 3, which the runner
-            # reads as "a requested tool is absent from PATH" — a TRANSIENT
-            # misconfiguration it keeps the marker for, with no attempts
-            # penalty, and retries at every idle tick. This refusal is
-            # PERMANENT: the machine's memory does not change between ticks, so
-            # the retry can never succeed, and because `tools=both` markers run
-            # the CBM leg first, the effect is CBM rebuilding forever on a box
-            # that can never admit gitnexus.
-            #
-            # So the run reports what it actually did. The marker is consumed,
-            # the refusal is logged with the override that lifts it, and the
-            # next index request says the same thing again rather than spinning
-            # between requests.
-            _log "REFUSED gitnexus: $GITNEXUS_MEM_REFUSE"
-            _log "      this is permanent on this machine, so the request is NOT retried;"
+            _log "SKIP gitnexus: $GITNEXUS_MEM_REFUSE"
             _log "      raise CODE_INTEL_GITNEXUS_MEMORY_MAX / lower CODE_INTEL_SIBLING_RESERVE_BYTES to override"
+            MISSING="${MISSING:+$MISSING }gitnexus"
         else
-            ( cd "$REPO_PATH" && MEM_MAX="$GITNEXUS_MEM_MAX" _run_with_watchdog gitnexus "$_GN" analyze ) || RC=$?
+            ( cd "$REPO_PATH" && MEM_MAX="$GITNEXUS_MEM_MAX" _run_with_watchdog gitnexus "$_GN" analyze ) \
+                && GN_RAN=1 || RC=$?
         fi
     else
         _log "gitnexus not available — skipped"
@@ -487,10 +464,25 @@ fi
 # B1: a requested tool absent from PATH means NOTHING was indexed for it. Never
 # report that as success (rc 0) — the idle runner would consume the marker and
 # stamp a fresh full-index timestamp, silently disabling indexing until someone
-# notices the graph is stale. Distinct rc 3 == "requested tool missing".
-if [ "$RC" = "0" ] && [ -n "$MISSING" ]; then
-    _log "ERROR: requested tool(s) missing from PATH: ${MISSING%% } — nothing indexed (rc=3)"
-    RC=3
+# notices the graph is stale. Per-leg outcome codes so a completed leg is
+# consumable and a skipped/refused leg never stamps cbm's shared full clock:
+#   rc 3: nothing indexed — at least one requested tool missing or refused
+#   rc 4: cbm leg completed, gitnexus leg did not run
+#   rc 5: gitnexus leg completed, cbm leg did not run
+if [ "$RC" = "0" ]; then
+    _cbm_wanted=0; _gn_wanted=0
+    { [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; } && _cbm_wanted=1
+    { [ "$TOOLS" = "gitnexus" ] || [ "$TOOLS" = "both" ]; } && _gn_wanted=1
+    if [ -n "$MISSING" ] && [ "$CBM_RAN" != "1" ] && [ "$GN_RAN" != "1" ]; then
+        _log "ERROR: requested tool(s) missing or refused: ${MISSING%% } — nothing indexed (rc=3)"
+        RC=3
+    elif [ "$_gn_wanted" = "1" ] && [ "$GN_RAN" != "1" ] && [ "$CBM_RAN" = "1" ]; then
+        _log "cbm leg done; gitnexus leg did not run (${MISSING:-unknown reason}) — partial (rc=4)"
+        RC=4
+    elif [ "$_cbm_wanted" = "1" ] && [ "$CBM_RAN" != "1" ] && [ "$GN_RAN" = "1" ]; then
+        _log "gitnexus leg done; cbm leg did not run — partial, cbm full clock NOT stamped (rc=5)"
+        RC=5
+    fi
 fi
 
 _log "done (rc=$RC): $REPO_PATH"

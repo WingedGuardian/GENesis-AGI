@@ -271,7 +271,9 @@ else
     echo "  Git identity: $(git -C "$GENESIS_ROOT" config user.name) <$(git -C "$GENESIS_ROOT" config user.email)>"
 fi
 
-# Node.js >= 22 (required by the pinned Claude Code release)
+# Node.js >= 22 (required by the pinned Claude Code release), raised to the
+# pinned GitNexus engine range (^22.18.0 || >=24.11.0) so an install does not
+# strand GitNexus on a Node its pin refuses — see scripts/lib/gitnexus_version.sh.
 _node_version_ok() {
     command -v node &>/dev/null || return 1
     local ver
@@ -280,18 +282,22 @@ _node_version_ok() {
     # caller instead of returning "not ok". Latent today (every call site is
     # `if _node_version_ok`), which is exactly how this class hides.
     ver=$(node --version 2>/dev/null | sed 's/^v//') || ver=""
-    local major="${ver%%.*}"
-    [[ "$major" -ge 22 ]] 2>/dev/null
+    local major="${ver%%.*}" minor="${ver#*.}"
+    minor="${minor%%.*}"
+    [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+    { [[ "$major" -eq 22 && "$minor" -ge 18 ]] \
+        || [[ "$major" -eq 24 && "$minor" -ge 11 ]] \
+        || [[ "$major" -gt 24 ]]; } 2>/dev/null
 }
 if ! _node_version_ok; then
     if command -v node &>/dev/null; then
-        echo "  Node.js $(node --version) is too old (need >= 22) — upgrading..."
+        echo "  Node.js $(node --version) is too old (need ^22.18.0 or >=24.11.0) — upgrading..."
     else
         echo "  Node.js not found — installing..."
     fi
     install_pkg nodejs || true
     if ! _node_version_ok; then
-        echo "  WARNING: Node.js >= 22 not available. Claude Code will not work."
+        echo "  WARNING: Node.js ^22.18.0 or >=24.11.0 not available. Claude Code will not work."
         echo "           Install via: curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -"
         echo "                        sudo apt-get install -y nodejs"
     fi
@@ -299,7 +305,7 @@ fi
 if _node_version_ok; then
     echo "  Node: $(node --version)"
 else
-    echo "  Node: $(node --version 2>/dev/null || echo 'not available') (needs >= 22)"
+    echo "  Node: $(node --version 2>/dev/null || echo 'not available') (needs ^22.18.0 or >=24.11.0)"
 fi
 
 # --- Claude Code version pin (install or align to the pinned version) ---
