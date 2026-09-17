@@ -104,12 +104,14 @@ def _deadline_timeout(deadline: float | None, cap: float) -> float:
     Callers running under a host kill-window (the commit/push hooks' registered
     timeouts) pass one deadline so a stalled probe consumes the SAME budget the
     later gates need instead of resetting it — a per-call cap alone lets serial
-    probes overrun the kill, which fails OPEN. An already-elapsed deadline still
-    permits a minimal 0.1s probe rather than branching on time here.
+    probes overrun the kill, which fails OPEN.
+    An already-elapsed deadline yields a ~1ms probe that times out
+    immediately rather than granting a fresh 0.1s of post-deadline work —
+    serial probes must not reach the host kill window, which fails OPEN.
     """
     if deadline is None:
         return cap
-    return max(0.1, min(cap, deadline - time.monotonic()))
+    return max(0.001, min(cap, deadline - time.monotonic()))
 
 
 def _worktree_root(cwd: str | None = None, *, deadline: float | None = None) -> str:

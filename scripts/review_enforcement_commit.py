@@ -387,7 +387,7 @@ def _staged_files(cwd: str | None, *, deadline: float | None = None) -> list[str
             args,
             capture_output=True,
             text=True,
-            timeout=max(0.1, min(10, deadline - time.monotonic()))
+            timeout=max(0.001, min(10, deadline - time.monotonic()))
             if deadline is not None
             else 10,
         )
@@ -654,7 +654,7 @@ def _worktree_root(cwd: str, *, deadline: float | None = None) -> str:
             ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True,
-            timeout=max(0.1, min(5, deadline - time.monotonic()))
+            timeout=max(0.001, min(5, deadline - time.monotonic()))
             if deadline is not None
             else 5,
         )
@@ -852,7 +852,7 @@ def _branch_review_budget(
             text=True,
             # Share the one deadline: a flat 8 here plus the evaluator's own
             # serial calls is exactly what overran the harness window.
-            timeout=max(0.1, min(8.0, deadline - time.monotonic())),
+            timeout=max(0.001, min(8.0, deadline - time.monotonic())),
             check=False,
         )
         if pr_read.returncode != 0:
@@ -1190,7 +1190,7 @@ def main() -> None:
 
     branch = get_current_branch(cwd=cwd, deadline=hook_deadline)
     cloud_budget = _branch_review_budget(
-        cwd, branch, budget_seconds=max(0.1, hook_deadline - time.monotonic())
+        cwd, branch, budget_seconds=max(0.001, hook_deadline - time.monotonic())
     )
     pending_round_approval = bool(
         cloud_budget is not None

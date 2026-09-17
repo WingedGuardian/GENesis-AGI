@@ -3560,25 +3560,21 @@ def _review_budget_message(pr_num: str, result: dict, repo: str) -> str:
     )
 
 
-def _comment_review_request_signal(argv: list[str]) -> bool | None:
-    """Whether a comment's body is visibly an ``@codex review`` request.
+def _comment_body(argv: list[str]) -> tuple[str | None, bool]:
+    """Effective inline body of a ``gh pr comment`` argv, plus opacity.
 
-    ``None`` means the body is opaque at pre-execution time (body file, editor,
-    web flow, or an omitted body).  Opaque is evaluated as a possible request:
-    standing authorization may still allow it, while an approval boundary asks
-    or denies.  This avoids a body-file spelling becoming a cap bypass without
-    pretending a file cannot be rewritten earlier in the same shell command.
+    Returns ``(body, opaque)``: the LAST ``-b``/``--body``/``--body=`` value
+    (gh string flags take the last supplied value, so earlier overridden
+    bodies never reach GitHub) and whether any opaque body channel is present
+    (body file, editor, web, or a missing -b value). ``(None, False)`` means a
+    body-free invocation.
     """
     try:
         start = argv.index("comment") + 1
     except ValueError:
-        return False
-    # gh string flags take the LAST supplied value, so the effective inline
-    # body is the last -b/--body argument — earlier values are overridden and
-    # never reach GitHub.
+        return None, False
     inline_body: str | None = None
     opaque = False
-    delete_only = "--delete-last" in argv[start:]
     i = start
     while i < len(argv):
         tok = argv[i]
@@ -3599,6 +3595,24 @@ def _comment_review_request_signal(argv: list[str]) -> bool | None:
         elif tok.startswith("--body-file=") or (tok.startswith("-F") and len(tok) > 2):
             opaque = True
         i += 1
+    return inline_body, opaque
+
+
+def _comment_review_request_signal(argv: list[str]) -> bool | None:
+    """Whether a comment's body is visibly an ``@codex review`` request.
+
+    ``None`` means the body is opaque at pre-execution time (body file, editor,
+    web flow, or an omitted body).  Opaque is evaluated as a possible request:
+    standing authorization may still allow it, while an approval boundary asks
+    or denies.  This avoids a body-file spelling becoming a cap bypass without
+    pretending a file cannot be rewritten earlier in the same shell command.
+    """
+    try:
+        start = argv.index("comment") + 1
+    except ValueError:
+        return False
+    inline_body, opaque = _comment_body(argv)
+    delete_only = "--delete-last" in argv[start:]
     if inline_body is not None and "@codex review" in inline_body.lower():
         return True
     if inline_body is not None:
@@ -3681,7 +3695,16 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
             # The exemption licenses ONE dispatch: every request is judged on
             # pre-command state, so a second marked request in the same command
             # would also read exempt. The first consumes it; the rest ask.
-            if body_signal is True and marker in " ".join(seg.argv) and not exemption_used:
+            # The marker must sit in the EFFECTIVE body — an overridden earlier
+            # -b value never reaches GitHub, so argv-wide matching would exempt
+            # a request that posts no marker at all.
+            eff_body, _eff_opaque = _comment_body(seg.argv)
+            if (
+                body_signal is True
+                and eff_body is not None
+                and marker in eff_body
+                and not exemption_used
+            ):
                 exemption_used = True
                 decisions.append(("allow", ""))
                 continue
