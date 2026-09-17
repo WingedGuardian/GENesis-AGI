@@ -71,6 +71,18 @@ inject_confidence_floor: 0.7
 # above; the enabled/mode full-worker stops still apply on top).
 open_pr_enabled: true
 
+# ── PR-verification lane (issue #1718 half B) ───────────────────────────────
+# One durable pr_verifications row per MERGED PR: the post-merge E2E obligation
+# that survives the merge (the merge-time E2E: declaration is advisory). A
+# documentation-only diff is auto-closed with the reason recorded — a
+# DETERMINISTIC exemption by path (doc_paths.is_doc_path), never a model call.
+# Everything else stays open for the validator session. An unreadable
+# changed-file list fails toward KEEPING the obligation (the row opens).
+# Same lever ladder as open_pr_enabled: this knob stops ONLY this lane; the
+# enabled/mode full-worker stops apply on top. Backlog reader:
+#   python scripts/repo_pulse_worker.py --verification-backlog
+verification_enabled: true
+
 # A PR whose last update (updatedAt) is at least this many days ago is "stale"
 # and eligible to surface.
 open_pr_stale_days: 7

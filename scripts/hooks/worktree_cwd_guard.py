@@ -38,12 +38,58 @@ import sys
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import read_payload, run_guard, tool_input  # noqa: E402
-from shell_parse import (  # noqa: E402
-    analyze_checked,
-    git_subcommand_index,
-    untokenizable,
-)
+try:
+    from hook_input import (  # noqa: E402
+        degraded_exit,
+        read_payload,
+        run_guard,
+        tool_input,
+    )
+except Exception:  # noqa: BLE001 — a missing NEW helper must block.
+    if __name__ != "__main__":
+        raise
+    # REVERSE version skew: this guard may be newer than hook_input.py, in which case
+    # nothing it could import can recover it — degraded_exit is the thing that is
+    # missing. So fail closed locally. The exception is not rendered (even __str__ can
+    # raise) and os._exit is used so a broken diagnostic stream cannot replace exit 2
+    # during interpreter shutdown.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (worktree_cwd_guard): shared hook_input is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
+
+# DEGRADED-path mention set, defined ABOVE the guarded import so it survives that
+# import failing. `run_guard`'s own docstring names worktree removal among the
+# operations for which fail-closed is correct, and this guard exited 1 on a poisoned
+# tree until now — so the helper listed a guard it did not cover.
+#
+# ONE TOKEN, and a distinctive one: MEASURED over 74,282 real commands it appears in
+# 2,245 (3.02%). That is the price of the broken-tree state and it is small, which is
+# what makes wiring this guard right where wiring the background-pipe guard would be
+# wrong (its only usable token is the pipe character, at 70.30%).
+_DEGRADED_GATED = r"\bworktree\b"
+
+try:
+    from shell_parse import (  # noqa: E402
+        analyze_checked,
+        git_subcommand_index,
+        untokenizable,
+    )
+except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
+    if __name__ != "__main__":
+        raise
+    degraded_exit("worktree_cwd_guard", gated=_DEGRADED_GATED, exc=_exc)
+
+try:  # noqa: E402
+    import discarded_write
+except Exception:  # noqa: BLE001 — GUARDED: an unguarded import failure would abort
+    # module load → exit 1 → CC reads non-2 as NON-blocking → the removal RUNS.
+    discarded_write = None  # type: ignore[assignment]
 
 # Kept ONLY for the untokenizable fallback below and as a cheap pre-gate — never
 # as the verdict. As the verdict it was quote-blind: it matched the phrase inside
@@ -262,6 +308,8 @@ def _block_with_pids(target: str, pids: list[int]) -> int:
         "This would brick those sessions. Wait for them to finish or use the lifecycle manager.",
         file=sys.stderr,
     )
+    if discarded_write is not None:
+        discarded_write.warn()
     return 2
 
 
@@ -282,12 +330,22 @@ def _block_no_direct_removal(target: str) -> int:
         "python scripts/worktree_lifecycle.py --dry-run",
         file=sys.stderr,
     )
+    if discarded_write is not None:
+        discarded_write.warn()
     return 2
 
 
 def _handle_bash(data: dict) -> int:
     """Handle Bash tool — intercept `git worktree remove` commands."""
     cmd = data.get("command", "")
+    # ONLY the Bash path has a command to report on. The EnterWorktree /
+    # ExitWorktree tool paths carry an `action`, not a `command`, so their two
+    # refusal sites are deliberately left un-noted: there is no Bash call for a
+    # "the whole command was discarded" note to be about. `warn()` degrades to
+    # silence when nothing was remembered, so this is safe rather than merely
+    # untested.
+    if discarded_write is not None:
+        discarded_write.remember(cmd)
     if not cmd:
         return 0
 
@@ -326,7 +384,25 @@ def _handle_bash(data: dict) -> int:
     # that already fail closed here. The legacy regex extractor is the same
     # coarser reading the untokenizable case falls back to: weaker than the
     # parser, but it reads the raw text, so a bound cannot hide anything from it.
-    if untokenizable(cmd) or blind is not None:
+    # `blind.bounds_induced`, NOT `blind is not None`, and the comment above says
+    # why without meaning to: it justifies this fallback with "a BOUND stopped the
+    # parse — and `analyze_checked` then returns NO segments". That is the whole
+    # argument, and it is true of the BOUNDS causes only. A cause that leaves the
+    # segments COMPLETE — the parse succeeded, one word of it is unreadable — hands
+    # this branch a full segment list and then throws it away for a quote-blind
+    # regex over the raw text.
+    #
+    # MEASURED base-vs-branch when this read `blind is not None`: a `gh pr` whose
+    # verb was a variable, with a --body whose PROSE mentions removing a worktree,
+    # went ALLOW -> hard BLOCK. Writing a PR body about worktree removal is
+    # something sessions do constantly — this one's own body does it — and a hard
+    # block on prose is the worst direction available to this guard.
+    #
+    # `untokenizable` keeps the fallback unchanged: there the tokens really are
+    # unreliable. The parsed route below has its own carrier fallback for a removal
+    # the parser cannot see, so declining to degrade here is not the same as
+    # trusting the parse blindly.
+    if untokenizable(cmd) or (blind is not None and blind.bounds_induced):
         targets = _legacy_targets(cmd)
     else:
         targets = _extract_worktree_targets(segs)
@@ -384,6 +460,8 @@ def _handle_bash(data: dict) -> int:
                 "fail with 'Path does not exist').",
                 file=sys.stderr,
             )
+            if discarded_write is not None:
+                discarded_write.warn()
             return 2
 
         # Check 2: Cross-session — another process is using it

@@ -62,6 +62,10 @@ class TestClassify:
         assert registry.classify("config/genesis-bridge.service") is ProtectionLevel.CRITICAL
 
     def test_critical_wildcard_service(self, registry: ProtectedPathRegistry):
+        # Like the bridge case above, this file no longer exists — it was the
+        # second config/ duplicate of a scripts/systemd template and was removed.
+        # `classify` matches the path as a STRING and never stats it, so the
+        # generic "*.service" rule is still what is under test here.
         assert registry.classify("config/genesis-tmp-watchgod.service") is ProtectionLevel.CRITICAL
 
     def test_critical_systemd_template(self, registry: ProtectedPathRegistry):

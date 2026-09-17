@@ -264,6 +264,65 @@ async def test_drain_reconstructs_request_with_thread_and_recipient(config, db):
 
 
 @pytest.mark.asyncio
+async def test_drain_carries_the_discord_subchannel_as_recipient(config, db):
+    """A queued Discord SUB-CHANNEL row must reach the pipeline as the discord
+    ADAPTER plus the sub-channel as the recipient override.
+
+    This is the half a live send caught rather than a test. The drain maps
+    "announcements" → channel="discord" so the adapter resolves; without also
+    setting target_chat_id, _deliver falls through to
+    `self._recipients["discord"]` (OUTREACH_RECIPIENT_DISCORD, default
+    "dev-discussion") and the webhook adapter USED to fall back to the default
+    webhook rather than failing — so a release announcement posted to the dev
+    channel and reported success.
+
+    Until this test existed, scheduler.py's target_chat_id line had NO coverage:
+    every other Discord test in the suite stubs `pipeline.submit` on the LIVE
+    path (outreach_send), so the drain path was asserted nowhere.
+    """
+    from genesis.db.crud import pending_outreach
+
+    await pending_outreach.enqueue(
+        db, message="v3.0b18 is out", category="notification", channel="announcements",
+    )
+    pipeline = _drain_pipeline(OutreachStatus.DELIVERED)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    pipeline.submit.assert_called_once()
+    req = pipeline.submit.call_args[0][0]
+    assert req.channel == "discord", "must route through the discord ADAPTER"
+    assert req.target_chat_id == "announcements", (
+        "the sub-channel must ride as the recipient override — without it the "
+        "drained send lands in OUTREACH_RECIPIENT_DISCORD (default dev-discussion)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_drain_leaves_a_non_discord_channel_untouched(config, db):
+    """The discord branch must not rewrite telegram/email rows.
+
+    Guards the opposite direction of the test above: a mapping applied too
+    broadly would give every queued row a target_chat_id, which on TELEGRAM is a
+    numeric chat id and would redirect owner messages to a bogus chat.
+    """
+    from genesis.db.crud import pending_outreach
+
+    await pending_outreach.enqueue(
+        db, message="ping", category="notification", channel="telegram",
+    )
+    pipeline = _drain_pipeline(OutreachStatus.DELIVERED)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    req = pipeline.submit.call_args[0][0]
+    assert req.channel == "telegram"
+    assert req.target_chat_id is None
+
+
+@pytest.mark.asyncio
 async def test_drain_delivers_verbatim_on_urgent_path(config, db):
     """High-urgency queued rows go through submit_urgent — which must ALSO
     receive verbatim=True so the drafter never rewrites the stored message."""
@@ -623,3 +682,59 @@ async def test_ambient_recovery_failing_alerts_with_remedy(config, db):
     text = scheduler._pipeline.submit_raw.call_args[0][0]
     assert "auto-recovery exhausted" in text
     assert "ESPHome API" in text  # the recovery-failing remedy hint
+
+
+@pytest.mark.asyncio
+async def test_drain_does_not_send_a_row_cancelled_after_the_snapshot(config, db):
+    """A cancel landing between drain and send must stop the send.
+
+    `drain` takes a snapshot of up to 20 rows and the loop then sends them one at a
+    time, each costing an LLM draft plus an adapter round-trip — so the snapshot is
+    stale by seconds to minutes. That is exactly when someone cancels: they cancel
+    because the message is about to go out. Without a re-read, cancel() reports
+    "cancelled", the message ships anyway, and the row ends up recorded as BOTH
+    cancelled and delivered — a contradiction no reader can resolve.
+
+    Simulated by cancelling from inside the pipeline's submit, which runs at the
+    same point in the sequence a concurrent cancel would.
+    """
+    from genesis.db.crud import pending_outreach
+
+    first = await pending_outreach.enqueue(
+        db, message="first", category="notification", channel="telegram"
+    )
+    second = await pending_outreach.enqueue(
+        db, message="second — cancelled while the first is in flight",
+        category="notification", channel="telegram",
+    )
+
+    pipeline = _drain_pipeline(OutreachStatus.DELIVERED)
+    original = pipeline.submit
+
+    async def _submit_then_cancel_the_next(req):
+        # Runs while row 1 is being sent — the real window.
+        await pending_outreach.cancel(db, second)
+        return await original(req)
+
+    pipeline.submit = AsyncMock(side_effect=_submit_then_cancel_the_next)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    sent = [c[0][0].context for c in pipeline.submit.call_args_list]
+    assert any("first" in m for m in sent), "the uncancelled row must still send"
+    assert not any("cancelled while" in m for m in sent), (
+        "the row cancelled after the drain snapshot was still sent — cancel() told "
+        "the caller it was cancelled and the recipient got it anyway"
+    )
+
+    cur = await db.execute(
+        "SELECT delivered, cancelled_at FROM pending_outreach WHERE id = ?", (second,)
+    )
+    row = await cur.fetchone()
+    assert row["cancelled_at"] is not None
+    assert row["delivered"] == 0, (
+        "a cancelled row must not also be marked delivered — that is the "
+        "contradictory record this guard exists to prevent"
+    )
+    assert first  # the id is used only to distinguish the two rows

@@ -12,6 +12,18 @@ from flask import Flask
 from genesis.hosting.openclaw.adapter import OpenClawAdapter
 from genesis.hosting.openclaw.completions import blueprint
 
+_TOKEN = "test-openclaw-bearer-token"
+
+
+@pytest.fixture(autouse=True)
+def _configured_token(monkeypatch):
+    """Every test runs with the bearer token configured.
+
+    Without it the shared ``/v1/*`` check fails closed at 503 and no test below
+    reaches the behaviour it is about. The unconfigured case gets its own test.
+    """
+    monkeypatch.setenv("GENESIS_MCP_HTTP_TOKEN", _TOKEN)
+
 
 @pytest.fixture()
 def app():
@@ -25,6 +37,15 @@ def app():
 
 @pytest.fixture()
 def client(app):
+    """An AUTHORIZED client — the header rides every request via environ_base."""
+    c = app.test_client()
+    c.environ_base["HTTP_AUTHORIZATION"] = f"Bearer {_TOKEN}"
+    return c
+
+
+@pytest.fixture()
+def anon_client(app):
+    """A client that sends no Authorization header."""
     return app.test_client()
 
 
@@ -296,3 +317,112 @@ def test_adapter_is_idempotent():
     adapter.register_blueprints(app)
     completions_rules = [r for r in app.url_map.iter_rules() if "/v1/chat/completions" in r.rule]
     assert len(completions_rules) == 1
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+#
+# This route invokes CC. The dashboard session gate exempts the whole ``/v1/*``
+# prefix for machine callers, so the bearer check here is the ONLY thing between
+# a caller who can reach the port and a CC subprocess.
+
+
+def test_missing_authorization_header_is_refused(anon_client):
+    resp = anon_client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert resp.status_code == 401
+
+
+def test_wrong_bearer_token_is_refused(app):
+    c = app.test_client()
+    c.environ_base["HTTP_AUTHORIZATION"] = "Bearer not-the-configured-token"
+    resp = c.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert resp.status_code == 401
+
+
+def test_non_bearer_authorization_scheme_is_refused(app):
+    c = app.test_client()
+    c.environ_base["HTTP_AUTHORIZATION"] = f"Basic {_TOKEN}"
+    resp = c.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert resp.status_code == 401
+
+
+def test_unconfigured_token_fails_closed_not_open(anon_client, mock_rt, monkeypatch):
+    """No token configured must REFUSE, never open the endpoint.
+
+    Status alone cannot carry this: a READY-check failure answers 503 too, so
+    asserting only the code passes even with the gate deleted (observed — a
+    mutation run removing the check left this test green). The distinguishing
+    fact is WHICH 503 came back, so the body is asserted, and the runtime is
+    patched ready so the readiness 503 cannot be the one under test.
+    """
+    monkeypatch.delenv("GENESIS_MCP_HTTP_TOKEN", raising=False)
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = mock_rt
+        resp = anon_client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hello"}]},
+        )
+    assert resp.status_code == 503
+    assert "GENESIS_MCP_HTTP_TOKEN" in resp.get_json()["error"]
+
+
+def test_unauthorized_request_never_reaches_cc(anon_client, mock_rt):
+    """Auth runs BEFORE the runtime probe, the body parse and the semaphore.
+
+    The distinguishing assertion is the LAST one: a 401 alone would also hold if
+    the route refused only after spawning work, which is the failure this
+    ordering exists to prevent.
+    """
+    with patch("genesis.runtime.GenesisRuntime") as MockRT, \
+         patch("genesis.hosting.openclaw.completions.asyncio.run_coroutine_threadsafe",
+               return_value=_mock_future()) as spawn:
+        MockRT.instance.return_value = mock_rt
+        resp = anon_client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hello"}]},
+        )
+        resp.get_data()  # drain: a streamed body does no work until consumed
+    assert resp.status_code == 401
+    spawn.assert_not_called()
+
+
+def test_non_ascii_authorization_header_is_401_not_500(app, monkeypatch):
+    """A high byte in the header must refuse cleanly.
+
+    WSGI decodes headers as latin-1 and `hmac.compare_digest` refuses non-ASCII
+    `str`, so comparing as text raised TypeError -> HTTP 500 with a stack trace
+    on every such request. Fail-closed either way; 401 is the correct refusal.
+    """
+    monkeypatch.setitem(app.config, "TESTING", False)
+    c = app.test_client()
+    c.environ_base["HTTP_AUTHORIZATION"] = "Bearer tokén-with-é"
+    resp = c.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert resp.status_code == 401
+
+
+def test_whitespace_only_configured_token_is_treated_as_unset(anon_client, mock_rt, monkeypatch):
+    """A quoted "   " in secrets.env is not a token.
+
+    Without the strip it counts as configured, and a request presenting the
+    same blank credential then PASSES the gate.
+    """
+    monkeypatch.setenv("GENESIS_MCP_HTTP_TOKEN", "   ")
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = mock_rt
+        resp = anon_client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hello"}]},
+        )
+    assert resp.status_code == 503
+    assert "GENESIS_MCP_HTTP_TOKEN" in resp.get_json()["error"]

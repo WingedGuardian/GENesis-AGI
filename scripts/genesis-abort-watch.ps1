@@ -98,6 +98,25 @@ function Stop-GenesisWatcher {
     $parts = $raw -split '\|'
     $wpid  = 0
     if (-not [int]::TryParse($parts[0], [ref]$wpid) -or $wpid -le 0) {
+        # An unreadable record is not proof of a dead watcher: a torn rewrite
+        # leaves a live poller nothing can name. The heartbeat is the only
+        # other signal, so it decides which side this falls on — a fresh beat
+        # means the watcher is LIVE and unverifiable, which is the refusal
+        # case -Uninstall exists for, not the discard case.
+        if (Test-Path $BeatPath) {
+            $beat = Get-Content $BeatPath -Raw -ErrorAction SilentlyContinue
+            $beatTime = [datetime]::MinValue
+            if ($null -ne $beat -and [datetime]::TryParse($beat.Trim(), [ref]$beatTime)) {
+                $beatAge = ((Get-Date).ToUniversalTime() - $beatTime.ToUniversalTime()).TotalSeconds
+                # 6 beats is the same 30s horizon genesis-act.ps1 uses to
+                # declare the watcher dead; inside it the watcher is live by
+                # the only evidence available.
+                if ($beatAge -le 6 * $BeatSeconds) {
+                    $script:GenesisStopRefused = $true
+                    return "watcher pid record is unreadable ('$raw') but the heartbeat is $([math]::Round($beatAge))s old - a live poller may exist; REFUSING. Wait for the beat to go stale, or stop the process by hand."
+                }
+            }
+        }
         Remove-Item $pidf -Force -ErrorAction Ignore
         return "watcher pid record was unreadable ('$raw') - discarded, nothing killed"
     }

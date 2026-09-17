@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -21,6 +22,30 @@ async def db():
     conn.row_factory = aiosqlite.Row
     for table in ("entities", "entity_mentions", "entity_links",
                   "entity_merge_journal", "deferred_work_queue"):
+        await conn.execute(TABLES[table])
+    await conn.commit()
+    yield conn
+    await conn.close()
+
+
+@pytest_asyncio.fixture
+async def file_db():
+    """File-backed DB at the conftest-redirected ``genesis_db_path()``.
+
+    ``record_anchors`` opens its OWN ``get_raw_db(genesis_db_path())`` connection,
+    so the test must share the SAME on-disk file (WAL-aware) to observe its
+    committed writes — a ``:memory:`` connection would be a different, private
+    database and the mentions would never appear here. The autouse
+    ``_isolate_genesis_db_path`` conftest fixture already redirects
+    ``genesis_db_path()`` to ``tmp_path/isolated-genesis.db``.
+    """
+    from genesis.env import genesis_db_path
+
+    conn = await aiosqlite.connect(str(genesis_db_path()))
+    conn.row_factory = aiosqlite.Row
+    await conn.execute("PRAGMA journal_mode=WAL")
+    for table in ("entities", "entity_mentions", "entity_links",
+                  "deferred_work_queue"):
         await conn.execute(TABLES[table])
     await conn.commit()
     yield conn
@@ -64,20 +89,110 @@ class TestAnchorExtraction:
         assert len(anchors) == 16  # capped, deduped
 
     @pytest.mark.asyncio
-    async def test_record_anchors_writes_mentions(self, db):
+    async def test_record_anchors_writes_mentions(self, file_db):
+        # record_anchors owns its own get_raw_db(genesis_db_path()) connection; the
+        # writes must appear on the shared on-disk file (file_db reads the SAME file).
         n = await record_anchors(
-            db, "mem-1", "touched src/genesis/memory/store.py in PR #977",
+            "mem-1", "touched src/genesis/memory/store.py in PR #977",
         )
         assert n == 2
-        rows = await db.execute_fetchall(
+        rows = await file_db.execute_fetchall(
             "SELECT entity_id FROM entity_mentions WHERE memory_id = 'mem-1'"
         )
         assert len(rows) == 2
         entity = await entities_crud.get_by_norm_name(
-            db, norm_name="src/genesis/memory/store.py",
+            file_db, norm_name="src/genesis/memory/store.py",
         )
         assert entity["entity_type"] == "code_file"
         assert entity["source"] == "mechanical"
+
+    @pytest.mark.asyncio
+    async def test_record_anchors_batch_is_atomic_on_failure(self, file_db):
+        """A mid-batch write failure rolls the WHOLE owned-conn batch back.
+
+        The owned ``BEGIN IMMEDIATE`` … ``COMMIT`` envelope means an exception on a
+        later anchor discards the earlier anchors' writes too — nothing partial is
+        left behind (verify-RED: with a per-op commit the first anchor's entity
+        would survive). record_anchors is best-effort, so the error propagates to
+        store()'s suppress; here we assert both the raise and the empty tables.
+        """
+        # Two anchors; blow up on the SECOND upsert_mention so the first anchor's
+        # entity+mention are already written (uncommitted) when the batch aborts.
+        calls = {"n": 0}
+        real_upsert = entities_crud.upsert_mention
+
+        async def _boom_on_second(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("injected mid-batch failure")
+            return await real_upsert(*args, **kwargs)
+
+        content = "touched src/genesis/memory/store.py and genesis.memory.retrieval"
+        with patch(
+            "genesis.db.crud.entities.upsert_mention", side_effect=_boom_on_second
+        ), pytest.raises(RuntimeError, match="injected mid-batch failure"):
+            await record_anchors("mem-2", content)
+
+        # Whole batch rolled back: neither the mentions NOR the first anchor's entity
+        # survive on the shared file.
+        mentions = await file_db.execute_fetchall(
+            "SELECT 1 FROM entity_mentions WHERE memory_id = 'mem-2'"
+        )
+        assert mentions == []
+        entity = await entities_crud.get_by_norm_name(
+            file_db, norm_name="src/genesis/memory/store.py",
+        )
+        assert entity is None
+
+    @pytest.mark.asyncio
+    async def test_record_anchors_isolated_from_concurrent_writer(self, file_db):
+        """Acceptance bar: a concurrent writer on a SEPARATE connection cannot see
+        (or force-commit) record_anchors' in-flight batch — the owned connection
+        isolates it.
+
+        This is the concurrency gap the fix closes: on the OLD shared
+        ``SerializedConnection`` a peer coroutine's ``commit()`` could durably commit
+        the half-written batch (the lock releases between ops). Here we pause the
+        batch after its first mention, prove a peer connection sees NOTHING (the
+        writes live on record_anchors' own uncommitted txn), let it finish, and prove
+        both anchors then appear.
+        """
+        first_write = asyncio.Event()
+        release = asyncio.Event()
+        real_upsert = entities_crud.upsert_mention
+        calls = {"n": 0}
+
+        async def _pause_after_first(*args, **kwargs):
+            result = await real_upsert(*args, **kwargs)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                first_write.set()
+                await release.wait()
+            return result
+
+        content = "touched src/genesis/memory/store.py and genesis.memory.retrieval"
+        with patch(
+            "genesis.db.crud.entities.upsert_mention", side_effect=_pause_after_first
+        ):
+            task = asyncio.create_task(record_anchors("mem-iso", content))
+            await asyncio.wait_for(first_write.wait(), timeout=5)
+
+            # A concurrent peer commits on a DIFFERENT connection — it must not make
+            # record_anchors' first-anchor write (uncommitted on its OWN conn) visible.
+            await file_db.commit()
+            mid = await file_db.execute_fetchall(
+                "SELECT 1 FROM entity_mentions WHERE memory_id = 'mem-iso'"
+            )
+            assert mid == []  # isolated: the owned batch is invisible until it commits
+
+            release.set()
+            assert await asyncio.wait_for(task, timeout=5) == 2
+
+        # Once record_anchors commits its owned batch, both anchors are visible.
+        final = await file_db.execute_fetchall(
+            "SELECT 1 FROM entity_mentions WHERE memory_id = 'mem-iso'"
+        )
+        assert len(final) == 2
 
 
 class TestRecordExtraction:
@@ -266,3 +381,251 @@ class TestCodexRemediationE3:
             "SELECT link_type, confidence FROM entity_links ORDER BY link_type",
         )
         assert [(r[0], r[1]) for r in rows] == [("is_a", 1.0), ("part_of", 0.0)]
+
+
+class TestAnchorWritesGoWhereTheCallerSaid:
+    """``db_path`` names WHICH database, since the connection is no longer the
+    caller's to pass (Codex P2, PR #1653).
+
+    ``scripts/entity_backfill.py`` supports ``--db`` to run against a copy or a
+    restored backup. Dropping the old positional connection without replacing
+    the target would have sent every anchor write to the live default while the
+    run reported success against the file the operator named — silent, and
+    against the wrong database.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_db_path_is_honoured(self, tmp_path):
+        from genesis.env import genesis_db_path
+
+        target = tmp_path / "operator-chosen.db"
+        conn = await aiosqlite.connect(str(target))
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA journal_mode=WAL")
+        for table in ("entities", "entity_mentions", "entity_links",
+                      "deferred_work_queue"):
+            await conn.execute(TABLES[table])
+        await conn.commit()
+        try:
+            n = await record_anchors(
+                "mem-target", "touched src/genesis/memory/store.py in PR #977",
+                db_path=str(target),
+            )
+            assert n == 2
+            rows = await conn.execute_fetchall(
+                "SELECT entity_id FROM entity_mentions WHERE memory_id = 'mem-target'"
+            )
+            assert len(rows) == 2, "the write did not land in the named database"
+        finally:
+            await conn.close()
+
+        # ...and NOWHERE ELSE. The control that makes this test mean something:
+        # without it, a call that wrote to BOTH databases would pass.
+        default = await aiosqlite.connect(str(genesis_db_path()))
+        try:
+            for table in ("entities", "entity_mentions", "entity_links",
+                          "deferred_work_queue"):
+                await default.execute(TABLES[table])
+            await default.commit()
+            leaked = await default.execute_fetchall(
+                "SELECT 1 FROM entity_mentions WHERE memory_id = 'mem-target'"
+            )
+            assert not leaked, "anchors leaked into the default database"
+        finally:
+            await default.close()
+
+    @pytest.mark.asyncio
+    async def test_no_db_path_still_uses_the_resolved_default(self, file_db):
+        """CONTROL. Every other caller passes no target and must keep landing in
+        ``genesis_db_path()`` — the parameter is additive."""
+        n = await record_anchors("mem-default", "see src/genesis/memory/store.py")
+        assert n == 1
+        rows = await file_db.execute_fetchall(
+            "SELECT entity_id FROM entity_mentions WHERE memory_id = 'mem-default'"
+        )
+        assert len(rows) == 1
+
+    def test_the_backfill_script_calls_it_the_new_way(self):
+        """The caller the finding is actually about. It passes three positionals
+        against a two-positional signature, so the run aborts with TypeError at
+        the FIRST memory carrying an anchor — read from the script's source
+        because importing it pulls argparse/aiosqlite plumbing this test does
+        not need."""
+        import ast
+        from pathlib import Path
+
+        src = (
+            Path(__file__).resolve().parents[2] / "scripts" / "entity_backfill.py"
+        ).read_text()
+        calls = [
+            node
+            for node in ast.walk(ast.parse(src))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "record_anchors"
+        ]
+        assert len(calls) == 1, "the backfill's call site moved — retarget this test"
+        call = calls[0]
+        assert len(call.args) == 2, (
+            f"{len(call.args)} positional args; the signature takes memory_id and "
+            "content only, so anything else raises TypeError mid-backfill"
+        )
+        assert "db_path" in {kw.arg for kw in call.keywords}, (
+            "--db is not honoured: writes would go to the default database while "
+            "the run reports against the file the operator named"
+        )
+
+class TestAnchorWritesFollowTheStoresDatabase:
+    """A MemoryStore must anchor into the database its OWN connection is on.
+
+    `record_anchors` deliberately takes a PATH, not this store's connection —
+    owning its own connection is what keeps it off the shared
+    `SerializedConnection`. But it resolves `genesis_db_path()` when given no
+    target, so a store bound to a NON-default database silently enriched the
+    live default entity graph while the database the caller named stayed
+    unenriched: dangling mentions in one, missing anchors in the other, both
+    halves quiet. (Codex P1, PR #1653.)
+
+    Asserted on the EFFECT — which rows land in which FILE — rather than on
+    the argument, because the argument is an implementation detail of how the
+    target reaches the writer, and the rows are the thing that was wrong.
+    """
+
+    ANCHORED = "the fix lives in src/genesis/memory/store.py and nowhere else"
+    ANCHOR_TABLES = ("entities", "entity_mentions", "entity_links", "deferred_work_queue")
+
+    @classmethod
+    async def _create_tables(cls, conn):
+        for table in cls.ANCHOR_TABLES:
+            await conn.execute(TABLES[table])
+        await conn.commit()
+
+    @classmethod
+    async def _make_db(cls, path):
+        conn = await aiosqlite.connect(str(path))
+        try:
+            await cls._create_tables(conn)
+        finally:
+            await conn.close()
+
+    @staticmethod
+    async def _mentions_in(path) -> int:
+        conn = await aiosqlite.connect(str(path))
+        try:
+            cur = await conn.execute("SELECT COUNT(*) FROM entity_mentions")
+            return (await cur.fetchone())[0]
+        finally:
+            await conn.close()
+
+    @classmethod
+    async def _store_through(cls, conn):
+        from genesis.memory.store import MemoryStore
+
+        ep = MagicMock()
+        ep.embed = AsyncMock(return_value=[0.1] * 1024)
+        ep.enrich = MagicMock(return_value="episodic: x")
+        store = MemoryStore(
+            embedding_provider=ep,
+            qdrant_client=MagicMock(),
+            db=conn,
+            linker=None,
+        )
+        with (
+            patch("genesis.memory.store.upsert_point"),
+            patch("genesis.memory.store.memory_crud") as mock_mem,
+        ):
+            mock_mem.upsert = AsyncMock(return_value="mem-1")
+            mock_mem.create_metadata = AsyncMock(return_value=None)
+            mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
+            await store.store(
+                content=cls.ANCHORED,
+                memory_type="episodic",
+                source="test",
+            )
+
+    @pytest.mark.asyncio
+    async def test_an_isolated_store_anchors_into_its_own_database(self, tmp_path):
+        default_db = tmp_path / "default.db"
+        isolated_db = tmp_path / "isolated.db"
+        await self._make_db(default_db)
+        await self._make_db(isolated_db)
+
+        # genesis_db_path() is what record_anchors falls back to with no
+        # target. Pointing it at a sentinel makes a regression VISIBLE here
+        # instead of writing into the real graph of whoever runs the suite.
+        with patch("genesis.env.genesis_db_path", return_value=str(default_db)):
+            conn = await aiosqlite.connect(str(isolated_db))
+            conn.row_factory = aiosqlite.Row
+            try:
+                await self._store_through(conn)
+            finally:
+                await conn.close()
+
+        assert await self._mentions_in(isolated_db) == 1, (
+            "the database this store is bound to received no anchors"
+        )
+        assert await self._mentions_in(default_db) == 0, (
+            "anchors leaked into the DEFAULT graph — the reported defect"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_in_memory_store_does_not_anchor_into_the_default(self, tmp_path):
+        # An in-memory database reports '' from PRAGMA database_list: no file
+        # another connection could open. Falling back to genesis_db_path()
+        # there would write into a database the caller never named — the same
+        # defect wearing different clothes — so anchoring is SKIPPED.
+        default_db = tmp_path / "default.db"
+        await self._make_db(default_db)
+
+        with patch("genesis.env.genesis_db_path", return_value=str(default_db)):
+            conn = await aiosqlite.connect(":memory:")
+            conn.row_factory = aiosqlite.Row
+            await self._create_tables(conn)
+            try:
+                await self._store_through(conn)
+            finally:
+                await conn.close()
+
+        assert await self._mentions_in(default_db) == 0, (
+            "an in-memory store wrote anchors into the default database"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_target_is_resolved_once_per_store(self, tmp_path):
+        # The target is derived from the connection rather than passed in, so
+        # it sits on the hot store path. Pin the cache: a regression here is a
+        # PRAGMA per store() call, which is silent and shows up only as load.
+        from genesis.memory.store import MemoryStore
+
+        db_file = tmp_path / "x.db"
+        await self._make_db(db_file)
+        conn = await aiosqlite.connect(str(db_file))
+        conn.row_factory = aiosqlite.Row
+        try:
+            ep = MagicMock()
+            ep.embed = AsyncMock(return_value=[0.1] * 1024)
+            store = MemoryStore(
+                embedding_provider=ep,
+                qdrant_client=MagicMock(),
+                db=conn,
+                linker=None,
+            )
+            first = await store._anchor_target()
+
+            real_execute = conn.execute
+            seen: list[str] = []
+
+            async def _counting(sql, *a, **kw):
+                seen.append(str(sql))
+                return await real_execute(sql, *a, **kw)
+
+            conn.execute = _counting  # type: ignore[assignment]
+            second = await store._anchor_target()
+        finally:
+            await conn.close()
+
+        assert first == (True, str(db_file)), first
+        assert second == first
+        assert not [s for s in seen if "database_list" in s], (
+            f"the target was re-derived instead of cached: {seen}"
+        )
