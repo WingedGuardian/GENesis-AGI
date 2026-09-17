@@ -27,23 +27,27 @@ genesis_gitnexus_node_supported() {
     genesis_gitnexus_node_version_supported "$version"
 }
 
-genesis_gitnexus_resolve_binary() {
+# Every resolvable gitnexus binary, in a canonical order that does NOT depend on
+# the caller's PATH. genesis-code-intel.service supplies its own PATH with
+# ~/.npm-global/bin first while an interactive MCP client may resolve
+# /usr/local/bin first — PATH-first resolution lets the analyzer and the
+# launcher silently pick different binaries (and different storage formats).
+_genesis_gitnexus_candidates() {
     local candidate="" prefix=""
-    if [ -n "${GITNEXUS_BIN:-}" ] && [ -x "$GITNEXUS_BIN" ]; then
-        printf '%s\n' "$GITNEXUS_BIN"
-        return 0
-    fi
-    candidate="$(command -v gitnexus 2>/dev/null || true)"
-    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
-        printf '%s\n' "$candidate"
-        return 0
-    fi
+    local -a found=()
+    _genesis_gitnexus_add() {
+        [ -n "$1" ] && [ -x "$1" ] || return 0
+        local existing
+        for existing in ${found[@]+"${found[@]}"}; do
+            [ "$existing" = "$1" ] && return 0
+        done
+        found+=("$1")
+    }
+    _genesis_gitnexus_add "${GITNEXUS_BIN:-}"
     if command -v npm >/dev/null 2>&1; then
         prefix="$(npm config get prefix 2>/dev/null || true)"
-        candidate="${prefix%/}/bin/gitnexus"
-        if [[ "$prefix" = /* ]] && [ -x "$candidate" ]; then
-            printf '%s\n' "$candidate"
-            return 0
+        if [[ "$prefix" = /* ]]; then
+            _genesis_gitnexus_add "${prefix%/}/bin/gitnexus"
         fi
     fi
     for candidate in \
@@ -51,12 +55,36 @@ genesis_gitnexus_resolve_binary() {
         "${HOME:-}/.local/bin/gitnexus" \
         /usr/local/bin/gitnexus \
         /usr/bin/gitnexus; do
-        if [ -x "$candidate" ]; then
-            printf '%s\n' "$candidate"
-            return 0
+        _genesis_gitnexus_add "$candidate"
+    done
+    _genesis_gitnexus_add "$(command -v gitnexus 2>/dev/null || true)"
+    printf '%s\n' ${found[@]+"${found[@]}"}
+}
+
+genesis_gitnexus_resolve_binary() {
+    local -a candidates=()
+    local candidate
+    while IFS= read -r candidate; do
+        candidates+=("$candidate")
+    done < <(_genesis_gitnexus_candidates)
+    [ "${#candidates[@]}" -gt 0 ] || return 1
+    [ "${#candidates[@]}" -eq 1 ] && { printf '%s\n' "${candidates[0]}"; return 0; }
+    # Shadow scan: more than one installation exists. Canonical order already
+    # makes every caller resolve the same one, but a second install at a
+    # DIFFERENT version may have written a different storage format — refuse the
+    # conflict instead of trusting whichever binary the canonical order chose.
+    local first_version="" version=""
+    for candidate in "${candidates[@]}"; do
+        version="$("$candidate" --version 2>/dev/null || true)"
+        if [ -z "$first_version" ]; then
+            first_version="$version"
+        elif [ "${version#v}" != "${first_version#v}" ]; then
+            printf 'gitnexus: conflicting installations — %s reports %s, %s reports %s; remove one\n' \
+                "${candidates[0]}" "${first_version:-unreadable}" "$candidate" "${version:-unreadable}" >&2
+            return 1
         fi
     done
-    return 1
+    printf '%s\n' "${candidates[0]}"
 }
 
 genesis_gitnexus_installed_version() {

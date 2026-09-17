@@ -10,9 +10,112 @@ from __future__ import annotations
 
 import re
 import time
+import tomllib
 from pathlib import Path
 
+import pytest
+from packaging.requirements import Requirement
+from packaging.version import Version
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _qdrant_client_requirement() -> Requirement:
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    for dep in data["project"]["dependencies"]:
+        if Requirement(dep).name == "qdrant-client":
+            return Requirement(dep)
+    pytest.fail("qdrant-client is not declared in pyproject.toml dependencies")
+
+
+def _qdrant_server_version() -> tuple[int, int]:
+    """The server version scripts/install.sh installs when Qdrant is absent."""
+    text = (REPO_ROOT / "scripts" / "install.sh").read_text()
+    m = re.search(r'QDRANT_VERSION="\$\{QDRANT_VERSION:-([0-9]+)\.([0-9]+)\.[0-9]+\}"', text)
+    assert m, "could not find the QDRANT_VERSION default in scripts/install.sh"
+    return int(m.group(1)), int(m.group(2))
+
+
+def _qdrant_compatible(v: Version, s_major: int, s_minor: int) -> bool:
+    """Qdrant's own client/server rule, from qdrant_client/common/version_check.py:
+    same major, and abs(server.minor - client.minor) <= 1."""
+    return v.major == s_major and abs(v.minor - s_minor) <= 1
+
+
+def _candidate_versions(s_major: int, s_minor: int) -> list[Version]:
+    """A dense grid around the server version, spanning both boundaries.
+
+    Deliberately a GRID rather than a handful of sample points. An earlier version
+    of this test probed three specific strings ("{major}.{minor+2}.0", one
+    lower-side value, "{major+1}.0.0") and every one of its gaps was a real hole:
+
+      - probing only ``.0`` of a disallowed minor let ``!=1.16.0`` through while
+        ``1.16.1`` still resolved, so patch levels are enumerated;
+      - probing ``minor - 2`` computed a valid minor when the server minor was 0
+        or 1, so the window is now computed per candidate rather than assumed;
+      - probing only ``major + 1`` let ``>=0`` admit 0.x clients, so majors below
+        the server's are covered too.
+
+    The grid is the declared coverage model, and it is a model — a version outside
+    it has no cell and so passes in silence. It spans two majors either side and
+    three minors either side of the server, which is far wider than any plausible
+    coordinated bump.
+    """
+    majors = range(max(0, s_major - 2), s_major + 3)
+    minors = range(max(0, s_minor - 3), s_minor + 4)
+    patches = (0, 1, 7)  # .0 is not representative of a minor line
+    return [Version(f"{a}.{b}.{c}") for a in majors for b in minors for c in patches]
+
+
+def test_qdrant_client_pin_admits_only_compatible_clients():
+    """Every version the specifier admits must satisfy Qdrant's compatibility rule.
+
+    This is the coupling the qdrant-client pin exists to hold. Without it the pin
+    is only a comment in pyproject.toml, and moving EITHER number — the client
+    specifier or the install.sh server default — leaves CI green while the pairing
+    goes unsupported.
+    """
+    req = _qdrant_client_requirement()
+    s_major, s_minor = _qdrant_server_version()
+
+    admitted_incompatible: list[str] = []
+    admitted_compatible: list[str] = []
+    for v in _candidate_versions(s_major, s_minor):
+        if not req.specifier.contains(str(v)):
+            continue
+        target = (
+            admitted_compatible
+            if _qdrant_compatible(v, s_major, s_minor)
+            else admitted_incompatible
+        )
+        target.append(str(v))
+
+    assert not admitted_incompatible, (
+        f"'{req}' admits {admitted_incompatible} — incompatible with server "
+        f"{s_major}.{s_minor}.x, whose rule is same major and at most one minor "
+        f"apart. Bump BOTH the client specifier and QDRANT_VERSION, or neither."
+    )
+    assert admitted_compatible, (
+        f"'{req}' admits NO client compatible with server {s_major}.{s_minor}.x — "
+        f"the pin and the server default have drifted apart in the other direction."
+    )
+
+
+def test_qdrant_client_pin_is_bounded_at_all():
+    """An unbounded specifier is what created the skew this pin fixes.
+
+    ``qdrant-client`` carried no specifier at all, so a fresh install resolved to
+    whatever was newest and paired it with a server pinned three releases back.
+    Guard the SHAPE, not just the current numbers: a future edit that drops the
+    upper bound reintroduces the drift even if it happens to resolve correctly on
+    the day it lands.
+    """
+    req = _qdrant_client_requirement()
+    operators = {spec.operator for spec in req.specifier}
+    assert operators & {"<", "<=", "==", "~="}, (
+        f"'{req}' has no upper bound — the client will drift past the server "
+        "again. Qdrant requires the two stay within one minor."
+    )
 
 
 def test_gitnexus_pin_is_single_sourced_and_current():
@@ -51,12 +154,22 @@ def test_gitnexus_pin_is_single_sourced_and_current():
     ), "an optional pin helper must not preempt interrupted-update recovery"
 
 
-def test_installers_enforce_the_declared_node_22_floor():
+def test_installers_enforce_the_pinned_tools_node_floor():
+    """The installer floor must satisfy EVERY pinned tool, not just Claude Code.
+
+    Claude Code's floor is Node >= 22; the pinned GitNexus declares
+    ``^22.18.0 || >=24.11.0``. A major-only check lets Node 22.0–22.17 install
+    and then strands GitNexus: every launcher and indexing attempt refuses on
+    the engine range forever. Both installers must enforce the GitNexus range
+    (which is a strict subset of >= 22 anyway).
+    """
     install = (REPO_ROOT / "scripts" / "install.sh").read_text()
     bootstrap = (REPO_ROOT / "scripts" / "bootstrap.sh").read_text()
     assert 'NODE_MAJOR="${NODE_MAJOR:-22}"' in install
-    assert '[ "${ver:-0}" -ge 22 ]' in install
-    assert '[[ "$major" -ge 22 ]]' in bootstrap
+    for relative, text in (("install.sh", install), ("bootstrap.sh", bootstrap)):
+        assert '"$major" -eq 22 && "$minor" -ge 18' in text, relative
+        assert '"$major" -eq 24 && "$minor" -ge 11' in text, relative
+        assert '"$major" -gt 24' in text, relative
 
 
 def test_installers_do_not_run_cbm_installer_while_kill_switch_is_active():
@@ -98,6 +211,44 @@ def test_every_gitnexus_package_resolver_uses_the_shared_pin():
         "bunx gitnexus",
     ):
         assert dynamic_resolver.search(mutation), mutation
+
+
+def test_no_unpinned_gitnexus_resolver_in_repository_files():
+    """The pattern above is only a detector — apply it to the repo itself.
+
+    A mutation-table test proves the regex fires; it says nothing about whether
+    an actual source file floats to an npm tag. Scan the executable surfaces
+    and fail on any resolver invocation that does not pin through
+    ``GENESIS_GITNEXUS_VERSION`` (``gitnexus@${GENESIS_GITNEXUS_VERSION}``) — a
+    floating ``npx gitnexus`` can fetch an unreviewed release that writes an
+    unreadable storage format.
+    """
+    offenders: list[str] = []
+    scanned = 0
+    for base, glob in (
+        ("scripts", "**/*.sh"),
+        (".claude", "**/*"),
+        ("src", "**/*.py"),
+    ):
+        root = REPO_ROOT / base
+        if not root.is_dir():
+            continue
+        for path in root.rglob(glob):
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text()
+            except UnicodeDecodeError:
+                continue
+            scanned += 1
+            for lineno, line in enumerate(text.splitlines(), 1):
+                if _RESOLVER_PATTERN.search(line) and "GENESIS_GITNEXUS_VERSION" not in line:
+                    offenders.append(f"{path.relative_to(REPO_ROOT)}:{lineno}")
+    assert scanned > 0, "resolver scan covered no files — the guard is vacuous"
+    assert not offenders, (
+        "gitnexus resolver invocations that do not pin via "
+        f"GENESIS_GITNEXUS_VERSION: {offenders}"
+    )
 
 
 

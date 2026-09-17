@@ -89,14 +89,17 @@ GITNEXUS_MEM_MAX="${CODE_INTEL_GITNEXUS_MEMORY_MAX:-${_LEGACY_MEM_MAX:-8G}}"
 # So the effective cap is min(configured, what this box can spare), and when
 # what it can spare is below the measured working set the job is REFUSED rather
 # than run with a cap that cannot bite.
-_genesis_mem_bytes() {  # "8G"/"512M"/"1024K"/bytes -> bytes on stdout, or nothing
+_genesis_mem_bytes() {  # "8G"/"512M"/"1024K"/"5.5G"/bytes -> bytes on stdout, or nothing
     local v="${1:-}"
+    # Fractional values are legal systemd (MemoryMax=5.5G); Bash arithmetic is
+    # integer-only, so the multiply goes through awk. A bare number must be an
+    # integer byte count — a unitless "5.5" is malformed, not 5.5 bytes.
+    [[ "$v" =~ ^([0-9]+(\.[0-9]+)?)([GgMmKk])$ || "$v" =~ ^[0-9]+$ ]] || return 1
     case "$v" in
-        *[Gg]) printf '%s' "$(( ${v%[Gg]} * 1024 * 1024 * 1024 ))" ;;
-        *[Mm]) printf '%s' "$(( ${v%[Mm]} * 1024 * 1024 ))" ;;
-        *[Kk]) printf '%s' "$(( ${v%[Kk]} * 1024 ))" ;;
-        *[0-9]) printf '%s' "$v" ;;
-        *) : ;;
+        *[Gg]) awk -v n="${v%[Gg]}" 'BEGIN{printf "%d", n * 1073741824}' ;;
+        *[Mm]) awk -v n="${v%[Mm]}" 'BEGIN{printf "%d", n * 1048576}' ;;
+        *[Kk]) awk -v n="${v%[Kk]}" 'BEGIN{printf "%d", n * 1024}' ;;
+        *) printf '%s' "$v" ;;
     esac
 }
 
@@ -148,7 +151,16 @@ CODE_INTEL_GITNEXUS_MIN_BYTES="${CODE_INTEL_GITNEXUS_MIN_BYTES:-$(( 4874166272 )
 _genesis_ceiling_b="$(_genesis_mem_ceiling)"
 _genesis_want_b="$(_genesis_mem_bytes "$GITNEXUS_MEM_MAX")"
 GITNEXUS_MEM_REFUSE=""
-if [ -n "$_genesis_ceiling_b" ] && [ -n "$_genesis_want_b" ]; then
+if [ -z "$_genesis_want_b" ]; then
+    # Fail closed: an unparseable cap must not reach MemoryMax, and skipping the
+    # admission check silently would run the job unbounded.
+    GITNEXUS_MEM_REFUSE="CODE_INTEL_GITNEXUS_MEMORY_MAX='${GITNEXUS_MEM_MAX}' is not a parseable memory value — refusing rather than running unbounded"
+elif [ "$_genesis_want_b" -lt "$CODE_INTEL_GITNEXUS_MIN_BYTES" ]; then
+    # A configured cap below the measured working set cannot bite: on a large
+    # host the rebuild would still run and be killed by its own cgroup, which
+    # reads as a flaky index failure instead of the refusal it should be.
+    GITNEXUS_MEM_REFUSE="configured cap ${GITNEXUS_MEM_MAX} is below the $(( CODE_INTEL_GITNEXUS_MIN_BYTES / 1024 / 1024 ))M a measured full rebuild needs — a cap that cannot bite only relocates the kill"
+elif [ -n "$_genesis_ceiling_b" ]; then
     _genesis_spare_b=$(( _genesis_ceiling_b - CODE_INTEL_SIBLING_RESERVE_BYTES ))
     if [ "$_genesis_spare_b" -lt "$CODE_INTEL_GITNEXUS_MIN_BYTES" ]; then
         GITNEXUS_MEM_REFUSE="this install has $(( _genesis_ceiling_b / 1024 / 1024 ))M total; after reserving $(( CODE_INTEL_SIBLING_RESERVE_BYTES / 1024 / 1024 ))M for the services around it that leaves $(( _genesis_spare_b / 1024 / 1024 ))M, below the $(( CODE_INTEL_GITNEXUS_MIN_BYTES / 1024 / 1024 ))M a measured full rebuild needs"
@@ -394,6 +406,8 @@ _run_with_watchdog() {
 
 RC=0
 MISSING=""  # requested-but-absent tools — makes a no-op run rc=3, not a false success
+CBM_RAN=0
+GN_RAN=0
 
 if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
     if [ -e "$CBM_DISABLE_FILE" ]; then
@@ -405,7 +419,8 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
         # .codebase-memory/graph.db.zst artifact so a wiped cache restores from it
         # instead of a full 0->100 re-index.
         MEM_MAX="$CBM_MEM_MAX" _run_with_watchdog cbm codebase-memory-mcp cli index_repository \
-            --repo-path "$REPO_PATH" --mode "$MODE" --persistence "$PERSISTENCE" || RC=$?
+            --repo-path "$REPO_PATH" --mode "$MODE" --persistence "$PERSISTENCE" \
+            && CBM_RAN=1 || RC=$?
     else
         _log "codebase-memory-mcp not on PATH — skipped"
         MISSING="${MISSING}cbm "
@@ -437,7 +452,8 @@ if [ "$TOOLS" = "gitnexus" ] || [ "$TOOLS" = "both" ]; then
             _log "      raise CODE_INTEL_GITNEXUS_MEMORY_MAX / lower CODE_INTEL_SIBLING_RESERVE_BYTES to override"
             MISSING="${MISSING:+$MISSING }gitnexus"
         else
-            ( cd "$REPO_PATH" && MEM_MAX="$GITNEXUS_MEM_MAX" _run_with_watchdog gitnexus "$_GN" analyze ) || RC=$?
+            ( cd "$REPO_PATH" && MEM_MAX="$GITNEXUS_MEM_MAX" _run_with_watchdog gitnexus "$_GN" analyze ) \
+                && GN_RAN=1 || RC=$?
         fi
     else
         _log "gitnexus not available — skipped"
@@ -448,10 +464,25 @@ fi
 # B1: a requested tool absent from PATH means NOTHING was indexed for it. Never
 # report that as success (rc 0) — the idle runner would consume the marker and
 # stamp a fresh full-index timestamp, silently disabling indexing until someone
-# notices the graph is stale. Distinct rc 3 == "requested tool missing".
-if [ "$RC" = "0" ] && [ -n "$MISSING" ]; then
-    _log "ERROR: requested tool(s) missing from PATH: ${MISSING%% } — nothing indexed (rc=3)"
-    RC=3
+# notices the graph is stale. Per-leg outcome codes so a completed leg is
+# consumable and a skipped/refused leg never stamps cbm's shared full clock:
+#   rc 3: nothing indexed — at least one requested tool missing or refused
+#   rc 4: cbm leg completed, gitnexus leg did not run
+#   rc 5: gitnexus leg completed, cbm leg did not run
+if [ "$RC" = "0" ]; then
+    _cbm_wanted=0; _gn_wanted=0
+    { [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; } && _cbm_wanted=1
+    { [ "$TOOLS" = "gitnexus" ] || [ "$TOOLS" = "both" ]; } && _gn_wanted=1
+    if [ -n "$MISSING" ] && [ "$CBM_RAN" != "1" ] && [ "$GN_RAN" != "1" ]; then
+        _log "ERROR: requested tool(s) missing or refused: ${MISSING%% } — nothing indexed (rc=3)"
+        RC=3
+    elif [ "$_gn_wanted" = "1" ] && [ "$GN_RAN" != "1" ] && [ "$CBM_RAN" = "1" ]; then
+        _log "cbm leg done; gitnexus leg did not run (${MISSING:-unknown reason}) — partial (rc=4)"
+        RC=4
+    elif [ "$_cbm_wanted" = "1" ] && [ "$CBM_RAN" != "1" ] && [ "$GN_RAN" = "1" ]; then
+        _log "gitnexus leg done; cbm leg did not run — partial, cbm full clock NOT stamped (rc=5)"
+        RC=5
+    fi
 fi
 
 _log "done (rc=$RC): $REPO_PATH"
