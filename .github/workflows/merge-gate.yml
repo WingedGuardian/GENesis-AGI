@@ -132,28 +132,25 @@ jobs:
             --repo "$GITHUB_REPOSITORY"
           rc=$?
           echo "rc=${rc}" >> "$GITHUB_OUTPUT"
-          # pull_request* events attach their ambient job check to the PR head
-          # automatically — exit with the gate's rc so THAT check is the verdict.
-          # issue_comment / workflow_dispatch / workflow_run execute on the
-          # DEFAULT branch: a nonzero exit would only paint a red check onto the
-          # base SHA, and the real verdict is published onto the PR head in the
-          # next step instead.
-          case "$GITHUB_EVENT_NAME" in
-            pull_request|pull_request_review|pull_request_review_comment)
-              exit "$rc" ;;
-          esac
+          # Only `pull_request` attaches its ambient job check to the PR merge
+          # ref — exit with the gate's rc so THAT check is the verdict.
+          # pull_request_review*/issue_comment/workflow_run/workflow_dispatch
+          # attach to the synthetic merge SHA or the default-branch SHA —
+          # neither is the PR head a consumer reads. A nonzero exit here would
+          # only paint red onto an unrelated SHA; the real verdict is
+          # published onto the PR head in the next step instead.
+          [ "$GITHUB_EVENT_NAME" = "pull_request" ] && exit "$rc"
           exit 0
 
       - name: Publish the verdict on the PR head
-        # Only the events whose ambient job check lands on the DEFAULT branch
-        # (invisible on the PR) need the explicit check run. For pull_request*
-        # events the ambient check already sits on the head — publishing here
-        # would duplicate the same check name on one SHA (measured on this
-        # branch: green ambient + red API entries side by side).
-        if: >-
-          github.event_name == 'issue_comment' ||
-          github.event_name == 'workflow_dispatch' ||
-          github.event_name == 'workflow_run'
+        # Every event except `pull_request` attaches its ambient check to a
+        # SHA that is NOT the PR head (default-branch SHA for comments,
+        # dispatch and workflow_run; the synthetic merge SHA for review
+        # events) — publish the verdict explicitly on the head so head-SHA
+        # consumers (the local gate, a future required check) always read the
+        # newest evaluation on the SHA they inspect. `pull_request` skips
+        # this: its ambient check already sits on the merge ref.
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GATE_RC: ${{ steps.gate.outputs.rc }}
