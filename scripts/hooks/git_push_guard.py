@@ -62,22 +62,23 @@ post a comment (issue comment) or PR review whose body contains a marker
 ``<!-- genesis-scheduled-review: head=<full-40-hex-sha> kind=<name> -->`` naming the exact
 head it reviewed AND which routine it was (``kind``). The merge gate
 (``_check_scheduled_claude_reviewed_head``) blocks unless an owner-authored marker for
-EVERY effective required kind (``_required_scheduled_review_kinds()`` — DEFAULT
-code-review + leaks, with the leak scanner irreducible; an install may relax the optional
-kinds to advisory via ``merge_gate.required_scheduled_reviews`` in genesis.yaml) names
+EVERY effective required kind (``_required_scheduled_review_kinds()`` — DEFAULT ``leaks``
+alone, which is also irreducible; ``code-review`` is ADVISORY by default because no
+routine emits its marker, and an install that runs one re-arms it via
+``merge_gate.required_scheduled_reviews`` in genesis.yaml) names
 the PR's CURRENT head — so if any required routine never ran, ran on a stale commit, or
 was rate-limited, the merge is blocked (naming the missing kinds). An ADVISORY routine
-(one relaxed out of the required set locally) still posts its review on the PR to be read
+still posts its review on the PR to be read
 and addressed, but its absence does not block. SCOPE: this gate
 enforces ONLY when the merge targets the configured PUBLIC repo — the declared
 ``github.user``/``github.public_repo`` in ``~/.genesis/config/genesis.yaml``
 (``_scheduled_gate_applies`` / ``_canonical_public_repo``). A merge to any OTHER repo
 (a private fork, the voice repo, backups) no-ops, since the required ``/schedule``
-routines run only on the public repo. Deployment note: on the public repo the required
-routines ARE configured (the deploy precondition); a clone that runs on its own public
-repo without a producer uses `# scheduled-review-override` (or relaxes the optional kinds
-via ``merge_gate.required_scheduled_reviews``) — the override valve is the escape by design, not an
-opt-in flag. Fail-closed on scope uncertainty: if the canonical repo is undeterminable
+routines run only on the public repo. Deployment note: on the public repo the leaks
+routine IS configured (the deploy precondition); a clone that runs on its own public
+repo without a producer uses `# scheduled-review-override` — since the only default kind
+is the irreducible one, config cannot relax it, and the override valve is the escape by
+design, not an opt-in flag. Fail-closed on scope uncertainty: if the canonical repo is undeterminable
 the gate ENGAGES rather than silently disarming.
 A DISMISSED or PENDING (draft) review no longer vouches (its marker is ignored), mirroring
 the Codex path. The marker means "ran CLEAN", not merely "ran": a review whose body carries a
@@ -5338,9 +5339,37 @@ _SCHEDULED_REVIEW_ANYCASE_HEAD_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
 
 # Default scheduled-review kinds the merge gate REQUIRES at head. A PR merges only when
 # a valid owner-authored marker for EACH effective required kind names the current head.
-# The DEFAULT is the full set (shipped to every install, unchanged); an install may relax
-# the OPTIONAL kinds locally — see _required_scheduled_review_kinds() for the lever.
-_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
+# An install may EXPAND this set locally — see _required_scheduled_review_kinds().
+#
+# WHY code-review IS NOT IN THE DEFAULT. A required kind is a promise that some producer
+# emits its marker. For `code-review` no producer exists: measured 2026-09-16 over every
+# owner-authored comment and review on all 51 open non-draft PRs and the 40 most recently
+# merged ones, `leaks` markers appear 47 and 31 times respectively and `code-review`
+# markers appear ZERO times — not stale at an earlier head, never emitted at all. The gate
+# consequently blocked 51/51 open PRs on a kind nothing produces, so every one of those 40
+# merges necessarily carried `# scheduled-review-override`: a sigil that verifies NOTHING,
+# demoted by daily use from an exception valve to the standard merge incantation. That is
+# strictly worse than not requiring the kind, because it also disarms the override for the
+# leaks lane, where it is the only escape. Requiring a marker no routine writes does not
+# buy review; it buys a habit of waiving review.
+#
+# What is NOT lost: `code-review` is a QUALITY review, and per-head quality review is
+# already enforced by two other gates that do have live producers — Codex-at-head
+# freshness (_check_codex_reviewed_head) and the inline-finding thresholds
+# (_check_inline_review_findings). Nothing about LEAK protection changes: `leaks` stays
+# irreducible below, and the mechanical `leak-detector` CI job still runs per head.
+#
+# The kind remains KNOWN (_KNOWN_SCHEDULED_REVIEW_KINDS), so an install that DOES stand a
+# producer up re-arms it with one line of local config:
+#
+#     # ~/.genesis/config/genesis.yaml
+#     merge_gate:
+#       required_scheduled_reviews: [code-review, leaks]
+#
+# Accepted residue: while the kind is advisory, a `code-review` marker whose body carries a
+# blocking finding is not consulted — an advisory kind is neither required nor refusable.
+# Inert today (no producer), and the config line above is what makes it bind again.
+_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
 # The leak/secret scanner is IRREDUCIBLE: always required, never removable by config. A
 # secret reaching a public repo is irreversible, so no local policy may waive it.
 _IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
@@ -5396,16 +5425,18 @@ _IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
 _MECHANICAL_RESCAN_BY_KIND = {"leaks": ("leak-detector", "CI")}
 # Every kind an install is ALLOWED to name in config. A configured kind outside this set
 # (a typo, a wrong type, a stale routine name) can never be satisfied by a real marker, so
-# the whole config is treated as invalid and we fail closed to the default rather than let
-# it either wedge merges forever or silently narrow the required set.
+# the whole config is treated as invalid and we fall back to the default rather than let it
+# wedge merges forever on a kind nothing can stamp. The fallback is announced (the NOTE in
+# _required_scheduled_review_kinds) because, the default being minimal, it can NARROW a
+# policy the operator declared.
 _KNOWN_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
 
 
 def _validate_configured_kinds(items: object) -> list[str] | None:
     """Lowercase + validate a configured kind list. Returns the cleaned list (possibly
     empty, meaning "only the irreducible kinds"), or None if ANYTHING is off — not a list,
-    a non-string element, a blank element, or an unknown kind. None makes the caller fail
-    CLOSED to the full default rather than honor a malformed/ambiguous relaxation."""
+    a non-string element, a blank element, or an unknown kind. None makes the caller fall
+    back to the default rather than honor a malformed/ambiguous policy."""
     if not isinstance(items, list):
         return None
     out: list[str] = []
@@ -5422,25 +5453,30 @@ def _validate_configured_kinds(items: object) -> list[str] | None:
 def _required_scheduled_review_kinds() -> tuple[str, ...]:
     """The scheduled-review kinds the merge gate REQUIRES at head, as a tuple.
 
-    Default is the full set (``code-review`` + ``leaks``) — shipped unchanged to every
-    install. An install MAY relax the OPTIONAL kinds (e.g. make the structural
-    code-review ADVISORY, so its absence no longer blocks — its review still posts on the
-    PR to be read/addressed if it ran) via LOCAL config, keeping install policy out of the
-    public default:
+    Default is ``leaks`` alone — the only kind with a producer that actually emits its
+    marker (see ``_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS`` for the measurement). An
+    install MAY name a LARGER set via LOCAL config, keeping install policy out of the
+    public default — e.g. one that runs a ``code-review`` routine re-arms it with:
 
         # ~/.genesis/config/genesis.yaml
         merge_gate:
-          required_scheduled_reviews: [leaks]
+          required_scheduled_reviews: [code-review, leaks]
 
     The leak/secret scanner (``_IRREDUCIBLE_...``) is ALWAYS unioned in and CANNOT be
-    dropped by config. Fail-CLOSED toward MORE review: a missing key / unreadable file /
+    dropped by config. Fail-CLOSED toward the default: a missing key / unreadable file /
     parse error / duplicate key / wrong-type / blank / unknown kind ALL fall back to the
-    full default set, never to fewer kinds. Configured kinds are validated against
-    ``_KNOWN_SCHEDULED_REVIEW_KINDS`` and lowercased to the marker grammar. Test seam:
-    ``_TEST_REQUIRED_SCHEDULED_REVIEWS`` (comma-separated) overrides the config file.
+    default set, and the irreducible kind survives every path. Because the default is now
+    MINIMAL rather than maximal, config EXPANDS it, so — exactly as in
+    ``_required_ci_workflows`` — a fallback can silently NARROW a stricter declared
+    policy. When the key is visibly present in the file but its value was discarded, a
+    NOTE names the substitution (the fallback itself is unchanged). Configured kinds are
+    validated against ``_KNOWN_SCHEDULED_REVIEW_KINDS`` and lowercased to the marker
+    grammar. Test seam: ``_TEST_REQUIRED_SCHEDULED_REVIEWS`` (comma-separated) overrides
+    the config file.
     """
     raw = os.environ.get("_TEST_REQUIRED_SCHEDULED_REVIEWS")
     configured: list[str] | None = None
+    key_seen_in_file = False
     if raw is not None:
         # Test seam: comma-list; empties dropped so "" means "only the irreducible kinds".
         configured = _validate_configured_kinds([k.strip() for k in raw.split(",") if k.strip()])
@@ -5451,6 +5487,11 @@ def _required_scheduled_review_kinds() -> tuple[str, ...]:
             path = os.path.expanduser("~/.genesis/config/genesis.yaml")
             with open(path) as fh:
                 text = fh.read()
+            # A textual sighting of the KEY LINE (not a comment/prose mention): if the
+            # value is then discarded, the operator DECLARED a policy we are about to
+            # substitute, and with a minimal default that substitution can be a
+            # NARROWING. Checked BEFORE the parse so a yaml error can't skip it.
+            key_seen_in_file = bool(re.search(r"(?m)^\s*required_scheduled_reviews\s*:", text))
             # yaml.safe_load silently keeps the LAST value for a repeated key, so a
             # badly-merged file (two merge_gate: or required_scheduled_reviews: lines)
             # could quietly narrow the required set. Catch the realistic cases with a
@@ -5465,7 +5506,16 @@ def _required_scheduled_review_kinds() -> tuple[str, ...]:
                 (cfg.get("merge_gate") or {}).get("required_scheduled_reviews")
             )
         except Exception:
-            configured = None  # fail-closed: fall back to the full default set below
+            configured = None  # fail-closed: fall back to the default set below
+    if configured is None and key_seen_in_file:
+        print(
+            "NOTE: merge_gate.required_scheduled_reviews in ~/.genesis/config/"
+            "genesis.yaml is present but unreadable/invalid (duplicate key, wrong type, "
+            "blank element, or unknown kind) — enforcing the DEFAULT required set "
+            f"{_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS} instead of your configured "
+            "value. Fix the config to restore your declared policy.",
+            file=sys.stderr,
+        )
     kinds = configured if configured is not None else list(_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS)
     # leaks (and any irreducible kind) is always required, even if config omits it.
     merged = list(dict.fromkeys([*kinds, *_IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS]))
@@ -5518,10 +5568,11 @@ def _required_ci_workflows() -> tuple[str, ...]:
     Fail-CLOSED toward the default: a missing key / unreadable file / parse error /
     duplicate key / wrong type / EMPTY list / blank element ALL fall back to the full
     default — there is no config value that disables the check. Because free-text
-    config can also EXPAND the required set (unlike the whitelist-relaxed scheduled
-    kinds, whose default is maximal), a fallback here can silently NARROW a stricter
-    declared policy — so when the key is visibly present but its value was discarded,
-    a NOTE is printed naming the substitution (the fallback itself is unchanged).
+    config can also EXPAND the required set, a fallback here can silently NARROW a
+    stricter declared policy — so when the key is visibly present but its value was
+    discarded, a NOTE is printed naming the substitution (the fallback itself is
+    unchanged). ``_required_scheduled_review_kinds`` carries the same NOTE for the
+    same reason.
     Test seam: ``_TEST_REQUIRED_CI_WORKFLOWS`` (comma-separated) overrides the config
     file; a blank seam parses to an empty (=invalid) list and also yields the
     default."""
