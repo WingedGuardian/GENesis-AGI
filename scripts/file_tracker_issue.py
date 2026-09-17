@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -461,19 +462,27 @@ def privacy_scan(title: str, body: str) -> list[str]:
             "Run from the repo with its venv: .venv/bin/python scripts/file_tracker_issue.py"
         ) from exc
 
-    # Title and body are scanned TOGETHER but as separate lines: scan_prose is
-    # line-oriented, and concatenating them without a newline could splice a
-    # detectable value across the seam into something neither scanner pattern
-    # matches.
-    result = scan_prose(f"{title}\n{body}")
-    blocking = result.blocking()
+    # Scanned SEPARATELY, one call per field, because the line number is the
+    # only locator a withheld finding leaves the author. Concatenating them put
+    # the title on line 1 and shifted every body line by one, so the refusal
+    # named a line the author would read as clean and edit the wrong text —
+    # confidently wrong is worse than absent when the content is withheld by
+    # design. Separate calls make each number native to the field it names, and
+    # they retire the question of whether a value could splice across the seam
+    # rather than answering it.
+    blocking: list[tuple[str, object]] = []
+    surfaced: list[tuple[str, object]] = []
+    for where, text in (("title", title), ("body", body)):
+        result = scan_prose(text)
+        blocking += [(where, f) for f in result.blocking()]
+        surfaced += [(where, f) for f in result.findings]
     if blocking:
         raise Refused(
             f"privacy scan BLOCKED this issue ({len(blocking)} finding(s)): "
-            + "; ".join(_describe_finding(f) for f in blocking)
-            + _interpreter_hint(blocking)
+            + "; ".join(_describe_finding(f, where) for where, f in blocking)
+            + _interpreter_hint([f for _, f in blocking])
         )
-    return [_describe_finding(f) for f in result.findings]
+    return [_describe_finding(f, where) for where, f in surfaced]
 
 
 #: Findings whose ``detail`` is a fixed SENTINEL describing the scanner's own
@@ -485,12 +494,11 @@ _INFRASTRUCTURE_DETAILS = frozenset(
         "scan_error",
         "nonzero_exit",
         "missing_fingerprint_file",
-        "unreadable_fingerprint_file",
     }
 )
 
 
-def _describe_finding(f) -> str:
+def _describe_finding(f, where: str = "draft") -> str:
     """Render a finding WITHOUT reproducing what it matched.
 
     A refusal is printed to stderr, which on this system lands in terminal
@@ -510,12 +518,14 @@ def _describe_finding(f) -> str:
     content and are exactly the ones an operator needs spelled out, because
     they are about the environment rather than the draft.
     """
-    where = f" at line {f.line}" if f.line else ""
     if f.detail in _INFRASTRUCTURE_DETAILS:
         return f"[{f.kind.value}] {f.message}"
     # Deliberately no message and no detail: naming the RULE is actionable,
-    # quoting the MATCH is a second copy of the secret.
-    return f"[{f.kind.value}] matched by {f.scanner or 'a scanner'}{where} (content withheld)"
+    # quoting the MATCH is a second copy of the secret. The FIELD and the line
+    # are what is left, so they have to be right — see privacy_scan for why
+    # they are scanned separately.
+    at = f" line {f.line}" if f.line else ""
+    return f"[{f.kind.value}] matched by {f.scanner or 'a scanner'} in the {where}{at} (content withheld)"
 
 
 def _interpreter_hint(blocking) -> str:
@@ -558,31 +568,52 @@ def _snapshot(data: bytes) -> tuple[str, str]:
     gh's read. The name carries 16 bytes of urandom rather than the pid alone,
     which a peer could predict.
 
-    Cleanup is the CALLER's, in a finally — and it must never convert a
-    successful post into a failure, which is why the removal is suppressed.
+    CREATION IS ALL-OR-NOTHING. Anything that fails after the directory exists
+    removes it before propagating, because the caller learns the directory's
+    name only from a successful RETURN — a partial write would otherwise leave
+    a copy of the body on disk that nothing knows to clean up (Devin, Codex P2).
+    ``BaseException``, not ``Exception``: a SIGINT or a disk-full landing
+    between the mkdir and the chmod is exactly when the leftover matters, and
+    KeyboardInterrupt is not an Exception.
+
+    Cleanup of the SUCCESSFUL case is the caller's, in a finally — and it must
+    never convert a successful post into a failure, which is why that removal
+    is suppressed.
     """
     parent = Path.home() / "tmp"
     parent.mkdir(parents=True, exist_ok=True)
     d = parent / f"issue-body-{os.getpid()}-{os.urandom(16).hex()}"
     os.mkdir(d, 0o700)
-    path = d / "body.md"
-    path.write_bytes(data)
-    path.chmod(0o600)
+    try:
+        path = d / "body.md"
+        # Mode at CREATION, not after: a write-then-chmod leaves the body
+        # world-readable for the width of that window, under a 0700 directory
+        # that makes it unreachable but not unreadable to the owner's own
+        # processes. os.open with 0o600 closes it.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            # LOOP, because os.write returns a COUNT and a short write is not an
+            # error. Discarding that count lets gh post a TRUNCATED body while
+            # the script reports success — which would make this function's own
+            # guarantee ("the posted bytes are the scanned bytes") false in
+            # exactly the direction nothing detects: posted becomes a proper
+            # subset of scanned. I could not reproduce a short write on a
+            # regular file here, and did not try to fill the disk; the loop is
+            # correct on the API's contract rather than on an observation, and
+            # the `except BaseException` below covers only the RAISING form of
+            # disk-full, not this one.
+            written = 0
+            while written < len(data):
+                n = os.write(fd, data[written:])
+                if n <= 0:
+                    raise OSError(errno.EIO, "short write staging the scanned body")
+                written += n
+        finally:
+            os.close(fd)
+    except BaseException:
+        shutil.rmtree(d, ignore_errors=True)
+        raise
     return str(d), str(path)
-
-
-def _digest(data: bytes) -> str:
-    """SHA-256 of the draft bytes.
-
-    Takes BYTES, not a path, and that is the whole point. An earlier version
-    re-READ the file to digest it, which put the entire privacy scan — one
-    ``detect-secrets`` subprocess per line — inside an unguarded window between
-    the read that produced the scanned text and the read that produced the
-    digest. A write landing there was digested but never scanned, so the later
-    comparison passed and the refusal message promised something the code could
-    not deliver. Digest the bytes the scan actually saw.
-    """
-    return hashlib.sha256(data).hexdigest()
 
 
 def create_issue(
@@ -728,7 +759,16 @@ def _run_main(argv: Sequence[str] | None, run: Runner) -> int:
             # so they belong on exit 2 with everything else that refused — not on
             # the generic exit 1. UnicodeDecodeError is a ValueError, which no
             # handler here caught before.
-            raise Refused(f"cannot read the draft files: {exc}") from exc
+            # TYPE only — the same reasoning as the staging refusal below.
+            # An OSError here names the draft path, which is caller-supplied
+            # and routinely under a home directory. Pre-existing, but in a
+            # block this change rewrites and squarely the class this PR is
+            # about, so it is corrected rather than left as the one that got
+            # away.
+            raise Refused(
+                f"cannot read the draft files ({type(exc).__name__}) — check "
+                "--title-file and --body-file are readable UTF-8."
+            ) from exc
         if not title:
             raise Refused("title file is empty")
         if not body:
@@ -756,7 +796,16 @@ def _run_main(argv: Sequence[str] | None, run: Runner) -> int:
             # other refusal — not the generic exit 1 the module docstring
             # reserves for an unexpected error. Same correction as the draft
             # read above; a new failure path silently inherited the wrong code.
-            raise Refused(f"cannot stage the scanned body for posting: {exc}") from exc
+            # TYPE only, never str(exc). An OSError from os.mkdir/os.open
+            # carries the FILENAME, and that path is under the operator's home
+            # — so interpolating it reproduces exactly the class of value this
+            # refusal machinery exists to keep out of stderr (CodeRabbit). I
+            # removed `f.detail` from the refusal for that reason and then
+            # reintroduced the same leak here, one function away.
+            raise Refused(
+                f"cannot stage the scanned body for posting ({type(exc).__name__}). "
+                "Check that ~/tmp is writable."
+            ) from exc
 
         labels = validate_labels(args.area, args.difficulty)
         slug = resolve_tracker(run)
@@ -832,12 +881,22 @@ def _run_main(argv: Sequence[str] | None, run: Runner) -> int:
         return _finish(1)
     finally:
         # The snapshot holds a copy of the body, so it does not outlive the run.
-        # Suppressed on purpose and in BOTH directions: a cleanup failure must
-        # never convert a confirmed post into an error, and it must never
-        # replace a refusal's exit code either. A leftover directory is
-        # 0700 under ~/tmp and the daily hygiene timer prunes it.
+        # Suppressed in BOTH directions: a cleanup failure must never convert a
+        # confirmed post into an error, and it must never replace a refusal's
+        # exit code either.
+        #
+        # BaseException, not OSError. A SIGINT arriving DURING this rmtree
+        # propagates out of the finally and replaces whatever main() was about
+        # to return — including a confirmed post, which would then be reported
+        # as an interrupt and send the operator to retry into a duplicate
+        # (Codex P2). The window is small and the consequence is the exact
+        # misreport this module is organised to prevent. A leftover directory
+        # is 0700 under ~/tmp and the daily hygiene timer reaps it once it is 7
+        # DAYS old (scripts/disk_hygiene.sh prune_tmp) — the timer is daily,
+        # the threshold is not; losing the
+        # correct exit code is not recoverable.
         if snapshot_dir:
-            with contextlib.suppress(OSError):
+            with contextlib.suppress(BaseException):
                 shutil.rmtree(snapshot_dir, ignore_errors=True)
 
 

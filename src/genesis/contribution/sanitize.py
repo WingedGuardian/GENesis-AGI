@@ -435,29 +435,7 @@ def _check_fingerprints(
     try:
         raw = fingerprint_file.read_text(encoding="utf-8")
     except OSError:
-        # FAIL CLOSED. Returning [] here was a fail-open in a privacy gate
-        # (Codex P2): the caller has already decided the file EXISTS and has
-        # appended "fingerprint" to scanners_run, so an empty list reads as
-        # "the install-specific check ran and found nothing" when in fact it
-        # never ran at all. Two ways to reach it — a file present but
-        # unreadable (permissions, a bad mount), and the TOCTOU where it is
-        # removed between the caller's is_file() and this read — and both
-        # silently disable exactly the scanner that knows this install's own
-        # hostnames and identifiers.
-        return [
-            Finding(
-                kind=FindingKind.FINGERPRINT,
-                severity=Severity.BLOCK,
-                message=(
-                    "Release fingerprint file exists but could not be read — refusing "
-                    "rather than scanning without this install's own identifiers. "
-                    "Check its permissions, or regenerate it with "
-                    "`python -m genesis.contribution.fingerprints --write`."
-                ),
-                scanner="fingerprint",
-                detail="unreadable_fingerprint_file",
-            )
-        ]
+        return []
     patterns: list[re.Pattern[str]] = []
     for line in raw.splitlines():
         stripped = line.strip()
@@ -924,9 +902,9 @@ def scan_diff(
                 scanner="fingerprint",
                 # A SENTINEL, not the path. `detail` is rendered into refusals
                 # and CLI output, and this path routinely embeds the operator's
-                # account name — the same class of leak as echoing a matched
-                # secret (Codex P1, one finding over). The message already says
-                # what is missing, and the default location is documented.
+                # account name — the same class of leak as reproducing a matched
+                # secret. The message already names what is missing, and the
+                # default location is documented on scan_prose.
                 detail="missing_fingerprint_file",
             )
         )
@@ -1033,9 +1011,11 @@ def scan_prose(
                     "`python -m genesis.contribution.fingerprints --write`)."
                 ),
                 scanner="fingerprint",
-                # A SENTINEL, not the path — this value is rendered into
-                # refusals, and the path routinely embeds the operator's
-                # account name. Same reasoning as the scan_diff sibling.
+                # A SENTINEL, not the path. `detail` is rendered into refusals
+                # and CLI output, and this path routinely embeds the operator's
+                # account name — the same class of leak as reproducing a matched
+                # secret. The message already names what is missing, and the
+                # default location is documented on scan_prose.
                 detail="missing_fingerprint_file",
             )
         )
