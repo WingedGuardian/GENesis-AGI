@@ -79,6 +79,58 @@ _GENESIS_DIR = Path.home() / ".genesis"
 _PENDING_FILE = _GENESIS_DIR / "plan_bookmark_pending.json"
 
 
+def _outside_fences(lines: list[str]):
+    """Yield `(index, line)` for lines that are NOT inside a fenced block.
+
+    A plan documents a convention by SHOWING it, so the divider and the title
+    heading both appear inside ``` examples in perfectly ordinary plans — this
+    repo's own reference doc does exactly that. Matching those is how a plan
+    truncates itself at its own illustration.
+
+    Fence detection is the CommonMark-ish subset that markdown writers actually
+    use: a line whose first non-space run is three or more backticks or tildes
+    toggles the state. The info string is ignored, and a closing fence of a
+    different character does not close — ``` inside a ~~~ block is content.
+    """
+    fence_char = ""
+    for idx, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped[:3] in ("```", "~~~"):
+            char = stripped[0]
+            if not fence_char:
+                fence_char = char
+                continue
+            if char == fence_char:
+                fence_char = ""
+            continue
+        if not fence_char:
+            yield idx, line
+
+
+def _live_half(content: str) -> str:
+    """The part of a plan above its superseded-content divider.
+
+    The convention is documented in the genesis-development skill
+    (`references/plan-docs.md`): a heading containing SUPERSEDED BELOW divides
+    live plan content from archaeology kept for provenance. No divider means
+    the whole document is live, which is also the correct reading for every
+    plan written before the convention existed.
+
+    Matched on the WORDS at a heading line, not on the decorative rule the
+    template draws around them — the box characters are ornament and a plan
+    that omits them still means it. Anchored at column zero on a `#` heading so
+    the phrase quoted inside a paragraph cannot truncate the document, and
+    skipped inside FENCED blocks so a plan that documents the convention by
+    showing it — which is how anyone would document it, and how the reference
+    doc does — does not truncate itself at its own example.
+    """
+    lines = content.splitlines()
+    for idx, line in _outside_fences(lines):
+        if line.startswith("#") and "SUPERSEDED BELOW" in line:
+            return "\n".join(lines[:idx])
+    return content
+
+
 def _classify_plan_complexity(plan_path: str) -> str:
     """Classify plan as small/medium/large based on task and step count."""
     if not plan_path:
@@ -88,7 +140,13 @@ def _classify_plan_complexity(plan_path: str) -> str:
     except OSError:
         return "unknown"
 
-    # Count tasks (### Task headers) and steps (- [ ] checkboxes)
+    # Count tasks (### Task headers) and steps (- [ ] checkboxes) in the LIVE
+    # half only. A long-running plan keeps superseded sections below a
+    # divider for provenance; counting those makes a small current plan
+    # classify as `large`, and `_plan_instructions` then injects the full
+    # planning pipeline on the strength of work that is already done. The
+    # archaeology grows without bound, so this only ever gets worse.
+    content = _live_half(content)
     task_count = content.count("### Task")
     step_count = content.count("- [ ]")
 
@@ -143,8 +201,7 @@ def _extract_plan_info(hook_input: dict) -> tuple[str, str]:
         try:
             path = Path(plan_path)
             if path.exists():
-                for line in path.read_text().splitlines()[:10]:
-                    line = line.strip()
+                for line in _title_candidate_lines(path.read_text()):
                     if line.startswith("#") and not line.startswith("<!--"):
                         title = line.lstrip("#").strip()
                         break
@@ -152,6 +209,78 @@ def _extract_plan_info(hook_input: dict) -> tuple[str, str]:
             pass
 
     return plan_path, title
+
+
+def _title_candidate_lines(text: str) -> list[str]:
+    """The lines a plan's `# ` title can plausibly be on, stripped.
+
+    YAML frontmatter is skipped first. Without that, a plan carrying the
+    structured header (13 lines including both fences) pushes its heading past
+    the scan window, `title` stays empty, and the bookmark becomes unfindable
+    by keyword — silently, since nothing raises and nothing logs. MEASURED
+    2026-09-15 against a real headered plan: extracted title was ``''``.
+
+    The window stays bounded rather than scanning the file: a plan doc runs to
+    thousands of lines, and a `# ` heading that far down is a section, not the
+    document's title. Ten lines is kept from the original — the point of this
+    change is where the window STARTS, not how wide it is.
+
+    A leading `---` only opens frontmatter if a closing fence is actually
+    found; otherwise it is a thematic break and the text is scanned as-is.
+
+    BOTH fences are matched at COLUMN ZERO, without stripping, because that is
+    what YAML frontmatter is — and `.strip()` gets all three cases wrong:
+      - an INDENTED thematic break (` ---`) would read as an opener, so
+        `` ---\\n# Actual title\\n…\\n---`` loses the title it used to find;
+      - an indented `  ---` inside a block scalar would read as the closing
+        fence, starting the scan window inside the YAML;
+      - and there is no third spelling to be lenient toward: the delimiter is
+        exactly three hyphens at column zero.
+
+    The closing fence is searched for across the whole document rather than a
+    fixed number of lines. An arbitrary bound reintroduces the very bug this
+    function exists to fix the moment a header grows past it — and the header's
+    id lists are documented as growing — while buying nothing: the lines are
+    already in memory, so the scan is a walk over a list we have.
+
+    And a matched PAIR of column-zero rules is still not enough on its own: a
+    plan that opens with a thematic break and uses another later has the same
+    shape as frontmatter, and skipping between them loses a real title. There is
+    no lexical tell that separates the two — so the block is PARSED. Frontmatter
+    is YAML by definition, so content that does not load as a YAML MAPPING is
+    not frontmatter, whatever it is fenced by. That replaces a fourth heuristic
+    with the actual definition; the three heuristics above were each wrong in a
+    different direction before this.
+    """
+    lines = text.splitlines()
+    if lines and lines[0] == "---":
+        for idx in range(1, len(lines)):
+            if lines[idx] == "---":
+                if _is_yaml_mapping("\n".join(lines[1:idx])):
+                    lines = lines[idx + 1 :]
+                break
+    return [line.strip() for line in lines[:10]]
+
+
+def _is_yaml_mapping(block: str) -> bool:
+    """Whether `block` loads as a YAML mapping — i.e. is really frontmatter.
+
+    Degrades to TRUE when PyYAML is unavailable, which keeps the previous
+    paired-fence behaviour rather than newly treating every header as prose. A
+    plan whose header stops being skipped would lose its title again, the exact
+    regression this module exists to fix; a plan whose thematic rules are
+    wrongly skipped loses a title it never reliably had. Fail toward the
+    behaviour that is already shipped and tested.
+    """
+    try:
+        import yaml
+    except ImportError:
+        return True
+    try:
+        return isinstance(yaml.safe_load(block), dict)
+    except yaml.YAMLError:
+        # Unparseable is a positive answer to "is this frontmatter?": no.
+        return False
 
 
 def _guess_session_id() -> str:
