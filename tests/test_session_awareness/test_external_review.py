@@ -111,7 +111,11 @@ class TestCommentFetch:
         up in different strings and dedup silently fails open.
         """
         encoded = base64.b64encode(REAL_REPORT.encode()).decode()
-        runner = _runner_returning({"issues/1932/comments": (0, encoded + "\n", "")})
+        runner = _runner_returning({
+            "issues/1932/comments": (0, encoded + "\n", ""),
+            "pulls/1932/reviews": (0, "", ""),
+            "pulls/1932/comments": (0, "", ""),
+        })
         bodies = er._pr_comment_bodies(1932, "o/r", runner)
         assert bodies is not None
         assert len(bodies) == 1, "one comment must decode to exactly one body"
@@ -119,12 +123,12 @@ class TestCommentFetch:
 
     def test_failed_read_is_none_not_empty(self):
         """None means 'could not tell'; [] means 'no comments'. Only [] is safe."""
-        runner = _runner_returning({"comments": (1, "", "boom")})
+        runner = _runner_returning({"comments": (1, "", "boom"), "reviews": (1, "", "boom")})
         assert er._pr_comment_bodies(1932, "o/r", runner) is None
 
     def test_undecodable_comment_fails_the_whole_read(self):
         """One bad comment must not read as 'no comments' — that means re-dispatch."""
-        runner = _runner_returning({"comments": (0, "!!!not-base64!!!\n", "")})
+        runner = _runner_returning({"comments": (0, "!!!not-base64!!!\n", ""), "reviews": (0, "", "")})
         assert er._pr_comment_bodies(1932, "o/r", runner) is None
 
 
@@ -314,6 +318,7 @@ class TestScanBudget:
                 "repo view": (0, "o/r\n", ""),
                 "pr list": (0, json.dumps(prs), ""),
                 "comments": (0, "", ""),
+                "reviews": (0, "", ""),
             }
         )
         monkeypatch.setattr(er, "record", lambda rows: None)
@@ -340,6 +345,7 @@ class TestScanBudget:
                 # live mode re-reads the head immediately before spawning
                 "pr view": (0, json.dumps(prs[0]), ""),
                 "comments": (0, "", ""),
+                "reviews": (0, "", ""),
             }
         )
         monkeypatch.setattr(er, "record", lambda rows: "/tmp/claim.jsonl")
@@ -347,6 +353,8 @@ class TestScanBudget:
         # The SPAWN fails (not the config — a malformed template is now caught in
         # preflight, which is a different defect). This isolates the budget property:
         # an attempt that fails has still consumed a decision.
+        monkeypatch.setattr(er, "claim_dispatch", lambda *a, **k: True)
+        monkeypatch.setattr(er, "release_claim", lambda *a, **k: None)
         monkeypatch.setattr(
             er, "dispatch", lambda *a, **k: (er.DECISION_FAILED, "spawn failed: boom")
         )
@@ -382,6 +390,7 @@ class TestScanBudget:
         summary = er.scan(runner=_explode, cfg=cfg)
         assert summary["dispatched"] == 0
         assert "no permitted workflow" in summary["detail"]
+        assert "failure" not in summary, "an unconfigured install is the designed no-op"
 
     def test_live_without_a_report_marker_refuses(self):
         """No marker means no dedup, which would re-review everything every tick."""
@@ -413,6 +422,7 @@ class TestScanBudget:
                     "",
                 ),
                 "comments": (0, "", ""),
+                "reviews": (0, "", ""),
             }
         )
         monkeypatch.setattr(er, "record", lambda rows: None)
@@ -437,10 +447,11 @@ class TestScanBudget:
                     "",
                 ),
                 "comments": (0, "", ""),
+                "reviews": (0, "", ""),
             }
         )
         monkeypatch.setattr(er, "record", lambda rows: None)
-        monkeypatch.setattr(er, "recent_dispatch_heads", lambda *a, **k: {(7, HEAD)})
+        monkeypatch.setattr(er, "recent_dispatch_heads", lambda *a, **k: {("o/r", 7, HEAD)})
         summary = er.review_one(7, runner=runner, cfg=_cfg())
         assert summary["dispatched"] == 0
 
@@ -525,12 +536,12 @@ class TestRecentDispatchHeads:
 
     def test_a_recorded_dispatch_is_returned(self, tmp_path, monkeypatch):
         monkeypatch.setattr(er, "store_dir", lambda: str(tmp_path))
-        self._write(tmp_path, [{"pr": 7, "head": HEAD, "decision": er.DECISION_DISPATCHED}])
-        assert (7, HEAD) in er.recent_dispatch_heads()
+        self._write(tmp_path, [{"repo": "o/r", "pr": 7, "head": HEAD, "decision": er.DECISION_DISPATCHED}])
+        assert ("o/r", 7, HEAD) in er.recent_dispatch_heads()
 
     def test_a_skip_is_not_a_dispatch(self, tmp_path, monkeypatch):
         monkeypatch.setattr(er, "store_dir", lambda: str(tmp_path))
-        self._write(tmp_path, [{"pr": 7, "head": HEAD, "decision": er.DECISION_SKIPPED}])
+        self._write(tmp_path, [{"repo": "o/r", "pr": 7, "head": HEAD, "decision": er.DECISION_SKIPPED}])
         assert er.recent_dispatch_heads() == set()
 
     def test_absent_store_degrades_to_empty(self, tmp_path, monkeypatch):
@@ -541,15 +552,15 @@ class TestRecentDispatchHeads:
         """One bad file must narrow less, never fail the whole run."""
         monkeypatch.setattr(er, "store_dir", lambda: str(tmp_path))
         (tmp_path / "bad.jsonl").write_text("{not json\n")
-        self._write(tmp_path, [{"pr": 7, "head": HEAD, "decision": er.DECISION_DISPATCHED}])
-        assert (7, HEAD) in er.recent_dispatch_heads()
+        self._write(tmp_path, [{"repo": "o/r", "pr": 7, "head": HEAD, "decision": er.DECISION_DISPATCHED}])
+        assert ("o/r", 7, HEAD) in er.recent_dispatch_heads()
 
     def test_cooloff_excludes_an_old_file(self, tmp_path, monkeypatch):
         import os as _os
         import time as _time
 
         monkeypatch.setattr(er, "store_dir", lambda: str(tmp_path))
-        self._write(tmp_path, [{"pr": 7, "head": HEAD, "decision": er.DECISION_DISPATCHED}])
+        self._write(tmp_path, [{"repo": "o/r", "pr": 7, "head": HEAD, "decision": er.DECISION_DISPATCHED}])
         old = _time.time() - 60
         _os.utime(tmp_path / "a.jsonl", (old, old))
         assert er.recent_dispatch_heads(within_s=10) == set()
@@ -569,7 +580,12 @@ class TestPrefilter:
         return base
 
     def _call(self, pr, **over):
-        kwargs = {"skip_drafts": True, "require_ci_green": True, "recently_dispatched": set()}
+        kwargs = {
+            "skip_drafts": True,
+            "require_ci_green": True,
+            "recently_dispatched": set(),
+            "slug": "o/r",
+        }
         kwargs.update(over)
         return er.prefilter(pr, **kwargs)
 
@@ -579,11 +595,11 @@ class TestPrefilter:
 
     def test_recently_dispatched_head_is_suppressed(self):
         """VERIFY-RED ANCHOR: without this the same head re-dispatches every tick."""
-        ok, reason = self._call(self._pr(), recently_dispatched={(7, HEAD)})
+        ok, reason = self._call(self._pr(), recently_dispatched={("o/r", 7, HEAD)})
         assert not ok and "may still be in flight" in reason
 
     def test_a_different_head_is_not_suppressed(self):
-        ok, _ = self._call(self._pr(), recently_dispatched={(7, OTHER_HEAD)})
+        ok, _ = self._call(self._pr(), recently_dispatched={("o/r", 7, OTHER_HEAD)})
         assert ok
 
     def test_draft_and_ci_are_decided_without_comments(self):
@@ -637,6 +653,7 @@ def _live_runner(head=HEAD, number=7):
             "pr list": (0, json.dumps([body]), ""),
             "pr view": (0, json.dumps(body), ""),
             "comments": (0, "", ""),
+                "reviews": (0, "", ""),
         }
     )
 
@@ -658,6 +675,8 @@ class TestWorkOrderDispatch:
         """VERIFY-RED ANCHOR: ordering is the property. A claim written after the
         spawn means a failed write leaves a running review with no record of it."""
         order = []
+        monkeypatch.setattr(er, "claim_dispatch", lambda *a, **k: order.append("claim") or True)
+        monkeypatch.setattr(er, "release_claim", lambda *a, **k: None)
         monkeypatch.setattr(er, "record", lambda rows: order.append("record") or "/tmp/x")
         monkeypatch.setattr(
             er,
@@ -666,13 +685,17 @@ class TestWorkOrderDispatch:
         )
         monkeypatch.setattr(er, "recent_dispatch_heads", lambda *a, **k: set())
         er.review_one(7, runner=_live_runner(), cfg=_cfg(mode="live"))
-        assert order[:2] == ["record", "dispatch"], f"claim must precede spawn, got {order}"
+        assert order[:3] == ["claim", "record", "dispatch"], (
+            f"interlock must precede the audit claim, which must precede spawn, got {order}"
+        )
 
     def test_unpersistable_claim_refuses_to_spend(self, monkeypatch):
         """If the audit cannot be written, the dispatch does not happen — the trail
         that stands in for the approval gate is not optional."""
         monkeypatch.setattr(er, "record", lambda rows: None)  # write_batch failure
         monkeypatch.setattr(er, "recent_dispatch_heads", lambda *a, **k: set())
+        monkeypatch.setattr(er, "claim_dispatch", lambda *a, **k: True)
+        monkeypatch.setattr(er, "release_claim", lambda *a, **k: None)
 
         def _explode(*a, **k):
             raise AssertionError("must not spawn when the claim cannot be persisted")
@@ -698,6 +721,7 @@ class TestWorkOrderDispatch:
                 "pr list": (0, json.dumps([listed]), ""),
                 "pr view": (0, json.dumps(moved), ""),  # head moved before the spawn
                 "comments": (0, "", ""),
+                "reviews": (0, "", ""),
             }
         )
         monkeypatch.setattr(er, "record", lambda rows: "/tmp/x")
@@ -715,7 +739,7 @@ class TestWorkOrderDispatch:
         """The allowlist cannot bind a child that is never told which workflow."""
         cfg = _cfg(mode="live")
         cfg["orchestrator"] = dict(cfg["orchestrator"], argv=["run", "{pr}"])
-        assert "{workflow}" in er._preflight(cfg, "live")
+        assert "{workflow}" in er._preflight(cfg, "live")[0]
 
     def test_live_requires_pr_and_head_in_the_template(self):
         """Without {pr} the same untargeted command fires for every pull request;
@@ -727,14 +751,14 @@ class TestWorkOrderDispatch:
             (["{workflow}", "{pr}"], "{head}"),
         ):
             cfg["orchestrator"] = dict(cfg["orchestrator"], argv=argv)
-            assert needle in er._preflight(cfg, "live")
+            assert needle in er._preflight(cfg, "live")[0]
 
     def test_repo_override_requires_repo_in_the_template(self):
         """A --repo override with no {repo} would review the same-numbered PR in the
         working-directory repository instead of the selected one."""
         cfg = _cfg(mode="live")
-        assert er._preflight(cfg, "live", repo_override="other/repo") is not None
-        assert er._preflight(cfg, "live", repo_override=None) is None
+        assert er._preflight(cfg, "live", repo_override="other/repo")[0] is not None
+        assert er._preflight(cfg, "live", repo_override=None) == (None, False)
 
     def test_run_log_is_owner_only(self, tmp_path, monkeypatch):
         """The log holds a review agent's full transcript of a private repository."""
@@ -757,9 +781,9 @@ class TestBoundaryUnknowns:
         """Valid JSON of the WRONG SHAPE escaped the handler and killed the run."""
         monkeypatch.setattr(er, "store_dir", lambda: str(tmp_path))
         (tmp_path / "a.jsonl").write_text(
-            '[]\n"corrupt"\n' + json.dumps({"pr": 7, "head": HEAD, "decision": "dispatched"})
+            '[]\n"corrupt"\n' + json.dumps({"repo": "o/r", "pr": 7, "head": HEAD, "decision": "dispatched"})
         )
-        assert (7, HEAD) in er.recent_dispatch_heads()
+        assert ("o/r", 7, HEAD) in er.recent_dispatch_heads()
 
     def test_non_object_pr_entries_are_dropped(self):
         runner = _runner_returning({"pr list": (0, json.dumps([{"number": 1}, "junk", 5]), "")})
@@ -858,3 +882,188 @@ class TestConfig:
         merged = cfgmod.orchestrator({"orchestrator": {"command": "mytool"}})
         assert merged["command"] == "mytool"
         assert "report_marker" in merged and "allow_workflows" in merged
+
+
+class TestSinglePassSubstitution:
+    """VERIFY-RED ANCHOR: chained replaces re-scan freshly INSERTED values."""
+
+    def test_a_value_containing_a_placeholder_is_not_resubstituted(self):
+        """A workflow literally named `review-{pr}` is allowlisted as-is; sequential
+        replacement would rewrite its embedded token and dispatch a workflow the
+        allowlist never named."""
+        block = dict(
+            _cfg()["orchestrator"],
+            argv=["{workflow}", "{pr}"],
+            workflow="review-{pr}",
+            allow_workflows=["review-{pr}"],
+        )
+        argv = er.build_argv(block, workflow="review-{pr}", pr=42, head=HEAD)
+        assert argv[1] == "review-{pr}", "the substituted value must not be re-scanned"
+        assert argv[2] == "42"
+
+    def test_unknown_tokens_pass_through_verbatim(self):
+        block = dict(_cfg()["orchestrator"], argv=["--flag={bogus}", "{pr}"])
+        argv = er.build_argv(block, workflow=WORKFLOW, pr=9, head=HEAD)
+        assert argv[1] == "--flag={bogus}"
+
+
+class TestStrictFlags:
+    """A malformed boolean must fail to the SAFE default, never silently off."""
+
+    @pytest.mark.parametrize("bad", ["false", "no", 0, None, ""])
+    def test_non_boolean_values_keep_the_guard_on(self, bad):
+        assert cfgmod.flag({"skip_drafts": bad}, "skip_drafts") is True
+
+    def test_literal_false_disarms(self):
+        assert cfgmod.flag({"skip_drafts": False}, "skip_drafts") is False
+
+    def test_literal_true_holds(self):
+        assert cfgmod.flag({"require_ci_green": True}, "require_ci_green") is True
+
+
+class TestStoreDirSandbox:
+    """The env override must stay inside $HOME — the unit's ReadWritePaths is %h."""
+
+    def test_an_absolute_path_inside_home_is_accepted(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GENESIS_EXTERNAL_REVIEW_DIR", str(tmp_path / "store"))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert er.store_dir() == str(tmp_path / "store")
+
+    def test_a_path_outside_home_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("GENESIS_EXTERNAL_REVIEW_DIR", "/srv/external-review")
+        monkeypatch.setenv("HOME", "/home/tester")
+        assert er.store_dir() == "/home/tester/.genesis/external_review_runs"
+
+    def test_a_relative_path_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("GENESIS_EXTERNAL_REVIEW_DIR", "relative/store")
+        monkeypatch.setenv("HOME", "/home/tester")
+        assert er.store_dir() == "/home/tester/.genesis/external_review_runs"
+
+
+class TestDispatchClaim:
+    """The cross-process interlock the audit row cannot provide."""
+
+    def test_the_first_claim_wins_and_the_second_loses(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(er, "store_dir", lambda: str(tmp_path))
+        assert er.claim_dispatch("o/r", 7, HEAD) is True
+        assert er.claim_dispatch("o/r", 7, HEAD) is False
+
+    def test_release_frees_the_key(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(er, "store_dir", lambda: str(tmp_path))
+        assert er.claim_dispatch("o/r", 7, HEAD) is True
+        er.release_claim("o/r", 7, HEAD)
+        assert er.claim_dispatch("o/r", 7, HEAD) is True
+
+    def test_a_stale_claim_is_reclaimable(self, tmp_path, monkeypatch):
+        import os as _os
+        import time as _time
+
+        monkeypatch.setattr(er, "store_dir", lambda: str(tmp_path))
+        assert er.claim_dispatch("o/r", 7, HEAD) is True
+        claims = list(tmp_path.glob("claims/*.json"))
+        assert claims
+        old = _time.time() - er.DISPATCH_COOLOFF_S - 60
+        _os.utime(claims[0], (old, old))
+        assert er.claim_dispatch("o/r", 7, HEAD) is True
+
+    def test_an_unwritable_store_degrades_permissive(self, tmp_path, monkeypatch):
+        """Dedup narrows or stays silent; it must never crash-block a dispatch."""
+        monkeypatch.setattr(er, "store_dir", lambda: str(tmp_path / "missing" / "deep"))
+        (tmp_path / "missing").mkdir(mode=0o500)
+        try:
+            assert er.claim_dispatch("o/r", 7, HEAD) is True
+        finally:
+            (tmp_path / "missing").chmod(0o700)
+
+
+class TestDedupKeyScope:
+    """(repo, pr, head) — forks share PR numbers and SHAs legitimately."""
+
+    def test_the_same_pr_in_another_repo_is_not_suppressed(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(er, "store_dir", lambda: str(tmp_path))
+        rows = [{"repo": "a/x", "pr": 7, "head": HEAD, "decision": "dispatched"}]
+        (tmp_path / "a.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
+        heads = er.recent_dispatch_heads()
+        assert ("a/x", 7, HEAD) in heads
+        assert ("b/y", 7, HEAD) not in heads
+
+    def test_a_failed_row_cancels_the_claim(self, tmp_path, monkeypatch):
+        """A spawn that provably never started must not suppress its own retry for
+        the whole cooloff — the corrective FAILED row frees the key."""
+        import os as _os
+        import time as _time
+
+        monkeypatch.setattr(er, "store_dir", lambda: str(tmp_path))
+        (tmp_path / "claim.jsonl").write_text(
+            json.dumps({"repo": "o/r", "pr": 7, "head": HEAD, "decision": "dispatched"})
+        )
+        (tmp_path / "fail.jsonl").write_text(
+            json.dumps({"repo": "o/r", "pr": 7, "head": HEAD, "decision": "failed"})
+        )
+        now = _time.time()
+        _os.utime(tmp_path / "claim.jsonl", (now - 10, now - 10))
+        _os.utime(tmp_path / "fail.jsonl", (now, now))
+        assert ("o/r", 7, HEAD) not in er.recent_dispatch_heads()
+
+    def test_a_claim_file_suppresses_without_an_audit_row(self, tmp_path, monkeypatch):
+        """The interlock half of dedup: a claim that outlives an unwritten audit."""
+        monkeypatch.setattr(er, "store_dir", lambda: str(tmp_path))
+        assert er.claim_dispatch("o/r", 7, HEAD) is True
+        assert ("o/r", 7, HEAD) in er.recent_dispatch_heads()
+
+
+class TestClosedEligibility:
+    def test_a_merged_pr_is_ineligible_even_with_a_green_rollup(self):
+        ok, reason = er.eligibility(
+            {
+                "number": 1,
+                "headRefOid": HEAD,
+                "isDraft": False,
+                "state": "MERGED",
+                "statusCheckRollup": [{"conclusion": "SUCCESS"}],
+            },
+            already_reviewed=False,
+            comments_readable=True,
+            skip_drafts=True,
+            require_ci_green=True,
+        )
+        assert not ok and "merged" in reason
+
+    def test_fresh_revalidation_catches_a_late_draft(self, monkeypatch):
+        """The listing was clean; the pre-spawn re-read is not — do not spend."""
+        listed = {
+            "number": 7,
+            "headRefOid": HEAD,
+            "isDraft": False,
+            "state": "OPEN",
+            "statusCheckRollup": [{"conclusion": "SUCCESS"}],
+        }
+        drafted = dict(listed, isDraft=True)
+        runner = _runner_returning(
+            {
+                "repo view": (0, "o/r\n", ""),
+                "pr list": (0, json.dumps([listed]), ""),
+                "pr view": (0, json.dumps(drafted), ""),
+                "comments": (0, "", ""),
+                "reviews": (0, "", ""),
+            }
+        )
+        monkeypatch.setattr(er, "record", lambda rows: "/tmp/x")
+        monkeypatch.setattr(er, "recent_dispatch_heads", lambda *a, **k: set())
+
+        def _explode(*a, **k):
+            raise AssertionError("must not dispatch against a newly-drafted PR")
+
+        monkeypatch.setattr(er, "dispatch", _explode)
+        summary = er.scan(runner=runner, cfg=_cfg(mode="live"))
+        assert summary["dispatched"] == 0
+        assert "no longer eligible" in summary["decisions"][0][2]
+
+
+class TestPreflightArgvTypes:
+    def test_a_non_string_element_is_reported_not_raised(self):
+        """' '.join([None]) raises TypeError — out of the fail-safe boundary."""
+        cfg = _cfg(mode="live")
+        cfg["orchestrator"] = dict(cfg["orchestrator"], argv=["{workflow}", None, "{pr}", "{head}"])
+        detail, is_failure = er._preflight(cfg, "live")
+        assert is_failure and "list of strings" in detail

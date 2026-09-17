@@ -60,6 +60,15 @@ def main(argv: list[str] | None = None) -> int:
         print(runner.store_dir())
         return 0
 
+    # THE KILL SWITCH BEFORE THE CONFIG READ — the same ordering scan()/review_one()
+    # keep internally, applied to the one thing they cannot protect: the load below.
+    # The switch's promise is that it works when the YAML path does not (a blocked
+    # network mount, a wedged overlay), and reaching load_config() first would hang
+    # the timer on exactly the file the operator set the switch to escape.
+    if config.disabled_by_env():
+        print(f"external-review: mode=off — disabled ({config.DISABLE_ENV} is set)")
+        return 0
+
     cfg = config.load_config()
     # An explicit --dry-run may only ever REMOVE authority. It overrides `live`, and
     # it must not resurrect a runner the operator switched off: `off` stays off, or

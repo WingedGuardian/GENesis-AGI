@@ -112,6 +112,21 @@ prune_mcp_spawn() {
 # own pass; deleting whole old files is the one retention shape that is safe here
 # (a run log is written once by a detached process and never appended to again).
 # Age first because it is the cheaper predicate and usually enough.
+# _path_is_open PATH — true while any process still holds PATH open. The mtime
+# guard above can only see a writer that is WRITING; a stalled one still holds the
+# descriptor, and unlinking an open file destroys the transcript without freeing
+# the bytes. Requires /proc; where it is absent the check reports false and the
+# mtime guard stands alone.
+_path_is_open() {
+    local target fd resolved
+    target="$(readlink -f "$1" 2>/dev/null)" || target="$1"
+    for fd in /proc/[0-9]*/fd/*; do
+        resolved="$(readlink "$fd" 2>/dev/null)" || continue
+        [ "$resolved" = "$target" ] && return 0
+    done
+    return 1
+}
+
 prune_external_review_logs() {
     local dir="${1:?}" max_bytes="${2:?}" total remaining
     [ -d "$dir" ] || return 0
@@ -120,13 +135,20 @@ prune_external_review_logs() {
     # for minutes; unlinking it loses the pathname while the bytes stay allocated
     # until the child closes the descriptor, so the size bound is not even restored —
     # the diagnostics are simply destroyed. Both reviewers found this independently.
-    # `-mmin +60` is the guard: a run is minutes, so an hour of silence means the
-    # writer is done. Note the ORDERING that makes this safe rather than hopeful —
-    # deletion is oldest-first, and an active log is by definition the newest, so the
-    # prune can only reach one after every completed log is already gone. That case
-    # is a single run whose own log exceeds the cap, and there the right answer is to
+    # `-mmin +60` is the first guard: a run is minutes, so an hour of silence means
+    # the writer is done. But mtime is only a PROXY for "still being written" — a
+    # stalled child can go quiet for an hour without closing its descriptor, so any
+    # candidate is ALSO checked against /proc/*/fd before it is unlinked. Where
+    # /proc is absent the mtime guard stands alone; it degrades, never widens.
+    # Note the ORDERING that makes this safe rather than hopeful — deletion is
+    # oldest-first, and an active log is by definition the newest, so the prune can
+    # only reach one after every completed log is already gone. That case is a
+    # single run whose own log exceeds the cap, and there the right answer is to
     # stop and SAY SO rather than destroy a live transcript to hit a number.
-    find "$dir" -maxdepth 1 -type f -name '*.log' -mmin +60 -mtime +30 -delete 2>/dev/null || true
+    find "$dir" -maxdepth 1 -type f -name '*.log' -mmin +60 -mtime +30 -print0 2>/dev/null \
+        | while IFS= read -r -d '' path; do
+            _path_is_open "$path" || rm -f "$path" 2>/dev/null
+        done
 
     total="$(find "$dir" -maxdepth 1 -type f -name '*.log' -printf '%s\n' 2>/dev/null \
         | awk '{s+=$1} END {print s+0}')"
@@ -140,6 +162,7 @@ prune_external_review_logs() {
         | sort -n \
         | while read -r _mtime size path; do
             [ "${total:-0}" -gt "$max_bytes" ] || break
+            _path_is_open "$path" && continue
             rm -f "$path" 2>/dev/null && total=$((total - size))
         done
 

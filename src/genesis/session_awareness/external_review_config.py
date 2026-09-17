@@ -209,6 +209,28 @@ def max_dispatches_per_scan(config: dict[str, Any] | None = None) -> int:
     return raw
 
 
+def flag(config: dict[str, Any] | None, key: str) -> bool:
+    """A boolean safety switch, NORMALISED rather than coerced.
+
+    ``bool(cfg.get("skip_drafts", True))`` is the dangerous spelling here: a
+    malformed overlay value — ``null``, ``0``, ``""``, a stray string — coerces
+    False and silently turns the guard OFF, which is the one direction a safety
+    filter must never fail. Only a literal ``false`` disarms; anything else that
+    is not a bool is reported and the SAFE default (on) is kept.
+    """
+    cfg = {} if config is None else config
+    raw = cfg.get(key, DEFAULTS.get(key, True))
+    if isinstance(raw, bool):
+        return raw
+    logger.warning(
+        "external_review: %s %r is not a boolean; keeping the safe default %s",
+        key,
+        raw,
+        DEFAULTS.get(key, True),
+    )
+    return bool(DEFAULTS.get(key, True))
+
+
 def orchestrator(config: dict[str, Any] | None = None) -> dict[str, Any]:
     """The install's orchestrator block, with every key present."""
     cfg = load_config() if config is None else config

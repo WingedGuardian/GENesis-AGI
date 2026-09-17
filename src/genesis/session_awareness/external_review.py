@@ -52,12 +52,15 @@ from __future__ import annotations
 import base64
 import binascii
 import contextlib
+import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -93,10 +96,21 @@ def store_dir() -> str:
     real store grew unbounded.
     """
     override = os.environ.get("GENESIS_EXTERNAL_REVIEW_DIR")
-    if override and os.path.isabs(override):
-        return override
     if override:
-        logger.warning("GENESIS_EXTERNAL_REVIEW_DIR must be absolute; ignoring %r", override)
+        home = os.path.realpath(os.path.expanduser("~"))
+        resolved = os.path.realpath(override) if os.path.isabs(override) else None
+        # The timer's unit runs ProtectSystem=strict with ReadWritePaths=%h only,
+        # so a store outside $HOME is unwritable on the scheduled path even though
+        # this function would accept it — every dispatch would then fail on the
+        # claim write. Constrain the override to the sandbox rather than let the
+        # unit discover the mismatch one failed run at a time.
+        if resolved and (resolved == home or resolved.startswith(home + os.sep)):
+            return override
+        logger.warning(
+            "GENESIS_EXTERNAL_REVIEW_DIR %r must be an absolute path inside %s; ignoring",
+            override,
+            home,
+        )
     return os.path.expanduser(f"~/.genesis/{_STORE_DIRNAME}")
 
 
@@ -147,6 +161,10 @@ def _default_runner(argv: Sequence[str], *, timeout: int = 60) -> tuple[int, str
 
 Runner = Callable[..., tuple[int, str, str]]
 
+#: Every substitution ``build_argv`` offers. One compiled pattern so the
+#: replacement is a single left-to-right pass over the TEMPLATE text.
+_PLACEHOLDER_RE = re.compile(r"\{workflow\}|\{pr\}|\{repo\}|\{head\}")
+
 
 def resolve_repo(runner: Runner = _default_runner) -> str | None:
     """The repo slug, resolved LIVE.
@@ -180,32 +198,22 @@ def report_mentions_head(comment_bodies: Sequence[str], *, marker: str, head: st
     return any(marker in body and needle in body.lower() for body in comment_bodies if body)
 
 
-def _pr_comment_bodies(pr: int, repo: str, runner: Runner = _default_runner) -> list[str] | None:
-    """Every issue-comment body on the PR, or ``None`` when the read FAILED.
+def _gh_bodies(runner: Runner, path: str, pr: int) -> list[str] | None:
+    """Every body an endpoint returns, one per line, base64-decoded — or ``None``.
 
-    The None/[] distinction is the whole point: an empty list means "read fine, no
-    comments", while None means "could not tell", and only the first is safe to treat
-    as 'never reviewed'.
+    Each body is base64-encoded by jq so ONE COMMENT IS ONE LINE. A plain
+    `-q .[].body` emits the bodies raw, and a review comment is many lines, so
+    splitting the output on newlines shreds each comment into fragments — the
+    report marker lands in one fragment and the head SHA in another, and a dedup
+    needing both in the same string then never matches. MEASURED against a live
+    pull request: the raw form produced 174 "bodies" for 4 comments and reported an
+    already-reviewed head as never reviewed.
     """
-    # Each body is base64-encoded by jq so ONE COMMENT IS ONE LINE. A plain
-    # `-q .[].body` emits the bodies raw, and a review comment is many lines, so
-    # splitting the output on newlines shreds each comment into fragments — the
-    # report marker lands in one fragment and the head SHA in another, and a dedup
-    # needing both in the same string then never matches. MEASURED against a live
-    # pull request: the raw form produced 174 "bodies" for 4 comments and reported an
-    # already-reviewed head as never reviewed.
     rc, out, err = runner(
-        [
-            "gh",
-            "api",
-            f"repos/{repo}/issues/{pr}/comments",
-            "--paginate",
-            "-q",
-            ".[].body | @base64",
-        ]
+        ["gh", "api", path, "--paginate", "-q", ".[].body | @base64"]
     )
     if rc != 0:
-        logger.warning("external_review: PR #%s comments unreadable (%s)", pr, err.strip())
+        logger.warning("external_review: PR #%s %s unreadable (%s)", pr, path, err.strip())
         return None
 
     bodies: list[str] = []
@@ -219,8 +227,35 @@ def _pr_comment_bodies(pr: int, repo: str, runner: Runner = _default_runner) -> 
             # One unreadable comment must not be reported as "no comments" — that
             # reads as "never reviewed" and would re-dispatch. Fail the whole read
             # instead, which the caller treats as "cannot rule out a duplicate".
-            logger.warning("external_review: PR #%s comment undecodable (%r)", pr, exc)
+            logger.warning("external_review: PR #%s body undecodable (%r)", pr, exc)
             return None
+    return bodies
+
+
+def _pr_comment_bodies(pr: int, repo: str, runner: Runner = _default_runner) -> list[str] | None:
+    """Every body that could carry the report on the PR, or ``None`` on ANY failure.
+
+    The report is not guaranteed to be an issue comment: an orchestrator that posts
+    its verdict as a pull-request REVIEW (or an inline review comment) is invisible
+    to ``issues/{pr}/comments``, so its head would read as never-reviewed and get
+    re-dispatched on every cooloff expiry. Issue comments, reviews and review
+    comments are all read; if ANY of the three cannot be fetched the whole read is
+    None, because a partial surface cannot rule out a duplicate.
+
+    The None/[] distinction is the whole point: an empty list means "read fine, no
+    comments", while None means "could not tell", and only the first is safe to treat
+    as 'never reviewed'.
+    """
+    bodies: list[str] = []
+    for path in (
+        f"repos/{repo}/issues/{pr}/comments",
+        f"repos/{repo}/pulls/{pr}/reviews",
+        f"repos/{repo}/pulls/{pr}/comments",
+    ):
+        chunk = _gh_bodies(runner, path, pr)
+        if chunk is None:
+            return None
+        bodies.extend(chunk)
     return bodies
 
 
@@ -281,9 +316,11 @@ def build_argv(
     subs = {"{workflow}": workflow, "{pr}": str(pr), "{repo}": repo or "", "{head}": head or ""}
     out = [exe]
     for arg in template:
-        for token, value in subs.items():
-            arg = arg.replace(token, value)
-        out.append(arg)
+        # ONE pass over the template's own tokens — never a sequential replace.
+        # Chained replaces re-scan the freshly INSERTED value, so an allowlisted
+        # workflow literally named "review-{pr}" would have its embedded token
+        # rewritten too, dispatching a workflow the allowlist never approved.
+        out.append(_PLACEHOLDER_RE.sub(lambda m: subs[m.group(0)], arg))
     return out
 
 
@@ -406,14 +443,29 @@ def compress_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-#: How long a recorded dispatch suppresses another for the same (pr, head).
+#: How long a recorded dispatch suppresses another for the same (repo, pr, head).
 #: A review runs for minutes; this is generous enough to cover a slow one and short
 #: enough that a genuinely lost dispatch retries the same day.
 DISPATCH_COOLOFF_S = 6 * 3600
 
+#: Claim files live in a subdirectory of the store, like the run logs: the shared
+#: size trimmer counts top-level ``*.jsonl`` only, so a subdirectory is invisible
+#: to it and claims get their own lifetime semantics (the cooloff) instead.
+_CLAIMS_DIRNAME = "claims"
 
-def recent_dispatch_heads(within_s: int = DISPATCH_COOLOFF_S) -> set[tuple[int, str]]:
-    """``(pr, head)`` pairs this box dispatched recently, from the audit store.
+
+def _row_key(row: dict[str, Any]) -> tuple[str, int, str] | None:
+    """The dedup key an audit row or claim carries, or ``None`` when it has none."""
+    pr = row.get("pr")
+    head = str(row.get("head") or "").lower()
+    repo = str(row.get("repo") or "").lower()
+    if isinstance(pr, int) and len(head) == 40 and repo:
+        return repo, pr, head
+    return None
+
+
+def recent_dispatch_heads(within_s: int = DISPATCH_COOLOFF_S) -> set[tuple[str, int, str]]:
+    """``(repo, pr, head)`` triples this box dispatched recently, from the audit store.
 
     THE SECOND HALF OF DEDUP, and the half that cannot live on the pull request.
     Asking the PR answers "did a report appear", which is the wrong question while a
@@ -428,23 +480,35 @@ def recent_dispatch_heads(within_s: int = DISPATCH_COOLOFF_S) -> set[tuple[int, 
     store, malformed row — every one degrades to an EMPTY set, which is the
     permissive direction, so this can only ever suppress a dispatch that the PR-side
     check already permitted. It narrows; it never widens.
-    """
-    import time
 
-    out: set[tuple[int, str]] = set()
-    store = Path(store_dir())
-    if not store.is_dir():
-        return out
+    The repository is part of the key: ``--repo`` lets one install scan more than
+    one slug, and forks or mirrors legitimately share PR numbers and commit SHAs, so
+    a dispatch in one must not suppress the same-numbered PR in another.
+
+    A FAILED row for the same key CANCELS the earlier claim. The pre-dispatch claim
+    is written ``dispatched`` for durability, so a spawn that then failed left the
+    key suppressed for the whole cooloff — a review that never started blocking its
+    own retry for six hours. Ordering is read from file mtimes: the corrective row
+    is written after the claim, so a failed marker newer than the claim wins.
+    """
+    dispatched: dict[tuple[str, int, str], float] = {}
+    failed: dict[tuple[str, int, str], float] = {}
     cutoff = time.time() - max(0, within_s)
+    store = Path(store_dir())
     try:
-        entries = [e for e in os.scandir(store) if e.is_file() and e.name.endswith(".jsonl")]
+        entries = (
+            [e for e in os.scandir(store) if e.is_file() and e.name.endswith(".jsonl")]
+            if store.is_dir()
+            else []
+        )
     except OSError as exc:
         logger.warning("external_review: audit store unreadable (%r)", exc)
-        return out
+        entries = []
 
     for entry in entries:
         try:
-            if entry.stat().st_mtime < cutoff:
+            mtime = entry.stat().st_mtime
+            if mtime < cutoff:
                 continue
             for line in Path(entry.path).read_text(encoding="utf-8").splitlines():
                 line = line.strip()
@@ -460,17 +524,104 @@ def recent_dispatch_heads(within_s: int = DISPATCH_COOLOFF_S) -> set[tuple[int, 
                         "external_review: non-object audit row in %s — skipping", entry.name
                     )
                     continue
-                if row.get("decision") != DECISION_DISPATCHED:
+                key = _row_key(row)
+                if key is None:
                     continue
-                pr = row.get("pr")
-                head = str(row.get("head") or "").lower()
-                if isinstance(pr, int) and len(head) == 40:
-                    out.add((pr, head))
+                decision = row.get("decision")
+                if decision == DECISION_DISPATCHED:
+                    dispatched[key] = max(dispatched.get(key, 0.0), mtime)
+                elif decision == DECISION_FAILED:
+                    failed[key] = max(failed.get(key, 0.0), mtime)
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             # One bad file must not blind the whole check; the rest still narrow.
             logger.warning("external_review: audit row unreadable in %s (%r)", entry.name, exc)
             continue
+
+    out = {key for key, mtime in dispatched.items() if failed.get(key, 0.0) < mtime}
+    # Outstanding CLAIM files suppress too: they are the cross-process half of
+    # dedup and survive an audit write that never landed, so a dispatch recorded
+    # only as a claim still counts as possibly in flight.
+    out |= _fresh_claims(cutoff)
     return out
+
+
+def _claims_dir() -> Path:
+    return Path(store_dir()) / _CLAIMS_DIRNAME
+
+
+def _claim_path(slug: str, pr: int, head: str) -> Path:
+    digest = hashlib.sha256(f"{slug}|{pr}|{head}".encode()).hexdigest()[:24]
+    return _claims_dir() / f"claim-{digest}.json"
+
+
+def _fresh_claims(cutoff: float) -> set[tuple[str, int, str]]:
+    """Keys with a live claim file — degrades to EMPTY on any read failure."""
+    out: set[tuple[str, int, str]] = set()
+    claims = _claims_dir()
+    try:
+        entries = [e for e in os.scandir(claims) if e.is_file() and e.name.endswith(".json")]
+    except OSError:
+        return out
+    for entry in entries:
+        try:
+            if entry.stat().st_mtime < cutoff:
+                continue
+            row = json.loads(Path(entry.path).read_text(encoding="utf-8"))
+            if isinstance(row, dict):
+                key = _row_key(row)
+                if key is not None:
+                    out.add(key)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            logger.warning("external_review: claim unreadable in %s (%r)", entry.name, exc)
+    return out
+
+
+def claim_dispatch(slug: str, pr: int, head: str) -> bool:
+    """Atomically claim (repo, pr, head) for this process. True = ours to spend.
+
+    The audit row CANNOT serialise two runners: both read ``recent_dispatch_heads``
+    before either writes, see nothing, and both spawn — a measured duplicate-spend
+    shape, because the writer's one-file-per-flush design deliberately never
+    refuses. The claim file is the atomic interlock instead: ``O_CREAT|O_EXCL``
+    succeeds for exactly one creator per key.
+
+    A claim whose mtime is older than the cooloff is stale — its owner is gone —
+    so it is unlinked and re-claimed. The unlink-then-create pair is not itself
+    atomic, and a boundary racer can lose a fresh claim to it; that residue is the
+    cooloff edge, accepted because the alternative is a claim that can never be
+    retried. Everything else degrades PERMISSIVE like the rest of dedup: an
+    unwritable claims dir cannot dispatch-block the queue, only audit writes can.
+    """
+    path = _claim_path(slug, pr, head)
+    payload = json.dumps(
+        {"repo": slug, "pr": pr, "head": head, "pid": os.getpid(), "ts": time.time()}
+    ).encode()
+    for _attempt in (0, 1):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                if time.time() - path.stat().st_mtime < DISPATCH_COOLOFF_S:
+                    return False  # a live runner owns this dispatch
+                path.unlink()
+            except OSError:
+                return False
+            continue
+        except OSError as exc:
+            # Cannot interlock at all — degrade permissive, as the audit dedup does.
+            logger.warning("external_review: dispatch claim failed (%r) — proceeding", exc)
+            return True
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+        return True
+    return False
+
+
+def release_claim(slug: str, pr: int, head: str) -> None:
+    """Drop OUR claim — only after a spawn that provably never started."""
+    with contextlib.suppress(OSError):
+        _claim_path(slug, pr, head).unlink()
 
 
 def record(rows: Sequence[dict[str, Any]]) -> str | None:
@@ -502,7 +653,7 @@ def open_prs(repo: str, runner: Runner = _default_runner) -> list[dict[str, Any]
             "--limit",
             "100",
             "--json",
-            "number,headRefOid,isDraft,statusCheckRollup,title",
+            "number,headRefOid,isDraft,state,statusCheckRollup,title",
         ],
         timeout=120,
     )
@@ -578,8 +729,12 @@ def eligibility(
     if already_reviewed:
         return False, f"already reviewed at head {head[:12]}"
 
-    if skip_drafts and bool(pr.get("isDraft")):
+    if skip_drafts and pr.get("isDraft") is True:
         return False, "draft"
+
+    state = str(pr.get("state") or "").upper()
+    if state and state != "OPEN":
+        return False, f"pull request is {state.lower()}"
 
     if require_ci_green:
         green = ci_is_green(pr)
@@ -596,7 +751,8 @@ def prefilter(
     *,
     skip_drafts: bool,
     require_ci_green: bool,
-    recently_dispatched: set[tuple[int, str]],
+    recently_dispatched: set[tuple[str, int, str]],
+    slug: str = "",
 ) -> tuple[bool, str]:
     """The checks that cost NOTHING, run before the ones that cost an API call.
 
@@ -616,8 +772,12 @@ def prefilter(
     if len(head) != 40:
         return False, "head oid missing or malformed"
 
-    if skip_drafts and bool(pr.get("isDraft")):
+    if skip_drafts and pr.get("isDraft") is True:
         return False, "draft"
+
+    state = str(pr.get("state") or "").upper()
+    if state and state != "OPEN":
+        return False, f"pull request is {state.lower()}"
 
     if require_ci_green:
         green = ci_is_green(pr)
@@ -626,7 +786,7 @@ def prefilter(
         if not green:
             return False, "CI not green"
 
-    if isinstance(number, int) and (number, head) in recently_dispatched:
+    if isinstance(number, int) and (slug, number, head) in recently_dispatched:
         return False, f"dispatched recently for head {head[:12]} — may still be in flight"
 
     return True, "passed cheap filters"
@@ -639,7 +799,7 @@ def _consider(
     mode: str,
     cfg: dict[str, Any],
     runner: Runner,
-    recent: set[tuple[int, str]] | None = None,
+    recent: set[tuple[str, int, str]] | None = None,
 ) -> tuple[dict[str, Any], str, str]:
     """Decide and (if eligible) dispatch one PR. Returns ``(audit_row, decision, reason)``.
 
@@ -663,9 +823,10 @@ def _consider(
     # cost nothing beyond the list call that fetched them.
     passed, reason = prefilter(
         pr,
-        skip_drafts=bool(cfg.get("skip_drafts", True)),
-        require_ci_green=bool(cfg.get("require_ci_green", True)),
+        skip_drafts=config.flag(cfg, "skip_drafts"),
+        require_ci_green=config.flag(cfg, "require_ci_green"),
         recently_dispatched=recent if recent is not None else set(),
+        slug=slug,
     )
     if not passed:
         row["decision"] = DECISION_SKIPPED
@@ -681,8 +842,8 @@ def _consider(
         pr,
         already_reviewed=already,
         comments_readable=bodies is not None,
-        skip_drafts=bool(cfg.get("skip_drafts", True)),
-        require_ci_green=bool(cfg.get("require_ci_green", True)),
+        skip_drafts=config.flag(cfg, "skip_drafts"),
+        require_ci_green=config.flag(cfg, "require_ci_green"),
     )
     row["reason"] = reason
     if not ok:
@@ -713,6 +874,30 @@ def _consider(
         row["decision"] = DECISION_SKIPPED
         row["reason"] = f"head moved to {fresh_head[:12]} after the checks — re-deciding next tick"
         return row, DECISION_SKIPPED, row["reason"]
+    # The head standing still is not the whole revalidation: the LISTING's other
+    # fields are just as stale. A PR drafted, closed, or newly red between the
+    # listing and this moment authorised nothing, so the mutable checks run again
+    # against the fresh payload — same head, new verdict means do not spend.
+    still_ok, stale_reason = eligibility(
+        fresh,
+        already_reviewed=False,
+        comments_readable=True,
+        skip_drafts=config.flag(cfg, "skip_drafts"),
+        require_ci_green=config.flag(cfg, "require_ci_green"),
+    )
+    if not still_ok:
+        row["decision"] = DECISION_SKIPPED
+        row["reason"] = f"no longer eligible on fresh read: {stale_reason}"
+        return row, DECISION_SKIPPED, row["reason"]
+
+    # CLAIM THE KEY ACROSS PROCESSES before recording the intent. Two runners that
+    # both read an empty dedup set otherwise spawn on the same head — the audit row
+    # serialises ticks, never concurrent processes.
+    claimed = claim_dispatch(slug, number, head)
+    if not claimed:
+        row["decision"] = DECISION_SKIPPED
+        row["reason"] = f"dispatch for head {head[:12]} already claimed by another runner"
+        return row, DECISION_SKIPPED, row["reason"]
 
     # CLAIM BEFORE SPENDING. The audit row is what suppresses a duplicate on the next
     # tick, and writing it AFTER the spawn means a failed write leaves a running
@@ -725,6 +910,7 @@ def _consider(
     claim["intent"] = True
     claim["detail"] = "intent recorded before dispatch"
     if record([claim]) is None:
+        release_claim(slug, number, head)
         row["decision"] = DECISION_FAILED
         row["reason"] = "audit claim could not be persisted — refusing to dispatch"
         row["detail"] = row["reason"]
@@ -736,10 +922,19 @@ def _consider(
     row["decision"] = decision
     row["detail"] = detail
     # The claim above already recorded this attempt; tell the caller not to batch a
-    # second copy. A FAILED spawn still leaves the claim in place deliberately — we
-    # cannot be certain the child did not start, and the cooloff bounds the cost of
-    # being wrong in the conservative direction.
+    # second copy.
     row["_claimed"] = True
+    if decision == DECISION_FAILED:
+        # dispatch() only reports FAILED when the child provably never started
+        # (binary missing, spawn refused, log unwritable) — nothing is in flight,
+        # so the intent row must not suppress a retry for the whole cooloff. A
+        # corrective row frees the dedup key and the claim file releases the
+        # interlock; the audit trail keeps both facts.
+        release_claim(slug, number, head)
+        correction = dict(row)
+        correction.pop("_claimed", None)
+        correction["detail"] = detail
+        record([correction])
     # Report the ELIGIBILITY reason, not the dispatch detail: "no report for head X"
     # is the fact an operator reads the log to learn, and "would run <workflow>"
     # restates the decision already in the column beside it. A FAILURE is the
@@ -747,26 +942,39 @@ def _consider(
     return row, decision, (detail if decision == DECISION_FAILED else reason)
 
 
-def _preflight(cfg: dict[str, Any], mode: str, *, repo_override: str | None = None) -> str | None:
+def _preflight(
+    cfg: dict[str, Any], mode: str, *, repo_override: str | None = None
+) -> tuple[str | None, bool]:
     """The reasons a scan should not start at all, checked once, up front.
 
-    Returns a detail string to report, or ``None`` to proceed. Checking here rather
-    than per-PR means an unconfigured install reports ONE clean line instead of
+    Returns ``(detail, is_failure)``: the text to report and whether it counts as
+    an infrastructure failure for the exit status. Checking here rather than
+    per-PR means an unconfigured install reports ONE clean line instead of
     marking every open pull request as a failed dispatch.
     """
     if not config.workflow_name(cfg):
-        return "no permitted workflow configured — nothing to dispatch"
+        # Unconfigured is the DESIGNED no-op state: the shipped allowlist is
+        # deliberately empty, so "nothing permitted" is a quiet scan rather than a
+        # broken lane. Reporting it as a failure would fill the timer's journal
+        # with red for an install nobody asked to run — the exact false-alarm the
+        # failure channel exists to avoid.
+        return "no permitted workflow configured — nothing to dispatch", False
     if mode == "live":
         block = config.orchestrator(cfg)
         if not orchestrator_binary(str(block.get("command") or "")):
-            return "review orchestrator is not installed — nothing to dispatch"
+            return "review orchestrator is not installed — nothing to dispatch", True
         if not block.get("report_marker"):
             # Without a marker there is no way to recognise an existing report, so
             # every tick would re-review every pull request. Refuse rather than spend.
-            return "orchestrator.report_marker is unset — cannot detect existing reports"
+            return "orchestrator.report_marker is unset — cannot detect existing reports", True
 
         template = block.get("argv")
-        joined = " ".join(template) if isinstance(template, list) else ""
+        # " ".join on a list carrying a non-string element raises TypeError out of
+        # this fail-safe boundary — one malformed nested value would crash the
+        # scheduled run instead of reporting the misconfiguration.
+        if not isinstance(template, list) or not all(isinstance(a, str) for a in template):
+            return "orchestrator.argv must be a list of strings", True
+        joined = " ".join(template)
         # The allowlist decides WHICH workflow may run, but it only binds the child
         # if the child is actually told. A template that never substitutes
         # {workflow} leaves the executable free to pick its own default, so the
@@ -774,7 +982,7 @@ def _preflight(cfg: dict[str, Any], mode: str, *, repo_override: str | None = No
         # enforcing nothing. Refuse the configuration rather than record a weaker
         # guarantee in the audit row.
         if "{workflow}" not in joined:
-            return "orchestrator.argv must contain {workflow} — the allowlist cannot bind the child without it"
+            return "orchestrator.argv must contain {workflow} — the allowlist cannot bind the child without it", True
         # {pr} and {head} are the dispatch's identity. Without {pr} the same
         # untargeted command launches for every pull request; without {head} the
         # child resolves HEAD itself and can review a commit pushed after the
@@ -782,13 +990,13 @@ def _preflight(cfg: dict[str, Any], mode: str, *, repo_override: str | None = No
         # it. Both are unconditional — they bind per-run state, not the repo.
         for ph in ("{pr}", "{head}"):
             if ph not in joined:
-                return f"orchestrator.argv must contain {ph} — the dispatch would not be bound to the PR and commit that authorised it"
+                return f"orchestrator.argv must contain {ph} — the dispatch would not be bound to the PR and commit that authorised it", True
         # A --repo override changes which repository supplies the pull requests. The
         # child otherwise resolves the repository from its own working directory, so
         # without {repo} it would review the same-numbered PR in the wrong place.
         if repo_override and "{repo}" not in joined:
-            return "--repo was given but orchestrator.argv has no {repo} — the child cannot be pointed at it"
-    return None
+            return "--repo was given but orchestrator.argv has no {repo} — the child cannot be pointed at it", True
+    return None, False
 
 
 def review_one(
@@ -824,13 +1032,16 @@ def review_one(
         summary["detail"] = "disabled (config mode=off or kill switch set)"
         return summary
 
-    blocked = _preflight(cfg, mode, repo_override=repo)
+    blocked, is_failure = _preflight(cfg, mode, repo_override=repo)
     if blocked:
         summary["detail"] = blocked
         # A misconfiguration is an INFRASTRUCTURE failure, not a quiet scan: under
         # the timer it means the review lane does no work at all, and an exit 0
         # would let systemd report every invocation as a success while nothing ran.
-        summary["failure"] = blocked
+        # An empty allowlist is the opposite — the designed no-op — so _preflight
+        # says which is which.
+        if is_failure:
+            summary["failure"] = blocked
         return summary
 
     slug = repo or resolve_repo(runner)
@@ -869,8 +1080,8 @@ def review_one(
     if decision == DECISION_FAILED:
         summary["failure"] = reason
     # A row already written as a pre-dispatch claim is not batched again.
-    if not row.pop("_claimed", False):
-        record([row])
+    if not row.pop("_claimed", False) and record([row]) is None:
+        summary["failure"] = "audit trail unwritable — decision not persisted"
     return summary
 
 
@@ -885,7 +1096,7 @@ def pr_detail(pr: int, repo: str, runner: Runner = _default_runner) -> dict[str,
             "--repo",
             repo,
             "--json",
-            "number,headRefOid,isDraft,statusCheckRollup,title",
+            "number,headRefOid,isDraft,state,statusCheckRollup,title",
         ]
     )
     if rc != 0:
@@ -933,13 +1144,16 @@ def scan(
         summary["detail"] = "disabled (config mode=off or kill switch set)"
         return summary
 
-    blocked = _preflight(cfg, mode, repo_override=repo)
+    blocked, is_failure = _preflight(cfg, mode, repo_override=repo)
     if blocked:
         summary["detail"] = blocked
         # A misconfiguration is an INFRASTRUCTURE failure, not a quiet scan: under
         # the timer it means the review lane does no work at all, and an exit 0
         # would let systemd report every invocation as a success while nothing ran.
-        summary["failure"] = blocked
+        # An empty allowlist is the opposite — the designed no-op — so _preflight
+        # says which is which.
+        if is_failure:
+            summary["failure"] = blocked
         return summary
 
     slug = repo or resolve_repo(runner)
@@ -1012,5 +1226,9 @@ def scan(
         if decision == DECISION_FAILED:
             summary.setdefault("failure", reason)
 
-    record(compress_rows(rows))
+    # The audit trail is what stands in for the approval gate; a store that refuses
+    # the batch leaves every decision above unpersisted, and an exit 0 would report
+    # a scan whose only evidence is gone.
+    if rows and record(compress_rows(rows)) is None:
+        summary.setdefault("failure", "audit trail unwritable — decisions not persisted")
     return summary
