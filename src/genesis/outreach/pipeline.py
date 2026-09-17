@@ -11,9 +11,11 @@ from pathlib import Path
 
 import aiosqlite
 
+from genesis.channels.base import ChannelNotConfiguredError
 from genesis.content.drafter import ContentDrafter
 from genesis.content.egress import gate
 from genesis.content.formatter import ContentFormatter
+from genesis.content.limits import get_limits
 from genesis.content.types import DraftRequest, FormatTarget, FormattedContent
 from genesis.db.crud import autonomous_email_sends as aes
 from genesis.db.crud import capability_grants as cg
@@ -547,23 +549,58 @@ class OutreachPipeline:
                     error="self-addressed email suppressed",
                 )
 
-        if not adapter or not recipient:
+        if not adapter:
+            # NO ADAPTER IS PERMANENT, and that is what separates this from the
+            # missing-recipient case below. `self._channels` is injected once at
+            # construction by `runtime/init/outreach.py` from environment read at
+            # that moment, and nothing mutates it afterwards (verified: the map
+            # has no writer outside the constructor). So within this process the
+            # channel is unreachable, and deferring buys the full retry ladder —
+            # 5 attempts over ~2.35h, then re-attempts every drain cycle until
+            # the 24h age-out — rebuilding a channel that cannot appear.
+            #
+            # This is the same misconfiguration the ChannelNotConfiguredError
+            # handler below treats as terminal, arriving one branch earlier: an
+            # install with no default Discord webhook configured never registers
+            # the Discord adapter at all (see `runtime/init/outreach.py`, which
+            # owns that variable's name — the external-io guard keeps it there),
+            # so a Discord send returned HERE and was deferred, never reaching
+            # that handler. Naming the specific channel was not enough; the
+            # unconfigured-entirely case is the more common one.
+            #
+            # IGNORED, not FAILED, for the reason spelled out below: the drain
+            # treats FAILED as transient and retries it.
+            msg = (
+                f"No adapter for channel {channel} — this install has no way to "
+                f"reach it, so the message is dropped rather than retried."
+            )
+            logger.error("%s", msg)
+            return OutreachResult(
+                outreach_id=outreach_id,
+                status=OutreachStatus.IGNORED,
+                channel=channel,
+                message_content=formatted.text,
+                error=msg,
+            )
+        if not recipient:
+            # A missing RECIPIENT is genuinely transient — a reply thread or a
+            # later configuration read can supply one — so this keeps deferring.
             if best_effort:
                 logger.warning(
-                    "No adapter/recipient for channel %s — dropping (best-effort)", channel,
+                    "No recipient for channel %s — dropping (best-effort)", channel,
                 )
             else:
-                logger.warning("No adapter/recipient for channel %s — deferring", channel)
+                logger.warning("No recipient for channel %s — deferring", channel)
                 await self._defer(
                     outreach_id, channel, formatted.text, request,
-                    f"No adapter or recipient for {channel}",
+                    f"No recipient for {channel}",
                 )
             return OutreachResult(
                 outreach_id=outreach_id,
                 status=OutreachStatus.FAILED,
                 channel=channel,
                 message_content=formatted.text,
-                error=f"No adapter or recipient for {channel}",
+                error=f"No recipient for {channel}",
             )
 
         # WS-8 autonomy capability gate — deterministic owner-authorization for
@@ -684,7 +721,16 @@ class OutreachPipeline:
                     error=f"Content scan quarantine: {egress.scan.detected}",
                 )
             if egress.fixes_applied:
-                formatted = replace(formatted, text=egress.text)
+                # The scrub can GROW the text -- a bare em dash becomes two
+                # hyphens -- and the platform limit was applied BEFORE this ran.
+                # Without re-applying it, a message sitting at the limit
+                # overflows and the adapter hard-cuts it downstream, which is
+                # both an unwanted second message and a split dash pair.
+                text = egress.text
+                target = _CHANNEL_FORMAT.get(channel, FormatTarget.GENERIC)
+                if len(text) > get_limits(target).max_length:
+                    text = self._formatter.format(text, target).text
+                formatted = replace(formatted, text=text)
 
         try:
             delivery_id = await adapter.send_message(
@@ -699,6 +745,32 @@ class OutreachPipeline:
                     await adapter.send_message(recipient, formatted.text)
                 except Exception:
                     logger.warning("DM copy failed for 'both' routing", exc_info=True)
+        except ChannelNotConfiguredError as exc:
+            # PERMANENT: this install has no way to reach the named channel, so
+            # retrying cannot help. Must be caught BEFORE the generic handler
+            # below, which defers — and a deferred row is then retried 5 times
+            # over ~2.35h rebuilding the same unreachable channel
+            # (resilience/outreach_recovery.py), each exhaustion filing a
+            # priority="high" observation that does not dedupe across rows
+            # (its content embeds deferred_id), while the drain re-attempts a
+            # FAILED row every cycle until the 24h age-out.
+            #
+            # IGNORED rather than FAILED is what makes it terminal: the drain
+            # treats DELIVERED/ENGAGED/HELD/IGNORED as terminal and FAILED as
+            # "transient and retried next cycle" (outreach/scheduler.py), so
+            # FAILED here would still buy a day of pointless re-sends. IGNORED
+            # already means "the pipeline deliberately dropped it", which is
+            # exactly what a misconfigured channel is.
+            logger.error(
+                "Delivery refused on %s (not configured): %s", channel, exc,
+            )
+            return OutreachResult(
+                outreach_id=outreach_id,
+                status=OutreachStatus.IGNORED,
+                channel=channel,
+                message_content=formatted.text,
+                error=str(exc),
+            )
         except Exception as exc:
             logger.error("Delivery failed on %s: %s", channel, exc, exc_info=True)
             if not gate_cleared and not best_effort:
@@ -750,6 +822,7 @@ class OutreachPipeline:
                     self._db,
                     outreach_id=outreach_id,
                     category=request.category.value,
+                    channel=channel,
                     stated_confidence=request.stated_confidence,
                 )
             except Exception:  # noqa: BLE001 — ledger is best-effort; never break the send

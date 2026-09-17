@@ -179,7 +179,8 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "inbox_items.evaluated_content")
 
     # Inbox URL-level batching: drop_id groups the eval-batches carved from one
-    # file's delta; batch_items stores that batch's exact item lines so resume
+    # file's delta; batch_items stores that batch's exact logical items (new
+    # writes use the versioned JSON-in-TEXT codec in inbox_items CRUD) so resume
     # re-dispatches the delta (not a full-file re-read) and survives restart.
     await _try_alter(db,
         "ALTER TABLE inbox_items ADD COLUMN drop_id TEXT",

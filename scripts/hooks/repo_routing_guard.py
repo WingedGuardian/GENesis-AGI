@@ -50,7 +50,34 @@ from pathlib import Path
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import field, read_payload  # noqa: E402
+try:
+    from hook_input import field, read_payload  # noqa: E402
+except Exception:  # noqa: BLE001 — an unimportable hook_input must BLOCK, not vanish.
+    if __name__ != "__main__":
+        raise
+    # NOTHING TO FALL BACK ON: hook_input is the module that would recover us, so this
+    # guard refuses outright. Its only verdicts are BLOCK and ALLOW, and the
+    # alternative to blocking is permitting. An unguarded import exits 1, which Claude
+    # Code reads as NON-BLOCKING, and this gate disappears.
+    #
+    # The exception is not rendered (even __str__ can raise) and the exit uses
+    # os._exit, because sys.exit lets the interpreter retry a failed stream flush
+    # during shutdown and replace the status with 120 — which is not 2.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (repo_routing_guard): shared hook_input could not be "
+            "imported; BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
+
+try:  # noqa: E402
+    import discarded_write
+except Exception:  # noqa: BLE001 — GUARDED: an unguarded import failure would abort
+    # module load → exit 1 → CC reads non-2 as NON-blocking → the command RUNS.
+    discarded_write = None  # type: ignore[assignment]
 
 _OVERRIDE_RE = re.compile(r"#\s*repo-routing-override\b")
 
@@ -429,6 +456,8 @@ def main() -> int:
     """Entry point: parse hook input, classify staged files, block or advise."""
     try:
         cmd = field(read_payload(), "command")
+        if discarded_write is not None:
+            discarded_write.remember(cmd)
         if not cmd:
             return 0
         # Cheap pre-filter: skip clearly non-git commands. Do NOT match "git add"
@@ -535,6 +564,8 @@ def main() -> int:
                     f"could not be scoped and were NOT checked.)",
                     file=sys.stderr,
                 )
+            if discarded_write is not None:
+                discarded_write.warn()
             return 2
 
         notes: list[str] = []

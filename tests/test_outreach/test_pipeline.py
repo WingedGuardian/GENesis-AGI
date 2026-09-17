@@ -551,7 +551,11 @@ async def test_submit_to_email_scrubs_em_dash_end_to_end(config, db, mock_drafte
     result = await pipeline.submit(req)
     assert result.status == OutreachStatus.DELIVERED
     sent_text = email_adapter.send_message.call_args.args[1]
-    assert sent_text == "ship it—now"  # em dash collapsed by the egress gate
+    # The owner ruling is that published prose never carries an em dash: an
+    # earned dash is two hyphens closed up. The egress gate now rewrites the
+    # BARE form too, not only the spaced one, so this asserts the published
+    # form rather than the intermediate one.
+    assert sent_text == "ship it--now"
 
 
 @pytest.mark.asyncio
@@ -969,13 +973,16 @@ async def test_deliver_writes_ledger_predictions(
     from genesis.db.crud import ledger_predictions
 
     gate = GovernanceGate(config, db)
+    # EXTERNAL channel (discord): reply predictions are created only for external
+    # outreach — owner-facing channels (telegram/voice) are skipped, since they solicit
+    # no external reply (see test_deliver_owner_channel_skips_ledger_predictions).
     pipeline = OutreachPipeline(
         governance=gate, drafter=mock_drafter, formatter=mock_formatter,
-        channels={"telegram": mock_channel}, db=db, config=config,
-        recipients={"telegram": "12345"},
+        channels={"discord": mock_channel}, db=db, config=config,
+        recipients={"discord": "12345"},
     )
     req = OutreachRequest(
-        category=OutreachCategory.SURPLUS, topic="Ledger test",
+        category=OutreachCategory.SURPLUS, topic="Ledger test", channel="discord",
         context="Predict me", salience_score=0.9, signal_type="surplus_insight",
     )
     result = await pipeline.submit(req)
@@ -991,9 +998,12 @@ async def test_deliver_writes_ledger_predictions(
 
 
 @pytest.mark.asyncio
-async def test_deliver_threads_stated_confidence(
+async def test_deliver_owner_channel_skips_ledger_predictions(
     config, db, mock_drafter, mock_formatter, mock_channel,
 ):
+    # Owner-facing delivery (telegram) creates NO reply/engagement predictions — the owner
+    # gets the message, there is no external reply to predict, so they'd only ever grade as
+    # silence and poison outreach calibration.
     from genesis.db.crud import ledger_predictions
 
     gate = GovernanceGate(config, db)
@@ -1003,7 +1013,31 @@ async def test_deliver_threads_stated_confidence(
         recipients={"telegram": "12345"},
     )
     req = OutreachRequest(
-        category=OutreachCategory.SURPLUS, topic="Stated",
+        category=OutreachCategory.SURPLUS, topic="Owner ping", channel="telegram",
+        context="hi", salience_score=0.9, signal_type="surplus_insight",
+    )
+    result = await pipeline.submit(req)
+    rows = await ledger_predictions.list_by_subject(
+        db, action_class="outreach_send", subject_ref_id=result.outreach_id,
+    )
+    assert rows == []  # owner-facing channel → no predictions
+
+
+@pytest.mark.asyncio
+async def test_deliver_threads_stated_confidence(
+    config, db, mock_drafter, mock_formatter, mock_channel,
+):
+    from genesis.db.crud import ledger_predictions
+
+    gate = GovernanceGate(config, db)
+    # EXTERNAL channel (discord) — predictions are created only for external outreach.
+    pipeline = OutreachPipeline(
+        governance=gate, drafter=mock_drafter, formatter=mock_formatter,
+        channels={"discord": mock_channel}, db=db, config=config,
+        recipients={"discord": "12345"},
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.SURPLUS, topic="Stated", channel="discord",
         context="c", salience_score=0.9, signal_type="surplus_insight",
         stated_confidence=0.3,
     )
@@ -1180,3 +1214,152 @@ async def test_defer_retry_false_suppresses_the_deferral(config, db, mock_drafte
     assert result.status == OutreachStatus.FAILED
     mock_deferred.enqueue.assert_not_called()
     mock_deferred.has_open.assert_not_awaited()  # gate sits ABOVE the dedup probe
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_channel_is_terminal_and_never_defers(
+    config, db, mock_drafter, mock_formatter
+):
+    """A channel this install cannot reach must NOT enter the retry machinery.
+
+    The counterpart of test_delivery_failure_defers above: a ConnectionError is
+    transient and SHOULD defer, but "no webhook is configured for this channel"
+    cannot be fixed by retrying — no amount of waiting creates a webhook.
+
+    What deferring costs, all verified in the code rather than assumed:
+    resilience/outreach_recovery.py retries a deferred row 5 times over ~2.35h
+    (_BACKOFF_SCHEDULE 60/300/900/3600/3600, _MAX_RETRIES 5), rebuilding the
+    SAME channel and target_chat_id from the payload each time; on exhaustion it
+    files a priority="high" delivery-exhausted observation whose content embeds
+    `deferred_id`, so skip_if_duplicate does NOT collapse them across rows. And
+    the drain counts DELIVERED/ENGAGED/HELD/IGNORED as terminal while FAILED is
+    "transient and retried next cycle" (outreach/scheduler.py), so a FAILED here
+    would additionally be re-sent every drain cycle until the 24h age-out.
+
+    IGNORED is the status that stops both, and it already means "the pipeline
+    deliberately dropped it" — which is what a misconfigured channel is.
+    """
+    from genesis.channels.base import ChannelNotConfiguredError
+
+    refusing_channel = AsyncMock()
+    refusing_channel.send_message.side_effect = ChannelNotConfiguredError(
+        "No Discord webhook configured for channel 'bug-reports'"
+    )
+    mock_deferred = AsyncMock()
+    mock_deferred.has_open = AsyncMock(return_value=False)
+
+    gate = GovernanceGate(config, db)
+    pipeline = OutreachPipeline(
+        governance=gate,
+        drafter=mock_drafter,
+        formatter=mock_formatter,
+        channels={"telegram": refusing_channel},
+        deferred_queue=mock_deferred,
+        db=db,
+        config=config,
+        recipients={"telegram": "12345"},
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.SURPLUS,
+        topic="Refusal test",
+        context="Channel is not configured",
+        salience_score=0.9,
+        signal_type="surplus_insight",
+    )
+    result = await pipeline.submit(req)
+
+    assert result.status == OutreachStatus.IGNORED, (
+        "a permanent misconfiguration must be TERMINAL; FAILED would be re-sent "
+        "every drain cycle until the 24h age-out"
+    )
+    mock_deferred.enqueue.assert_not_called()
+    # The operator still needs to know WHY — terminal must not mean silent.
+    assert "bug-reports" in (result.error or ""), result.error
+
+
+@pytest.mark.asyncio
+async def test_channel_with_no_adapter_at_all_is_terminal_too(
+    config, db, mock_drafter, mock_formatter
+):
+    """The commoner half of the same misconfiguration, and the one the first
+    version of this fix missed.
+
+    An install with no ``DISCORD_WEBHOOK_URL`` never registers the Discord
+    adapter at all (``runtime/init/outreach.py``), so a Discord send never
+    reaches ``send_message`` and never raises ``ChannelNotConfiguredError`` — it
+    returns from the no-adapter branch and gets DEFERRED, then retried 5 times
+    over ~2.35h and re-attempted every drain cycle until the 24h age-out, each
+    exhaustion filing a non-deduping high-priority observation.
+
+    Deferring cannot help: ``self._channels`` is injected once at construction
+    and nothing mutates it, so within this process the channel is unreachable.
+    """
+    mock_deferred = AsyncMock()
+    mock_deferred.has_open = AsyncMock(return_value=False)
+
+    gate = GovernanceGate(config, db)
+    pipeline = OutreachPipeline(
+        governance=gate,
+        drafter=mock_drafter,
+        formatter=mock_formatter,
+        channels={},  # nothing registered — the unconfigured install
+        deferred_queue=mock_deferred,
+        db=db,
+        config=config,
+        recipients={"telegram": "12345"},
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.SURPLUS,
+        topic="No adapter test",
+        context="Nothing is configured at all",
+        salience_score=0.9,
+        signal_type="surplus_insight",
+    )
+    result = await pipeline.submit(req)
+
+    assert result.status == OutreachStatus.IGNORED, (
+        "a channel with no adapter is unreachable for this whole process; "
+        "deferring only buys the retry ladder and the age-out"
+    )
+    mock_deferred.enqueue.assert_not_called()
+    assert "No adapter" in (result.error or ""), result.error
+
+
+@pytest.mark.asyncio
+async def test_missing_recipient_still_defers(
+    config, db, mock_drafter, mock_formatter, mock_channel
+):
+    """The control, and the reason the branch was SPLIT rather than widened.
+
+    A missing recipient is genuinely transient — a reply thread or a later
+    configuration read can supply one — so it must keep deferring. A fix that
+    made the whole ``not adapter or not recipient`` branch terminal would pass
+    the test above while silently dropping recoverable sends.
+    """
+    mock_deferred = AsyncMock()
+    mock_deferred.has_open = AsyncMock(return_value=False)
+
+    gate = GovernanceGate(config, db)
+    pipeline = OutreachPipeline(
+        governance=gate,
+        drafter=mock_drafter,
+        formatter=mock_formatter,
+        channels={"telegram": mock_channel},
+        deferred_queue=mock_deferred,
+        db=db,
+        config=config,
+        recipients={},  # adapter present, recipient absent
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.SURPLUS,
+        topic="No recipient test",
+        context="Adapter exists, recipient does not",
+        salience_score=0.9,
+        signal_type="surplus_insight",
+    )
+    result = await pipeline.submit(req)
+
+    assert result.status == OutreachStatus.FAILED, (
+        "a missing recipient is recoverable and must stay retriable"
+    )
+    mock_deferred.enqueue.assert_called_once()

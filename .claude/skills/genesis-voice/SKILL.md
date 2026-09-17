@@ -90,7 +90,8 @@ Genesis should sound like a thinking entity, not a polished AI response.
 
 Key items:
 - No banned words (delve, leverage, utilize, robust, seamless, etc.)
-- No spaced em dashes (` — ` is a hard fail)
+- No em dashes in published prose (` — ` is a hard fail; an earned dash is
+  two hyphens closed up, `word--word` — owner ruling 2026-09-16)
 - No three-part parallel lists
 - No "importance" sentences
 - No contrast structures ("Not X, but Y")

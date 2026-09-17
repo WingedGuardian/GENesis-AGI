@@ -30,9 +30,10 @@ below (Steps 1–4, Gate 1) is replaced by this:
    absolute path and apply their rules yourself: `voice-master` at the repo's
    `.claude/skills/voice-master/` (+ the user companion `~/.claude/skills/voice-master/`),
    `humanizer` at `~/.claude/skills/humanizer/`. **Hard final check before emitting — do it
-   IN-SESSION, never assume a skill did it: the rendered artifact must contain ZERO spaced
-   em-dashes (` — `; replace each with a comma, period, or colon) and none of the banned AI-tell
-   words.** Spaced em-dashes are the #1 tell and a hard fail; verify the SOURCE before you render.
+   IN-SESSION, never assume a skill did it: the rendered artifact must contain ZERO
+   em-dashes, spaced or bare (` — ` and `word—word` both; replace each with a comma, period,
+   colon, or an earned `word--word`) and none of the banned AI-tell
+   words.** The spaced em-dash is the #1 tell and a hard fail; verify the SOURCE before you render.
 4. **Gate 2 is still YOURS — run it IN-SESSION.** The `Task` subagent tool is NOT available in an
    executor step (verified), so do not try to spawn a fresh-context reviewer. Instead re-open your
    rendered file yourself (Bash `pdftotext`/`pdfinfo`, or `python -m fitz`) and verify it against
