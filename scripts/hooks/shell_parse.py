@@ -1790,10 +1790,28 @@ _C_VALUE_TAKING = {
 #: Every other supported interpreter takes `-o option` but not `-O`.
 _C_VALUE_TAKING_DEFAULT = frozenset("o")
 
+#: Options that make the shell PARSE the script and not execute it. MEASURED on
+#: bash 5.2: `bash -n -c CMD`, `bash -D -c CMD` and `bash -o noexec -c CMD` all
+#: exit without running CMD. Walking past one and reporting the operand as an
+#: executed command is a false block on a command that provably does nothing —
+#: so they TERMINATE resolution instead of being transparent.
+#:
+#: `-D` is bash-only (dump translatable strings) but is harmless to treat as
+#: no-exec elsewhere: the cost of a false STOP is a command we do not report,
+#: and the pre-existing behaviour for an unrecognised shape is already to report
+#: nothing. Erring that way costs visibility we never had.
+_C_NO_EXEC_LETTERS = frozenset("nD")
+#: The `-o` VALUE that does the same thing.
+_C_NO_EXEC_OPTION_VALUES = frozenset({"noexec"})
+
 _C_BUNDLE_OPTIONS = {
     "bash": frozenset("abcefhiklmnprstuvxBCEHPTD"),
-    "sh": frozenset("abcefhilmnprstuvxCEIV"),
-    "dash": frozenset("abcefhilmnprstuvxCEIV"),
+    # MEASURED against the installed dash (and /usr/bin/sh, which IS dash here):
+    # `-h`, `-r` and `-t` are rejected with "Illegal option" and nothing runs.
+    # They were in this table, so the operand scan walked past them and reported
+    # a command the shell never executed — a false block.
+    "sh": frozenset("abcefilmnpsuvxCEIV"),
+    "dash": frozenset("abcefilmnpsuvxCEIV"),
     "ash": frozenset("abcefhilmnprstuvx"),
     "ksh": frozenset("abcefhilmnprstuvx"),
     "zsh": frozenset("Gabcefhilmnprstuvx"),
@@ -2719,11 +2737,22 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
         has_value = bool(set(options) & takes_value)
         if not set(options) - takes_value <= allowed:
             continue
+        # The bundle carrying `-c` can itself suppress execution: `bash -cn CMD`
+        # parses CMD and runs nothing.
+        if set(options) & _C_NO_EXEC_LETTERS:
+            return ""
+        if has_value and i + 1 < len(argv) and argv[i + 1] in _C_NO_EXEC_OPTION_VALUES:
+            return ""
         start = i + 2 if has_value else i + 1
 
+        # ONCE A VALID `-c` BUNDLE OWNS SELECTION, its resolution is final.
+        # Resuming the outer scan let a LATER `-c` be read as a fresh command
+        # selector: `bash -c -z -c CMD` is rejected by bash and runs nothing,
+        # but the second `-c` was then treated as the real one and CMD reported.
+        # The first `-c` decides, and if its operand cannot be resolved the
+        # answer is "nothing", not "keep looking".
         found, script = _first_operand(argv, start, allowed, takes_value)
-        if found:
-            return script
+        return script if found else ""
 
     return ""
 
@@ -2775,6 +2804,14 @@ def _first_operand(
             letters = set(tok[1:])
             if not letters - takes_value <= allowed:
                 return (False, "")  # the shell refuses this invocation
+            if letters & _C_NO_EXEC_LETTERS:
+                return (False, "")  # parsed but never executed
+            if (
+                letters & takes_value
+                and j + 1 < len(argv)
+                and argv[j + 1] in _C_NO_EXEC_OPTION_VALUES
+            ):
+                return (False, "")
             j += 2 if letters & takes_value else 1
             continue
         return (True, tok)

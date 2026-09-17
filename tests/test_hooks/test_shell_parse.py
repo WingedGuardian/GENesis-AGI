@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import inspect
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -1207,3 +1208,90 @@ def test_an_empty_script_is_an_operand_not_a_miss():
     assert "git" not in [seg.exe for seg in segments], (
         "an empty -c command was treated as a miss and the scan ran on"
     )
+
+
+#: Shapes a real shell REFUSES or PARSES-WITHOUT-EXECUTING. Reporting a command
+#: for any of these is a false block on something that provably does nothing.
+#: Every entry is proven inert below before it is used, so the corpus cannot
+#: quietly stop describing reality when a shell changes.
+_INERT_C_SHAPES = [
+    "bash -c -n 'PAYLOAD'",          # -n: read but do not execute
+    "bash -cn 'PAYLOAD'",            # same, inside the -c bundle
+    "bash -c -D 'PAYLOAD'",          # -D: dump strings, does not execute
+    "bash -c -o noexec 'PAYLOAD'",   # the -o spelling of -n
+    "bash -c -z -c 'PAYLOAD'",       # -z rejected; a later -c is not a retry
+    "dash -c -t 'PAYLOAD'",          # dash: Illegal option
+    "dash -c -h 'PAYLOAD'",
+    "dash -c -r 'PAYLOAD'",
+]
+
+
+@pytest.mark.parametrize("template", _INERT_C_SHAPES)
+def test_a_command_the_shell_never_runs_is_not_reported(template):
+    """The other direction from the bypass tests, and the one three review
+    rounds were spent on.
+
+    Over-parsing is not free: reporting a nested command for an invocation the
+    shell refuses or neuters makes every downstream guard block something that
+    was never going to run. Each of these was a real false block.
+    """
+    probe = subprocess.run(
+        ["bash", "-c", template.replace("PAYLOAD", "echo $((6*7))")],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=_shell_oracle_env(),
+    )
+    # Guard-the-guard, and the load-bearing half: prove the shell really does
+    # NOT run it. A shape that started executing would make the assertion below
+    # a demand for a genuine bypass.
+    assert probe.stdout.strip().splitlines()[:1] != ["42"], (
+        f"{template!r} now EXECUTES its payload, so refusing to report it would "
+        f"be a bypass rather than a fix: {probe.stdout!r}"
+    )
+
+    command = template.replace("PAYLOAD", "git push origin main")
+    segments, _blind = sp.analyze_checked(command)
+    assert "git" not in [seg.exe for seg in segments], (
+        f"{command!r} reports a nested git command, but the shell never runs it "
+        "— every guard downstream blocks a command that does nothing"
+    )
+
+
+def test_the_dash_allowlist_matches_what_dash_accepts():
+    """The table was asserting things about dash that dash disagrees with.
+
+    MEASURED against the installed dash: `-h`, `-r` and `-t` are rejected with
+    "Illegal option" and nothing runs, yet all three were in the sh/dash
+    allowlists, so the operand scan walked past them. Pinned by asking the shell
+    rather than by re-typing a list, so the test cannot drift from reality the
+    way the table did.
+    """
+    if not shutil.which("dash"):
+        pytest.skip("dash is not installed; this assertion needs the real shell")
+    for letter in sorted(sp._C_BUNDLE_OPTIONS["dash"]):
+        if letter == "c":
+            continue
+        probe = subprocess.run(
+            ["dash", f"-{letter}", "-c", "echo $((6*7))"],
+            capture_output=True, text=True, timeout=30, env=_shell_oracle_env(),
+        )
+        combined = probe.stdout + probe.stderr
+        assert "llegal option" not in combined and "nvalid option" not in combined, (
+            f"the dash allowlist contains {letter!r}, which the installed dash "
+            f"rejects: {combined.strip()[:120]!r}"
+        )
+
+
+def test_the_first_c_bundle_owns_the_decision():
+    """A rejected option after the first `-c` terminates resolution.
+
+    Resuming the outer scan let a LATER `-c` be read as a fresh selector, so an
+    invocation the shell rejects outright still produced a command."""
+    assert sp._nested_script(
+        ["bash", "-c", "-z", "-c", "git push origin main"], "bash"
+    ) == ""
+    # CONTROL: a single valid -c still resolves, so this is not "always refuse".
+    assert sp._nested_script(
+        ["bash", "-c", "git push origin main"], "bash"
+    ) == "git push origin main"
