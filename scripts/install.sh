@@ -641,10 +641,22 @@ if [ -e "$HOME/.genesis/codebase-memory-mcp.disabled" ]; then
     echo "    . codebase-memory-mcp install/upgrade skipped (machine kill switch active)"
 else
     # --skip-config prevents the upstream installer from registering a raw,
-    # uncapped MCP command; Genesis owns registration below.
-    curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui --skip-config 2>/dev/null \
-        && echo "    + codebase-memory-mcp installed/upgraded" \
-        || echo "    NOTE: codebase-memory-mcp unavailable (optional)"
+    # uncapped MCP command; Genesis owns registration below. The installer is
+    # pinned to a reviewed upstream commit and verified against a
+    # repository-owned digest — `main` is mutable third-party code and must
+    # never reach `bash` unverified. Bump BOTH the commit and the digest when
+    # re-reviewing the upstream installer (bootstrap.sh shares this pin).
+    _cbm_installer=$(mktemp 2>/dev/null) || _cbm_installer=""
+    if [[ -n "$_cbm_installer" ]] \
+        && curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/59a05eb1bf9e11deb060d782cd7d3a29f2ae2866/install.sh -o "$_cbm_installer" 2>/dev/null \
+        && echo "13049c7cc51bc508d68b8ecb8a9fd9574ecb7c6f2c9dd5a19bf7d4c187321145  $_cbm_installer" | sha256sum -c - >/dev/null 2>&1; then
+        bash "$_cbm_installer" --ui --skip-config 2>/dev/null \
+            && echo "    + codebase-memory-mcp installed/upgraded" \
+            || echo "    NOTE: codebase-memory-mcp unavailable (optional)"
+    else
+        echo "    NOTE: codebase-memory-mcp installer unavailable or failed verification (optional)"
+    fi
+    [[ -n "$_cbm_installer" ]] && rm -f "$_cbm_installer"
 fi
 
 _GITNEXUS_PIN_READY=0

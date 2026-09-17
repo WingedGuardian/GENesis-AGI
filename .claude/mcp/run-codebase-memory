@@ -30,8 +30,13 @@ if [[ -z "$_user_home" ]]; then
     done < /etc/passwd
 fi
 _disable_file="${CODEBASE_MEMORY_MCP_DISABLE_FILE:-${_user_home:+${_user_home}/.genesis/codebase-memory-mcp.disabled}}"
-if [[ -z "$_disable_file" ]]; then
-    printf 'run-codebase-memory: cannot resolve disable-state path; refusing to start\n' >&2
+if [[ "$_disable_file" == "~/"* ]]; then
+    # With no resolvable home this collapses to a relative path and the
+    # absolute-path check below fails closed.
+    _disable_file="${_user_home:+${_user_home}/}${_disable_file#\~/}"
+fi
+if [[ -z "$_disable_file" || "$_disable_file" != /* ]]; then
+    printf 'run-codebase-memory: disable-state path must be absolute\n' >&2
     exit 1
 fi
 if [[ -e "$_disable_file" ]]; then
