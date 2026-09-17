@@ -186,8 +186,12 @@ def test_installers_do_not_run_cbm_installer_while_kill_switch_is_active():
     """
     for relative in ("scripts/install.sh", "scripts/bootstrap.sh"):
         text = (REPO_ROOT / relative).read_text()
-        sentinel = 'if [ -e "$HOME/.genesis/codebase-memory-mcp.disabled" ]; then'
+        # The sentinel is the resolved shared-site path (cbm_disable_file.sh),
+        # honouring CODEBASE_MEMORY_MCP_DISABLE_FILE — never a hard-coded
+        # $HOME literal that would ignore the override.
+        sentinel = '[ -e "$_cbm_disable" ]'
         assert text.index(sentinel) < text.index("genesis_cbm_install"), relative
+        assert 'lib/cbm_disable_file.sh' in text, relative
         assert "raw.githubusercontent.com/DeusData/codebase-memory-mcp/" not in text, relative
     # The shared script's OWN kill switch is exercised, not grepped, by
     # test_bootstrap_guards.py::test_b9_direct_run_honours_the_kill_switch — a

@@ -174,7 +174,26 @@ MEM_MAX="$GITNEXUS_MEM_MAX"
 IO_WEIGHT="${CODE_INTEL_INDEX_IO_WEIGHT:-20}"
 CPU_QUOTA="${CODE_INTEL_INDEX_CPU_QUOTA:-200%}"
 PERSISTENCE="${CODE_INTEL_INDEX_PERSISTENCE:-true}"
-CBM_DISABLE_FILE="${CODEBASE_MEMORY_MCP_DISABLE_FILE:-$HOME/.genesis/codebase-memory-mcp.disabled}"
+# The kill-switch path resolves through the ONE shared site (same override
+# semantics the launcher enforces). An override that is relative, or begins
+# with a ~/ that no HOME can expand, would make `-e` silently read as
+# "not disabled" — an UNRESOLVABLE path instead refuses the cbm leg below,
+# never indexing a tool the machine may have switched off.
+CBM_DISABLE_FILE=""
+CBM_DISABLE_UNRESOLVED=1
+# %/* not dirname(1): minimal-PATH invocations (stripped-env services) may not
+# have dirname, and a resolver that cannot be found fails the leg closed.
+_cbm_disable_lib="${BASH_SOURCE[0]%/*}/cbm_disable_file.sh"
+[ "$_cbm_disable_lib" = "${BASH_SOURCE[0]}/cbm_disable_file.sh" ] \
+    && _cbm_disable_lib="./cbm_disable_file.sh"
+if [ -r "$_cbm_disable_lib" ]; then
+    # shellcheck source=cbm_disable_file.sh
+    . "$_cbm_disable_lib"
+    if declare -F genesis_cbm_disable_file >/dev/null \
+        && CBM_DISABLE_FILE="$(genesis_cbm_disable_file 2>/dev/null)"; then
+        CBM_DISABLE_UNRESOLVED=""
+    fi
+fi
 
 _GITNEXUS_PIN_READY=0
 _gitnexus_pin_file="$(dirname "${BASH_SOURCE[0]}")/gitnexus_version.sh"
@@ -410,7 +429,10 @@ CBM_RAN=0
 GN_RAN=0
 
 if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
-    if [ -e "$CBM_DISABLE_FILE" ]; then
+    if [ -n "$CBM_DISABLE_UNRESOLVED" ]; then
+        _log "cbm kill-switch path unresolvable — refusing cbm leg (fail closed)"
+        MISSING="${MISSING}cbm "
+    elif [ -e "$CBM_DISABLE_FILE" ]; then
         _log "codebase-memory-mcp disabled by $CBM_DISABLE_FILE — skipped"
     elif command -v codebase-memory-mcp >/dev/null 2>&1; then
         _log "indexing (codebase-memory-mcp, mode=$MODE): $REPO_PATH"

@@ -21,6 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = REPO_ROOT / "scripts" / "bootstrap.sh"
 INSTALL = REPO_ROOT / "scripts" / "install.sh"
 CBM_INSTALLER = REPO_ROOT / "scripts" / "lib" / "cbm_installer.sh"
+CBM_DISABLE_LIB = REPO_ROOT / "scripts" / "lib" / "cbm_disable_file.sh"
 SETUP_LOCAL = REPO_ROOT / "scripts" / "setup-local-config.sh"
 
 
@@ -214,6 +215,9 @@ def _run_cbm_install(tmp_path: Path, payload: str, digest: str | None, label: st
     if digest is not None:  # re-point the committed digest at this payload
         body = _CBM_DIGEST_RE.sub(f'GENESIS_CBM_INSTALLER_SHA256="{digest}"', body)
     lib.write_text(body)
+    # The installer sources its kill-switch resolver as a sibling file; the
+    # sandboxed copy needs it beside it or every call refuses as unresolvable.
+    (work / "cbm_disable_file.sh").write_text(CBM_DISABLE_LIB.read_text())
     payload_file = work / "payload"
     payload_file.write_text(payload)
     argv_file = work / "argv"

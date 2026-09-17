@@ -651,7 +651,19 @@ done
 # Code intelligence tools (optional — enhance Claude Code sessions)
 echo "    Installing code intelligence tools..."
 
-if [ -e "$HOME/.genesis/codebase-memory-mcp.disabled" ]; then
+# The kill-switch path resolves through the ONE shared site — an override via
+# CODEBASE_MEMORY_MCP_DISABLE_FILE is honoured here the same way the launcher
+# and indexer honour it, and an UNRESOLVABLE path refuses rather than falling
+# through to an install the machine may have disabled.
+_cbm_disable=""
+if [ -r "$SCRIPT_DIR/lib/cbm_disable_file.sh" ]; then
+    # shellcheck source=lib/cbm_disable_file.sh
+    . "$SCRIPT_DIR/lib/cbm_disable_file.sh"
+    _cbm_disable="$(genesis_cbm_disable_file 2>/dev/null)" || _cbm_disable=""
+fi
+if [ -z "$_cbm_disable" ]; then
+    echo "    NOTE: codebase-memory-mcp kill-switch path unresolvable — refusing install (fail closed)"
+elif [ -e "$_cbm_disable" ]; then
     echo "    . codebase-memory-mcp install/upgrade skipped (machine kill switch active)"
 else
     # The pin, the digest and the install itself live in ONE place, shared with
@@ -664,6 +676,7 @@ else
         0) echo "    + codebase-memory-mcp installed/upgraded" ;;
         1) echo "    NOTE: codebase-memory-mcp installer download failed (optional)" ;;
         3) echo "    ERROR: codebase-memory-mcp pin/digest mismatch (see above) — repository bug, not transient" ;;
+        4) echo "    NOTE: codebase-memory-mcp install refused — machine kill switch active" ;;
         *) echo "    NOTE: codebase-memory-mcp unavailable (optional) — see the error above" ;;
     esac
 fi
@@ -1081,7 +1094,7 @@ if command -v claude &>/dev/null; then
         # uncapped raw server in the next session — and stays uncapped after the
         # sentinel is removed until somebody runs this again.
         _register_mcp "codebase-memory-mcp" "user" "$REPO_DIR/.claude/mcp/run-codebase-memory"
-        if [ -e "$HOME/.genesis/codebase-memory-mcp.disabled" ]; then
+        if [ -n "${_cbm_disable:-}" ] && [ -e "$_cbm_disable" ]; then
             echo "    . codebase-memory-mcp registered to the launcher; kill switch active, so it will refuse to start"
         fi
     fi
