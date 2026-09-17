@@ -1660,6 +1660,28 @@ class TestRequiredScheduledReviewKinds:
         _mod._required_scheduled_review_kinds()
         assert "required_scheduled_reviews" not in capsys.readouterr().err
 
+    def test_a_flow_style_declaration_is_announced(self, monkeypatch, tmp_path, capsys):
+        # A line scan for `^\s*required_scheduled_reviews\s*:` never sees the key here,
+        # so the declaration is only visible in the PARSED structure.
+        self._write_cfg(
+            tmp_path, monkeypatch, 'merge_gate: {"required_scheduled_reviews": [foo]}\n'
+        )
+        assert _mod._required_scheduled_review_kinds() == ("leaks",)
+        assert "DEFAULT required set" in capsys.readouterr().err
+
+    def test_the_key_name_inside_an_unrelated_scalar_is_not_a_declaration(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        # Converse of the above: the text is there, the KEY is not. Announcing a
+        # substitution for a policy nobody declared is the same class of lie.
+        self._write_cfg(
+            tmp_path,
+            monkeypatch,
+            "notes: |\n  required_scheduled_reviews: [code-review, leaks]\n",
+        )
+        assert _mod._required_scheduled_review_kinds() == ("leaks",)
+        assert "required_scheduled_reviews" not in capsys.readouterr().err
+
     def test_config_empty_list_is_leaks_only(self, monkeypatch, tmp_path):
         self._write_cfg(tmp_path, monkeypatch, "merge_gate:\n  required_scheduled_reviews: []\n")
         assert _mod._required_scheduled_review_kinds() == ("leaks",)

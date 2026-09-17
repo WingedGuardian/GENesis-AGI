@@ -5487,10 +5487,12 @@ def _required_scheduled_review_kinds() -> tuple[str, ...]:
             path = os.path.expanduser("~/.genesis/config/genesis.yaml")
             with open(path) as fh:
                 text = fh.read()
-            # A textual sighting of the KEY LINE (not a comment/prose mention): if the
-            # value is then discarded, the operator DECLARED a policy we are about to
-            # substitute, and with a minimal default that substitution can be a
-            # NARROWING. Checked BEFORE the parse so a yaml error can't skip it.
+            # Did the operator DECLARE a policy we are about to substitute? With a
+            # minimal default that substitution can be a NARROWING, so it is worth a
+            # NOTE. Text scan FIRST, so a file yaml cannot parse at all still answers;
+            # the parsed structure overrides it below whenever there IS one, because
+            # the scan alone both misses a key written flow-style or quoted and fires
+            # on the key's own name appearing inside an unrelated block scalar.
             key_seen_in_file = bool(re.search(r"(?m)^\s*required_scheduled_reviews\s*:", text))
             # yaml.safe_load silently keeps the LAST value for a repeated key, so a
             # badly-merged file (two merge_gate: or required_scheduled_reviews: lines)
@@ -5502,9 +5504,13 @@ def _required_scheduled_review_kinds() -> tuple[str, ...]:
             ):
                 raise ValueError("duplicate merge_gate/required_scheduled_reviews key")
             cfg = yaml.safe_load(text) or {}
-            configured = _validate_configured_kinds(
-                (cfg.get("merge_gate") or {}).get("required_scheduled_reviews")
-            )
+            merge_gate = cfg.get("merge_gate") or {}
+            if not isinstance(merge_gate, dict):
+                merge_gate = {}
+            # The parse succeeded, so the STRUCTURE is what the operator declared --
+            # authoritative over the text scan in both directions.
+            key_seen_in_file = "required_scheduled_reviews" in merge_gate
+            configured = _validate_configured_kinds(merge_gate.get("required_scheduled_reviews"))
         except Exception:
             configured = None  # fail-closed: fall back to the default set below
     if configured is None and key_seen_in_file:
