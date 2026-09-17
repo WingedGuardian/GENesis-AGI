@@ -1,6 +1,7 @@
 """Tests for ConversationLoop."""
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -728,6 +729,225 @@ async def test_should_reset_uses_local_midnight_not_utc(loop, monkeypatch):
     assert loop._should_reset({"started_at": "2026-08-24T06:00:00+00:00"}, now=now) is False
 
 
+# ── Stream-truncation degradation (PR #1625) ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_turn_degrades_to_contingency_and_never_parks(
+    loop_with_contingency, mock_invoker, monkeypatch,
+):
+    """Typing the size failure must not cost the turn its SAFE degradation.
+
+    `CCStreamTruncatedError` is a `CCProcessError`, so it stopped matching the
+    `(CCQuotaExhaustedError, CCRateLimitError)` handler — and with it went the
+    rate-limit stamp, the failure-detector class, and `_try_contingency`. The
+    turn fell to the terminal `except CCError` and dead-ended on raw internal
+    prose. Contingency routes through the API with NO CC tool access, so it is
+    the one fallback that cannot repeat what the truncated run already did.
+
+    The PARK stays suppressed on purpose: `park_conversation` stores the prompt
+    for a resume worker to re-dispatch with full tools, which is a SCHEDULED
+    replay of the exact hazard.
+    """
+    from genesis.cc import rate_limit_park
+    from genesis.cc.exceptions import CCRateLimitError, CCStreamTruncatedError
+
+    loop, contingency = loop_with_contingency
+    parked: list = []
+    monkeypatch.setattr(
+        rate_limit_park, "park_conversation",
+        AsyncMock(side_effect=lambda *a, **k: parked.append(a)),
+    )
+
+    exc = CCStreamTruncatedError("dropped 1 over-limit line")
+    exc.__cause__ = CCRateLimitError("429")
+    mock_invoker.run.side_effect = exc
+
+    result = await loop.handle_message("hello", user_id="u1", channel=ChannelType.TERMINAL)
+
+    assert "Contingency mode" in result, f"turn dead-ended instead: {result!r}"
+    contingency.dispatch_conversation.assert_awaited_once()
+    assert not parked, "a truncated turn queued itself for a full-tools re-dispatch"
+    assert mock_invoker.run.await_count == 1, "the prompt was replayed"
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_turn_records_the_rate_limit_it_was_hiding(
+    loop_with_contingency, mock_invoker, db,
+):
+    """The provider's classification survives as `__cause__`, and the stamp is
+    recovered from it rather than guessed from the message text. Without this
+    the account looks healthy to scheduling while it is actually rate-limited.
+    """
+    from genesis.cc.exceptions import CCQuotaExhaustedError, CCStreamTruncatedError
+
+    loop, _ = loop_with_contingency
+    exc = CCStreamTruncatedError("dropped 1 over-limit line")
+    exc.__cause__ = CCQuotaExhaustedError("usage limit reached")
+    mock_invoker.run.side_effect = exc
+
+    await loop.handle_message("hello", user_id="u1", channel=ChannelType.TERMINAL)
+
+    row = await cc_sessions.get_active_foreground(db, user_id="u1", channel="terminal")
+    assert row is not None and row.get("rate_limited_at"), (
+        "a rate limit behind a truncation went unrecorded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_truncation_with_no_rate_limit_cause_records_none(
+    loop_with_contingency, mock_invoker, db,
+):
+    """CLAUSE COVER for the `__cause__` isinstance check.
+
+    An ordinary truncation (no provider limit behind it) must not stamp the
+    session rate-limited — that stamp drives scheduling back-off, and a false
+    one throttles a healthy account.
+    """
+    from genesis.cc.exceptions import CCStreamTruncatedError
+
+    loop, _ = loop_with_contingency
+    mock_invoker.run.side_effect = CCStreamTruncatedError("dropped 1 over-limit line")
+
+    await loop.handle_message("hello", user_id="u1", channel=ChannelType.TERMINAL)
+
+    row = await cc_sessions.get_active_foreground(db, user_id="u1", channel="terminal")
+    assert row is not None and not row.get("rate_limited_at"), (
+        "a plain truncation was recorded as a rate limit"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_truncation_after_streaming_does_not_answer_twice(
+    loop_with_contingency, mock_invoker,
+):
+    """The BOUND on the contingency degradation — and it must not be silence.
+
+    An oversized TOOL-RESULT line can be dropped after answer text already
+    reached the user. Running contingency then stacks a second,
+    differently-sourced answer on top of what is on screen.
+
+    But returning "" is the wrong way to stop it, which is the correction this
+    test now carries (Codex P1, PR #1625 round 4). `streamed["text"]` records
+    that a text EVENT passed `_failover_tracked`, NOT that anything was
+    delivered: outside a private Telegram chat the streamer is None
+    (`_handler_messages.py:122-128`) and `_on_event` no-ops
+    (`_handler_context.py:99`) while the flag still flips. An empty return
+    there shows the user nothing at all — a silent empty success, the exact
+    shape this PR exists to prevent. A short notice is safe when text DID
+    arrive and is the only output when it did not.
+    """
+    from genesis.cc.exceptions import CCStreamTruncatedError
+    from genesis.cc.types import StreamEvent
+
+    loop, contingency = loop_with_contingency
+
+    async def _stream_then_drop(inv, on_event=None):
+        if on_event:
+            await on_event(StreamEvent(event_type="text", text="half an answer"))
+        raise CCStreamTruncatedError("dropped 1 over-limit line")
+
+    mock_invoker.run_streaming = AsyncMock(side_effect=_stream_then_drop)
+
+    result = await loop.handle_message_streaming(
+        "hello", user_id="u1", channel=ChannelType.TERMINAL, on_event=AsyncMock(),
+    )
+
+    # No second answer...
+    contingency.dispatch_conversation.assert_not_awaited()
+    assert "Kimi fallback response" not in result
+    # ...and no silence either. The second assertion is the one that would have
+    # caught the regression; `!= ""` alone would pass on any stray whitespace.
+    assert result.strip(), "a truncated turn returned an empty, non-error reply"
+    assert "lost this answer" in result, f"the user was told nothing useful: {result!r}"
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_failover_peer_is_never_parked(
+    loop_with_contingency, mock_invoker, monkeypatch,
+):
+    """The park hazard, reached through the FAILOVER peer rather than the home
+    attempt — the route the earlier suppression did not cover.
+
+    When the home model is rate-limited and a roster peer runs tools but then
+    truncates before emitting text, `_try_roster_failover` used to return a
+    bare `None`. Both call sites read that as ordinary exhausted failover, so
+    when contingency was also unavailable they called `park_conversation` —
+    which in live mode durably schedules the SAME prompt for a later
+    full-tools direct session, repeating every write and send the truncated
+    peer had already performed (Codex P1, PR #1625).
+
+    The helper now returns `UNREPLAYABLE`, which permits tool-less contingency
+    and forbids the park.
+    """
+    from genesis.cc import rate_limit_park
+    from genesis.cc.conversation import UNREPLAYABLE
+    from genesis.cc.exceptions import CCRateLimitError
+
+    loop, contingency = loop_with_contingency
+    parked: list = []
+    monkeypatch.setattr(
+        rate_limit_park, "park_conversation",
+        AsyncMock(side_effect=lambda *a, **k: parked.append(a)),
+    )
+    # Contingency unavailable — the only branch that reaches the park.
+    # Unsuccessful RESULT, not None: _try_contingency reads result.success,
+    # so None would crash before reaching the branch under test.
+    contingency.dispatch_conversation = AsyncMock(
+        return_value=SimpleNamespace(success=False, reason="unavailable",
+                                     text=None, model=None),
+    )
+    monkeypatch.setattr(
+        loop, "_try_roster_failover", AsyncMock(return_value=UNREPLAYABLE),
+    )
+    mock_invoker.run.side_effect = CCRateLimitError("429")
+
+    result = await loop.handle_message(
+        "hello", user_id="u1", channel=ChannelType.TERMINAL,
+    )
+
+    assert not parked, (
+        "a truncated failover peer queued its prompt for a full-tools "
+        "re-dispatch — every write and send it already performed will run again"
+    )
+    assert result, "the turn returned nothing at all"
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_exhausted_failover_still_parks(
+    loop_with_contingency, mock_invoker, monkeypatch,
+):
+    """CONTROL, and it is what keeps the sentinel meaningful.
+
+    Parking is the CORRECT behaviour when the peer chain is merely exhausted
+    and nothing ran — the turn auto-resumes when capacity returns. An
+    implementation that suppressed every park would satisfy the test above
+    while silently dropping turns that should have been retried.
+    """
+    from genesis.cc import rate_limit_park
+    from genesis.cc.exceptions import CCRateLimitError
+
+    loop, contingency = loop_with_contingency
+    parked: list = []
+    monkeypatch.setattr(
+        rate_limit_park, "park_conversation",
+        AsyncMock(side_effect=lambda *a, **k: parked.append(a)
+                  or SimpleNamespace(copy="parked")),
+    )
+    contingency.dispatch_conversation = AsyncMock(
+        return_value=SimpleNamespace(success=False, reason="unavailable",
+                                     text=None, model=None),
+    )
+    monkeypatch.setattr(loop, "_try_roster_failover", AsyncMock(return_value=None))
+    mock_invoker.run.side_effect = CCRateLimitError("429")
+
+    await loop.handle_message("hello", user_id="u1", channel=ChannelType.TERMINAL)
+
+    assert parked, (
+        "an ordinary exhausted failover was NOT parked — turns that should "
+        "auto-resume when capacity returns are now dropped instead"
+    )
+
 # --- Session self-knowledge on RESUMED turns (measured 2026-09-02) ----------
 # A Telegram DM session refused "switch to Opus, medium effort", claiming it
 # could not change its own model. session_config existed and GENESIS_SESSION_ID
@@ -910,3 +1130,70 @@ async def test_contingency_reassembles_identity_on_a_RESUMED_turn(
     # The distinguishing fact: FULL identity, not just the appended fragment
     # that a resumed turn's prompt had been reduced to.
     assert "You are Genesis." in (system_prompt or ""), (system_prompt or "")[:300]
+
+
+def test_was_resume_stays_required_at_the_chokepoint():
+    """LOCK on the fix itself, not on one call site.
+
+    `was_resume` shipped with a `False` default, and every call site had to
+    REMEMBER to pass it. Three later sites did not: they inherited the
+    default, silently skipped identity assembly on resumed turns, merged
+    without a conflict, and broke no test — because `system_prompt is None`
+    is the broken proxy the parameter exists to replace, and on Telegram a
+    resumed prompt is never None.
+
+    Making it required turns that whole class into a TypeError at the call
+    site. A default restored here would re-open it while every existing test
+    stays green (they all pass it explicitly), so the guarantee is asserted
+    on the SIGNATURE rather than on behaviour. (PR #1625 merge audit.)
+    """
+    import inspect
+
+    from genesis.cc.conversation import ConversationLoop
+
+    for name in ("_try_contingency", "_handle_stream_truncated"):
+        sig = inspect.signature(getattr(ConversationLoop, name))
+        param = sig.parameters.get("was_resume")
+        assert param is not None, f"{name} lost its was_resume parameter"
+        assert param.default is inspect.Parameter.empty, (
+            f"{name}.was_resume regained a default — a future call site can "
+            "now inherit it and silently skip identity assembly on a resumed "
+            "turn, with no conflict and no failing test"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_turn_reaching_contingency_via_truncation_keeps_identity(
+    loop_with_contingency, mock_invoker
+):
+    """The DIMENSION the suite was missing, and why 95 green tests proved
+    nothing about it.
+
+    Main's identity test drives a RESUMED Telegram turn through the
+    rate-limit call site. This branch's truncation tests drive TERMINAL with
+    no resume through a DIFFERENT call site. Disjoint — so a resumed turn
+    reaching contingency through the TRUNCATION path was covered by neither,
+    and that site had silently inherited `was_resume=False`.
+
+    Same assertion as main's test, aimed at the site this branch added: the
+    tool-less router must receive full Genesis identity, not the appended
+    fragment a resumed prompt had been reduced to.
+    """
+    from genesis.cc.exceptions import CCStreamTruncatedError
+
+    loop, contingency = loop_with_contingency
+    # Turn 1 establishes the session so that turn 2 RESUMES it.
+    await loop.handle_message("hello", user_id="tg-trunc", channel=ChannelType.TELEGRAM)
+    mock_invoker.run.side_effect = CCStreamTruncatedError("dropped 1 over-limit line")
+
+    await loop.handle_message("follow up", user_id="tg-trunc", channel=ChannelType.TELEGRAM)
+
+    contingency.dispatch_conversation.assert_awaited()
+    kwargs = contingency.dispatch_conversation.await_args.kwargs
+    args = contingency.dispatch_conversation.await_args.args
+    system_prompt = kwargs.get("system_prompt") or (args[1] if len(args) > 1 else "")
+    assert "You are Genesis." in (system_prompt or ""), (
+        "a resumed turn degraded through the TRUNCATION path handed the "
+        "tool-less router a prompt with no Genesis identity: "
+        f"{(system_prompt or '')[:300]!r}"
+    )

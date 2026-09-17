@@ -613,7 +613,12 @@ behind the writer, and 7 were a guard since removed.
   calls. Always pass ≥2 questions; if only one is real, add a trivial/filler
   second question to satisfy the tool. Every time, no exceptions.
 - **Plan mode by default** for any task with 3+ steps or architectural
-  decisions. If something goes sideways — STOP and re-plan.
+  decisions. If something goes sideways — STOP and re-plan. A plan-mode
+  document under `~/.claude/plans/` that will outlive one session opens with
+  the structured header (status, `pinned.main`, `binds`/`prevents`, and the
+  trackers it executes) — format and rationale in the genesis-development
+  skill, `references/plan-docs.md`. Task-executor plans (`/task`,
+  `TASK_INTAKE.md`) keep their own section contract and are out of scope.
 - **Use subagents** to keep main context clean. One concern per subagent.
   **A MANDATED subagent is already the request** — when a gate's block message
   tells you to dispatch one, dispatch it; don't stop to ask. Ask only for

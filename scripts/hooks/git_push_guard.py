@@ -62,22 +62,23 @@ post a comment (issue comment) or PR review whose body contains a marker
 ``<!-- genesis-scheduled-review: head=<full-40-hex-sha> kind=<name> -->`` naming the exact
 head it reviewed AND which routine it was (``kind``). The merge gate
 (``_check_scheduled_claude_reviewed_head``) blocks unless an owner-authored marker for
-EVERY effective required kind (``_required_scheduled_review_kinds()`` — DEFAULT
-code-review + leaks, with the leak scanner irreducible; an install may relax the optional
-kinds to advisory via ``merge_gate.required_scheduled_reviews`` in genesis.yaml) names
+EVERY effective required kind (``_required_scheduled_review_kinds()`` — DEFAULT ``leaks``
+alone, which is also irreducible; ``code-review`` is ADVISORY by default because no
+routine emits its marker, and an install that runs one re-arms it via
+``merge_gate.required_scheduled_reviews`` in genesis.yaml) names
 the PR's CURRENT head — so if any required routine never ran, ran on a stale commit, or
 was rate-limited, the merge is blocked (naming the missing kinds). An ADVISORY routine
-(one relaxed out of the required set locally) still posts its review on the PR to be read
+still posts its review on the PR to be read
 and addressed, but its absence does not block. SCOPE: this gate
 enforces ONLY when the merge targets the configured PUBLIC repo — the declared
 ``github.user``/``github.public_repo`` in ``~/.genesis/config/genesis.yaml``
 (``_scheduled_gate_applies`` / ``_canonical_public_repo``). A merge to any OTHER repo
 (a private fork, the voice repo, backups) no-ops, since the required ``/schedule``
-routines run only on the public repo. Deployment note: on the public repo the required
-routines ARE configured (the deploy precondition); a clone that runs on its own public
-repo without a producer uses `# scheduled-review-override` (or relaxes the optional kinds
-via ``merge_gate.required_scheduled_reviews``) — the override valve is the escape by design, not an
-opt-in flag. Fail-closed on scope uncertainty: if the canonical repo is undeterminable
+routines run only on the public repo. Deployment note: on the public repo the leaks
+routine IS configured (the deploy precondition); a clone that runs on its own public
+repo without a producer uses `# scheduled-review-override` — since the only default kind
+is the irreducible one, config cannot relax it, and the override valve is the escape by
+design, not an opt-in flag. Fail-closed on scope uncertainty: if the canonical repo is undeterminable
 the gate ENGAGES rather than silently disarming.
 A DISMISSED or PENDING (draft) review no longer vouches (its marker is ignored), mirroring
 the Codex path. The marker means "ran CLEAN", not merely "ran": a review whose body carries a
@@ -815,8 +816,10 @@ _CI_PENDING_STATES = {"PENDING", "EXPECTED"}
 # almost always by a `concurrency: cancel-in-progress` supersession, which leaves
 # the cancelled dup attached to the head commit. It is red BY DEFAULT (it is also
 # in _CI_RED_CONCLUSIONS), and dropped ONLY when a check of the SAME identity
-# (name + workflowName, see _ci_identity) concluded SUCCESS at-or-after it on this
-# head (so a SUCCESS-then-cancel re-run on an unchanged head still blocks).
+# (name + workflowName, see _ci_identity) concluded SUCCESS STRICTLY AFTER it on this
+# head (so a SUCCESS-then-cancel re-run on an unchanged head still blocks, and so does
+# an EQUAL second-precision timestamp, which orders nothing — see
+# _drop_superseded_cancels for why an unprovable ordering fails closed).
 # Deliberately scoped to CANCELLED alone: FAILURE/TIMED_OUT/ACTION_REQUIRED/
 # STARTUP_FAILURE carry real verdicts and always block, even with a success sibling.
 _CI_CANCEL_CONCLUSIONS = {"CANCELLED"}
@@ -861,18 +864,152 @@ def _ci_identity(c: dict) -> tuple[str, str] | None:
     return None
 
 
+def _ci_completed_at(entry: dict) -> _dt.datetime | None:
+    """A check-run's ``completedAt`` as an OFFSET-AWARE datetime, or None.
+
+    None on anything that cannot be established: absent, blank, unparseable, or
+    parsed but NAIVE. A NON-STRING value is the one shape that does not return
+    None -- ``.strip()`` raises AttributeError out of this helper, which
+    ``run_guard`` converts to exit 2, a BLOCK. Unreachable from GitHub (the
+    ``DateTime`` scalar is string-or-null) and fail-closed either way, but the
+    enumeration above would otherwise be false. Every caller treats None as "cannot be compared", which on
+    this path means an unparseable SUCCESS supersedes nothing and an unparseable
+    CANCEL is kept — the fail-closed direction.
+
+    Naive is rejected rather than assumed UTC. Comparing a naive datetime against
+    an aware one raises TypeError, and the alternative to rejecting it is guessing
+    a zone, which is exactly the kind of assumption this function exists to stop
+    relying on. GitHub has always sent an offset; if it ever sends a bare value,
+    the gate should get stricter, not luckier.
+    """
+    raw = (entry.get("completedAt") or "").strip()
+    if not raw:
+        return None
+    try:
+        # `fromisoformat` accepts a literal `Z` from 3.11, but normalising first
+        # costs nothing and keeps this readable against older interpreters.
+        parsed = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _drop_superseded_cancels(checks: list) -> list:
+    """Return *checks* with superseded ``concurrency: cancel-in-progress`` duplicates
+    removed — a CANCELLED CheckRun is dropped ONLY when a SUCCESS of the EXACT same
+    ``(name, workflowName)`` identity completed STRICTLY AFTER it; every other entry is
+    returned unchanged, in order.
+
+    STRICTLY after, not at-or-after. ``completedAt`` is second-precision, so an EQUAL
+    timestamp does not order the two runs at all — it says only that they finished in
+    the same second, which is not evidence that the success came second. On a
+    supersession the successful run STARTS when the cancel fires and finishes a whole
+    job later, so a tie is not even the shape this drop exists to recognise; a tie is
+    far likelier to be two unrelated runs, or a genuinely-cancelled latest attempt.
+    An unprovable ordering therefore fails CLOSED, like every other unresolvable case
+    below. MEASURED before tightening (the Actions runs API over 400 runs / 2 days,
+    30 real cancelled jobs on 25 shas): 18/30 had a strictly-later success, 12/30 had
+    none, and **0/30 turned on a tie** — so this costs nothing observed, and 30 is a
+    small denominator, which is precisely why the direction matters more than the
+    rate: being wrong here over-blocks, it cannot wrong-green.
+
+    THE ONE home of that rule. It had two: ``_pr_ci_status`` (which has always
+    applied it) and ``_mechanical_scan_is_green`` (added later, which re-derived a
+    naive ``all(c == "SUCCESS")`` and never handled a cancel at all). A doubled
+    workflow dispatch — two ``pull_request`` runs for one sha, leaving EVERY
+    check-run as a success+cancelled pair — made the two disagree about one payload
+    inside ONE process: ``ci: green`` alongside "'leak-detector' is not green at
+    this head", a message that sends the reader to inspect a job that is green.
+    Deterministic for as long as that head stands, not a flake. Any FUTURE consumer
+    of check-run conclusions calls this rather than re-deriving it a third time.
+
+    Every condition below fails CLOSED — a cancel that cannot be PROVEN superseded
+    is returned, and the caller's own red/not-green logic then sees it:
+
+    * Only GitHub Actions CheckRuns with a resolvable identity AND a ``completedAt``
+      may serve as the superseding sibling (``_ci_identity`` → None for a legacy
+      StatusContext or a non-Actions check; a timestampless SUCCESS is skipped). So
+      a StatusContext SUCCESS can never drop a same-named CheckRun cancel.
+    * A cancel with no identity, no ``completedAt``, or no qualifying success STAYS.
+      That includes SUCCESS-then-cancel on an unchanged head: the latest attempt
+      never passed, so nothing supersedes the cancel.
+    * ONLY ``_CI_CANCEL_CONCLUSIONS`` (deliberately ``{"CANCELLED"}`` alone) is
+      droppable. FAILURE / TIMED_OUT / ACTION_REQUIRED / STARTUP_FAILURE / STALE
+      carry real verdicts and are never dropped, whatever completed beside them —
+      so this can never widen into "ignore anything that is not SUCCESS".
+    * Non-terminal entries (an in-flight re-run) are not conclusions and are never
+      touched; the caller still counts them PENDING.
+    * Entries that are not dicts are passed through untouched, so a caller's own
+      shape checks still see the payload it was given.
+
+    Comparison PARSES both ``completedAt`` values and compares datetimes, in both
+    passes. This is NOT the pulled #1420 finding-magnet, which sorted the WHOLE set
+    (including QUEUED runs with a null ``startedAt``) to pick a global "latest".
+
+    IT USED TO BE A LEXICOGRAPHIC STRING COMPARE, and the reason it no longer is
+    was written down here before it was acted on. GitHub's GraphQL ``completedAt``
+    is emitted as second-precision UTC with a literal ``Z`` (MEASURED 2017/2017
+    entries across 122 PR rollups — every one ``Z``-suffixed with no fractional
+    part). That is an OBSERVATION, not a contract: the schema documents the
+    ``DateTime`` scalar only as "An ISO-8601 encoded UTC date string", which
+    constrains neither sub-second precision nor the offset spelling. String order
+    equals chronological order only while EVERY value shares one format, and two
+    real shapes break it — a ``+00:00`` offset instead of ``Z``, and fractional
+    seconds (``'Z'`` sorts ABOVE ``'.'``, so a SUCCESS at ``:00Z`` compares as later
+    than a cancel at ``:00.9Z`` and wrongly drops it). The consequence is not
+    cosmetic: `_mechanical_scan_is_green` consumes this, so a reversed ordering
+    drops a real cancellation and carries an old leaks review forward — and under
+    ``# ci-override`` that relief is the only remaining check of the mechanical
+    layer. An observation is not a thing to gate on when parsing costs one call.
+
+    ``_ci_completed_at`` fails CLOSED on anything it cannot parse into an
+    OFFSET-AWARE datetime, including a naive value: an unparseable SUCCESS cannot
+    supersede anything, and an unparseable CANCEL is kept. Naive is excluded rather
+    than assumed-UTC because comparing naive against aware raises, and guessing a
+    zone to avoid that is how a wrong-green gets built.
+    """
+    # Pass 1: the latest completedAt among SUCCESS runs, per strict identity.
+    success_latest: dict[tuple[str, str], _dt.datetime] = {}
+    for c in checks:
+        if not isinstance(c, dict) or c.get("conclusion") not in _CI_GREEN:
+            continue
+        ident = _ci_identity(c)
+        ts = _ci_completed_at(c)
+        if ident is None or ts is None:
+            continue
+        known = success_latest.get(ident)
+        if known is None or ts > known:
+            success_latest[ident] = ts
+
+    # Pass 2: drop only the cancels pass 1 proves superseded. STRICTLY after, so a
+    # tie keeps the cancel: equal second-precision stamps make the ordering
+    # unprovable, and unprovable must not mean droppable.
+    kept: list = []
+    for c in checks:
+        if isinstance(c, dict) and c.get("conclusion") in _CI_CANCEL_CONCLUSIONS:
+            ident = _ci_identity(c)
+            cts = _ci_completed_at(c)
+            if ident is not None and cts is not None:
+                latest = success_latest.get(ident)
+                if latest is not None and latest > cts:
+                    continue
+        kept.append(c)
+    return kept
+
+
 def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]:
     """Classify a PR's CI check-runs.
 
     Returns ``(state, problem_checks)`` where state is one of:
       * ``"green"``   — every non-skipped check concluded SUCCESS
       * ``"red"``     — at least one check failed/timed-out, or was cancelled
-                        with NO same-identity SUCCESS completing at-or-after it.
+                        with NO same-identity SUCCESS completing STRICTLY AFTER it.
                         A CANCELLED CheckRun that a same (name, workflowName)
-                        SUCCESS completed at-or-after is a superseded
+                        SUCCESS completed strictly after is a superseded
                         `concurrency: cancel-in-progress` duplicate and is dropped
-                        (see _ci_identity + success_latest) — strict identity,
-                        terminal completedAt comparison only, fail-closed.
+                        by the SHARED _drop_superseded_cancels helper (see
+                        _ci_identity) — strict identity, terminal completedAt
+                        comparison only, fail-closed.
       * ``"pending"`` — a check is still queued/running (and none are red)
       * ``"absent"``  — a READABLE but genuinely EMPTY rollup (``[]``): zero checks
                         exist, i.e. CI has NOT run. A DEFINITE fact, not a read
@@ -942,26 +1079,21 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         # never fired (e.g. a conflicting branch suppresses the whole suite).
         return "absent", []
 
-    # First pass: for each strict identity (name, workflowName), the latest
-    # `completedAt` among its SUCCESS CheckRuns on this head. A CANCELLED entry is
-    # a superseded concurrency-cancel duplicate ONLY if a SUCCESS of the same
-    # identity completed AT OR AFTER it (see the drop branch). Only GitHub Actions
-    # CheckRuns with a resolvable identity AND a completedAt contribute; legacy
-    # StatusContexts, non-Actions checks, and timestampless successes never serve
-    # as siblings. This is NOT the #1420 finding-magnet: that sorted the WHOLE set
-    # (incl. QUEUED runs with null startedAt) to pick a global "latest"; here both
-    # sides of the comparison are terminal COMPLETED runs that always carry a
-    # completedAt, and every unresolvable case fails CLOSED (stays red).
-    success_latest: dict[tuple[str, str], str] = {}
-    for c in checks:
-        if not isinstance(c, dict) or c.get("conclusion") not in _CI_GREEN:
-            continue
-        ident = _ci_identity(c)
-        ts = (c.get("completedAt") or "").strip()
-        if ident is None or not ts:
-            continue
-        if ts > success_latest.get(ident, ""):
-            success_latest[ident] = ts
+    # Drop superseded `concurrency: cancel-in-progress` duplicates via the SHARED
+    # primitive (_drop_superseded_cancels — read its docstring for the strict
+    # identity + strictly-after rule and every fail-closed case). Filtering here rather
+    # than branching inside the classify loop is behaviour-identical: a drop implies
+    # a same-identity SUCCESS in this very list, and that sibling sets
+    # `saw_recognized` and contributes the same casefolded `workflowName` to
+    # `workflows_ran` on its own. A cancel that is NOT dropped falls through to the
+    # red branch below, because CANCELLED is also in _CI_RED_CONCLUSIONS.
+    #
+    # Deliberately AFTER the empty-rollup "absent" return above, which reads the
+    # RAW payload: "zero checks exist" must stay a fact about what GitHub reported,
+    # never an artefact of our own filtering. (The filter cannot empty a non-empty
+    # list anyway — a drop requires a surviving SUCCESS sibling — but the ordering
+    # makes that independent of this helper's behaviour.)
+    checks = _drop_superseded_cancels(checks)
 
     red: list[str] = []
     pending: list[str] = []
@@ -983,30 +1115,16 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         if conclusion in _CI_SKIP_CONCLUSIONS:
             saw_recognized = True
             continue
-        if conclusion in _CI_CANCEL_CONCLUSIONS:
-            ident = _ci_identity(c)
-            cts = (c.get("completedAt") or "").strip()
-            if ident is not None and cts and success_latest.get(ident, "") >= cts:
-                # Superseded concurrency-cancel duplicate: a SUCCESS of this EXACT
-                # identity (name + workflowName) completed AT OR AFTER this cancel,
-                # so the cancelled entry is a `cancel-in-progress` leftover with no
-                # verdict of its own — drop it. Wrong-green-impossible:
-                # FAILURE/TIMED_OUT are not in _CI_CANCEL_CONCLUSIONS (still red);
-                # an in-flight re-run is a non-terminal entry that still counts
-                # pending below; and a cancel with no identity, no completedAt, or
-                # NO same-identity success at-or-after it (e.g. SUCCESS-then-cancel
-                # on an unchanged head) falls through and stays red.
-                saw_recognized = True
-                # A superseded duplicate implies a same-identity SUCCESS exists on
-                # this head, so the workflow demonstrably ran.
-                workflows_ran.add(wf_key)
-                continue
+        # Any CANCELLED entry still present here was NOT superseded (the shared
+        # filter above proved it, or could not) and falls through to the red branch,
+        # because CANCELLED is in _CI_RED_CONCLUSIONS. The dropped ones need no arm
+        # of their own: each implies a same-identity SUCCESS in this list, which
+        # sets saw_recognized and adds the identical workflowName to workflows_ran.
         if conclusion in _CI_RED_CONCLUSIONS or state in _CI_RED_STATES:
             saw_recognized = True
             red.append(name)
         elif conclusion in _CI_GREEN or state in _CI_GREEN:
-            # The ONLY branch (besides the superseded-cancel drop above, which implies
-            # a green sibling) that feeds workflows_ran: the required-identity check
+            # The ONLY branch that feeds workflows_ran: the required-identity check
             # runs only when nothing is red/pending (those return first, and already
             # block), so only PASSING verdicts can vouch that a required workflow ran.
             # A COMPLETED run with a null conclusion (the benign ignore below) carries
@@ -5221,9 +5339,37 @@ _SCHEDULED_REVIEW_ANYCASE_HEAD_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
 
 # Default scheduled-review kinds the merge gate REQUIRES at head. A PR merges only when
 # a valid owner-authored marker for EACH effective required kind names the current head.
-# The DEFAULT is the full set (shipped to every install, unchanged); an install may relax
-# the OPTIONAL kinds locally — see _required_scheduled_review_kinds() for the lever.
-_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
+# An install may EXPAND this set locally — see _required_scheduled_review_kinds().
+#
+# WHY code-review IS NOT IN THE DEFAULT. A required kind is a promise that some producer
+# emits its marker. For `code-review` no producer exists: measured 2026-09-16 over every
+# owner-authored comment and review on all 51 open non-draft PRs and the 40 most recently
+# merged ones, `leaks` markers appear 47 and 31 times respectively and `code-review`
+# markers appear ZERO times — not stale at an earlier head, never emitted at all. The gate
+# consequently blocked 51/51 open PRs on a kind nothing produces, so every one of those 40
+# merges necessarily carried `# scheduled-review-override`: a sigil that verifies NOTHING,
+# demoted by daily use from an exception valve to the standard merge incantation. That is
+# strictly worse than not requiring the kind, because it also disarms the override for the
+# leaks lane, where it is the only escape. Requiring a marker no routine writes does not
+# buy review; it buys a habit of waiving review.
+#
+# What is NOT lost: `code-review` is a QUALITY review, and per-head quality review is
+# already enforced by two other gates that do have live producers — Codex-at-head
+# freshness (_check_codex_reviewed_head) and the inline-finding thresholds
+# (_check_inline_review_findings). Nothing about LEAK protection changes: `leaks` stays
+# irreducible below, and the mechanical `leak-detector` CI job still runs per head.
+#
+# The kind remains KNOWN (_KNOWN_SCHEDULED_REVIEW_KINDS), so an install that DOES stand a
+# producer up re-arms it with one line of local config:
+#
+#     # ~/.genesis/config/genesis.yaml
+#     merge_gate:
+#       required_scheduled_reviews: [code-review, leaks]
+#
+# Accepted residue: while the kind is advisory, a `code-review` marker whose body carries a
+# blocking finding is not consulted — an advisory kind is neither required nor refusable.
+# Inert today (no producer), and the config line above is what makes it bind again.
+_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
 # The leak/secret scanner is IRREDUCIBLE: always required, never removable by config. A
 # secret reaching a public repo is irreversible, so no local policy may waive it.
 _IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
@@ -5257,19 +5403,40 @@ _IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
 # travel with a clone rather than describing one install. A suite named differently
 # simply finds no match, and no match means NO RELIEF -- the pre-relief behaviour, so
 # the failure direction of a wrong pin is a missing convenience, never a weaker gate.
+#
+# THE WORKFLOW HALF IS A DISPLAY NAME, AND A DISPLAY NAME IS NOT UNIQUE PROVENANCE.
+# GitHub does not require `name:` to be unique across workflow files (its workflow-syntax
+# reference states no such constraint; an OMITTED name falls back to the file path, which
+# is unique — an explicit one is not). So a second file declaring `name: CI` with a job
+# named `leak-detector` would share this tuple, and its SUCCESS could both supersede the
+# real scanner's CANCELLED in _drop_superseded_cancels and satisfy the pin below.
+# Real provenance exists in GraphQL (checkSuite.workflowRun.workflow.databaseId, or
+# checkSuite.workflowRun.file.path) but `gh pr view --json statusCheckRollup` does NOT
+# expose it — a rollup entry carries only __typename/completedAt/conclusion/detailsUrl/
+# name/startedAt/status/workflowName, and detailsUrl's RUN id cannot separate a decoy
+# from a legitimate re-run of the same file. Pinning on provenance therefore means
+# replacing this gate's read path with a raw GraphQL query.
+# Until then the PRECONDITION is closed instead of the consequence:
+# TestWorkflowDisplayNameIsUniqueProvenance fails CI if two workflow files ever share a
+# display name, or if this pin stops resolving to exactly one file. That is complete for
+# the reachable case — workflowName is populated only for Actions check-runs, and those
+# come from this repo's own workflow files; a non-Actions check-run has no workflowName,
+# so _ci_identity returns None and it is never a sibling.
 _MECHANICAL_RESCAN_BY_KIND = {"leaks": ("leak-detector", "CI")}
 # Every kind an install is ALLOWED to name in config. A configured kind outside this set
 # (a typo, a wrong type, a stale routine name) can never be satisfied by a real marker, so
-# the whole config is treated as invalid and we fail closed to the default rather than let
-# it either wedge merges forever or silently narrow the required set.
+# the whole config is treated as invalid and we fall back to the default rather than let it
+# wedge merges forever on a kind nothing can stamp. The fallback is announced (the NOTE in
+# _required_scheduled_review_kinds) because, the default being minimal, it can NARROW a
+# policy the operator declared.
 _KNOWN_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
 
 
 def _validate_configured_kinds(items: object) -> list[str] | None:
     """Lowercase + validate a configured kind list. Returns the cleaned list (possibly
     empty, meaning "only the irreducible kinds"), or None if ANYTHING is off — not a list,
-    a non-string element, a blank element, or an unknown kind. None makes the caller fail
-    CLOSED to the full default rather than honor a malformed/ambiguous relaxation."""
+    a non-string element, a blank element, or an unknown kind. None makes the caller fall
+    back to the default rather than honor a malformed/ambiguous policy."""
     if not isinstance(items, list):
         return None
     out: list[str] = []
@@ -5286,25 +5453,30 @@ def _validate_configured_kinds(items: object) -> list[str] | None:
 def _required_scheduled_review_kinds() -> tuple[str, ...]:
     """The scheduled-review kinds the merge gate REQUIRES at head, as a tuple.
 
-    Default is the full set (``code-review`` + ``leaks``) — shipped unchanged to every
-    install. An install MAY relax the OPTIONAL kinds (e.g. make the structural
-    code-review ADVISORY, so its absence no longer blocks — its review still posts on the
-    PR to be read/addressed if it ran) via LOCAL config, keeping install policy out of the
-    public default:
+    Default is ``leaks`` alone — the only kind with a producer that actually emits its
+    marker (see ``_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS`` for the measurement). An
+    install MAY name a LARGER set via LOCAL config, keeping install policy out of the
+    public default — e.g. one that runs a ``code-review`` routine re-arms it with:
 
         # ~/.genesis/config/genesis.yaml
         merge_gate:
-          required_scheduled_reviews: [leaks]
+          required_scheduled_reviews: [code-review, leaks]
 
     The leak/secret scanner (``_IRREDUCIBLE_...``) is ALWAYS unioned in and CANNOT be
-    dropped by config. Fail-CLOSED toward MORE review: a missing key / unreadable file /
+    dropped by config. Fail-CLOSED toward the default: a missing key / unreadable file /
     parse error / duplicate key / wrong-type / blank / unknown kind ALL fall back to the
-    full default set, never to fewer kinds. Configured kinds are validated against
-    ``_KNOWN_SCHEDULED_REVIEW_KINDS`` and lowercased to the marker grammar. Test seam:
-    ``_TEST_REQUIRED_SCHEDULED_REVIEWS`` (comma-separated) overrides the config file.
+    default set, and the irreducible kind survives every path. Because the default is now
+    MINIMAL rather than maximal, config EXPANDS it, so — exactly as in
+    ``_required_ci_workflows`` — a fallback can silently NARROW a stricter declared
+    policy. When the key is visibly present in the file but its value was discarded, a
+    NOTE names the substitution (the fallback itself is unchanged). Configured kinds are
+    validated against ``_KNOWN_SCHEDULED_REVIEW_KINDS`` and lowercased to the marker
+    grammar. Test seam: ``_TEST_REQUIRED_SCHEDULED_REVIEWS`` (comma-separated) overrides
+    the config file.
     """
     raw = os.environ.get("_TEST_REQUIRED_SCHEDULED_REVIEWS")
     configured: list[str] | None = None
+    key_seen_in_file = False
     if raw is not None:
         # Test seam: comma-list; empties dropped so "" means "only the irreducible kinds".
         configured = _validate_configured_kinds([k.strip() for k in raw.split(",") if k.strip()])
@@ -5315,6 +5487,13 @@ def _required_scheduled_review_kinds() -> tuple[str, ...]:
             path = os.path.expanduser("~/.genesis/config/genesis.yaml")
             with open(path) as fh:
                 text = fh.read()
+            # Did the operator DECLARE a policy we are about to substitute? With a
+            # minimal default that substitution can be a NARROWING, so it is worth a
+            # NOTE. Text scan FIRST, so a file yaml cannot parse at all still answers;
+            # the parsed structure overrides it below whenever there IS one, because
+            # the scan alone both misses a key written flow-style or quoted and fires
+            # on the key's own name appearing inside an unrelated block scalar.
+            key_seen_in_file = bool(re.search(r"(?m)^\s*required_scheduled_reviews\s*:", text))
             # yaml.safe_load silently keeps the LAST value for a repeated key, so a
             # badly-merged file (two merge_gate: or required_scheduled_reviews: lines)
             # could quietly narrow the required set. Catch the realistic cases with a
@@ -5325,11 +5504,24 @@ def _required_scheduled_review_kinds() -> tuple[str, ...]:
             ):
                 raise ValueError("duplicate merge_gate/required_scheduled_reviews key")
             cfg = yaml.safe_load(text) or {}
-            configured = _validate_configured_kinds(
-                (cfg.get("merge_gate") or {}).get("required_scheduled_reviews")
-            )
+            merge_gate = cfg.get("merge_gate") or {}
+            if not isinstance(merge_gate, dict):
+                merge_gate = {}
+            # The parse succeeded, so the STRUCTURE is what the operator declared --
+            # authoritative over the text scan in both directions.
+            key_seen_in_file = "required_scheduled_reviews" in merge_gate
+            configured = _validate_configured_kinds(merge_gate.get("required_scheduled_reviews"))
         except Exception:
-            configured = None  # fail-closed: fall back to the full default set below
+            configured = None  # fail-closed: fall back to the default set below
+    if configured is None and key_seen_in_file:
+        print(
+            "NOTE: merge_gate.required_scheduled_reviews in ~/.genesis/config/"
+            "genesis.yaml is present but unreadable/invalid (duplicate key, wrong type, "
+            "blank element, or unknown kind) — enforcing the DEFAULT required set "
+            f"{_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS} instead of your configured "
+            "value. Fix the config to restore your declared policy.",
+            file=sys.stderr,
+        )
     kinds = configured if configured is not None else list(_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS)
     # leaks (and any irreducible kind) is always required, even if config omits it.
     merged = list(dict.fromkeys([*kinds, *_IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS]))
@@ -5382,10 +5574,11 @@ def _required_ci_workflows() -> tuple[str, ...]:
     Fail-CLOSED toward the default: a missing key / unreadable file / parse error /
     duplicate key / wrong type / EMPTY list / blank element ALL fall back to the full
     default — there is no config value that disables the check. Because free-text
-    config can also EXPAND the required set (unlike the whitelist-relaxed scheduled
-    kinds, whose default is maximal), a fallback here can silently NARROW a stricter
-    declared policy — so when the key is visibly present but its value was discarded,
-    a NOTE is printed naming the substitution (the fallback itself is unchanged).
+    config can also EXPAND the required set, a fallback here can silently NARROW a
+    stricter declared policy — so when the key is visibly present but its value was
+    discarded, a NOTE is printed naming the substitution (the fallback itself is
+    unchanged). ``_required_scheduled_review_kinds`` carries the same NOTE for the
+    same reason.
     Test seam: ``_TEST_REQUIRED_CI_WORKFLOWS`` (comma-separated) overrides the config
     file; a blank seam parses to an empty (=invalid) list and also yields the
     default."""
@@ -5957,9 +6150,13 @@ def _mechanical_scan_is_green(
     class this file already documents at _ci_identity, and the whole point of
     this relief is that the mechanical layer really ran.
 
+    Superseded ``concurrency: cancel-in-progress`` duplicates are dropped first, by
+    the SHARED ``_drop_superseded_cancels`` — the same primitive ``_pr_ci_status``
+    uses, so the two gates cannot disagree about one rollup.
+
     Returns False on ANY doubt: a gh error, an unparseable payload, a head that
-    does not match, no entry with that identity, or any conclusion other than
-    SUCCESS. This feeds a merge gate that forces --admin, so an unreadable or
+    does not match, no entry with that identity, or any surviving conclusion other
+    than SUCCESS. This feeds a merge gate that forces --admin, so an unreadable or
     ambiguous scan must never read as a pass.
 
     Tests inject via ``_TEST_GH_ROLLUP_WITH_HEAD`` (a JSON object with
@@ -6010,6 +6207,20 @@ def _mechanical_scan_is_green(
     wanted_workflow = (workflow or "").strip().lower()
     if not wanted_workflow:
         return False  # an unpinned kind can never be established -> fail closed
+    # Drop superseded `concurrency: cancel-in-progress` duplicates FIRST, through the
+    # SAME primitive the CI gate uses (_drop_superseded_cancels — strict
+    # (name, workflowName) identity, a SUCCESS completing STRICTLY AFTER, fail-closed on
+    # every unresolvable case). This path used to have no cancel handling at all, so a
+    # doubled workflow dispatch — which leaves every check-run as a success+cancelled
+    # pair — made ONE `--check-pr` run report `ci: green` and, on the same rollup,
+    # "'leak-detector' is not green at this head", pointing the reader at a green job
+    # while relief stayed unreachable for as long as that head stood.
+    #
+    # Note what the drop does NOT do, because this is where it would be dangerous: it
+    # removes ONLY cancels proven superseded. FAILURE/TIMED_OUT/STALE and an
+    # unsuperseded cancel all survive into `conclusions` and still contradict SUCCESS,
+    # so the guarantee below is intact.
+    rollup = _drop_superseded_cancels(rollup)
     # Collect EVERY same-identity entry, never the first match. One head can carry
     # several runs of one job (a re-run after a ruleset change, a superseded
     # concurrency sibling), and rollup ORDER is not a guarantee -- _pr_ci_status

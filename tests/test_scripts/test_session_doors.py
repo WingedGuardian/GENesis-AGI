@@ -158,6 +158,22 @@ exit 1
 """
 
 
+# Fake claude: the subcommand bypass `exec`s the real binary instead of building
+# a tmux session, so the only way to prove the bypass ran — rather than merely
+# that tmux was not called — is to see claude receive the argv. Logs and exits 0.
+_FAKE_CLAUDE = """#!/usr/bin/env bash
+[[ -n "${FAKE_CLAUDE_LOG:-}" ]] && printf '%s\\n' "$*" >> "$FAKE_CLAUDE_LOG"
+# The slot path pins cwd to $GENESIS_ROOT before running claude; the bypass must
+# match it, because mcp scope, project state and doctor's settings read are all
+# cwd-keyed. Recording pwd is the only way to assert that from outside.
+[[ -n "${FAKE_CLAUDE_CWD:-}" ]] && pwd > "$FAKE_CLAUDE_CWD"
+# Distinguish UNSET from empty: an exported-but-empty TMPDIR is a different
+# (worse) bug than no TMPDIR, and `${TMPDIR:-}` would conflate them.
+[[ -n "${FAKE_CLAUDE_ENV:-}" ]] && printf 'TMPDIR=[%s]\n' "${TMPDIR-<unset>}" > "$FAKE_CLAUDE_ENV"
+exit 0
+"""
+
+
 @pytest.fixture()
 def door(tmp_path):
     """Run cc-slot.sh with a fake tmux + isolated HOME.
@@ -172,6 +188,10 @@ def door(tmp_path):
     fake_tmux = bin_dir / "tmux"
     fake_tmux.write_text(_FAKE_TMUX)
     fake_tmux.chmod(fake_tmux.stat().st_mode | stat.S_IEXEC)
+
+    fake_claude = bin_dir / "claude"
+    fake_claude.write_text(_FAKE_CLAUDE)
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IEXEC)
 
     home = tmp_path / "home"
     home.mkdir()
@@ -190,6 +210,9 @@ def door(tmp_path):
     snap2 = tmp_path / "snap2.txt"
     killlog = tmp_path / "kill.log"
     cap_log = tmp_path / "cap_calls.txt"
+    claude_log = tmp_path / "claude.log"
+    claude_cwd = tmp_path / "claude_cwd.txt"
+    claude_env = tmp_path / "claude_env.txt"
 
     def _env() -> dict:
         return {
@@ -210,6 +233,9 @@ def door(tmp_path):
             "FAKE_TMUX_SNAP": str(snap),
             "FAKE_TMUX_SNAP2": str(snap2),
             "FAKE_TMUX_SNAP_N": str(tmp_path / "snap_calls.txt"),
+            "FAKE_CLAUDE_LOG": str(claude_log),
+            "FAKE_CLAUDE_CWD": str(claude_cwd),
+            "FAKE_CLAUDE_ENV": str(claude_env),
             "FAKE_TMUX_KILLLOG": str(killlog),
             "FAKE_TMUX_KILL_RC": os.environ.get("_TEST_FAKE_KILL_RC", "0"),
             # Pre-kill admission probe: "" = unavailable (fail-open),
@@ -250,6 +276,9 @@ def door(tmp_path):
     run.snap2 = snap2  # snapshot served from the SECOND call on (TOCTOU tests)
     run.killlog = killlog  # exact kill-session targets, one per line
     run.cap_log = cap_log  # argv of each pre-kill admission probe
+    run.claude_log = claude_log  # argv of a claude the door exec'd DIRECTLY
+    run.claude_cwd = claude_cwd  # cwd that claude inherited from the bypass
+    run.claude_env = claude_env  # TMPDIR claude inherited (unset vs empty)
     run.home = home  # so a test can make the temp-dir candidates unusable
     return run, log, sessions, listing, panes
 
@@ -1288,3 +1317,278 @@ class TestAdmissionSurvivesTheKill:
         assert branch < oauth
         window = text[branch:oauth]
         assert "_oauth_notice" not in window
+
+
+class TestSubcommandBypass:
+    """An EPHEMERAL `claude <subcommand>` must not be given a persistent slot.
+
+    It prints and exits, so a slot occupies capacity the operator wanted for a
+    session, leaves a tmux session behind, and captures the pane's scrollback on
+    exit — which for `setup-token` is a long-lived credential. The capture is
+    already scrubbed and fails closed, so this is defence in depth.
+
+    The split is by LIFETIME, not by "is it listed under Commands:". Three of
+    claude's subcommands are exactly what the slot exists for, and bypassing
+    them would hand an SSH drop the failure this launcher prevents.
+    """
+
+    # Ephemeral: prints and exits. These bypass.
+    EPHEMERAL = [
+        "auth", "auto-mode", "doctor", "import", "install", "mcp", "plugin",
+        "plugins", "project", "setup-token", "update", "upgrade",
+    ]
+    # Long-lived: a daemon, the interactive agent view, and a minutes-long
+    # cloud review. These KEEP the slot, as a recorded decision.
+    KEEPS_A_SLOT = ["agents", "gateway", "ultrareview"]
+
+    @staticmethod
+    def _door_list(name: str) -> set[str]:
+        """Parse a bash array literal out of cc-slot.sh."""
+        text = _CC_SLOT.read_text()
+        line = next(
+            (ln for ln in text.splitlines() if ln.startswith(f"{name}=(")), None
+        )
+        assert line is not None, (
+            f"{name} not found in cc-slot.sh — it was renamed or indented, and "
+            "the tests below would then be checking nothing"
+        )
+        return set(line.split("(", 1)[1].rstrip(") \t").split())
+
+    # ---- the bypass -------------------------------------------------------
+
+    def test_setup_token_is_handed_straight_to_claude(self, door):
+        """The acceptance bar: the case the bypass exists for.
+
+        Asserts what RAN, not merely that tmux was idle — a door that crashed
+        before reaching tmux would also leave the log empty.
+        """
+        run, log, _sessions, _listing, _panes = door
+        result = run("manual", "setup-token")
+        assert result.returncode == 0, result.stderr
+        assert run.claude_log.exists(), "claude was never exec'd"
+        assert run.claude_log.read_text().strip() == "setup-token"
+        assert not log.exists() or "new-session" not in log.read_text(), (
+            "setup-token was given a tmux slot, so its output would be captured"
+        )
+
+    @pytest.mark.parametrize("sub", EPHEMERAL)
+    def test_every_ephemeral_subcommand_bypasses_the_slot(self, door, sub):
+        run, log, _sessions, _listing, _panes = door
+        result = run("manual", sub)
+        assert result.returncode == 0, result.stderr
+        assert run.claude_log.read_text().strip() == sub
+        assert not log.exists() or "new-session" not in log.read_text()
+
+    def test_arguments_after_the_subcommand_are_passed_through(self, door):
+        """`claude mcp list` must reach claude intact, not as a bare `mcp`."""
+        run, _log, _sessions, _listing, _panes = door
+        result = run("manual", "mcp", "list", "--scope", "user")
+        assert result.returncode == 0, result.stderr
+        assert run.claude_log.read_text().strip() == "mcp list --scope user"
+
+    def test_the_bypass_runs_in_the_repo_like_the_slot_path_does(self, door):
+        """cwd must match the slot path's `cd ${GENESIS_ROOT} && claude`.
+
+        `mcp` scope, `project` state and `doctor`'s settings read are all keyed
+        on the working directory, and an SSH login shell starts in $HOME. A
+        bypass that inherited the caller's cwd would silently retarget them —
+        `mcp list` would not see the repo's own .mcp.json, and `project purge`
+        would name a different project.
+        """
+        run, _log, _sessions, _listing, _panes = door
+        result = run("manual", "mcp", "list")
+        assert result.returncode == 0, result.stderr
+        assert run.claude_cwd.exists(), "claude never recorded a cwd"
+        assert run.claude_cwd.read_text().strip() == str(run.home / "genesis")
+
+    # ---- what must STILL get a slot ---------------------------------------
+
+    @pytest.mark.parametrize("sub", KEEPS_A_SLOT)
+    def test_long_lived_subcommands_keep_their_slot(self, door, sub):
+        """A daemon / TUI / minutes-long job must survive a dropped SSH.
+
+        Bypassing these would tie them to the connection, which is the exact
+        failure the slot exists to prevent.
+        """
+        run, log, _sessions, _listing, _panes = door
+        result = run("manual", sub)
+        assert result.returncode == 0, result.stderr
+        # Check existence first: without it a bypassed `sub` never calls tmux,
+        # and this fails with a bare FileNotFoundError instead of saying why.
+        assert log.exists(), f"{sub} never reached tmux — it was bypassed"
+        assert "new-session" in log.read_text(), f"{sub} lost its slot"
+        assert not run.claude_log.exists(), f"{sub} was exec'd directly"
+
+    def test_a_bare_interactive_session_still_gets_a_slot(self, door):
+        run, log, _sessions, _listing, _panes = door
+        result = run("manual")
+        assert result.returncode == 0, result.stderr
+        assert "new-session" in log.read_text()
+        assert not run.claude_log.exists(), "the door exec'd claude directly"
+
+    def test_a_prompt_naming_a_subcommand_still_gets_a_slot(self, door):
+        """`claude "mcp is broken"` is a PROMPT, not the `mcp` subcommand."""
+        run, log, _sessions, _listing, _panes = door
+        result = run("manual", "mcp is broken")
+        assert result.returncode == 0, result.stderr
+        assert "new-session" in log.read_text()
+        assert not run.claude_log.exists()
+
+    def test_a_flag_whose_value_names_a_subcommand_still_gets_a_slot(self, door):
+        """Only $1 is matched, so a flag value is never mistaken for one."""
+        run, log, _sessions, _listing, _panes = door
+        result = run("manual", "--agent", "mcp")
+        assert result.returncode == 0, result.stderr
+        assert "new-session" in log.read_text()
+        assert not run.claude_log.exists()
+
+    def test_hostname_mode_never_bypasses(self, door):
+        """The bypass is gated on manual mode; a slot door keeps its slot."""
+        run, log, _sessions, _listing, _panes = door
+        result = run("genesis-3-4", "setup-token")
+        assert result.returncode == 0, result.stderr
+        assert log.exists(), "hostname mode was bypassed — tmux never ran"
+        assert "-s cc-4" in log.read_text()
+        assert not run.claude_log.exists()
+
+    # ---- drift ------------------------------------------------------------
+
+    def test_the_door_and_the_test_declare_the_same_lists(self):
+        """Guard-the-guard: both lists must be the ones the door enforces."""
+        assert self._door_list("_CC_EPHEMERAL") == set(self.EPHEMERAL)
+        assert self._door_list("_CC_KEEPS_A_SLOT") == set(self.KEEPS_A_SLOT)
+
+    def test_the_two_lists_are_disjoint(self):
+        assert not set(self.EPHEMERAL) & set(self.KEEPS_A_SLOT)
+
+    def test_every_installed_subcommand_is_CLASSIFIED(self):
+        """A new subcommand must be CLASSIFIED, not defaulted into the bypass.
+
+        Polarity matters here. Asserting "everything installed is in the bypass
+        list" would make the only green-again move for a future `claude serve`
+        be to bypass it — turning a curated allowlist into an auto-expanding
+        denylist, which is how a daemon would end up losing its slot. So the
+        test demands a DECISION into one list or the other.
+
+        Skipped where claude is absent (a fresh clone, a CI runner), which makes
+        this a LOCAL drift detector rather than a gate. Said plainly, because a
+        test that silently skips everywhere reads like coverage it is not.
+        """
+        import shutil
+
+        if shutil.which("claude") is None:
+            pytest.skip("claude is not installed — cannot check list drift")
+        helptext = subprocess.run(
+            ["claude", "--help"], capture_output=True, text=True, timeout=60
+        ).stdout
+        _, _, commands = helptext.partition("Commands:")
+        assert commands.strip(), "could not find the Commands: section in --help"
+        installed = {
+            line.split()[0].split("|")[0]
+            for line in commands.splitlines()
+            if line.startswith("  ") and line.strip() and not line.startswith("    ")
+        }
+        assert installed, "parsed zero subcommands — the --help layout changed"
+        classified = set(self.EPHEMERAL) | set(self.KEEPS_A_SLOT)
+        unclassified = installed - classified - {"help"}
+        assert not unclassified, (
+            "claude ships subcommands this door has not classified. Decide per "
+            "entry: prints-and-exits -> _CC_EPHEMERAL; daemon / TUI / "
+            f"long-running -> _CC_KEEPS_A_SLOT. Unclassified: {sorted(unclassified)}"
+        )
+
+
+class TestBypassTempDirIsValidatedNotAssumed:
+    """The bypass must apply the SAME temp-dir validation as the slot path.
+
+    It used to test `-d "$HOME/tmp"` and export it. `-d` says a directory
+    exists, not that it is ours, writable, or private — so a root-owned
+    leftover from an earlier `sudo` run was accepted, and `claude install` /
+    `claude update` would unpack state into a directory this script never
+    established anyone else could not read. The slot path a few hundred lines
+    down creates the candidate, checks writability, and requires `chmod 700`.
+
+    Both now call one `_cc_resolve_tmpdir`, so there is a single policy rather
+    than two that can drift — which is what let the weaker copy exist at all.
+    """
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the mode bit")
+    def test_an_unusable_candidate_is_not_exported_to_a_bypassed_subcommand(
+        self, door
+    ):
+        """Unusable candidates must leave TMPDIR unset, never pointed at them."""
+        run, _log, _sessions, _listing, _panes = door
+        home = Path(run.home)
+        for cand in (home / ".genesis" / "cc-tmp", home / "tmp"):
+            cand.mkdir(parents=True, exist_ok=True)
+            # 0500 fails the WRITABILITY test, so `continue` fires before the
+            # chmod is ever attempted. The chmod-rejection branch needs a
+            # foreign-owned world-writable directory and is NOT covered here.
+            cand.chmod(0o500)
+        try:
+            proc = run("manual", "update")
+        finally:
+            for cand in (home / ".genesis" / "cc-tmp", home / "tmp"):
+                cand.chmod(0o700)  # so tmp_path teardown can clean up
+        assert proc.returncode == 0, proc.stderr
+        assert run.claude_env.exists(), "claude was never reached"
+        observed = run.claude_env.read_text().strip()
+        assert observed == "TMPDIR=[<unset>]", (
+            "the bypass exported a temp dir it had not validated; the slot path "
+            f"rejects this same directory. Got: {observed}"
+        )
+
+    def test_a_usable_candidate_IS_exported_to_a_bypassed_subcommand(self, door):
+        """Negative control: without it the test above passes on a broken bypass.
+
+        A bypass that simply never set TMPDIR would satisfy the unusable case
+        while losing the reason the resolution exists — `install`/`update`
+        unpacking into the small ambient temp.
+        """
+        run, _log, _sessions, _listing, _panes = door
+        home = Path(run.home)
+        (home / ".genesis" / "cc-tmp").mkdir(parents=True, exist_ok=True)
+        proc = run("manual", "update")
+        assert proc.returncode == 0, proc.stderr
+        observed = run.claude_env.read_text().strip()
+        assert observed == f"TMPDIR=[{home / '.genesis' / 'cc-tmp'}]", (
+            f"a usable candidate was not exported to the bypass. Got: {observed}"
+        )
+
+    def test_an_explicit_caller_TMPDIR_is_left_alone(self, door):
+        """An operator who exported TMPDIR chose it; do not second-guess them."""
+        run, _log, _sessions, _listing, _panes = door
+        home = Path(run.home)
+        (home / ".genesis" / "cc-tmp").mkdir(parents=True, exist_ok=True)
+        os.environ["_TEST_INHERITED_TMPDIR"] = "/inherited/from/parent"
+        try:
+            proc = run("manual", "update")
+        finally:
+            os.environ.pop("_TEST_INHERITED_TMPDIR", None)
+        assert proc.returncode == 0, proc.stderr
+        observed = run.claude_env.read_text().strip()
+        assert observed == "TMPDIR=[/inherited/from/parent]", (
+            f"the bypass overrode a TMPDIR the caller had set. Got: {observed}"
+        )
+
+    def test_one_resolution_function_serves_both_paths(self):
+        """Guard-the-guard: the duplication must not quietly come back.
+
+        The defect was two temp-dir policies, one weaker. If a future edit
+        reintroduces a second candidate loop, the tests above still pass while
+        the drift they exist to prevent is back.
+        """
+        body = _CC_SLOT.read_text()
+        assert body.count("_cc_resolve_tmpdir()") == 1, "more than one definition"
+        assert body.count('for _cand in "$HOME/.genesis/cc-tmp"') == 1, (
+            "a second candidate loop exists outside _cc_resolve_tmpdir"
+        )
+        # NOT a `count(...) >= 3` check: there are four mentions and one is
+        # prose, so deleting a real call site still satisfies it. Assert the
+        # call sites themselves, which is what could actually regress.
+        assert "|| _cc_resolve_tmpdir\n" in body or "! _cc_resolve_tmpdir" in body, (
+            "the bypass no longer calls the shared resolution"
+        )
+        assert "if _cc_resolve_tmpdir; then" in body, (
+            "the slot path no longer calls the shared resolution"
+        )

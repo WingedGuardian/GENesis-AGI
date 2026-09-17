@@ -40,7 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 # Load API keys before any LLM calls
 from dotenv import load_dotenv  # noqa: E402
 
-from genesis.env import secrets_path  # noqa: E402
+from genesis.env import genesis_db_path, repo_root, secrets_path  # noqa: E402
 
 _secrets = secrets_path()
 if _secrets.exists():
@@ -62,7 +62,18 @@ async def main(args: argparse.Namespace) -> None:
         run_extraction_cycle,
     )
 
-    db_path = Path.home() / "genesis" / "data" / "genesis.db"
+    # genesis_db_path() and NOT a hardcoded ~/genesis path: it honours
+    # GENESIS_DB_PATH and resolves relative to the importing tree, so the
+    # hardcoded form silently targets a DIFFERENT database whenever this
+    # script is run from a worktree or a relocated install — while every
+    # other writer in the process follows the resolver.
+    db_path = genesis_db_path()
+    # Name the resolved target. `exists()` alone is not protection: a stray
+    # empty `data/genesis.db` is minted in a worktree by anything that
+    # resolves the path there, and 6 such files exist on this box today — the
+    # guard then PASSES and the run reports zero rows against an empty
+    # database. Printing the path is what makes that visible.
+    logger.info("Resolved database: %s", db_path)
     if not db_path.exists():
         logger.error("Database not found at %s", db_path)
         return
@@ -136,7 +147,7 @@ async def main(args: argparse.Namespace) -> None:
                 linker=linker,
             )
 
-            config_path = Path.home() / "genesis" / "config" / "model_routing.yaml"
+            config_path = repo_root() / "config" / "model_routing.yaml"
             if not config_path.exists():
                 logger.error("Routing config not found at %s", config_path)
                 return

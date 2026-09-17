@@ -551,7 +551,11 @@ async def test_submit_to_email_scrubs_em_dash_end_to_end(config, db, mock_drafte
     result = await pipeline.submit(req)
     assert result.status == OutreachStatus.DELIVERED
     sent_text = email_adapter.send_message.call_args.args[1]
-    assert sent_text == "ship it—now"  # em dash collapsed by the egress gate
+    # The owner ruling is that published prose never carries an em dash: an
+    # earned dash is two hyphens closed up. The egress gate now rewrites the
+    # BARE form too, not only the spaced one, so this asserts the published
+    # form rather than the intermediate one.
+    assert sent_text == "ship it--now"
 
 
 @pytest.mark.asyncio

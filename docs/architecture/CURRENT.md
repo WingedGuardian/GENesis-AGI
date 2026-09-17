@@ -698,10 +698,19 @@ Every autonomous action on the outside world funnels through deterministic
 in-code gates. Owner-facing delivery (Telegram/voice/email-to-owner) is NEVER
 gated — that contract is one-directional.
 
+**"Never gated" is about APPROVAL, not about timing.** Owner-facing delivery is
+never held for permission, but `outreach/governance.py` can still DELAY it: the
+quiet-hours window deferred every non-`ALERT`/`BLOCKER` category, which held an
+explicitly-scheduled 01:30 reminder until 07:00. Quiet hours now ship DISABLED
+(a zero-width `00:00`/`00:00` window in `config/outreach.yaml`; `_in_quiet_hours`
+treats `start == end` as off, matching `ego/cadence.py`), so nothing delays an
+owner-facing send by default. The salience thresholds and the shared daily cap
+are the other timing/volume controls on that path.
+
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: 5808e7cd 2026-09-03
+verified: d6edbcc6 2026-09-11
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
@@ -1142,7 +1151,13 @@ verified: d0627c854 2026-09-11
   live runtime (stale-but-functional).
 - **hosting/**: the OUTER layer that calls the runtime. `standalone.py` is the
   default (`python -m genesis serve`; also hosts the OpenClaw
-  `/v1/chat/completions` endpoint); Agent Zero adapter optional.
+  `/v1/chat/completions` endpoint, and registers the desk brain at
+  `/v1/desk/chat/completions` — `dashboard/routes/desk_api.py`, an
+  OpenAI-compatible surface that routes each turn through `ModelRouter` on two
+  lanes rather than spawning a CC subprocess, so a desktop client holds no model
+  credential. Bearer-authed with `GENESIS_MCP_HTTP_TOKEN`; text-only, and an
+  empty completion is a 502 rather than a blank turn); Agent Zero adapter
+  optional.
 - **browser/**: profile/state layer only (persistent
   `~/.genesis/browser-profile`, `BrowserLayer` enum, pgrep patterns as the
   single source of process detection). The automation TOOLS live in
@@ -1299,11 +1314,36 @@ verified: 84c7259d 2026-08-31
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
-  systemd timer; `check.py` runs 5 parallel probes → 6-state machine → act;
+  systemd timer; `check.py` runs 6 parallel probes → 6-state machine → act;
   Proxmox disk/RAM provisioning verbs) and container side (`watchdog.py`
   monitors the host Guardian every awareness tick, incl. git-SHA code-drift
   detection). Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
+- **guard-layer watch** (`guardian/guard_layer_watch.py`, a SIDE-watch in
+  `run_check`, not a `probe_*`): asks whether the AGENT TOOLING can still
+  evaluate — the `genesis-hook` LAUNCHER end to end, the container venv
+  interpreter, `hook_input` / `shell_parse` importability, container `node`, and
+  the host's own `cc.path` binary (probed as the CONSUMER `diagnosis.py` launches,
+  not as `node --version`, so a PATH failure is a true positive rather than a
+  false one). Host-side by necessity: a broken guard layer bricks CC sessions, and
+  the container-side Sentinel is itself a CC call site, so it would dispatch into
+  the same broken tooling (`sentinel/remediation_map.py` `UNMAPPED_BY_DESIGN`
+  encodes that reasoning independently). Deliberately NOT a `probe_*`:
+  `SignalResult` carries no severity, so every probe feeds the confirmation ladder
+  into `RecoveryEngine.execute` — a broken hook file must never be able to trigger
+  `RESTART_CONTAINER`. Two polarities motivate it: an unimportable `hook_input`
+  fails CLOSED (Bash refused, loud), while a dead launcher or venv makes
+  `genesis-hook` exit non-2, which Claude Code treats as non-blocking, so every
+  guard is silently OFF while Bash keeps working — the quiet one nothing else
+  reports. **ALERT-ONLY, by decision rather than omission.** A draft carried one
+  automatic repair verb; an adversarial audit REPRODUCED two ways it destroyed
+  work (`git checkout HEAD -- <file>` overwrites the index, losing staged content
+  recoverable only via `git fsck`; mid-merge it clears the conflict stages and
+  silently resolves to ours while `MERGE_HEAD` remains) and showed its dirty/clean
+  signal failed OPEN, since `git diff --quiet` is tri-state and both error codes
+  read as the value that authorised the write. Detection shipped alone; the repair
+  verb is tracked separately. A test asserts the module defines no repair function
+  and no executed payload carries a mutating git verb.
 - **autonomy zombie-scheduler watchdog** (`autonomy/watchdog.py`, run out-of-process
   by `genesis-watchdog.timer` every 300s via `watchdog_runner.py`; distinct from the
   container `watchdog.py` above): reads `~/.genesis/status.json` (written by the runtime's
