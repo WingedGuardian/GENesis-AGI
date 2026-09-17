@@ -1151,7 +1151,13 @@ verified: d0627c854 2026-09-11
   live runtime (stale-but-functional).
 - **hosting/**: the OUTER layer that calls the runtime. `standalone.py` is the
   default (`python -m genesis serve`; also hosts the OpenClaw
-  `/v1/chat/completions` endpoint); Agent Zero adapter optional.
+  `/v1/chat/completions` endpoint, and registers the desk brain at
+  `/v1/desk/chat/completions` — `dashboard/routes/desk_api.py`, an
+  OpenAI-compatible surface that routes each turn through `ModelRouter` on two
+  lanes rather than spawning a CC subprocess, so a desktop client holds no model
+  credential. Bearer-authed with `GENESIS_MCP_HTTP_TOKEN`; text-only, and an
+  empty completion is a 502 rather than a blank turn); Agent Zero adapter
+  optional.
 - **browser/**: profile/state layer only (persistent
   `~/.genesis/browser-profile`, `BrowserLayer` enum, pgrep patterns as the
   single source of process detection). The automation TOOLS live in
