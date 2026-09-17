@@ -158,6 +158,22 @@ class TaskDispatcher:
         ok = False
         try:
             ok = await self._guarded_execute(task_id)
+        except asyncio.CancelledError:
+            # MEASURED on this interpreter: asyncio.CancelledError.__mro__ is
+            # (CancelledError, BaseException, object) -- it is NOT an Exception
+            # and the handler below never sees it. Without this branch a resume
+            # cancelled while queued on the execution semaphore (service
+            # shutdown is the ordinary case) spends the approval, leaves the
+            # task BLOCKED, and records nothing at all. Log, emit, and RE-RAISE:
+            # swallowing a cancellation would break the shutdown that caused it.
+            logger.error(
+                "Resume of blocked task %s CANCELLED after claiming approval "
+                "%s — the approval is spent and the task remains BLOCKED; it "
+                "will not be retried without a new approval",
+                task_id, claimed,
+            )
+            await self._emit_resume_failed(task_id, claimed, reason="cancelled")
+            raise
         except Exception:
             logger.error(
                 "Resume of blocked task %s FAILED after claiming approval %s — "
@@ -173,23 +189,37 @@ class TaskDispatcher:
                     "BLOCKED; it will not be retried without a new approval",
                     task_id, claimed,
                 )
-        if not ok and self._event_bus:
-            try:
-                from genesis.observability.types import Severity, Subsystem
-
-                await self._event_bus.emit(
-                    Subsystem.AUTONOMY,
-                    Severity.ERROR,
-                    "task.resume_failed",
-                    f"Task {task_id} stayed blocked after spending approval {claimed}",
-                    task_id=task_id,
-                    approval_request_id=claimed,
-                )
-            except Exception:
-                logger.error(
-                    "Failed to emit task.resume_failed event", exc_info=True,
-                )
+        if not ok:
+            await self._emit_resume_failed(task_id, claimed, reason="failed")
         return ok
+
+    async def _emit_resume_failed(
+        self, task_id: str, claimed: str, *, reason: str,
+    ) -> None:
+        """Announce that a claimed approval was spent without freeing the task.
+
+        Extracted so the CANCELLED path emits it too. That path re-raises, so
+        it can never fall through to a check after the try block -- and a
+        cancellation that spends an approval silently is exactly the state
+        this event exists to make visible.
+        """
+        if not self._event_bus:
+            return
+        try:
+            from genesis.observability.types import Severity, Subsystem
+
+            await self._event_bus.emit(
+                Subsystem.AUTONOMY,
+                Severity.ERROR,
+                "task.resume_failed",
+                f"Task {task_id} stayed blocked after spending approval "
+                f"{claimed} ({reason})",
+                task_id=task_id,
+                approval_request_id=claimed,
+                reason=reason,
+            )
+        except Exception:
+            logger.error("Failed to emit task.resume_failed event", exc_info=True)
 
     async def submit(
         self,

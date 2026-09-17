@@ -411,3 +411,262 @@ async def test_unblock_approval_is_not_swept_by_approve_all():
         )
     finally:
         await db.close()
+# ── Review findings: the claim must be ONE decision over ALL siblings ──────
+
+
+@pytest.fixture
+async def claim_db():
+    """A schema-complete in-memory DB, closed even when a test FAILS.
+
+    Closing at the end of a test body only closes on the happy path: an
+    assertion error skips it, the aiosqlite worker thread is never joined,
+    and pytest HANGS rather than reporting the failure. Measured while
+    mutation-testing these tests -- the mutation was caught, but it presented
+    as a timeout, which is indistinguishable from an infrastructure stall.
+    """
+    db = await _db()
+    try:
+        yield db
+    finally:
+        await db.close()
+
+
+async def _mk_req(
+    db,
+    *,
+    rid,
+    task_id,
+    status,
+    resolved_at,
+    action_type=TASK_UNBLOCK_ACTION_TYPE,
+):
+    """An approval_requests row addressed to *task_id*.
+
+    Column names come from the real schema, not from memory: the timestamp is
+    ``created_at`` (not ``requested_at``) and ``description`` is NOT NULL.
+    Getting either wrong raises inside the aiosqlite worker and surfaces as a
+    hang rather than a failure.
+    """
+    await db.execute(
+        "INSERT INTO approval_requests "
+        "(id, action_type, action_class, description, context, status, "
+        " created_at, resolved_at) "
+        "VALUES (?, ?, 'reversible', ?, ?, ?, ?, ?)",
+        (
+            rid,
+            action_type,
+            f"resume {task_id}",
+            json.dumps({"task_id": task_id}),
+            status,
+            "2026-09-01T00:00:00+00:00",
+            resolved_at,
+        ),
+    )
+    await db.commit()
+
+
+async def _consumed_at(db, rid):
+    cur = await db.execute("SELECT consumed_at FROM approval_requests WHERE id = ?", (rid,))
+    row = await cur.fetchone()
+    return row[0] if row else None
+
+
+@pytest.mark.asyncio
+async def test_a_newer_rejection_beats_an_older_approval(claim_db):
+    """The docstring says the newest answer governs. Filtering to
+    status='approved' BEFORE ranking cannot deliver that: the later negative
+    answer is removed by the very filter that is supposed to be ranked."""
+    await _mk_req(
+        claim_db,
+        rid="a-old",
+        task_id="t-1",
+        status="approved",
+        resolved_at="2026-09-01T10:00:00+00:00",
+    )
+    await _mk_req(
+        claim_db,
+        rid="a-new",
+        task_id="t-1",
+        status="rejected",
+        resolved_at="2026-09-01T12:00:00+00:00",
+    )
+
+    assert (
+        await ar_crud.claim_approved_for_task(
+            claim_db, task_id="t-1", action_type=TASK_UNBLOCK_ACTION_TYPE
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_control_a_newer_approval_is_still_claimable(claim_db):
+    """Without this, a claim that always returned None would pass above."""
+    await _mk_req(
+        claim_db,
+        rid="b-old",
+        task_id="t-2",
+        status="rejected",
+        resolved_at="2026-09-01T10:00:00+00:00",
+    )
+    await _mk_req(
+        claim_db,
+        rid="b-new",
+        task_id="t-2",
+        status="approved",
+        resolved_at="2026-09-01T12:00:00+00:00",
+    )
+
+    assert (
+        await ar_crud.claim_approved_for_task(
+            claim_db, task_id="t-2", action_type=TASK_UNBLOCK_ACTION_TYPE
+        )
+        == "b-new"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_rejection_does_not_retire_other_rows(claim_db):
+    """A negative answer declines THIS resume; it is not a licence to
+    invalidate rows the user has not answered yet."""
+    await _mk_req(claim_db, rid="c-pending", task_id="t-3", status="pending", resolved_at=None)
+    await _mk_req(
+        claim_db,
+        rid="c-rej",
+        task_id="t-3",
+        status="rejected",
+        resolved_at="2026-09-01T12:00:00+00:00",
+    )
+
+    assert (
+        await ar_crud.claim_approved_for_task(
+            claim_db, task_id="t-3", action_type=TASK_UNBLOCK_ACTION_TYPE
+        )
+        is None
+    )
+    assert await _consumed_at(claim_db, "c-pending") is None
+
+
+@pytest.mark.asyncio
+async def test_pending_sibling_is_retired_when_a_claim_wins(claim_db):
+    """A pending sibling left answerable is worse than a stale approved one:
+    the user taps it later, after the task has reached a DIFFERENT blocker,
+    and it releases a block nobody approved."""
+    await _mk_req(
+        claim_db,
+        rid="d-ok",
+        task_id="t-4",
+        status="approved",
+        resolved_at="2026-09-01T12:00:00+00:00",
+    )
+    await _mk_req(claim_db, rid="d-pending", task_id="t-4", status="pending", resolved_at=None)
+
+    assert (
+        await ar_crud.claim_approved_for_task(
+            claim_db, task_id="t-4", action_type=TASK_UNBLOCK_ACTION_TYPE
+        )
+        == "d-ok"
+    )
+    assert await _consumed_at(claim_db, "d-pending") is not None
+
+
+@pytest.mark.asyncio
+async def test_siblings_of_another_task_are_untouched(claim_db):
+    """Control on the retirement sweep: it must be scoped to this task."""
+    await _mk_req(
+        claim_db,
+        rid="e-ok",
+        task_id="t-5",
+        status="approved",
+        resolved_at="2026-09-01T12:00:00+00:00",
+    )
+    await _mk_req(
+        claim_db,
+        rid="e-other",
+        task_id="t-6",
+        status="approved",
+        resolved_at="2026-09-01T11:00:00+00:00",
+    )
+
+    await ar_crud.claim_approved_for_task(
+        claim_db, task_id="t-5", action_type=TASK_UNBLOCK_ACTION_TYPE
+    )
+    assert await _consumed_at(claim_db, "e-other") is None
+
+
+@pytest.mark.asyncio
+async def test_claim_and_retirement_land_in_one_transaction(claim_db):
+    """If the claim committed before the sweep, a failure in between would
+    leave the approval permanently spent with its siblings still live --
+    exactly the state this function exists to prevent."""
+    await _mk_req(
+        claim_db,
+        rid="f-ok",
+        task_id="t-7",
+        status="approved",
+        resolved_at="2026-09-01T12:00:00+00:00",
+    )
+    await _mk_req(
+        claim_db,
+        rid="f-sib",
+        task_id="t-7",
+        status="approved",
+        resolved_at="2026-09-01T11:00:00+00:00",
+    )
+
+    commits = 0
+    real_commit = claim_db.commit
+
+    async def counting_commit():
+        nonlocal commits
+        commits += 1
+        await real_commit()
+
+    claim_db.commit = counting_commit
+    try:
+        claimed = await ar_crud.claim_approved_for_task(
+            claim_db, task_id="t-7", action_type=TASK_UNBLOCK_ACTION_TYPE
+        )
+    finally:
+        claim_db.commit = real_commit
+
+    assert claimed == "f-ok"
+    assert commits == 1, f"claim spanned {commits} transactions, expected 1"
+    assert await _consumed_at(claim_db, "f-sib") is not None
+@pytest.mark.asyncio
+async def test_generic_resolve_refuses_a_task_unblock_row():
+    """Excluding a type from the BATCH sweep is not enough on its own.
+
+    A `cli_approve_all:<request_id>` callback resolves the TRIGGERING row
+    through the generic per-item path first, and only then runs the filtered
+    sweep -- so a type the sweep skips is still approved when it is the row
+    that triggered it. The exclusion has to exist at both ends.
+    """
+    from genesis.autonomy.approval_gate import AutonomousCliApprovalGate
+
+    gate = AutonomousCliApprovalGate.__new__(AutonomousCliApprovalGate)
+    gate._approval_manager = AsyncMock()
+    gate.get_request = AsyncMock(
+        return_value={"id": "r-1", "action_type": TASK_UNBLOCK_ACTION_TYPE},
+    )
+
+    ok = await gate.resolve_request("r-1", decision="approved", resolved_by="user")
+    assert ok is False
+    gate._approval_manager.resolve.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_control_generic_resolve_still_works_for_ordinary_types():
+    """Without this, a refusal that blocked EVERYTHING would pass above."""
+    from genesis.autonomy.approval_gate import AutonomousCliApprovalGate
+
+    gate = AutonomousCliApprovalGate.__new__(AutonomousCliApprovalGate)
+    gate._approval_manager = AsyncMock()
+    gate._approval_manager.resolve = AsyncMock(return_value=True)
+    gate.get_request = AsyncMock(
+        return_value={"id": "r-2", "action_type": "some_ordinary_type"},
+    )
+
+    ok = await gate.resolve_request("r-2", decision="approved", resolved_by="user")
+    assert ok is True
+    gate._approval_manager.resolve.assert_awaited_once()
