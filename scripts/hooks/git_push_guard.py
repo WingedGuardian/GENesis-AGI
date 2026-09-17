@@ -1083,29 +1083,35 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
     # when the gate itself runs as a GitHub check, its OWN check-run sits in the
     # rollup it reads — IN_PROGRESS while it executes (every run would then block
     # on itself, a self-deadlock) and a stale FAILURE/PENDING from an earlier run
-    # of the same workflow on the same head (a comment- or review-triggered
-    # re-run would inherit its own verdict and fail forever). The running
-    # workflow's identity is `GITHUB_WORKFLOW`, set by Actions — not injectable
-    # from the workflow file, so the check cannot widen its own escape hatch.
-    # Entries from THAT workflow are dropped before classification: the
-    # self-check never vouches and never blocks. Both vars are absent locally, so
-    # the interactive merge path is byte-identical.
+    # of the same check on the same head (a comment- or review-triggered re-run
+    # would inherit its own verdict and fail forever). Two identities cover both
+    # publishing lanes: `GITHUB_WORKFLOW` matches the ambient job check, and
+    # `GITHUB_JOB` matches check runs published under the job's name via the
+    # check-runs API (whose `workflowName` is null — a comment-triggered
+    # re-evaluation would otherwise inherit its predecessor's FAILURE). Both are
+    # set by Actions, not injectable from the workflow file, so the check cannot
+    # widen its own escape hatch. Entries so identified are dropped before
+    # classification: the self-check never vouches and never blocks. All vars
+    # are absent locally, so the interactive merge path is byte-identical.
     if os.environ.get("GITHUB_ACTIONS") == "true":
         self_wf = (os.environ.get("GITHUB_WORKFLOW") or "").strip().casefold()
-        if self_wf:
-            checks = [
-                c
-                for c in checks
-                if not (
-                    isinstance(c, dict)
-                    and (c.get("workflowName") or "").strip().casefold() == self_wf
-                )
-            ]
-            if not checks:
-                # The ONLY thing in the rollup is our own run: zero OTHER checks
-                # have run — the same definite "CI has not run" fact a genuinely
-                # empty rollup carries.
-                return "absent", []
+        self_job = (os.environ.get("GITHUB_JOB") or "").strip().casefold()
+
+        def _is_self_check(c: object) -> bool:
+            if not isinstance(c, dict):
+                return False
+            if self_wf and (c.get("workflowName") or "").strip().casefold() == self_wf:
+                return True
+            if self_job and (c.get("name") or "").strip().casefold() == self_job:
+                return True
+            return False
+
+        checks = [c for c in checks if not _is_self_check(c)]
+        if not checks:
+            # The ONLY thing in the rollup is our own run: zero OTHER checks
+            # have run — the same definite "CI has not run" fact a genuinely
+            # empty rollup carries.
+            return "absent", []
 
     # Drop superseded `concurrency: cancel-in-progress` duplicates via the SHARED
     # primitive (_drop_superseded_cancels — read its docstring for the strict

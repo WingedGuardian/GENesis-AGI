@@ -3041,9 +3041,10 @@ class TestPrCiStatusSelfWorkflow:
     pair for all other tests; here we setenv per case."""
 
     @staticmethod
-    def _actions(monkeypatch, workflow="merge-gate"):
+    def _actions(monkeypatch, workflow="merge-gate", job="genesis-merge-gate"):
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         monkeypatch.setenv("GITHUB_WORKFLOW", workflow)
+        monkeypatch.setenv("GITHUB_JOB", job)
 
     def test_own_in_progress_run_does_not_pending(self, guard_module, monkeypatch):
         # THE self-deadlock case: our own check is IN_PROGRESS while we classify.
@@ -3106,6 +3107,29 @@ class TestPrCiStatusSelfWorkflow:
              "status": "IN_PROGRESS", "conclusion": None},
         ]))
         assert guard_module._pr_ci_status("1") == ("green", [])
+
+    def test_api_check_run_filtered_by_job_name(self, guard_module, monkeypatch):
+        # A check run published via the check-runs API carries NO workflowName —
+        # it is identified by its NAME (= the job name). This is the
+        # comment-triggered re-evaluation case: the previous API-published
+        # FAILURE must not be inherited by its successor.
+        self._actions(monkeypatch, workflow="other-wf")
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "genesis-merge-gate", "workflowName": None,
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+        ]))
+        assert guard_module._pr_ci_status("1") == ("green", [])
+
+    def test_unrelated_same_named_check_is_not_filtered(self, guard_module, monkeypatch):
+        # Name-based filtering keys on THIS job's name only — a different job's
+        # checks still classify normally.
+        self._actions(monkeypatch, job="genesis-merge-gate")
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "some-other-check", "workflowName": None,
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+        ]))
+        assert guard_module._pr_ci_status("1") == ("red", ["some-other-check"])
 
 
 class TestPrCiStatusRequiredWorkflows:

@@ -11,20 +11,24 @@ name: merge-gate
 #
 # Why the workflow is named `merge-gate` and not `CI`: `_pr_ci_status` treats
 # `workflowName` "CI" as the required-workflow identity, and under Actions the
-# gate drops entries for ITS OWN workflow (GITHUB_WORKFLOW) from the rollup so
-# the check can never vouch for or block on itself. Keeping the name distinct
-# keeps the required-CI check AND the self-exclusion exact.
+# gate drops entries for ITS OWN workflow/job (GITHUB_WORKFLOW/GITHUB_JOB) from
+# the rollup so the check can never vouch for or block on itself. Keeping the
+# names distinct keeps the required-CI check AND the self-exclusion exact.
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, edited]
-  # Review submissions and comments carry the gate's inputs (Codex/cross-review
-  # findings, scheduled-review markers, override sigils) — re-evaluate when they
-  # land so the check reflects the newest review state on the same head.
+  # Review submissions, inline review comments, and issue comments carry the
+  # gate's inputs (Codex/cross-review findings, maintainer replies that count
+  # as engagement, scheduled-review markers, override sigils) — re-evaluate
+  # when they land or are removed so the check reflects the newest review
+  # state on the same head.
   pull_request_review:
     types: [submitted, dismissed]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
   issue_comment:
-    types: [created, edited]
+    types: [created, edited, deleted]
   workflow_dispatch:
     inputs:
       pr:
@@ -32,13 +36,18 @@ on:
         required: true
         type: number
 
-# Read-only by construction: the gate classifies GitHub state (checks, reviews,
-# comments, mergeability) and never writes. No write scopes exist to grant.
+# Almost-read-only by construction: the gate classifies GitHub state (checks,
+# reviews, comments, mergeability) and never writes to the repository. The
+# single write scope is `checks` — events other than `pull_request` run on the
+# DEFAULT branch, so their ambient job check attaches to the base SHA and the
+# PR never sees the re-evaluated verdict. Those runs publish the verdict as an
+# explicit check run on the PR head via the check-runs API, which is exactly
+# what the scope exists for.
 permissions:
   contents: read
   pull-requests: read
   issues: read
-  checks: read
+  checks: write
   statuses: read
 
 # Latest event wins — a stale run evaluating an older review state reports a
@@ -56,19 +65,30 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Resolve PR number
+      - name: Resolve PR, head, and base
         id: pr
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr }}
-        run: echo "number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          echo "number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --json baseRefOid,headRefOid \
+            -q '"base=" + .baseRefOid, "head=" + .headRefOid' >> "$GITHUB_OUTPUT"
 
-      - name: Checkout the PR's own gate
+      - name: Checkout the base's gate
         uses: actions/checkout@v7
         with:
-          # Evaluate with the guard version the PR ships, not base's — a PR that
-          # changes the gate is judged by its own rules (hook-surface PRs get
-          # their extra review teeth from the local gate regardless).
-          ref: refs/pull/${{ steps.pr.outputs.number }}/head
+          # Evaluate with the guard version on the PR's BASE, not its head —
+          # the check runs reviewed code. A fork (or any PR) can replace
+          # `git_push_guard.py`; running head code would execute unreviewed
+          # Python under a token that can publish check runs onto the PR. The
+          # trade: a PR that changes the gate is judged by the gate it lands
+          # on, which is the correct posture for an enforcement check —
+          # self-judging gate changes are exactly what the local hook-surface
+          # teeth exist to prevent at merge time.
+          ref: ${{ steps.pr.outputs.base }}
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -83,6 +103,7 @@ jobs:
         run: pip install pyyaml
 
       - name: Run the merge gate
+        id: gate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Documented CI seam for the canonical-repo scope: the gate's
@@ -94,10 +115,49 @@ jobs:
           # and the scheduled gate no-ops instead of demanding markers a fork
           # cannot have.
           _TEST_CANONICAL_PUBLIC_REPO: WingedGuardian/GENesis-AGI
-        run: >-
-          python3 scripts/hooks/git_push_guard.py
-          --check-pr "${{ steps.pr.outputs.number }}"
-          --repo "${{ github.repository }}"
+        run: |
+          set +e
+          python3 scripts/hooks/git_push_guard.py \
+            --check-pr "${{ steps.pr.outputs.number }}" \
+            --repo "$GITHUB_REPOSITORY"
+          rc=$?
+          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
+          # On `pull_request` the ambient job check IS the verdict: it attaches
+          # to the PR head automatically, so exit with the gate's rc.
+          # Every other event runs on the DEFAULT branch — a nonzero exit here
+          # would only paint a red check onto the base SHA, and the real verdict
+          # is published onto the PR head in the next step instead.
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then exit "$rc"; fi
+          exit 0
+
+      - name: Publish the verdict on the PR head
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GATE_RC: ${{ steps.gate.outputs.rc }}
+          HEAD_SHA: ${{ steps.pr.outputs.head }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          if [ "$GATE_RC" = "0" ]; then
+            concl=success; title="merge gate: all gates pass"
+          else
+            concl=failure; title="merge gate: blocks reported — see run log"
+          fi
+          # Check runs are addressed to a SHA: comment/review-triggered runs
+          # execute on the default branch, so the only way a refreshed verdict
+          # reaches the PR is an explicit check run on its head. The name
+          # matches the job name, keeping one check identity (`genesis-merge-
+          # gate`) across every event — that is the context a future ruleset
+          # promotion will require.
+          gh api "repos/$GITHUB_REPOSITORY/check-runs" \
+            -f name="genesis-merge-gate" \
+            -f head_sha="$HEAD_SHA" \
+            -f status=completed \
+            -f conclusion="$concl" \
+            -f "output[title]=$title" \
+            -f "output[summary]=Advisory merge-gate re-evaluation of PR #${PR_NUMBER}, triggered by ${GITHUB_EVENT_NAME}. The full gate report is in this run's 'Run the merge gate' step log." \
+            -f "details_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
 # Promotion to a required check (phase 2 of #1670 — NOT this PR):
 #   1. Run advisory until the false-block rate is measurable: target >=14 days
