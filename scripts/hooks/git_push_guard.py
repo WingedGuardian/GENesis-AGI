@@ -3696,7 +3696,17 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
             "approval cannot authorize several actions.",
         )
     if asks:
-        return "ask", asks[0]
+        reason = asks[0]
+        # A stale worktree still emits the retired terminal sigil. It is parsed
+        # (kept in _KNOWN_SIGILS so a compound stays order-independent) but
+        # authorizes nothing — name that in the prompt so an old habit does not
+        # read an ask as a gate misfire.
+        if any(has_trailing_override(seg.raw, "final-round-accept") for seg, _ in triggers):
+            reason += (
+                "\n\nNOTE: `# final-round-accept` is retired and no longer "
+                "authorizes any gate; only this native approval admits the request."
+            )
+        return "ask", reason
     return "allow", ""
 
 

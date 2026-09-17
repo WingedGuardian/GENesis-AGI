@@ -706,6 +706,13 @@ def _is_dispatched() -> bool:
 
 def _native_ask(reason: str) -> None:
     """Emit a native PreToolUse decision and exit successfully for CC to ask."""
+    # Nothing is discarded YET here — the decision is still open — so this warns
+    # about what DECLINING costs, which is the thing an approval dialog
+    # otherwise hides.
+    if discarded_write is not None:
+        extra = discarded_write.prompt_note()
+        if extra:
+            reason = f"{reason}\n\n{extra}"
     print(
         json.dumps(
             {
@@ -1180,6 +1187,17 @@ def main() -> None:
         """Exit through the one approval chokepoint after all hard checks pass."""
         if pending_round_approval and cloud_budget is not None:
             reason = _commit_budget_reason(cloud_budget)
+            # A stale worktree still emits the retired terminal sigil. It is
+            # parsed but authorizes nothing — name that so an old habit does
+            # not read the ask as a gate misfire.
+            if commit_segs and all(
+                has_trailing_override(s.raw, "final-round-accept") for s in commit_segs
+            ):
+                reason += (
+                    "\n\nNOTE: `# final-round-accept` is retired and no longer "
+                    "authorizes any gate; only this native approval admits the "
+                    "commit."
+                )
             if _is_dispatched():
                 _deny("BLOCKED: " + reason)
                 return
