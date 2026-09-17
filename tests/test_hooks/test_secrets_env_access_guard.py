@@ -338,17 +338,70 @@ class TestAuditFindings:
         return mod.touches_secrets(**kw)
 
     # ── C-2: Grep's `glob` selects files and was never read ──────────────────
-    def test_grep_glob_field_is_gated(self, db: str) -> None:
+    @pytest.fixture
+    def fake_home(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """A real ``$HOME/genesis/secrets.env`` for glob expansion, so the
+        inode-resolving checks never read the host's actual file."""
+        home = tmp_path / "home"
+        (home / "genesis").mkdir(parents=True)
+        (home / "genesis" / "secrets.env").write_text("API_KEY=x\n")
+        monkeypatch.setenv("HOME", str(home))
+        return home
+
+    def test_grep_glob_field_is_gated(self, db: str, fake_home: Path) -> None:
         """`Grep {"path": "~/genesis", "glob": "secrets.env"}` dumps the keys.
 
         With output_mode "content" this returns the matching LINES, i.e. the
         credential values. The first version read file_path/path/pattern only.
         """
-        home = str(Path.home() / "genesis")
+        home = str(fake_home / "genesis")
         assert self._touches(paths=[home, "secrets.env", os.path.join(home, "secrets.env")])
 
-    def test_grep_glob_alone_is_gated(self) -> None:
-        assert self._touches(paths=[str(Path.home() / "genesis" / "secrets*")])
+    def test_grep_glob_alone_is_gated(self, fake_home: Path) -> None:
+        assert self._touches(paths=[str(fake_home / "genesis" / "secrets*")])
+
+    def test_grep_pattern_is_content_not_a_path(self, db: str) -> None:
+        """External finding: `Grep {"pattern": "secrets.env"}` searches file
+        CONTENT for the string — a mention, not an access. Only Glob uses
+        `pattern` as a path."""
+        env = {**os.environ, "GENESIS_DB_PATH": db}
+        proc = subprocess.run(
+            [sys.executable, str(_GUARD)],
+            input=json.dumps(
+                {
+                    "tool_name": "Grep",
+                    "session_id": "grep-mention",
+                    "tool_input": {"pattern": "secrets.env", "path": "scripts"},
+                }
+            ),
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        assert proc.returncode == 0
+        assert proc.stdout.strip() == "", proc.stdout
+
+    def test_glob_pattern_still_gates(self, db: str, fake_home: Path) -> None:
+        """The control: Glob's `pattern` IS a path selector."""
+        env = {**os.environ, "GENESIS_DB_PATH": db}
+        proc = subprocess.run(
+            [sys.executable, str(_GUARD)],
+            input=json.dumps(
+                {
+                    "tool_name": "Glob",
+                    "session_id": "glob-path",
+                    "tool_input": {"pattern": str(fake_home / "genesis" / "secrets*")},
+                }
+            ),
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        assert proc.returncode == 0
+        decision = json.loads(proc.stdout)["hookSpecificOutput"]["permissionDecision"]
+        assert decision == "ask"
 
     # ── H-1: bash brace expansion happens before the command runs ────────────
     def test_brace_expansion_is_resolved(self) -> None:
@@ -363,6 +416,9 @@ class TestAuditFindings:
             'grep -n "secrets.env" scripts/bootstrap.sh',
             "gh pr create --body 'documents the secrets.env gate'",
             "echo 'the secrets.env file' >> notes.md",
+            # Quoted mention + an unrelated variable read like suspicion at
+            # the command level before quote-stripping applied there too.
+            'git commit -m "gate secrets access" && echo $PWD',
         ],
     )
     def test_quoted_mention_does_not_gate(self, command: str) -> None:
@@ -400,7 +456,7 @@ class TestAuditFindings:
         assert not self._touches(command="ls /sys/*/*/*/* /usr/*/*/*")
         assert time.monotonic() - start < 1.0
 
-    def test_secrets_glob_still_resolves(self) -> None:
+    def test_secrets_glob_still_resolves(self, fake_home: Path) -> None:
         """The control: bounding the walk must not blind the globs that matter."""
         assert self._touches(command="cat ~/genesis/secrets.*")
         assert self._touches(command="cat ~/genesis/s*.env")

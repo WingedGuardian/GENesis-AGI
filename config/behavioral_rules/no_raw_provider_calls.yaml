@@ -107,7 +107,7 @@ patterns:
     context: "direct Gemini API call — must go through a routing call site"
   - regex: 'api\.anthropic\.com/v1/(messages|complete)'
     context: "direct Anthropic API call — must go through a routing call site"
-  - regex: 'api\.openai\.com/v1/(chat/)?completions'
+  - regex: 'api\.openai\.com/v1/(responses|(chat/)?completions)'
     context: "direct OpenAI API call — must go through a routing call site"
   - regex: 'api\.x\.ai/v1'
     context: "direct xAI API call — must go through a routing call site"

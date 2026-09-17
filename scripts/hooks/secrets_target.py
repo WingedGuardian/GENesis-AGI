@@ -237,7 +237,11 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
 
     # Heredoc bodies are data. Everything below reasons about operands.
     scan = _HEREDOC.sub(" ", command)
-    secretish = _SECRETISH.search(scan) is not None
+    # Quoted regions are DATA for the command-level arm too: a commit message
+    # naming the file is not an operand. The declared shell-variable residual
+    # (`f=secrets; cat $f.env`) is unquoted, so it survives stripping.
+    bare = strip_quoted(scan)
+    secretish = _SECRETISH.search(bare) is not None
 
     # Command-LEVEL suspicion. Tokenising splits on parentheses, so a command
     # substitution like `cat $(echo secrets).env` leaves no single token holding
@@ -245,7 +249,7 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
     # another token pattern (the tar pit), ask the whole command: does it mention
     # secrets AND contain something only a shell can resolve? If so, gate. This
     # fails toward asking, which in a foreground session costs one prompt.
-    if secretish and _SUSPICIOUS.search(scan):
+    if secretish and _SUSPICIOUS.search(bare):
         return True
 
     # Tokens that are NOT inside quotes. Used only to decide the bare-basename

