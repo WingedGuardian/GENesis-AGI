@@ -22,6 +22,13 @@ class ContentFormatter:
         truncated = len(text) > limits.max_length
         if truncated:
             cut_at = limits.max_length - len(limits.truncation_suffix)
+            # Never cut BETWEEN the two hyphens of an earned dash. The pair is
+            # one piece of punctuation, so splitting it leaves a trailing "-"
+            # that reads as a typo -- and across a chunked platform it puts the
+            # other half at the head of the next message. This is independent
+            # of the scrubber: an author can type the pair directly.
+            if cut_at > 0 and text[cut_at - 1] == "-" and text[cut_at:cut_at + 1] == "-":
+                cut_at -= 1
             text = text[:cut_at] + limits.truncation_suffix
 
         return FormattedContent(
