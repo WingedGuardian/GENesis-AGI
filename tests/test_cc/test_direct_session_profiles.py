@@ -110,6 +110,16 @@ def test_observe_blocks_memory_writes():
     assert "mcp__genesis-memory__procedure_store" in PROFILES["observe"]
 
 
+@pytest.mark.parametrize("profile", sorted(PROFILES))
+def test_every_profile_blocks_memory_supersede(profile):
+    """memory_supersede mutates BOTH stores (SQLite deprecation + Qdrant
+    payload) — a deprecation is a write by any name, so it sits behind the
+    same universal vector-store isolation as the store tools. A background
+    session deprecating owner memories would violate the declared isolation
+    without ever calling memory_store (Codex P1 3981896405, PR #1933)."""
+    assert "mcp__genesis-memory__memory_supersede" in PROFILES[profile]
+
+
 # --- Entity-merge human-approval gate (safety-critical) ---
 # The whole point of the entity-merge approval gate is that NO autonomous session
 # can approve+apply its own merges (self-approving the human gate). approve/apply/

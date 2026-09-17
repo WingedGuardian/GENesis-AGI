@@ -531,7 +531,7 @@ async def get_metadata(
     """Return metadata row for a memory_id, or None if not found."""
     rows = await db.execute_fetchall(
         "SELECT memory_id, collection, embedding_status, deprecated, "
-        "superseded_by, superseded_at FROM memory_metadata "
+        "superseded_by, superseded_at, invalid_at FROM memory_metadata "
         "WHERE memory_id = ?",
         (memory_id,),
     )
@@ -545,6 +545,7 @@ async def get_metadata(
         "deprecated": row[3],
         "superseded_by": row[4],
         "superseded_at": row[5],
+        "invalid_at": row[6],
     }
 
 

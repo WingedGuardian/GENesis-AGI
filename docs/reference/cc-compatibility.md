@@ -711,7 +711,17 @@ When a new CC version is released, run through this:
    safety guard a real payload, so it catches a changed hook payload shape that
    would otherwise silently disable the guards (see the hook input contract
    under "Actively Used" above).
-8. **Update this document** with findings.
+8. **Re-probe the `AskUserQuestion` rewrite path.** The gate-menu substitution
+   (`scripts/hooks/ask_gate_menu.py`) rests on `updatedInput` rewriting an
+   `AskUserQuestion` call, and on it working ONLY without a `permissionDecision` field.
+   Both are documented or measured, but the docs carry no version contract and do not
+   enumerate the contexts where the field degrades. Make one real ask at the cap and
+   confirm the appended question renders.
+   **Failure here is QUIET, and quiet in the direction that does not announce itself:**
+   the session simply relays the gate's options in its own words again — the
+   pre-2026-09 behaviour, and the exact thing the mechanism exists to stop. Nothing
+   blocks and nothing errors, because by design no gate reads this back.
+9. **Update this document** with findings.
 
 ---
 
@@ -1155,6 +1165,76 @@ typed turn writes no transcript, and "newest transcript" mis-attributes a
 concurrent session's — identify your own transcript by before/after set
 difference and send a real turn.
 
+### A PreToolUse hook can REWRITE an `AskUserQuestion` — variant B only (measured 2.1.246, 2026-09-13; docs confirmed 2026-09-14)
+
+A PreToolUse hook returning `updatedInput` under `hookSpecificOutput` rewrites the
+tool input before the tool runs. It is **documented** (hooks reference), it is
+**documented as applying to `AskUserQuestion`**, and it is what lets a gate put its own
+question in front of the user instead of the session's retelling
+(`scripts/hooks/ask_gate_menu.py`).
+
+| shape | payload | result |
+|---|---|---|
+| A — with a decision | `{"hookSpecificOutput": {…, "permissionDecision": "allow", "updatedInput": {…}}}` | the call returns **"user did not answer"** WITHOUT the user acting |
+| **B — the only one that works** | `{"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {…}}}` | the rewritten questions render; the user answers normally |
+
+Variant A's failure is a FALSE NEGATIVE that reads exactly like a real decline, which is
+what makes it dangerous. The docs independently state that a `permissionDecision: "deny"`
+alongside `updatedInput` discards the rewrite; the `"allow"` case above is undocumented
+and measured here. Two reasons, one rule: never emit that field alongside `updatedInput`.
+A test pins its absence.
+
+**The apparent docs contradiction is NOT one.** "There is no built-in `AskUserQuestion`
+hook type" is about hook EVENT types (there is no `AskUserQuestion` event); "all tools
+fire PreToolUse" is about which TOOLS fire it. Both true, and the tool does fire it.
+
+**Schema bounds, read from the binary — the OPTIONS axis has a hard MINIMUM**, which the
+questions axis does not: `options:Me(J7o()).min(2).max(4)` against
+`questions:Me(mnr()).min(1).max(4)`. Out of range is not a shorter menu — CC rejects the
+WHOLE call, the person never sees it, and the steer says *"Do not retry this call."* So a
+hook that rewrites this tool must bound the option count itself, since the rewrite
+bypasses whatever the model would have produced — and must TEST that bound by driving
+the builder with an out-of-range set, not by asserting statically about the shipped
+constant. MEASURED: a static assertion left the guard unexercised, and deleting it
+entirely kept the suite green.
+
+The 4-question maximum has a consequence worth stating for any hook that APPENDS: a
+call already carrying four questions cannot be appended to, so the append must be
+skipped rather than risk the rejection. That makes an appending hook suppressible by
+a caller that pads to four. `header` is described as max 12
+characters but is a bare `z.string()`, so an over-long value renders clipped rather than
+rejecting. There is also a whole-call refinement an appending hook can violate without
+touching any single field: **question TEXTS must be unique across the call**, and option
+labels unique within a question. Replacing a forged copy of your question in place (rather
+than appending a second one) satisfies the first by construction; appending blind does not.
+These bounds are **undocumented** — the binary is the only source.
+
+**An invalid rewrite is a DENY, not a no-op — so a rewriting hook's own bounds checks are
+load-bearing, not defensive padding.** MEASURED in the binary: `updatedInput` is accepted
+only on the branch where no `permissionBehavior` is set, and if it fails the tool's input
+schema CC converts it to `behavior: "deny"` **attributed to the hook by name**. So the
+cheerful framing "a broken rewrite just costs the feature" is wrong: it costs the user's
+question. Anyone relaxing an option-count or uniqueness guard on the grounds that the
+failure is harmless is mis-pricing it by a severity level.
+
+Also measured: exactly **one** PreToolUse invocation per call, so an unconditional append
+cannot compound. And `procedure_advisor.py` (matcher `.*`) emits **nothing** for
+`AskUserQuestion`, so its `permissionDecision: "allow"` never meets another hook's
+`updatedInput` — verified by feeding it the payload directly, not inferred from the
+matcher.
+
+**The transcript is NOT a record of what the user saw.** It stores the tool call AS THE
+AGENT EMITTED IT — substitution is applied afterwards — so a transcript-read
+"verification" of what was presented reads exactly the untrusted values it is trying to
+check. PR #1863 built that; do not rebuild it.
+
+**Undocumented edges, stated so the gap is not mistaken for a guarantee.** The docs do
+not enumerate contexts where `updatedInput` degrades (remote/cloud, headless, subagents),
+and a path exists in the bundle that records the field as dropped on the PreToolUse
+branch — scope UNVERIFIED. Failure THERE is menu-absent (the field is dropped, so the
+call proceeds unrewritten), which is distinct from the schema-invalid case above. Re-probe
+on every pin bump; there is no version contract for the field.
+
 ### Bypass/auto mode tells the agent to edit via Bash — safe for reads, NOT for writes (measured 2.1.246, 2026-09-05)
 
 In bypass or auto permission mode the CC binary injects a meta message:
@@ -1228,6 +1308,81 @@ output format or flag semantics, our wrappers break silently.
 
 **Mitigation:** Integration tests that exercise CCInvoker with real CC CLI calls.
 Currently: `scripts/test_cc_cli.sh` (manual). Phase 7+: automated in CI.
+
+### An MCP server that misses the connect timeout is dropped SILENTLY for the life of the process (measured 2.1.246, 2026-09-13)
+
+CC gives each MCP server **30 000 ms** to connect, and a server that misses it is
+dropped for that CC PROCESS — not retried, and **not restored by `/clear`**, which
+starts a new session inside the same process. The session then runs with that
+server's tools simply absent from its registry. Nothing announces it: no banner,
+no context line, no tool-list note.
+
+MEASURED on this install, from CC's own log
+(`~/.cache/claude-cli-nodejs/<project>/mcp-logs-<server>/<start>.jsonl`):
+
+```
+23:36:16.161Z  Starting connection with timeout of 30000ms
+23:36:46.163Z  Connection timeout triggered after 30003ms (limit: 30000ms)
+23:36:46.170Z  Connection failed (CONNECT_TIMEOUT)
+```
+
+The session ran without all 34 `genesis-memory` tools and was discovered only by
+reaching for one. `claude mcp list` said `Connected` throughout — that command
+opens its OWN probe connections and says nothing about what a given running
+session holds.
+
+**Why it happens here.** A session starts **8 servers inside an 11-second
+window**, four of which are heavy Python trees. `-X importtime` on the memory
+server: 5.50 s of imports before any of its own code runs (`litellm` 4.37 s,
+`fastmcp` 2.50 s, `qdrant_client.http` 1.95 s — subtrees overlap, so they do not
+sum), then runtime init, for ~10.5 s standalone. Against 6 cores at load ~7.5,
+that overruns 30 s.
+
+**Rate, with the denominator each figure belongs to.** Across EVERY server in one
+install's log dir: **2 incidents / 1,646 connect attempts (0.12 %)**. Per server,
+the two that have ever timed out are `genesis-memory` (**1 / 217, 0.46 %**) and
+`gitnexus` (**1 / 215, 0.47 %**) — note it is not a single-server problem, which
+is the reason to fix the ceiling rather than one server. Count INCIDENTS, not
+matching lines: each timeout writes `CONNECT_TIMEOUT` twice (`Connection failed
+after Nms (CONNECT_TIMEOUT)` and `Connection failed (CONNECT_TIMEOUT)`), so a
+line-count double-counts.
+
+Frequency was never the real argument, though: the worst SUCCESSFUL connect was
+**25 395 ms**, i.e. 85 % of the 30 s ceiling. The margin was the problem.
+
+**Mitigation (shipped), in TWO halves — one is not enough:**
+
+1. `MCP_TIMEOUT: "120000"` in the repo's `.claude/settings.json` `env` block, for
+   sessions that read repo settings.
+2. The same value in `CCInvoker._build_env`, because **most dispatched sessions
+   never read those settings** — they run with a cwd outside any git repo, so CC
+   does not load them. Without half 2 the entire background fleet (reflection,
+   research, sentinel, direct sessions) keeps the 30 s default, which is the worst
+   place to miss: an unattended session has nobody to notice its tools are gone.
+   (A worktree-cwd dispatch is the exception and DOES load repo settings; both
+   halves carry the same number, so those paths agree either way. A test compares
+   the two, since they cannot share a constant.)
+
+VERIFIED end-to-end — a CC process started after the change logs
+`Starting connection with timeout of 120000ms` where it previously logged
+`30000ms`.
+
+**`MCP_TIMEOUT` is NOT connect-only, despite where it shows up in the log.**
+MEASURED in the 2.1.246 binary, one getter reads it and is applied to the server
+connect, generic MCP requests, `tools/list`, resource reads, the `mcp_tool` hook
+cap and the subscriptions listen stream. So raising it also widens the ceiling on
+a server that wedges MID-session, not just at startup — 120 s per operation
+instead of 30 s, against a shortest MCP-carrying dispatch budget of 600 s.
+
+CC has a **separate** `MCP_CONNECT_TIMEOUT_MS` (default 5000 ms) sitting beside it
+in the same env registry, and a third `MCP_TOOL_TIMEOUT`. Do not conflate them —
+naming a local constant after the connect variable sends the next maintainer to
+the wrong one, which is a mistake this repo made and corrected.
+
+**This makes the drop rarer, not visible.** Detecting and announcing a missing
+server is separate work (see the issue tracking it). Until that lands, the way to
+check a suspicion is to read the per-server log named above for the CURRENT
+process and look for `CONNECT_TIMEOUT` — not to run `claude mcp list`.
 
 ### Desktop vs Server Gap
 CC's feature roadmap prioritizes desktop app experiences (scheduled tasks, teleport,

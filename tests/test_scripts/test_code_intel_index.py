@@ -1107,3 +1107,13 @@ def test_cap_is_emitted_as_M_so_the_rlimit_fallback_can_parse_it(tmp_path):
         out = _derive_mem_max(limit, tmp_path)
         assert out.endswith("M"), out
         assert "%" not in out
+
+
+def test_installer_does_not_claim_queue_success_after_writer_failure():
+    text = (_REPO_ROOT / "scripts/install.sh").read_text()
+    queue = text.split("# Queue initial code intelligence indexing", 1)[1].split(
+        "# ═", 1
+    )[0]
+    assert "index_marker.py\" write" in queue
+    assert "|| true" not in queue
+    assert "WARNING: could not queue initial code intelligence index" in queue

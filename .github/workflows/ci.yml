@@ -504,7 +504,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-09-09: 60 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-09-15: 63 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -682,6 +682,24 @@ jobs:
     # CI is blocking — local full-suite runs are banned. See procedure
     # test_verification and CLAUDE.md "Targeted tests during development."
     #
+    # This job had NO timeout-minutes, so it inherited GitHub's 360-minute
+    # default. Two runs in this workflow have hit ~5.7h (33991793671,
+    # 33991913763, both failed) — consistent with that default killing them.
+    # WHICH job wedged is no longer recoverable (the per-job API returns an
+    # empty list for both now), so this cap is not attributed to `test`; it
+    # bounds `test` because that is the long job, not because it was proven
+    # guilty. The sibling jobs all still inherit 360.
+    #
+    # Derived, not guessed — MEASURED 2026-09-06 over the last 23 successful
+    # main runs, per JOB (`gh api .../runs/<id>/jobs`, name == "test"), NOT the
+    # workflow-run duration, which is ~20 min longer because it includes 12
+    # sibling jobs and queue time: min 19m38s, p50 29m22s, max 31m15s.
+    # The ceiling must exceed the worst LEGITIMATE case — that max plus one
+    # full per-test kill (pyproject `timeout = 3600`) = ~91 min — or this job
+    # would pre-empt the per-test timeout and make it dead code. 180 leaves
+    # ~89 min of growth headroom and still halves the default.
+    # Revisit as the suite grows — the --durations output below is the data.
+    timeout-minutes: 180
     # fetch-depth: 0 because measurement tests derive a rate from this
     # repository's own commit history and SKIP on a shallow clone rather than
     # lie. A skipped gate is an unevaluated gate: the commit-msg framing
@@ -700,18 +718,98 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[test]"
       - name: Run tests
+        # The narrator below fires on THIS step's failure, not on the job's.
+        id: tests
         run: |
           # Never measure a stale report: if pytest dies before writing
           # one, the checker must find nothing rather than yesterday's.
           rm -f junit.xml
           # Ignore preserved AZ-era test files that import removed modules
-          pytest -v \
+          #
+          # --durations: this suite's per-test cost has NEVER been measured.
+          # No --durations anywhere, no registered markers, and the sole
+          # pytest.mark.slow is an unregistered no-op whose own docstring
+          # claims those tests are "skipped in normal CI runs" — CI passes no
+          # -m "not slow", so they run. Every timeout in this repo has
+          # therefore been a guess. Print the 25 slowest so the next person
+          # inherits a number instead of one.
+          #
+          # NO -v, and that is a diagnosability decision, not tidiness.
+          # MEASURED 2026-09-14 (run 34898229755): -v printed one line per
+          # test across 26,074 tests, GitHub's log APIs truncated the step at
+          # ~44% of the suite — and pytest prints its FAILURES block at the
+          # TAIL, so a red run named no failing test through --log,
+          # --log-failed, the whole-run log or the raw endpoint. -rfE keeps a
+          # compact list in the summary; the failure-summary step below
+          # carries the names somewhere truncation cannot reach at all.
+          #
+          # -rfE, not -rf: E is ERRORS, which are a DIFFERENT outcome from
+          # failures, not a louder one. A fixture that raises or a module
+          # that fails to import is reported as an error and appears in
+          # NEITHER the -rf list nor the FAILURES block, so -rf alone leaves
+          # the collection-time breakages -- the ones hardest to read off a
+          # truncated log -- named nowhere.
+          pytest -rfE --durations=25 \
             --ignore-glob='**/test_*az*.py' \
             --ignore-glob='**/test_*shim*.py' \
             --ignore=tests/test_ui/ \
             --junit-xml=junit.xml
         env:
           GENESIS_TESTING: "1"
+          # The breadcrumb the conftest rewrites before every test and fsyncs.
+          # It is the ONLY channel that survives a hard crash inside a test --
+          # no report is written and, without -v, the log names nothing either.
+          GENESIS_ACTIVE_TEST_FILE: active-test.txt
+      # The step log's tail is where pytest names the failures, and the tail
+      # is what GitHub's log cap drops (measurement above). The step summary
+      # is rendered by the Actions UI OUTSIDE the log, so it survives however
+      # long the suite grows. failure() rather than !cancelled(): on green
+      # there is nothing to narrate, and the script's own notice covers the
+      # report-never-written case (pytest died in collection) rather than
+      # letting a missing file read as a second failure.
+      #
+      # AND scoped to the TEST step, because a job-wide condition is true after
+      # ANY earlier step fails. Checkout, setup-python and the dependency
+      # install all precede this one: unscoped, a broken install makes this say
+      # "pytest died before writing a report" about a pytest that never ran,
+      # and a broken CHECKOUT leaves no script and no interpreter, so the
+      # narrator itself goes red -- a second failure invented by the step whose
+      # entire contract is never to add one. A skipped test step reads
+      # 'skipped', so every pre-pytest failure is silent.
+      #
+      # !cancelled() rather than failure(), and the reason is not style. An
+      # `if` containing NO status-check function gets an implicit success()
+      # AND-ed onto it, so the outcome test ALONE would never run after a
+      # failure -- the condition has to carry one. failure() would work today
+      # but is the wrong one to carry: it is false when a step is marked
+      # continue-on-error, so adding that to the test step later would silently
+      # take this narrator offline while `outcome` still read 'failure'.
+      # !cancelled() survives that, and matches the two sibling steps below.
+      #
+      # `outcome`, not `conclusion`, for the same reason: outcome is the raw
+      # result before continue-on-error rewrites it.
+      - name: Name the failures where truncation cannot reach
+        if: ${{ !cancelled() && steps.tests.outcome == 'failure' }}
+        run: python scripts/ci/failure_summary.py junit.xml >> "$GITHUB_STEP_SUMMARY"
+        env:
+          GENESIS_ACTIVE_TEST_FILE: active-test.txt
+      # The junit report holds every traceback in full and was previously
+      # DISCARDED with the runner — the dormancy guard parsed it, then it
+      # died with the VM while the truncated log held ~44% of the run.
+      # !cancelled() matches the dormancy guard's reasoning below: always()
+      # would also fire on a re-push cancellation and archive a half-written
+      # report as though it described a finished run.
+      - name: Preserve the test report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-test-report
+          path: junit.xml
+          # pytest can die before writing any report (collection crash); the
+          # failure-summary step already names that case in the summary, so a
+          # missing file here is information, not an upload error.
+          if-no-files-found: ignore
+          retention-days: 14
       # A test that stops running is invisible: it makes the suite SMALLER,
       # not red. Two axes, because dormancy moves both ways — a broken
       # skipif RAISES the skip count, while a lost marker or a dropped
@@ -753,4 +851,31 @@ jobs:
         # does not. That asymmetry is the trap: an under-set floor still passes,
         # so the guard quietly forfeits the exact fit it exists to hold and
         # nothing says a word.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23217
+        #
+        # +33 collected by the capped-read advisory (2026-09-14), MEASURED BY
+        # COLLECTION on the two files that change: the new suite collects 32 and
+        # the advisory-channel net gains 1. 23217 -> 23250.
+        #
+        # RE-COUNTED after the adversarial review's fixes added four cases (the
+        # literal defect command, the remedy-correctness lock, and two limit
+        # spellings). The first count of +29 was taken BEFORE those landed --
+        # which is the exact trap the comment below describes, caught this time
+        # by re-counting after the last test-adding edit rather than before.
+        #
+        # The CEILING is deliberately NOT raised. The one test that can skip is
+        # the gh-defaults drift check, gated on `shutil.which("gh")`, and gh is
+        # pre-installed on GitHub-hosted runners, so it RUNS rather than skips.
+        # That skip was kept rather than softened into a vacuous pass precisely
+        # because a test that silently no-ops when its tool is absent is the
+        # dormancy this ceiling exists to catch. If this line ever goes red at
+        # 100, that is the cause and the fix is one number.
+        # RE-COUNTED after the round that deleted the completeness claim and
+        # closed three silences: this suite is now 62 collected (+1 in the
+        # advisory-channel net) = +63 over the 23217 base, so 23280. Counted by
+        # --collect-only AFTER the last test-adding edit, per the comment above
+        # -- which has now caught a stale number FOUR times on this branch,
+        # every one from counting an edit too early.
+        # The base is deliberately NOT re-derived from the merged tree: this is
+        # a FLOOR, so a lagging base is conservative and can only under-catch,
+        # never go falsely red.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23298

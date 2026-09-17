@@ -544,12 +544,19 @@ def print_json_bounded(
     # wrong direction for a size check, since it says "fine" about the one
     # outcome this module exists to prevent.
     #
-    # Latent rather than live today, stated plainly: this function has no
-    # caller outside its tests (grep across .claude/, scripts/, src/), and the
-    # default budget sits 200 chars under the cap, so the off-by-one only bites
-    # a caller passing budget=HOOK_STDOUT_CAP. Fixed now because the adopters
-    # this module was written for are the next PR, and an off-by-one in a size
-    # guarantee is not something to hand them.
+    # The off-by-one only bites a caller passing budget=HOOK_STDOUT_CAP, since the
+    # default budget sits 200 chars under the cap. It was fixed while still latent,
+    # because an off-by-one in a size guarantee is not something to hand an adopter.
+    #
+    # Callers outside tests, ENUMERATED rather than counted from memory
+    # (`grep -rn print_json_bounded scripts/ src/`, no limit): capped_read_advisory
+    # (checks the return value), git_discard_guard (envelope backstop behind its own
+    # whole-note selection), plan_confidence_reminder (defence-in-depth — a fixed
+    # string far under budget). This sentence has now been wrong twice in the same
+    # direction: it first read "no caller outside its tests", then named one of
+    # three. Both times an adopting change falsified a status claim living in a file
+    # the adopter never edits, which is exactly the kind of staleness a grep cannot
+    # catch. If you add a caller, this line is part of the change.
     for _ in range(4 * max(1, len(text_keys))):
         blob = json.dumps(payload)
         if emit_cost(blob) <= budget:

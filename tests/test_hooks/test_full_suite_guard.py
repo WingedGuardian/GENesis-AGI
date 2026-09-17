@@ -15,6 +15,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 _WORKTREE = Path(__file__).resolve().parent.parent.parent
 _SCRIPT = _WORKTREE / "scripts" / "hooks" / "full_suite_guard.py"
 _PYTHON = sys.executable
@@ -183,3 +185,114 @@ class TestEndToEnd:
         # post-#1455 the redirect TARGET (errors.py) is stripped from argv, so this is a
         # bare pytest → BLOCK (no phantom .py file target).
         assert _run_guard("pytest 2> errors.py").returncode == 2
+
+
+class TestUvCarrierBypasses:
+    """Four reported shapes, all measured fail-OPEN before this change.
+
+    The resolver models uv's option grammar to find the carried command, and that
+    grammar is an OPEN set: every missing entry is the next round's finding, which
+    is how this PR reached four. Two of them are closed by encoding CLOSED-set
+    facts (`uv tool run` is a literal token pair; `pkg@version` is a documented
+    spelling), one by removing a wrongly-listed boolean flag, and the residual —
+    an unknown value-taking flag before `run` — by refusing to let an unresolved
+    carrier read as clean.
+
+    Recorded per-shape rather than as one loop so a regression names the spelling
+    that broke.
+    """
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "pytest",
+            "uv run pytest",
+            "uv run --isolated pytest",  # --isolated is BOOLEAN in uv
+            "uv --color always run pytest",  # unlisted value flag BEFORE run
+            "uv --cache-dir /tmp/c run pytest",  # ditto, different flag
+            "uv tool run pytest",  # documented uvx alias
+            "uvx pytest@8.3.5",  # documented versioned name
+            # A front-end value flag moves `tool run` off argv[1:3]; the versioned
+            # name must still normalise, or the exe is `pytest@8.3.5` and matches
+            # no gate. MEASURED fail-OPEN before the resolver reported the fact.
+            "uv --directory /x tool run pytest@8.3.5",
+            "uv --python 3.12 tool run pytest@8.3.5",
+            "poetry run pytest",
+            "uv run pytest tests/",  # whole-directory run
+            # Skipping a value-flag's VALUE must not skip the command word after
+            # it: `--with pytest-cov` names a dependency, `pytest` is still the
+            # bare run. And `--isolated` is BOOLEAN, so nothing follows it to skip.
+            "uv --color always run --with pytest-cov pytest",
+            "uv --color always run --isolated pytest",
+            # An `@` inside a DIRECTORY is not a version suffix. Splitting the whole
+            # token resolved this to `python` — matching no gate at all.
+            "uvx /opt/homebrew/opt/python@3.12/bin/pytest tests/",
+        ],
+    )
+    def test_a_full_suite_run_is_blocked_through_every_carrier_spelling(self, cmd):
+        assert _run_guard(cmd).returncode == 2, f"fail-OPEN: {cmd!r} was allowed"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "uv run pytest tests/foo.py",
+            # Targeted THROUGH an unresolved carrier — the fail-closed leg must
+            # still read the pytest args rather than blanket-blocking, or it
+            # impedes ordinary work behind an exotic flag.
+            "uv --color always run pytest tests/foo.py",
+            "uvx pytest@8.3.5 tests/foo.py",
+            "uv run pytest -k mytest",
+            # Not a pytest run at all — a carrier doing something else must not
+            # be caught by the carrier check.
+            "uv pip install requests",
+            # Installing/inspecting pytest is not RUNNING it. Scanning the whole
+            # argv for the token blocked 206 of 746 generated carrier forms,
+            # every one of them install-shaped, with a message telling the user
+            # to target a specific file — advice that means nothing here.
+            "uv pip install pytest",
+            "uv pip uninstall pytest",
+            "uv pip show pytest",
+            "uv add pytest",
+            "uv add --dev pytest",
+            "uv remove pytest",
+            "uv sync --extra pytest",
+            "uv tool install pytest",
+            # A value flag's VALUE is a dependency name, not the command. Reading
+            # it as one refused a ruff run and a correctly TARGETED pytest run —
+            # the shape that trains a session to reflex-append the override.
+            "uv --color always run --with pytest ruff check .",
+            "uv --color always run --with pytest pytest tests/foo.py",
+            # The `run` walk skips value-flag values too, so a flag whose value is
+            # the literal `run` no longer looks like the subcommand.
+            "uv --directory run pip install pytest",
+            "poetry add pytest",
+            "poetry remove pytest",
+            "pipenv install pytest",
+            "pdm add pytest",
+            "rye add pytest",
+            "uv run ruff check .",
+            # The carried executable is the first command after `run`; a later
+            # pytest token is an argument to that program, not an invocation.
+            "uv --color always run echo pytest",
+            "uv --color always run ruff check pytest",
+            "uvx echo pytest",
+            # A mere textual MENTION is not an invocation.
+            "echo pytest",
+            "git commit -m 'run pytest later'",
+        ],
+    )
+    def test_a_targeted_or_unrelated_command_is_not_over_blocked(self, cmd):
+        assert _run_guard(cmd).returncode == 0, f"OVER-BLOCK: {cmd!r} was refused"
+
+    def test_the_carrier_check_does_not_swallow_a_destructive_subcommand(self):
+        """`uv rm -rf /` must still resolve to `uv`, not past it.
+
+        The resolver deliberately gates on the `run` literal so a blanket
+        positional-consuming entry cannot skip over `rm` and hide it from the
+        destructive gate. Adding `tool run` must not weaken that, so this pins
+        the neighbouring safety property the change could plausibly have broken.
+        """
+        from shell_parse import analyze
+
+        seg = [s for s in analyze("uv rm -rf /") if s.depth == 0][0]
+        assert seg.exe == "uv", seg.exe
