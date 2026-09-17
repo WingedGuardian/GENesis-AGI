@@ -237,6 +237,19 @@ genesis_gitnexus_ensure_pin() {
             printf '  remove all but one of: %s\n' "${_copies[*]}" >&2
             return 3
         fi
+        # A LONE install outside npm's prefix is the same trap one step earlier:
+        # `npm install -g` cannot touch it, so the upgrade lands as a SECOND
+        # copy at the prefix — the multi-copy conflict above, self-created.
+        local _prefix_bin="" _pfx=""
+        if command -v npm >/dev/null 2>&1; then
+            _pfx="$(npm config get prefix 2>/dev/null || true)"
+            [[ "$_pfx" = /* ]] && _prefix_bin="${_pfx%/}/bin/gitnexus"
+        fi
+        if [ -n "$_prefix_bin" ] && [ "${_copies[0]}" != "$_prefix_bin" ]; then
+            printf 'gitnexus: %s is outside the npm prefix (%s) — upgrading would leave it as a stale shadow; remove it first\n' \
+                "${_copies[0]}" "$_prefix_bin" >&2
+            return 3
+        fi
     fi
 
     npm install -g --engine-strict "gitnexus@${GENESIS_GITNEXUS_VERSION}" \

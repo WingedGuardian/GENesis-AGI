@@ -386,6 +386,51 @@ def test_gitnexus_ensure_pin_install_upgrade_and_postconditions(tmp_path):
             )
 
 
+def test_gitnexus_ensure_pin_refuses_to_create_a_shadow_conflict(tmp_path):
+    """`npm install -g` writes only to npm's prefix. Upgrading while the resolver
+    sees several same-version copies — or one copy outside the prefix — lands a
+    pinned install NEXT to an untouched older one, manufacturing the conflict
+    the shadow scan then refuses. Refuse first instead."""
+    helper = REPO_ROOT / "scripts" / "lib" / "gitnexus_version.sh"
+    fakebin = tmp_path / "bin"
+    shadow = tmp_path / "home" / ".local" / "bin"  # a scanned canonical location
+    fakebin.mkdir()
+    shadow.mkdir(parents=True)
+    version_file = tmp_path / "version"
+    version_file.write_text("1.6.8\n")
+    npm_log = tmp_path / "npm.log"
+    for d in (fakebin, shadow):
+        g = d / "gitnexus"
+        g.write_text(f'#!/bin/sh\ncat "{version_file}"\n')
+        g.chmod(0o755)
+    npm = fakebin / "npm"
+    # npm reports a prefix NEITHER binary lives under.
+    npm.write_text(f'#!/bin/sh\nif [ "${{1:-}}" = config ]; then echo "{tmp_path}/prefix"; exit 0; fi\n'
+                   f'printf "%s\\n" "$*" > "{npm_log}"\n')
+    npm.chmod(0o755)
+    env = {"PATH": f"{fakebin}:/usr/bin:/bin", "HOME": str(tmp_path / "home")}
+
+    # Two same-version copies: the resolver accepts them, but upgrading one
+    # leaves the other stale — refuse (rc 3) and never call npm.
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; genesis_gitnexus_ensure_pin', "bash", str(helper)],
+        env=env, check=False, capture_output=True, text=True,
+    )
+    assert result.returncode == 3
+    assert not npm_log.exists()
+
+    # The lone install outside npm's prefix gets the same verdict: an upgrade
+    # would only create the second, conflicting copy.
+    (shadow / "gitnexus").unlink()
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; genesis_gitnexus_ensure_pin', "bash", str(helper)],
+        env=env, check=False, capture_output=True, text=True,
+    )
+    assert result.returncode == 3
+    assert "shadow" in result.stderr
+    assert not npm_log.exists()
+
+
 def test_gitnexus_resolver_finds_npm_prefix_outside_path(tmp_path):
     helper = REPO_ROOT / "scripts" / "lib" / "gitnexus_version.sh"
     path_bin = tmp_path / "path-bin"
