@@ -576,6 +576,8 @@ async def test_the_traversal_sends_an_unfloored_now(tmp_path, monkeypatch):
             return _Graph()
 
     store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    # Parameter precision is independent of background client startup scheduling.
+    store._db = _Client()
     with (
         patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
         patch.object(falkor_mod, "_FalkorDB", _Client),

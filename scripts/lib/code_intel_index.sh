@@ -42,7 +42,7 @@
 # tell "lock held / host-frozen — keep the marker" apart from a real success).
 #
 # Env overrides:
-#   CODE_INTEL_INDEX_MEMORY_MAX   default 2G     (per systemd scope)
+#   CODE_INTEL_INDEX_MEMORY_MAX   default: measured 4096M, BOUNDED by the container
 #   CODE_INTEL_INDEX_IO_WEIGHT    default 20     (1-10000; low = polite)
 #   CODE_INTEL_INDEX_CPU_QUOTA    default 200%   (2 cores worth)
 #   CODE_INTEL_INDEX_MODE         default fast   (fast|moderate|full; 3rd arg wins)
@@ -66,12 +66,294 @@ REPO_PATH="${1:-}"
 TOOLS="${2:-both}"
 MODE="${3:-${CODE_INTEL_INDEX_MODE:-fast}}"
 
-MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-2G}"
+# Cap sized FROM A MEASUREMENT, not a guess (closes #1776).
+#
+# The old 2G default was ~40% BELOW what the job actually needs, so the indexer
+# was killed for being correctly sized against a wrong limit. MEASURED
+# 2026-09-08: a clean codebase-memory fast-index of this repo peaks at
+# 2,836 MB RSS (48,986 nodes / 302,236 edges, artifact written, rc=0, run under
+# a deliberately generous 8G cap). Every observed kill was
+# constraint=CONSTRAINT_MEMCG inside a code-intel-* scope sitting on its own 2G
+# limit at anon-rss ~2,084,000 kB — i.e. the cap was the killer, not container
+# pressure and not a leak. 4G is that measurement plus ~40% headroom.
+#
+# Note CBM_MEM_BUDGET_MB is NOT the lever for this: pinned to 1500 the index
+# still died at 2.03G, so it does not bound the index path.
+#
+# NOT a percentage-of-RAM cap, and that half of the reasoning stands: the
+# indexer's requirement scales with the REPO being indexed, not with the host, so
+# a pure 25%-of-RAM cap would be 8G here and 2G on an 8 GiB box — REPRODUCING
+# this exact bug on small installs. The TARGET must come from the measurement.
+#
+# A percentage would also be actively unsafe here: the rlimit fallback below
+# parses only <int>[.frac]G|M, so "25%" falls through to "running
+# memory-uncapped" — failing OPEN to something worse than the bug.
+# (Percentages DO work on a systemd scope, e.g. cc/invoker.py — but only on the
+# scope path, and the fallback is the trap.)
+#
+# .claude/mcp/run-codebase-memory keeps 2G on purpose; see the matching comment
+# there. It caps a long-lived SERVER against an upstream leak, not a batch job
+# whose size is set by the repo. The divergence is a decision, not drift.
+#
+# BUT the measured floor alone is not a safe cap, and shipping it as an absolute
+# 4G was wrong: scripts/host-setup.sh floors a Genesis install at 4 GiB, so on a
+# MINIMUM install MemoryMax=4G EQUALS the container limit and the scope stops
+# isolating anything — the parent cgroup reaches its own OOM before the scope
+# boundary is ever hit, taking the server or a session with it. A cap equal to
+# the whole container is not a cap.
+#
+# So: the measured need is the TARGET, and the container's real limit BOUNDS it.
+# That keeps the anti-percentage argument above intact (the target still comes
+# from a measurement, not from a fraction of whatever host we land on) while
+# guaranteeing the scope can actually fire before the container does.
+# _derive_mem_max emits an explicit <N>M value, never a percentage, so the rlimit
+# fallback below can still parse it.
+#
+# On a box too small for the bounded cap the index will still be killed at its
+# scope — that is the CORRECT failure: it protects the container instead of
+# taking it down. The real answer for such a host is not to start the job at all,
+# which is admission control and is deliberately NOT claimed here as present.
+_CI_MEM_TARGET_MB=4096   # the 2,836 MB measurement + ~40% headroom
+_CI_MEM_CONTAINER_FRACTION=60  # percent of the container limit the cap may take
+_CI_MEM_MIN_MB=256       # below this, refuse instead of exceeding the parent
+# ...AND never come within this much of the container limit. The fraction alone
+# is not enough: 60% of a 4 GiB minimum install is 2,457M, which leaves 1,639M
+# for genesis-server + Qdrant + a CC session together — so the parent cgroup can
+# still reach its own OOM before the scope boundary, which is the failure the
+# bound exists to prevent. A reserve states the invariant directly ("always leave
+# this much for everything else") instead of hoping a percentage happens to.
+# 2 GiB is the rough floor for server + Qdrant + one session on this reference
+# install; it is not a measurement of a minimum install, and is deliberately
+# conservative because being wrong small costs a stale index, while being wrong
+# large costs the container.
+_CI_MEM_RESERVE_MB=2048
+
+# What this CANNOT do, stated so nobody reads more into it: no static cap can
+# guarantee the scope fires before the container, because the headroom at the
+# moment of pressure depends on what everything else is doing. Unknown or tiny
+# parent limits are therefore refused before launch; dynamic admission control
+# against current usage is separate work and is not claimed here.
+_derive_mem_max() {
+    # Read this process's exact cgroup chain. A readable `max`/v1 sentinel is
+    # known-unbounded; missing, unreadable or malformed metadata is UNKNOWN and
+    # fails closed. Treating both states as "4096M" was the unsafe ambiguity.
+    #
+    # Read with the `read` BUILTIN, not `cat`: this entrypoint can run with a
+    # minimal PATH (the rlimit-fallback environment its own tests construct), and
+    # `cat` missing there made the read fail, empty the value, and silently
+    # return the UNBOUNDED target — restoring a cap equal to the parent limit on
+    # exactly the constrained install the bound protects. A builtin cannot go
+    # missing.
+    # Walk THIS PROCESS'S OWN cgroup chain and take the SMALLEST finite limit on
+    # it — not just the container root. cgroup v2 nested limits only restrict
+    # further and are enforced across the subtree, so a constrained ANCESTOR binds
+    # before the root does: a 3 GiB user slice inside a 32 GiB container would
+    # otherwise derive 4096M for a scope that can never fire before its own slice
+    # OOMs, taking the server or a session with it — strictly worse than the 2 GiB
+    # scope this replaces, which at least isolated. Reading only
+    # /sys/fs/cgroup/memory.max was that blind spot.
+    #
+    # This repo already documents the identical hierarchical rule and walks the
+    # chain for pids.max: see _collect_pid_budget in
+    # src/genesis/observability/snapshots/infrastructure.py. Same reasoning, same
+    # shape, different controller.
+    local root="${CODE_INTEL_FAKE_CGROUP_ROOT:-/sys/fs/cgroup}"
+    local selfcg="${CODE_INTEL_FAKE_CGROUP_SELF:-/proc/self/cgroup}"
+    local mountinfo="${CODE_INTEL_FAKE_CGROUP_MOUNTINFO:-/proc/self/mountinfo}"
+    if [ ! -r "$selfcg" ]; then
+        echo "ERROR: cannot determine the process cgroup; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+        return 1
+    fi
+
+    local v2_rel="" v1_rel="" line controllers rel
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            0::*)
+                v2_rel="${line#0::}"
+                ;;
+            *:*:*)
+                controllers="${line#*:}"
+                controllers="${controllers%%:*}"
+                case ",$controllers," in
+                    *,memory,*) v1_rel="${line#*:*:}" ;;
+                esac
+                ;;
+        esac
+    done < "$selfcg" 2>/dev/null
+
+    case "$v1_rel" in *" (deleted)") v1_rel="${v1_rel% (deleted)}" ;; esac
+    case "$v2_rel" in *" (deleted)") v2_rel="${v2_rel% (deleted)}" ;; esac
+
+    local mount="" filename="" version=""
+    if [ -n "$v1_rel" ]; then
+        if [ ! -r "$mountinfo" ]; then
+            echo "ERROR: cannot resolve the v1 memory-controller mount; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+            return 1
+        fi
+        local mi_line mi_left mi_right mi_root mi_point mi_type mi_opts
+        local -a mi_left_fields mi_right_fields
+        while IFS= read -r mi_line || [ -n "$mi_line" ]; do
+            case "$mi_line" in *" - "*) ;; *) continue ;; esac
+            mi_left="${mi_line%% - *}"
+            mi_right="${mi_line#* - }"
+            # Fields 4 and 5 are the filesystem root and mount point; fields
+            # after the separator begin with type, source, and super-options.
+            # Kernel whitespace/backslash escapes keep each pathname one field.
+            read -r -a mi_left_fields <<< "$mi_left"
+            [ "${#mi_left_fields[@]}" -ge 6 ] || continue
+            mi_root="${mi_left_fields[3]}"; mi_point="${mi_left_fields[4]}"
+            read -r -a mi_right_fields <<< "$mi_right"
+            [ "${#mi_right_fields[@]}" -ge 3 ] || continue
+            mi_type="${mi_right_fields[0]}"; mi_opts="${mi_right_fields[2]}"
+            [ "$mi_type" = "cgroup" ] || continue
+            case ",$mi_opts," in *,memory,*) ;; *) continue ;; esac
+            mi_root="${mi_root//\\040/ }"; mi_root="${mi_root//\\011/$'\t'}"
+            mi_root="${mi_root//\\012/$'\n'}"; mi_root="${mi_root//\\134/\\}"
+            mi_point="${mi_point//\\040/ }"; mi_point="${mi_point//\\011/$'\t'}"
+            mi_point="${mi_point//\\012/$'\n'}"; mi_point="${mi_point//\\134/\\}"
+            case "$mi_root" in /*) ;; *) continue ;; esac
+            case "$mi_point" in /*) ;; *) continue ;; esac
+            case "$v1_rel" in /*) ;; *) continue ;; esac
+            case "/${mi_root#/}/" in *"/../"*|*"/./"*) continue ;; esac
+            case "/${mi_point#/}/" in *"/../"*|*"/./"*) continue ;; esac
+            if [ "$mi_root" = "/" ]; then
+                rel="$v1_rel"
+            elif [ "$v1_rel" = "$mi_root" ]; then
+                rel="/"
+            else
+                case "$v1_rel" in
+                    "$mi_root"/*) rel="${v1_rel#"$mi_root"}" ;;
+                    *) continue ;;
+                esac
+            fi
+            mount="$mi_point"
+            break
+        done < "$mountinfo" 2>/dev/null
+        if [ -z "$mount" ]; then
+            echo "ERROR: cannot resolve the v1 memory-controller mount; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+            return 1
+        fi
+        filename="memory.limit_in_bytes"; version="v1"
+    elif [ -n "$v2_rel" ]; then
+        mount="$root"; rel="$v2_rel"; filename="memory.max"; version="v2"
+    else
+        echo "ERROR: cannot determine a memory-controller cgroup for this process; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+        return 1
+    fi
+
+    case "$rel" in
+        *" (deleted)") rel="${rel% (deleted)}" ;;
+    esac
+    case "$rel" in
+        /*) : ;;
+        *)
+            echo "ERROR: cannot determine a safe cgroup path for this process; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+            return 1
+            ;;
+    esac
+    case "/${rel#/}/" in
+        *"/../"*|*"/./"*)
+            echo "ERROR: cannot determine a safe cgroup path for this process; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+            return 1
+            ;;
+    esac
+    [ "$rel" = "/" ] && rel=""
+
+    local limit_bytes="" dir="$mount$rel" f v v_len
+    while :; do
+        f="$dir/$filename"
+        if [ ! -e "$f" ] && [ "$version" = "v2" ] && [ "$dir" = "$mount" ]; then
+            # cgroup v2 controller interface files exist only on non-root
+            # cgroups. Reaching the mount root without memory.max therefore
+            # means this final ancestor is unbounded, not that detection failed.
+            # A missing file anywhere BELOW the root remains an unknown limit
+            # and must fail closed.
+            :
+        elif [ ! -r "$f" ]; then
+            echo "ERROR: cannot determine the binding memory limit: $f is unreadable; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+            return 1
+        else
+            v=""
+            # `read` returns non-zero at EOF for a newline-less file after setting v.
+            read -r v < "$f" 2>/dev/null || true
+            case "$v" in
+                max)
+                    [ "$version" = "v2" ] || {
+                        echo "ERROR: cannot determine the binding memory limit: invalid v1 value; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+                        return 1
+                    }
+                    ;;
+                -1)
+                    [ "$version" = "v1" ] || {
+                        echo "ERROR: cannot determine the binding memory limit: invalid v2 value; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+                        return 1
+                    }
+                    ;;
+                ''|*[!0-9]*)
+                    echo "ERROR: cannot determine the binding memory limit: $f is malformed; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+                    return 1
+                    ;;
+                *)
+                    # v1 reports a huge numeric sentinel for unlimited. Avoid shell
+                    # integer overflow by classifying values wider than 16 digits
+                    # before arithmetic; any such limit is immaterial to a 4 GiB cap.
+                    v_len="${#v}"
+                    if [ "$version" = "v1" ] && { [ "$v_len" -gt 16 ] || { [ "$v_len" -eq 16 ] && [ "$v" -gt 4503599627370496 ]; }; }; then
+                        :
+                    elif [ -z "$limit_bytes" ] || [ "$v" -lt "$limit_bytes" ]; then
+                        limit_bytes="$v"
+                    fi
+                    ;;
+            esac
+        fi
+
+        [ "$dir" = "$mount" ] && break
+        dir="${dir%/*}"
+        case "$dir" in
+            "$mount"|"$mount"/*) : ;;
+            *)
+                echo "ERROR: cannot determine a safe cgroup path for this process; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+                return 1
+                ;;
+        esac
+    done
+
+    # Every level was readable and explicitly unlimited.
+    if [ -z "$limit_bytes" ]; then
+        printf '%sM\n' "$_CI_MEM_TARGET_MB"
+        return 0
+    fi
+
+    local limit_mb=$(( limit_bytes / 1024 / 1024 ))
+    if [ "$limit_mb" -lt "$_CI_MEM_MIN_MB" ]; then
+        echo "ERROR: binding memory limit (${limit_bytes} bytes) is too small for a safe index scope; refusing to start." >&2
+        return 1
+    fi
+
+    # The cap is the SMALLEST of: the measured target, a fraction of the BINDING
+    # limit found on the chain above, and whatever is left after the reserve.
+    local cap=$_CI_MEM_TARGET_MB
+    local by_fraction=$(( limit_mb * _CI_MEM_CONTAINER_FRACTION / 100 ))
+    [ "$by_fraction" -lt "$cap" ] && cap=$by_fraction
+    local by_reserve=$(( limit_mb - _CI_MEM_RESERVE_MB ))
+    [ "$by_reserve" -lt "$cap" ] && cap=$by_reserve
+
+    # A parent that cannot leave both the reserve and the minimum useful scope
+    # cannot run this 2.8 GiB index. Refuse instead of raising the cap above a
+    # known parent or silently discarding a sub-MiB finite limit.
+    if [ "$cap" -lt "$_CI_MEM_MIN_MB" ]; then
+        echo "ERROR: binding memory limit (${limit_mb} MiB) is too small for a safe index scope; refusing to start." >&2
+        return 1
+    fi
+    printf '%sM\n' "$cap"
+}
+
 IO_WEIGHT="${CODE_INTEL_INDEX_IO_WEIGHT:-20}"
 CPU_QUOTA="${CODE_INTEL_INDEX_CPU_QUOTA:-200%}"
 PERSISTENCE="${CODE_INTEL_INDEX_PERSISTENCE:-true}"
 
 _log() { printf '[code-intel-index] %s\n' "$*"; }
+
 
 # Shared load/iowait sampler for the pressure watchdog. Best-effort: if it's
 # missing (older checkout), the watchdog degrades to a wall-clock cap only.
@@ -144,6 +426,16 @@ if command -v flock >/dev/null 2>&1 && { exec 9>"$LOCK_FILE"; } 2>/dev/null; the
     fi
 else
     _log "WARNING: flock or lock file unavailable ($LOCK_FILE) — proceeding UNLOCKED"
+fi
+
+# Discover the automatic cap only once an invocation is certain to launch an
+# index. Disabled, invalid, worktree, and lock-held paths intentionally do no
+# work and must retain their own exit semantics even if cgroup metadata is
+# unavailable. An explicit operator override still bypasses discovery.
+if [ -n "${CODE_INTEL_INDEX_MEMORY_MAX:-}" ]; then
+    MEM_MAX="$CODE_INTEL_INDEX_MEMORY_MAX"
+elif ! MEM_MAX="$(_derive_mem_max)"; then
+    exit 1
 fi
 
 # ── 3. Resource-capped runner ───────────────────────────────────────────
