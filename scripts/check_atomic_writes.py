@@ -10,8 +10,8 @@ both halves -- the leak happens, and nothing sweeps that directory
 covers `~/.genesis/cc-tmp` and `/tmp`. Neither covers the `~/.genesis` root).
 
 WHY A GUARD AND NOT JUST FIXES. MEASURED 2026-09-09 against the merge of this
-branch into main: 62 atomic-write sites across 54 files, 30 of them dirty.
-That denominator moved THREE times, in both directions, and every move is worth
+tree (re-derived 2026-09-15): 63 atomic-write sites across 55 files, 30 of them dirty.
+That denominator moved FOUR times, in both directions, and every move is worth
 recording because each was invisible in a different way:
   * +1 site (58 -> 59). The temp-name test was anchored to the END of a string
     literal, so `f".{name}.restore-tmp-{getpid()}"` at guardian/cred_integrity.py
@@ -41,6 +41,13 @@ recording because each was invisible in a different way:
     easier to miss — the PR's own CI is where it surfaces, so a session that
     pushes without reading `gh pr checks` will not see it. That is how this one
     was found: three pushes late.
+  * +2 sites (61 -> 63, dirty unchanged at 30). This branch's own
+    `worktree_lifecycle._compress_entry` and `._write_board_cache`, both
+    CLEANS_UP, landing as main re-derived to 61 without them. That is the bullet
+    above a second time, which is the point of recording it: the shape recurs
+    every time a PR adding sites is open while main re-measures, and it is the
+    merge -- not either parent -- that has to be measured. Found by the audit of
+    that merge, not by the merge itself.
 Fixing 30 instances of a recurring pattern leaves nothing to stop instance 31.
 This is the prose-to-gate move: the rule was "clean up your temp", carried by
 convention, and conventions are what reviewers find one instance of at a time.

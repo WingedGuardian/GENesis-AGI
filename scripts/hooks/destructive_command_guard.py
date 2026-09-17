@@ -29,7 +29,28 @@ import sys
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import brace_expand, field, read_payload, run_guard  # noqa: E402
+try:
+    from hook_input import brace_expand, field, read_payload, run_guard  # noqa: E402
+except Exception:  # noqa: BLE001 — an unimportable hook_input must BLOCK, not vanish.
+    if __name__ != "__main__":
+        raise
+    # NOTHING TO FALL BACK ON: hook_input is the module that would recover us, so this
+    # guard refuses outright. Its only verdicts are BLOCK and ALLOW, and the
+    # alternative to blocking is permitting. An unguarded import exits 1, which Claude
+    # Code reads as NON-BLOCKING, and the recursive-rm gate disappears.
+    #
+    # The exception is not rendered (even __str__ can raise) and the exit uses
+    # os._exit, because sys.exit lets the interpreter retry a failed stream flush
+    # during shutdown and replace the status with 120 — which is not 2.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (destructive_command_guard): shared hook_input could not "
+            "be imported; BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
 
 try:  # noqa: E402
     import discarded_write

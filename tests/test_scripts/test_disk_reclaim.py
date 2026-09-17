@@ -5,7 +5,9 @@ partial deletion, MEDIUM-tier gating, and the --fail-above exit contract that
 the remediation registry relies on to escalate a stuck disk.
 """
 
+import fcntl
 import importlib.util
+import sqlite3
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -25,6 +27,7 @@ CacheTarget = _mod.CacheTarget
 
 
 # ─── Safety allowlist ────────────────────────────────────────────────────
+
 
 class TestIsSafeTarget:
     def test_rejects_home(self):
@@ -61,6 +64,7 @@ class TestIsSafeTarget:
 
 
 # ─── Cache clearing ──────────────────────────────────────────────────────
+
 
 def _make_cache(tmp_path: Path, name: str = "c", tier: str = "cheap") -> CacheTarget:
     d = tmp_path / name
@@ -105,10 +109,13 @@ class TestClearCache:
 
 # ─── main(): gating + exit contract ──────────────────────────────────────
 
+
 class TestMain:
     def _run(self, argv, disk_pct):
-        with patch.object(_mod.sys, "argv", ["disk_reclaim.py", *argv]), \
-             patch.object(_mod, "_disk_pct", return_value=disk_pct):
+        with (
+            patch.object(_mod.sys, "argv", ["disk_reclaim.py", *argv]),
+            patch.object(_mod, "_disk_pct", return_value=disk_pct),
+        ):
             return _mod.main()
 
     def test_medium_held_below_threshold(self, tmp_path):
@@ -116,8 +123,8 @@ class TestMain:
         medium = _make_cache(tmp_path, "med1", "medium")
         with patch.object(_mod, "_CACHE_TARGETS", [cheap, medium]):
             self._run(["--apply", "--if-above", "90"], disk_pct=80.0)
-        assert not cheap.path.exists()     # cheap always cleared
-        assert medium.path.exists()        # medium held below 90
+        assert not cheap.path.exists()  # cheap always cleared
+        assert medium.path.exists()  # medium held below 90
 
     def test_medium_cleared_above_threshold(self, tmp_path):
         cheap = _make_cache(tmp_path, "cheap2", "cheap")
@@ -125,7 +132,7 @@ class TestMain:
         with patch.object(_mod, "_CACHE_TARGETS", [cheap, medium]):
             self._run(["--apply", "--if-above", "90"], disk_pct=92.0)
         assert not cheap.path.exists()
-        assert not medium.path.exists()    # medium cleared at/above 90
+        assert not medium.path.exists()  # medium cleared at/above 90
 
     def test_dry_run_deletes_nothing(self, tmp_path):
         cheap = _make_cache(tmp_path, "cheap3", "cheap")
@@ -149,33 +156,117 @@ class TestLastResortTier:
     turns every later index into a full 0->100 rebuild that storms the box."""
 
     def _run(self, argv, disk_pct, home):
-        with patch.object(_mod.sys, "argv", ["disk_reclaim.py", *argv]), \
-             patch.object(_mod, "_disk_pct", return_value=disk_pct), \
-             patch.dict(_mod.os.environ, {"GENESIS_HOME": str(home)}):
+        with (
+            patch.object(_mod.sys, "argv", ["disk_reclaim.py", *argv]),
+            patch.object(_mod, "_disk_pct", return_value=disk_pct),
+            patch.dict(_mod.os.environ, {"GENESIS_HOME": str(home)}),
+        ):
             return _mod.main()
 
     def test_index_caches_are_last_resort_tier(self):
-        tiers = {t.tier for t in _mod._CACHE_TARGETS
-                 if "index" in t.description or "gitnexus" in t.description.lower()}
+        tiers = {
+            t.tier
+            for t in _mod._CACHE_TARGETS
+            if "index" in t.description or "gitnexus" in t.description.lower()
+        }
         assert tiers == {"last_resort"}, tiers
 
     def test_held_below_last_resort_threshold(self, tmp_path):
         # Medium gate (90) is crossed but last_resort (95) is not: DB survives.
         lr = _make_cache(tmp_path, "lr1", "last_resort")
         with patch.object(_mod, "_CACHE_TARGETS", [lr]):
-            self._run(["--apply", "--if-above", "90"], disk_pct=92.0,
-                      home=tmp_path / ".genesis")
+            self._run(["--apply", "--if-above", "90"], disk_pct=92.0, home=tmp_path / ".genesis")
         assert lr.path.exists()  # NOT deleted at 92% — the whole point
 
     def test_cleared_at_last_resort_threshold_drops_marker(self, tmp_path):
         lr = _make_cache(tmp_path, "lr2", "last_resort")
         home = tmp_path / ".genesis"
         with patch.object(_mod, "_CACHE_TARGETS", [lr]):
-            self._run(["--apply", "--last-resort-above", "95"], disk_pct=96.0,
-                      home=home)
+            self._run(["--apply", "--last-resort-above", "95"], disk_pct=96.0, home=home)
         assert not lr.path.exists()  # cleared at 96%
-        markers = list((home / "index-requests").glob("*.json"))
-        assert markers, "clearing an index DB must queue an idle rebuild marker"
+        with sqlite3.connect(home / "index-requests" / "queue.sqlite3") as db:
+            assert db.execute("SELECT count(*) FROM pending").fetchone()[0] == 1
+
+    def test_empty_last_resort_cache_does_not_drop_rebuild_marker(self, tmp_path):
+        empty = _mod.CacheTarget("empty index", tmp_path / "empty-index", "last_resort")
+        empty.path.mkdir()
+        home = tmp_path / ".genesis"
+
+        with patch.object(_mod, "_CACHE_TARGETS", [empty]):
+            rc = self._run(
+                ["--apply", "--last-resort-above", "95"],
+                disk_pct=96.0,
+                home=home,
+            )
+
+        assert rc == 0
+        assert empty.path.exists()
+        assert not (home / "index-requests").exists()
+
+    def test_busy_queue_spools_rebuild_before_last_resort_cache_clear(self, tmp_path):
+        lr = _make_cache(tmp_path, "lr-busy", "last_resort")
+        home = tmp_path / ".genesis"
+        marker_dir = home / "index-requests"
+        with patch.dict(_mod.os.environ, {"GENESIS_HOME": str(home)}):
+            assert _mod._drop_index_marker()
+        lock = sqlite3.connect(marker_dir / "queue.sqlite3", isolation_level=None)
+        lock.execute("BEGIN IMMEDIATE")
+        try:
+            with patch.object(_mod, "_CACHE_TARGETS", [lr]):
+                self._run(["--apply", "--last-resort-above", "95"], disk_pct=96.0, home=home)
+            spools = list(marker_dir.glob(".spool-*.spool"))
+            assert len(spools) == 1, "the rebuild request must be durable before deletion"
+            assert not lr.path.exists()
+        finally:
+            lock.rollback()
+            lock.close()
+        with patch.dict(_mod.os.environ, {"GENESIS_HOME": str(home)}):
+            import index_marker
+
+            assert len(index_marker.list_markers()) == 1
+        assert not spools[0].exists()
+
+    def test_runner_cannot_consume_marker_during_last_resort_deletion(self, tmp_path):
+        lr = _make_cache(tmp_path, "lr-race", "last_resort")
+        home = tmp_path / ".genesis"
+        runner_lock = home / "locks" / "code-intel-runner.lock"
+        original_clear = _mod._clear_cache
+        runner_acquired = []
+
+        def racing_clear(target, *, apply):
+            with runner_lock.open("a") as lock:
+                try:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    runner_acquired.append(True)
+                except BlockingIOError:
+                    runner_acquired.append(False)
+            return original_clear(target, apply=apply)
+
+        with (
+            patch.object(_mod, "_CACHE_TARGETS", [lr]),
+            patch.object(_mod, "_clear_cache", side_effect=racing_clear),
+        ):
+            self._run(["--apply", "--last-resort-above", "95"], disk_pct=96.0, home=home)
+        assert runner_acquired == [False]
+        with sqlite3.connect(home / "index-requests" / "queue.sqlite3") as db:
+            assert db.execute("SELECT count(*) FROM pending").fetchone()[0] == 1
+
+    def test_active_runner_at_critical_threshold_returns_failure_signal(self, tmp_path):
+        lr = _make_cache(tmp_path, "lr-active", "last_resort")
+        home = tmp_path / ".genesis"
+        runner_lock = home / "locks" / "code-intel-runner.lock"
+        runner_lock.parent.mkdir(parents=True)
+        with runner_lock.open("a") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch.object(_mod, "_CACHE_TARGETS", [lr]):
+                rc = self._run(
+                    ["--apply", "--last-resort-above", "95"],
+                    disk_pct=96.0,
+                    home=home,
+                )
+
+        assert rc == 2
+        assert lr.path.exists()
 
     def test_dry_run_never_drops_marker(self, tmp_path):
         lr = _make_cache(tmp_path, "lr3", "last_resort")

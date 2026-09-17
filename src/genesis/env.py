@@ -233,8 +233,9 @@ def internal_api_token_path() -> Path:
 
     Trusted loopback/host callers read this to authenticate to ``/api`` mutation
     endpoints when a dashboard password is set (see the dashboard auth gate).
-    Distinct from the optional ``GENESIS_MCP_HTTP_TOKEN`` (voice API) — this one
-    always exists once the server has booted, so callers need no configuration.
+    Distinct from the optional ``GENESIS_MCP_HTTP_TOKEN`` (the voice, OpenClaw
+    and desk-brain HTTP surfaces) — this one always exists once the server has
+    booted, so callers need no configuration.
     Written by the dashboard auth layer with mode 0600.
     """
     return genesis_home() / "internal_api_token"
@@ -268,6 +269,20 @@ def memory_writebacks_off() -> bool:
     re-rank memories for later ones. Default off: production unaffected.
     """
     return os.environ.get("GENESIS_MEMORY_WRITEBACKS_OFF", "").strip() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def daily_budget_disabled() -> bool:
+    """True when the per-provider daily budget ledger must be inert
+    (kill switch). With the switch on, ``DailyBudgetLedger.exhausted()``
+    is always False and ``record()`` no-ops — routing behaves exactly as
+    before the feature existed. Read live per check, so toggling does not
+    require a restart.
+    """
+    return os.environ.get("GENESIS_DAILY_BUDGET_DISABLED", "").strip() in (
         "1",
         "true",
         "yes",

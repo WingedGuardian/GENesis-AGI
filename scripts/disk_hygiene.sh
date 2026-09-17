@@ -129,6 +129,7 @@ prune_guard_corpus() {
 }
 
 main() {
+    local disk_reclaim_rc=0
     if [ -z "$VENV_PY" ]; then
         echo "disk_hygiene: no python interpreter found" >&2
         exit 1
@@ -153,7 +154,11 @@ main() {
     "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" || echo "worktree_lifecycle exited $?"
 
     echo "--- cache reclamation ---"
-    "$VENV_PY" "$REPO_DIR/scripts/disk_reclaim.py" --apply --if-above 90 || echo "disk_reclaim exited $?"
+    "$VENV_PY" "$REPO_DIR/scripts/disk_reclaim.py" --apply --if-above 90 \
+        --fail-above 95 || disk_reclaim_rc=$?
+    if [ "$disk_reclaim_rc" -ne 0 ]; then
+        echo "disk_reclaim exited $disk_reclaim_rc"
+    fi
 
     # Reap orphaned per-session background-CC sandboxes (~/tmp/bg-cc-sessions/<id>).
     # direct_session._run_session removes these in a finally on normal completion;
@@ -315,6 +320,7 @@ main() {
     prune_guard_corpus "$HOME/.genesis/output"
 
     echo "=== genesis-disk-hygiene done ==="
+    return "$disk_reclaim_rc"
 }
 
 # Run main only when executed directly — lets tests `source` this file to call a

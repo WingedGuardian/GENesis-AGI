@@ -119,6 +119,42 @@ class TestNesting:
     def test_bash_lc_bundle(self):
         assert _commit_nv("bash -lc 'git commit -n -m wip'")
 
+    def test_bash_ce_bundle(self):
+        assert any(s.exe == "echo" for s in sp.analyze("bash -ce 'echo hello'"))
+
+    def test_zsh_Gc_bundle_recurse(self):
+        assert any(
+            s.exe == "git" and sp.git_subcommand(s.argv) == "push"
+           for s in sp.analyze("zsh -Gc 'git push origin main'")
+        )
+
+    def test_bash_cl_bundle(self):
+        assert any(s.exe == "echo" for s in sp.analyze("bash -cl 'echo hello'"))
+
+    def test_bash_co_value_taking_option_bundle(self):
+        assert any(s.exe == "echo" for s in sp.analyze("bash -co pipefail 'echo hello'"))
+
+    def test_bash_Oc_value_taking_option_bundle(self):assert any(s.exe == "echo" for s in sp.analyze("bash -Oc extglob 'echo hello'"))
+
+    def test_bash_ec_bundle_still_works(self):
+        assert any(s.exe == "echo" for s in sp.analyze("bash -ec 'echo hello'"))
+
+    @pytest.mark.parametrize("interpreter", ["dash", "sh"])
+    @pytest.mark.parametrize("options", ["cC", "Cc", "cE", "Ec", "cI", "Ic", "cV", "Vc"])
+    def test_dash_valid_uppercase_c_bundles_recurse(self, interpreter, options):
+        assert any(s.exe == "echo" for s in sp.analyze(f"{interpreter} -{options} 'echo hello'"))
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "bash -- -ce 'echo hidden'",
+            "bash - -ce 'echo hidden'",
+            "bash -cz 'echo hidden'",
+        ],
+    )
+    def test_interpreter_non_options_and_invalid_bundles_do_not_recurse(self, command):
+        assert not any(s.exe == "echo" for s in sp.analyze(command))
+
     def test_command_substitution(self):
         assert _push_blocked('echo "$(git push origin main)"')
 
@@ -297,6 +333,13 @@ class TestCommandPositionStrip:
     def test_subshell_spaced(self):
         assert self._detects("( git clean -f )", "git", "clean")
 
+    def test_case_selector_ending_in_paren(self):
+        assert self._detects(
+            'case "$(printf b)" in b) git push origin main ;; esac',
+            "git",
+            "push",
+        )
+
     def test_subshell_glued(self):
         assert self._detects("(git clean -f)", "git", "clean")
 
@@ -313,6 +356,85 @@ class TestCommandPositionStrip:
     def test_while_do_done(self):
         assert self._detects("while :; do git push --force origin main; done", "git", "push")
 
+    def test_case_pattern_command(self):
+        assert self._detects("case x in y) echo hello ;; esac", "echo")
+
+    def test_case_multiple_pattern_commands(self):
+        command = "case x in a) echo first ;; b) echo second ;; esac"
+        segments = sp.analyze(command)
+
+        assert sum(s.exe == "echo" for s in segments) == 2
+
+    def test_case_parenthesized_later_pattern_command(self):
+        assert self._detects(
+            "case b in a) : ;; (b) git push origin main ;; esac",
+            "git",
+            "push",
+        )
+
+    def test_function_body_command(self):
+        assert self._detects("f() { echo hello; }", "echo")
+
+    def test_function_body_command_with_spaced_parens(self):
+        assert self._detects("f () { echo hello; }", "echo")
+
+    def test_function_body_git_push_with_spaced_parens(self):
+        assert self._detects("f () { git push origin main; }", "git", "push")
+
+    def test_function_keyword_body_command(self):
+        assert self._detects("function f { echo hello; }", "echo")
+
+    def test_function_keyword_with_optional_parens_body_command(self):
+        assert self._detects(
+            "function f () { git push origin main; }",
+            "git",
+            "push",
+        )
+
+    def test_function_keyword_if_body_command(self):
+        assert self._detects(
+            "function f if git push origin main; then :; fi",
+            "git",
+            "push",
+        )
+
+    def test_function_keyword_while_body_command(self):
+        assert self._detects(
+            "function f while git push origin main; do :; done",
+            "git",
+            "push",
+        )
+
+    def test_function_keyword_case_body_command(self):
+        assert self._detects(
+           "function f case x in x) git push origin main ;; esac",
+           "git",
+           "push",
+        )
+
+    def test_coproc_command(self):
+        assert self._detects("coproc echo hello", "echo")
+
+    def test_named_coproc_compound_body_command(self):
+        assert self._detects("coproc worker { rm -rf /tmp/scratch; }", "rm")
+
+    @pytest.mark.parametrize(
+       "opener, closer",
+       [("(", ")"), ("if true; then", "fi"), ("while false; do", "done")],
+    )
+
+    def test_named_coproc_other_compound_body_command(self, opener, closer):
+       assert self._detects(
+          f"coproc worker {opener} rm -rf /tmp/scratch; {closer}",
+          "rm",
+       )
+
+    def test_coproc_named_subshell_command(self):
+       assert self._detects(
+          "coproc worker (git push origin main)",
+          "git",
+          "push",
+       )
     def test_glued_rm(self):
         assert self._detects("(rm -rf ~)", "rm")
 
