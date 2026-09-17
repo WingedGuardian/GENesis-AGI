@@ -24,11 +24,22 @@ if ! source "$PIN_FILE" \
     exit 1
 fi
 
-BINARY="$(genesis_gitnexus_resolve_binary 2>/dev/null || true)"
+# STDERR IS NOT DISCARDED. The resolver refuses for two different reasons --
+# nothing found, or conflicting installations -- and only it knows which. Sending
+# its diagnostic to /dev/null and printing "not installed" told an operator with
+# two installs to go and install the thing they already had twice.
+_GN_RESOLVE_ERR="$(mktemp 2>/dev/null || printf '/tmp/run-gitnexus.%s' "$$")"
+BINARY="$(genesis_gitnexus_resolve_binary 2>"$_GN_RESOLVE_ERR" || true)"
 if [ -z "$BINARY" ] || [ ! -x "$BINARY" ]; then
-    printf 'run-gitnexus: GitNexus is not installed\n' >&2
+    if [ -s "$_GN_RESOLVE_ERR" ]; then
+        cat "$_GN_RESOLVE_ERR" >&2
+    else
+        printf 'run-gitnexus: GitNexus is not installed\n' >&2
+    fi
+    rm -f "$_GN_RESOLVE_ERR"
     exit 1
 fi
+rm -f "$_GN_RESOLVE_ERR"
 
 if ! genesis_gitnexus_node_supported; then
     printf 'run-gitnexus: GitNexus %s does not support Node %s\n' \

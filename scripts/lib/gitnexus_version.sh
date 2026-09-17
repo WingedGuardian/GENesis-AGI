@@ -58,13 +58,77 @@ _genesis_gitnexus_candidates() {
         _genesis_gitnexus_add "$candidate"
     done
     _genesis_gitnexus_add "$(command -v gitnexus 2>/dev/null || true)"
-    printf '%s\n' ${found[@]+"${found[@]}"}
+    # EMIT NOTHING when nothing was found. `printf '%s\n'` with no arguments
+    # still writes a newline, which the caller's `while read` turned into a
+    # one-element list containing the empty string -- so "no GitNexus anywhere"
+    # resolved SUCCESSFULLY to "". MEASURED: `genesis_gitnexus_ensure_pin` then
+    # believed a binary was present, read an empty version, failed the semver
+    # check and returned 3 instead of installing. A resolver that succeeds with
+    # no result is a fail-OPEN, and every caller that trusts the exit code
+    # inherits it.
+    [ "${#found[@]}" -gt 0 ] || return 0
+    printf '%s\n' "${found[@]}"
+}
+
+# The version of ONE candidate, WITHOUT executing it where that can be avoided.
+#
+# WHY NOT JUST `"$candidate" --version`. GitNexus is a Node script, so running it
+# runs whatever `node` is first on PATH. Any caller that stubs node -- which the
+# launcher's own node-version gate forces its tests to do -- makes every
+# Node-based candidate report the STUB's output instead of its version. MEASURED:
+# with a stubbed node echoing `v22.22.2`, the real install "reported" v22.22.2,
+# the shadow scan read that as a conflict with the 1.6.12 candidate beside it,
+# and the launcher refused to start with "GitNexus is not installed".
+#
+# Reading package.json cannot be hijacked that way, and npm always installs one
+# next to the binary. The package NAME is checked so walking up cannot pick up an
+# unrelated manifest. Executing the candidate remains the fallback, because a
+# binary with no manifest (a test fake, a hand-built copy) still has to be
+# readable -- but it is the last resort rather than the first.
+_genesis_gitnexus_version_of() {
+    local binary="${1:-}" real="" dir="" pkg="" name="" version=""
+    [ -n "$binary" ] || return 1
+    real="$(readlink -f "$binary" 2>/dev/null || printf '%s' "$binary")"
+    dir="$(dirname "$real")"
+    # Bounded walk: dist/cli/index.js -> dist/cli -> dist -> package root.
+    local depth=0
+    while [ "$depth" -lt 5 ] && [ -n "$dir" ] && [ "$dir" != "/" ]; do
+        pkg="$dir/package.json"
+        if [ -r "$pkg" ]; then
+            name="$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$pkg" | head -1)"
+            if [ "$name" = "gitnexus" ]; then
+                version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$pkg" | head -1)"
+                if [ -n "$version" ]; then
+                    printf '%s' "$version"
+                    return 0
+                fi
+            fi
+        fi
+        dir="$(dirname "$dir")"
+        depth=$(( depth + 1 ))
+    done
+    "$binary" --version 2>/dev/null
 }
 
 genesis_gitnexus_resolve_binary() {
+    # AN EXPLICIT OVERRIDE ENDS THE SEARCH, and therefore the shadow scan too.
+    # The scan exists to resolve AMBIGUITY about which of several installations
+    # a caller will get; naming one removes the ambiguity rather than adding to
+    # it. Scanning anyway meant that on any machine with a real install beside
+    # the named binary, the resolver refused a conflict the operator had already
+    # settled -- and the launcher then reported "not installed", which is false
+    # twice over.
+    if [ -n "${GITNEXUS_BIN:-}" ] && [ -x "$GITNEXUS_BIN" ]; then
+        printf '%s\n' "$GITNEXUS_BIN"
+        return 0
+    fi
     local -a candidates=()
     local candidate
     while IFS= read -r candidate; do
+        # Skip a blank line rather than admitting "" as a candidate: the emitter
+        # no longer produces one, and this makes that guarantee local to the
+        # reader too, so a future change there cannot reopen the fail-open.
+        [ -n "$candidate" ] || continue
         candidates+=("$candidate")
     done < <(_genesis_gitnexus_candidates)
     [ "${#candidates[@]}" -gt 0 ] || return 1
@@ -75,7 +139,7 @@ genesis_gitnexus_resolve_binary() {
     # conflict instead of trusting whichever binary the canonical order chose.
     local first_version="" version=""
     for candidate in "${candidates[@]}"; do
-        version="$("$candidate" --version 2>/dev/null || true)"
+        version="$(_genesis_gitnexus_version_of "$candidate" || true)"
         if [ -z "$first_version" ]; then
             first_version="$version"
         elif [ "${version#v}" != "${first_version#v}" ]; then
@@ -90,7 +154,10 @@ genesis_gitnexus_resolve_binary() {
 genesis_gitnexus_installed_version() {
     local binary
     binary="$(genesis_gitnexus_resolve_binary)" || return 1
-    "$binary" --version 2>/dev/null
+    # Same reasoning as the shadow scan: a stubbed `node` would otherwise make
+    # this report the stub's output as GitNexus's version, and this value gates
+    # the pin check.
+    _genesis_gitnexus_version_of "$binary"
 }
 
 genesis_gitnexus_installed_is_pinned() {
