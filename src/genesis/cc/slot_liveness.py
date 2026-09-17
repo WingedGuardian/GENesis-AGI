@@ -1,0 +1,269 @@
+"""Is an interactive `claude` actually running inside a tmux slot?
+
+`cc-slot.sh` attaches to an existing `cc-N` session with `tmux new-session -A`.
+When the session already exists, tmux ATTACHES and **silently discards the
+shell-command argument** — so the launch command never runs. A slot that is
+alive but sitting at a bare shell prompt is therefore self-perpetuating: every
+subsequent connection lands at that prompt, and the door has no way to notice.
+
+This module answers the one question the door needs before it decides whether
+to attach or to relaunch.
+
+WHY NOT ``#{pane_current_command}``
+-----------------------------------
+It is the obvious signal and it is WRONG here, which is worth recording because
+it reads as correct. MEASURED on a live install, all five sessions:
+
+    session  pane command shape                     pane_current_command  claude?
+    cc-4     bash -c "cd … && claude …; trailer"    bash                  YES
+    cc-5     bash -c "cd … && claude …; trailer"    bash                  YES
+    cc-6     login shell, claude typed by hand      claude                YES
+    cc-7     legacy `exec claude`                   claude                YES
+    lobby    login shell, idle                      bash                  NO
+
+The canonical pane command is a NON-interactive `bash -c`, and it deliberately
+dropped `exec` so the exit-capture trailer can run after claude returns. Without
+job control, claude shares the shell's process group, so tmux resolves the tty's
+foreground group to the group LEADER — the shell. The two sessions that report
+`claude` do so only because they are the legacy/manual shapes. In other words
+the signal is wrong for exactly the sessions the launcher creates, and reading
+it would classify a healthy slot as broken.
+
+FAIL DIRECTION
+--------------
+Deliberately biased toward reporting ALIVE. A false ALIVE costs a plain attach —
+which is the pre-existing behaviour, so nothing is lost. A false POISONED makes
+the door type a launch command into a pane where a session IS running, i.e. into
+a live TUI. The two errors are not symmetric, and every ambiguity resolves the
+cheap way.
+
+That is also why this does not reuse ``observability/cc_slots._is_interactive``:
+that predicate treats an unreadable cmdline as NOT interactive, which is correct
+for its purpose (never let an internal `claude -p` masquerade as a slot) and
+exactly backwards for this one.
+
+Reads only `comm` and `cmdline` under `/proc` — both world-readable for the
+same uid. Never `environ`, which is ptrace-gated and returns EACCES under a
+hardened service sandbox.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+ALIVE = "ALIVE"
+POISONED = "POISONED"
+UNKNOWN = "UNKNOWN"
+
+
+# A pane shell -> claude is one hop; a hand-typed `bash` in between makes two.
+# The bound only stops a cycle in a malformed /proc from spinning.
+_MAX_ANCESTRY_HOPS = 40
+
+
+def _read(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def _is_headless(cmdline: bytes | None) -> bool:
+    """True only when we can POSITIVELY prove this is a `claude -p` call.
+
+    Unreadable cmdline returns False (i.e. "treat as a real session"), which is
+    the sparing direction — see FAIL DIRECTION above.
+    """
+    if cmdline is None:
+        return False
+    args = cmdline.split(b"\x00")
+    return b"-p" in args or b"--print" in args
+
+
+# `comm` is the primary signal and is MEASURED correct today: the shipped
+# `claude.exe` reports comm=="claude" on every live session, including one
+# whose exe had been replaced by an upgrade. It is still ONE signal about an
+# external binary we do not control, and if a future release changed it every
+# live slot would read as poisoned — the expensive direction. argv[0] is
+# therefore accepted as an alternative. Both are exact-basename matches, so a
+# neighbouring tool ("claude-wrapper", "claude-monitor") does not qualify;
+# widening here only ever costs a plain attach.
+_CLAUDE_NAMES = frozenset({b"claude", b"claude.exe", b"claude-code"})
+
+# An interpreter-wrapped install is a REAL shape, not a hypothetical: this repo
+# already carries a closed rule set for it in
+# `scripts/check_cc_running_versions.sh` (`is_cc_name`, `is_interpreter_name`,
+# `cmdline_runs_cc`). Recognising fewer shapes there means a false all-clear;
+# recognising fewer shapes HERE means classifying a live `node .../cli.js`
+# session as claude-less and offering to destroy it. Same sets, worse failure,
+# so they are kept in step by `test_slot_liveness` rather than by good
+# intentions.
+_INTERPRETERS = frozenset({b"node", b"nodejs", b"bun", b"deno"})
+_ENTRY_SCRIPTS = frozenset({b"cli.js"})
+
+
+def _runs_entry_script(args: list[bytes]) -> bool:
+    """True when this interpreter's argv mentions the CC entry script anywhere.
+
+    ANY token, not the first non-flag one — and that is a deliberate retreat
+    from parsing. `node --enable-source-maps /opt/cc/cli.js` already defeats
+    testing argv[1]; `node -r preload /opt/cc/cli.js` then defeats
+    first-non-flag, because skipping a flag without consuming its OPERAND is
+    not a parser. Getting that right means knowing which of an interpreter's
+    options take values — per interpreter, per version — which is not knowledge
+    this module can hold, and being wrong costs a live session.
+
+    So the question is weakened until it needs no grammar at all. The price is
+    a false ALIVE for a command that merely mentions the entry script without
+    running it (`node server.js --config /opt/cc/cli.js`), which costs the
+    operator a rebuild offer. The alternative price is a false POISONED on a
+    running session, which costs their work. Asymmetric, so the safe side wins.
+    """
+    return any(a.rsplit(b"/", 1)[-1] in _ENTRY_SCRIPTS for a in args)
+
+
+def _is_claude(comm: bytes | None, cmdline: bytes | None) -> bool:
+    if comm is not None and comm.strip() in _CLAUDE_NAMES:
+        return True
+    if not cmdline:
+        return False
+    args = [a for a in cmdline.split(b"\x00") if a]
+    if not args:
+        return False
+    base = args[0].rsplit(b"/", 1)[-1]
+    if base in _CLAUDE_NAMES:
+        return True
+    return base in _INTERPRETERS and _runs_entry_script(args[1:])
+
+
+def _ppid_of(proc_root: Path, pid: int) -> int | None:
+    """Parent pid from /proc/<pid>/stat.
+
+    The comm field is parenthesised and may itself contain spaces or ')', so the
+    fields after it are located from the LAST ')' — splitting on whitespace from
+    the left mis-parses any process whose name contains a space.
+    """
+    raw = _read(proc_root / str(pid) / "stat")
+    if raw is None:
+        return None
+    try:
+        after = raw[raw.rindex(b")") + 1 :].split()
+        return int(after[1])  # state, ppid, …
+    except (ValueError, IndexError):
+        return None
+
+
+def claude_pids(proc_root: Path) -> list[tuple[int, bool]] | None:
+    """``(pid, is_headless)`` for every claude process, or None if /proc failed.
+
+    Headless processes are RETAINED rather than dropped here, because whether
+    one matters depends on WHERE it is running and that is not known yet. The
+    caller resolves it: a headless task outside the target pane is somebody
+    else's background probe and is ignored exactly as before, but one INSIDE
+    the pane is that pane's own work. Dropping them all up front reported a
+    slot running `claude -p` as claude-less, and the door then offered to
+    destroy a live headless task with a message saying nothing was running.
+    """
+    try:
+        entries = [p for p in proc_root.iterdir() if p.name.isdigit()]
+    except OSError:
+        return None
+    found = []
+    for entry in entries:
+        cmdline = _read(entry / "cmdline")
+        comm = _read(entry / "comm")
+        if not _is_claude(comm, cmdline):
+            continue
+        found.append((int(entry.name), _is_headless(cmdline)))
+    return found
+
+
+def liveness(pane_pids: list[int], proc_root: Path = Path("/proc")) -> str:
+    """Report whether an interactive claude descends from any of *pane_pids*."""
+    if not pane_pids:
+        # The door could not tell us which panes to inspect; do not guess.
+        return UNKNOWN
+    pids = claude_pids(proc_root)
+    if pids is None:
+        return UNKNOWN
+    targets = set(pane_pids)
+    # POISONED requires every walk to CONCLUDE (reach init without meeting a
+    # pane pid). A walk cut short — hop bound hit, stat unreadable mid-chain —
+    # proves nothing, and the broken walk is exactly the one that might have
+    # connected claude to the pane; treating it as death is the expensive
+    # error. Such runs answer UNKNOWN, which costs a plain attach. One
+    # deliberately ACCEPTED consequence: a single process with an unresolvable
+    # ancestry (a stat cycle, a >hop-bound chain) suppresses heals box-wide for
+    # as long as it lives — that is the fail-direction's price, not a bug.
+    inconclusive = False
+    for pid, headless in pids:
+        if pid in targets:
+            return ALIVE  # the pane process IS claude (legacy `exec` shape)
+        verdict = _walk_verdict(proc_root, pid, targets)
+        if verdict == ALIVE:
+            return ALIVE
+        # A HEADLESS process only ever votes ALIVE. Outside the pane it is a
+        # background probe elsewhere on the host and must stay invisible here —
+        # which is what dropping it early achieved, and letting its UNKNOWN walk
+        # set `inconclusive` would over-achieve: a single unresolvable headless
+        # ancestry anywhere on the box would suppress every heal (see the note
+        # above on that consequence being priced, not free).
+        if verdict == UNKNOWN and not headless:
+            inconclusive = True
+    return UNKNOWN if inconclusive else POISONED
+
+
+def _walk_verdict(proc_root: Path, pid: int, targets: set[int]) -> str:
+    """One candidate's ancestry, resolved to ALIVE / POISONED / UNKNOWN.
+
+    POISONED here means "this candidate is conclusively NOT the pane's claude"
+    — it contributes to (never decides) the session verdict. A candidate that
+    VANISHED since enumeration (its /proc dir is gone at hop 0) is exactly as
+    conclusive as one that walked to init: an exited process cannot be the
+    slot's live claude, and scoring it UNKNOWN would let routine box-wide
+    claude churn suppress every heal. A candidate still PRESENT but with an
+    unreadable/unparseable stat stays UNKNOWN — it might be ours.
+    """
+    cur, hops = pid, 0
+    while True:
+        if hops >= _MAX_ANCESTRY_HOPS:
+            return UNKNOWN
+        parent = _ppid_of(proc_root, cur)
+        if parent is None:
+            if hops == 0 and not (proc_root / str(cur)).exists():
+                return POISONED  # exited between enumeration and walk
+            return UNKNOWN
+        if parent <= 1:
+            return POISONED  # walked to init: a real conclusion
+        if parent in targets:
+            return ALIVE
+        cur, hops = parent, hops + 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Print the verdict on line 1 and a human note on line 2.
+
+    Mirrors the stdout protocol of the sibling gates (`session_cap`,
+    `login_gate`) so the launcher parses all three the same way. Any internal
+    error prints UNKNOWN rather than raising: the caller must never be left
+    without a verdict, and UNKNOWN is the sparing one.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    try:
+        pids = [int(p) for p in args if p.strip().isdigit()]
+        verdict = liveness(pids)
+    except Exception:  # noqa: BLE001 - a crash here must not break the door
+        verdict = UNKNOWN
+    notes = {
+        ALIVE: "an interactive claude is running in this slot",
+        POISONED: "no interactive claude is running in this slot",
+        UNKNOWN: "could not determine the slot's state; leaving it untouched",
+    }
+    print(verdict)
+    print(notes[verdict])
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - module entry point
+    raise SystemExit(main())

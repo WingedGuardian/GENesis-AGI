@@ -11,6 +11,60 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("genesis.runtime")
 
+_DISCORD_WEBHOOK_PREFIX = "DISCORD_WEBHOOK_"
+
+
+def _discord_webhook_env(channel: str) -> str:
+    """Env var that configures the Discord webhook for ``channel``.
+
+    The exact inverse of the discovery loop in ``init`` below (which strips the
+    prefix, lowercases, and maps ``_`` → ``-``), kept beside it so the two cannot
+    drift apart.
+
+    Lives in THIS module rather than in ``channels/discord_adapter.py`` because
+    ``scripts/check_external_io.py`` treats a webhook-env literal as an egress
+    door and requires the containing file to be ALLOWLISTED — this module is on
+    that allowlist, and the guard's own docstring states the adapter is covered
+    via its URL's ORIGIN here. The adapter takes this as an injected callable so
+    its refusal message can still name the exact setting to configure.
+    """
+    return _DISCORD_WEBHOOK_PREFIX + channel.upper().replace("-", "_")
+
+
+# The DEFAULT webhook's variable. The discovery loop below EXCLUDES it from the
+# per-channel map on purpose, so no channel name may resolve to it.
+_DISCORD_DEFAULT_ENV = _DISCORD_WEBHOOK_PREFIX + "URL"
+
+
+def _is_reserved_discord_channel(channel: str) -> bool:
+    """True when ``channel`` would name the DEFAULT webhook, not a per-channel one.
+
+    The forward rule has a HOLE in its domain: `DISCORD_WEBHOOK_URL` is filtered
+    out of the per-channel map, so there is no channel whose webhook it is. The
+    inverse rule does not know that, and maps the literal channel ``url`` — in
+    any letter case, and ``URL`` via the ``-``→``_`` rule too — straight onto it.
+
+    A caller that looks the variable up directly therefore found the DEFAULT
+    webhook, posted there, and reported success for a channel named ``url``:
+    exactly the undetectable redirect this module exists to prevent, reached
+    through the one name nobody thinks to test. Derived from the two rules
+    rather than hardcoded, so it cannot drift from either.
+    """
+    return _discord_webhook_env(channel) == _DISCORD_DEFAULT_ENV
+
+
+def _discord_channel_from_env(key: str) -> str:
+    """Channel name for a ``DISCORD_WEBHOOK_<NAME>`` env var — the FORWARD rule.
+
+    Extracted so it is shipped code rather than a line the discovery loop keeps
+    to itself. Its round-trip test used to TRANSCRIBE this transform inline,
+    which reads as verification and is not one: a change here would have left
+    that test green while ``_discord_webhook_env`` started naming a variable
+    that would not in fact configure the channel — confidently wrong, which is
+    worse than no hint at all.
+    """
+    return key[len(_DISCORD_WEBHOOK_PREFIX):].lower().replace("_", "-")
+
 
 async def init(rt: GenesisRuntime) -> None:
     """Initialize outreach pipeline, scheduler, MCP wiring."""
@@ -80,18 +134,36 @@ async def init(rt: GenesisRuntime) -> None:
 
             discord_webhooks = {}
             for key, val in os.environ.items():
-                if key.startswith("DISCORD_WEBHOOK_") and key != "DISCORD_WEBHOOK_URL" and val:
-                    name = key[len("DISCORD_WEBHOOK_"):].lower().replace("_", "-")
+                if (
+                    key.startswith(_DISCORD_WEBHOOK_PREFIX)
+                    and key != _DISCORD_DEFAULT_ENV
+                    and val
+                ):
+                    name = _discord_channel_from_env(key)
                     discord_webhooks[name] = val
 
-            channels["discord"] = DiscordWebhookAdapter(
-                webhooks=discord_webhooks,
-                default_webhook=discord_webhook,
-            )
+            # Resolve the default recipient BEFORE building the adapter: the
+            # adapter needs it to tell "the configured default channel" (which
+            # legitimately resolves to DISCORD_WEBHOOK_URL) apart from "a named
+            # channel nobody configured a webhook for" (which it must refuse
+            # rather than silently redirect). Same value either way — an
+            # explicit recipients entry still wins.
             if "discord" not in recipients:
                 recipients["discord"] = os.environ.get(
                     "OUTREACH_RECIPIENT_DISCORD", "dev-discussion"
                 )
+            channels["discord"] = DiscordWebhookAdapter(
+                webhooks=discord_webhooks,
+                default_webhook=discord_webhook,
+                default_channel=recipients["discord"],
+                # The env-var naming rule lives HERE, not in the adapter: this
+                # module is the allow-listed egress door in
+                # scripts/check_external_io.py, and that guard covers the adapter
+                # via this origin rather than by allow-listing it. Passing the
+                # template keeps the refusal message actionable (it names the
+                # exact var) without putting a webhook-env literal in the adapter.
+                config_hint=_discord_webhook_env,
+            )
             logger.info("Discord webhook adapter registered")
 
         # Wire voice adapter for proactive chiming (HA TTS)
