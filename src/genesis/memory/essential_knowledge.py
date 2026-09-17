@@ -195,6 +195,18 @@ async def _active_session_pivots(db: aiosqlite.Connection) -> list[str]:
         return []
 
 
+def _safe_origin_values() -> tuple[str, ...]:
+    """Origin classes that may reach L1, DERIVED from the provenance module.
+
+    Same reasoning as the channel allowlist: an EXCLUDE list admits whatever
+    nobody thought of, which for a query feeding every session is the wrong
+    default. ``_SAFE_ORIGINS`` is already the canonical complement.
+    """
+    from genesis.memory.provenance import _SAFE_ORIGINS
+
+    return tuple(sorted(_SAFE_ORIGINS))
+
+
 def _owner_attended_channel_values() -> tuple[str, ...]:
     """Channel values that count as owner-attended, DERIVED from the predicate.
 
@@ -218,6 +230,8 @@ async def _recent_session_topics(db: aiosqlite.Connection, days: int = 7) -> lis
     content an outside party chose, and this query feeds every session.
     """
     allowed = _owner_attended_channel_values()
+    safe_origins = _safe_origin_values()
+    origin_ph = ", ".join("?" for _ in safe_origins)
     # Only "?" characters, one per enum member -- no caller input reaches the
     # SQL text, and the channel VALUES below are still bound parameters.
     placeholders = ", ".join("?" for _ in allowed)
@@ -228,11 +242,26 @@ async def _recent_session_topics(db: aiosqlite.Connection, days: int = 7) -> lis
         "WHERE source_tag = 'foreground' "
         "AND topic IS NOT NULL AND topic != '' "
         f"AND (channel IS NULL OR channel IN ({placeholders})) "
+        # Belt and braces on the NULL branch, and an ALLOWLIST for the same
+        # reason the channel clause is one. The first draft of this listed the
+        # origins to EXCLUDE, five lines under a docstring saying never to
+        # hardcode such a set -- so an origin class nobody had thought of
+        # reached L1 by default, and one of the two names in it
+        # ('external') was not even a real origin class. The safe set already
+        # exists as provenance._SAFE_ORIGINS; derive from it.
+        # NULL still passes for the reason it passes above: most rows have no
+        # origin_class at all. This does NOT close the whole hole -- a
+        # transcript auto-registered from the filesystem carries neither field
+        # and is indistinguishable from a CLI session here. That residual
+        # belongs to the registration path and is tracked separately.
+        f"AND (origin_class IS NULL OR origin_class IN ({origin_ph})) "
         "AND started_at > datetime('now', ?) "
         "ORDER BY started_at DESC LIMIT 10"
     )
     try:
-        cursor = await db.execute(sql, (*allowed, f"-{days} days"))
+        cursor = await db.execute(
+            sql, (*allowed, *safe_origins, f"-{days} days"),
+        )
         rows = await cursor.fetchall()
         return [row[0][:200] for row in rows if row[0]]
     except Exception:

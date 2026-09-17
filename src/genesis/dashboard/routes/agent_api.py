@@ -155,10 +155,14 @@ def _conversation_id() -> str:
 def agent_ping():
     """Liveness plus a reachability proof for the calling agent.
 
-    Behind the same auth as everything else here. Note this does not make the
-    surface invisible to an unauthenticated prober — 503 and 401 are still
-    distinguishable, and reveal whether the connector is configured — it only
-    withholds the install's identity.
+    Behind the same auth as everything else here, but that does NOT make the
+    surface invisible to an unauthenticated prober, and this docstring should
+    not imply it does. Three things leak with no credential: 503 versus 401
+    reveals whether the connector is configured; Flask answers OPTIONS with 200
+    and an ``Allow`` header BEFORE any view code runs, so the route and its
+    methods are discoverable either way; and the path is published by the serve
+    listener regardless. What auth withholds is the install's identity and any
+    ability to act.
     """
     auth = require_bearer(_AUTH_ENV, "agent connector")
     if auth is not None:
@@ -229,7 +233,12 @@ def agent_chat_completions():
 
     conversation_loop = current_app.config.get("GENESIS_CONVERSATION_LOOP")
     event_loop = current_app.config.get("GENESIS_EVENT_LOOP")
-    if conversation_loop is None or event_loop is None:
+    # is_running() matters, not just existence: during shutdown, or with a
+    # configured-but-stopped loop, run_coroutine_threadsafe raises RuntimeError
+    # and the caller gets a 500 while the coroutine it just created is never
+    # awaited. The voice route guards the same way.
+    if (conversation_loop is None or event_loop is None
+            or not getattr(event_loop, "is_running", lambda: True)()):
         logger.warning("agent connector hit before runtime is ready (caller %s)", caller)
         return jsonify({"error": "runtime starting"}), 503
 

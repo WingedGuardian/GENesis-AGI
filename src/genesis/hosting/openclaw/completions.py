@@ -64,7 +64,12 @@ def chat_completions():
 
     conversation_loop = current_app.config.get("OPENCLAW_CONVERSATION_LOOP")
     event_loop = current_app.config.get("GENESIS_EVENT_LOOP")
-    if conversation_loop is None or event_loop is None:
+    # is_running() matters, not just existence: with a configured-but-stopped
+    # loop (shutdown being the ordinary case) run_coroutine_threadsafe raises
+    # RuntimeError, so the caller gets a 500 while the coroutine it just
+    # created is never awaited. The 503 below is the response that case wants.
+    if (conversation_loop is None or event_loop is None
+            or not getattr(event_loop, "is_running", lambda: True)()):
         # Fallback: ConversationLoop not initialized (e.g., DB unavailable)
         return jsonify({"error": "ConversationLoop not available", "type": "error"}), 503
 

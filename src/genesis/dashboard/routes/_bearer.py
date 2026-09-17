@@ -14,7 +14,11 @@ Three of them are not obvious:
 * **A blank-ish token is not a credential.** A trailing space after the ``=``
   in an env file, or a half-filled placeholder, leaves the variable *set*. Such
   a value must behave exactly like unset, or the surface reports itself enabled
-  in the boot log while guarding a guessable secret.
+  in the boot log while guarding a guessable secret. Empty and whitespace-only
+  are refused unconditionally; the length FLOOR is per-surface (``min_chars``),
+  because raising it on a surface that already exists would silently disable a
+  live integration whose operator chose a shorter token years ago. New surfaces
+  take the default.
 * **The scheme is case-insensitive.** RFC 7235 section 2.1 defines auth-scheme
   as a case-insensitive token, so a conforming client sending ``bearer`` is not
   sending a malformed request.
@@ -33,17 +37,20 @@ from flask import request
 MIN_TOKEN_CHARS = 16
 
 
-def token_is_configured(env_var: str) -> bool:
+def token_is_configured(env_var: str, *, min_chars: int = MIN_TOKEN_CHARS) -> bool:
     """Whether *env_var* holds something that counts as a credential.
 
     Exposed so a boot-time log can tell the truth about whether a surface is
     enabled, using the SAME rule the request path applies. A warning that says
     "enabled" while every request 503s is worse than no warning.
     """
-    return len(os.environ.get(env_var, "").strip()) >= MIN_TOKEN_CHARS
+    value = os.environ.get(env_var, "").strip()
+    return bool(value) and len(value) >= min_chars
 
 
-def require_bearer(env_var: str, label: str) -> tuple[str, int] | None:
+def require_bearer(
+    env_var: str, label: str, *, min_chars: int = MIN_TOKEN_CHARS,
+) -> tuple[str, int] | None:
     """Validate the request's bearer token. ``None`` means OK.
 
     Returns ``(message, status)`` otherwise: 503 when *env_var* is not
@@ -51,7 +58,7 @@ def require_bearer(env_var: str, label: str) -> tuple[str, int] | None:
     trusted network), 401 for a missing, malformed or wrong credential.
     """
     token = os.environ.get(env_var, "").strip()
-    if len(token) < MIN_TOKEN_CHARS:
+    if not token or len(token) < min_chars:
         return (f"{label} disabled: {env_var} not configured", 503)
 
     auth_header = request.headers.get("Authorization", "")

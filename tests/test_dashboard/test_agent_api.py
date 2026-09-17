@@ -165,6 +165,27 @@ def test_503_when_runtime_not_ready(client):
     assert "starting" in resp.get_json()["error"]
 
 
+def _assert_all_permits_free():
+    """Every permit is back in the pool.
+
+    Counting to _MAX_CONCURRENT is the whole point. A release/free test whose
+    pool holds more than ONE unit cannot fail when the release is deleted:
+    with _MAX_CONCURRENT == 2 a single acquire still succeeds. MEASURED by
+    mutation -- replacing the endpoint`s `finally: release()` with `pass` left
+    the old single-acquire assertions green.
+    """
+    got = 0
+    try:
+        while agent_api._semaphore.acquire(blocking=False):
+            got += 1
+    finally:
+        for _ in range(got):
+            agent_api._semaphore.release()
+    assert got == agent_api._MAX_CONCURRENT, (
+        f"{got} of {agent_api._MAX_CONCURRENT} permits free - the limiter leaked"
+    )
+
+
 def _ready_app():
     app = Flask(__name__)
     app.register_blueprint(agent_api_bp)
@@ -242,8 +263,7 @@ def test_timeout_returns_504_and_releases_the_limiter():
         )
     assert resp.status_code == 504
     # The limiter must not leak on the error path, or the endpoint wedges.
-    assert agent_api._semaphore.acquire(blocking=False) is True
-    agent_api._semaphore.release()
+    _assert_all_permits_free()
 
 
 def test_invocation_failure_returns_500_and_releases_the_limiter():
@@ -257,8 +277,7 @@ def test_invocation_failure_returns_500_and_releases_the_limiter():
             json={"messages": [{"role": "user", "content": "hi"}]},
         )
     assert resp.status_code == 500
-    assert agent_api._semaphore.acquire(blocking=False) is True
-    agent_api._semaphore.release()
+    _assert_all_permits_free()
 
 
 def test_at_capacity_returns_429():
@@ -614,3 +633,46 @@ def test_every_text_block_of_a_multipart_message_is_forwarded():
     forwarded = app.config["GENESIS_CONVERSATION_LOOP"].handle_message.call_args.args[0]
     assert "look at this" in forwarded
     assert "what is wrong with it" in forwarded
+def test_stopped_event_loop_is_503_not_500():
+    """Existence is not readiness. A configured-but-stopped loop makes
+    run_coroutine_threadsafe raise, so the caller gets a 500 and the coroutine
+    it just created is never awaited."""
+    app = Flask(__name__)
+    app.register_blueprint(agent_api_bp)
+    app.config["TESTING"] = True
+    app.config["GENESIS_CONVERSATION_LOOP"] = MagicMock()
+    stopped = MagicMock()
+    stopped.is_running.return_value = False
+    app.config["GENESIS_EVENT_LOOP"] = stopped
+
+    with _with_token():
+        resp = app.test_client().post(
+            "/v1/agent/chat/completions",
+            headers=AUTH,
+            json={"messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert resp.status_code == 503
+
+
+def test_control_a_running_loop_is_accepted():
+    """Without this, a readiness check that refused everything would pass."""
+    app = Flask(__name__)
+    app.register_blueprint(agent_api_bp)
+    app.config["TESTING"] = True
+    app.config["GENESIS_CONVERSATION_LOOP"] = MagicMock()
+    running = MagicMock()
+    running.is_running.return_value = True
+    app.config["GENESIS_EVENT_LOOP"] = running
+
+    fut = MagicMock()
+    fut.result.return_value = "ok"
+    with (
+        _with_token(),
+        patch.object(agent_api.asyncio, "run_coroutine_threadsafe", return_value=fut),
+    ):
+        resp = app.test_client().post(
+            "/v1/agent/chat/completions",
+            headers=AUTH,
+            json={"messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert resp.status_code == 200
