@@ -31,7 +31,98 @@ providers:
     # provider NAME keeps its historical "-free" suffix deliberately: 30
     # call-site chains reference it, and an in-place semantic fix beats a
     # rename churn (same reasoning as the groq-free alias below).
-    free: false
+    #
+    # `free:` ANSWERS ONE QUESTION: does a successful call add to the bill?
+    # Nothing else. Every consumer reads it that way — litellm_delegate sets
+    # `cost = 0.0` on it, router.py's budget gate skips non-free providers when
+    # the daily cap is EXCEEDED, and `_filter_chain` drops non-free entries from
+    # never_pays sites. None of them asks "is this account entitled?" or "did the
+    # operator have to pay something to unlock it?". Those are separate facts and
+    # they now live in the profile's `entitlement:` block.
+    #
+    # Which is why this is back to `true` (2026-09-07). Mistral's tier is $0 per
+    # call under its rate limits; the 403 is an ENTITLEMENT refusal, not a billing
+    # event, so it costs no MONEY. Marking it `false` did not describe a price — it fabricated
+    # one, and MEASURED, the fabrication is not free: with `free: false` the
+    # ledger records this family at litellm's paid rate against a default-seeded
+    # $2/day budget, and once that trips, router.py:352 removes EVERY paid
+    # provider from EVERY chain — including the contingency lane that exists for
+    # exactly that moment.
+    #
+    # AN INSTALL ON A METERED MISTRAL PLAN SHOULD OVERRIDE `free: false` in its
+    # local overlay. That direction is the safe one to get wrong: it over-records
+    # spend for an install that is genuinely paying, rather than inventing spend
+    # for one that is not.
+    #
+    # WHAT `free: true` COSTS HERE, stated because the first draft of this comment
+    # argued it away. `_filter_chain` keeps free providers on never_pays sites, so
+    # Large is now WALKED on all three of them (4_light_reflection,
+    # 12_surplus_brainstorm, 45_intelligence_intake) where `free: false` had
+    # filtered it out entirely. On an account whose 403 this file documents as
+    # durable, that is a doomed round-trip on every breaker-closed window: three
+    # failures trip it, it re-probes after open_duration_s, fails, trips again.
+    # No money — but latency and failure noise on exactly the sites the rung is
+    # meant to help. Cross-model review flagged this (2026-09-07) against an
+    # earlier wording here that said the refusal "costs nothing precisely because
+    # the call never happens". It costs no MONEY; the call does happen.
+    # Accepted, because the same flag is what admits Medium — which IS reachable —
+    # to those chains, and a fast 403 ahead of a working rung is a better trade
+    # than filtering both out. Revisit if Large's entitlement is ever restored,
+    # or if the wasted probe shows up in latency.
+    free: true
+    rpm_limit: 4
+    open_duration_s: 120
+  mistral-medium-free:
+    type: mistral
+    model: mistral-medium-latest
+    profile: mistral-medium
+    # The rung DIRECTLY BELOW Large in every chain that carries Large, so the
+    # Mistral family degrades within itself before leaving the family — and
+    # when Large's entitlement returns (or an install has a paid plan), the
+    # chain silently uses the best available tier with no config change.
+    # ENTITLEMENT VERIFIED 2026-09-06, PRICING STILL PRESUMED. A live probe of
+    # all three tiers on one free-tier account, same request shape, same minute:
+    #   mistral-large-latest  -> 403 tier_not_allowed
+    #   mistral-medium-latest -> 429 rate_limited
+    #   mistral-small-latest  -> 429 rate_limited
+    # The 403/429 split IS the discriminator: a tier check precedes rate
+    # limiting, so Large is refused by entitlement while Medium is merely
+    # throttled. Medium is therefore reachable on a tier that refuses Large,
+    # which is the whole premise of this rung.
+    # rpm matches Large's conservative 4 until real traffic says otherwise.
+    #
+    # `free: true` — see the reasoning on mistral-large-free above; the same
+    # question is being answered here (marginal cost, not entitlement).
+    #
+    # This SHIPPED `free: false` for one day (2026-09-06) on a fail-closed
+    # argument: never_pays is a cost-safety invariant, a 429 proves reachable
+    # rather than $0, so assume paid. The argument was sound and the conclusion
+    # was still wrong, because it priced the wrong risk. MEASURED afterwards:
+    #
+    #   * With `free: false`, litellm prices this model at 1.50/7.50 per MTok —
+    #     NOT the 0.40/2.00 the profile documented, because `completion_cost()`
+    #     is tried before the profile fallback ever runs.
+    #   * Of the 30 chains carrying this rung, 10 have NO free provider ahead of
+    #     it AS THE ROUTER LOADS THE CONFIG. Say which basis, because the two
+    #     counts differ and two reviewers reached different numbers from it: raw
+    #     YAML gives 9, and 30_triage_calibration joins once lmstudio-30b is
+    #     dropped at load for having no key. 10 is the number that describes
+    #     runtime, which is the one that matters here.
+    #     (13_morning_report, 21_session_observer, 31_outcome_classification,
+    #     32_delta_assessment, dream_cycle_synthesis_challenge, …). With Large
+    #     403-dead, Medium is the FIRST provider actually tried on those — on
+    #     ordinary operation, not during an outage.
+    #   * That fabricated spend accrues against a default-seeded $2/day budget,
+    #     and `router.py:352` responds by skipping every non-free provider at
+    #     every call site. There is no production caller passing
+    #     `budget_override=True`.
+    #
+    # So the two errors are not symmetric. Wrongly `true` costs real money on the
+    # three never_pays sites, bounded by 4 RPM. Wrongly `false` invents spend on
+    # ten first-tried chains and can disable the entire paid fallback tier
+    # system-wide. The fail-closed instinct was protecting the smaller blast
+    # radius while opening the larger one.
+    free: true
     rpm_limit: 4
     open_duration_s: 120
   mistral-small-free:
@@ -59,6 +150,14 @@ providers:
     profile: gpt-oss-120b
     free: true
     rpm_limit: 30
+    # Daily free-tier budget, each cap in Groq's OWN unit (never converted):
+    # tpd_limit measured from Groq's own 429 text ("tokens per day (TPD):
+    # Limit 200000"); rpd_limit per the documented free tier (1K RPD, cited
+    # above). When spent, the router DESELECTS this provider until the next
+    # UTC day instead of burning the rest of the day on 429s. NOTE: the real
+    # budget is per ACCOUNT — keep one provider entry per Groq account.
+    rpd_limit: 1000
+    tpd_limit: 200000
     open_duration_s: 120
     params:
       extra_body:
@@ -76,6 +175,10 @@ providers:
     profile: gemini-3.5-flash
     free: true
     rpm_limit: 15
+    # NO rpd_limit yet, deliberately: live 429s show "limit: 20" and Genesis
+    # peaks well under 20/min, so a ~20 requests/DAY cap is INFERRED but not
+    # proven. A wrong shipped daily cap would deselect the provider on every
+    # install. Measure (count successes per UTC day vs 20) before setting.
     open_duration_s: 120
     # gemini-3.5-flash reasons by default (~70-90 thinking tokens even on trivial
     # prompts → empty content at tight max_tokens + free-tier TPM bloat). This is
@@ -279,6 +382,7 @@ call_sites:
     - mistral-small-free
     - openrouter-free
     - mistral-large-free
+    - mistral-medium-free
     - groq-free
     - gemini-free
     # Additional free providers so an essential reflection (3_micro_reflection
@@ -293,6 +397,7 @@ call_sites:
     - gemini-free
     - groq-free
     - mistral-large-free
+    - mistral-medium-free
     default_paid: false
     never_pays: true
   5_deep_reflection:
@@ -320,6 +425,7 @@ call_sites:
     - gemini-free
     - nvidia-nim-deepseek
     - mistral-large-free
+    - mistral-medium-free
     - openrouter-deepseek-v4-flash
   # V4 placeholder: cognitive state IS actively maintained today, but via direct
   # DB writes (awareness/loop.py, cc/reflection_bridge*.py), NOT this call site.
@@ -340,6 +446,7 @@ call_sites:
     chain:
     - gemini-free
     - mistral-large-free
+    - mistral-medium-free
     - groq-free
     - openrouter-free
     - nvidia-nim-deepseek
@@ -347,6 +454,7 @@ call_sites:
   13_morning_report:
     chain:
     - mistral-large-free
+    - mistral-medium-free
     - groq-free
     - gemini-free
     - openrouter-free
@@ -391,6 +499,7 @@ call_sites:
   21_session_observer:
     chain:
     - mistral-large-free
+    - mistral-medium-free
     - groq-free
     - gemini-free
     - openrouter-free
@@ -413,13 +522,34 @@ call_sites:
   # Adversarial challenge of synthesis output. Must stay model-independent from
   # synthesis across the WHOLE chain, not just the primary: synthesis falls back
   # to groq-free, so a groq-led challenge could self-approve under a DeepSeek
-  # outage. This challenge leads with mistral-large-free (disjoint from every
-  # synthesis provider — deepseek-flash / groq) + paid Kimi as the deep fallback.
+  # outage. This challenge leads with the MISTRAL family (disjoint from every
+  # synthesis provider — deepseek-flash / groq): Large, then Medium as the free
+  # in-family rung, then paid Kimi as the deep fallback.
+  #
+  # WHAT MEDIUM ACTUALLY BUYS HERE — stated carefully, because the first version
+  # of this comment claimed more than the code delivers. It said Medium "keeps a
+  # dead/entitlement-blocked Large from sending EVERY challenge to paid Kimi".
+  # Cross-model review (2026-09-06) ran this site under the install's OWN
+  # measured state — Large 403 tier_not_allowed, Medium 429 rate_limited — and
+  # the challenge was served by paid kimi-k2.5 anyway. A 429 is RATE_LIMITED,
+  # which deliberately does not trip a breaker, so Medium is re-attempted on
+  # every challenge while throttled at 4 RPM shared across every chain carrying
+  # it. Medium DOES intercept when it is not throttled, so the rung earns its
+  # place — but under the throttling actually observed, falling through to paid
+  # Kimi is the common case, not the outage case.
+  #
+  # PROVENANCE, because the distinction matters for anyone re-checking this:
+  # both runs above are the REVIEWER'S HARNESS (the real Router against the real
+  # config, with the network stubbed) — NOT production traffic. A follow-up audit
+  # found `cost_events` contains no mistral row of any kind, ever, so nothing here
+  # is corroborated by the live ledger. Treat as a faithful simulation of the
+  # routing logic, not as an observation of this install in flight.
   # NIM's free Kimi was retired 2026-08 (404-for-account). Locked by
   # test_config_invariants::test_adversarial_challenge_sites_are_model_independent.
   dream_cycle_synthesis_challenge:
     chain:
     - mistral-large-free
+    - mistral-medium-free
     # Paid Kimi via OpenRouter as last-resort fallback — a non-DeepSeek, non-groq
     # family, so the challenge stays model-independent from synthesis across the
     # whole chain even when the free tier is down. Only billed during an outage.
@@ -434,6 +564,7 @@ call_sites:
     # from the DeepSeek entity_challenge while surviving a free-tier outage.
     - gemini-free
     - mistral-large-free
+    - mistral-medium-free
     - openrouter-gemma4
     retry_profile: background
   # MW-2 relationship classifier — coarse relationship judgment
@@ -448,6 +579,7 @@ call_sites:
     - openrouter-free
     - gemini-free
     - mistral-large-free
+    - mistral-medium-free
     - openrouter-gemma4
     retry_profile: background
   # Adversarial challenge of entity "duplicate" verdicts. Flipped pairing:
@@ -466,6 +598,7 @@ call_sites:
     - openrouter-free
     - gemini-free
     - mistral-large-free
+    - mistral-medium-free
     - openrouter-gemma4
     retry_profile: background
   # Adversarial challenge of an entity-node "merge" verdict. Flipped pairing
@@ -506,23 +639,27 @@ call_sites:
     chain:
     - groq-free
     - mistral-large-free
+    - mistral-medium-free
     - openrouter-nemo
   30_triage_calibration:
     chain:
     - lmstudio-30b
     - mistral-large-free
+    - mistral-medium-free
     default_paid: true
     retry_profile: background
   31_outcome_classification:
     chain:
     - glm51
     - mistral-large-free
+    - mistral-medium-free
     default_paid: true
     never_pays: false
   32_delta_assessment:
     chain:
     - glm51
     - mistral-large-free
+    - mistral-medium-free
     default_paid: true
     never_pays: false
   33_skill_refiner:
@@ -531,12 +668,14 @@ call_sites:
     - groq-free
     - nvidia-nim-deepseek
     - mistral-large-free
+    - mistral-medium-free
     description: LLM-driven skill improvement proposals
   34_research_synthesis:
     chain:
     - gemini-free
     - groq-free
     - mistral-large-free
+    - mistral-medium-free
     - nvidia-nim-deepseek
     description: Synthesize research results into concise summaries
   38_procedure_extraction:
@@ -546,6 +685,7 @@ call_sites:
     - openrouter-deepseek-v4
     - groq-free
     - mistral-large-free
+    - mistral-medium-free
     default_paid: true
     description: Judge + store procedures from struggle detection and extraction
       pipeline candidates
@@ -556,10 +696,20 @@ call_sites:
     description: Cross-task_type procedure dedup judgment (is a new procedure
       redundant with existing ones). S-tier only — precision is the safety
       property (validated 0 false-merges on deepseek-v4); fires per novel
-      procedure, low volume.
+      procedure, low volume. DELIBERATELY a chain of one. A second rung was
+      added here for availability and then removed — this call site has exactly
+      two outcomes, suppress and store, and only a provider whose false-merge
+      rate has been measured may suppress (extractor.py
+      `_NOVELTY_VALIDATED_MODELS`). An unvalidated rung's suppressing verdict
+      is therefore discarded and its distinct verdict equals the fail-open
+      default — so it cannot change the decision, and adding one buys a paid
+      call and latency while LOOKING like restored availability. An outage
+      takes dedup offline, which fails toward storing a duplicate; that is the
+      direction this call site already prefers.
   41_reflection_json_salvage:
     chain:
     - mistral-large-free
+    - mistral-medium-free
     - gemini-free
     - openrouter-deepseek-v4
     default_paid: true
@@ -579,6 +729,7 @@ call_sites:
     - openrouter-deepseek-v4-flash
     - openrouter-deepseek-v4
     - mistral-large-free
+    - mistral-medium-free
     - gemini-free
     default_paid: true
     description: Post-execution retrospective learning extraction
@@ -588,6 +739,7 @@ call_sites:
     - openrouter-deepseek-v4-flash
     - openrouter-deepseek-v4
     - mistral-large-free
+    - mistral-medium-free
     - gemini-free
     default_paid: true
     description: Pre-mortem failure analysis before committing to execution
@@ -596,6 +748,7 @@ call_sites:
     - gemini-free
     - groq-free
     - mistral-large-free
+    - mistral-medium-free
     - openrouter-free
     never_pays: true
     retry_profile: background
@@ -612,6 +765,7 @@ call_sites:
     - nvidia-nim-deepseek
     - gemini-free
     - mistral-large-free
+    - mistral-medium-free
     - openrouter-free
     default_paid: true
     retry_profile: background
@@ -621,6 +775,7 @@ call_sites:
     - gemini-free
     - groq-free
     - mistral-large-free
+    - mistral-medium-free
     - openrouter-free
     description: Draft content for various platforms
   23_outreach_review:
@@ -628,6 +783,7 @@ call_sites:
     - gemini-free
     - groq-free
     - mistral-large-free
+    - mistral-medium-free
     description: "Outreach pre-send cross-vendor review (free chain). Renamed from 23_fresh_eyes_review 2026-05-10 (disambiguates from executor Gate 2 at 17_executor_review)."
   36_code_auditor:
     chain:
@@ -644,6 +800,7 @@ call_sites:
     chain:
     - groq-free
     - mistral-large-free
+    - mistral-medium-free
     - openrouter-nemo
     default_paid: true
     retry_profile: background
@@ -654,6 +811,7 @@ call_sites:
     - groq-free
     - gemini-free
     - mistral-large-free
+    - mistral-medium-free
     - openrouter-free
     - openrouter-deepseek-v4-flash
     default_paid: true
@@ -662,6 +820,7 @@ call_sites:
   41_resume_review_pass1:
     chain:
     - mistral-large-free
+    - mistral-medium-free
     - gemini-free
     - groq-free
     - openrouter-free
@@ -670,6 +829,7 @@ call_sites:
   42_resume_review_pass2:
     chain:
     - mistral-large-free
+    - mistral-medium-free
     - gemini-free
     - groq-free
     - openrouter-free
@@ -712,6 +872,7 @@ call_sites:
   cc_update_analysis:
     chain:
     - mistral-large-free
+    - mistral-medium-free
     - groq-free
     - gemini-free
     default_paid: true
@@ -766,12 +927,50 @@ call_sites:
     - groq-free
     - gemini-free
     - mistral-large-free
+    - mistral-medium-free
     default_paid: false
     retry_profile: user_facing
     dispatch: api
     description: "Voice channel conversation \u2014 low-latency free-tier chain\
       \ for HA voice assistant. Groq first for speed (~1s), Gemini/Mistral\
       \ as fallbacks."
+  desk_primary:
+    chain:
+    - openrouter-deepseek-v4
+    - glm51
+    - openrouter-sonnet
+    default_paid: true
+    retry_profile: desk_interactive
+    dispatch: api
+    description: "Desktop assistant \u2014 the conversational brain behind a local
+      OpenAI-compatible client (/v1/desk/chat/completions). CAPABLE first, not
+      cheapest: that client fires its own tools by emitting an exact control tag
+      and a near-miss silently does nothing, so instruction-following is the
+      binding constraint. DeepSeek V4-pro leads on the owner's stated preference
+      for open models over frontier pricing; Sonnet is last-resort resilience,
+      never the default."
+  desk_fast:
+    chain:
+    - groq-free
+    - openrouter-deepseek-v4-flash
+    - gemini-free
+    default_paid: true
+    retry_profile: desk_interactive
+    dispatch: api
+    description: "Desktop assistant, PHONE lane \u2014 briefings and hotline answers
+      composed while a call is live, where latency is heard directly. Upstream
+      pinned a fast tier here for exactly that reason; this chain preserves the
+      intent. No control tags are emitted on this lane, so the capability bar
+      that governs desk_primary does not apply.
+      default_paid is TRUE because the middle hop bills: the field is display-only
+      (the router enforces never_pays, not this), so labelling a chain with a paid
+      link 'false' would be a lever that looks pulled and is not connected. The
+      paid fallback is deliberate \u2014 both free hops sit on shared rate gates.
+      HONEST LIMIT: the model is only half the latency budget. groq-free is a
+      2.0s serialized interval shared with ~33 call sites and gemini-free a 4.0s
+      one shared with ~32, so during background reflection a turn can queue in the
+      rate gate before any model is reached. Fixing that needs a non-blocking
+      acquire in the router, not a chain edit."
   attention_salience:
     chain:
     - mistral-small-free
@@ -844,6 +1043,22 @@ retry:
     base_delay_ms: 300
     max_delay_ms: 5000
     max_total_s: 180
+  # An interactive desk turn answers a client that gives up at 120s, and the
+  # endpoint holds a 110s wall so the client gets a parseable error instead of a
+  # dead socket. Inside that wall a retry and a fallback compete for the same
+  # seconds. A timed-out attempt is not the threat — TIMEOUT fails fast and is
+  # never retried — but a provider failing SLOWLY without timing out (a 503 at
+  # ~25s) is TRANSIENT, and user_facing gives it three goes before the chain
+  # advances. The next provider is worth more than another attempt at the one
+  # that just failed, so this profile buys fallback instead of retry:
+  # 3 providers x 1 attempt x 30s = 90s, inside the wall. max_total_s is the
+  # router's own belt, set under the endpoint's budget so whichever bound trips
+  # first, the caller still gets a structured answer.
+  desk_interactive:
+    max_retries: 0
+    base_delay_ms: 300
+    max_delay_ms: 5000
+    max_total_s: 100
   background:
     max_retries: 4
     base_delay_ms: 1000

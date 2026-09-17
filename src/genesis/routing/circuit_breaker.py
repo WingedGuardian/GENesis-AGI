@@ -22,6 +22,12 @@ _STATE_FILE = Path.home() / ".genesis" / "circuit_breaker_state.json"
 
 _MAX_OPEN_S = 1800  # 30-minute cap on escalating backoff
 _MAX_QUOTA_OPEN_S = 14400  # 4-hour cap for quota/billing exhaustion
+# Categories that hold the breaker open on the LONG cap: neither an exhausted
+# allowance nor a missing entitlement resolves itself within the 30m default.
+_LONG_OPEN_CATEGORIES = frozenset({
+    ErrorCategory.QUOTA_EXHAUSTED,
+    ErrorCategory.NOT_ENTITLED,
+})
 
 
 
@@ -82,17 +88,37 @@ class CircuitBreaker:
 
     @property
     def last_failure_category(self) -> ErrorCategory | None:
-        """Category of the most recent failure that tripped the breaker."""
+        """Category of the most recent failure — NOT only of a tripping one.
+
+        ``record_failure`` assigns this before it evaluates the trip threshold,
+        so a CLOSED breaker routinely carries a category from a failure that
+        never tripped it, and a category that never trips at all (RATE_LIMITED)
+        can sit here indefinitely. ``record_success`` clears it to None, so the
+        honest reading is "the most recent outcome was a failure of this kind,
+        and nothing has succeeded since".
+
+        The docstring used to say "that tripped the breaker". Two separate
+        defects were reasoned out from that wrong description before it was
+        corrected (2026-09-07), so the precision here is load-bearing rather
+        than pedantic.
+        """
         return self._last_failure_category
 
     def _effective_open_duration(self) -> float:
         """Open duration with escalating backoff.
 
         First trip uses base duration; each subsequent trip doubles it.
-        Capped at _MAX_QUOTA_OPEN_S (4h) for quota exhaustion, _MAX_OPEN_S (30m) otherwise.
+        Capped at _MAX_QUOTA_OPEN_S (4h) for quota exhaustion and entitlement
+        denial, _MAX_OPEN_S (30m) otherwise. Both of those clear on a timescale
+        set by an account change, not by a passing outage, so re-probing them on
+        the short cap only buys a doomed attempt 8x more often.
         """
         exponent = max(0, self._trip_count - 1)
-        cap = _MAX_QUOTA_OPEN_S if self._last_failure_category == ErrorCategory.QUOTA_EXHAUSTED else _MAX_OPEN_S
+        cap = (
+            _MAX_QUOTA_OPEN_S
+            if self._last_failure_category in _LONG_OPEN_CATEGORIES
+            else _MAX_OPEN_S
+        )
         return min(self._open_duration_s * (2 ** exponent), cap)
 
     @property
@@ -554,6 +580,37 @@ class CircuitBreakerRegistry:
         as covered keeps coverage consistent with routing and avoids a false
         ESSENTIAL alarm while a provider is recovering. A name not in the
         provider set counts as unavailable.
+
+        **A CLOSED breaker is not always evidence of health.** RATE_LIMITED is
+        deliberately excluded from tripping (``retry.py`` — 429 is provider
+        backpressure, not a health signal, and tripping would take a reachable
+        provider offline for every other call site). The consequence for THIS
+        function is that a provider whose steady state is 429 never trips, so it
+        reads "available" forever while serving nothing — and because coverage is
+        ``any(available)``, one such member is enough to mark an essential site
+        covered and silence the ESSENTIAL degradation alarm while every call to
+        that site fails.
+
+        That is not hypothetical: adding a 429-throttled rung to
+        ``4_light_reflection`` and ``9_fact_extraction`` did exactly this, and it
+        survived three cost-focused review rounds because it is caused by chain
+        MEMBERSHIP — independent of the ``free:`` flag and of ``never_pays``
+        filtering, which is where everyone was looking.
+
+        **KNOWN GAP, NOT FIXED HERE — and the obvious fix does not work.** The
+        tempting guard is ``if cb.last_failure_category is RATE_LIMITED: return
+        False``. It is INERT: ``router.py`` (see its RATE_LIMITED/BAD_REQUEST
+        exclusion) never calls ``record_failure`` for a 429 at all, so
+        ``_last_failure_category`` is never assigned that value on the production
+        path — a 429-only provider carries ``None`` and zero consecutive
+        failures. That guard would read as protection and provide none, which is
+        worse than leaving the gap visible. It was written, MEASURED to be inert,
+        and removed (2026-09-07).
+
+        Closing this properly needs a signal the breaker does not currently keep:
+        either a suppressed-failure counter recorded alongside the excluded
+        categories, or a "has ever served a request" bit. Both change breaker
+        semantics and belong in their own change, not in a config PR.
         """
         cfg = self._providers.get(name)
         if cfg is None:

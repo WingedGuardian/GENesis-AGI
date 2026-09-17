@@ -21,6 +21,9 @@ MIGRATION = importlib.import_module("genesis.db.migrations.0030_capability_grant
 MIGRATION_PRD = importlib.import_module("genesis.db.migrations.0033_autonomy_earn_lose")
 
 _EMAIL = {"domain": "email", "verb": "send", "risk_class": "standard"}
+#: A synthetic domain outside PROMOTABLE_DOMAINS. Deliberately not a real
+#: capability name — this suite tests the CLASS, not one member of it.
+_WIDGET = {"domain": "widget", "verb": "poke", "risk_class": "standard"}
 _TS = "2026-06-21T00:00:00"
 
 
@@ -393,3 +396,229 @@ class TestPRDCompetence:
         assert bulk["state"] == CellState.NOT_DETERMINED.value
         assert bulk["granted_at"] is None
         assert bulk["last_decayed_at"] == now
+
+
+# --------------------------------------------------------------------------- #
+# Promotable-domain allowlist — which capabilities may EVER hold standing       #
+# autonomy.  Promotion is the one transition that converts per-action approval  #
+# into a standing grant, so the set of domains allowed to make it is closed.    #
+# --------------------------------------------------------------------------- #
+class TestPromotableDomains:
+    @pytest.mark.asyncio
+    async def test_allowlist_contents_are_pinned(self):
+        # Adding a domain here hands it standing autonomy — that must be a
+        # deliberate act with a test to change, never a quiet import.
+        assert sorted(cg.PROMOTABLE_CELLS) == [("email", "send")]
+        assert sorted(cg.PROMOTABLE_DOMAINS) == ["email"]  # derived, never declared
+        assert cg.is_promotable_cell("email", "send", "standard") is True
+        assert cg.is_promotable_cell("widget", "poke", "standard") is False
+        # FINANCIAL is hardline in an ALLOWLISTED domain too — RiskClass calls
+        # it "never trust-unlockable", and this is what makes that true.
+        assert cg.is_promotable_cell("email", "send", "financial") is False
+
+    async def test_a_new_verb_under_an_allowlisted_domain_is_not_promotable(self, db):
+        """The allowlist is keyed on (domain, verb), not domain alone.
+
+        A cell's identity is (domain, verb, risk_class), so a domain-only bar
+        would be COARSER than the invariant the constant states: a future
+        `email:forward` path would inherit promotion eligibility the moment it
+        banked five successes, with no edit to the allowlist and no tripwire
+        firing. Inert when written — `send` was email's only verb — which is
+        why it was worth closing before a second verb made it live.
+        Found by cross-model review of PR #1838.
+        """
+        assert cg.is_promotable_cell("email", "forward", "standard") is False
+        assert cg.is_promotable_cell("email", "send", "standard") is True  # control
+
+        now = "2026-06-21T00:00:00+00:00"
+        await cg.apply_event(
+            db, domain="email", verb="forward", risk_class="standard",
+            event=CellEvent.CLASSIFY, updated_at=now, origin_class="owner",
+        )
+        for _ in range(10):
+            await cg.record_success(
+                db, domain="email", verb="forward", risk_class="standard",
+                updated_at=now, origin_class="owner",
+            )
+        cands = {(c["domain"], c["verb"]) for c in await cg.detect_promotable_cells(db)}
+        assert ("email", "forward") not in cands
+
+        with pytest.raises(InvalidTransition):
+            await cg.apply_event(
+                db, domain="email", verb="forward", risk_class="standard",
+                event=CellEvent.APPROVE, updated_at=now, origin_class="owner",
+            )
+
+    @pytest.mark.asyncio
+    async def test_detect_promotable_excludes_non_promotable_domain(self, db):
+        # Evidence far past BOTH bars — the only thing holding it back is the
+        # domain.  Without the allowlist this cell is a promotion proposal.
+        for ev in (CellEvent.CLASSIFY,):
+            await cg.apply_event(
+                db, origin_class="first_party", event=ev, updated_at=_TS, **_WIDGET
+            )
+        for _ in range(cg.MIN_PROMOTE_N * 2):
+            await cg.record_success(db, origin_class="first_party", updated_at=_TS, **_WIDGET)
+
+        row = await cg.get_cell(db, **_WIDGET)
+        assert row["state"] == CellState.ASK.value  # it IS an ASK cell with evidence
+        assert row["successes"] >= cg.MIN_PROMOTE_N
+        assert cg.cell_posterior(row["successes"], row["corrections"], 0.0) > cg.PROMOTE_THRESHOLD
+
+        assert await cg.detect_promotable_cells(db) == []
+
+    @pytest.mark.asyncio
+    async def test_detect_promotable_still_returns_allowlisted_domain(self, db):
+        # The behaviour-preserving control: the allowlist must not blind the
+        # scan to the domain it exists to keep working.
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL
+        )
+        for _ in range(cg.MIN_PROMOTE_N):
+            await cg.record_success(db, origin_class="first_party", updated_at=_TS, **_EMAIL)
+
+        assert [c["id"] for c in await cg.detect_promotable_cells(db)] == ["email:send:standard"]
+
+    @pytest.mark.asyncio
+    async def test_approve_refused_for_non_promotable_domain(self, db):
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.CLASSIFY, updated_at=_TS, **_WIDGET
+        )
+        with pytest.raises(InvalidTransition, match="not promotable"):
+            await cg.apply_event(
+                db, origin_class="first_party", event=CellEvent.APPROVE, updated_at=_TS, **_WIDGET
+            )
+        # Refused, and the refusal did not mutate the cell.
+        assert (await cg.get_cell(db, **_WIDGET))["state"] == CellState.ASK.value
+
+    @pytest.mark.asyncio
+    async def test_refused_approve_does_not_seed_a_cell(self, db):
+        # No CLASSIFY first: a refusal must not create the row on its way out,
+        # or a refused promotion would leave evidence that it was considered.
+        with pytest.raises(InvalidTransition):
+            await cg.apply_event(
+                db, origin_class="first_party", event=CellEvent.APPROVE, updated_at=_TS, **_WIDGET
+            )
+        assert await cg.get_cell(db, **_WIDGET) is None
+
+    @pytest.mark.asyncio
+    async def test_non_promotable_domain_still_classifies_and_gates(self, db):
+        # Non-promotable is NOT disabled: the cell still exists, still records
+        # evidence, and still sits at ASK — i.e. every action keeps its approval.
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.CLASSIFY, updated_at=_TS, **_WIDGET
+        )
+        await cg.record_success(db, origin_class="first_party", updated_at=_TS, **_WIDGET)
+        row = await cg.get_cell(db, **_WIDGET)
+        assert row["state"] == CellState.ASK.value
+        assert row["successes"] == 1
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_domain_still_promotes(self, db):
+        # The other half of the control: APPROVE is untouched where it is allowed.
+        for ev in (CellEvent.CLASSIFY, CellEvent.APPROVE):
+            await cg.apply_event(
+                db, origin_class="first_party", event=ev, updated_at=_TS, **_EMAIL
+            )
+        assert (await cg.get_cell(db, **_EMAIL))["state"] == CellState.GRANTED.value
+
+    def test_migrations_touching_granted_cells_are_a_reviewed_set(self):
+        """A migration writes cell state in raw SQL, BELOW apply_event — so none
+        of the three enforcement layers can reach it.
+
+        Pinned as a closed SET of filenames rather than by parsing the SQL:
+        a domain literal can be spelled a dozen ways, but a new migration file
+        cannot hide.  Adding one that touches granted capability cells has to be
+        looked at by a human, who then decides whether its domain belongs in
+        PROMOTABLE_DOMAINS — instead of inheriting standing autonomy in silence.
+        """
+        from pathlib import Path
+
+        import genesis
+
+        mig_dir = Path(genesis.__file__).parent / "db" / "migrations"
+        found = set()
+        for path in sorted(mig_dir.glob("*.py")):
+            src = path.read_text()
+            # Case-INSENSITIVE: a migration writing the state symbolically
+            # (`CellState.GRANTED.value` in an f-string) never contains the
+            # lowercase literal, and would otherwise pass unseen.
+            if "capability_grants" in src and "granted" in src.lower():
+                found.add(path.name)
+
+        reviewed = {
+            # Creates the table; 'granted' appears only in the state CHECK list.
+            "0030_capability_grants.py",
+            # Prose only — its module docstring describes the GRANTED path.
+            "0031_pending_email_sends.py",
+            # Seeds email:send:standard GRANTED — email is in PROMOTABLE_DOMAINS.
+            "0032_seed_email_standard_grant.py",
+            # Deletes 0032's pristine seed (all-ASK); its down() restores it.
+            "0033_autonomy_earn_lose.py",
+            # Prose only — a column comment mentions a GRANTED cell.
+            "0044_capability_shadow_events.py",
+        }
+        assert found == reviewed, (
+            "a migration now touches GRANTED capability cells outside the reviewed "
+            f"set: {found ^ reviewed}. Migrations write cell state directly and "
+            "bypass apply_event's PROMOTABLE_DOMAINS guard — confirm the domain it "
+            "grants is allowlisted, then add the file here."
+        )
+
+    @pytest.mark.asyncio
+    async def test_financial_cell_is_never_promotable_even_in_email(self, db):
+        """FINANCIAL is hardline by RiskClass's own docstring ("never
+        trust-unlockable"). Until now that was true only because email_gate
+        holds financial sends BEFORE the first CLASSIFY — one caller's
+        ordering. A financial cell reached by any other path was promotable.
+        """
+        fin = {"domain": "email", "verb": "send", "risk_class": "financial"}
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.CLASSIFY, updated_at=_TS, **fin
+        )
+        for _ in range(cg.MIN_PROMOTE_N * 2):
+            await cg.record_success(db, origin_class="first_party", updated_at=_TS, **fin)
+
+        row = await cg.get_cell(db, **fin)
+        assert row["successes"] >= cg.MIN_PROMOTE_N  # evidence is NOT the reason
+        assert await cg.detect_promotable_cells(db) == []
+        with pytest.raises(InvalidTransition, match="not promotable"):
+            await cg.apply_event(
+                db, origin_class="first_party", event=CellEvent.APPROVE, updated_at=_TS, **fin
+            )
+        assert (await cg.get_cell(db, **fin))["state"] == CellState.ASK.value
+
+    @pytest.mark.asyncio
+    async def test_raw_string_event_cannot_bypass_the_promotion_guard(self, db):
+        """CellEvent is a StrEnum: "approve" is NOT identical to
+        CellEvent.APPROVE but IS equal to it, and _TRANSITIONS is a dict keyed
+        on equality. An identity check here was skipped while transition() still
+        returned GRANTED — committing the promotion, then failing on
+        event.value AFTER the write. The guard must key on the VALUE.
+        """
+        await cg.apply_event(
+            db,
+            origin_class="first_party",
+            event=CellEvent.CLASSIFY.value,  # raw string on the way in, too
+            updated_at=_TS,
+            **_WIDGET,
+        )
+        with pytest.raises(InvalidTransition, match="not promotable"):
+            await cg.apply_event(
+                db,
+                origin_class="first_party",
+                event=CellEvent.APPROVE.value,  # the bypass vector
+                updated_at=_TS,
+                **_WIDGET,
+            )
+        assert (await cg.get_cell(db, **_WIDGET))["state"] == CellState.ASK.value
+
+    @pytest.mark.asyncio
+    async def test_unknown_event_raises_invalid_transition(self, db):
+        """Normalizing the event must not change the error type this function
+        documents: an unrecognised event was already an InvalidTransition."""
+        with pytest.raises(InvalidTransition, match="unknown cell event"):
+            await cg.apply_event(
+                db, origin_class="first_party", event="not_an_event",
+                updated_at=_TS, **_WIDGET,
+            )

@@ -28,6 +28,16 @@ _HOOK = _REPO_ROOT / "scripts" / "review_enforcement_commit.py"
 _REVIEW_STATE = _REPO_ROOT / "scripts" / "review_state.py"
 _INVALIDATE = _REPO_ROOT / "scripts" / "review_invalidate_on_commit.py"
 
+sys.path.insert(0, str(_REPO_ROOT / "scripts" / "hooks"))
+sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+import review_invalidate_on_commit as _invalidator  # noqa: E402
+import shell_parse  # noqa: E402
+
+#: The invalidator's no-parser fallback, IMPORTED rather than re-typed so a fixture
+#: can prove it is a form that fallback misses. A copied regex would drift and leave
+#: these tests asserting against a pattern nobody ships.
+_STRICT_COMMIT_PAT = _invalidator._STRICT_COMMIT
+
 
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
@@ -626,6 +636,65 @@ def test_invalidate_ignores_non_commit(repo: Path, home: Path) -> None:
     assert len(_markers(home)) == 1  # marker survives
 
 
+def test_invalidate_clears_when_the_parse_went_blind(repo: Path, home: Path) -> None:
+    """A commit the parser could not reach must still clear the marker.
+
+    `analyze` stops descending past a depth bound, so for a commit buried deeper
+    than that the segment list comes back WITHOUT it. Treating that as "no commit
+    happened" is this module's documented bypass in its worst form: the marker is
+    never cleared, and the next commit reuses a review that no longer applies —
+    silently, and for the marker's whole TTL.
+
+    Over-clearing costs one redundant re-review, which is the direction this module
+    already chose everywhere else it cannot be sure. The parse reports that it went
+    blind, so the choice is available rather than guessed at.
+    """
+    assert _mark(repo, home).returncode == 0
+    assert len(_markers(home)) == 1
+
+    buried = "$(" * 40 + "git commit -m done" + ")" * 40
+    _run_invalidate(buried, repo, home)
+    assert _markers(home) == [], (
+        "a commit buried past the parser's depth bound left the review marker in "
+        "place — the next commit would reuse a review that no longer applies"
+    )
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        "git commit -m done",
+        "git -C {repo} commit -m done",
+        "git -c user.name=x commit -m done",
+    ],
+    ids=["plain", "dash_C", "dash_c_config"],
+)
+def test_invalidate_clears_for_every_commit_form_the_checker_gates(
+    repo: Path, home: Path, form: str
+) -> None:
+    """The forms matter, and the first version of this test only covered one of them.
+
+    A blind parse used to fall back to `_STRICT_COMMIT` (`\\bgit\\s+commit\\b`), which
+    requires ADJACENCY. MEASURED: it matches `git commit` but NOT `git -C <dir> commit`
+    nor `git -c k=v commit` — precisely the forms the PreToolUse checker still gates.
+    So for those, the marker survived a real commit and the next one rode a stale
+    review, which is the bypass this module's own header warns about.
+
+    The original regression test used the plain form, the one shape the regex does
+    match, so it passed while the other two stayed broken. Parametrising over the
+    checker's whole accepted set is what makes it non-vacuous.
+    """
+    assert _mark(repo, home).returncode == 0
+    assert len(_markers(home)) == 1
+
+    buried = "$(" * 40 + form.format(repo=repo) + ")" * 40
+    _run_invalidate(buried, repo, home)
+    assert _markers(home) == [], (
+        f"a buried {form!r} left the review marker in place — the checker gates this "
+        "form, so the invalidator must clear for it too or the two disagree"
+    )
+
+
 # ── Invalidator/checker cwd symmetry (the #1254 follow-up, ab42b04f) ──────
 # #1254 made the PreToolUse checker resolve the commit's real worktree via
 # `git -C` / the last `cd` / the payload cwd. The PostToolUse invalidator was
@@ -687,6 +756,227 @@ def test_git_dash_C_commit_clears_target_worktree_not_shell(
         f"git -C {repo} commit -m done", run_from=repo_b, payload_cwd=repo_b, home=home
     )
     assert _markers(home) == [], "`git -C W commit` did not clear W's marker"
+
+
+def test_clear_all_markers_reports_an_unreadable_dir_instead_of_claiming_success(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An unreadable marker dir must be a REPORTED failure, never a clean success.
+
+    `Path.glob` does not raise on a directory it cannot read — it swallows the
+    PermissionError and yields nothing. VERIFIED on 3.12: a marker dir at mode 000
+    holding one marker globs to `[]`. So an `except OSError` around the glob is dead
+    code, and "0 markers found" is indistinguishable between "none exist" and "every
+    marker survived and I could not see them".
+
+    The second is precisely the bypass this function exists to close — a review marker
+    outliving its commit — and it was being reported as success, which is worse than
+    an error because nothing downstream looks again.
+    """
+    import review_state as rs
+
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    (markers / "a.json").write_text("{}")
+    monkeypatch.setattr(rs, "_MARKER_DIR", markers)
+    monkeypatch.setattr(rs, "_LEGACY_STATE_FILE", tmp_path / "legacy.json")
+
+    os.chmod(markers, 0o000)
+    try:
+        cleared, failures = rs.clear_all_markers()
+    finally:
+        os.chmod(markers, 0o700)  # always restore, or tmp_path cleanup fails
+    assert cleared == 0
+    assert failures, "an unreadable marker dir must be REPORTED, not silently empty"
+    assert (markers / "a.json").exists(), "fixture sanity: the marker did survive"
+
+    # And the ordinary path still works, so the probe is not simply always-failing.
+    cleared, failures = rs.clear_all_markers()
+    assert cleared == 1 and not failures
+    assert not list(markers.glob("*.json"))
+
+
+def test_clear_all_markers_does_not_count_an_absent_legacy_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`missing_ok=True` succeeds on an absent file, so counting it unconditionally
+    reported "cleared 1" against an empty marker directory — a number the
+    operator-facing message repeats verbatim."""
+    import review_state as rs
+
+    markers = tmp_path / "markers_empty"
+    markers.mkdir()
+    monkeypatch.setattr(rs, "_MARKER_DIR", markers)
+    monkeypatch.setattr(rs, "_LEGACY_STATE_FILE", tmp_path / "nope.json")
+    assert rs.clear_all_markers() == (0, [])
+
+
+def test_clear_all_markers_clears_legacy_when_the_marker_dir_was_never_created(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The legacy marker authorizes a commit ON ITS OWN, so an early return past it
+    is the bypass this function exists to close — reported as a clean success.
+
+    `_load_marker` reads `(_state_file(cwd), _LEGACY_STATE_FILE)` in that order, so
+    the legacy file needs no per-worktree directory to be honoured. This is the
+    upgraded-install shape: only `~/.genesis/review_state.json` exists and
+    `review_markers/` was never created. The `os.access` probe returned `(0, [])`
+    BEFORE the legacy unlink further down, so the caller was told the bypass was
+    closed while a time-valid marker sat there ready to authorize the next commit.
+
+    The two probe branches are separate clauses and get separate tests; this is the
+    one that reported no failure at all.
+    """
+    import review_state as rs
+
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text('{"diff_hash": "abc"}')
+    monkeypatch.setattr(rs, "_MARKER_DIR", tmp_path / "never_created")
+    monkeypatch.setattr(rs, "_LEGACY_STATE_FILE", legacy)
+
+    cleared, failures = rs.clear_all_markers()
+    assert not legacy.exists(), "the legacy marker survived a clear_all_markers()"
+    assert cleared == 1, "the legacy marker it removed must be counted"
+    assert failures == [], "an absent marker dir is not a failure, just nothing to do"
+
+
+def test_clear_all_markers_clears_legacy_even_when_the_marker_dir_is_unreadable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The other early-return clause: the legacy marker is reachable even when the
+    per-worktree directory is not, so an unreadable directory must not shield it.
+
+    The unreadable-directory failure is still REPORTED — the point is that the two
+    are independent, not that one replaces the other. A directory this cannot read
+    is a real failure AND the legacy file is a real marker it can still remove.
+    """
+    import review_state as rs
+
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text('{"diff_hash": "abc"}')
+    markers = tmp_path / "markers_unreadable"
+    markers.mkdir()
+    (markers / "a.json").write_text("{}")
+    monkeypatch.setattr(rs, "_MARKER_DIR", markers)
+    monkeypatch.setattr(rs, "_LEGACY_STATE_FILE", legacy)
+
+    os.chmod(markers, 0o000)
+    try:
+        cleared, failures = rs.clear_all_markers()
+    finally:
+        os.chmod(markers, 0o700)  # always restore, or tmp_path cleanup fails
+
+    assert not legacy.exists(), "an unreadable marker dir must not shield the legacy one"
+    assert cleared == 1, "the legacy marker it removed must be counted"
+    assert any("unreadable" in f for f in failures), (
+        "the unreadable directory is still a REPORTED failure — clearing the legacy "
+        "marker does not make the markers it could not see go away"
+    )
+    assert (markers / "a.json").exists(), "fixture sanity: the unseen marker did survive"
+
+
+def test_clear_all_markers_reports_a_legacy_unlink_that_did_not_take(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A legacy `unlink()` that returns success against a file still on disk must be
+    REPORTED, not counted — the same re-read the per-worktree markers already get.
+
+    Clearing the legacy marker happens before the `_MARKER_DIR` probe (it has to, or
+    an early return skips it), which puts it OUTSIDE the survivors re-glob at the end
+    of the function — and that glob scans `_MARKER_DIR` only. This file is the one
+    deletion here that authorizes a commit on its own, so counting it on trust is the
+    same silent under-clear the survivors check exists to catch, one file over.
+
+    The lying `unlink` stands in for the real cases: a racing writer, or an overlay
+    filesystem that reports a delete it did not perform.
+    """
+    import review_state as rs
+
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text('{"diff_hash": "abc"}')
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    monkeypatch.setattr(rs, "_MARKER_DIR", markers)
+    monkeypatch.setattr(rs, "_LEGACY_STATE_FILE", legacy)
+
+    real_unlink = Path.unlink
+
+    def lying_unlink(self, *args, **kwargs):
+        if self == legacy:
+            return None  # "succeeds", removes nothing
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", lying_unlink)
+
+    cleared, failures = rs.clear_all_markers()
+    assert cleared == 0, "a deletion that did not happen must not be counted as one"
+    assert any("still present after unlink" in f for f in failures), (
+        f"a surviving legacy marker must be reported, got {failures}"
+    )
+
+
+def test_an_over_length_dash_C_commit_clears_the_marker_it_cannot_identify(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    """Over the SIZE limit, the `-C` target is unrecoverable — so clear everything.
+
+    `git -C W commit -m '<payload over the cap>'` yields no segments at all (a
+    bounded parse returns nothing, because a truncated one is a wrong answer rather
+    than a weak one). The candidate-set over-clear covers the payload cwd, a leading
+    `cd`, and the process cwd — every SHELL-side candidate — but W is named only
+    inside the command, so W's marker survived a real commit and could authorize an
+    unreviewed one for its TTL.
+
+    Recovering `-C` from the raw string would mean a second, hand-rolled shell
+    parser, which is the trap these guards exist to avoid. The fail-safe is breadth:
+    this module's own cost model says an extra clear costs one redundant re-review
+    while a survivor costs an unreviewed commit.
+    """
+    repo_b = _second_repo(tmp_path, "repo_b_overlong")  # the shell's worktree
+    assert _mark(repo, home).returncode == 0  # review recorded for repo (= W)
+    assert len(_markers(home)) == 1
+    over_cap = "x" * (shell_parse.MAX_COMMAND_CHARS + 1024)
+    _run_invalidate_at(
+        f"git -C {repo} commit -m '{over_cap}'",
+        run_from=repo_b,
+        payload_cwd=repo_b,
+        home=home,
+    )
+    assert _markers(home) == [], (
+        "an over-length `git -C W commit` left a marker alive. The target is not "
+        "recoverable from a bounded parse, so blind invalidation must clear broadly "
+        "rather than clear only the shell-side candidates"
+    )
+
+
+def test_an_untokenizable_dash_C_commit_still_uses_its_recovered_segments(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    """`untokenizable` does NOT truncate, so its segments must still be used.
+
+    An apostrophe inside a trailing comment is valid shell that shlex cannot
+    tokenize. The parse still resolves the complete `git -C W commit` argv — but an
+    earlier version discarded the segments for ANY blind spot and fell back to
+    `_STRICT_COMMIT` (`\\bgit\\s+commit\\b`), which requires adjacency and so misses
+    the `-C` form entirely. Invalidation then exited and W's marker survived.
+
+    This is the counterpart to the over-length test above: there the parse yields
+    nothing and the answer is to clear broadly; here it yields an EXACT answer and
+    the answer is to use it.
+    """
+    repo_b = _second_repo(tmp_path, "repo_b_untok")
+    assert _mark(repo, home).returncode == 0
+    assert len(_markers(home)) == 1
+    cmd = f"git -C {repo} commit -m done # don" + chr(39) + "t"
+    assert shell_parse.untokenizable(cmd), "fixture must genuinely defeat the tokenizer"
+    assert not _STRICT_COMMIT_PAT.search(cmd), (
+        "fixture must be a form the strict-adjacency fallback MISSES, or it proves nothing"
+    )
+    _run_invalidate_at(cmd, run_from=repo_b, payload_cwd=repo_b, home=home)
+    assert _markers(home) == [], (
+        "an untokenizable `git -C W commit` left W's marker alive — its recovered "
+        "segments name the target exactly and were thrown away"
+    )
 
 
 def test_git_dash_C_no_stale_bypass_e2e(repo: Path, home: Path, tmp_path: Path) -> None:
@@ -1559,3 +1849,369 @@ def test_same_worktree_different_subdir_chain_allowed(repo: Path, home: Path) ->
         home,
     )
     assert res.returncode == 0, res.stdout + res.stderr
+
+
+# ─── merge hint on the DEPTH denial ──────────────────────────────────────────
+#
+# _merge_note was appended to the cap / mode-switch / escalation-ack / audit-ack
+# denials but NOT to the depth denial, so a commit that was only a merge hit the
+# depth gate with no indication a merge was in flight and no route through it.
+# Observed live: a session pulling main into a PR branch aborted the merge rather
+# than use an ack whose stated purpose (a format mismatch) did not fit.
+
+
+def _begin_merge(repo: Path) -> None:
+    """Simulate a merge in flight the way git does — a sentinel in .git."""
+    (repo / ".git" / "MERGE_HEAD").write_text("0" * 40 + "\n")
+
+
+def test_depth_denial_carries_the_merge_hint(repo: Path, home: Path) -> None:
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _begin_merge(repo)
+    res = _run_hook('git commit -m "merge main"', repo, home)
+    assert res.returncode == 2
+    assert "review depth" in res.stderr.lower()
+    assert "git integration sentinel is present" in res.stderr
+
+
+def test_depth_hint_describes_the_DEPTH_failure_not_the_round_counter(
+    repo: Path, home: Path
+) -> None:
+    """The two gates are misled by a merge differently — the counter sees another
+    round, the depth gate sees a large authored change. A reader handed the wrong
+    explanation goes looking for the wrong thing."""
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _begin_merge(repo)
+    res = _run_hook('git commit -m "merge main"', repo, home)
+    assert "counts toward substantiality" in res.stderr
+    assert "round counter" not in res.stderr, "that is the OTHER gate's explanation"
+
+
+def test_depth_hint_names_both_classification_sources(repo: Path, home: Path) -> None:
+    """Rule 2.5 does NOT always classify the staged diff: when the commit may add
+    content beyond the index (`-am`, a pathspec) it uses the RECORDED marker level
+    instead (review_enforcement_commit.py, the `if commit_may_add_content:` branch).
+    A merge committed that way would read a note claiming a source the gate did not
+    use, and go looking at the wrong artifact."""
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _begin_merge(repo)
+    res = _run_hook('git commit -m "merge main"', repo, home)
+    assert "staged diff" in res.stderr
+    assert "recorded marker level" in res.stderr
+
+
+def test_depth_hint_does_not_call_a_local_delta_somebody_elses_work(repo: Path, home: Path) -> None:
+    """The detector fires on FIVE sequencer states, only one of which implies an
+    already-reviewed upstream merge. A cherry-pick, a revert, and any conflict
+    resolution stage code the author wrote or chose. The note must not tell that
+    reader the audit belongs to somebody else — that would launder unreviewed
+    code through an ack the gate logs as honest."""
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    (repo / ".git" / "CHERRY_PICK_HEAD").write_text("0" * 40 + "\n")
+    res = _run_hook('git commit -m "cherry-pick"', repo, home)
+    assert res.returncode == 2
+    assert "git integration sentinel is present" in res.stderr
+    assert "cherry-pick" in res.stderr
+    assert "conflict resolution" in res.stderr
+    assert "NOT an exemption" in res.stderr
+
+
+def test_depth_hint_names_every_sigil_the_advertised_route_needs(repo: Path, home: Path) -> None:
+    """MEASURED before the fix: `# depth-ack` alone cleared Rule 2.5 and was then
+    blocked by the review-current gate (rc=2), so the note advertised a route that
+    dead-ends one step later. The note must name the whole route, and the route it
+    names must actually complete."""
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _begin_merge(repo)
+    res = _run_hook('git commit -m "merge main"', repo, home)
+    assert "# depth-ack review-override" in res.stderr
+
+    # The advertised route completes end-to-end.
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _begin_merge(repo)
+    done = _run_hook('git commit -m "merge main"  # depth-ack review-override', repo, home)
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_no_merge_hint_when_no_merge_in_flight(repo: Path, home: Path) -> None:
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    res = _run_hook('git commit -m "prompt"', repo, home)
+    assert res.returncode == 2
+    assert "git integration sentinel is present" not in res.stderr
+
+
+def test_merge_sentinel_does_not_become_an_exemption(repo: Path, home: Path) -> None:
+    """THE SECURITY PROPERTY. .git/MERGE_HEAD is unauthenticated — anyone with
+    shell access can `echo x > .git/MERGE_HEAD`. The hint tells the author what
+    the gate can see; it must never decide the verdict. A forged sentinel already
+    froze the round counter across three defect rounds once, which is why this is
+    advisory text only and why adding a second caller must not change that."""
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _begin_merge(repo)
+    res = _run_hook('git commit -m "merge main"', repo, home)
+    assert res.returncode == 2, "a forged merge sentinel must NOT allow the commit"
+    assert "BLOCKED" in res.stderr
+
+
+# ─── round-2: the note's own claims about the route ──────────────────────────
+
+
+def test_depth_hint_does_not_prescribe_the_second_sigil_unconditionally(
+    repo: Path, home: Path
+) -> None:
+    """`review-override` is needed only when the review-current gate ACTUALLY
+    fires. A merge usually leaves the marker stale, but not if the author
+    re-marked afterwards: with a CURRENT-but-non-adversarial marker, Rule 2.5
+    still denies while Rule 2 is satisfied, so `# depth-ack` alone succeeds.
+
+    MEASURED in that state before this wording: rc=0 for depth-ack alone, while
+    the note said BOTH sigils were required. Prescribing `review-override` there
+    is not merely redundant — it records findings as accepted when there were
+    none, in a log that is meant to be evidence.
+    """
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _begin_merge(repo)
+    _mark(repo, home)  # current marker, but not an adversarial audit
+
+    denied = _run_hook('git commit -m "merge main"', repo, home)
+    assert denied.returncode == 2
+    assert "review depth" in denied.stderr.lower()
+    assert "ONLY once that gate actually fires" in denied.stderr
+
+    # ...and in this state the single sigil really is enough.
+    allowed = _run_hook('git commit -m "merge main"  # depth-ack', repo, home)
+    assert allowed.returncode == 0, allowed.stdout + allowed.stderr
+
+
+def test_depth_hint_says_sigils_bind_per_commit_segment(
+    repo: Path, home: Path
+) -> None:
+    """`has_trailing_override` binds a comment to the segment it terminates, and
+    the depth check requires the sigil on EVERY commit segment
+    (`all(... for s in commit_segs)`). So "one trailing comment" is right for a
+    single commit and wrong for the supported chained shape
+    (`git commit … && git commit --amend …`), where it binds only the last.
+
+    MEASURED: chained with one trailing comment -> rc=2.  A comment ends at the
+    physical line, so ``&&`` cannot follow one, which means the only way to put
+    a sigil on every segment of a chain is a NEWLINE between them — and a
+    newline is not ``&&``.  The note therefore prescribes separate commands
+    rather than that multi-line shape, and this test holds it to that: the
+    multi-line form is exercised here only to show what it costs, never as the
+    advertised route.
+    """
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _begin_merge(repo)
+    res = _run_hook('git commit -m "merge main"', repo, home)
+    assert "PER COMMIT SEGMENT" in res.stderr
+    assert "binds only the" in res.stderr
+
+    chained = (
+        'git commit -m "merge main" && '
+        "git commit --amend --no-edit  # depth-ack review-override"
+    )
+    assert _run_hook(chained, repo, home).returncode == 2, (
+        "one trailing comment on a chain must NOT clear the gate"
+    )
+
+    # SEPARATE COMMANDS are the route the note prescribes, and each clears the
+    # gate on its own.  Nothing about one invocation can leave the other
+    # half-done, which is the whole reason this is what gets advertised.
+    assert (
+        _run_hook('git commit -m "merge main"  # depth-ack review-override', repo, home).returncode
+        == 0
+    ), "a single commit carrying the sigil must clear the gate"
+    assert (
+        _run_hook("git commit --amend --no-edit  # depth-ack review-override", repo, home).returncode
+        == 0
+    ), "the amend, run as its own command, must clear the gate too"
+
+    # And the note must NOT send anyone down the multi-line road.  The parser
+    # accepts that shape — the hazard is in bash, not in the hook — so the
+    # guard here is on what the message ADVERTISES.
+    # POSITIVE assertions, because a denylist cannot tell PRESCRIBING a shape
+    # from WARNING about it — the note has to name the multi-line form in order
+    # to steer the reader off it, and a bare "multi-line" ban fired on exactly
+    # that sentence.
+    assert "OWN command" in res.stderr, (
+        "the note no longer tells the reader to run each commit separately"
+    )
+    assert "Do not reach for a multi-line command" in res.stderr, (
+        "the note no longer steers the reader away from the multi-line form"
+    )
+    assert "a newline is not `&&`" in res.stderr, (
+        "the note names the shape but not the reason it is unsafe — without the "
+        "short-circuit point a reader has no cause to prefer separate commands"
+    )
+    # This one IS prescription-only wording, so banning it is sound: it survives
+    # in no warning, only in the advice this finding removed.
+    assert "repeated on each segment" not in res.stderr, (
+        "the note still prescribes running the sigil on each segment of a chain"
+    )
+
+    # The hazard itself, demonstrated in a real shell rather than asserted in
+    # prose: with a newline the second command runs even though the first
+    # FAILED, and `--amend` then rewrites the PREVIOUS commit while the whole
+    # thing exits 0.  This is why the shape is not advertised.
+    (repo / ".git" / "MERGE_HEAD").unlink()
+    before = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    newline_form = "false\ngit commit --amend --no-edit"
+    actual = subprocess.run(
+        ["bash", "-c", newline_form], cwd=repo, capture_output=True, text=True, timeout=30
+    )
+    assert actual.returncode == 0, (
+        "the newline form should have swallowed the failure and exited 0 — if this "
+        "assertion fails the hazard has changed and the note can be revisited"
+    )
+    after = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    assert after != before, "the amend did not rewrite the previous commit"
+    reflog = subprocess.run(
+        ["git", "reflog", "-1", "--format=%gs"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert reflog.startswith("commit (amend):"), reflog
+
+
+def test_depth_hint_names_every_form_the_gate_itself_accepts(repo: Path, home: Path) -> None:
+    """The class fix. Three separate review findings were the same defect: the
+    NOTE was narrower than the PREDICATE, so the gate permitted a form the advice
+    never warned about — and the reader who followed the advice carefully was the
+    one who acked over content they were never told to look at.
+
+    Adding the missing form each round is predicate #4. This asserts the
+    relationship instead: EVERY selector the gate decides on must appear in the
+    text it prints. DERIVED from the module's own constants, so a form added to
+    `_COMMIT_SELECT_LONG` / `_COMMIT_SELECT_SHORT` / `_STAGING_SUBCOMMANDS` next
+    year fails here until the note carries it. The note builds its sentence from
+    the same constants, so this passes by construction today — which is the
+    point: it is now impossible to widen the gate and leave the advice behind.
+    """
+    import review_enforcement_commit as mod
+
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _mark(repo, home)
+    (repo / "f.py").write_text("local tracked edit\n")
+    _begin_merge(repo)
+    res = _run_hook('git commit -m "merge main"', repo, home)
+    assert res.returncode == 2
+
+    missing = [flag for flag in sorted(mod._COMMIT_SELECT_LONG) if flag not in res.stderr]
+    assert not missing, (
+        f"the gate accepts {missing} but the depth note never names them — an author "
+        "following the note would ack over content those forms bring in"
+    )
+    missing_short = [
+        f"-{ch}" for ch in sorted(mod._COMMIT_SELECT_SHORT) if f"-{ch}" not in res.stderr
+    ]
+    assert not missing_short, (
+        f"the gate accepts {missing_short} but the depth note never names them"
+    )
+    missing_staging = [
+        f"git {verb}" for verb in mod._STAGING_SUBCOMMANDS if f"git {verb}" not in res.stderr
+    ]
+    assert not missing_staging, (
+        f"the gate treats {missing_staging} as content-adding but the note omits them"
+    )
+    assert "git restore --staged" in res.stderr, (
+        "restore --staged is handled by the predicate but absent from the note"
+    )
+    # Guard-the-guard: a note that printed nothing, or constants that were empty,
+    # would satisfy every assertion above vacuously.
+    assert len(mod._COMMIT_SELECT_LONG) >= 5 and len(mod._COMMIT_SELECT_SHORT) >= 4, (
+        "the selector constants look empty — this test would pass against a note "
+        "that named nothing at all"
+    )
+
+
+def test_the_newline_hazard_is_attributed_to_the_newline_not_to_and_and(
+    repo: Path, home: Path
+) -> None:
+    """`&&` short-circuits correctly. MEASURED: `false && echo X` runs nothing and
+    exits 1; `false` NEWLINE `echo X` runs X and exits 0. An earlier version of
+    this note blamed the `&&` form, which is a false technical claim in the one
+    place an author is being told how to be careful."""
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _begin_merge(repo)
+    res = _run_hook('git commit -m "merge main"', repo, home)
+    assert res.returncode == 2
+    assert "`&&` short-circuits correctly" in res.stderr, (
+        "the note no longer states that && is the SAFE form — without it the "
+        "reader cannot tell which construct actually carries the hazard"
+    )
+
+    # Ground truth for both halves of that claim, in a real shell.
+    amp = subprocess.run(
+        ["bash", "-c", "false && echo RAN"], capture_output=True, text=True, timeout=30
+    )
+    assert amp.returncode == 1 and "RAN" not in amp.stdout, (
+        f"&& no longer short-circuits; the note's claim needs revisiting: {amp!r}"
+    )
+    nl = subprocess.run(
+        ["bash", "-c", "false\necho RAN"], capture_output=True, text=True, timeout=30
+    )
+    assert nl.returncode == 0 and "RAN" in nl.stdout, (
+        f"the newline form no longer swallows the failure: {nl!r}"
+    )
+
+
+def test_depth_hint_covers_content_staged_after_the_hook_runs(repo: Path, home: Path) -> None:
+    """The hook runs BEFORE any staging segment of the command, so `git add -A &&
+    git commit` commits content the index did not hold when this note was
+    written. `_commit_may_add_content` already recognises that whole family; the
+    guidance has to name it too, or an author inspects the index, sees nothing
+    local, and acks honestly over an edit `git add` is about to bring in."""
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _mark(repo, home)
+    (repo / "f.py").write_text("local tracked edit\n")
+    _begin_merge(repo)
+    res = _run_hook('git add -A && git commit -m "merge main"', repo, home)
+    assert res.returncode == 2
+    for form in ("add", "reset", "restore --staged"):
+        assert form in res.stderr, (
+            f"the inspection guidance does not name {form!r}, a deferred-staging form "
+            "the gate's own predicate recognises"
+        )
+    assert "BEFORE" in res.stderr, (
+        "the guidance does not say the hook runs before the staging segment, which "
+        "is the reason the index is not the thing to inspect"
+    )
+
+
+def test_depth_hint_covers_the_prospective_content_of_dash_a(repo: Path, home: Path) -> None:
+    """The note must not license depth-ack after inspecting only the index: -a
+    adds tracked working-tree edits at commit time, beyond that snapshot."""
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _mark(repo, home)  # records substantial, non-adversarial marker depth
+    (repo / "f.py").write_text("local tracked edit\n")
+    _begin_merge(repo)
+    res = _run_hook('git commit -a -m "merge main"', repo, home)
+    assert res.returncode == 2
+    # Case-insensitive: the note SHOUTS "PROSPECTIVE" deliberately, and this
+    # assertion is about the concept being present, not about its casing.
+    assert "prospective commit" in res.stderr.lower()
+    # The -a form specifically must still be named, which is now derived rather
+    # than hand-written -- see test_depth_hint_names_every_form_the_gate_accepts.
+    assert "-a" in res.stderr
+    # The old hand-written prose ("tracked working-tree changes selected by -a")
+    # is gone on purpose: the note now DERIVES its form list from the gate's own
+    # constants, so `-a` and `--all` both appear because the predicate accepts
+    # them, not because someone remembered to type them.
+    assert "--all" in res.stderr and "-a" in res.stderr
+
+
+def test_depth_hint_covers_a_squash_merge(repo: Path, home: Path) -> None:
+    """`git merge --squash` leaves reviewed content staged and SQUASH_MSG present,
+    but does not create MERGE_HEAD; it needs the same advisory explanation."""
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    (repo / ".git" / "SQUASH_MSG").write_text("Squashed commit\n")
+    res = _run_hook('git commit -m "squash merge"', repo, home)
+    assert res.returncode == 2
+    assert "git integration sentinel is present" in res.stderr
+    assert "squash merge" in res.stderr

@@ -77,6 +77,27 @@ class InteractionSummary:
     token_count: int
     channel: str
     timestamp: datetime
+    # True only when the RUNTIME cut the response short (CCOutput.bg_truncated),
+    # never when this pipeline elided it for size. The graders are asked to judge
+    # a response, and "did the model stop early" is a question they must answer
+    # from evidence rather than infer from a fragment we handed them.
+    # Last, with a default: this dataclass is constructed positionally by callers.
+    response_truncated: bool = False
+    # How many characters `_fit_response` removed from the middle, or 0. The
+    # graders are TOLD this; it is never recovered by searching response_text,
+    # which the response itself controls.
+    response_elided_chars: int = 0
+    # True when `tool_calls` came from the runtime's own `tool_use` events, and
+    # so names tools that actually RAN. False when it was scraped out of the
+    # response text, which cannot distinguish a tool that ran from one the
+    # response merely discussed. The prompt says which, because presenting a
+    # scraped name as fact is the same defect as inferring elision from the body.
+    tool_calls_from_runtime: bool = False
+    # The request gets the same bookkeeping as the reply — same reason, same
+    # mechanism (`summarizer._fit`), and the assessor grading request-against-
+    # delivery is the one that would otherwise read a cut-off request as an
+    # underspecified one.
+    user_text_elided_chars: int = 0
 
 
 @dataclass(frozen=True)

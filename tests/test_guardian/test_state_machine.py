@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -434,3 +435,219 @@ class TestDownAlertFlag:
         sm.mark_down_alert_sent()
         sm._reset_to_healthy("2026-06-16T00:00:00+00:00")
         assert sm.state.down_alert_sent is True
+
+
+class TestRebootResetsTheEpisode:
+    """The Guardian's escalation ladder must not resume mid-climb after a host
+    reboot.
+
+    `load_state` restores StateData verbatim (fresh only on corruption), and the
+    300s bootstrap grace is consulted from exactly ONE transition —
+    CONFIRMING->SURVEYING. So after a reboot: past CONFIRMING the grace is never
+    reached, and inside CONFIRMING `elapsed` is computed from the persisted
+    PRE-reboot `first_failure_at` and is already expired on arrival. Meanwhile
+    the container legitimately IS bootstrapping and needs the full window.
+
+    Resetting to HEALTHY re-arms the grace that already works, via the normal
+    HEALTHY->SIGNAL_DROPPED->CONFIRMING path — rather than adding a second
+    mechanism beside it.
+    """
+
+    BOOT_A = "1a2b3c4d-0000-4111-8000-000000000001"
+    BOOT_B = "9f1c2d3e-0000-4444-8888-aaaabbbbcccc"
+
+    def _rebooted(self, sm: ConfirmationStateMachine, *, was: GuardianState) -> bool:
+        sm._state.current_state = was
+        sm._state.boot_id = self.BOOT_A
+        return sm.reset_if_rebooted(self.BOOT_B)
+
+    def test_reboot_resets_the_episode(self, sm: ConfirmationStateMachine) -> None:
+        sm._state.first_failure_at = "2026-03-25T11:50:00+00:00"
+        sm._state.consecutive_failures = 4
+        sm._state.recheck_count = 3
+        assert self._rebooted(sm, was=GuardianState.CONFIRMED_DEAD) is True
+        assert sm.state.current_state is GuardianState.HEALTHY
+        assert sm.state.first_failure_at is None
+        assert sm.state.consecutive_failures == 0
+        assert sm.state.recheck_count == 0
+
+    def test_same_boot_leaves_an_in_flight_episode_alone(
+        self, sm: ConfirmationStateMachine,
+    ) -> None:
+        sm._state.current_state = GuardianState.SURVEYING
+        sm._state.boot_id = self.BOOT_A
+        assert sm.reset_if_rebooted(self.BOOT_A) is False
+        assert sm.state.current_state is GuardianState.SURVEYING
+
+    def test_legacy_state_adopts_the_boot_id_without_resetting(
+        self, sm: ConfirmationStateMachine,
+    ) -> None:
+        # A state.json written before this field existed has boot_id == "".
+        # Treating that as a reboot would wipe a live episode on the very tick
+        # the new code first runs, on every install.
+        sm._state.current_state = GuardianState.SURVEYING
+        assert sm.state.boot_id == ""
+        assert sm.reset_if_rebooted(self.BOOT_B) is False
+        assert sm.state.current_state is GuardianState.SURVEYING
+        assert sm.state.boot_id == self.BOOT_B
+
+    def test_unreadable_boot_time_does_not_reset(
+        self, sm: ConfirmationStateMachine,
+    ) -> None:
+        # Fail OPEN. A false positive silently discards an in-flight episode,
+        # which is worse than carrying a stale one for another tick.
+        sm._state.current_state = GuardianState.SURVEYING
+        sm._state.boot_id = self.BOOT_A
+        assert sm.reset_if_rebooted(None) is False
+        assert sm.state.current_state is GuardianState.SURVEYING
+
+    def test_reboot_clears_dialogue_state(self, sm: ConfirmationStateMachine) -> None:
+        # The dialogue counterparty lives in the container and is gone across a
+        # reboot; a stale sentinel_state would later be read as "proceed".
+        sm._state.dialogue_sent_at = "2026-03-25T11:50:00+00:00"
+        sm._state.dialogue_eta_s = 120
+        sm._state.dialogue_action = "self_heal"
+        sm._state.sentinel_state = "investigating"
+        self._rebooted(sm, was=GuardianState.AWAITING_SELF_HEAL)
+        assert sm.state.dialogue_sent_at is None
+        assert sm.state.dialogue_eta_s == 0
+        assert sm.state.dialogue_action is None
+        assert sm.state.sentinel_state == ""
+
+    # ── the bounded behaviours a reset must NOT re-enable ──────────────
+
+    def test_reboot_preserves_recovery_attempts(
+        self, sm: ConfirmationStateMachine,
+    ) -> None:
+        """RESTART_CONTAINER and SNAPSHOT_ROLLBACK *cause* reboots. Zeroing the
+        escalation budget on a reboot the Guardian itself triggered turns a
+        bounded 3-rung ladder into an unbounded loop."""
+        sm._state.recovery_attempts = 2
+        sm._state.last_recovery_at = "2026-03-25T11:50:00+00:00"
+        self._rebooted(sm, was=GuardianState.RECOVERING)
+        assert sm.state.recovery_attempts == 2
+        assert sm.state.last_recovery_at == "2026-03-25T11:50:00+00:00"
+
+    def test_reboot_preserves_io_triage_budget(
+        self, sm: ConfirmationStateMachine,
+    ) -> None:
+        """IO_TRIAGE kills processes. Its budget resetting on every reboot would
+        grant unlimited kills to a box in a reboot loop."""
+        sm._state.io_triage_attempts = 4
+        self._rebooted(sm, was=GuardianState.RECOVERING)
+        assert sm.state.io_triage_attempts == 4
+
+    def test_reboot_preserves_auto_reset_count(
+        self, sm: ConfirmationStateMachine,
+    ) -> None:
+        """The confirmed-dead oscillation guard, capped at max_auto_resets."""
+        sm._state.auto_reset_count = 2
+        self._rebooted(sm, was=GuardianState.CONFIRMED_DEAD)
+        assert sm.state.auto_reset_count == 2
+
+    def test_reboot_preserves_down_alert_latch(
+        self, sm: ConfirmationStateMachine,
+    ) -> None:
+        """GUARD-R2-01's one-alert-per-episode latch. Clearing it on a reboot
+        sends a fresh CRITICAL every 30s to a box in a reboot loop — which is
+        exactly the situation where reboots are observed."""
+        sm.mark_down_alert_sent()
+        self._rebooted(sm, was=GuardianState.CONFIRMED_DEAD)
+        assert sm.state.down_alert_sent is True
+
+    def test_reboot_preserves_the_snapshot_size_baseline(
+        self, sm: ConfirmationStateMachine,
+    ) -> None:
+        """Not a counter — the disk-space baseline gating safe_to_snapshot().
+        It is also aliased by reference from check.py and recovery.py, so the
+        SAME list object must survive, not just equal contents."""
+        history = sm._state.snapshot_size_history
+        history.extend([4096, 8192, 49430528])
+        self._rebooted(sm, was=GuardianState.RECOVERING)
+        assert sm.state.snapshot_size_history == [4096, 8192, 49430528]
+        assert sm.state.snapshot_size_history is history, (
+            "re-binding a fresh list detaches the aliases held by check.py/recovery.py"
+        )
+
+    def test_reboot_preserves_pause_state_through_the_next_tick(
+        self, sm: ConfirmationStateMachine,
+    ) -> None:
+        """User sovereignty: resetting these re-arms an already-sent reminder.
+
+        Asserted through a following `process()`, not just on the field. Forcing
+        current_state to HEALTHY would make `_handle_paused` treat the next tick
+        as a NEW pause and rewrite paused_since — so a field-only assertion would
+        pass while the value survived exactly zero ticks.
+        """
+        # A RECENT pause, so the 24h long-pause reminder does not legitimately
+        # fire and overwrite last_pause_reminder_at — that would be correct
+        # behaviour masquerading as a failure of the thing under test.
+        paused_at = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        sm._state.paused_since = paused_at
+        sm._state.last_pause_reminder_at = None
+        self._rebooted(sm, was=GuardianState.PAUSED)
+        sm.process(_paused_snapshot())
+        assert sm.state.paused_since == paused_at, (
+            "forcing PAUSED to HEALTHY makes the next tick read as a NEW pause, "
+            "restarting the long-pause reminder clock on every host reboot"
+        )
+
+    def test_reboot_clears_stale_signal_history(
+        self, sm: ConfirmationStateMachine,
+    ) -> None:
+        # check.py quotes signal_history[-5:] into three alert bodies. Carrying
+        # pre-reboot signals across makes a post-reboot alert read as if the
+        # episode were contiguous.
+        sm._state.signal_history.append(
+            {"at": "2026-03-25T11:50:00+00:00", "all_alive": False, "failed": ["health_api"]},
+        )
+        self._rebooted(sm, was=GuardianState.CONFIRMED_DEAD)
+        assert sm.state.signal_history == []
+
+    def test_reboot_clears_cc_unavailable_tracking(
+        self, sm: ConfirmationStateMachine,
+    ) -> None:
+        # Tracks a CC outage episode on the HOST; the host just rebooted, so its
+        # CC state is new.
+        sm.set_cc_unavailable()
+        sm.record_cc_unavailable_alert()
+        self._rebooted(sm, was=GuardianState.CONFIRMED_DEAD)
+        assert sm.state.cc_unavailable_since is None
+        assert sm.state.last_cc_unavailable_alert_at is None
+
+    def test_boot_id_survives_a_save_load_round_trip(
+        self, config: GuardianConfig, tmp_path: Path,
+    ) -> None:
+        sm = ConfirmationStateMachine(config)
+        sm._state.boot_id = self.BOOT_A
+        state_file = tmp_path / "state.json"
+        sm.save_state(state_file)
+
+        sm2 = ConfirmationStateMachine(config)
+        sm2.load_state(state_file)
+        assert sm2.state.boot_id == self.BOOT_A
+
+    def test_a_non_string_boot_id_on_disk_does_not_raise(
+        self, config: GuardianConfig, tmp_path: Path,
+    ) -> None:
+        # The gateway's reset-state verb read-modify-writes this same JSON, and a
+        # hand-edited file is plausible. An uncoerced value would raise inside the
+        # comparison — before the heartbeat write and the finally: save_state.
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({"current_state": "healthy", "boot_id": 12345}))
+        sm = ConfirmationStateMachine(config)
+        sm.load_state(state_file)
+        assert sm.state.boot_id == "12345"
+        assert sm.reset_if_rebooted(self.BOOT_A) is True
+
+    def test_post_reboot_failure_gets_the_full_bootstrap_grace(
+        self, sm: ConfirmationStateMachine,
+    ) -> None:
+        """The point of the reset: a fresh first_failure_at means CONFIRMING
+        holds for the whole grace window instead of arriving already expired."""
+        sm._state.first_failure_at = "2020-01-01T00:00:00+00:00"  # long expired
+        self._rebooted(sm, was=GuardianState.CONFIRMING)
+        sm.process(_dead_snapshot(["health_api"]))   # HEALTHY -> SIGNAL_DROPPED
+        sm.process(_dead_snapshot(["health_api"]))   # -> CONFIRMING, fresh onset
+        assert sm.state.current_state is GuardianState.CONFIRMING
+        assert sm._is_within_bootstrap_grace() is True

@@ -335,10 +335,17 @@ async def has_pending_cli_approval(
     wording change to the approval message can never silently break the gate.
     """
     cursor = await db.execute(
+        # json_valid guard: a bare json_extract raises OperationalError on a
+        # malformed `context`, and a bare AND-chain does not promise to
+        # short-circuit past it — SQLite's evaluation order is plan-dependent.
+        # The class here is the COLUMN (approval_requests.context), not the
+        # file: the two queries in approval_requests.py were guarded first and
+        # this third member was missed by scoping the enumeration to that file.
         "SELECT 1 FROM approval_requests "
         "WHERE status = 'pending' "
         "AND action_type = 'autonomous_cli_fallback' "
-        "AND json_extract(context, '$.policy_id') = ? LIMIT 1",
+        "AND (CASE WHEN json_valid(context) "
+        "          THEN json_extract(context, '$.policy_id') END) = ? LIMIT 1",
         (source_tag,),
     )
     return await cursor.fetchone() is not None

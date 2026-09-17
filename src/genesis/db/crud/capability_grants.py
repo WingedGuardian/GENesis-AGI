@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 
 import aiosqlite
 
-from genesis.autonomy.capabilities import transition
+from genesis.autonomy.capabilities import InvalidTransition, transition
 from genesis.autonomy.types import CellEvent, CellState, RiskClass
 
 #: Owner-approved-promotion bar (mirrors the legacy L-threshold): a cell is
@@ -32,6 +32,56 @@ PROMOTE_THRESHOLD = 0.70
 #: Minimum approved successes before a cell may be PROPOSED for promotion —
 #: closes the low-N trap (one lucky success is not earned trust).
 MIN_PROMOTE_N = 5
+
+#: (domain, verb) pairs whose cells may reach GRANTED (standing autonomy).  An
+#: ALLOWLIST on purpose: promotion is the one transition that converts
+#: per-action approval into a standing grant, so a capability stays
+#: non-promotable until someone DECIDES otherwise in code.  A denylist would
+#: grant that conversion to every future capability by default — i.e. by being
+#: forgotten.  Cells outside this set stay at ASK for their whole life: they
+#: still classify, still accumulate evidence, and still gate every single action
+#: on the owner.  Deliberately not config-driven — arming a capability for
+#: standing autonomy is a reviewed code change, never a YAML edit.
+#:
+#: KEYED ON (domain, verb), NOT domain alone.  A cell's identity is
+#: (domain, verb, risk_class), so a domain-only allowlist is COARSER than the
+#: invariant stated above: a new verb under an allowlisted domain — an
+#: ``email:forward`` path, say — would inherit promotion eligibility the moment
+#: it accrued five owner-approved successes, with no edit here and no tripwire
+#: firing.  Inert when this was written (``send`` was email's only verb), which
+#: is exactly why it was worth closing before a second verb made it live.
+#: Found by cross-model review of PR #1838.
+PROMOTABLE_CELLS: frozenset[tuple[str, str]] = frozenset({("email", "send")})
+
+#: Domains appearing in :data:`PROMOTABLE_CELLS`, derived rather than declared
+#: so the two can never disagree.  Read-only convenience for callers that
+#: genuinely only have a domain; the PREDICATE is the supported entry point.
+PROMOTABLE_DOMAINS: frozenset[str] = frozenset(d for d, _ in PROMOTABLE_CELLS)
+
+
+def is_promotable_cell(domain: str, verb: str, risk_class: str) -> bool:
+    """Whether this cell may EVER hold standing autonomy (GRANTED).
+
+    Two independent bars, both closed sets:
+
+    * the (DOMAIN, VERB) pair must be allowlisted (above); and
+    * the RISK CLASS must not be FINANCIAL.  ``RiskClass``'s own docstring
+      calls financial "hardline — never trust-unlockable", but nothing
+      enforced that: financial cells stayed out of the matrix only because
+      ``email_gate.check`` holds them BEFORE the first CLASSIFY — one
+      caller's statement ordering, not a mechanism.  A financial cell
+      created by any other path would have been promotable.
+
+    One predicate rather than two, deliberately: a second, weaker one is
+    what a future call site reaches for by accident.  The signature takes the
+    cell's full identity for the same reason — a caller that cannot supply a
+    verb is a caller that does not know which cell it is asking about.
+    """
+    return (
+        (domain, verb) in PROMOTABLE_CELLS
+        and risk_class != RiskClass.FINANCIAL.value
+    )
+
 
 #: Consequence weights by risk_class (WS-8 PR-D).  A correction's damage to a
 #: cell's RE-earn posterior is severity-proportional.  GATE-DERIVED from the
@@ -188,9 +238,18 @@ async def apply_event(
 ) -> CellState:
     """Apply a state-machine event to the cell and persist the new state.
 
-    Raises :class:`genesis.autonomy.capabilities.InvalidTransition` if the
-    event is illegal from the current state.  Sets ``granted_at`` when the
-    cell first reaches GRANTED.
+    Raises :class:`genesis.autonomy.capabilities.InvalidTransition` in TWO
+    cases, and a caller that suppresses it swallows both: an illegal
+    state/event pair, AND an ``APPROVE`` for a cell that is not promotable
+    (:func:`is_promotable_cell`).  The second is a POLICY refusal, not a
+    state-machine one — do NOT copy ``email_gate.check``'s
+    ``contextlib.suppress(InvalidTransition)`` idiom to an APPROVE call site:
+    that idiom exists to tolerate a CLASSIFY on an already-advanced cell, and
+    on APPROVE it would silently discard the promotion bar.  Normalization of
+    an unrecognised ``event`` raises the same type, deliberately, so the error
+    contract this function already documented is unchanged.
+
+    Sets ``granted_at`` when the cell first reaches GRANTED.
 
     ``origin_class`` (REQUIRED — WS-3 gate-3) is the provenance of whatever
     prompted this state change: ``owner`` for owner decisions
@@ -200,6 +259,19 @@ async def apply_event(
     inert gate. Under gate-3 ENFORCE a blockable origin is REFUSED (no
     transition; returns the CURRENT state) — the emit records the attempt.
     """
+    # Normalize BEFORE anything reads `event`. CellEvent is a StrEnum, so a
+    # caller passing the bare string "approve" is NOT identical to
+    # CellEvent.APPROVE but IS equal to it — and _TRANSITIONS is a dict, which
+    # matches on equality. An identity check on the promotion guard below would
+    # therefore be skipped while transition() still returned GRANTED, committing
+    # the promotion and only then failing on `event.value`. Coercing here closes
+    # that for every use in this function, not just the guard.
+    try:
+        event = CellEvent(event)
+    except ValueError:
+        # Keep the error type this function already documents; an unknown event
+        # was previously a KeyError inside transition() surfacing the same way.
+        raise InvalidTransition(f"unknown cell event {event!r}") from None
     if _autonomy_enforce_refuses(origin_class):
         await _emit_autonomy_gate(
             db, fn="apply_event", origin_class=origin_class,
@@ -212,6 +284,19 @@ async def apply_event(
         # state machine's default when no cell exists.
         row = await get_cell(db, domain, verb, risk_class)
         return CellState(row["state"]) if row else CellState.NOT_DETERMINED
+    if event == CellEvent.APPROVE and not is_promotable_cell(domain, verb, risk_class):
+        # (ASK, APPROVE) is the ONLY edge into GRANTED, and this is the only
+        # call of transition() that can carry it — so refusing HERE is the
+        # mechanism, not a convention every promotion path has to remember.
+        # Raises rather than reporting the unchanged state: the sole caller
+        # (ego/cell_promotion) reads a swallowed refusal as a SUCCESSFUL
+        # promotion, and a gate that lies about what it did is worse than none.
+        # Refuse before ensure_cell so a refused promotion cannot seed a row.
+        raise InvalidTransition(
+            f"cell '{cell_id(domain, verb, risk_class)}' is not promotable — "
+            f"only allowlisted domains, and never FINANCIAL, reach GRANTED "
+            f"(per-action approval only)"
+        )
     row = await ensure_cell(
         db, domain=domain, verb=verb, risk_class=risk_class, updated_at=updated_at
     )
@@ -384,10 +469,12 @@ async def detect_promotable_cells(
 ) -> list[dict]:
     """ASK cells with enough evidence to PROPOSE for owner-approved promotion.
 
-    A cell qualifies when it has ≥ ``min_successes`` approved successes AND its
-    severity-weighted re-earn posterior is ≥ ``threshold``.  Recommend-only:
-    this never promotes — it surfaces candidates for the cadence to propose and
-    the owner to approve.  Each returned row carries a computed ``posterior``.
+    A cell qualifies when it is promotable at all (``is_promotable_cell`` —
+    allowlisted domain, not FINANCIAL), it has ≥ ``min_successes`` approved
+    successes, AND its severity-weighted
+    re-earn posterior is ≥ ``threshold``.  Recommend-only: this never promotes —
+    it surfaces candidates for the cadence to propose and the owner to approve.
+    Each returned row carries a computed ``posterior``.
     """
     cursor = await db.execute(
         "SELECT * FROM capability_grants WHERE state = ?", (CellState.ASK.value,)
@@ -395,6 +482,8 @@ async def detect_promotable_cells(
     out: list[dict] = []
     for r in await cursor.fetchall():
         row = dict(r)
+        if not is_promotable_cell(row["domain"], row["verb"], row["risk_class"]):
+            continue  # never propose what apply_event would refuse to grant
         if row["successes"] < min_successes:
             continue
         posterior = cell_posterior(

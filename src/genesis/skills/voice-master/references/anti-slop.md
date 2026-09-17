@@ -118,13 +118,22 @@ in any medium. Tier 1 words include "delve", "tapestry", "testament",
 "fostering", "garner", "interplay", "enduring", "vibrant", "crucial",
 "enhance".
 
+The **Tier 1: significance & structure inflation** section in
+`ai-vocabulary.md` is Tier 1 as well. It includes phrases such as "stands as",
+"sits at the intersection of", "a hallmark of", "a plethora of", and
+"rich tapestry". Scan the whole section; these examples are illustrative, not
+an exhaustive allowlist.
+
 ### Em dashes (hard rule)
 
 A spaced em dash (` — `) is the #1 AI punctuation tell. **Hard fail:** if
-` — ` appears anywhere in output, the audit failed. Never put spaces around an
-em dash. Prefer restructuring to a comma, period, colon, or semicolon; if an
-em dash is genuinely needed, use it unspaced (`word—word`). Max 1–2 per page,
-not per paragraph. Stacking them is an AI fingerprint.
+` — ` appears anywhere in output, the audit failed. Prefer restructuring to a
+comma, period, colon, or semicolon; when a dash is genuinely needed in
+published prose, write two hyphens closed up (`word--word`) — the true em
+dash reads typeset rather than typed, and the double hyphen is what people
+actually type (owner ruling 2026-09-16). Max 1–2 per page, not per paragraph.
+Stacking dashes is an AI fingerprint. (Conversational output is out of this
+file's scope and keeps its em dash, per `identity/CONVERSATION.md`.)
 
 ### Structural tells
 

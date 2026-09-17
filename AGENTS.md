@@ -4,6 +4,15 @@ Cross-tool agent entry point (Codex, Cursor, OpenCode, …). The canonical
 project instructions live in **CLAUDE.md** — read it first; everything below
 is supplementary.
 
+## Codex external-client boundary
+
+Codex connects to Genesis through the project `.codex/config.toml` as an
+external MCP client. It can request Genesis capabilities on demand, but it is
+not a Genesis foreground or background session: never register its transcript,
+create a charter for it, send its identifiers to session tools, or add lifecycle
+hooks that make Genesis manage the conversation. See
+`.agents/skills/genesis-external-client/SKILL.md` when working through Codex.
+
 ## Code Review Mandate (adversarial)
 
 When reviewing a diff or PR (including automated PR review), review ADVERSARIALLY,
@@ -46,6 +55,26 @@ not to confirm:
   verdict ("remaining items are out-of-threat-model residue, not blocking") instead of
   continuing to enumerate: over-hardening code whose functionality doesn't warrant it is
   itself a review failure.
+- **"The approach itself is wrong" is a legitimate review verdict — say it when the
+  evidence supports it.** Rounds accumulate for two different reasons and the round
+  count cannot tell them apart: a sound solution carrying defects converges, while a
+  WRONG-SHAPED solution does not — each fix creates the surface for the next finding,
+  so the loop reads like whack-a-mole while it is really a design error accruing
+  interest. You are the only reviewer positioned to notice, because the author has
+  three rounds of sunk cost and the read-model that produced the design.
+  Three signals, none of which requires you to judge intent — all are visible in the
+  diff and the review history:
+  * findings CONCENTRATE in one file or one function rather than scattering;
+  * a finding lands on a line THIS pull request itself added in an earlier round
+    (the fix is generating its own bug supply);
+  * the diff GROWS across rounds instead of shrinking.
+  When two or more hold, say so plainly and name the alternative shape — delete the
+  mechanism, move it one layer up, make the problem impossible rather than detected.
+  A denylist defeated by a caller does not become correct by enumerating callers.
+  Scope it honestly, because the opposite error is just as expensive: findings that
+  SCATTER across a diff, each with a local fix, are ordinary defects in a sound
+  design, and telling that author their architecture is wrong sends them hunting a
+  problem that is not there. Absent the signals, review the code.
 - **End with a verdict:** `Ready to merge: Yes | No | With fixes` + a one-line reason.
 
 ### Documentation is out of scope for review
@@ -119,6 +148,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - **aws-fde-delivery** — Forward Deployed Engineer delivery contract for AWS engagements, build-first artifacts, grounded cost estimates, Well-Architected review, evolution roadmap
 - **browser-automation** — Web automation with 4-layer escalation (Fetch, Genesis Browser, On-Demand MCP, Computer Use), anti-detection, and persistent profiles
 - **cc-update** — Update Claude Code (the CC CLI / "clog code") to a new version, or bump the pinned CC version. Use when the user asks to update Claude Code, bump the CC pin, evaluate a new CC release, or says "clog code update". Routes to the canonical, standardized process in docs/reference/cc-compatibility.md — do NOT re-derive the update mechanism by grepping every time. Do NOT use for general "what changed in CC" trivia with no intent to update.
+- **closing-session** — This skill should be used when a session's job is to DRIVE OPEN PRs TO MERGE rather than to write new code — "close out the open PRs", "review and fix the open PRs", "what's blocking our PRs", "which PRs are mergeable". It owns the In Review column: it reads each PR's gate status, verifies and fixes review findings on PRs OTHER sessions built, replies in-thread, and stops at the merge gate for the user's per-PR approval. Do NOT load it for building a feature and opening its PR — that is a build session (`genesis-development`).
 - **code-intelligence** — Code understanding tool selection. Use when exploring architecture, finding definitions, tracing call chains, assessing blast radius of changes, or debugging code paths in the Genesis codebase.
 - **content-publish** — End-to-end content creation and publishing. Takes a topic (or generates one), drafts in the user's voice, gets approval via Telegram, and publishes to Medium via browser automation. Invoke with "publish a post about X", "write and publish to Medium", "content-publish", or when an ego-dispatched session needs to create and distribute content.
 - **debugging** — Systematic debugging of issues — use when a test fails, runtime error occurs, unexpected behavior is reported, or an awareness tick produces anomalous results
@@ -142,7 +172,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - **linkedin-post-writer** — This skill should be used when the user asks to "write a LinkedIn post", "draft a post about", "help me post on LinkedIn", "create LinkedIn content", or when Genesis proactively generates post ideas during surplus compute. Also triggered by content calendar execution or when the user shares a topic they want to write about.
 - **linkedin-profile-optimizer** — This skill should be used when the user asks to "optimize my LinkedIn profile", "update my LinkedIn headline", "rewrite my LinkedIn summary", "improve my LinkedIn about section", or when Genesis identifies that the user's profile doesn't align with their current goals or target audience.
 - **obstacle-resolution** — Resolve obstacles using fallback chains — use when an approach fails, a dependency is unavailable, an API returns errors, or a task is blocked and needs an alternative path forward
-- **onboarding** — First-run onboarding — guides new users through Genesis setup on their first CC session. Configures user profile, essential API keys, Telegram, GitHub backup, and service verification. Triggered automatically when ~/.genesis/setup-complete is absent. Re-runnable by asking Genesis to "run setup" or "reconfigure [section]".
+- **onboarding** — First-run onboarding — guides new users through Genesis setup on their first CC session. Configures user profile, essential API keys, Telegram, GitHub backup, and service verification. Triggered automatically while the install is not yet FUNCTIONAL (the setup floor — Claude Code login + an LLM key + an embedding key — is unmet), not merely while ~/.genesis/setup-complete is absent. Re-runnable by asking Genesis to "run setup" or "reconfigure [section]".
 - **osint** — OSINT investigation — discover, track, and report on people, companies, and technologies
 - **prospect-researcher** — This skill should be used when the user asks to "research this company", "look into this person", "find the best angle for reaching out to", "who should I contact at [company]", "what does [company] care about", or when preparing outreach to a specific target. Also triggered by "help me prepare for an interview with [company]" or "I want to apply to [company]". Combines lead-generation intelligence with LinkedIn-specific approach planning.
 - **research** — Deep research on a topic — use when investigating unfamiliar domains, answering complex questions requiring multiple sources, or when an evaluation flags something for deeper analysis
@@ -156,6 +186,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - **user_evaluate** — Evaluate content for personal relevance to the user using the user model
 - **video-processing** — Download, transcribe, analyze, and clip video content — vertical shorts, captions, thumbnails
 - **voice-master** — Foundational voice authority and AI humanizer — writes content in the user's authentic voice with built-in AI detection, and supports stealth / anti- attribution writing (forum personas, anonymous posts, "write as not-me"). Use when asked to write/draft/generate content, invoke /voice, /write-as-me, or /humanize, run voice calibration, check "does this sound like me?", "make this sound human" / "de-AI this", "write a forum post as [persona]", or run AI detection ("does this sound like AI?", "check for AI patterns", "anti-slop check"). Do NOT use this skill for code, technical docs, or any output the user has not asked to be written in their voice — code styling defers to the separate code-voice skill.
+- **web-research** — Evidence-driven web and open-source research for questions that require multiple sources, factual verification, comparisons, or an adopt/adapt/build decision. Use for substantial research in foreground sessions, the genesis-researcher subagent, and research-profile background sessions. Skip for a single stable fact or a known URL that only needs fetching.
 - **youtube-fetch** — Fetches YouTube video metadata and transcripts using yt-dlp. Activate when the user shares a YouTube URL (youtube.com, youtu.be), asks to 'fetch this video', 'get the transcript', 'what does this video say', 'summarize this YouTube video', or references video content that needs to be retrieved. Also activate when processing multiple YouTube URLs in batch. Do NOT use for non-YouTube video platforms, local video files, or audio-only podcast URLs.
 
 ### MCP Tools
@@ -189,6 +220,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - `campaign_trigger` — Manually trigger a campaign tick (bypasses schedule).
 - `campaign_update` — Update campaign configuration.
 - `codebase_navigate` — Navigate the Genesis codebase progressively.
+- `contributor_issue_propose` — Propose a public GitHub issue for the Contributor Work-Log — sanitize it server-side and, if clean, hold it for owner approval on the dashboard.
 - `db_schema` — Query database schema: list all tables, or get columns for a specific table.
 - `direct_session_list` — List recent direct background sessions.
 - `direct_session_run` — Spawn a directed background CC session with profile-based tool restrictions.
@@ -230,8 +262,12 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 
 **genesis-outreach**
 
+- `marketing_prospects_list` — List the ACTIVE, non-opted-out marketing prospects — the cold-outreach targets the campaign may pitch — so it can enumerate → personalise a pitch → call ``marketing_send(prospect_id, subject, body)``.
+- `marketing_send` — Stage a COLD marketing email to a curated prospect. Returns a neutral queued/refused JSON status.
+- `outreach_cancel` — Cancel a queued, not-yet-sent message by its pending id.
 - `outreach_digest` — Generate a digest of recent outreach activity.
 - `outreach_engagement` — Record an engagement OUTCOME (useful, engaged, acted_on, acknowledged, not_useful, ambivalent, ignored; 'replied' maps to 'useful').
+- `outreach_pending` — List messages QUEUED but not yet sent — the ones `outreach_cancel` can act on.
 - `outreach_poll` — Create a Discord poll via webhook. Returns JSON with message_id.
 - `outreach_preferences` — Get/set user channel preferences and quiet hours.
 - `outreach_queue` — View recent outreach messages.
@@ -245,6 +281,8 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - `recon_cc_update_check` — Analyze a Claude Code version change for impact on Genesis.
 - `recon_config` — View or modify recon configuration.
 - `recon_findings` — Query stored recon findings.
+- `recon_github_read` — Inspect GitHub repository metadata, a recursive tree, or one file.
+- `recon_github_search` — Search public GitHub.com repositories or issues without shell access.
 - `recon_run_github_discovery` — Discover GitHub repos for a topic, ranked by momentum/activity/maturity.
 - `recon_run_github_discovery_job` — Run the curated GitHub Discovery JOB on-demand (files new repos → triage).
 - `recon_run_model_intelligence` — Run model intelligence scan — check for new models, pricing changes, stale profiles.
