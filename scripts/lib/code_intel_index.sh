@@ -164,15 +164,27 @@ _genesis_mem_working_set_from() {
     [[ "$current" =~ ^[0-9]+$ ]] || return 1
     [ -r "$stat_path" ] || { printf '%s' "$current"; return; }
 
-    local fields inactive active dirty writeback reserve reclaimable discount
+    local fields inactive active dirty writeback v1_inactive v1_active v1_dirty v1_writeback reserve reclaimable discount
     fields="$(awk '
         $1 == "inactive_file" { inactive = $2 }
         $1 == "active_file" { active = $2 }
         $1 == "file_dirty" { dirty = $2 }
         $1 == "file_writeback" { writeback = $2 }
-        END { printf "%s %s %s %s", inactive, active, dirty, writeback }
+        $1 == "total_inactive_file" { v1_inactive = $2 }
+        $1 == "total_active_file" { v1_active = $2 }
+        $1 == "total_dirty" { v1_dirty = $2 }
+        $1 == "total_writeback" { v1_writeback = $2 }
+        END { printf "%s|%s|%s|%s|%s|%s|%s|%s", inactive, active, dirty, writeback, v1_inactive, v1_active, v1_dirty, v1_writeback }
     ' "$stat_path" 2>/dev/null)" || { printf '%s' "$current"; return; }
-    read -r inactive active dirty writeback <<< "$fields"
+    IFS='|' read -r inactive active dirty writeback v1_inactive v1_active v1_dirty v1_writeback <<< "$fields"
+    if [[ "$inactive" =~ ^[0-9]+$ && "$active" =~ ^[0-9]+$ && "$dirty" =~ ^[0-9]+$ && "$writeback" =~ ^[0-9]+$ ]]; then
+        :  # cgroup v2 schema
+    elif [[ "$v1_inactive" =~ ^[0-9]+$ && "$v1_active" =~ ^[0-9]+$ && "$v1_dirty" =~ ^[0-9]+$ && "$v1_writeback" =~ ^[0-9]+$ ]]; then
+        inactive="$v1_inactive"; active="$v1_active"; dirty="$v1_dirty"; writeback="$v1_writeback"
+    else
+        printf '%s' "$current"
+        return
+    fi
     for fields in "$inactive" "$active" "$dirty" "$writeback"; do
         [[ "$fields" =~ ^[0-9]+$ ]] || { printf '%s' "$current"; return; }
     done

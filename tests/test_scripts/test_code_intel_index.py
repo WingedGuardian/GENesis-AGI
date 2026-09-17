@@ -930,6 +930,18 @@ def test_working_set_keeps_small_cache_and_fails_closed_on_bad_stats(tmp_path):
     ) == current
 
 
+def test_working_set_supports_the_complete_cgroup_v1_schema(tmp_path):
+    gib = 1024**3
+    current = 12 * gib
+    v1 = (
+        f"total_inactive_file {6 * gib}\n"
+        "total_active_file 0\n"
+        "total_dirty 0\n"
+        "total_writeback 0\n"
+    )
+    assert _working_set_from_stat(tmp_path, current, v1, 2 * gib) == 8 * gib
+
+
 def test_cache_heavy_install_is_admitted_by_working_set_not_total_charge(tmp_path):
     gib = 1024**3
     statfile = tmp_path / "memory.stat"
@@ -949,6 +961,28 @@ def test_cache_heavy_install_is_admitted_by_working_set_not_total_charge(tmp_pat
         },
     )
     assert not why, f"clean file cache falsely blocked a safe rebuild: {why}"
+    assert cap == "8G", cap
+
+
+def test_cache_heavy_v1_install_is_admitted_by_working_set_not_total_charge(tmp_path):
+    gib = 1024**3
+    statfile = tmp_path / "memory.stat"
+    statfile.write_text(
+        f"total_inactive_file {4 * gib}\n"
+        f"total_active_file {9 * gib}\n"
+        "total_dirty 0\n"
+        "total_writeback 0\n"
+    )
+    cap, why = _headroom_decision(
+        tmp_path,
+        32,
+        env_overrides={
+            "CODE_INTEL_MEM_CURRENT_BYTES": "",
+            "CODE_INTEL_MEM_RAW_CURRENT_BYTES": str(27 * gib),
+            "CODE_INTEL_MEM_STAT_PATH": str(statfile),
+        },
+    )
+    assert not why, f"clean v1 file cache falsely blocked a safe rebuild: {why}"
     assert cap == "8G", cap
 
 
