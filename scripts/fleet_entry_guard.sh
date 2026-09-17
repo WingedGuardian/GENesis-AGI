@@ -306,7 +306,22 @@ if [ -n "$_clear_enabled" ] && [ -n "$stranded_ids" ]; then
             incomplete="${incomplete}${_id} "
             continue
         fi
-        _tmux_do copy-mode -q -t "$_id"
+        # ATOMIC, not just selected. The shell-side test above ran against an
+        # inventory taken several tmux calls ago, and a concurrent SSH login can
+        # attach in that window — Login A classifies %9 as detached, Login B
+        # attaches, Login A then cancels B's chooser. Re-reading in shell only
+        # narrows that; `if-shell -F` makes tmux evaluate the condition and run
+        # the clear in ONE command, so nothing can interleave between them.
+        #
+        # Both layers are kept on purpose. The shell aggregation is the
+        # CORRECTNESS layer — it is deterministic and it is what handles a pane
+        # shared into several sessions. `if-shell -t <pane>` resolves to one of
+        # those sessions and MEASURED it picks the attached one (it declined to
+        # clear a pane a live client was viewing), but that is an observation of
+        # tmux's target resolution, not a guarantee it owes us — so it is the
+        # atomicity layer, never the only check.
+        _tmux_do if-shell -t "$_id" -F '#{==:#{session_attached},0}' \
+            "copy-mode -q -t $_id"
         attempted="${attempted}${_id} "
     done
     unset _id

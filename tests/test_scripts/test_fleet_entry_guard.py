@@ -495,8 +495,14 @@ def _stub_tmux(tmp_path, *, clears: bool) -> Path:
     )
     stub.write_text(
         "#!/bin/sh\n"
+        # The clear is issued as `if-shell -F <cond> "copy-mode -q -t %N"`, so
+        # tmux evaluates the attachment condition and the clear as ONE command
+        # and nothing can attach between them. The witness matches BOTH verbs:
+        # keyed on `copy-mode` alone it stopped seeing the clear the moment the
+        # call became atomic, which is a stub that silently stops testing the
+        # thing it was written for.
         'case "$1" in\n'
-        f'  copy-mode) : > "{witness}"; exit 0 ;;\n'
+        f'  if-shell|copy-mode) : > "{witness}"; exit 0 ;;\n'
         "esac\n"
         'for a in "$@"; do\n'
         '  case "$a" in\n'
@@ -532,6 +538,53 @@ def _run_with_stub(tmp_path, bin_dir: Path, **extra_env):
     )
     logs = sorted((home / ".genesis" / "logs").glob("fleet_entry_*.log"))
     return proc, (logs[0].read_text() if logs else "")
+
+
+def test_the_clear_is_issued_atomically_with_its_attachment_check(tmp_path):
+    """The TOCTOU fix, bound by the argv tmux actually receives.
+
+    The shell-side attachment test runs against an inventory taken several tmux
+    calls earlier, so a concurrent SSH login can attach inside that window:
+    login A classifies %9 as detached, login B attaches, login A cancels B's
+    chooser. Re-reading in shell only narrows that. `if-shell -F` makes tmux
+    evaluate the condition and run the clear as ONE command, so nothing can
+    interleave.
+
+    Asserting the pane ends up clear would NOT catch a revert to a bare
+    `copy-mode` — both clear it. Only the issued command distinguishes them.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_log = tmp_path / "argv.log"
+    stub = bin_dir / "tmux"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> "{argv_log}"\n'
+        'case "$1" in\n'
+        "  if-shell|copy-mode) exit 0 ;;\n"
+        "esac\n"
+        'for a in "$@"; do\n'
+        '  case "$a" in\n'
+        "    *kind=*) "
+        'echo "in_mode=1 kind=dest pane=%9 attached=0 cc-9:1.0 '
+        'mode=tree-mode pid=1 cmd=bash"; exit 0 ;;\n'
+        '    pane=*in_mode*) echo "pane=%9 in_mode=0"; exit 0 ;;\n'
+        "  esac\n"
+        "done\n"
+        "exit 0\n"
+    )
+    stub.chmod(0o755)
+    _run_with_stub(tmp_path, bin_dir)
+
+    calls = argv_log.read_text() if argv_log.exists() else ""
+    clear_calls = [ln for ln in calls.splitlines() if "copy-mode" in ln]
+    assert clear_calls, f"no clear was issued at all:\n{calls}"
+    for call in clear_calls:
+        assert call.startswith("if-shell"), (
+            "the clear must be issued through `if-shell -F` so the attachment "
+            f"check and the clear cannot be interleaved. Got: {call!r}"
+        )
+        assert "session_attached" in call, f"`if-shell` carries no attachment condition: {call!r}"
 
 
 def test_a_clear_that_did_not_work_is_reported_as_failed_not_as_success(tmp_path):
@@ -611,7 +664,7 @@ def test_a_budget_spent_mid_sweep_says_so_rather_than_going_silent(tmp_path):
     stub = bin_dir / "tmux"
     stub.write_text(
         "#!/bin/sh\n"
-        'case "$1" in copy-mode) sleep 3; exit 0 ;; esac\n'
+        'case "$1" in if-shell|copy-mode) sleep 3; exit 0 ;; esac\n'
         'for a in "$@"; do\n'
         '  case "$a" in\n'
         "    *kind=*) "
