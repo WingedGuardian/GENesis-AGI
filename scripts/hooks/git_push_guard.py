@@ -1085,15 +1085,15 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
     # would deadlock on its own IN_PROGRESS entry or inherit a stale FAILURE
     # from an earlier run on the same head, and locally the mirror would
     # double-count real blocks as `ci: red (genesis-merge-gate)` and demand a
-    # spurious ci-override on top of the genuine sigils. Two constant
-    # identities cover both publishing lanes: workflowName "merge-gate" is the
-    # ambient job check; name "genesis-merge-gate" with an EMPTY workflowName
-    # is a check run published via the check-runs API (which carries no
-    # workflowName). The empty-workflowName requirement keeps a coincidentally
-    # same-named check inside another workflow counting normally — the
-    # exclusion must cover exactly our own runs, nothing wider. The
-    # GITHUB_WORKFLOW/GITHUB_JOB env lanes stay as a drift-proof backup: if
-    # the workflow is ever renamed, the running job still recognizes itself.
+    # spurious ci-override on top of the genuine sigils. The name alone is the
+    # identity: `genesis-merge-gate` is OUR check name, and measured on PR
+    # #1954 an API-published verdict was attached to a check suite owned by a
+    # DIFFERENT workflow ("Labeler") — GitHub assigns the suite, not the
+    # publisher, so the empty-workflowName lane the first version relied on
+    # does not hold. A same-named check published by something else would be
+    # someone else mirroring THIS gate's verdict; excluding it is still right.
+    # The GITHUB_WORKFLOW/GITHUB_JOB env lanes stay as a drift-proof backup for
+    # the ambient-run case where the workflow is renamed but the job is not.
     self_wf = (os.environ.get("GITHUB_WORKFLOW") or "").strip().casefold()
     self_job = (os.environ.get("GITHUB_JOB") or "").strip().casefold()
 
@@ -1102,9 +1102,9 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
             return False
         wf = (c.get("workflowName") or "").strip().casefold()
         name = (c.get("name") or "").strip().casefold()
-        if wf == "merge-gate" or (self_wf and wf == self_wf) or (self_job and wf == self_job):
+        if name == "genesis-merge-gate" or wf == "merge-gate":
             return True
-        return name == "genesis-merge-gate" and not wf
+        return (self_wf and wf == self_wf) or (self_job and wf == self_job)
 
     checks = [c for c in checks if not _is_self_check(c)]
     if not checks:

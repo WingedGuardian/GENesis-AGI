@@ -3143,17 +3143,29 @@ class TestPrCiStatusSelfWorkflow:
         ]))
         assert guard_module._pr_ci_status("1") == ("red", ["some-other-check"])
 
-    def test_same_name_in_other_workflow_is_not_filtered(self, guard_module, monkeypatch):
-        # The name lane applies ONLY to workflowName-less (API-published) runs —
-        # a check coincidentally named after this job inside another workflow is
-        # a real verdict and still counts (CodeRabbit: scope the name filter).
+    def test_api_published_run_in_foreign_suite_is_filtered(self, guard_module, monkeypatch):
+        # MEASURED on PR #1954: a `genesis-merge-gate` verdict published via the
+        # check-runs API was attached to a check suite owned by a DIFFERENT
+        # workflow ("Labeler") — GitHub assigns the suite, not the publisher, so
+        # an API-published mirror can carry ANY workflowName. The name is the
+        # identity regardless of the suite it lands in.
         self._actions(monkeypatch, workflow="merge-gate", job="genesis-merge-gate")
         monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
-            {"name": "genesis-merge-gate", "workflowName": "CI",
+            {"name": "genesis-merge-gate", "workflowName": "Labeler",
              "status": "COMPLETED", "conclusion": "FAILURE"},
             {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
         ]))
-        assert guard_module._pr_ci_status("1") == ("red", ["genesis-merge-gate"])
+        assert guard_module._pr_ci_status("1") == ("green", [])
+
+    def test_mirror_name_filtered_locally_under_any_workflow_name(self, guard_module, monkeypatch):
+        # Same lane on the interactive path: an API-published mirror carrying a
+        # foreign workflowName must not double-count as `ci: red`.
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": "Labeler",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]))
+        assert guard_module._pr_ci_status("1") == ("green", [])
 
 
 class TestPrCiStatusRequiredWorkflows:
