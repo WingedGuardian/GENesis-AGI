@@ -45,6 +45,7 @@
 #   CODE_INTEL_INDEX_MEMORY_MAX   legacy override for both tools
 #   CODE_INTEL_CBM_MEMORY_MAX     default 2G     (CBM batch scope)
 #   CODE_INTEL_GITNEXUS_MEMORY_MAX default 8G    (measured GitNexus rebuild)
+#   CODE_INTEL_FILE_CACHE_RESERVE_BYTES default 2G (clean cache kept outside job)
 #   CODE_INTEL_INDEX_IO_WEIGHT    default 20     (1-10000; low = polite)
 #   CODE_INTEL_INDEX_CPU_QUOTA    default 200%   (2 cores worth)
 #   CODE_INTEL_INDEX_MODE         default fast   (fast|moderate|full; 3rd arg wins)
@@ -149,6 +150,45 @@ _genesis_mem_ceiling() {
     [ -n "$total_kb" ] && printf '%s' "$(( total_kb * 1024 ))"
 }
 
+# Convert a cgroup's total charge into a conservative working-set estimate.
+# memory.current includes clean filesystem cache, which the kernel can reclaim
+# before an OOM. Counting every cached byte as permanently occupied starves the
+# indexer on a cache-heavy box even when anon+kernel memory is small. Do NOT use
+# anon alone: shmem, dirty/writeback pages and kernel memory still consume the
+# parent cgroup. Mirror read_container_memory_reclaimable(): the file LRU
+# counters exclude tmpfs/shmem, unlike the broad `file` counter. Discount only
+# clean LRU cache above a retained floor. Missing/malformed statistics fail
+# closed to the raw charge.
+_genesis_mem_working_set_from() {
+    local current="${1:-}" stat_path="${2:-}"
+    [[ "$current" =~ ^[0-9]+$ ]] || return 1
+    [ -r "$stat_path" ] || { printf '%s' "$current"; return; }
+
+    local fields inactive active dirty writeback reserve reclaimable discount
+    fields="$(awk '
+        $1 == "inactive_file" { inactive = $2 }
+        $1 == "active_file" { active = $2 }
+        $1 == "file_dirty" { dirty = $2 }
+        $1 == "file_writeback" { writeback = $2 }
+        END { printf "%s %s %s %s", inactive, active, dirty, writeback }
+    ' "$stat_path" 2>/dev/null)" || { printf '%s' "$current"; return; }
+    read -r inactive active dirty writeback <<< "$fields"
+    for fields in "$inactive" "$active" "$dirty" "$writeback"; do
+        [[ "$fields" =~ ^[0-9]+$ ]] || { printf '%s' "$current"; return; }
+    done
+
+    reserve="${CODE_INTEL_FILE_CACHE_RESERVE_BYTES:-$(( 2 * 1024 * 1024 * 1024 ))}"
+    [[ "$reserve" =~ ^[0-9]+$ ]] || { printf '%s' "$current"; return; }
+    reclaimable=$(( inactive + active ))
+    [ "$(( dirty + writeback ))" -lt "$reclaimable" ] \
+        || { printf '%s' "$current"; return; }
+    reclaimable=$(( reclaimable - dirty - writeback ))
+    [ "$reclaimable" -gt "$reserve" ] || { printf '%s' "$current"; return; }
+    discount=$(( reclaimable - reserve ))
+    [ "$discount" -lt "$current" ] || { printf '%s' "$current"; return; }
+    printf '%s' "$(( current - discount ))"
+}
+
 # What everything on this box is using RIGHT NOW, job included — the fixed
 # reserve below is a floor for a machine whose live usage cannot be read. A
 # container where Genesis, Qdrant and the sessions already exceed that floor
@@ -160,14 +200,19 @@ _genesis_mem_current() {
         printf '%s' "$CODE_INTEL_MEM_CURRENT_BYTES"
         return
     fi
-    local raw=""
-    if [ -r /sys/fs/cgroup/memory.current ]; then
+    local raw="" stat_path=""
+    if [ -n "${CODE_INTEL_MEM_RAW_CURRENT_BYTES:-}" ]; then
+        raw="$CODE_INTEL_MEM_RAW_CURRENT_BYTES"
+        stat_path="${CODE_INTEL_MEM_STAT_PATH:-/sys/fs/cgroup/memory.stat}"
+    elif [ -r /sys/fs/cgroup/memory.current ]; then
         raw="$(cat /sys/fs/cgroup/memory.current 2>/dev/null)"
+        stat_path="${CODE_INTEL_MEM_STAT_PATH:-/sys/fs/cgroup/memory.stat}"
     elif [ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ]; then
         raw="$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null)"
+        stat_path="${CODE_INTEL_MEM_STAT_PATH:-/sys/fs/cgroup/memory/memory.stat}"
     fi
     if [ -n "$raw" ] && [ "$raw" -gt 0 ] 2>/dev/null; then
-        printf '%s' "$raw"
+        _genesis_mem_working_set_from "$raw" "$stat_path"
         return
     fi
     local total_kb avail_kb
