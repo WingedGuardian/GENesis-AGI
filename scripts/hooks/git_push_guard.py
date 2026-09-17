@@ -1099,8 +1099,10 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
     self_wf = (os.environ.get("GITHUB_WORKFLOW") or "").strip().casefold()
     self_job = (os.environ.get("GITHUB_JOB") or "").strip().casefold()
 
+    # Host-pinned to github.com: an arbitrary host could serve a run URL whose
+    # path carries this repo's slug — host + slug together are the provenance.
     _run_url_re = re.compile(
-        r"^https?://[^/]+/([^/]+/[^/]+)/(?:runs|actions/runs)/\d+", re.IGNORECASE
+        r"^https?://github\.com/([^/]+/[^/]+)/(?:runs|actions/runs)/\d+", re.IGNORECASE
     )
 
     _self_repo = repo if repo is not None else _derive_repo_from_cwd(os.getcwd())

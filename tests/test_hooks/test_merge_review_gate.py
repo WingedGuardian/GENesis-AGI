@@ -3193,6 +3193,17 @@ class TestPrCiStatusSelfWorkflow:
         ]))
         assert guard_module._pr_ci_status("1", repo="owner/repo") == ("red", ["genesis-merge-gate"])
 
+    def test_same_slug_non_github_host_still_counts(self, guard_module, monkeypatch):
+        # Host is provenance too: a non-github.com URL whose PATH carries this
+        # repo's slug must not be accepted as our mirror.
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": None,
+             "detailsUrl": "https://evil.example.com/OWNER/REPO/runs/42",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]))
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("red", ["genesis-merge-gate"])
+
 
 class TestPrCiStatusRequiredWorkflows:
     """Required-CI-workflow identity (closes the #1484 P2 partial-rollup residual):
