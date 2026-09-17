@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -24,6 +25,7 @@ _REVIEW_STATE = _REPO_ROOT / "scripts" / "review_state.py"
 
 sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 sys.path.insert(0, str(_REPO_ROOT / "scripts" / "hooks"))
+import review_scope  # noqa: E402
 import review_state  # noqa: E402
 
 
@@ -55,6 +57,64 @@ def home(tmp_path: Path) -> Path:
 def _stage(repo: Path, content: str) -> None:
     (repo / "f.py").write_text(content)
     _git(repo, "add", "-A")
+
+
+def test_the_shared_review_state_name_is_not_hijacked():
+    """The premise every `monkeypatch.setattr(review_state, ...)` here rests on.
+
+    `review_enforcement_commit` imports `review_state` at CALL time, so a patch
+    applied in this file only reaches production code if this module's
+    `review_state` and `sys.modules["review_state"]` are the SAME object.
+
+    Other test modules load a private copy of that script under the shared name.
+    pytest imports every test module at COLLECTION, so the last registration
+    wins for the whole session: a module collected earlier keeps a reference to
+    the object it bound, while production resolves whatever is in `sys.modules`
+    now. The patch then lands on nobody and the real function runs — a failure
+    invisible in a single-file run and visible only in the full suite, in
+    collection order.
+
+    Asserting the premise directly means the next unrestored hijack fails HERE,
+    naming the cause, instead of surfacing as a bewildering assertion in an
+    unrelated test. `tests.conftest.private_module` is the supported way to load
+    a private copy without leaking the name.
+    """
+    assert sys.modules.get("review_state") is review_state, (
+        "sys.modules['review_state'] is not the module this file imported — "
+        "some test module loaded a private copy under the shared name and did "
+        "not restore it, so monkeypatching this module patches nothing that "
+        "production code will resolve. Load it via tests.conftest.private_module."
+    )
+
+
+def test_the_shared_review_scope_name_is_not_hijacked():
+    """The sibling lock, for the second name the commit gate imports at call time.
+
+    `review_scope` is resolved by a call-time import in five places, including
+    `review_enforcement_commit.classify_change_substantiality`, so the premise is
+    the same one the `review_state` lock above rests on: a patch applied to the
+    object THIS file holds only reaches production if it is the object
+    `sys.modules` hands the call-time import.
+
+    This file binds `review_scope` at module scope purely so that identity exists
+    to compare against — a canonical importer has to come from somewhere, and an
+    earlier revision of this lock concluded from its absence that PATH equality
+    was the best available check. It is not: two distinct module objects loaded
+    from the SAME path compare equal by path and differ by identity, so a private
+    copy left registered would pass a path assert while a `monkeypatch.setattr`
+    on the canonical object reached nobody. That is the exact divergence this
+    file exists to catch, and it is not hypothetical here —
+    `tests/test_scripts/test_check_review_depth.py` patches
+    `review_scope.classify_range_substantiality` against a call-time import at
+    `scripts/check_review_depth.py:60`.
+    """
+    assert sys.modules.get("review_scope") is review_scope, (
+        "sys.modules['review_scope'] is not the module this file imported — "
+        "some test module loaded a private copy under the shared name and did "
+        "not restore it. Same path is NOT sufficient: a same-path copy is a "
+        "different object, so patches land on one and production resolves the "
+        "other. Load it via tests.conftest.private_module."
+    )
 
 
 # ── Counter unit tests (review_state) ─────────────────────────────────────
@@ -120,6 +180,43 @@ def test_reset_clears(repo, _isolate_rounds):
     review_state.bump_review_round(cwd=str(repo), source="external")
     review_state.reset_review_round(cwd=str(repo))
     assert review_state.get_review_round(cwd=str(repo)) == 0
+
+
+def test_snapshot_accessor_agrees_with_the_two_it_replaces(repo, _isolate_rounds):
+    """`get_review_counters` exists so a reader deciding a TIER cannot assemble a pair
+    that never existed (two reads, a concurrent mark between them). That is only safe
+    while it reports the SAME values the individual accessors do — a drift here would
+    make every tier decision quietly wrong rather than loudly broken, so the agreement
+    is pinned across the states that actually differ: fresh, mid-streak, after a reset
+    (streak clears, lifetime does NOT), and on another branch.
+    """
+
+    def both():
+        return (
+            review_state.get_review_round(cwd=str(repo)),
+            review_state.get_review_lifetime(cwd=str(repo)),
+        )
+
+    assert review_state.get_review_counters(cwd=str(repo)) == both() == (0, 0)
+
+    _stage(repo, "a = 2\n")
+    review_state.bump_review_round(cwd=str(repo), source="external")
+    assert review_state.get_review_counters(cwd=str(repo)) == both()
+
+    _stage(repo, "a = 3\n")
+    review_state.bump_review_round(cwd=str(repo), source="external")
+    mid = review_state.get_review_counters(cwd=str(repo))
+    assert mid == both() and mid[0] > 0, mid
+
+    # The asymmetry the pair exists to carry: the ack clears the streak, never lifetime.
+    review_state.reset_review_round(cwd=str(repo))
+    after = review_state.get_review_counters(cwd=str(repo))
+    assert after == both(), after
+    assert after[0] == 0 and after[1] == mid[1], after
+
+    _git(repo, "commit", "-qm", "wip")
+    _git(repo, "checkout", "-q", "-b", "other-branch")
+    assert review_state.get_review_counters(cwd=str(repo)) == both() == (0, 0)
 
 
 def test_legacy_counter_without_last_source_is_discarded(repo, _isolate_rounds):
@@ -1169,3 +1266,170 @@ def test_terminal_message_names_the_co_required_sigil(repo, home):
     res = _run_hook('git commit -m "wip"', repo, home)
     assert res.returncode == 2
     assert "final-round-accept escalation-ack" in res.stderr
+
+
+# ── The two-path disposition doctrine, in the block MESSAGES ──────────────
+#
+# A gate's enumerated remedies ARE the option set a session picks from — it does
+# not invent a menu of its own. So a remedy the messages never name is a remedy
+# nobody takes, and before this every option at both tiers PRESERVED the change
+# (audit harder / redesign / narrow / shelve). Handing it back to a builder
+# session — the only remedy that helps when the PREMISE is what is wrong — was
+# reachable from neither message. These tests pin the option SET and its ORDER,
+# which is the part a later edit can silently drop; the prose around it is free
+# to change.
+
+
+def _stderr_at_round(repo, home, n: int) -> str:
+    """Block stderr with the counter standing at exactly ``n`` rounds.
+
+    The blocked commit never lands, so the counter is unchanged afterwards and
+    a caller can advance to the next tier and read again in the same test.
+    """
+    res = _run_hook('git commit -m "wip"', repo, home)
+    assert res.returncode == 2, f"round {n} did not block: {res.stdout + res.stderr}"
+    return res.stderr
+
+
+def test_mode_switch_offers_handing_back_as_a_named_alternative(repo, home):
+    """Round 2 must present BOTH remedies, because they are opposites.
+
+    Fixing the whole class is right when the premise holds. When it does not,
+    no further round can help — and a message that only says "audit harder"
+    sends the author back into the loop it is trying to end.
+    """
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 1)
+    err = _stderr_at_round(repo, home, review_state.ESCALATION_ROUND_CAP - 1)
+    assert "PREMISE is wrong" in err
+    assert "BUILDER session" in err
+    # …and the class-level audit must SURVIVE alongside it: this is a fork, not
+    # a replacement. A message offering only hand-back would send every
+    # ordinary two-round change back to a builder.
+    assert "CLASS" in err
+    assert "FRESH-CONTEXT adversarial reviewer" in err
+
+
+def test_mode_switch_states_the_evidence_bar_for_handing_back(repo, home):
+    """Hand-back is the MINORITY case and must read that way.
+
+    The failure mode guarded here is the gate handing back a change that only
+    needed polish — which costs more than the extra round, and costs most of
+    all when the gate turns out to have been the thing that was wrong.
+    """
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 1)
+    err = _stderr_at_round(repo, home, review_state.ESCALATION_ROUND_CAP - 1)
+    # The wrong-shape signals — which is what "evidence" means at this tier.
+    assert "CONCENTRATING" in err
+    assert "GROWING" in err
+    # TWO OR MORE signals, not one. The review mandate sets that bar and this
+    # message must not undercut it: one signal alone is an ordinary local defect
+    # wearing an architectural shape — findings concentrate in any large parser.
+    # An earlier version of this message listed the signals with `or` and a bare
+    # "absent those" default, which classified a single signal as (A).
+    assert re.search(r"TWO OR MORE", err), err
+    # …and the explicit default short of that bar. Matched loosely on punctuation
+    # so an ordinary prose edit does not break a structural claim.
+    assert re.search(r"Short of two[,\s]+it is \(B\)", err), err
+
+
+def test_the_premise_check_DOC_states_the_same_two_signal_bar():
+    """The gate message and the doc it points at must set the SAME bar.
+
+    This is the lock on a two-instance class whose second instance a reviewer
+    found, not this suite: the message above was corrected to TWO OR MORE, and
+    `.claude/docs/premise-check.md` — the document that message directs the
+    reader to — was left stating the one-signal version. A doc that sets a lower
+    bar than the gate is the easier surface to read, so it wins in practice.
+
+    Asserted on the DOC rather than by diffing the two texts: they are written
+    for different readers and should not be byte-identical. What must not drift
+    is the bar itself and the fallback short of it.
+    """
+    doc = (
+        Path(__file__).resolve().parents[2] / ".claude" / "docs" / "premise-check.md"
+    ).read_text()
+    assert "TWO OR MORE" in doc, "the doc must state the same evidence bar as the gate message"
+    assert re.search(r"[Ss]hort of\s+two", doc), (
+        "the doc must state the fallback short of that bar, or a single signal "
+        "silently reads as sufficient for a hand-back"
+    )
+    assert "class-level audit" in doc, "…and name what that fallback IS"
+
+
+def test_escalation_cap_names_handing_back_FIRST(repo, home):
+    """At the cap, option (a) must be hand-back — not another way to keep going.
+
+    Three rounds each finding something NEW after a class-level audit is the
+    strongest evidence available that the premise is wrong. A menu whose first
+    entry preserves the change reads as "try harder" at precisely the moment
+    that is the wrong instruction.
+    """
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    err = _stderr_at_round(repo, home, review_state.ESCALATION_ROUND_CAP)
+    hand_back = err.find("HAND IT BACK")
+    redesign = err.find("(b) REDESIGN")
+    shelve = err.find("(d) SHELVE")
+    assert hand_back != -1, "the cap message must name handing it back"
+    assert redesign != -1 and shelve != -1, "the other options must survive"
+    assert hand_back < redesign < shelve, (
+        "hand-back must be the FIRST option at the cap — a session takes the "
+        f"menu in the order the gate prints it (got {hand_back}, {redesign}, "
+        f"{shelve})"
+    )
+
+
+def test_the_cap_gives_hand_back_no_sigil_exit(repo, home):
+    """Option (a) must NOT be told to rerun the commit with `# escalation-ack`.
+
+    At the cap the index still holds the design just judged premise-broken and
+    its review marker is current, so that sigil would permit exactly that commit
+    AND reset the streak — landing the work and erasing the evidence that
+    stopped it. The same conditional-exit defect was fixed at the round-2 tier
+    and left here, which is why this is pinned separately rather than trusted to
+    the neighbouring test.
+    """
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    err = _stderr_at_round(repo, home, review_state.ESCALATION_ROUND_CAP)
+    assert "THE EXIT DEPENDS ON WHICH OPTION" in err, err
+    assert "do NOT run that command" in err, err
+    # The sigil must still be offered to the options that legitimately continue.
+    assert "escalation-ack" in err
+    # Guard the guard: the hand-back warning must sit AFTER the sigil it warns
+    # about, or a reader takes the command and never reaches the caveat.
+    assert err.index("escalation-ack") < err.index("do NOT run that command")
+
+
+def test_both_tiers_route_the_fork_to_evidence_not_feel(repo, home):
+    """Neither tier may leave premise-or-polish to gut feeling, and both must
+    say the discarded work was not wasted.
+
+    Sunk cost is the force that keeps a wrong-shaped change in review: a
+    session reading hand-back as failure patches one more time instead, which
+    is the loop both tiers exist to end. Checked at BOTH tiers in one test —
+    the counter survives a blocked commit, so round 2 is read, then advanced.
+    """
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 1)
+    mode_switch = _stderr_at_round(repo, home, review_state.ESCALATION_ROUND_CAP - 1)
+    # Advance one distinct defect-bearing round into the hard cap.
+    _stage(repo, "cap = 1\n")
+    assert _mark(repo, home).returncode == 0
+    cap = _stderr_at_round(repo, home, review_state.ESCALATION_ROUND_CAP)
+    # Guard the guard: two DIFFERENT tiers were read, not the same one twice.
+    # Anchor on the mode-switch message's OPENING PREFIX, not the bare word:
+    # the cap message also contains "mode-switch" (in "the round-2 mode-switch
+    # audit did NOT converge"), so a bare-substring guard passes when BOTH
+    # reads land on the cap — and since every other assertion here holds in
+    # both messages, the whole test would pass on a doubled cap read. Measured
+    # by mutation during this PR's own pre-push review.
+    assert "BLOCKED (mode-switch)" in mode_switch
+    assert "BLOCKED (mode-switch)" not in cap, "the two reads collapsed onto one tier"
+    assert "escalation cap" in cap
+    for tier, err in (("mode-switch", mode_switch), ("cap", cap)):
+        assert ".claude/docs/premise-check.md" in err, f"no method named at {tier}"
+        assert "bought the understanding" in err, f"no sunk-cost framing at {tier}"
+    # …and the doc both tiers send the reader to must actually exist. Without
+    # this, renaming or moving it rots all four references while every test
+    # above stays green — they assert on the STRING, not the file.
+    assert (_REPO_ROOT / ".claude" / "docs" / "premise-check.md").is_file(), (
+        "both gate tiers cite .claude/docs/premise-check.md — it is missing"
+    )

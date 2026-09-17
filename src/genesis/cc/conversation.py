@@ -18,6 +18,7 @@ from genesis.cc.exceptions import (
     CCNetworkOfflineError,
     CCQuotaExhaustedError,
     CCRateLimitError,
+    CCStreamTruncatedError,
     CCTimeoutError,
 )
 from genesis.cc.formatter import ResponseFormatter
@@ -31,6 +32,7 @@ from genesis.cc.types import (
     EffortLevel,
     StreamEvent,
     is_owner_attended_channel,
+    model_name_supports_effort,
     origin_delivery_supported,
     session_origin_for_channel,
     task_detected_origin,
@@ -60,6 +62,47 @@ def _bg_notice(output) -> str:
     return _BG_TRUNCATION_NOTICE if getattr(output, "bg_truncated", False) else ""
 
 
+# What a turn says when an over-limit stream line ate its answer. A SENTENCE,
+# never "": an empty reply is a silent empty success, and the whole point of
+# CCStreamTruncatedError is that this failure is never silent. Deliberately
+# names the reason the turn is not being retried for the user — the tools the
+# first attempt already ran would run a second time — so "just try again" is
+# their decision rather than an invisible default.
+
+class _Unreplayable:
+    """The failover peer TRUNCATED after it had already done work.
+
+    A third outcome, distinct from both "here is the answer" (a string) and
+    "the peer chain is exhausted, try contingency" (None), because neither of
+    those expresses the constraint that matters: contingency MAY still run —
+    it is a tool-less API call and cannot repeat a side effect — but the turn
+    must NOT be parked. `rate_limit_park.park_conversation` durably schedules
+    the same prompt for a later FULL-TOOLS direct session, so parking a
+    truncated peer replays whatever writes or sends it already performed.
+
+    A distinct object rather than a magic string: the string channel here IS
+    the answer channel, and a sentinel that can be mistaken for an answer is
+    one `is not None` away from being delivered to a user (Codex P1, #1625).
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostic only
+        return "<unreplayable: peer truncated after doing work>"
+
+
+#: Singleton; compare with `is`, never `==`.
+UNREPLAYABLE = _Unreplayable()
+
+
+_TRUNCATION_NOTICE = (
+    "⚠️ Genesis lost this answer: one line of the model's output was too "
+    "large to read back. It is not being retried automatically, because the "
+    "tools the first attempt already ran would run again. Send it again if "
+    "you want another attempt."
+)
+
+
 # Nudge for dispatched, delivery-addressable (Telegram) channels: route long research/bg work
 # durable direct_session lane instead of an inline Workflow, which the CC bg-wait ceiling
 # kills after ~10min with nothing left to report back (the 2026-07-20 silent-death class).
@@ -79,6 +122,131 @@ _BG_RESEARCH_ROUTING = (
     "success or failure — back to this exact conversation. Keep quick answers and short "
     "tool use inline as usual."
 )
+
+
+# The block's own delimiter, shared by the builder and the stripper below so
+# the two cannot drift. A failover peer must NOT receive this block — it
+# describes the HOME model and effort, and the peer runs a different one — so
+# something has to be able to find it again after composition.
+_SESSION_CONTROL_HEADING = "\n\n## Changing your own model / effort\n"
+
+
+def _strip_session_control_block(prompt: str | None) -> str | None:
+    """Remove the session-control block, leaving every other fragment intact.
+
+    The peer is told what it is by its OWN invocation; forwarding the home
+    block states a model and effort the peer is not running, and `session_config`
+    cannot change a peer dispatch that has already been created. Topic context,
+    the research-routing nudge and the assembled identity are all
+    peer-independent and must survive — which is why this removes one named
+    section rather than rebuilding the prompt from scratch.
+
+    Bounded by the NEXT top-level section, or the end of the prompt. Verified
+    against the builder's output: the block is exactly one `## ` heading plus
+    one paragraph and contains no nested section, so the next `\\n\\n## ` is
+    always the start of a different fragment.
+    """
+    if not prompt or _SESSION_CONTROL_HEADING not in prompt:
+        return prompt
+    start = prompt.index(_SESSION_CONTROL_HEADING)
+    # Search for the next section AFTER this heading's own delimiter.
+    nxt = prompt.find("\n\n## ", start + len(_SESSION_CONTROL_HEADING))
+    end = nxt if nxt != -1 else len(prompt)
+    # `or None` normalises a prompt that was ENTIRELY this block. Kept, though
+    # it is unreachable today: the block and the research-routing nudge are
+    # gated on the same channel predicate, so the block never appears without
+    # a fragment after it. Both spellings are falsy and every caller tests
+    # truthiness, so the branch cannot change behaviour either way — which is
+    # also why it is not worth changing.
+    return (prompt[:start] + prompt[end:]) or None
+
+
+def _session_control_block(
+    channel: ChannelType | str | None,
+    model,
+    effort,
+    session_id: str | None,
+) -> str:
+    """Tell a conversation session what it currently IS, and that it can change it.
+
+    Two failures this closes, both MEASURED on a Telegram DM session 2026-09-02.
+
+    1. The session was asked to "switch to Opus, medium effort" and replied that
+       it could not change its own model. It could: `session_config` has existed
+       on the health MCP since long before, its docstring literally says "Call
+       when the user asks to switch models ('use opus', 'switch to haiku')", and
+       `GENESIS_SESSION_ID` — the id that tool needs — was in its environment.
+       It had even run `env` and seen that variable 31 seconds earlier. No
+       capability was missing; the session simply held a false belief about
+       itself. A tool the model does not know it has is not a capability.
+
+    2. The model/effort a session believes it is running are stated ONLY in the
+       fresh-session system prompt. A resumed turn sends no system prompt, so
+       after any /model or /effort switch the session's self-description goes
+       stale and stays stale for the life of the conversation.
+
+    Both are fixed by re-stating the CURRENT values every turn, which is why this
+    rides `--append-system-prompt` alongside `--resume` (the same delivery the
+    topic-context block uses) rather than living in the assembler — an assembler
+    change would reach fresh sessions only, i.e. it would have missed the very
+    turn that failed.
+
+    Deliberately NOT a natural-language intent matcher. The failure was
+    self-knowledge, not parsing: no pattern over the USER's words would have
+    corrected a model that believed the capability did not exist.
+
+    Scoped to OWNER-ATTENDED channels via ``origin_delivery_supported`` — i.e.
+    Telegram today. That predicate was written for a different purpose (can a
+    background result be delivered back here) but it is the correct one here for
+    an independent reason: it is the same "the owner is on the other end" test.
+
+    Withheld everywhere else, deliberately:
+    - TERMINAL: the human already has Claude Code's own /model and /effort, and
+      a terminal resume carries NO system prompt at all (an invariant
+      test_second_message_resumes pins).
+    - WEB (OpenClaw): `/v1/chat/completions` is registered with NO auth gate and
+      the invocation is stamped supervised=False, origin=external_untrusted.
+      Telling THAT session it can switch its own model — and never to refuse —
+      hands an anonymous caller a lever the user is supposed to own. Quality
+      over cost is the USER's tradeoff to make.
+    - VOICE / WHATSAPP: no ConversationLoop call sites exist for them today.
+    """
+    if not origin_delivery_supported(channel):
+        return ""
+    # Haiku does not use --effort at all: `invoker._build_args` gates the flag on
+    # `model_supports_effort`, so a stored effort never reaches dispatch there —
+    # while `session_config` still writes the row and returns success. Stating an
+    # ACTIVE effort on Haiku would have the session confirm a change dispatch
+    # never saw, which is the same false self-belief this block exists to remove.
+    # An unrecognised (roster/provider) id resolves to effort-capable, so nothing
+    # is silently stripped of effort on a model we cannot classify.
+    if model_name_supports_effort(str(model)):
+        current = (
+            f"You are currently running model={model}, effort={effort}. "
+            "Neither is fixed for the conversation. "
+        )
+        asks = '("use opus", "switch to haiku", "think harder", "low effort")'
+    else:
+        current = (
+            f"You are currently running model={model}, which has no effort "
+            f"setting — a stored effort ({effort}) is inert until you switch "
+            "models. Your model is not fixed. "
+        )
+        # No effort examples here: on a model with no effort setting, "think
+        # harder" is not a switch this session can make.
+        asks = '("use opus", "switch to sonnet")'
+    return (
+        _SESSION_CONTROL_HEADING
+        + current
+        + f"When the user asks you to switch {asks}, "
+        f'call `mcp__genesis-health__session_config` with session_id="{session_id}" '
+        "(not the shorter id in the [Clock | Session: x] tag). The change takes "
+        "effect on your next response, so say what you switched to and continue. "
+        "You DO have this capability when that tool is listed — do not refuse on "
+        "the belief that you cannot. If it is absent from this session, or "
+        "returns an error, report that verbatim rather than a change that did "
+        "not happen."
+    )
 
 
 def _apply_research_routing(system_prompt: str | None, channel) -> str | None:
@@ -284,6 +452,13 @@ class ConversationLoop:
                 )
                 resume_id = None
 
+            # Self-knowledge on BOTH new and resumed turns — see
+            # _session_control_block. Same slot as the routing nudge below and
+            # for the same reason: a resumed turn carries no system prompt.
+            _ctl = _session_control_block(channel, model, effort, session["id"])
+            if _ctl:
+                system_prompt = (system_prompt + _ctl) if system_prompt else _ctl
+
             # Non-terminal (dispatched) channels end the turn after replying, so long
             # inline work is killed at the CC bg-wait ceiling with nothing left to report
             # back — nudge routing to the durable background lane (delivers back via
@@ -352,11 +527,29 @@ class ConversationLoop:
                     invocation, session=session, channel=channel,
                     model=model, effort=effort, prompt_text=prompt_text,
                 )
+                if roster_reply is UNREPLAYABLE:
+                    # The peer truncated AFTER doing work. Tool-less contingency
+                    # is still allowed; PARKING is not, because a park schedules
+                    # a full-tools replay of side effects that already ran.
+                    fallback = await self._try_contingency(
+                        prompt_text, system_prompt, channel,
+                        session_id=session["id"],
+                        was_resume=resume_id is not None,
+                    )
+                    if fallback is not None:
+                        return fallback
+                    logger.error(
+                        "Truncated failover peer and no contingency — NOT "
+                        "parking, because a park would replay its writes: %s",
+                        e, exc_info=True,
+                    )
+                    return _TRUNCATION_NOTICE
                 if roster_reply is not None:
                     return roster_reply
                 fallback = await self._try_contingency(
                     prompt_text, system_prompt, channel,
                     session_id=session["id"],
+                    was_resume=resume_id is not None,
                 )
                 if fallback is not None:
                     return fallback
@@ -377,6 +570,14 @@ class ConversationLoop:
                     effort=effort,
                 )
                 return outcome.copy
+            except CCStreamTruncatedError as e:
+                # Ahead of the terminal `except CCError`, which would otherwise
+                # dead-end this turn on raw internal prose. See the handler.
+                return await self._handle_stream_truncated(
+                    e, session=session, system_prompt=system_prompt,
+                    prompt_text=prompt_text, channel=channel,
+                    was_resume=resume_id is not None,
+                )
             except CCMCPError as e:
                 self._fire_failure_detection("mcp_error")
                 server = f" ({e.server_name})" if e.server_name else ""
@@ -629,6 +830,14 @@ class ConversationLoop:
                     else:
                         system_prompt = topic_ctx
 
+            # Self-knowledge, injected for BOTH new and resumed sessions for the
+            # same reason as the topic context above: a resumed turn carries no
+            # system prompt, so anything stated only at session start is both
+            # absent from every later turn AND stale after a /model switch.
+            _ctl = _session_control_block(channel, model, effort, session["id"])
+            if _ctl:
+                system_prompt = (system_prompt + _ctl) if system_prompt else _ctl
+
             # Route long research off this turn to the durable background lane
             # (dispatched channels end the turn). See _apply_research_routing.
             system_prompt = _apply_research_routing(system_prompt, channel)
@@ -726,11 +935,29 @@ class ConversationLoop:
                         model=model, effort=effort, prompt_text=prompt_text,
                         on_event=_failover_tracked, streamed=streamed,
                     )
+                    if roster_reply is UNREPLAYABLE:
+                        # The peer truncated AFTER doing work. Tool-less contingency
+                        # is still allowed; PARKING is not, because a park schedules
+                        # a full-tools replay of side effects that already ran.
+                        fallback = await self._try_contingency(
+                            prompt_text, system_prompt, channel,
+                            session_id=session["id"],
+                            was_resume=resume_id is not None,
+                        )
+                        if fallback is not None:
+                            return fallback
+                        logger.error(
+                            "Truncated failover peer and no contingency — NOT "
+                            "parking, because a park would replay its writes: %s",
+                            e, exc_info=True,
+                        )
+                        return _TRUNCATION_NOTICE
                     if roster_reply is not None:
                         return roster_reply
                 fallback = await self._try_contingency(
                     prompt_text, system_prompt, channel,
                     session_id=session["id"],
+                    was_resume=resume_id is not None,
                 )
                 if fallback is not None:
                     return fallback
@@ -751,6 +978,16 @@ class ConversationLoop:
                     effort=effort,
                 )
                 return outcome.copy
+            except CCStreamTruncatedError as e:
+                # Ahead of the terminal `except CCError`, which would otherwise
+                # dead-end this turn on raw internal prose. `streamed` is passed
+                # so the handler can tell whether contingency would answer over
+                # text the user can already see.
+                return await self._handle_stream_truncated(
+                    e, session=session, system_prompt=system_prompt,
+                    prompt_text=prompt_text, channel=channel, streamed=streamed,
+                    was_resume=resume_id is not None,
+                )
             except CCMCPError as e:
                 self._fire_failure_detection("mcp_error")
                 server = f" ({e.server_name})" if e.server_name else ""
@@ -858,6 +1095,14 @@ class ConversationLoop:
             # retry fresh (which would also just re-raise offline). Let the
             # caller's terminal handler deal with it.
             raise
+        except CCStreamTruncatedError:
+            # PROPHYLACTIC, and say so rather than implying it fires today:
+            # `run()` reads with `communicate()` and has no drop loop, so this
+            # type cannot currently reach here. The streaming twin's tuple
+            # carries it, and the asymmetry is the trap — the day truncation is
+            # classified on the non-streaming path too, its absence here would
+            # SILENTLY restore the full stale-resume replay this PR removed.
+            raise
         except CCError:
             if not was_resume:
                 raise
@@ -898,11 +1143,20 @@ class ConversationLoop:
             CCQuotaExhaustedError,
             CCTimeoutError,
             CCNetworkOfflineError,
+            CCStreamTruncatedError,
         ):
             # Account-wide (rate/quota) or a timeout — retrying fresh won't help;
             # a timeout retry just burns a second full window (2026-06-30 DM). A
             # network-offline preflight (PR-3) likewise must NOT fail the live
             # session as a stale resume — the internet is down, not the session.
+            #
+            # CCStreamTruncatedError is here for a DIFFERENT reason, and the
+            # difference matters: retrying would work. It must not, because the
+            # first attempt already ran its tool calls — an MCP write, an
+            # outreach send — before the oversized line ate its answer, and a
+            # fresh run would repeat them with nothing downstream to dedupe.
+            # The session is healthy; only the transport failed. Losing one
+            # answer loudly beats performing its side effects twice.
             raise
         except CCError:
             if not was_resume:
@@ -935,8 +1189,14 @@ class ConversationLoop:
             session_id=session_id,
         )
         system_prompt = await self._enrich_with_context(system_prompt, prompt_text)
-        # A stale-resume retry rebuilds the prompt from scratch — re-apply the
-        # dispatched-channel research routing so the nudge isn't lost on recovery.
+        # A stale-resume retry rebuilds the prompt from scratch — re-apply both
+        # the dispatched-channel research routing and the session-control block,
+        # so neither is lost on recovery.
+        # This path always has a freshly assembled prompt, so a plain append is
+        # enough; the block is "" on TERMINAL and appends nothing.
+        system_prompt += _session_control_block(
+            channel, model, effort, session_id,
+        )
         system_prompt = _apply_research_routing(system_prompt, channel)
         return CCInvocation(
             prompt=prompt_text,
@@ -1046,6 +1306,7 @@ class ConversationLoop:
         peer_inv: CCInvocation,
         *,
         sticky: dict | None,
+        resume_system_prompt: str | None = None,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None,
         streamed: dict | None = None,
     ) -> Any:
@@ -1053,20 +1314,51 @@ class ConversationLoop:
         peer, resume it for continuity; on a stale resume (non-rate-limit CCError)
         retry once FRESH on the same peer — UNLESS answer text already streamed (a
         fresh retry would re-stream and double-output). Rate-limit/quota propagate
-        to the caller (which moves to the next peer)."""
+        to the caller (which moves to the next peer).
+
+        ``resume_system_prompt`` is the turn's own fragments WITHOUT the
+        assembled identity, and it is used on exactly one branch: the resume
+        below. `peer_inv` carries the identity, so every FRESH path — a peer
+        the sticky session does not name, and the stale-resume retry — keeps
+        it by construction. THAT is why the choice lives here rather than
+        upstream: whether this turn resumes is a per-PEER fact decided on the
+        next three lines, and predicting it before the loop got it wrong for a
+        non-matching peer and for the retry (both measured)."""
         inv = peer_inv  # fresh by default (failover_invocations set resume=None)
         if (
             sticky
             and sticky.get("roster_model") == peer_name
             and sticky.get("cc_session_id")
         ):
-            inv = replace(peer_inv, resume_session_id=sticky["cc_session_id"])
+            # The peer's OWN session already holds the identity; re-sending it
+            # duplicates the whole SOUL/user prompt on every sticky turn.
+            inv = replace(
+                peer_inv,
+                resume_session_id=sticky["cc_session_id"],
+                system_prompt=resume_system_prompt,
+            )
         try:
             return await self._invoke_peer(inv, on_event)
-        except (CCRateLimitError, CCQuotaExhaustedError, CCNetworkOfflineError):
+        except (
+            CCRateLimitError,
+            CCQuotaExhaustedError,
+            CCNetworkOfflineError,
+            CCStreamTruncatedError,
+        ):
             # Offline joins the fast-re-raise (same class as CAVEAT A): a dead
             # network is not a stale peer resume — retrying fresh won't help and
             # must not mark the sticky peer session stale.
+            #
+            # CCStreamTruncatedError joins it because THIS handler is the second
+            # retry site, and the size failure defeats its own side-effect guard.
+            # The `streamed.get("text")` check below exists to stop a re-run once
+            # answer text has reached the user — but an oversized line eats the
+            # answer, so `text` is empty precisely when the re-run is least safe.
+            # The peer already ran its tool calls; replaying the prompt repeats
+            # them. Before this branch typed the failure it arrived as a bare
+            # ValueError and missed this handler entirely, so classifying it is
+            # what armed this path — the type has to be re-raised at BOTH sites
+            # or the fix moves the hazard instead of removing it.
             raise
         except CCError as exc:
             # Don't re-run: nothing to recover if already fresh, and never once
@@ -1111,8 +1403,19 @@ class ConversationLoop:
         prompt_text: str,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
         streamed: dict | None = None,
-    ) -> str | None:
-        """STICKY conversation failover. During an account-wide home-model outage,
+    ) -> str | _Unreplayable | None:
+        """STICKY conversation failover.
+
+        RETURNS one of three things, and the distinction is load-bearing:
+        a STRING (the peer answered — deliver it), ``UNREPLAYABLE`` (the peer
+        truncated after doing work — tool-less contingency may run, but the
+        turn must NOT be parked), or ``None`` (the chain is exhausted and
+        nothing ran — contingency and parking are both fine).
+
+        ``UNREPLAYABLE`` is TRUTHY, so a caller written as
+        ``if reply is not None`` treats it as an answer and re-opens the park
+        hazard. Branch on ``is UNREPLAYABLE`` first (PR #1625 merge audit).
+ During an account-wide home-model outage,
         run the turn on a roster peer (full tools) BEFORE the degraded contingency
         path. Returns the formatted reply on success, or None to fall through to
         contingency. Never raises (failover must not break the turn)."""
@@ -1123,15 +1426,55 @@ class ConversationLoop:
             # session being resumed). The peer runs a FRESH session, so re-assemble
             # the identity/context — otherwise the peer answers with no Genesis
             # persona/instructions.
-            if base_inv.system_prompt is None:
-                system_prompt = await self._assembler.assemble(
+            # Keyed on the RESUME FACT, not on `system_prompt is None`. The
+            # latter is a proxy that silently breaks the moment anything is
+            # appended to a resumed turn's prompt (the research-routing nudge
+            # already does this on Telegram), leaving the peer with only that
+            # fragment as its whole identity.
+            # The re-assembled identity COMPOSES with whatever fragments the
+            # turn already assembled (topic context with the live proposal
+            # board, session-control block, research-routing nudge) — it never
+            # replaces them. Those fragments are the only place that per-turn
+            # context exists on a resume; dropping them made "approve this
+            # proposal" arrive at the peer with no referent.
+            sticky = self._session_fallback_session(session)
+
+            # The home session-control block never travels to a peer, sticky or
+            # fresh. It names the HOME model and effort, the peer runs its own,
+            # and `session_config` cannot change a dispatch already created —
+            # so forwarding it states something false and actionable. Stripped
+            # rather than suppressed upstream: the block is correct for the
+            # home invocation, and only this path needs it gone.
+            base_inv = replace(
+                base_inv,
+                system_prompt=_strip_session_control_block(base_inv.system_prompt),
+            )
+
+            # The turn's own fragments, WITHOUT the identity below. A sticky
+            # resume gets these and nothing more, because the peer's session
+            # already holds the identity — but that choice is made per PEER,
+            # in `_run_failover_peer`, not here. Gating the rebuild on
+            # `not sticky` at this point was wrong twice, both measured: a
+            # peer the sticky session does not NAME runs fresh, and so does
+            # the stale-resume retry, and neither would have had any identity
+            # at all.
+            fragments_only = base_inv.system_prompt
+
+            if base_inv.resume_session_id is not None:
+                identity = await self._assembler.assemble(
                     db=self._db, model=str(model), effort=str(effort),
                     session_id=session["id"],
                 )
-                system_prompt = await self._enrich_with_context(
-                    system_prompt, prompt_text,
+                identity = await self._enrich_with_context(
+                    identity, prompt_text,
                 )
-                base_inv = replace(base_inv, system_prompt=system_prompt)
+                fragments = base_inv.system_prompt
+                base_inv = replace(
+                    base_inv,
+                    system_prompt=(
+                        f"{identity}\n\n{fragments}" if fragments else identity
+                    ),
+                )
             peers = roster.failover_invocations(home, base_inv)
             if not peers:
                 # Say so. This is the one branch that degrades SILENTLY at the
@@ -1190,7 +1533,11 @@ class ConversationLoop:
                     }},
                 )
 
-            sticky = self._session_fallback_session(session)
+            # `sticky` was resolved above, where the prompt is composed. Not
+            # for a race — `_session_fallback_session` parses the in-memory
+            # `session` dict and touches no store, and nothing between the two
+            # points reassigns it, so a second read would be identical. It is
+            # simply needed there.
             for peer_name, peer_inv in peers:
                 if streamed and streamed.get("text"):
                     break  # a prior peer already streamed answer text — can't fail
@@ -1198,6 +1545,7 @@ class ConversationLoop:
                 try:
                     output = await self._run_failover_peer(
                         peer_name, peer_inv, sticky=sticky,
+                        resume_system_prompt=fragments_only,
                         on_event=on_event, streamed=streamed,
                     )
                 except (CCRateLimitError, CCQuotaExhaustedError) as exc:
@@ -1237,6 +1585,53 @@ class ConversationLoop:
                         # would stack a SECOND answer on the first.
                         return ""
                     continue  # this peer is also down → try the next one
+                except CCStreamTruncatedError:
+                    # The SAME hazard as the re-run inside `_run_failover_peer`,
+                    # one level out: re-raising there only stopped the sticky
+                    # retry on THIS peer, and the generic `except CCError` below
+                    # would then `continue` the loop — handing the identical
+                    # prompt, with full tools, to the NEXT peer. The first peer
+                    # may already have made an MCP write or sent outreach before
+                    # the over-limit line ate its answer, and the
+                    # `streamed["text"]` guard the loop otherwise relies on reads
+                    # empty precisely because the answer is what was lost. So the
+                    # loop ENDS here rather than advancing.
+                    #
+                    # Availability is deliberately not recorded on the failure
+                    # side: an over-limit line is our own reader's ceiling, not
+                    # the peer refusing, and `note_failure` would decline it as
+                    # evidence anyway.
+                    logger.warning(
+                        "failover peer %s lost its answer to an over-limit stream "
+                        "line — abandoning failover rather than replaying the "
+                        "prompt on another peer",
+                        peer_name, exc_info=True,
+                    )
+                    if streamed and streamed.get("text"):
+                        # The peer demonstrably SERVED — clear any stale block,
+                        # as the branches above do — and stop the caller running
+                        # contingency, which would stack a second answer on text
+                        # the user may already be reading.
+                        #
+                        # The NOTICE rather than "", for the reason spelled out
+                        # in `_handle_stream_truncated`: this flag records that a
+                        # text EVENT was observed, not that anything reached the
+                        # user, so on a channel whose streamer is a no-op an
+                        # empty return shows nothing at all. A sentence is safe
+                        # either way; silence is not.
+                        await _record_peer(peer_availability.note_success, peer_name)
+                        return _TRUNCATION_NOTICE
+                    # UNREPLAYABLE, not None. Contingency may still run — it
+                    # is TOOL-LESS (`contingency.dispatch_conversation`: "no
+                    # CC tool access"), so it cannot repeat what the peer
+                    # already did. But a bare None ALSO told both callers
+                    # "ordinary exhausted failover", and their next move when
+                    # contingency fails is `park_conversation`, which durably
+                    # schedules a FULL-TOOLS replay of this prompt — repeating
+                    # the writes and sends the truncated peer had already
+                    # performed. The same hazard this PR exists to prevent,
+                    # reached by a later route (Codex P1, PR #1625).
+                    return UNREPLAYABLE
                 except CCError as exc:
                     logger.warning("failover peer %s failed", peer_name, exc_info=True)
                     # Routed through the SAME classifier on purpose: a local fault
@@ -1689,13 +2084,104 @@ class ConversationLoop:
             logger.warning("Failed to load recovery context", exc_info=True)
             return ""
 
+    async def _handle_stream_truncated(
+        self,
+        exc: CCStreamTruncatedError,
+        *,
+        session: dict,
+        system_prompt: str | None,
+        prompt_text: str,
+        channel: ChannelType,
+        was_resume: bool,
+        streamed: dict | None = None,
+    ) -> str:
+        """Degrade a size-truncated turn without replaying it ANYWHERE.
+
+        Typing this failure is what stops stale-resume recovery and roster
+        failover re-running tool calls the first attempt already made. But the
+        new type also stops the turn matching the
+        ``(CCQuotaExhaustedError, CCRateLimitError)`` handler, and three of the
+        things that handler did are NOT replays and were lost with it: the
+        rate-limit stamp, the failure-detector class, and ``_try_contingency``.
+        Without this clause the turn fell through to the terminal
+        ``except CCError`` and dead-ended on raw internal prose.
+
+        Contingency is the one safe degradation, and it is the SAME reasoning
+        ``_try_roster_failover`` returns None for:
+        ``contingency.dispatch_conversation`` routes messages through the API
+        with no CC tool access, so it cannot repeat anything the truncated run
+        did.
+
+        What stays suppressed, deliberately: the rate-limit PARK.
+        ``rate_limit_park.park_conversation`` stores the prompt for a resume
+        worker to re-dispatch later with full tools — a park IS a scheduled
+        replay, which is the hazard itself. A truncated turn degrades or says
+        so; it never queues itself for a re-run.
+        """
+        self._fire_failure_detection("stream_truncated")
+        # The provider's own classification survives as ``__cause__`` — the
+        # raise sites chain it precisely so this bookkeeping is RECOVERED here
+        # rather than guessed from the message text.
+        cause = exc.__cause__
+        if isinstance(cause, CCRateLimitError | CCQuotaExhaustedError):
+            try:
+                from datetime import UTC, datetime
+                await cc_sessions.update_rate_limit(
+                    self._db, session["id"],
+                    rate_limited_at=datetime.now(UTC).isoformat(),
+                )
+            except Exception:
+                logger.error("Failed to record rate limit", exc_info=True)
+        if streamed and streamed.get("text"):
+            # Text was OBSERVED on the stream, so contingency must not run — it
+            # would stack a second, differently-sourced answer on top of what
+            # the user may already be reading.
+            #
+            # Returning "" here would be wrong, and this is the one place in
+            # the file where the difference is load-bearing. `streamed["text"]`
+            # records that a text EVENT went past `_failover_tracked`
+            # (`conversation.py:693`), NOT that anything was delivered: the
+            # Telegram streamer is None outside a private chat
+            # (`_handler_messages.py:122-128`), so `_on_event` no-ops
+            # (`_handler_context.py:99`) while the flag still flips. An empty
+            # return there shows the user nothing at all — a silent empty
+            # success, which is precisely what this PR exists to prevent.
+            #
+            # So say it instead. The notice is a short sentence, not a second
+            # answer, so it is safe when text DID reach the user and it is the
+            # only output when it did not. Strictly better than "" in both.
+            logger.warning(
+                "CC stream truncated after text was streamed — contingency "
+                "suppressed, returning the notice only: %s", exc,
+            )
+            return _TRUNCATION_NOTICE
+        fallback = await self._try_contingency(
+            prompt_text, system_prompt, channel, session_id=session["id"],
+            was_resume=was_resume,
+        )
+        if fallback is not None:
+            return fallback
+        logger.error(
+            "CC stream truncated and contingency unavailable: %s", exc, exc_info=True,
+        )
+        return _TRUNCATION_NOTICE
+
     async def _try_contingency(
         self,
         prompt_text: str,
         system_prompt: str | None,
         channel: ChannelType,
+        *,
         session_id: str | None = None,
+        was_resume: bool,
     ) -> str | None:
+        # `was_resume` is REQUIRED, and keyword-only, deliberately. It was
+        # added with a `False` default and every call site had to REMEMBER to
+        # pass it; three later sites did not, inherited the default, and
+        # silently skipped identity assembly on resumed turns — a clean
+        # auto-merge with no conflict and no failing test. A required
+        # parameter turns that class into a TypeError at the call site
+        # (PR #1625 merge audit).
         """Attempt to route through API contingency dispatcher.
 
         Returns formatted response string on success, None on failure.
@@ -1703,16 +2189,34 @@ class ConversationLoop:
         if self._contingency is None:
             return None
 
-        # Rebuild system prompt if it was None (resume case)
-        if system_prompt is None:
+        # Rebuild the system prompt for the resume case. Keyed on the resume
+        # FACT: a resumed turn's prompt may be a non-empty fragment (an appended
+        # nudge) rather than None, and shipping that fragment alone to a raw
+        # router LLM would answer as Genesis with no Genesis identity at all.
+        # The rebuilt identity COMPOSES with the incoming fragments (same rule
+        # as _try_roster_failover): the tool-less router has no other referent
+        # for "this one" / "the older ones" than the topic context the turn
+        # already assembled — replacing it strips exactly that.
+        # The contingency router gets the same treatment as a roster peer, and
+        # for a sharper reason: it is TOOL-LESS. The block tells the session to
+        # call `session_config` and not to refuse on the belief that it cannot
+        # — said to a model with no MCP tools at all — and states a model and
+        # effort that are not what `result.model` will actually run. Same
+        # finding as the peer path, worse instance (CodeRabbit Major, #1627).
+        system_prompt = _strip_session_control_block(system_prompt)
+
+        if was_resume or system_prompt is None:
             try:
-                system_prompt = await self._assembler.assemble(
+                identity = await self._assembler.assemble(
                     db=self._db, model="sonnet", effort="medium",
                     session_id=session_id,
                 )
             except Exception:
                 logger.error("Failed to assemble system prompt for contingency", exc_info=True)
                 return None
+            system_prompt = (
+                f"{identity}\n\n{system_prompt}" if system_prompt else identity
+            )
 
         messages = [{"role": "user", "content": prompt_text}]
 

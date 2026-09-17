@@ -80,7 +80,39 @@ async def outreach_send(
     For email replies, pass thread_id to route to the correct recipient.
     The thread_id maps to a registered email thread whose recipient is
     used for delivery.
+
+    **Discord: name the CHANNEL, not the adapter.** Pass
+    ``channel="announcements"`` (or any name in ``DISCORD_CHANNELS``) and it is
+    routed to that channel. ``channel="discord"`` still works and goes wherever
+    ``OUTREACH_RECIPIENT_DISCORD`` points, which defaults to ``dev-discussion``.
+
+    That default is why this exists. The pipeline has always supported steering
+    a Discord send (the recipient IS the webhook name), but this tool exposed no
+    way to say which channel — so every caller asking for "Discord" got
+    dev-discussion, silently, including a release announcement that belonged in
+    announcements. A caller could not tell it had been redirected: nothing
+    errored, and the log line recorded the REQUESTED name.
+
+    That fallback is gone. A channel with no configured webhook is now REFUSED
+    with an error naming the setting to add. The refusal is correct, expected
+    behaviour and not a fault to work around: configure the named setting, or
+    send to the default channel. Do not retry it — the condition is permanent
+    until an operator changes configuration.
     """
+    # Discord sub-channel → adapter + recipient. `target_chat_id` is the
+    # pipeline's existing per-request recipient override (it wins over the
+    # configured default in _deliver), so this needs no new plumbing — only a
+    # name the caller can actually pass.
+    #
+    # NOTE THE ORDERING, it is load-bearing. `channel` is NOT rewritten here,
+    # because the queued path below enqueues it verbatim and the scheduler's
+    # drain does its own sub-channel mapping from the RAW name. Rewriting it up
+    # front would store "discord" in pending_outreach and lose which channel was
+    # asked for — the exact bug this change exists to remove, reintroduced one
+    # code path over. MEASURED: a first version of this fix did precisely that.
+    from genesis.outreach.types import DISCORD_CHANNELS
+
+    discord_channel: str | None = channel if channel in DISCORD_CHANNELS else None
     # Resolve the per-thread recipient for email sends BEFORE the
     # pipeline/fallback split — so a QUEUED follow-up (pipeline=None subprocess)
     # carries its thread recipient through pending_outreach instead of arriving
@@ -155,9 +187,16 @@ async def outreach_send(
         context=message,
         salience_score=salience_score,
         signal_type=category,
-        channel=channel,
+        # Adapter name for the live-pipeline path. The raw sub-channel rides in
+        # target_chat_id beside it; the queued path above kept the raw name and
+        # lets the drain do this same mapping.
+        channel="discord" if discord_channel else channel,
         labeled_surplus=labeled_surplus,
         validated_recipient=validated_recipient,
+        # The Discord sub-channel, when one was named. `_deliver` resolves
+        # `validated_recipient or target_chat_id or <configured default>`, so
+        # this steers the send without disturbing any other channel.
+        target_chat_id=discord_channel,
         thread_id=thread_id,
         # The caller composed this message; deliver it exactly — never route an
         # agent-authored message back through the LLM drafter (it once inverted
@@ -358,11 +397,45 @@ async def outreach_poll(
         duration_hours: How long the poll stays open (default 7 days, max 768h).
         allow_multiselect: Whether users can vote for multiple options.
     """
-    # Resolve webhook URL from environment
-    env_key = f"DISCORD_WEBHOOK_{channel.upper().replace('-', '_')}"
-    webhook_url = os.environ.get(env_key) or os.environ.get("DISCORD_WEBHOOK_URL")
+    # Resolve the webhook, REFUSING an unconfigured named channel rather than
+    # posting to the default one. This tool kept its own copy of the `or
+    # DISCORD_WEBHOOK_URL` fallback, so `outreach_poll(channel="bug-reports")`
+    # posted to the default channel and returned {"status": "created",
+    # "channel": "bug-reports"} — the same undetectable redirect this change
+    # removes from outreach_send, and worse for a poll, which then collects the
+    # wrong audience's votes.
+    #
+    # `_discord_webhook_env` is imported rather than re-derived: this was the
+    # THIRD copy of the env-naming rule, and a copy is what lets a refusal
+    # message name a variable that would not actually configure the channel.
+    from genesis.runtime.init.outreach import (
+        _discord_webhook_env,
+        _is_reserved_discord_channel,
+    )
+
+    env_key = _discord_webhook_env(channel)
+    # The RESERVED name is checked BEFORE the lookup, not after. `url` (in any
+    # case) inverts onto DISCORD_WEBHOOK_URL — the default webhook — so a direct
+    # lookup SUCCEEDS, short-circuits the default-channel test below, and posts
+    # the poll to the default channel while reporting the `url` channel back.
+    # That is the redirect this whole change removes, arriving through the one
+    # channel name that is not a channel.
+    webhook_url = None if _is_reserved_discord_channel(channel) else os.environ.get(env_key)
     if not webhook_url:
-        return json.dumps({"error": f"No webhook URL found (tried {env_key} and DISCORD_WEBHOOK_URL)"})
+        # The DEFAULT channel legitimately resolves to DISCORD_WEBHOOK_URL — it
+        # need not also appear in the per-channel map. Any OTHER unconfigured
+        # name is refused.
+        default_channel = os.environ.get("OUTREACH_RECIPIENT_DISCORD") or "dev-discussion"
+        if not channel or channel == default_channel:
+            webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
+        if not webhook_url:
+            return json.dumps({
+                "error": (
+                    f"No Discord webhook configured for channel {channel!r} — "
+                    f"refusing to post to the default channel instead. Configure "
+                    f"{env_key}, or send to {default_channel}."
+                )
+            })
 
     # ── Dedup check: skip if same poll posted within 7 days ──
     if _db is not None:

@@ -47,17 +47,40 @@ def test_reattach_bypass_and_session_exists_preserved(script_text):
 def test_fail_open_and_reclaim_present(script_text):
     assert "_cap_fail_open" in script_text
     assert "_cap_reclaim" in script_text
-    assert "timeout 15" in script_text
+    # Bounded AND with a hard kill deadline. Plain `timeout` sends TERM and then
+    # WAITS, which a process wedged in uninterruptible I/O outlives — and this
+    # gate can run after the consent rebuild already destroyed the slot, so a
+    # TERM-only bound leaves the operator with neither pane nor replacement.
+    assert 'timeout -k 2 15 "$_cap_py"' in script_text
 
 
 def test_levers_sourced_and_exported_before_the_gate(script_text):
     # cc-slot.env must be sourced (and the cap levers exported) BEFORE the Python
     # gate call, or the documented tunables never take effect / never reach the
-    # subprocess. Assert the source precedes the session_cap invocation.
-    src_i = script_text.index('. "${HOME}/.genesis/cc-slot.env"')
+    # subprocess. The load lives in `_cc_load_levers` because the consent-rebuild
+    # path re-runs it after the 120-second prompt; what matters here is that the
+    # top-level CALL — not merely the definition — precedes the gate.
+    call_i = script_text.index("\n_cc_load_levers\n")
     gate_i = script_text.index("-m genesis.cc.session_cap --existing")
-    assert src_i < gate_i
-    assert 'export "$_lever"' in script_text
+    assert call_i < gate_i
+    assert '. "${HOME}/.genesis/cc-slot.env"' in script_text
+    assert 'export "$_l"' in script_text
+
+
+def test_the_lever_loader_clears_before_it_reads(script_text):
+    """A bare `.` only OVERLAYS, so a lever the operator DELETED survives.
+
+    That matters because the consent prompt is precisely when they go and edit
+    this file: removing `GENESIS_CC_PERMISSION_MODE=bypass` must disarm the
+    rebuild, not leave the old value sitting in the shell.
+    """
+    body = script_text.split("_cc_load_levers() {", 1)[1].split("\n}", 1)[0]
+    unset_i = body.index('unset "$_l"')
+    src_i = body.index('. "${HOME}/.genesis/cc-slot.env"')
+    assert unset_i < src_i, (
+        "the loader must clear the known levers BEFORE sourcing, or a removed "
+        "assignment can never take effect"
+    )
 
 
 # ── Hermetic end-to-end harness ───────────────────────────────────────────────

@@ -12,25 +12,20 @@ from genesis.outreach.config import OutreachConfig
 from genesis.outreach.engagement import EngagementTracker
 from genesis.outreach.morning_report import MorningReportGenerator
 from genesis.outreach.pipeline import OutreachPipeline
-from genesis.outreach.types import OutreachCategory, OutreachRequest, OutreachStatus
+from genesis.outreach.types import (
+    # Discord SUB-CHANNEL names used by campaign sessions in pending_outreach.
+    # The outreach pipeline routes via adapter name ("discord"), not sub-channel.
+    # Lives in outreach.types so `outreach_send` and this module share ONE list;
+    # the private alias keeps existing references here reading unchanged.
+    DISCORD_CHANNELS as _DISCORD_CHANNELS,
+)
+from genesis.outreach.types import (
+    OutreachCategory,
+    OutreachRequest,
+    OutreachStatus,
+)
 
 logger = logging.getLogger(__name__)
-
-# Discord sub-channel names used by campaign sessions in pending_outreach.
-# The outreach pipeline routes via adapter name ("discord"), not sub-channel.
-_DISCORD_CHANNELS = frozenset(
-    {
-        "announcements",
-        "dev-discussion",
-        "general",
-        "showcase",
-        "getting-started",
-        "design",
-        "bug-reports",
-        "feature-requests",
-        "troubleshooting",
-    }
-)
 
 
 class OutreachScheduler:
@@ -749,8 +744,18 @@ class OutreachScheduler:
                     # Map Discord sub-channel names to adapter name.
                     # Campaign sessions queue with channel="announcements" etc.,
                     # but the pipeline adapter is registered as "discord".
+                    #
+                    # AND CARRY THE SUB-CHANNEL. Mapping the name away without
+                    # keeping it is how a queued "announcements" post silently
+                    # became a dev-discussion post: _deliver then resolves the
+                    # recipient from OUTREACH_RECIPIENT_DISCORD (default
+                    # "dev-discussion"), and the webhook adapter falls back to
+                    # the default webhook rather than failing, so nothing
+                    # anywhere reports the redirect. MEASURED 2026-09-07 with a
+                    # real v3.0b18 announcement, caught before it drained.
                     raw_channel = row.get("channel", "telegram")
-                    channel = "discord" if raw_channel in _DISCORD_CHANNELS else raw_channel
+                    is_discord_subchannel = raw_channel in _DISCORD_CHANNELS
+                    channel = "discord" if is_discord_subchannel else raw_channel
 
                     req = OutreachRequest(
                         category=cat,
@@ -761,6 +766,10 @@ class OutreachScheduler:
                         channel=channel,
                         thread_id=row.get("thread_id"),
                         validated_recipient=row.get("validated_recipient"),
+                        # The sub-channel the row asked for. _deliver resolves
+                        # validated_recipient or target_chat_id or <default>, so
+                        # an explicit recipient on the row still wins.
+                        target_chat_id=raw_channel if is_discord_subchannel else None,
                         # Preserve the BULK/campaign flag through the queue so a
                         # QUEUED cold-marketing send classifies BULK at the
                         # autonomy gate (a legacy row lacking the column → False).
@@ -789,10 +798,18 @@ class OutreachScheduler:
                     ):
                         delivered_at = datetime.now(UTC).isoformat()
                         await self._mark_row_delivered(row, delivered_at)
+                        # Carry result.error, as the retry branch below already
+                        # does. A terminal disposition is not always a success:
+                        # IGNORED covers a self-send, a missing recipient, AND a
+                        # channel this install cannot reach — and that last one
+                        # is a misconfiguration the operator has to fix. Marking
+                        # the row delivered while logging only "ignored" turns a
+                        # refused announcement into a silent drop.
                         logger.info(
-                            "Drained pending outreach %s: %s (terminal)",
+                            "Drained pending outreach %s: %s (terminal)%s",
                             row.get("id") or f"rowid:{row.get('rowid')}",
                             result.status.value,
+                            f" — {result.error}" if result.error else "",
                         )
                     else:
                         logger.warning(

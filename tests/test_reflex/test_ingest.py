@@ -58,6 +58,12 @@ def _ingestor(db, *, enabled=True, **kwargs):
 
 
 def _event(event_type="task.failed", subsystem="health", **details):
+    # CONSUMER-side fixture: a hand-built event, NOT what any real producer
+    # emits — for months it set error_type while the real task.failed payload
+    # had none, so these tests stayed green over a producer→consumer path that
+    # never worked. Producer→consumer coverage lives in
+    # test_task_failed_funnel.py (real emit through a real bus); keep this
+    # fixture for ingestor-behavior tests only.
     base = {
         "task_name": "mem-sync",
         "error": "KeyError: 'x'",
