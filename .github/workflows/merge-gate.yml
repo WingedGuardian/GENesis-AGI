@@ -29,6 +29,12 @@ on:
     types: [created, edited, deleted]
   issue_comment:
     types: [created, edited, deleted]
+  # When the CI workflow completes on a head, the last evaluation's `ci:` row
+  # (pending/absent/incomplete) is stale — re-evaluate so the check settles to
+  # the post-CI verdict instead of waiting for the next comment or push.
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
   workflow_dispatch:
     inputs:
       pr:
@@ -53,15 +59,19 @@ permissions:
 # Latest event wins — a stale run evaluating an older review state reports a
 # verdict nobody should read.
 concurrency:
-  group: merge-gate-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr || github.ref }}
+  group: merge-gate-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.event.inputs.pr || github.ref }}
   cancel-in-progress: true
 
 jobs:
   genesis-merge-gate:
     # issue_comment fires on issues too — only run when it's a PR comment.
+    # workflow_run fires for CI completions on ANY ref — only run when the
+    # completed run is associated with at least one pull request.
     if: >-
-      github.event_name != 'issue_comment' ||
-      github.event.issue.pull_request != null
+      (github.event_name != 'issue_comment' ||
+       github.event.issue.pull_request != null) &&
+      (github.event_name != 'workflow_run' ||
+       github.event.workflow_run.pull_requests[0] != null)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -69,7 +79,7 @@ jobs:
         id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.event.inputs.pr }}
         run: |
           set -euo pipefail
           echo "number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
@@ -122,16 +132,28 @@ jobs:
             --repo "$GITHUB_REPOSITORY"
           rc=$?
           echo "rc=${rc}" >> "$GITHUB_OUTPUT"
-          # On `pull_request` the ambient job check IS the verdict: it attaches
-          # to the PR head automatically, so exit with the gate's rc.
-          # Every other event runs on the DEFAULT branch — a nonzero exit here
-          # would only paint a red check onto the base SHA, and the real verdict
-          # is published onto the PR head in the next step instead.
-          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then exit "$rc"; fi
+          # pull_request* events attach their ambient job check to the PR head
+          # automatically — exit with the gate's rc so THAT check is the verdict.
+          # issue_comment / workflow_dispatch / workflow_run execute on the
+          # DEFAULT branch: a nonzero exit would only paint a red check onto the
+          # base SHA, and the real verdict is published onto the PR head in the
+          # next step instead.
+          case "$GITHUB_EVENT_NAME" in
+            pull_request|pull_request_review|pull_request_review_comment)
+              exit "$rc" ;;
+          esac
           exit 0
 
       - name: Publish the verdict on the PR head
-        if: github.event_name != 'pull_request'
+        # Only the events whose ambient job check lands on the DEFAULT branch
+        # (invisible on the PR) need the explicit check run. For pull_request*
+        # events the ambient check already sits on the head — publishing here
+        # would duplicate the same check name on one SHA (measured on this
+        # branch: green ambient + red API entries side by side).
+        if: >-
+          github.event_name == 'issue_comment' ||
+          github.event_name == 'workflow_dispatch' ||
+          github.event_name == 'workflow_run'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GATE_RC: ${{ steps.gate.outputs.rc }}

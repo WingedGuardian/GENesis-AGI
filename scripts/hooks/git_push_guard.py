@@ -1100,11 +1100,16 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         def _is_self_check(c: object) -> bool:
             if not isinstance(c, dict):
                 return False
-            return (
-                self_wf
-                and (c.get("workflowName") or "").strip().casefold() == self_wf
-            ) or (
+            wf = (c.get("workflowName") or "").strip().casefold()
+            if self_wf and wf == self_wf:
+                return True
+            # The name lane covers check runs published via the check-runs API,
+            # which carry NO workflowName. Requiring an empty workflowName keeps
+            # a same-named check inside some OTHER workflow counting normally —
+            # the exclusion must cover exactly our own runs, nothing wider.
+            return bool(
                 self_job
+                and not wf
                 and (c.get("name") or "").strip().casefold() == self_job
             )
 

@@ -3131,6 +3131,18 @@ class TestPrCiStatusSelfWorkflow:
         ]))
         assert guard_module._pr_ci_status("1") == ("red", ["some-other-check"])
 
+    def test_same_name_in_other_workflow_is_not_filtered(self, guard_module, monkeypatch):
+        # The name lane applies ONLY to workflowName-less (API-published) runs —
+        # a check coincidentally named after this job inside another workflow is
+        # a real verdict and still counts (CodeRabbit: scope the name filter).
+        self._actions(monkeypatch, workflow="merge-gate", job="genesis-merge-gate")
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": "CI",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]))
+        assert guard_module._pr_ci_status("1") == ("red", ["genesis-merge-gate"])
+
 
 class TestPrCiStatusRequiredWorkflows:
     """Required-CI-workflow identity (closes the #1484 P2 partial-rollup residual):
