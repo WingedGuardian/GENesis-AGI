@@ -369,7 +369,7 @@ def _effective_diff_cwd(command: str, payload: dict, segs: list, commit_seg=None
     return _existing_dir_or_unknown(cur)
 
 
-def _staged_files(cwd: str | None) -> list[str] | None:
+def _staged_files(cwd: str | None, *, deadline: float | None = None) -> list[str] | None:
     """Staged paths for the pending commit, or None if the diff cannot be read.
 
     Uses ``--name-status -M`` so renames/copies surface BOTH sides (P2-E): a
@@ -383,7 +383,14 @@ def _staged_files(cwd: str | None) -> list[str] | None:
         args += ["-C", cwd]
     args += ["diff", "--cached", "--name-status", "-M"]
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=max(0.1, min(10, deadline - time.monotonic()))
+            if deadline is not None
+            else 10,
+        )
         if result.returncode != 0:
             return None
         paths: list[str] = []
@@ -636,7 +643,7 @@ def _branch_mutation_risk(argv: list[str]) -> str | None:
     return None
 
 
-def _worktree_root(cwd: str) -> str:
+def _worktree_root(cwd: str, *, deadline: float | None = None) -> str:
     """The git worktree ROOT that owns ``cwd`` (canonicalized), or ``realpath(cwd)``
     as a fallback. Two different SUBDIRECTORIES of one worktree — and a symlink alias
     of it — resolve to the same root, so a legitimate same-worktree commit chain
@@ -647,7 +654,9 @@ def _worktree_root(cwd: str) -> str:
             ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=max(0.1, min(5, deadline - time.monotonic()))
+            if deadline is not None
+            else 5,
         )
         root = r.stdout.strip()
         if r.returncode == 0 and root:
@@ -759,7 +768,11 @@ def _current_branch_pr_identity(raw: str) -> tuple[str, int] | None | dict:
         return _unknown_budget("commit_pr_status_malformed")
     state = current.get("state")
     if state in {"CLOSED", "MERGED"}:
-        return None
+        # ``gh pr status`` exposes only the NEWEST match for the branch. A closed
+        # singular record does not prove no older OPEN PR exists for it, and an
+        # unseen open PR may already have exhausted its budget — so "closed" is
+        # unknown evidence, never proof of absence.
+        return _unknown_budget("commit_pr_status_closed_only")
     number, url = current.get("number"), current.get("url")
     if state != "OPEN" or not isinstance(number, int) or not isinstance(url, str):
         return _unknown_budget("commit_pr_identity_malformed")
@@ -939,6 +952,16 @@ def main() -> None:
         )
         return
 
+    # One aggregate deadline for the WHOLE hook, opened before the first local
+    # git probe. The hook is registered with `"timeout": 10`, and an overrun is a
+    # SIGKILL — which FAILS OPEN: the commit proceeds with neither the budget
+    # check nor the review-current/depth checks behind it. Per-call subprocess
+    # caps each reset the clock, so serial local probes (worktree/branch/counter
+    # reads, then the budget lookup) could overrun the window in aggregate; every
+    # probe below draws from this one deadline instead. The small reserve keeps
+    # room to print the decision and exit before the kill lands.
+    hook_deadline = time.monotonic() + _COMMIT_HOOK_REGISTERED_TIMEOUT - 0.5
+
     # Resolve the dir the commit actually targets (git -C / the LAST cd before
     # the commit segment / payload cwd). A decoy `cd A && …; cd B && git commit`
     # runs in B, and B is what we must inspect. An ambiguous cwd (variable /
@@ -1063,7 +1086,9 @@ def main() -> None:
             )
             return
         seg_cwds.append(seg_cwd)
-        seg_branch = get_current_branch(cwd=seg_cwd if isinstance(seg_cwd, str) else None)
+        seg_branch = get_current_branch(
+            cwd=seg_cwd if isinstance(seg_cwd, str) else None, deadline=hook_deadline
+        )
         if seg_branch in ("main", "master"):
             _deny(
                 "BLOCKED: Direct commits to main are not allowed. "
@@ -1084,7 +1109,10 @@ def main() -> None:
     # different-subdir case). Only resolved when ≥2 commits actually chain, to avoid
     # the extra git call on the common single-commit path.
     if len(all_commit_segs) >= 2:
-        distinct_dirs = {_worktree_root(c) if isinstance(c, str) else c for c in seg_cwds}
+        distinct_dirs = {
+            _worktree_root(c, deadline=hook_deadline) if isinstance(c, str) else c
+            for c in seg_cwds
+        }
         if len(distinct_dirs) > 1:
             _deny(
                 "BLOCKED: this command chains git commits into DIFFERENT worktrees, "
@@ -1151,11 +1179,13 @@ def main() -> None:
     # chained sibling commit). NOTE: on a nested `bash -c 'git commit …'` the ack
     # must sit on the INNER command (the sigil isn't propagated to wrappers); the
     # documented `git commit … # escalation-ack` form is a plain segment.
-    round_n, _local_lifetime = get_review_counters(cwd=cwd)
+    round_n, _local_lifetime = get_review_counters(cwd=cwd, deadline=hook_deadline)
     commit_segs = [s for s in segs if git_subcommand(s.argv) == "commit"]
 
-    branch = get_current_branch(cwd=cwd)
-    cloud_budget = _branch_review_budget(cwd, branch)
+    branch = get_current_branch(cwd=cwd, deadline=hook_deadline)
+    cloud_budget = _branch_review_budget(
+        cwd, branch, budget_seconds=max(0.1, hook_deadline - time.monotonic())
+    )
     pending_round_approval = bool(
         cloud_budget is not None
         and (
@@ -1169,11 +1199,11 @@ def main() -> None:
             s
             for s in segs
             if git_subcommand(s.argv) in {"push", "merge"}
-            or gh_pr_subcommand(s.argv) in {"create", "merge", "close"}
-            or (
-                gh_pr_subcommand(s.argv) == "comment"
-                and any("@codex review" in tok.lower() for tok in s.argv)
-            )
+            # EVERY ``gh pr comment`` counts separately: an inline body can hide a
+            # review request the argv scan sees, but a ``--body-file``/editor body
+            # is opaque here — gating on the visible ``@codex review`` token let one
+            # approval cover a request it never read.
+            or gh_pr_subcommand(s.argv) in {"create", "merge", "close", "comment"}
         ]
         if len(commit_segs) != 1 or separately_gated:
             _deny(
@@ -1344,7 +1374,7 @@ def main() -> None:
     commit_may_add_content = _commit_may_add_content(segs)
 
     if not commit_may_add_content:
-        staged = _staged_files(cwd)
+        staged = _staged_files(cwd, deadline=hook_deadline)
         if staged and all(_is_docs_or_config(p) for p in staged):
             _allow()
 

@@ -563,6 +563,26 @@ def _evaluate_pr_inner(
     if final_head != test_head:
         return _unknown("head_changed_during_evaluation", current_head=final_head)
 
+    # The head check alone does not pin the MUTABLE evidence: a review or a
+    # confirmation comment posted after the fetches but before the head read
+    # leaves the head unchanged while the snapshot under-counts the budget.
+    # Re-read the two mutable endpoints and require the snapshots to agree —
+    # the race window shrinks to the last call rather than the whole fetch
+    # block. (REST offers no point-in-time read; this narrows, not closes, it.)
+    for name, env_name, argv in endpoints:
+        if name not in ("reviews", "comments"):
+            continue
+        raw = os.environ.get(env_name)
+        if raw is None:
+            rc, raw, _ = run(argv, 8)
+            if rc != 0:
+                return _unknown(f"{name}_unreadable", current_head=test_head)
+        rows, error = _json_lines(raw, name)
+        if error:
+            return _unknown(error, current_head=test_head)
+        if (rows or []) != fetched[name]:
+            return _unknown("evidence_changed_during_evaluation", current_head=final_head)
+
     commit_heads: list[str] = []
     for item in fetched["commits"]:
         sha = item.get("sha")

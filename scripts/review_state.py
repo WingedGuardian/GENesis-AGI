@@ -98,7 +98,21 @@ _MAX_EVIDENCE_AGE_SECONDS = 1800  # 30 minutes
 _GSTACK_ANALYTICS = Path.home() / ".gstack" / "analytics" / "skill-usage.jsonl"
 
 
-def _worktree_root(cwd: str | None = None) -> str:
+def _deadline_timeout(deadline: float | None, cap: float) -> float:
+    """Subprocess timeout bounded by an optional aggregate ``time.monotonic()`` deadline.
+
+    Callers running under a host kill-window (the commit/push hooks' registered
+    timeouts) pass one deadline so a stalled probe consumes the SAME budget the
+    later gates need instead of resetting it — a per-call cap alone lets serial
+    probes overrun the kill, which fails OPEN. An already-elapsed deadline still
+    permits a minimal 0.1s probe rather than branching on time here.
+    """
+    if deadline is None:
+        return cap
+    return max(0.1, min(cap, deadline - time.monotonic()))
+
+
+def _worktree_root(cwd: str | None = None, *, deadline: float | None = None) -> str:
     """Absolute worktree root used to key per-worktree state.
 
     Primary: ``git rev-parse --show-toplevel``. Fallback — git missing or timed out,
@@ -116,7 +130,7 @@ def _worktree_root(cwd: str | None = None) -> str:
             ["git", "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=_deadline_timeout(deadline, 5),
             cwd=cwd,
         )
         root = result.stdout.strip()
@@ -134,7 +148,7 @@ def _worktree_root(cwd: str | None = None) -> str:
     return str(base)
 
 
-def _worktree_key(cwd: str | None = None) -> str:
+def _worktree_key(cwd: str | None = None, *, deadline: float | None = None) -> str:
     """Stable, per-location key from the worktree root (see ``_worktree_root``).
 
     Concurrent CC sessions each work in their own git worktree; a single global
@@ -142,7 +156,7 @@ def _worktree_key(cwd: str | None = None) -> str:
     session A's marker mid-workflow). Keying by worktree root isolates them — and the
     key stays isolated even when git is briefly unavailable (no shared fallback).
     """
-    return hashlib.sha256(_worktree_root(cwd).encode()).hexdigest()[:12]
+    return hashlib.sha256(_worktree_root(cwd, deadline=deadline).encode()).hexdigest()[:12]
 
 
 def _evidence_file(cwd: str | None = None) -> Path:
@@ -649,9 +663,9 @@ def clear_all_markers() -> tuple[int, list[str]]:
 # advance it.
 
 
-def _round_file(cwd: str | None = None) -> Path:
+def _round_file(cwd: str | None = None, *, deadline: float | None = None) -> Path:
     """Per-worktree round-counter path (same worktree key as the marker)."""
-    return _ROUND_DIR / f"{_worktree_key(cwd)}.json"
+    return _ROUND_DIR / f"{_worktree_key(cwd, deadline=deadline)}.json"
 
 
 def _staged_content_hash(cwd: str | None = None) -> str:
@@ -699,7 +713,7 @@ def _coerce_finite_int(value: object, default: int = 0) -> int:
         return default
 
 
-def _load_round(cwd: str | None = None) -> dict:
+def _load_round(cwd: str | None = None, *, deadline: float | None = None) -> dict:
     """Read the round-counter file, normalizing shape AND the round VALUE.
 
     Validating once, here at the single load boundary, is the whole class-fix for
@@ -715,7 +729,7 @@ def _load_round(cwd: str | None = None) -> dict:
     Never raises.
     """
     try:
-        p = _round_file(cwd)
+        p = _round_file(cwd, deadline=deadline)
         if p.exists():
             data = json.loads(p.read_text())
             if isinstance(data, dict):
@@ -918,7 +932,9 @@ def get_review_lifetime(cwd: str | None = None) -> int:
     return _coerce_finite_int(state.get("lifetime", 0))
 
 
-def get_review_counters(cwd: str | None = None) -> tuple[int, int]:
+def get_review_counters(
+    cwd: str | None = None, *, deadline: float | None = None
+) -> tuple[int, int]:
     """``(round, lifetime)`` from ONE snapshot of the counter file. Never raises.
 
     WHY THIS EXISTS RATHER THAN TWO CALLS. Which enforcement tier is live is a
@@ -941,8 +957,8 @@ def get_review_counters(cwd: str | None = None) -> tuple[int, int]:
     Same branch-scoping contract as the two accessors it replaces: a counter written
     for a different branch reads as ``(0, 0)``, because a new change starts fresh.
     """
-    state = _load_round(cwd)
-    if not state or state.get("branch") != get_current_branch(cwd=cwd):
+    state = _load_round(cwd, deadline=deadline)
+    if not state or state.get("branch") != get_current_branch(cwd=cwd, deadline=deadline):
         return (0, 0)
     return (
         _coerce_finite_int(state.get("round", 0)),
@@ -993,14 +1009,14 @@ def reset_review_round(cwd: str | None = None) -> None:
     )
 
 
-def get_current_branch(cwd: str | None = None) -> str:
+def get_current_branch(cwd: str | None = None, *, deadline: float | None = None) -> str:
     """Get current git branch name."""
     try:
         result = subprocess.run(
             ["git", "branch", "--show-current"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=_deadline_timeout(deadline, 5),
             cwd=cwd,
         )
         return result.stdout.strip() or "unknown"
