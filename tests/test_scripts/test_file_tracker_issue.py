@@ -638,10 +638,13 @@ def test_indeterminate_only_when_the_reconciling_lookup_also_fails():
 def test_lock_directory_failure_refuses_rather_than_using_a_tmpdir_fallback(monkeypatch):
     """A TMPDIR-dependent fallback is not a lock: CC sets TMPDIR, a shell does not."""
 
-
     monkeypatch.setattr(fti, "Path", _PathWithFailingMkdir)
-    with pytest.raises(fti.Refused, match="TMPDIR-dependent fallback"):
+    with pytest.raises(fti.Refused, match="TMPDIR-dependent fallback") as excinfo:
         fti._lock_path("Org/Repo")
+    msg = str(excinfo.value)
+    assert "read-only file system" not in msg, "raw exception text must not leak into refusal"
+    assert str(Path.home()) not in msg, "home directory must not leak into refusal"
+    assert "(OSError)" in msg, "exception class name should be rendered instead"
 
 
 def test_no_tempfile_fallback_remains_in_the_source():

@@ -341,7 +341,7 @@ def _lock_path(slug: str) -> Path:
         base.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise Refused(
-            f"cannot establish the per-install lock directory ({base}): {exc}. "
+            f"cannot establish the per-install lock directory ({type(exc).__name__}). "
             "Refusing rather than using a TMPDIR-dependent fallback, which would "
             "let two sessions lock different files and both post."
         ) from exc
