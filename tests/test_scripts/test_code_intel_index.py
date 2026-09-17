@@ -934,11 +934,17 @@ def test_working_set_supports_the_complete_cgroup_v1_schema(tmp_path):
     gib = 1024**3
     current = 12 * gib
     v1 = (
+        f"inactive_file {gib}\n"
+        f"active_file {gib}\n"
+        "file_dirty 0\n"
+        "file_writeback 0\n"
         f"total_inactive_file {6 * gib}\n"
         "total_active_file 0\n"
         "total_dirty 0\n"
         "total_writeback 0\n"
     )
+    # v1 exposes local and hierarchical counters in the same file. Its usage
+    # charge is hierarchical, so its total_* values must win over local ones.
     assert _working_set_from_stat(tmp_path, current, v1, 2 * gib) == 8 * gib
 
 

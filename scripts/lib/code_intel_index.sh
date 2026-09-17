@@ -177,10 +177,13 @@ _genesis_mem_working_set_from() {
         END { printf "%s|%s|%s|%s|%s|%s|%s|%s", inactive, active, dirty, writeback, v1_inactive, v1_active, v1_dirty, v1_writeback }
     ' "$stat_path" 2>/dev/null)" || { printf '%s' "$current"; return; }
     IFS='|' read -r inactive active dirty writeback v1_inactive v1_active v1_dirty v1_writeback <<< "$fields"
-    if [[ "$inactive" =~ ^[0-9]+$ && "$active" =~ ^[0-9]+$ && "$dirty" =~ ^[0-9]+$ && "$writeback" =~ ^[0-9]+$ ]]; then
-        :  # cgroup v2 schema
-    elif [[ "$v1_inactive" =~ ^[0-9]+$ && "$v1_active" =~ ^[0-9]+$ && "$v1_dirty" =~ ^[0-9]+$ && "$v1_writeback" =~ ^[0-9]+$ ]]; then
+    # A v1 memory.stat includes both local unprefixed counters and hierarchical
+    # total_* counters. memory.usage_in_bytes is hierarchical too, so choose
+    # the matching total_* schema before considering a v2 schema.
+    if [[ "$v1_inactive" =~ ^[0-9]+$ && "$v1_active" =~ ^[0-9]+$ && "$v1_dirty" =~ ^[0-9]+$ && "$v1_writeback" =~ ^[0-9]+$ ]]; then
         inactive="$v1_inactive"; active="$v1_active"; dirty="$v1_dirty"; writeback="$v1_writeback"
+    elif [[ "$inactive" =~ ^[0-9]+$ && "$active" =~ ^[0-9]+$ && "$dirty" =~ ^[0-9]+$ && "$writeback" =~ ^[0-9]+$ ]]; then
+        :  # cgroup v2 schema
     else
         printf '%s' "$current"
         return
