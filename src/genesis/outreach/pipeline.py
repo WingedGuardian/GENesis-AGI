@@ -15,6 +15,7 @@ from genesis.channels.base import ChannelNotConfiguredError
 from genesis.content.drafter import ContentDrafter
 from genesis.content.egress import gate
 from genesis.content.formatter import ContentFormatter
+from genesis.content.limits import get_limits
 from genesis.content.types import DraftRequest, FormatTarget, FormattedContent
 from genesis.db.crud import autonomous_email_sends as aes
 from genesis.db.crud import capability_grants as cg
@@ -720,7 +721,16 @@ class OutreachPipeline:
                     error=f"Content scan quarantine: {egress.scan.detected}",
                 )
             if egress.fixes_applied:
-                formatted = replace(formatted, text=egress.text)
+                # The scrub can GROW the text -- a bare em dash becomes two
+                # hyphens -- and the platform limit was applied BEFORE this ran.
+                # Without re-applying it, a message sitting at the limit
+                # overflows and the adapter hard-cuts it downstream, which is
+                # both an unwanted second message and a split dash pair.
+                text = egress.text
+                target = _CHANNEL_FORMAT.get(channel, FormatTarget.GENERIC)
+                if len(text) > get_limits(target).max_length:
+                    text = self._formatter.format(text, target).text
+                formatted = replace(formatted, text=text)
 
         try:
             delivery_id = await adapter.send_message(
