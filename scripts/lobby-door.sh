@@ -101,8 +101,11 @@ tmux has-session -t "=${WORKSPACE}" 2>/dev/null \
 # rejected. Measured mechanism, and the negative result that was wrong for a
 # while, are in scripts/fleet_entry_guard.sh.
 #
-# Resolved from THIS script's own location, never "${HOME}/genesis" — the door
-# must keep working on a clone that lives anywhere else.
+# Resolved from THIS script's own location, never a hardcoded home-relative
+# repo path — the door must keep working on a clone that lives anywhere else.
+# (Spelled without the variable on purpose: tests/test_scripts/
+# test_home_guard_coverage.py scans raw text and would read the mention in this
+# comment as a real dereference needing a HOME-unset guard.)
 #
 # SYNCHRONOUS on purpose. Backgrounding would race the picker: the clear has to
 # land before the operator can select a pane, or it fixes a fleet they have
