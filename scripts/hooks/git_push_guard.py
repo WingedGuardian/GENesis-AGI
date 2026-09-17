@@ -8213,7 +8213,13 @@ def _ask(reason: str) -> int:
     # about what DECLINING costs, which is the thing a "block the push?" dialog
     # otherwise hides.
     if discarded_write is not None:
-        extra = discarded_write.prompt_note()
+        # Cosmetic only — a stale module without prompt_note, or a failure inside
+        # it, must never take down the ask: a crash before the print exits
+        # non-zero, which is non-BLOCKING and would run the command unapproved.
+        try:
+            extra = discarded_write.prompt_note()
+        except Exception:
+            extra = None
         if extra:
             reason = f"{reason}\n\n{extra}"
     print(
