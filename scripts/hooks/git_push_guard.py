@@ -1079,6 +1079,40 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         # never fired (e.g. a conflicting branch suppresses the whole suite).
         return "absent", []
 
+    # Self-exclusion for the check-run form of this gate (issue #1670). The
+    # `genesis-merge-gate` check only MIRRORS this gate's verdict, so its
+    # entries must never classify — in ANY environment: under Actions a run
+    # would deadlock on its own IN_PROGRESS entry or inherit a stale FAILURE
+    # from an earlier run on the same head, and locally the mirror would
+    # double-count real blocks as `ci: red (genesis-merge-gate)` and demand a
+    # spurious ci-override on top of the genuine sigils. Two constant
+    # identities cover both publishing lanes: workflowName "merge-gate" is the
+    # ambient job check; name "genesis-merge-gate" with an EMPTY workflowName
+    # is a check run published via the check-runs API (which carries no
+    # workflowName). The empty-workflowName requirement keeps a coincidentally
+    # same-named check inside another workflow counting normally — the
+    # exclusion must cover exactly our own runs, nothing wider. The
+    # GITHUB_WORKFLOW/GITHUB_JOB env lanes stay as a drift-proof backup: if
+    # the workflow is ever renamed, the running job still recognizes itself.
+    self_wf = (os.environ.get("GITHUB_WORKFLOW") or "").strip().casefold()
+    self_job = (os.environ.get("GITHUB_JOB") or "").strip().casefold()
+
+    def _is_self_check(c: object) -> bool:
+        if not isinstance(c, dict):
+            return False
+        wf = (c.get("workflowName") or "").strip().casefold()
+        name = (c.get("name") or "").strip().casefold()
+        if wf == "merge-gate" or (self_wf and wf == self_wf) or (self_job and wf == self_job):
+            return True
+        return name == "genesis-merge-gate" and not wf
+
+    checks = [c for c in checks if not _is_self_check(c)]
+    if not checks:
+        # The ONLY thing in the rollup is our own run: zero OTHER checks
+        # have run — the same definite "CI has not run" fact a genuinely
+        # empty rollup carries.
+        return "absent", []
+
     # Drop superseded `concurrency: cancel-in-progress` duplicates via the SHARED
     # primitive (_drop_superseded_cancels — read its docstring for the strict
     # identity + strictly-after rule and every fail-closed case). Filtering here rather
