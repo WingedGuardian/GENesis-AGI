@@ -1,11 +1,11 @@
-"""Tests for the fleet entry-capture retention prune in scripts/disk_hygiene.sh.
+"""Tests for the fleet entry-guard retention prune in scripts/disk_hygiene.sh.
 
 Mirrors test_disk_hygiene_guard_corpus_prune's source-and-call pattern: the
 script only DEFINES functions when sourced (``main`` is guarded), so the prune
 can be exercised alone. Age is set via os.utime, so these are wall-clock
 independent.
 
-``scripts/fleet_entry_capture.sh`` appends one dated file per UTC day, forever.
+``scripts/fleet_entry_guard.sh`` appends one dated file per UTC day, forever.
 The store is small but unbounded, and an unbounded store on a smaller disk than
 this one is a slow leak whatever its rate — so the retention ships with the
 writer rather than as a follow-up.

@@ -35,30 +35,56 @@ Windows one-click: make a shortcut whose target is `wt.exe ssh <host>-lobby`
 
 ## "It dropped me into a frozen session with a yellow line"
 
-The session is almost certainly not frozen. Yellow is tmux's `mode-style`
-(default `bg=yellow`), not the status line — so the pane is **in a MODE**,
-normally the `choose-tree` picker or `copy-mode`, and the keys you type are
-being read as that mode's keys rather than by a shell.
+**This repairs itself now** — reconnect and the stale pane is cleared on the way
+in. The rest of this section is what was happening and what to check if it
+somehow recurs.
+
+The session was never frozen. Yellow is tmux's `mode-style` (default
+`bg=yellow`), not the status line — so the pane is **in a MODE**, normally the
+`choose-tree` picker or `copy-mode`, and the keys you type are read as that
+mode's keys rather than by a shell.
 
 It happens because a pane mode belongs to the **pane**, not to the client, so it
 outlives a disconnect. Press `Ctrl-b s` in a slot to look around, close the
-window without leaving the chooser, and that slot keeps the mode. The next
-connection that selects it lands straight back inside the chooser. MEASURED on
-tmux 3.4: no programmatic clear works — `send-keys -X cancel` answers *"not in a
-mode"* while `pane_in_mode` still reads 1, with or without a client attached.
+window without leaving the chooser, and that slot keeps the mode indefinitely.
+The next connection that selected it landed straight back inside that chooser.
 
-Try `q` first, then `Escape`. If neither returns you to a shell, note which slot
-it was before you kill the window — that detail is what the fix needs.
+Both doors now clear it at entry, using `tmux copy-mode -q`, which cancels any
+mode without disturbing the pane's process. A pane is only touched when it is in
+a mode, is a real destination rather than one of the doors' own transient
+pickers, and **has no client attached anywhere** — so a session somebody is
+actively looking at is never interfered with. That last condition costs nothing:
+a stranded pane is by definition one whose client left.
 
-Every connection through either door records the fleet's pane-mode state to
-`~/.genesis/logs/fleet_entry_<date>.log` (owner-only, pruned after 45 days). A
-slot found holding a mode is written as a greppable line, so after it happens:
+What a clear costs you, honestly:
+
+- leaving a **chooser** or **copy-mode**: only a view position — a scroll offset,
+  or where the cursor sat. Nothing running is affected, and scrollback is intact.
+- leaving **view-mode** (text a `run-shell` put on screen): that text is lost.
+  It lives in the mode rather than in the scrollback, so it cannot be recovered
+  afterwards. Accepted deliberately — it is transient output in a pane nobody is
+  attached to, against a slot you otherwise cannot use.
+
+Scope worth knowing: the guard looks at every tmux session on the box, not only
+`cc-*` slots. A scratch session of your own left in a chooser gets cleared too.
+
+Each entry is logged to `~/.genesis/logs/fleet_entry_<date>.log` (owner-only,
+pruned after 45 days):
 
 ```bash
-grep ANOMALY ~/.genesis/logs/fleet_entry_*.log
+grep -E 'ANOMALY|CLEARED|CLEAR-FAILED' ~/.genesis/logs/fleet_entry_*.log
 ```
 
-The capture only observes — it changes no pane and blocks no entry.
+`ANOMALY` is a stranded pane that was found, `CLEARED` is one confirmed
+repaired by a follow-up read, and `CLEAR-FAILED` means the clear did not take —
+report that one, it should not happen.
+
+To turn the clearing off and keep the logging, set `GENESIS_FLEET_GUARD_CLEAR=off`.
+
+One thing still unknown: whether pressing `q` at the keyboard escapes such a
+pane. Every programmatic route through `send-keys` fails, and injecting a real
+keypress into a test could not be done, so if you ever do land in one before the
+guard catches it, that keystroke is worth trying.
 
 ## The session cap and the operator emergency slot
 

@@ -42,8 +42,9 @@
 #      (the guard replay corpus and any temp an interrupted rebuild left; it is
 #      regenerable, and it holds verbatim command lines — see prune_guard_corpus)
 #  15. Retention prune of ~/.genesis/logs/fleet_entry_*.log (>45d)
-#      (fleet pane-mode capture, one dated file per UTC day — whole-file age
-#      prune, which is why the writer dates them; see prune_fleet_entry_logs)
+#      (fleet pane-mode guard: what it found and cleared at each SSH entry, one
+#      dated file per UTC day — a whole-file age prune, which is why the writer
+#      dates them rather than rolling one log; see prune_fleet_entry_logs)
 #
 # Note: run under a hardened systemd sandbox (NoNewPrivileges, ProtectSystem=
 # strict), so disk_reclaim's --system (/var, sudo) path is intentionally NOT
@@ -132,7 +133,7 @@ prune_guard_corpus() {
 }
 
 prune_fleet_entry_logs() {
-    # scripts/fleet_entry_capture.sh appends the fleet's pane-MODE state on every
+    # scripts/fleet_entry_guard.sh appends what it found on the fleet on every
     # connection through either door, one file per UTC day. Each record is a few
     # lines and a busy day is a handful of connections, so this is small — but it
     # is append-forever, and an append-forever store on someone else's smaller
@@ -341,7 +342,7 @@ main() {
     echo "--- guard replay corpus retention prune (>45d) ---"
     prune_guard_corpus "$HOME/.genesis/output"
 
-    echo "--- fleet entry-capture log retention prune (>45d) ---"
+    echo "--- fleet entry-guard log retention prune (>45d) ---"
     prune_fleet_entry_logs "$HOME/.genesis/logs"
 
     echo "=== genesis-disk-hygiene done ==="
