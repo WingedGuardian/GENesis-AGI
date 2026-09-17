@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # The shared hook-input helper lives in scripts/hooks/; this script runs from
@@ -761,15 +762,37 @@ def _current_branch_pr_identity(raw: str) -> tuple[str, int] | None | dict:
     return match.group(1), number
 
 
-def _branch_review_budget(cwd: str | None, branch: str | None) -> dict | None:
+#: This hook is registered in .claude/settings.json with `"timeout": 10`, and an
+#: overrun SIGKILLs it -- which FAILS OPEN: the commit proceeds with neither the
+#: budget check nor the review-current and depth checks that run after it. The
+#: lookup is several serial GitHub calls of 6-8s each, so a degraded-but-not-dead
+#: GitHub keeps every individual call inside its own cap while the total runs far
+#: past 10s. These bound the whole lookup instead.
+#:
+#: The split leaves ~2.5s for everything else this hook does after the lookup
+#: (diff classification, marker reads, message rendering), all of it local.
+_COMMIT_HOOK_REGISTERED_TIMEOUT = 10.0
+_COMMIT_BUDGET_LOOKUP_SECONDS = 7.5
+
+
+def _branch_review_budget(
+    cwd: str | None,
+    branch: str | None,
+    *,
+    budget_seconds: float = _COMMIT_BUDGET_LOOKUP_SECONDS,
+) -> dict | None:
     """The current branch PR's shared budget; None means a proven no-open-PR.
 
     A read/import/identity failure is an ``unknown`` result, never the same as
-    no pull request. Tests select a PR with ``_TEST_REVIEW_BUDGET_PR`` and feed
-    the shared evaluator through its endpoint seams.
+    no pull request. So is running out of time: one aggregate deadline covers
+    every network call here, and exhausting it asks a human rather than letting
+    the harness kill the hook and allow the commit unchecked. Tests select a PR
+    with ``_TEST_REVIEW_BUDGET_PR`` and feed the shared evaluator through its
+    endpoint seams.
     """
     if not cwd or not branch:
         return _unknown_budget("commit_pr_identity_unknown")
+    deadline = time.monotonic() + budget_seconds
     try:
         import review_budget
     except Exception:  # noqa: BLE001 — reverse version skew asks/denies.
@@ -782,7 +805,9 @@ def _branch_review_budget(cwd: str | None, branch: str | None) -> dict | None:
         repo = os.environ.get("_TEST_REVIEW_BUDGET_REPO", "owner/repo")
         if not test_pr.isdigit():
             return _unknown_budget("commit_pr_identity_unknown")
-        result = review_budget.evaluate_pr(repo, test_pr)
+        result = review_budget.evaluate_pr(
+            repo, test_pr, budget_seconds=max(0.0, deadline - time.monotonic())
+        )
         result["pr"] = int(test_pr)
         result["repo"] = repo
         return result
@@ -799,7 +824,9 @@ def _branch_review_budget(cwd: str | None, branch: str | None) -> dict | None:
             cwd=cwd,
             capture_output=True,
             text=True,
-            timeout=8,
+            # Share the one deadline: a flat 8 here plus the evaluator's own
+            # serial calls is exactly what overran the harness window.
+            timeout=max(0.1, min(8.0, deadline - time.monotonic())),
             check=False,
         )
         if pr_read.returncode != 0:
@@ -810,7 +837,9 @@ def _branch_review_budget(cwd: str | None, branch: str | None) -> dict | None:
         if isinstance(identity, dict):
             return identity
         repo, number = identity
-        result = review_budget.evaluate_pr(repo, number)
+        result = review_budget.evaluate_pr(
+            repo, number, budget_seconds=max(0.0, deadline - time.monotonic())
+        )
         result["pr"] = number
         result["repo"] = repo
         return result

@@ -204,3 +204,199 @@ def test_evaluate_pr_rejects_head_change_during_fetch(monkeypatch):
     got = rb.evaluate_pr("owner/repo", 1, external_identity_templates=())
     assert got["status"] == "unknown"
     assert "head_changed_during_evaluation" in got["errors"]
+
+
+# ── aggregate lookup deadline ───────────────────────────────────────
+# The per-call caps are 6-8s each and run SERIALLY, so a degraded-but-not-dead
+# GitHub keeps every individual call inside its own cap while the total runs to
+# ~36s. The PreToolUse commit hook is registered for 10s and an overrun SIGKILLs
+# it -- which fails OPEN, letting the commit through with neither the budget
+# check nor the review-current and depth checks that follow it. These bind the
+# aggregate bound that prevents that.
+
+
+class _FakeClock:
+    """A monotonic clock the calls themselves advance. No sleeping."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _slow_runner(clock: _FakeClock, calls: list[tuple[str, float]]):
+    """A runner that consumes its FULL allotted timeout, as a stalled call does.
+
+    It SUCCEEDS. A failing runner is the wrong probe here: the first non-zero
+    return short-circuits to `unknown` after one call, so the serial sum this
+    deadline exists to bound is never exercised and the test passes with the
+    clamp deleted. VERIFY-RED caught exactly that. Each endpoint therefore
+    returns the minimal well-formed payload its parser accepts, so the lookup
+    runs the whole way through and the cost is the SUM of the calls.
+    """
+
+    def run(argv, *, timeout):
+        joined = " ".join(argv)
+        calls.append((" ".join(argv[:3]), timeout))
+        clock.now += timeout
+        if "headRefOid" in joined:
+            return 0, H5 + "\n", ""
+        if joined.endswith("/files") or "/files" in joined:
+            return 0, json.dumps({"path": "src/x.py"}) + "\n", ""
+        if "/commits" in joined:
+            return 0, "\n".join(json.dumps({"sha": h}) for h in (H1, H2, H3, H4, H5)) + "\n", ""
+        if "/reviews" in joined or "/comments" in joined:
+            return 0, "", ""
+        return 0, "", ""
+
+    return run
+
+
+def test_the_lookup_stops_at_its_aggregate_deadline():
+    """A stalled GitHub must not run the hook past its harness window.
+
+    Each call consumes its whole timeout here, which is what a hung connection
+    does. Without an aggregate bound the serial caps sum far past the 10s the
+    hook is registered for; with one, the lookup stops inside its budget and
+    reports `unknown` -- which asks a human and denies autonomous sessions,
+    the same as any other unreadable endpoint. Slow and unreadable are the same
+    outcome on purpose: in both the evidence did not arrive.
+    """
+    clock = _FakeClock()
+    calls: list[tuple[str, float]] = []
+    start = clock.now
+    result = rb.evaluate_pr(
+        "owner/repo",
+        "1",
+        runner=_slow_runner(clock, calls),
+        external_identity_templates=(),
+        budget_seconds=7.5,
+        monotonic=clock,
+    )
+    elapsed = clock.now - start
+    assert elapsed <= 7.5, f"the lookup ran {elapsed}s past a 7.5s budget: {calls}"
+    assert result["status"] == "unknown", result
+    # Denies an autonomous session and asks an interactive one.
+    assert result["approval_required"] is True
+    assert result["commit_approval_required"] is True
+    # No call may be issued with a timeout that would itself cross the deadline.
+    for argv, timeout in calls:
+        assert timeout <= 7.5, (argv, timeout)
+
+
+def test_no_deadline_leaves_every_call_at_its_own_cap():
+    """The control. `budget_seconds=None` is the default, and every non-hook
+    caller keeps the unbounded behaviour it had before -- a CLI or a merge gate
+    is not living under a 10s harness timeout, and clamping them would trade a
+    real answer for `unknown` at no benefit."""
+    clock = _FakeClock()
+    calls: list[tuple[str, float]] = []
+    rb.evaluate_pr(
+        "owner/repo",
+        "1",
+        runner=_slow_runner(clock, calls),
+        external_identity_templates=(),
+        monotonic=clock,
+    )
+    assert calls, "no call was issued at all"
+    # The first call keeps its own full cap rather than a clamped remainder.
+    assert calls[0][1] >= 6.0, calls
+
+
+def test_the_budget_is_not_spent_on_a_call_too_small_to_finish():
+    """Below the floor the lookup stops rather than issuing a doomed call.
+
+    A sub-second timeout cannot complete a TLS handshake plus a GitHub round
+    trip, so issuing it burns the rest of the budget to reach the same
+    `unknown` -- with the timeout landing INSIDE the caller's harness window
+    instead of before it.
+    """
+    clock = _FakeClock()
+    calls: list[tuple[str, float]] = []
+    rb.evaluate_pr(
+        "owner/repo",
+        "1",
+        runner=_slow_runner(clock, calls),
+        external_identity_templates=(),
+        budget_seconds=6.2,  # one 6s call, then 0.2s left -- below the floor
+        monotonic=clock,
+    )
+    assert len(calls) == 1, f"a doomed sub-floor call was issued: {calls}"
+
+
+def test_the_commit_hook_budget_fits_inside_its_registered_timeout():
+    """The number is not free-floating: it is derived from the registration.
+
+    `.claude/settings.json` is the authority for how long the harness allows
+    this hook, and the lookup budget must leave room for the local work that
+    follows it. Bumping one without the other is exactly how the overrun
+    appeared, so this reads BOTH and relates them.
+    """
+    import json
+    import sys as _sys
+
+    _sys.path.insert(0, str(_ROOT / "scripts"))
+    import review_enforcement_commit as rec
+
+    settings = json.loads((_ROOT / ".claude" / "settings.json").read_text())
+    registered = [
+        hook["timeout"]
+        for matcher in settings["hooks"]["PreToolUse"]
+        for hook in matcher.get("hooks", [])
+        if "review_enforcement_commit.py" in hook.get("command", "")
+    ]
+    assert registered, "the commit hook is not wired in settings.json"
+    assert float(registered[0]) == rec._COMMIT_HOOK_REGISTERED_TIMEOUT, (
+        f"the constant says {rec._COMMIT_HOOK_REGISTERED_TIMEOUT}s but settings.json "
+        f"registers {registered[0]}s -- one of them moved without the other"
+    )
+    assert rec._COMMIT_BUDGET_LOOKUP_SECONDS < rec._COMMIT_HOOK_REGISTERED_TIMEOUT, (
+        "the network budget must leave headroom for the local work after it"
+    )
+    headroom = rec._COMMIT_HOOK_REGISTERED_TIMEOUT - rec._COMMIT_BUDGET_LOOKUP_SECONDS
+    assert headroom >= 2.0, f"only {headroom}s left for diff classification and rendering"
+
+
+def test_every_paginated_read_asks_for_a_full_page_in_the_path():
+    """The page size must ride in the PATH, never as a `gh api -f` field.
+
+    Two separate defects, and the second is why this test exists rather than a
+    comment. First, gh defaults to 30 per page while the caps above tolerate 250
+    commits and 3000 files, so the default makes a large PR dozens of SERIAL
+    round trips under the commit hook's aggregate deadline.
+
+    Second, the obvious fix is wrong in a way that hides itself. MEASURED:
+    `gh api -f per_page=100` sends the value as a POST BODY field, which flips
+    the HTTP method -- every one of these reads returns
+    `{"message": "Not Found"}` and the whole lookup degrades to `unknown`,
+    FASTER than the healthy path. A gate that silently stops reading evidence
+    and returns sooner is the exact shape nobody notices, so the shape is
+    asserted here instead of trusted.
+    """
+    import ast
+
+    source = (_ROOT / "scripts" / "review_budget.py").read_text()
+    tree = ast.parse(source)
+    fn = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_evaluate_pr_inner"
+    )
+    paginated = 0
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.List):
+            continue
+        argv = [ast.unparse(e).strip("\"'") for e in node.elts]
+        if "--paginate" not in argv:
+            continue
+        paginated += 1
+        # -f / --raw-field / --field would flip the method to POST.
+        assert not any(a in ("-f", "--raw-field", "-F", "--field") for a in argv), (
+            f"a paginated read passes a body field, which makes it a POST: {argv}"
+        )
+        path = next((a for a in argv if "repos/" in a), "")
+        assert "per_page=" in path, (
+            f"a paginated read does not request a full page in its path: {path}"
+        )
+    assert paginated == 4, f"expected 4 paginated reads, found {paginated}"
+    assert rb._PAGE_SIZE == 100, "100 is the GitHub API maximum page size"

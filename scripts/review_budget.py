@@ -19,6 +19,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,14 @@ from typing import Any
 SCHEMA_VERSION = 1
 CODEX_REVIEW_BOT = "chatgpt-codex-connector[bot]"
 MAX_PR_COMMITS_RESPONSE = 250
+#: gh defaults to 30 per page, and the caps above tolerate far more than
+#: that — so the default turns a large PR into dozens of SERIAL round trips,
+#: which the commit hook then runs under one aggregate deadline. 100 is the
+#: API maximum. It goes in the PATH: `gh api -f` sends a POST body field and
+#: flips the method, which MEASURED returns 404 on every one of these reads
+#: and degrades the whole lookup to `unknown` — faster than the healthy path,
+#: which is exactly how it would go unnoticed.
+_PAGE_SIZE = 100
 MAX_PR_FILES_RESPONSE = 3000
 
 STANDING_REVIEWED_HEAD_LIMIT = 4
@@ -148,6 +157,11 @@ def confirmation_marker(head: str) -> str:
     if not _FULL_SHA_RE.fullmatch(normalized):
         raise ValueError("confirmation head must be a full 40-character SHA")
     return CONFIRMATION_MARKER_TEMPLATE.format(head=normalized)
+
+
+
+class _BudgetExhausted(Exception):
+    """The aggregate lookup budget ran out before this call could be issued."""
 
 
 def _unknown(*errors: str, current_head: str = "") -> dict[str, Any]:
@@ -362,15 +376,36 @@ def _json_lines(raw: str, source: str) -> tuple[list[dict[str, Any]] | None, str
     return rows, None
 
 
-def evaluate_pr(
+def _evaluate_pr_inner(
     repo: str,
     pr: int | str,
     *,
     external_identity_templates: Sequence[str] | None = None,
     runner: Runner = _default_runner,
     timeout_for: Callable[[float], float] | None = None,
+    budget_seconds: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
-    """Fetch and evaluate one PR.  Every failed endpoint yields ``unknown``."""
+    """Fetch and evaluate one PR.  Every failed endpoint yields ``unknown``.
+
+    ``budget_seconds`` caps the WHOLE lookup, not each call. The per-call caps
+    below are 6-8s each and run serially, so a degraded-but-not-dead GitHub can
+    keep every individual call inside its own cap while the total runs to ~36s.
+    A caller living under a harness timeout needs the aggregate bound instead:
+    the PreToolUse commit hook is registered for 10s, and an overrun SIGKILLs
+    it, which FAILS OPEN — the commit proceeds with neither this budget check
+    nor the review-current and depth checks that run after it.
+
+    Exhausting the budget yields ``unknown`` like any other unreadable endpoint,
+    which denies autonomous sessions and asks a human. Slow is treated as
+    unreadable on purpose: both mean the evidence did not arrive, and only the
+    reason differs.
+
+    Default is ``None`` — unbounded, the behaviour every non-hook caller had
+    before. ``monotonic`` is a seam so the deadline can be tested without
+    sleeping; it is monotonic rather than wall-clock so an NTP step cannot
+    expire or extend a live budget.
+    """
     if not repo or "/" not in repo or not str(pr).isdigit():
         return _unknown("invalid_pr_identity")
 
@@ -380,8 +415,19 @@ def evaluate_pr(
             return _unknown(config_error)
 
     timeout_for = timeout_for or (lambda seconds: seconds)
+    deadline = None if budget_seconds is None else monotonic() + budget_seconds
+    # A call given less than this cannot complete a TLS handshake plus a GitHub
+    # round trip, so issuing it would burn the remaining budget to arrive at the
+    # same `unknown` — with the timeout landing INSIDE the caller's harness
+    # window rather than before it.
+    floor = 0.75
 
     def run(argv: list[str], seconds: float) -> tuple[int, str, str]:
+        if deadline is not None:
+            remaining = deadline - monotonic()
+            if remaining < floor:
+                raise _BudgetExhausted
+            seconds = min(seconds, remaining)
         try:
             return runner(argv, timeout=timeout_for(seconds))
         except Exception:
@@ -415,7 +461,7 @@ def evaluate_pr(
             [
                 "gh",
                 "api",
-                f"repos/{repo}/pulls/{pr}/reviews",
+                f"repos/{repo}/pulls/{pr}/reviews?per_page={_PAGE_SIZE}",
                 "--paginate",
                 "--jq",
                 ".[] | {login: .user.login, commit_id: .commit_id, state: .state}",
@@ -427,7 +473,7 @@ def evaluate_pr(
             [
                 "gh",
                 "api",
-                f"repos/{repo}/issues/{pr}/comments",
+                f"repos/{repo}/issues/{pr}/comments?per_page={_PAGE_SIZE}",
                 "--paginate",
                 "--jq",
                 ".[] | {login: .user.login, type: .user.type, body: .body}",
@@ -439,7 +485,7 @@ def evaluate_pr(
             [
                 "gh",
                 "api",
-                f"repos/{repo}/pulls/{pr}/files",
+                f"repos/{repo}/pulls/{pr}/files?per_page={_PAGE_SIZE}",
                 "--paginate",
                 "--jq",
                 ".[] | {filename: .filename, previous_filename: .previous_filename}",
@@ -451,7 +497,7 @@ def evaluate_pr(
             [
                 "gh",
                 "api",
-                f"repos/{repo}/pulls/{pr}/commits",
+                f"repos/{repo}/pulls/{pr}/commits?per_page={_PAGE_SIZE}",
                 "--paginate",
                 "--jq",
                 ".[] | {sha: .sha}",
@@ -519,6 +565,20 @@ def evaluate_pr(
         changed_files=fetched["files"],
         external_identity_templates=external_identity_templates,
     )
+
+
+def evaluate_pr(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """`_evaluate_pr_inner`, with the aggregate-budget stop turned into a result.
+
+    The budget stop is an exception rather than a return code so it cannot be
+    mistaken for one endpoint failing: it must abandon the whole lookup, and a
+    sentinel return would have to be re-checked at every call site — which is
+    the shape that lets one missed check issue another 8-second call.
+    """
+    try:
+        return _evaluate_pr_inner(*args, **kwargs)
+    except _BudgetExhausted:
+        return _unknown("lookup_budget_exhausted")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
