@@ -3087,16 +3087,28 @@ class TestPrCiStatusSelfWorkflow:
         ]))
         assert guard_module._pr_ci_status("1") == ("absent", [])
 
-    def test_no_filter_without_actions(self, guard_module, monkeypatch):
-        # GITHUB_ACTIONS absent (interactive merge path): a check named after the
-        # gate's workflow is a normal rollup entry — byte-identical behaviour.
-        monkeypatch.setenv("GITHUB_WORKFLOW", "merge-gate")
+    def test_local_path_excludes_the_mirror_check(self, guard_module, monkeypatch):
+        # GITHUB_ACTIONS absent (interactive merge path): the advisory check is
+        # only a MIRROR of this gate's verdict, so it must never classify — a
+        # red mirror would double-count real blocks as `ci: red` and demand a
+        # spurious ci-override. Constant-name exclusion applies without the
+        # Actions env vars (conftest scrubs them for every hook test).
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": None,
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]))
+        assert guard_module._pr_ci_status("1") == ("green", [])
+
+    def test_local_path_excludes_ambient_workflow_entries(self, guard_module, monkeypatch):
+        # The constant workflow-name lane applies locally too: ambient runs of
+        # the merge-gate workflow carry workflowName="merge-gate".
         monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
         monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
             {"name": "genesis-merge-gate", "workflowName": "merge-gate",
              "status": "IN_PROGRESS", "conclusion": None},
         ]))
-        assert guard_module._pr_ci_status("1")[0] == "pending"
+        assert guard_module._pr_ci_status("1") == ("absent", [])
 
     def test_casefolded_workflow_match(self, guard_module, monkeypatch):
         # workflowName matching is case-insensitive, like the rest of the gate.
