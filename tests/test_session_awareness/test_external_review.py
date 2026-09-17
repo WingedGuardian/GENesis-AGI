@@ -1060,6 +1060,20 @@ class TestClosedEligibility:
         assert "no longer eligible" in summary["decisions"][0][2]
 
 
+    def test_unknown_draft_status_fails_closed(self):
+        """A payload that cannot say `isDraft: false` is treated as a draft —
+        the skip is cheap, the dispatch is not."""
+        ok, _ = er.eligibility(
+            {"number": 1, "headRefOid": HEAD, "isDraft": None,
+             "statusCheckRollup": [{"conclusion": "SUCCESS"}]},
+            already_reviewed=False,
+            comments_readable=True,
+            skip_drafts=True,
+            require_ci_green=True,
+        )
+        assert not ok
+
+
 class TestPreflightArgvTypes:
     def test_a_non_string_element_is_reported_not_raised(self):
         """' '.join([None]) raises TypeError — out of the fail-safe boundary."""

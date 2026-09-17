@@ -729,8 +729,11 @@ def eligibility(
     if already_reviewed:
         return False, f"already reviewed at head {head[:12]}"
 
-    if skip_drafts and pr.get("isDraft") is True:
-        return False, "draft"
+    if skip_drafts and pr.get("isDraft") is not False:
+        # Anything but a literal False fails CLOSED here: a payload that cannot
+        # say it is not a draft is treated as one, which costs a skip — never a
+        # dispatch on a field whose value nobody verified.
+        return False, "draft (or draft status unreadable)"
 
     state = str(pr.get("state") or "").upper()
     if state and state != "OPEN":
@@ -772,8 +775,8 @@ def prefilter(
     if len(head) != 40:
         return False, "head oid missing or malformed"
 
-    if skip_drafts and pr.get("isDraft") is True:
-        return False, "draft"
+    if skip_drafts and pr.get("isDraft") is not False:
+        return False, "draft (or draft status unreadable)"
 
     state = str(pr.get("state") or "").upper()
     if state and state != "OPEN":
