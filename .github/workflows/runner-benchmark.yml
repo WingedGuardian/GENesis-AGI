@@ -1,0 +1,630 @@
+name: Runner benchmark
+
+# An A/B of the test suite across runner providers, run ON DEMAND ONLY.
+#
+# WHY dispatch-only: the merge gate reads ANY red check as "CI red"
+# (`git_push_guard.py` `_ci_status`: `if red: return "red"`, not scoped to
+# required workflows). A benchmark attached to `push` or `pull_request` would,
+# the first time a provider hiccuped, mark EVERY open PR red and stop the queue.
+#
+# ⚠ `workflow_dispatch` does NOT make that impossible, and an earlier version of
+# this comment claimed it did ("attaches to nothing"). Check runs key by COMMIT
+# SHA, not by triggering event: dispatch this against a ref that is an open PR's
+# head and its check lands in that PR's rollup anyway, where a red arm blocks the
+# merge gate and a running arm stalls it. Dispatch-only removes the AUTOMATIC
+# path, not every path.
+#
+# So the job's conclusion is made robust instead of relying on that claim — see
+# `continue-on-error` on the pytest step. Residual, stated rather than implied: a
+# TIMEOUT or an infrastructure failure still fails the job, so do not dispatch
+# this against a branch that is an open PR's head. Genesis's own gate is the only
+# thing at risk — the native ruleset requires `test`, `leak-detector` and `lint`
+# by name, so a red benchmark cannot block GitHub's merge button.
+#
+# WHY both arms in ONE run rather than comparing against historical medians:
+# a median over 30 days mixes commits, dependency sets and queue conditions.
+# Running both arms on the same ref at the same moment controls the first two
+# outright, and the third only PARTLY — which is a correction to what this
+# comment used to claim. One run fixes when the RUN starts, not when each arm
+# is handed a machine; a capacity-constrained provider can make its arm wait
+# and the phase tables below, which begin after allocation, would never show
+# it. So allocation delay is measured per arm and reported beside the phases
+# rather than folded into them, and the compare job states the exclusion on
+# every run. The difference that remains inside the phases is the runner; the
+# end-to-end difference is that plus the allocation line.
+#
+# WHY run it TWICE to draw a conclusion: the vendor's own guidance is that the
+# first run shows hardware and the second shows cache. A single run measures
+# the cold case only, and reporting that as "the speedup" would understate a
+# cache-heavy provider and overstate a cold-fast one.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pytest_args:
+        description: >-
+          Extra args appended to pytest. Default is the full suite, matching
+          CI's `test` job. Narrow it (e.g. `tests/test_memory`) for a cheap
+          smoke of the harness itself before spending on a full run.
+        required: false
+        default: ""
+
+# A third-party runner executes this job on its own hardware, so state what it
+# receives rather than leaving it to be inferred: no `secrets.*` is referenced
+# anywhere below, and `permissions` is narrowed to `contents: read`, so the only
+# credential THIS RUN hands the provider is a read-scoped GITHUB_TOKEN. That is
+# the minimum a checkout needs and it cannot write to the repo. Widening these
+# permissions, or adding a secret, changes what an external provider holds — do
+# it deliberately, not as a side effect of adding a step.
+#
+# That bounds the per-job token and NOTHING ELSE. The provider's runners exist
+# because of a standing GitHub App installation on the account, which carries
+# its own separate grant that no line in this file constrains or describes. The
+# scope of that grant is a question for whoever owns the installation; it is not
+# answered here, and an earlier version of this comment read as though it were.
+permissions:
+  contents: read
+  # Read-only, and for exactly one call: the run's own `run_started_at`, which
+  # is what makes each arm's allocation delay measurable. There is no context
+  # property for it (see the capture step), so the API is the only source.
+  actions: read
+
+concurrency:
+  # Never let two benchmarks overlap: they would compete for the same cache
+  # and for a shared runner pool, which is precisely the variable this is
+  # trying to hold still. Queue rather than cancel — a cancelled arm yields
+  # no measurement, and an incomplete pair is worse than a late one.
+  group: runner-benchmark
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    name: ${{ matrix.arm.label }}
+    strategy:
+      # Both arms always run. Without this a failure in one arm cancels the
+      # other, and a pair with one side missing measures nothing.
+      fail-fast: false
+      matrix:
+        arm:
+          - label: github-4vcpu
+            runs-on: ubuntu-latest
+            expect_cpus: 4
+            expect_mem_gb: 16
+          # 4 vCPU on BOTH sides, and the earlier version of this file got it
+          # wrong in the flattering direction. It paired `ubuntu-latest` with
+          # `avrea-ubuntu-latest` (2 vCPU / 8 GB) and claimed the pair "isolates
+          # the HARDWARE and leaves machine size out of it". It does not:
+          # GitHub's standard `ubuntu-latest` is 4 CPU / 16 GB on PUBLIC
+          # repositories and 2 CPU / 8 GB only on private ones (GitHub's
+          # runners reference, read 2026-09-16). This repo is public, so that
+          # pairing handed the control arm twice the CPU and twice the RAM
+          # while asserting the sizes matched — the result would have been a
+          # real number measuring the wrong thing.
+          - label: avrea-4vcpu
+            runs-on: avrea-ubuntu-latest-4-vcpu
+            expect_cpus: 4
+            expect_mem_gb: 16
+    runs-on: ${{ matrix.arm.runs-on }}
+    # Bounds the blast radius of a single benchmark rather than the suite's
+    # legitimate worst case — CI's `test` job carries 180 for that reason and
+    # this is not that job. MEASURED baseline for the control arm: p50 29m22s,
+    # max 31m15s over 23 successful main runs (2026-09-06). 60 leaves roughly
+    # double the observed max and caps what one misbehaving run can spend.
+    timeout-minutes: 60
+    steps:
+      # The size match is VERIFIED here, not assumed from the label. A label is
+      # a request; this is what the provider actually handed us, and the two
+      # have already disagreed once — see the matrix comment. Refusing outright
+      # rather than warning, because a mismatched pair produces a real-looking
+      # number that answers a question nobody asked.
+      - name: Assert the runner is the size this arm claims
+        env:
+          EXPECT_CPUS: ${{ matrix.arm.expect_cpus }}
+          EXPECT_MEM_GB: ${{ matrix.arm.expect_mem_gb }}
+          ARM: ${{ matrix.arm.label }}
+        run: |
+          set -eu
+          cpus=$(nproc)
+          mem_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+          mem_gb=$(( mem_kb / 1024 / 1024 ))
+          printf '%s: %s vCPU, %s GB RAM\n' "$ARM" "$cpus" "$mem_gb"
+          {
+            printf '### %s runner\n\n' "$ARM"
+            printf -- '- detected: **%s vCPU**, **%s GB RAM**\n' "$cpus" "$mem_gb"
+            printf -- '- expected: %s vCPU, ~%s GB\n\n' "$EXPECT_CPUS" "$EXPECT_MEM_GB"
+          } >> "$GITHUB_STEP_SUMMARY"
+          fail=0
+          if [ "$cpus" -ne "$EXPECT_CPUS" ]; then
+            echo "::error::$ARM expected ${EXPECT_CPUS} vCPU, got ${cpus}."
+            fail=1
+          fi
+          # MEMORY IS ASSERTED TOO. An earlier version measured RAM, PRINTED it,
+          # and checked only the CPU count while the comment above claimed the
+          # machine-size match was verified — the same shape as the defect that
+          # produced this step (a claim of verification that verified less than
+          # it said). Memory pressure changes cache behaviour and therefore the
+          # thing being measured, so an unequal-RAM pair is not comparable even
+          # at equal CPU.
+          #
+          # A TOLERANCE, not equality: MemTotal reports usable RAM after the
+          # kernel's own reservations, so a nominal 16 GB box reports somewhat
+          # less and the exact shortfall differs by kernel and hypervisor. 2 GB
+          # absorbs that without admitting a genuinely different tier — the
+          # sizes above and below in both catalogues are 8 and 32.
+          low=$(( EXPECT_MEM_GB - 2 ))
+          if [ "$mem_gb" -lt "$low" ] || [ "$mem_gb" -gt "$EXPECT_MEM_GB" ]; then
+            echo "::error::$ARM expected ~${EXPECT_MEM_GB} GB RAM" \
+                 "(tolerating ${low}-${EXPECT_MEM_GB}), got ${mem_gb}."
+            fail=1
+          fi
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::The arms are not the same size, so any timing from" \
+                 "this run measures something other than the provider. Fix the" \
+                 "labels before treating it as a measurement."
+            exit 1
+          fi
+
+      # Every phase below is measured from HERE — which is AFTER a machine was
+      # allocated and after the size assertion above. Queue and startup time
+      # therefore sits outside every number this workflow prints, so a
+      # capacity-constrained provider can post the faster TABLE while delivering
+      # slower CI end to end. Putting both arms in one workflow equalises when
+      # the run STARTS; it does not equalise when each arm gets a machine.
+      #
+      # Measured rather than argued away: `github.run_started_at` is the run's
+      # own start, identical for both arms, so t0 minus that IS this arm's
+      # allocation delay. It is reported beside the phases and is deliberately
+      # NOT folded into them — the phase split answers "which part is faster",
+      # and allocation is not a part, it is the cost of getting to the parts.
+      - name: Record start
+        id: t0
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      # fetch-depth: 0 mirrors CI's `test` job, where it is load-bearing —
+      # measurement tests derive a rate from this repository's commit history
+      # and SKIP on a shallow clone. It is also a real part of the cost being
+      # measured, so shortening it here would flatter both arms unequally.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # This job only READS the tree, and one of its two arms runs on
+          # infrastructure outside GitHub's trust boundary — which is exactly
+          # the case ci.yml's read-only jobs already set this for. Persisted
+          # credentials otherwise sit in `.git/config` for every later step,
+          # and for the host, for no benefit.
+          persist-credentials: false
+
+      - name: Record post-checkout
+        id: t1
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Record post-install
+        id: t2
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      # The input is whitespace-separated simple arguments and nothing else.
+      # Constraining the FORMAT rather than parsing shell quoting is the
+      # deliberate choice: `-k 'foo or bar'` unquoted splits into fragments,
+      # pytest exits with a usage error in about a second, and — because the
+      # run step is continue-on-error — that near-instant exit would be
+      # reported as a timing. A benchmark that can present a usage error as a
+      # fast result is the failure mode this whole file is trying to avoid, so
+      # the input is refused up front instead.
+      - name: Validate extra pytest args
+        env:
+          PYTEST_ARGS: ${{ inputs.pytest_args }}
+        run: |
+          set -eu
+          case "$PYTEST_ARGS" in
+            *\'*|*\"*|*\\*|*\$*|*\`*)
+              echo "::error::pytest_args must be whitespace-separated simple" \
+                   "arguments — no quotes, backslashes, \$ or backticks." \
+                   "Quoted expressions like -k 'a or b' fragment on expansion" \
+                   "and pytest exits with a usage error that would be recorded" \
+                   "as a fast run. Pass -k a_or_b style selectors, or edit this" \
+                   "workflow to build a real argument array."
+              exit 1
+              ;;
+          esac
+
+      - name: Run tests
+        id: pytest
+        # `continue-on-error` so a failing suite cannot turn this JOB red.
+        # That matters because a red job reaches the PR rollup that Genesis's
+        # merge gate reads (see the header), and a benchmark must never be able
+        # to block a merge.
+        #
+        # It hides nothing: `steps.pytest.outcome` keeps the true result and the
+        # summary below prints it. An earlier version of this file refused
+        # `continue-on-error` on the grounds that it would "paint a red suite
+        # green" — that conflated two different things. What it suppresses is
+        # the job's CONCLUSION, which is a signal to other automation; the
+        # measurement, and the pass/fail report, are untouched.
+        continue-on-error: true
+        run: |
+          rm -f junit.xml
+          # PYTEST_ARGS arrives through `env`, never interpolated into this
+          # script. An Actions expression here would be substituted as TEXT
+          # before bash ever sees it, so a dispatch input containing shell
+          # metacharacters would execute — the standard Actions script
+          # injection. Through `env` the value is only ever data.
+          #
+          # This comment used to DEMONSTRATE the expression it warns about, and
+          # that was a parse error rather than an illustration: Actions
+          # evaluates expressions inside a `run` block before the shell sees a
+          # character of it, and a `#` buys nothing because bash never gets the
+          # chance to treat it as a comment. An empty expression is invalid, so
+          # a comment about injection safety was itself capable of stopping this
+          # workflow from running at all.
+          #
+          # Unquoted on purpose so several args split into several words;
+          # that is the whole point of the input. It also means globbing
+          # applies, which is harmless for a benchmark knob and is why this
+          # input is documented as "extra pytest args" rather than a path.
+          # shellcheck disable=SC2086
+          pytest -v --durations=25 \
+            --ignore-glob='**/test_*az*.py' \
+            --ignore-glob='**/test_*shim*.py' \
+            --ignore=tests/test_ui/ \
+            --junit-xml=junit.xml $PYTEST_ARGS
+        env:
+          GENESIS_TESTING: "1"
+          PYTEST_ARGS: ${{ inputs.pytest_args }}
+
+      - name: Record end
+        id: t3
+        if: ${{ always() }}
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      # Two arms are only comparable if they ran the SAME TESTS, and this suite
+      # has skip conditions keyed on the environment — root, GPG, Node, systemd
+      # tooling. A third-party image missing one of those turns those tests into
+      # SUCCESSFUL SKIPS, so the arm runs less work, finishes sooner, and stays
+      # green. "Faster" would then be measuring a smaller suite.
+      #
+      # ci.yml already guards its own suite against exactly this (the dormancy
+      # guard, two axes: collected and skipped). The benchmark wrote junit.xml
+      # and never opened it, which is the same omission one layer over.
+      - name: Capture test population
+        if: ${{ always() }}
+        env:
+          ARM: ${{ matrix.arm.label }}
+          T0: ${{ steps.t0.outputs.epoch }}
+          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess, sys, urllib.request
+          import xml.etree.ElementTree as ET
+          arm = os.environ["ARM"]
+
+          # ALLOCATION DELAY — measured here rather than at t0, because getting
+          # it needs an API call and t0 runs before checkout and before Python.
+          #
+          # There is NO `github.run_started_at` CONTEXT PROPERTY. An earlier
+          # revision of this file used one, and a reviewer caught it: the
+          # documented `github` context does not define it, and Actions
+          # evaluates a nonexistent property to an EMPTY STRING rather than
+          # failing — so every arm would have recorded "not measured", on every
+          # run, forever, and the summary would have read like a runner quirk
+          # instead of a bug. The value exists only on the RUN object in the
+          # REST API, which is why this costs a request and an `actions: read`
+          # scope.
+          #
+          # Why it matters at all: every phase below is timed from t0, which is
+          # after a machine was allocated. One workflow run fixes when the RUN
+          # starts, identically for both arms — not when each arm is handed a
+          # machine. So run_started_at is the common origin, and t0 minus it IS
+          # this arm's queue time.
+          def _alloc_delay():
+              t0 = os.environ.get("T0") or ""
+              if not t0.isdigit():
+                  return None
+              api = os.environ.get("GITHUB_API_URL") or "https://api.github.com"
+              repo = os.environ.get("GITHUB_REPOSITORY") or ""
+              run_id = os.environ.get("GITHUB_RUN_ID") or ""
+              token = os.environ.get("GH_API_TOKEN") or ""
+              if not (repo and run_id and token):
+                  return None
+              req = urllib.request.Request(
+                  f"{api}/repos/{repo}/actions/runs/{run_id}",
+                  headers={"Authorization": f"Bearer {token}",
+                           "Accept": "application/vnd.github+json",
+                           "User-Agent": "genesis-runner-benchmark"},
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      started = json.load(resp).get("run_started_at")
+              except Exception:  # noqa: BLE001 — a benchmark never fails on telemetry
+                  return None
+              if not isinstance(started, str) or not started:
+                  return None
+              from datetime import datetime
+              try:
+                  origin = datetime.fromisoformat(started.replace("Z", "+00:00"))
+              except ValueError:
+                  return None
+              # None, never 0, on every failure path above: 0 on both arms would
+              # compare EQUAL and read as "neither queued" — the
+              # agreement-from-absence failure this whole file exists to refuse.
+              return int(t0) - int(origin.timestamp())
+          p = pathlib.Path("junit.xml")
+          if not p.is_file():
+              # No report at all — record that rather than a zero, which would
+              # compare equal to another missing report and read as agreement.
+              pop = {"arm": arm, "readable": False}
+          else:
+              root = ET.parse(p).getroot()
+              suites = [root] if root.tag == "testsuite" else list(root)
+              # EVERY axis independently, not a single derived total. An earlier
+              # version compared only `collected - skipped`, which two arms can
+              # match while doing different work: environment-specific skips can
+              # offset, and a fast ERROR on one arm where the other PASSES leaves
+              # the executed count identical. A derived number hides exactly the
+              # disagreements it is being used to detect.
+              pop = {
+                  "arm": arm, "readable": True,
+                  "collected": sum(int(s.get("tests", 0)) for s in suites),
+                  "skipped": sum(int(s.get("skipped", 0)) for s in suites),
+                  "failures": sum(int(s.get("failures", 0)) for s in suites),
+                  "errors": sum(int(s.get("errors", 0)) for s in suites),
+              }
+              pop["executed"] = pop["collected"] - pop["skipped"]
+              # THE AXES ABOVE ARE COUNTS, AND COUNTS ARE ANONYMOUS. If one arm
+              # skips test X while the other skips test Y — plausible, since
+              # this suite's skips key on the environment (root, GPG, Node,
+              # systemd tooling) — every counter above stays equal while the
+              # arms ran different tests. Two rounds of review tightened the
+              # counters and the hole survived both, because it is not a
+              # counting bug: no aggregate can distinguish "same work" from
+              # "same amount of different work".
+              #
+              # So identity, not arithmetic: each case's file::class::name with
+              # its outcome, sorted, digested. Same digest means the two arms
+              # ran the same tests and reached the same verdicts. The per-case
+              # list is written beside it so a mismatch is diffable rather than
+              # merely reported.
+              def _status(case):
+                  for tag in ("failure", "error", "skipped"):
+                      if case.find(tag) is not None:
+                          return tag
+                  return "passed"
+              cases = sorted(
+                  "{}::{}::{}".format(
+                      c.get("file") or "", c.get("classname") or "", c.get("name") or ""
+                  )
+                  + " " + _status(c)
+                  for s in suites
+                  for c in s.iter("testcase")
+              )
+              pop["cases_count"] = len(cases)
+              pop["cases_sha256"] = hashlib.sha256(
+                  "\n".join(cases).encode()
+              ).hexdigest()[:16]
+              pathlib.Path(f"cases-{arm}.txt").write_text("\n".join(cases) + "\n")
+          pop["alloc_delay_s"] = _alloc_delay()
+          # Dependency identity. `pip install -e ".[test]"` resolves RANGES, and
+          # pip's default upgrade strategy is `only-if-needed` — so a package
+          # already present in a runner image that satisfies the range is KEPT.
+          # Two images therefore produce two dependency sets from one command,
+          # and a version difference in anything hot is a performance difference
+          # attributed to the provider. Captured rather than enforced: a lock
+          # file would change what CI measures, while a manifest lets the
+          # comparison say whether the sets actually matched.
+          # `pip list --format=freeze`, NOT `pip freeze`. This repo is installed
+          # EDITABLE, and MEASURED in this venv, `pip freeze` emits the install
+          # LOCATION rather than a version:
+          #     # Editable install with no version control (genesis-memory==0.1.0)
+          #     -e /tmp/genesis-memory
+          #     -e git+https://…@<40-hex sha>#egg=genesis_v3
+          # Two providers with different workspace paths therefore produce
+          # different digests with every package version identical, and the
+          # comparison would reject a perfectly valid benchmark — a FALSE
+          # mismatch, the mirror image of the false agreements this round fixed,
+          # and just as bad because it discards a good run. `pip list
+          # --format=freeze` reports `genesis-v3==3.0.0b18` with no location.
+          try:
+              freeze = subprocess.run(
+                  [sys.executable, "-m", "pip", "list", "--format=freeze"],
+                  capture_output=True, text=True, timeout=120)
+              # A NONZERO EXIT IS NOT A MANIFEST. `check=True` was absent, so a
+              # pip that died on malformed installed-package metadata returned
+              # normally and whatever partial — often empty — stdout it had
+              # produced got hashed. Two arms failing the same way then hash
+              # IDENTICALLY, and the comparison below reports matching
+              # dependency sets on the strength of two failures. That is the
+              # same shape as the missing-junit case, and it is why the round-2
+              # claim that this job "fails when a manifest could not be captured
+              # at all" was false: it only caught the exception path.
+              if freeze.returncode != 0:
+                  raise RuntimeError(
+                      f"pip freeze exited {freeze.returncode}: "
+                      f"{(freeze.stderr or '').strip()[:160]}"
+                  )
+              pkgs = sorted(l.strip() for l in freeze.stdout.splitlines() if l.strip())
+              pop["deps_count"] = len(pkgs)
+              pop["deps_sha256"] = hashlib.sha256("\n".join(pkgs).encode()).hexdigest()[:16]
+              pathlib.Path(f"deps-{arm}.txt").write_text("\n".join(pkgs) + "\n")
+          except Exception as exc:  # noqa: BLE001
+              pop["deps_sha256"] = None
+              pop["deps_error"] = str(exc)[:200]
+          pathlib.Path(f"population-{arm}.json").write_text(json.dumps(pop))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write(f"\npopulation: `{json.dumps(pop)}`\n")
+          PY
+
+      - name: Upload population
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: population-${{ matrix.arm.label }}
+          path: |
+            population-${{ matrix.arm.label }}.json
+            deps-${{ matrix.arm.label }}.txt
+            cases-${{ matrix.arm.label }}.txt
+          if-no-files-found: error
+
+      # A single total cannot tell a cache win from a CPU win, and those have
+      # different consequences: a cache win shrinks with a warm GitHub cache
+      # too, while a CPU win does not. The phase split is what makes the
+      # result actionable rather than merely favourable.
+      - name: Phase timings
+        if: ${{ always() }}
+        env:
+          T0: ${{ steps.t0.outputs.epoch }}
+          T1: ${{ steps.t1.outputs.epoch }}
+          T2: ${{ steps.t2.outputs.epoch }}
+          T3: ${{ steps.t3.outputs.epoch }}
+          ARM: ${{ matrix.arm.label }}
+          RUNS_ON: ${{ matrix.arm.runs-on }}
+          PYTEST_OUTCOME: ${{ steps.pytest.outcome }}
+        run: |
+          set -u
+          # A missing timestamp means the step before it never ran. Report the
+          # phase as unmeasured rather than computing a difference against an
+          # empty string, which would silently render as a plausible number.
+          phase() {
+            local name=$1 start=$2 end=$3
+            if [ -z "$start" ] || [ -z "$end" ]; then
+              printf '| %s | not measured |\n' "$name"
+            else
+              printf '| %s | %ds |\n' "$name" "$((end - start))"
+            fi
+          }
+          {
+            printf '### %s (`%s`)\n\n' "$ARM" "$RUNS_ON"
+            printf 'pytest outcome: **%s**\n\n' "$PYTEST_OUTCOME"
+            printf '| phase | duration |\n|---|---|\n'
+            phase 'checkout' "$T0" "$T1"
+            phase 'setup + install' "$T1" "$T2"
+            phase 'pytest' "$T2" "$T3"
+            phase 'total' "$T0" "$T3"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Whether the two timings are COMPARABLE is a separate question from whether
+  # the suite passed, and the two get opposite treatment on purpose.
+  #
+  # A red suite does not fail the bench job (`continue-on-error` on the run
+  # step): the tests failing is a fact about the code, not a defect in the
+  # measurement, and a red job would reach a PR rollup the merge gate reads.
+  #
+  # A population MISMATCH does fail this job, loudly. It means the arms ran
+  # different amounts of work, so any speed conclusion drawn from them is
+  # wrong — and a benchmark that reports an invalid measurement as valid is
+  # the one outcome worse than reporting nothing.
+  compare:
+    needs: bench
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: population-*
+          merge-multiple: true
+
+      - name: Compare test populations
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+          files = sorted(pathlib.Path().glob("population-*.json"))
+          pops = [json.loads(f.read_text()) for f in files]
+          cols = ("collected", "skipped", "failures", "errors", "executed")
+          lines = ["## Test population across arms\n",
+                   "| arm | " + " | ".join(cols) + " | cases | deps | alloc |",
+                   "|---|" + "---|" * (len(cols) + 3)]
+          for p in pops:
+              if p.get("readable"):
+                  cells = " | ".join(str(p.get(c, "?")) for c in cols)
+                  alloc = p.get("alloc_delay_s")
+                  lines.append(
+                      f"| {p['arm']} | {cells} | {p.get('cases_sha256') or 'n/a'} | "
+                      f"{p.get('deps_sha256') or 'n/a'} | "
+                      f"{'not measured' if alloc is None else str(alloc) + 's'} |"
+                  )
+              else:
+                  lines.append(f"| {p['arm']} |" + " no report |" * (len(cols) + 3))
+          problems = []
+          if len(pops) < 2:
+              problems.append(f"only {len(pops)} arm(s) reported a population; "
+                              "a comparison needs both")
+          unreadable = [p["arm"] for p in pops if not p.get("readable")]
+          if unreadable:
+              problems.append("no junit report from: " + ", ".join(unreadable))
+          # EVERY axis independently. Comparing only the derived `executed`
+          # count lets offsetting skips, or an ERROR on one arm against a PASS
+          # on the other, report "comparable" while the arms did different work.
+          readable = [p for p in pops if p.get("readable")]
+          for col in cols:
+              vals = {p.get(col) for p in readable}
+              if len(vals) > 1:
+                  problems.append(f"arms disagree on `{col}` {sorted(vals)} — "
+                                  "they did not do the same work")
+          # Dependency identity: pip resolves ranges against whatever the image
+          # already has, so one command can yield two dependency sets.
+          # Identity, above the counters. Equal counters with unequal digests is
+          # precisely the case no aggregate can see: the same AMOUNT of
+          # different work. Reported as its own problem so the summary says
+          # which kind of disagreement happened.
+          case_shas = {p.get("cases_sha256") for p in readable}
+          if None in case_shas:
+              problems.append("a per-testcase digest could not be computed, so "
+                              "the arms cannot be shown to have run the same tests")
+          elif len(case_shas) > 1:
+              problems.append("arms ran DIFFERENT tests or reached different "
+                              f"verdicts {sorted(s for s in case_shas if s)} — "
+                              "diff the cases-*.txt artifacts; equal counters "
+                              "here would have meant the same amount of "
+                              "different work, not the same work")
+          shas = {p.get("deps_sha256") for p in readable}
+          if None in shas:
+              problems.append("a dependency manifest could not be captured, so "
+                              "the sets cannot be shown to match")
+          elif len(shas) > 1:
+              problems.append("arms installed DIFFERENT dependency versions "
+                              f"{sorted(s for s in shas if s)} — compare the "
+                              "deps-*.txt artifacts; a version difference in "
+                              "anything hot is a speed difference this run "
+                              "would otherwise credit to the provider")
+          lines.append("")
+          lines.append("**comparable: NO**" if problems else "**comparable: yes**")
+          for p in problems:
+              lines.append(f"- {p}")
+          # SCOPE THE CONCLUSION, do not fail on it. A queue difference is a
+          # real property of a provider rather than a defect in the
+          # measurement, so it must not turn the job red — but the phase tables
+          # start after allocation, so leaving it unsaid lets a provider that
+          # is slower END TO END post the faster table. Stating it is what
+          # keeps "comparable: yes" a claim about the phases it measured.
+          allocs = {p["arm"]: p.get("alloc_delay_s") for p in pops}
+          known = {a: v for a, v in allocs.items() if v is not None}
+          lines.append("")
+          if len(known) < len(allocs) or not known:
+              lines.append("- NOTE: allocation delay was not measured on every "
+                           "arm, so the phase tables exclude an unknown amount "
+                           "of queue time on at least one of them.")
+          else:
+              spread = max(known.values()) - min(known.values())
+              lines.append(
+                  "- NOTE: every phase above is measured from AFTER a machine "
+                  "was allocated. Allocation delay was "
+                  + ", ".join(f"{a} {v}s" for a, v in sorted(known.items()))
+                  + f" (spread {spread}s), and is EXCLUDED from those phases. "
+                  "A conclusion about end-to-end CI has to add it back; a "
+                  "conclusion about the machines themselves should not."
+              )
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write("\n".join(lines) + "\n")
+          for p in problems:
+              print(f"::error::{p}")
+          sys.exit(1 if problems else 0)
+          PY

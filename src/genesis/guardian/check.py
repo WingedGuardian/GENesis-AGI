@@ -471,6 +471,16 @@ async def run_check(config: GuardianConfig | None = None) -> None:
     # failures this tick re-enqueue behind it. Best-effort; never blocks a check.
     await _drain_host_alert_queue(config, dispatcher)
 
+    # BEFORE the cycle, deliberately. _check_cycle can invoke DiagnosisEngine,
+    # which runs the host's `claude -p` with cc.timeout_s (default 3600s) — the
+    # SAME binary the guard-layer watch's host leg probes. Sequencing the watch
+    # after it would queue the detector behind the very operation whose failure it
+    # exists to detect: with the container down and that binary wedged, each
+    # observation the confirmation ladder needs could take an hour, so the alert
+    # arrives late or never in the exact outage it was built for. The watch takes
+    # no action and never touches the state machine, so running it first is free.
+    await _check_guard_layer_and_alert(config, dispatcher)
+
     try:
         await _check_cycle(config, sm, dispatcher, snapshots, diagnosis_engine, recovery_engine)
         # Snapshot lifecycle maintenance runs regardless of resulting state —
@@ -763,6 +773,21 @@ async def _check_container_git_and_alert(
         await check_container_git_and_alert(config, dispatcher)
     except Exception:
         logger.warning("git-health watch failed", exc_info=True)
+
+
+async def _check_guard_layer_and_alert(
+    config: GuardianConfig, dispatcher: AlertDispatcher,
+) -> None:
+    """Can the agent tooling still EVALUATE? ALERT-ONLY - this watch takes no action.
+
+    Lazy import (cycle avoidance) inside its own try/except, so a crash here can
+    never abort the tick or the watches after it.
+    """
+    try:
+        from genesis.guardian.guard_layer_watch import check_guard_layer_and_alert
+        await check_guard_layer_and_alert(config, dispatcher)
+    except Exception:
+        logger.warning("guard-layer watch failed", exc_info=True)
 
 
 async def _check_repo_bundle_and_alert(

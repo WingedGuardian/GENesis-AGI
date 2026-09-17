@@ -113,6 +113,50 @@ def get_or_create_internal_api_token() -> str:
     return tok
 
 
+# ── Machine-caller bearer auth for /v1/* surfaces ───────────────────
+#
+# ``_check_auth`` below exempts the whole ``/v1/*`` prefix from the dashboard
+# SESSION gate, deliberately: those routes serve machine callers that have no
+# browser session. That exemption is not an exemption from auth — each such
+# route enforces its own bearer check, and this is the one implementation they
+# share so a new ``/v1/*`` surface cannot quietly ship without one.
+
+
+def check_bearer_token(surface: str) -> tuple[str, int] | None:
+    """Validate a machine caller's ``Authorization: Bearer`` header.
+
+    Returns ``(error message, http status)`` on refusal, or ``None`` when the
+    caller is authorized.
+
+    Fail-closed: with no ``GENESIS_MCP_HTTP_TOKEN`` configured the surface
+    answers 503 rather than opening. These endpoints reach real authority —
+    CC invocation, memory writes, the voice graduation write — so
+    open-by-default is not acceptable even on a trusted overlay network.
+
+    ``surface`` names the caller in the 503 text only, so an operator who hits
+    a disabled endpoint learns which one to configure.
+    """
+    # .strip() matches get_dashboard_password() — a quoted "   " in secrets.env
+    # otherwise reads as a configured token that a blank credential satisfies.
+    token = os.environ.get("GENESIS_MCP_HTTP_TOKEN", "").strip()
+    if not token:
+        return (f"{surface} disabled: GENESIS_MCP_HTTP_TOKEN not configured", 503)
+
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return ("Missing or invalid Authorization header", 401)
+
+    # Compare BYTES: compare_digest refuses non-ASCII str operands, and WSGI
+    # decodes headers as latin-1 — so a header carrying any high byte raised
+    # TypeError and surfaced as a 500 with a stack trace per request. Still
+    # fail-closed, but a spammable 500 where a 401 belongs.
+    presented = auth_header[7:].encode("utf-8", "surrogateescape")
+    if not hmac.compare_digest(presented, token.encode("utf-8", "surrogateescape")):
+        return ("Invalid bearer token", 401)
+
+    return None
+
+
 def is_authenticated() -> bool:
     """Check if current request has a valid session."""
     if not get_dashboard_password():
