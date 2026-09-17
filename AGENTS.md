@@ -4,6 +4,15 @@ Cross-tool agent entry point (Codex, Cursor, OpenCode, …). The canonical
 project instructions live in **CLAUDE.md** — read it first; everything below
 is supplementary.
 
+## Codex external-client boundary
+
+Codex connects to Genesis through the project `.codex/config.toml` as an
+external MCP client. It can request Genesis capabilities on demand, but it is
+not a Genesis foreground or background session: never register its transcript,
+create a charter for it, send its identifiers to session tools, or add lifecycle
+hooks that make Genesis manage the conversation. See
+`.agents/skills/genesis-external-client/SKILL.md` when working through Codex.
+
 ## Code Review Mandate (adversarial)
 
 When reviewing a diff or PR (including automated PR review), review ADVERSARIALLY,
