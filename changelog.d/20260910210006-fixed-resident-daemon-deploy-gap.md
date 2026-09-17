@@ -3,8 +3,10 @@
   its backing script when something restarts it — and nothing did: not
   `update.sh`, not bootstrap, so a merged fix could run weeks late while the
   unit dutifully kept its pre-merge copy alive. `update.sh` now compares each
-  resident repo-script daemon's start time against its script's on-disk change
-  time and restarts the stale ones, on no-op runs too (a daemon left stale by
+  resident repo-script daemon's start time against the newest on-disk mtime
+  among its startup-loaded files (ExecStart script, libraries it sources at
+  start, and its rendered unit template) and restarts the stale ones, on
+  no-op runs too (a daemon left stale by
   an earlier pull must not stay stale just because today's merge brought
   nothing). The deploy-health snapshot gains the matching `stale_units`
   finding, so a daemon running pre-update code raises the standing

@@ -300,13 +300,17 @@ _guardian_redeploy_reason() {
 # restarted by _sync_deploy_targets when it is RUNNING code older than any
 # of its listed files (verified instance: tmp_watchgod ran a 7-week-old copy
 # for two weeks after its OOM-capture feature merged, leaving the one
-# instrument built to explain silent session deaths inert).
+# instrument built to explain silent session deaths inert). The rendered
+# unit template is listed too: a template-only change is met with
+# daemon-reload by bootstrap (scripts/bootstrap.sh renders + reloads, never
+# restarts), so the running daemon would keep its old directives until an
+# unrelated bounce.
 # DELIBERATELY EXCLUDED: genesis-code-intel-freeze — an operator-armed
 # kill switch whose whole guarantee is continuously HOLDING the index
 # locks; an auto-bounce would release them mid-freeze. Its code freshness
 # is the operator's re-arm. Keep in LOCKSTEP with deploy_health's
 # RESIDENT_UNIT_SCRIPTS (test-enforced).
-RESIDENT_UNIT_SCRIPTS="genesis-tmp-watchgod.service:scripts/tmp_watchgod.sh,scripts/lib/alert_queue.sh"
+RESIDENT_UNIT_SCRIPTS="genesis-tmp-watchgod.service:scripts/tmp_watchgod.sh,scripts/lib/alert_queue.sh,scripts/systemd/genesis-tmp-watchgod.service.template"
 
 _unit_restart_reason() {
     # Pure verdict: facts in → reason out (mirrors _guardian_redeploy_reason,
@@ -651,26 +655,55 @@ _sync_deploy_targets() {
         if [ -n "$_ru_start_ts" ] && [ "$_ru_start_ts" != "n/a" ]; then
             _ru_start_epoch=$(TZ=UTC date -d "$_ru_start_ts" +%s 2>/dev/null) || _ru_start_epoch=""
         fi
-        # Newest change across ALL the unit's startup-loaded files.
+        # Newest change across ALL the unit's startup-loaded files. One
+        # unreadable or future-dated file voids the WHOLE unit's verdict —
+        # deciding on the remaining paths would let a missing ExecStart
+        # read as unchanged while a newer library forced a restart on
+        # incomplete facts (fail direction: unreadable → no restart).
+        _ru_now=$(date +%s 2>/dev/null) || _ru_now=""
         _ru_script_epoch=""
+        _ru_unreadable=0
         for _ru_one in ${_ru_script//,/ }; do
             _ru_e=""
             _ru_e=$(stat -c %Y "$GENESIS_ROOT/$_ru_one" 2>/dev/null) || _ru_e=""
-            case "$_ru_e" in '' | *[!0-9]*) continue ;; esac
+            case "$_ru_e" in '' | *[!0-9]*) _ru_unreadable=1; break ;; esac
+            if [ -n "$_ru_now" ] && [ "$_ru_e" -gt "$_ru_now" ]; then
+                # Future-dated mtime (clock rollback, restored snapshot):
+                # arrival time untrustworthy → unit unjudgeable.
+                _ru_unreadable=1; break
+            fi
             if [ -z "$_ru_script_epoch" ] || [ "$_ru_e" -gt "$_ru_script_epoch" ]; then
                 _ru_script_epoch="$_ru_e"
             fi
         done
+        [ "$_ru_unreadable" = "1" ] && _ru_script_epoch=""
         _ru_reason=""
         _ru_reason=$(_unit_restart_reason "$_ru_active" "$_ru_start_epoch" "$_ru_script_epoch" "$_ru_unit") || _ru_reason=""
         if [ -n "$_ru_reason" ]; then
             echo "  $_ru_reason"
-            if ! systemctl --user restart "$_ru_unit" 2>/dev/null; then
+            # try-restart, not restart: closes the is-active→act race so an
+            # operator-stopped unit STAYS stopped — starting it is
+            # bootstrap's enablement decision, the same invariant the
+            # inactive-skip above encodes.
+            if ! systemctl --user try-restart "$_ru_unit" 2>/dev/null; then
                 echo "  WARNING: restart of $_ru_unit failed"
                 # Deploy-target alignment failure — accumulate like every
                 # other miss in this function, so update_history records a
                 # degraded deployment instead of a clean one.
                 HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}unit_restart_${_ru_unit%%.service}"
+            else
+                # LIVENESS, not the exit code: genesis-tmp-watchgod is
+                # Type=exec + Restart=always(10s), so a script that execs
+                # and dies parks the unit in activating(auto-restart)
+                # while `try-restart` exits 0 — install.sh:1327 already
+                # keys on is-active for exactly this reason (a healthy
+                # unit reads `active` immediately; the short settle only
+                # covers the exec→die window, overridable for tests).
+                sleep "${_RU_SETTLE_S:-3}" 2>/dev/null || true
+                if ! systemctl --user is-active --quiet "$_ru_unit" 2>/dev/null; then
+                    echo "  WARNING: $_ru_unit is not active after restart — still running old code or crash-looping"
+                    HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}unit_restart_${_ru_unit%%.service}"
+                fi
             fi
         fi
     done

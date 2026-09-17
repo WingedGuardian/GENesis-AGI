@@ -249,11 +249,56 @@ def test_stale_units_fresh_and_inactive_and_unreadable(tmp_path):
     assert collect_stale_units({"u.service": script}, probe=lambda u: (True, 3000.0)) == []
     # Inactive → never stale (starting it is bootstrap's decision).
     assert collect_stale_units({"u.service": script}, probe=lambda u: (False, None)) == []
-    # Unreadable start time → fail-open, not stale.
-    assert collect_stale_units({"u.service": script}, probe=lambda u: (True, None)) == []
-    # Missing script file → fail-open (None verdict for the unit is skipped).
+    # Unreadable start time on an ACTIVE unit → "could not determine",
+    # never a clean [] that resolves a live alert.
+    assert collect_stale_units({"u.service": script}, probe=lambda u: (True, None)) is None
+    # Missing script file → that unit is unjudgeable, skipped (no flag).
     gone = tmp_path / "missing.sh"
     assert collect_stale_units({"u.service": gone}, probe=lambda u: (True, 1000.0)) == []
+
+
+def test_stale_units_unreadable_sibling_voids_unit_verdict(tmp_path):
+    """External finding: one unreadable startup file must void the WHOLE
+    unit — the remaining readable paths must not force a verdict on
+    incomplete facts (a missing ExecStart + newer library shape)."""
+    root = tmp_path
+    gone = root / "missing.sh"
+    lib = root / "lib.sh"
+    lib.write_text("#!/bin/bash\n")
+    import os
+
+    os.utime(lib, (3000, 3000))
+    assert collect_stale_units(
+        {"u.service": (gone, lib)}, probe=lambda u: (True, 1000.0)
+    ) == []
+
+
+def test_stale_units_whole_second_precision(tmp_path):
+    """The systemd start timestamp is rendered only to whole seconds; a
+    fractional mtime in the SAME second must not read as newer (shell heal
+    truncates both via date +%s / stat -c %Y — the two verdicts must agree)."""
+    script = tmp_path / "w.sh"
+    script.write_text("#!/bin/bash\n")
+    import os
+
+    os.utime(script, (2000.9, 2000.9))
+    # Daemon started at 2000.9 → rendered epoch 2000. Without int() this
+    # compared 2000 < 2000.9 and flagged a fresh daemon stale forever.
+    assert collect_stale_units({"u.service": script}, probe=lambda u: (True, 2000.0)) == []
+
+
+def test_stale_units_future_dated_file_skips_unit(tmp_path):
+    """A future-dated mtime (clock rollback, restored snapshot) is
+    untrustworthy — the unit is skipped rather than flagged stale forever."""
+    import time
+
+    script = tmp_path / "w.sh"
+    script.write_text("#!/bin/bash\n")
+    import os
+
+    fut = int(time.time()) + 10**6
+    os.utime(script, (fut, fut))
+    assert collect_stale_units({"u.service": script}, probe=lambda u: (True, 1000.0)) == []
 
 
 def test_stale_units_probe_error_returns_none(tmp_path):

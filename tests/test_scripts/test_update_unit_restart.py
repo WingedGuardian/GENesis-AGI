@@ -153,12 +153,16 @@ def _run_block(
     script_exists: bool = True,
     lib_mtime: int | None = None,
     restart_fails: bool = False,
+    future_mtime: bool = False,
+    restart_crashloops: bool = False,
 ) -> tuple[str, list[str]]:
     """Run the extracted block against a stub systemctl + a real tmp script."""
     root = tmp_path / "root"
     (root / "scripts" / "lib").mkdir(parents=True)
+    (root / "scripts" / "systemd").mkdir(parents=True)
     script = root / "scripts" / "tmp_watchgod.sh"
     lib = root / "scripts" / "lib" / "alert_queue.sh"
+    template = root / "scripts" / "systemd" / "genesis-tmp-watchgod.service.template"
     import os
 
     if script_exists:
@@ -166,26 +170,43 @@ def _run_block(
         os.utime(script, (script_mtime, script_mtime))
     lib.write_text("#!/bin/bash\n")
     os.utime(lib, (lib_mtime if lib_mtime is not None else script_mtime,) * 2)
+    template.write_text("# template\n")
+    if future_mtime:
+        import time
+
+        fut = int(time.time()) + 10**6
+        os.utime(template, (fut, fut))
+    else:
+        os.utime(template, (script_mtime, script_mtime))
 
     calls = tmp_path / "systemctl.calls"
     calls.write_text("")
+    dead_marker = tmp_path / "unit_dead"
     stub_dir = tmp_path / "bin"
     stub_dir.mkdir()
     stub = stub_dir / "systemctl"
-    is_active_rc = "0" if active else "3"
+    # is-active: the probe reads `active`; after a try-restart that crashed
+    # the unit, the post-restart liveness recheck must see it inactive.
+    if restart_crashloops:
+        is_active_case = (
+            f'  *is-active*) [ -f "{dead_marker}" ] && exit 3 || exit {"0" if active else "3"} ;;\n'
+        )
+        restart_case = f'  *try-restart*) touch "{dead_marker}" ;;\n'
+    else:
+        is_active_case = f'  *is-active*) exit {"0" if active else "3"} ;;\n'
+        restart_case = '  *try-restart*) exit 1 ;;\n' if restart_fails else ""
     show_line = (
         "  *ExecMainStartTimestamp*) exit 1 ;;\n"
         if show_fails
         else f'  *ExecMainStartTimestamp*) echo "$(date -d @{start_epoch} "+%a %F %T %Z")" ;;\n'
     )
-    restart_line = '  *" restart "*) exit 1 ;;\n' if restart_fails else ""
     stub.write_text(
         "#!/bin/bash\n"
         f'echo "$*" >> "{calls}"\n'
         'case "$*" in\n'
-        f'  *is-active*) exit {is_active_rc} ;;\n'
+        + is_active_case
         + show_line
-        + restart_line
+        + restart_case
         + "esac\n"
         "exit 0\n"
     )
@@ -196,7 +217,8 @@ def _run_block(
         "set -euo pipefail\n"
         f'PATH="{stub_dir}:$PATH"\n'
         f'GENESIS_ROOT="{root}"\n'
-        'RESIDENT_UNIT_SCRIPTS="genesis-tmp-watchgod.service:scripts/tmp_watchgod.sh,scripts/lib/alert_queue.sh"\n'
+        "_RU_SETTLE_S=0\n"
+        'RESIDENT_UNIT_SCRIPTS="genesis-tmp-watchgod.service:scripts/tmp_watchgod.sh,scripts/lib/alert_queue.sh,scripts/systemd/genesis-tmp-watchgod.service.template"\n'
         + _extract_func(text, "_unit_restart_reason")
         + "\n"
         + "HOST_CC_DEGRADED=\"\"\n"
@@ -259,3 +281,42 @@ class TestRestartLoop:
     def test_inactive_unit_not_started(self, text: str, tmp_path: Path) -> None:
         _out, calls = _run_block(text, tmp_path, active=False, start_epoch=1000, script_mtime=2000)
         assert not any("restart" in c for c in calls), calls
+
+    def test_missing_main_script_never_restarts_on_partial_facts(self, text: str, tmp_path: Path) -> None:
+        """External finding: an unreadable ExecStart must void the unit's
+        whole verdict — a newer readable LIBRARY must not restart on
+        incomplete freshness facts."""
+        out, calls = _run_block(
+            text, tmp_path, active=True, start_epoch=1000, script_mtime=2000,
+            script_exists=False, lib_mtime=3000,
+        )
+        assert "RC=0" in out
+        assert not any("restart" in c for c in calls), calls
+
+    def test_future_dated_file_never_restarts(self, text: str, tmp_path: Path) -> None:
+        """A future-dated mtime (clock rollback, restored snapshot) is
+        untrustworthy like an unreadable one — skip the unit."""
+        out, calls = _run_block(
+            text, tmp_path, active=True, start_epoch=1000, script_mtime=2000,
+            future_mtime=True,
+        )
+        assert "RC=0" in out
+        assert not any("restart" in c for c in calls), calls
+
+    def test_restart_uses_try_restart(self, text: str, tmp_path: Path) -> None:
+        """try-restart preserves an operator-stopped unit across the
+        is-active→act race (external finding)."""
+        _out, calls = _run_block(text, tmp_path, active=True, start_epoch=1000, script_mtime=2000)
+        assert any("try-restart genesis-tmp-watchgod.service" in c for c in calls), calls
+        assert not any("--user restart" in c for c in calls), calls
+
+    def test_crashlooping_restart_marks_degraded(self, text: str, tmp_path: Path) -> None:
+        """try-restart exits 0 while the unit sits in activating
+        (auto-restart) — the post-restart liveness check must turn that
+        into a degraded deployment, not a clean one (external finding)."""
+        out, calls = _run_block(
+            text, tmp_path, active=True, start_epoch=1000, script_mtime=2000,
+            restart_crashloops=True,
+        )
+        assert any("try-restart genesis-tmp-watchgod.service" in c for c in calls), calls
+        assert "unit_restart_genesis-tmp-watchgod" in out

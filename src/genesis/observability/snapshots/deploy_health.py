@@ -79,7 +79,10 @@ GUARDIAN_HOST_PATHS = (
 # Resident daemons whose ExecStart is a repo script — keep in LOCKSTEP with
 # update.sh RESIDENT_UNIT_SCRIPTS (the restart heal; test-enforced). Values
 # are EVERY startup-loaded repo-relative file (ExecStart script + libraries
-# it sources at start), resolved against repo_root() at collection time.
+# it sources at start + the rendered unit template — a template-only change
+# gets daemon-reload from bootstrap, no restart, so the running daemon would
+# keep its old directives until an unrelated bounce), resolved against
+# repo_root() at collection time.
 # Timer-fired oneshots re-exec their script every tick and are immune;
 # genesis-server/bridge have their own restart handling in update.sh;
 # genesis-code-intel-freeze is deliberately excluded (operator-armed kill
@@ -88,6 +91,7 @@ RESIDENT_UNIT_SCRIPTS = {
     "genesis-tmp-watchgod.service": (
         "scripts/tmp_watchgod.sh",
         "scripts/lib/alert_queue.sh",
+        "scripts/systemd/genesis-tmp-watchgod.service.template",
     ),
 }
 
@@ -213,27 +217,51 @@ def collect_stale_units(
     its listed files (mtime = when the code arrived on THIS install; a commit
     timestamp is authored upstream and misses the started-between-commit-and-
     pull window; multiple files because a daemon sources libraries once at
-    start). Unreadable facts fail open per unit (skip, never flag); a broken
-    probe returns ``None`` — "could not determine", never a clean empty
-    (fail-closed data-access doctrine: an outage must not masquerade as
-    health)."""
+    start). An unreadable or future-dated file mtime makes the whole unit
+    unjudgeable — skip it rather than decide on partial facts (a skipped
+    file would let a missing ExecStart read as "no change" while a newer
+    library forced a verdict). An ACTIVE unit whose start timestamp cannot
+    be read is likewise unjudgeable: when nothing else is stale the result
+    is ``None`` — "could not determine" — never a clean empty (fail-closed
+    data-access doctrine: an outage must not masquerade as health)."""
     probe_fn = probe or _probe_unit
+    now_ts = _utcnow().timestamp()
     try:
         stale: list[str] = []
+        unknown = False
         for unit, scripts in unit_scripts.items():
             active, start_epoch = probe_fn(unit)
-            if not active or start_epoch is None:
+            if not active:
+                continue
+            if start_epoch is None:
+                unknown = True
                 continue
             paths = (scripts,) if isinstance(scripts, (str, Path)) else scripts
             newest = None
+            unreadable = False
             for script in paths:
                 try:
                     m = Path(script).stat().st_mtime
                 except OSError:
-                    continue
+                    unreadable = True
+                    break
+                if m > now_ts:
+                    # Future-dated mtime (clock rollback, restored snapshot):
+                    # the file's arrival time is untrustworthy, so the unit
+                    # cannot be judged — same fail direction as unreadable.
+                    unreadable = True
+                    break
                 newest = m if newest is None else max(newest, m)
-            if newest is not None and start_epoch < newest:
+            if unreadable:
+                continue
+            # Whole-second comparison, mirroring update.sh's `date +%s` /
+            # `stat -c %Y`: the systemd timestamp is rendered only to whole
+            # seconds, so a fractional mtime in the same second must not
+            # read as newer than the daemon's start.
+            if newest is not None and start_epoch < int(newest):
                 stale.append(unit)
+        if not stale and unknown:
+            return None
         return sorted(stale)
     except Exception:
         logger.debug("deploy_health: stale-unit probe failed", exc_info=True)
