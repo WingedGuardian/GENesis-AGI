@@ -775,6 +775,14 @@ def _preflight(cfg: dict[str, Any], mode: str, *, repo_override: str | None = No
         # guarantee in the audit row.
         if "{workflow}" not in joined:
             return "orchestrator.argv must contain {workflow} — the allowlist cannot bind the child without it"
+        # {pr} and {head} are the dispatch's identity. Without {pr} the same
+        # untargeted command launches for every pull request; without {head} the
+        # child resolves HEAD itself and can review a commit pushed after the
+        # green-CI decision while the audit row records the one that authorised
+        # it. Both are unconditional — they bind per-run state, not the repo.
+        for ph in ("{pr}", "{head}"):
+            if ph not in joined:
+                return f"orchestrator.argv must contain {ph} — the dispatch would not be bound to the PR and commit that authorised it"
         # A --repo override changes which repository supplies the pull requests. The
         # child otherwise resolves the repository from its own working directory, so
         # without {repo} it would review the same-numbered PR in the wrong place.

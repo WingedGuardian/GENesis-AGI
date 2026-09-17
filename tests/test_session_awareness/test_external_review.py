@@ -51,7 +51,7 @@ def _cfg(**over):
         "mode": "dry_run",
         "orchestrator": {
             "command": "true",  # a real, always-present executable
-            "argv": ["{workflow}", "{pr}"],
+            "argv": ["{workflow}", "{pr}", "{head}"],
             "workflow": WORKFLOW,
             "allow_workflows": [WORKFLOW],
             "report_marker": MARKER,
@@ -233,9 +233,9 @@ class TestDispatchScope:
 class TestBuildArgv:
     def test_substitutes_workflow_and_pr(self):
         block = _cfg()["orchestrator"]
-        argv = er.build_argv(block, workflow=WORKFLOW, pr=42)
+        argv = er.build_argv(block, workflow=WORKFLOW, pr=42, head=HEAD)
         assert argv is not None
-        assert argv[1:] == [WORKFLOW, "42"]
+        assert argv[1:] == [WORKFLOW, "42", HEAD]
 
     def test_non_list_argv_is_refused(self):
         block = dict(_cfg()["orchestrator"], argv="run {pr}")
@@ -716,6 +716,18 @@ class TestWorkOrderDispatch:
         cfg = _cfg(mode="live")
         cfg["orchestrator"] = dict(cfg["orchestrator"], argv=["run", "{pr}"])
         assert "{workflow}" in er._preflight(cfg, "live")
+
+    def test_live_requires_pr_and_head_in_the_template(self):
+        """Without {pr} the same untargeted command fires for every pull request;
+        without {head} the child re-resolves HEAD after the decision that
+        authorised a specific commit."""
+        cfg = _cfg(mode="live")
+        for argv, needle in (
+            (["{workflow}", "{head}"], "{pr}"),
+            (["{workflow}", "{pr}"], "{head}"),
+        ):
+            cfg["orchestrator"] = dict(cfg["orchestrator"], argv=argv)
+            assert needle in er._preflight(cfg, "live")
 
     def test_repo_override_requires_repo_in_the_template(self):
         """A --repo override with no {repo} would review the same-numbered PR in the
