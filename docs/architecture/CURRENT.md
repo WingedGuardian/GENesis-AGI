@@ -1313,6 +1313,31 @@ verified: 84c7259d 2026-08-31
   monitors the host Guardian every awareness tick, incl. git-SHA code-drift
   detection). Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
+- **guard-layer watch** (`guardian/guard_layer_watch.py`, a SIDE-watch in
+  `run_check`, not a `probe_*`): asks whether the AGENT TOOLING can still
+  evaluate — the `genesis-hook` LAUNCHER end to end, the container venv
+  interpreter, `hook_input` / `shell_parse` importability, container `node`, and
+  the host's own `cc.path` binary (probed as the CONSUMER `diagnosis.py` launches,
+  not as `node --version`, so a PATH failure is a true positive rather than a
+  false one). Host-side by necessity: a broken guard layer bricks CC sessions, and
+  the container-side Sentinel is itself a CC call site, so it would dispatch into
+  the same broken tooling (`sentinel/remediation_map.py` `UNMAPPED_BY_DESIGN`
+  encodes that reasoning independently). Deliberately NOT a `probe_*`:
+  `SignalResult` carries no severity, so every probe feeds the confirmation ladder
+  into `RecoveryEngine.execute` — a broken hook file must never be able to trigger
+  `RESTART_CONTAINER`. Two polarities motivate it: an unimportable `hook_input`
+  fails CLOSED (Bash refused, loud), while a dead launcher or venv makes
+  `genesis-hook` exit non-2, which Claude Code treats as non-blocking, so every
+  guard is silently OFF while Bash keeps working — the quiet one nothing else
+  reports. **ALERT-ONLY, by decision rather than omission.** A draft carried one
+  automatic repair verb; an adversarial audit REPRODUCED two ways it destroyed
+  work (`git checkout HEAD -- <file>` overwrites the index, losing staged content
+  recoverable only via `git fsck`; mid-merge it clears the conflict stages and
+  silently resolves to ours while `MERGE_HEAD` remains) and showed its dirty/clean
+  signal failed OPEN, since `git diff --quiet` is tri-state and both error codes
+  read as the value that authorised the write. Detection shipped alone; the repair
+  verb is tracked separately. A test asserts the module defines no repair function
+  and no executed payload carries a mutating git verb.
 - **autonomy zombie-scheduler watchdog** (`autonomy/watchdog.py`, run out-of-process
   by `genesis-watchdog.timer` every 300s via `watchdog_runner.py`; distinct from the
   container `watchdog.py` above): reads `~/.genesis/status.json` (written by the runtime's
