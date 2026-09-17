@@ -1013,6 +1013,33 @@ class TestSettingsStructure:
         matchers = [h.get("matcher") for h in settings["hooks"]["PreToolUse"]]
         assert "WebFetch" in matchers
 
+    @pytest.mark.parametrize("tool", ["EnterPlanMode", "ExitPlanMode"])
+    def test_the_plan_confidence_reminder_is_wired(
+        self, settings: dict, tool: str
+    ) -> None:
+        """Built is not wired. The hook's own tests all pass with the
+        settings.json entry deleted, so nothing else in the suite would notice a
+        rebase or a merge conflict dropping it -- and the failure is silent, since
+        a hook that is not wired simply never speaks.
+
+        BOTH tools are asserted, and EnterPlanMode is the load-bearing half: it is
+        the only moment at which the reminder can reach the plan the user is about
+        to read. Dropping it back to ExitPlanMode alone would restore the exact
+        wrong-moment defect this hook was rebuilt to fix, and a matcher naming one
+        tool would still pass a test that only looked for the other.
+        """
+        entries = [
+            e for e in settings["hooks"]["PreToolUse"]
+            if tool in (e.get("matcher") or "").split("|")
+        ]
+        assert entries, f"no PreToolUse entry matches {tool}"
+        commands = " ".join(
+            h.get("command", "") for e in entries for h in e.get("hooks", [])
+        )
+        assert "hooks/plan_confidence_reminder.py" in commands, (
+            f"the {tool} PreToolUse entry does not run plan_confidence_reminder.py"
+        )
+
     def test_bash_hook_is_command(self, settings: dict) -> None:
         """Bash hooks are type=command (inline bash -c or Python script)."""
         for entry in settings["hooks"]["PreToolUse"]:

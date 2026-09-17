@@ -59,8 +59,46 @@ from fnmatch import fnmatch
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import brace_expand, read_payload, run_guard, tool_input  # noqa: E402
-from shell_parse import analyze_checked  # noqa: E402
+try:
+    from hook_input import (  # noqa: E402
+        brace_expand,
+        degraded_exit,
+        read_payload,
+        run_guard,
+        tool_input,
+    )
+except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must block.
+    if __name__ != "__main__":
+        raise
+    # Reverse version skew: this guard may be newer than hook_input.py. Nothing
+    # imported from that older helper can recover us, so fail closed locally. Do
+    # not render the exception — even __str__ can raise — and use os._exit so a
+    # broken diagnostic stream cannot replace exit 2 during interpreter shutdown.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (protected_paths_guard): shared hook_input is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
+
+# Gated-operation pattern for the DEGRADED path. Defined ABOVE the guarded import
+# ON PURPOSE: it must still be bound when the import below is the one that failed.
+# Deliberately the same two verbs as `_RM_PATTERN` further down — kept as a separate
+# literal rather than shared, because sharing would put the constant after the import
+# it has to survive.
+_DEGRADED_GATED = r"\brm\b|\brmdir\b"
+
+try:
+    from shell_parse import analyze_checked  # noqa: E402
+except Exception as _exc:  # noqa: BLE001 — see degraded_exit: exit 1 is a FAIL-OPEN.
+    if __name__ != "__main__":
+        # A test importing a deliberately broken tree must see the real error, not a
+        # process exit. Only the live hook invocation degrades.
+        raise
+    degraded_exit("protected_paths_guard", gated=_DEGRADED_GATED, exc=_exc)
 
 try:  # noqa: E402
     import discarded_write
@@ -279,11 +317,64 @@ def main() -> int:
                 f"an rm command that {blind.cause}, so its real targets cannot be "
                 f"resolved. To proceed: {blind.hint}"
             )
-        # `untokenizable` keeps the pre-existing substring fallback, unchanged. It is
-        # not a bound this change introduced, and widening it here would newly refuse
-        # ordinary work under cover of a regression fix.
+        # The substring fallback ADDS to the precise scan below; it does not replace
+        # it, and the missing `else` here used to be a fail-open.
+        #
+        # The comment this replaces said the fallback was kept "unchanged" so as not
+        # to "newly refuse ordinary work". True of the fallback itself, and it missed
+        # what the early RETURN did: any non-bounds blind spot skipped the segment
+        # scan entirely, downgrading this guard to a test the comment 25 lines above
+        # already calls STRICTLY WEAKER — precisely on the ANCESTOR and GLOB shapes
+        # it lists, which a substring test structurally cannot see.
+        #
+        # That was latent while `untokenizable` was the only non-bounds cause. It
+        # stopped being latent when shell_parse gained a second one: MEASURED
+        # base-vs-branch through this guard, `<a command whose verb the shell
+        # builds> && rm -rf ~/genesis` — the PARENT of the protected production
+        # database — went BLOCK -> ALLOW, because the concealed verb raised a blind
+        # spot and the blind spot skipped the scan that catches an ancestor.
+        #
+        # Falling through is safe in the direction that matters: the scan can only
+        # ADD refusals, and it runs on segments that tokenized fine (the bounds
+        # branch above has already returned for the case where there are none).
+        # MEASURED over 129,179 real commands: 1,697 mention rm, 68 of those reach
+        # this branch at all, and 0 change verdict.
         reason = _legacy_substring_block(cmd, dirs, f"that {blind.cause}. To proceed: {blind.hint}")
-        return _block(reason) if reason else 0
+        if reason:
+            return _block(reason)
+
+        # THE FALL-THROUGH APPLIES TO `untokenizable` TOO, DELIBERATELY, AND THE
+        # OVER-BLOCK IT CAUSES IS THE PRICE. Both directions were measured, because
+        # each reviewer who looked at this saw only one of them.
+        #
+        # An unreadable parse makes the fallback segments unreliable in BOTH
+        # directions, and the two costs are not comparable:
+        #
+        #   * segment INVENTED. A `printf` of one quoted argument that merely
+        #     CONTAINS rm-shaped prose runs nothing, yet the naive split emits an
+        #     `rm` segment naming a protected path. Falling through refuses it.
+        #     Cost: a refused `printf`, rephrase and move on.
+        #   * segment REAL. An `rm -rf` of a protected ancestor placed BEFORE the
+        #     construct the tokenizer cannot read — bash runs the removal. The
+        #     substring check cannot see an ancestor or a glob spelling, so an early
+        #     return here ALLOWS it. Cost: the production database's parent
+        #     directory, irreversibly.
+        #
+        # MEASURED, three constructed removals of that parent (two spellings plus a
+        # glob) against one benign `printf`:
+        #
+        #     with the early return   3 real removals ALLOWED, prose allowed
+        #     falling through         3 real removals BLOCKED, prose refused
+        #
+        # So this is not "scan or do not scan", it is which error to make when the
+        # command cannot be read, and for the guard standing in front of the
+        # database it is not close. The BOUNDS branch above already refuses outright
+        # on the same reasoning, and this module's docstring already says the
+        # fallback is weakest exactly where the command is most destructive.
+        #
+        # An earlier revision took the other side, having measured only the invented
+        # case. Recorded here because the shape recurs: a rate measured on one side
+        # of a trade-off reads as a clean result and is half a measurement.
 
     cwd = payload.get("cwd") if isinstance(payload, dict) else None
     for seg in segs:
