@@ -54,6 +54,23 @@ def _fresh_proactive_writer():
 
 
 @pytest.fixture(autouse=True)
+def _scrub_actions_self_workflow(monkeypatch):
+    """Delete the Actions job-identity vars for EVERY hook test.
+
+    ``_pr_ci_status`` drops rollup entries from the RUNNING workflow when it
+    detects ``GITHUB_ACTIONS``+``GITHUB_WORKFLOW`` (the self-exclusion that keeps
+    the gate's own check-run from deadlocking on itself, issue #1670). Hook
+    tests run INSIDE the repo's CI workflow, where that pair means "CI" — so a
+    fixture rollup carrying ``workflowName: "CI"`` would be filtered out by the
+    very env the test cannot see, and green/absent verdicts would flip on the
+    Actions environment and nowhere else. Scrub them: tests for the exclusion
+    setenv the pair themselves and win. Local runs had neither var → unchanged."""
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("GITHUB_WORKFLOW", raising=False)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _pin_required_ci_workflows(monkeypatch):
     """Pin the merge gate's required-CI-workflow identity policy to the shipped
     default ("CI") for EVERY hook test. The required set is config-driven from the

@@ -1,0 +1,111 @@
+name: merge-gate
+
+# Issue #1670 phase 1 — run the local merge gate (`git_push_guard.py --check-pr`)
+# as a GitHub check, so the same report every install produces at merge time is
+# produced server-side for every PR and every reviewer comment.
+#
+# ADVISORY ONLY. This check is NOT in .github/rulesets/checks.json — it reports
+# red/green but blocks nothing. Promotion to required_status_checks is a
+# separate step that must happen only after this check has run advisory long
+# enough to measure its false-block rate (see "promotion" at the bottom).
+#
+# Why the workflow is named `merge-gate` and not `CI`: `_pr_ci_status` treats
+# `workflowName` "CI" as the required-workflow identity, and under Actions the
+# gate drops entries for ITS OWN workflow (GITHUB_WORKFLOW) from the rollup so
+# the check can never vouch for or block on itself. Keeping the name distinct
+# keeps the required-CI check AND the self-exclusion exact.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  # Review submissions and comments carry the gate's inputs (Codex/cross-review
+  # findings, scheduled-review markers, override sigils) — re-evaluate when they
+  # land so the check reflects the newest review state on the same head.
+  pull_request_review:
+    types: [submitted, dismissed]
+  issue_comment:
+    types: [created, edited]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number to evaluate
+        required: true
+        type: number
+
+# Read-only by construction: the gate classifies GitHub state (checks, reviews,
+# comments, mergeability) and never writes. No write scopes exist to grant.
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  checks: read
+  statuses: read
+
+# Latest event wins — a stale run evaluating an older review state reports a
+# verdict nobody should read.
+concurrency:
+  group: merge-gate-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  genesis-merge-gate:
+    # issue_comment fires on issues too — only run when it's a PR comment.
+    if: >-
+      github.event_name != 'issue_comment' ||
+      github.event.issue.pull_request != null
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Resolve PR number
+        id: pr
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr }}
+        run: echo "number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the PR's own gate
+        uses: actions/checkout@v7
+        with:
+          # Evaluate with the guard version the PR ships, not base's — a PR that
+          # changes the gate is judged by its own rules (hook-surface PRs get
+          # their extra review teeth from the local gate regardless).
+          ref: refs/pull/${{ steps.pr.outputs.number }}/head
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # PyYAML so config reads resolve deterministically instead of silently
+      # degrading to defaults (the gate imports yaml lazily; without it the
+      # merge_gate.required_* config readers fail open to the shipped defaults —
+      # which is also exactly what an install with no genesis.yaml gets).
+      - name: Install pyyaml
+        run: pip install pyyaml
+
+      - name: Run the merge gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Documented CI seam for the canonical-repo scope: the gate's
+          # scheduled-review lane fail-closes when the canonical repo is
+          # undeterminable, and there is no ~/.genesis/config/genesis.yaml in CI.
+          # Hardcoding the canonical slug keeps fork checkouts (which share this
+          # workflow file but not the scope) out of the fail-closed lane —
+          # on a fork `_scheduled_gate_applies` resolves a NON-canonical target
+          # and the scheduled gate no-ops instead of demanding markers a fork
+          # cannot have.
+          _TEST_CANONICAL_PUBLIC_REPO: WingedGuardian/GENesis-AGI
+        run: >-
+          python3 scripts/hooks/git_push_guard.py
+          --check-pr "${{ steps.pr.outputs.number }}"
+          --repo "${{ github.repository }}"
+
+# Promotion to a required check (phase 2 of #1670 — NOT this PR):
+#   1. Run advisory until the false-block rate is measurable: target >=14 days
+#      or >=50 evaluations, whichever is later. A false block is a red check
+#      whose cause is the check itself (unreadable API, self-reference, wrong
+#      canonical scope), NOT a gate verdict a real merge would also produce.
+#   2. Add "genesis-merge-gate" to required_status_checks in
+#      .github/rulesets/checks.json in its OWN reviewed commit.
+#   3. Before promoting, decouple --admin's two meanings (GitHub bypass +
+#      explicit-approval marker) so a required check binds merges without a
+#      standing bypass actor — a bypassed required check is decoration.

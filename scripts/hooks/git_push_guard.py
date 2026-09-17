@@ -1079,6 +1079,34 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         # never fired (e.g. a conflicting branch suppresses the whole suite).
         return "absent", []
 
+    # Self-exclusion for the Actions check-run form of this gate (issue #1670):
+    # when the gate itself runs as a GitHub check, its OWN check-run sits in the
+    # rollup it reads — IN_PROGRESS while it executes (every run would then block
+    # on itself, a self-deadlock) and a stale FAILURE/PENDING from an earlier run
+    # of the same workflow on the same head (a comment- or review-triggered
+    # re-run would inherit its own verdict and fail forever). The running
+    # workflow's identity is `GITHUB_WORKFLOW`, set by Actions — not injectable
+    # from the workflow file, so the check cannot widen its own escape hatch.
+    # Entries from THAT workflow are dropped before classification: the
+    # self-check never vouches and never blocks. Both vars are absent locally, so
+    # the interactive merge path is byte-identical.
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        self_wf = (os.environ.get("GITHUB_WORKFLOW") or "").strip().casefold()
+        if self_wf:
+            checks = [
+                c
+                for c in checks
+                if not (
+                    isinstance(c, dict)
+                    and (c.get("workflowName") or "").strip().casefold() == self_wf
+                )
+            ]
+            if not checks:
+                # The ONLY thing in the rollup is our own run: zero OTHER checks
+                # have run — the same definite "CI has not run" fact a genuinely
+                # empty rollup carries.
+                return "absent", []
+
     # Drop superseded `concurrency: cancel-in-progress` duplicates via the SHARED
     # primitive (_drop_superseded_cancels — read its docstring for the strict
     # identity + strictly-after rule and every fail-closed case). Filtering here rather
