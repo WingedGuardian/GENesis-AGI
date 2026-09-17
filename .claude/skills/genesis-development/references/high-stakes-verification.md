@@ -25,6 +25,7 @@ is the one that goes stale.
 | Every harness needs a control expected to FAIL, wired as an abort | SKILL.md, guard corollaries ("pair it with a control that DOES flip") |
 | Re-measure another agent's finding before acting on it | CLAUDE.md, "Verify agent output" |
 | Acceptance bar + measured rate as the default method | SKILL.md, On-Load Mindset |
+| **Choosing a command/value by reasoning about an external tool** — do not; §9 below | here |
 
 The rest of this file is what those do not cover.
 
@@ -141,3 +142,92 @@ there is, and it is invisible unless written down.
 
 A finding that shrinks under investigation is a SUCCESS of this method, not a
 failure of it. The alternative was shipping it.
+
+## 9. A question about an external tool is a MEASUREMENT, never a choice
+
+The trigger, stated mechanically so it cannot be reasoned around: **you are about
+to ship a command, a value, a flag, or a procedure, and your reason for picking it
+is a claim about how something outside this repo behaves** — git, the shell, the
+harness, a provider API. At that moment the question "which of these is right?" is
+not a judgement you are entitled to make. It is an experiment you have not run.
+
+Run it. Then ship what the run says.
+
+This is not the same rule as §4. That one is about FINDING defects in code you
+wrote. This is about CHOOSING an answer whose correctness lives in another
+program's semantics, where reading the manual feels like evidence and is not.
+
+### Enumerate the space; never pick cases from it
+
+Behaviour that depends on state has a STATE SPACE, and the cases you would think
+of are the cases you already believe in — which is precisely why they pass. So:
+
+1. List the AXES that independently change the behaviour. Not scenarios, axes.
+2. Sweep the cross product. A few hundred cells is seconds of compute.
+3. Score every candidate on every cell and read the table.
+
+A candidate that wins on four hand-picked cases tells you nothing, because the
+hand that picked them is the hand that got it wrong.
+
+### Pre-register the predicate, the decision rule, and the losing outcome
+
+Before looking at any result, write down: what counts as success per cell, how the
+winner is chosen, and **what you will do if nothing passes everywhere**. That last
+clause is the one that does the work — without it, the least-bad option gets
+rationalised into "the right one", which is the same move that produced the
+original guess with extra arithmetic attached.
+
+### Control the instrument, or its numbers are decoration
+
+Every sweep carries two controls, and they are not optional:
+
+- an **ORACLE** arm that should be perfect. If it does not score 100%, the
+  instrument or the predicate is broken and **every number in the run is void** —
+  including the ones you like.
+- a **NO-OP** arm that should fail. If it scores well, the scorer cannot see
+  failure.
+
+Treat a surprising sweep result as a suspicion about the harness first. Four
+separate instrument bugs each arrived looking exactly like a finding: a scorer
+that dropped a path from both sides of its own comparison, an oracle whose
+teardown deleted the evidence it had just created, two success criteria that
+contradicted each other so that nothing could satisfy both, and a decorated
+directory name passed where a state label belonged — which made an arm report
+that every candidate failed.
+
+### Split the space where the question stops being well-posed
+
+Sometimes the sweep reveals that one region cannot be scored at all — a comparison
+measured against a moving reference, a capture of a state that no longer exists.
+Report that region separately rather than folding it into the headline, and say in
+the shipped artifact where its advice stops applying. A procedure that is right in
+one regime and wrong in another is only safe if it names the boundary.
+
+### The instance
+
+A hook note told the reader how to undo a destructive git operation. The advice was
+wrong FOUR times, each version chosen by reasoning about git's semantics and each
+refuted by a reviewer constructing a state nobody had tried:
+
+1. `stash apply --index` — believed to write conflict markers. Re-measured: it
+   refuses and leaves the file untouched. The stated reason for abandoning it did
+   not exist.
+2. `checkout <snap> -- .` — loses a tracked DELETION, because path checkout is
+   overlay-mode by default.
+3. the two above as a chain, complete-form-first — `stash apply` exits 0 on the
+   central shape while leaving the reverted file reverted, so the "complete" form
+   completed nothing.
+4. the same chain with the order defended — still 56/240.
+
+The fifth version was not chosen. 320 enumerated states (intervening commit x
+unstaged x staged x tracked deletion x untracked file x post-rewind activity x
+same-file overlap x pathspec scope) x six candidate procedures x an oracle and a
+no-op, predicate pre-registered. The answer was a three-step procedure scoring
+240/240 where a single command managed at most 56 — and the sweep also found the
+boundary no amount of reasoning had surfaced: that same procedure scores 0/80 once
+the reader has committed, because its second step restores a HEAD that by then
+contains the damage.
+
+The measurement cost about twenty minutes. The four guesses cost three review
+rounds, a merge-blocking finding each time, and a note that would have told someone
+to run a command that quietly did not work.
