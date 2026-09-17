@@ -135,7 +135,10 @@ class RecoveryEngine:
                 await self._dispatcher.send(Alert(
                     severity=AlertSeverity.INFO,
                     title=f"Recovery successful: {action.value}",
-                    body=f"Genesis is back online after {duration:.0f}s.",
+                    body=(
+                        f"Genesis is back online after {duration:.0f}s.\n"
+                        f"{detail}"
+                    ),
                     duration_s=duration,
                 ))
             else:
@@ -320,12 +323,16 @@ class RecoveryEngine:
         # — and a spurious abort here now retires the rung AND burns one of
         # max_escalations. The cheapest precondition should not have the tightest
         # budget in the file.
-        rc, _, stderr = await _run_subprocess(
+        rc, stash_out, stderr = await _run_subprocess(
             "incus", "exec", container, "--",
             "su", "-", "ubuntu", "-c",
             "cd ~/genesis && git stash",
             timeout=30.0,
         )
+        # `git stash` can create the stash commit and then fail cleaning the
+        # worktree (a smudge-filter failure during its reset), so a nonzero rc
+        # does not mean refs/stash is unmoved — the alert has to send the
+        # operator at `git stash list`, not just at the error.
         if rc != 0:
             # `_run_subprocess` returns rc=-1 with stderr "timeout" for a timeout
             # and rc=-1 with the exception text for an exec failure — neither is
@@ -335,7 +342,8 @@ class RecoveryEngine:
             # wrong thing.
             what = "timed out — state unknown" if stderr == "timeout" else "failed"
             return False, (
-                f"git stash {what}, refusing to revert: {stderr}"
+                f"git stash {what}, refusing to revert: {stderr} "
+                "(a partial stash is possible — check `git stash list`)"
             )
 
         # Revert the last commit
@@ -348,8 +356,16 @@ class RecoveryEngine:
         if rc != 0:
             return False, f"git revert failed: {stderr}"
 
-        # Restart services after code change
+        # Restart services after code change. `git stash` exits 0 with
+        # "No local changes to save" on a clean tree — claiming work was
+        # stashed then would point the operator at `git stash pop`, which
+        # applies whatever unrelated entry sits at stash@{0}.
         svc_ok, svc_detail = await self._restart_services(container)
+        if "No local changes to save" in stash_out:
+            return svc_ok, (
+                f"Code reverted, {svc_detail} — working tree was clean, "
+                "nothing was stashed"
+            )
         return svc_ok, (
             f"Code reverted, {svc_detail} — tracked uncommitted work was moved to "
             "a git stash and NOT popped (recover: git stash list / git stash pop)"

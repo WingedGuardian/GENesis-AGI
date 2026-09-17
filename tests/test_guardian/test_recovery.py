@@ -232,7 +232,7 @@ class TestRecoveryIOTriage:
 
 
 def _revert_mock(
-    *, stash: tuple[int, str] = (0, ""),
+    *, stash: tuple[int, str] = (0, ""), stash_out: str = "Saved working directory",
     calls: list[str] | None = None, kwargs_seen: list[dict] | None = None,
 ):
     """Mock `_run_subprocess` for the revert path, dispatching on the shell command.
@@ -253,7 +253,7 @@ def _revert_mock(
         if kwargs_seen is not None:
             kwargs_seen.append({"cmd": cmd, **kwargs})
         if "git stash" in cmd:
-            return (stash[0], "", stash[1])
+            return (stash[0], stash_out, stash[1])
         return (0, "", "")
     return mock
 
@@ -387,6 +387,57 @@ class TestRevertCodeStashGuard:
             ok, _ = await engine._revert_code("genesis")
         assert ok is True
         assert any("git revert" in c for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_clean_tree_does_not_recommend_stash_pop(
+        self, engine: RecoveryEngine,
+    ) -> None:
+        # "No local changes to save" creates no stash entry; telling the
+        # operator to `git stash pop` then would apply an UNRELATED older
+        # stash onto the freshly reverted checkout.
+        with patch(
+            "genesis.guardian.recovery._run_subprocess",
+            _revert_mock(stash_out="No local changes to save"),
+        ):
+            ok, detail = await engine._revert_code("genesis")
+        assert ok is True
+        assert "stash pop" not in detail
+        assert "nothing was stashed" in detail
+
+    @pytest.mark.asyncio
+    async def test_failed_stash_points_the_operator_at_stash_list(
+        self, engine: RecoveryEngine,
+    ) -> None:
+        # `git stash` can create the stash commit and then fail cleaning the
+        # worktree — nonzero rc does not mean refs/stash is unmoved, so the
+        # alert must name the recovery path, not just the error.
+        with patch(
+            "genesis.guardian.recovery._run_subprocess",
+            _revert_mock(stash=(1, "fatal: unable to write new index file")),
+        ):
+            ok, detail = await engine._revert_code("genesis")
+        assert ok is False
+        assert "stash list" in detail
+
+    @pytest.mark.asyncio
+    async def test_success_alert_carries_the_stash_instructions(
+        self, engine: RecoveryEngine,
+    ) -> None:
+        # `_revert_code`'s detail is the only place the owner learns their
+        # work was stashed and how to recover it — the INFO alert must not
+        # drop it.
+        send = AsyncMock(return_value=True)
+        with (
+            patch("genesis.guardian.recovery._run_subprocess", _revert_mock()),
+            patch("genesis.guardian.recovery.collect_all_signals", return_value=_healthy_snapshot()),
+            patch.object(engine._snapshots, "take", return_value="pre-recovery"),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            patch.object(engine._dispatcher, "send", send),
+        ):
+            result = await engine.execute(_diagnosis(RecoveryAction.REVERT_CODE))
+        assert result.success is True
+        body = send.await_args.args[0].body
+        assert "stash" in body.lower()
 
 
 class TestRecoveryRevertCode:
