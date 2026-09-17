@@ -186,7 +186,11 @@ def test_installers_do_not_run_cbm_installer_while_kill_switch_is_active():
     """
     for relative in ("scripts/install.sh", "scripts/bootstrap.sh"):
         text = (REPO_ROOT / relative).read_text()
-        sentinel = 'if [ -e "$HOME/.genesis/codebase-memory-mcp.disabled" ]; then'
+        sentinel = '[ -e "$_cbm_disable_file" ]'
+        assert sentinel in text, (
+            f"{relative}: does not check the resolved kill-switch path before "
+            "installing"
+        )
         assert text.index(sentinel) < text.index("genesis_cbm_install"), relative
         assert "raw.githubusercontent.com/DeusData/codebase-memory-mcp/" not in text, relative
     # The shared script's OWN kill switch is exercised, not grepped, by
@@ -428,7 +432,12 @@ def test_gitnexus_registration_always_drift_heals_to_fail_closed_launcher():
         text = (REPO_ROOT / relative).read_text()
         registration = '_register_mcp "gitnexus" "user"'
         assert registration in text
-        registration_block = text[text.rfind("if ", 0, text.index(registration)) :]
+        # Bound the slice at the registration CALL: extending to end-of-file
+        # lets a later unrelated `-x` check satisfy the assertion even when the
+        # GitNexus guard itself is gone.
+        start = text.rfind("if ", 0, text.index(registration))
+        end = text.index("\n", text.index(registration)) + 1
+        registration_block = text[start:end]
         assert '-x "$' in registration_block
         assert ".claude/mcp/run-gitnexus" in registration_block
         assert "_GITNEXUS_PIN_READY" not in registration_block

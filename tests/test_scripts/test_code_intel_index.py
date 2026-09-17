@@ -208,7 +208,10 @@ def test_cbm_disable_sentinel_blocks_index_spawn(tmp_path):
         path=f"{fakebin}:{_SYSTEM_PATH}",
         env_extra={"CODEBASE_MEMORY_MCP_DISABLE_FILE": str(disable_file)},
     )
-    assert res.returncode == 0
+    # rc 3, not 0: a requested-but-skipped leg is not a success — rc 0 would
+    # let the runner consume the marker and stamp cbm's shared full clock for
+    # work that never ran.
+    assert res.returncode == 3, res.stderr
     assert f"disabled by {disable_file}" in res.stdout
     assert not log.exists()
 
@@ -541,7 +544,19 @@ def test_gitnexus_scope_uses_measured_8g_cap(tmp_path):
     _fake_tools(fakebin, log)
     _fake_systemd_run(fakebin, slog, probe_ok=True)
     repo = _make_repo(tmp_path)
-    res = _run_entry(tmp_path, repo, "gitnexus", path=f"{fakebin}:{_SYSTEM_PATH}")
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "gitnexus",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        # Pin the ceiling AND the live-usage seam: the admission block reads
+        # the host cgroup/MemTotal otherwise, so this assertion used to depend
+        # on how much RAM the machine running the test happened to have.
+        env_extra={
+            "CODE_INTEL_MEM_CEILING_BYTES": str(64 * 1024**3),
+            "CODE_INTEL_MEM_CURRENT_BYTES": str(512 * 1024**2),
+        },
+    )
     assert res.returncode == 0, res.stderr
     assert "MemoryMax=8G" in slog.read_text()
     assert "gitnexus ARGS:analyze" in log.read_text()
@@ -774,6 +789,9 @@ def _headroom_decision(tmp_path, ceiling_gib: int, want: str = "8G") -> tuple[st
             env={
                 **os.environ,
                 "CODE_INTEL_MEM_CEILING_BYTES": str(ceiling_gib * 1024**3),
+                # Live usage feeds the same arithmetic; pin it or the verdict
+                # depends on what the test host happens to be running.
+                "CODE_INTEL_MEM_CURRENT_BYTES": str(512 * 1024**2),
                 "GITNEXUS_MEM_MAX": want,
             },
         ).stdout

@@ -547,6 +547,10 @@ def _cbm_outcome_block(script: Path) -> str:
         if ln.strip().startswith(".") and 'lib/cbm_installer.sh"' in ln
     )
     end = next(i for i, ln in enumerate(lines) if i > start and ln.strip() == "esac")
+    # The kill-switch guard wraps the whole source→call→case path in an
+    # if/elif/else — the slice must include its closing `fi` or the extracted
+    # block is a syntax error rather than the outcome path under test.
+    end = next(i for i, ln in enumerate(lines) if i > end and ln.strip() == "fi")
     return "\n".join(lines[start : end + 1]) + "\n"
 
 

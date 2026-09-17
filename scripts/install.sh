@@ -651,19 +651,24 @@ done
 # Code intelligence tools (optional — enhance Claude Code sessions)
 echo "    Installing code intelligence tools..."
 
-if [ -e "$HOME/.genesis/codebase-memory-mcp.disabled" ]; then
+# The pin, the digest and the install itself live in ONE place, shared with
+# bootstrap.sh, so the commit and its digest cannot drift apart.
+# shellcheck source=lib/cbm_installer.sh
+. "$SCRIPT_DIR/lib/cbm_installer.sh"
+# Honour the SAME kill-switch path the launcher and indexer enforce — a custom
+# CODEBASE_MEMORY_MCP_DISABLE_FILE that stops every cbm process used to leave
+# this installer happily replacing the tool anyway.
+_cbm_disable_file="$(genesis_cbm_resolve_disable_file 2>/dev/null || true)"
+if [ -n "$_cbm_disable_file" ] && [ -e "$_cbm_disable_file" ]; then
     echo "    . codebase-memory-mcp install/upgrade skipped (machine kill switch active)"
 else
-    # The pin, the digest and the install itself live in ONE place, shared with
-    # bootstrap.sh, so the commit and its digest cannot drift apart.
-    # shellcheck source=lib/cbm_installer.sh
-    . "$SCRIPT_DIR/lib/cbm_installer.sh"
     _cbm_rc=0
     genesis_cbm_install || _cbm_rc=$?
     case "$_cbm_rc" in
         0) echo "    + codebase-memory-mcp installed/upgraded" ;;
         1) echo "    NOTE: codebase-memory-mcp installer download failed (optional)" ;;
-        3) echo "    ERROR: codebase-memory-mcp pin/digest mismatch (see above) — repository bug, not transient" ;;
+        3) echo "    ERROR: codebase-memory-mcp integrity check failed — the pinned installer does not match the committed digest (see above)" ;;
+        4) echo "    . codebase-memory-mcp install refused — kill switch active or its path unresolvable" ;;
         *) echo "    NOTE: codebase-memory-mcp unavailable (optional) — see the error above" ;;
     esac
 fi
@@ -1081,7 +1086,9 @@ if command -v claude &>/dev/null; then
         # uncapped raw server in the next session — and stays uncapped after the
         # sentinel is removed until somebody runs this again.
         _register_mcp "codebase-memory-mcp" "user" "$REPO_DIR/.claude/mcp/run-codebase-memory"
-        if [ -e "$HOME/.genesis/codebase-memory-mcp.disabled" ]; then
+        if [ -z "$_cbm_disable_file" ]; then
+            echo "    . codebase-memory-mcp registered to the launcher; kill-switch state unverifiable — it fails closed"
+        elif [ -e "$_cbm_disable_file" ]; then
             echo "    . codebase-memory-mcp registered to the launcher; kill switch active, so it will refuse to start"
         fi
     fi

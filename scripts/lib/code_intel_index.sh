@@ -96,9 +96,12 @@ _genesis_mem_bytes() {  # "8G"/"512M"/"1024K"/"5.5G"/bytes -> bytes on stdout, o
     # integer byte count — a unitless "5.5" is malformed, not 5.5 bytes.
     [[ "$v" =~ ^([0-9]+(\.[0-9]+)?)([GgMmKk])$ || "$v" =~ ^[0-9]+$ ]] || return 1
     case "$v" in
-        *[Gg]) awk -v n="${v%[Gg]}" 'BEGIN{printf "%d", n * 1073741824}' ;;
-        *[Mm]) awk -v n="${v%[Mm]}" 'BEGIN{printf "%d", n * 1048576}' ;;
-        *[Kk]) awk -v n="${v%[Kk]}" 'BEGIN{printf "%d", n * 1024}' ;;
+        # `%.0f`, not `%d`: mawk implements %d through a signed 32-bit int and
+        # clamps 8 GiB to 2147483647, which reads as "below the working set"
+        # and refuses every run. %f goes through double, exact past 2^32.
+        *[Gg]) awk -v n="${v%[Gg]}" 'BEGIN{printf "%.0f", n * 1073741824}' ;;
+        *[Mm]) awk -v n="${v%[Mm]}" 'BEGIN{printf "%.0f", n * 1048576}' ;;
+        *[Kk]) awk -v n="${v%[Kk]}" 'BEGIN{printf "%.0f", n * 1024}' ;;
         *) printf '%s' "$v" ;;
     esac
 }
@@ -140,6 +143,34 @@ _genesis_mem_ceiling() {
     [ -n "$total_kb" ] && printf '%s' "$(( total_kb * 1024 ))"
 }
 
+# What everything on this box is using RIGHT NOW, job included — the fixed
+# reserve below is a floor for a machine whose live usage cannot be read. A
+# container where Genesis, Qdrant and the sessions already exceed that floor
+# would otherwise get a cap computed as if the headroom were free, and the
+# parent cgroup takes the kill anyway. cgroup v2 first, then v1, then
+# MemTotal-MemAvailable. Unreadable means the caller falls back to the floor.
+_genesis_mem_current() {
+    if [ -n "${CODE_INTEL_MEM_CURRENT_BYTES:-}" ]; then
+        printf '%s' "$CODE_INTEL_MEM_CURRENT_BYTES"
+        return
+    fi
+    local raw=""
+    if [ -r /sys/fs/cgroup/memory.current ]; then
+        raw="$(cat /sys/fs/cgroup/memory.current 2>/dev/null)"
+    elif [ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ]; then
+        raw="$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null)"
+    fi
+    if [ -n "$raw" ] && [ "$raw" -gt 0 ] 2>/dev/null; then
+        printf '%s' "$raw"
+        return
+    fi
+    local total_kb avail_kb
+    total_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
+    avail_kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)"
+    [ -n "$total_kb" ] && [ -n "$avail_kb" ] && [ "$total_kb" -gt "$avail_kb" ] \
+        && printf '%s' "$(( (total_kb - avail_kb) * 1024 ))"
+}
+
 #: Left for everything that is NOT this job -- Genesis, Qdrant, the session that
 #: launched it. Below this the box is not able to host a rebuild safely.
 CODE_INTEL_SIBLING_RESERVE_BYTES="${CODE_INTEL_SIBLING_RESERVE_BYTES:-$(( 2 * 1024 * 1024 * 1024 ))}"
@@ -161,9 +192,16 @@ elif [ "$_genesis_want_b" -lt "$CODE_INTEL_GITNEXUS_MIN_BYTES" ]; then
     # reads as a flaky index failure instead of the refusal it should be.
     GITNEXUS_MEM_REFUSE="configured cap ${GITNEXUS_MEM_MAX} is below the $(( CODE_INTEL_GITNEXUS_MIN_BYTES / 1024 / 1024 ))M a measured full rebuild needs — a cap that cannot bite only relocates the kill"
 elif [ -n "$_genesis_ceiling_b" ]; then
-    _genesis_spare_b=$(( _genesis_ceiling_b - CODE_INTEL_SIBLING_RESERVE_BYTES ))
+    # Live usage plus the reserve as growth headroom when the kernel can tell
+    # us the real figure; the reserve alone when it cannot.
+    _genesis_live_b="$(_genesis_mem_current)"
+    _genesis_siblings_b="$CODE_INTEL_SIBLING_RESERVE_BYTES"
+    if [ -n "$_genesis_live_b" ]; then
+        _genesis_siblings_b=$(( _genesis_live_b + CODE_INTEL_SIBLING_RESERVE_BYTES ))
+    fi
+    _genesis_spare_b=$(( _genesis_ceiling_b - _genesis_siblings_b ))
     if [ "$_genesis_spare_b" -lt "$CODE_INTEL_GITNEXUS_MIN_BYTES" ]; then
-        GITNEXUS_MEM_REFUSE="this install has $(( _genesis_ceiling_b / 1024 / 1024 ))M total; after reserving $(( CODE_INTEL_SIBLING_RESERVE_BYTES / 1024 / 1024 ))M for the services around it that leaves $(( _genesis_spare_b / 1024 / 1024 ))M, below the $(( CODE_INTEL_GITNEXUS_MIN_BYTES / 1024 / 1024 ))M a measured full rebuild needs"
+        GITNEXUS_MEM_REFUSE="this install has $(( _genesis_ceiling_b / 1024 / 1024 ))M total; live usage and the reserve claim $(( _genesis_siblings_b / 1024 / 1024 ))M of it, leaving $(( _genesis_spare_b / 1024 / 1024 ))M, below the $(( CODE_INTEL_GITNEXUS_MIN_BYTES / 1024 / 1024 ))M a measured full rebuild needs"
     elif [ "$_genesis_spare_b" -lt "$_genesis_want_b" ]; then
         GITNEXUS_MEM_MAX="$(( _genesis_spare_b / 1024 / 1024 ))M"
     fi
@@ -174,7 +212,20 @@ MEM_MAX="$GITNEXUS_MEM_MAX"
 IO_WEIGHT="${CODE_INTEL_INDEX_IO_WEIGHT:-20}"
 CPU_QUOTA="${CODE_INTEL_INDEX_CPU_QUOTA:-200%}"
 PERSISTENCE="${CODE_INTEL_INDEX_PERSISTENCE:-true}"
-CBM_DISABLE_FILE="${CODEBASE_MEMORY_MCP_DISABLE_FILE:-$HOME/.genesis/codebase-memory-mcp.disabled}"
+CBM_DISABLE_FILE="${CODEBASE_MEMORY_MCP_DISABLE_FILE:-${HOME:+$HOME/.genesis/codebase-memory-mcp.disabled}}"
+# A literal `~/` override arrives unexpanded; with no resolvable home this
+# collapses to a relative path and the check below refuses.
+if [[ "$CBM_DISABLE_FILE" == "~/"* ]]; then
+    CBM_DISABLE_FILE="${HOME:+$HOME/}${CBM_DISABLE_FILE#\~/}"
+fi
+# FAIL CLOSED on an unresolvable kill-switch path — same rule as
+# .claude/mcp/run-codebase-memory and scripts/lib/cbm_installer.sh. With HOME
+# unset the default used to collapse to /.genesis/… — absolute, but not this
+# machine's switch — so `-e` came back false and cbm indexed while disabled.
+CBM_DISABLE_UNRESOLVED=0
+if [[ -z "$CBM_DISABLE_FILE" || "$CBM_DISABLE_FILE" != /* ]]; then
+    CBM_DISABLE_UNRESOLVED=1
+fi
 
 _GITNEXUS_PIN_READY=0
 _gitnexus_pin_file="$(dirname "${BASH_SOURCE[0]}")/gitnexus_version.sh"
@@ -410,8 +461,12 @@ CBM_RAN=0
 GN_RAN=0
 
 if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
-    if [ -e "$CBM_DISABLE_FILE" ]; then
+    if [ "$CBM_DISABLE_UNRESOLVED" = "1" ]; then
+        _log "cbm disable-state path unresolvable ('${CODEBASE_MEMORY_MCP_DISABLE_FILE:-}') — refusing cbm leg"
+        MISSING="${MISSING}cbm "
+    elif [ -e "$CBM_DISABLE_FILE" ]; then
         _log "codebase-memory-mcp disabled by $CBM_DISABLE_FILE — skipped"
+        MISSING="${MISSING}cbm "
     elif command -v codebase-memory-mcp >/dev/null 2>&1; then
         _log "indexing (codebase-memory-mcp, mode=$MODE): $REPO_PATH"
         # Flag form (cbm >=0.9): --mode selects the pipeline depth (default here is

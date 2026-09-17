@@ -219,6 +219,21 @@ genesis_gitnexus_ensure_pin() {
         genesis_gitnexus_installed_is_pinned && return 0
         [[ "${actual#v}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || return 3
         genesis_gitnexus_version_is_newer_than_pin "$actual" && return 2
+        # Two or more copies at the SAME old version resolve cleanly above —
+        # but `npm install -g` upgrades only the configured prefix, and the
+        # postcondition's shadow scan would then see the new copy beside the
+        # untouched one and refuse on the version conflict WE just created.
+        # Refuse the partial upgrade and name the copies instead.
+        local -a _copies=() _c
+        while IFS= read -r _c; do
+            [ -n "$_c" ] && _copies+=("$_c")
+        done < <(_genesis_gitnexus_candidates)
+        if [ "${#_copies[@]}" -gt 1 ]; then
+            printf 'gitnexus: %d installations report %s — npm can only upgrade its own prefix;\n' \
+                "${#_copies[@]}" "$actual" >&2
+            printf '  remove all but one of: %s\n' "${_copies[*]}" >&2
+            return 3
+        fi
     fi
 
     npm install -g --engine-strict "gitnexus@${GENESIS_GITNEXUS_VERSION}" \

@@ -28,10 +28,42 @@
 GENESIS_CBM_INSTALLER_COMMIT="59a05eb1bf9e11deb060d782cd7d3a29f2ae2866"  # pragma: allowlist secret  (public commit SHA, not a secret)
 GENESIS_CBM_INSTALLER_SHA256="13049c7cc51bc508d68b8ecb8a9fd9574ecb7c6f2c9dd5a19bf7d4c187321145"  # pragma: allowlist secret  (public file digest, not a secret)
 
+# The kill-switch path, resolved the same way for every cbm entry point:
+# CODEBASE_MEMORY_MCP_DISABLE_FILE, a literal `~/` expanded against HOME, or
+# the HOME-based default. Prints the resolved ABSOLUTE path and returns 1 when
+# none can be resolved. Callers MUST fail closed on that — an unresolvable
+# switch cannot prove the machine did not say no, which is exactly the state
+# `/.genesis/…` pretended to check.
+genesis_cbm_resolve_disable_file() {
+    local f="${CODEBASE_MEMORY_MCP_DISABLE_FILE:-}"
+    if [[ "$f" == "~/"* ]]; then
+        f="${HOME:+${HOME}/}${f#\~/}"
+    fi
+    if [ -z "$f" ]; then
+        [ -n "${HOME:-}" ] || return 1
+        f="${HOME}/.genesis/codebase-memory-mcp.disabled"
+    fi
+    [[ "$f" == /* ]] || return 1
+    printf '%s' "$f"
+}
+
 # 0 installed/upgraded · 1 download failed · 2 the installer ran and failed
 # 3 the pin and the digest in THIS file disagree — see below, it is not transient
+# 4 the kill switch is active, or its path cannot be resolved (fail closed)
 genesis_cbm_install() {
     local installer="" rc=0
+    # Sourced callers inherit the refusal — the kill switch gates EVERY path
+    # that can install cbm, not just direct invocation of this file.
+    local _cbm_disable_file=""
+    if ! _cbm_disable_file="$(genesis_cbm_resolve_disable_file)"; then
+        printf 'codebase-memory-mcp: kill-switch path cannot be resolved; refusing to install\n' >&2
+        return 4
+    fi
+    if [ -e "$_cbm_disable_file" ]; then
+        printf 'codebase-memory-mcp: machine kill switch is active (%s); refusing to install\n' \
+            "$_cbm_disable_file" >&2
+        return 4
+    fi
     installer="$(mktemp 2>/dev/null)" || installer=""
     if [ -z "$installer" ]; then
         printf 'codebase-memory-mcp: no temporary file available\n' >&2
@@ -91,24 +123,13 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     # default collapsed to /.genesis/… — absolute, but not this machine's
     # switch — so `-e` came back false and the install proceeded precisely when
     # the machine said not to. run-codebase-memory refuses on this condition;
-    # so does this.
-    _cbm_disable="${CODEBASE_MEMORY_MCP_DISABLE_FILE:-}"
-    if [ -z "$_cbm_disable" ]; then
-        if [ -z "${HOME:-}" ]; then
-            printf 'codebase-memory-mcp: HOME is unset, so the kill-switch path cannot be\n' >&2
-            printf '  resolved; refusing to install. Set HOME or CODEBASE_MEMORY_MCP_DISABLE_FILE.\n' >&2
-            exit 4
-        fi
-        _cbm_disable="${HOME}/.genesis/codebase-memory-mcp.disabled"
-    fi
-    case "$_cbm_disable" in
-        /*) ;;
-        *)
-            printf 'codebase-memory-mcp: kill-switch path must be absolute (%s); refusing to install\n' \
-                "$_cbm_disable" >&2
-            exit 4
-            ;;
-    esac
+    # so does this, through the same resolver the sourced callers now inherit.
+    _cbm_disable="$(genesis_cbm_resolve_disable_file)" || {
+        printf 'codebase-memory-mcp: the kill-switch path cannot be resolved (HOME unset\n' >&2
+        printf '  or the override empty/relative); refusing to install. Set HOME or an\n' >&2
+        printf '  absolute CODEBASE_MEMORY_MCP_DISABLE_FILE.\n' >&2
+        exit 4
+    }
     if [ -e "$_cbm_disable" ]; then
         printf 'codebase-memory-mcp: machine kill switch is active (%s); refusing to install\n' \
             "$_cbm_disable" >&2
