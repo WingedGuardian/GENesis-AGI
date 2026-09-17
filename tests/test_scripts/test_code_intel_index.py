@@ -866,6 +866,132 @@ def _headroom_decision(tmp_path, ceiling_gib: int, want: str = "8G", env_overrid
     return cap, why
 
 
+def _working_set_from_stat(tmp_path, current: int, stat: str, reserve: int) -> int:
+    """Run the shipped cgroup working-set helper against synthetic statistics."""
+    src = _ENTRYPOINT.read_text()
+    start = src.index("_genesis_mem_working_set_from() {")
+    end = src.index("\n}\n", start) + len("\n}\n")
+    blockfile = tmp_path / "working-set.sh"
+    blockfile.write_text(src[start:end])
+    statfile = tmp_path / "memory.stat"
+    statfile.write_text(stat)
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{blockfile}"; '
+            f'CODE_INTEL_FILE_CACHE_RESERVE_BYTES={reserve} '
+            f'_genesis_mem_working_set_from {current} "{statfile}"',
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    return int(result.stdout)
+
+
+def test_working_set_discounts_only_clean_file_cache_above_reserve(tmp_path):
+    gib = 1024**3
+    mib = 1024**2
+    current = 27 * gib
+    working = _working_set_from_stat(
+        tmp_path,
+        current,
+        "\n".join(
+            (
+                f"inactive_file {5 * gib}",
+                f"active_file {8 * gib + 512 * mib}",
+                f"file_dirty {512 * mib}",
+                f"file_writeback {512 * mib}",
+            )
+        )
+        + "\n",
+        2 * gib,
+    )
+    # Of 13.5 GiB file memory, 1 GiB is not immediately reclaimable and 2 GiB
+    # is deliberately retained. The remaining 10.5 GiB must not make a safe
+    # cache-heavy box look permanently full.
+    assert working == current - (10 * gib + 512 * mib)
+
+
+def test_working_set_keeps_small_cache_and_fails_closed_on_bad_stats(tmp_path):
+    gib = 1024**3
+    current = 12 * gib
+    small = f"inactive_file {gib}\nactive_file 0\nfile_dirty 0\nfile_writeback 0\n"
+    assert _working_set_from_stat(tmp_path, current, small, 2 * gib) == current
+    bad = "inactive_file not-a-number\nactive_file 0\nfile_dirty 0\nfile_writeback 0\n"
+    assert _working_set_from_stat(tmp_path, current, bad, 2 * gib) == current
+    assert _working_set_from_stat(
+        tmp_path,
+        current,
+        f"inactive_file {gib}\nactive_file 0\nfile_dirty {2 * gib}\nfile_writeback 0\n",
+        2 * gib,
+    ) == current
+
+
+def test_working_set_supports_the_complete_cgroup_v1_schema(tmp_path):
+    gib = 1024**3
+    current = 12 * gib
+    v1 = (
+        f"inactive_file {gib}\n"
+        f"active_file {gib}\n"
+        "file_dirty 0\n"
+        "file_writeback 0\n"
+        f"total_inactive_file {6 * gib}\n"
+        "total_active_file 0\n"
+        "total_dirty 0\n"
+        "total_writeback 0\n"
+    )
+    # v1 exposes local and hierarchical counters in the same file. Its usage
+    # charge is hierarchical, so its total_* values must win over local ones.
+    assert _working_set_from_stat(tmp_path, current, v1, 2 * gib) == 8 * gib
+
+
+def test_cache_heavy_install_is_admitted_by_working_set_not_total_charge(tmp_path):
+    gib = 1024**3
+    statfile = tmp_path / "memory.stat"
+    statfile.write_text(
+        f"inactive_file {4 * gib}\n"
+        f"active_file {9 * gib}\n"
+        "file_dirty 0\n"
+        "file_writeback 0\n"
+    )
+    cap, why = _headroom_decision(
+        tmp_path,
+        32,
+        env_overrides={
+            "CODE_INTEL_MEM_CURRENT_BYTES": "",
+            "CODE_INTEL_MEM_RAW_CURRENT_BYTES": str(27 * gib),
+            "CODE_INTEL_MEM_STAT_PATH": str(statfile),
+        },
+    )
+    assert not why, f"clean file cache falsely blocked a safe rebuild: {why}"
+    assert cap == "8G", cap
+
+
+def test_cache_heavy_v1_install_is_admitted_by_working_set_not_total_charge(tmp_path):
+    gib = 1024**3
+    statfile = tmp_path / "memory.stat"
+    statfile.write_text(
+        f"total_inactive_file {4 * gib}\n"
+        f"total_active_file {9 * gib}\n"
+        "total_dirty 0\n"
+        "total_writeback 0\n"
+    )
+    cap, why = _headroom_decision(
+        tmp_path,
+        32,
+        env_overrides={
+            "CODE_INTEL_MEM_CURRENT_BYTES": "",
+            "CODE_INTEL_MEM_RAW_CURRENT_BYTES": str(27 * gib),
+            "CODE_INTEL_MEM_STAT_PATH": str(statfile),
+        },
+    )
+    assert not why, f"clean v1 file cache falsely blocked a safe rebuild: {why}"
+    assert cap == "8G", cap
+
+
 def test_a_small_install_refuses_the_rebuild_rather_than_capping_it_uselessly(tmp_path):
     """A fixed 8G cap is a cap, not a reservation.
 
