@@ -21,6 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = REPO_ROOT / "scripts" / "bootstrap.sh"
 INSTALL = REPO_ROOT / "scripts" / "install.sh"
 CBM_INSTALLER = REPO_ROOT / "scripts" / "lib" / "cbm_installer.sh"
+CBM_DISABLE_LIB = REPO_ROOT / "scripts" / "lib" / "cbm_disable_file.sh"
 SETUP_LOCAL = REPO_ROOT / "scripts" / "setup-local-config.sh"
 
 
@@ -214,6 +215,9 @@ def _run_cbm_install(tmp_path: Path, payload: str, digest: str | None, label: st
     if digest is not None:  # re-point the committed digest at this payload
         body = _CBM_DIGEST_RE.sub(f'GENESIS_CBM_INSTALLER_SHA256="{digest}"', body)
     lib.write_text(body)
+    # The installer sources its kill-switch resolver as a sibling file; the
+    # sandboxed copy needs it beside it or every call refuses as unresolvable.
+    (work / "cbm_disable_file.sh").write_text(CBM_DISABLE_LIB.read_text())
     payload_file = work / "payload"
     payload_file.write_text(payload)
     argv_file = work / "argv"
@@ -541,15 +545,16 @@ def _cbm_outcome_block(script: Path) -> str:
     assignment outside everything it executes.
     """
     lines = script.read_text().splitlines()
+    # Anchored on the kill-switch guard's `if [ -z "$_cbm_disable" ]` — the
+    # if/elif/else encloses the source line, the call wire and the `case`, so
+    # slicing from any inner line leaves an orphaned `fi`; `_cbm_disable` is
+    # pre-set by the caller to a nonexistent path so the else branch runs.
     start = next(
         i
         for i, ln in enumerate(lines)
-        if ln.strip().startswith(".") and 'lib/cbm_installer.sh"' in ln
+        if ln.strip() == 'if [ -z "$_cbm_disable" ]; then'
     )
     end = next(i for i, ln in enumerate(lines) if i > start and ln.strip() == "esac")
-    # The kill-switch guard wraps the whole source→call→case path in an
-    # if/elif/else — the slice must include its closing `fi` or the extracted
-    # block is a syntax error rather than the outcome path under test.
     end = next(i for i, ln in enumerate(lines) if i > end and ln.strip() == "fi")
     return "\n".join(lines[start : end + 1]) + "\n"
 
@@ -575,7 +580,12 @@ def test_b9_callers_render_a_digest_mismatch_distinctly(tmp_path):
         rendered = {}
         for rc in ("0", "1", "2", "3"):
             proc = subprocess.run(
-                ["/bin/bash", "-c", f'set -euo pipefail\nSCRIPT_DIR="{stub_root}"\n{block}'],
+                [
+                    "/bin/bash",
+                    "-c",
+                    f'set -euo pipefail\nSCRIPT_DIR="{stub_root}"\n'
+                    f'_cbm_disable="{stub_root}/no-sentinel-present"\n{block}',
+                ],
                 capture_output=True,
                 text=True,
                 env={"PATH": "/usr/bin:/bin", "FAKE_CBM_RC": rc},

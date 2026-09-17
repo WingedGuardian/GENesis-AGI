@@ -212,19 +212,26 @@ MEM_MAX="$GITNEXUS_MEM_MAX"
 IO_WEIGHT="${CODE_INTEL_INDEX_IO_WEIGHT:-20}"
 CPU_QUOTA="${CODE_INTEL_INDEX_CPU_QUOTA:-200%}"
 PERSISTENCE="${CODE_INTEL_INDEX_PERSISTENCE:-true}"
-CBM_DISABLE_FILE="${CODEBASE_MEMORY_MCP_DISABLE_FILE:-${HOME:+$HOME/.genesis/codebase-memory-mcp.disabled}}"
-# A literal `~/` override arrives unexpanded; with no resolvable home this
-# collapses to a relative path and the check below refuses.
-if [[ "$CBM_DISABLE_FILE" == "~/"* ]]; then
-    CBM_DISABLE_FILE="${HOME:+$HOME/}${CBM_DISABLE_FILE#\~/}"
-fi
-# FAIL CLOSED on an unresolvable kill-switch path — same rule as
-# .claude/mcp/run-codebase-memory and scripts/lib/cbm_installer.sh. With HOME
-# unset the default used to collapse to /.genesis/… — absolute, but not this
-# machine's switch — so `-e` came back false and cbm indexed while disabled.
-CBM_DISABLE_UNRESOLVED=0
-if [[ -z "$CBM_DISABLE_FILE" || "$CBM_DISABLE_FILE" != /* ]]; then
-    CBM_DISABLE_UNRESOLVED=1
+
+# The kill-switch path resolves through the ONE shared site (same override
+# semantics the launcher enforces). An override that is relative, or begins
+# with a ~/ that no HOME can expand, would make `-e` silently read as
+# "not disabled" — an UNRESOLVABLE path instead refuses the cbm leg below,
+# never indexing a tool the machine may have switched off.
+CBM_DISABLE_FILE=""
+CBM_DISABLE_UNRESOLVED=1
+# %/* not dirname(1): minimal-PATH invocations (stripped-env services) may not
+# have dirname, and a resolver that cannot be found fails the leg closed.
+_cbm_disable_lib="${BASH_SOURCE[0]%/*}/cbm_disable_file.sh"
+[ "$_cbm_disable_lib" = "${BASH_SOURCE[0]}/cbm_disable_file.sh" ] \
+    && _cbm_disable_lib="./cbm_disable_file.sh"
+if [ -r "$_cbm_disable_lib" ]; then
+    # shellcheck source=cbm_disable_file.sh
+    . "$_cbm_disable_lib"
+    if declare -F genesis_cbm_disable_file >/dev/null \
+        && CBM_DISABLE_FILE="$(genesis_cbm_disable_file 2>/dev/null)"; then
+        CBM_DISABLE_UNRESOLVED=""
+    fi
 fi
 
 _GITNEXUS_PIN_READY=0
@@ -461,8 +468,8 @@ CBM_RAN=0
 GN_RAN=0
 
 if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
-    if [ "$CBM_DISABLE_UNRESOLVED" = "1" ]; then
-        _log "cbm disable-state path unresolvable ('${CODEBASE_MEMORY_MCP_DISABLE_FILE:-}') — refusing cbm leg"
+    if [ -n "$CBM_DISABLE_UNRESOLVED" ]; then
+        _log "cbm kill-switch path unresolvable — refusing cbm leg (fail closed)"
         MISSING="${MISSING}cbm "
     elif [ -e "$CBM_DISABLE_FILE" ]; then
         _log "codebase-memory-mcp disabled by $CBM_DISABLE_FILE — skipped"

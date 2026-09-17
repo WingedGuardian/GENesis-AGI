@@ -48,11 +48,11 @@ if ! genesis_gitnexus_node_supported; then
     exit 1
 fi
 
-# Check the ALREADY-RESOLVED binary, not a fresh resolution and not its
-# `--version` output: GitNexus is a Node script, so executing it runs whatever
-# `node` is first on PATH, and a wrapped or stubbed node answers for it (the
-# same failure the shadow scan's package.json read exists to avoid). Passing
-# $BINARY also skips a second resolve, whose candidate set could differ.
+# The ALREADY-RESOLVED binary goes through the library's version reader, not a
+# direct `--version` exec: _genesis_gitnexus_version_of reads package.json
+# first precisely because a Node binary's --version reports whatever `node`
+# resolves to here — a stubbed node would make a real install report the
+# stub's output.
 if ! genesis_gitnexus_installed_is_pinned "$BINARY"; then
     actual="$(genesis_gitnexus_installed_version "$BINARY" 2>/dev/null || true)"
     printf 'run-gitnexus: refusing unpinned GitNexus %s; expected %s\n' \

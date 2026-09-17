@@ -374,30 +374,40 @@ echo "--- Installing code intelligence tools ---"
 # --skip-config: the installer's own agent-config step registers the RAW binary
 # in ~/.claude/.mcp.json, bypassing our 2G-capped launcher. We register the
 # capped wrapper below via _register_mcp, so the installer must NOT self-register.
-# The pin, the digest and the install itself live in ONE place, shared with
-# install.sh, so the commit and its digest cannot drift apart.
-# shellcheck source=lib/cbm_installer.sh
-. "$SCRIPT_DIR/lib/cbm_installer.sh"
-# Honour the SAME kill-switch path the launcher and indexer enforce — a custom
-# CODEBASE_MEMORY_MCP_DISABLE_FILE that stops every cbm process used to leave
-# this installer happily replacing the tool anyway.
-_cbm_disable_file="$(genesis_cbm_resolve_disable_file 2>/dev/null || true)"
-if [ -n "$_cbm_disable_file" ] && [ -e "$_cbm_disable_file" ]; then
-    echo "  codebase-memory-mcp: install/upgrade skipped (machine kill switch active)"
+# The kill-switch path resolves through the ONE shared site — an override via
+# CODEBASE_MEMORY_MCP_DISABLE_FILE is honoured here the same way the launcher
+# and indexer honour it, and an UNRESOLVABLE path refuses rather than falling
+# through to an install the machine may have disabled.
+_cbm_disable=""
+if [ -r "$SCRIPT_DIR/lib/cbm_disable_file.sh" ]; then
+    # shellcheck source=lib/cbm_disable_file.sh
+    . "$SCRIPT_DIR/lib/cbm_disable_file.sh"
+    _cbm_disable="$(genesis_cbm_disable_file 2>/dev/null)" || _cbm_disable=""
+fi
+if [ -z "$_cbm_disable" ]; then
+    echo "  WARNING: codebase-memory-mcp kill-switch path unresolvable — refusing install (fail closed)"
+elif [ -e "$_cbm_disable" ]; then
+    echo "  codebase-memory-mcp: install/upgrade skipped (machine kill switch active: $_cbm_disable)"
 else
     echo "  codebase-memory-mcp: installing/upgrading..."
+    # The pin, the digest and the install itself live in ONE place, shared with
+    # install.sh, so the commit and its digest cannot drift apart.
+    # shellcheck source=lib/cbm_installer.sh
+    . "$SCRIPT_DIR/lib/cbm_installer.sh"
     _cbm_rc=0
     genesis_cbm_install || _cbm_rc=$?
     case "$_cbm_rc" in
         0) ;;
         1) echo "  WARNING: codebase-memory-mcp installer download failed (non-critical)" ;;
-        3) echo "  ERROR: codebase-memory-mcp integrity check failed — the pinned installer does not match the committed digest (see above)" ;;
-        4) echo "  codebase-memory-mcp: install refused — kill switch active or its path unresolvable" ;;
+        3) echo "  ERROR: codebase-memory-mcp pin/digest mismatch (see above) — repository bug, not transient" ;;
+        4) echo "  WARNING: codebase-memory-mcp install refused — machine kill switch active" ;;
         *) echo "  WARNING: codebase-memory-mcp install/upgrade failed (non-critical)" ;;
     esac
 fi
-if [ -z "$_cbm_disable_file" ] || [ -e "$_cbm_disable_file" ]; then
-    echo "  codebase-memory-mcp status probe skipped (kill switch active or unverifiable)"
+if [ -z "$_cbm_disable" ]; then
+    echo "  codebase-memory-mcp status probe skipped (kill-switch path unresolvable)"
+elif [ -e "$_cbm_disable" ]; then
+    echo "  codebase-memory-mcp status probe skipped (machine kill switch active)"
 elif command -v codebase-memory-mcp &>/dev/null; then
     echo "  codebase-memory-mcp: $(codebase-memory-mcp --version 2>/dev/null || echo 'installed')"
 fi
@@ -765,9 +775,7 @@ if command -v codebase-memory-mcp &>/dev/null; then
     # uncapped raw server in the next session — and stays uncapped after the
     # sentinel is removed until somebody runs this again.
     _register_mcp "codebase-memory-mcp" "user" "$GENESIS_ROOT/.claude/mcp/run-codebase-memory"
-    if [ -z "$_cbm_disable_file" ]; then
-        echo "  codebase-memory-mcp registered to the launcher; kill-switch state unverifiable — it fails closed"
-    elif [ -e "$_cbm_disable_file" ]; then
+    if [ -n "${_cbm_disable:-}" ] && [ -e "$_cbm_disable" ]; then
         echo "  codebase-memory-mcp registered to the launcher; the kill switch is active, so it will refuse to start"
     fi
 fi

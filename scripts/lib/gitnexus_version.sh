@@ -165,6 +165,9 @@ genesis_gitnexus_resolve_binary() {
     printf '%s\n' "${candidates[0]}"
 }
 
+# Optional $1: a caller that has ALREADY resolved the binary passes it in, so
+# the check runs against the file it will execute instead of re-resolving —
+# the launcher is the user of this.
 genesis_gitnexus_installed_version() {
     local binary="${1:-}"
     if [ -z "$binary" ]; then
