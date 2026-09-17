@@ -3626,6 +3626,7 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
         _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
 
     decisions: list[tuple[str, str]] = []
+    exemption_used = False
     for seg, body_signal in triggers:
         unresolvable = _unresolvable_identity(seg.argv)
         if unresolvable is not None:
@@ -3674,7 +3675,11 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
             marker = _review_budget.confirmation_marker(
                 str(result.get("current_head") or "")
             )
-            if body_signal is True and marker in " ".join(seg.argv):
+            # The exemption licenses ONE dispatch: every request is judged on
+            # pre-command state, so a second marked request in the same command
+            # would also read exempt. The first consumes it; the rest ask.
+            if body_signal is True and marker in " ".join(seg.argv) and not exemption_used:
+                exemption_used = True
                 decisions.append(("allow", ""))
                 continue
             # The exemption is mechanically one-shot only when the request
