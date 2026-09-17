@@ -1272,15 +1272,25 @@ if [ -f "$SYSTEMD_USER_DIR/genesis-tmp-watchgod.service" ]; then
     # D-Bus, a masked unit) while the service is already running from an earlier
     # install, so liveness alone would report success on a box where temp
     # protection will not survive a reboot.
+    # The STATE, not the exit code. `is-enabled` exits 0 for several states that
+    # do not mean what this check needs — `static`, `alias`, `indirect`,
+    # `generated`, `transient`, and above all `enabled-runtime`, which lives
+    # under /run and DISAPPEARS at reboot. A unit runtime-enabled by something
+    # earlier, plus a persistent `enable --now` that failed (a read-only user
+    # config directory, say), would otherwise be reported as durably enabled
+    # when its activation symlink is gone after the next boot. Only the literal
+    # `enabled` means the thing the operator is being told.
     _wg_enabled=0; _wg_active=0
-    systemctl --user is-enabled --quiet genesis-tmp-watchgod.service 2>/dev/null && _wg_enabled=1
+    _wg_state=$(systemctl --user is-enabled genesis-tmp-watchgod.service 2>/dev/null) || true
+    [ "$_wg_state" = "enabled" ] && _wg_enabled=1
     systemctl --user is-active --quiet genesis-tmp-watchgod.service 2>/dev/null && _wg_active=1
     if [ "$_wg_enabled" = "1" ] && [ "$_wg_active" = "1" ]; then
         echo "    + genesis-tmp-watchgod.service enabled + started"
     else
         if [ "$_wg_active" = "1" ]; then
-            echo "    WARNING: genesis-tmp-watchgod.service is running but NOT enabled —"
-            echo "             temp protection will not come back after a reboot"
+            echo "    WARNING: genesis-tmp-watchgod.service is running but not durably"
+            echo "             enabled (state: ${_wg_state:-unknown}) — temp protection"
+            echo "             will not come back after a reboot"
         else
             echo "    WARNING: genesis-tmp-watchgod.service is NOT running — temp protection is OFF"
         fi
