@@ -102,7 +102,6 @@ MAX_FORK_DEPTH = 10
 
 Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 
-
 class Refused(Exception):
     """A precondition failed. NOTHING was posted — this is a hard guarantee."""
 
@@ -408,6 +407,99 @@ def _reconcile_uncertain_create(slug: str, title: str, cause: str, run: Runner) 
     )
 
 
+def privacy_scan(title: str, body: str) -> list[str]:
+    """Scan the issue text for things that must never reach a public tracker.
+
+    Returns the WARN-level messages (for display) and raises :class:`Refused`
+    on anything BLOCK-severity. Nothing is posted on a refusal, by the same
+    guarantee every other Refused carries.
+
+    WHY THIS EXISTS. CI's leak detector reads PR DIFFS and PR BODIES. Nothing
+    reads issue bodies — an issue is a terminal egress surface with no backstop
+    whatsoever, and until now this script's only defence was the author
+    remembering. ``scan_prose`` is the sanctioned reader for that shape: it runs
+    the raw-string detectors that are meaningful on prose (portability classes
+    such as IPs and ``/home/<user>`` paths, personal emails outside the
+    allowlist, install fingerprints, and the required ``detect-secrets`` floor)
+    and deliberately skips the diff-STRUCTURAL scanners, which describe a
+    unified diff's shape rather than prose.
+
+    Do NOT substitute ``scan_diff`` here. It routes through ``parse_diff``,
+    which drops every non-``+`` line, so plain text yields zero added lines and
+    returns ok=True regardless of content — a fail-OPEN hole through a
+    fail-CLOSED component. Its own docstring says so.
+
+    FAIL-CLOSED IS THE POINT, including when the scanner itself is missing: a
+    missing ``detect-secrets`` binary and a missing fingerprint file are both
+    BLOCK findings, so an install that cannot scan cannot file.
+
+    The commonest way to hit that is the interpreter, not the install.
+    ``detect-secrets`` is resolved from ``Path(sys.executable).parent`` and is
+    installed only in the repo venv, so a bare ``python3 scripts/…`` refuses
+    every issue — correctly, but for a reason that is about the invocation
+    rather than the draft. Run it as ``.venv/bin/python scripts/…``; the
+    refusal below says so. An earlier revision of this script tried to REPAIR
+    that by re-executing itself under the venv, and it was cut: the predicate
+    it needed ("am I already the right interpreter?") compared resolved
+    interpreter paths, and a ``--symlinks`` venv makes ``venv/bin/python``
+    resolve to the same real binary as ``/usr/bin/python3`` — so the test was
+    true exactly when the repair was needed, and the mechanism never fired on
+    any install. Do not reintroduce it without comparing UNRESOLVED bin
+    directories, and do not reintroduce it at all before asking whether the
+    documentation line is the real fix.
+    """
+    src = str(Path(__file__).resolve().parent.parent / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    try:
+        from genesis.contribution.sanitize import scan_prose
+    except ImportError as exc:
+        raise Refused(
+            f"cannot import the privacy scanner ({exc}). An issue is a public, "
+            "irreversible post with no CI backstop, so it is not filed unscanned. "
+            "Run from the repo with its venv: .venv/bin/python scripts/file_tracker_issue.py"
+        ) from exc
+
+    # Title and body are scanned TOGETHER but as separate lines: scan_prose is
+    # line-oriented, and concatenating them without a newline could splice a
+    # detectable value across the seam into something neither scanner pattern
+    # matches.
+    result = scan_prose(f"{title}\n{body}")
+    blocking = result.blocking()
+    if blocking:
+        detail = "; ".join(
+            f"[{f.kind.value}] {f.message}" + (f" — {f.detail}" if f.detail else "")
+            for f in blocking
+        )
+        hint = ""
+        if any(f.scanner == "detect-secrets" and "not found" in f.message for f in blocking):
+            # Name the invocation rather than the draft. This refusal is about
+            # the interpreter, and an operator reading "BLOCKED" about text they
+            # just wrote will edit the text, which cannot help.
+            hint = (
+                "  This one is about the INTERPRETER, not your draft: re-run as "
+                "`.venv/bin/python scripts/file_tracker_issue.py …`."
+            )
+        raise Refused(
+            f"privacy scan BLOCKED this issue ({len(blocking)} finding(s)): {detail}{hint}"
+        )
+    return [f"[{f.kind.value}] {f.message}" for f in result.findings]
+
+
+def _digest(data: bytes) -> str:
+    """SHA-256 of the draft bytes.
+
+    Takes BYTES, not a path, and that is the whole point. An earlier version
+    re-READ the file to digest it, which put the entire privacy scan — one
+    ``detect-secrets`` subprocess per line — inside an unguarded window between
+    the read that produced the scanned text and the read that produced the
+    digest. A write landing there was digested but never scanned, so the later
+    comparison passed and the refusal message promised something the code could
+    not deliver. Digest the bytes the scan actually saw.
+    """
+    return hashlib.sha256(data).hexdigest()
+
+
 def create_issue(
     slug: str, title: str, body_path: str, labels: Sequence[str], run: Runner = _run
 ) -> str:
@@ -541,8 +633,13 @@ def _run_main(argv: Sequence[str] | None, run: Runner) -> int:
         try:
             with open(args.title_file, encoding="utf-8") as fh:
                 title = fh.read().strip()
-            with open(args.body_file, encoding="utf-8") as fh:
-                body = fh.read().strip()
+            # ONE read of the body, kept as bytes. gh re-reads this file at
+            # create time, so the digest has to cover exactly the bytes the scan
+            # below sees — a second read to digest would leave the whole scan
+            # sitting in an unguarded window.
+            body_bytes = Path(args.body_file).read_bytes()
+            body_digest = _digest(body_bytes)
+            body = body_bytes.decode("utf-8").strip()
         except (OSError, UnicodeDecodeError) as exc:
             # Unreadable or non-UTF-8 drafts are a "nothing was posted" outcome,
             # so they belong on exit 2 with everything else that refused — not on
@@ -561,6 +658,12 @@ def _run_main(argv: Sequence[str] | None, run: Runner) -> int:
         if "\n" in title or "\r" in title:
             raise Refused("title contains a newline — GitHub's handling of that is unverified")
 
+        # BEFORE the lock and before any network call. A refusal here must cost
+        # nothing and leave no trace on the tracker; running it after
+        # resolve_tracker would spend API calls to learn where not to post.
+        for warning in privacy_scan(title, body):
+            _warn(f"privacy scan: {warning}")
+
         labels = validate_labels(args.area, args.difficulty)
         slug = resolve_tracker(run)
         perm = check_permission(slug, run)
@@ -578,6 +681,21 @@ def _run_main(argv: Sequence[str] | None, run: Runner) -> int:
             # has already happened — letting the print's OSError fall through to
             # the generic handler would report exit 1 for a CONFIRMED issue and
             # send the operator to retry into a duplicate.
+            # Last possible moment before gh re-reads the file. Inside the lock
+            # and after the duplicate check, so the window this closes is as
+            # small as the design allows.
+            try:
+                current = _digest(Path(args.body_file).read_bytes())
+            except OSError as exc:
+                # Same class as the initial draft read, so the same outcome:
+                # refused, nothing posted, exit 2 — not the generic exit 1 the
+                # module docstring reserves for an unexpected error.
+                raise Refused(f"cannot re-read the draft body: {exc}") from exc
+            if current != body_digest:
+                raise Refused(
+                    f"{args.body_file} changed after it was scanned — refusing to post "
+                    "text no privacy scan has seen. Re-run to scan the new content."
+                )
             create_attempted = True
             posted = create_issue(slug, title, args.body_file, labels, run)
         # From here the issue EXISTS. Nothing below may report otherwise — see

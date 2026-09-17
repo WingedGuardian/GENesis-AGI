@@ -57,6 +57,33 @@ def _runner(responses: dict[str, subprocess.CompletedProcess[str]], calls: list 
     return run
 
 
+#: A SYNTHETIC fingerprint list. Never this install's real one: a test fixture
+#: is tracked, public, and permanent, so real hostnames or subnets in it are the
+#: leak the scanner exists to prevent.
+_SYNTHETIC_FINGERPRINTS = "# synthetic test fingerprints\nexample-fixture-host\n"
+
+
+@pytest.fixture(autouse=True)
+def synthetic_fingerprints(tmp_path_factory, monkeypatch):
+    """Point the privacy scan at a fingerprint file that EXISTS.
+
+    ``scan_prose`` fails CLOSED when the fingerprint list is missing — correct,
+    because an issue is a terminal egress surface with no CI backstop. But
+    ``~/.genesis/release-fingerprints.txt`` is written by bootstrap, and a
+    GitHub runner has no such file, so without this every test that reaches the
+    scan would fail on CI while passing on a developer box.
+
+    MEASURED 2026-09-16 when the scan was wired in: 13 of 60 tests in this
+    module passed locally and failed under an empty HOME. The env var is
+    inherited, so this covers the subprocess tests as well as the in-process
+    ones. ``test_a_missing_fingerprint_file_refuses`` opts out to pin the
+    fail-closed direction itself.
+    """
+    path = tmp_path_factory.mktemp("fingerprints") / "release-fingerprints.txt"
+    path.write_text(_SYNTHETIC_FINGERPRINTS, encoding="utf-8")
+    monkeypatch.setenv("GENESIS_RELEASE_FINGERPRINTS", str(path))
+
+
 # --- round 3: the permission check resolved the FORK and reported ADMIN -------
 
 
@@ -1145,3 +1172,149 @@ class TestSigtermHandlerIsScoped:
         assert rc == 0
         assert seen, "the runner was never called, so nothing was observed"
         assert all(h is fti._sigterm_as_interrupt for h in seen)
+# --- the privacy scan: an issue is a terminal egress surface -----------------
+#
+# CI's leak detector reads PR diffs and PR bodies. NOTHING reads issue bodies,
+# so until this scan existed the only thing between a draft and a permanent
+# public post was the author remembering. These pin the three properties that
+# make it a gate rather than a gesture: it blocks, it blocks BEFORE any network
+# call, and it cannot be satisfied by an install that cannot actually scan.
+
+
+def _scan_runner(calls: list):
+    """A runner that answers the lookups but records everything it is asked."""
+    return _runner(
+        {
+            "isFork": _proc(
+                json.dumps({"isFork": False, "nameWithOwner": "Org/Repo", "parent": None})
+            ),
+            "viewerPermission": _proc(json.dumps({"viewerPermission": "WRITE"})),
+            # Newline-delimited JSON OBJECTS, one per issue. An empty body
+            # means "no issues" — a JSON array here is a DIFFERENT shape and
+            # crashes the reader.
+            "gh api": _proc(""),
+            "issue create": _proc("https://github.com/Org/Repo/issues/1"),
+        },
+        calls,
+    )
+
+
+def _file(tmp_path, title: str, body: str) -> tuple[str, str]:
+    t, b = tmp_path / "title.txt", tmp_path / "body.md"
+    t.write_text(title, encoding="utf-8")
+    b.write_text(body, encoding="utf-8")
+    return str(t), str(b)
+
+
+def _main(t, b, run):
+    return fti.main(
+        [
+            "--title-file",
+            t,
+            "--body-file",
+            b,
+            "--area",
+            "area:other",
+            "--difficulty",
+            "help wanted",
+        ],
+        run,
+    )
+
+
+def test_acceptance_a_home_path_in_the_body_is_refused_with_no_network_call(tmp_path, capsys):
+    """THE ACCEPTANCE BAR. A /home/<user> path is the portability class that
+    leaks an operator's account name, and it must never reach the tracker.
+
+    The zero-call assertion is the half that matters most: refusing AFTER
+    resolving the tracker would still be a refusal, but it would spend API
+    calls learning where not to post and would leave the draft one bug away
+    from a real create. The scan runs before anything leaves the machine.
+    """
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "Repro: run it from /home/someoperator/genesis.")
+    rc = _main(t, b, _scan_runner(calls))
+    assert rc == 2, "a home path must REFUSE, and a refusal means nothing was posted"
+    err = capsys.readouterr().err
+    assert "privacy scan BLOCKED" in err
+    assert calls == [], f"the scan must precede every subprocess call, got {calls}"
+
+
+def test_a_clean_body_still_files(tmp_path, capsys):
+    """The control. Without it the test above cannot distinguish a working
+    scanner from one that refuses everything -- which is exactly the state this
+    change exists to fix, so it is not a hypothetical failure mode."""
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "A plain technical description, no private data.")
+    rc = _main(t, b, _scan_runner(calls))
+    assert rc == 0, capsys.readouterr().err
+    assert any("issue create" in " ".join(c) for c in calls)
+
+
+def test_a_missing_fingerprint_file_refuses_rather_than_filing(tmp_path, capsys, monkeypatch):
+    """Fail-CLOSED, pinned rather than inherited.
+
+    Opts out of the autouse fixture by pointing at a path that does not exist.
+    An install whose fingerprint list was never generated cannot scan, and an
+    unscannable issue is not filed -- the direction scan_prose chose because
+    prose egress has no CI backstop to catch what it misses.
+    """
+    monkeypatch.setenv("GENESIS_RELEASE_FINGERPRINTS", str(tmp_path / "absent.txt"))
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "Entirely innocuous text.")
+    rc = _main(t, b, _scan_runner(calls))
+    assert rc == 2
+    # WHICH floor refused matters: on an interpreter where detect-secrets is
+    # also unreachable this would pass for the wrong reason and pin nothing
+    # about the fingerprint floor.
+    assert "fingerprint" in capsys.readouterr().err.lower()
+    assert calls == []
+
+
+def test_a_body_edited_after_the_scan_is_not_posted(tmp_path, capsys):
+    """gh re-reads the body FILE at create time, so the bytes it sends are not
+    the string that was scanned. Without the digest re-check, an edit landing in
+    that window publishes text nothing ever looked at."""
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "Clean at scan time.")
+    inner = _scan_runner(calls)
+
+    def run(argv):
+        # Swap the body the moment the tracker is resolved -- inside the
+        # window, before the create.
+        if "isFork" in " ".join(argv):
+            Path(b).write_text("Now mentions /home/someoperator/secrets", encoding="utf-8")
+        return inner(argv)
+
+    rc = _main(t, b, run)
+    assert rc == 2, "an edit after the scan must refuse"
+    assert "changed after it was scanned" in capsys.readouterr().err
+    assert not any("issue create" in " ".join(c) for c in calls)
+def test_a_body_edited_DURING_the_scan_is_not_posted(tmp_path, capsys, monkeypatch):
+    """The window the digest fix actually closed, which the test above misses.
+
+    The other TOCTOU test edits the body after the digest was taken, so it
+    passes under either implementation. This one edits it WHILE the scan runs —
+    the window between the read that produced the scanned text and the digest.
+    Under the earlier shape, where the digest was a SECOND read taken after the
+    scan returned, the edit was digested but never scanned, the in-lock
+    comparison matched, and gh posted text nothing had looked at.
+
+    That window is the widest in the flow: scan_prose spawns one detect-secrets
+    subprocess per line, so it is not a hairline race.
+    """
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "Clean at read time.")
+    real = fti.privacy_scan
+
+    def scan_then_tamper(title, body):
+        out = real(title, body)
+        # Land the write mid-scan, after the bytes were read.
+        Path(b).write_text("Now mentions /home/someoperator/secrets", encoding="utf-8")
+        return out
+
+    monkeypatch.setattr(fti, "privacy_scan", scan_then_tamper)
+    rc = _main(t, b, _scan_runner(calls))
+    assert rc == 2, "an edit landing during the scan must refuse"
+    assert "changed after it was scanned" in capsys.readouterr().err
+    assert not any("issue create" in " ".join(c) for c in calls)
