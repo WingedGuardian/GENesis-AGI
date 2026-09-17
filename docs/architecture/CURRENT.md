@@ -2763,7 +2763,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 50b79ffb 2026-09-01
+verified: 2ac29c19 2026-09-14
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -2791,6 +2791,16 @@ verified: 50b79ffb 2026-09-01
   `<!-- genesis:skills -->` block in `AGENTS.md` for Cursor/Codex/other
   runtimes — on-demand and committed (re-run when skills/MCP tools change;
   `update.sh` restores AGENTS.md to HEAD, so the block must live in the commit).
+  Codex has a separate external-client adapter in `.codex/config.toml`: it
+  starts the existing standalone health and memory MCP servers through a
+  launcher that scrubs inherited Genesis session identity, provenance,
+  supervision, slot, and trace context, then allowlists health plus explicit
+  recall tools. In a linked worktree the launcher sets `GENESIS_REPO_ROOT` to
+  the main checkout, which owns the live database and secrets. This gives Codex
+  on-demand access without registering its transcript,
+  creating a charter, or joining Genesis foreground/background lifecycle
+  management. Recall remains read-oriented rather than side-effect-free: its
+  normal retrieval-use metadata may still be updated.
   `web-research` is the shared method for foreground sessions, the
   `genesis-researcher` subagent, and research-profile background sessions;
   task risk and breadth select its depth. Tier-2 `research` resources resolve and
