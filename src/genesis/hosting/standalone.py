@@ -749,11 +749,24 @@ class StandaloneAdapter:
             if "voice_api" not in app.blueprints:
                 app.register_blueprint(voice_api_bp)
                 logger.info("Voice API blueprint registered")
-            if not os.environ.get("GENESIS_MCP_HTTP_TOKEN"):
+            # .strip() to match check_bearer_token, which treats a quoted
+            # whitespace-only token as unconfigured. Without it the two
+            # disagree in exactly the case the warning exists for: every /v1
+            # surface answers 503 while boot stays silent, because the raw
+            # value is truthy.
+            if not os.environ.get("GENESIS_MCP_HTTP_TOKEN", "").strip():
+                # Names EVERY surface the token gates. A warning that lists
+                # some of them is worse than one that lists none: an operator
+                # who configured the desk endpoint and sees only voice and
+                # OpenClaw named concludes their own surface is fine and goes
+                # looking somewhere else for the 503. Anything added to this
+                # token's consumers belongs in this string and in
+                # secrets.env.example, which carries the same list.
                 logger.warning(
-                    "voice API disabled: GENESIS_MCP_HTTP_TOKEN not configured "
-                    "— all /v1/voice/* routes answer 503 (fail-closed; set the "
-                    "token in secrets.env to enable the voice API)"
+                    "GENESIS_MCP_HTTP_TOKEN not configured — all /v1/voice/* "
+                    "routes, /v1/chat/completions (OpenClaw) AND "
+                    "/v1/desk/chat/completions (desk brain) answer 503 "
+                    "(fail-closed; set the token in secrets.env to enable them)"
                 )
         except Exception:
             logger.exception("Failed to register voice API blueprint")
@@ -776,6 +789,16 @@ class StandaloneAdapter:
                 )
         except Exception:
             logger.exception("Failed to register agent connector blueprint")
+
+        # Desk brain API — a desktop assistant's router-backed brain.
+        try:
+            from genesis.dashboard.routes.desk_api import desk_api_bp
+
+            if "desk_api" not in app.blueprints:
+                app.register_blueprint(desk_api_bp)
+                logger.info("Desk brain API blueprint registered")
+        except Exception:
+            logger.exception("Failed to register desk brain API blueprint")
 
     def _run_flask(self) -> None:
         """Run Flask in a thread (called from daemon thread)."""

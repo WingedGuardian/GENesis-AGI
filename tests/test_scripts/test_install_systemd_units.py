@@ -47,11 +47,15 @@ a duplicate SOURCE FILE (structural — compares two directories, reads no
 spellings) and a unit that NAMES the repo directly (the root allowlist).
 """
 
+import shlex
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE_DIR = REPO_ROOT / "scripts" / "systemd"
 CONFIG_DIR = REPO_ROOT / "config"
+INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
 
 UNIT_SUFFIXES = ("*.service", "*.timer")
 
@@ -114,10 +118,46 @@ _PATH_DIRECTIVES = ("ExecStart", "ExecStartPre", "ExecStartPost", "ExecStop",
 _ALLOWED_ROOT_PREFIXES = ("/bin/", "/usr/", "/sbin/", "%h/.local/share/")
 
 
-def _first_path_token(value: str) -> str:
-    """The program or directory a directive names, minus systemd's `-` prefix."""
-    token = value.strip().split()[0] if value.strip() else ""
-    return token[1:] if token.startswith("-") else token
+def _path_tokens(value: str) -> list[str]:
+    """EVERY path-looking token in a directive value, not just the program.
+
+    Reading only argv[0] was a real hole: seven of the shipped templates are
+    `ExecStart=/bin/bash __REPO_DIR__/scripts/...`, so `/bin/bash` satisfied the
+    allowlist and the repo path after it — the part that actually has to be
+    portable — was never checked. Writing `/bin/bash %h/genesis/scripts/x.sh`
+    into any of them reproduced the original non-portable failure with the suite
+    green.
+
+    Widening from argv[0] to every element moved the narrowness rather than
+    removing it — the first version of this function dropped any token that
+    matched no start-character, which is FAIL-OPEN, and it read tokens the
+    shell would have unquoted. Three things it got wrong, all measured:
+
+    * systemd allows `@ + ! !! : -` as exec prefixes, alone or combined, and
+      only on the PROGRAM. Stripping just `-` meant `ExecStart=+%h/genesis/x.sh`
+      produced no tokens at all and sailed through.
+    * `.split()` leaves quotes attached, so `/bin/bash -c '%h/genesis/x.sh'`
+      was invisible — and that `-c '...'` shape already ships, in
+      `config/genesis-guardian-watchman.service`.
+    * `$MAINPID`, `%n`, `%i` are not paths. Flagging them failed legitimate
+      units and pointed the author at `__REPO_DIR__`, which is nonsense advice.
+
+    So: unquote the way the shell would, strip the full prefix set from argv[0]
+    only, and require a token to contain a separator before judging its root —
+    a bare specifier or environment variable has no root to check.
+    """
+    try:
+        parts = shlex.split(value, posix=True)
+    except ValueError:
+        # Unbalanced quotes: systemd would reject the unit anyway. Fall back to
+        # a naive split rather than returning nothing, which would be fail-open.
+        parts = value.strip().split()
+    tokens = []
+    for index, raw in enumerate(parts):
+        token = (raw.lstrip("@+!:-") or raw) if index == 0 else raw
+        if "/" in token and token.startswith(("/", "~", "%", "__", "$")):
+            tokens.append(token)
+    return tokens
 
 
 def _unit_sources() -> list[Path]:
@@ -144,15 +184,13 @@ def test_every_unit_path_starts_at_an_ALLOWED_root():
             name, sep, value = line.partition("=")
             if not sep or name.strip() not in _PATH_DIRECTIVES:
                 continue
-            token = _first_path_token(value)
-            if not token:
-                continue
-            if token.startswith("__") or token.startswith(_ALLOWED_ROOT_PREFIXES):
-                continue
-            offenders.append(
-                f"{source.relative_to(REPO_ROOT)}:{lineno}: {name.strip()} starts "
-                f"at {token!r}, which is not an allowed root"
-            )
+            for token in _path_tokens(value):
+                if token.startswith("__") or token.startswith(_ALLOWED_ROOT_PREFIXES):
+                    continue
+                offenders.append(
+                    f"{source.relative_to(REPO_ROOT)}:{lineno}: {name.strip()} "
+                    f"names {token!r}, which is not an allowed root"
+                )
     assert not offenders, (
         "a systemd unit names a path root that is not allowed. Use __REPO_DIR__ "
         "(or another placeholder) so the installer renders it against the real "
@@ -161,24 +199,73 @@ def test_every_unit_path_starts_at_an_ALLOWED_root():
     )
 
 
-def test_the_allowlist_actually_rejects_the_original_defect():
-    """Guard-the-guard: prove the predicate is not vacuous.
-
-    Every shipped unit passes the test above, so on its own that test cannot
-    distinguish "the allowlist works" from "the allowlist accepts everything".
-    These two lines are the real defect and its correct form.
-    """
-    bad = _first_path_token("%h/genesis/scripts/tmp_watchgod.sh")
-    assert not (bad.startswith("__") or bad.startswith(_ALLOWED_ROOT_PREFIXES)), (
-        "the allowlist accepts the exact line that caused this bug"
+def _rejected(value: str) -> bool:
+    """What the allowlist test would conclude about one directive value."""
+    toks = _path_tokens(value)
+    return bool(toks) and any(
+        not (t.startswith("__") or t.startswith(_ALLOWED_ROOT_PREFIXES)) for t in toks
     )
-    good = _first_path_token("__REPO_DIR__/scripts/tmp_watchgod.sh")
-    assert good.startswith("__"), "the allowlist rejects the correct form"
-    # The guardian deploy target is outside the repo and must stay legal.
-    guardian = _first_path_token("%h/.local/share/genesis-guardian/.venv/bin/python")
-    assert guardian.startswith(_ALLOWED_ROOT_PREFIXES), "guardian units rejected"
-    # systemd's ignore-failure prefix must not smuggle a bad root past the check.
-    assert _first_path_token("-%h/genesis/x.sh") == "%h/genesis/x.sh"
+
+
+# Built from systemd's OWN GRAMMAR — exec prefixes and quoting — not from the
+# shipped units. "All 23 sources still pass" only measures the corpus the author
+# already handled; every row below was a real miss in some earlier revision of
+# this predicate, in one direction or the other.
+_MUST_REJECT = [
+    # The original defect, as the program.
+    "%h/genesis/scripts/tmp_watchgod.sh",
+    # ...and as an ARGUMENT, the shape seven shipped templates use.
+    "/bin/bash %h/genesis/scripts/x.sh",
+    # Every systemd exec prefix, alone and combined. Stripping only `-` made
+    # each of these produce NO tokens at all, which is fail-open.
+    "+%h/genesis/scripts/x.sh",
+    "@%h/genesis/scripts/x.sh argv0",
+    "!%h/genesis/scripts/x.sh",
+    "!!%h/genesis/scripts/x.sh",
+    ":%h/genesis/scripts/x.sh",
+    "-+%h/genesis/scripts/x.sh",
+    # Quoted. `.split()` left the quote attached so the token matched nothing —
+    # and `-c '...'` already ships in config/genesis-guardian-watchman.service.
+    "/bin/bash -c '%h/genesis/scripts/x.sh'",
+    '/bin/bash -c "/home/someuser/genesis/x.sh"',
+    # Other spellings of the same root.
+    "~/code/genesis/x.sh",
+    "$HOME/src/genesis/x.sh",
+    "%h/genesis",
+]
+
+_MUST_PASS = [
+    # Canonical systemd idioms. These are NOT paths, and flagging them told the
+    # author to "use __REPO_DIR__", which is nonsense advice.
+    "/bin/kill -HUP $MAINPID",
+    "/usr/bin/foo $OPTIONS",
+    "/usr/bin/foo --name %n",
+    "/usr/bin/foo --instance %i",
+    # The correct forms, in both positions.
+    "__REPO_DIR__/scripts/tmp_watchgod.sh",
+    "/bin/bash __REPO_DIR__/scripts/backup.sh",
+    "/bin/bash __REPO_DIR__/scripts/x.sh __REPO_DIR__",
+    # The guardian deploy target is outside the repo and stays legal.
+    "%h/.local/share/genesis-guardian/.venv/bin/python",
+    # System binaries, with and without the ignore-failure prefix.
+    "/usr/bin/systemctl --user stop code-intel-*.scope",
+    "-/usr/bin/systemctl --user stop x.scope",
+    # Shipped verbatim in config/genesis-guardian-watchman.service.
+    "/bin/bash -c 'systemctl --user is-active genesis-guardian.timer"
+    " || systemctl --user start genesis-guardian.timer'",
+    # A quoted shell fragment containing a bare `/` is not a path root.
+    "/bin/bash -c 'df --output=pcent / | tail -1'",
+]
+
+
+@pytest.mark.parametrize("value", _MUST_REJECT)
+def test_allowlist_rejects_a_hardcoded_repo_path(value):
+    assert _rejected(value), f"fail-open: {value}"
+
+
+@pytest.mark.parametrize("value", _MUST_PASS)
+def test_allowlist_passes_legitimate_unit_values(value):
+    assert not _rejected(value), f"over-fire: {value}"
 
 
 def test_watchgod_uses_Type_exec_so_a_failed_exec_cannot_read_active():
@@ -202,3 +289,32 @@ def test_watchgod_uses_Type_exec_so_a_failed_exec_cannot_read_active():
         "installer's liveness check can read `active` for a unit that never ran"
     )
     assert "\nType=simple\n" not in body
+
+
+def test_installer_requires_the_literal_enabled_state_not_an_exit_code():
+    """`is-enabled` exit 0 does not mean "will survive a reboot".
+
+    It also succeeds for `static`, `alias`, `indirect`, `generated`,
+    `transient` — and for `enabled-runtime`, which lives under /run and
+    disappears at the next boot. A unit runtime-enabled by something earlier,
+    plus a persistent `enable --now` that failed (a read-only user config
+    directory, say), would be reported as durably enabled while its activation
+    symlink is already gone.
+
+    That is the same defect this area was fixed for once already: treating a
+    success exit code as proof of a durable property.
+
+    Text-level, and honest about it: this pins the DECISION and its reason so a
+    future edit cannot quietly revert to the exit code. It does not exercise
+    systemd — the behavioural check for that is the install job, which runs the
+    real installer on a clean machine.
+    """
+    body = INSTALL_SH.read_text()
+    assert 'is-enabled --quiet genesis-tmp-watchgod' not in body, (
+        "the installer is back to reading is-enabled's EXIT CODE, which is also "
+        "0 for enabled-runtime and does not mean the unit survives a reboot"
+    )
+    assert '_wg_state=$(systemctl --user is-enabled genesis-tmp-watchgod.service' in body
+    assert '[ "$_wg_state" = "enabled" ]' in body, (
+        "the state must be compared to the literal 'enabled'"
+    )

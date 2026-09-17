@@ -16,6 +16,13 @@ Protocol notes (confirmed from OpenClaw source/docs):
 - ``x-openclaw-message-channel`` carries the originating channel name
   (e.g. "whatsapp", "telegram") — logged for observability
 
+Auth: ``Authorization: Bearer <GENESIS_MCP_HTTP_TOKEN>``, enforced per-route via
+the shared ``/v1/*`` check. The dashboard's session gate exempts the whole
+``/v1/*`` prefix (machine callers have no browser session), so without this the
+route would authenticate nobody — and it reaches CC invocation. Configure the
+same token on the OpenClaw side as the provider's API key; it is a standard
+OpenAI-compatible client, so the header needs no custom code there.
+
 Architecture:
   ConversationLoop (created by StandaloneAdapter at startup) runs in the main
   asyncio loop.  Flask threads submit coroutines via
@@ -37,6 +44,7 @@ from flask import Blueprint, Response, current_app, jsonify, request
 
 from genesis.cc.types import ChannelType
 from genesis.hosting.openai_messages import extract_last_user_message
+from genesis.dashboard.auth import check_bearer_token
 
 logger = logging.getLogger("genesis.hosting.openclaw")
 
@@ -57,6 +65,14 @@ def chat_completions():
     streams the response as OpenAI-format SSE.
     """
     from genesis.runtime import GenesisRuntime
+
+    # Auth BEFORE any work: this route spawns CC subprocesses, so an
+    # unauthenticated caller must not reach the readiness probe, the body
+    # parse, or the semaphore.
+    denied = check_bearer_token("OpenClaw completions")
+    if denied:
+        message, status = denied
+        return jsonify({"error": message, "type": "error"}), status
 
     rt = GenesisRuntime.instance()
     if not rt.is_bootstrapped or rt.cc_invoker is None:
