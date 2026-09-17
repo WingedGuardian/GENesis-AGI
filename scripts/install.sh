@@ -675,7 +675,7 @@ else
     case "$_cbm_rc" in
         0) echo "    + codebase-memory-mcp installed/upgraded" ;;
         1) echo "    NOTE: codebase-memory-mcp installer download failed (optional)" ;;
-        3) echo "    ERROR: codebase-memory-mcp pin/digest mismatch (see above) — repository bug, not transient" ;;
+        3) echo "    ERROR: codebase-memory-mcp integrity check failed — the pinned installer does not match the committed digest (see above)" ;;
         4) echo "    NOTE: codebase-memory-mcp install refused — machine kill switch active" ;;
         *) echo "    NOTE: codebase-memory-mcp unavailable (optional) — see the error above" ;;
     esac

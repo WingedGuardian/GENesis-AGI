@@ -399,7 +399,7 @@ else
     case "$_cbm_rc" in
         0) ;;
         1) echo "  WARNING: codebase-memory-mcp installer download failed (non-critical)" ;;
-        3) echo "  ERROR: codebase-memory-mcp pin/digest mismatch (see above) — repository bug, not transient" ;;
+        3) echo "  ERROR: codebase-memory-mcp integrity check failed — the pinned installer does not match the committed digest (see above)" ;;
         4) echo "  WARNING: codebase-memory-mcp install refused — machine kill switch active" ;;
         *) echo "  WARNING: codebase-memory-mcp install/upgrade failed (non-critical)" ;;
     esac
