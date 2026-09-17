@@ -24,7 +24,7 @@ on:
   # when they land or are removed so the check reflects the newest review
   # state on the same head.
   pull_request_review:
-    types: [submitted, dismissed]
+    types: [submitted, edited, dismissed]
   pull_request_review_comment:
     types: [created, edited, deleted]
   issue_comment:

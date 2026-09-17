@@ -1100,11 +1100,13 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         def _is_self_check(c: object) -> bool:
             if not isinstance(c, dict):
                 return False
-            if self_wf and (c.get("workflowName") or "").strip().casefold() == self_wf:
-                return True
-            if self_job and (c.get("name") or "").strip().casefold() == self_job:
-                return True
-            return False
+            return (
+                self_wf
+                and (c.get("workflowName") or "").strip().casefold() == self_wf
+            ) or (
+                self_job
+                and (c.get("name") or "").strip().casefold() == self_job
+            )
 
         checks = [c for c in checks if not _is_self_check(c)]
         if not checks:
