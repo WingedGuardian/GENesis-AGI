@@ -831,7 +831,7 @@ def test_installer_does_not_claim_queue_success_after_writer_failure():
 
 # ── the cap must be bounded by what the INSTALL has, not by a constant ───────
 
-def _headroom_decision(tmp_path, ceiling_gib: int, want: str = "8G") -> tuple[str, str]:
+def _headroom_decision(tmp_path, ceiling_gib: int, want: str = "8G", env_overrides: dict | None = None) -> tuple[str, str]:
     """Run the SHIPPED decision block at a given install size.
 
     The block is EXTRACTED from the real script rather than re-typed: a copy
@@ -859,6 +859,7 @@ def _headroom_decision(tmp_path, ceiling_gib: int, want: str = "8G") -> tuple[st
                 # depends on what the test host happens to be running.
                 "CODE_INTEL_MEM_CURRENT_BYTES": str(512 * 1024**2),
                 "GITNEXUS_MEM_MAX": want,
+                **(env_overrides or {}),
             },
         ).stdout
     cap, _, why = out.partition("|")
@@ -889,8 +890,8 @@ def test_a_mid_size_install_gets_the_cap_trimmed_to_its_headroom(tmp_path):
     lowered to the headroom rather than left at a value the box cannot honour."""
     cap, why = _headroom_decision(tmp_path, 8)
     assert not why, f"an 8 GiB install was refused: {why}"
-    assert cap.endswith("M"), cap
-    trimmed = int(cap[:-1]) * 1024 * 1024
+    assert cap.isdigit(), cap
+    trimmed = int(cap)
     assert trimmed < 8 * 1024**3, "the cap was not trimmed to the install's headroom"
     assert trimmed >= 4874166272, (
         f"trimmed to {cap}, which is below the measured working set — that is the "
@@ -905,6 +906,23 @@ def test_a_large_install_is_left_alone(tmp_path):
         cap, why = _headroom_decision(tmp_path, gib)
         assert not why, f"a {gib} GiB install was refused: {why}"
         assert cap == "8G", f"a {gib} GiB install had its cap changed to {cap}"
+
+
+def test_sub_mib_headroom_keeps_full_byte_precision(tmp_path):
+    """Admission proves the byte cap safe, so trimming must not round it down.
+    A spare that sits above the measured minimum but below the next whole MiB
+    used to come out as a lower MiB cap and defeat the refusal it just passed.
+    systemd accepts an integer byte count, so carry it exactly."""
+    spare = 4874166272 + (1024 * 1024) - 1
+    cap, why = _headroom_decision(
+        tmp_path, 8,
+        env_overrides={
+            "CODE_INTEL_MEM_CEILING_BYTES": str((512 * 1024**2) + (512 * 1024**2) + spare),
+            "CODE_INTEL_SIBLING_RESERVE_BYTES": str(512 * 1024**2),
+        },
+    )
+    assert not why, f"a sub-MiB spare was refused: {why}"
+    assert cap == str(spare), f"trimmed cap lost byte precision: {cap}"
 
 
 def test_a_configured_cap_below_the_working_set_is_refused(tmp_path):

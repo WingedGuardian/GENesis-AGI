@@ -209,7 +209,11 @@ elif [ -n "$_genesis_ceiling_b" ]; then
     if [ "$_genesis_spare_b" -lt "$CODE_INTEL_GITNEXUS_MIN_BYTES" ]; then
         GITNEXUS_MEM_REFUSE="this install has $(( _genesis_ceiling_b / 1024 / 1024 ))M total; live usage and the reserve claim $(( _genesis_siblings_b / 1024 / 1024 ))M of it, leaving $(( _genesis_spare_b / 1024 / 1024 ))M, below the $(( CODE_INTEL_GITNEXUS_MIN_BYTES / 1024 / 1024 ))M a measured full rebuild needs"
     elif [ "$_genesis_spare_b" -lt "$_genesis_want_b" ]; then
-        GITNEXUS_MEM_MAX="$(( _genesis_spare_b / 1024 / 1024 ))M"
+        # Bytes, not a rounded-down MiB: admission already proved this exact
+        # spare is safe, and rounding it can cross below the measured working
+        # set only to admit a cap that cannot bite. systemd accepts integer
+        # byte counts and the rlimit fallback parses them.
+        GITNEXUS_MEM_MAX="$_genesis_spare_b"
     fi
 fi
 # Probe with the larger supported value; each tool overrides this dynamically
