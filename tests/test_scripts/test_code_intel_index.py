@@ -250,6 +250,66 @@ def test_cbm_done_gitnexus_refused_is_partial_rc4(tmp_path):
     assert "codebase-memory-mcp ARGS:" in log.read_text()
 
 
+def test_cbm_done_gitnexus_failed_is_partial_rc4(tmp_path):
+    """cbm done + gitnexus leg FAILED (not merely skipped) is still rc 4:
+    the completed leg must be consumable, not restored as a whole-request
+    failure that rebuilds cbm on every retry."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    _write_exec(
+        fakebin / "gitnexus",
+        '#!/usr/bin/env bash\n'
+        'if [ "${1:-}" = "--version" ]; then echo "1.6.12"; exit 0; fi\n'
+        f'echo "gitnexus ARGS:$*" >> "{log}"\n'
+        "exit 7\n",
+    )
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "both", path=f"{fakebin}:{_SYSTEM_PATH}")
+    assert res.returncode == 4, res.stderr
+    assert "codebase-memory-mcp ARGS:" in log.read_text()
+    assert "gitnexus ARGS:" in log.read_text()  # ran and failed — not missing
+
+
+def test_cbm_failed_gitnexus_done_is_partial_rc5(tmp_path):
+    """The inverse: cbm fails, gitnexus succeeds — rc 5, so gitnexus's work is
+    consumed and cbm's shared full clock is not stamped for work that errored."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    _write_exec(
+        fakebin / "codebase-memory-mcp",
+        '#!/usr/bin/env bash\n'
+        f'echo "codebase-memory-mcp ARGS:$*" >> "{log}"\n'
+        "exit 9\n",
+    )
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "both", path=f"{fakebin}:{_SYSTEM_PATH}")
+    assert res.returncode == 5, res.stderr
+    assert "gitnexus ARGS:analyze" in log.read_text()
+
+
+def test_both_legs_failed_keeps_failure_rc(tmp_path):
+    """When NO requested leg completed there is no partial outcome: the raw
+    failure rc is preserved so the runner applies the attempts penalty."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    _write_exec(
+        fakebin / "codebase-memory-mcp",
+        '#!/usr/bin/env bash\n'
+        f'echo "codebase-memory-mcp ARGS:$*" >> "{log}"\n'
+        "exit 9\n",
+    )
+    _write_exec(
+        fakebin / "gitnexus",
+        '#!/usr/bin/env bash\n'
+        'if [ "${1:-}" = "--version" ]; then echo "1.6.12"; exit 0; fi\n'
+        f'echo "gitnexus ARGS:$*" >> "{log}"\n'
+        "exit 7\n",
+    )
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "both", path=f"{fakebin}:{_SYSTEM_PATH}")
+    assert res.returncode == 7, res.stderr  # last leg's failure code, not 3/4/5
+
+
 def test_tool_selection_gitnexus_only(tmp_path):
     fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
     _fake_tools(fakebin, log)

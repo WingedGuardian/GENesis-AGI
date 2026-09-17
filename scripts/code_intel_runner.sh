@@ -240,27 +240,43 @@ for line in "${_MARKERS[@]}"; do
             _log "requested tool missing or refused (rc=3) — kept marker, no penalty: $repo"
             ;;
         4)
-            # cbm leg completed; the gitnexus leg did not run (missing, wrong
-            # version, or refused by admission control — the last is permanent
-            # for this install size). Restoring the marker would rebuild cbm
-            # every idle tick forever, so consume it like a clean rc 0: cbm's
-            # work is durable, and gitnexus gets another chance on the next
-            # marker enqueue.
-            if [ "$run_mode" = "full" ]; then
-                action="consume_full"
+            # cbm leg completed; the gitnexus leg did not (missing, wrong
+            # version, refused by admission control, or failed). Restoring the
+            # whole marker would rebuild cbm every idle tick forever, so consume
+            # cbm's durable work — and requeue a gitnexus-only marker FIRST, so
+            # the unfinished leg survives: its blocking condition (sentinel
+            # removed, install repaired, admission headroom) can clear without
+            # a new trigger ever writing a marker. Written before the consume
+            # so a runner death mid-branch restores the inflight "both" marker
+            # and coalesces — the pending work is never lost. A refused leg then
+            # retries like any rc-3 marker (no penalty); a failed leg retries
+            # with attempts counting, bounded by MAX_ATTEMPTS.
+            if ! _marker write --repo "$repo" --tools gitnexus --mode "$mode" >> "$LOG_FILE" 2>&1; then
+                _log "could not requeue gitnexus leg for $repo — restoring combined marker"
+                _finish_outcome "$hash" restore "$claim_id" >/dev/null || exit 76
+            elif [ "$run_mode" = "full" ]; then
+                _finish_outcome "$hash" consume_full "$claim_id" >/dev/null || exit 76
             else
-                action="consume"
+                _finish_outcome "$hash" consume "$claim_id" >/dev/null || exit 76
             fi
-            _finish_outcome "$hash" "$action" "$claim_id" >/dev/null || exit 76
-            _log "cbm indexed; gitnexus leg did not run (rc=4) — consumed: $repo"
+            _log "cbm indexed; gitnexus leg did not complete (rc=4) — consumed cbm, requeued gitnexus: $repo"
             ;;
         5)
-            # gitnexus leg completed; the cbm leg did not run (missing or
-            # kill-switch-skipped). Consume the marker, but NEVER consume_full:
-            # cbm never ran, so stamping the shared full-success clock would
-            # suppress its genuinely-needed full pass for the whole interval.
-            _finish_outcome "$hash" consume "$claim_id" >/dev/null || exit 76
-            _log "gitnexus indexed; cbm leg did not run (rc=5) — consumed, no full stamp: $repo"
+            # gitnexus leg completed; the cbm leg did not (missing, kill-switch-
+            # skipped, or failed). Same split as rc 4: requeue a cbm-only marker
+            # before consuming so the skipped leg's request is not discarded
+            # when the sentinel is later removed. Consume, but NEVER
+            # consume_full: cbm never ran, so stamping the shared full-success
+            # clock would suppress its genuinely-needed full pass for the
+            # whole interval. The requeued fast marker re-escalates on its own
+            # next tick if a full is still due.
+            if ! _marker write --repo "$repo" --tools cbm --mode "$mode" >> "$LOG_FILE" 2>&1; then
+                _log "could not requeue cbm leg for $repo — restoring combined marker"
+                _finish_outcome "$hash" restore "$claim_id" >/dev/null || exit 76
+            else
+                _finish_outcome "$hash" consume "$claim_id" >/dev/null || exit 76
+            fi
+            _log "gitnexus indexed; cbm leg did not complete (rc=5) — consumed gitnexus, requeued cbm, no full stamp: $repo"
             ;;
         *)
             if [ "$run_mode" = "full" ] && [ "$mode" != "full" ]; then

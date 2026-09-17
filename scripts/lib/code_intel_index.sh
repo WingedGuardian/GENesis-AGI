@@ -529,22 +529,23 @@ fi
 # notices the graph is stale. Per-leg outcome codes so a completed leg is
 # consumable and a skipped/refused leg never stamps cbm's shared full clock:
 #   rc 3: nothing indexed — at least one requested tool missing or refused
-#   rc 4: cbm leg completed, gitnexus leg did not run
-#   rc 5: gitnexus leg completed, cbm leg did not run
-if [ "$RC" = "0" ]; then
-    _cbm_wanted=0; _gn_wanted=0
-    { [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; } && _cbm_wanted=1
-    { [ "$TOOLS" = "gitnexus" ] || [ "$TOOLS" = "both" ]; } && _gn_wanted=1
-    if [ -n "$MISSING" ] && [ "$CBM_RAN" != "1" ] && [ "$GN_RAN" != "1" ]; then
-        _log "ERROR: requested tool(s) missing or refused: ${MISSING%% } — nothing indexed (rc=3)"
-        RC=3
-    elif [ "$_gn_wanted" = "1" ] && [ "$GN_RAN" != "1" ] && [ "$CBM_RAN" = "1" ]; then
-        _log "cbm leg done; gitnexus leg did not run (${MISSING:-unknown reason}) — partial (rc=4)"
-        RC=4
-    elif [ "$_cbm_wanted" = "1" ] && [ "$CBM_RAN" != "1" ] && [ "$GN_RAN" = "1" ]; then
-        _log "gitnexus leg done; cbm leg did not run — partial, cbm full clock NOT stamped (rc=5)"
-        RC=5
-    fi
+#   rc 4: cbm leg completed, gitnexus leg did not (missing, refused, or failed)
+#   rc 5: gitnexus leg completed, cbm leg did not (missing, skipped, or failed)
+# A leg that ran AND FAILED still counts as "did not complete": when the other
+# leg succeeded, reporting the raw failure rc makes the runner restore the
+# combined marker and rebuild the completed leg on every retry.
+_cbm_wanted=0; _gn_wanted=0
+{ [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; } && _cbm_wanted=1
+{ [ "$TOOLS" = "gitnexus" ] || [ "$TOOLS" = "both" ]; } && _gn_wanted=1
+if [ "$RC" = "0" ] && [ -n "$MISSING" ] && [ "$CBM_RAN" != "1" ] && [ "$GN_RAN" != "1" ]; then
+    _log "ERROR: requested tool(s) missing or refused: ${MISSING%% } — nothing indexed (rc=3)"
+    RC=3
+elif [ "$_gn_wanted" = "1" ] && [ "$GN_RAN" != "1" ] && [ "$CBM_RAN" = "1" ]; then
+    _log "cbm leg done; gitnexus leg did not complete (${MISSING:-failed rc=$RC}) — partial (rc=4)"
+    RC=4
+elif [ "$_cbm_wanted" = "1" ] && [ "$CBM_RAN" != "1" ] && [ "$GN_RAN" = "1" ]; then
+    _log "gitnexus leg done; cbm leg did not complete — partial, cbm full clock NOT stamped (rc=5)"
+    RC=5
 fi
 
 _log "done (rc=$RC): $REPO_PATH"
