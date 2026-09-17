@@ -400,3 +400,64 @@ def test_every_paginated_read_asks_for_a_full_page_in_the_path():
         )
     assert paginated == 4, f"expected 4 paginated reads, found {paginated}"
     assert rb._PAGE_SIZE == 100, "100 is the GitHub API maximum page size"
+
+
+# ── records whose author account is gone ────────────────────────────
+# GitHub returns `user: null` once an author account is deleted, so the jq
+# yields `login: null` while the body and commit stay readable. Rejecting that
+# as malformed makes the WHOLE budget permanently `unknown` -- every foreground
+# request prompts, every autonomous session is denied -- over a record that has
+# nothing to do with Codex. Verified by execution against jq before fixing.
+
+
+def test_a_deleted_author_does_not_wedge_the_whole_budget():
+    """A null-author review is skipped, not treated as unreadable evidence."""
+    ghost = {"login": None, "commit_id": H4, "state": "COMMENTED"}
+    result = _eval(reviews=(ghost, _review(H5)))
+    assert result["status"] == "ok", result
+    assert result["reviewed_heads"] == [H5], result
+    # CONTROL: a record that is unreadable in a way we cannot attribute at all
+    # still fails closed. The fix narrows strictness, it does not remove it.
+    broken = {"login": 17, "commit_id": H4, "state": "COMMENTED"}
+    assert _eval(reviews=(broken,))["status"] == "unknown"
+
+
+def test_a_deleted_author_comment_still_counts_for_the_confirmation_marker():
+    """The marker is matched on TEXT, so authorship does not gate it.
+
+    Skipping the record entirely would silently drop a confirmation request
+    whose author later deleted their account -- turning a satisfied gate back
+    into an unsatisfied one.
+    """
+    marker = rb.confirmation_marker(H5)
+    ghost = {"login": None, "type": None, "body": f"please re-review {marker}"}
+    result = _eval(comments=(ghost,))
+    assert result["status"] == "ok", result
+    assert result["confirmation_requested"] is True, result
+    # CONTROL: an unreadable BODY is still malformed — there is nothing to match.
+    assert _eval(comments=({"login": None, "type": None, "body": None},))["status"] == "unknown"
+
+
+def test_the_cli_loads_configured_reviewer_identities():
+    """No flag must mean `None` (load the config), not `[]` (no reviewers).
+
+    An empty list is a real value, so passing it suppressed the branch that
+    reads `report_identity_template`. On an install with a configured secondary
+    reviewer the CLI then omitted those reviewed heads and could report standing
+    authorization while the hook callers reported approval required -- two
+    answers to the same question from one module.
+    """
+    import argparse
+    import inspect
+
+    src = inspect.getsource(rb.main)
+    assert 'action="append", default=None' in src, (
+        "the CLI must default to None so evaluate_pr loads the configured identity"
+    )
+    # And the parser really does yield None rather than [].
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--external-identity-template", action="append", default=None)
+    assert parser.parse_args([]).external_identity_template is None
+    assert parser.parse_args(
+        ["--external-identity-template", "x{head}"]
+    ).external_identity_template == ["x{head}"]

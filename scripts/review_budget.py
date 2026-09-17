@@ -252,6 +252,10 @@ def evaluate_evidence(
         if not isinstance(item, Mapping):
             return _unknown("malformed_review_record", current_head=head)
         login = item.get("login")
+        if login is None:
+            # Deleted author. Not Codex -- that account exists -- so it carries
+            # no evidence either way, and rejecting it would wedge the budget.
+            continue
         if not isinstance(login, str):
             return _unknown("malformed_review_record", current_head=head)
         if login != CODEX_REVIEW_BOT:
@@ -267,6 +271,15 @@ def evaluate_evidence(
         if not isinstance(item, Mapping):
             return _unknown("malformed_comment_record", current_head=head)
         login, author_type, body = item.get("login"), item.get("type"), item.get("body")
+        if (login is None or author_type is None) and isinstance(body, str):
+            # Deleted author, readable body. The body still counts for the
+            # confirmation marker below -- that marker is matched on TEXT, not on
+            # who wrote it -- but the record can never be Codex, so it is not
+            # evidence of a review and must not wedge the budget.
+            comment_bodies.append(body)
+            if any(m.group(1).lower() == head for m in _CONFIRMATION_RE.finditer(body)):
+                confirmation_requested = True
+            continue
         if (
             not isinstance(login, str)
             or not isinstance(author_type, str)
@@ -585,7 +598,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--pr", required=True)
-    parser.add_argument("--external-identity-template", action="append", default=[])
+    # `default=None`, NOT `[]`. An empty list is a real value meaning "no
+    # reviewer identities", so passing it suppresses the `None` branch that
+    # loads `report_identity_template` from the shipped and install-local
+    # config. On an install with a configured secondary reviewer the CLI then
+    # omitted those reviewed heads and could report standing authorization
+    # while the hook callers — which do take the `None` branch — reported that
+    # approval was required. Two answers to the same question from one module.
+    parser.add_argument("--external-identity-template", action="append", default=None)
     args = parser.parse_args(argv)
     result = evaluate_pr(
         args.repo,
