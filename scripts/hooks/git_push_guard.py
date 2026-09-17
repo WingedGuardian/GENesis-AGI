@@ -1103,11 +1103,15 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         r"^https?://[^/]+/([^/]+/[^/]+)/(?:runs|actions/runs)/\d+", re.IGNORECASE
     )
 
+    _self_repo = repo if repo is not None else _derive_repo_from_cwd(os.getcwd())
+
     def _details_url_is_own_run(c: dict) -> bool:
         m = _run_url_re.match((c.get("detailsUrl") or "").strip())
         if not m:
             return False
-        return repo is None or m.group(1).casefold() == repo.casefold()
+        # Fail-CLOSED on unresolvable repo identity: a check we cannot prove is
+        # ours is not our mirror, so it must still classify.
+        return _self_repo is not None and m.group(1).casefold() == _self_repo.casefold()
 
     def _is_self_check(c: object) -> bool:
         if not isinstance(c, dict):

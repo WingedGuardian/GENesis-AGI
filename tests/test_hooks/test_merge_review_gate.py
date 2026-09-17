@@ -3099,7 +3099,7 @@ class TestPrCiStatusSelfWorkflow:
              "status": "COMPLETED", "conclusion": "FAILURE"},
             {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
         ]))
-        assert guard_module._pr_ci_status("1") == ("green", [])
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("green", [])
 
     def test_local_path_excludes_ambient_workflow_entries(self, guard_module, monkeypatch):
         # The constant workflow-name lane applies locally too: ambient runs of
@@ -3133,7 +3133,7 @@ class TestPrCiStatusSelfWorkflow:
              "detailsUrl": "https://github.com/OWNER/REPO/runs/99",
              "status": "COMPLETED", "conclusion": "FAILURE"},
         ]))
-        assert guard_module._pr_ci_status("1") == ("green", [])
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("green", [])
 
     def test_unrelated_same_named_check_is_not_filtered(self, guard_module, monkeypatch):
         # Name-based filtering keys on THIS job's name only — a different job's
