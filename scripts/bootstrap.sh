@@ -378,20 +378,18 @@ if [ -e "$HOME/.genesis/codebase-memory-mcp.disabled" ]; then
     echo "  codebase-memory-mcp: install/upgrade skipped (machine kill switch active)"
 else
     echo "  codebase-memory-mcp: installing/upgrading..."
-    # The installer is pinned to a reviewed upstream commit and verified against
-    # a repository-owned digest — `main` is mutable third-party code and must
-    # never reach `bash` unverified. Bump BOTH the commit and the digest when
-    # re-reviewing the upstream installer (install.sh shares this pin).
-    _cbm_installer=$(mktemp 2>/dev/null) || _cbm_installer=""
-    if [[ -n "$_cbm_installer" ]] \
-        && curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/59a05eb1bf9e11deb060d782cd7d3a29f2ae2866/install.sh -o "$_cbm_installer" 2>/dev/null \
-        && echo "13049c7cc51bc508d68b8ecb8a9fd9574ecb7c6f2c9dd5a19bf7d4c187321145  $_cbm_installer" | sha256sum -c - >/dev/null 2>&1; then
-        bash "$_cbm_installer" --ui --skip-config \
-            || echo "  WARNING: codebase-memory-mcp install/upgrade failed (non-critical)"
-    else
-        echo "  WARNING: codebase-memory-mcp installer download or verification failed (non-critical)"
-    fi
-    [[ -n "$_cbm_installer" ]] && rm -f "$_cbm_installer"
+    # The pin, the digest and the install itself live in ONE place, shared with
+    # install.sh, so the commit and its digest cannot drift apart.
+    # shellcheck source=lib/cbm_installer.sh
+    . "$SCRIPT_DIR/lib/cbm_installer.sh"
+    _cbm_rc=0
+    genesis_cbm_install || _cbm_rc=$?
+    case "$_cbm_rc" in
+        0) ;;
+        1) echo "  WARNING: codebase-memory-mcp installer download failed (non-critical)" ;;
+        3) echo "  ERROR: codebase-memory-mcp pin/digest mismatch (see above) — repository bug, not transient" ;;
+        *) echo "  WARNING: codebase-memory-mcp install/upgrade failed (non-critical)" ;;
+    esac
 fi
 if [ -e "$HOME/.genesis/codebase-memory-mcp.disabled" ]; then
     echo "  codebase-memory-mcp status probe skipped (machine kill switch active)"

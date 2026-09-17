@@ -15,7 +15,7 @@
 # membership changes.
 #
 # Install the tool first:
-#   curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui
+#   bash scripts/lib/cbm_installer.sh — a pinned, sha256-verified upstream installer.
 
 # Machine-local kill switch. Registrations can survive process termination and
 # bootstrap can drift-heal them later, so the launcher itself must enforce the
@@ -30,6 +30,8 @@ if [[ -z "$_user_home" ]]; then
     done < /etc/passwd
 fi
 _disable_file="${CODEBASE_MEMORY_MCP_DISABLE_FILE:-${_user_home:+${_user_home}/.genesis/codebase-memory-mcp.disabled}}"
+# shellcheck disable=SC2088  # matching a LITERAL ~/ prefix is the point: the
+# override arrived unexpanded, and this is where it gets expanded.
 if [[ "$_disable_file" == "~/"* ]]; then
     # With no resolvable home this collapses to a relative path and the
     # absolute-path check below fails closed.
@@ -64,7 +66,7 @@ MEM_MAX="${CODEBASE_MEMORY_MCP_MEMORY_MAX:-2G}"
 
 if [[ -z "$BINARY" || ! -x "$BINARY" ]]; then
     printf 'codebase-memory-mcp not installed.\n' >&2
-    printf 'Install: curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui\n' >&2
+    printf 'Install: bash scripts/lib/cbm_installer.sh (pinned, sha256-verified upstream installer)\n' >&2
     exit 1
 fi
 

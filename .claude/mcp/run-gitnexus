@@ -24,22 +24,22 @@ if ! source "$PIN_FILE" \
     exit 1
 fi
 
-# STDERR IS NOT DISCARDED. The resolver refuses for two different reasons --
-# nothing found, or conflicting installations -- and only it knows which. Sending
-# its diagnostic to /dev/null and printing "not installed" told an operator with
-# two installs to go and install the thing they already had twice.
-_GN_RESOLVE_ERR="$(mktemp 2>/dev/null || printf '/tmp/run-gitnexus.%s' "$$")"
-BINARY="$(genesis_gitnexus_resolve_binary 2>"$_GN_RESOLVE_ERR" || true)"
+# STDERR IS NOT DISCARDED. The resolver refuses for several different reasons --
+# nothing found, conflicting installations, a candidate whose version cannot be
+# read -- and only it knows which. Sending its diagnostic to /dev/null and
+# printing "not installed" told an operator with two installs to go and install
+# the thing they already had twice.
+#
+# It reaches them by simply NOT being redirected. Capturing it to a temp file
+# first bought nothing here -- no code needs the text as a VALUE -- and cost a
+# predictable path: when mktemp was unavailable the fallback name held only the
+# pid, which a local attacker can pre-create as a symlink so that the
+# redirection truncates a file of their choosing.
+BINARY="$(genesis_gitnexus_resolve_binary || true)"
 if [ -z "$BINARY" ] || [ ! -x "$BINARY" ]; then
-    if [ -s "$_GN_RESOLVE_ERR" ]; then
-        cat "$_GN_RESOLVE_ERR" >&2
-    else
-        printf 'run-gitnexus: GitNexus is not installed\n' >&2
-    fi
-    rm -f "$_GN_RESOLVE_ERR"
+    printf 'run-gitnexus: no usable GitNexus installation; refusing to start\n' >&2
     exit 1
 fi
-rm -f "$_GN_RESOLVE_ERR"
 
 if ! genesis_gitnexus_node_supported; then
     printf 'run-gitnexus: GitNexus %s does not support Node %s\n' \

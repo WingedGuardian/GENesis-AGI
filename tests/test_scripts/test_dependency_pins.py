@@ -176,11 +176,23 @@ def test_installers_enforce_the_pinned_tools_node_floor():
 
 
 def test_installers_do_not_run_cbm_installer_while_kill_switch_is_active():
+    """Neither install path may reach the installer while the kill switch is set.
+
+    The fetch moved to scripts/lib/cbm_installer.sh — one site for the pin, its
+    digest and the install — so the ordering is now checked against the CALL,
+    and the callers are additionally held to not growing a second copy of the
+    fetch. The shared script also refuses on its own when run directly, so the
+    guarantee does not rest on every future caller remembering to check.
+    """
     for relative in ("scripts/install.sh", "scripts/bootstrap.sh"):
         text = (REPO_ROOT / relative).read_text()
         sentinel = 'if [ -e "$HOME/.genesis/codebase-memory-mcp.disabled" ]; then'
-        installer = "https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/"
-        assert text.index(sentinel) < text.index(installer), relative
+        assert text.index(sentinel) < text.index("genesis_cbm_install"), relative
+        assert "raw.githubusercontent.com/DeusData/codebase-memory-mcp/" not in text, relative
+    # The shared script's OWN kill switch is exercised, not grepped, by
+    # test_bootstrap_guards.py::test_b9_direct_run_honours_the_kill_switch — a
+    # substring here would survive inverting the test to `[ ! -e ]`, or moving
+    # it below the install.
 
 
 #: Dynamic npm-resolver invocations of gitnexus. Hoisted to module scope so the

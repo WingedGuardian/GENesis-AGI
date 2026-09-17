@@ -140,12 +140,26 @@ genesis_gitnexus_resolve_binary() {
     local first_version="" version=""
     for candidate in "${candidates[@]}"; do
         version="$(_genesis_gitnexus_version_of "$candidate" || true)"
+        # AN UNREADABLE CANDIDATE ENDS THE SCAN. Letting it through was a
+        # two-part bug: `first_version` tracked initialization by EMPTINESS, so
+        # an unreadable candidates[0] left it empty and the SECOND candidate
+        # initialized it — the conflict check then never compared against the
+        # first — and the function returned candidates[0] anyway, handing the
+        # caller the very binary whose version could not be read. The launcher
+        # rejected it as unpinned and pin enforcement read the empty version as
+        # unclassifiable. With more than one installation present there is no
+        # basis for choosing, so refuse and name the file.
+        if [ -z "$version" ]; then
+            printf 'gitnexus: cannot determine the version of %s; remove or repair it\n' \
+                "$candidate" >&2
+            return 2
+        fi
         if [ -z "$first_version" ]; then
             first_version="$version"
         elif [ "${version#v}" != "${first_version#v}" ]; then
             printf 'gitnexus: conflicting installations — %s reports %s, %s reports %s; remove one\n' \
                 "${candidates[0]}" "${first_version:-unreadable}" "$candidate" "${version:-unreadable}" >&2
-            return 1
+            return 2
         fi
     done
     printf '%s\n' "${candidates[0]}"
@@ -186,8 +200,19 @@ genesis_gitnexus_version_is_newer_than_pin() {
 # newer storage format. Return 3 for an installed version whose output cannot
 # be classified safely. Other failures return 1.
 genesis_gitnexus_ensure_pin() {
-    local actual=""
-    if genesis_gitnexus_resolve_binary >/dev/null; then
+    local actual="" resolved=0
+    genesis_gitnexus_resolve_binary >/dev/null || resolved=$?
+    # rc 2 from the resolver means installations EXIST but cannot be told apart
+    # -- a version conflict, or a candidate whose version cannot be read. That is
+    # the documented "cannot be classified safely" case, so it returns 3 rather
+    # than falling through to the install: adding another copy does not resolve
+    # an ambiguity between the copies already there, and the resolver would
+    # refuse again immediately afterwards. rc 1 means nothing is installed at
+    # all, which the install below is exactly the answer to.
+    if [ "$resolved" = "2" ]; then
+        return 3
+    fi
+    if [ "$resolved" = "0" ]; then
         actual="$(genesis_gitnexus_installed_version)" || actual=""
         genesis_gitnexus_installed_is_pinned && return 0
         [[ "${actual#v}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || return 3
