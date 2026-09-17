@@ -1269,52 +1269,184 @@ def test_a_missing_fingerprint_file_refuses_rather_than_filing(tmp_path, capsys,
     # about the fingerprint floor.
     assert "fingerprint" in capsys.readouterr().err.lower()
     assert calls == []
+# --- what gh POSTS is the snapshot, not the caller's file --------------------
+#
+# Codex P1: checking the draft and then letting gh reopen the path cannot
+# deliver "the posted bytes were scanned" — the window ends inside another
+# process. These replace two earlier tests that asserted a REFUSAL on edit;
+# under the snapshot an edit is simply irrelevant, which is the stronger
+# guarantee and needs the stronger assertion.
 
 
-def test_a_body_edited_after_the_scan_is_not_posted(tmp_path, capsys):
-    """gh re-reads the body FILE at create time, so the bytes it sends are not
-    the string that was scanned. Without the digest re-check, an edit landing in
-    that window publishes text nothing ever looked at."""
+def _body_file_arg(calls: list) -> str:
+    for c in calls:
+        if "issue" in c and "create" in c:
+            return c[c.index("--body-file") + 1]
+    raise AssertionError(f"no create call recorded: {calls}")
+
+
+def test_gh_is_handed_a_snapshot_not_the_callers_path(tmp_path, capsys):
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "Clean technical text.")
+    rc = _main(t, b, _scan_runner(calls))
+    assert rc == 0, capsys.readouterr().err
+    posted = _body_file_arg(calls)
+    assert posted != b, "gh was handed the caller's mutable path"
+    assert "issue-body-" in posted
+
+
+def test_an_edit_after_the_scan_cannot_change_what_is_posted(tmp_path, capsys):
+    """The bytes gh reads are the bytes that passed the scan.
+
+    The draft is rewritten mid-run with content the scan would have BLOCKED.
+    Under the old shape gh reopened that path; here it reads a snapshot taken
+    after the scan passed, so the edit reaches nothing.
+    """
     calls: list = []
     t, b = _file(tmp_path, "A real title", "Clean at scan time.")
     inner = _scan_runner(calls)
+    tampered = "Now mentions /home/someoperator/secrets"
+
+    seen: dict = {}
 
     def run(argv):
-        # Swap the body the moment the tracker is resolved -- inside the
-        # window, before the create.
+        # Land the write once the tracker lookup starts — after the scan and
+        # after the snapshot, i.e. inside the window that used to be open.
         if "isFork" in " ".join(argv):
-            Path(b).write_text("Now mentions /home/someoperator/secrets", encoding="utf-8")
+            Path(b).write_text(tampered, encoding="utf-8")
+        if "issue" in argv and "create" in argv:
+            # Read it HERE: the snapshot is removed in a finally, so reading
+            # after _main returns finds nothing (which is itself correct).
+            seen["bytes"] = Path(argv[argv.index("--body-file") + 1]).read_bytes()
         return inner(argv)
 
     rc = _main(t, b, run)
-    assert rc == 2, "an edit after the scan must refuse"
-    assert "changed after it was scanned" in capsys.readouterr().err
-    assert not any("issue create" in " ".join(c) for c in calls)
-def test_a_body_edited_DURING_the_scan_is_not_posted(tmp_path, capsys, monkeypatch):
-    """The window the digest fix actually closed, which the test above misses.
+    assert rc == 0, capsys.readouterr().err
+    posted_bytes = seen["bytes"]
+    assert b"Clean at scan time." in posted_bytes
+    assert tampered.encode() not in posted_bytes, "gh would have posted unscanned text"
+    # Guard-the-guard: the tamper really happened, or this asserts nothing.
+    assert Path(b).read_text() == tampered
 
-    The other TOCTOU test edits the body after the digest was taken, so it
-    passes under either implementation. This one edits it WHILE the scan runs —
-    the window between the read that produced the scanned text and the digest.
-    Under the earlier shape, where the digest was a SECOND read taken after the
-    scan returned, the edit was digested but never scanned, the in-lock
-    comparison matched, and gh posted text nothing had looked at.
 
-    That window is the widest in the flow: scan_prose spawns one detect-secrets
-    subprocess per line, so it is not a hairline race.
+def test_the_snapshot_is_private_and_removed_afterwards(tmp_path, capsys):
+    """It holds a copy of the body, so it must not be readable by others and
+    must not outlive the run."""
+    calls: list = []
+    seen: dict = {}
+    t, b = _file(tmp_path, "A real title", "Clean technical text.")
+    inner = _scan_runner(calls)
+
+    def run(argv):
+        if "issue" in argv and "create" in argv:
+            path = Path(argv[argv.index("--body-file") + 1])
+            seen["file_mode"] = path.stat().st_mode & 0o777
+            seen["dir_mode"] = path.parent.stat().st_mode & 0o777
+            seen["dir"] = path.parent
+        return inner(argv)
+
+    assert _main(t, b, run) == 0, capsys.readouterr().err
+    assert seen["dir_mode"] == 0o700, f"snapshot dir is {oct(seen['dir_mode'])}"
+    assert seen["file_mode"] == 0o600, f"snapshot file is {oct(seen['file_mode'])}"
+    assert not seen["dir"].exists(), "the snapshot outlived the run"
+
+
+def test_the_snapshot_is_removed_when_the_post_fails(tmp_path, capsys):
+    """Cleanup is in a finally, so a refusal must not leave the body on disk."""
+    calls: list = []
+    seen: dict = {}
+    t, b = _file(tmp_path, "A real title", "Clean technical text.")
+
+    def run(argv):
+        calls.append(list(argv))
+        joined = " ".join(argv)
+        if "isFork" in joined:
+            return _proc(json.dumps({"isFork": False, "nameWithOwner": "Org/Repo", "parent": None}))
+        if "viewerPermission" in joined:
+            return _proc(json.dumps({"viewerPermission": "WRITE"}))
+        if "gh api" in joined:
+            # Fail the duplicate lookup: a Refused AFTER the snapshot exists.
+            return _proc(returncode=1, stderr="network down")
+        raise AssertionError(joined)
+
+    # Capture the directory by listing ~/tmp before and after.
+    parent = Path.home() / "tmp"
+    before = {p.name for p in parent.glob("issue-body-*")} if parent.exists() else set()
+    rc = _main(t, b, run)
+    after = {p.name for p in parent.glob("issue-body-*")} if parent.exists() else set()
+    assert rc == 2, capsys.readouterr().err
+    assert after == before, f"a refusal left snapshots behind: {after - before}"
+    seen.clear()
+
+
+# --- a refusal must not reproduce what it blocked ----------------------------
+
+
+def test_a_refusal_does_not_echo_the_matched_text(tmp_path, capsys):
+    """Codex P1. sanitize stores the first 120 chars of the offending LINE in
+    `detail`, and the email scanner puts the address in `message`.
+
+    A refusal goes to stderr, which lands in scrollback, session transcripts
+    and CI logs — so echoing the match takes a value successfully blocked from
+    a public tracker and writes it somewhere durable instead. The leak moved
+    one surface over rather than stopped.
     """
     calls: list = []
-    t, b = _file(tmp_path, "A real title", "Clean at read time.")
-    real = fti.privacy_scan
-
-    def scan_then_tamper(title, body):
-        out = real(title, body)
-        # Land the write mid-scan, after the bytes were read.
-        Path(b).write_text("Now mentions /home/someoperator/secrets", encoding="utf-8")
-        return out
-
-    monkeypatch.setattr(fti, "privacy_scan", scan_then_tamper)
+    secret = "/home/someoperator/genesis/very-distinctive-path-fragment"
+    t, b = _file(tmp_path, "A real title", f"Repro: run it from {secret} and see.")
     rc = _main(t, b, _scan_runner(calls))
-    assert rc == 2, "an edit landing during the scan must refuse"
-    assert "changed after it was scanned" in capsys.readouterr().err
-    assert not any("issue create" in " ".join(c) for c in calls)
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "privacy scan BLOCKED" in err
+    assert "very-distinctive-path-fragment" not in err, "the refusal reproduced the match"
+    assert secret not in err
+    # It must still be ACTIONABLE: name the rule and where, just not the value.
+    assert "content withheld" in err
+    assert "portability" in err.lower()
+
+
+def test_an_infrastructure_refusal_still_explains_itself(tmp_path, capsys, monkeypatch):
+    """The withholding is scoped to CONTENT findings.
+
+    A scanner-state failure carries no scanned text and is exactly what an
+    operator needs spelled out, because it is about the environment rather than
+    the draft. Suppressing it too would make the gate unactionable.
+    """
+    monkeypatch.setenv("GENESIS_RELEASE_FINGERPRINTS", str(tmp_path / "absent.txt"))
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "Entirely innocuous text.")
+    rc = _main(t, b, _scan_runner(calls))
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "fingerprint file not found" in err.lower()
+    assert "content withheld" not in err
+
+
+def test_an_unreadable_fingerprint_file_fails_closed(tmp_path, capsys, monkeypatch):
+    """Codex P2, and it was a fail-OPEN in a privacy gate.
+
+    `_check_fingerprints` returned [] on OSError while the caller had already
+    recorded the scanner as having run — so an existing-but-unreadable file
+    silently disabled the install-specific checks and the issue was permitted.
+    """
+    fp = tmp_path / "release-fingerprints.txt"
+    fp.write_text("example-fixture-host\n", encoding="utf-8")
+    fp.chmod(0o000)
+    monkeypatch.setenv("GENESIS_RELEASE_FINGERPRINTS", str(fp))
+    # Guard-the-guard: if this process can still read it (root, or an odd fs),
+    # the test proves nothing — say so rather than passing.
+    try:
+        fp.read_text(encoding="utf-8")
+    except OSError:
+        pass
+    else:
+        pytest.skip("this process can read a 0000 file; the OSError path is unreachable here")
+
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "Entirely innocuous text.")
+    rc = _main(t, b, _scan_runner(calls))
+    err = capsys.readouterr().err
+    assert rc == 2, "an unreadable fingerprint file must REFUSE, not scan without it"
+    assert "could not be read" in err
+    assert calls == []
+    fp.chmod(0o600)
