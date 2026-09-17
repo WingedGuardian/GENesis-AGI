@@ -43,13 +43,20 @@ from needs_user import decide  # noqa: E402
 from secrets_target import touches_secrets  # noqa: E402
 
 #: Fields carrying a path across the tools this hook is wired to. Read/Edit/Write
-#: use `file_path`; Grep uses `path`, `pattern` AND `glob`; Glob uses `pattern`;
-#: NotebookEdit uses `notebook_path`. Collected generously — a field we do not
-#: read is a hole, and `glob` was exactly that: MEASURED, the first version
-#: silently allowed `Grep {"pattern":"API_KEY","path":"~/genesis","glob":"secrets.env"}`,
+#: use `file_path`; Grep uses `path` AND `glob`; NotebookEdit uses
+#: `notebook_path`. Collected generously — a field we do not read is a hole, and
+#: `glob` was exactly that: MEASURED, the first version silently allowed
+#: `Grep {"pattern":"API_KEY","path":"~/genesis","glob":"secrets.env"}`,
 #: which with `output_mode: "content"` returns the key VALUES. The tests only
 #: exercised Bash, so nothing caught it.
-_PATH_FIELDS = ("file_path", "path", "pattern", "notebook_path", "glob")
+#: `pattern` is NOT in this set: it is a path for Glob but a CONTENT regex for
+#: Grep — `Grep {"pattern": "secrets.env", "path": "src"}` only searches file
+#: text for the string, so treating it as a path gated a mention the same way
+#: the first Bash version did.
+_PATH_FIELDS = ("file_path", "path", "notebook_path", "glob")
+
+#: Tools whose `pattern` field IS a path selector.
+_PATTERN_IS_PATH_TOOLS = ("Glob",)
 
 
 def main() -> int:
@@ -57,6 +64,10 @@ def main() -> int:
     ti = tool_input(payload)
 
     paths = [ti[f] for f in _PATH_FIELDS if isinstance(ti.get(f), str)]
+    if payload.get("tool_name") in _PATTERN_IS_PATH_TOOLS and isinstance(
+        ti.get("pattern"), str
+    ):
+        paths.append(ti["pattern"])
     command = ti.get("command") if isinstance(ti.get("command"), str) else ""
 
     # Grep's `glob` is relative to its `path` (or the cwd). Checking it alone
