@@ -30,11 +30,14 @@ permissions:
   statuses: read
   actions: read # read the triggering run's artifacts
 
-# Keyed on the triggering run: publisher runs are independent and each
-# carries its own verdict handoff; cancelling a prior publisher could
-# drop a PR's verdict entirely.
+# Prefer serializing per PR (when the triggering run's payload carries one);
+# fall back to per triggering run otherwise. cancel-in-progress is safe either
+# way: the supersede check in the publish step is the real ordering guard — it
+# refuses to write when a NEWER merge-gate run already owns the PR, so a
+# superseded publisher can never restore a stale verdict.
 concurrency:
-  group: merge-gate-publish-${{ github.event.workflow_run.id }}
+  group: merge-gate-publish-${{ github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.id }}
+  cancel-in-progress: true
 
 jobs:
   publish:
@@ -49,7 +52,7 @@ jobs:
         run: |
           set -euo pipefail
           aid=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts" \
-            --jq '[.artifacts[] | select(.name == "merge-gate-verdict" and .expired == false) | .id] | first // ""')
+            --jq '[.artifacts[] | select((.name | startswith("merge-gate-verdict")) and .expired == false) | .id] | first // ""')
           if [ -z "$aid" ]; then
             # Most merge-gate runs publish directly and leave no handoff.
             echo "have=false" >> "$GITHUB_OUTPUT"

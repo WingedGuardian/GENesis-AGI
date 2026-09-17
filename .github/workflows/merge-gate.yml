@@ -143,6 +143,7 @@ jobs:
           exit 0
 
       - name: Publish the verdict on the PR head
+        id: publish
         # Every event except `pull_request` attaches its ambient check to a
         # SHA that is NOT the PR head (default-branch SHA for comments,
         # dispatch and workflow_run; the synthetic merge SHA for review
@@ -174,6 +175,9 @@ jobs:
                 echo "::notice::Fork-PR $GITHUB_EVENT_NAME runs under a read-only token; handing off to merge-gate-publish."
                 mkdir -p verdict
                 printf '{"pr":%s}\n' "$PR_NUMBER" > verdict/merge-gate-verdict.json
+                # The artifact NAME also carries the PR so the trusted
+                # publisher can supersede older handoffs for the same PR
+                # without opening every artifact.
                 echo "fork_pending=true" >> "$GITHUB_OUTPUT"
                 exit 0
               fi ;;
@@ -207,7 +211,7 @@ jobs:
         if: steps.publish.outputs.fork_pending == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: merge-gate-verdict
+          name: merge-gate-verdict-${{ steps.pr.outputs.number }}
           path: verdict/
           retention-days: 1
           if-no-files-found: error
