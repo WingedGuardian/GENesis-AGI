@@ -3573,7 +3573,10 @@ def _comment_review_request_signal(argv: list[str]) -> bool | None:
         start = argv.index("comment") + 1
     except ValueError:
         return False
-    inline_bodies: list[str] = []
+    # gh string flags take the LAST supplied value, so the effective inline
+    # body is the last -b/--body argument — earlier values are overridden and
+    # never reach GitHub.
+    inline_body: str | None = None
     opaque = False
     delete_only = "--delete-last" in argv[start:]
     i = start
@@ -3583,12 +3586,12 @@ def _comment_review_request_signal(argv: list[str]) -> bool | None:
             if i + 1 >= len(argv):
                 opaque = True
             else:
-                inline_bodies.append(argv[i + 1])
+                inline_body = argv[i + 1]
                 i += 1
         elif tok.startswith("--body="):
-            inline_bodies.append(tok.split("=", 1)[1])
+            inline_body = tok.split("=", 1)[1]
         elif tok.startswith("-b") and len(tok) > 2:
-            inline_bodies.append(tok[2:])
+            inline_body = tok[2:]
         elif tok in {"-F", "--body-file", "-e", "--editor", "-w", "--web"}:
             opaque = True
             if tok in {"-F", "--body-file"} and i + 1 < len(argv):
@@ -3596,9 +3599,9 @@ def _comment_review_request_signal(argv: list[str]) -> bool | None:
         elif tok.startswith("--body-file=") or (tok.startswith("-F") and len(tok) > 2):
             opaque = True
         i += 1
-    if any("@codex review" in body.lower() for body in inline_bodies):
+    if inline_body is not None and "@codex review" in inline_body.lower():
         return True
-    if inline_bodies:
+    if inline_body is not None:
         return None if opaque else False
     if delete_only and not opaque and "--edit-last" not in argv[start:]:
         return False
