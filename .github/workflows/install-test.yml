@@ -180,6 +180,42 @@ jobs:
             fi
           done
 
+          # THE DENOMINATOR COMES FROM THE REPO, not from what the installer
+          # happened to render. Every state check below iterates a glob over
+          # ~/.config/systemd/user and skips anything absent, so if install.sh
+          # ever stopped rendering templates the globs match nothing, every
+          # iteration is skipped, and the job passes having checked NOTHING.
+          # A loop over zero units cannot fail. install.sh:930 renders every
+          # *.service.template and *.timer.template unconditionally, so the
+          # shipped templates are the correct expected set — and deriving it
+          # from the repo means a new template is covered the moment it lands.
+          # Counted INSIDE the walk, not with `ls … | wc -l`. The step runs
+          # `set -euo pipefail`, bash does not set nullglob, so an unmatched
+          # pattern reaches `ls` literally, `ls` exits 2, pipefail propagates it
+          # and errexit kills the step AT THE ASSIGNMENT — the guard below never
+          # runs and prints nothing. MEASURED, and it fires when only ONE of the
+          # two globs is unmatched, so a repo with service templates and no
+          # timer template would die on every run with no message. `[ -f ]`
+          # inside the loop already handles the literal-pattern case.
+          _unrendered=""
+          _tpl_count=0
+          for _tpl in scripts/systemd/*.service.template scripts/systemd/*.timer.template; do
+            [ -f "$_tpl" ] || continue
+            _tpl_count=$((_tpl_count + 1))
+            _want=$(basename "$_tpl" .template)
+            [ -f ~/.config/systemd/user/"$_want" ] || _unrendered="$_unrendered $_want"
+          done
+          if [ -n "$_unrendered" ]; then
+            echo "::error::templates shipped but never rendered:$_unrendered"
+            exit 1
+          fi
+          # The set must be non-empty, or everything above passes vacuously.
+          if [ "$_tpl_count" -lt 1 ]; then
+            echo "::error::no unit templates found under scripts/systemd — this check would pass vacuously"
+            exit 1
+          fi
+          echo "  $_tpl_count shipped unit template(s), all rendered"
+
           # AUTO-STARTED units must actually be RUNNING, for the same reason
           # genesis-server is checked above and for a sharper one: the installer
           # SUPPRESSES these failures. Both `enable --now` call sites end in
@@ -244,12 +280,23 @@ jobs:
           # Their enable calls are suppressed with `|| true` exactly like the
           # others, so the same silent-death applies.
           #
-          # Guarded on the unit FILE so a variant install that never renders one
-          # is not failed for it. Kept in step with install.sh by
+          # REQUIRED, not skipped-if-absent. The old `|| continue` was there so a
+          # variant install that never renders one would not be failed for it —
+          # but this job is a single known configuration doing a full install, so
+          # "variant" cannot apply and the skip only ever hid a regression: stop
+          # rendering the unit and the loop passes having checked nothing.
+          # genesis-cc-tmp-align is caught by the template denominator above;
+          # qdrant.service is NOT template-derived, so without this it has no
+          # existence check anywhere in the job.
+          #
+          # Kept in step with install.sh by
           # test_install_test_covers_every_enable_site, which parses the enable
           # sites out of the installer — this list is derived, not remembered.
           for _svc in genesis-cc-tmp-align.service qdrant.service; do
-            [ -f ~/.config/systemd/user/"$_svc" ] || continue
+            if [ ! -f ~/.config/systemd/user/"$_svc" ]; then
+              echo "::error::$_svc was never rendered — install.sh enables it, so a full install must produce it"
+              exit 1
+            fi
             if ! systemctl --user is-enabled --quiet "$_svc"; then
               echo "::error::$_svc rendered but NOT enabled — its enable failed silently"
               systemctl --user status "$_svc" --no-pager -l || true

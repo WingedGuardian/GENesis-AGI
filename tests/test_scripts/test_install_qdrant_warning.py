@@ -445,13 +445,50 @@ def test_install_test_covers_every_enable_site():
     # satisfied by a loop that only greps for `__TOKEN__` and never asks whether
     # anything started. Caught by mutation — replacing the liveness glob alone
     # left the placeholder one and the check still passed.
-    liveness = re.search(
-        r"for _t in [^\n]*genesis-\*\.timer.*?is-enabled", wf, re.DOTALL,
+    timer_head = re.search(
+        r"^(?P<indent> *)for \w+ in [^\n]*genesis-\*\.timer[^\n]*; do$", wf, re.MULTILINE
     )
-    assert liveness, (
-        "the workflow must iterate the rendered timers and assert is-enabled on "
-        "each; a placeholder scan over the same glob is not a liveness check, "
-        "and a new timer template would be rendered-but-dead with nothing noticing"
+    assert timer_head, (
+        "the workflow must iterate the rendered timers; a placeholder scan over "
+        "the same glob is not a liveness check, and a new timer template would be "
+        "rendered-but-dead with nothing noticing"
+    )
+    # Bound at the loop's OWN `done`, anchored to the head's indentation. A
+    # nested loop cannot impersonate it — a nested `done` is indented deeper.
+    #
+    # Two wrong bounds were measured before this one, and both failed by
+    # including text the loop does not contain. Plain `done` (any indent) is
+    # re-paired by a nested retry loop, shrinking the region to nothing and
+    # failing a healthy workflow. Bounding at the next sibling `for` instead
+    # left 30 lines AFTER the loop inside the region, so an unrelated
+    # is-enabled/is-active pair down there satisfied this gate while the timer
+    # loop asserted nothing at all.
+    _indent = len(timer_head.group("indent"))
+    _rest = wf[timer_head.end():]
+    _end = re.search(rf"^ {{{_indent}}}done\b", _rest, re.MULTILINE)
+    timer_body = _rest[: _end.start()] if _end else _rest
+    # ...and strip comments, whole-line and trailing. Measured: the two verbs
+    # supplied only as commented-out text satisfied the gate.
+    timer_body = "\n".join(
+        re.sub(r"\s#.*$", "", ln) for ln in timer_body.splitlines()
+        if not ln.lstrip().startswith("#")
+    )
+
+    # BOTH questions, on the SAME variable. Requiring only is-enabled passes a
+    # workflow that dropped is-active — and enabled-but-inactive is exactly the
+    # state this PR exists for: `enable --now` reports success when its START
+    # leg failed, which is how the watchgod unit shipped dead. The variable is
+    # derived rather than hardcoded so renaming the loop variable cannot quietly
+    # satisfy one check with the other unit.
+    _checked = {
+        verb: set(re.findall(rf'is-{verb} --quiet "\$(\w+)"', timer_body))
+        for verb in ("enabled", "active")
+    }
+    assert _checked["enabled"] & _checked["active"], (
+        "the timer loop must assert BOTH is-enabled and is-active on the same "
+        f"unit variable; found is-enabled on {sorted(_checked['enabled'])} and "
+        f"is-active on {sorted(_checked['active'])}. is-enabled alone accepts a "
+        "timer whose `enable --now` armed it and then failed to start it"
     )
 
     # Compare against the units the workflow ASSERTS ON, not against the whole
