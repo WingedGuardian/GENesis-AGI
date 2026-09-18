@@ -29,12 +29,44 @@
              most prominent position. It now carries the denominator, and a
              stale or blind detector replaces it with a warning instead of a
              number — the same rule the PR cache follows when it withholds a
-             stale count rather than printing it beside its age. -->
+             stale count rather than printing it beside its age.
+
+             THE AXIS THAT WAS MISSED, found by finally rendering this panel in
+             a browser: the rule above was applied to the DETECTOR's freshness
+             and not to the TRANSPORT's. When a refresh starts failing after a
+             board has loaded, the body grows a loud "Refresh is FAILING …" line
+             and the badge above it kept printing a confident number for a board
+             that may be hours old. Same defect, one layer out, in the same
+             prominent position.
+
+             The predicate is `refreshFailing`, not `panelState(…) === 'stale'`,
+             and that distinction is the whole fix rather than a spelling. A
+             panel's STATE is the phase it is in right now, and `startFetch`
+             moves it to `refreshing` for the entire duration of every attempt —
+             so gating on `stale` restored the confident number during each
+             retry. Under a sustained server-error outage it never withheld at
+             all: api.js backs off up to ~62s while this panel polls every 60s,
+             so each request is superseded before it returns, and a superseded
+             non-throwing response never reaches `failFetch`. `refreshFailing`
+             asks for the FAULT instead — the last completed attempt failed and
+             a board was loaded before it — which survives the retry because
+             only a SUCCESS clears it.
+             (`loading` and `error` still cannot reach this badge: both mean no
+             fetch has ever succeeded, so there is no `lastSuccess`, no
+             `zeroDropView`, and no header chip to mislabel.)
+
+             The warning JOINS its causes rather than ranking them. The ternary
+             this replaces printed "detector blind" and silently swallowed the
+             fact that the detector was ALSO stale; a reader who fixes the blind
+             leg would then have seen a number reappear with the staleness still
+             true. A badge is an inventory of what is wrong, not a verdict about
+             which wrongness matters most. -->
         <span class="panel-status"
               x-show="$store.genesisDashboard.zeroDropView?.gaps?.status === 'ok'
                       && $store.genesisDashboard.zeroDropView?.gaps?.open > 0
                       && !$store.genesisDashboard.zeroDropView?.gaps?.detector?.stale
-                      && !$store.genesisDashboard.zeroDropView?.gaps?.detector?.blind">
+                      && !$store.genesisDashboard.zeroDropView?.gaps?.detector?.blind
+                      && !$store.genesisDashboard.refreshFailing('zeroDrop')">
           <span class="status-dot" style="background:#ffa726;"></span>
           <span x-text="$store.genesisDashboard.zeroDropView.gaps.open + ' of '
                         + $store.genesisDashboard.zeroDropView.gaps.listed_of + ' stranded'"></span>
@@ -42,23 +74,32 @@
         <span class="panel-status"
               x-show="$store.genesisDashboard.zeroDropView?.gaps?.status === 'ok'
                       && ($store.genesisDashboard.zeroDropView?.gaps?.detector?.stale
-                          || $store.genesisDashboard.zeroDropView?.gaps?.detector?.blind)">
+                          || $store.genesisDashboard.zeroDropView?.gaps?.detector?.blind
+                          || $store.genesisDashboard.refreshFailing('zeroDrop'))">
           <span class="status-dot" style="background:#f0ad4e;"></span>
-          <span x-text="$store.genesisDashboard.zeroDropView.gaps.detector?.blind
-                        ? 'detector blind — not a count'
-                        : 'detector stale — not a count'"></span>
+          <span x-text="[
+                          $store.genesisDashboard.zeroDropView.gaps.detector?.blind ? 'detector blind' : null,
+                          $store.genesisDashboard.zeroDropView.gaps.detector?.stale ? 'detector stale' : null,
+                          $store.genesisDashboard.refreshFailing('zeroDrop') ? 'refresh failing' : null
+                        ].filter(Boolean).join(' + ') + ' — not a count'"></span>
         </span>
       </div>
       <div class="panel-body">
 
         <!-- ── Transport state ─────────────────────────────────────
              Three states, not two. `error` is a fetch that has NEVER
-             succeeded; `stale` is one that succeeded before and is now
-             failing — and without its own banner the panel would keep
+             succeeded; a FAILING REFRESH is one that succeeded before and is
+             now failing — and without its own banner the panel would keep
              rendering the last good payload forever with nothing saying so.
              The data layer withholds a stale PR count for exactly this
              reason; the UI must not apply a weaker standard to its own
-             transport than the view applies to its sources. -->
+             transport than the view applies to its sources.
+
+             The third branch reads `refreshFailing` rather than the `stale`
+             PHASE, matching the badge above it. They must use the SAME
+             predicate: on the phase, the banner vanished for the duration of
+             every retry while the badge went back to printing a number, so the
+             two disagreed precisely when the reader needed them to agree. -->
         <template x-if="$store.genesisDashboard.panelState('zeroDrop') === 'loading'">
           <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
             Loading…
@@ -69,7 +110,7 @@
             Couldn't load the board — will keep retrying. This is NOT a clean board.
           </div>
         </template>
-        <template x-if="$store.genesisDashboard.panelState('zeroDrop') === 'stale'">
+        <template x-if="$store.genesisDashboard.refreshFailing('zeroDrop')">
           <div style="padding:0.6rem; margin-bottom:0.75rem; border-radius:4px; background:rgba(240,173,78,0.12); color:#f0ad4e; font-size:0.72rem;">
             Refresh is FAILING — everything below is the last board that loaded
             <span x-show="$store.genesisDashboard.fetchState.zeroDrop.lastSuccess"
@@ -196,9 +237,28 @@
               <div style="font-size:0.7rem; font-weight:700; text-transform:uppercase; color:var(--color-text-secondary); margin-bottom:0.4rem;">
                 PR pipeline
               </div>
-              <div style="font-size:0.85rem;"
-                   :style="$store.genesisDashboard.zeroDropView.pr_pipeline?.status !== 'ok' ? 'color:#f0ad4e;' : ''"
-                   x-text="$store.genesisDashboard.zeroDropView.pr_pipeline?.verdict || $store.genesisDashboard.zeroDropView.pr_pipeline?.reason || 'unknown'"></div>
+              <!-- Three statuses, and only two of them describe themselves.
+                   `ok` and `stale` both carry a `verdict` written to be read on
+                   its own ("cache is 27h old (TTL 24h) — the pulse worker is not
+                   running"). `unavailable` carries only a `reason`, and this
+                   line used to render that reason BARE — so the part that could
+                   not be read looked like a part reporting a fact, in a panel
+                   whose other three parts all say "Unavailable — … (not a zero)".
+                   The amber colour carried the distinction and the words did
+                   not, which fails anyone reading the text rather than the hue.
+                   Same framing as the siblings now; the `stale` path is
+                   untouched, because its verdict already says what it is. -->
+              <template x-if="$store.genesisDashboard.zeroDropView.pr_pipeline?.status === 'unavailable'">
+                <div style="font-size:0.85rem; color:#f0ad4e;">
+                  Unavailable — <span x-text="$store.genesisDashboard.zeroDropView.pr_pipeline.reason || 'unknown'"></span>
+                  <span style="color:var(--color-text-secondary);"> (not a zero)</span>
+                </div>
+              </template>
+              <template x-if="$store.genesisDashboard.zeroDropView.pr_pipeline?.status !== 'unavailable'">
+                <div style="font-size:0.85rem;"
+                     :style="$store.genesisDashboard.zeroDropView.pr_pipeline?.status !== 'ok' ? 'color:#f0ad4e;' : ''"
+                     x-text="$store.genesisDashboard.zeroDropView.pr_pipeline?.verdict || 'unknown'"></div>
+              </template>
               <div style="font-size:0.7rem; color:var(--color-text-secondary);"
                    x-show="$store.genesisDashboard.zeroDropView.pr_pipeline?.age_seconds != null"
                    x-text="'cache age: ' + Math.round($store.genesisDashboard.zeroDropView.pr_pipeline.age_seconds / 3600) + 'h'"></div>

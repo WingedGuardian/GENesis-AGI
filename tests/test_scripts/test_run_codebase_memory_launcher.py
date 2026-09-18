@@ -77,6 +77,7 @@ def _run_launcher(tmp_path, *args, fakebin=None, env_extra=None):
         "PATH": path,
         "HOME": str(tmp_path),
         "CODEBASE_MEMORY_MCP_BIN": str(binary),
+        "CODEBASE_MEMORY_MCP_DISABLE_FILE": str(tmp_path / "not-disabled"),
         **(env_extra or {}),
     }
     res = subprocess.run(
@@ -98,6 +99,18 @@ def test_missing_binary_errors(tmp_path):
     )
     assert res.returncode == 1
     assert "not installed" in res.stderr
+
+
+def test_disable_sentinel_refuses_to_spawn_binary(tmp_path):
+    disable_file = tmp_path / "codebase-memory-mcp.disabled"
+    disable_file.write_text("incident freeze\n")
+    res, blog = _run_launcher(
+        tmp_path,
+        env_extra={"CODEBASE_MEMORY_MCP_DISABLE_FILE": str(disable_file)},
+    )
+    assert res.returncode == 1
+    assert f"disabled by {disable_file}" in res.stderr
+    assert not blog.exists()
 
 
 def test_scope_path_passes_memorymax(tmp_path):
@@ -223,7 +236,11 @@ def test_scrubbed_env_resolves_via_path(tmp_path):
     minbin = _minimal_path(tmp_path)
     res = subprocess.run(
         ["bash", str(_LAUNCHER)],
-        env={"PATH": f"{bindir}:{minbin}", "HOME": ""},
+        env={
+            "PATH": f"{bindir}:{minbin}",
+            "HOME": "",
+            "CODEBASE_MEMORY_MCP_DISABLE_FILE": str(tmp_path / "not-disabled"),
+        },
         capture_output=True, text=True, timeout=30,
     )
     assert res.returncode == 0, res.stderr
@@ -287,6 +304,7 @@ def _launcher_env(**extra: str) -> dict[str, str]:
     return {
         "PATH": os.environ["PATH"],
         "HOME": os.environ["HOME"],
+        "CODEBASE_MEMORY_MCP_DISABLE_FILE": "/dev/null/not-disabled",
         **{k: os.environ[k]
            for k in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
            if k in os.environ},

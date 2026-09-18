@@ -35,6 +35,25 @@ async def test_create_persists_drop_id_and_batch_items(db):
     assert row["batch_items"] == "line1\nline2"
 
 
+def test_batch_items_v2_round_trips_exact_item_boundaries():
+    items = [
+        "standalone note",
+        "annotation\nhttps://example.com/path?q=✓!",
+    ]
+    stored = inbox_items.serialize_batch_items(items)
+
+    assert stored.startswith(inbox_items.BATCH_ITEMS_V2_PREFIX)
+    assert inbox_items.batch_items_for_dispatch(stored) == "\n\n".join(items)
+    assert inbox_items._handled_items_from_storage(stored) == items
+    for corrupt in ("not-json", "[]", '[""]', '["   "]'):
+        stored_corrupt = f"{inbox_items.BATCH_ITEMS_V2_PREFIX}{corrupt}"
+        assert inbox_items.batch_items_for_dispatch(stored_corrupt) is None
+        assert inbox_items._handled_items_from_storage(stored_corrupt) == []
+    binary_corrupt = b'inbox-items-v2:["item"]'
+    assert inbox_items.batch_items_for_dispatch(binary_corrupt) is None
+    assert inbox_items._handled_items_from_storage(binary_corrupt) == []
+
+
 @pytest.mark.asyncio
 async def test_update_status_for_drop_only_touches_pending_processing(db):
     await _mk(db, id="a", drop_id="D1", status="completed",
@@ -51,6 +70,159 @@ async def test_update_status_for_drop_only_touches_pending_processing(db):
     assert (await inbox_items.get_by_id(db, "a"))["status"] == "completed"
     assert (await inbox_items.get_by_id(db, "b"))["status"] == "failed"
     assert (await inbox_items.get_by_id(db, "c"))["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_restart_requeue_atomically_covers_every_pending_row(db):
+    for index in range(55):
+        await _mk(
+            db,
+            id=f"pending-{index:02d}",
+            drop_id=f"drop-{index:02d}",
+            created_at=f"2026-06-30T00:{index:02d}:00+00:00",
+        )
+    await inbox_items.update_status(db, "pending-54", status="pending", retry_count=2)
+
+    count = await inbox_items.requeue_pending_after_restart(
+        db,
+        processed_at="2026-06-30T01:00:00+00:00",
+    )
+    rows = await db.execute_fetchall(
+        "SELECT status, retry_count, error_message FROM inbox_items ORDER BY id"
+    )
+
+    assert count == 55
+    assert len(rows) == 55
+    assert all(row["status"] == "failed" for row in rows)
+    assert all(row["error_message"] == "pending_restart_requeue" for row in rows)
+    assert rows[-1]["retry_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_restart_requeue_recovers_unmarked_processing_but_preserves_approvals(db):
+    await _mk(
+        db,
+        id="claimed",
+        drop_id="D1",
+        status="processing",
+        created_at="2026-06-30T00:00:00+00:00",
+    )
+    await _mk(
+        db,
+        id="awaiting",
+        drop_id="D2",
+        status="processing",
+        created_at="2026-06-30T00:01:00+00:00",
+    )
+    await inbox_items.update_status(
+        db,
+        "awaiting",
+        status="processing",
+        error_message=f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-1",
+    )
+    await _mk(
+        db,
+        id="dispatching",
+        drop_id="D3",
+        status="processing",
+        created_at="2026-06-30T00:02:00+00:00",
+    )
+    await inbox_items.update_status(
+        db,
+        "dispatching",
+        status="processing",
+        error_message=f"{inbox_items.DISPATCHING_PREFIX}attempt-1",
+    )
+
+    count = await inbox_items.requeue_pending_after_restart(
+        db,
+        processed_at="2026-06-30T01:00:00+00:00",
+    )
+
+    assert count == 1
+    claimed = await inbox_items.get_by_id(db, "claimed")
+    awaiting = await inbox_items.get_by_id(db, "awaiting")
+    dispatching = await inbox_items.get_by_id(db, "dispatching")
+    assert claimed["status"] == "failed"
+    assert claimed["error_message"] == "pending_restart_requeue"
+    assert awaiting["status"] == "processing"
+    assert awaiting["error_message"] == f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-1"
+    assert dispatching["status"] == "processing"
+    assert dispatching["error_message"] == f"{inbox_items.DISPATCHING_PREFIX}attempt-1"
+
+
+@pytest.mark.asyncio
+async def test_claim_preapproved_for_dispatch_is_null_marker_cas(db):
+    await _mk(
+        db, id="ready", drop_id="D1", status="processing",
+        created_at="2026-06-30T00:00:00+00:00",
+    )
+    await _mk(
+        db, id="awaiting", drop_id="D2", status="processing",
+        created_at="2026-06-30T00:01:00+00:00",
+    )
+    await inbox_items.update_status(
+        db,
+        "awaiting",
+        status="processing",
+        error_message=f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-1",
+    )
+
+    assert await inbox_items.claim_preapproved_for_dispatch(
+        db, "ready", token="attempt-1",
+    ) is True
+    assert (await inbox_items.get_by_id(db, "ready"))["error_message"] == (
+        f"{inbox_items.DISPATCHING_PREFIX}attempt-1"
+    )
+    assert await inbox_items.claim_preapproved_for_dispatch(
+        db, "ready", token="attempt-2",
+    ) is False
+    assert await inbox_items.claim_preapproved_for_dispatch(
+        db, "awaiting", token="attempt-2",
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_get_handled_batch_content_has_no_age_cutoff(db):
+    await _failed(
+        db,
+        "terminal",
+        "/inbox/A.md",
+        retry_count=3,
+        created_at="2020-01-01T00:00:00+00:00",
+    )
+    await db.execute(
+        "UPDATE inbox_items SET batch_items = ? WHERE id = ?",
+        (
+            inbox_items.serialize_batch_items(
+                ["annotation\nhttps://example.com/dead"]
+            ),
+            "terminal",
+        ),
+    )
+    await db.commit()
+    await _failed(db, "retriable", "/inbox/A.md", retry_count=2)
+
+    assert await inbox_items.get_handled_batch_content(
+        db, "/inbox/A.md", max_retries=3,
+    ) == ["annotation\nhttps://example.com/dead"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_multiline_batch_is_opaque_not_a_handled_association(db):
+    await _failed(
+        db, "legacy", "/inbox/A.md", retry_count=3,
+        error="partial_url_failure", created_at="2026-09-12T00:00:00+00:00",
+    )
+    await db.execute(
+        "UPDATE inbox_items SET batch_items = ? WHERE id = ?",
+        ("standalone note\nhttps://example.com/url", "legacy"),
+    )
+    await db.commit()
+
+    assert await inbox_items.get_handled_batch_content(
+        db, "/inbox/A.md", max_retries=3,
+    ) == []
 
 
 @pytest.mark.asyncio

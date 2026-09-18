@@ -80,7 +80,7 @@ if [ -n "$new_noncodes" ]; then
 fi
 
 # Strip GitNexus's auto-injected block from staged CLAUDE.md.
-# The post-commit hook runs `npx gitnexus analyze`, which re-injects a
+# GitNexus analyze can re-inject a
 # <!-- gitnexus:start --> … <!-- gitnexus:end --> block into BOTH CLAUDE.md and
 # AGENTS.md on every commit (it has no per-file flag). We keep it in AGENTS.md
 # (read by cross-tool agents) but it must never enter CLAUDE.md. The hourly
