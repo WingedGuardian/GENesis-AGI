@@ -88,6 +88,8 @@ gh pr checks <PR-number>                          # CI results (replaces local f
 curl -s http://localhost:6333/collections | jq .  # Verify Qdrant
 systemctl --user restart genesis-server           # Restart server (NEVER nohup)
 systemctl --user status genesis-server            # Verify server running
+scripts/deploy_code_only.sh                       # Code-only DEPLOY (lock + watchdog/guardian standdown + health verify + SHA receipt) — never the bare pull/reinstall/restart chain
+scripts/run_under_deploy_lock.sh -- <cmd>         # Validation/E2E against the live server (shared deploy-lock hold; --receipt records the validated SHA)
 ```
 
 ## Code Intelligence

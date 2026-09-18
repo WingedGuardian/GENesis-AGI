@@ -7,8 +7,8 @@
 # machine with a live genesis-server re-runs installers (curl|bash, npm -g,
 # pip), re-registers MCP servers + systemd units, and edits dotfiles on top
 # of a running system — the direct trigger of the 2026-07-13 eth0/load
-# incident. Code changes deploy via scripts/update.sh (or git pull +
-# pip install -e . + systemctl --user restart genesis-server).
+# incident. Code changes deploy via scripts/update.sh (or, code-only,
+# scripts/deploy_code_only.sh — the locked, health-verified form).
 #
 # This function makes that rule mechanical: refuse to proceed while
 # genesis-server is live, unless one of two overrides applies:
@@ -71,8 +71,9 @@ re-registers services on top of a running server (this triggered the
 
 To deploy code changes, use the sanctioned path instead:
     scripts/update.sh
-  or, for a code-only change:
-    git pull && pip install -e . && systemctl --user restart genesis-server
+  or, for a code-only change (deploy lock + watchdog/guardian standdown +
+  health verify + SHA receipt — issue #1699):
+    scripts/deploy_code_only.sh
 
 To run bootstrap for deliberate live repair anyway:
     ./scripts/bootstrap.sh --force
