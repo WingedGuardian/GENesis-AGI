@@ -246,6 +246,31 @@ def test_harvest_ula_prefixes(monkeypatch, tmp_path):
     assert not any("::1" in p for p in pats)  # loopback excluded
 
 
+def test_harvest_ula_skips_the_well_known_tailnet_prefix(monkeypatch, tmp_path):
+    """Tailscale's public v6 /48 is every tailnet's prefix, not this install's.
+
+    Recorded as a private pattern it false-positives on any diff that names
+    Tailscale v6 space — including the endpoint adapter that must. Hextets
+    below are written split for the same reason the production constant is.
+    """
+    tailnet = ":".join(("fd7a", "115c"))
+    fake = (
+        "1: lo\n    inet6 ::1/128 scope host\n"
+        "2: tailscale0\n"
+        f"    inet6 {tailnet}:a1e0:ab12:cd34:ef56/128 scope global\n"
+        "3: eth0\n    inet6 fd12:3456:789a::5/64 scope global\n"
+    )
+    monkeypatch.setattr(
+        fp.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=fake, stderr=""),
+    )
+    home = _fake_home(tmp_path)
+    pats = {p for p, _ in fp.harvest(home=home, repo_root=Path("/srv/proj"), run_ip6=True)}
+    assert tailnet not in pats
+    assert r"fd12:3456" in pats  # a real private ULA still harvested
+
+
 def test_harvest_ula_ip_absent_no_raise(monkeypatch, tmp_path):
     def _boom(*a, **k):
         raise FileNotFoundError("ip")

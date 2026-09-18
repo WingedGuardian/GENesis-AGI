@@ -202,6 +202,38 @@ def _bootstrap_health(transport_kwargs: dict) -> None:
                     exc_info=True,
                 )
 
+            # Wire user job tools with DB-only access, same split as campaigns.
+            # Registering them without this leaves _db as None and every one of
+            # the four answers "Database not initialized" — a tool that is
+            # present and broken, which is only marginally better than the dead
+            # tool the import was added to fix. All four work here: mutations
+            # write the DB, and the server-side scheduler's reconcile loop
+            # converges APScheduler onto the table — including run_now, which
+            # stamps run_requested_at and is dispatched within a reconcile
+            # tick by the server's process.
+            try:
+                from genesis.mcp.health.user_job_tools import init_user_job_tools
+
+                init_user_job_tools(db=db, scheduler=None)
+            except Exception:
+                logger.warning(
+                    "User job tools not available in standalone MCP",
+                    exc_info=True,
+                )
+
+            # Module tools likewise need the DB so module_list/module_call
+            # report the operator's persisted enabled/config state rather
+            # than YAML defaults.
+            try:
+                from genesis.mcp.health.module_ops import init_module_ops
+
+                init_module_ops(db=db)
+            except Exception:
+                logger.warning(
+                    "Module ops tools not available in standalone MCP",
+                    exc_info=True,
+                )
+
             clear_mcp_crash("health")
             yield
         finally:
