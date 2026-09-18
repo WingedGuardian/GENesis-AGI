@@ -72,6 +72,9 @@ async def _get_db() -> aiosqlite.Connection:
     # Standalone fallback connection. Not routed through get_raw_db() because
     # callers hold this connection across awaits (it's returned, not scoped to
     # a context manager); it sets the same pragmas get_raw_db() applies.
+    from genesis.db.integrity import assert_not_quarantined
+
+    assert_not_quarantined(_DB_PATH)
     db = await aiosqlite.connect(str(_DB_PATH))
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode=WAL")

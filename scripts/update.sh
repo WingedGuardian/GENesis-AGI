@@ -118,7 +118,7 @@ SEOF
 # deploy", so the window before it is cleaned is harmless.
 _clear_deploy_state() {
     rm -f "$STATE_FILE" 2>/dev/null || true
-    local _m="$HOME/.genesis/update_in_progress.pid" _pid
+    local _m="${GENESIS_HOME:-$HOME/.genesis}/update_in_progress.pid" _pid
     _pid="$(cat "$_m" 2>/dev/null || true)"
     if [ "$_pid" = "$$" ] || { [ -n "$_pid" ] && ! kill -0 "$_pid" 2>/dev/null; }; then
         rm -f "$_m" 2>/dev/null || true
@@ -201,7 +201,7 @@ fi
 # run refuses immediately rather than queuing. Placed AFTER the worktree refusal
 # (worktree runs never take it) and BEFORE the rollback tag / backup and the
 # ERR/signal traps — a contention exit leaves the running server untouched.
-UPDATE_LOCK_FILE="$HOME/.genesis/locks/update.lock"
+UPDATE_LOCK_FILE="${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock"
 mkdir -p "$(dirname "$UPDATE_LOCK_FILE")"
 exec {_UPDATE_LOCK_FD}>"$UPDATE_LOCK_FILE"
 if ! flock -n "$_UPDATE_LOCK_FD"; then

@@ -118,6 +118,9 @@ def upsert_sync(
 ) -> None:
     """Sync heartbeat write for hooks. Best-effort, never raises."""
     try:
+        from genesis.db.integrity import assert_not_quarantined
+
+        assert_not_quarantined(db_path)
         now = datetime.now(UTC).isoformat()
         conn = sqlite3.connect(db_path, timeout=timeout)
         try:

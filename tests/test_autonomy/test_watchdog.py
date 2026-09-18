@@ -180,6 +180,27 @@ class TestDeployInProgress:
         assert checker.check() is WatchdogAction.RESTART
 
 
+class TestDatabaseQuarantine:
+    def test_matching_quarantine_suppresses_restart_without_failure_accounting(
+        self, tmp_path: Path, stale_status: Path
+    ):
+        checker = _make_checker(tmp_path, stale_status)
+        state = {
+            "consecutive_failures": 2,
+            "next_attempt_after": None,
+            "last_reason": "target_inactive",
+        }
+
+        with (
+            patch.object(checker, "_targets_server", return_value=True),
+            patch("genesis.autonomy.watchdog.database_is_quarantined", return_value=True),
+        ):
+            action = checker._restart_if_allowed(state, reason="target_inactive")
+
+        assert action is WatchdogAction.SKIP
+        assert state["consecutive_failures"] == 2
+
+
 class TestStaleBootstrapGrace:
     """A status file stale from BEFORE the service started is not evidence about
     THIS process (2026-09-08 incident: post-outage boot left a 22,583s-stale

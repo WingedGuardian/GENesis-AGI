@@ -236,6 +236,16 @@ def _evidence_names_pr(evidence: str | None, pr_number: int) -> bool:
     return bool(evidence) and re.search(rf"#\s*{int(pr_number)}\b", evidence) is not None
 
 
+def _connect_rw(db_path: Path | str):
+    """Return a writable connection only while the DB is not quarantined."""
+    import aiosqlite
+
+    from genesis.db.integrity import assert_not_quarantined
+
+    assert_not_quarantined(db_path)
+    return aiosqlite.connect(str(db_path), timeout=10)
+
+
 async def _record_telemetry(db_path: Path | str, status: str, detail: str) -> bool:
     """Best-effort call_site_last_run row for the neural monitor."""
     try:
@@ -259,10 +269,12 @@ async def _record_run(db_path: Path | str, **kwargs) -> bool:
     Returns False when the write demonstrably did not land (pre-migration
     tables, locked DB) — the caller must then leave the cursor alone.
     """
-    import aiosqlite
+
+    from genesis.db.integrity import assert_not_quarantined
 
     try:
-        async with aiosqlite.connect(str(db_path), timeout=10) as db:
+        assert_not_quarantined(db_path)
+        async with _connect_rw(db_path) as db:
             await db.execute("PRAGMA busy_timeout=5000")
             return await pulse_crud.record_run(db, **kwargs)
     except Exception:
@@ -355,9 +367,12 @@ async def _reconcile(db_path: Path | str, now_iso: str) -> dict[str, int]:
     """
     import aiosqlite
 
+    from genesis.db.integrity import assert_not_quarantined
+
+    assert_not_quarantined(db_path)
     counts: dict[str, int] = {}
     try:
-        async with aiosqlite.connect(str(db_path), timeout=10) as db:
+        async with _connect_rw(db_path) as db:
             await db.execute("PRAGMA busy_timeout=5000")
             db.row_factory = aiosqlite.Row
             proposed = await pulse_crud.list_annotations(db, status="proposed")
@@ -596,7 +611,7 @@ async def _verification_lane(
     import aiosqlite
 
     opened = auto_closed = 0
-    async with aiosqlite.connect(str(db_path), timeout=10) as db:
+    async with _connect_rw(db_path) as db:
         await db.execute("PRAGMA busy_timeout=5000")
         db.row_factory = aiosqlite.Row
         if not await verif_crud.tables_available(db):
@@ -651,6 +666,9 @@ async def _run_locked(
     t0: float,
     mode: str,
 ) -> dict:
+    from genesis.db.integrity import assert_not_quarantined
+
+    assert_not_quarantined(db_path)
     run_id = uuid.uuid4().hex
     cfg = load_config()
     cursor = _read_cursor(root)
@@ -901,7 +919,7 @@ async def _run_locked(
     if exact_matches:
         import aiosqlite
 
-        async with aiosqlite.connect(str(db_path), timeout=10) as db:
+        async with _connect_rw(db_path) as db:
             await db.execute("PRAGMA busy_timeout=5000")
             db.row_factory = aiosqlite.Row
             if not await pulse_crud.tables_available(db):
@@ -1004,7 +1022,7 @@ async def _run_locked(
     if followup_matches:
         import aiosqlite
 
-        async with aiosqlite.connect(str(db_path), timeout=10) as db:
+        async with _connect_rw(db_path) as db:
             await db.execute("PRAGMA busy_timeout=5000")
             db.row_factory = aiosqlite.Row
             if not await pulse_crud.tables_available(db):
@@ -1143,7 +1161,7 @@ async def _run_locked(
                 if closes_matches:
                     import aiosqlite
 
-                    async with aiosqlite.connect(str(db_path), timeout=10) as db:
+                    async with _connect_rw(db_path) as db:
                         await db.execute("PRAGMA busy_timeout=5000")
                         db.row_factory = aiosqlite.Row
                         if not await pulse_crud.tables_available(db):

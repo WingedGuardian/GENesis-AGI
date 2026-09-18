@@ -29,8 +29,9 @@ from typing import TYPE_CHECKING, Any
 import yaml
 
 from genesis.autonomy.types import WatchdogAction
+from genesis.db.integrity import database_is_quarantined
+from genesis.env import genesis_db_path, update_in_progress
 from genesis.env import secrets_path as default_secrets_path
-from genesis.env import update_in_progress
 from genesis.util.systemd import systemctl_env
 
 if TYPE_CHECKING:
@@ -448,6 +449,17 @@ class WatchdogChecker:
 
     def _restart_if_allowed(self, state: dict, *, reason: str) -> WatchdogAction:
         """Shared restart logic: backoff → validation → restart or skip."""
+        # A corrupt DB is a durable stop condition, not a crash to retry.  This
+        # check precedes failure accounting so a quarantined database cannot
+        # consume the restart/flap budget every watchdog tick.
+        if self._targets_server() and database_is_quarantined(genesis_db_path()):
+            logger.critical(
+                "Database quarantine active — suppressing %s restart until a "
+                "verified replacement database is installed",
+                reason,
+            )
+            return WatchdogAction.SKIP
+
         # Defer restarts while a deploy is running. update.sh intentionally stops
         # genesis-server for its merge/bootstrap/migrate window; a watchdog revival
         # there takes the DB write lock and deadlocks bootstrap's seed (incident
@@ -1354,5 +1366,4 @@ def restart_bridge(service: str = "genesis-server.service", *, timeout_s: int = 
         return 0
     logger.error("%s not active after restart attempt", service)
     return 1
-
 

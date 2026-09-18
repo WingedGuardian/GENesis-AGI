@@ -33,18 +33,33 @@ def _make_stub(path: Path, body: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _write_systemctl(bind: Path, calls: Path, *, active: bool = True, stop_rc: int = 0) -> None:
+def _write_systemctl(
+    bind: Path,
+    calls: Path,
+    *,
+    active: bool = True,
+    stop_rc: int = 0,
+    probe_marker_on_stop: bool = False,
+) -> None:
     """Configurable systemctl stub: logs every call; `is-active --quiet` exits 0
     iff ``active`` (the gateway uses the exit code, not output); `stop` exits
     ``stop_rc``."""
-    active_rc = 0 if active else 3
+    state_file = calls.with_suffix(".state")
+    state_file.write_text("active" if active else "inactive")
+    marker_probe = ""
+    if probe_marker_on_stop:
+        marker_probe = (
+            f' [ -f "$HOME/.genesis/update_in_progress.pid" ] && '
+            f'echo MARKER_PRESENT_AT_STOP >> "{calls}";'
+        )
     _make_stub(
         bind / "systemctl",
         "#!/usr/bin/env bash\n"
         f'echo "$*" >> "{calls}"\n'
         'case "$*" in\n'
-        f"  *is-active*) exit {active_rc} ;;\n"
-        f"  *stop*) exit {stop_rc} ;;\n"
+        f'  *is-active*) grep -qx active "{state_file}"; exit $? ;;\n'
+        f'  *stop*){marker_probe} [ {stop_rc} -eq 0 ] && '
+        f'echo inactive > "{state_file}"; exit {stop_rc} ;;\n'
         "esac\n"
         "exit 0\n",
     )
@@ -93,12 +108,12 @@ def _seed_live_db(gd: Path) -> Path:
 def _seed_backup(tmp_path: Path) -> Path:
     """Backup dir with a plaintext SQL dump (no GPG)."""
     bkp = tmp_path / "backup"
-    (bkp / "data").mkdir(parents=True)
+    (bkp / "data").mkdir(parents=True, exist_ok=True)
     (bkp / "data" / "genesis.sql").write_text("CREATE TABLE t(x);\nINSERT INTO t VALUES(42);\n")
     return bkp
 
 
-def _run_restore(sandbox):
+def _run_restore(sandbox, *extra_args: str):
     bkp = _seed_backup(sandbox["tmp"])
     env = dict(os.environ)
     env["HOME"] = str(sandbox["home"])
@@ -106,7 +121,7 @@ def _run_restore(sandbox):
     env["QDRANT_URL"] = "http://127.0.0.1:1"  # dead → Qdrant restore skips fast
     env["PATH"] = f"{sandbox['bind']}:{env['PATH']}"
     return subprocess.run(
-        ["bash", str(_RESTORE), "--from", str(bkp), "--force"],
+        ["bash", str(_RESTORE), "--from", str(bkp), "--force", *extra_args],
         env=env,
         capture_output=True,
         text=True,
@@ -139,6 +154,23 @@ def test_restore_clears_stale_wal_shm(sandbox):
     assert out.stdout.strip() == "42", f"DB not restored from backup dump: {out.stdout!r}"
 
 
+def test_database_only_restore_skips_every_non_database_payload(sandbox):
+    db = _seed_live_db(sandbox["gd"])
+    backup = _seed_backup(sandbox["tmp"])
+    (backup / "memory").mkdir()
+    (backup / "memory" / "must-not-restore.txt").write_text("unrelated")
+
+    proc = _run_restore(sandbox, "--database-only")
+
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert "--- Qdrant ---" not in proc.stdout
+    assert not (sandbox["home"] / ".claude" / "projects").exists()
+    restored = subprocess.run(
+        ["sqlite3", str(db), "SELECT x FROM t;"], capture_output=True, text=True
+    ).stdout.strip()
+    assert restored == "42"
+
+
 # NOTE: this test's name must NOT contain the marker word — restore.sh logs the
 # (tmp) DB path, and a test name leaking into that path would false-match.
 def test_restore_verifies_db_after_restore(sandbox):
@@ -146,27 +178,26 @@ def test_restore_verifies_db_after_restore(sandbox):
     proc = _run_restore(sandbox)
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     # New code emits this exact marker only on a passing PRAGMA integrity_check.
-    assert "integrity_check ok" in proc.stdout.lower(), (
+    assert "passed integrity, foreign-key, and schema checks" in proc.stdout.lower(), (
         f"integrity_check not run/logged after restore:\n{proc.stdout}"
     )
     status = json.loads((sandbox["home"] / ".genesis" / "restore_status.json").read_text())
     assert status["sqlite_restored"] is True, status
 
 
-def test_restore_proceeds_and_warns_when_stop_fails(sandbox):
-    """If genesis-server can't be stopped, the restore proceeds with a warning —
-    and must NOT claim 'left stopped' (the server never stopped)."""
+def test_restore_refuses_when_stop_fails(sandbox):
+    """A live writer that cannot be stopped leaves the live DB untouched."""
     _write_systemctl(sandbox["bind"], sandbox["calls"], active=True, stop_rc=1)
     db = _seed_live_db(sandbox["gd"])
     proc = _run_restore(sandbox)
     assert proc.returncode == 1, f"{proc.stdout}\n{proc.stderr}"  # warn → failure → exit 1
-    assert "could not stop genesis-server" in proc.stdout
+    assert "could not confirm genesis-server stopped" in proc.stdout
     assert "left stopped" not in proc.stdout, "misleading note after a failed stop"
     assert (
         subprocess.run(
             ["sqlite3", str(db), "SELECT x FROM t;"], capture_output=True, text=True
         ).stdout.strip()
-        == "42"
+        == "1"
     )
 
 
@@ -190,33 +221,20 @@ def test_restore_warns_on_integrity_failure(sandbox):
     """A restored DB that fails PRAGMA integrity_check must warn loudly, record a
     failure, and exit non-zero — never silently accept a corrupt restore."""
     _write_sqlite3_integrity_intercept(sandbox["bind"])
-    _seed_live_db(sandbox["gd"])
+    db = _seed_live_db(sandbox["gd"])
     proc = _run_restore(sandbox)
     assert proc.returncode == 1, f"{proc.stdout}\n{proc.stderr}"
     assert "integrity_check failed" in proc.stdout.lower(), proc.stdout
     status = json.loads((sandbox["home"] / ".genesis" / "restore_status.json").read_text())
     assert status["success"] is False
     assert status["failures"], "integrity failure not recorded in restore_status.json"
+    live = subprocess.run(
+        ["sqlite3", str(db), "SELECT x FROM t;"], capture_output=True, text=True
+    ).stdout.strip()
+    assert live == "1", "failed staged validation modified the live DB"
 
 
 # ── Deploy-in-progress marker (watchdog must not revive the server mid-restore) ──
-
-
-def _write_systemctl_marker_probe(bind: Path, calls: Path) -> None:
-    """systemctl stub that, on `stop`, records whether the deploy marker file
-    already exists — proving the marker is held BEFORE the server is stopped (the
-    window the watchdog would otherwise revive the half-built DB in)."""
-    _make_stub(
-        bind / "systemctl",
-        "#!/usr/bin/env bash\n"
-        f'echo "$*" >> "{calls}"\n'
-        'case "$*" in\n'
-        "  *is-active*) exit 0 ;;\n"
-        '  *stop*) [ -f "$HOME/.genesis/update_in_progress.pid" ] '
-        f'&& echo MARKER_PRESENT_AT_STOP >> "{calls}"; exit 0 ;;\n'
-        "esac\n"
-        "exit 0\n",
-    )
 
 
 def test_restore_holds_deploy_marker_across_stop(sandbox):
@@ -224,7 +242,9 @@ def test_restore_holds_deploy_marker_across_stop(sandbox):
     ``update_in_progress`` marker env.update_in_progress() honors — in place
     BEFORE the stop and released by the EXIT trap — so the autonomy watchdog
     defers instead of reviving the server into a half-built DB."""
-    _write_systemctl_marker_probe(sandbox["bind"], sandbox["calls"])
+    _write_systemctl(
+        sandbox["bind"], sandbox["calls"], probe_marker_on_stop=True
+    )
     _seed_live_db(sandbox["gd"])
     proc = _run_restore(sandbox)
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
@@ -266,11 +286,10 @@ def test_restore_holds_marker_when_server_already_inactive(sandbox):
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     calls = _calls(sandbox)
     assert "stop genesis-server" not in calls, "stopped a server that wasn't active"
-    assert "MARKER_PRESENT_DURING_READ" in calls, (
-        "deploy marker NOT held during the DB rebuild when the server was already "
-        f"inactive — watchdog could revive mid-restore:\n{calls}\n{proc.stdout}"
-    )
-    assert "MARKER_ABSENT_DURING_READ" not in calls, calls
+    # Candidate construction is intentionally online and isolated. The marker
+    # is acquired only for the short validated swap window.
+    assert "MARKER_ABSENT_DURING_READ" in calls, calls
+    assert "holding deploy-in-progress marker" in proc.stdout.lower(), proc.stdout
     assert not (sandbox["home"] / ".genesis" / "update_in_progress.pid").exists(), (
         "deploy marker not released by the EXIT trap"
     )
@@ -279,7 +298,7 @@ def test_restore_holds_marker_when_server_already_inactive(sandbox):
 def test_restore_does_not_clobber_a_live_foreign_deploy_marker(sandbox):
     """If a real update.sh/dashboard deploy already owns the marker, restore must
     NOT overwrite it (and must not remove another deploy's marker in its trap);
-    the concurrency is surfaced as a warning (exit 1) but the restore proceeds."""
+    the concurrency is fatal and the live DB remains untouched."""
     marker = sandbox["home"] / ".genesis" / "update_in_progress.pid"
     sleeper = subprocess.Popen(["sleep", "30"])  # a live stand-in "other deploy"
     try:
@@ -287,7 +306,7 @@ def test_restore_does_not_clobber_a_live_foreign_deploy_marker(sandbox):
         _seed_live_db(sandbox["gd"])
         proc = _run_restore(sandbox)
         assert proc.returncode == 1, f"{proc.stdout}\n{proc.stderr}"  # warn → exit 1
-        assert "not overwriting" in proc.stdout.lower(), proc.stdout
+        assert "refusing concurrent" in proc.stdout.lower(), proc.stdout
         assert marker.exists() and marker.read_text().strip() == str(sleeper.pid), (
             "a live foreign deploy marker was clobbered"
         )
@@ -297,8 +316,8 @@ def test_restore_does_not_clobber_a_live_foreign_deploy_marker(sandbox):
                 capture_output=True,
                 text=True,
             ).stdout.strip()
-            == "42"
-        ), "restore did not proceed"
+            == "1"
+        ), "restore modified the DB despite a foreign deploy"
     finally:
         sleeper.terminate()
         sleeper.wait()
@@ -325,10 +344,8 @@ def _seed_wal_db(gd: Path) -> Path:
     return db
 
 
-def test_pre_restore_safety_copy_is_valid_and_taken_via_backup(sandbox):
-    """The pre-restore undo copy must be a STRUCTURALLY VALID sqlite db holding
-    the pre-restore state — taken via ``sqlite3 .backup`` (WAL-aware) after the
-    writer is quiesced, not a torn main-file-only ``cp`` from under a live WAL."""
+def test_pre_restore_safety_copy_preserves_raw_database(sandbox):
+    """The pre-restore DB is retained byte-for-byte for rollback/forensics."""
     _seed_wal_db(sandbox["gd"])
     proc = _run_restore(sandbox)
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
@@ -346,7 +363,7 @@ def test_pre_restore_safety_copy_is_valid_and_taken_via_backup(sandbox):
         ["sqlite3", str(copies[0]), "SELECT x FROM t;"], capture_output=True, text=True
     ).stdout.strip()
     assert val == "1", f"pre-restore copy missing the pre-restore state: {val!r}"
-    assert "wal-correct" in proc.stdout.lower(), proc.stdout
+    assert "preserved raw pre-restore" in proc.stdout.lower(), proc.stdout
 
 
 def test_the_audit_store_is_restored_after_secrets_so_its_path_can_be_configured():

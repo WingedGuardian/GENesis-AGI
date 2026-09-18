@@ -99,6 +99,8 @@ _SQL_ESCROW_DRIFT=false # env-decryptable but escrow stale → off-site DR degra
 _QDRANT_FRESH=""    # space-separated collections snapshotted+encrypted this run
 _QDRANT_FAILED=""   # collections that EXIST (HTTP 200) but failed to snapshot this run
 _SQL_TMP=""         # plaintext ~269MB dump temp — trap-cleaned (N2, credential-bearing)
+_SQL_ARTIFACT_TMP="" # encrypted candidate — promoted only after round-trip verification
+_SQL_VERIFY_TMP=""   # decrypted candidate used for exact restore validation
 # Tier-1 replication: true once the local repo is in sync with the GitHub remote.
 _TIER1_PUSHED=false
 # Off-site snapshot bookkeeping. _T2_SNAPSHOT_COUNT / _T2_PRUNED stay UNSET until
@@ -157,7 +159,7 @@ _on_exit() {
     backend_cleanup || true
     # N2: the credential-bearing plaintext SQL dump must not outlive the script
     # if it died mid-section (before its inline rm).
-    rm -f "${_SQL_TMP:-}" 2>/dev/null || true
+    rm -f "${_SQL_TMP:-}" "${_SQL_ARTIFACT_TMP:-}" "${_SQL_VERIFY_TMP:-}" 2>/dev/null || true
     return 0
 }
 trap _on_exit EXIT
@@ -252,25 +254,36 @@ encrypt_file() {
 _GIT_NET_TIMEOUT="${GENESIS_BACKUP_GIT_TIMEOUT:-300}"
 _git_net() { timeout -k 10 "$_GIT_NET_TIMEOUT" git "$@"; }
 
-# _roundtrip_ok <passphrase> <artifact.gpg> [stderr_file] — decrypt-verify that
-# <artifact.gpg> decrypts with <passphrase> AND ends with the sqlite `.dump`
-# success marker `COMMIT;` (a mid-dump failure ends `ROLLBACK; -- due to
-# errors`). Returns 0 on verified, 1 otherwise. Streams (no plaintext temp).
-# Captures the decrypt tail into a var FIRST so `grep -q` matching early can't
-# SIGPIPE `tail` and flip the pipeline non-zero under pipefail on a good dump.
+# _roundtrip_ok <passphrase> <artifact.gpg> [stderr_file] — prove that the exact
+# encrypted candidate decrypts, imports into a new database, and passes full
+# integrity, foreign-key, and non-empty-schema checks.  Checking only the live
+# source before `.dump` leaves a race; checking only the dump's COMMIT trailer
+# misses broken UNIQUE indexes and other logical inconsistencies.
 _roundtrip_ok() {
-    local _pass="$1" _art="$2" _errf="${3:-/dev/null}" _tailf _rc _grc
-    _tailf=$(mktemp -p "$GENESIS_BIG_TMP")
-    # Real pipeline (NOT inside $()) so PIPESTATUS reflects gpg's own exit; tail
-    # buffers to a file (not piped into grep) so nothing can SIGPIPE gpg/tail and
-    # flip the result under pipefail. tail -5 reads to EOF, so gpg always runs
-    # fully and its exit at PIPESTATUS[1] (printf=0, gpg=1, tail=2) is authoritative.
-    printf '%s' "$_pass" | gpg --batch --passphrase-fd 0 -d "$_art" 2>"$_errf" | tail -5 > "$_tailf"
-    _rc=${PIPESTATUS[1]}
-    if [ "$_rc" -ne 0 ]; then rm -f "$_tailf"; return 1; fi
-    grep -q '^COMMIT;' "$_tailf"; _grc=$?
-    rm -f "$_tailf"
-    return "$_grc"
+    local _pass="$1" _art="$2" _errf="${3:-/dev/null}" _verify_db _gpg_rc _sqlite_rc _ic _fk _schema
+    _verify_db=$(mktemp -p "$GENESIS_BIG_TMP")
+    rm -f "$_verify_db"
+    _SQL_VERIFY_TMP=$(mktemp -p "$GENESIS_BIG_TMP")
+    printf '%s' "$_pass" | gpg --batch --passphrase-fd 0 -d "$_art" \
+        >"$_SQL_VERIFY_TMP" 2>"$_errf"
+    _gpg_rc=${PIPESTATUS[1]}
+    if [ "$_gpg_rc" -eq 0 ]; then
+        sqlite3 "$_verify_db" ".bail on" ".read $_SQL_VERIFY_TMP" 2>>"$_errf"
+        _sqlite_rc=$?
+    else
+        _sqlite_rc=1
+    fi
+    if [ "$_gpg_rc" -ne 0 ] || [ "$_sqlite_rc" -ne 0 ]; then
+        rm -f "$_SQL_VERIFY_TMP" "$_verify_db" "$_verify_db-journal" "$_verify_db-wal" "$_verify_db-shm"
+        _SQL_VERIFY_TMP=""
+        return 1
+    fi
+    _ic=$(sqlite3 "$_verify_db" "PRAGMA integrity_check;" 2>>"$_errf") || _ic=""
+    _fk=$(sqlite3 "$_verify_db" "PRAGMA foreign_key_check;" 2>>"$_errf") || _fk="CHECK_FAILED"
+    _schema=$(sqlite3 "$_verify_db" "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%';" 2>>"$_errf") || _schema=0
+    rm -f "$_SQL_VERIFY_TMP" "$_verify_db" "$_verify_db-journal" "$_verify_db-wal" "$_verify_db-shm"
+    _SQL_VERIFY_TMP=""
+    [ "$_ic" = "ok" ] && [ -z "$_fk" ] && [ "${_schema:-0}" -gt 0 ]
 }
 
 # _verify_sql_roundtrip <artifact.gpg> — classify the freshly-encrypted SQL
@@ -316,6 +329,38 @@ _verify_sql_roundtrip() {
     return 0
 }
 
+# Refuse before touching the backup clone or any canonical artifact.  A dump
+# can sometimes finish despite index corruption, but promoting it would erase
+# the provenance boundary between a known-good backup and a damaged source.
+DB_FILE="$GENESIS_DIR/data/genesis.db"
+if [ ! -f "$DB_FILE" ]; then
+    die "SQLite source database not found at $DB_FILE"
+fi
+_DB_CHECK_OUTPUT=""
+_DB_CHECK_RC=0
+if [ -x "$GENESIS_DIR/.venv/bin/python" ] \
+    && [ -f "$GENESIS_DIR/src/genesis/db/integrity.py" ]; then
+    _DB_CHECK_OUTPUT=$(PYTHONPATH="$GENESIS_DIR/src" \
+        "$GENESIS_DIR/.venv/bin/python" -m genesis.db.integrity check \
+        "$DB_FILE" --source backup --quarantine-on-failure 2>&1) \
+        || _DB_CHECK_RC=$?
+else
+    _DB_CHECK_OUTPUT=$(sqlite3 "$DB_FILE" "PRAGMA quick_check;" 2>&1) \
+        || _DB_CHECK_RC=$?
+fi
+if [ "$_DB_CHECK_RC" -ne 0 ] || [ "$_DB_CHECK_OUTPUT" != "ok" ]; then
+    _DB_CHECK_SAFE=$(printf '%s' "${_DB_CHECK_OUTPUT:-no output}" \
+        | LC_ALL=C tr -cd '[:print:]\n' | tr '\n' ';' | cut -c1-500)
+    # The integrity CLI has already written the durable quarantine marker.
+    # Stop the main writer immediately; the watchdog honors the marker and will
+    # not revive it. Existing shared connections also re-check quarantine on
+    # every operation.
+    systemctl --user stop genesis-server.service 2>/dev/null \
+        || log "WARNING: could not stop genesis-server after DB quarantine"
+    die "SQLite source integrity check failed — last-known-good SQL artifact and NAS snapshots preserved ($_DB_CHECK_SAFE)"
+fi
+log "SQLite source integrity check: ok"
+
 # --- Clone or pull backup repo ---
 if [ ! -d "$BACKUP_DIR/.git" ]; then
     # Determine backup repo URL: env var → auto-detect from existing clone → fail
@@ -344,7 +389,6 @@ _git_net pull --rebase --quiet 2>/dev/null || log "WARNING: git pull failed, con
 # --- 1. SQLite dump (encrypted — may hold memory-stored credentials/PII) ---
 log "Backing up SQLite database..."
 mkdir -p data
-DB_FILE="$GENESIS_DIR/data/genesis.db"
 # Purge any pre-encryption plaintext dumps so they don't persist in the
 # backup repo alongside the new encrypted form.
 rm -f data/genesis.sql data/genesis.db
@@ -355,16 +399,19 @@ if [ -f "$DB_FILE" ]; then
         _SQL_TMP=$(mktemp -p "$GENESIS_BIG_TMP")  # ~269MB dump — keep off cc-tmp/RAM
         if sqlite3 "$DB_FILE" .dump > "$_SQL_TMP" 2>/dev/null; then
             _SQLITE_LINES=$(wc -l < "$_SQL_TMP")
-            if encrypt_file "$_SQL_TMP" data/genesis.sql.gpg; then
-                _SQL_FRESH=true
+            _SQL_ARTIFACT_TMP="data/.genesis.sql.gpg.partial.$$"
+            if encrypt_file "$_SQL_TMP" "$_SQL_ARTIFACT_TMP"; then
                 log "SQLite: $_SQLITE_LINES lines (encrypted)"
                 # SF4 round-trip: classify the fresh artifact's restorability
                 # (see _verify_sql_roundtrip). ROUNDTRIP_DETAIL is set (sanitized)
                 # only on CORRUPT. _SQL_RESTORABLE gates the OFF-SITE upload so a
                 # DR box never auto-selects a COMPLETE snapshot it can't decrypt.
                 ROUNDTRIP_DETAIL=""
-                case "$(_verify_sql_roundtrip data/genesis.sql.gpg)" in
+                case "$(_verify_sql_roundtrip "$_SQL_ARTIFACT_TMP")" in
                     RESTORABLE)
+                        mv "$_SQL_ARTIFACT_TMP" data/genesis.sql.gpg
+                        _SQL_ARTIFACT_TMP=""
+                        _SQL_FRESH=true
                         _SQL_RESTORABLE=true
                         log "SQLite: round-trip decrypt verified"
                         ;;
@@ -377,6 +424,9 @@ if [ -f "$DB_FILE" ]; then
                         # pre-rotation passphrase == the escrow, stays restorable)
                         # and surface a distinct re-escrow alert via the off-site
                         # path (never CRITICAL "backup failed").
+                        mv "$_SQL_ARTIFACT_TMP" data/genesis.sql.gpg
+                        _SQL_ARTIFACT_TMP=""
+                        _SQL_FRESH=true
                         _SQL_RESTORABLE=false
                         _SQL_ESCROW_DRIFT=true
                         log "WARNING: SQL round-trip failed with the ESCROWED passphrase but SUCCEEDED with the env one — escrow is stale (secrets.env rotated?). Local backup OK; off-site DR degraded until re-escrow."
@@ -386,11 +436,15 @@ if [ -f "$DB_FILE" ]; then
                         _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }SQL archive failed round-trip decrypt with its own env passphrase (${ROUNDTRIP_DETAIL:-no gpg output}) — corrupt/unrestorable, withheld from off-site"
                         log "WARNING: $_FAILURE_REASON"
                         _SQLITE_LINES=0
+                        rm -f "$_SQL_ARTIFACT_TMP"
+                        _SQL_ARTIFACT_TMP=""
                         ;;
                 esac
             else
                 log "WARNING: SQLite encryption failed"
                 _SQLITE_LINES=0
+                rm -f "$_SQL_ARTIFACT_TMP"
+                _SQL_ARTIFACT_TMP=""
             fi
         else
             log "WARNING: sqlite3 dump failed"

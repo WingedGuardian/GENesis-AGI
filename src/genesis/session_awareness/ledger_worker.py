@@ -284,6 +284,9 @@ async def _promote_live(db_path: Path | str, session_id: str, *, trigger: str) -
     mode_stopped = False
     sweep_error = False
     try:
+        from genesis.db.integrity import assert_not_quarantined
+
+        assert_not_quarantined(db_path)
         async with aiosqlite.connect(str(db_path), timeout=10) as db:
             # Row factory is REQUIRED, not tidiness: `crud.get` builds
             # `dict(row)`, which raises on a plain tuple. That exception was
@@ -575,6 +578,9 @@ async def _mark_run_failed(db_path: Path | str, run_id: str, note: str) -> None:
     import aiosqlite
 
     try:
+        from genesis.db.integrity import assert_not_quarantined
+
+        assert_not_quarantined(db_path)
         async with aiosqlite.connect(str(db_path), timeout=10) as db:
             await db.execute("PRAGMA busy_timeout=5000")
             await db.execute(
@@ -595,7 +601,10 @@ async def _record_run(db_path: Path | str, **kwargs) -> bool:
     """
     import aiosqlite
 
+    from genesis.db.integrity import assert_not_quarantined
+
     try:
+        assert_not_quarantined(db_path)
         async with aiosqlite.connect(str(db_path), timeout=10) as db:
             await db.execute("PRAGMA busy_timeout=5000")
             return await shadow_crud.record_run(db, **kwargs)

@@ -5,7 +5,7 @@
 # local config overlays, and secrets.
 #
 # Usage:
-#   scripts/restore.sh [--from <backup-repo-url>] [--dry-run] [--force]
+#   scripts/restore.sh [--from <backup-repo-url>] [--dry-run] [--force] [--database-only]
 #
 # Environment variables (match backup.sh):
 #   GENESIS_BACKUP_REPO        — Git URL (used when a fresh clone is needed)
@@ -54,11 +54,13 @@ source "$_SCRIPT_DIR/lib/backup_backends.sh"
 BACKUP_REPO_OVERRIDE=""
 DRY_RUN=false
 FORCE=false
+DATABASE_ONLY=false
 while [ $# -gt 0 ]; do
     case "$1" in
         --from) BACKUP_REPO_OVERRIDE="$2"; shift 2 ;;
         --dry-run) DRY_RUN=true; shift ;;
         --force) FORCE=true; shift ;;
+        --database-only) DATABASE_ONLY=true; shift ;;
         -h|--help)
             grep -E '^#( |$)' "$0" | sed 's/^# //; s/^#//'
             exit 0 ;;
@@ -110,8 +112,8 @@ _acquire_deploy_marker() {
         local _other
         _other="$(cat "$_UPDATE_PID_FILE" 2>/dev/null || true)"
         if [[ "$_other" =~ ^[0-9]+$ ]] && [ "$_other" -gt 1 ] && kill -0 "$_other" 2>/dev/null; then
-            warn "a deploy already holds $_UPDATE_PID_FILE (pid $_other) — not overwriting; a concurrent update+restore is unsafe, verify the result"
-            return 0
+            log "ERROR: a deploy already holds $_UPDATE_PID_FILE (pid $_other) — refusing concurrent update+restore"
+            return 1
         fi
     fi
     echo "$$" > "$_UPDATE_PID_FILE"
@@ -130,7 +132,13 @@ _release_deploy_marker() {
 # trap-protect them. (Empty-string default → no-op before they're assigned.)
 _SQL_TMP=""
 _QDRANT_TMP=""
-_cleanup_plaintext() { rm -f "${_SQL_TMP:-}" "${_QDRANT_TMP:-}" 2>/dev/null || true; }
+_DB_STAGE=""
+_cleanup_plaintext() {
+    rm -f "${_SQL_TMP:-}" "${_QDRANT_TMP:-}" 2>/dev/null || true
+    if [ -n "${_DB_STAGE:-}" ]; then
+        rm -f "$_DB_STAGE" "$_DB_STAGE-journal" "$_DB_STAGE-wal" "$_DB_STAGE-shm" 2>/dev/null || true
+    fi
+}
 trap '_write_status; _release_deploy_marker; backend_cleanup; _cleanup_plaintext' EXIT
 
 # ── Setup ────────────────────────────────────────────────────────────
@@ -168,6 +176,16 @@ if ! flock -w "$_LOCK_WAIT" "$DR_LOCK_FD"; then
 fi
 dr_lock_stamp restore
 
+# Serialize with scripts/update.sh as well as backup.sh. Both restore and update
+# stop services and own the same deploy marker; a check-then-write PID file is
+# not mutual exclusion by itself.
+_UPDATE_LOCK_FILE="${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock"
+mkdir -p "$(dirname "$_UPDATE_LOCK_FILE")"
+exec {_RESTORE_UPDATE_LOCK_FD}>"$_UPDATE_LOCK_FILE"
+if ! flock -n "$_RESTORE_UPDATE_LOCK_FD"; then
+    die "Genesis update lock is held — refusing concurrent update+restore"
+fi
+
 # Private-by-default for every plaintext this restore writes (SF7): gpg -d and
 # cp otherwise honor the inherited umask (typically 0022 → world-readable), so a
 # decrypted secrets.env / transcript / memory file (all PII-bearing) would be
@@ -200,16 +218,17 @@ _quiesce_genesis_server() {
     # may have crashed. Gating the marker on is-active (as an earlier draft did)
     # would leave that highest-risk case — the multi-minute .read — unprotected.
     # Only the stop ACTION below is gated on liveness.
-    _acquire_deploy_marker
+    _acquire_deploy_marker || die "another live deploy owns the deploy marker — live database left untouched"
     if systemctl --user is-active --quiet genesis-server 2>/dev/null; then
         log "Stopping genesis-server before SQLite restore (will NOT auto-restart)..."
         # Only record "stopped" if the stop actually succeeded — otherwise the
         # end-of-run note would tell the operator to restart a server that never
         # stopped (and is still holding the DB).
-        if systemctl --user stop genesis-server 2>/dev/null; then
+        if systemctl --user stop genesis-server 2>/dev/null \
+            && ! systemctl --user is-active --quiet genesis-server 2>/dev/null; then
             _SERVER_WAS_STOPPED=true
         else
-            warn "could not stop genesis-server — proceeding (a live writer may still hold the DB; verify before trusting the restore)"
+            die "could not confirm genesis-server stopped — live database left untouched"
         fi
     fi
 }
@@ -287,10 +306,12 @@ confirm() {
 }
 
 # ── Obtain backup repo ───────────────────────────────────────────────
+_EXPLICIT_LOCAL_SOURCE=false
 if [ -n "$BACKUP_REPO_OVERRIDE" ]; then
     if [ -d "$BACKUP_REPO_OVERRIDE/.git" ] || [ -d "$BACKUP_REPO_OVERRIDE" ]; then
         # Treat as local path
         BACKUP_DIR="$BACKUP_REPO_OVERRIDE"
+        _EXPLICIT_LOCAL_SOURCE=true
         log "Using backup source: $BACKUP_DIR"
     else
         log "Cloning backup repo from $BACKUP_REPO_OVERRIDE..."
@@ -461,7 +482,12 @@ _pull_from_offsite() {
         done < <(backend_list "$snap/$_sub" 2>/dev/null | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u)
     done
 }
-_pull_from_offsite
+if $DATABASE_ONLY && $_EXPLICIT_LOCAL_SOURCE \
+    && { [ -f "$BACKUP_DIR/data/genesis.sql.gpg" ] || [ -f "$BACKUP_DIR/data/genesis.sql" ]; }; then
+    log "database-only: using explicit local SQL payload without off-site replacement"
+else
+    _pull_from_offsite
+fi
 
 # N5: a restore that finds NO payloads at all (empty/wrong BACKUP_DIR, no
 # off-site) used to log "no payload" per section and exit 0 "success" having
@@ -511,6 +537,11 @@ _backup_has_payload() {
 if ! $DRY_RUN && ! _backup_has_payload; then
     die "no restorable payloads found under $BACKUP_DIR (empty or wrong backup source, and no off-site snapshot pulled) — nothing to restore"
 fi
+if $DATABASE_ONLY \
+    && [ ! -f "$BACKUP_DIR/data/genesis.sql.gpg" ] \
+    && [ ! -f "$BACKUP_DIR/data/genesis.sql" ]; then
+    die "database-only restore requires a SQLite payload"
+fi
 
 # Check encrypted payloads exist without passphrase → fail fast.
 _has_encrypted=false
@@ -545,56 +576,75 @@ if resolve_payload "$BACKUP_DIR/data/genesis.sql"; then
                 cp "$src" "$_SQL_TMP"
             fi
             if [ -s "$_SQL_TMP" ]; then
-                # Fresh DB from the SQL dump. Stop the live writer FIRST — both
-                # the pre-restore safety copy AND the new DB must be taken with
-                # no open WAL connection, or they are torn/stale.
+                command -v sqlite3 >/dev/null \
+                    || die "SQLite: sqlite3 binary not installed — live database left untouched"
+
+                # Import and validate away from the live path. No failure before
+                # the final rename is allowed to alter the current DB trio.
+                _DB_STAGE="${DB_FILE}.restore-stage.$$"
+                rm -f "$_DB_STAGE"
+                sqlite3 "$_DB_STAGE" ".read $_SQL_TMP" \
+                    || die "SQLite .read failed in staging — live database left untouched"
+                _ic=$(sqlite3 "$_DB_STAGE" "PRAGMA integrity_check;" 2>&1) \
+                    || die "SQLite staged integrity_check could not complete — live database left untouched"
+                [ "$_ic" = "ok" ] \
+                    || die "SQLite staged integrity_check FAILED (${_ic:-no output}) — live database left untouched"
+                _fk=$(sqlite3 "$_DB_STAGE" "PRAGMA foreign_key_check;" 2>&1) \
+                    || die "SQLite staged foreign_key_check could not complete — live database left untouched"
+                [ -z "$_fk" ] \
+                    || die "SQLite staged foreign_key_check FAILED — live database left untouched"
+                _schema_count=$(sqlite3 "$_DB_STAGE" \
+                    "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%';")
+                [ "${_schema_count:-0}" -gt 0 ] \
+                    || die "SQLite staged database has no application schema — live database left untouched"
+                log "SQLite: staged candidate passed integrity, foreign-key, and schema checks"
+
                 _quiesce_genesis_server
-                # Back up the existing DB before we overwrite it. Taken AFTER
-                # quiescing and via `sqlite3 .backup` (WAL-aware) so the undo
-                # artifact is a consistent snapshot — the old behavior did a
-                # plain `cp` of only the main db file BEFORE quiescing, missing
-                # the -wal, so the sole rollback copy was torn exactly when an
-                # operator needs it to undo a bad restore. Fall back to copying
-                # the db + its sidecars together if sqlite3 is unavailable.
+                # Durable crash fence. If power is lost anywhere in the swap,
+                # startup fails closed instead of creating an empty DB at a
+                # temporarily missing path. A verified replacement inode clears
+                # this marker below.
+                PYTHONPATH="$_SCRIPT_DIR/../src" python3 -m genesis.db.integrity mark \
+                    "$DB_FILE" --source restore-in-progress \
+                    --detail "validated candidate staged; database swap in progress" \
+                    >/dev/null \
+                    || die "could not establish durable database quarantine — live database left untouched"
+
+                # Session-scoped MCP processes can outlive genesis-server. The
+                # marker is established before this scan, so all shared open
+                # paths refuse from here onward; any already-open handle would
+                # keep writing the old inode/WAL after swap and is fatal.
+                if find /proc/[0-9]*/fd -lname "$DB_FILE*" -print -quit \
+                    2>/dev/null | grep -q .; then
+                    die "SQLite database still has open process handles after server stop — quarantine retained"
+                fi
+
+                sync -f "$_DB_STAGE"
+                _PRE_RESTORE=""
                 if [ -f "$DB_FILE" ]; then
                     _PRE_RESTORE="${DB_FILE}.pre-restore.$(date +%s)"
-                    if command -v sqlite3 >/dev/null && sqlite3 "$DB_FILE" ".backup '$_PRE_RESTORE'" 2>/dev/null; then
-                        log "SQLite: pre-restore safety copy → $_PRE_RESTORE (sqlite3 .backup, WAL-correct)"
-                    else
-                        cp "$DB_FILE" "$_PRE_RESTORE"
-                        [ -f "$DB_FILE-wal" ] && cp "$DB_FILE-wal" "${_PRE_RESTORE}-wal"
-                        [ -f "$DB_FILE-shm" ] && cp "$DB_FILE-shm" "${_PRE_RESTORE}-shm"
-                        log "SQLite: pre-restore safety copy → $_PRE_RESTORE (cp + sidecars; sqlite3 unavailable)"
-                    fi
+                    # Hard-link the quiesced main file so DB_FILE remains valid
+                    # until the candidate's single atomic rename. Preserve raw
+                    # sidecars before removing them from the live basename.
+                    ln "$DB_FILE" "$_PRE_RESTORE" \
+                        || die "could not preserve pre-restore database — quarantine retained"
+                    if [ -f "$DB_FILE-wal" ]; then cp -p "$DB_FILE-wal" "${_PRE_RESTORE}-wal"; fi
+                    if [ -f "$DB_FILE-shm" ]; then cp -p "$DB_FILE-shm" "${_PRE_RESTORE}-shm"; fi
+                    log "SQLite: preserved raw pre-restore DB/WAL/SHM → $_PRE_RESTORE*"
                 fi
-                # Clear stale WAL/SHM sidecars — a leftover -wal would replay
-                # onto the new DB and corrupt it.
-                rm -f "$DB_FILE" "$DB_FILE-wal" "$DB_FILE-shm"
-                if command -v sqlite3 >/dev/null; then
-                    if sqlite3 "$DB_FILE" ".read $_SQL_TMP"; then
-                        _SQLITE_RESTORED=true
-                        log "SQLite: restored → $DB_FILE"
-                        # Verify the restored DB is structurally sound — loud on failure.
-                        # 2>&1 so a sqlite3 error (can't open, etc.) surfaces in the warn.
-                        # `|| true`: a HARD sqlite3 error (can't reopen the DB)
-                        # fails the pipeline; under set -e the assignment would
-                        # abort the script BEFORE the warn below, skipping the
-                        # rest of the restore. Capture the error text (2>&1) as
-                        # _ic and let the not-"ok" branch surface it. (N6)
-                        _ic=$(sqlite3 "$DB_FILE" "PRAGMA integrity_check;" 2>&1 | head -1) || true
-                        if [ "$_ic" = "ok" ]; then
-                            log "SQLite: integrity_check ok"
-                        else
-                            warn "SQLite: integrity_check FAILED (${_ic:-no output}) — restored DB may be corrupt; inspect ${DB_FILE}.pre-restore.*"
-                        fi
-                    else
-                        warn "SQLite .read failed — inspect ${DB_FILE}.pre-restore.*"
-                    fi
-                else
-                    warn "SQLite: sqlite3 binary not installed — cannot apply dump. Install sqlite3 and re-run."
-                fi
+                rm -f "$DB_FILE-wal" "$DB_FILE-shm"
+                mv "$_DB_STAGE" "$DB_FILE" \
+                    || die "SQLite atomic replacement failed; live DB remains available and quarantine is retained"
+                _DB_STAGE=""
+                sync -f "$DB_FILE"
+                sync -f "$(dirname "$DB_FILE")"
+                PYTHONPATH="$_SCRIPT_DIR/../src" python3 -m genesis.db.integrity check \
+                    "$DB_FILE" --source restore-complete >/dev/null \
+                    || die "installed database failed final verification — quarantine retained"
+                _SQLITE_RESTORED=true
+                log "SQLite: restored and verified → $DB_FILE"
             else
-                warn "SQLite: dump payload is empty — backup may have been produced before sqlite3 was installed. Re-run backup.sh."
+                die "SQLite: dump payload is empty — live database left untouched"
             fi
             rm -f "$_SQL_TMP"
         else
@@ -603,6 +653,21 @@ if resolve_payload "$BACKUP_DIR/data/genesis.sql"; then
     fi
 else
     log "SQLite: no backup payload found (neither genesis.sql.gpg nor genesis.sql)"
+fi
+
+if $DATABASE_ONLY; then
+    if $DRY_RUN; then
+        _SUCCESS=true
+        log "Database-only restore dry-run complete"
+        exit 0
+    fi
+    $_SQLITE_RESTORED || die "database-only restore did not install a database"
+    if [ ${#_FAILURES[@]} -ne 0 ]; then
+        exit 1
+    fi
+    _SUCCESS=true
+    log "Database-only restore complete; genesis-server remains stopped for operator verification"
+    exit 0
 fi
 
 # ── 2. Qdrant ────────────────────────────────────────────────────────

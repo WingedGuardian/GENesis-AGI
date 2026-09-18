@@ -271,6 +271,7 @@ class SerializedConnection:
             "_reconnect_fn",
             "_consecutive_errors",
             "_max_errors",
+            "_db_path",
         }
     )
 
@@ -281,12 +282,14 @@ class SerializedConnection:
         conn: aiosqlite.Connection,
         *,
         reconnect_fn: Callable[[], Awaitable[aiosqlite.Connection]] | None = None,
+        db_path: Path | None = None,
     ) -> None:
         object.__setattr__(self, "_conn", conn)
         object.__setattr__(self, "_lock", asyncio.Lock())
         object.__setattr__(self, "_reconnect_fn", reconnect_fn)
         object.__setattr__(self, "_consecutive_errors", 0)
         object.__setattr__(self, "_max_errors", self._MAX_LOCK_ERRORS)
+        object.__setattr__(self, "_db_path", db_path)
 
     # -- Attribute passthrough (e.g. row_factory, in_transaction) ----------
 
@@ -365,6 +368,10 @@ class SerializedConnection:
         slept = 0.0
         for attempt in range(1, attempts + 1):
             try:
+                if self._db_path is not None:
+                    from genesis.db.integrity import assert_not_quarantined
+
+                    assert_not_quarantined(self._db_path)
                 result = await fn()
                 self._reset_error_count()
                 return result
@@ -452,6 +459,10 @@ class SerializedConnection:
         # idempotent. Keeps the pre-retry behavior: count + re-raise.
         async def _locked() -> aiosqlite.Cursor:
             async with self._lock:
+                if self._db_path is not None:
+                    from genesis.db.integrity import assert_not_quarantined
+
+                    assert_not_quarantined(self._db_path)
                 try:
                     result = await self._conn.executescript(sql)
                     self._reset_error_count()
@@ -483,6 +494,10 @@ class SerializedConnection:
 
     async def cursor(self) -> aiosqlite.Cursor:
         async with self._lock:
+            if self._db_path is not None:
+                from genesis.db.integrity import assert_not_quarantined
+
+                assert_not_quarantined(self._db_path)
             return await self._conn.cursor()
 
     # -- Async iteration support (used by some callers) --------------------
@@ -511,6 +526,9 @@ async def get_db(
     deliberate, separate decision).
     """
     path = Path(path)
+    from genesis.db.integrity import assert_not_quarantined
+
+    assert_not_quarantined(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     async def _configure(conn: aiosqlite.Connection) -> None:
@@ -535,11 +553,12 @@ async def get_db(
 
     # Build reconnect closure (SQLite-specific; replace for PostgreSQL)
     async def _reconnect() -> aiosqlite.Connection:
+        assert_not_quarantined(path)
         conn = await aiosqlite.connect(str(path))
         await _configure(conn)
         return conn
 
-    return SerializedConnection(db, reconnect_fn=_reconnect)
+    return SerializedConnection(db, reconnect_fn=_reconnect, db_path=path)
 
 
 @asynccontextmanager
@@ -560,6 +579,9 @@ async def get_raw_db(
     shared across coroutines. Yields the connection and closes it on exit.
     """
     path = Path(path)
+    from genesis.db.integrity import assert_not_quarantined
+
+    assert_not_quarantined(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     db = await aiosqlite.connect(str(path))
     try:

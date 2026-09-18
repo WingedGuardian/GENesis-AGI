@@ -124,6 +124,13 @@ def sandbox(tmp_path):
     offsite.mkdir()
     bind = tmp_path / "bin"
     bind.mkdir()
+    systemctl_calls = tmp_path / "systemctl_calls.log"
+    _make_stub(
+        bind / "systemctl",
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> "{systemctl_calls}"\n'
+        "exit 0\n",
+    )
     tg = tmp_path / "telegram_calls.log"
     return {
         "home": home,
@@ -133,6 +140,7 @@ def sandbox(tmp_path):
         "offsite": offsite,
         "clone": clone,
         "tmp": tmp_path,
+        "systemctl_calls": systemctl_calls,
     }
 
 
@@ -319,11 +327,33 @@ def test_corrupt_sql_fails_and_withheld(sandbox):
         f'for a in "$@"; do [ "$a" = "-d" ] && {{ echo "gpg: decryption failed: Bad session key" >&2; exit 2; }}; done\n'
         f'exec {real_gpg} "$@"\n',
     )
+    prior = sandbox["clone"] / "data" / "genesis.sql.gpg"
+    prior.parent.mkdir(parents=True, exist_ok=True)
+    prior.write_bytes(b"last-known-good")
     proc, status = _run_backup(sandbox)
     assert status["success"] is False, status
     assert "round-trip" in status["failure_reason"], status
+    assert prior.read_bytes() == b"last-known-good"
     files = _offsite_files(sandbox)
     assert not any(f.endswith("data/genesis.sql.gpg") for f in files), files
+
+
+def test_corrupt_source_refuses_before_backup_state_changes(sandbox):
+    """A known-corrupt source never replaces local last-good or reaches NAS."""
+    _install_curl(sandbox, _CURL_HEALTHY)
+    prior = sandbox["clone"] / "data" / "genesis.sql.gpg"
+    prior.parent.mkdir(parents=True, exist_ok=True)
+    prior.write_bytes(b"last-known-good")
+    db = sandbox["gd"] / "data" / "genesis.db"
+    db.write_bytes(b"not a sqlite database")
+
+    proc, status = _run_backup(sandbox)
+
+    assert proc.returncode != 0, proc.stdout
+    assert status["success"] is False
+    assert "source integrity check failed" in status["failure_reason"]
+    assert prior.read_bytes() == b"last-known-good"
+    assert _offsite_files(sandbox) == []
 
 
 def test_roundtrip_error_detail_sanitized_valid_json(sandbox):
@@ -425,7 +455,9 @@ def test_stale_sql_excluded_from_offsite(sandbox):
     (data_dir / "genesis.sql.gpg").write_bytes(b"old-sql")
     proc, status = _run_backup(sandbox)
     assert status["success"] is False, status
-    assert "genesis.sql.gpg is stale" in proc.stdout, proc.stdout
+    assert proc.returncode != 0
+    assert "source database not found" in proc.stdout, proc.stdout
+    assert (data_dir / "genesis.sql.gpg").read_bytes() == b"old-sql"
     files = _offsite_files(sandbox)
     assert not any(f.endswith("data/genesis.sql.gpg") for f in files), files
 

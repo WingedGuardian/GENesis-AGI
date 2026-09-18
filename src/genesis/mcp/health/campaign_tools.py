@@ -51,6 +51,9 @@ def init_campaign_tools(*, runner, db) -> None:
 
 async def _get_db() -> aiosqlite.Connection:
     """Open a direct DB connection for MCP fallback reads/writes."""
+    from genesis.db.integrity import assert_not_quarantined
+
+    assert_not_quarantined(_DB_PATH)
     db = await aiosqlite.connect(str(_DB_PATH))
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode=WAL")
