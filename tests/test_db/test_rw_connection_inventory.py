@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-
 _ROOT = Path(__file__).resolve().parents[2] / "src" / "genesis"
 _IMPLEMENTATIONS = {
     "db/connection.py",
@@ -51,9 +50,7 @@ def test_canonical_rw_opens_use_guarded_factories():
         source = path.read_text()
         tree = ast.parse(source)
         parents = {
-            child: parent
-            for parent in ast.walk(tree)
-            for child in ast.iter_child_nodes(parent)
+            child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
         }
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
@@ -82,5 +79,5 @@ def test_update_path_inline_writers_enforce_quarantine():
     repo = _ROOT.parents[1]
     update = (repo / "scripts" / "update.sh").read_text()
     bootstrap = (repo / "scripts" / "bootstrap.sh").read_text()
-    assert "connect_sqlite_rw(os.environ[\"GH_DB_PATH\"]" in update
+    assert 'connect_sqlite_rw(os.environ["GH_DB_PATH"]' in update
     assert "assert_not_quarantined('$DB_PATH')" in bootstrap
