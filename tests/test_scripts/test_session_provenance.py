@@ -276,7 +276,7 @@ def test_a_pr_outside_the_scan_window_is_not_reported_as_open(repo, monkeypatch,
     it from a git failure, one level subtler: here the scan SUCCEEDED and was
     merely too short. A merged PR reported as open is a confident wrong answer.
     """
-    monkeypatch.setattr(sp, "_pr_state_and_head", lambda n: ("MERGED", "feat/x"))
+    monkeypatch.setattr(sp, "_pr_lookup", lambda n: ("MERGED", "feat/x", "", ""))
     rc = sp.cmd_pr(999999)
     out, err = capsys.readouterr()
     assert rc == 1
@@ -289,7 +289,7 @@ def test_an_open_pr_outside_the_window_still_resolves_via_its_branch(repo, monke
     _commit(repo, "a.txt", "feat: base\n\nGenesis-Session: 11111111\n")
     _git(repo, "checkout", "-q", "-b", "feature")
     _commit(repo, "f.txt", "feat: work\n\nGenesis-Session: 22222222\n")
-    monkeypatch.setattr(sp, "_pr_state_and_head", lambda n: ("OPEN", "feature"))
+    monkeypatch.setattr(sp, "_pr_lookup", lambda n: ("OPEN", "feature", "", ""))
     rc = sp.cmd_pr(4242)
     out = capsys.readouterr().out
     assert rc == 0
@@ -349,14 +349,20 @@ def test_a_separator_inside_a_commit_body_does_not_split_the_record(repo):
     assert found[0]["sessions"] == ["0a1b2c3d"], "and its provenance must survive"
 
 
-def test_a_closed_unmerged_pr_is_not_reported_as_open(repo, monkeypatch, capsys):
-    """gh returns a head ref for a closed PR too, so the fall-through lied."""
-    monkeypatch.setattr(sp, "_pr_state_and_head", lambda n: ("CLOSED", ""))
+def test_a_closed_unmerged_pr_with_a_gone_head_fails_closed(repo, monkeypatch, capsys):
+    """A deleted head branch is an unreadable answer, not a successful empty one.
+
+    GitHub returns an empty headRefName for a closed PR whose branch is gone;
+    printing the state and exiting 0 reported INCOMPLETE provenance as success —
+    while a named branch that cannot be read exits 1. Both must fail alike.
+    """
+    monkeypatch.setattr(sp, "_pr_lookup", lambda n: ("CLOSED", "", "", ""))
     rc = sp.cmd_pr(4242)
-    out = capsys.readouterr().out
-    assert rc == 0
+    out, err = capsys.readouterr()
+    assert rc == 1, "missing provenance must not exit 0"
     assert "CLOSED without merging" in out
     assert "OPEN" not in out
+    assert "gone" in err
 
 
 def test_an_invalid_revision_is_a_clean_error_not_a_traceback(repo, capsys):
@@ -398,6 +404,152 @@ def test_a_squash_merged_branch_is_not_reported_as_unlanded(repo, monkeypatch, c
     sp.cmd_session("22222222", 50)
     out = capsys.readouterr().out
     assert "unlanded branches" not in out, "a shipped branch must not be called unlanded"
+
+
+# ─── round-2 review findings, each pinned ────────────────────────────────────
+
+
+def test_a_multi_commit_squash_is_not_reported_as_unlanded(repo, monkeypatch, capsys):
+    """P1: git cherry compares each commit's patch INDEPENDENTLY.
+
+    A squash commit carries the AGGREGATE patch, so a two-commit branch's
+    individual patch-ids match nothing upstream and cherry reports both `+` —
+    the shipped branch read as unlanded. The merged-PR join closes that gap by
+    asking which merged PR actually used this head object.
+    """
+    _commit(repo, "base.txt", "feat: base\n\nGenesis-Session: 11111111\n")
+    _git(repo, "checkout", "-q", "-b", "shipped")
+    _commit(repo, "f1.txt", "feat: one\n\nGenesis-Session: 22222222\n")
+    _commit(repo, "f2.txt", "feat: two\n\nGenesis-Session: 22222222\n")
+    tip = _git(repo, "rev-parse", "shipped").strip()
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "merge", "--squash", "shipped")
+    _git(repo, "commit", "-q", "-m", "feat: squashed (#2)")
+
+    # cherry alone must see unique commits — that is the reproduction.
+    cherry = _git(repo, "cherry", "main", "shipped")
+    assert any(ln.startswith("+") for ln in cherry.splitlines()), \
+        "precondition: the aggregate squash defeats per-commit patch-ids"
+
+    import json as _json
+
+    real_run = subprocess.run
+
+    def _fake_gh(args, **kwargs):
+        if args[:1] == ["gh"]:
+            return subprocess.CompletedProcess(
+                args=[], returncode=0,
+                stdout=_json.dumps([{"number": 2, "headRefOid": tip}]), stderr="",
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(sp.subprocess, "run", _fake_gh)
+    assert sp._is_patch_merged("shipped") is True
+
+
+def test_trailer_matching_requires_a_column_zero_stamp(repo):
+    """P2: `\\s` crosses newlines, and an indented example is prose, not a stamp."""
+    _commit(
+        repo, "a.txt",
+        "feat: x\n\n"
+        "docs mention `Genesis-Session:\naaaaaaaa` across a line break, and\n"
+        "    Genesis-Session: bbbbbbbb  <- an indented markdown example\n\n"
+        "Genesis-Session: cccccccc\n",
+    )
+    assert sp.scan("main", limit=1)[0]["sessions"] == ["cccccccc"]
+
+
+def test_enrich_checks_the_transcript_id_namespace_too(repo, tmp_path, monkeypatch):
+    """P2: foreground sessions are stamped with a CC transcript id, stored in
+    `cc_session_id` — the `id` column is Genesis's own UUID namespace."""
+    import sqlite3
+
+    db = tmp_path / "g.db"
+    con = sqlite3.connect(db)
+    con.execute(
+        "CREATE TABLE cc_sessions (id TEXT, cc_session_id TEXT, session_type TEXT, "
+        "channel TEXT, model TEXT, status TEXT, started_at TEXT, topic TEXT)"
+    )
+    con.execute(
+        "INSERT INTO cc_sessions VALUES ('genesis-uuid-1', 'aaaabbbb-rest', "
+        "'terminal', 'cli', 'opus', 'done', '2026-01-01', 'the topic')"
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setattr(sp, "DB_PATH", db)
+    info = sp.enrich("aaaabbbb")
+    assert info["db"] is not None, "a cc_session_id match must enrich"
+    assert info["db"]["topic"] == "the topic"
+
+
+def test_enrich_marks_a_broken_store_unknown_not_absent(repo, tmp_path, monkeypatch):
+    """P2: a failed lookup is UNKNOWN, not a confident 'no DB row'."""
+    db = tmp_path / "g.db"
+    db.write_bytes(b"not a sqlite file")
+    monkeypatch.setattr(sp, "DB_PATH", db)
+    info = sp.enrich("deadbeef")
+    desc = sp._describe(info)
+    assert "INCOMPLETE" in desc, f"a failed read must not claim absence: {desc}"
+
+
+def test_ambiguous_transcript_prefixes_are_not_pick_one(repo, tmp_path, monkeypatch):
+    """P2: `next(glob(...))` picks an arbitrary filesystem-order match."""
+    proj = tmp_path / "projects" / "p"
+    proj.mkdir(parents=True)
+    (proj / "deadbeef-aaaa.jsonl").write_text("{}")
+    (proj / "deadbeef-bbbb.jsonl").write_text("{}")
+    monkeypatch.setattr(sp, "PROJECTS_DIR", tmp_path / "projects")
+    info = sp.enrich("deadbeef")
+    assert info["transcript"] is None
+    assert "ambiguous" in sp._describe(info)
+
+
+def test_an_open_pr_resolves_by_its_head_object(repo, monkeypatch, capsys):
+    """P2: a cross-repo PR's headRefName is unqualified — use headRefOid."""
+    _commit(repo, "a.txt", "feat: base\n\nGenesis-Session: 11111111\n")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "f.txt", "feat: work\n\nGenesis-Session: 22222222\n")
+    oid = _git(repo, "rev-parse", "feature").strip()
+    # A same-named local branch pointing somewhere else must not be attributed.
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "checkout", "-q", "-b", "someone-elses-feature")
+    _commit(repo, "x.txt", "feat: unrelated\n\nGenesis-Session: 99999999\n")
+    _git(repo, "branch", "-M", "someone-elses-feature", "feature")  # reuse the name
+    monkeypatch.setattr(
+        sp, "_pr_lookup", lambda n: ("OPEN", "feature", oid, ""),
+    )
+    rc = sp.cmd_pr(4242)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "22222222" in out
+    assert "99999999" not in out, "the same-named local branch is not the PR head"
+
+
+def test_file_and_line_modes_exist(repo, capsys):
+    """P2: the docstring advertises file and line attribution — provide it."""
+    sha = _commit(repo, "a.txt", "feat: work\n\nGenesis-Session: 22222222\n")
+    assert sp.cmd_file("a.txt", None, 50) == 0
+    out = capsys.readouterr().out
+    assert "22222222" in out
+    assert sp.cmd_file("a.txt", 1, 50) == 0
+    out = capsys.readouterr().out
+    assert sha[:9] in out
+
+
+def test_the_pr_limit_flag_is_effective(repo, monkeypatch, capsys):
+    """P2: --limit must reach cmd_pr's scan; previously it was advice that
+    could never work — the command used a fixed constant."""
+    seen: list[int] = []
+    real = sp.scan
+
+    def _spy(rev_range, limit=None, path=None):
+        seen.append(limit)
+        return real(rev_range, limit, path)
+
+    monkeypatch.setattr(sp, "scan", _spy)
+    monkeypatch.setattr(sp, "_pr_lookup", lambda n: ("MERGED", "x", "", ""))
+    sp.cmd_pr(999999, limit=7)
+    assert seen == [7], f"--limit must be the scan bound, got {seen}"
 
 
 def test_a_capped_ambiguity_count_says_at_least(repo):

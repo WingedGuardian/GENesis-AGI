@@ -37,6 +37,7 @@ Usage:
     session_provenance.py --pr 1702          # sessions behind a PR (open or merged)
     session_provenance.py --commit <sha>     # sessions behind one commit
     session_provenance.py --branch <name>    # sessions behind a branch's own commits
+    session_provenance.py --file <path> [--line N]  # sessions behind a file / one line
     session_provenance.py --session <id8>    # everything a session shipped
     session_provenance.py --coverage [N]     # how attributable is recent history
 
@@ -63,8 +64,12 @@ PROJECTS_DIR = Path.home() / ".claude" / "projects"
 # uppercase CLAUDE_CODE_SESSION_ID stamps `Genesis-Session: ABCDEF12` — which a
 # lowercase-only pattern reports as UNSTAMPED. Silent under-attribution, on a
 # tool whose entire job is attribution.
-_SESSION_RE = re.compile(r"^\s*Genesis-Session:\s*([0-9a-fA-F]{8})\s*$", re.MULTILINE)
-_INSTALL_RE = re.compile(r"^\s*Install:\s*([0-9a-fA-F]{8})\s*$", re.MULTILINE)
+# Anchored at COLUMN ZERO with horizontal-only padding: `\s` accepts newlines,
+# so `Genesis-Session:\nabcdef12` used to match across a line break, and a
+# leading `\s*` matched an indented Markdown example as a real stamp. The hook
+# emits exactly one column-zero trailer line; anything else is prose.
+_SESSION_RE = re.compile(r"^Genesis-Session:[ \t]*([0-9a-fA-F]{8})[ \t]*$", re.MULTILINE)
+_INSTALL_RE = re.compile(r"^Install:[ \t]*([0-9a-fA-F]{8})[ \t]*$", re.MULTILINE)
 _PR_RE = re.compile(r"\(#(\d+)\)\s*$")
 # The hook shape-constrains ids to exactly 8 lowercase hex; anything else reaching
 # a glob or a SQL GLOB is a pattern, not an identifier.
@@ -76,14 +81,15 @@ _SESSION_ID_RE = re.compile(r"[0-9a-f]{8}")
 # one, on exactly the code path whose failure used to read as "the PR is open".
 _PR_SEARCH_LIMIT = 4000
 
-# Record/field framing. A commit MESSAGE can legally contain any byte, including
-# U+001E/U+001F, and a body carrying one would split a real commit into two
-# records or truncate it at `parts[3]` — losing exactly the provenance lines this
-# tool exists to read. So the separators are long random-ish sentinels rather than
-# single control characters: still impossible to produce accidentally, but no
-# longer a single byte a message might contain.
-_SEP_FIELD = "\x1fGXF\x1f"
-_SEP_REC = "\x1eGXR\x1e"
+# Record/field framing. ANY byte pattern can legally appear in a commit message,
+# including whatever sentinel this tool picks — a body carrying the field token
+# used to truncate at `parts[3]` and a record token split one commit into two,
+# losing exactly the provenance lines this tool exists to read (reproduced:
+# `scan()` returned the commit with an empty session list). The only delimiter
+# that cannot collide is one messages cannot CONTAIN: NUL — git's own `-z`/`%x00`
+# framing relies on the same exclusion, so it is impossible by the platform's
+# own contract rather than by our token's length.
+_SEP = "\x00"
 
 
 def _git(*args: str, check: bool = False):
@@ -131,8 +137,12 @@ def installs_in(text: str) -> list[str]:
     return sorted({m.lower() for m in _INSTALL_RE.findall(text)})
 
 
-def scan(rev_range: str, limit: int | None = None) -> list[dict] | None:
+def scan(
+    rev_range: str, limit: int | None = None, path: str | None = None
+) -> list[dict] | None:
     """Commits in ``rev_range``, each with the sessions stamped in its message.
+
+    ``path`` restricts the walk to commits touching that file.
 
     Returns None when GIT ITSELF FAILED, and [] only when the range is genuinely
     empty. Collapsing those two was a fail-open: a timeout made ``cmd_pr`` report
@@ -141,7 +151,9 @@ def scan(rev_range: str, limit: int | None = None) -> list[dict] | None:
     """
     args = [
         "log",
-        f"--format=%H{_SEP_FIELD}%ad{_SEP_FIELD}%s{_SEP_FIELD}%B{_SEP_REC}",
+        "-z",  # NUL frame terminators — see _SEP for why nothing else is safe
+        # %x00 because an argv element cannot itself contain a NUL byte.
+        "--format=%H%x00%ad%x00%s%x00%B",
         "--date=short",
     ]
     if limit is not None:
@@ -153,22 +165,22 @@ def scan(rev_range: str, limit: int | None = None) -> list[dict] | None:
             raise ValueError(f"history limit must be positive, got {limit}")
         args.append(f"-{limit}")
     args.append(rev_range)
+    if path is not None:
+        args += ["--", path]
     raw = _git(*args, check=True)
     if raw is None:
         return None
 
     out: list[dict] = []
     dropped = 0
-    for rec in raw.split(_SEP_REC):
-        if not rec.strip():
-            continue
-        parts = rec.strip().split(_SEP_FIELD)
-        if len(parts) < 4:
-            # N6: a silently-dropped record would shrink the coverage DENOMINATOR,
-            # so a parse failure would read as a higher attribution rate. Count it.
+    # %x00 fields + -z record terminator: fields = H, ad, s, B, then a NUL record
+    # boundary, so the stream splits into groups of exactly 4.
+    fields = raw.split(_SEP)
+    for i in range(0, len(fields) - 3, 4):
+        sha, date, subject, body = (f.strip("\n") for f in fields[i : i + 4])
+        if not sha:
             dropped += 1
             continue
-        sha, date, subject, body = parts[0], parts[1], parts[2], parts[3]
         pr = _PR_RE.search(subject)
         out.append(
             {
@@ -191,13 +203,51 @@ def scan(rev_range: str, limit: int | None = None) -> list[dict] | None:
 
 
 def _is_patch_merged(branch: str) -> bool:
-    """Whether every commit on ``branch`` is already in main BY PATCH.
+    """Whether every commit on ``branch`` is already in main.
 
-    ``git cherry`` marks a commit ``-`` when an equivalent patch exists upstream,
-    which is what a squash merge produces. Fail-SAFE toward "not merged": on any
-    error the branch keeps being reported, since over-reporting unlanded work is
+    `git cherry` compares each branch commit's patch INDEPENDENTLY, but this
+    repository's normal landing is a SQUASH whose single commit carries the
+    aggregate patch — so every original commit is marked `+` and a squash-merged
+    branch reads as unlanded forever (reproduced: a two-commit squashed branch
+    was reported as unlanded). Three methods, cheapest first — ancestor (free,
+    covers ordinary merges), a merged-PR join validated against the merged HEAD
+    OBJECT rather than the name (a reused branch name is not evidence THIS work
+    shipped), then patch-id for the single-commit case. Fail-safe toward
+    "not merged" on any error: reporting unlanded work that already shipped is
     the harmless direction for a tool that exists to find it.
     """
+    try:
+        r = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", branch, "main"],
+            capture_output=True,
+            cwd=str(REPO_ROOT),
+            timeout=10,
+        )
+        if r.returncode == 0:
+            return True
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
+        pass
+    tip = _git("rev-parse", branch).strip()
+    if tip:
+        try:
+            r = subprocess.run(
+                [
+                    "gh", "pr", "list", "--head", branch, "--base", "main",
+                    "--state", "merged", "--limit", "10",
+                    "--json", "number,headRefOid",
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+                timeout=30,
+            )
+            if r.returncode == 0:
+                for pr in json.loads(r.stdout):
+                    if pr.get("headRefOid") == tip:
+                        return True
+        except (subprocess.TimeoutExpired, FileNotFoundError,
+                json.JSONDecodeError, OSError, ValueError):
+            pass
     out = _git("cherry", "main", branch)
     if not out:
         return False
@@ -210,16 +260,31 @@ def enrich(session_id: str) -> dict:
     Every lookup here is best-effort: the point of the module is that a session
     can be entirely absent from both stores and still have authored real work.
     """
-    info: dict = {"id": session_id, "db": None, "transcript": None}
+    info: dict = {
+        "id": session_id,
+        "db": None,
+        "transcript": None,
+        # Lookup failures are tracked, not collapsed into the absent case: a
+        # corrupt DB or unreadable directory is "unknown", and reporting it as
+        # "no DB row" turns a failed check into a confident false provenance.
+        "db_error": False,
+        "transcript_error": False,
+        "transcript_ambiguous": 0,
+    }
 
     if DB_PATH.exists():
         try:
             con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5)
             try:
                 row = con.execute(
+                    # The stamped id is a CC transcript id prefix, stored in
+                    # `cc_session_id` for foreground sessions — `id` alone is
+                    # Genesis's own UUID namespace and misses them entirely
+                    # (the hook's own lookup recipe checks both columns).
                     "SELECT id, session_type, channel, model, status, started_at, "
-                    "COALESCE(topic, '') FROM cc_sessions WHERE id GLOB ? LIMIT 3",
-                    (session_id + "*",),
+                    "COALESCE(topic, '') FROM cc_sessions "
+                    "WHERE id GLOB ? OR cc_session_id GLOB ? LIMIT 3",
+                    (session_id + "*", session_id + "*"),
                 ).fetchall()
             # NOTE the LIMIT below is 3, not 2: with LIMIT 2 the count could only
             # ever be "at least 2", yet it was rendered as the exact sentence
@@ -236,15 +301,20 @@ def enrich(session_id: str) -> dict:
                 # the count is exact, since the query is capped.
                 info["db"] = {"ambiguous": len(row), "capped": len(row) >= 3}
         except sqlite3.Error:
-            pass
+            info["db_error"] = True
 
     if PROJECTS_DIR.exists():
         try:
-            hit = next(PROJECTS_DIR.glob(f"*/{session_id}*.jsonl"), None)
-            if hit:
-                info["transcript"] = str(hit)
+            hits = list(PROJECTS_DIR.glob(f"*/{session_id}*.jsonl"))
+            if len(hits) == 1:
+                info["transcript"] = str(hits[0])
+            elif len(hits) > 1:
+                # An 8-char filename prefix is no more unique on disk than the
+                # DB prefix is in `id` — `next(...)` would pick an arbitrary
+                # filesystem-order match and print it as THIS session.
+                info["transcript_ambiguous"] = len(hits)
         except OSError:
-            pass
+            info["transcript_error"] = True
 
     return info
 
@@ -259,8 +329,27 @@ def _describe(info: dict) -> str:
         topic = (db.get("topic") or "").strip()
         head = f"{db.get('type', '?')}/{db.get('status', '?')} started {db.get('started_at', '?')}"
         return f"{head}{' — ' + topic[:70] if topic else ''}"
+    parts: list[str] = []
+    if info.get("db_error"):
+        parts.append("DB unreadable")
+    else:
+        parts.append("no DB row")
+    if info.get("transcript_ambiguous"):
+        parts.append(
+            f"{info['transcript_ambiguous']} transcripts share this prefix — ambiguous"
+        )
+    elif info.get("transcript_error"):
+        parts.append("transcripts unreadable")
+    elif info.get("transcript"):
+        parts.append("transcript on disk")
+    else:
+        parts.append("no transcript")
+    if info.get("db_error") or info.get("transcript_error"):
+        return "; ".join(parts) + " — enrichment INCOMPLETE, not absent"
     if info.get("transcript"):
         return "no DB row, transcript on disk"
+    if info.get("transcript_ambiguous"):
+        return "; ".join(parts)
     return "no DB row, no transcript — the commit is the only record"
 
 
@@ -269,9 +358,10 @@ def _describe(info: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def cmd_pr(number: int) -> int:
+def cmd_pr(number: int, limit: int | None = None) -> int:
     """Sessions behind a PR — merged (on main) or still open (on its branch)."""
-    commits = scan("main", limit=_PR_SEARCH_LIMIT)
+    window = limit or _PR_SEARCH_LIMIT
+    commits = scan("main", limit=window)
     if commits is None:
         print(
             f"PR #{number}: could not read main's history — refusing to guess "
@@ -288,24 +378,61 @@ def cmd_pr(number: int) -> int:
         return 0
 
     # Not found in the scanned window. That is NOT evidence the PR is open: the
-    # scan is bounded at _PR_SEARCH_LIMIT, so an older merge simply falls outside
-    # it. Ask GitHub for the state rather than inferring it from our own bound —
-    # the same fail-open shape as the git-failure case above, one level subtler
-    # because here the scan SUCCEEDED and was merely too short.
-    state, head = _pr_state_and_head(number)
+    # scan is bounded, so an older merge simply falls outside it. Ask GitHub for
+    # the state — and, for a merged PR, its mergeCommit OID, which identifies the
+    # merge directly rather than by how far back our window happened to reach.
+    state, head, head_oid, merge_oid = _pr_lookup(number)
     if state == "CLOSED":
         # Closed without merging. gh still returns a head ref, so falling through
         # would print "OPEN" for a PR that is demonstrably not open.
-        print(f"PR #{number} — CLOSED without merging (head branch {head or '?'})")
-        return cmd_branch(head, header=False) if head else 0
-    if state == "MERGED":
+        print(f"PR #{number} — CLOSED without merging (head {head or head_oid or '?'})")
+        if head_oid and _git("rev-parse", "--verify", "--quiet", head_oid).strip():
+            return _report_commits(scan(f"main..{head_oid}"), head)
+        if head:
+            return cmd_branch(head, header=False)
+        # GitHub can return an empty headRefName for a closed PR whose branch is
+        # deleted. Printing the state and exiting 0 would be an INCOMPLETE answer
+        # rendered as success — the named-branch path returns nonzero, so this
+        # one does too.
         print(
-            f"PR #{number} — MERGED, but its merge commit is outside the "
-            f"{_PR_SEARCH_LIMIT}-commit scan window. Re-run with a larger "
-            f"--limit to attribute it.",
+            f"PR #{number}: provenance unreadable — head branch is gone",
             file=sys.stderr,
         )
         return 1
+    if state == "MERGED":
+        # The window missed it, but GitHub names the merge commit exactly —
+        # read that commit instead of demanding a bigger scan.
+        if merge_oid:
+            merged = scan(f"{merge_oid}~1..{merge_oid}") or scan(merge_oid, limit=1)
+            if merged:
+                c = merged[0]
+                print(f"PR #{number} — merged as {c['short']} on {c['date']}")
+                print(f"  {c['subject']}")
+                _print_sessions(c["sessions"])
+                return 0
+        print(
+            f"PR #{number} — MERGED, but its merge commit is outside the "
+            f"{window}-commit scan window and the merge commit is not in this "
+            f"clone. Re-run with a larger --limit to attribute it.",
+            file=sys.stderr,
+        )
+        return 1
+    if head_oid:
+        # The PR's head is an OBJECT, not a name: for a cross-repository PR the
+        # headRefName is unqualified, and resolving it as a branch would
+        # silently attribute whichever same-named local branch happens to exist
+        # — or fail when the fork's branch was never fetched here.
+        if not _git("rev-parse", "--verify", "--quiet", head_oid).strip():
+            print(
+                f"PR #{number} — OPEN, head {head_oid[:12]} is not in this clone "
+                f"(cross-repository or unfetched head). Run `git fetch` for it "
+                f"first; attributing the same-named local branch instead would "
+                f"be a guess, not an answer.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"PR #{number} — OPEN, head {head} ({head_oid[:12]})")
+        return _report_commits(scan(f"main..{head_oid}"), head)
     if not head:
         print(
             f"PR #{number}: no merge commit on main, and gh could not name its "
@@ -318,17 +445,43 @@ def cmd_pr(number: int) -> int:
     return cmd_branch(head, header=False)
 
 
-def _pr_state_and_head(number: int) -> tuple[str, str]:
-    """``(state, headRefName)`` for a PR, or ``("", "")`` when gh cannot say.
+def _report_commits(commits: list[dict] | None, label: str) -> int:
+    """Print the per-commit table + session rollup for a resolved ref."""
+    if commits is None:
+        print(f"could not read history for {label}", file=sys.stderr)
+        return 1
+    if not commits:
+        print("  (nothing unique to this branch)")
+        return 0
+    all_sessions: set[str] = set()
+    for c in commits:
+        all_sessions.update(c["sessions"])
+        print(
+            f"  {c['short']}  {c['date']}  {','.join(c['sessions']) or '-':<28} {c['subject'][:60]}"
+        )
+    print()
+    _print_sessions(sorted(all_sessions))
+    return 0
+
+
+def _pr_lookup(number: int) -> tuple[str, str, str, str]:
+    """``(state, headRefName, headRefOid, mergeCommitOid)``, ``("", "", "", "")``
+    when gh cannot say.
 
     State is fetched alongside the head ref so a caller never has to INFER
     "merged" or "open" from whether its own bounded scan happened to reach the
     merge commit. That inference is wrong whenever the PR is older than the
-    window, and wrong in the confident direction.
+    window, and wrong in the confident direction. The OIDs are taken alongside
+    because a branch NAME is not an identity: names are reused, and a fork's
+    unqualified name resolves to nothing (or worse, to an unrelated local
+    branch) here.
     """
     try:
         r = subprocess.run(
-            ["gh", "pr", "view", str(number), "--json", "headRefName,state"],
+            [
+                "gh", "pr", "view", str(number), "--json",
+                "headRefName,headRefOid,state,mergeCommit",
+            ],
             capture_output=True,
             text=True,
             cwd=str(REPO_ROOT),
@@ -336,10 +489,16 @@ def _pr_state_and_head(number: int) -> tuple[str, str]:
         )
         if r.returncode == 0:
             d = json.loads(r.stdout)
-            return str(d.get("state") or ""), str(d.get("headRefName") or "")
+            merge = d.get("mergeCommit") or {}
+            return (
+                str(d.get("state") or ""),
+                str(d.get("headRefName") or ""),
+                str(d.get("headRefOid") or ""),
+                str(merge.get("oid") or ""),
+            )
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError, OSError):
         pass
-    return "", ""
+    return "", "", "", ""
 
 
 def cmd_branch(branch: str, header: bool = True) -> int:
@@ -357,19 +516,7 @@ def cmd_branch(branch: str, header: bool = True) -> int:
         return 1
     if header:
         print(f"branch {ref} — {len(commits)} commit(s) not in main")
-    if not commits:
-        print("  (nothing unique to this branch)")
-        return 0
-
-    all_sessions: set[str] = set()
-    for c in commits:
-        all_sessions.update(c["sessions"])
-        print(
-            f"  {c['short']}  {c['date']}  {','.join(c['sessions']) or '-':<28} {c['subject'][:60]}"
-        )
-    print()
-    _print_sessions(sorted(all_sessions))
-    return 0
+    return _report_commits(commits, ref)
 
 
 def cmd_commit(rev: str) -> int:
@@ -413,14 +560,30 @@ def cmd_session(session_id: str, limit: int) -> int:
 
     live: list[tuple[str, int]] = []
     incomplete: list[str] = []
-    refs = _git("for-each-ref", "--format=%(refname:short)", "refs/heads", check=True)
+    refs = _git(
+        "for-each-ref",
+        "--format=%(refname:short) %(objectname)",
+        "refs/heads",
+        "refs/remotes/origin",
+        check=True,
+    )
     if refs is None:
-        print("could not enumerate local branches", file=sys.stderr)
+        print("could not enumerate branches", file=sys.stderr)
         return 1
+    # Local AND remote-tracking refs: work pushed then deleted locally is still
+    # unlanded work, and a heads-only scan used to omit it silently. Dedupe on
+    # the TIP OBJECT, not the name — `foo` and `origin/foo` sharing a tip are
+    # one branch; the same name at different tips are two.
+    seen_tips: set[str] = set()
     for line in refs.splitlines():
-        b = line.strip()
-        if not b or b == "main":
+        b, _, tip = line.partition(" ")
+        b = b.strip()
+        tip = tip.strip()
+        if not b or b in ("main", "origin/main") or b.endswith("/HEAD"):
             continue
+        if tip in seen_tips:
+            continue
+        seen_tips.add(tip)
         if _is_patch_merged(b):
             # This repo SQUASH-merges, so a merged branch's original commits are
             # not ancestors of main and `main..<branch>` still returns them.
@@ -450,6 +613,38 @@ def cmd_session(session_id: str, limit: int) -> int:
         )
         return 1
     return 0
+
+
+def cmd_file(path: str, line: int | None, limit: int) -> int:
+    """Sessions behind a file — one line's commit via blame, or its history."""
+    if line is not None:
+        # `--line-porcelain` emits the 40-hex sha as the first field of each
+        # blame block — stable across the porcelain's per-commit grouping.
+        raw = _git(
+            "blame", "--line-porcelain", f"-L{line},{line}", "--", path,
+            check=True,
+        )
+        if raw is None:
+            print(f"could not blame {path}:{line}", file=sys.stderr)
+            return 1
+        first = raw.split(None, 1)[0] if raw.split(None, 1) else ""
+        if not re.fullmatch(r"[0-9a-f]{40}", first or ""):
+            print(f"could not blame {path}:{line}", file=sys.stderr)
+            return 1
+        if set(first) == {"0"}:
+            print(f"{path}:{line} is uncommitted work — no session to report")
+            return 0
+        return cmd_commit(first)
+
+    commits = scan("main", limit=limit, path=path)
+    if commits is None:
+        print(f"could not read history for {path}", file=sys.stderr)
+        return 1
+    if not commits:
+        print(f"{path}: no commits found (not on main, or beyond --limit)")
+        return 1
+    print(f"{path} — {len(commits)} commit(s) in the last {limit} on main:")
+    return _report_commits(commits, path)
 
 
 def cmd_coverage(limit: int) -> int:
@@ -514,6 +709,7 @@ def main() -> int:
     g.add_argument("--pr", type=int, help="PR number (open or merged)")
     g.add_argument("--commit", help="commit-ish")
     g.add_argument("--branch", help="branch name")
+    g.add_argument("--file", help="path — sessions behind commits touching it")
     g.add_argument("--session", help="8-hex session id")
     g.add_argument(
         "--coverage",
@@ -524,12 +720,19 @@ def main() -> int:
         help="attribution rate over the last N commits",
     )
     ap.add_argument(
+        "--line",
+        type=_positive,
+        help="with --file: attribute that single line via git blame",
+    )
+    ap.add_argument(
         "--limit",
         type=_positive,
-        default=400,
-        help="commits of main to scan for --session (default 400)",
+        help="commits of main to scan (--session/--file default 400, --pr "
+        "default 4000)",
     )
     args = ap.parse_args()
+    if args.line is not None and args.file is None:
+        ap.error("--line requires --file")
 
     # Bind the CHOSEN MODE once, from which option argparse actually set — never
     # re-derive it from a value's truthiness. Truthiness conflates "not supplied"
@@ -538,10 +741,11 @@ def main() -> int:
     # and exited 0. A caller asking "which session authored this commit?" got a
     # different question's answer and a success code.
     handlers = {
-        "pr": lambda a: cmd_pr(a.pr),
+        "pr": lambda a: cmd_pr(a.pr, a.limit),
         "commit": lambda a: cmd_commit(a.commit),
         "branch": lambda a: cmd_branch(a.branch),
-        "session": lambda a: cmd_session(a.session.strip().lower(), a.limit),
+        "file": lambda a: cmd_file(a.file, a.line, a.limit or 400),
+        "session": lambda a: cmd_session(a.session.strip().lower(), a.limit or 400),
         "coverage": lambda a: cmd_coverage(a.coverage),
     }
     chosen = [k for k in handlers if getattr(args, k, None) is not None]
