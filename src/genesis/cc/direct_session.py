@@ -158,6 +158,10 @@ _UNIVERSAL_DISALLOW = [
     "mcp__genesis-memory__memory_store",
     "mcp__genesis-memory__memory_synthesize",
     "mcp__genesis-memory__memory_extract",
+    # memory_supersede mutates BOTH stores (SQLite deprecation + Qdrant
+    # payload): a background session deprecating owner memories is a write
+    # by any name, so it sits behind the same isolation as the store tools.
+    "mcp__genesis-memory__memory_supersede",
     # Knowledge ingestion requires explicit user authorization.
     "mcp__genesis-memory__knowledge_ingest",
     "mcp__genesis-memory__knowledge_ingest_batch",
@@ -497,7 +501,7 @@ cannot access. Do not apologize for limitations. Handle what you can.
 # Skills auto-injected by profile (always loaded for that profile)
 _PROFILE_SKILLS: dict[str, list[str]] = {
     "interact": ["stealth-browser"],
-    "research": [],
+    "research": ["web-research"],
     "observe": [],
     "campaign": ["voice-master"],
     "steward": ["voice-master"],
@@ -677,7 +681,10 @@ def _build_profile_addendum(profile: str) -> str:
 def _resolve_skills(request: DirectSessionRequest) -> list[str]:
     """Determine which skills to inject: explicit > profile + auto-detect."""
     if request.skills is not None:
-        return request.skills
+        skills = list(request.skills)
+        if request.profile == "research" and "web-research" not in skills:
+            skills.append("web-research")
+        return skills
 
     # Start with profile-bound skills
     skills = list(_PROFILE_SKILLS.get(request.profile, []))
@@ -996,8 +1003,22 @@ class DirectSessionRunner:
                 roster_model=output.roster_model,
             )
 
-            # Persist result in session metadata (merge, don't overwrite)
-            await self._store_result(session_id, request, result)
+            # Persist result in session metadata (merge, don't overwrite).
+            # A dropped over-limit stream line is recorded alongside the result:
+            # `tools_summary` below is built from the events `on_event` SAW, so
+            # a drop makes it a floor rather than an inventory, and every later
+            # reader of this row (the audit call below, the MCP session views)
+            # needs that stated rather than inferable only from a log line.
+            await self._store_result(
+                session_id,
+                request,
+                result,
+                extra_metadata=(
+                    {"stream_lines_dropped": output.stream_lines_dropped}
+                    if output.stream_lines_dropped
+                    else None
+                ),
+            )
 
             # Turn-independent fallback recovery: a successful run on the HOME model
             # proves it's back (no foreground conversation turn needed). "Home" is the
@@ -1036,12 +1057,37 @@ class DirectSessionRunner:
                             with contextlib.suppress(json.JSONDecodeError, TypeError):
                                 metadata = json.loads(row["metadata"])
 
+                    # The auditor's pre-filter (autonomy/audit.py) skips
+                    # transcript parsing — and records a clean audit — when a
+                    # TRUTHY tools_summary contains no Write/Edit. That filter is
+                    # only sound while the summary is an inventory. A dropped
+                    # over-limit line can have carried the `tool_use` event for a
+                    # Write the CLI still executed, so with any other small tool
+                    # present the summary is truthy AND missing the mutation, and
+                    # a protected-path write would be certified audit-clean.
+                    #
+                    # Withhold the summary rather than trying to repair it: a
+                    # FALSY summary is exactly the "I cannot pre-filter" signal
+                    # that arm already understands, and it routes the session to
+                    # the CC transcript on disk — a source that does not depend
+                    # on our reading of the stream. Fail toward inspection, per
+                    # the fail-closed data-access rule; the cost is parsing one
+                    # transcript on a rare run.
+                    _incomplete = bool(metadata.get("stream_lines_dropped"))
                     await self._auditor.audit_session(
                         session_id,
                         transcript_path=metadata.get("transcript_path", ""),
-                        tools_summary=metadata.get("tools_summary"),
+                        tools_summary=None if _incomplete else metadata.get("tools_summary"),
                         session_success=result.success,
                         caller_context=_audit_ctx,
+                        # Withholding the summary routes the auditor to the
+                        # transcript; telling it the stream was incomplete is
+                        # what lets it distinguish "the transcript says nothing
+                        # happened" from "there is no transcript". Without
+                        # this, a dropped event plus a background-truncated
+                        # run with no session_id produced a CLEAN audit over
+                        # no evidence at all (Codex P1, PR #1625).
+                        stream_incomplete=_incomplete,
                     )
                 except Exception:
                     logger.debug(
@@ -1499,7 +1545,16 @@ class DirectSessionRunner:
             from genesis.learning.skills.wiring import load_skill
 
             for name in skill_names:
-                content = load_skill(name)
+                try:
+                    content = load_skill(name)
+                except (OSError, UnicodeError) as exc:
+                    if request.profile == "research" and name == "web-research":
+                        raise RuntimeError(
+                            "research profile requires the web-research skill"
+                        ) from exc
+                    raise
+                if request.profile == "research" and name == "web-research" and not content:
+                    raise RuntimeError("research profile requires the web-research skill")
                 if content:
                     system_prompt += f"\n\n## Skill: {name}\n{content}"
 
@@ -1534,6 +1589,12 @@ class DirectSessionRunner:
         # observe/research get health + memory only.
         mcp_profile = _PROFILE_TO_MCP.get(request.profile, "reflection")
         mcp_config = self._config_builder.build_mcp_config(profile=mcp_profile)
+        if request.profile == "research":
+            if mcp_config is None:
+                raise RuntimeError("research profile requires its MCP configuration")
+            # Derive this from the live recon registry after tool exceptions so
+            # neither an exception nor a future recon tool can widen the pair.
+            disallowed += self._config_builder.build_research_recon_disallowed()
         # Secure-by-default: strict_mcp_config (CCInvocation default True) makes the
         # generated --mcp-config authoritative, dropping the user-scoped ~/.claude.json
         # servers. Honor an EXPLICIT mcp_profile="full" (a deliberate, trusted

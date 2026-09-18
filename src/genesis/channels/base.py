@@ -3,6 +3,29 @@
 from abc import ABC, abstractmethod
 
 
+class ChannelNotConfiguredError(ValueError):
+    """A channel was named that this install has no configuration to reach.
+
+    PERMANENT, not transient — which is the whole reason it is its own type.
+    `pipeline._deliver` catches a bare `Exception` from a send and DEFERS it
+    (`pipeline.py`), and `resilience/outreach_recovery.py` then retries the
+    deferred row 5 times over ~2.35h (`_BACKOFF_SCHEDULE` 60/300/900/3600/3600)
+    rebuilding the SAME channel and target each time, before filing a
+    `priority="high"` delivery-exhausted observation whose content embeds
+    `deferred_id` — so `skip_if_duplicate` does not collapse them across rows.
+    Meanwhile the drain treats FAILED as "transient, retried next cycle"
+    (`outreach/scheduler.py`) until the 24h age-out.
+
+    None of that can help: no amount of retrying creates a webhook. Raising a
+    distinguishable type lets `_deliver` return a TERMINAL result instead, so a
+    misconfiguration is reported once rather than becoming a day of retries and
+    repeated high-priority alerts.
+
+    Subclasses ValueError so any caller already handling ValueError from an
+    adapter keeps working unchanged.
+    """
+
+
 class ChannelAdapter(ABC):
     """Base interface for all messaging channel adapters.
 

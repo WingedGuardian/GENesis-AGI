@@ -338,41 +338,12 @@ class TestCommitGuardFailsClosedOnCrash:
             f"got {r.returncode}\n{r.stdout}{r.stderr}"
         )
 
-    def test_import_time_failure_is_a_documented_gap(self, tmp_path):
-        """The wrap covers main(), NOT module import. Measured, and locked.
-
-        `run_guard` is called at the bottom of the module, so an exception
-        raised while the module is still importing — a broken dependency, a
-        syntax error in a helper — never reaches it. MEASURED: the guard exits 1
-        in that case, which CC treats as non-blocking, i.e. it still fails OPEN.
-
-        This is pinned rather than hidden so the wrap is not read as a stronger
-        guarantee than it is. Closing it needs the import itself guarded, which
-        is a different change; what this PR fixes is every crash from main()
-        onward, which is where the gate's own logic lives.
-        """
-        scripts = tmp_path / "scripts"
-        hooks = scripts / "hooks"
-        hooks.mkdir(parents=True)
-        (scripts / _COMMIT_GUARD.name).write_text(_COMMIT_GUARD.read_text())
-        (hooks / "hook_input.py").write_text((_HOOKS_DIR / "hook_input.py").read_text())
-        (hooks / "shell_parse.py").write_text("raise RuntimeError('broken at import')\n")
-        r = subprocess.run(
-            [_PY, str(scripts / _COMMIT_GUARD.name)],
-            input=json.dumps(
-                {"tool_name": "Bash", "tool_input": {"command": f"git {COMMIT} -m x"}}
-            ),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=_child_env(),
-            cwd=str(tmp_path),
-        )
-        assert r.returncode == 1, (
-            "documented gap changed — an import-time failure now exits "
-            f"{r.returncode}. If this is now 2 the gap is CLOSED: delete this "
-            "test and say so, rather than loosening it."
-        )
+    # test_import_time_failure_is_a_documented_gap was DELETED here, on that test's
+    # own written instruction: it asserted exit 1 and said "If this is now 2 the gap
+    # is CLOSED: delete this test and say so, rather than loosening it." The gap is
+    # closed by hook_input.degraded_exit; the replacement locks live in
+    # tests/test_hooks/test_import_time_degraded.py, which asserts BOTH directions
+    # (gated mention blocks, benign command still runs) across all four guards.
 
     def test_ordinary_commit_still_reaches_a_verdict(self, tmp_path):
         """CONTROL — the wrap must not turn every command into a block.
@@ -676,3 +647,113 @@ class TestNoConsumerCanSkipTheChokepoint:
             f"allowlist entries for modules that no longer import bare `analyze`: "
             f"{stale}. Remove them so the exemption cannot be inherited silently."
         )
+class TestOpaqueConstructs:
+    """Constructs the segmenter cannot represent, which shlex tokenizes cleanly.
+
+    `untokenizable()` began as "shlex raised", and that is a strictly narrower
+    question than the one every caller actually asks: can the parse be trusted?
+    A construct can tokenize perfectly and still leave `analyze()` reporting an
+    executable that is not one — a reserved word, or the letters trailing an
+    option bundle — with no signal that anything was missed. "Nothing gated
+    here" and "I could not see this" then return the same value, which is the
+    exact confusion this probe exists to remove.
+
+    The inner command in every fixture below is a NEUTRAL placeholder, not a
+    gated verb. These cases are about whether the parser can see a command
+    position at all; using a real gated operation would add nothing to the test
+    and would put a working shape in a public file.
+    """
+
+    # Assembled rather than written, per this file's convention.
+    _INNER = "my" + "cmd"
+
+    @pytest.mark.parametrize(
+        "label,command",
+        [
+            ("case arm", f"case x in x) {_INNER};; esac"),
+            ("function body", f"f() {{ {_INNER}; }}; f"),
+            ("function keyword", f"function f {{ {_INNER}; }}; f"),
+            ("coproc", f"coproc {_INNER}"),
+            ("interpreter bundle, c not last", f"bash -ce '{_INNER}'"),
+            ("interpreter bundle, other letter", f"bash -cl '{_INNER}'"),
+            ("sh bundle", f"sh -ce '{_INNER}'"),
+        ],
+    )
+    def test_a_construct_the_segmenter_now_represents(self, label, command):
+        import shell_parse as sp
+
+        assert any(s.exe == self._INNER for s in sp.analyze(command)), (
+            f"{label}: parser still does not surface the inner command"
+        )
+        assert not sp.untokenizable(command), (
+            f"{label}: parser now represents this construct but probe still fires"
+        )
+
+    @pytest.mark.parametrize(
+        "label,command",
+        [
+            ("plain", _INNER),
+            ("if/then", f"if true; then {_INNER}; fi"),
+            ("while/do", f"while false; do {_INNER}; done"),
+            ("for/do", f"for i in 1; do {_INNER}; done"),
+            ("select/do", f"select i in a; do {_INNER}; done"),
+            ("subshell", f"( {_INNER} )"),
+            ("brace group", f"{{ {_INNER}; }}"),
+            ("negation", f"! {_INNER}"),
+            ("interpreter, plain -c", f"bash -c '{_INNER}'"),
+            ("interpreter bundle, c last", f"bash -ec '{_INNER}'"),
+        ],
+    )
+    def test_a_construct_the_segmenter_handles_is_not_reported(self, label, command):
+        """The other half of the measurement.
+
+        Over-reporting is the safe direction but it is not free: every caller
+        treats this signal as "fall back to the coarse path", so a probe that
+        fires on ordinary syntax quietly converts the whole guard layer back to
+        substring matching. These are the shapes the segmenter demonstrably
+        handles, and they must stay clean.
+        """
+        import shell_parse as sp
+
+        assert any(s.exe == self._INNER for s in sp.analyze(command)), (
+            f"{label}: fixture is stale — the segmenter no longer sees this"
+        )
+        assert not sp.untokenizable(command), f"{label}: false positive on ordinary syntax"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "grep -r 'case x in x) something;; esac' .",
+            "echo 'define with f() { ... }'",
+            "git commit -m 'use coproc for the reader'",
+        ],
+    )
+    def test_a_reserved_word_inside_a_quoted_argument_is_not_a_construct(self, command):
+        """The discriminator is TOKENS, not raw text, and that is the whole
+        reason this is quote-safe: shlex keeps a quoted argument as ONE token,
+        so a reserved word inside it never appears as a bare token. A raw-text
+        scan would fire on every one of these and re-block the mention-only
+        commands the parser migration exists to release."""
+        import shell_parse as sp
+
+        assert not sp.untokenizable(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A zero-argument call in a heredoc body. This probe reads heredoc
+            # text as ordinary command text by design, so without the brace
+            # requirement these fired: MEASURED 574 of them in 51,052 real
+            # commands, every one of which would have pushed a guard back onto
+            # its coarse path.
+            "python3 - <<'PY' import x\nmain()\nPY",
+            "echo build; runner()",
+        ],
+    )
+    def test_a_call_without_a_body_brace_is_not_a_function_definition(self, command):
+        """`name()` alone is not the grammar. A shell function definition is
+        `name() {`, and requiring the brace is what separates it from a call
+        appearing in embedded code."""
+        import shell_parse as sp
+
+        assert not sp.untokenizable(command)

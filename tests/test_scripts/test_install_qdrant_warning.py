@@ -1,0 +1,606 @@
+"""install.sh: a SUCCESSFUL Qdrant install must not report a setup warning.
+
+The defect this pins, found by the first run of the fresh-install CI check in
+this same PR: the "Qdrant not found → install it" branch set ``SETUP_WARNINGS=1``
+unconditionally at the end of the branch, outside the inner success/failure
+if-chain. So a clean install printed
+
+    + Qdrant 1.14.0 installed to /usr/local/bin/
+    Genesis REQUIRES Qdrant for vector storage.
+
+— the second line contradicting the first — and left the warning flag set. Under
+``GENESIS_INSTALL_STRICT=1`` that is a guaranteed nonzero exit on every genuinely
+fresh machine, i.e. the check could never be green.
+
+Why it survived: a box that already has Qdrant takes the FIRST branch and never
+reaches this code. Every developer box already has Qdrant. Only a fresh machine
+reaches it, and nothing had installed Genesis on a fresh machine in ~12 weeks.
+
+The branch is extracted from the shipped script and executed, so these tests
+exercise the real control flow rather than a restatement of it. The only textual
+substitution is the hardcoded ``/tmp`` path, redirected into the sandbox so a
+test run cannot collide with a real download or with a concurrent test; the
+if/else structure and the warn decision — what is actually under test — are
+untouched.
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+INSTALL = REPO_ROOT / "scripts" / "install.sh"
+
+
+def _extract_qdrant_block() -> str:
+    """Pull the shipped Qdrant infrastructure block verbatim.
+
+    Anchored on the two comments that bracket it, so a rename inside the block
+    cannot silently shrink what is under test — the extraction fails loudly.
+    """
+    text = INSTALL.read_text()
+    m = re.search(
+        r"^# Qdrant \(required\)\n(.*?)^# Ollama \(optional\)",
+        text,
+        re.DOTALL | re.MULTILINE,
+    )
+    assert m, "Qdrant block anchors not found in install.sh — extraction is stale"
+    block = m.group(1)
+    assert "_qdrant_installed" in block, "extracted block is missing the success flag"
+    return block
+
+
+def _run(tmp_path: Path, *, download_ok: bool, binary_in_archive: bool, sudo_ok: bool):
+    """Execute the shipped block with stubbed curl/tar/sudo. Returns CompletedProcess."""
+    sandbox_tmp = tmp_path / "tmp"
+    sandbox_tmp.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+
+    # curl: the reachability probe must FAIL (so the block takes the install
+    # branch); the download then succeeds or fails per scenario.
+    (fake_bin / "curl").write_text(
+        "#!/bin/bash\n"
+        'for a in "$@"; do case "$a" in *collections) exit 7;; esac; done\n'
+        f"exit {0 if download_ok else 22}\n"
+    )
+    # tar: materialise the extracted binary, or not.
+    (fake_bin / "tar").write_text(
+        "#!/bin/bash\n"
+        + (f'echo stub > "{sandbox_tmp}/qdrant"\n' if binary_in_archive else "")
+        + "exit 0\n"
+    )
+    (fake_bin / "sudo").write_text("#!/bin/bash\n" + ('exec "$@"\n' if sudo_ok else "exit 1\n"))
+    for f in fake_bin.iterdir():
+        f.chmod(0o755)
+
+    block = _extract_qdrant_block().replace("/tmp/", f"{sandbox_tmp}/")
+    # /usr/local/bin is not writable in the sandbox; send the sudo-success path
+    # somewhere it can actually land, without touching the branch logic.
+    usr_local = tmp_path / "usrlocal"
+    usr_local.mkdir()
+    block = block.replace("/usr/local/bin/qdrant", f"{usr_local}/qdrant")
+
+    script = f"""set -euo pipefail
+SETUP_WARNINGS=0
+SETUP_WARNING_LOG=""
+setup_warn() {{ SETUP_WARNINGS=1; SETUP_WARNING_LOG="$SETUP_WARNING_LOG $1"; }}
+{block}
+echo "RESULT_WARNINGS=$SETUP_WARNINGS"
+echo "RESULT_REASONS=$SETUP_WARNING_LOG"
+"""
+    return subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "HOME": str(home),
+            "QDRANT_URL": "http://localhost:6333",
+            "QDRANT_VERSION": "1.14.0",
+        },
+        timeout=60,
+    )
+
+
+def test_successful_install_records_no_setup_warning(tmp_path):
+    """THE regression. A clean install must leave the flag at 0."""
+    r = _run(tmp_path, download_ok=True, binary_in_archive=True, sudo_ok=True)
+    assert r.returncode == 0, r.stderr
+    assert "RESULT_WARNINGS=0" in r.stdout, r.stdout
+    assert "installed to" in r.stdout, "the success path did not actually run"
+    assert "REQUIRES Qdrant" not in r.stdout, (
+        "a successful install still printed the 'you need Qdrant' advice — "
+        "the line that contradicts the '+ installed' line above it"
+    )
+
+
+def test_successful_install_without_sudo_also_records_no_warning(tmp_path):
+    """The ~/.local/bin fallback is equally a success and must not warn either —
+    the flag has to be set on the shared success path, not in one sub-branch."""
+    r = _run(tmp_path, download_ok=True, binary_in_archive=True, sudo_ok=False)
+    assert r.returncode == 0, r.stderr
+    assert "RESULT_WARNINGS=0" in r.stdout, r.stdout
+    assert ".local/bin" in r.stdout, "the no-sudo path did not run"
+
+
+@pytest.mark.parametrize(
+    ("download_ok", "binary_in_archive", "label"),
+    [(False, False, "download failed"), (True, False, "binary missing from archive")],
+)
+def test_failed_install_still_warns(tmp_path, download_ok, binary_in_archive, label):
+    """The other direction — a precision fix that blinded the real warning would
+    be worse than the bug. A genuinely failed install must still warn, and the
+    reason must name Qdrant so the strict-mode exit is diagnosable."""
+    r = _run(tmp_path, download_ok=download_ok, binary_in_archive=binary_in_archive, sudo_ok=True)
+    assert r.returncode == 0, r.stderr
+    assert "RESULT_WARNINGS=1" in r.stdout, f"{label}: should still warn\n{r.stdout}"
+    assert "REQUIRES Qdrant" in r.stdout, f"{label}: lost the operator-facing advice"
+    assert "Qdrant" in r.stdout.split("RESULT_REASONS=")[1], (
+        f"{label}: the recorded reason does not name Qdrant, so a strict-mode "
+        "failure would again be a bare flag with no cause"
+    )
+
+
+def test_every_warning_setter_goes_through_setup_warn():
+    """Structural guardrail: no bare ``SETUP_WARNINGS=1`` assignment may remain.
+
+    The reason log only works if every setter registers a cause. A future edit
+    that adds a bare assignment would set the flag with no reason, and the strict
+    exit would print a header over an empty list — silently back to the
+    undiagnosable state this replaced. Asserted on the shipped text because there
+    is no runtime moment at which all eight paths are exercised.
+    """
+    text = INSTALL.read_text()
+
+    # Exactly one bare assignment is legitimate: the one INSIDE setup_warn. Cut
+    # the helper's body out first rather than relaxing the pattern, so the check
+    # still fires on a bare assignment anywhere else — including one added right
+    # next to the helper.
+    helper = re.search(r"^setup_warn\(\) \{\n(?:.*?\n)*?^\}\n", text, re.MULTILINE)
+    assert helper, "setup_warn helper not found — has the mechanism been removed?"
+    assert "SETUP_WARNINGS=1" in helper.group(0), "setup_warn no longer sets the flag"
+    outside = text[: helper.start()] + text[helper.end() :]
+
+    # Allowed in `outside`: the declaration (=0), the reads, and comment prose.
+    offenders = [
+        line for line in outside.splitlines() if re.match(r"^\s*SETUP_WARNINGS=1\s*$", line)
+    ]
+    assert not offenders, (
+        'bare SETUP_WARNINGS=1 assignment(s) found — use setup_warn "reason" so '
+        f"the strict-mode exit can name the cause: {offenders}"
+    )
+    assert text.count("setup_warn ") >= 8, (
+        "expected every warning site to route through setup_warn; found "
+        f"{text.count('setup_warn ')} call(s)"
+    )
+
+
+# ── generated-code escaping ───────────────────────────────────────────────────
+# install.sh GENERATES shell (the `genesis` wrapper, a .bashrc line) and a sed
+# replacement. Both embed values that can contain metacharacters, and both used
+# fixed quoting that silently mis-renders rather than failing loudly.
+
+
+@pytest.mark.parametrize(
+    "repo_dir",
+    [
+        "/home/u/it's genesis",   # apostrophe ENDS a single-quoted string early
+        "/home/u/plain",
+        '/home/u/say "hi"',
+        "/home/u/with space",
+        # Closes the double-quoted diagnostic and appends a command. This is the
+        # shape that proved the message was code, not prose.
+        '/home/u/x"; echo PWNED; echo "',
+    ],
+)
+def test_generated_genesis_wrapper_parses_for_any_repo_path(repo_dir):
+    """The generated wrapper must be valid shell whatever the checkout path is.
+
+    With fixed single quotes an apostrophe in the path closed the string early, so
+    /usr/local/bin/genesis did not even parse — and nothing would surface that
+    until the first time someone typed `genesis`.
+
+    Runs the SHIPPED quoting and the SHIPPED heredoc, extracted from install.sh.
+    An earlier version of this test re-implemented `printf %q` inline and was
+    consequently GREEN when the production quoting was mutated back to fixed
+    single quotes — it was testing its own copy. Mutation testing is what caught
+    that, and it is the reason this extracts instead of restating.
+    """
+    text = INSTALL.read_text()
+
+    m = re.search(r"^(\s*_repo_q=.*)$", text, re.MULTILINE)
+    assert m, "could not extract the _repo_q assignment from install.sh — stale"
+    quote_line = m.group(1).strip()
+
+    h = re.search(
+        r"sudo tee /usr/local/bin/genesis >/dev/null <<WRAPPER\n(.*?)\nWRAPPER",
+        text, re.DOTALL,
+    )
+    assert h, "could not extract the wrapper heredoc from install.sh — stale"
+    heredoc_body = h.group(1)
+
+    # Reproduce install.sh's generation step verbatim: set REPO_DIR, run the
+    # shipped quoting line, expand the shipped heredoc.
+    gen = subprocess.run(
+        ["bash", "-c",
+         f'REPO_DIR="$1"\n{quote_line}\ncat <<WRAPPER\n{heredoc_body}\nWRAPPER\n',
+         "_", repo_dir],
+        capture_output=True, text=True,
+    )
+    assert gen.returncode == 0, f"generation failed: {gen.stderr}"
+    script = gen.stdout
+
+    syn = subprocess.run(["bash", "-n", "/dev/stdin"], input=script,
+                         capture_output=True, text=True)
+    assert syn.returncode == 0, (
+        f"the generated wrapper does not parse for {repo_dir!r}: {syn.stderr}\n{script}"
+    )
+
+    # And its `cd` must target the SAME directory, not a truncated one.
+    #
+    # Everything UP TO AND INCLUDING the cd is executed, not the cd line alone.
+    # The line is no longer self-contained: the path is interpolated once into a
+    # variable and the cd reads that, so running the cd in isolation left the
+    # variable unset, `cd ""` silently stayed put, and the probe reported the
+    # TEST's cwd — a false failure that looks exactly like a truncated path.
+    # Running the generated prefix is also the more faithful check: it is the
+    # script as installed, not a fragment of it.
+    lines = script.splitlines()
+    cd_i = next(i for i, line in enumerate(lines) if line.startswith("cd "))
+    prefix = "\n".join(lines[:cd_i])
+    cd_line = lines[cd_i].split(" 2>/dev/null")[0]
+    probe = subprocess.run(
+        ["bash", "-c", f'{prefix}\n{cd_line} 2>/dev/null && pwd || echo MISSING'],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    assert probe in (repo_dir, "MISSING"), (
+        f"the generated cd resolved to {probe!r}, a DIFFERENT directory than {repo_dir!r}"
+    )
+
+    # The path must appear as DATA exactly once. Interpolating it a second time —
+    # into the diagnostic, on the reasoning that a message is "prose, not code" —
+    # put it inside a double-quoted string in generated shell, where %q was
+    # protecting only the cd operand. MEASURED with a path carrying `"; echo
+    # PWNED; echo "`, the old form emitted an `echo PWNED` that runs the first
+    # time someone types `genesis` and the cd fails.
+    assert "$REPO_DIR" not in heredoc_body, (
+        "the wrapper heredoc interpolates the RAW path; it is unquoted, so any "
+        "shell metacharacter in the checkout path becomes code in the generated "
+        "script. Interpolate the %q-escaped form once and reference it."
+    )
+
+
+@pytest.mark.parametrize(
+    "az_root",
+    [
+        "/tmp/R&D",          # bare & in a sed replacement = the whole matched text
+        "/tmp/a|b",          # the delimiter — sed rejects the expression outright
+        "/tmp/back\\slash",
+        "/home/u/agent-zero",
+    ],
+)
+@pytest.mark.parametrize(
+    "placeholder",
+    ["__HOME__", "__VENV__", "__REPO_DIR__", "__CC_BIN_DIR__", "__AZ_ROOT__"],
+)
+def test_every_sed_substitution_value_renders_verbatim(az_root, placeholder):
+    """EVERY value used as a sed REPLACEMENT must render verbatim, not just AZ_ROOT.
+
+    Unescaped, `/tmp/R&D` rendered `WorkingDirectory=/tmp/R__TOKEN__D` — `&` means
+    "the whole match" — and `|` is the delimiter, so sed rejected the expression
+    outright and aborted the install under `set -e`.
+
+    Parametrized over the placeholders rather than over AZ_ROOT alone, because
+    the original reasoning for escaping only AZ_ROOT — "the others are
+    installer-derived paths, not user input" — is false for REPO_DIR, which is
+    simply wherever the operator chose to clone. The installer had already
+    demonstrated a shell injection through that same value elsewhere.
+
+    The escape is extracted from the shipped script so this tests the real
+    expression, not a restatement of it — and the first version emitted TWO
+    backslashes and still mis-rendered, which is why this asserts the rendered
+    OUTPUT rather than the shape of the escape.
+    """
+    text = INSTALL.read_text()
+    m = re.search(r"_sed_repl_esc\(\) \{ printf '%s' \"\$1\" \| (sed -e '[^']+'); \}", text)
+    assert m, "could not extract the sed replacement escape from install.sh — stale"
+    escape_cmd = m.group(1)
+
+    rendered = subprocess.run(
+        ["bash", "-c",
+         f'esc=$(printf "%s" "$1" | {escape_cmd}); '
+         f'printf "WorkingDirectory={placeholder}\n" | sed -e "s|{placeholder}|$esc|g"',
+         "_", az_root],
+        capture_output=True, text=True,
+    )
+    assert rendered.returncode == 0, f"sed rejected the expression: {rendered.stderr}"
+    assert rendered.stdout.strip() == f"WorkingDirectory={az_root}", rendered.stdout
+
+
+# ── rendered-template placeholder parity ──────────────────────────────────────
+
+
+def test_every_template_placeholder_is_substituted_by_the_render_loop():
+    """Every ``__TOKEN__`` in any shipped unit template must be in install.sh's sed
+    list, or the installer writes a unit with a literal placeholder in it.
+
+    This is stated as parity between two sets rather than as a check for one known
+    token, because the specific defect it was written for —
+    ``agent-zero.service.template``'s ``WorkingDirectory=__AZ_ROOT__``, absent from
+    the sed list, so systemd would reject the rendered unit — is only interesting as
+    an instance. Testing for ``__AZ_ROOT__`` by name would pass forever and catch
+    nothing new; the next template to add a placeholder is the actual risk.
+
+    It went unnoticed because install.sh never enables agent-zero, so the broken
+    unit just sat on disk unusable.
+    """
+    templates = sorted((REPO_ROOT / "scripts" / "systemd").glob("*.template"))
+    assert templates, "no unit templates found — this test is looking in the wrong place"
+
+    install_text = INSTALL.read_text()
+    # The sed expressions in the render loop, e.g. -e "s|__HOME__|$HOME|g"
+    substituted = set(re.findall(r'-e "s\|(__[A-Z0-9_]+__)\|', install_text))
+    assert substituted, "could not find the render loop's sed list — extraction is stale"
+
+    missing: dict[str, set[str]] = {}
+    for template in templates:
+        tokens = set(re.findall(r"__[A-Z0-9_]+__", template.read_text()))
+        unhandled = tokens - substituted
+        if unhandled:
+            missing[template.name] = unhandled
+
+    assert not missing, (
+        "unit template placeholder(s) with no substitution in install.sh's render "
+        f"loop — the rendered unit ships the literal token: {missing}. Add each to "
+        "the sed list (with a default if the value is optional)."
+    )
+
+
+def test_user_facing_artifacts_use_the_actual_repo_dir_not_a_hardcoded_home_path():
+    """The ``genesis`` command and the login auto-cd must reference $REPO_DIR.
+
+    Both hardcoded ``~/genesis``. On any clone elsewhere the wrapper was installed
+    dead ("Genesis repo not found") and the login hook pointed at a non-existent
+    directory — while every install-test assertion still passed, because nothing
+    checked where they pointed. The installer already knows its own location.
+    """
+    text = INSTALL.read_text()
+
+    wrapper = re.search(r"sudo tee /usr/local/bin/genesis .*?\nWRAPPER", text, re.DOTALL)
+    assert wrapper, "genesis wrapper heredoc not found — extraction is stale"
+    body = wrapper.group(0)
+    # The wrapper must reference the INSTALLER-KNOWN path, but via the %q-escaped
+    # form rather than the raw variable. Asserting `$REPO_DIR` appears in the
+    # heredoc would now require the injection site back: unquoted, the raw value
+    # is code in the generated script (see the hostile-path case in
+    # test_generated_genesis_wrapper_parses_for_any_repo_path). The derivation
+    # from REPO_DIR is still asserted — one line up, where it belongs.
+    assert "$_repo_q" in body, (
+        "the wrapper heredoc must reference the %q-escaped path variable"
+    )
+    assert "$REPO_DIR" not in body, (
+        "the heredoc interpolates the RAW path — unquoted, that is code in the "
+        "generated script, not prose"
+    )
+    assert re.search(r'_repo_q="\$\(printf .%q. "\$REPO_DIR"\)"', text), (
+        "_repo_q must be derived from $REPO_DIR via printf %q — the installer "
+        "already knows its own location, and the escaping is what makes it safe"
+    )
+    assert "~/genesis" not in body, (
+        "the genesis wrapper still hardcodes ~/genesis — dead on any other clone"
+    )
+    assert '"\\$@"' in body or "\\$@" in body, (
+        "the wrapper heredoc is unquoted (so $REPO_DIR expands); $@ must be escaped "
+        "or the generated script loses its arguments"
+    )
+
+    autocd = re.search(r"# Auto-cd to Genesis project on login.*?\nfi", text, re.DOTALL)
+    assert autocd, "auto-cd block not found — extraction is stale"
+    assert "$REPO_DIR" in autocd.group(0)
+
+
+def test_install_test_covers_every_enable_site():
+    """Every unit install.sh ENABLES must be liveness-checked by the workflow.
+
+    The verification list and the installer are two hand-synced copies, and that
+    is what produced this class of finding: three review rounds each surfaced
+    another unit the job rendered but never looked at. The installer suppresses
+    every one of these failures with ``|| true``, so a unit with a bad directive
+    installs "successfully" and is simply dead — and the placeholder scan cannot
+    see it, because a unit can be fully substituted and still refuse to start.
+
+    So the two are kept in step by a test rather than by remembering. The enable
+    sites are PARSED out of install.sh; a new one fails here until the workflow
+    covers it.
+    """
+    install = INSTALL.read_text()
+    wf = (INSTALL.parent.parent / ".github/workflows/install-test.yml").read_text()
+
+    # Literal unit names on `systemctl --user enable [--now] <name>` lines.
+    enabled = set()
+    for m in re.finditer(r"systemctl --user enable (?:--now )?([A-Za-z0-9_.@$\"-]+)", install):
+        name = m.group(1)
+        if name.startswith(("$", '"', "-")):
+            # `$`/`"` are the generic timer loop, covered by its own assertion
+            # above. `-` is the optional `--now ` group backtracking and
+            # capturing the FLAG as the unit name — reachable when nothing
+            # class-matching follows it. Harmless while the membership test
+            # searched the whole file, since `--now` appears in it; it names a
+            # nonexistent unit the moment that test is scoped.
+            continue
+        enabled.add(name if "." in name else f"{name}.service")
+
+    assert enabled, "no enable sites parsed from install.sh — extraction is stale"
+
+    # The timer loop is asserted generically, so its units need no literal entry.
+    # Scoped to the LIVENESS check, not merely "the glob appears somewhere": the
+    # placeholder scan iterates the same glob, so an unscoped `in wf` is
+    # satisfied by a loop that only greps for `__TOKEN__` and never asks whether
+    # anything started. Caught by mutation — replacing the liveness glob alone
+    # left the placeholder one and the check still passed.
+    timer_head = re.search(
+        r"^(?P<indent> *)for \w+ in [^\n]*genesis-\*\.timer[^\n]*; do$", wf, re.MULTILINE
+    )
+    assert timer_head, (
+        "the workflow must iterate the rendered timers; a placeholder scan over "
+        "the same glob is not a liveness check, and a new timer template would be "
+        "rendered-but-dead with nothing noticing"
+    )
+    # Bound at the loop's OWN `done`, anchored to the head's indentation. A
+    # nested loop cannot impersonate it — a nested `done` is indented deeper.
+    #
+    # Two wrong bounds were measured before this one, and both failed by
+    # including text the loop does not contain. Plain `done` (any indent) is
+    # re-paired by a nested retry loop, shrinking the region to nothing and
+    # failing a healthy workflow. Bounding at the next sibling `for` instead
+    # left 30 lines AFTER the loop inside the region, so an unrelated
+    # is-enabled/is-active pair down there satisfied this gate while the timer
+    # loop asserted nothing at all.
+    _indent = len(timer_head.group("indent"))
+    _rest = wf[timer_head.end():]
+    _end = re.search(rf"^ {{{_indent}}}done\b", _rest, re.MULTILINE)
+    timer_body = _rest[: _end.start()] if _end else _rest
+    # ...and strip comments, whole-line and trailing. Measured: the two verbs
+    # supplied only as commented-out text satisfied the gate.
+    timer_body = "\n".join(
+        re.sub(r"\s#.*$", "", ln) for ln in timer_body.splitlines()
+        if not ln.lstrip().startswith("#")
+    )
+
+    # BOTH questions, on the SAME variable. Requiring only is-enabled passes a
+    # workflow that dropped is-active — and enabled-but-inactive is exactly the
+    # state this PR exists for: `enable --now` reports success when its START
+    # leg failed, which is how the watchgod unit shipped dead. The variable is
+    # derived rather than hardcoded so renaming the loop variable cannot quietly
+    # satisfy one check with the other unit.
+    _checked = {
+        verb: set(re.findall(rf'is-{verb} --quiet "\$(\w+)"', timer_body))
+        for verb in ("enabled", "active")
+    }
+    assert _checked["enabled"] & _checked["active"], (
+        "the timer loop must assert BOTH is-enabled and is-active on the same "
+        f"unit variable; found is-enabled on {sorted(_checked['enabled'])} and "
+        f"is-active on {sorted(_checked['active'])}. is-enabled alone accepts a "
+        "timer whose `enable --now` armed it and then failed to start it"
+    )
+
+    # Compare against the units the workflow ASSERTS ON, not against the whole
+    # file. `stem not in wf` is satisfied by any mention anywhere — a comment, or
+    # the placeholder-scan glob, which iterates the same unit paths without ever
+    # asking whether anything started. MEASURED: deleting `qdrant.service` from
+    # the liveness loop left this test GREEN, because the word survives on the
+    # glob line and in a comment. The scoping mistake is the one the `liveness`
+    # check above already fixed for itself, made again on the next line.
+    # Strip comments before matching, WHOLE-LINE and TRAILING both. A trailing
+    # `# qdrant.service is checked elsewhere` on a real assertion line would
+    # otherwise satisfy this check with a remark, which is the same defect one
+    # layer down.
+    body = "\n".join(
+        re.sub(r"\s#.*$", "", ln) for ln in wf.splitlines()
+        if not ln.lstrip().startswith("#")
+    )
+    stems = {n.rsplit(".", 1)[0]: n for n in enabled}
+
+    def _units(text: str) -> set[str]:
+        """Tokens in `text` that NAME a unit install.sh enables.
+
+        Asking "does this token name one of the units we are looking for?"
+        rather than "does this token look like a unit?" is what removes the
+        hardcoded prefix list this test used to carry — a hand-synced list
+        inside a test whose entire purpose is to replace hand-syncing. It can
+        no longer miss a name (`agent-zero` was the live example: rendered,
+        named in the workflow, and dropped by a `genesis`/`qdrant` prefix
+        filter) and it cannot invent one.
+
+        Both spellings resolve, since the workflow writes
+        `is-active --quiet genesis-server` bare and `qdrant.service` suffixed
+        while `enabled` has already normalised everything to `.service`.
+        """
+        found = set()
+        for tok in re.split(r"[\s;]+", text):
+            tok = tok.strip("\"'")
+            if tok in enabled:
+                found.add(tok)
+            elif tok in stems:
+                found.add(stems[tok])
+        return found
+
+    asserted = set()
+    for line in body.splitlines():
+        if re.search(r"systemctl --user is-(?:enabled|active)", line):
+            asserted |= _units(line)
+    # ...plus `for _x in <names>; do` loops, where the names sit on the `for`
+    # line rather than on the assertion. Bind the head to an assertion naming
+    # its LOOP VARIABLE, not to a slice ending at the next `done`: an ordinary
+    # retry loop nested in the body re-pairs that `done` and the head silently
+    # loses its assertion. Requiring the variable also stops a loop being
+    # credited for units its body never checks.
+    for m in re.finditer(r"for (\w+) in ([^\n;]+); do", body):
+        var, head = m.group(1), m.group(2)
+        if re.search(
+            rf"systemctl --user is-(?:enabled|active)[^\n]*\$\{{?{var}\b",
+            body[m.end():],
+        ):
+            asserted |= _units(head)
+
+    # Computed before the staleness assert so a workflow that dropped its
+    # assertions reports WHICH units lost cover, rather than the blunter
+    # "extraction is stale".
+    missing = sorted(n for n in enabled if n not in asserted)
+    assert asserted or not missing, (
+        "no unit-state assertions parsed from the workflow — extraction is stale"
+    )
+    assert not missing, (
+        f"install.sh enables {missing} but the install test never checks whether "
+        "they came up. The enable is suppressed with `|| true`, so this is the "
+        "exact shape that ships a dead unit behind a green install."
+    )
+
+
+def test_every_sed_replacement_uses_an_ESCAPED_variable():
+    """The escape must be APPLIED, not merely defined.
+
+    The sibling test above extracts `_sed_repl_esc` and proves the expression
+    itself is correct — but it says nothing about whether the render loop uses
+    it. MEASURED: reverting `__REPO_DIR__` to the raw `$REPO_DIR` left that
+    whole matrix green, because a function tested in isolation is a claim about
+    the function and not about the call site.
+
+    So this asserts the BINDING: every substitution in the render loop must
+    interpolate a variable produced by the escape, never a raw path variable.
+    """
+    text = INSTALL.read_text()
+    pairs = re.findall(r'-e "s\|(__[A-Z0-9_]+__)\|\$(\w+)\|g"', text)
+    assert pairs, "found no sed substitutions in install.sh — this test is stale"
+
+    escaped_vars = set(re.findall(r"(\w+)=\$\(_sed_repl_esc ", text))
+    assert escaped_vars, "no variables are produced by _sed_repl_esc"
+
+    # The denominator comes from the TEMPLATES, not from what the regex happened
+    # to match. `assert pairs` only proves the regex found something: a sixth
+    # placeholder written as ${X}, without `g`, or not on its own -e line would
+    # contribute no pair and go silently unchecked — a weaker version of the
+    # exists-vs-binds failure this test was written to close.
+    declared = set()
+    for tpl in (REPO_ROOT / "scripts" / "systemd").glob("*.template"):
+        declared |= set(re.findall(r"__[A-Z0-9_]+__", tpl.read_text()))
+    covered = {token for token, _ in pairs}
+    missing = sorted(declared - covered)
+    assert not missing, (
+        f"placeholder(s) declared in a template with no checked sed substitution: {missing}"
+    )
+
+    raw = [f"{token} <- ${var}" for token, var in pairs if var not in escaped_vars]
+    assert not raw, (
+        "a sed replacement interpolates a RAW value rather than an escaped one. "
+        "An unescaped `&` means the whole matched text and `|` is the delimiter, "
+        "so either corrupts the rendered unit or aborts the install:\n  "
+        + "\n  ".join(raw)
+    )

@@ -1,0 +1,940 @@
+"""The git atoms are parsed against REAL git output, never a hand-made fixture.
+
+Hand-rolled parsing of a tool's output is this repo's most reliably-wrong
+pattern: a fixture written from memory encodes the shape you BELIEVE git emits,
+so the test and the bug agree with each other. These tests drive a real
+temporary repository through the real ``git`` binary, including the shapes that
+break naive parsers — a path with a space, a non-ASCII path, a rename with its
+origin field, and an untracked file.
+
+The porcelain default output C-QUOTES any path with a space, a quote or a
+non-ASCII byte; ``-z`` emits it raw. That is why the atom uses ``-z``, and this
+file is what proves the difference matters.
+"""
+
+import subprocess
+
+import pytest
+
+from genesis.session_awareness.zero_drop_git import (
+    list_local_branches,
+    list_remote_heads,
+    list_worktrees,
+    parse_status_z,
+    worktree_status,
+)
+
+
+def _git(repo, *args, check=True):
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=check
+    )
+
+
+@pytest.fixture
+def repo(tmp_path):
+    r = tmp_path / "repo"
+    r.mkdir()
+    _git(r, "init", "-q", "-b", "main")
+    _git(r, "config", "user.email", "t@example.invalid")
+    _git(r, "config", "user.name", "T")
+    (r / "seed.txt").write_text("seed\n")
+    _git(r, "add", "seed.txt")
+    _git(r, "commit", "-qm", "seed")
+    return r
+
+
+async def test_status_parses_paths_that_break_naive_parsers(repo):
+    (repo / "a file with spaces.txt").write_text("x\n")
+    (repo / "ünïcode.txt").write_text("x\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "add tricky names")
+
+    (repo / "a file with spaces.txt").write_text("modified\n")
+    _git(repo, "mv", "ünïcode.txt", "renamed ünïcode.txt")
+    (repo / "untracked thing.py").write_text("x\n")
+
+    out = await worktree_status(str(repo))
+    assert "error" not in out, out
+    paths = {p for _xy, p in out["entries"]}
+
+    assert "a file with spaces.txt" in paths, "a space-containing path was mangled"
+    assert "renamed ünïcode.txt" in paths, "a non-ASCII path was mangled"
+    assert "untracked thing.py" in paths, "untracked work is stranded work — it counts"
+    assert "ünïcode.txt" not in paths, (
+        "a rename's ORIGIN field must be consumed, not reported as its own entry"
+    )
+    assert any(xy.strip().startswith("R") for xy, _ in out["entries"])
+
+
+async def test_porcelain_default_would_have_mangled_those_paths(repo):
+    """The MEASUREMENT behind the -z choice, not an assumption about it."""
+    (repo / "a file with spaces.txt").write_text("x\n")
+    default = _git(repo, "status", "--porcelain").stdout
+    assert '"a file with spaces.txt"' in default, (
+        "git no longer quotes spaced paths — the -z rationale needs re-deriving"
+    )
+    nul = _git(repo, "status", "--porcelain", "-z").stdout
+    assert "a file with spaces.txt\0" in nul and '"' not in nul
+
+
+async def test_clean_worktree_reports_no_entries(repo):
+    out = await worktree_status(str(repo))
+    assert out == {"entries": []}
+
+
+async def test_status_on_a_nonexistent_path_is_an_error_not_a_clean_read(tmp_path):
+    """The whole degraded-leg design rests on this: a failed status must NOT
+    be indistinguishable from a clean worktree, or a vanished worktree would
+    silently resolve its findings."""
+    out = await worktree_status(str(tmp_path / "does-not-exist"))
+    assert "error" in out
+
+
+def test_parse_status_z_counts_what_it_could_not_read():
+    """Never guess at an unrecognised record — and never silently DROP it.
+
+    Dropping was the original behaviour and it failed in the one direction a
+    detector cannot afford: a garbled status stream shrank to zero entries,
+    which reads as a perfectly clean worktree. The count is what lets the
+    caller tell "nothing changed" from "I could not see".
+    """
+    entries, unparsed = parse_status_z("M  ok.py\0garbage\0?? new.py\0")
+    assert entries == [("M ", "ok.py"), ("??", "new.py")]
+    assert unparsed == 1
+    assert parse_status_z("") == ([], 0)
+
+
+async def test_unreadable_status_output_is_an_error_not_a_clean_worktree(repo, monkeypatch):
+    """The rc check catches a failed CALL; this catches a successful call whose
+    OUTPUT we cannot read. Both must degrade the class."""
+    from genesis.session_awareness import zero_drop_git as g
+
+    async def _garbled(argv, timeout):
+        return 0, "not\0porcelain\0at\0all\0", ""
+
+    out = await g.worktree_status(str(repo), runner=_garbled)
+    assert "error" in out and "unparseable" in out["error"]
+
+
+async def test_unreadable_ref_line_fails_the_whole_branch_leg(repo):
+    """The branch classes reconcile against a COMPLETE candidate set. A quietly
+    short one resolves findings for branches that were simply never listed."""
+    from genesis.session_awareness import zero_drop_git as g
+
+    async def _garbled(argv, timeout):
+        return 0, "only-one-field\n", ""
+
+    out = await g.list_local_branches(str(repo), runner=_garbled)
+    assert "error" in out and "unparseable" in out["error"]
+
+
+async def test_a_prunable_worktree_is_reported_as_prunable(repo, tmp_path):
+    """MEASURED on git 2.43: deleting a worktree's DIRECTORY leaves the
+    registration behind with a `prunable` marker, and `git -C <gone> status`
+    fails rc=128. Reading that as "unreadable" would freeze the whole dirty
+    class on every sweep from then on — one stale registration, permanent
+    blindness."""
+    import shutil
+
+    wt = tmp_path / "doomed"
+    _git(repo, "worktree", "add", "-q", "-b", "doomed", str(wt))
+    shutil.rmtree(wt)
+
+    out = await list_worktrees(str(repo))
+    entry = next(w for w in out["worktrees"] if w["path"] == str(wt))
+    assert entry["prunable"], f"git no longer marks this prunable: {out['worktrees']}"
+
+    dead = await worktree_status(str(wt))
+    assert "error" in dead, "the status call on a gone worktree must still fail"
+
+    live = next(w for w in out["worktrees"] if w["path"] == str(repo))
+    assert not live["prunable"]
+
+
+async def test_branch_sweep_reports_ahead_counts_against_the_base(repo):
+    """One for-each-ref gives the whole candidate set with ahead/behind —
+    no per-branch rev-list. Requires git >= 2.41 for %(ahead-behind:)."""
+    _git(repo, "checkout", "-qb", "feat/ahead")
+    (repo / "new.txt").write_text("x\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "work")
+    _git(repo, "checkout", "-q", "main")
+
+    out = await list_local_branches(str(repo), base="main")
+    assert "error" not in out, out
+    by_name = {b["branch"]: b for b in out["branches"]}
+    assert by_name["feat/ahead"]["ahead"] == 1
+    assert by_name["feat/ahead"]["behind"] == 0
+    assert by_name["main"]["ahead"] == 0
+    assert by_name["feat/ahead"]["tip_sha"] and by_name["feat/ahead"]["tip_date"]
+
+
+async def test_branch_sweep_against_a_missing_base_never_reports_zero_ahead(repo):
+    """An unknown base must read as UNKNOWN, never as 'nothing on this branch'
+    — the classifier drops unknowns rather than clearing findings on them."""
+    out = await list_local_branches(str(repo), base="origin/nope")
+    assert "error" in out or all(b["ahead"] is None for b in out["branches"]), out
+
+
+async def test_branch_names_cannot_contain_a_tab_or_space(repo):
+    """The MEASUREMENT behind the TAB-separated ref format: git itself refuses
+    a name that would break the split."""
+    for bad in ["has space", "has\ttab"]:
+        assert _git(repo, "check-ref-format", "--branch", bad, check=False).returncode != 0
+
+
+async def test_worktree_list_reports_path_and_branch(repo, tmp_path):
+    wt = tmp_path / "linked"
+    _git(repo, "worktree", "add", "-q", "-b", "feat/linked", str(wt))
+
+    out = await list_worktrees(str(repo))
+    assert "error" not in out, out
+    by_path = {w["path"]: w for w in out["worktrees"]}
+    assert by_path[str(repo)]["branch"] == "main"
+    assert by_path[str(wt)]["branch"] == "feat/linked"
+
+
+async def test_one_branch_checked_out_TWICE_is_stamped_on_both_worktrees(repo, tmp_path):
+    """`git worktree add --force` puts one branch in two worktrees at once.
+
+    The classifier keys a dirty-worktree finding on the branch, so without a
+    stamp the two collapse onto one identity and only the first sighting
+    survives (Codex P2, PR #1794). The flag is computed HERE, over the whole
+    listing, because the worker's hold path and the classifier see different
+    SUBSETS of it and would otherwise disagree about which branches are
+    duplicated — a hold key matching no finding, which fails silently.
+
+    The premise is asserted rather than assumed: if a future git refuses the
+    forced duplicate, this test says so instead of quietly passing.
+    """
+    first, second, solo = tmp_path / "d1", tmp_path / "d2", tmp_path / "solo"
+    _git(repo, "worktree", "add", "-q", "-b", "feat/twice", str(first))
+    forced = _git(repo, "worktree", "add", "-q", "--force", str(second), "feat/twice", check=False)
+    assert forced.returncode == 0, (
+        f"git no longer allows a forced duplicate checkout — the discriminator's "
+        f"rationale needs re-deriving: {forced.stderr}"
+    )
+    _git(repo, "worktree", "add", "-q", "-b", "feat/once", str(solo))
+
+    out = await list_worktrees(str(repo))
+    assert "error" not in out, out
+    by_path = {w["path"]: w for w in out["worktrees"]}
+
+    assert by_path[str(first)]["branch_duplicated"] is True
+    assert by_path[str(second)]["branch_duplicated"] is True
+    # The control, and it is the load-bearing half: the identity IS the ack
+    # key, so a branch checked out ONCE must keep its bare name or every
+    # acknowledgement ever written expires at once.
+    assert by_path[str(solo)]["branch_duplicated"] is False
+    assert by_path[str(repo)]["branch_duplicated"] is False
+
+
+async def test_a_detached_worktree_is_never_stamped_as_a_duplicate(repo, tmp_path):
+    """`branch` is None for a detached worktree and several may be detached at
+    once. Counting None as a branch would mark them all duplicated and rewrite
+    every detached identity — which already keys on its path and needs no
+    discriminator."""
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    for name in ("det1", "det2"):
+        _git(repo, "worktree", "add", "-q", "--detach", str(tmp_path / name), head)
+
+    out = await list_worktrees(str(repo))
+    detached = [w for w in out["worktrees"] if w["detached"]]
+    assert len(detached) == 2, out
+    assert [w["branch_duplicated"] for w in detached] == [False, False]
+
+
+async def test_detached_worktree_has_no_branch(repo, tmp_path):
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    wt = tmp_path / "detached"
+    _git(repo, "worktree", "add", "-q", "--detach", str(wt), head)
+
+    out = await list_worktrees(str(repo))
+    entry = next(w for w in out["worktrees"] if w["path"] == str(wt))
+    assert entry["branch"] is None
+    assert entry["detached"] is True
+
+
+async def test_ls_remote_without_a_remote_is_an_error_not_an_empty_set(repo):
+    """An empty set would classify every pushed branch as never-pushed. The
+    worker freezes both branch classes on this error instead."""
+    out = await list_remote_heads(str(repo))
+    assert "error" in out
+
+
+async def test_ls_remote_reads_the_live_remote(repo, tmp_path):
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    _git(repo, "remote", "add", "origin", str(origin))
+    _git(repo, "push", "-q", "origin", "main")
+
+    out = await list_remote_heads(str(repo))
+    assert set(out["heads"]) == {"main"}
+    # The SHA is the point of this atom: local-tip vs remote-tip is the
+    # direct test for commits that exist nowhere but this machine.
+    head = _git(repo, "rev-parse", "main").stdout.strip()
+    assert out["heads"]["main"] == head
+
+
+async def test_ls_remote_OUTPUT_that_parses_to_nothing_is_an_error(repo):
+    """rc=0 with output carrying no branch refs. The rc check above cannot see
+    this (that test uses a repo with no remote, which fails rc≠0 and never
+    reaches the guard), and accepting it does not fail neutrally: it
+    reclassifies EVERY branch as never-pushed, and class is part of a finding's
+    identity — so it forks rows instead of correcting them.
+
+    Scoped to OUTPUT. This test used to assert the same of a zero-byte result,
+    which was wrong and is corrected next door: a cleared remote legitimately
+    answers with nothing, and refusing that froze both branch classes forever.
+    """
+    from genesis.session_awareness import zero_drop_git as g
+
+    async def _unexpected_shape(argv, timeout):
+        return 0, "deadbeef\trefs/tags/v1\n", ""
+
+    assert "error" in await g.list_remote_heads(str(repo), runner=_unexpected_shape)
+
+
+@pytest.mark.parametrize(
+    "base",
+    ["origin/%(objectname)", "origin/(x)", "origin/a b", "origin/a\tb", "", "x" * 300],
+)
+async def test_an_unsafe_base_ref_is_REFUSED_not_sanitised(repo, base):
+    """`base` is spliced into a git FORMAT STRING, where `%(...)` is a
+    directive — and a git ref name may legally contain `%`, `(` and `)`. A name
+    carrying a directive would inject extra fields into output the classifier
+    trusts to be four TAB-separated columns. A ref name that cannot be safely
+    formatted is not a value we accept."""
+    from genesis.session_awareness import zero_drop_git as g
+
+    assert not g.is_safe_base_ref(base)
+    out = await g.list_local_branches(str(repo), base=base)
+    assert "error" in out and "unsafe base ref" in out["error"]
+
+
+@pytest.mark.parametrize(
+    "base", ["origin/main", "main", "origin/release/1.2", "upstream/feat_x-1@a"]
+)
+def test_ordinary_base_refs_are_accepted(base):
+    """The guard must not reject the names a real fork actually uses."""
+    from genesis.session_awareness import zero_drop_git as g
+
+    assert g.is_safe_base_ref(base)
+
+
+async def test_a_dirty_symlink_is_dated_by_ITSELF_not_by_its_target(repo, tmp_path):
+    """`os.stat` follows symlinks. A dirty entry that is a symlink would then be
+    dated by a file OUTSIDE the worktree — dating this worktree's work by
+    something unrelated, and disclosing that file's mtime into a finding."""
+    import os
+
+    from genesis.session_awareness.zero_drop_worker import _observe_worktrees
+
+    outside = tmp_path / "ancient.txt"
+    outside.write_text("x\n")
+    os.utime(outside, (0, 0))  # 1970
+    os.symlink(outside, repo / "link.txt")
+
+    out = await _observe_worktrees(str(repo))
+    obs = next(o for o in out["observations"] if o["path"] == str(repo))
+
+    assert obs["entries"], "the symlink should show as untracked"
+    assert obs["newest_mtime"] is not None
+    assert obs["newest_mtime"].year > 2000, (
+        f"the entry was dated by its TARGET, not itself: {obs['newest_mtime']}"
+    )
+
+
+async def test_a_real_prunable_worktree_is_HELD_per_item_not_frozen_wholesale(repo, tmp_path):
+    """The worker-level assertion, against real git rather than a fake listing.
+
+    This test previously asserted that a prunable worktree is neither reported
+    nor HELD — that it is simply ABSENT, so its finding resolves. A cross-model
+    reviewer disproved the premise: `prunable` means git could not find the
+    directory, which is UNREACHABLE, not necessarily gone. An unmounted volume
+    or a directory renamed aside gives the byte-identical
+    `gitdir file points to non-existent location`, and DEMONSTRATED on git 2.43
+    the work comes back intact when the path does. Resolving destroys the ack
+    and the recurrence count permanently; holding costs a stale row.
+
+    The subsystem's own doctrine settles which error to prefer: "an extra
+    acknowledged row costs less than a clean board that lied." So a prunable
+    worktree is now HELD — and the cost is named rather than hidden: for a
+    genuinely DELETED worktree the row will not resolve on its own and takes an
+    acknowledgement to clear. A confirm-by-repetition refinement (resolve only
+    after N consecutive prunable sightings, which an unmounted volume survives
+    and a deleted directory does not) would recover that, and is filed rather
+    than built here.
+
+    What must NOT change is the per-ITEM granularity: one unreachable worktree
+    holds only itself, never the whole dirty class.
+    """
+    import shutil
+
+    from genesis.session_awareness.zero_drop_worker import _observe_worktrees
+
+    wt = tmp_path / "doomed"
+    _git(repo, "worktree", "add", "-q", "-b", "doomed", str(wt))
+    shutil.rmtree(wt)
+
+    out = await _observe_worktrees(str(repo))
+
+    assert out["prunable"] == 1
+    assert out["errors"] == [], "a gone worktree must not be reported as unreadable"
+    assert out["held"] == {"doomed"}, "an unreachable worktree is held, never resolved"
+    # Per-item, not wholesale: the live worktree is still observed.
+    assert [o["path"] for o in out["observations"]] == [str(repo)]
+
+
+async def test_base_ref_resolution_returns_None_when_there_is_no_origin_HEAD(repo):
+    """None, not the fallback string. Returning "origin/main" on failure makes
+    "resolved to origin/main" and "guessed origin/main" the same value, so the
+    caller cannot say which happened — and a wrong base inflates every
+    ahead-count."""
+    from genesis.session_awareness.zero_drop_worker import _resolve_base_ref
+
+    assert await _resolve_base_ref(str(repo)) is None  # fresh repo: no origin/HEAD
+
+    _git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
+    assert await _resolve_base_ref(str(repo)) == "origin/trunk"
+
+
+# ── is_ancestor / count_unique_work_commits: the SHA-evidence atoms ────────────
+#
+# These exist because "a PR with this name merged" is a heuristic while "this
+# commit is reachable from that one" is a fact. Both are THREE-valued: the
+# unanswerable case is what stops a missing object from being read as proof.
+
+
+async def test_is_ancestor_answers_yes_no_and_UNANSWERABLE(repo):
+    """rc 0/1 are answers; rc 128 (object not in this repo) is NOT.
+
+    Folding the missing-object case into False would turn "I cannot see that
+    commit" into "those commits are stranded" — a confident finding built on
+    absent evidence, which is the class of defect this module exists to avoid.
+    """
+    from genesis.session_awareness.zero_drop_git import is_ancestor
+
+    first = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "later.txt").write_text("later\n")
+    _git(repo, "add", "later.txt")
+    _git(repo, "commit", "-q", "-m", "later")
+    second = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    assert await is_ancestor(str(repo), first, second) is True
+    assert await is_ancestor(str(repo), second, first) is False
+    # A well-formed SHA this repository has never heard of.
+    assert await is_ancestor(str(repo), "0" * 40, second) is None
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "--upload-pack=touch /tmp/x",
+        "HEAD",
+        "main",
+        "abc123",
+        "",
+        "0" * 39,
+        "0" * 41,
+        "G" * 40,
+        # A wrong TYPE, not just a wrong value. `headRefOid` is JSON from gh and
+        # a tip_sha is parsed from git output, so null is a shape either can
+        # take. A validator that raises on it is worse than one that rejects
+        # it: the exception escapes the classifier and kills the WHOLE sweep,
+        # which is the one outcome a detector cannot afford.
+        None,
+        123,
+        ["a" * 40],
+    ],
+)
+async def test_is_ancestor_REFUSES_anything_that_is_not_a_full_sha(repo, bad):
+    """Both arguments reach subprocess argv, and both arrive from OUTSIDE this
+    repository — `headRefOid` from gh's JSON, remote tips from ls-remote. A
+    refused argument returns the unanswerable None, never an answer, and never
+    an exception."""
+    from genesis.session_awareness.zero_drop_git import count_unique_work_commits, is_ancestor
+
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert await is_ancestor(str(repo), bad, head) is None
+    assert await is_ancestor(str(repo), head, bad) is None
+    assert await count_unique_work_commits(str(repo), bad, head) is None
+    assert await count_unique_work_commits(str(repo), head, bad) is None
+
+
+async def test_count_unique_work_commits_ignores_a_CLEAN_merge(repo):
+    """A branch whose only local-only commit is a CLEAN merge holds nothing.
+
+    Counting it would flag a branch that has merged the base in but has nothing
+    of its own — noise sitting on top of the real signal, in the one class
+    where a false positive costs an acknowledgement.
+
+    The qualifier is load-bearing and was missing: this is true of an AUTO-merge
+    and false of a conflict-resolved one. See the sibling test below, which
+    pins the case whose absence made this one read as a general rule.
+    """
+    from genesis.session_awareness.zero_drop_git import count_unique_work_commits
+
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "checkout", "-q", "-b", "side")
+    (repo / "side.txt").write_text("side\n")
+    _git(repo, "add", "side.txt")
+    _git(repo, "commit", "-q", "-m", "side work")
+    side = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    _git(repo, "checkout", "-q", "-")
+    (repo / "trunk.txt").write_text("trunk\n")
+    _git(repo, "add", "trunk.txt")
+    _git(repo, "commit", "-q", "-m", "trunk work")
+    _git(repo, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+    merged = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    # One real commit on the side branch, not reachable from base.
+    assert await count_unique_work_commits(str(repo), base, side) == 1
+    # From the merge commit's side: the merge itself carries no unique work.
+    assert await count_unique_work_commits(str(repo), side, merged) == 1  # trunk work only
+    assert await count_unique_work_commits(str(repo), merged, merged) == 0
+    assert await count_unique_work_commits(str(repo), "0" * 40, merged) is None
+    assert await count_unique_work_commits(str(repo), "not-a-sha", merged) is None
+
+
+async def test_a_CONFLICT_RESOLVED_merge_counts_as_unique_work(repo):
+    """The false-clean this function was fixed for (Codex P1, PR #1794).
+
+    A merge whose conflicts were resolved by hand holds a tree that exists in
+    NEITHER parent — the resolution is real work living only on this branch.
+    The earlier implementation ran `rev-list --count --no-merges`, counted 0,
+    and the caller turned that into PUSH_BEHIND, which SUPPRESSES the finding.
+    A detector that suppresses stranded work is the exact failure this
+    subsystem exists to prevent.
+
+    MEASURED on this repository at the time of the fix: 3 of 23 recent merge
+    commits (13%) carry a non-empty combined diff. Not hypothetical — and more
+    likely here than elsewhere, because this repo cannot rebase, so branches
+    catch up by merging and every hand-resolved conflict lands in a merge.
+    """
+    from genesis.session_awareness.zero_drop_git import count_unique_work_commits
+
+    (repo / "shared.txt").write_text("base\n")
+    _git(repo, "add", "shared.txt")
+    _git(repo, "commit", "-q", "-m", "shared base")
+
+    # Two branches change the SAME line, so the merge cannot auto-resolve.
+    _git(repo, "checkout", "-q", "-b", "conflicting")
+    (repo / "shared.txt").write_text("theirs\n")
+    _git(repo, "commit", "-q", "-am", "their change")
+
+    _git(repo, "checkout", "-q", "-")
+    (repo / "shared.txt").write_text("ours\n")
+    _git(repo, "commit", "-q", "-am", "our change")
+    ours = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    _git(repo, "merge", "--no-commit", "conflicting", check=False)
+    # The resolution: a value present on NEITHER side.
+    (repo / "shared.txt").write_text("resolved-to-something-neither-parent-has\n")
+    _git(repo, "add", "shared.txt")
+    _git(repo, "commit", "-q", "-m", "merge with hand resolution")
+    resolved = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    # Preconditions, asserted rather than assumed — this test is only meaningful
+    # if the range really does contain one merge and one ordinary commit.
+    total = _git(repo, "rev-list", "--count", f"{ours}..{resolved}").stdout.strip()
+    non_merge = _git(
+        repo, "rev-list", "--count", "--no-merges", f"{ours}..{resolved}"
+    ).stdout.strip()
+    assert (total, non_merge) == ("2", "1"), (
+        f"fixture drift: expected 2 commits of which 1 is a merge, got {total}/{non_merge}"
+    )
+    combined = _git(repo, "log", "--cc", "-1", "--format=", resolved).stdout
+    assert any(ln[:1] in "+-" for ln in combined.splitlines()), (
+        "fixture drift: the merge must carry a combined diff, or it is not a resolution"
+    )
+
+    # The old implementation answered 1 — it saw only the ordinary commit and
+    # discarded the resolution. The resolution is work that exists nowhere else,
+    # so the honest answer is 2.
+    assert await count_unique_work_commits(str(repo), ours, resolved) == 2
+
+
+# ── rc=0 with nothing parsed is a FAILURE, on every enumerator ───────────────
+
+
+@pytest.mark.parametrize(
+    "fn_name,kind",
+    [
+        ("list_local_branches", "for-each-ref"),
+        ("list_remote_heads", "ls-remote"),
+        ("list_worktrees", "worktree list"),
+    ],
+)
+@pytest.mark.parametrize("payload", ["not a record at all\n", "   \n\n"])
+async def test_rc0_with_OUTPUT_that_parsed_to_nothing_freezes_the_class(
+    repo, fn_name, kind, payload
+):
+    """Output we cannot read does not fail neutrally — it RESOLVES the class.
+
+    Each of these feeds a class that reconciles, so whatever is not returned is
+    treated as gone: silent, confident, complete. The guard used to exist on
+    ls-remote ONLY, and `worktree list` accepted unparseable garbage as a clean
+    empty set.
+
+    Whitespace-only counts as OUTPUT here, and that is a measurement rather than
+    a preference: an empty set is exactly ZERO bytes (below), so whitespace is
+    something git did not print for an empty set — it belongs on the freezing
+    side, which is the direction that does not resolve findings.
+    """
+    from genesis.session_awareness import zero_drop_git as g
+
+    async def _runner(argv, timeout):
+        return 0, payload, ""
+
+    out = await getattr(g, fn_name)(str(repo), runner=_runner)
+    assert "error" in out, f"{kind} accepted an unreadable parse as success"
+    # Either refusal is correct — an unreadable line and output that parsed to
+    # nothing both mean "this is not what we think it is", and both freeze the
+    # class. What must never happen is a clean empty success.
+    assert any(
+        m in out["error"]
+        for m in (
+            "none of which parsed",
+            "unrecognised",
+            "unparseable",
+            # `worktree list` refuses on its own reasoning rather than the
+            # shared guard's, so it has its own wording.
+            "main worktree is always listed",
+        )
+    ), out["error"]
+
+
+@pytest.mark.parametrize(
+    "fn_name",
+    ["list_local_branches", "list_remote_heads"],
+)
+async def test_an_rc0_empty_OUTPUT_is_a_true_observation_not_corruption(repo, fn_name):
+    """The correction, and my own test was what encoded the wrong predicate.
+
+    The first version of this guard refused EVERY rc=0 empty, on the reasoning
+    that a repository always has at least one local branch and one remote
+    branch. Both halves are false: an unborn repository has no local refs, and a
+    newly created or fully cleared remote answers with no heads (Codex P2, PR
+    #1794). Refusing them froze BOTH branch classes on every sweep, forever,
+    because nothing about the condition changes — and in the cleared-remote case
+    every local branch is precisely the unpushed work the detector exists to
+    report.
+
+    MEASURED 2026-09-13 on git 2.43: both spellings return rc=0 with stdout of
+    EXACTLY zero bytes; `--exit-code` is the optional flag that would have made
+    emptiness an error, and this code does not pass it.
+    """
+    from genesis.session_awareness import zero_drop_git as g
+
+    async def _runner(argv, timeout):
+        return 0, "", ""
+
+    out = await getattr(g, fn_name)(str(repo), runner=_runner)
+    assert "error" not in out, f"a legitimately empty set was refused: {out}"
+    assert out in ({"branches": []}, {"heads": {}})
+
+
+async def test_an_empty_WORKTREE_listing_is_still_refused(repo):
+    """The exception, and it is not an inconsistency: `git worktree list` always
+    names the main worktree of any repository it can read, so nothing parsed
+    means the output is unreadable whether or not it was empty. Its reason is
+    stated on the call site rather than borrowed from the shared guard."""
+    from genesis.session_awareness.zero_drop_git import list_worktrees
+
+    async def _runner(argv, timeout):
+        return 0, "", ""
+
+    out = await list_worktrees(str(repo), runner=_runner)
+    assert "error" in out
+    assert "main worktree is always listed" in out["error"]
+
+
+async def test_a_real_worktree_listing_still_parses(repo, tmp_path):
+    """The guard-the-guard: a refusal that also refuses valid input is worse
+    than no refusal, because it freezes the class permanently."""
+    from genesis.session_awareness.zero_drop_git import list_worktrees
+
+    out = await list_worktrees(str(repo))
+    assert "error" not in out
+    assert len(out["worktrees"]) >= 1
+
+
+async def test_every_git_argv_declines_optional_locks(repo, monkeypatch, tmp_path):
+    """READ-ONLY is a stated REQUIREMENT of this module, and it was not true.
+
+    MEASURED on git 2.43: a plain `git status --porcelain` rewrites .git/index
+    whenever a tracked file's mtime has moved — it refreshes the stat cache and
+    takes index.lock to do it. Across ~161 worktrees that is 161 lock
+    acquisitions per sweep contending with whatever else is running.
+
+    Asserted over EVERY atom rather than the one that was caught, because the
+    obligation is the kind a call site forgets one instance of.
+    """
+    from genesis.session_awareness import zero_drop_git as g
+
+    seen: list[list[str]] = []
+
+    async def _spy(argv, timeout):
+        seen.append(argv)
+        return 1, "", "stopped"
+
+    await g.list_local_branches(str(repo), runner=_spy)
+    await g.list_remote_heads(str(repo), runner=_spy)
+    await g.list_worktrees(str(repo), runner=_spy)
+    await g.worktree_status(str(repo), runner=_spy)
+    await g.is_ancestor(str(repo), "a" * 40, "b" * 40, runner=_spy)
+    await g.count_unique_work_commits(str(repo), "a" * 40, "b" * 40, runner=_spy)
+
+    assert len(seen) == 6, "every atom must have issued exactly one command"
+    for argv in seen:
+        assert argv[0] == "git"
+        assert "--no-optional-locks" in argv, f"writes to the repo it reads: {argv}"
+
+
+async def test_the_push_probe_is_BUDGETED_like_its_sibling(monkeypatch):
+    """An unbounded probe loop under a GLOBAL flock starves every later sweep.
+
+    Per-call timeouts do not bound a loop: N diverged branches x 2 calls x 30s
+    is an unbounded wall-clock, and the sweep holds `detector.lock` throughout.
+    A security review caught that the ancestry probe was capped and this one was
+    not. Over-budget branches read as UNKNOWN, which the classifier HOLDS —
+    never reported, never resolved — so the ceiling costs findings, not truth.
+    """
+    from genesis.session_awareness import zero_drop_worker as w
+
+    calls = 0
+
+    async def _counting(root, a, b, runner=None):
+        nonlocal calls
+        calls += 1
+        return False  # never an ancestor, so each branch takes the second call too
+
+    async def _count_zero(root, a, b, runner=None):
+        return 5
+
+    monkeypatch.setattr(w, "is_ancestor", _counting)
+    monkeypatch.setattr(w, "count_unique_work_commits", _count_zero)
+
+    branches = [{"branch": f"b{i}", "tip_sha": f"{i:040x}"} for i in range(50)]
+    heads = {f"b{i}": "f" * 40 for i in range(50)}
+
+    out = await w._resolve_push_states("/repo", branches, heads, budget=5)
+    assert calls == 5, "the probe must stop at the budget, not run once per branch"
+    states = out["push_states"]
+    assert sum(1 for v in states.values() if v == "diverged") == 5
+    assert sum(1 for v in states.values() if v == "unknown") == 45
+    assert len(states) == 50, "every branch still gets a state — none is silently dropped"
+
+
+async def test_a_new_file_inside_an_untracked_DIRECTORY_is_visible(repo):
+    """The ack-key false-clean (Codex P1, PR #1794).
+
+    Under git's default untracked mode an untracked DIRECTORY collapses to one
+    `?? dir/` entry, so nothing about its contents reaches the caller. The
+    dirty-state key is derived from these entries and an acknowledgement is
+    keyed to that state — so a whole new file could appear inside an
+    already-untracked directory while the key stayed BYTE-IDENTICAL, and the
+    ack went on suppressing work it was never granted against.
+
+    DEMONSTRATED before the fix: `?? somedir/` was the entire output both
+    before and after adding a third file.
+    """
+    (repo / "scratch").mkdir()
+    (repo / "scratch" / "a.py").write_text("one\n")
+    before = await worktree_status(str(repo))
+    assert "error" not in before, before
+
+    (repo / "scratch" / "b.py").write_text("two\n")
+    after = await worktree_status(str(repo))
+    assert "error" not in after, after
+
+    paths_before = {p for _xy, p in before["entries"]}
+    paths_after = {p for _xy, p in after["entries"]}
+
+    assert "scratch/a.py" in paths_before, (
+        "a file inside an untracked directory must be visible at FILE granularity — "
+        "the default mode collapses it to 'scratch/' and hides the contents"
+    )
+    assert paths_after - paths_before == {"scratch/b.py"}, (
+        "adding a file inside an untracked directory MUST change the observed "
+        "state, or an acknowledgement keyed to it silently suppresses new work"
+    )
+
+
+async def test_the_default_untracked_mode_would_have_hidden_it(repo):
+    """The MEASUREMENT behind `--untracked-files=all`, not an assumption.
+
+    Pins the git behaviour the fix exists for, so if git ever stops collapsing
+    untracked directories this rationale is re-derived rather than cargo-culted.
+    """
+    (repo / "scratch").mkdir()
+    (repo / "scratch" / "a.py").write_text("one\n")
+    default_before = _git(repo, "status", "--porcelain").stdout
+    (repo / "scratch" / "b.py").write_text("two\n")
+    default_after = _git(repo, "status", "--porcelain").stdout
+
+    assert default_before == default_after == "?? scratch/\n", (
+        "git no longer collapses untracked directories — the -uall rationale "
+        f"needs re-deriving (before={default_before!r} after={default_after!r})"
+    )
+    allmode = _git(repo, "status", "--porcelain", "--untracked-files=all").stdout
+    assert "scratch/a.py" in allmode and "scratch/b.py" in allmode
+
+
+async def test_a_worktree_path_containing_a_newline_is_parsed_whole(repo, tmp_path):
+    """`worktree list --porcelain` is newline-delimited; a path may contain one.
+
+    Without `-z` one record splits into two: a truncated path that resolves to
+    nothing, plus a phantom remainder counted as an unparsed record. Both halves
+    are wrong, and the truncated one is worse — it names a worktree that does
+    not exist (Codex P2, PR #1794).
+    """
+    weird = tmp_path / "line\nbreak"
+    try:
+        _git(repo, "worktree", "add", "-q", "-b", "newline-branch", str(weird))
+    except Exception as exc:  # pragma: no cover - filesystem refused the name
+        pytest.skip(f"filesystem will not hold a newline in a path: {exc}")
+
+    out = await list_worktrees(str(repo))
+    assert "error" not in out, out
+    paths = {w["path"] for w in out["worktrees"]}
+    assert str(weird) in paths, (
+        f"the newline-containing path was split or mangled; got {sorted(paths)}"
+    )
+    assert out.get("unparsed", 0) == 0, "a split record also inflates the unparsed count"
+
+
+async def test_an_inherited_GIT_DIR_cannot_redirect_the_sweep(repo, tmp_path, monkeypatch):
+    """git's repo-discovery environment OVERRIDES `-C`, and since an rc=0 empty
+    set became a legitimate observation, that stopped failing closed.
+
+    `-C` is equivalent to `cd`; `GIT_DIR` takes precedence over discovery from
+    the working directory. So with one inherited, every argv reads a repository
+    the caller never named — and an empty result there now reads as "this repo
+    has no branches", which RESOLVES every open and acked branch finding.
+    """
+    import subprocess
+
+    other = tmp_path / "elsewhere.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(other)], check=True)
+    monkeypatch.setenv("GIT_DIR", str(other))
+
+    out = await list_worktrees(str(repo))
+    assert "error" not in out, out
+    assert any(w["path"] == str(repo) for w in out["worktrees"]), (
+        f"GIT_DIR redirected the sweep to another repository: {out}"
+    )
+
+    branches = await list_local_branches(str(repo), base="main")
+    assert "error" not in branches, branches
+    assert [b["branch"] for b in branches["branches"]] == ["main"], branches
+
+
+async def test_ls_remote_lines_it_cannot_parse_are_COUNTED_not_dropped(repo):
+    """The third sibling. Its two peers have counted unreadable lines from the
+    start; this one dropped them silently, so a PARTIAL parse was accepted as a
+    complete remote listing and the dropped branches forked into the wrong
+    class."""
+    from genesis.session_awareness import zero_drop_git as g
+
+    async def _partial(argv, timeout):
+        return 0, ("a" * 40) + "\trefs/heads/real\nnot-a-ref-line-at-all\n", ""
+
+    out = await g.list_remote_heads(str(repo), runner=_partial)
+    assert "error" in out, f"a partial parse was accepted as complete: {out}"
+    assert "unparseable" in out["error"]
+
+    async def _tags_only(argv, timeout):
+        return 0, ("b" * 40) + "\trefs/tags/v1\n", ""
+
+    # A server sending tags despite --heads is not a format change: it must not
+    # freeze the class on the unparsed path...
+    tagged = await g.list_remote_heads(str(repo), runner=_tags_only)
+    assert "unparseable" not in tagged.get("error", ""), tagged
+
+
+async def test_a_BINARY_conflict_resolution_counts_as_unique_work(repo):
+    """The sibling of the text-conflict case, and the predicate missed it.
+
+    A hand-resolved BINARY conflict produces a valid combined diff whose body
+    is ``Binary files differ`` — no line begins with ``+`` or ``-``, because
+    there are no textual hunks to show. MEASURED on git 2.43:
+
+        diff --cc f.bin
+        index 62830a0,080ea7c..0de5691
+        Binary files differ
+
+    The old predicate scanned for a leading ``+``/``-``, so it read that as an
+    empty combined diff and omitted the merge. A branch whose only novel tree
+    is such a merge then counted 0 and was suppressed as PUSH_BEHIND — the
+    false-clean this whole function exists to prevent, reappearing through a
+    door the text-conflict fix did not cover.
+
+    The predicate is now "the combined diff is non-empty at all", which is
+    what ``--cc`` already means by construction and needs no knowledge of what
+    git's diff body looks like. That is deliberate: every finding in this file
+    of the form "a git default lost information" came from a parser encoding a
+    belief about git's output, so the fix removes an assumption rather than
+    adding a second one.
+    """
+    from genesis.session_awareness.zero_drop_git import count_unique_work_commits
+
+    (repo / "f.bin").write_bytes(b"A\x00\x01\x02")
+    _git(repo, "add", "f.bin")
+    _git(repo, "commit", "-qm", "binary base")
+
+    # Two branches rewrite the SAME binary file, so the merge cannot resolve.
+    _git(repo, "checkout", "-q", "-b", "binconflict")
+    (repo / "f.bin").write_bytes(b"X\x00\xff\xfe")
+    _git(repo, "commit", "-qam", "their binary")
+    theirs = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    _git(repo, "checkout", "-q", "-")
+    (repo / "f.bin").write_bytes(b"B\x00\x40\x41")
+    _git(repo, "commit", "-qam", "our binary")
+
+    _git(repo, "merge", "binconflict", "-m", "merge binary", check=False)
+    # Resolve to a THIRD value: the tree exists in neither parent, so the
+    # resolution is real work living only here.
+    (repo / "f.bin").write_bytes(b"R\x00\x80\x81")
+    _git(repo, "add", "f.bin")
+    _git(repo, "commit", "-q", "--no-edit")
+    merged = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    # From their tip: "our binary" (1 non-merge) + the resolving merge (1).
+    # The old predicate returned 1 and the caller read that as PUSH_BEHIND.
+    assert await count_unique_work_commits(str(repo), theirs, merged) == 2, (
+        "a hand-resolved binary conflict is unique work and must be counted"
+    )
+
+
+async def test_a_branch_SHARING_A_NAME_WITH_A_TAG_is_emitted_unambiguously(repo):
+    """``%(refname:short)`` is ambiguity-sensitive; the identity must not be.
+
+    MEASURED on git 2.43: with both ``refs/heads/foo`` and ``refs/tags/foo``
+    present, ``for-each-ref --format='%(refname:short)' refs/heads`` emits
+    ``heads/foo`` — short enough to be unambiguous, which is exactly the
+    problem. The remote and the PR history both key on ``foo``, so the branch
+    matches NEITHER the ls-remote join nor the PR-name join, and an ahead
+    branch in that state is falsely reported as unpushed work with no PR.
+
+    This enumeration is already scoped to ``refs/heads``, so the prefix is a
+    known constant and ``lstrip=2`` removes exactly it — a fixed strip rather
+    than a context-sensitive abbreviation. The identity is the ack key, so a
+    name that changes shape when an unrelated tag appears would also expire a
+    standing acknowledgement.
+    """
+    _git(repo, "branch", "foo")
+    _git(repo, "tag", "foo")
+
+    out = await list_local_branches(str(repo), base="main")
+
+    assert "error" not in out, out
+    names = {b["branch"] for b in out["branches"]}
+    assert "foo" in names, f"the branch must be named as the remote names it: {names}"
+    assert "heads/foo" not in names, (
+        "a disambiguated short ref misses both the ls-remote and PR joins"
+    )

@@ -90,3 +90,45 @@ class TestStripMarkdown:
 
     def test_strikethrough(self):
         assert strip_markdown("~~struck~~") == "struck"
+class TestTruncationNeverSplitsADashPair:
+    """Two hyphens are ONE piece of punctuation, so a cut must not land between
+    them. On a chunked platform a split pair leaves a trailing hyphen on one
+    message and a leading one on the next. This is independent of the scrubber:
+    an author can type the pair directly.
+    """
+
+    def test_cut_landing_mid_pair_backs_off(self):
+        from genesis.content.formatter import ContentFormatter
+        from genesis.content.limits import get_limits
+        from genesis.content.types import FormatTarget
+
+        target = FormatTarget.DISCORD
+        limits = get_limits(target)
+        cut_at = limits.max_length - len(limits.truncation_suffix)
+        # Place the pair so the naive cut falls exactly between its hyphens.
+        text = "a" * (cut_at - 1) + "--" + "z" * 50
+
+        out = ContentFormatter().format(text, target).text
+        body = out[: -len(limits.truncation_suffix)]
+        assert not body.endswith("-"), "truncation split a dash pair"
+
+    def test_control_oversized_text_is_still_truncated(self):
+        """Without this, a change that stopped truncating would pass above."""
+        from genesis.content.formatter import ContentFormatter
+        from genesis.content.limits import get_limits
+        from genesis.content.types import FormatTarget
+
+        target = FormatTarget.DISCORD
+        limits = get_limits(target)
+        out = ContentFormatter().format("b" * (limits.max_length + 500), target)
+        assert out.truncated is True
+        assert len(out.text) <= limits.max_length
+
+    def test_control_text_under_the_limit_is_untouched(self):
+        from genesis.content.formatter import ContentFormatter
+        from genesis.content.types import FormatTarget
+
+        text = "a short message--with an earned dash."
+        out = ContentFormatter().format(text, FormatTarget.DISCORD)
+        assert out.text == text
+        assert out.truncated is False

@@ -1,7 +1,8 @@
 {
     "env": {
         "DISABLE_AUTOUPDATER": "1",
-        "DISABLE_UPDATES": "1"
+        "DISABLE_UPDATES": "1",
+        "MCP_TIMEOUT": "120000"
     },
     "cleanupPeriodDays": 180,
     "attribution": {
@@ -302,6 +303,16 @@
                 "hooks": [
                     {
                         "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/capped_read_advisory.py",
+                        "timeout": 10
+                    }
+                ]
+            },
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook review_enforcement_commit.py",
                         "timeout": 10
                     }
@@ -355,6 +366,26 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/agent_tool_guidance.py",
+                        "timeout": 10
+                    }
+                ]
+            },
+            {
+                "matcher": "EnterPlanMode|ExitPlanMode",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/plan_confidence_reminder.py",
+                        "timeout": 10
+                    }
+                ]
+            },
+            {
+                "matcher": "AskUserQuestion",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/ask_gate_menu.py",
                         "timeout": 10
                     }
                 ]
