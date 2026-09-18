@@ -39,8 +39,9 @@ from pathlib import Path
 from typing import Any
 
 from genesis.cc.foreground_reaper_config import effective_mode, knob_int, load_config
-from genesis.db.crud import cc_sessions, observations
+from genesis.db.crud import cc_sessions, observations, session_heartbeats
 from genesis.env import cc_project_dir
+from genesis.observability.cc_slots import read_proc_start_iso
 from genesis.session_awareness.transcript import _assistant_text, typed_prompt_text
 
 logger = logging.getLogger(__name__)
@@ -284,6 +285,63 @@ async def _observe(
         )
 
 
+_PROC_ROOT = "/proc"
+
+
+def _pid_dead(pid: int, row: dict) -> bool:
+    """Death-proof for a terminal-registered row's recorded pid.
+
+    True only on POSITIVE evidence the recorded process is gone: /proc entry
+    absent (ENOENT/ESRCH — a MISSING entry, not merely an unreadable one:
+    EACCES from a hidepid mount or another uid is "cannot see", which must
+    fail open), comm no longer ``claude``, or the process at that pid
+    started after the row's newest liveness stamp (pid recycled). The
+    anchor is max(started_at, last_activity_at), NOT started_at alone: a
+    ``--resume`` reopens the row with a NEW pid in the same write that
+    stamps last_activity_at, so the fresh process always starts BEFORE the
+    anchor — anchoring to the original started_at would read every resumed
+    session as recycled. A genuinely recycled pid began after the session's
+    last sign of life, so detection is preserved; any miss fails open into
+    the 24h path. Unknown start time → False (fail-open, matching
+    ``read_proc_start_iso``'s own contract).
+    """
+    proc = Path(_PROC_ROOT) / str(pid)
+    try:
+        comm = (proc / "comm").read_text().strip()
+    except (FileNotFoundError, ProcessLookupError):
+        return True  # the pid does not exist — positive death evidence
+    except (OSError, UnicodeError):
+        # Unreadable (permissions, /proc hiccup) or undecodable (a reused pid
+        # whose comm has invalid bytes for the locale) — fail open; one bad
+        # candidate must not abort the pass for every other stale row.
+        return False
+    if comm != "claude":
+        return True
+    anchor = max(
+        (t for t in (row.get("started_at"), row.get("last_activity_at")) if t),
+        default=None,
+    )
+    if not anchor:
+        return False
+    started = read_proc_start_iso(pid)
+    if started is None:
+        return False
+    return started > anchor
+
+
+async def _fresh_heartbeat_ids(db: Any, *, now: datetime) -> set[str]:
+    """cc_session_ids with a heartbeat inside the freshness window — the
+    ALIVE-proof set. Injectable ``now`` (no wall clock) so tests and the
+    reaper share one cutoff; the window is the heartbeats table's own
+    staleness convention."""
+    cutoff = (now - session_heartbeats._STALE_THRESHOLD).isoformat()
+    cur = await db.execute(
+        "SELECT cc_session_id FROM session_heartbeats WHERE updated_at > ?",
+        (cutoff,),
+    )
+    return {r[0] for r in await cur.fetchall()}
+
+
 async def _process_row(
     rt: Any,
     db: Any,
@@ -291,12 +349,23 @@ async def _process_row(
     *,
     now: datetime,
     cutoff: datetime,
+    age_cutoff: datetime | None = None,
     mode: str,
     result: dict,
 ) -> None:
     """Reap one dark row (checkpoint → classify → observe/notify). Isolated per
-    row by the caller so one bad row cannot abort the pass."""
-    won = await cc_sessions.checkpoint_dark(db, row["id"], checkpointed_at=now.isoformat())
+    row by the caller so one bad row cannot abort the pass.
+
+    ``age_cutoff`` is the unanswered-turn age guard for THIS row's eligibility
+    evidence: rows admitted on PID-proven death use the dead-process cutoff
+    (a dead process cannot be a mid-flight turn), while timestamp-only rows
+    keep the full idle cutoff. Defaults to ``cutoff``."""
+    won = await cc_sessions.checkpoint_dark(
+        db,
+        row["id"],
+        checkpointed_at=now.isoformat(),
+        expected_last_activity=row.get("last_activity_at"),
+    )
     if not won:
         # A concurrent turn revived the row between the query and this write.
         return
@@ -312,14 +381,15 @@ async def _process_row(
         result["shadow"] += 1
 
     # Notify-eligible = a CRISP dead request we should tell the user about:
-    # unanswered user turn, in notify mode, the turn itself older than the idle
-    # cutoff (age guard — excludes a mid-flight long turn whose session-level
-    # last_activity is merely stale), and not already owned by the rate-limit
-    # park / dispatch machinery.
+    # unanswered user turn, in notify mode, the turn itself older than the
+    # eligibility cutoff (age guard — on the 24h path this excludes a
+    # mid-flight long turn whose session-level last_activity is merely stale;
+    # a PID-proven death carries no such ambiguity), and not already owned by
+    # the rate-limit park / dispatch machinery.
     notify_eligible = (
         signal == "unanswered_user"
         and mode == "notify"
-        and _ts_older_than(tail_ts, cutoff)
+        and _ts_older_than(tail_ts, age_cutoff if age_cutoff is not None else cutoff)
         and not await _covered_by_other_subsystem(db, row["id"])
     )
     notified = False
@@ -349,12 +419,20 @@ async def reap_dark_foreground(
     now: datetime | None = None,
     idle_hours: int | None = None,
     mode: str | None = None,
+    dead_only: bool = False,
 ) -> dict:
     """One reaper pass. Returns a summary dict (mode/scanned/reaped/notified/shadow).
 
     Safe to call from the ``session_reaper`` job. Never raises for a per-row
     problem (each row is isolated); a catastrophic failure (bad db) surfaces to
     the caller's try/except.
+
+    ``dead_only=True`` skips the 24h-idle query and runs ONLY the dead-pid
+    fast path — it exists for the separate frequent job that sweeps dead
+    processes at the ``dead_process_minutes`` cadence, because the primary
+    ``session_reaper`` job runs only a few times a day and a dead process
+    would otherwise wait hours for the evidence path that was built to
+    catch it early.
     """
     result = {"mode": None, "scanned": 0, "reaped": 0, "notified": 0, "shadow": 0}
     db = getattr(rt, "_db", None)
@@ -373,7 +451,42 @@ async def reap_dark_foreground(
     now = now or datetime.now(UTC)
     cutoff = now - timedelta(hours=idle_hours)
 
-    rows = await cc_sessions.query_stale_foreground(db, older_than=cutoff.isoformat())
+    rows = (
+        []
+        if dead_only
+        else await cc_sessions.query_stale_foreground(db, older_than=cutoff.isoformat())
+    )
+
+    # Evidence-based fast path (2026-09-04, the 6.5h ghost): a terminal-
+    # registered row (pid known, id == cc_session_id) whose recorded process
+    # is provably GONE need not wait out the 24h idle gate — a dead session
+    # is dark the moment it dies. Same target state (checkpointed — dead but
+    # resumable), same per-row flow, just earlier; the lever grants no new
+    # authority, so it rides the existing mode gate.
+    dead_ids: set[str] = set()
+    dead_cutoff = cutoff
+    if cfg.get("close_dead", True) is True:
+        dead_cutoff = now - timedelta(minutes=knob_int(cfg, "dead_process_minutes"))
+        fast_rows = await cc_sessions.query_dead_candidate_foreground(
+            db, older_than=dead_cutoff.isoformat()
+        )
+        seen = {r["id"] for r in rows}
+        for row in fast_rows:
+            if row["id"] in seen:
+                continue  # already in the 24h set; process once
+            if _pid_dead(row["pid"], row):
+                dead_ids.add(row["id"])
+                rows.append(row)
+
+    # ALIVE-proof outranks everything, on BOTH paths: a fresh heartbeat means
+    # the session is running right now — a 25h-idle-at-prompt session must
+    # not be checkpointed under an active user, and a "dead pid" verdict on a
+    # heartbeating row means OUR pid evidence is stale, not the session.
+    # Heartbeat ABSENCE proves nothing (idle-at-prompt sessions don't beat).
+    fresh = await _fresh_heartbeat_ids(db, now=now)
+    if fresh:
+        rows = [r for r in rows if r.get("cc_session_id") not in fresh]
+
     result["scanned"] = len(rows)
     if len(rows) > max_per_tick:
         logger.warning(
@@ -386,7 +499,16 @@ async def reap_dark_foreground(
 
     for row in rows:
         try:
-            await _process_row(rt, db, row, now=now, cutoff=cutoff, mode=mode, result=result)
+            await _process_row(
+                rt,
+                db,
+                row,
+                now=now,
+                cutoff=cutoff,
+                age_cutoff=dead_cutoff if row["id"] in dead_ids else cutoff,
+                mode=mode,
+                result=result,
+            )
         except Exception:
             logger.warning(
                 "foreground reaper: processing failed for %s",

@@ -1270,6 +1270,33 @@ async def init(rt: GenesisRuntime) -> None:
             max_instances=1,
             misfire_grace_time=3600,
         )
+        # The dead-pid fast path needs its own frequent cadence: on the
+        # 6-hourly session_reaper a dead terminal process would sit 'active'
+        # for up to ~6h, voiding the early-evidence path entirely. dead_only
+        # keeps this pass to the cheap candidate query + /proc check.
+        async def _reap_dead_foreground() -> None:
+            try:
+                from genesis.cc.foreground_reaper import reap_dark_foreground
+
+                await reap_dark_foreground(rt, dead_only=True)
+                rt.record_job_success("session_reaper_dead_pid")
+            except Exception as exc:
+                rt.record_job_failure("session_reaper_dead_pid", exc=exc)
+                logger.warning("Foreground dead-pid sweep failed", exc_info=True)
+
+        from apscheduler.triggers.interval import IntervalTrigger
+
+        from genesis.cc.foreground_reaper_config import knob_int, load_config
+
+        rt._learning_scheduler.add_job(
+            _reap_dead_foreground,
+            IntervalTrigger(
+                minutes=knob_int(load_config(), "dead_process_minutes"),
+            ),
+            id="session_reaper_dead_pid",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
         # The boot-time sweep kick for this job lives at the END of
         # GenesisRuntime.bootstrap() (not here) — session end-hooks (e.g. the
         # ego's dispatch-outcome tracker) register during LATER init steps,
