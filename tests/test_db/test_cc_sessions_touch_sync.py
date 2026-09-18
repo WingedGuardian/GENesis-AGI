@@ -15,7 +15,10 @@ import aiosqlite
 import pytest
 
 from genesis.db.crud import cc_sessions as crud
-from genesis.db.crud.cc_sessions import touch_terminal_session_row_sync
+from genesis.db.crud.cc_sessions import (
+    register_terminal_session_sync,
+    touch_terminal_session_row_sync,
+)
 from genesis.db.schema import create_all_tables
 
 
@@ -100,8 +103,16 @@ async def test_voice_row_untouched(file_db):
 
 
 def test_missing_db_is_silent(tmp_path):
-    """Best-effort contract: no DB, no error, no delay."""
-    touch_terminal_session_row_sync(str(tmp_path / "absent.db"), "x")
+    """Best-effort contract: no DB, no error, no delay — and NO FILE. The
+    documented contract is "never creates the DB file": sqlite3.connect
+    creates one on open, so the helpers must open mode=rw (a missing path
+    raises, is swallowed, and nothing is left behind — file existence is
+    the bootstrap signal register_cc_session.py's pre-bootstrap guard reads)."""
+    absent = tmp_path / "absent.db"
+    touch_terminal_session_row_sync(str(absent), "x")
+    assert not absent.exists()
+    register_terminal_session_sync(str(absent), "y")
+    assert not absent.exists()
 
 
 def test_failed_row_not_reopened(tmp_path):

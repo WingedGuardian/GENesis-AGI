@@ -151,13 +151,18 @@ async def cc_sessions(
         # where the discipline has stamped it, else the best-known end proxy —
         # which also keeps historical unstamped rows countable with no
         # backfill migration.
+        # All day/hour-level cutoffs compare through julianday() on BOTH
+        # operands: the stored values are ISO-8601 text with 'T' while
+        # datetime('now', …) renders with a space, and 'T' sorts after ' '
+        # — a lexical compare would admit nearly-48h-old rows on the cutoff
+        # calendar date.
         cursor = await db.execute(
             """SELECT session_type,
                       AVG((julianday(COALESCE(completed_at, last_activity_at))
                            - julianday(started_at)) * 86400000.0) as avg_ms
                FROM cc_sessions
                WHERE status = 'completed'
-                 AND COALESCE(completed_at, last_activity_at) >= datetime('now', '-1 day')
+                 AND julianday(COALESCE(completed_at, last_activity_at)) >= julianday('now', '-1 day')
                GROUP BY session_type"""
         )
         for row in await cursor.fetchall():
@@ -167,7 +172,7 @@ async def cc_sessions(
         cursor = await db.execute(
             """SELECT COUNT(*) as cnt FROM cc_sessions
                WHERE status = 'failed'
-                 AND COALESCE(completed_at, last_activity_at) >= datetime('now', '-1 day')"""
+                 AND julianday(COALESCE(completed_at, last_activity_at)) >= julianday('now', '-1 day')"""
         )
         row = await cursor.fetchone()
         failed_24h = row["cnt"] if row else 0
@@ -180,7 +185,7 @@ async def cc_sessions(
         cursor = await db.execute(
             """SELECT strftime('%Y-%m-%d %H:00:00', started_at) as hour, COUNT(*) as cnt
                FROM cc_sessions
-               WHERE started_at >= datetime('now', '-24 hours')
+               WHERE julianday(started_at) >= julianday('now', '-24 hours')
                GROUP BY hour ORDER BY hour"""
         )
         hourly_data = [(row[0], row[1]) for row in await cursor.fetchall()]
@@ -218,7 +223,7 @@ async def cc_sessions(
         cursor = await db.execute(
             """SELECT COUNT(*) FROM cc_sessions
                WHERE rate_limited_at IS NOT NULL
-                 AND rate_limited_at >= datetime('now', '-1 day')"""
+                 AND julianday(rate_limited_at) >= julianday('now', '-1 day')"""
         )
         row = await cursor.fetchone()
         rate_limited_24h = row[0] if row else 0

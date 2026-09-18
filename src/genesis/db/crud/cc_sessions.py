@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
+from urllib.parse import quote
 
 import aiosqlite
 
@@ -185,7 +186,12 @@ def register_terminal_session_sync(
 
     now = datetime.now(UTC).isoformat()
     try:
-        with sqlite3.connect(db_path, timeout=1.0) as conn:
+        # mode=rw: open read-write WITHOUT creating — a missing file raises
+        # OperationalError (swallowed below) instead of leaving a stray empty
+        # DB behind, which would fool the caller's exists() pre-bootstrap guard.
+        with sqlite3.connect(
+            f"file:{quote(str(db_path), safe='/')}?mode=rw", uri=True, timeout=1.0
+        ) as conn:
             cur = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cc_sessions'"
             )
@@ -236,7 +242,10 @@ def touch_terminal_session_row_sync(db_path: str, cc_session_id: str) -> None:
 
     now = datetime.now(UTC).isoformat()
     try:
-        with sqlite3.connect(db_path, timeout=1.0) as conn:
+        # mode=rw for the same reason as the registration write above.
+        with sqlite3.connect(
+            f"file:{quote(str(db_path), safe='/')}?mode=rw", uri=True, timeout=1.0
+        ) as conn:
             conn.execute(
                 "UPDATE cc_sessions SET last_activity_at = ?, status = 'active', "
                 "completed_at = NULL "

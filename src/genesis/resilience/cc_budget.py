@@ -56,7 +56,8 @@ class CCBudgetTracker:
         cutoff = (self._clock() - timedelta(hours=1)).isoformat()
         cursor = await self._db.execute(
             """SELECT COUNT(*) FROM cc_sessions
-               WHERE started_at > ? AND status IN ('active', 'completed', 'expired')
+               WHERE started_at > ?
+                 AND status IN ('active', 'completed', 'expired', 'checkpointed', 'failed')
                  AND source_tag != 'voice'""",
             (cutoff,),
         )

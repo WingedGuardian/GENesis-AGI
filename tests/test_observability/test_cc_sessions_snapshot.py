@@ -110,3 +110,26 @@ async def test_stat_queries_reference_only_real_columns(db):
             - {"datetime"}
         )
         assert not fake, f"SQL references non-existent columns: {sorted(fake)}"
+
+
+async def test_24h_cutoff_compares_as_dates_not_text(db):
+    """Stored timestamps are ISO text with 'T'; datetime('now', ...) renders
+    with a space, and 'T' sorts after ' ' — so a row older than 24h but on the
+    cutoff's CALENDAR DATE passed the lexical compare. julianday() on both
+    operands excludes it."""
+    now = datetime.now(UTC)
+    boundary = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    started = (boundary - timedelta(hours=2)).isoformat()
+    await crud.create(
+        db,
+        id="edge",
+        session_type="foreground",
+        model="sonnet",
+        effort="medium",
+        status="active",
+        started_at=started,
+        last_activity_at=started,
+    )
+    await crud.update_status(db, "edge", status="failed", ts=boundary.isoformat())
+    snap = await snapshot(db, None, None)
+    assert snap["failed_24h"] == 0

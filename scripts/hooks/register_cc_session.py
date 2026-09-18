@@ -91,13 +91,19 @@ def main() -> None:
     except Exception:
         return
 
-    model = None
-    try:
-        from session_heartbeat import cached_model
+    # Prefer the model THIS hook's own payload carries: SessionStart hooks run
+    # in parallel with no ordering guarantee, so the cache genesis_session_
+    # context writes may not exist yet — a cache-only read permanently stores
+    # 'unknown'. The cache remains the --resume fallback (payload model can be
+    # absent on some hook events).
+    model = str(payload.get("model") or "") or None
+    if model is None:
+        try:
+            from session_heartbeat import cached_model
 
-        model = cached_model(sid)
-    except Exception:
-        model = None
+            model = cached_model(sid)
+        except Exception:
+            model = None
 
     try:
         from genesis.db.crud.cc_sessions import register_terminal_session_sync

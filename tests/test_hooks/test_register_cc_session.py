@@ -191,3 +191,38 @@ def test_pre_migration_table_guard(tmp_path):
     conn = sqlite3.connect(db_file)
     assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='cc_sessions'").fetchone() is None
     conn.close()
+
+
+class TestModelSource:
+    @pytest.mark.asyncio
+    async def test_payload_model_wins_over_empty_cache(self, tmp_path, monkeypatch):
+        """SessionStart hooks run in parallel with no ordering — the context
+        hook's model cache may not exist yet. The registration payload itself
+        carries `model`; prefer it and keep the cache as the resume fallback."""
+        import genesis.env
+        from genesis.db.schema import create_all_tables
+
+        mod = _load()
+        sid = "s-payload-model"
+        monkeypatch.setattr(mod, "read_payload", lambda: {"session_id": sid, "model": "opus-x"})
+        monkeypatch.setattr(mod, "_claude_ancestor", lambda _pid: (200, ["claude"]))
+        monkeypatch.setattr(mod.os, "getppid", lambda: 300)
+
+        db_file = tmp_path / "genesis.db"
+        conn = await aiosqlite.connect(db_file)
+        await create_all_tables(conn)
+        await conn.commit()
+        await conn.close()
+
+        monkeypatch.setattr(genesis.env, "genesis_db_path", lambda: db_file)
+
+        import session_heartbeat
+
+        monkeypatch.setattr(session_heartbeat, "cached_model", lambda _sid: "cache-loses")
+
+        mod.main()
+
+        row = sqlite3.connect(db_file).execute(
+            "SELECT model FROM cc_sessions WHERE id = ?", (sid,)
+        ).fetchone()
+        assert row and row[0] == "opus-x"

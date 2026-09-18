@@ -310,8 +310,11 @@ def _pid_dead(pid: int, row: dict) -> bool:
         comm = (proc / "comm").read_text().strip()
     except (FileNotFoundError, ProcessLookupError):
         return True  # the pid does not exist — positive death evidence
-    except OSError:
-        return False  # unreadable (permissions, /proc hiccup) — fail open
+    except (OSError, UnicodeError):
+        # Unreadable (permissions, /proc hiccup) or undecodable (a reused pid
+        # whose comm has invalid bytes for the locale) — fail open; one bad
+        # candidate must not abort the pass for every other stale row.
+        return False
     if comm != "claude":
         return True
     anchor = max(
@@ -404,12 +407,20 @@ async def reap_dark_foreground(
     now: datetime | None = None,
     idle_hours: int | None = None,
     mode: str | None = None,
+    dead_only: bool = False,
 ) -> dict:
     """One reaper pass. Returns a summary dict (mode/scanned/reaped/notified/shadow).
 
     Safe to call from the ``session_reaper`` job. Never raises for a per-row
     problem (each row is isolated); a catastrophic failure (bad db) surfaces to
     the caller's try/except.
+
+    ``dead_only=True`` skips the 24h-idle query and runs ONLY the dead-pid
+    fast path — it exists for the separate frequent job that sweeps dead
+    processes at the ``dead_process_minutes`` cadence, because the primary
+    ``session_reaper`` job runs only a few times a day and a dead process
+    would otherwise wait hours for the evidence path that was built to
+    catch it early.
     """
     result = {"mode": None, "scanned": 0, "reaped": 0, "notified": 0, "shadow": 0}
     db = getattr(rt, "_db", None)
@@ -428,7 +439,11 @@ async def reap_dark_foreground(
     now = now or datetime.now(UTC)
     cutoff = now - timedelta(hours=idle_hours)
 
-    rows = await cc_sessions.query_stale_foreground(db, older_than=cutoff.isoformat())
+    rows = (
+        []
+        if dead_only
+        else await cc_sessions.query_stale_foreground(db, older_than=cutoff.isoformat())
+    )
 
     # Evidence-based fast path (2026-09-04, the 6.5h ghost): a terminal-
     # registered row (pid known, id == cc_session_id) whose recorded process
