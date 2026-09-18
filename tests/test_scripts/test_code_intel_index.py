@@ -1157,18 +1157,15 @@ def test_oom_score_adj_keeps_a_higher_inherited_value(tmp_path):
     fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
     _fake_tools(fakebin, log)
     repo = _make_repo(tmp_path)
-    # Raise THIS process; the entrypoint inherits it. Restore the ORIGINAL value,
-    # not a hardcoded 0 — this is global process state shared with every later
-    # test in the session, and the value is not 0 everywhere: a GitHub runner
-    # starts at 500 (measured), so resetting to 0 would silently change what
-    # _inherited_oom_adj() returns for the cells that assert on it.
-    adj = Path("/proc/self/oom_score_adj")
-    original = adj.read_text().strip()
-    adj.write_text("1000\n")
-    try:
-        res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
-    finally:
-        adj.write_text(f"{original}\n")
+    # Change only subprocess state. Mutating the pytest parent would contaminate
+    # later tests if restoration failed or the test process were interrupted.
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        preexec_fn=lambda: Path("/proc/self/oom_score_adj").write_text("1000\n"),
+    )
     assert res.returncode == 0, res.stderr
     assert "OOM_ADJ:1000" in log.read_text(), (
         "the inherited maximum did not reach the disposable child"
@@ -1181,16 +1178,14 @@ def test_explicit_override_cannot_lower_child_preference(tmp_path):
     fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
     _fake_tools(fakebin, log)
     repo = _make_repo(tmp_path)
-    adj = Path("/proc/self/oom_score_adj")
-    original = adj.read_text().strip()
-    adj.write_text("800\n")
-    try:
-        res = _run_entry(
-            tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
-            env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "321"},
-        )
-    finally:
-        adj.write_text(f"{original}\n")
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "321"},
+        preexec_fn=lambda: Path("/proc/self/oom_score_adj").write_text("800\n"),
+    )
     assert res.returncode != 0
     assert "requires 1000" in res.stderr
     assert not log.exists() or "codebase-memory-mcp ARGS:" not in log.read_text()
