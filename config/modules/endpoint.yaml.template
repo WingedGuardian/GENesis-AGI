@@ -61,13 +61,15 @@ endpoint:
   # never a public address.
   allowed_networks: [lan, tailnet]
 
-# NO health_check BLOCK, deliberately. Configuring one activates the inherited
-# SSH probe, which runs `<remote_claude_path> --version` — a Claude Code check,
-# not a machine check. On a Windows endpoint that returns non-zero, so the module
-# would register permanently unhealthy and refuse every operation while the
-# dashboard showed an error. WindowsEndpointAdapter overrides check_health with a
-# probe that asks the right question (is the state dir reachable), which is
-# exactly the precondition a mission needs.
+# NO health_check BLOCK, deliberately. Configuring one makes the inherited
+# register() run the SSH health probe — `<remote_claude_path> --version`, a
+# Claude Code check, not a machine check — at registration on every boot. On a
+# Windows endpoint that probe fails where the machine is fine, which marks the
+# module unhealthy at startup and errors the dashboard until the first cached
+# check refreshes. WindowsEndpointAdapter overrides check_health with a probe
+# that asks the right question — can we reach the machine and run a command on
+# it (`powershell exit 0` over the SSH transport) — which is exactly the
+# precondition a mission needs.
 
 lifecycle:
   ssh_host: "user@host-or-ip"

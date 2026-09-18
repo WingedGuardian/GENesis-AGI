@@ -10,9 +10,10 @@ import made four tools appear in the standalone MCP and answer
 absent, which is a different failure, not a fixed one.
 
 The standalone server now wires them DB-only, the same split
-``init_campaign_tools(runner=None, db=db)`` already uses. Two of the four then
-work; the two that need the live scheduler say so, because the scheduler exists
-only in the server process and no amount of wiring here can conjure one.
+``init_campaign_tools(runner=None, db=db)`` already uses — and that is all
+four tools, not two: the DB is the shared channel to the server's scheduler,
+which reconciles the table into APScheduler on an interval. ``run_now``
+stamps ``run_requested_at`` and the server dispatches and clears it.
 
 Note the alternative pattern, so a future author picks deliberately rather than
 by accident: ``task_tools`` takes no injection at all in this process — it falls
@@ -190,22 +191,46 @@ async def test_with_no_db_the_message_does_not_advertise_db_backed_tools():
 
 
 @pytest.mark.asyncio
-async def test_with_a_db_but_no_scheduler_the_message_names_the_server(tmp_path):
-    """The state the standalone MCP actually runs in."""
+async def test_with_a_db_but_no_scheduler_mutations_still_work(tmp_path):
+    """The state the standalone MCP actually runs in — and it is not dead.
+
+    Scheduler-less mutations write the DB; the server-side scheduler's
+    reconcile loop applies them. ``run_now`` stamps ``run_requested_at``
+    rather than erroring — the server dispatches it on its next tick.
+    """
     import aiosqlite
 
+    from genesis.db.crud import user_jobs as crud
     from genesis.db.schema import TABLES
     from genesis.mcp.health import user_job_tools as t
 
     db = await aiosqlite.connect(tmp_path / "t.db")
     db.row_factory = aiosqlite.Row
     await db.execute(TABLES["user_jobs"])
+    await db.execute(TABLES["user_job_runs"])
     await db.commit()
     try:
         t.init_user_job_tools(db=db, scheduler=None)
-        control = await t.user_job_control.fn(job_id="x", action="pause")
-        assert "running Genesis server" in control["error"], control
-        assert "user_job_list" in control["error"], "say what DOES work here"
+
+        created = await t.user_job_create.fn(
+            title="x", cron_expression="0 2 * * 0", dispatch_prompt="p"
+        )
+        assert created.get("success") is True, created
+        job_id = created["job_id"]
+
+        paused = await t.user_job_control.fn(job_id=job_id, action="pause")
+        assert paused == {"success": True, "action": "paused", "job_id": job_id}, paused
+        job = await crud.get_job(db, job_id)
+        assert job["status"] == "paused"
+
+        run = await t.user_job_control.fn(job_id=job_id, action="run_now")
+        assert run["success"] is True and run["action"] == "queued", run
+        job = await crud.get_job(db, job_id)
+        assert job["run_requested_at"] is not None
+
+        deleted = await t.user_job_control.fn(job_id=job_id, action="delete")
+        assert deleted["success"] is True, deleted
+        assert await crud.get_job(db, job_id) is None
     finally:
         t.init_user_job_tools(db=None, scheduler=None)
         await db.close()

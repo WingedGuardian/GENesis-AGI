@@ -290,8 +290,12 @@ class WindowsEndpointAdapter(ExternalProgramAdapter):
                 "declares no `endpoint:` config block"
             )
         for required in ("state_dir", "mission_command", "machine_id"):
-            if not getattr(ep, required, None):
-                raise ValueError(f"module '{config.name}': endpoint.{required} is required")
+            value = getattr(ep, required, None)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"module '{config.name}': endpoint.{required} must be a "
+                    "non-empty string"
+                )
 
         # Only state_dir is embedded in a remote string literal. mission_command
         # is passed VERBATIM to the remote shell (see dispatch_mission), so
@@ -337,6 +341,15 @@ class WindowsEndpointAdapter(ExternalProgramAdapter):
                     f"{label} command is {_cmd_units(cmd)} UTF-16 code units against "
                     f"a {_CMD_LINE_MAX} limit before any payload is added"
                 )
+        # Same cap, no state_dir involved: mission_command is sent verbatim as
+        # the SHELL step, so an over-limit one is a config error best caught
+        # here rather than on the first dispatch's remote refusal.
+        if _cmd_units(ep.mission_command) > _CMD_LINE_MAX:
+            raise ValueError(
+                f"module '{config.name}': endpoint.mission_command is "
+                f"{_cmd_units(ep.mission_command)} UTF-16 code units against a "
+                f"{_CMD_LINE_MAX} limit — cmd.exe refuses it before it runs"
+            )
         # BACKSTOP, and currently UNREACHABLE — said plainly rather than left to
         # look like live cover. MEASURED against the exact command strings in
         # this file: the prepare command embeds state_dir THREE times and
@@ -486,9 +499,10 @@ class WindowsEndpointAdapter(ExternalProgramAdapter):
         deleted; no faked transport can produce it, because a fake answers every
         probe the same way.
         """
-        # This method IS the real probe, so it owns the flag — set BEFORE any
-        # assignment to _healthy, whose getter reads it.
-        self._probed_once = True
+        # This method IS the real probe, so it owns the flag — but the flag
+        # moves only once a verdict exists. Setting it before the await let a
+        # concurrent check_health_cached see _probed_once=True mid-flight and
+        # serve the gated (still-false) result as a finished verdict.
         probe = 'powershell -NoProfile -Command "exit 0"'
         try:
             # Its OWN short budget, not the module's work timeout. Without this
@@ -499,9 +513,11 @@ class WindowsEndpointAdapter(ExternalProgramAdapter):
                 probe, data={"timeout_s": _HEALTH_PROBE_TIMEOUT}, method="SHELL"
             )
         except Exception as exc:  # transport must never take the runtime down
+            self._probed_once = True
             self._healthy = False
             self._last_health_error = str(exc)
             return False
+        self._probed_once = True
         self._healthy = res.get("exit_code") == 0 and not res.get("error")
         self._last_health_error = (
             None
@@ -650,19 +666,24 @@ class WindowsEndpointAdapter(ExternalProgramAdapter):
         # remote machine — a worse lie than the one the gate prevents. Resolving
         # here and holding it keeps the refusal where this method's contract
         # says it is: before any I/O.
-        async with self._ipc.one_verdict():
-            # Then LIVE state. With no health_check block configured (the shape
-            # the template ships) register() sets _healthy True WITHOUT probing,
-            # and nothing else on this path revises it — so without this refresh
-            # the gate would only reflect a verdict some unrelated dashboard
-            # render happened to collect, which reads as live and is not. Cached
-            # (60s TTL) and bounded at _HEALTH_PROBE_TIMEOUT.
+        # The verdict is taken INSIDE the dispatch lock: a mission that waits
+        # behind a minutes-long in-flight dispatch must not hold a network
+        # verdict resolved before it queued — the host could have been
+        # reconfigured away in the meantime. Resolving after the lock keeps
+        # the verdict fresh at the moment the wire steps actually run.
+        async with self._dispatch_lock, self._ipc.one_verdict():
+            # Then LIVE state. With no health_check block configured (the
+            # shape the template ships) register() sets _healthy True
+            # WITHOUT probing, and nothing else on this path revises it —
+            # so without this refresh the gate would only reflect a
+            # verdict some unrelated dashboard render happened to
+            # collect, which reads as live and is not. Cached (60s TTL)
+            # and bounded at _HEALTH_PROBE_TIMEOUT.
             await self.check_health_cached()
             if not self._healthy:
                 return {"error": f"Module '{self.name}' is not healthy"}
 
-            async with self._dispatch_lock:
-                return await self._dispatch_locked(raw, mission_id)
+            return await self._dispatch_locked(raw, mission_id)
 
     async def _dispatch_locked(self, raw: bytes, mission_id: str) -> dict[str, Any]:
         # Prepare FIRST: create the state dir and drop any previous reply.

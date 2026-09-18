@@ -306,10 +306,25 @@ def harvest(
     return deduped
 
 
+# Tailscale's well-known IPv6 /48 prefix is the SAME on every tailnet and
+# appears in public documentation and in code that legitimately classifies
+# tailnet traffic. Harvested from a live address it looks install-specific
+# and then blocks PRs that reference it (observed: an endpoint adapter's
+# tailnet-v6 constant plus its test, match count 2). The hextets are joined
+# at import rather than written verbatim: this file IS the generator, and a
+# literal here would itself scan as a private pattern on any diff that
+# touches it — self-tripping the gate it fixes.
+_WELL_KNOWN_ULA_PREFIXES = frozenset(
+    ":".join(parts) for parts in (("fd7a", "115c"),)
+)
+
+
 def _harvest_ula_prefixes() -> list[str]:
     """First-two-hextet IPv6 ULA prefixes (RFC 4193) from ``ip -6 addr``.
 
-    Returns ``[]`` if ``ip`` is absent, errors, or times out — never raises.
+    Well-known PUBLIC ULA prefixes (see ``_WELL_KNOWN_ULA_PREFIXES``) are not
+    install-specific and are skipped. Returns ``[]`` if ``ip`` is absent,
+    errors, or times out — never raises.
     """
     try:
         proc = subprocess.run(
@@ -334,6 +349,8 @@ def _harvest_ula_prefixes() -> list[str]:
         if len(hextets) < 2 or not hextets[0] or not hextets[1]:
             continue
         prefix = f"{hextets[0]}:{hextets[1]}"
+        if prefix in _WELL_KNOWN_ULA_PREFIXES:
+            continue
         if prefix not in seen:
             seen.add(prefix)
             prefixes.append(prefix)

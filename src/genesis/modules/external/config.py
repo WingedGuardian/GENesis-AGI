@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 from genesis.modules.config_schema import ConfigField, infer_field_type
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -50,6 +53,28 @@ class LifecycleConfig:
 
 
 _KNOWN_NETWORKS = ("lan", "tailnet")
+
+
+def _positive_number(raw, default):
+    """Normalize a numeric config field; invalid values fall back to default.
+
+    An unvalidated timeout reaches ``min()`` inside the transport layer as
+    a raw YAML scalar — a string raises TypeError there, a bool silently
+    becomes 1s, and a negative kills the subprocess instantly. None of
+    those errors name the config key that caused them. Falls back rather
+    than raising so a bad value degrades visibly (a warning here) instead
+    of deleting the module.
+    """
+    if (
+        isinstance(raw, (int, float))
+        and not isinstance(raw, bool)
+        and raw > 0
+    ):
+        return raw
+    logger.warning(
+        "Invalid numeric config value %r — using default %s", raw, default
+    )
+    return default
 
 
 def _validated_networks(raw):
@@ -145,13 +170,15 @@ class ProgramConfig:
         ipc = IPCConfig(
             method=ipc_data.get("method", "http"),
             url=ipc_data.get("url"),
-            timeout=ipc_data.get("timeout", 30),
+            timeout=_positive_number(ipc_data.get("timeout", 30), 30),
             command=ipc_data.get("command", []),
             working_dir=Path(ipc_data["working_dir"]) if ipc_data.get("working_dir") else None,
             env=ipc_data.get("env", {}),
             ssh_host=ipc_data.get("ssh_host"),
             ssh_key=ipc_data.get("ssh_key"),
-            ssh_connect_timeout=ipc_data.get("ssh_connect_timeout", 10),
+            ssh_connect_timeout=_positive_number(
+                ipc_data.get("ssh_connect_timeout", 10), 10
+            ),
             remote_working_dir=ipc_data.get("remote_working_dir"),
             remote_claude_path=ipc_data.get("remote_claude_path", "claude"),
         )
