@@ -349,12 +349,23 @@ async def _process_row(
     *,
     now: datetime,
     cutoff: datetime,
+    age_cutoff: datetime | None = None,
     mode: str,
     result: dict,
 ) -> None:
     """Reap one dark row (checkpoint → classify → observe/notify). Isolated per
-    row by the caller so one bad row cannot abort the pass."""
-    won = await cc_sessions.checkpoint_dark(db, row["id"], checkpointed_at=now.isoformat())
+    row by the caller so one bad row cannot abort the pass.
+
+    ``age_cutoff`` is the unanswered-turn age guard for THIS row's eligibility
+    evidence: rows admitted on PID-proven death use the dead-process cutoff
+    (a dead process cannot be a mid-flight turn), while timestamp-only rows
+    keep the full idle cutoff. Defaults to ``cutoff``."""
+    won = await cc_sessions.checkpoint_dark(
+        db,
+        row["id"],
+        checkpointed_at=now.isoformat(),
+        expected_last_activity=row.get("last_activity_at"),
+    )
     if not won:
         # A concurrent turn revived the row between the query and this write.
         return
@@ -370,14 +381,15 @@ async def _process_row(
         result["shadow"] += 1
 
     # Notify-eligible = a CRISP dead request we should tell the user about:
-    # unanswered user turn, in notify mode, the turn itself older than the idle
-    # cutoff (age guard — excludes a mid-flight long turn whose session-level
-    # last_activity is merely stale), and not already owned by the rate-limit
-    # park / dispatch machinery.
+    # unanswered user turn, in notify mode, the turn itself older than the
+    # eligibility cutoff (age guard — on the 24h path this excludes a
+    # mid-flight long turn whose session-level last_activity is merely stale;
+    # a PID-proven death carries no such ambiguity), and not already owned by
+    # the rate-limit park / dispatch machinery.
     notify_eligible = (
         signal == "unanswered_user"
         and mode == "notify"
-        and _ts_older_than(tail_ts, cutoff)
+        and _ts_older_than(tail_ts, age_cutoff if age_cutoff is not None else cutoff)
         and not await _covered_by_other_subsystem(db, row["id"])
     )
     notified = False
@@ -451,6 +463,8 @@ async def reap_dark_foreground(
     # is dark the moment it dies. Same target state (checkpointed — dead but
     # resumable), same per-row flow, just earlier; the lever grants no new
     # authority, so it rides the existing mode gate.
+    dead_ids: set[str] = set()
+    dead_cutoff = cutoff
     if cfg.get("close_dead", True) is True:
         dead_cutoff = now - timedelta(minutes=knob_int(cfg, "dead_process_minutes"))
         fast_rows = await cc_sessions.query_dead_candidate_foreground(
@@ -461,6 +475,7 @@ async def reap_dark_foreground(
             if row["id"] in seen:
                 continue  # already in the 24h set; process once
             if _pid_dead(row["pid"], row):
+                dead_ids.add(row["id"])
                 rows.append(row)
 
     # ALIVE-proof outranks everything, on BOTH paths: a fresh heartbeat means
@@ -484,7 +499,16 @@ async def reap_dark_foreground(
 
     for row in rows:
         try:
-            await _process_row(rt, db, row, now=now, cutoff=cutoff, mode=mode, result=result)
+            await _process_row(
+                rt,
+                db,
+                row,
+                now=now,
+                cutoff=cutoff,
+                age_cutoff=dead_cutoff if row["id"] in dead_ids else cutoff,
+                mode=mode,
+                result=result,
+            )
         except Exception:
             logger.warning(
                 "foreground reaper: processing failed for %s",

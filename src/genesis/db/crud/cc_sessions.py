@@ -353,11 +353,15 @@ async def query_dead_candidate_foreground(
     return [dict(r) for r in await cursor.fetchall()]
 
 
+_ACTIVITY_UNSET = object()
+
+
 async def checkpoint_dark(
     db: aiosqlite.Connection,
     id: str,
     *,
     checkpointed_at: str,
+    expected_last_activity: str | None | object = _ACTIVITY_UNSET,
 ) -> bool:
     """Relabel a dark (abandoned) foreground row ``active`` → ``checkpointed``.
 
@@ -366,13 +370,29 @@ async def checkpoint_dark(
     (``get_active_foreground`` matches ``checkpointed`` and
     ``get_or_create_foreground`` flips it back to ``active`` on reuse). The
     ``status = 'active'`` guard makes this a no-op (rowcount 0) when a
-    concurrent turn revived the row between the reaper's read and this write.
+    concurrent turn flipped the row's status between the reaper's read and
+    this write.
+
+    ``expected_last_activity`` tightens that guard to the EVIDENCE the caller
+    selected on: a prompt reviving an already-active row only refreshes
+    ``last_activity_at`` (status stays ``active``), so status alone cannot
+    catch that race. Passing the candidate row's observed
+    ``last_activity_at`` makes the write conditional on the liveness stamp
+    being unchanged — a revived row is left active for the next pass.
     """
-    cursor = await db.execute(
-        "UPDATE cc_sessions SET status = 'checkpointed', checkpointed_at = ? "
-        "WHERE id = ? AND status = 'active'",
-        (checkpointed_at, id),
-    )
+    if expected_last_activity is _ACTIVITY_UNSET:
+        cursor = await db.execute(
+            "UPDATE cc_sessions SET status = 'checkpointed', checkpointed_at = ? "
+            "WHERE id = ? AND status = 'active'",
+            (checkpointed_at, id),
+        )
+    else:
+        cursor = await db.execute(
+            "UPDATE cc_sessions SET status = 'checkpointed', checkpointed_at = ? "
+            "WHERE id = ? AND status = 'active' "
+            "AND COALESCE(last_activity_at, '') = COALESCE(?, '')",
+            (checkpointed_at, id, expected_last_activity),
+        )
     await db.commit()
     return cursor.rowcount > 0
 

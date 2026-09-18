@@ -337,6 +337,56 @@ async def test_dead_pid_with_fresh_heartbeat_stays(db, monkeypatch):
     assert row["status"] == "active"
 
 
+async def test_dead_pid_fast_path_notifies_recent_unanswered(db, monkeypatch):
+    """A PID-proven death cannot be a mid-flight turn: the unanswered-turn
+    age guard uses the dead-process cutoff, not the 24h idle cutoff — a user
+    prompt 40 minutes before the crash must still alert."""
+    # id == cc_session_id marks a terminal row (the fast-path discriminator);
+    # channel/chat_id make the origin addressable for the notify.
+    sid = await _seed(db, sid="term-tg", cc_sid="term-tg", last_activity=IDLE_40M)
+    await cc_sessions.set_pid(db, sid, pid=4242)
+    _patch_tail(monkeypatch, [_user("finish this now", IDLE_40M)])
+    monkeypatch.setattr(fr, "_pid_dead", lambda pid, row: True)
+    rt = _rt(db)
+    res = await fr.reap_dark_foreground(rt, now=NOW, idle_hours=24, mode="notify")
+    assert res["reaped"] == 1 and res["notified"] == 1
+    rt._outreach_pipeline.submit_urgent.assert_awaited_once()
+
+
+async def test_dead_pid_race_refresh_leaves_row_active(db, monkeypatch):
+    """Prompt revival between selection and checkpoint: the row dict carries
+    a stale last_activity_at while the live row was refreshed — the guarded
+    write must lose and leave the row active."""
+    await _seed_terminal(db)
+    stale_row = {
+        "id": "term-1",
+        "cc_session_id": "term-1",
+        "pid": 4242,
+        "last_activity_at": IDLE_40M,
+    }
+    monkeypatch.setattr(
+        fr.cc_sessions,
+        "query_dead_candidate_foreground",
+        lambda *a, **k: _ret([stale_row]),
+    )
+    monkeypatch.setattr(fr, "_pid_dead", lambda pid, row: True)
+    # Revival lands between the SELECT and the UPDATE.
+    await db.execute(
+        "UPDATE cc_sessions SET last_activity_at = ? WHERE id = ?",
+        (NOW.isoformat(), "term-1"),
+    )
+    await db.commit()
+    _patch_tail(monkeypatch, [])
+    res = await fr.reap_dark_foreground(_rt(db), now=NOW, idle_hours=24, mode="observe")
+    row = await cc_sessions.get_by_id(db, "term-1")
+    assert row["status"] == "active"
+    assert res["reaped"] == 0
+
+
+async def _ret(rows):
+    return rows
+
+
 async def test_close_dead_lever_disables_fast_path(db, monkeypatch):
     await _seed_terminal(db)
     _patch_tail(monkeypatch, [])

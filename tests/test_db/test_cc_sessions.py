@@ -278,6 +278,32 @@ async def test_checkpoint_dark_and_race_guard(db, sess_fields):
     assert again is False
 
 
+@pytest.mark.asyncio
+async def test_checkpoint_dark_evidence_guard(db, sess_fields):
+    """A revived row keeps status='active' but its last_activity_at moves —
+    the evidence guard must reject the checkpoint when the stamp the caller
+    selected on no longer matches."""
+    await cc_sessions.create(db, **sess_fields)  # active, last_activity set
+    row = await cc_sessions.get_by_id(db, "sess-1")
+    stale = "2026-07-20T00:00:00+00:00"
+    assert row["last_activity_at"] != stale
+    won = await cc_sessions.checkpoint_dark(
+        db,
+        "sess-1",
+        checkpointed_at="2026-07-22T12:00:00+00:00",
+        expected_last_activity=stale,
+    )
+    assert won is False
+    assert (await cc_sessions.get_by_id(db, "sess-1"))["status"] == "active"
+    won = await cc_sessions.checkpoint_dark(
+        db,
+        "sess-1",
+        checkpointed_at="2026-07-22T12:00:00+00:00",
+        expected_last_activity=row["last_activity_at"],
+    )
+    assert won is True
+
+
 # ── Terminal-timestamp discipline (update_status as the single writer) ────
 # Origin (measured 2026-09-04): completed_at had ZERO writers — 0 of 4556
 # live rows ever carried one — because update_status wrote status alone and
