@@ -182,6 +182,7 @@ _DEGRADED_GATED = (
 try:
     from shell_parse import (  # noqa: E402
         _KNOWN_SIGILS,
+        _basename,
         analyze,
         analyze_checked,
         commit_skips_hooks,
@@ -251,6 +252,14 @@ _GATED_MENTION = re.compile(
 # nothing and would have measured 0 false positives by never firing at all.
 _GH_MENTION = re.compile(r"\bgh\b")
 _CREATE_MENTION = re.compile(r"\bcreate\b")
+# `gh pr close` (and the `gh api ... PATCH ... state=closed` REST equivalent) is
+# the FIFTH gated op. Same shape as the create conjunction and for the same
+# reason: `close` alone is ordinary English, so it is required WITH `gh`, never a
+# bare `close` alternative. This net only ever yields ask (interactive) or deny
+# (dispatched), never allow, and fires only when the command is ALSO untokenizable
+# AND left no parsed gated segment — so an untokenizable `gh pr close` cannot slip
+# a dispatched session the way the tokenizable form is caught by the close arm.
+_CLOSE_MENTION = re.compile(r"\bclose\b")
 
 #: The programs whose SUBCOMMAND this guard gates. Used on the blind path to ask
 #: whether a segment that resolved to one of them left its operation unreadable —
@@ -264,7 +273,10 @@ def _mentions_gated_op(command: str) -> bool:
     """Whether the RAW text names any gated operation, on the blind path only."""
     if _GATED_MENTION.search(command):
         return True
-    return bool(_GH_MENTION.search(command) and _CREATE_MENTION.search(command))
+    return bool(
+        _GH_MENTION.search(command)
+        and (_CREATE_MENTION.search(command) or _CLOSE_MENTION.search(command))
+    )
 
 
 # Local push allowlist (offline re-push cache). SOFT dependency, guarded exactly
@@ -3693,6 +3705,309 @@ def _comment_repo(argv: list[str]) -> str | None:
     return val
 
 
+def _close_ask_reason(pr: str | None, commitment: str | None) -> str:
+    """The native-ask reason shown when a FOREGROUND session closes a PR.
+
+    Closing abandons work and is irreversible-outward, so it is the user's
+    decision, not the session's — the #1579 lesson (a foreground session closed
+    a reviewed PR without asking; presence is not consent). When the PR reached
+    the review terminal a rebuild-commitment was required first, and its opening
+    is quoted so the user approves the obligation, not a bare close.
+    """
+    who = f"PR #{pr}" if pr else "this pull request"
+    reason = (
+        f"Closing {who} abandons reviewed work — an irreversible-outward act, so "
+        "it is YOUR decision to make, not this session's (the session is not "
+        "you; presence is not consent). Approve only if you want it closed. "
+        "[The interactive close-ask was directed by the user on 2026-09-04 after "
+        "PR #1579 was closed without their approval.]"
+    )
+    if commitment:
+        head = " ".join(commitment.split())[:300]
+        reason += (
+            "\n\nThis PR reached the review terminal, so closing it is a commitment "
+            "to REBUILD from the recorded failure classes — not the end of the work. "
+            f"The commitment on file:\n--- {head} ---"
+        )
+    return reason
+
+
+def _close_target(argv: list[str]) -> tuple[str | None, str | None]:
+    """(pr_number, repo) from a ``gh pr close`` segment's argv.
+
+    Mirrors ``_comment_target`` (number from a bare number, #N, or a /pull/N URL
+    that also carries OWNER/REPO; an explicit --repo/-R wins). A branch-name or
+    any non-numeric/non-URL positional yields (None, …) — deliberately FAIL
+    CLOSED on the number, never resolve a wrong PR. The CLOSE still asks
+    regardless (consent is unconditional); the number is used only to look up
+    whether the PR reached the review terminal, and an unresolved number fails
+    toward a plain ask (no rebuild-commitment demanded), never toward another
+    PR's history. NOT reusing ``_extract_pr_number`` (hardwired to `gh pr merge`,
+    which would resolve the WRONG PR here).
+    """
+    pr_num: str | None = None
+    url_repo: str | None = None
+    try:
+        idx = argv.index("close")
+    except ValueError:
+        return None, None
+    # Value-taking flags on `gh pr close` whose SEPARATED value must not be read
+    # as the positional target.
+    _VALUE_FLAGS = {"-c", "--comment", "-R", "--repo"}
+    skip_next = False
+    for tok in argv[idx + 1 :]:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in _VALUE_FLAGS:
+            skip_next = True
+            continue
+        if tok.startswith("-"):
+            continue
+        if pr_num is None and tok.isdigit():
+            pr_num = tok
+        elif pr_num is None and tok.startswith("#") and tok[1:].isdigit():
+            pr_num = tok[1:]
+        elif pr_num is None:
+            m = re.match(r"(?:[a-z]+://[^/\s]+/)?([^/\s]+/[^/\s]+)/pull/(\d+)\b", tok)
+            if m:
+                url_repo, pr_num = m.group(1), m.group(2)
+    return pr_num, _comment_repo(argv) or url_repo
+
+
+def _gh_api_opaque_body(argv: list[str]) -> bool:
+    """True when a ``gh api`` argv carries a body the mention scan cannot read.
+
+    ``--input <file>``/``--input=<file>`` (``--input -`` is stdin) supplies the
+    whole body; a field value written ``k=@<file>`` (``-f``/``-F``/``--field``/
+    ``--raw-field``, separated or glued) is read from a file. Either can hide a
+    ``state=closed`` field or a ``closePullRequest`` mutation — fail toward
+    ask/deny rather than let it through unread.
+    """
+    return any(
+        tok == "--input" or tok.startswith("--input=") or re.search(r"=@", tok)
+        for tok in argv
+    )
+
+
+def _gh_api_glued_state_closed(argv: list[str]) -> bool:
+    """A ``gh api`` field flag GLUED to ``state=closed`` (``-fstate=closed``,
+    ``--field=state=closed``, ``-Fstate=closed``, ``--raw-field=state=closed``).
+
+    ``\\bstate\\b`` on the joined argv cannot match inside ``fstate`` — the
+    word boundary fails between two word characters — so the glued spellings
+    need this per-token scan. The separated form (``-f state=closed``) is
+    already covered by the joined-string scan in the caller.
+    """
+    return any(
+        re.match(
+            r"^(?:-[fF]|--(?:f|field|raw-field))=?state\s*[=:]\s*[\"']?closed\b",
+            tok,
+            re.IGNORECASE,
+        )
+        for tok in argv
+    )
+
+
+def _gh_api_closes_pr(argv: list[str]) -> bool:
+    r"""True when a ``gh api`` call could close a PULL REQUEST.
+
+    The REST/GraphQL equivalents of ``gh pr close`` — documented walk-arounds of
+    a subcommand-only gate. This covers the CLASS, not one form:
+      * ``gh api repos/O/R/pulls/N -X PATCH … state=closed``;
+      * ``gh api repos/O/R/issues/N -X PATCH … state=closed`` — a PR *is* an
+        issue in GitHub's model, so PATCHing the issues endpoint with
+        ``state=closed`` closes the underlying PR. This deliberately OVER-covers
+        a raw-API *issue* close too (which now asks/denies), because telling a PR
+        from an issue by number needs a network lookup; ``gh issue close`` stays
+        the unaffected normal path for closing an issue;
+      * ``gh api graphql … closePullRequest …`` — the GraphQL mutation (no
+        ``/pulls`` path, POST not PATCH), which the REST scan and the blind-spot
+        ``\bclose\b`` mention would both miss.
+    A MENTION SCAN whose only outcomes are ask (interactive) or deny
+    (dispatched), never allow — an imprecise predicate cannot authorize
+    anything, so over-breadth costs one confirmation, not a bypass, and it does
+    NOT fall into the argv->effect trap. A PATCH that only edits title/body
+    carries no ``state=closed`` and no opaque body, so it does not fire.
+    """
+    if not argv or _basename(argv[0]) != "gh" or "api" not in argv:
+        # The executable and subcommand, not merely a token: ``curl api x`` or
+        # ``my-tool api …`` must not trip a gate written for ``gh api``.
+        return False
+    joined = " ".join(argv)
+    # GraphQL close mutation — no REST path; matched by the operation name,
+    # OR hidden inside an opaque body the argv scan cannot read.
+    if "graphql" in argv and (
+        re.search(r"closePullRequest", joined, re.IGNORECASE)
+        or _gh_api_opaque_body(argv)
+    ):
+        return True
+    # REST: a PATCH to a PR's own resource — /pulls/N OR /issues/N (see above).
+    if not any(re.search(r"(?:^|/)(?:pulls|issues)/\d+(?:/|\b)", tok) for tok in argv):
+        return False
+    method: str | None = None
+    for i, tok in enumerate(argv):
+        if tok in ("-X", "--method") and i + 1 < len(argv):
+            method = argv[i + 1].upper()
+        elif tok.startswith("-X") and len(tok) > 2:
+            method = tok[2:].upper()
+        elif tok.startswith("--method="):
+            method = tok.split("=", 1)[1].upper()
+    if method != "PATCH":
+        return False
+    # Case-insensitive: the field value the API acts on is lowercase, but the
+    # guard must not turn on the caller's casing. Covers the SEPARATED field
+    # form (``-f state=closed``) via the joined string.
+    if re.search(r"\bstate\b\s*[=:]\s*[\"']?closed\b", joined, re.IGNORECASE):
+        return True
+    # Glued field spellings (``-fstate=closed``, ``--field=state=closed``):
+    # ``\b`` cannot match inside ``fstate``, so they need a per-token scan.
+    if _gh_api_glued_state_closed(argv):
+        return True
+    # An opaque request body (file or stdin) could carry state=closed — fail
+    # toward the ask/deny rather than let it through unread.
+    return _gh_api_opaque_body(argv)
+
+
+def _close_branch_target(argv: list[str]) -> str | None:
+    """The positional target of ``gh pr close`` when it is a BRANCH, else None.
+
+    ``gh pr close`` accepts ``{<number> | <url> | <branch>}``; a number or URL
+    is already read by ``_close_target``, so this returns only a NON-numeric,
+    non-URL positional — the branch name the caller resolves to a PR number.
+    """
+    try:
+        idx = argv.index("close")
+    except ValueError:
+        return None
+    value_flags = {"-c", "--comment", "-R", "--repo"}
+    skip_next = False
+    for tok in argv[idx + 1 :]:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in value_flags:
+            skip_next = True
+            continue
+        if tok.startswith("-"):
+            continue
+        if tok.isdigit() or (tok.startswith("#") and tok[1:].isdigit()):
+            return None
+        if re.match(r"(?:[a-z]+://[^/\s]+/)?[^/\s]+/[^/\s]+/pull/\d+\b", tok):
+            return None
+        return tok
+    return None
+
+
+def _resolve_branch_pr(branch: str, repo: str | None) -> str | None:
+    """The open PR number for ``branch`` via ``gh pr view``, else None.
+
+    Fail-safe: any error, timeout, or non-numeric answer -> None, and the
+    caller then fails CLOSED (the terminal check could not run).
+    """
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "view",
+                branch,
+                *_repo_args(repo),
+                "--json",
+                "number",
+                "--jq",
+                ".number",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(6),
+        )
+        num = result.stdout.strip()
+        if result.returncode == 0 and num.isdigit():
+            return num
+    except Exception:
+        pass
+    return None
+
+
+def _gh_api_close_target(argv: list[str]) -> tuple[str | None, str | None]:
+    """(pr_number, repo) from a ``gh api .../repos/O/R/{pulls,issues}/N ...`` argv.
+
+    A GraphQL close carries a node id, not a number, so it resolves to
+    (None, …) — the caller then fails CLOSED on the gated repo: a terminal
+    state that cannot be read cannot be skipped. An /issues number that is
+    really an issue resolves too, but ``_codex_reviews`` then 404s on
+    /pulls/N/reviews → None, and the caller keeps it a plain ask because the
+    target is not a definite PR.
+    """
+    for tok in argv:
+        m = re.search(r"(?:^|/)repos/([^/\s]+/[^/\s]+)/(?:pulls|issues)/(\d+)(?:/|\b)", tok)
+        if m:
+            return m.group(2), m.group(1)
+    for tok in argv:
+        m = re.search(r"(?:^|/)(?:pulls|issues)/(\d+)(?:/|\b)", tok)
+        if m:
+            return m.group(1), _comment_repo(argv)
+    return None, _comment_repo(argv)
+
+
+# Rebuild-commitment: closing a PR that reached the review TERMINAL is "back to
+# the drawing board", not the end, so the gate requires a written commitment to
+# rebuild before that specific close can even be asked. This is a FORCING
+# FUNCTION, not security — the session writes the file; the real enforcement is
+# the user's approval on the ask, which quotes the commitment so the user sees
+# the obligation they are approving. Every OTHER close (a supersede, a
+# duplicate, an experiment the user asked to drop) needs no commitment — only
+# the approval ask. (User decision 2026-09-04.)
+_CLOSE_COMMITMENT_MIN_CHARS = 200
+
+
+def _close_commitment_dir() -> str:
+    # Lifecycle: backed up by scripts/backup.sh (close-commitment store) and
+    # deliberately NOT auto-pruned — a commitment is the user's recorded
+    # rebuild obligation, and the store grows by one small file per terminal
+    # close (a rare event bounded by review-terminal frequency, not by runs).
+    override = os.environ.get("_TEST_CLOSE_COMMITMENT_DIR")
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), ".genesis", "close_commitments")
+
+
+def _read_close_commitment(repo: str | None, pr: str) -> str | None:
+    """The rebuild-commitment text for (repo, pr), or None if absent/invalid.
+
+    File ``<dir>/<repo-slug>__<pr>.txt`` (repo slug ``/`` -> ``__``; no head
+    component — a close abandons the head, and re-recording while the user
+    deliberates should not require a fresh gh call). Requirements, checked as
+    FORMAT only: at least ``_CLOSE_COMMITMENT_MIN_CHARS`` chars, contains the PR
+    number, and contains a follow-up id line (``Follow-up:``/``follow_up``).
+    Any read error or unmet requirement -> None (missing -> the close is blocked
+    at the terminal). Returns the raw text so the ask can quote its opening.
+    """
+    slug = (repo or "").replace("/", "__")
+    fname = f"{slug}__{pr}.txt" if slug else f"{pr}.txt"
+    path = os.path.join(_close_commitment_dir(), fname)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except (OSError, ValueError):
+        # OSError = absent/unreadable; ValueError covers UnicodeDecodeError on a
+        # non-UTF-8 file. Either way -> None -> the terminal close is blocked
+        # (the safe direction: an unreadable commitment is no commitment).
+        return None
+    if len(text) < _CLOSE_COMMITMENT_MIN_CHARS:
+        return None
+    # Word-BOUNDED, not substring: a commitment naming #1579 must not satisfy a
+    # close of #15 (the digits appear inside the longer number).
+    if not re.search(rf"#?{re.escape(pr)}\b", text):
+        return None
+    # ``Follow-up:`` must name an actual follow-up id, not just the word —
+    # ``follow_up`` as bare prose satisfies nothing the gate can point at.
+    if not re.search(r"(?i)\bfollow[_-]?up\s*[:=]\s*\S+", text):
+        return None
+    return text
+
+
 def _final_round_chained_advisory(pr_num: str) -> str:
     """A second terminal-stage dispatch behind the SAME acceptance.
 
@@ -3740,8 +4055,13 @@ def _final_round_advisory(pr_num: str, rounds: int, repo: str | None = None) -> 
         "  (a) ACCEPT the outstanding findings and merge — document each one and why "
         "it is acceptable in the PR body. The COMMIT gate is where that decision is "
         "recorded, and there the acceptance is one-shot.\n"
-        "  (b) ABANDON the branch and restart from a design that does not need this "
-        "many rounds.\n\n"
+        "  (b) ABANDON this PR and rebuild from a design that does not need this "
+        "many rounds — but abandoning is NOT the end. Closing the PR is itself a "
+        "USER decision (it fires an approval dialog a session cannot self-satisfy; "
+        "a dispatched session is denied and must ask the user), and closing a "
+        "terminal-reached PR requires a written rebuild-commitment FIRST — so the "
+        "close is a commitment to rebuild from the recorded failure classes, not a "
+        "walk-away.\n\n"
         "If the user directs ONE more round, that decision rides on this command:\n"
         f"    gh pr comment {pr_num}{repo_arg} --body '@codex review'  # final-round-accept\n"
         "Required on EVERY dispatch past the terminal — this gate keeps no state, so "
@@ -8745,6 +9065,8 @@ def _run_merge_and_push_gates() -> int:
         merge_git_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "merge"]
         create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
         merge_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"]
+        close_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "close"]
+        close_via_api_segs = [s for s in segs if _gh_api_closes_pr(s.argv)]
 
         # ── Blind-spot net: unverifiable near a gated op → DENY ────────────
         # Keep the broad raw-mention predicate: a failed parse cannot prove an
@@ -8795,7 +9117,14 @@ def _run_merge_and_push_gates() -> int:
         if blind is not None and (
             hidden_gated_verb
             or (
-                not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
+                not (
+                    push_segs
+                    or merge_pr_segs
+                    or merge_git_segs
+                    or create_segs
+                    or close_pr_segs
+                    or close_via_api_segs
+                )
                 and _mentions_gated_op(cmd)
             )
         ):
@@ -8822,14 +9151,27 @@ def _run_merge_and_push_gates() -> int:
         # `gh pr merge 1 --admin && gh pr merge 2 --admin` can't smuggle the
         # second past the CI/review gates, which only inspect the first segment.
         # gh pr create is un-gated (#1241) — a review request on already-pushed
-        # code, riding a push's approval — so it is NOT counted here; the
-        # exception where gh itself would push an unpushed branch is handled by
-        # the create arm below.)
-        if len(push_segs) + len(merge_pr_segs) > 1:
+        # code, riding a push's approval — so it is NOT counted here UNLESS it
+        # would itself publish AND no push segment already carries that
+        # publish: `git push && gh pr create` is ONE prompt for the push (the
+        # create rides it), but `gh pr create && gh pr close N` on an unpushed
+        # branch would hide the close behind the create's own prompt.
+        _publishing_creates = 0 if push_segs else sum(
+            1 for s in create_segs if _pr_create_would_publish(s.argv)
+        )
+        if (
+            len(push_segs)
+            + len(merge_pr_segs)
+            + len(close_pr_segs)
+            + len(close_via_api_segs)
+            + _publishing_creates
+            > 1
+        ):
             print(
-                "BLOCKED: multiple publish/merge operations (git push / gh pr "
-                "merge) in one command would share a single gate. Run each as "
-                "its own command so each is gated separately.",
+                "BLOCKED: multiple publish/merge/close operations (git push / "
+                "gh pr create that would push / gh pr merge / gh pr close) in "
+                "one command would share a single gate. Run each as its own "
+                "command so each is gated separately.",
                 file=sys.stderr,
             )
             return 2
@@ -9095,6 +9437,105 @@ def _run_merge_and_push_gates() -> int:
                 ask_reason = (
                     "gh pr create would push this (not-yet-pushed) branch — approve it like a push."
                 )
+
+        # ── gh pr close  /  gh api PATCH state=closed ─────────────────
+        # Closing a PR abandons reviewed work and is irreversible-outward, so it
+        # is a USER decision, never the session's — the #1579 lesson: a
+        # FOREGROUND session closed a reviewed PR by just running the command,
+        # and "a human is present" is not "the human chose it". Dispatched → hard
+        # deny (no human to ask; the message NAMES a route). Interactive → a
+        # native ask the session cannot self-satisfy, on the same footing as the
+        # push / pr-open gates (this is also an irreversible-outward act). The
+        # `gh api ... -X PATCH .../pulls/N ... state=closed` REST form is the
+        # documented walk-past of a subcommand-only gate, so it rides the same
+        # arm. When the PR reached the review TERMINAL, closing it is "back to the
+        # drawing board" (user directive after #1579), so a written
+        # rebuild-commitment is required FIRST — checked only on the canonical
+        # public repo, and only there because that is where the review terminal
+        # runs. Every other close (supersede, duplicate, a dropped experiment)
+        # needs only the approval ask.
+        close_segs = close_pr_segs + close_via_api_segs
+        if close_segs:
+            if _is_dispatched():
+                print(
+                    "BLOCKED: closing a pull request abandons reviewed work, which "
+                    "is a USER decision — and this is an autonomous session, so "
+                    "there is no one here to make it.\n"
+                    "If you have reached a review-round stop, the disposition is the "
+                    "user's to choose: accept the outstanding findings and merge, do "
+                    "one more round of fixes and then accept, or abandon and rebuild "
+                    "(which you cannot do anyway — a rebuild is a different builder "
+                    "session).\n"
+                    "ASK, do not decide: use the outreach_send_and_wait MCP tool to "
+                    "put the choice to the user and wait for the answer. Say what is "
+                    "outstanding, what you would recommend, and why.",
+                    file=sys.stderr,
+                )
+                return 2
+            # Interactive. Resolve the PR; on the canonical repo, if it reached the
+            # review terminal, a rebuild-commitment must exist before we even ask.
+            if close_pr_segs:
+                _close_pr, _close_repo = _close_target(close_pr_segs[0].argv)
+            else:
+                _close_pr, _close_repo = _gh_api_close_target(close_via_api_segs[0].argv)
+            # A bare close targets gh's cwd repo, not the hook's — derive it the
+            # way the merge gate does, or a private-fork close would apply the
+            # PUBLIC repo's terminal check (and the public repo's review
+            # history) to a repo it does not govern.
+            if _close_repo is None:
+                _close_repo = _derive_repo_from_cwd(os.getcwd())
+            # A branch target (``gh pr close feature/x``) yields no number:
+            # resolve it to its PR rather than skipping the terminal check.
+            if _close_pr is None and close_pr_segs:
+                _branch = _close_branch_target(close_pr_segs[0].argv)
+                if _branch:
+                    _close_pr = _resolve_branch_pr(_branch, _close_repo)
+            if _close_pr is None and _scheduled_gate_applies(_close_repo):
+                # Numberless/GraphQL/unresolvable close on the gated repo: the
+                # terminal state cannot be read, so the commitment check cannot
+                # run — fail closed instead of silently skipping it. Re-running
+                # with an explicit number or URL is the route through.
+                print(
+                    "BLOCKED: cannot resolve which PR this close targets, so the "
+                    "review-terminal check cannot run.\n"
+                    "Re-run the close with an explicit PR number or URL (e.g. "
+                    "`gh pr close 1579`).",
+                    file=sys.stderr,
+                )
+                return 2
+            _close_commitment: str | None = None
+            if _close_pr and _scheduled_gate_applies(_close_repo):
+                _reviews = _codex_reviews(_close_pr, repo=_close_repo)
+                # ``_reviews is None`` (API failure, or an /issues target that
+                # is a real issue — the 404 reads identically) stays a plain
+                # ask: the commitment is a forcing function layered on the
+                # unconditional ask, not a security boundary, and blocking every
+                # close on GitHub availability is the wrong failure mode. The
+                # genuine hardening here is the numberless/unresolvable-target
+                # block above, which is what kept this path reachable past the
+                # check entirely.
+                if _reviews is not None and len(_reviews) >= FINAL_ROUND_CAP:
+                    _close_commitment = _read_close_commitment(_close_repo, _close_pr)
+                    if _close_commitment is None:
+                        print(
+                            f"BLOCKED: PR #{_close_pr} reached the review terminal "
+                            f"({FINAL_ROUND_CAP} rounds). Closing work that could not "
+                            "pass review is not the end — it is a commitment to "
+                            "rebuild from the recorded failure classes.\n"
+                            "Write that commitment first, then re-run the close:\n"
+                            f"  {os.path.join(_close_commitment_dir(), (f'{_close_repo.replace('/', '__')}__{_close_pr}.txt' if _close_repo else f'{_close_pr}.txt'))}\n"
+                            f"It must be at least {_CLOSE_COMMITMENT_MIN_CHARS} chars, "
+                            f"name PR #{_close_pr}, and cite a Follow-up: <id> line for "
+                            "the rebuild. The approval dialog will quote it back so the "
+                            "user approves the rebuild obligation, not a bare close.",
+                            file=sys.stderr,
+                        )
+                        return 2
+            # The close reason must WIN over any ask_reason an earlier arm set
+            # (e.g. a would-publish `gh pr create` in the same command): only
+            # it names the close, the resolved PR, and the rebuild commitment
+            # the approval dialog must quote.
+            ask_reason = _close_ask_reason(_close_pr, _close_commitment)
 
         # ── gh pr merge ────────────────────────────────────────────
         if merge_pr_segs:

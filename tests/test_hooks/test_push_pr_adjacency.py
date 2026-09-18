@@ -385,11 +385,12 @@ def test_a_pr_close_in_the_same_command_cancels_the_silent_allow(
         monkeypatch, tmp_path, fake, capsys,
         command="gh pr close 123 && git push",
     )
-    assert rc == 0
-    doc = json.loads(out)
-    reason = doc["hookSpecificOutput"]["permissionDecisionReason"]
-    assert doc["hookSpecificOutput"]["permissionDecision"] == "ask", out
-    assert "CLOSES a pull request" in reason, reason
+    # The compound gate now refuses close+push outright (each op must be gated
+    # separately) — a BLOCK, which is stronger than the ask this test was
+    # written to demand. The property it guards — the push must not ride a
+    # silent republish allow while the command voids the open-PR count — holds.
+    assert rc == 2
+    assert "multiple publish/merge/close operations" in err, err
 
 
 def test_an_ordinary_repush_with_an_open_pr_is_still_silent(
