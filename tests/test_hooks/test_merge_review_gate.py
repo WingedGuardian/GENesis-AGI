@@ -5638,6 +5638,66 @@ class TestFindingsDistribution:
         assert "2 scored finding(s)" in out
         assert "(no path)" in out
 
+    def test_pathless_findings_do_not_get_buried_or_win_concentration(self, guard_module):
+        """Pathless findings are real work but prove nothing about WHICH file is
+        hot — an unknown anchor is not a seam. A pathless-only population must not
+        print a leader, and pathless weight must not pad a real leader's share."""
+        out = guard_module._findings_distribution(
+            [("P1", "") for _ in range(10)] + [("P2", "src/a.py")]
+        )
+        assert "(no path)" in out
+        assert "ONE file" not in out, "an unknown anchor cannot be 'the' seam"
+
+    def test_rename_aliases_report_under_one_name(self, guard_module):
+        """A renamed file must not split into two rows — the seam is the same
+        file on both sides of the rename (Codex P2, PR #2005)."""
+        out = guard_module._findings_distribution(
+            [("P1", "old/name.py"), ("P1", "new/name.py")],
+            renames={"old/name.py": "new/name.py"},
+        )
+        assert "new/name.py" in out
+        assert "old/name.py" not in out
+        assert "2 P1" in out
+
+    def test_tied_leaders_suppress_the_single_seam_note(self, guard_module):
+        """A tie means no plausible single seam — ranking order alone must not
+        crown one (Codex P2, PR #2005)."""
+        out = guard_module._findings_distribution(
+            [("P1", "src/a.py"), ("P1", "src/a.py"), ("P1", "src/b.py"), ("P1", "src/b.py")]
+        )
+        assert "ONE file" not in out, "a 2-2 tie has no concentrated leader"
+        assert "DISTRIBUTION:" in out  # the counts still print; the inference does not
+
+    def test_an_unreliable_scan_is_labeled_partial_and_suppresses_the_note(
+        self, guard_module
+    ):
+        """A truncated read makes every percentage a shape nobody measured —
+        provisional counts may print, the inference must not (Codex P2)."""
+        out = guard_module._findings_distribution(
+            [("P1", "src/a.py") for _ in range(6)], reliable=False
+        )
+        assert "PARTIAL" in out, "an unreliable scan must be labeled, not disguised"
+        assert "ONE file" not in out
+
+    def test_a_path_cannot_write_to_the_terminal(self, guard_module):
+        """Findings are quoted text: a path is API-supplied untrusted data, so it
+        must be rendered escaped, not raw — '\r' rewrites the line, '\x1b[' is an
+        escape sequence (CodeRabbit Minor, PR #2005)."""
+        out = guard_module._findings_distribution(
+            [("P1", "src/\x1b[2K\rweird\nname.py")]
+        )
+        assert "\x1b" not in out and "\r" not in out and "weird\nname" not in out
+        assert "\\u001b" in out, "the escape must be rendered visibly, not dropped"
+
+    def test_a_reported_round_is_now_the_unresolved_set(self, guard_module):
+        """The scorer accumulates across review submissions, so 'this round' was a
+        false claim about what was counted — the report describes all unresolved
+        findings (Codex P2, PR #2005)."""
+        out = guard_module._findings_distribution(
+            [("P1", "src/a.py") for _ in range(6)]
+        )
+        assert "unresolved findings" in out
+
 
 class TestFindingsDistributionIsWired:
     """The report must actually REACH the reader.

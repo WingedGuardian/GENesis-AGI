@@ -2477,8 +2477,24 @@ _CONCENTRATION_SHARE = 0.5
 _CONCENTRATION_MIN_FINDINGS = 4
 
 
-def _findings_distribution(scored_at: list[tuple[str, str]]) -> str:
-    """Where this round's findings LAND, as a report — never a verdict.
+def _safe_report_path(path: str) -> str:
+    """A path rendered safe for a terminal report.
+
+    Finding paths are contributor-controlled strings: a reviewed file can be
+    named with ANSI escapes or carriage returns, and interpolating the raw value
+    would let it forge or conceal the surrounding gate output. JSON quoting
+    makes every control character visible and inert.
+    """
+    return json.dumps(path)
+
+
+def _findings_distribution(
+    scored_at: list[tuple[str, str]],
+    *,
+    renames: dict[str, str] | None = None,
+    reliable: bool = True,
+) -> str:
+    """Where the unresolved findings LAND, as a report — never a verdict.
 
     WHY THE GATE PRINTS THIS AT ALL, including on round one. A list of findings
     reads as a work queue, so the default response is to answer them one by one;
@@ -2506,32 +2522,57 @@ def _findings_distribution(scored_at: list[tuple[str, str]]) -> str:
     if not scored_at:
         return ""
 
-    by_file: dict[str, list[str]] = {}
+    # Findings with no path (outdated anchors, path omitted by the API) count in
+    # the total — they are real findings — but they are NOT a file: four of them
+    # bucketing together proves nothing about a shared seam, so the None bucket
+    # is listed (sorted last) and excluded from the concentration call below.
+    by_file: dict[str | None, list[str]] = {}
     for severity, path in scored_at:
-        by_file.setdefault(path or "(no path)", []).append(severity)
+        # A file renamed during the PR leaves older comments anchored to its
+        # previous name; fold the alias into the current path before grouping,
+        # or one logical file reads as two and its share is underreported.
+        by_file.setdefault(
+            (renames or {}).get(path, path) or None, []
+        ).append(severity)
 
     total = len(scored_at)
-    ranked = sorted(by_file.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    n_files = sum(1 for k in by_file if k is not None)
+    ranked = sorted(
+        by_file.items(),
+        key=lambda kv: (-len(kv[1]), kv[0] is None, kv[0] or ""),
+    )
     lines = [
-        f"DISTRIBUTION: {total} scored finding(s) across {len(by_file)} file(s) —"
-        f" read as a class before answering as a list:"
+        f"DISTRIBUTION: {total} scored finding(s) across {n_files} file(s)"
+        + ("" if reliable else " — PARTIAL: the scan did not read everything, so this shape is provisional")
+        + " — read as a class before answering as a list:"
     ]
     for path, sevs in ranked[:6]:
         share = 100.0 * len(sevs) / total
         mix = ", ".join(f"{sevs.count(s)} {s}" for s in ("P1", "P2", "CR") if sevs.count(s))
-        lines.append(f"    {len(sevs):>2} ({share:4.0f}%)  {path}  [{mix}]")
+        lines.append(
+            f"    {len(sevs):>2} ({share:4.0f}%)  "
+            f"{_safe_report_path(path) if path is not None else '(no path)'}  [{mix}]"
+        )
     if len(ranked) > 6:
         lines.append(f"    … and {len(ranked) - 6} more file(s)")
 
-    top_path, top_sevs = ranked[0]
+    # The single-seam note needs ONE file that actually dominates: a pathless
+    # bucket is not a file, and a 2–2 tie names a lexicographic winner that does
+    # not exist. No concentration inference at all on a partial read — an
+    # unread page could hold the finding that changes the shape.
+    known_ranked = [(path, sevs) for path, sevs in ranked if path is not None]
     concentrated = (
-        total >= _CONCENTRATION_MIN_FINDINGS
-        and len(top_sevs) / total >= _CONCENTRATION_SHARE
+        reliable
+        and bool(known_ranked)
+        and total >= _CONCENTRATION_MIN_FINDINGS
+        and len(known_ranked[0][1]) / total >= _CONCENTRATION_SHARE
+        and (len(known_ranked) == 1 or len(known_ranked[0][1]) > len(known_ranked[1][1]))
     )
     if concentrated:
+        top_path, top_sevs = known_ranked[0]
         lines.append(
-            f"  NOTE: {100.0 * len(top_sevs) / total:.0f}% of this round's findings are in ONE "
-            f"file ({top_path}). Findings that concentrate on a single seam — or that land on "
+            f"  NOTE: {100.0 * len(top_sevs) / total:.0f}% of the unresolved findings are in ONE "
+            f"file ({_safe_report_path(top_path)}). Findings that concentrate on a single seam — or that land on "
             "code added to answer an EARLIER round — are a mechanism signal: they often share "
             "one cause, and fixing the cause retires them together while fixing them "
             "individually tends to produce the next round's findings."
@@ -3090,7 +3131,16 @@ def _check_inline_review_findings(
     # while reading the list, before any threshold is consulted. Emitted on EVERY
     # round including the first: one round is a lead rather than a proof, but a
     # lead nobody is shown is a lead nobody follows.
-    distribution = _findings_distribution(scored_at)
+    # The report is only as good as the scan behind it: a truncated comment read
+    # or a failed changed-file resolution makes every percentage below a shape
+    # nobody actually measured, so a PARTIAL scan prints counts but never the
+    # concentration inference.
+    reliable = complete and (not _scope_cache or _scope_cache[0] is not None)
+    distribution = _findings_distribution(
+        scored_at,
+        renames=_pr_rename_map(pr_num, repo=repo),
+        reliable=reliable,
+    )
     if distribution:
         print(distribution, file=sys.stderr)
     # The lane is resolved ONLY when there is a score to compare, so a PR with no
@@ -4610,6 +4660,7 @@ def _bind_pr_files_cache_head(head: str) -> None:
     global _PR_FILES_CACHE_HEAD
     if head != _PR_FILES_CACHE_HEAD:
         _PR_FILES_CACHE.clear()
+        _PR_RENAME_CACHE.clear()
         _PR_FILES_CACHE_HEAD = head
 
 
@@ -4617,6 +4668,7 @@ def _reset_pr_files_cache() -> None:
     """Drop the memo AND its head binding. For tests; a hook process never needs it."""
     global _PR_FILES_CACHE_HEAD
     _PR_FILES_CACHE.clear()
+    _PR_RENAME_CACHE.clear()
     _PR_FILES_CACHE_HEAD = None
 
 
@@ -4689,6 +4741,61 @@ def _pr_changed_files_uncached(pr_num: str, repo: str | None = None) -> list[str
         # 3000-entry endpoint cap a hook file may be hidden beyond it.
         return None
     return files
+
+
+#: Rename aliases for the findings-distribution report: previous_filename ->
+#: current filename for every file this PR renamed. ``_pr_changed_files`` flattens
+#: both names into one list, so the pairing has to be read separately — an extra
+#: ``pulls/N/files`` call, paid only when a distribution is actually printed.
+#: Advisory data: any failure yields an empty map (the report degrades to raw
+#: paths) rather than None, because there is no verdict here to fail closed on.
+_PR_RENAME_CACHE: dict[tuple[str, str | None, str | None], dict[str, str]] = {}
+
+
+def _pr_rename_map(pr_num: str, repo: str | None = None) -> dict[str, str]:
+    """previous_filename -> filename for this PR's renames, ``{}`` on any error."""
+    cache_key = (pr_num, repo, os.environ.get("_TEST_GH_PR_FILES"))
+    if cache_key in _PR_RENAME_CACHE:
+        return _PR_RENAME_CACHE[cache_key]
+    raw = os.environ.get("_TEST_GH_PR_FILES")
+    if raw == "__error__":
+        return {}
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/files",
+                    "--paginate",
+                    "--jq",
+                    ".[] | {filename: .filename, previous_filename: .previous_filename}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_gh_timeout(8),
+            )
+            if result.returncode != 0:
+                return {}
+            raw = result.stdout
+        except Exception:
+            return {}
+    renames: dict[str, str] = {}
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            return {}  # malformed row → the map cannot be vouched for
+        if not isinstance(obj, dict):
+            return {}
+        fname, prev = obj.get("filename"), obj.get("previous_filename")
+        if isinstance(fname, str) and fname and isinstance(prev, str) and prev:
+            renames[prev] = fname
+    _PR_RENAME_CACHE[cache_key] = renames
+    return renames
 
 
 def _pr_lane(pr_num: str, repo: str | None = None) -> str:
