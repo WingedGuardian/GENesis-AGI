@@ -37,10 +37,11 @@ class Deadline:
         remaining = self.remaining()
         return remaining is not None and remaining < minimum_useful
 
-    def capped_after(self, seconds: float) -> Deadline:
-        """Return a child deadline no later than this one or ``seconds`` away."""
+    def capped_after(self, seconds: float, *, reserve: float = 0.0) -> Deadline:
+        """Return a child deadline while preserving ``reserve`` for its parent."""
         child = self.monotonic() + seconds
-        expires_at = child if self.expires_at is None else min(self.expires_at, child)
+        parent_cap = None if self.expires_at is None else self.expires_at - reserve
+        expires_at = child if parent_cap is None else min(parent_cap, child)
         return Deadline(expires_at, self.monotonic)
 
     def timeout(self, cap: float) -> float:

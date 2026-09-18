@@ -47,7 +47,8 @@ def test_live_deadline_never_grants_time_beyond_what_remains():
 def test_child_deadline_preserves_post_lookup_headroom():
     now = [100.0]
     outer = Deadline.after(9.5, monotonic=lambda: now[0])
-    lookup = outer.capped_after(7.5)
+    now[0] += 3.0
+    lookup = outer.capped_after(7.5, reserve=2.0)
     assert lookup.expires_at == 107.5
     assert outer.expires_at == 109.5
 

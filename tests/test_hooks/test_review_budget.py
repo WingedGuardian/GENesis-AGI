@@ -171,6 +171,31 @@ def test_external_identity_environment_is_exact_and_optional(monkeypatch):
     assert templates == ("<!-- external-review head={head} -->",)
 
 
+def test_quoted_external_identity_allows_an_inline_yaml_comment(monkeypatch, tmp_path):
+    local = tmp_path / ".genesis" / "config" / "external_review.local.yaml"
+    local.parent.mkdir(parents=True)
+    local.write_text(
+        'report_identity_template: "external report head={head}" # marker\n',
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("GENESIS_EXTERNAL_REVIEW_IDENTITY_TEMPLATE", raising=False)
+    monkeypatch.setattr(rb.Path, "home", classmethod(lambda cls: tmp_path))
+
+    assert rb.configured_external_identity_templates() == (
+        ("external report head={head}",),
+        None,
+    )
+
+    local.write_text(
+        "report_identity_template: 'reviewer''s report head={head}' # marker\n",
+        encoding="utf-8",
+    )
+    assert rb.configured_external_identity_templates() == (
+        ("reviewer's report head={head}",),
+        None,
+    )
+
+
 def test_evaluate_pr_rejects_documented_endpoint_ceilings(monkeypatch):
     monkeypatch.setenv("_TEST_REVIEW_BUDGET_HEAD", H5)
     monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")

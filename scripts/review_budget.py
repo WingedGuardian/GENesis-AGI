@@ -102,6 +102,24 @@ _CONFIRMATION_RE = re.compile(
 Runner = Callable[..., tuple[int, str, str]]
 
 
+def _parse_external_identity_scalar(raw: str) -> object:
+    """Decode the small YAML scalar subset used by the stdlib-only hook."""
+    if raw.startswith('"'):
+        value, end = json.JSONDecoder().raw_decode(raw)
+        suffix = raw[end:]
+        if suffix.strip() and (
+            not suffix[:1].isspace() or not suffix.lstrip().startswith("#")
+        ):
+            raise ValueError("unexpected content after quoted scalar")
+        return value
+    if raw.startswith("'"):
+        match = re.fullmatch(r"'((?:[^']|'')*)'(?:\s+#.*)?\s*", raw)
+        if match is None:
+            raise ValueError("malformed single-quoted scalar")
+        return match.group(1).replace("''", "'")
+    return raw.split(" #", 1)[0].strip()
+
+
 def configured_external_identity_templates() -> tuple[tuple[str, ...], str | None]:
     """Load the optional external-review identity without a YAML dependency.
 
@@ -135,12 +153,7 @@ def configured_external_identity_templates() -> tuple[tuple[str, ...], str | Non
                 found = ""
                 continue
             try:
-                if raw.startswith('"'):
-                    value = json.loads(raw)
-                elif raw.startswith("'") and raw.endswith("'"):
-                    value = raw[1:-1].replace("''", "'")
-                else:
-                    value = raw.split(" #", 1)[0].strip()
+                value = _parse_external_identity_scalar(raw)
             except (json.JSONDecodeError, ValueError):
                 return (), "external_identity_config_malformed"
             if not isinstance(value, str):

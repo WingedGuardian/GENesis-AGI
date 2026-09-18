@@ -894,6 +894,7 @@ def _current_branch_pr_identity(raw: str) -> tuple[str, int] | None | dict:
 #: (diff classification, marker reads, message rendering), all of it local.
 _COMMIT_HOOK_REGISTERED_TIMEOUT = 10.0
 _COMMIT_BUDGET_LOOKUP_SECONDS = 7.5
+_COMMIT_POST_LOOKUP_SECONDS = 2.0
 
 
 def _branch_review_budget(
@@ -915,7 +916,9 @@ def _branch_review_budget(
     if not cwd or not branch:
         return _unknown_budget("commit_pr_identity_unknown")
     lookup_deadline = (
-        deadline.capped_after(budget_seconds) if deadline else Deadline.after(budget_seconds)
+        deadline.capped_after(budget_seconds, reserve=_COMMIT_POST_LOOKUP_SECONDS)
+        if deadline
+        else Deadline.after(budget_seconds)
     )
     try:
         import review_budget

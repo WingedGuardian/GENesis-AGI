@@ -157,6 +157,7 @@ def test_current_branch_status_distinguishes_no_pr_from_malformed_evidence():
 def test_cloud_lookup_reserves_two_seconds_for_post_lookup_checks(monkeypatch, repo):
     now = [100.0]
     outer = _guard.Deadline.after(9.5, monotonic=lambda: now[0])
+    now[0] += 3.0  # Earlier mandatory local probes consume part of the hook budget.
     calls = []
 
     def consumes_timeout(*args, timeout, **kwargs):
@@ -179,7 +180,7 @@ def test_cloud_lookup_reserves_two_seconds_for_post_lookup_checks(monkeypatch, r
     result = _guard._branch_review_budget(str(repo), "feature/review-budget", deadline=outer)
 
     assert result["status"] == "unknown"
-    assert calls == [7.5]
+    assert calls == [4.5]
     assert outer.remaining() == 2.0
 
 
