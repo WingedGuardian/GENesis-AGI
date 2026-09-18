@@ -66,18 +66,6 @@ STATE_FILE="$HOME/.genesis/update_state.json"
 # for a live deploy window (Kimi P3, 2026-09-06).
 HEALTH_URL="http://localhost:5000/api/genesis/health"
 
-# Same refusal update.sh makes, same reason: pip install -e from a worktree
-# redirects system-wide imports at the live server (measured incident).
-if [[ "$GENESIS_ROOT" == *"/.claude/worktrees/"* ]] || \
-   [[ "$GENESIS_ROOT" == *"/.worktrees/"* ]]; then
-    echo "ERROR: deploy_code_only.sh must not run from a worktree." >&2
-    echo "       GENESIS_ROOT=$GENESIS_ROOT — run the main checkout's copy." >&2
-    exit 1
-fi
-if [ -n "${GENESIS_DEPLOY_ROOT:-}" ]; then
-    echo "  NOTE: GENESIS_DEPLOY_ROOT override in effect — deploying $GENESIS_ROOT"
-fi
-
 # CC sessions lack D-Bus env vars, making `systemctl --user` fail — the same
 # guard update.sh carries, for the same primary caller.
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -88,6 +76,25 @@ export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNT
 _SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/deploy_lock.sh
 source "$_SELF_DIR/lib/deploy_lock.sh"
+
+# Same refusal update.sh makes, same reason: pip install -e from a worktree
+# redirects system-wide imports at the live server (measured incident). A
+# linked worktree can live at ANY path (`git worktree add /workspace/x`), so a
+# path-substring test alone would wave it through — ask Git instead (Codex P2,
+# #1804). The substring arms stay as well: a plain CLONE sitting under a marker
+# dir is not a linked worktree and fools the git check, but carries the same
+# pip -e hazard (adversarial audit, #1804). Sits AFTER the lib source (the
+# helper lives there), BEFORE any state write or lock acquisition.
+if deploy_tree_is_linked_worktree "$GENESIS_ROOT" || \
+   [[ "$GENESIS_ROOT" == *"/.claude/worktrees/"* ]] || \
+   [[ "$GENESIS_ROOT" == *"/.worktrees/"* ]]; then
+    echo "ERROR: deploy_code_only.sh must not run from a worktree." >&2
+    echo "       GENESIS_ROOT=$GENESIS_ROOT — run the main checkout's copy." >&2
+    exit 1
+fi
+if [ -n "${GENESIS_DEPLOY_ROOT:-}" ]; then
+    echo "  NOTE: GENESIS_DEPLOY_ROOT override in effect — deploying $GENESIS_ROOT"
+fi
 # Short pause window: this path's server-DOWN span is one restart (seconds),
 # not update.sh's stop→merge→bootstrap span. Renewer bound unchanged (~10min
 # worst-case silence if we are SIGKILLed; host expires_at is the hard TTL).
@@ -139,9 +146,23 @@ _RECEIPTED=""
 _cleanup() {
     local rc=$?
     if [ "$rc" -ne 0 ] && [ -z "$_RECEIPTED" ] && [ "$_PHASE" != "init" ]; then
+        local _fail_sha
+        _fail_sha="$(git -C "$GENESIS_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
         append_deploy_receipt "deploy_failed" \
-            "$(git -C "$GENESIS_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)" \
+            "$_fail_sha" \
             "code-only" "failed at $_PHASE"
+        # Alert-and-hold (Codex P1, #1804): past the tree-advance point a failed
+        # deploy is silent otherwise — the receipt is a ledger row nobody reads
+        # live. A failed install after a pull leaves the STILL-RUNNING server
+        # lazily importing a mixture of old in-memory modules and newly pulled
+        # files, indefinitely, because the process stays "healthy"; a failed
+        # install can also leave the venv WITHOUT the package (pip -e removes
+        # the old dist first), breaking the next lazy import; a failed restart
+        # can leave the server down. Same doctrine as the health_failed path:
+        # no auto-revert, a human converges process and tree.
+        queue_alert critical deploy-code-only \
+            "code-only deploy failed at $_PHASE ($_fail_sha)" \
+            "code-only deploy failed at phase '$_PHASE'. If the pull advanced the tree, the running genesis-server was NOT restarted and may lazily import a mix of old and new code; a failed pip install -e may have removed the old editable dist, so the next lazy import breaks; a failed restart may have left the server down. Tree left at $_fail_sha — no auto-revert by design. Converge by hand: journalctl --user -u genesis-server -n 50, then restart or re-run scripts/deploy_code_only.sh. Receipts: $GENESIS_DEPLOY_RECEIPTS"
     fi
     _guardian_resume
     rm -f "$STATE_FILE" 2>/dev/null || true
@@ -211,6 +232,12 @@ SHA="$(git -C "$GENESIS_ROOT" rev-parse HEAD)"
 echo "  Deploying $SHA"
 
 echo "  pip install -e (venv)…"
+# Phase marker BEFORE the install (adversarial audit, #1804): pip -e removes the
+# old dist before installing, so an install failure leaves the venv WITHOUT the
+# package — the running server then breaks on its next lazy import, silently.
+# With --no-pull the phase would otherwise still be "init" and _cleanup would
+# skip both the failure receipt and the alert.
+_PHASE="installing"
 "$VENV_DIR/bin/pip" install -e "$GENESIS_ROOT" --quiet
 _PHASE="installed"
 
@@ -233,7 +260,37 @@ for _ in $(seq 1 "${GENESIS_DEPLOY_HEALTH_ATTEMPTS:-12}"); do
     sleep "${GENESIS_DEPLOY_HEALTH_INTERVAL:-15}"
 done
 if [ "$HEALTH_OK" = true ] && systemctl --user is-active --quiet genesis-server; then
-    append_deploy_receipt "deployed" "$SHA" "code-only"
+    # Receipt attribution (Codex P2, #1804): the exclusive hold only
+    # coordinates cooperating lock users — verify the tree is STILL the SHA we
+    # deployed before recording that it is. A HEAD that moved mid-deploy gets a
+    # failure receipt + alert, never a false "deployed".
+    _NOW_SHA="$(git -C "$GENESIS_ROOT" rev-parse HEAD)"
+    if [ "$_NOW_SHA" != "$SHA" ]; then
+        append_deploy_receipt "deploy_failed" "$SHA" "code-only" \
+            "HEAD moved to $_NOW_SHA during the deploy"
+        _RECEIPTED=1
+        queue_alert critical deploy-code-only \
+            "HEAD moved mid code-only deploy ($SHA -> $_NOW_SHA)" \
+            "The serving checkout moved while the deploy held the exclusive station lock — the lock coordinates cooperating users only. The server was restarted onto an unattributed tree; receipts name both SHAs. Investigate who moved $GENESIS_ROOT."
+        echo "ERROR: HEAD moved mid-deploy ($SHA -> $_NOW_SHA) — receipt refused, alert queued." >&2
+        exit 1
+    fi
+    # A dirty tree deploys and serves its tracked modifications (pip install -e
+    # means the TREE is the install), so a bare "deployed $SHA" would misname
+    # what is serving. Deploy proceeds — with --no-pull that is the operator's
+    # deliberate act — but the receipt must say so (Codex P2 / Devin, #1804).
+    # Untracked files are excluded: they cannot alter already-installed
+    # modules, and the main checkout legitimately carries local scratch.
+    # The probe fails CLOSED: a git error aborts the receipt via set -e (the
+    # EXIT trap then records deploy_failed), never a bare "deployed".
+    _DIRTY="$(git -C "$GENESIS_ROOT" status --porcelain --untracked-files=no)"
+    if [ -n "$_DIRTY" ]; then
+        append_deploy_receipt "deployed" "$SHA" "code-only" \
+            "tracked-dirty tree — $SHA does not fully describe the served code"
+        echo "  WARNING: tracked uncommitted changes present — receipt for $SHA carries a dirty-tree note." >&2
+    else
+        append_deploy_receipt "deployed" "$SHA" "code-only"
+    fi
     echo "  Healthy — deployed $SHA (receipt: $GENESIS_DEPLOY_RECEIPTS)"
     exit 0
 fi

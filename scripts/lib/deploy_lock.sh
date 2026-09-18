@@ -31,7 +31,9 @@
 # RECEIPTS: every deploy/validation appends one JSON line to
 # ~/.genesis/deploy_receipts.jsonl — {ts, status, sha, path, by, note?} —
 # so "validated" becomes an attributable claim about a specific serving SHA
-# instead of a race (#1699's second ask). update_history is deliberately NOT
+# instead of a race (#1699's second ask). status: deployed | deploy_failed |
+# health_failed | deployed_not_started (update.sh honouring an operator stop) |
+# validated. update_history is deliberately NOT
 # reused: it is tag-update-shaped (old_tag/new_tag rows driving the dashboard
 # update view); code-only restarts and validation holds are a different kind of
 # event, and this ordered cross-path ledger needs no migration. Retention:
@@ -84,8 +86,26 @@ _acquire_deploy_lock() {
 acquire_deploy_lock_ex() { _acquire_deploy_lock -x "$1"; }
 acquire_deploy_lock_sh() { _acquire_deploy_lock -s "$1"; }
 
+# deploy_tree_is_linked_worktree <root>
+#   True when <root> is a LINKED worktree (git worktree add) rather than the
+#   main checkout: a linked worktree's git dir lives under the main repo's
+#   .git/worktrees/, so --git-dir differs from --git-common-dir. A
+#   path-SUBSTRING test misses worktrees at arbitrary locations
+#   (`git worktree add /workspace/feature`), and pip install -e from one
+#   redirects the live server's editable installation at it — the exact
+#   hazard the callers' worktree refusals exist to prevent (Codex P2, #1804).
+#   A non-git <root> answers FALSE: the callers' later rev-parse under set -e
+#   already rejects that, and the test seam's fixture trees are plain repos.
+deploy_tree_is_linked_worktree() {
+    local root="$1" gd gcd
+    gd="$(git -C "$root" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+    gcd="$(cd "$root" 2>/dev/null && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+    [ -n "$gd" ] && [ -n "$gcd" ] && [ "$gd" != "$gcd" ]
+}
+
 # append_deploy_receipt <status> <sha> <path> [note]
-#   status: deployed | validated | health_failed        path: code-only | update.sh | validation
+#   status: deployed | deploy_failed | health_failed | deployed_not_started | validated
+#   path: code-only | update.sh | validation
 #   Values cross via the environment (never interpolated into code), matching
 #   alert_queue.sh's injection-safe convention. Best-effort: a receipt failure
 #   must never abort a deploy — but it says so on stderr rather than
@@ -141,9 +161,18 @@ PY
 #   tomorrow, which is the right trade for a daily groom — queueing it behind a
 #   2h validation hold would be backwards.
 #   Returns 0 when it pruned or had nothing to do, 2 when the station was busy.
+#   A lock SETUP failure (unusable lock path, flock operational error) propagates
+#   the acquirer's 1 unchanged — mapping it to 2 would report a persistent fault
+#   as a benign busy-station skip on every daily run, and the ledger would never
+#   be pruned (Codex P3 / CodeRabbit Minor, #1804).
 prune_deploy_receipts() {
     [ -f "$GENESIS_DEPLOY_RECEIPTS" ] || return 0
-    acquire_deploy_lock_ex 0 || return 2
+    local lock_rc=0
+    acquire_deploy_lock_ex 0 || lock_rc=$?
+    if [ "$lock_rc" -eq "$DEPLOY_LOCK_HELD_RC" ]; then
+        return 2
+    fi
+    [ "$lock_rc" -eq 0 ] || return "$lock_rc"
     # A .tmp orphaned by a kill between tail and mv would sit forever; clear it
     # before (re)writing.
     rm -f "$GENESIS_DEPLOY_RECEIPTS.tmp"

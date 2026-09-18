@@ -79,16 +79,25 @@ _guardian_pause() {
         # Start the bounded lease renewer so an over-TTL downtime can't expire
         # the pause mid-deploy. _guardian_resume (and the caller's EXIT trap)
         # kills it. Redirect its fds so it (and its `sleep` child) don't hold
-        # the caller's stdout/stderr open — and close the deploy-lock fd, when a
-        # caller holds one, so an orphaned renewer cannot extend the EXCLUSIVE
-        # hold past a SIGKILLed deploy. The residue was bounded (RENEW_MAX ×
-        # TTL/2 ≈ 10 min) rather than unbounded, but that lands exactly on a
-        # retry's default 600s wait, so the retry could time out against a deploy
-        # that was already dead. `${_DEPLOY_LOCK_FD:-...}` keeps this lib usable
-        # standalone: guardian_pause.sh does not require deploy_lock.sh to be
-        # sourced, and closing a never-opened fd would be an error under set -e.
-        # (Kimi P3, 2026-09-06.)
-        if [ -n "${_DEPLOY_LOCK_FD:-}" ]; then
+        # the caller's stdout/stderr open — and close the STATION-LOCK fd, so an
+        # orphaned renewer cannot extend the EXCLUSIVE hold past a SIGKILLed
+        # deploy. Two callers, two variable names: the lib's own acquirers keep
+        # the fd in _DEPLOY_LOCK_FD, while update.sh takes the same lock file
+        # with its own inline flock in _UPDATE_LOCK_FD (scripts/update.sh) — a
+        # SIGKILLed update.sh otherwise left the renewer holding the station
+        # for up to RENEW_MAX × TTL/2 = 60 min, timing out the code-only deploy
+        # path and every validation behind it (Codex P2, #1804). The residue was
+        # bounded rather than unbounded, but that lands exactly on a retry's
+        # default 600s wait, so the retry could time out against a deploy that
+        # was already dead. `${VAR:-...}` keeps this lib usable standalone:
+        # guardian_pause.sh does not require deploy_lock.sh OR update.sh's lock
+        # to be in play, and closing a never-opened fd would be an error under
+        # set -e. (Kimi P3, 2026-09-06.)
+        if [ -n "${_DEPLOY_LOCK_FD:-}" ] && [ -n "${_UPDATE_LOCK_FD:-}" ]; then
+            _guardian_renew_loop >/dev/null 2>&1 {_DEPLOY_LOCK_FD}>&- {_UPDATE_LOCK_FD}>&- &
+        elif [ -n "${_UPDATE_LOCK_FD:-}" ]; then
+            _guardian_renew_loop >/dev/null 2>&1 {_UPDATE_LOCK_FD}>&- &
+        elif [ -n "${_DEPLOY_LOCK_FD:-}" ]; then
             _guardian_renew_loop >/dev/null 2>&1 {_DEPLOY_LOCK_FD}>&- &
         else
             _guardian_renew_loop >/dev/null 2>&1 &

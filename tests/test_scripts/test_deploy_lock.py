@@ -120,7 +120,10 @@ def _hold_lock(env, mode: str, seconds: float) -> subprocess.Popen:
             "bash",
             "-c",
             f'source "{_LIB}"; acquire_deploy_lock_{mode} 30 || exit $?; '
-            f"echo HELD; sleep {seconds}",
+            # exec: the sleep BECOMES this process, so _kill(p.pid) terminates
+            # the very process owning the inherited lock fd — killing a bash
+            # parent instead would leave the sleep holding the lock.
+            f"echo HELD; exec sleep {seconds}",
         ],
         env=env,
         stdout=subprocess.PIPE,
@@ -381,11 +384,120 @@ class TestCodeOnlyWrapper:
         assert rows[0]["note"] == "failed at installed"
         assert not (station["home"] / ".genesis" / "update_state.json").exists()
 
+    def test_install_failure_alerts_and_holds(self, station):
+        """Codex P1 (#1804), --no-pull shape: pip install -e removes the old
+        dist BEFORE installing, so a failed install can leave the venv without
+        the package — the running server breaks on its next lazy import, and
+        the tree on disk no longer matches the code in memory. The 'installing'
+        phase marker (set BEFORE the pip call) is what makes cleanup see this
+        as a post-advance failure: receipt + critical alert, not silence."""
+        env = station["env"]
+        _write_exec(station["root"] / ".venv" / "bin" / "pip", "#!/bin/bash\nexit 1\n")
+        r = subprocess.run(
+            ["bash", str(_WRAPPER), "--no-pull", "--wait", "5"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 1
+        rows = _receipts(env)
+        assert [row["status"] for row in rows] == ["deploy_failed"]
+        assert rows[0]["note"] == "failed at installing"
+        queue = station["home"] / ".genesis" / "alerts" / "queue"
+        alerts = list(queue.glob("*.json")) if queue.exists() else []
+        assert len(alerts) == 1, "an install failure must raise exactly one critical alert"
+        assert json.loads(alerts[0].read_text())["severity"] == "critical"
+
+    def test_restart_failure_alerts_and_holds(self, station):
+        """Codex P1 (#1804): a failed restart leaves the server down or running
+        stale in-memory code against the on-disk tree — indefinitely, because
+        the failure was previously only a ledger row nobody reads live. The
+        cleanup path must raise a critical alert, same doctrine as
+        health_failed."""
+        env, shims = station["env"], station["shims"]
+        _write_exec(shims / "systemctl", "#!/bin/bash\nexit 1\n")
+        r = subprocess.run(
+            ["bash", str(_WRAPPER), "--no-pull", "--wait", "5"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode != 0
+        queue = station["home"] / ".genesis" / "alerts" / "queue"
+        alerts = list(queue.glob("*.json")) if queue.exists() else []
+        assert len(alerts) == 1, "a post-install failure must raise exactly one critical alert"
+        alert = json.loads(alerts[0].read_text())
+        assert alert["severity"] == "critical"
+        assert alert["source"] == "deploy-code-only"
+
+    def test_deployed_receipt_flags_a_tracked_dirty_tree(self, station):
+        """pip install -e means the TREE is the install: tracked modifications
+        are served, so a bare 'deployed <sha>' would misname what is serving.
+        The deploy proceeds (an operator's --no-pull tree is deliberate) but
+        the receipt must carry the dirty-tree note (Codex P2 / Devin, #1804)."""
+        env, root = station["env"], station["root"]
+        tracked = root / "served_module.py"
+        tracked.write_text("v1\n")
+        subprocess.run(["git", "-C", str(root), "add", tracked.name], check=True)
+        subprocess.run(
+            ["git", "-C", str(root), "-c", "user.email=t@local", "-c", "user.name=t",
+             "commit", "-qm", "track a served file"],
+            check=True,
+        )
+        tracked.write_text("v2 — dirty\n")
+        r = subprocess.run(
+            ["bash", str(_WRAPPER), "--no-pull", "--wait", "5"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 0, r.stderr
+        rows = _receipts(env)
+        assert [row["status"] for row in rows] == ["deployed"]
+        assert "tracked-dirty" in rows[0].get("note", ""), (
+            "a dirty-tree deploy must be flagged on the receipt, not attributed bare"
+        )
+
+    def test_deploy_refuses_the_receipt_when_head_moves_mid_run(self, station):
+        """The exclusive hold coordinates cooperating lock users ONLY — if the
+        checkout moves mid-deploy, 'deployed <old sha>' is a false claim. The
+        health probe stands in for the mover, firing between restart and
+        receipt (Codex P2, #1804)."""
+        env, root, shims = station["env"], station["root"], station["shims"]
+        _write_exec(
+            shims / "curl",
+            "#!/bin/bash\n"
+            f'git -C "{root}" -c user.email=t@local -c user.name=t commit --allow-empty -qm moved\n'
+            "exit 0\n",
+        )
+        r = subprocess.run(
+            ["bash", str(_WRAPPER), "--no-pull", "--wait", "5"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 1
+        rows = _receipts(env)
+        assert [row["status"] for row in rows] == ["deploy_failed"]
+        assert "HEAD moved" in rows[0]["note"]
+        queue = station["home"] / ".genesis" / "alerts" / "queue"
+        alerts = list(queue.glob("*.json")) if queue.exists() else []
+        assert len(alerts) == 1
+        assert json.loads(alerts[0].read_text())["severity"] == "critical"
+
     def test_worktree_refusal(self, station, tmp_path):
+        """The refusal must hold for a linked worktree at an ARBITRARY path —
+        `git worktree add /anywhere` carries no marker substring, so a pathname
+        test waves it through while pip install -e redirects the live server's
+        editable install at it (Codex P2, #1804). Detected via Git's
+        git-dir/common-dir split, not the path."""
         env = dict(station["env"])
-        fake = tmp_path / "x" / ".claude" / "worktrees" / "wt"
-        fake.mkdir(parents=True)
-        env["GENESIS_DEPLOY_ROOT"] = str(fake)
+        wt = tmp_path / "anywhere" / "feature"  # deliberately no marker substring
+        subprocess.run(
+            ["git", "-C", str(station["root"]), "worktree", "add", "--detach", "-q", str(wt)],
+            check=True,
+        )
+        env["GENESIS_DEPLOY_ROOT"] = str(wt)
         r = subprocess.run(
             ["bash", str(_WRAPPER), "--no-pull"],
             env=env,
@@ -394,6 +506,18 @@ class TestCodeOnlyWrapper:
         )
         assert r.returncode == 1
         assert "must not run from a worktree" in r.stderr
+
+    def test_main_checkout_is_not_misread_as_a_worktree(self, station):
+        """The git-based detector's other half: the fixture's MAIN tree must
+        NOT be refused, or every deploy fails."""
+        env = station["env"]
+        r = subprocess.run(
+            ["bash", str(_WRAPPER), "--no-pull", "--wait", "5"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 0, r.stderr
 
 
 class TestRunUnderDeployLock:
@@ -447,6 +571,91 @@ class TestRunUnderDeployLock:
         finally:
             holder.wait()
 
+    def test_sigterm_to_the_wrapper_kills_the_wrapped_command(self, station):
+        """The lock fd is CLOSED in the wrapped command (leak guard), so a
+        command that outlives its wrapper would keep running with NO lock held
+        — and a deploy could then restart the live server mid-validation
+        (Codex P2, #1804). The wrapper must forward TERM to the tracked child
+        before the lock releases."""
+        env = station["env"]
+        pidfile = station["tmp"] / "child.pid"
+        p = subprocess.Popen(
+            [
+                "bash",
+                str(_RUN_UNDER),
+                "--shared",
+                "--wait",
+                "5",
+                "--",
+                # exec: the sleep IS the tracked child, so a forwarded TERM
+                # settles it; no grandchild is left to linger in CI.
+                "bash",
+                "-c",
+                f'echo $$ > "{pidfile}"; exec sleep 60',
+            ],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not pidfile.exists():
+            time.sleep(0.05)
+        assert pidfile.exists(), "the wrapped command never started"
+        child = int(pidfile.read_text().strip())
+        p.terminate()
+        p.wait(timeout=15)
+        assert not _alive(child), (
+            "SIGTERM to the wrapper never reached the wrapped command — it is "
+            "still running while the station lock has been released"
+        )
+        acq = subprocess.run(
+            ["bash", "-c", f'source "{_LIB}"; acquire_deploy_lock_ex 0'],
+            env=env,
+        )
+        assert acq.returncode == 0, "the lock must be free once wrapper AND child are gone"
+
+    def test_sigterm_wedges_no_station_when_the_child_ignores_term(self, station):
+        """The forwarded TERM has a bounded grace: a child that IGNORES TERM
+        must be SIGKILLed after 10s, not waited on forever — otherwise the
+        wrapper (and the station lock) wedges behind it, worse than the
+        pre-forwarding behaviour where the wrapper died and the kernel
+        released the lock (adversarial audit F2, #1804)."""
+        env = station["env"]
+        pidfile = station["tmp"] / "child.pid"
+        p = subprocess.Popen(
+            [
+                "bash",
+                str(_RUN_UNDER),
+                "--shared",
+                "--wait",
+                "5",
+                "--",
+                # SIG_IGN survives the exec, so the sleep itself ignores TERM.
+                "bash",
+                "-c",
+                f'trap "" TERM; echo $$ > "{pidfile}"; exec sleep 60',
+            ],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not pidfile.exists():
+            time.sleep(0.05)
+        assert pidfile.exists(), "the wrapped command never started"
+        child = int(pidfile.read_text().strip())
+        t0 = time.monotonic()
+        p.terminate()
+        p.wait(timeout=25)
+        elapsed = time.monotonic() - t0
+        assert not _alive(child), "a TERM-ignoring child must be SIGKILLed after the grace window"
+        assert elapsed < 20, f"wrapper wedged {elapsed:.0f}s behind a TERM-ignoring child"
+        acq = subprocess.run(
+            ["bash", "-c", f'source "{_LIB}"; acquire_deploy_lock_ex 0'],
+            env=env,
+        )
+        assert acq.returncode == 0, "the lock must be free once wrapper AND child are gone"
+
 
 class TestRunUnderReceiptScope:
     def test_receipt_refused_with_an_exclusive_hold(self, station):
@@ -485,11 +694,16 @@ class TestRunUnderReceiptScope:
     def test_receipt_refused_from_a_worktree_copy(self, station, tmp_path):
         """--receipt's SHA claim is about the SERVING tree (architect SF4): a
         worktree copy recording its branch HEAD as 'validated' would falsify
-        the ledger's core attribution."""
+        the ledger's core attribution. The worktree sits at an arbitrary path
+        with no marker substring — Git's git-dir/common-dir split catches it
+        (Codex P2, #1804)."""
         env = dict(station["env"])
-        fake = tmp_path / "y" / ".claude" / "worktrees" / "wt"
-        fake.mkdir(parents=True)
-        env["GENESIS_DEPLOY_ROOT"] = str(fake)
+        wt = tmp_path / "elsewhere" / "validation"
+        subprocess.run(
+            ["git", "-C", str(station["root"]), "worktree", "add", "--detach", "-q", str(wt)],
+            check=True,
+        )
+        env["GENESIS_DEPLOY_ROOT"] = str(wt)
         r = subprocess.run(
             ["bash", str(_RUN_UNDER), "--receipt", "--", "true"],
             env=env,
@@ -498,6 +712,68 @@ class TestRunUnderReceiptScope:
         )
         assert r.returncode == 1
         assert "serving tree" in r.stderr
+        assert _receipts(env) == []
+
+    def test_receipt_refused_when_the_command_moved_head(self, station):
+        """The shared hold coordinates cooperating lock users ONLY — the wrapped
+        command itself can still commit or check out another revision, and the
+        pre-read SHA would then attribute the run to a tree it did not validate
+        (Codex P2, #1804). Verify identity at receipt time; refuse instead."""
+        env = station["env"]
+        root = station["root"]
+        r = subprocess.run(
+            [
+                "bash",
+                str(_RUN_UNDER),
+                "--receipt",
+                "--wait",
+                "5",
+                "--",
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.email=t@local",
+                "-c",
+                "user.name=t",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "moved",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 1
+        assert "HEAD moved" in r.stderr
+        assert _receipts(env) == []
+
+    def test_receipt_refused_on_a_tracked_dirty_tree(self, station):
+        """pip install -e means the tree IS the install: uncommitted TRACKED
+        modifications are served, so a 'validated <HEAD>' receipt on a dirty
+        tree names code that was not what ran (Codex P2, #1804)."""
+        env = station["env"]
+        tracked = station["root"] / "deploy_code_only_marker"
+        tracked.write_text("clean\n")
+        subprocess.run(
+            ["git", "-C", str(station["root"]), "add", tracked.name],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(station["root"]), "-c", "user.email=t@local", "-c", "user.name=t",
+             "commit", "-qm", "track the marker"],
+            check=True,
+        )
+        tracked.write_text("dirty now\n")
+        r = subprocess.run(
+            ["bash", str(_RUN_UNDER), "--receipt", "--wait", "5", "--", "true"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 1
+        assert "uncommitted TRACKED changes" in r.stderr
         assert _receipts(env) == []
 
 
@@ -705,6 +981,70 @@ class TestLockFdIsNotLeakedToChildren:
         finally:
             _kill(renewer)
 
+    def test_guardian_renewer_does_not_hold_updates_lock_fd(self, station):
+        """update.sh takes the SAME lock file with its own inline flock, kept in
+        _UPDATE_LOCK_FD rather than _DEPLOY_LOCK_FD. A SIGKILLed update.sh left
+        the orphaned renewer holding the exclusive station lock for up to
+        RENEW_MAX x TTL/2 (update.sh: 60 min), timing out code-only deploys and
+        validations against a dead deploy (Codex P2 / Devin, #1804)."""
+        env, home, root, shims = (
+            station["env"],
+            station["home"],
+            station["root"],
+            station["shims"],
+        )
+        key = home / "fake_key"
+        key.write_text("k")
+        (home / ".genesis" / "guardian_remote.yaml").write_text(
+            f"host_ip: 127.0.0.1\nhost_user: tester\nssh_key: {key}\n"
+        )
+        _write_exec(
+            root / ".venv" / "bin" / "python",
+            "#!/bin/bash\n"
+            'case "$2" in\n'
+            "  *host_ip*) echo 127.0.0.1 ;;\n"
+            "  *host_user*) echo tester ;;\n"
+            f"  *ssh_key*) echo {key} ;;\n"
+            "esac\n",
+        )
+        _write_exec(shims / "ssh", "#!/bin/bash\nexit 0\n")
+        lib_g = _SCRIPTS / "lib" / "guardian_pause.sh"
+        pidfile = station["tmp"] / "renew.pid"
+        r = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f'VENV_DIR="{root}/.venv"; GENESIS_ROOT="{root}"; '
+                f'source "{_LIB}"; source "{lib_g}"; '
+                # update.sh's own shape: inline flock on the shared path, kept
+                # in _UPDATE_LOCK_FD — never in _DEPLOY_LOCK_FD.
+                'exec {_UPDATE_LOCK_FD}>>"$GENESIS_DEPLOY_LOCK"; '
+                'flock -x "$_UPDATE_LOCK_FD" || exit 9; '
+                "GUARDIAN_PAUSE_TTL=300; _guardian_pause; "
+                f'echo "$_GUARDIAN_RENEW_PID" > "{pidfile}"',
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert r.returncode == 0, f"stdout={r.stdout} stderr={r.stderr}"
+        raw = pidfile.read_text().strip()
+        assert raw, "no renewer was started — this test would prove nothing"
+        renewer = int(raw)
+        try:
+            assert _alive(renewer), "the renewer exited before the assertion — vacuous otherwise"
+            acq = subprocess.run(
+                ["bash", "-c", f'source "{_LIB}"; acquire_deploy_lock_ex 0'],
+                env=env,
+            )
+            assert acq.returncode == 0, (
+                "the orphaned guardian renewer inherited update.sh's _UPDATE_LOCK_FD "
+                "and is still holding the exclusive lock after its deploy died"
+            )
+        finally:
+            _kill(renewer)
+
 
 class TestLockErrorsAreReportedHonestly:
     def test_only_a_timeout_reports_as_contention(self, station):
@@ -771,15 +1111,42 @@ class TestReceiptsPrune:
         env = station["env"]
         receipts = Path(env["GENESIS_DEPLOY_RECEIPTS"])
         receipts.write_text('{"n": 0}\n')
-        holder = _hold_lock(env, "sh", 1.5)
+        # Bound the holder by the assertion, not by a short sleep: a 1.5s hold
+        # can expire before the probe subprocess starts on a loaded CI runner,
+        # and the probe would then read a FREE station as "skipped"
+        # (CodeRabbit, #1804). Killed in the finally via exec sleep.
+        holder = _hold_lock(env, "sh", 60)
         try:
             r = subprocess.run(
                 ["bash", "-c", f'source "{_LIB}"; prune_deploy_receipts'],
                 env=env,
+                timeout=30,
             )
             assert r.returncode == 2, "busy station must report skip, not success"
         finally:
-            holder.wait()
+            _kill(holder.pid)
+            holder.wait(timeout=10)
+
+    def test_setup_failure_is_not_reported_as_contention(self, station):
+        """An unusable lock path is a FAULT, not a busy station: mapping it to 2
+        makes disk_hygiene skip forever while the ledger grows unpruned, and the
+        failure never surfaces (Codex P3 / CodeRabbit Minor, #1804)."""
+        env = dict(station["env"])
+        receipts = Path(env["GENESIS_DEPLOY_RECEIPTS"])
+        receipts.write_text('{"n": 0}\n')
+        # A regular file where the lock's parent DIR must be: mkdir -p fails.
+        blocker = station["tmp"] / "not-a-dir"
+        blocker.write_text("x")
+        env["GENESIS_DEPLOY_LOCK"] = str(blocker / "station.lock")
+        r = subprocess.run(
+            ["bash", "-c", f'source "{_LIB}"; prune_deploy_receipts'],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 1, (
+            f"a lock SETUP failure must propagate 1, not the contention rc — got {r.returncode}"
+        )
 
     def test_disk_hygiene_calls_the_lib_not_its_own_copy(self):
         """The prune moved into the lib so it could be tested; the groom must

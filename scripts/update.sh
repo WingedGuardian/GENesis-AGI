@@ -175,8 +175,14 @@ if [ -e "$HOME/.genesis/cc_suppression_outcome" ]; then
 fi
 
 # Refuse to run from a worktree — pip install -e in bootstrap.sh would
-# redirect system-wide imports and cause I/O death spiral.
-if [[ "$GENESIS_ROOT" == *"/.claude/worktrees/"* ]] || \
+# redirect system-wide imports and cause I/O death spiral. A linked worktree
+# can live at ANY path (`git worktree add /workspace/x`), so a path-substring
+# test alone would wave it through — ask Git instead (Codex P2, #1804; helper
+# in lib/deploy_lock.sh, sourced above). The substring arms stay as well: a
+# plain CLONE under a marker dir is not a linked worktree, but carries the
+# same pip -e hazard.
+if deploy_tree_is_linked_worktree "$GENESIS_ROOT" || \
+   [[ "$GENESIS_ROOT" == *"/.claude/worktrees/"* ]] || \
    [[ "$GENESIS_ROOT" == *"/.worktrees/"* ]]; then
     echo "ERROR: update.sh must not run from a worktree."
     echo "       GENESIS_ROOT=$GENESIS_ROOT"
@@ -2005,7 +2011,16 @@ _record_update_history "success" "" "$_p6_degraded"
 # "never abort now" tail — a transient .git lock must not strand the state
 # file one line before its cleanup.
 _receipt_sha="$(git -C "$GENESIS_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
-append_deploy_receipt "deployed" "$_receipt_sha" "update.sh"
+if [ "${_OPERATOR_STOP:-false}" = "true" ]; then
+    # The server was deliberately stopped before this update and is NOT running
+    # now (no restart, no health check) — a bare "deployed" receipt would name a
+    # SHA nothing is serving, in the ledger built to make that claim
+    # attributable (Devin, #1804).
+    append_deploy_receipt "deployed_not_started" "$_receipt_sha" "update.sh" \
+        "operator-stopped: server was not running at update start — not restarted, not health-verified"
+else
+    append_deploy_receipt "deployed" "$_receipt_sha" "update.sh"
+fi
 
 _write_state "done"
 
