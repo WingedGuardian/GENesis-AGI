@@ -335,14 +335,31 @@ _FINISHING_PATTERNS = re.compile(
 # so the verdict routinely arrives bolded or dash-joined. MEASURED across this
 # install's transcripts, of 710 negative-verdict occurrences the plain `: No`
 # spelling covers 674 and the bold-value and dash forms account for the other 36
-# — a 5% hole in a rule whose whole job is polarity. Admitting the dash also
-# admits "ready to merge - no problem", which is why `no` carries the lookahead:
-# without it the widening would trade one wrong fire for one wrong SILENCE, and
-# a wrong silence is the direction that loses the feature.
+# — a 5% hole in a rule whose whole job is polarity.
+#
+# `No` is matched as a COMPLETE verdict value (Codex P2, #1840): the protocol's
+# literal is the bare word, so anything followed by an ordinary continuation
+# ("no blockers remain", "no regressions observed", "no further changes
+# needed") is a REASON, not a verdict — an earlier exclusion-list encoding
+# suppressed those affirmative completion claims, a wrong silence on the
+# nudge this hook exists to deliver. The lookahead admits the closings a
+# quoted verdict actually carries: punctuation, a bold marker, a dash-led
+# explanation, or end-of-line.
+#
+# `with fixes` cannot use the same rule: a quoted verdict legitimately
+# continues ("With fixes on the dedup work" — pinned below), so it keeps a
+# prefix match but stops at PAST-TENSE completion continuations ("with fixes
+# applied/landed/merged/addressed/done", "with fixes in place"), which are the
+# assistant's own status prose, not a verdict (Devin, #1840). One intervening
+# adverb is allowed ("with fixes NOW applied") — without it the exclusion
+# re-introduces the scalability flaw the complete-value `no` encoding just
+# removed (adversarial audit, #1840).
 _NOT_READY_VERDICT = re.compile(
-    r"\**\s*[:—–-]\s*\**\s*"
-    r"(?:no\b(?!\s+(?:blocker|issue|problem|concern|finding|change))|with\s+fixes\b)",
-    re.IGNORECASE,
+    r"\**\s*[:—–-]\s*\**\s*(?:"
+    r"no(?=\s*(?:[.!,;*\"')`\]]|[—–-]|$))"
+    r"|with\s+fixes\b(?!\s+(?:[a-z]+\s+)?(?:applied|landed|merged|addressed|done|in\s+place)\b)"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
@@ -398,8 +415,59 @@ _VERIFICATION_EVIDENCE = re.compile(
 _NOT_YET_VERIFIED = re.compile(
     r"\b(?:next\s+session|needs?|needed|deferred|pending|todo|to-do|not\s+yet"
     r"|planned|could\s?n[o']?t|cannot|can'?t|failed|failing|unable\s+to"
+    # Explicit non-execution (CodeRabbit Major / Codex P2 / Devin, #1840): the
+    # plain negative forms a status report actually uses. "I did not run the
+    # integration test" named the evidence phrase while matching NO qualifier,
+    # so the admission bought silence — the exact inversion this list is for.
+    # Every `run` carries the `(?! into)` guard: "did not run INTO issues" is
+    # the idiom for a CLEAN run, i.e. true evidence (adversarial audit, #1840).
+    r"|did\s+not\s+(?:run(?!\s+into\b)|perform|complete|execute|verify)"
+    r"|didn'?t\s+(?:run(?!\s+into\b)|perform|complete|execute|verify)"
+    r"|does\s+not\s+(?:run(?!\s+into\b)|perform|complete|execute|verify)"
+    r"|(?:was|were)\s+not\s+(?:run(?!\s+into\b)|performed|completed|executed|verified)"
+    r"|(?:wasn'?t|weren'?t)\s+(?:run(?!\s+into\b)|performed|completed|executed|verified)"
+    r"|(?:has|have)\s+not\s+been\s+(?:run(?!\s+into\b)|performed|completed|executed|verified)"
+    r"|(?:hasn'?t|haven'?t)\s+been\s+(?:run(?!\s+into\b)|performed|completed|executed|verified)"
+    r"|not\s+(?:run(?!\s+into\b)|performed|completed|executed|verified)"
+    # Non-completion OUTCOMES, not just non-starts (Codex P2, #1840). `blocked`
+    # is scoped to its complement / sentence end — as an adjective for users or
+    # requests ("verified blocked users get a 403") it is routine auth-test
+    # prose, not an admission (adversarial audit, #1840). `timed\s+out`, not
+    # `time.*out`: "time out of caution" is not a test result.
+    r"|timed\s+out|errored|timeouts?"
+    r"|blocked(?:\s+(?:by|on|until)\b|(?=\s*(?:[.!,;]|$)))"
     r"|skip(?:s|ped|ping)?|untested|unverified"
     r"|before\s+(?:merg(?:e|es|ed|ing)|ship(?:s|ped|ping)?|land(?:s|ed|ing)?))\b",
+    re.IGNORECASE,
+)
+
+# Two qualifier RECLASSIFICATIONS, both measured false-rejects (Codex P2, #1840):
+#
+# A qualifier can itself be NEGATED — "no follow-up needed", "not needed" — in
+# which case it closes the work instead of owing it. The negation cue is read
+# in the ~20 chars before the match, allowing one intervening word ("no
+# follow-up needed", "no longer needed"). The skip applies ONLY to the
+# owed-work family below — never to a non-execution qualifier: "No I didn't
+# run the integration test" is an admission with a capital N, and skipping it
+# would re-admit the exact hole this repair exists to close (audit F4, #1840).
+_QUALIFIER_NEGATED = re.compile(r"(?:\bno\s+(?:[\w-]+\s+)?|\bnot\s+)$", re.IGNORECASE)
+_OWED_WORK_QUALIFIER = re.compile(
+    r"(?:next\s+session|needs?|needed|deferred|pending|todo|to-do|planned)",
+    re.IGNORECASE,
+)
+#
+# And a qualifier can be HISTORICAL: "the integration test failed initially,
+# but now passes" records a recovery in one sentence, and the sentence-wide
+# window sees the old failure. The recovery marker re-binds the qualifier to
+# the past. A pass-word is REQUIRED — "but I fixed it" claims a repair, not a
+# re-run, and stays owed; "but it works on my machine" is the canonical
+# NON-verification, so `works` is deliberately absent (audit F5, #1840).
+# Deliberate trade: "X failed, but Y passes" also reads as recovered (the
+# message still demonstrates verification activity; this is a nudge, not a
+# proof checker).
+_VERIFICATION_RECOVERY = re.compile(
+    r"\b(?:but|however|though)\b[^.!?;\n]*\b(?:now\s+)?"
+    r"(?:pass(?:es|ed|ing)?|succeed(?:s|ed|ing)?|green|clean)\b",
     re.IGNORECASE,
 )
 
@@ -439,8 +507,26 @@ def _has_verification_evidence(assistant_message: str) -> bool:
     """
     for m in _VERIFICATION_EVIDENCE.finditer(assistant_message):
         left, right = _sentence_around(assistant_message, m.start(), m.end())
-        if not _NOT_YET_VERIFIED.search(assistant_message, left, right):
-            return True
+        sentence = assistant_message[left:right]
+        qualifiers = [
+            q
+            for q in _NOT_YET_VERIFIED.finditer(sentence)
+            # A negated OWED-WORK qualifier ("no follow-up needed") closes work
+            # rather than owing it — skip it. The family gate matters: "No I
+            # didn't run the test" is an admission, and the lookback would
+            # otherwise read its capital "No" as a negation cue (audit, #1840).
+            if not (
+                _OWED_WORK_QUALIFIER.fullmatch(q.group())
+                and _QUALIFIER_NEGATED.search(
+                    sentence[max(0, q.start() - 20) : q.start()]
+                )
+            )
+        ]
+        # A qualifier with a recovery marker in its sentence is historical
+        # ("failed initially, but now passes") — the evidence stands.
+        if qualifiers and not _VERIFICATION_RECOVERY.search(sentence):
+            continue
+        return True
     return False
 
 

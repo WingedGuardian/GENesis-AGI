@@ -282,6 +282,20 @@ def test_the_suppressor_does_not_blind_the_real_cases(tmp_path, message):
         # opens a reason rather than being the verdict. A wrong SILENCE is the
         # direction that loses the feature, so this must still fire.
         ("Ready to merge — no blockers remain on the branch.", True),
+        # The exclusion-list encoding of that distinction could not scale:
+        # every affirmative continuation NOT on the list was misread as the
+        # negative verdict (Codex P2 / Devin, #1840). `No` is now matched as a
+        # COMPLETE verdict value, so a reason-continuation fires the nudge.
+        ("Ready to merge — no regressions observed.", True),
+        ("Ready to merge: no further changes needed.", True),
+        ("Ready to merge: no remaining blockers.", True),
+        # "With fixes" keeps a prefix match (a quoted verdict legitimately
+        # continues, per the pinned case above) but stops at PAST-TENSE
+        # completion prose — the assistant's own status, not a verdict. One
+        # intervening adverb must not defeat the exclusion.
+        ("Ready to merge — with fixes applied.", True),
+        ("Ready to merge — with fixes in place.", True),
+        ("Ready to merge — with fixes now applied.", True),
     ],
 )
 def test_a_NOT_ready_verdict_is_not_a_completion_claim(tmp_path, message, should_fire):
@@ -359,6 +373,46 @@ def test_a_finishing_word_is_matched_WHOLE(tmp_path, message, should_fire):
         # suppressed message ("values never printed") in a clause with nothing
         # to do with whether the test ran.
         ("Ready to merge. Values are never printed and the smoke test passes.", False),
+        # Explicit non-execution in the forms a status report actually uses
+        # (CodeRabbit Major / Codex P2 / Devin, #1840): naming the test while
+        # saying it did NOT happen must not buy silence.
+        ("Ready to merge. I did not run the integration test.", True),
+        ("Ready to merge. The integration test was not run on this host.", True),
+        ("Ready to merge. The integration test didn't run in this environment.", True),
+        ("Ready to merge. The e2e test has not been run.", True),
+        # Non-completion OUTCOMES are also owed verification.
+        ("Ready to merge. The integration test timed out.", True),
+        ("Ready to merge. The integration test hit a timeout on startup.", True),
+        ("Ready to merge. The smoke test errored on startup.", True),
+        ("Ready to merge. The integration test is blocked by the outage.", True),
+        # A qualifier can be HISTORICAL — a same-sentence recovery ("failed
+        # initially, but now passes") records the fix landing, not an
+        # outstanding debt (Codex P2, #1840).
+        ("Ready to merge. The integration test failed initially, but now passes.", False),
+        ("Ready to merge. The smoke test failed before the fix but is green now.", False),
+        # ...and a qualifier can itself be NEGATED ("no follow-up needed"),
+        # which closes the work instead of owing it.
+        ("Ready to merge. The smoke test passed, no follow-up needed.", False),
+        # The mixed sentence stays honest: a pass-word must FOLLOW the
+        # conjunction, so "passes, but the e2e test failed" is not a recovery.
+        ("Ready to merge. The smoke test passes, but the e2e test failed.", True),
+        # Adversarial-audit regressions (#1840, fix-of-fix round):
+        # "did not run INTO issues" is the idiom for a CLEAN run — true evidence.
+        ("Ready to merge. The integration test did not run into issues.", False),
+        # "blocked" as an adjective for users/requests is auth-test prose.
+        ("Ready to merge. The smoke test verified blocked users get a 403.", False),
+        # Past-tense recovery ("passed", not only "passes").
+        ("Ready to merge. The e2e test failed on the first try, but it passed on re-run.", False),
+        # A negation cue never silences a NON-EXECUTION qualifier — "No I
+        # didn't run it" is an admission, not a closed debt.
+        ("Ready to merge. No I didn't run the integration test.", True),
+        # "works on my machine" is the canonical NON-verification; `works` is
+        # deliberately not a recovery pass-word.
+        ("Ready to merge. The integration test failed on CI, but it works on my machine.", True),
+        # "time out of caution" is not a test result; the pass stands. The
+        # probe shares the evidence sentence on purpose — with a `;` break the
+        # qualifier window would never see it and the case would be vacuous.
+        ("Ready to merge. The smoke test passed and I would rather time out of caution than widen the window.", False),
     ],
 )
 def test_verification_NAMED_is_not_verification_DONE(tmp_path, message, should_fire):
