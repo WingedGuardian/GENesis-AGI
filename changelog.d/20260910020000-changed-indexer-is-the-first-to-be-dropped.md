@@ -1,9 +1,1 @@
-- **If the machine runs out of memory, the code indexer is now the first thing
-  dropped.** It is background work that can simply run again, unlike a session
-  holding whatever you were in the middle of. Previously nothing expressed that
-  preference, so the choice came down to whichever process happened to be using
-  the most memory — which could well be your session. There is also a setting for
-  anyone who wants to choose the priority themselves, and it now validates what it
-  is given: a value written with a leading zero used to be read as a different
-  number entirely, and an absurdly large one wrapped around and quietly became the
-  *least* protective setting possible.
+- **Batch code-index commands and their newly spawned descendants now receive the maximum OOM preference without sacrificing their supervisor.** Only the disposable batch child is adjusted; the watchdog and launcher keep their inherited score so they can still pause, stop, and reap it. The preference applies within the kernel's eligible OOM domain, and a lower override or an adjustment that cannot be verified refuses the heavy workload instead of silently weakening protection. Workers already running in an external daemon are not reprioritized by this launcher.
