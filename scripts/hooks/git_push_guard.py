@@ -645,7 +645,7 @@ def _gh_timeout(cap: float) -> float:
     unaffected). Under a deadline, the smaller of ``cap`` and the time remaining.
     An expired budget raises before another process starts; the outer fail-closed
     guard or a caller's explicit error path then decides safely."""
-    return _bounded_timeout(_merge_deadline, cap)
+    return _bounded_timeout(_merge_deadline, cap, monotonic=time.monotonic)
 
 
 def _derive_repo_from_cwd(cwd: str) -> str | None:
