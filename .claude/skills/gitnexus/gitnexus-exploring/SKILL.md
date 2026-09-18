@@ -23,7 +23,7 @@ description: "Use when the user asks how code works, wants to understand archite
 5. READ gitnexus://repo/{name}/process/{name}      → Trace full execution flow
 ```
 
-> If step 2 says "Index is stale" → run `npx gitnexus analyze` in terminal.
+> If step 2 says "Index is stale" → refresh through `scripts/lib/code_intel_index.sh "$PWD" gitnexus fast` only from the main checkout; in a linked worktree, use Serena for live branch truth.
 
 ## Checklist
 

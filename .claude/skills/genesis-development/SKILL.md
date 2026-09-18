@@ -1130,7 +1130,7 @@ flows, route/tool maps, coupling/community analysis — but it is **snapshot-
 based**: its answers are only correct when the index matches the working tree,
 and it drifts after you pull merged PRs (its reindex fires on local commit, not
 on pull). So reach for GitNexus deliberately for its unique views, and run
-**`gitnexus analyze` first** when freshness matters; for live "who calls this"
+**from the main checkout, run `scripts/lib/code_intel_index.sh "$PWD" gitnexus fast` first** when freshness matters. Linked worktrees deliberately skip indexing; for live "who calls this"
 during active editing, prefer Serena. There is no "always run impact before
 every edit" mandate — that just gates work behind a tool that's stale-by-design.
 
@@ -1872,7 +1872,7 @@ thinking any of these, STOP — you are rationalizing a shortcut.
 | "I'll clean this up in the next commit" | Next commit never comes in autonomous sessions. Do it now, or file it — Genesis-repo work is a GitHub issue, not a local row. |
 | "This file is too large to read fully" | Read the relevant section. Partial reads lead to partial understanding and wrong fixes. |
 | "The linter is happy, ship it" | Linters catch syntax, not logic. Clean lint with broken behavior is worse than a warning with correct behavior. |
-| "This change is low-risk, no impact analysis needed" | Your confidence is based on what you know; checking callers reveals what you don't. Serena `find_referencing_symbols` is live — run it. For multi-hop blast radius, `gitnexus analyze` then `impact`. |
+| "This change is low-risk, no impact analysis needed" | Your confidence is based on what you know; checking callers reveals what you don't. Serena `find_referencing_symbols` is live — run it. For multi-hop blast radius from the main checkout, run `scripts/lib/code_intel_index.sh "$PWD" gitnexus fast`, then `impact`; in a linked worktree, use Serena for live branch truth. |
 | "I can skip the worktree, I'll be quick" | Concurrent session safety exists because "quick" commits have destroyed work before. Always worktree. |
 | "The error is transient, retry will fix it" | Diagnose first. Retrying a misdiagnosed error wastes tokens and masks root causes. |
 | "I'll add the follow-up later" | Records not created in-session are lost. File it now while context is fresh — Genesis-repo work as a GitHub issue, user-owned work as a follow-up. |

@@ -22,7 +22,7 @@ description: "Use when the user wants to rename, extract, split, move, or restru
 4. Plan update order: interfaces → implementations → callers → tests
 ```
 
-> If "Index is stale" → run `npx gitnexus analyze` in terminal.
+> If "Index is stale" → refresh through `scripts/lib/code_intel_index.sh "$PWD" gitnexus fast` only from the main checkout; in a linked worktree, use Serena for live branch truth.
 
 ## Checklists
 
