@@ -360,13 +360,17 @@ def test_dispatched_gh_api_issues_patch_close_blocks(repo):
 
 def test_foreground_gh_api_graphql_close_asks(repo):
     """The GraphQL closePullRequest mutation has no /pulls path and is POST, not
-    PATCH — it must still be caught by operation name, not slip as a silent allow."""
+    PATCH — it must still be caught by operation name, not slip as a silent allow.
+    It carries a node id rather than a PR number, so the terminal check cannot
+    run and the close is refused on the gated repo with a route through (close
+    by number). Either way: never a silent allow."""
     r = _run(
         "gh api graphql -f query='mutation{ closePullRequest(input:{pullRequestId:\"x\"}){ clientMutationId } }'",
         repo,
         dispatched=None,
     )
-    assert _verdict(r) == "ask", f"{_verdict(r)}: {r.stdout}{r.stderr}"
+    assert _verdict(r) == "block", f"{_verdict(r)}: {r.stdout}{r.stderr}"
+    assert "cannot resolve which PR" in (r.stderr or ""), r.stderr
 
 
 @pytest.mark.parametrize(
@@ -383,3 +387,56 @@ def test_gh_api_patch_close_forms_are_all_gated(repo, cmd):
     """Field-form and method-form variants of the PATCH close all ask (fg)."""
     r = _run(cmd, repo, dispatched=None)
     assert _verdict(r) == "ask", f"{cmd!r} -> {_verdict(r)}: {r.stdout}{r.stderr}"
+
+# ── glued fields, opaque bodies, and non-gh executables ────────────────────
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "gh api repos/o/r/pulls/1 -X PATCH -fstate=closed",
+        "gh api repos/o/r/pulls/1 -X PATCH -Fstate=closed",
+        "gh api repos/o/r/pulls/1 -X PATCH --field=state=closed",
+        "gh api repos/o/r/pulls/1 -X PATCH --raw-field=state=closed",
+        "gh api repos/o/r/pulls/1 -X PATCH -f body=@payload.json",
+    ],
+)
+def test_gh_api_glued_or_opaque_close_forms_are_gated(repo, cmd):
+    """The glued field spellings (-fstate=closed) evade the joined-argv \\b
+    scan, and a field value read from a file (k=@file) hides state=closed —
+    both must still gate."""
+    r = _run(cmd, repo, dispatched=None)
+    assert _verdict(r) == "ask", f"{cmd!r} -> {_verdict(r)}: {r.stdout}{r.stderr}"
+
+
+def test_gh_api_graphql_close_with_opaque_query_body_is_gated(repo):
+    """`gh api graphql --input q.json` hides the mutation in a file — the
+    operation-name scan cannot see closePullRequest, so the opaque body alone
+    must gate it."""
+    r = _run("gh api graphql --input q.json", repo, dispatched=None)
+    assert _verdict(r) == "block", f"{_verdict(r)}: {r.stdout}{r.stderr}"
+    rd = _run("gh api graphql --input q.json", repo, dispatched="1")
+    assert _verdict(rd) == "block", f"{_verdict(rd)}: {rd.stdout}{rd.stderr}"
+
+
+def test_non_gh_executable_with_api_args_is_not_gated(repo):
+    """`_gh_api_closes_pr` must require the executable to be `gh` — another
+    program merely taking `api`-shaped arguments is not a GitHub close."""
+    r = _run(
+        "faketool api repos/o/r/pulls/1 -X PATCH -f state=closed",
+        repo,
+        dispatched=None,
+    )
+    assert _verdict(r) == "allow", f"{_verdict(r)}: {r.stdout}{r.stderr}"
+
+
+def test_publishing_create_plus_close_is_a_compound_block(repo):
+    """`gh pr create` on an unpushed branch publishes code (gh pushes it), so
+    `gh pr create … && gh pr close N` is two gated operations sharing one
+    gate — refused, same as close+push."""
+    r = _run(
+        "gh pr create --title x --body y && gh pr close 1680",
+        repo,
+        dispatched=None,
+    )
+    assert _verdict(r) == "block", f"{_verdict(r)}: {r.stdout}{r.stderr}"

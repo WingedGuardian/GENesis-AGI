@@ -182,6 +182,7 @@ _DEGRADED_GATED = (
 try:
     from shell_parse import (  # noqa: E402
         _KNOWN_SIGILS,
+        _basename,
         analyze,
         analyze_checked,
         commit_skips_hooks,
@@ -3774,6 +3775,40 @@ def _close_target(argv: list[str]) -> tuple[str | None, str | None]:
     return pr_num, _comment_repo(argv) or url_repo
 
 
+def _gh_api_opaque_body(argv: list[str]) -> bool:
+    """True when a ``gh api`` argv carries a body the mention scan cannot read.
+
+    ``--input <file>``/``--input=<file>`` (``--input -`` is stdin) supplies the
+    whole body; a field value written ``k=@<file>`` (``-f``/``-F``/``--field``/
+    ``--raw-field``, separated or glued) is read from a file. Either can hide a
+    ``state=closed`` field or a ``closePullRequest`` mutation — fail toward
+    ask/deny rather than let it through unread.
+    """
+    return any(
+        tok == "--input" or tok.startswith("--input=") or re.search(r"=@", tok)
+        for tok in argv
+    )
+
+
+def _gh_api_glued_state_closed(argv: list[str]) -> bool:
+    """A ``gh api`` field flag GLUED to ``state=closed`` (``-fstate=closed``,
+    ``--field=state=closed``, ``-Fstate=closed``, ``--raw-field=state=closed``).
+
+    ``\\bstate\\b`` on the joined argv cannot match inside ``fstate`` — the
+    word boundary fails between two word characters — so the glued spellings
+    need this per-token scan. The separated form (``-f state=closed``) is
+    already covered by the joined-string scan in the caller.
+    """
+    return any(
+        re.match(
+            r"^(?:-[fF]|--(?:f|field|raw-field))=?state\s*[=:]\s*[\"']?closed\b",
+            tok,
+            re.IGNORECASE,
+        )
+        for tok in argv
+    )
+
+
 def _gh_api_closes_pr(argv: list[str]) -> bool:
     r"""True when a ``gh api`` call could close a PULL REQUEST.
 
@@ -3795,11 +3830,17 @@ def _gh_api_closes_pr(argv: list[str]) -> bool:
     NOT fall into the argv->effect trap. A PATCH that only edits title/body
     carries no ``state=closed`` and no opaque body, so it does not fire.
     """
-    if "api" not in argv:
+    if not argv or _basename(argv[0]) != "gh" or "api" not in argv:
+        # The executable and subcommand, not merely a token: ``curl api x`` or
+        # ``my-tool api …`` must not trip a gate written for ``gh api``.
         return False
     joined = " ".join(argv)
-    # GraphQL close mutation — no REST path; matched by the operation name.
-    if "graphql" in argv and re.search(r"closePullRequest", joined, re.IGNORECASE):
+    # GraphQL close mutation — no REST path; matched by the operation name,
+    # OR hidden inside an opaque body the argv scan cannot read.
+    if "graphql" in argv and (
+        re.search(r"closePullRequest", joined, re.IGNORECASE)
+        or _gh_api_opaque_body(argv)
+    ):
         return True
     # REST: a PATCH to a PR's own resource — /pulls/N OR /issues/N (see above).
     if not any(re.search(r"(?:^|/)(?:pulls|issues)/\d+(?:/|\b)", tok) for tok in argv):
@@ -3815,22 +3856,89 @@ def _gh_api_closes_pr(argv: list[str]) -> bool:
     if method != "PATCH":
         return False
     # Case-insensitive: the field value the API acts on is lowercase, but the
-    # guard must not turn on the caller's casing.
+    # guard must not turn on the caller's casing. Covers the SEPARATED field
+    # form (``-f state=closed``) via the joined string.
     if re.search(r"\bstate\b\s*[=:]\s*[\"']?closed\b", joined, re.IGNORECASE):
+        return True
+    # Glued field spellings (``-fstate=closed``, ``--field=state=closed``):
+    # ``\b`` cannot match inside ``fstate``, so they need a per-token scan.
+    if _gh_api_glued_state_closed(argv):
         return True
     # An opaque request body (file or stdin) could carry state=closed — fail
     # toward the ask/deny rather than let it through unread.
-    return any(tok == "--input" or tok.startswith("--input=") for tok in argv)
+    return _gh_api_opaque_body(argv)
+
+
+def _close_branch_target(argv: list[str]) -> str | None:
+    """The positional target of ``gh pr close`` when it is a BRANCH, else None.
+
+    ``gh pr close`` accepts ``{<number> | <url> | <branch>}``; a number or URL
+    is already read by ``_close_target``, so this returns only a NON-numeric,
+    non-URL positional — the branch name the caller resolves to a PR number.
+    """
+    try:
+        idx = argv.index("close")
+    except ValueError:
+        return None
+    value_flags = {"-c", "--comment", "-R", "--repo"}
+    skip_next = False
+    for tok in argv[idx + 1 :]:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in value_flags:
+            skip_next = True
+            continue
+        if tok.startswith("-"):
+            continue
+        if tok.isdigit() or (tok.startswith("#") and tok[1:].isdigit()):
+            return None
+        if re.match(r"(?:[a-z]+://[^/\s]+/)?[^/\s]+/[^/\s]+/pull/\d+\b", tok):
+            return None
+        return tok
+    return None
+
+
+def _resolve_branch_pr(branch: str, repo: str | None) -> str | None:
+    """The open PR number for ``branch`` via ``gh pr view``, else None.
+
+    Fail-safe: any error, timeout, or non-numeric answer -> None, and the
+    caller then fails CLOSED (the terminal check could not run).
+    """
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "view",
+                branch,
+                *_repo_args(repo),
+                "--json",
+                "number",
+                "--jq",
+                ".number",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(6),
+        )
+        num = result.stdout.strip()
+        if result.returncode == 0 and num.isdigit():
+            return num
+    except Exception:
+        pass
+    return None
 
 
 def _gh_api_close_target(argv: list[str]) -> tuple[str | None, str | None]:
     """(pr_number, repo) from a ``gh api .../repos/O/R/{pulls,issues}/N ...`` argv.
 
     A GraphQL close carries a node id, not a number, so it resolves to
-    (None, …) — the close still asks/denies, it just skips the terminal
-    commitment lookup (the safe direction). An /issues number that is really an
-    issue resolves too, but ``_codex_reviews`` then 404s on /pulls/N/reviews →
-    None → no terminal block, a plain ask.
+    (None, …) — the caller then fails CLOSED on the gated repo: a terminal
+    state that cannot be read cannot be skipped. An /issues number that is
+    really an issue resolves too, but ``_codex_reviews`` then 404s on
+    /pulls/N/reviews → None, and the caller keeps it a plain ask because the
+    target is not a definite PR.
     """
     for tok in argv:
         m = re.search(r"(?:^|/)repos/([^/\s]+/[^/\s]+)/(?:pulls|issues)/(\d+)(?:/|\b)", tok)
@@ -3855,6 +3963,10 @@ _CLOSE_COMMITMENT_MIN_CHARS = 200
 
 
 def _close_commitment_dir() -> str:
+    # Lifecycle: backed up by scripts/backup.sh (close-commitment store) and
+    # deliberately NOT auto-pruned — a commitment is the user's recorded
+    # rebuild obligation, and the store grows by one small file per terminal
+    # close (a rare event bounded by review-terminal frequency, not by runs).
     override = os.environ.get("_TEST_CLOSE_COMMITMENT_DIR")
     if override:
         return override
@@ -3885,9 +3997,13 @@ def _read_close_commitment(repo: str | None, pr: str) -> str | None:
         return None
     if len(text) < _CLOSE_COMMITMENT_MIN_CHARS:
         return None
-    if pr not in text:
+    # Word-BOUNDED, not substring: a commitment naming #1579 must not satisfy a
+    # close of #15 (the digits appear inside the longer number).
+    if not re.search(rf"#?{re.escape(pr)}\b", text):
         return None
-    if not re.search(r"(?i)\bfollow[_-]?up\b", text):
+    # ``Follow-up:`` must name an actual follow-up id, not just the word —
+    # ``follow_up`` as bare prose satisfies nothing the gate can point at.
+    if not re.search(r"(?i)\bfollow[_-]?up\s*[:=]\s*\S+", text):
         return None
     return text
 
@@ -9035,14 +9151,26 @@ def _run_merge_and_push_gates() -> int:
         # `gh pr merge 1 --admin && gh pr merge 2 --admin` can't smuggle the
         # second past the CI/review gates, which only inspect the first segment.
         # gh pr create is un-gated (#1241) — a review request on already-pushed
-        # code, riding a push's approval — so it is NOT counted here; the
-        # exception where gh itself would push an unpushed branch is handled by
-        # the create arm below.)
-        if len(push_segs) + len(merge_pr_segs) + len(close_pr_segs) + len(close_via_api_segs) > 1:
+        # code, riding a push's approval — so it is NOT counted here UNLESS it
+        # would itself publish: a create on an unpushed branch is a push in
+        # effect, and `gh pr create && gh pr close N` would otherwise emit one
+        # prompt that hides the close behind the create.
+        _publishing_creates = sum(
+            1 for s in create_segs if _pr_create_would_publish(s.argv)
+        )
+        if (
+            len(push_segs)
+            + len(merge_pr_segs)
+            + len(close_pr_segs)
+            + len(close_via_api_segs)
+            + _publishing_creates
+            > 1
+        ):
             print(
                 "BLOCKED: multiple publish/merge/close operations (git push / "
-                "gh pr merge / gh pr close) in one command would share a single "
-                "gate. Run each as its own command so each is gated separately.",
+                "gh pr create that would push / gh pr merge / gh pr close) in "
+                "one command would share a single gate. Run each as its own "
+                "command so each is gated separately.",
                 file=sys.stderr,
             )
             return 2
@@ -9349,9 +9477,42 @@ def _run_merge_and_push_gates() -> int:
                 _close_pr, _close_repo = _close_target(close_pr_segs[0].argv)
             else:
                 _close_pr, _close_repo = _gh_api_close_target(close_via_api_segs[0].argv)
+            # A bare close targets gh's cwd repo, not the hook's — derive it the
+            # way the merge gate does, or a private-fork close would apply the
+            # PUBLIC repo's terminal check (and the public repo's review
+            # history) to a repo it does not govern.
+            if _close_repo is None:
+                _close_repo = _derive_repo_from_cwd(os.getcwd())
+            # A branch target (``gh pr close feature/x``) yields no number:
+            # resolve it to its PR rather than skipping the terminal check.
+            if _close_pr is None and close_pr_segs:
+                _branch = _close_branch_target(close_pr_segs[0].argv)
+                if _branch:
+                    _close_pr = _resolve_branch_pr(_branch, _close_repo)
+            if _close_pr is None and _scheduled_gate_applies(_close_repo):
+                # Numberless/GraphQL/unresolvable close on the gated repo: the
+                # terminal state cannot be read, so the commitment check cannot
+                # run — fail closed instead of silently skipping it. Re-running
+                # with an explicit number or URL is the route through.
+                print(
+                    "BLOCKED: cannot resolve which PR this close targets, so the "
+                    "review-terminal check cannot run.\n"
+                    "Re-run the close with an explicit PR number or URL (e.g. "
+                    "`gh pr close 1579`).",
+                    file=sys.stderr,
+                )
+                return 2
             _close_commitment: str | None = None
             if _close_pr and _scheduled_gate_applies(_close_repo):
                 _reviews = _codex_reviews(_close_pr, repo=_close_repo)
+                # ``_reviews is None`` (API failure, or an /issues target that
+                # is a real issue — the 404 reads identically) stays a plain
+                # ask: the commitment is a forcing function layered on the
+                # unconditional ask, not a security boundary, and blocking every
+                # close on GitHub availability is the wrong failure mode. The
+                # genuine hardening here is the numberless/unresolvable-target
+                # block above, which is what kept this path reachable past the
+                # check entirely.
                 if _reviews is not None and len(_reviews) >= FINAL_ROUND_CAP:
                     _close_commitment = _read_close_commitment(_close_repo, _close_pr)
                     if _close_commitment is None:
@@ -9361,8 +9522,7 @@ def _run_merge_and_push_gates() -> int:
                             "pass review is not the end — it is a commitment to "
                             "rebuild from the recorded failure classes.\n"
                             "Write that commitment first, then re-run the close:\n"
-                            f"  {_close_commitment_dir()}/"
-                            f"{(_close_repo or '').replace('/', '__')}__{_close_pr}.txt\n"
+                            f"  {os.path.join(_close_commitment_dir(), (f'{_close_repo.replace('/', '__')}__{_close_pr}.txt' if _close_repo else f'{_close_pr}.txt'))}\n"
                             f"It must be at least {_CLOSE_COMMITMENT_MIN_CHARS} chars, "
                             f"name PR #{_close_pr}, and cite a Follow-up: <id> line for "
                             "the rebuild. The approval dialog will quote it back so the "
@@ -9370,8 +9530,11 @@ def _run_merge_and_push_gates() -> int:
                             file=sys.stderr,
                         )
                         return 2
-            if ask_reason is None:
-                ask_reason = _close_ask_reason(_close_pr, _close_commitment)
+            # The close reason must WIN over any ask_reason an earlier arm set
+            # (e.g. a would-publish `gh pr create` in the same command): only
+            # it names the close, the resolved PR, and the rebuild commitment
+            # the approval dialog must quote.
+            ask_reason = _close_ask_reason(_close_pr, _close_commitment)
 
         # ── gh pr merge ────────────────────────────────────────────
         if merge_pr_segs:
