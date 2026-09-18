@@ -61,8 +61,11 @@ class _GuardedAiosqliteConnector:
             # Quarantine may have become active while the worker thread opened
             # SQLite.  Never return that newly opened writable handle.
             assert_not_quarantined(self._db_path)
-        except BaseException:
-            await connection.close()
+        except BaseException as open_error:
+            try:
+                await connection.close()
+            except BaseException as close_error:
+                open_error.add_note(f"connection cleanup failed: {close_error!r}")
             raise
         self._connection = connection
         return connection

@@ -568,17 +568,27 @@ DB_FILE="$GENESIS_DIR/data/genesis.db"
 if resolve_payload "$BACKUP_DIR/data/genesis.sql"; then
     src="$__PAYLOAD_SRC"
     _RECOVERING_QUARANTINED_DB=false
-    if $DATABASE_ONLY && [ -f "$DB_FILE" ] \
-        && PYTHONPATH="$_SCRIPT_DIR/../src" python3 - "$DB_FILE" <<'PY'
+    if $DATABASE_ONLY && [ -f "$DB_FILE" ]; then
+        _QUARANTINE_CHECK_OUTPUT=""
+        _QUARANTINE_CHECK_RC=0
+        _QUARANTINE_CHECK_OUTPUT=$(PYTHONPATH="$_SCRIPT_DIR/../src" python3 - "$DB_FILE" <<'PY'
 import sys
 
 from genesis.db.integrity import database_is_quarantined
 
 raise SystemExit(0 if database_is_quarantined(sys.argv[1]) else 1)
 PY
-    then
-        _RECOVERING_QUARANTINED_DB=true
-        log "SQLite: live database is quarantined; verified recovery may replace it regardless of mtime"
+        ) || _QUARANTINE_CHECK_RC=$?
+        case "$_QUARANTINE_CHECK_RC" in
+            0)
+                _RECOVERING_QUARANTINED_DB=true
+                log "SQLite: live database is quarantined; verified recovery may replace it regardless of mtime"
+                ;;
+            1) ;;
+            *)
+                die "could not determine live database quarantine state (${_QUARANTINE_CHECK_OUTPUT:-checker unavailable})"
+                ;;
+        esac
     fi
     if [ -f "$DB_FILE" ] && [ "$DB_FILE" -nt "$src" ] \
         && ! $FORCE && ! $_RECOVERING_QUARANTINED_DB; then

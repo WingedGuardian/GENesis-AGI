@@ -57,6 +57,8 @@ preserved as the pre-restore forensic copy.
 When the live database is currently quarantined, database-only recovery may
 replace it even if the damaged file has a newer mtime; the newer-destination
 guard remains in force for non-quarantined databases.
+If restore cannot determine that quarantine state (for example, the integrity
+checker cannot start), it aborts instead of treating the database as healthy.
 
 ## During Migration Work
 

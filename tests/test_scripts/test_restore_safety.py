@@ -202,6 +202,40 @@ def test_database_only_restore_keeps_newer_guard_when_not_quarantined(sandbox):
     assert value == "1"
 
 
+def test_database_only_restore_aborts_if_quarantine_state_cannot_be_checked(sandbox):
+    db = _seed_live_db(sandbox["gd"])
+    backup = _seed_backup(sandbox["tmp"])
+    real_python = sys.executable
+    _make_stub(
+        sandbox["bind"] / "python3",
+        "#!/usr/bin/env bash\n"
+        'if [ "${1:-}" = "-" ]; then echo "integrity import failed" >&2; exit 7; fi\n'
+        f'exec "{real_python}" "$@"\n',
+    )
+    env = dict(os.environ)
+    env.update(
+        HOME=str(sandbox["home"]),
+        GENESIS_DIR=str(sandbox["gd"]),
+        QDRANT_URL="http://127.0.0.1:1",
+        PATH=f"{sandbox['bind']}:{os.environ['PATH']}",
+    )
+
+    proc = subprocess.run(
+        ["bash", str(_RESTORE), "--from", str(backup), "--database-only"],
+        env=env,
+        capture_output=True,
+        text=True,
+        input="y\n",
+    )
+
+    assert proc.returncode == 1
+    assert "could not determine live database quarantine state" in proc.stdout
+    value = subprocess.run(
+        ["sqlite3", str(db), "SELECT x FROM t;"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    assert value == "1"
+
+
 # NOTE: this test's name must NOT contain the marker word — restore.sh logs the
 # (tmp) DB path, and a test name leaking into that path would false-match.
 def test_restore_verifies_db_after_restore(sandbox):

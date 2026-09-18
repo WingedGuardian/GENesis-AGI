@@ -371,3 +371,30 @@ async def test_connect_aiosqlite_rw_closes_if_quarantined_during_open(tmp_path, 
         await connect_aiosqlite_rw(db)
 
     assert opened and opened[0]._connection is None
+
+
+@pytest.mark.asyncio
+async def test_connect_aiosqlite_rw_preserves_guard_error_if_cleanup_fails(tmp_path, monkeypatch):
+    from genesis.db.connection import connect_aiosqlite_rw
+
+    db = tmp_path / "genesis.db"
+    _healthy_db(db)
+
+    class FakeConnection:
+        async def close(self):
+            raise RuntimeError("close failed")
+
+    class QuarantineDuringOpen:
+        def __await__(self):
+            async def open_then_quarantine():
+                integrity.quarantine_database(db, source="test", detail="became bad during open")
+                return FakeConnection()
+
+            return open_then_quarantine().__await__()
+
+    monkeypatch.setattr(aiosqlite, "connect", lambda *_args, **_kwargs: QuarantineDuringOpen())
+
+    with pytest.raises(integrity.DatabaseIntegrityError) as raised:
+        await connect_aiosqlite_rw(db)
+
+    assert any("close failed" in note for note in raised.value.__notes__)
