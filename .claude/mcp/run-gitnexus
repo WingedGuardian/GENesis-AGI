@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# GitNexus MCP launcher — refuse a binary that does not match the repository pin.
+# Storage formats can change between releases. A stale reader cannot safely open
+# an index written by a newer analyzer, and an unreviewed newer analyzer can make
+# the index unreadable by the version Genesis supports.
+
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GENESIS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PIN_FILE="$GENESIS_ROOT/scripts/lib/gitnexus_version.sh"
+
+if [ ! -r "$PIN_FILE" ]; then
+    printf 'run-gitnexus: pin metadata unavailable; refusing to start\n' >&2
+    exit 1
+fi
+# shellcheck source=../../scripts/lib/gitnexus_version.sh
+if ! source "$PIN_FILE" \
+    || [[ ! "${GENESIS_GITNEXUS_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || ! declare -F genesis_gitnexus_node_supported >/dev/null \
+    || ! declare -F genesis_gitnexus_resolve_binary >/dev/null \
+    || ! declare -F genesis_gitnexus_installed_version >/dev/null \
+    || ! declare -F genesis_gitnexus_installed_is_pinned >/dev/null; then
+    printf 'run-gitnexus: invalid pin metadata; refusing to start\n' >&2
+    exit 1
+fi
+
+# STDERR IS NOT DISCARDED. The resolver refuses for several different reasons --
+# nothing found, conflicting installations, a candidate whose version cannot be
+# read -- and only it knows which. Sending its diagnostic to /dev/null and
+# printing "not installed" told an operator with two installs to go and install
+# the thing they already had twice.
+#
+# It reaches them by simply NOT being redirected. Capturing it to a temp file
+# first bought nothing here -- no code needs the text as a VALUE -- and cost a
+# predictable path: when mktemp was unavailable the fallback name held only the
+# pid, which a local attacker can pre-create as a symlink so that the
+# redirection truncates a file of their choosing.
+BINARY="$(genesis_gitnexus_resolve_binary || true)"
+if [ -z "$BINARY" ] || [ ! -x "$BINARY" ]; then
+    printf 'run-gitnexus: no usable GitNexus installation; refusing to start\n' >&2
+    exit 1
+fi
+
+if ! genesis_gitnexus_node_supported; then
+    printf 'run-gitnexus: GitNexus %s does not support Node %s\n' \
+        "$GENESIS_GITNEXUS_VERSION" "$(node --version 2>/dev/null || echo unavailable)" >&2
+    exit 1
+fi
+
+# The ALREADY-RESOLVED binary goes through the library's version reader, not a
+# direct `--version` exec: _genesis_gitnexus_version_of reads package.json
+# first precisely because a Node binary's --version reports whatever `node`
+# resolves to here — a stubbed node would make a real install report the
+# stub's output.
+if ! genesis_gitnexus_installed_is_pinned "$BINARY"; then
+    actual="$(genesis_gitnexus_installed_version "$BINARY" 2>/dev/null || true)"
+    printf 'run-gitnexus: refusing unpinned GitNexus %s; expected %s\n' \
+        "${actual:-unknown}" "$GENESIS_GITNEXUS_VERSION" >&2
+    exit 1
+fi
+
+exec "$BINARY" "$@"

@@ -42,7 +42,10 @@
 # tell "lock held / host-frozen — keep the marker" apart from a real success).
 #
 # Env overrides:
-#   CODE_INTEL_INDEX_MEMORY_MAX   default 2G     (per systemd scope)
+#   CODE_INTEL_INDEX_MEMORY_MAX   legacy override for both tools
+#   CODE_INTEL_CBM_MEMORY_MAX     default 2G     (CBM batch scope)
+#   CODE_INTEL_GITNEXUS_MEMORY_MAX default 8G    (measured GitNexus rebuild)
+#   CODE_INTEL_FILE_CACHE_RESERVE_BYTES default 2G (clean cache kept outside job)
 #   CODE_INTEL_INDEX_IO_WEIGHT    default 20     (1-10000; low = polite)
 #   CODE_INTEL_INDEX_CPU_QUOTA    default 200%   (2 cores worth)
 #   CODE_INTEL_INDEX_MODE         default fast   (fast|moderate|full; 3rd arg wins)
@@ -66,10 +69,255 @@ REPO_PATH="${1:-}"
 TOOLS="${2:-both}"
 MODE="${3:-${CODE_INTEL_INDEX_MODE:-fast}}"
 
-MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-2G}"
+_LEGACY_MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-}"
+CBM_MEM_MAX="${CODE_INTEL_CBM_MEMORY_MAX:-${_LEGACY_MEM_MAX:-2G}}"
+# Measured 2026-09-16: a forced full rebuild peaked at 4,874,166,272 bytes
+# (4.65 GiB) and completed under an 8 GiB, swapless scope. The old shared 2G
+# cap killed it on the way up. Keep headroom for repository growth; admission
+# control and the pressure watchdog still decide when the job may run.
+GITNEXUS_MEM_MAX="${CODE_INTEL_GITNEXUS_MEMORY_MAX:-${_LEGACY_MEM_MAX:-8G}}"
+
+# ── Bound the cap by what this INSTALL actually has ──────────────────────────
+# A fixed 8G is a cap, not a reservation, and on a large host that is fine. On a
+# 4-5 GiB container it is worse than no cap at all: the child scope never
+# reaches its own MemoryMax, so the PARENT cgroup hits its limit first and the
+# kernel picks a victim from every process in it -- Genesis, Qdrant, the running
+# session. The cap is supposed to make this job safe to run unattended, and at
+# that size it removes the only thing standing between a rebuild and the
+# services around it. The pressure watchdog does not cover this either: it
+# samples load and I/O wait, neither of which moves early enough on an OOM path.
+#
+# So the effective cap is min(configured, what this box can spare), and when
+# what it can spare is below the measured working set the job is REFUSED rather
+# than run with a cap that cannot bite.
+_genesis_mem_bytes() {  # "8G"/"512M"/"1024K"/"5.5G"/bytes -> bytes on stdout, or nothing
+    local v="${1:-}"
+    # Fractional values are legal systemd (MemoryMax=5.5G); Bash arithmetic is
+    # integer-only, so the multiply goes through awk. A bare number must be an
+    # integer byte count — a unitless "5.5" is malformed, not 5.5 bytes.
+    [[ "$v" =~ ^([0-9]+(\.[0-9]+)?)([GgMmKk])$ || "$v" =~ ^[0-9]+$ ]] || return 1
+    case "$v" in
+        # `%.0f`, not `%d`: mawk implements %d through a signed 32-bit int and
+        # clamps 8 GiB to 2147483647, which reads as "below the working set"
+        # and refuses every run. %f goes through double, exact past 2^32.
+        # awk is only reached for FRACTIONAL values — integer mantissas use
+        # Bash's 64-bit arithmetic so minimal environments without awk
+        # (the rlimit fallback's whole reason to exist) still get a cap.
+        *[Gg]) [[ "${v%[Gg]}" == *.* ]] && awk -v n="${v%[Gg]}" 'BEGIN{printf "%.0f", n * 1073741824}' \
+                || printf '%s' "$(( ${v%[Gg]} * 1073741824 ))" ;;
+        *[Mm]) [[ "${v%[Mm]}" == *.* ]] && awk -v n="${v%[Mm]}" 'BEGIN{printf "%.0f", n * 1048576}' \
+                || printf '%s' "$(( ${v%[Mm]} * 1048576 ))" ;;
+        *[Kk]) [[ "${v%[Kk]}" == *.* ]] && awk -v n="${v%[Kk]}" 'BEGIN{printf "%.0f", n * 1024}' \
+                || printf '%s' "$(( ${v%[Kk]} * 1024 ))" ;;
+        *) printf '%s' "$v" ;;
+    esac
+}
+
+# The container's own ceiling. cgroup v2 first (what an LXC/Docker limit shows
+# up as), then v1, then MemTotal. "max" means unlimited, so it is not a ceiling.
+_genesis_mem_ceiling() {
+    local raw=""
+    # A SEAM, not a convenience. Without it the refusal path below is
+    # unreachable on any box big enough to run the job, so the branch that
+    # protects small installs could only ever be verified by owning a small
+    # install. It doubles as the operator override when a container limit is
+    # not discoverable.
+    if [ -n "${CODE_INTEL_MEM_CEILING_BYTES:-}" ]; then
+        printf '%s' "$CODE_INTEL_MEM_CEILING_BYTES"
+        return
+    fi
+    if [ -r /sys/fs/cgroup/memory.max ]; then
+        raw="$(cat /sys/fs/cgroup/memory.max 2>/dev/null)"
+    elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+        raw="$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)"
+    fi
+    if [ -n "$raw" ] && [ "$raw" != "max" ] && [ "$raw" -gt 0 ] 2>/dev/null; then
+        # A v1 "unlimited" is a huge sentinel rather than a word; anything at or
+        # above MemTotal is not a container limit worth honouring.
+        local total_kb total_b
+        total_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
+        total_b=$(( ${total_kb:-0} * 1024 ))
+        if [ "$total_b" -gt 0 ] && [ "$raw" -lt "$total_b" ]; then
+            printf '%s' "$raw"
+            return
+        fi
+        [ "$total_b" -gt 0 ] && { printf '%s' "$total_b"; return; }
+        printf '%s' "$raw"
+        return
+    fi
+    local total_kb
+    total_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
+    [ -n "$total_kb" ] && printf '%s' "$(( total_kb * 1024 ))"
+}
+
+# Convert a cgroup's total charge into a conservative working-set estimate.
+# memory.current includes clean filesystem cache, which the kernel can reclaim
+# before an OOM. Counting every cached byte as permanently occupied starves the
+# indexer on a cache-heavy box even when anon+kernel memory is small. Do NOT use
+# anon alone: shmem, dirty/writeback pages and kernel memory still consume the
+# parent cgroup. Mirror read_container_memory_reclaimable(): the file LRU
+# counters exclude tmpfs/shmem, unlike the broad `file` counter. Discount only
+# clean LRU cache above a retained floor. Missing/malformed statistics fail
+# closed to the raw charge.
+_genesis_mem_working_set_from() {
+    local current="${1:-}" stat_path="${2:-}"
+    [[ "$current" =~ ^[0-9]+$ ]] || return 1
+    [ -r "$stat_path" ] || { printf '%s' "$current"; return; }
+
+    local fields inactive active dirty writeback v1_inactive v1_active v1_dirty v1_writeback reserve reclaimable discount
+    fields="$(awk '
+        $1 == "inactive_file" { inactive = $2 }
+        $1 == "active_file" { active = $2 }
+        $1 == "file_dirty" { dirty = $2 }
+        $1 == "file_writeback" { writeback = $2 }
+        $1 == "total_inactive_file" { v1_inactive = $2 }
+        $1 == "total_active_file" { v1_active = $2 }
+        $1 == "total_dirty" { v1_dirty = $2 }
+        $1 == "total_writeback" { v1_writeback = $2 }
+        END { printf "%s|%s|%s|%s|%s|%s|%s|%s", inactive, active, dirty, writeback, v1_inactive, v1_active, v1_dirty, v1_writeback }
+    ' "$stat_path" 2>/dev/null)" || { printf '%s' "$current"; return; }
+    IFS='|' read -r inactive active dirty writeback v1_inactive v1_active v1_dirty v1_writeback <<< "$fields"
+    # A v1 memory.stat includes both local unprefixed counters and hierarchical
+    # total_* counters. memory.usage_in_bytes is hierarchical too, so choose
+    # the matching total_* schema before considering a v2 schema.
+    if [[ "$v1_inactive" =~ ^[0-9]+$ && "$v1_active" =~ ^[0-9]+$ && "$v1_dirty" =~ ^[0-9]+$ && "$v1_writeback" =~ ^[0-9]+$ ]]; then
+        inactive="$v1_inactive"; active="$v1_active"; dirty="$v1_dirty"; writeback="$v1_writeback"
+    elif [[ "$inactive" =~ ^[0-9]+$ && "$active" =~ ^[0-9]+$ && "$dirty" =~ ^[0-9]+$ && "$writeback" =~ ^[0-9]+$ ]]; then
+        :  # cgroup v2 schema
+    else
+        printf '%s' "$current"
+        return
+    fi
+    for fields in "$inactive" "$active" "$dirty" "$writeback"; do
+        [[ "$fields" =~ ^[0-9]+$ ]] || { printf '%s' "$current"; return; }
+    done
+
+    reserve="${CODE_INTEL_FILE_CACHE_RESERVE_BYTES:-$(( 2 * 1024 * 1024 * 1024 ))}"
+    [[ "$reserve" =~ ^[0-9]+$ ]] || { printf '%s' "$current"; return; }
+    reclaimable=$(( inactive + active ))
+    [ "$(( dirty + writeback ))" -lt "$reclaimable" ] \
+        || { printf '%s' "$current"; return; }
+    reclaimable=$(( reclaimable - dirty - writeback ))
+    [ "$reclaimable" -gt "$reserve" ] || { printf '%s' "$current"; return; }
+    discount=$(( reclaimable - reserve ))
+    [ "$discount" -lt "$current" ] || { printf '%s' "$current"; return; }
+    printf '%s' "$(( current - discount ))"
+}
+
+# What everything on this box is using RIGHT NOW, job included — the fixed
+# reserve below is a floor for a machine whose live usage cannot be read. A
+# container where Genesis, Qdrant and the sessions already exceed that floor
+# would otherwise get a cap computed as if the headroom were free, and the
+# parent cgroup takes the kill anyway. cgroup v2 first, then v1, then
+# MemTotal-MemAvailable. Unreadable means the caller falls back to the floor.
+_genesis_mem_current() {
+    if [ -n "${CODE_INTEL_MEM_CURRENT_BYTES:-}" ]; then
+        printf '%s' "$CODE_INTEL_MEM_CURRENT_BYTES"
+        return
+    fi
+    local raw="" stat_path=""
+    if [ -n "${CODE_INTEL_MEM_RAW_CURRENT_BYTES:-}" ]; then
+        raw="$CODE_INTEL_MEM_RAW_CURRENT_BYTES"
+        stat_path="${CODE_INTEL_MEM_STAT_PATH:-/sys/fs/cgroup/memory.stat}"
+    elif [ -r /sys/fs/cgroup/memory.current ]; then
+        raw="$(cat /sys/fs/cgroup/memory.current 2>/dev/null)"
+        stat_path="${CODE_INTEL_MEM_STAT_PATH:-/sys/fs/cgroup/memory.stat}"
+    elif [ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ]; then
+        raw="$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null)"
+        stat_path="${CODE_INTEL_MEM_STAT_PATH:-/sys/fs/cgroup/memory/memory.stat}"
+    fi
+    if [ -n "$raw" ] && [ "$raw" -gt 0 ] 2>/dev/null; then
+        _genesis_mem_working_set_from "$raw" "$stat_path"
+        return
+    fi
+    local total_kb avail_kb
+    total_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
+    avail_kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)"
+    [ -n "$total_kb" ] && [ -n "$avail_kb" ] && [ "$total_kb" -gt "$avail_kb" ] \
+        && printf '%s' "$(( (total_kb - avail_kb) * 1024 ))"
+}
+
+#: Left for everything that is NOT this job -- Genesis, Qdrant, the session that
+#: launched it. Below this the box is not able to host a rebuild safely.
+CODE_INTEL_SIBLING_RESERVE_BYTES="${CODE_INTEL_SIBLING_RESERVE_BYTES:-$(( 2 * 1024 * 1024 * 1024 ))}"
+#: MEASURED 2026-09-16: a forced full rebuild peaked at 4,874,166,272 bytes
+#: (4.65 GiB). A cap below the working set does not protect anything, it just
+#: relocates the kill, so refuse instead of pretending.
+CODE_INTEL_GITNEXUS_MIN_BYTES="${CODE_INTEL_GITNEXUS_MIN_BYTES:-$(( 4874166272 ))}"
+
+_genesis_ceiling_b="$(_genesis_mem_ceiling)"
+_genesis_want_b="$(_genesis_mem_bytes "$GITNEXUS_MEM_MAX")"
+GITNEXUS_MEM_REFUSE=""
+if [ -z "$_genesis_want_b" ]; then
+    # Fail closed: an unparseable cap must not reach MemoryMax, and skipping the
+    # admission check silently would run the job unbounded.
+    GITNEXUS_MEM_REFUSE="CODE_INTEL_GITNEXUS_MEMORY_MAX='${GITNEXUS_MEM_MAX}' is not a parseable memory value — refusing rather than running unbounded"
+elif [ "$_genesis_want_b" -lt "$CODE_INTEL_GITNEXUS_MIN_BYTES" ]; then
+    # A configured cap below the measured working set cannot bite: on a large
+    # host the rebuild would still run and be killed by its own cgroup, which
+    # reads as a flaky index failure instead of the refusal it should be.
+    GITNEXUS_MEM_REFUSE="configured cap ${GITNEXUS_MEM_MAX} is below the $(( CODE_INTEL_GITNEXUS_MIN_BYTES / 1024 / 1024 ))M a measured full rebuild needs — a cap that cannot bite only relocates the kill"
+elif [ -n "$_genesis_ceiling_b" ]; then
+    # Live usage plus the reserve as growth headroom when the kernel can tell
+    # us the real figure; the reserve alone when it cannot.
+    _genesis_live_b="$(_genesis_mem_current)"
+    _genesis_siblings_b="$CODE_INTEL_SIBLING_RESERVE_BYTES"
+    if [ -n "$_genesis_live_b" ]; then
+        _genesis_siblings_b=$(( _genesis_live_b + CODE_INTEL_SIBLING_RESERVE_BYTES ))
+    fi
+    _genesis_spare_b=$(( _genesis_ceiling_b - _genesis_siblings_b ))
+    if [ "$_genesis_spare_b" -lt "$CODE_INTEL_GITNEXUS_MIN_BYTES" ]; then
+        GITNEXUS_MEM_REFUSE="this install has $(( _genesis_ceiling_b / 1024 / 1024 ))M total; live usage and the reserve claim $(( _genesis_siblings_b / 1024 / 1024 ))M of it, leaving $(( _genesis_spare_b / 1024 / 1024 ))M, below the $(( CODE_INTEL_GITNEXUS_MIN_BYTES / 1024 / 1024 ))M a measured full rebuild needs"
+    elif [ "$_genesis_spare_b" -lt "$_genesis_want_b" ]; then
+        # Bytes, not a rounded-down MiB: admission already proved this exact
+        # spare is safe, and rounding it can cross below the measured working
+        # set only to admit a cap that cannot bite. systemd accepts integer
+        # byte counts and the rlimit fallback parses them.
+        GITNEXUS_MEM_MAX="$_genesis_spare_b"
+    fi
+fi
+# Probe with the larger supported value; each tool overrides this dynamically
+# when its real scope/rlimit is created below.
+MEM_MAX="$GITNEXUS_MEM_MAX"
 IO_WEIGHT="${CODE_INTEL_INDEX_IO_WEIGHT:-20}"
 CPU_QUOTA="${CODE_INTEL_INDEX_CPU_QUOTA:-200%}"
 PERSISTENCE="${CODE_INTEL_INDEX_PERSISTENCE:-true}"
+
+# The kill-switch path resolves through the ONE shared site (same override
+# semantics the launcher enforces). An override that is relative, or begins
+# with a ~/ that no HOME can expand, would make `-e` silently read as
+# "not disabled" — an UNRESOLVABLE path instead refuses the cbm leg below,
+# never indexing a tool the machine may have switched off.
+CBM_DISABLE_FILE=""
+CBM_DISABLE_UNRESOLVED=1
+# %/* not dirname(1): minimal-PATH invocations (stripped-env services) may not
+# have dirname, and a resolver that cannot be found fails the leg closed.
+_cbm_disable_lib="${BASH_SOURCE[0]%/*}/cbm_disable_file.sh"
+[ "$_cbm_disable_lib" = "${BASH_SOURCE[0]}/cbm_disable_file.sh" ] \
+    && _cbm_disable_lib="./cbm_disable_file.sh"
+if [ -r "$_cbm_disable_lib" ]; then
+    # shellcheck source=cbm_disable_file.sh
+    . "$_cbm_disable_lib"
+    if declare -F genesis_cbm_disable_file >/dev/null \
+        && CBM_DISABLE_FILE="$(genesis_cbm_disable_file 2>/dev/null)"; then
+        CBM_DISABLE_UNRESOLVED=""
+    fi
+fi
+
+_GITNEXUS_PIN_READY=0
+_gitnexus_pin_file="$(dirname "${BASH_SOURCE[0]}")/gitnexus_version.sh"
+if [ -r "$_gitnexus_pin_file" ]; then
+    # shellcheck source=gitnexus_version.sh
+    if . "$_gitnexus_pin_file"; then
+        if [[ "${GENESIS_GITNEXUS_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            && declare -F genesis_gitnexus_node_supported >/dev/null \
+            && declare -F genesis_gitnexus_resolve_binary >/dev/null \
+            && declare -F genesis_gitnexus_installed_version >/dev/null \
+            && declare -F genesis_gitnexus_installed_is_pinned >/dev/null; then
+            _GITNEXUS_PIN_READY=1
+        fi
+    fi
+fi
 
 _log() { printf '[code-intel-index] %s\n' "$*"; }
 
@@ -174,11 +422,10 @@ _run_capped() {
         # Fallback: polite scheduling + soft address-space cap. Mirrors the
         # run-codebase-memory launcher's degradation (never block on missing
         # systemd — CI and minimal containers must still work).
-        local mem_kb=""
-        if [[ "$MEM_MAX" =~ ^([0-9]+)(\.[0-9]+)?([Gg])$ ]]; then
-            mem_kb=$(( ${BASH_REMATCH[1]} * 1024 * 1024 ))
-        elif [[ "$MEM_MAX" =~ ^([0-9]+)(\.[0-9]+)?([Mm])$ ]]; then
-            mem_kb=$(( ${BASH_REMATCH[1]} * 1024 ))
+        local mem_kb="" mem_b=""
+        mem_b="$(_genesis_mem_bytes "$MEM_MAX" 2>/dev/null || true)"
+        if [ -n "$mem_b" ]; then
+            mem_kb=$(( (mem_b + 1023) / 1024 ))
         else
             _log "WARNING: cannot parse '$MEM_MAX' for the rlimit fallback — running memory-uncapped (nice/ionice only)"
         fi
@@ -286,16 +533,38 @@ _run_with_watchdog() {
 
 RC=0
 MISSING=""  # requested-but-absent tools — makes a no-op run rc=3, not a false success
+CBM_RAN=0
+GN_RAN=0
+
+# A tool's RAW exit status must never reach the runner: the runner reads
+# 3/4/5/75 as OUTCOME PROTOCOL codes (missing / leg-incomplete / lock-held),
+# so a leg that happens to fail with one of them is silently misclassified —
+# rc 4 after a cbm failure would CONSUME the failed leg's request and even
+# stamp the shared full clock. Remap those statuses to 111 at capture; the
+# classification below then sees a genuine "ran and failed" either way.
+_leg_failed() {
+    RC=$?
+    case "$RC" in
+        3|4|5|75) RC=111 ;;
+    esac
+}
 
 if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
-    if command -v codebase-memory-mcp >/dev/null 2>&1; then
+    if [ -n "$CBM_DISABLE_UNRESOLVED" ]; then
+        _log "cbm kill-switch path unresolvable — refusing cbm leg (fail closed)"
+        MISSING="${MISSING}cbm "
+    elif [ -e "$CBM_DISABLE_FILE" ]; then
+        _log "codebase-memory-mcp disabled by $CBM_DISABLE_FILE — skipped"
+        MISSING="${MISSING}cbm "
+    elif command -v codebase-memory-mcp >/dev/null 2>&1; then
         _log "indexing (codebase-memory-mcp, mode=$MODE): $REPO_PATH"
         # Flag form (cbm >=0.9): --mode selects the pipeline depth (default here is
         # fast — no similarity/semantic edges); --persistence writes the shareable
         # .codebase-memory/graph.db.zst artifact so a wiped cache restores from it
         # instead of a full 0->100 re-index.
-        _run_with_watchdog cbm codebase-memory-mcp cli index_repository \
-            --repo-path "$REPO_PATH" --mode "$MODE" --persistence "$PERSISTENCE" || RC=$?
+        MEM_MAX="$CBM_MEM_MAX" _run_with_watchdog cbm codebase-memory-mcp cli index_repository \
+            --repo-path "$REPO_PATH" --mode "$MODE" --persistence "$PERSISTENCE" \
+            && CBM_RAN=1 || _leg_failed
     else
         _log "codebase-memory-mcp not on PATH — skipped"
         MISSING="${MISSING}cbm "
@@ -304,10 +573,14 @@ fi
 
 if [ "$TOOLS" = "gitnexus" ] || [ "$TOOLS" = "both" ]; then
     _GN=""
-    if command -v gitnexus >/dev/null 2>&1; then
-        _GN="gitnexus"
-    elif command -v npx >/dev/null 2>&1; then
-        _GN="npx gitnexus"
+    if [ "$_GITNEXUS_PIN_READY" -ne 1 ]; then
+        _log "GitNexus pin metadata unavailable — refusing dynamic resolver"
+    elif ! genesis_gitnexus_node_supported; then
+        _log "GitNexus ${GENESIS_GITNEXUS_VERSION} does not support Node $(node --version 2>/dev/null || echo unavailable) — refusing index"
+    elif genesis_gitnexus_installed_is_pinned; then
+        _GN="$(genesis_gitnexus_resolve_binary)"
+    elif genesis_gitnexus_resolve_binary >/dev/null; then
+        _log "GitNexus version $(genesis_gitnexus_installed_version 2>/dev/null || echo unknown) does not match expected pinned ${GENESIS_GITNEXUS_VERSION} — refusing index"
     fi
     if [ -n "$_GN" ]; then
         # gitnexus analyze is already incremental (only -f forces a full re-parse)
@@ -316,7 +589,16 @@ if [ "$TOOLS" = "gitnexus" ] || [ "$TOOLS" = "both" ]; then
         # ("error: unknown option '--quiet'" -> rc 1 on EVERY run); it silently
         # broke every entrypoint-driven gitnexus index since #910. Dropped.
         _log "indexing (gitnexus analyze): $REPO_PATH"
-        ( cd "$REPO_PATH" && _run_with_watchdog gitnexus $_GN analyze ) || RC=$?
+        if [ -n "$GITNEXUS_MEM_REFUSE" ]; then
+            # REFUSED, not silently skipped: a cap that cannot bite is worse
+            # than no job, because the parent cgroup takes the kill instead.
+            _log "SKIP gitnexus: $GITNEXUS_MEM_REFUSE"
+            _log "      raise CODE_INTEL_GITNEXUS_MEMORY_MAX / lower CODE_INTEL_SIBLING_RESERVE_BYTES to override"
+            MISSING="${MISSING:+$MISSING }gitnexus"
+        else
+            ( cd "$REPO_PATH" && MEM_MAX="$GITNEXUS_MEM_MAX" _run_with_watchdog gitnexus "$_GN" analyze ) \
+                && GN_RAN=1 || _leg_failed
+        fi
     else
         _log "gitnexus not available — skipped"
         MISSING="${MISSING}gitnexus "
@@ -326,10 +608,26 @@ fi
 # B1: a requested tool absent from PATH means NOTHING was indexed for it. Never
 # report that as success (rc 0) — the idle runner would consume the marker and
 # stamp a fresh full-index timestamp, silently disabling indexing until someone
-# notices the graph is stale. Distinct rc 3 == "requested tool missing".
-if [ "$RC" = "0" ] && [ -n "$MISSING" ]; then
-    _log "ERROR: requested tool(s) missing from PATH: ${MISSING%% } — nothing indexed (rc=3)"
+# notices the graph is stale. Per-leg outcome codes so a completed leg is
+# consumable and a skipped/refused leg never stamps cbm's shared full clock:
+#   rc 3: nothing indexed — at least one requested tool missing or refused
+#   rc 4: cbm leg completed, gitnexus leg did not (missing, refused, or failed)
+#   rc 5: gitnexus leg completed, cbm leg did not (missing, skipped, or failed)
+# A leg that ran AND FAILED still counts as "did not complete": when the other
+# leg succeeded, reporting the raw failure rc makes the runner restore the
+# combined marker and rebuild the completed leg on every retry.
+_cbm_wanted=0; _gn_wanted=0
+{ [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; } && _cbm_wanted=1
+{ [ "$TOOLS" = "gitnexus" ] || [ "$TOOLS" = "both" ]; } && _gn_wanted=1
+if [ "$RC" = "0" ] && [ -n "$MISSING" ] && [ "$CBM_RAN" != "1" ] && [ "$GN_RAN" != "1" ]; then
+    _log "ERROR: requested tool(s) missing or refused: ${MISSING%% } — nothing indexed (rc=3)"
     RC=3
+elif [ "$_gn_wanted" = "1" ] && [ "$GN_RAN" != "1" ] && [ "$CBM_RAN" = "1" ]; then
+    _log "cbm leg done; gitnexus leg did not complete (${MISSING:-failed rc=$RC}) — partial (rc=4)"
+    RC=4
+elif [ "$_cbm_wanted" = "1" ] && [ "$CBM_RAN" != "1" ] && [ "$GN_RAN" = "1" ]; then
+    _log "gitnexus leg done; cbm leg did not complete — partial, cbm full clock NOT stamped (rc=5)"
+    RC=5
 fi
 
 _log "done (rc=$RC): $REPO_PATH"

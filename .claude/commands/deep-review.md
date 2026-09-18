@@ -17,6 +17,13 @@ owner-tunable setting that has flipped before — verify at the PR rather than
 trusting this sentence) — and is required by the
 merge gate. The two are complementary (Codex catches cross-model blind spots). This command
 clears the local commit review-depth gate; it does not certify the PR by itself.
+A build session's work on an item ends when the **PR EXISTS** — not here. Clearing this
+gate merely unblocks the commit that this command's own later steps make, and the push and
+`gh pr create` after it: stopping at the gate would end the session before the durable
+handoff exists, leaving finished work in a local worktree that no closing session can see
+(Codex P2, PR #1638). From the open PR onward — the Codex round, the findings, the merge —
+the item belongs to a **closing session** (`.claude/skills/closing-session/`), which is why
+this command does not tell you to wait for a review it never triggers.
 
 ## 1. Stage everything, then scope the FULL branch diff
 

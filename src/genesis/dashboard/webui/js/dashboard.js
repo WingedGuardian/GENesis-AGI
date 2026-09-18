@@ -378,6 +378,12 @@
         // Monotonic request token — see fetchZeroDrop. Declared here rather
         // than created on first use so it is visible as state.
         _zeroDropFetchToken: 0,
+        // The token of the last request that actually INSTALLED a board. A
+        // failure is discardable only against this one, never against the
+        // started-token above — see `_newerRequestSucceeded`. Declared beside
+        // its sibling for the same reason, and because a key created on first
+        // use is invisible to the member scan in test_webui_js_integrity.
+        _zeroDropSucceededToken: 0,
         _cockpitInterval: null,
         _commsInterval: null,
         _tracesInterval: null,
@@ -728,7 +734,13 @@
         cleanup() {
           if (this._healthInterval) clearInterval(this._healthInterval);
           if (this._backupInterval) clearInterval(this._backupInterval);
-          for (const tab of ["overview", "chat", "internals", "config", "work", "observations", "traces", "autonomy"]) {
+          // Every tab in the registry, not a hand-kept list beside it. The
+          // literal here named eight of the sixteen, so half the panels — this
+          // one included — kept polling through cleanup. It costs nothing on
+          // `beforeunload`, where the page is being torn down anyway, but the
+          // list is a second place to remember a tab and this panel is the
+          // proof it gets forgotten.
+          for (const tab of Object.keys(this._TAB_INTERVALS)) {
             this._stopTabIntervals(tab);
           }
           // Terminal runs in its own window — no cleanup needed here
@@ -1204,24 +1216,46 @@
           this.startFetch("zeroDrop");
           try {
             const resp = await fetchApi("/api/genesis/zero-drop");
-            // Superseded while we were awaiting: a newer request has already
-            // finished. Drop this payload silently — it is not an error, and
-            // calling failFetch would mark a healthy transport as broken.
-            if (token !== this._zeroDropFetchToken) return;
             if (resp && resp.ok) {
               const payload = await resp.json();
-              // Re-checked AFTER the second await: parsing the body is another
-              // suspension point, and the newer response can land during it.
+              // Superseded: a NEWER request exists, so its result should win.
+              // Installing this older payload would let arrival order decide
+              // which board is on screen, and `finishFetch` would then stamp
+              // `lastSuccess` with now — so the older board would read as
+              // current. Dropping it costs one poll interval of staleness.
               if (token !== this._zeroDropFetchToken) return;
               this.zeroDropView = payload;
+              this._zeroDropSucceededToken = token;
               this.finishFetch("zeroDrop");
-            } else {
+            } else if (!this._newerRequestSucceeded(token)) {
               this.failFetch("zeroDrop", "Zero-drop endpoint returned an error");
             }
           } catch (e) {
             console.warn("Zero-drop fetch failed:", e);
-            this.failFetch("zeroDrop", "Failed to fetch the zero-drop view");
+            if (!this._newerRequestSucceeded(token)) {
+              this.failFetch("zeroDrop", "Failed to fetch the zero-drop view");
+            }
           }
+        },
+
+        // A FAILURE is only discardable once a newer request has actually
+        // produced a board — never merely because one has STARTED.
+        //
+        // The two are a poll interval apart and the difference is the whole
+        // defect. `_zeroDropFetchToken` increments when a request begins, so
+        // suppressing on it means: request A fails slowly (a hung connection,
+        // or `fetchApi`'s shared backoff sitting near its 60-62s ceiling), the
+        // 60s poll has already started request B, A returns here, sees a newer
+        // token and discards a real failure. B then does the same to C. Nothing
+        // ever reaches `failFetch`, `refreshFailing` stays false, and the badge
+        // shows an arbitrarily old count for the whole outage — which is
+        // precisely the failure the badge was changed to prevent.
+        //
+        // Keyed on a completed success instead, the suppression still does its
+        // one legitimate job: an older request that fails after a newer one has
+        // already installed a board must not mark a healthy transport broken.
+        _newerRequestSucceeded(token) {
+          return (this._zeroDropSucceededToken || 0) > token;
         },
 
         async fetchObservations() {
@@ -2892,8 +2926,8 @@
           effort: 'Processing depth: low (fast), medium (balanced), high (thorough), xhigh (deeper), or max (deepest)',
           timeout_s: 'Max seconds per inbox item processing before timeout',
           // Outreach
-          start: 'Quiet hours start \u2014 no outreach before this time (e.g., 22:00)',
-          end: 'Quiet hours end \u2014 outreach resumes after this time (e.g., 07:00)',
+          start: 'Quiet hours start \u2014 outreach is held until the window ends (e.g., 22:00). Set start = end (both 00:00, the default) to disable quiet hours entirely. Alerts and blockers always bypass it.',
+          end: 'Quiet hours end \u2014 held outreach resumes at this time (e.g., 07:00). A window that crosses midnight is fine. Equal to start means disabled.',
           default: 'Channel for general outreach (morning reports, digests)',
           blocker: 'Channel for blocking/critical alerts that need immediate attention',
           alert: 'Channel for non-blocking alerts and notifications',
@@ -3619,7 +3653,11 @@
           const state = this.fetchState[name];
           if (!state) return;
           state.state = state.lastSuccess ? "refreshing" : "loading";
-          state.error = null;
+          // `error` is deliberately NOT cleared here: a retry in flight does not
+          // un-fail the attempt before it. Clearing it made the fault disappear
+          // for the whole duration of every attempt, which is how a panel that
+          // withholds a count on failure showed a confident one anyway — see
+          // `refreshFailing` below. Only a SUCCESS clears it (finishFetch).
         },
 
         finishFetch(name) {
@@ -3640,6 +3678,29 @@
         panelState(name) {
           const state = this.fetchState[name];
           return state ? state.state : "unknown";
+        },
+
+        // The PHASE a panel's transport is in right now. `refreshFailing` is the
+        // FAULT, which is a different question and the one a panel withholding a
+        // number needs to ask.
+        //
+        // `startFetch` moves the phase to "refreshing" for the entire duration
+        // of each attempt, so a panel gating on `panelState === 'stale'` shows
+        // its number again during every retry. Worse, the retry can outlive the
+        // poll interval: api.js backs off up to ~62s on consecutive 5xx while
+        // panels poll every 60s, so each in-flight request is superseded by the
+        // next before it returns — and a superseded non-throwing response
+        // returns early without calling `failFetch`. The phase then never leaves
+        // "refreshing" at all, and a sustained server-error outage renders as a
+        // confident count with no warning of any kind.
+        //
+        // The fault survives that because `startFetch` no longer erases it: the
+        // first failure records it and only a success clears it. `lastSuccess`
+        // distinguishes this from a panel that has never loaded, which is the
+        // `loading`/`error` case and has no board to mislabel.
+        refreshFailing(name) {
+          const state = this.fetchState[name];
+          return !!(state && state.error && state.lastSuccess);
         },
 
         panelStateColor(name) {
@@ -3668,7 +3729,13 @@
           const state = this[name]?.fetch;
           if (!state) return;
           state.state = state.lastSuccess ? "refreshing" : "loading";
-          state.error = null;
+          // Same as `startFetch`, and it is here because the first version of
+          // that fix landed on one of the two parallel families. `state.error`
+          // is the record of the last COMPLETED attempt; a retry in flight does
+          // not un-fail it. Clearing it made every modal's failure text vanish
+          // for the duration of each retry — `fetchStatusDetail` renders it and
+          // `modalStatusDetail` feeds five modal templates. Only a success
+          // clears it (finishModalFetch).
         },
 
         finishModalFetch(name) {

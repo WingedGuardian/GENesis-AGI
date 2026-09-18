@@ -6,6 +6,18 @@
     html, body { overflow: auto !important; position: static !important; height: auto !important; }
     body { overscroll-behavior: auto !important; }
 
+    /* The `.panel` half of this same AZ neutralisation lives in components.css,
+       NOT here, and so does a copy of the html/body line above. dashboard.css
+       is linked by ONE page; components.css is linked by every page, and the
+       voice page uses `.panel` without ever loading this file.
+
+       The line above is the FIRST instance of this leak, fixed years-of-commits
+       ago and never carried to its neighbour — `.panel` sat unanswered at line
+       177 of this same file, 171 lines below it, for months. Two more instances turned
+       up while fixing that one, both on pages this sheet does not reach. Which
+       is the argument for the shared sheet: a page-specific answer is only ever
+       an answer for one page, and the leak is not. */
+
     /* Error banner */
     .error-banner {
       background: rgba(217,83,79,0.1);

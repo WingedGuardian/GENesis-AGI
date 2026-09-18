@@ -4,6 +4,15 @@ Cross-tool agent entry point (Codex, Cursor, OpenCode, …). The canonical
 project instructions live in **CLAUDE.md** — read it first; everything below
 is supplementary.
 
+## Codex external-client boundary
+
+Codex connects to Genesis through the project `.codex/config.toml` as an
+external MCP client. It can request Genesis capabilities on demand, but it is
+not a Genesis foreground or background session: never register its transcript,
+create a charter for it, send its identifiers to session tools, or add lifecycle
+hooks that make Genesis manage the conversation. See
+`.agents/skills/genesis-external-client/SKILL.md` when working through Codex.
+
 ## Code Review Mandate (adversarial)
 
 When reviewing a diff or PR (including automated PR review), review ADVERSARIALLY,
@@ -108,8 +117,9 @@ This repo is indexed by GitNexus. The MCP tools (`impact`, `query`,
 and execution-flow answers that grep can't. Use them when they fit the
 question — **none is a mandatory pre-edit gate** (see CLAUDE.md → Code
 Intelligence for the tool-selection matrix; Serena is the live-symbol
-default, GitNexus is snapshot-based so run `node .gitnexus/run.cjs analyze`
-first when freshness matters).
+default, GitNexus is snapshot-based. From the main checkout, run
+`scripts/lib/code_intel_index.sh "$PWD" gitnexus fast` when freshness matters;
+linked worktrees deliberately skip indexing, so use Serena for live branch truth).
 
 Useful entry points:
 
@@ -139,6 +149,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - **aws-fde-delivery** — Forward Deployed Engineer delivery contract for AWS engagements, build-first artifacts, grounded cost estimates, Well-Architected review, evolution roadmap
 - **browser-automation** — Web automation with 4-layer escalation (Fetch, Genesis Browser, On-Demand MCP, Computer Use), anti-detection, and persistent profiles
 - **cc-update** — Update Claude Code (the CC CLI / "clog code") to a new version, or bump the pinned CC version. Use when the user asks to update Claude Code, bump the CC pin, evaluate a new CC release, or says "clog code update". Routes to the canonical, standardized process in docs/reference/cc-compatibility.md — do NOT re-derive the update mechanism by grepping every time. Do NOT use for general "what changed in CC" trivia with no intent to update.
+- **closing-session** — This skill should be used when a session's job is to DRIVE OPEN PRs TO MERGE rather than to write new code — "close out the open PRs", "review and fix the open PRs", "what's blocking our PRs", "which PRs are mergeable". It owns the In Review column: it reads each PR's gate status, verifies and fixes review findings on PRs OTHER sessions built, replies in-thread, and stops at the merge gate for the user's per-PR approval. Do NOT load it for building a feature and opening its PR — that is a build session (`genesis-development`).
 - **code-intelligence** — Code understanding tool selection. Use when exploring architecture, finding definitions, tracing call chains, assessing blast radius of changes, or debugging code paths in the Genesis codebase.
 - **content-publish** — End-to-end content creation and publishing. Takes a topic (or generates one), drafts in the user's voice, gets approval via Telegram, and publishes to Medium via browser automation. Invoke with "publish a post about X", "write and publish to Medium", "content-publish", or when an ego-dispatched session needs to create and distribute content.
 - **debugging** — Systematic debugging of issues — use when a test fails, runtime error occurs, unexpected behavior is reported, or an awareness tick produces anomalous results
