@@ -900,7 +900,12 @@ def scan_diff(
                     "to generate it."
                 ),
                 scanner="fingerprint",
-                detail=str(fingerprint_file),
+                # A SENTINEL, not the path. `detail` is rendered into refusals
+                # and CLI output, and this path routinely embeds the operator's
+                # account name — the same class of leak as reproducing a matched
+                # secret. The message already names what is missing, and the
+                # default location is documented on scan_prose.
+                detail="missing_fingerprint_file",
             )
         )
 
@@ -1006,7 +1011,12 @@ def scan_prose(
                     "`python -m genesis.contribution.fingerprints --write`)."
                 ),
                 scanner="fingerprint",
-                detail=str(fingerprint_file),
+                # A SENTINEL, not the path. `detail` is rendered into refusals
+                # and CLI output, and this path routinely embeds the operator's
+                # account name — the same class of leak as reproducing a matched
+                # secret. The message already names what is missing, and the
+                # default location is documented on scan_prose.
+                detail="missing_fingerprint_file",
             )
         )
 

@@ -1012,6 +1012,15 @@ def untokenizable(command: str) -> bool:
         return True
 
 
+# Reserved words the segmenter does not model. CLOSED SET, and that is the whole
+# reason this list is safe where a list of command CARRIERS would not be: the
+# shell grammar fixes its reserved words, while the set of programs that take a
+# command as an argument grows forever. Enumerating the first converges;
+# enumerating the second is a race. Only words MEASURED to leave `analyze()`
+# without the inner command are here — `if`/`while`/`for`/`select` and the
+# grouping operators all resolve correctly and are deliberately absent, because
+# every entry costs a fallback to coarse matching.
+
 # WHY THIS MODULE HAS COST BOUNDS AT ALL
 #
 # Every guard is a hook registered with a wall clock (10s for the destructive and
@@ -1757,6 +1766,139 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
             result[0] = head + sep + name.split("@", 1)[0]
     return result
 
+_FUNCTION_DEF = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\(\)$")
+
+# Invocation-option letters that may share a short bundle with ``-c``.  These
+# are deliberately per interpreter: treating an unsupported letter as a script
+# carrier makes the parser recurse into an argument the shell rejects or treats
+# as a filename. The bash set comes from ``bash --help``; the dash/sh set was
+# verified against the installed dash implementation, which also provides
+# ``sh`` on the supported Linux hosts.
+_C_BUNDLE_OPTIONS = {
+    "bash": frozenset("abcefhiklmnprstuvxBCEHPTD"),
+    "sh": frozenset("abcefhilmnprstuvxCEIV"),
+    "dash": frozenset("abcefhilmnprstuvxCEIV"),
+    "ash": frozenset("abcefhilmnprstuvx"),
+    "ksh": frozenset("abcefhilmnprstuvx"),
+    "zsh": frozenset("Gabcefhilmnprstuvx"),
+}
+
+
+def _coproc_body(argv: list[str]) -> list[str]:
+    """The command run by ``coproc``, dropping its optional compound name."""
+    body = argv[1:]
+
+    # ``coproc NAME COMPOUND-COMMAND`` gives NAME to the coprocess. For
+    # ``coproc NAME command`` NAME is the command itself, so only strip it when
+    # the following token can open Bash's compound-command grammar.
+    if (
+        len(body) > 1
+        and (
+            body[1] in {
+                "{",
+                "(",
+                "if",
+                "while",
+                "until",
+                "for",
+                "case",
+                "select",
+                "function",
+            }
+            or body[1].startswith("(")
+        )
+        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", body[0])
+    ):
+        body = body[1:]
+
+    return body
+
+
+def _embedded_commands(
+    argv: list[str],
+    raw_argv: list[str] | None = None,
+) -> list[str]:
+    """Return command bodies embedded in shell constructs."""
+    if not argv:
+        return []
+
+    if raw_argv is None:
+        raw_argv = argv
+
+    if argv[0] == "case":
+        try:
+            start = raw_argv.index("in") + 1
+        except ValueError:
+            return []
+
+        for i, token in enumerate(raw_argv[start:], start):
+            if token.endswith(")") and i + 1 < len(raw_argv):
+                return [shlex.join(raw_argv[i + 1 :])]
+
+        return []
+
+    # A parenthesized case pattern such as `(b) git push ...` is stripped
+    # by `_strip_wrappers()` before reaching `argv`. Use the raw token so
+    # the pattern itself is not mistaken for the executable.
+    if (
+        len(raw_argv) > 1
+        and raw_argv[0].startswith("(")
+        and raw_argv[0].endswith(")")
+    ):
+        return [shlex.join(raw_argv[1:])]
+
+    if argv[0].endswith(")") and len(argv) > 1:
+        return [shlex.join(argv[1:])]
+
+    if argv[0] == "function" and len(argv) > 2:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", argv[1]):
+            return []
+
+        body_index = 2
+
+        # `function NAME () { ... }` is also valid Bash syntax.
+        if argv[2] == "()":
+            body_index = 3
+            if len(argv) <= body_index:
+                return []
+
+        if argv[body_index] in {
+            "{",
+            "(",
+            "if",
+            "while",
+            "until",
+            "for",
+            "case",
+            "select",
+        }:
+            if argv[body_index] == "{":
+                return [shlex.join(argv[body_index + 1 :])]
+            return [shlex.join(argv[body_index:])]
+
+        return []
+
+    if (
+        (
+            _FUNCTION_DEF.match(argv[0])
+            and len(argv) > 2
+            and argv[1] == "{"
+        )
+        or (
+            len(argv) > 3
+            and argv[0].isidentifier()
+            and argv[1] == "()"
+            and argv[2] == "{"
+        )
+    ):
+        start = 2 if argv[1] == "{" else 3
+        return [shlex.join(argv[start:])]
+
+    if argv[0] == "coproc" and len(argv) > 1:
+        return [shlex.join(_coproc_body(argv))]
+
+    return []
+
 
 #: Characters that make a shell WORD mean something other than what it spells.
 #: shlex implements quote removal and backslash escapes faithfully and implements
@@ -2416,11 +2558,11 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
         )
         nested = []
         if exe in _NESTED:
-            script = _nested_script(argv)
+            script = _nested_script(argv, exe)
             if script:
                 nested.append(script)
-        # $(...) / `...` bodies also execute — parsed from RAW, which STILL carries any
-        # expansion redirect target, so a nested command stays visible to the guards.
+
+        nested.extend(_embedded_commands(_argv(seg.argv_src)))
         nested.extend(_substitutions(raw))
         if not nested:
             continue
@@ -2533,34 +2675,49 @@ def _substitutions(text: str) -> list[str]:
     return subs
 
 
-def _nested_script(argv: list[str]) -> str:
+def _nested_script(argv: list[str], interpreter: str) -> str:
     """The script string passed to an interpreter's ``-c``, else ''.
 
-    For every interpreter in ``_NESTED`` the script is the NEXT argv token, and
-    where ``c`` sits inside a short bundle does not change that: ``-c 'script'``,
-    ``-lc 'script'`` and ``-ce 'script'`` all take it from the following token.
-
-    An earlier version read a bundle whose ``c`` was not last as an INLINE value
-    (``-ce`` → the script ``"e"``), which lost the real script entirely: the
-    parser then reported a segment whose executable was ``e``, and a guard keyed
-    on the nested command fell OPEN. Found by cross-model review, 2026-09-03.
-
-    MEASURED 2026-09-06 against the real interpreters, both directions:
-    ``bash -ce '<cmd>'`` and ``bash -cx '<cmd>'`` RUN ``<cmd>`` from the next
-    token, while the glued spelling that branch modelled is refused outright —
-    ``bash -c'<cmd>'`` prints "invalid option", ``sh``/``dash`` "Illegal option".
-    So the branch modelled a form none of these shells accepts and dropped one
-    they all do, and deleting it is strictly a widening.
+    Stops at ``--`` and a lone ``-``, which end option processing. A combined
+    option is accepted only when every letter is valid for this interpreter;
+    ``bash -cz`` is rejected by Bash and does not run a script.
     """
+    allowed = _C_BUNDLE_OPTIONS[interpreter]
+
     for i, tok in enumerate(argv[1:], 1):
-        if not tok.startswith("-") or tok.startswith("--"):
+        if tok in {"-", "--"}:
+            break
+        if not tok.startswith("-"):
             continue
-        if "c" not in tok[1:]:
+
+        options = tok[1:]
+        if "c" not in options:
             continue
+
+        pos = tok.find("c")
+
+        # `-co` / `-Oc`: `o` / `O` consumes the next token as its value,
+        # so the script is the token after that value.
+        value_taking = (
+            (pos + 1 < len(tok) and tok[pos + 1] in {"o", "O"})
+            or (pos > 0 and tok[pos - 1] in {"o", "O"})
+        )
+
+        if value_taking:
+            option_letters = set(options) - {"o", "O"}
+            if not option_letters <= allowed:
+                continue
+            if i + 2 < len(argv):
+                return argv[i + 2]
+            continue
+
+        if not set(options) <= allowed:
+            continue
+
         if i + 1 < len(argv):
             return argv[i + 1]
-    return ""
 
+    return ""
 
 # ── git-specific helpers ────────────────────────────────────────────────
 

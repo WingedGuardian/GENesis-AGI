@@ -97,8 +97,10 @@ Pick the tool by the question (full matrix + freshness model:
 **Serena** (Python LSP) for symbols/references/rename — **always live**, the
 default for "who calls X / what breaks if I change Z"; **codebase-memory-mcp**
 for architecture/graph; **GitNexus** for deep blast-radius/flows/coupling —
-**snapshot-based, so `gitnexus analyze` first** when freshness matters (it
-drifts after pulling merged PRs). Prefer these over manual reads for dependency
+**snapshot-based**. From the main checkout, refresh with
+`scripts/lib/code_intel_index.sh "$PWD" gitnexus fast` when freshness matters.
+Linked worktrees are deliberately not indexed; use Serena for live branch truth.
+GitNexus also drifts after pulling merged PRs. Prefer these over manual reads for dependency
 questions; none is a mandatory pre-edit gate.
 
 ## Skill Library
@@ -613,7 +615,12 @@ behind the writer, and 7 were a guard since removed.
   calls. Always pass ≥2 questions; if only one is real, add a trivial/filler
   second question to satisfy the tool. Every time, no exceptions.
 - **Plan mode by default** for any task with 3+ steps or architectural
-  decisions. If something goes sideways — STOP and re-plan.
+  decisions. If something goes sideways — STOP and re-plan. A plan-mode
+  document under `~/.claude/plans/` that will outlive one session opens with
+  the structured header (status, `pinned.main`, `binds`/`prevents`, and the
+  trackers it executes) — format and rationale in the genesis-development
+  skill, `references/plan-docs.md`. Task-executor plans (`/task`,
+  `TASK_INTAKE.md`) keep their own section contract and are out of scope.
 - **Use subagents** to keep main context clean. One concern per subagent.
   **A MANDATED subagent is already the request** — when a gate's block message
   tells you to dispatch one, dispatch it; don't stop to ask. Ask only for
