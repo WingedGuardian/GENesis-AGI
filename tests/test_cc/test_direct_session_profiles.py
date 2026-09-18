@@ -55,6 +55,7 @@ _UNIVERSAL_BLOCKED = {
     "mcp__genesis-memory__memory_store",
     "mcp__genesis-memory__memory_synthesize",
     "mcp__genesis-memory__memory_extract",
+    "mcp__genesis-memory__memory_supersede",
     # Knowledge ingestion — user authorization required
     "mcp__genesis-memory__knowledge_ingest",
     "mcp__genesis-memory__knowledge_ingest_batch",
