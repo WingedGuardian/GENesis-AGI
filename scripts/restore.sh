@@ -28,7 +28,8 @@
 #
 # Behavior:
 #   - Skips destinations that already exist AND are newer than the backup
-#     (avoid clobbering live data). Override with --force.
+#     (avoid clobbering live data). Override with --force. Database-only recovery
+#     may replace a currently quarantined DB regardless of its meaningless mtime.
 #   - Reads both encrypted (*.gpg) and legacy plaintext forms for backward
 #     compatibility with backups predating the encryption hardening.
 #   - Writes ~/.genesis/restore_status.json on every run (success or failure).
@@ -566,7 +567,21 @@ log "--- SQLite ---"
 DB_FILE="$GENESIS_DIR/data/genesis.db"
 if resolve_payload "$BACKUP_DIR/data/genesis.sql"; then
     src="$__PAYLOAD_SRC"
-    if [ -f "$DB_FILE" ] && [ "$DB_FILE" -nt "$src" ] && ! $FORCE; then
+    _RECOVERING_QUARANTINED_DB=false
+    if $DATABASE_ONLY && [ -f "$DB_FILE" ] \
+        && PYTHONPATH="$_SCRIPT_DIR/../src" python3 - "$DB_FILE" <<'PY'
+import sys
+
+from genesis.db.integrity import database_is_quarantined
+
+raise SystemExit(0 if database_is_quarantined(sys.argv[1]) else 1)
+PY
+    then
+        _RECOVERING_QUARANTINED_DB=true
+        log "SQLite: live database is quarantined; verified recovery may replace it regardless of mtime"
+    fi
+    if [ -f "$DB_FILE" ] && [ "$DB_FILE" -nt "$src" ] \
+        && ! $FORCE && ! $_RECOVERING_QUARANTINED_DB; then
         log "SQLite: destination is newer than backup — skipping (use --force to override)"
     else
         if $DRY_RUN; then

@@ -542,15 +542,14 @@ def test_corruption_backup_update_gate_and_database_restore_e2e(sandbox):
 
     _make_stub(
         sandbox["bind"] / "systemctl",
-        "#!/usr/bin/env bash\n"
-        'case "$*" in *"is-active"*) exit 1 ;; *) exit 0 ;; esac\n',
+        '#!/usr/bin/env bash\ncase "$*" in *"is-active"*) exit 1 ;; *) exit 0 ;; esac\n',
     )
     restored = subprocess.run(
-        ["bash", str(_RESTORE), "--database-only", "--force"],
+        ["bash", str(_RESTORE), "--database-only"],
         env=_env(sandbox),
         capture_output=True,
         text=True,
-        stdin=subprocess.DEVNULL,
+        input="y\n",
     )
     assert restored.returncode == 0, f"{restored.stdout}\n{restored.stderr}"
     assert not (sandbox["home"] / ".genesis" / "db_quarantine.json").exists()

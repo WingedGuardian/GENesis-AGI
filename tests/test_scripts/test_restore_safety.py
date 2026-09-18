@@ -58,7 +58,7 @@ def _write_systemctl(
         f'echo "$*" >> "{calls}"\n'
         'case "$*" in\n'
         f'  *is-active*) grep -qx active "{state_file}"; exit $? ;;\n'
-        f'  *stop*){marker_probe} [ {stop_rc} -eq 0 ] && '
+        f"  *stop*){marker_probe} [ {stop_rc} -eq 0 ] && "
         f'echo inactive > "{state_file}"; exit {stop_rc} ;;\n'
         "esac\n"
         "exit 0\n",
@@ -171,6 +171,36 @@ def test_database_only_restore_skips_every_non_database_payload(sandbox):
     assert restored == "42"
 
 
+def test_database_only_restore_keeps_newer_guard_when_not_quarantined(sandbox):
+    db = _seed_live_db(sandbox["gd"])
+    backup = _seed_backup(sandbox["tmp"])
+    sql = backup / "data" / "genesis.sql"
+    os.utime(sql, (1_000, 1_000))
+    os.utime(db, (2_000, 2_000))
+    env = dict(os.environ)
+    env.update(
+        HOME=str(sandbox["home"]),
+        GENESIS_DIR=str(sandbox["gd"]),
+        QDRANT_URL="http://127.0.0.1:1",
+        PATH=f"{sandbox['bind']}:{os.environ['PATH']}",
+    )
+
+    proc = subprocess.run(
+        ["bash", str(_RESTORE), "--from", str(backup), "--database-only"],
+        env=env,
+        capture_output=True,
+        text=True,
+        input="y\n",
+    )
+
+    assert proc.returncode != 0
+    assert "destination is newer than backup" in proc.stdout
+    value = subprocess.run(
+        ["sqlite3", str(db), "SELECT x FROM t;"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    assert value == "1"
+
+
 # NOTE: this test's name must NOT contain the marker word — restore.sh logs the
 # (tmp) DB path, and a test name leaking into that path would false-match.
 def test_restore_verifies_db_after_restore(sandbox):
@@ -242,9 +272,7 @@ def test_restore_holds_deploy_marker_across_stop(sandbox):
     ``update_in_progress`` marker env.update_in_progress() honors — in place
     BEFORE the stop and released by the EXIT trap — so the autonomy watchdog
     defers instead of reviving the server into a half-built DB."""
-    _write_systemctl(
-        sandbox["bind"], sandbox["calls"], probe_marker_on_stop=True
-    )
+    _write_systemctl(sandbox["bind"], sandbox["calls"], probe_marker_on_stop=True)
     _seed_live_db(sandbox["gd"])
     proc = _run_restore(sandbox)
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"

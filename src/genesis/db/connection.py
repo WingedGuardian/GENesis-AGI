@@ -12,7 +12,7 @@ import logging
 import os
 import random
 import sqlite3
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Iterable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
@@ -42,13 +42,51 @@ def connect_sqlite_rw(
     return sqlite3.connect(str(db_path), *args, **kwargs)
 
 
-def connect_aiosqlite_rw(path: str | Path = DEFAULT_DB_PATH, **kwargs: Any) -> aiosqlite.Connection:
-    """Return aiosqlite's awaitable/context-manager after quarantine guard."""
+class _GuardedAiosqliteConnector:
+    """Preserve aiosqlite's dual await/context API with open-time guards."""
+
+    def __init__(self, db_path: Path, kwargs: dict[str, Any]) -> None:
+        self._db_path = db_path
+        self._kwargs = kwargs
+        self._connection: aiosqlite.Connection | None = None
+
+    async def _open(self) -> aiosqlite.Connection:
+        from genesis.db.integrity import assert_not_quarantined
+
+        # Construction and opening are separate for aiosqlite.  Re-check here
+        # so a connector retained before quarantine cannot open afterward.
+        assert_not_quarantined(self._db_path)
+        connection = await aiosqlite.connect(str(self._db_path), **self._kwargs)
+        try:
+            # Quarantine may have become active while the worker thread opened
+            # SQLite.  Never return that newly opened writable handle.
+            assert_not_quarantined(self._db_path)
+        except BaseException:
+            await connection.close()
+            raise
+        self._connection = connection
+        return connection
+
+    def __await__(self) -> Generator[Any, None, aiosqlite.Connection]:
+        return self._open().__await__()
+
+    async def __aenter__(self) -> aiosqlite.Connection:
+        return await self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if self._connection is not None:
+            await self._connection.close()
+
+
+def connect_aiosqlite_rw(
+    path: str | Path = DEFAULT_DB_PATH, **kwargs: Any
+) -> _GuardedAiosqliteConnector:
+    """Return an awaitable/context-manager guarded through actual DB open."""
     from genesis.db.integrity import assert_not_quarantined
 
     db_path = Path(path).expanduser().resolve()
     assert_not_quarantined(db_path)
-    return aiosqlite.connect(str(db_path), **kwargs)
+    return _GuardedAiosqliteConnector(db_path, kwargs)
 
 
 # Per-connection page cache. Negative = KiB (SQLite convention), so -262144 is

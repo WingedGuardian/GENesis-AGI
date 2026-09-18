@@ -5,6 +5,7 @@ import os
 import sqlite3
 from pathlib import Path
 
+import aiosqlite
 import pytest
 
 from genesis.db import integrity
@@ -247,3 +248,64 @@ def test_connect_aiosqlite_rw_refuses_before_returning_connector(tmp_path):
 
     with pytest.raises(integrity.DatabaseIntegrityError):
         connect_aiosqlite_rw(db)
+
+
+@pytest.mark.asyncio
+async def test_connect_aiosqlite_rw_rechecks_when_delayed_await(tmp_path):
+    from genesis.db.connection import connect_aiosqlite_rw
+
+    db = tmp_path / "genesis.db"
+    _healthy_db(db)
+    pending = connect_aiosqlite_rw(db)
+    integrity.quarantine_database(db, source="test", detail="became bad before await")
+
+    with pytest.raises(integrity.DatabaseIntegrityError):
+        await pending
+
+
+@pytest.mark.asyncio
+async def test_connect_aiosqlite_rw_rechecks_on_context_entry(tmp_path):
+    from genesis.db.connection import connect_aiosqlite_rw
+
+    db = tmp_path / "genesis.db"
+    _healthy_db(db)
+    pending = connect_aiosqlite_rw(db)
+    integrity.quarantine_database(db, source="test", detail="became bad before entry")
+
+    with pytest.raises(integrity.DatabaseIntegrityError):
+        async with pending:
+            pytest.fail("quarantined database was opened")
+
+
+@pytest.mark.asyncio
+async def test_connect_aiosqlite_rw_closes_if_quarantined_during_open(tmp_path, monkeypatch):
+    from genesis.db.connection import connect_aiosqlite_rw
+
+    db = tmp_path / "genesis.db"
+    _healthy_db(db)
+    real_connect = aiosqlite.connect
+    opened: list[aiosqlite.Connection] = []
+
+    class QuarantineAfterOpen:
+        def __init__(self, connector):
+            self._connector = connector
+
+        def __await__(self):
+            async def open_then_quarantine():
+                connection = await self._connector
+                opened.append(connection)
+                integrity.quarantine_database(db, source="test", detail="became bad during open")
+                return connection
+
+            return open_then_quarantine().__await__()
+
+    monkeypatch.setattr(
+        aiosqlite,
+        "connect",
+        lambda *args, **kwargs: QuarantineAfterOpen(real_connect(*args, **kwargs)),
+    )
+
+    with pytest.raises(integrity.DatabaseIntegrityError):
+        await connect_aiosqlite_rw(db)
+
+    assert opened and opened[0]._connection is None

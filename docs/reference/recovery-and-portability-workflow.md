@@ -47,6 +47,9 @@ and `python -m genesis restore --database-only`; the staged replacement is
 validated before atomic installation. A healthy replacement inode makes the old
 quarantine stale and permits service restart, while the failed original remains
 preserved as the pre-restore forensic copy.
+When the live database is currently quarantined, database-only recovery may
+replace it even if the damaged file has a newer mtime; the newer-destination
+guard remains in force for non-quarantined databases.
 
 ## During Migration Work
 
