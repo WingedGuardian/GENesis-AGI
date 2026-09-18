@@ -173,10 +173,13 @@ except Exception:  # noqa: BLE001 — ANY failure (absent OR broken: SyntaxError
 try:
     from review_deadline import bounded_timeout as _bounded_timeout  # noqa: E402
 except Exception:  # Reverse skew: retain a conservative fail-fast local fallback.
-    def _bounded_timeout(deadline, cap, *, monotonic=time.monotonic, floor=0.001):
+    def _bounded_timeout(deadline, cap, *, monotonic=time.monotonic):
         if deadline is None:
             return cap
-        return max(floor, min(cap, deadline - monotonic()))
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise RuntimeError("aggregate review-gate deadline expired")
+        return min(cap, remaining)
 
 # The cloud-backed round budget is a newer soft dependency than this guard. A
 # missing/broken evaluator is UNKNOWN, never "zero rounds"; the request gate
@@ -639,10 +642,9 @@ def _gh_timeout(cap: float) -> float:
     """Per-call subprocess timeout under the shared merge-path deadline (``_merge_deadline``).
 
     ``cap`` when no merge deadline is set (every non-merge caller, and the tests, are
-    unaffected). Under a deadline, the smaller of ``cap`` and the time remaining, floored
-    at 1ms so an expired budget makes the call fail immediately — its caller's existing
-    error path then returns its fail-closed/open value — rather than overrun the
-    wall-clock and get the whole hook SIGKILLed mid-gate. Never raises."""
+    unaffected). Under a deadline, the smaller of ``cap`` and the time remaining.
+    An expired budget raises before another process starts; the outer fail-closed
+    guard or a caller's explicit error path then decides safely."""
     return _bounded_timeout(_merge_deadline, cap)
 
 
@@ -3789,6 +3791,14 @@ def _comment_body(argv: list[str]) -> tuple[str | None, bool]:
         elif tok.startswith("--body-file=") or (tok.startswith("-F") and len(tok) > 2):
             opaque = True
         i += 1
+    # shell_parse preserves expansion spelling in argv rather than evaluating it.
+    # The eventual body is therefore unknowable when it contains parameter or
+    # command substitution. Treat it like a body-file/editor source. This is
+    # deliberately conservative for a single-quoted literal containing "$" or
+    # backticks: the process gate cannot recover quote provenance from argv, and
+    # asking at a spent budget is safer than treating dynamic content as ordinary.
+    if inline_body is not None and ("$" in inline_body or "`" in inline_body):
+        opaque = True
     return inline_body, opaque
 
 
@@ -3808,6 +3818,8 @@ def _comment_review_request(argv: list[str]) -> tuple[str | None, bool, bool | N
         return None, False, False
     inline_body, opaque = _comment_body(argv)
     delete_only = "--delete-last" in argv[start:]
+    if opaque:
+        return inline_body, True, None
     if inline_body is not None and "@codex review" in inline_body.lower():
         return inline_body, opaque, True
     if inline_body is not None:
@@ -3833,6 +3845,16 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
     ]
     if not triggers:
         return "allow", ""
+
+    # One native decision must authorize exactly one request. Reject compounds
+    # before any network lookup or confirmation exemption so standing capacity,
+    # an exact-head marker, or opaque input cannot license a sibling request.
+    if len(triggers) > 1:
+        return (
+            "deny",
+            "BLOCKED: this command contains multiple review requests. Run each "
+            "request separately so every action receives its own policy decision.",
+        )
 
     global _merge_deadline
     if _merge_deadline is None:
@@ -3914,13 +3936,6 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
             decisions.append(("allow", ""))
 
     asks = [reason for decision, reason in decisions if decision == "ask"]
-    if asks and len(triggers) > 1:
-        return (
-            "deny",
-            "BLOCKED: this command contains multiple review requests and at least "
-            "one requires fresh user approval. Run each request separately so one "
-            "approval cannot authorize several actions.",
-        )
     if asks:
         reason = asks[0]
         # A stale worktree still emits the retired terminal sigil. It is parsed

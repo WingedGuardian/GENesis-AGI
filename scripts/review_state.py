@@ -65,13 +65,25 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 try:
-    from review_deadline import bounded_timeout
+    from review_deadline import DeadlineExpired, bounded_timeout, propagate_deadline_timeout
 except Exception:  # Reverse-version skew: keep state reads available and bounded.
 
-    def bounded_timeout(deadline, cap, *, monotonic=time.monotonic, floor=0.001):
+    class DeadlineExpired(RuntimeError):
+        """Local reverse-skew equivalent of the shared deadline exception."""
+
+    def bounded_timeout(deadline, cap, *, monotonic=time.monotonic):
         if deadline is None:
             return cap
-        return max(floor, min(cap, deadline - monotonic()))
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise DeadlineExpired("aggregate review-gate deadline expired")
+        return min(cap, remaining)
+
+    def propagate_deadline_timeout(deadline, error):
+        if deadline is not None:
+            raise DeadlineExpired(
+                "aggregate review-gate deadline expired during subprocess"
+            ) from error
 
 _MARKER_DIR = Path.home() / ".genesis" / "review_markers"
 # Per-worktree review-ROUND counter (escalation cap). Deliberately a SEPARATE store
@@ -114,9 +126,7 @@ def _deadline_timeout(deadline: float | None, cap: float) -> float:
     timeouts) pass one deadline so a stalled probe consumes the SAME budget the
     later gates need instead of resetting it — a per-call cap alone lets serial
     probes overrun the kill, which fails OPEN.
-    An already-elapsed deadline yields a ~1ms probe that times out
-    immediately rather than granting a fresh 0.1s of post-deadline work —
-    serial probes must not reach the host kill window, which fails OPEN.
+    An already-elapsed deadline raises before another subprocess starts.
     """
     return bounded_timeout(deadline, cap)
 
@@ -148,7 +158,9 @@ def _worktree_root(cwd: str | None = None, *, deadline: float | None = None) -> 
             # symlinks) for the SAME worktree — otherwise a git-success mark and a
             # git-failed hook check could compute different keys and disagree.
             return os.path.realpath(root)
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+    except subprocess.TimeoutExpired as exc:
+        propagate_deadline_timeout(deadline, exc)
+    except (FileNotFoundError, OSError):
         pass
     base = Path(cwd).resolve() if cwd else Path.cwd()
     for d in (base, *base.parents):
@@ -177,12 +189,12 @@ def _evidence_file(cwd: str | None = None) -> Path:
     return _EVIDENCE_DIR / f"{_worktree_key(cwd)}.txt"
 
 
-def _state_file(cwd: str | None = None) -> Path:
+def _state_file(cwd: str | None = None, *, deadline: float | None = None) -> Path:
     """Per-worktree marker path (see ``_worktree_key``)."""
-    return _MARKER_DIR / f"{_worktree_key(cwd)}.json"
+    return _MARKER_DIR / f"{_worktree_key(cwd, deadline=deadline)}.json"
 
 
-def get_current_diff_hash(cwd: str | None = None) -> str:
+def get_current_diff_hash(cwd: str | None = None, *, deadline: float | None = None) -> str:
     """SHA-256 of ``git diff --cached --raw --no-abbrev -z`` output (staged only).
 
     Only staged changes trigger review enforcement.  Unstaged changes
@@ -213,7 +225,7 @@ def get_current_diff_hash(cwd: str | None = None) -> str:
         result = subprocess.run(
             ["git", "diff", "--cached", "--raw", "--no-abbrev", "-z"],
             capture_output=True,  # bytes (no text= → no newline/encoding munging)
-            timeout=10,
+            timeout=_deadline_timeout(deadline, 10),
             cwd=cwd,
             # --stat output is TERMINAL-WIDTH sensitive: git truncates long paths
             # to fit COLUMNS (honored even without a tty). The mark is written from
@@ -230,18 +242,21 @@ def get_current_diff_hash(cwd: str | None = None) -> str:
         if not content:
             return "clean"
         return hashlib.sha256(content).hexdigest()[:16]
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+    except subprocess.TimeoutExpired as exc:
+        propagate_deadline_timeout(deadline, exc)
+        return "unknown"
+    except (FileNotFoundError, OSError):
         return "unknown"
 
 
-def has_code_changes(cwd: str | None = None) -> bool:
+def has_code_changes(cwd: str | None = None, *, deadline: float | None = None) -> bool:
     """Check if there are any uncommitted code changes."""
-    return get_current_diff_hash(cwd=cwd) not in ("clean", "unknown")
+    return get_current_diff_hash(cwd=cwd, deadline=deadline) not in ("clean", "unknown")
 
 
-def _load_marker(cwd: str | None = None) -> dict | None:
+def _load_marker(cwd: str | None = None, *, deadline: float | None = None) -> dict | None:
     """Read the per-worktree marker, falling back to the legacy global file."""
-    for path in (_state_file(cwd), _LEGACY_STATE_FILE):
+    for path in (_state_file(cwd, deadline=deadline), _LEGACY_STATE_FILE):
         try:
             if path.exists():
                 return json.loads(path.read_text())
@@ -250,16 +265,16 @@ def _load_marker(cwd: str | None = None) -> dict | None:
     return None
 
 
-def is_review_current(cwd: str | None = None) -> bool:
+def is_review_current(cwd: str | None = None, *, deadline: float | None = None) -> bool:
     """Check if the stored (per-worktree) marker matches current diff state."""
-    current = get_current_diff_hash(cwd=cwd)
+    current = get_current_diff_hash(cwd=cwd, deadline=deadline)
     if current in ("clean", "unknown"):
         return True  # No changes = no review needed
-    state = _load_marker(cwd)
+    state = _load_marker(cwd, deadline=deadline)
     return bool(state) and state.get("diff_hash") == current
 
 
-def marker_content_current(cwd: str | None = None) -> bool:
+def marker_content_current(cwd: str | None = None, *, deadline: float | None = None) -> bool:
     """Whether the marker's recorded FULL-content hash binds the CURRENT staged diff.
 
     A belt-and-suspenders companion to :func:`is_review_current`. Since ``diff_hash``
@@ -270,21 +285,21 @@ def marker_content_current(cwd: str | None = None) -> bool:
     IS the staged content (an audit of diff A must not clear a different diff B).
     Fails CLOSED: a real staged hash that mismatches / is absent / errors → False.
     """
-    current = _staged_content_hash(cwd=cwd)
+    current = _staged_content_hash(cwd=cwd, deadline=deadline)
     if current in ("clean", "unknown"):
         return False  # nothing concrete to bind (or a git error) — never clear on this
-    state = _load_marker(cwd)
+    state = _load_marker(cwd, deadline=deadline)
     return bool(state) and state.get("content_hash") == current
 
 
-def has_valid_review_marker(cwd: str | None = None) -> bool:
+def has_valid_review_marker(cwd: str | None = None, *, deadline: float | None = None) -> bool:
     """Check if a (per-worktree) review marker exists and is not expired.
 
     Unlike is_review_current(), this does NOT short-circuit on clean staged
     area. Used when the caller knows changes are about to be staged (e.g.
     git add && git commit in the same command).
     """
-    state = _load_marker(cwd)
+    state = _load_marker(cwd, deadline=deadline)
     if not state:
         return False
     try:
@@ -395,14 +410,16 @@ def _evidence_is_adversarial(text: str) -> tuple[bool, str]:
     return True, "adversarial-audit structure present"
 
 
-def get_marker_depth(cwd: str | None = None) -> tuple[str | None, bool]:
+def get_marker_depth(
+    cwd: str | None = None, *, deadline: float | None = None
+) -> tuple[str | None, bool]:
     """``(level, adversarial)`` recorded in the current marker; ``(None, False)`` if absent.
 
     Read by the commit gate's depth check. ``level`` is the computed
     substantiality at mark time; ``adversarial`` is the derived content-verify
     result — NEITHER is self-reported by the caller.
     """
-    state = _load_marker(cwd)
+    state = _load_marker(cwd, deadline=deadline)
     if not state:
         return None, False
     level = state.get("level")
@@ -677,7 +694,7 @@ def _round_file(cwd: str | None = None, *, deadline: float | None = None) -> Pat
     return _ROUND_DIR / f"{_worktree_key(cwd, deadline=deadline)}.json"
 
 
-def _staged_content_hash(cwd: str | None = None) -> str:
+def _staged_content_hash(cwd: str | None = None, *, deadline: float | None = None) -> str:
     """SHA-256 of the FULL staged patch (``git diff --cached``).
 
     A belt-and-suspenders content bind for the depth gate. ``get_current_diff_hash``
@@ -693,14 +710,17 @@ def _staged_content_hash(cwd: str | None = None) -> str:
             ["git", "diff", "--cached"],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=_deadline_timeout(deadline, 10),
             cwd=cwd,
         )
         content = result.stdout
         if not content.strip():
             return "clean"
         return hashlib.sha256(content.encode()).hexdigest()[:16]
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+    except subprocess.TimeoutExpired as exc:
+        propagate_deadline_timeout(deadline, exc)
+        return "unknown"
+    except (FileNotFoundError, OSError):
         return "unknown"
 
 
@@ -774,10 +794,12 @@ def get_review_round(cwd: str | None = None) -> int:
     return _coerce_finite_int(state.get("round", 0))
 
 
-def _write_round(state: dict, cwd: str | None = None) -> None:
+def _write_round(
+    state: dict, cwd: str | None = None, *, deadline: float | None = None
+) -> None:
     """Persist the round-counter state (best-effort — never raises)."""
     try:
-        rf = _round_file(cwd)
+        rf = _round_file(cwd, deadline=deadline)
         rf.parent.mkdir(parents=True, exist_ok=True)
         rf.write_text(json.dumps(state, indent=2))
     except OSError:
@@ -975,7 +997,7 @@ def get_review_counters(
     )
 
 
-def reset_review_round(cwd: str | None = None) -> None:
+def reset_review_round(cwd: str | None = None, *, deadline: float | None = None) -> None:
     """Reset the CONSECUTIVE streak, PRESERVING the lifetime count. Never raises.
 
     Deliberately preserves the legacy lifetime fields so stale hook trees remain
@@ -993,7 +1015,7 @@ def reset_review_round(cwd: str | None = None) -> None:
     count with it and leaving the terminal unreachable. Only external rounds are
     ever counted, so a surviving lifetime implies external provenance.
     """
-    state = _load_round(cwd)
+    state = _load_round(cwd, deadline=deadline)
     lifetime = _coerce_finite_int(state.get("lifetime", 0)) if state else 0
     branch = state.get("branch") if state else None
     if not lifetime or not branch:
@@ -1002,7 +1024,7 @@ def reset_review_round(cwd: str | None = None) -> None:
         import contextlib
 
         with contextlib.suppress(OSError):
-            _round_file(cwd).unlink(missing_ok=True)
+            _round_file(cwd, deadline=deadline).unlink(missing_ok=True)
         return
     _write_round(
         {
@@ -1015,6 +1037,7 @@ def reset_review_round(cwd: str | None = None) -> None:
             "final_accept_consumed": bool(state.get("final_accept_consumed")),
         },
         cwd,
+        deadline=deadline,
     )
 
 
@@ -1029,7 +1052,10 @@ def get_current_branch(cwd: str | None = None, *, deadline: float | None = None)
             cwd=cwd,
         )
         return result.stdout.strip() or "unknown"
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+    except subprocess.TimeoutExpired as exc:
+        propagate_deadline_timeout(deadline, exc)
+        return "unknown"
+    except (FileNotFoundError, OSError):
         return "unknown"
 
 

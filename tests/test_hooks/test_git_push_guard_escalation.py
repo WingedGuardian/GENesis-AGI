@@ -142,6 +142,37 @@ def test_multiple_requests_block_when_one_needs_approval(monkeypatch):
     assert "multiple review requests" in reason
 
 
+def test_multiple_requests_block_while_standing_authorization_remains(monkeypatch):
+    _evidence(monkeypatch, [(h, "COMMENTED") for h in HEADS[:3]])
+    decision, reason = _decision(f"{TRIGGER} && {TRIGGER}")
+    assert decision == "deny"
+    assert "multiple review requests" in reason
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["$BODY", "${BODY}", "$(cat request.txt)", "`cat request.txt`"],
+)
+def test_shell_expanded_inline_body_is_opaque_at_approval_boundary(monkeypatch, body):
+    _evidence(monkeypatch, [(h, "COMMENTED") for h in HEADS[:4]])
+    decision, _ = _decision(f'gh pr comment 1372 --repo owner/repo --body "{body}"')
+    assert decision == "ask"
+
+
+def test_shell_expanded_body_cannot_claim_confirmation_exemption(monkeypatch):
+    _evidence(
+        monkeypatch,
+        [(HEADS[0], "COMMENTED"), (HEADS[1], "COMMENTED")],
+        head=HEADS[2],
+        files=("scripts/review_budget.py",),
+    )
+    marker = _mod._review_budget.confirmation_marker(HEADS[2])
+    decision, _ = _decision(
+        f'gh pr comment 1372 --repo owner/repo --body "$BODY {marker}"'
+    )
+    assert decision == "ask"
+
+
 @pytest.mark.parametrize(
     "other",
     [

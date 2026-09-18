@@ -59,7 +59,12 @@ except Exception as _approval_exc:  # noqa: BLE001 — missing new helper must b
     os._exit(2)
 
 try:
-    from review_deadline import Deadline, bounded_timeout  # noqa: E402
+    from review_deadline import (  # noqa: E402
+        Deadline,
+        DeadlineExpired,
+        bounded_timeout,
+        propagate_deadline_timeout,
+    )
 except Exception as _deadline_exc:  # noqa: BLE001 — a broken deadline can fail open.
     if __name__ != "__main__":
         raise
@@ -434,6 +439,11 @@ def _staged_files(cwd: str | None, *, deadline: float | None = None) -> list[str
             elif len(parts) >= 2:
                 paths.append(parts[-1])
         return paths
+    except subprocess.TimeoutExpired as exc:
+        propagate_deadline_timeout(deadline, exc)
+        return None
+    except DeadlineExpired:
+        raise
     except Exception:
         return None
 
@@ -597,13 +607,12 @@ _UNRESOLVABLE_TARGET_CHARS = "$`*?[{\\()<>~"
 
 
 def _branch_mutation_risk(argv: list[str]) -> str | None:
-    """Whether a ``git switch``/``git checkout`` could move HEAD toward main/master or
-    an unverifiable branch.
+    """Whether a ``git switch``/``git checkout`` can move HEAD before a commit.
 
-    Returns ``"main"`` if it could land HEAD on main/master, ``"unknown"`` if the
-    target is unresolvable (a variable/subst/glob/``-`` previous-branch), else
-    ``None`` — a literal non-main branch (``checkout -b feature``) carries no
-    direct-to-main risk, and a FILE-RESTORE form moves no branch at all.
+    Returns ``"main"`` for main/master, ``"unknown"`` for an unresolvable target,
+    ``"branch"`` for another literal branch, and ``None`` only for a file-restore
+    form. The review budget is branch-specific, so every HEAD-moving form must run
+    separately from the commit; this hook can only inspect pre-command state.
 
     Only HEAD-MOVING forms are assessed, to avoid false-blocking file restores
     (``git checkout HEAD~1 -- f`` / ``git checkout main f.py``, which leave HEAD put):
@@ -691,7 +700,11 @@ def _branch_mutation_risk(argv: list[str]) -> str | None:
             return "main"
         if t == "-" or any(ch in t for ch in _UNRESOLVABLE_TARGET_CHARS):
             return "unknown"
-    return None
+    # Every valid `git switch` changes/selects HEAD. Even when option parsing
+    # cannot recover a target (`switch -- <branch>`, `switch --detach`, or a
+    # syntactically incomplete command), it cannot safely share a commit's
+    # pre-command branch budget. Checkout alone has file-restore forms.
+    return "branch" if sub == "switch" or targets else None
 
 
 def _worktree_root(cwd: str, *, deadline: float | None = None) -> str:
@@ -710,12 +723,16 @@ def _worktree_root(cwd: str, *, deadline: float | None = None) -> str:
         root = r.stdout.strip()
         if r.returncode == 0 and root:
             return os.path.realpath(root)
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+    except subprocess.TimeoutExpired as exc:
+        propagate_deadline_timeout(deadline, exc)
+    except (FileNotFoundError, OSError):
         pass
     return os.path.realpath(cwd)
 
 
-def _merge_note(cwd: str | None, *, gate: str = "round") -> str:
+def _merge_note(
+    cwd: str | None, *, gate: str = "round", deadline: float | None = None
+) -> str:
     """A hint appended to a denial when a merge is mid-flight.
 
     ``gate`` selects the consequence clause, because the two gates are misled by
@@ -740,7 +757,7 @@ def _merge_note(cwd: str | None, *, gate: str = "round") -> str:
             cwd=cwd,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=bounded_timeout(deadline, 5),
         )
         if out.returncode != 0 or not out.stdout.strip():
             return ""
@@ -754,6 +771,8 @@ def _merge_note(cwd: str | None, *, gate: str = "round") -> str:
             or (git_dir / "rebase-merge").exists()
             or (git_dir / "rebase-apply").exists()
         )
+    except DeadlineExpired:
+        return ""
     except (subprocess.SubprocessError, OSError, ValueError):
         return ""
     if not merging:
@@ -895,7 +914,9 @@ def _branch_review_budget(
     """
     if not cwd or not branch:
         return _unknown_budget("commit_pr_identity_unknown")
-    lookup_deadline = deadline or Deadline.after(budget_seconds)
+    lookup_deadline = (
+        deadline.capped_after(budget_seconds) if deadline else Deadline.after(budget_seconds)
+    )
     try:
         import review_budget
     except Exception:  # noqa: BLE001 — reverse version skew asks/denies.
@@ -1127,10 +1148,10 @@ def main() -> None:
     # branch ONCE at hook time, before any segment runs. A `git switch main` /
     # `git checkout main` (or an unresolvable target) EARLIER in the chain than a
     # commit lands that commit on a branch this read cannot see — slipping the
-    # direct-to-main block. Fail closed when a pre-commit branch mutation could reach
-    # main/master or is unresolvable; a literal non-main target (`git checkout -b
-    # feature && git commit`, the flow this gate itself recommends) carries no
-    # direct-to-main risk and stays allowed.
+    # direct-to-main block and the per-branch review budget. Refuse every recognized
+    # HEAD-moving form before a commit: even a literal non-main target can have a
+    # different PR budget from the branch sampled at hook entry. File-restore forms
+    # still pass because they do not move HEAD.
     #
     # SCOPE IS CONSCIOUSLY BOUNDED — do NOT keep adding forms one at a time (user
     # decision 2026-08-12, after the escalation cap fired on this axis). This covers
@@ -1151,9 +1172,8 @@ def main() -> None:
                 break
             if git_subcommand(s.argv) in _BRANCH_MUTATING_SUBCMDS and _branch_mutation_risk(s.argv):
                 _deny(
-                    "BLOCKED: this command switches branches (git switch/checkout to "
-                    "main/master or an unresolvable target) before a commit, so the "
-                    "guard cannot verify which branch the commit lands on. Run the "
+                    "BLOCKED: this command switches branches before a commit, so the "
+                    "guard cannot verify the destination branch's review budget. Run the "
                     "branch switch and the commit as SEPARATE commands."
                 )
                 return
@@ -1299,6 +1319,9 @@ def main() -> None:
 
     def _allow() -> None:
         """Exit through the one approval chokepoint after all hard checks pass."""
+        # Defense in depth: even a future helper that accidentally degrades a
+        # deadline failure must not reach an allow after the hook budget expired.
+        hook_budget.timeout(0.001)
         if pending_round_approval and cloud_budget is not None:
             reason = _commit_budget_reason(cloud_budget)
             # A stale worktree still emits the retired terminal sigil. It is
@@ -1359,7 +1382,7 @@ def main() -> None:
                 "streak — landing the work and erasing the evidence that stopped it. "
                 "Hand the branch off with the premise-check writeup instead. The streak "
                 "is per-branch, so whoever picks up the SAME branch inherits it: say so "
-                "in the handoff." + _merge_note(cwd)
+                "in the handoff." + _merge_note(cwd, deadline=hook_deadline)
             )
             return
         # Acked = a fresh decision to continue → reset the round budget so the next
@@ -1367,7 +1390,7 @@ def main() -> None:
         # life. Reset stands even if a later rule blocks THIS commit: the
         # acknowledgment was made, and erring toward less friction only happens
         # AFTER a conscious ack.
-        reset_review_round(cwd=cwd)
+        reset_review_round(cwd=cwd, deadline=hook_deadline)
     elif round_n == ESCALATION_ROUND_CAP - 1:
         # Tier 1 — MODE-SWITCH, one round BEFORE the hard stop. Two consecutive
         # defect-bearing rounds is the signature of fixing the INSTANCE a reviewer
@@ -1433,7 +1456,8 @@ def main() -> None:
                 "ATTESTS that the class-level audit happened — appending it because "
                 "you want to land something is falsifying it. Hand the branch off "
                 "with the evidence instead. (The streak is per-branch, so a builder "
-                "picking up the SAME branch inherits it: say so in the handoff.)" + _merge_note(cwd)
+                "picking up the SAME branch inherits it: say so in the handoff.)"
+                + _merge_note(cwd, deadline=hook_deadline)
             )
             return
 
@@ -1473,13 +1497,17 @@ def main() -> None:
     try:
         from review_scope import classify_change_substantiality
 
-        staged_level = classify_change_substantiality(cwd=cwd)
+        staged_level = classify_change_substantiality(cwd=cwd, deadline=hook_deadline)
+    except DeadlineExpired:
+        raise
     except Exception:  # noqa: BLE001 - depth is advisory; never crash the gate
         staged_level = "unknown"
     try:
         from review_state import get_marker_depth
 
-        marker_level, marker_adversarial = get_marker_depth(cwd=cwd)
+        marker_level, marker_adversarial = get_marker_depth(cwd=cwd, deadline=hook_deadline)
+    except DeadlineExpired:
+        raise
     except Exception:  # noqa: BLE001 - a marker-read error must not block on the add-chain
         # path (fail OPEN there); on the normal path the is_review_current() guard below
         # re-reads the marker and fails CLOSED, the safe direction for the stricter gate.
@@ -1505,7 +1533,9 @@ def main() -> None:
         # later substantial diff B that a '# review-override' then waives past Rule 2's
         # staleness block, when B was never audited (the integrity hole this gate closes).
         depth_level = staged_level
-        depth_is_adversarial = marker_adversarial and marker_content_current(cwd=cwd)
+        depth_is_adversarial = marker_adversarial and marker_content_current(
+            cwd=cwd, deadline=hook_deadline
+        )
 
     if depth_level == "substantial" and not depth_is_adversarial:
         depth_acked = bool(commit_segs) and all(
@@ -1533,7 +1563,7 @@ def main() -> None:
                 "escalation cap; no outcome flag needed\n"
                 "If the audit genuinely ran but its format isn't recognized, acknowledge with "
                 "a trailing shell comment (outside any quotes):  # depth-ack"
-                + _merge_note(cwd, gate="depth")
+                + _merge_note(cwd, gate="depth", deadline=hook_deadline)
             )
             return
 
@@ -1541,9 +1571,11 @@ def main() -> None:
     if commit_may_add_content:
         # The staged diff at hook time isn't what will be committed (staging deferred, -a,
         # a pathspec, …) — can't check the diff hash, so require a valid (unexpired) marker.
-        rule2_blocks = not has_valid_review_marker(cwd=cwd)
+        rule2_blocks = not has_valid_review_marker(cwd=cwd, deadline=hook_deadline)
     else:
-        rule2_blocks = has_code_changes(cwd=cwd) and not is_review_current(cwd=cwd)
+        rule2_blocks = has_code_changes(cwd=cwd, deadline=hook_deadline) and not is_review_current(
+            cwd=cwd, deadline=hook_deadline
+        )
 
     if rule2_blocks:
         # A trailing '# review-override' comment (outside quotes) acknowledges

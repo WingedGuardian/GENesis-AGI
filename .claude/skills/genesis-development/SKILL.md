@@ -2493,6 +2493,15 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   becomes zero rounds. Multiple gated actions must be split so one approval cannot cover
   several commits or review requests.
 
+  The native approval enforcement in this section is implemented at Claude Code's
+  `PreToolUse` hook boundary. The shared budget evaluator is reusable, but external
+  coding agents do not yet receive an equivalent approval prompt from this change and
+  must not be described as mechanically protected by it. Within Claude Code, keep each
+  protected action in its own command: a HEAD-moving `git switch`/`git checkout` cannot
+  share a command with `git commit`, and a command containing multiple possible review
+  requests is rejected before any request is sent. Inline comment bodies containing
+  shell expansion are opaque at the hook boundary and therefore take the ask/deny path.
+
   The round-2 block is not the round-3 cap arriving early — it is a different
   instruction. It says the *approach* is wrong (you are fixing instances, not the
   class), where the cap says *stop and re-decide*. Acking round 2 without actually
@@ -2594,7 +2603,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   reviewer rounds because a standing "proceed once clean" silently carried
   through rounds 4–6.)
 
-  **The PR-side budget uses the same shared evaluator.** A review request reads the
+  **The Claude Code PR-side hook uses the same shared evaluator.** A review request reads the
   distinct reviewed heads live from GitHub. Below four ordinary heads it proceeds under
   standing authorization. At four or more it emits a native user approval for exactly
   one request; at five or more its message strongly recommends stopping. API, parse,

@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -151,6 +152,35 @@ def test_current_branch_status_distinguishes_no_pr_from_malformed_evidence():
     )
     assert isinstance(malformed, dict)
     assert malformed["status"] == "unknown"
+
+
+def test_cloud_lookup_reserves_two_seconds_for_post_lookup_checks(monkeypatch, repo):
+    now = [100.0]
+    outer = _guard.Deadline.after(9.5, monotonic=lambda: now[0])
+    calls = []
+
+    def consumes_timeout(*args, timeout, **kwargs):
+        calls.append(timeout)
+        now[0] += timeout
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "currentBranch": {
+                        "number": 99,
+                        "state": "OPEN",
+                        "url": "https://github.com/owner/repo/pull/99",
+                    }
+                }
+            ),
+        )
+
+    monkeypatch.setattr(_guard.subprocess, "run", consumes_timeout)
+    result = _guard._branch_review_budget(str(repo), "feature/review-budget", deadline=outer)
+
+    assert result["status"] == "unknown"
+    assert calls == [7.5]
+    assert outer.remaining() == 2.0
 
 
 def test_ordinary_four_heads_asks_for_each_commit(monkeypatch, repo, home):

@@ -839,8 +839,29 @@ def test_review_state_keeps_its_safe_timeout_fallback_on_old_tree(tmp_path):
         text=True,
         timeout=30,
     )
+    assert res.returncode != 0
+    assert "aggregate review-gate deadline expired" in res.stderr
+
+
+def test_review_scope_keeps_advisory_fallback_without_deadline_helper(tmp_path):
+    root = _tree(tmp_path, poisoned=False)
+    (root / "scripts" / "review_deadline.py").unlink()
+    res = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                f"sys.path.insert(0, {str(root / 'scripts')!r}); "
+                "import review_scope; print('ok')"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
     assert res.returncode == 0, res.stderr
-    assert res.stdout.strip() == "0.001"
+    assert res.stdout.strip() == "ok"
 
 
 def test_check_pr_with_old_hook_input_surfaces_the_import_error(tmp_path):
