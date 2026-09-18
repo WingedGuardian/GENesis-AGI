@@ -1096,17 +1096,35 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
     # would deadlock on its own IN_PROGRESS entry or inherit a stale FAILURE
     # from an earlier run on the same head, and locally the mirror would
     # double-count real blocks as `ci: red (genesis-merge-gate)` and demand a
-    # spurious ci-override on top of the genuine sigils. Two constant
-    # identities cover both publishing lanes: workflowName "merge-gate" is the
-    # ambient job check; name "genesis-merge-gate" with an EMPTY workflowName
-    # is a check run published via the check-runs API (which carries no
-    # workflowName). The empty-workflowName requirement keeps a coincidentally
-    # same-named check inside another workflow counting normally — the
-    # exclusion must cover exactly our own runs, nothing wider. The
-    # GITHUB_WORKFLOW/GITHUB_JOB env lanes stay as a drift-proof backup: if
-    # the workflow is ever renamed, the running job still recognizes itself.
+    # spurious ci-override on top of the genuine sigils. workflowName
+    # "merge-gate" covers the ambient job check. For API-published verdicts the
+    # NAME is the identity — `genesis-merge-gate` is OUR check name — measured
+    # on PR #1954: a published verdict was attached to a check suite owned by a
+    # DIFFERENT workflow ("Labeler"), because GitHub assigns the suite, not the
+    # publisher, so the empty-workflowName lane the first version relied on
+    # does not hold. The name lane is therefore gated on the check's detailsUrl
+    # pointing at this repo's run pages (name alone is not provenance — a
+    # same-named foreign check must still count).
+    # The GITHUB_WORKFLOW/GITHUB_JOB env lanes stay as a drift-proof backup for
+    # the ambient-run case where the workflow is renamed but the job is not.
     self_wf = (os.environ.get("GITHUB_WORKFLOW") or "").strip().casefold()
     self_job = (os.environ.get("GITHUB_JOB") or "").strip().casefold()
+
+    # Host-pinned to github.com: an arbitrary host could serve a run URL whose
+    # path carries this repo's slug — host + slug together are the provenance.
+    _run_url_re = re.compile(
+        r"^https?://github\.com/([^/]+/[^/]+)/(?:runs|actions/runs)/\d+", re.IGNORECASE
+    )
+
+    _self_repo = repo if repo is not None else _derive_repo_from_cwd(os.getcwd())
+
+    def _details_url_is_own_run(c: dict) -> bool:
+        m = _run_url_re.match((c.get("detailsUrl") or "").strip())
+        if not m:
+            return False
+        # Fail-CLOSED on unresolvable repo identity: a check we cannot prove is
+        # ours is not our mirror, so it must still classify.
+        return _self_repo is not None and m.group(1).casefold() == _self_repo.casefold()
 
     def _is_self_check(c: object) -> bool:
         if not isinstance(c, dict):
@@ -1115,7 +1133,10 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         name = (c.get("name") or "").strip().casefold()
         if wf == "merge-gate" or (self_wf and wf == self_wf) or (self_job and wf == self_job):
             return True
-        return name == "genesis-merge-gate" and not wf
+        # Name alone is not provenance — check names are not unique identities.
+        # The mirror must also link into THIS repo's run pages: a same-named
+        # check from another app or workflow carries its own detailsUrl.
+        return name == "genesis-merge-gate" and _details_url_is_own_run(c)
 
     checks = [c for c in checks if not _is_self_check(c)]
     if not checks:
