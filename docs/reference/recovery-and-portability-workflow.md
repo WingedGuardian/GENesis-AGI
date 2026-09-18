@@ -23,6 +23,10 @@ or the database changes identity throughout the check, integrity is
 external, mode-0600 `~/.genesis/db_quarantine.json` marker and stops
 `genesis-server.service` plus the legacy bridge writer. The marker is external
 because a damaged database cannot reliably store its own stop condition.
+Only explicit `quick_check` findings or SQLite's `SQLITE_CORRUPT` /
+`SQLITE_NOTADB` result families establish corruption. Operational failures such
+as lock contention or I/O errors remain indeterminate: backup and update still
+fail loudly, but Genesis is not permanently quarantined on that evidence alone.
 
 The encrypted SQL artifact must then decrypt, import into a fresh mode-0600
 database, pass full integrity and foreign-key checks, and contain a non-empty

@@ -188,6 +188,68 @@ def test_indeterminate_check_never_quarantines_current_inode(tmp_path, monkeypat
     assert not integrity.quarantine_path().exists()
 
 
+def test_operational_sqlite_error_is_indeterminate_and_never_quarantines(tmp_path, monkeypatch):
+    db = tmp_path / "genesis.db"
+    _healthy_db(db)
+
+    def locked(*_args, **_kwargs):
+        exc = sqlite3.OperationalError("database is locked")
+        exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        exc.sqlite_errorname = "SQLITE_BUSY"
+        raise exc
+
+    monkeypatch.setattr(integrity.sqlite3, "connect", locked)
+    result = integrity.quick_check(db)
+
+    assert result.healthy is False
+    assert result.checked_fingerprint is None
+    assert "SQLITE_BUSY" in result.detail
+    with pytest.raises(integrity.DatabaseIntegrityError):
+        integrity.require_healthy_database(db, source="busy-test")
+    assert not integrity.quarantine_path().exists()
+
+
+def test_explicit_extended_corruption_error_remains_quarantinable(tmp_path, monkeypatch):
+    db = tmp_path / "genesis.db"
+    _healthy_db(db)
+
+    def corrupt(*_args, **_kwargs):
+        exc = sqlite3.DatabaseError("database disk image is malformed")
+        exc.sqlite_errorcode = sqlite3.SQLITE_CORRUPT | (3 << 8)
+        exc.sqlite_errorname = "SQLITE_CORRUPT_INDEX"
+        raise exc
+
+    monkeypatch.setattr(integrity.sqlite3, "connect", corrupt)
+    with pytest.raises(integrity.DatabaseIntegrityError):
+        integrity.require_healthy_database(db, source="corrupt-test")
+
+    assert integrity.database_is_quarantined(db)
+
+
+def test_quick_check_with_no_result_is_indeterminate(tmp_path, monkeypatch):
+    db = tmp_path / "genesis.db"
+    _healthy_db(db)
+
+    class EmptyResultConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _sql):
+            return type("Rows", (), {"fetchall": lambda self: []})()
+
+    monkeypatch.setattr(
+        integrity.sqlite3, "connect", lambda *_args, **_kwargs: EmptyResultConnection()
+    )
+    result = integrity.quick_check(db)
+
+    assert result.healthy is False
+    assert result.checked_fingerprint is None
+    assert result.detail == "quick_check returned no rows"
+
+
 def test_clear_cannot_unlink_marker_replaced_while_waiting_for_lock(tmp_path, monkeypatch):
     """Clear re-reads under the mutation lock and preserves a newer marker."""
     db = tmp_path / "genesis.db"

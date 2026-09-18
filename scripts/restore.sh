@@ -658,7 +658,7 @@ PY
                 sync -f "$DB_FILE"
                 sync -f "$(dirname "$DB_FILE")"
                 PYTHONPATH="$_SCRIPT_DIR/../src" python3 -m genesis.db.integrity check \
-                    "$DB_FILE" --source restore-complete >/dev/null \
+                    "$DB_FILE" --source restore-complete --quarantine-on-failure >/dev/null \
                     || die "installed database failed final verification — quarantine retained"
                 _SQLITE_RESTORED=true
                 log "SQLite: restored and verified → $DB_FILE"

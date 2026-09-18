@@ -200,13 +200,25 @@ def _quick_check_stable_identity(db_path: Path) -> IntegrityResult | None:
     except FileNotFoundError:
         return None
     uri = f"file:{quote(str(db_path.resolve()), safe='/')}?mode=ro"
+    error_proves_corruption = False
     try:
         with sqlite3.connect(uri, uri=True) as conn:
             rows = conn.execute("PRAGMA quick_check").fetchall()
         error = None
     except sqlite3.Error as exc:
         rows = []
-        error = f"quick_check could not complete: {exc}"
+        error_name = getattr(exc, "sqlite_errorname", exc.__class__.__name__)
+        error = f"quick_check could not complete ({error_name}): {exc}"
+        error_code = getattr(exc, "sqlite_errorcode", None)
+        # SQLite extended result codes retain their primary category in the
+        # low 8 bits. Only explicit database-format corruption is evidence for
+        # quarantine; BUSY/LOCKED, I/O, permissions, and open failures are
+        # operationally indeterminate and must fail the caller without claiming
+        # the stable inode itself is corrupt.
+        error_proves_corruption = isinstance(error_code, int) and (error_code & 0xFF) in {
+            sqlite3.SQLITE_CORRUPT,
+            sqlite3.SQLITE_NOTADB,
+        }
     try:
         after = _fingerprint(db_path)
     except FileNotFoundError:
@@ -214,11 +226,17 @@ def _quick_check_stable_identity(db_path: Path) -> IntegrityResult | None:
     if before != after:
         return None
     if error is not None:
-        return IntegrityResult(False, error, checked_fingerprint=after)
+        return IntegrityResult(
+            False,
+            error,
+            checked_fingerprint=after if error_proves_corruption else None,
+        )
     values = [str(row[0]) for row in rows]
     if values == ["ok"]:
         return IntegrityResult(True, "ok", checked_fingerprint=after)
-    detail = "\n".join(values) if values else "quick_check returned no rows"
+    if not values:
+        return IntegrityResult(False, "quick_check returned no rows")
+    detail = "\n".join(values)
     return IntegrityResult(False, detail, checked_fingerprint=after)
 
 

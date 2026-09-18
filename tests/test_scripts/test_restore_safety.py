@@ -21,6 +21,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -262,6 +263,30 @@ def test_restore_warns_on_integrity_failure(sandbox):
         ["sqlite3", str(db), "SELECT x FROM t;"], capture_output=True, text=True
     ).stdout.strip()
     assert live == "1", "failed staged validation modified the live DB"
+
+
+def test_failed_final_check_quarantines_installed_inode(sandbox):
+    """A post-swap failure must leave a fence bound to the replacement inode."""
+    real_python = sys.executable
+    _make_stub(
+        sandbox["bind"] / "python3",
+        "#!/usr/bin/env bash\n"
+        'case "$*" in\n'
+        '  *"-m genesis.db.integrity check"*"--source restore-complete"*)\n'
+        '    printf "not a sqlite database" > "$GENESIS_DIR/data/genesis.db" ;;\n'
+        "esac\n"
+        f'exec "{real_python}" "$@"\n',
+    )
+    _seed_live_db(sandbox["gd"])
+
+    proc = _run_restore(sandbox)
+
+    assert proc.returncode == 1, f"{proc.stdout}\n{proc.stderr}"
+    assert "installed database failed final verification" in proc.stdout
+    marker = json.loads((sandbox["home"] / ".genesis" / "db_quarantine.json").read_text())
+    installed = (sandbox["gd"] / "data" / "genesis.db").stat()
+    assert marker["st_dev"] == installed.st_dev
+    assert marker["st_ino"] == installed.st_ino
 
 
 # ── Deploy-in-progress marker (watchdog must not revive the server mid-restore) ──
