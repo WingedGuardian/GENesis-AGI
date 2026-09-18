@@ -552,7 +552,8 @@ def print_json_bounded(
     # (`grep -rn print_json_bounded scripts/ src/`, no limit): capped_read_advisory
     # (checks the return value), git_discard_guard (envelope backstop behind its own
     # whole-note selection), plan_confidence_reminder (defence-in-depth — a fixed
-    # string far under budget). This sentence has now been wrong twice in the same
+    # string far under budget), genesis_stop_hook (the Stop event's
+    # additionalContext). This sentence has now been wrong twice in the same
     # direction: it first read "no caller outside its tests", then named one of
     # three. Both times an adopting change falsified a status claim living in a file
     # the adopter never edits, which is exactly the kind of staleness a grep cannot
