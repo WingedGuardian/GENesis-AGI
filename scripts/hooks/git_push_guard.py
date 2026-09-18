@@ -9152,10 +9152,11 @@ def _run_merge_and_push_gates() -> int:
         # second past the CI/review gates, which only inspect the first segment.
         # gh pr create is un-gated (#1241) — a review request on already-pushed
         # code, riding a push's approval — so it is NOT counted here UNLESS it
-        # would itself publish: a create on an unpushed branch is a push in
-        # effect, and `gh pr create && gh pr close N` would otherwise emit one
-        # prompt that hides the close behind the create.
-        _publishing_creates = sum(
+        # would itself publish AND no push segment already carries that
+        # publish: `git push && gh pr create` is ONE prompt for the push (the
+        # create rides it), but `gh pr create && gh pr close N` on an unpushed
+        # branch would hide the close behind the create's own prompt.
+        _publishing_creates = 0 if push_segs else sum(
             1 for s in create_segs if _pr_create_would_publish(s.argv)
         )
         if (
