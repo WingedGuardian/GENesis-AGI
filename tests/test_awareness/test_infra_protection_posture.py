@@ -55,6 +55,7 @@ def _profile(
     swap_max: object = "max",
     oomd: object = True,
     tasksmax_ok: object = True,
+    oom_adj_ok: object = True,
     host_swap_kb: object = 8_000_000,
     knob: object = "true",
     networkd_route: object = True,
@@ -78,6 +79,7 @@ def _profile(
                     "cgroup_memory_swap_max": swap_max,
                     "oomd_user_slice_kill": oomd,
                     "pid_ceiling_effective_ok": tasksmax_ok,
+                    "oom_score_adj_declared_ok": oom_adj_ok,
                     # meminfo swap is NOT virtualized: 0 here on a HEALTHY
                     # container (verified live 2026-07-16) — the check must
                     # never key on it.
@@ -140,6 +142,7 @@ _ALL_DEFECTS = dict(
     swap_max=0,
     oomd=False,
     tasksmax_ok=False,
+    oom_adj_ok=False,
     host_swap_kb=0,
     knob="false",
     networkd_route=True,  # networkd owns the route, so the network rules apply
@@ -160,6 +163,7 @@ def test_all_defects_detected():
         "host_swap_absent",
         "network_watchdog_absent",
         "networkd_keepconfig_missing",
+        "oom_adj_declaration_not_applied",
         "oomd_pressure_kill_off",
         "pid_ceiling_unprovisioned",
     ]
@@ -607,6 +611,7 @@ def test_resilience_facts_are_covered():
         "cgroup_memory_swap_max",
         "oomd_user_slice_kill",
         "pid_ceiling_effective_ok",
+        "oom_score_adj_declared_ok",
         "swap_total_kb",
         "limits.memory.swap",
         "networkd_manages_default_route",

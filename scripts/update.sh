@@ -926,6 +926,22 @@ fi
 
 # ── Stop services for update ──────────────────────────────
 echo "--- Stopping services for update ---"
+
+# Baseline for the post-restart subsystem delta (consumed in the health block far
+# below). Captured HERE, while the old server is still ALIVE, and NOT next to the
+# code that uses it: `systemctl show -p MainPID` returns "0" for a stopped unit, so
+# reading the pid any time after the stop below can never match the pid recorded in
+# the manifest on disk — the baseline would be silently rejected on every deploy and
+# the delta would degrade to a no-op that still looks healthy.
+#
+# Why a delta at all: a subsystem's own status is ambiguous. "degraded" means BOTH
+# "an optional dependency is absent" (normal, and permanent on many installs) and
+# "the initializer crashed and swallowed its own exception" — and 30 of the 33
+# modules under runtime/init/ do exactly that, so "failed:" almost never appears.
+# "Was working before this restart, is not working after it" is unambiguous.
+MANIFEST_BEFORE="$(cat "$HOME/.genesis/bootstrap_manifest.json" 2>/dev/null || true)"
+SERVER_PID_BEFORE="$(systemctl --user show genesis-server.service -p MainPID --value 2>/dev/null || true)"
+
 # Detect what is running BEFORE stopping anything, so the pre-stop signal handler
 # can restart exactly what was running if an interrupt lands mid-stop (the stop
 # polls up to ~10s) — otherwise a Ctrl-C / shutdown during the stop would leave
@@ -1792,7 +1808,124 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
     HEALTH_OK=false
     DEGRADED=""
 
-    for attempt in $(seq 1 12); do
+    # The window must outlast a slow BOOT, not just a slow answer: bootstrap
+    # under load has been measured well past 3 minutes (2026-09-05: the server
+    # was still starting schedulers when a fixed 12x15s loop expired, and a
+    # WORKING deploy was rolled back). "Dead" and "still booting" are different
+    # states with different correct responses, so the loop keys on the unit:
+    # while genesis-server is alive it gets the full window; the moment the
+    # unit leaves the active/activating states the wait stops early - a dead
+    # server never answers, and waiting out the window would only delay the
+    # rollback it needs. Window is overridable for constrained installs.
+    # HOW LONG the window may be is NOT a free choice, and the timeout policy's
+    # "justify a lower value with a specific failure mode" is satisfiable here
+    # with two MEASURED ceilings rather than a guess:
+    #
+    #   1. GUARDIAN COVER. _guardian_pause runs BEFORE the stop (see its call
+    #      site), and its lease covers GUARDIAN_PAUSE_TTL renewed
+    #      GUARDIAN_PAUSE_RENEW_MAX times at TTL/2 - so cover ENDS at
+    #      RENEW_MAX*(TTL/2) + TTL after the pause, and this wait does not even
+    #      START until the stop, merge, bootstrap, migrations and restart are
+    #      done. Outlive that and the host Guardian resumes to find a container
+    #      whose health API is silent: precisely the state this loop is
+    #      deliberately waiting through, and the outage the pause exists to
+    #      suppress (docs/architecture/CURRENT.md, guardian/config.py's
+    #      "set it >= the largest caller TTL").
+    #   2. The autonomy watchdog's own staleness cutoff, which will act on a
+    #      server it considers stale even while this deploy is mid-flight.
+    #
+    # So the ceiling is DERIVED from the guardian constants above rather than
+    # written down twice - raise the cover and this rises with it, which is the
+    # only way the two cannot drift apart. Anyone overriding past the cap is
+    # told what else has to move.
+    HEALTH_GUARDIAN_COVER=$(( GUARDIAN_PAUSE_RENEW_MAX * (GUARDIAN_PAUSE_TTL / 2) + GUARDIAN_PAUSE_TTL ))
+    # Half the cover, leaving the other half for the stop/merge/bootstrap/
+    # migration/restart phases that run before this wait begins.
+    HEALTH_WINDOW_MAX=$(( HEALTH_GUARDIAN_COVER / 2 ))
+    # 15 minutes: three times the slowest boot actually observed (5 min on a
+    # busy machine), and comfortably inside the cap above.
+    HEALTH_WINDOW_SECS="${GENESIS_DEPLOY_HEALTH_WINDOW_SECS:-900}"
+    case "$HEALTH_WINDOW_SECS" in
+        ''|*[!0-9]*) HEALTH_WINDOW_SECS=900 ;;  # non-numeric -> default, never a broken gate
+    esac
+    # STRIP LEADING ZEROS FIRST. Doing the length bound before this judged a
+    # value by its PADDING rather than its magnitude, so a zero-padded 0000180
+    # became the cap - the operator asked for three minutes and got the ceiling.
+    HEALTH_WINDOW_SECS="${HEALTH_WINDOW_SECS#"${HEALTH_WINDOW_SECS%%[!0]*}"}"
+    [ -z "$HEALTH_WINDOW_SECS" ] && HEALTH_WINDOW_SECS=0   # the value was all zeros
+    # NOW bound the magnitude, before any arithmetic: past 2**63 bash wraps, and
+    # a wrap to zero or negative would land on the floor below - silently giving
+    # someone who asked for a huge window the old tight gate.
+    [ "${#HEALTH_WINDOW_SECS}" -gt 6 ] && HEALTH_WINDOW_SECS="$HEALTH_WINDOW_MAX"
+    # `10#` is REDUNDANT-BY-CONSTRUCTION given the strip above, and is kept as
+    # the second half of a pair rather than as an independent guard: the strip
+    # is what makes a padded value read correctly, and this is what still reads
+    # it correctly if a future edit removes the strip. Deleting either one alone
+    # leaves the other covering the octal case, so neither is separately
+    # pinnable - said here instead of asserted in a test that could not fail.
+    HEALTH_WINDOW_SECS=$((10#$HEALTH_WINDOW_SECS))
+    [ "$HEALTH_WINDOW_SECS" -lt 180 ] && HEALTH_WINDOW_SECS=180  # never tighter than the old gate
+    if [ "$HEALTH_WINDOW_SECS" -gt "$HEALTH_WINDOW_MAX" ]; then
+        echo "  NOTE: health window capped at ${HEALTH_WINDOW_MAX}s — a longer wait outlives the"
+        echo "        host Guardian pause; raise GUARDIAN_PAUSE_RENEW_MAX to extend both."
+        HEALTH_WINDOW_SECS="$HEALTH_WINDOW_MAX"
+    fi
+    # MONOTONIC, not wall clock. `date +%s` is steppable: an NTP correction, a
+    # VM resume or an administrator adjusting the clock during the wait either
+    # stretches it far past the window or expires it early and rolls back a
+    # healthy slow boot.
+    #
+    # The source is chosen ONCE, here, and never re-decided inside the loop.
+    # Deciding per call mixes clock DOMAINS: /proc/uptime reads in the
+    # thousands while an epoch reads in the billions, so a single transient
+    # read failure mid-loop would compare an epoch against an uptime deadline
+    # and exit instantly — a false rollback — while the reverse ordering makes
+    # the wait unbounded.
+    #
+    # A failed read in the chosen domain prints 0, which can never reach the
+    # deadline, so the wait HOLDS rather than ending on a bad reading. It is
+    # deliberately not "the last good value": this runs inside `$(...)`, a
+    # subshell, so nothing it assigns survives the call — any state-carrying
+    # version of this helper would silently do nothing. The attempt cap below
+    # is what bounds the hold.
+    if read -r _ < /proc/uptime 2>/dev/null; then
+        _HEALTH_CLOCK=uptime
+    else
+        _HEALTH_CLOCK=wall
+    fi
+    _health_now() {
+        local _up
+        if [ "$_HEALTH_CLOCK" = wall ]; then
+            date +%s
+        elif read -r _up _ < /proc/uptime 2>/dev/null && [ -n "${_up%%.*}" ]; then
+            printf '%s' "${_up%%.*}"
+        else
+            printf '0'
+        fi
+    }
+    HEALTH_START=$(_health_now)
+    # The BASELINE is the one reading where a 0 is not safe, and the asymmetry
+    # is easy to miss: inside the loop a 0 merely holds the wait, but here the
+    # deadline becomes the window itself (900), the first comparison against a
+    # real uptime (~4.4e6) fails, and the wait is skipped straight into a
+    # rollback with ZERO attempts — a working deploy discarded without ever
+    # asking the health endpoint. So a failed baseline switches the domain for
+    # the WHOLE wait rather than leaving a deadline nothing can satisfy.
+    if [ "$HEALTH_START" -eq 0 ] && [ "$_HEALTH_CLOCK" = uptime ]; then
+        echo "  NOTE: monotonic clock unreadable at start — falling back to the wall clock"
+        _HEALTH_CLOCK=wall
+        HEALTH_START=$(_health_now)
+    fi
+    HEALTH_DEADLINE=$(( HEALTH_START + HEALTH_WINDOW_SECS ))
+    # A clock-INDEPENDENT backstop, which the old fixed-attempt loop had for
+    # free and a pure deadline gives up. Each iteration sleeps 15s, so this can
+    # only bind if the clock stops advancing — exactly the case the hold above
+    # creates on a broken /proc read.
+    HEALTH_MAX_ATTEMPTS=$(( HEALTH_WINDOW_SECS / 15 + 2 ))
+    HEALTH_UNIT_STATE=""
+    attempt=0
+    while [ "$attempt" -lt "$HEALTH_MAX_ATTEMPTS" ] && [ "$(_health_now)" -lt "$HEALTH_DEADLINE" ]; do
+        attempt=$((attempt + 1))
         sleep 15
         # --max-time 20: bound a hung connection (server accepts but never
         # answers) so a single attempt can't block the update forever. Kept
@@ -1804,25 +1937,183 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
             HEALTH_OK=true
             break
         fi
-        echo "  Attempt $attempt: health endpoint not responding..."
+        # `|| true` stays: `is-active` exits non-zero for inactive/failed while
+        # still PRINTING the state, so the substitution must keep its stdout and
+        # ignore the status. (Writing `VAR=$(...) || VAR=...` instead would fire
+        # the fallback on every failed unit and overwrite a REAL state with a
+        # stale one — the fix for this finding is the empty case below, not the
+        # assignment.) A systemd or user D-Bus hiccup prints nothing, and that
+        # empty result is what must not be read as death.
+        HEALTH_UNIT_STATE=$(systemctl --user is-active genesis-server.service 2>/dev/null || true)
+        case "$HEALTH_UNIT_STATE" in
+            active|activating|reloading)
+                echo "  Attempt $attempt: health endpoint not responding (unit $HEALTH_UNIT_STATE - still booting, waiting)..."
+                ;;
+            '')
+                # Unreadable, not dead. `systemctl --help` documents is-active
+                # as "Check whether units are active" — it makes no claim about
+                # what an execution failure means, so this is not affirmative
+                # evidence and must not end the wait. The old attempt-count loop
+                # kept retrying here; keep that behaviour.
+                echo "  Attempt $attempt: unit state unreadable (systemd/D-Bus busy) - retrying, not concluding..."
+                ;;
+            *)
+                echo "  Attempt $attempt: genesis-server unit is '$HEALTH_UNIT_STATE' - it will not come up on its own; stopping the wait."
+                break
+                ;;
+        esac
     done
 
     if [ "$HEALTH_OK" = "true" ]; then
-        # Check for failed subsystems
-        DEGRADED=$(curl -sf --max-time 20 http://localhost:5000/api/genesis/health 2>/dev/null | \
-            "$VENV_DIR/bin/python" -c "
-import sys, json
+        # Which subsystems actually came up? The health ENDPOINT cannot answer
+        # that: its response carries no per-subsystem mapping. This check used to
+        # parse a `subsystems` key off it that has never existed, so DEGRADED was
+        # always empty and the branch below it had never fired on any install —
+        # a silent fail-open in a deploy gate.
+        #
+        # The bootstrap manifest is the authoritative record, written as the last
+        # statement of GenesisRuntime.bootstrap(). Statuses are exactly
+        # "ok" | "degraded" | "failed: <exc>" (runtime/_core.py _run_init_step).
+        #
+        # Two properties of that vocabulary drive the design, and testing a status
+        # in isolation gets BOTH of them wrong:
+        #
+        #   1. "failed:" is almost unreachable. _run_init_step only records it when
+        #      an exception ESCAPES the init function — and 30 of the 33 modules
+        #      under runtime/init/ catch their own (perception.py is the worked
+        #      example: `except Exception: logger.exception(...)`). A subsystem that
+        #      CRASHED therefore lands in the manifest as "degraded".
+        #   2. "degraded" is ambiguous. It is also the normal, PERMANENT state of an
+        #      optional dependency that is simply absent — no Ollama, no optional
+        #      API key — so reporting it outright cries wolf on every deploy of the
+        #      installs least able to act on it.
+        #
+        # So the check compares against a BASELINE taken before the restart instead.
+        # A delta is unambiguous where a status is not: a subsystem that was ok
+        # before this restart and is not ok after it regressed, whichever flavour of
+        # not-ok it is, while one that was already degraded stays quiet. Hard
+        # failures are reported regardless of baseline.
+        #
+        # ADVISORY, deliberately — it records, it does not revert. A CRITICAL
+        # subsystem (db/observability/router) never reaches here: the runtime
+        # refuses to report bootstrapped without all three, hosting/standalone.py
+        # then leaves no app and serve() exits, so the health wait above exhausts
+        # and rolls back on its own. What is left is the non-critical remainder,
+        # where reverting an otherwise-good deploy over one subsystem is the wrong
+        # trade. Surfaced like HOST_CC_DEGRADED below, via degraded_subsystems.
+        #
+        # python3, not "$VENV_DIR/bin/python": this needs stdlib only, and the
+        # venv may be mid-reinstall at this point in a deploy.
+        #
+        # Every read below fails CLOSED — an unowned, empty or unusable value
+        # reports `check:*` (unknown), never an empty string. Empty means "checked,
+        # nothing wrong", and handing that back for a check that did not happen is
+        # precisely the defect being fixed here: the old code trusted a key that was
+        # not there and therefore always said "clean".
+        SERVER_PID="$(systemctl --user show genesis-server.service -p MainPID --value 2>/dev/null || true)"
+        # Quoted heredoc, NOT `python3 -c '...'`: inside a single-quoted -c body an
+        # apostrophe in a comment silently terminates the shell string and breaks the
+        # script. Same form already used elsewhere in this file.
+        if ! DEGRADED=$(SERVER_PID="$SERVER_PID" SERVER_PID_BEFORE="$SERVER_PID_BEFORE" \
+                        MANIFEST_BEFORE="$MANIFEST_BEFORE" python3 - <<'PYEOF'
+import json, os, sys
+
+def rank(value):
+    """ok > degraded > everything else. Ordering only — never a pass/fail test."""
+    s = str(value)
+    return 2 if s == "ok" else 1 if s == "degraded" else 0
+
+def owner_ok(doc, pid_want):
+    """True IFF this document was written by pid_want.
+
+    Identity, not recency. The file is user-global and the server is not its only
+    writer (bridge, interactive terminal), so "written recently" cannot establish
+    whose it is — any writer can land at any moment. "Written by the process
+    systemd is running as genesis-server" is a yes/no fact.
+    """
+    return isinstance(doc, dict) and str(doc.get("pid")) == pid_want
+
+def payload(doc):
+    """The non-empty manifest mapping, or None. Kept SEPARATE from ownership so the
+    two failures get distinct sentinels — "someone else wrote this" and "this is
+    ours but says nothing" send a reader to completely different places."""
+    m = doc.get("manifest") if isinstance(doc, dict) else None
+    return m if isinstance(m, dict) and m else None
+
 try:
-    d = json.load(sys.stdin)
-    failed = [k for k,v in d.get('subsystems',{}).items() if v.get('status') == 'failed']
-    print(' '.join(failed))
-except Exception:
-    pass
-" 2>/dev/null || true)
+    pid_want = (os.environ.get("SERVER_PID") or "").strip()
+    if not pid_want or pid_want == "0":
+        print("check:no-server-pid")
+        sys.exit(0)
+    with open(os.path.expanduser("~/.genesis/bootstrap_manifest.json")) as fh:
+        doc = json.load(fh)
+    if not owner_ok(doc, pid_want):
+        # Written by the bridge, a terminal, or a previous boot. Unknown — and
+        # unknown is reported, never treated as a clean bill of health.
+        print("check:manifest-not-this-server")
+        sys.exit(0)
+    after = payload(doc)
+    if after is None:
+        print("check:manifest-empty")
+        sys.exit(0)
+
+    before, baseline_known = {}, False
+    raw = (os.environ.get("MANIFEST_BEFORE") or "").strip()
+    pid_before = (os.environ.get("SERVER_PID_BEFORE") or "").strip()
+    # `!= "0"` is load-bearing: "0" is what systemd reports for a STOPPED unit, and
+    # it is a TRUTHY string, so `raw and pid_before` alone would accept it and then
+    # fail the comparison silently — reporting "no baseline" (which reads like a
+    # first deploy) instead of "I read a stopped unit". Same falsy-check family that
+    # review already caught here once.
+    if raw and pid_before and pid_before != "0":
+        try:
+            d = json.loads(raw)
+            if owner_ok(d, pid_before):
+                b = payload(d)
+                if b is not None:
+                    before, baseline_known = b, True
+        except Exception:
+            pass
+
+    bad = []
+    if not baseline_known:
+        # First deploy on this install, or the pre-restart manifest was not the old
+        # server's. The check still runs, but it can only see hard failures — say so
+        # rather than emitting a confident-looking empty result.
+        bad.append("check:no-baseline")
+    for name, status in sorted(after.items()):
+        if rank(status) == 0:
+            bad.append(name)                          # hard failure, baseline or not
+        elif not baseline_known:
+            continue
+        elif name not in before:
+            # Arrived on THIS deploy already not-ok. The likeliest real regression:
+            # a newly added init step whose module swallows its own exception and
+            # so records "degraded" rather than "failed:".
+            if rank(status) < 2:
+                bad.append(name)
+        elif rank(status) < rank(before[name]):
+            bad.append(name)                          # regressed across the restart
+    if baseline_known:
+        # Present before, absent after. A manifest key is written on BOTH branches of
+        # _run_init_step, so an absent key means the step never ran at all — a
+        # deleted or newly-skipped subsystem. A legitimate rename costs one false
+        # positive, once; a silent drop costs the signal entirely.
+        for name in sorted(set(before) - set(after)):
+            if rank(before[name]) == 2:
+                bad.append(name + ":gone")
+    print(",".join(bad))
+except Exception as exc:
+    # Name the cause: this token is the only artefact the check leaves behind, and
+    # a bare "unreadable" makes the one signal it exists to emit undiagnosable.
+    print("check:manifest-unreadable(" + type(exc).__name__ + ")")
+PYEOF
+); then
+            # The interpreter itself failed (absent python3, OOM). Unknown, not clean.
+            DEGRADED="check:manifest-interpreter-failed"
+        fi
         if [ -n "$DEGRADED" ]; then
-            echo "  Degraded subsystems: $DEGRADED"
-            _do_rollback "subsystems failed after update: $DEGRADED" "$DEGRADED"
-            exit 1
+            echo "  NOTE: recording degraded subsystems after update: $DEGRADED"
         fi
     fi
 
@@ -1843,7 +2134,13 @@ except Exception:
     fi
 
     if [ "$HEALTH_OK" = "false" ]; then
-        _do_rollback "health endpoint did not respond after 12 attempts (3 minutes)"
+        # Report what the wait ACTUALLY spent, not the budget it was allowed.
+        # The unit-state branch breaks early, so quoting the budget after a 15s
+        # exit states a 900s wait that never happened — and this string is
+        # written to last_update_failure.json, which the recovery path reads.
+        HEALTH_ELAPSED=$(( $(_health_now) - HEALTH_START ))
+        [ "$HEALTH_ELAPSED" -lt 0 ] && HEALTH_ELAPSED=0   # clock read failed mid-wait
+        _do_rollback "health endpoint did not respond after ${HEALTH_ELAPSED}s of a ${HEALTH_WINDOW_SECS}s window ($attempt attempts, final unit state: ${HEALTH_UNIT_STATE:-unknown})"
         exit 1
     fi
     echo ""
@@ -1933,6 +2230,12 @@ _p6_degraded="$HOST_CC_DEGRADED"
 if [ "${_OPERATOR_STOP:-false}" = "true" ]; then
     echo "  NOTE: server was not running at update start (operator-stopped) — not restarted."
     _p6_degraded="${_p6_degraded:+$_p6_degraded,}genesis-server-not-restarted"
+fi
+# Subsystems that failed to initialise (or an unreadable/stale manifest). Advisory
+# by design — see the health-verification block — but it must reach the record,
+# or "surfaced, not silent" is only true of the console output of one run.
+if [ -n "${DEGRADED:-}" ]; then
+    _p6_degraded="${_p6_degraded:+$_p6_degraded,}$DEGRADED"
 fi
 _record_update_history "success" "" "$_p6_degraded"
 

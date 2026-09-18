@@ -7,6 +7,16 @@ from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
+from genesis.observability.session_context import get_session_id
+
+# Sentinel for ``create``'s source_session: distinguishes "caller said nothing"
+# (default from the ambient session scope) from an INTENDED NULL (store
+# nothing). Without it, a caller that resolved provenance and failed — e.g. the
+# MCP tool refusing to store a truncated id — could not express that refusal:
+# ``None`` would fall through to the ContextVar and store a substituted ambient
+# id, the exact outcome the contract forbids.
+_UNSET: object = object()
+
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -46,7 +56,7 @@ async def create(
     source: str,
     strategy: str,
     reason: str | None = None,
-    source_session: str | None = None,
+    source_session: str | None | object = _UNSET,
     scheduled_at: str | None = None,
     priority: str = "medium",
     pinned: bool = False,
@@ -59,6 +69,37 @@ async def create(
 ) -> str:
     """Create a follow-up and return its ID.
 
+    source_session: which session this work originated from — the CC TRANSCRIPT
+    session id, the namespace every live producer writes and every consumer
+    joins on (repo_pulse reads it as ``item_session_id``; charter/dashboard key
+    on transcript ids). Three-valued:
+      - a string: stored (empty normalizes to NULL — a degraded CC result can
+        carry ``session_id=""``, and "" is invisible to IS NULL consumers);
+      - None: an INTENDED NULL — the caller resolved provenance and refused to
+        substitute (e.g. an unresolvable prefix). Stored as NULL, never
+        defaulted away;
+      - omitted: defaults from the runtime session ContextVar
+        (``observability.session_context``). FORWARD-PROVISION, honestly: at
+        this writing NO ``create`` caller runs inside a scoped task tree, so
+        the branch has no live producer — and any future producer MUST set the
+        ContextVar to the CC transcript id, NOT ``cc_sessions.id`` (today's
+        setters store the internal row id, an indistinguishable-but-wrong
+        namespace for this column).
+
+    THIS FUNCTION DOES NOT VALIDATE THE ID'S SHAPE, BY CHOICE. The shape check
+    (``session_charters.is_full_session_id``) lives at the MCP tool boundary,
+    because that is the only place the value is TYPED by a model rather than
+    passed through from a store that already holds a full id — the inbox
+    evaluator, the task executor and the ledger escalator each forward an id
+    they read, and re-validating a value we ourselves stored would buy nothing.
+    The column is therefore NOT guaranteed canonical: it already carries four
+    16-hex ``ego_cycle`` rows (2026-05) that match no session in any store,
+    written before any of this existed. A new DIRECT caller that accepts a
+    model- or user-supplied id must apply the predicate itself.
+    NOTHING guesses: a wrong id is worse than none — measured 513/513 NULL
+    before this existed, while repo_pulse_worker read the column on every row
+    it ever annotated.
+
     kind:     'follow_up' (intended for action) or 'tabled' (tracked, not for action).
     domain:   'internal' | 'user_world' | None (None = not yet classified).
     goal_id:  optional link to a unified goal (user_goals.id) for future promotion.
@@ -66,6 +107,13 @@ async def create(
               re-evaluation) pass a stable hash so the same recommendation does
               not create duplicate rows; a partial unique index backstops races.
     """
+    if source_session is _UNSET:
+        source_session = get_session_id()
+    # One chokepoint, every caller: "" is not provenance. A degraded CC result
+    # constructs CCOutput with session_id="" on three invoker paths, and a
+    # per-site `or None` convention would have to be REMEMBERED at each of the
+    # six call sites (one already forgot).
+    source_session = source_session or None
     fid = id or _new_id()
     await db.execute(
         """INSERT INTO follow_ups
@@ -512,6 +560,59 @@ async def get_summary_counts(
         params,
     )
     return {row[0]: row[1] for row in await cursor.fetchall()}
+
+
+LANE_ACTIONABLE = "actionable"
+LANE_DEFERRED = "deferred"
+
+
+async def get_lane_counts(db: aiosqlite.Connection) -> dict[str, dict[str, int]]:
+    """Per-status counts for BOTH lanes of this store, from ONE statement.
+
+    Everything a caller needs to describe this store comes back together, and
+    that is the point rather than a convenience. A board assembled from several
+    reads of one population can publish figures that were never simultaneously
+    true: the connection is shared and releases its lock per database method,
+    so a row deleted or reclassified between two SELECTs yields arithmetic true
+    at no instant — ``unresolved > total``, or a negative remainder. A single
+    aggregate cannot disagree with itself.
+
+    Returns ``{lane: {status: count}}`` for exactly two lanes:
+    :data:`LANE_ACTIONABLE` (``kind = 'follow_up'`` — where work is dispatched
+    from) and :data:`LANE_DEFERRED` (every other kind). Both lanes are always
+    present, empty when they have no rows, so a caller never distinguishes
+    "no rows" from "key absent".
+
+    TWO LANES, EACH WITH ITS OWN STATUS MAP, and that shape is the fix rather
+    than an elaboration. An earlier version returned ONE status map with the
+    deferred rows folded in under a sentinel key: every caller then had to
+    strip that key before summing, the two lanes shared a single denominator
+    the second one did not belong to, and a deferred row in a terminal status
+    was silently counted as outstanding. Separate maps make the denominator of
+    each lane derivable from the lane itself, which is the property the surface
+    reading these numbers actually needs.
+
+    The deferred lane is a COMPLEMENT (``ELSE``) rather than an enumeration of
+    ``tabled``/``idea``: a kind added later lands in it automatically, where a
+    named list would drop those rows from both lanes — the exact under-count
+    this function exists to prevent. ``kind`` is NOT NULL with a CHECK
+    constraint (``db/schema/_tables.py``), so every row falls in exactly one
+    lane and none escapes both.
+
+    ``GROUP BY 1, 2`` uses ordinals deliberately. Grouping by an alias binds to
+    a real COLUMN of that name if one ever exists, which would collapse both
+    lanes into one group silently — verified on SQLite 3.45.1. Ordinals cannot
+    be shadowed.
+    """
+    cursor = await db.execute(
+        "SELECT CASE WHEN kind = 'follow_up' THEN ? ELSE ? END AS lane, "
+        "status, COUNT(*) FROM follow_ups GROUP BY 1, 2",
+        (LANE_ACTIONABLE, LANE_DEFERRED),
+    )
+    lanes: dict[str, dict[str, int]] = {LANE_ACTIONABLE: {}, LANE_DEFERRED: {}}
+    for lane, status, count in await cursor.fetchall():
+        lanes[lane][status] = count
+    return lanes
 
 
 async def get_recent(

@@ -14,10 +14,13 @@ import ast
 import importlib.util
 import json
 import os
+import re
+import shutil
 import signal
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -55,6 +58,33 @@ def _runner(responses: dict[str, subprocess.CompletedProcess[str]], calls: list 
         raise AssertionError(f"unexpected command: {joined}")
 
     return run
+
+
+#: A SYNTHETIC fingerprint list. Never this install's real one: a test fixture
+#: is tracked, public, and permanent, so real hostnames or subnets in it are the
+#: leak the scanner exists to prevent.
+_SYNTHETIC_FINGERPRINTS = "# synthetic test fingerprints\nexample-fixture-host\n"
+
+
+@pytest.fixture(autouse=True)
+def synthetic_fingerprints(tmp_path_factory, monkeypatch):
+    """Point the privacy scan at a fingerprint file that EXISTS.
+
+    ``scan_prose`` fails CLOSED when the fingerprint list is missing — correct,
+    because an issue is a terminal egress surface with no CI backstop. But
+    ``~/.genesis/release-fingerprints.txt`` is written by bootstrap, and a
+    GitHub runner has no such file, so without this every test that reaches the
+    scan would fail on CI while passing on a developer box.
+
+    MEASURED 2026-09-16 when the scan was wired in: 13 of 60 tests in this
+    module passed locally and failed under an empty HOME. The env var is
+    inherited, so this covers the subprocess tests as well as the in-process
+    ones. ``test_a_missing_fingerprint_file_refuses`` opts out to pin the
+    fail-closed direction itself.
+    """
+    path = tmp_path_factory.mktemp("fingerprints") / "release-fingerprints.txt"
+    path.write_text(_SYNTHETIC_FINGERPRINTS, encoding="utf-8")
+    monkeypatch.setenv("GENESIS_RELEASE_FINGERPRINTS", str(path))
 
 
 # --- round 3: the permission check resolved the FORK and reported ADMIN -------
@@ -638,10 +668,13 @@ def test_indeterminate_only_when_the_reconciling_lookup_also_fails():
 def test_lock_directory_failure_refuses_rather_than_using_a_tmpdir_fallback(monkeypatch):
     """A TMPDIR-dependent fallback is not a lock: CC sets TMPDIR, a shell does not."""
 
-
     monkeypatch.setattr(fti, "Path", _PathWithFailingMkdir)
-    with pytest.raises(fti.Refused, match="TMPDIR-dependent fallback"):
+    with pytest.raises(fti.Refused, match="TMPDIR-dependent fallback") as excinfo:
         fti._lock_path("Org/Repo")
+    msg = str(excinfo.value)
+    assert "read-only file system" not in msg, "raw exception text must not leak into refusal"
+    assert str(Path.home()) not in msg, "home directory must not leak into refusal"
+    assert "(OSError)" in msg, "exception class name should be rendered instead"
 
 
 def test_no_tempfile_fallback_remains_in_the_source():
@@ -1145,3 +1178,514 @@ class TestSigtermHandlerIsScoped:
         assert rc == 0
         assert seen, "the runner was never called, so nothing was observed"
         assert all(h is fti._sigterm_as_interrupt for h in seen)
+# --- the privacy scan: an issue is a terminal egress surface -----------------
+#
+# CI's leak detector reads PR diffs and PR bodies. NOTHING reads issue bodies,
+# so until this scan existed the only thing between a draft and a permanent
+# public post was the author remembering. These pin the three properties that
+# make it a gate rather than a gesture: it blocks, it blocks BEFORE any network
+# call, and it cannot be satisfied by an install that cannot actually scan.
+
+
+def _scan_runner(calls: list):
+    """A runner that answers the lookups but records everything it is asked."""
+    return _runner(
+        {
+            "isFork": _proc(
+                json.dumps({"isFork": False, "nameWithOwner": "Org/Repo", "parent": None})
+            ),
+            "viewerPermission": _proc(json.dumps({"viewerPermission": "WRITE"})),
+            # Newline-delimited JSON OBJECTS, one per issue. An empty body
+            # means "no issues" — a JSON array here is a DIFFERENT shape and
+            # crashes the reader.
+            "gh api": _proc(""),
+            "issue create": _proc("https://github.com/Org/Repo/issues/1"),
+        },
+        calls,
+    )
+
+
+def _file(tmp_path, title: str, body: str) -> tuple[str, str]:
+    t, b = tmp_path / "title.txt", tmp_path / "body.md"
+    t.write_text(title, encoding="utf-8")
+    b.write_text(body, encoding="utf-8")
+    return str(t), str(b)
+
+
+def _main(t, b, run):
+    return fti.main(
+        [
+            "--title-file",
+            t,
+            "--body-file",
+            b,
+            "--area",
+            "area:other",
+            "--difficulty",
+            "help wanted",
+        ],
+        run,
+    )
+
+
+def test_acceptance_a_home_path_in_the_body_is_refused_with_no_network_call(tmp_path, capsys):
+    """THE ACCEPTANCE BAR. A /home/<user> path is the portability class that
+    leaks an operator's account name, and it must never reach the tracker.
+
+    The zero-call assertion is the half that matters most: refusing AFTER
+    resolving the tracker would still be a refusal, but it would spend API
+    calls learning where not to post and would leave the draft one bug away
+    from a real create. The scan runs before anything leaves the machine.
+    """
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "Repro: run it from /home/someoperator/genesis.")
+    rc = _main(t, b, _scan_runner(calls))
+    assert rc == 2, "a home path must REFUSE, and a refusal means nothing was posted"
+    err = capsys.readouterr().err
+    assert "privacy scan BLOCKED" in err
+    assert calls == [], f"the scan must precede every subprocess call, got {calls}"
+
+
+def test_a_clean_body_still_files(tmp_path, capsys):
+    """The control. Without it the test above cannot distinguish a working
+    scanner from one that refuses everything -- which is exactly the state this
+    change exists to fix, so it is not a hypothetical failure mode."""
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "A plain technical description, no private data.")
+    rc = _main(t, b, _scan_runner(calls))
+    assert rc == 0, capsys.readouterr().err
+    assert any("issue create" in " ".join(c) for c in calls)
+
+
+def test_a_missing_fingerprint_file_refuses_rather_than_filing(tmp_path, capsys, monkeypatch):
+    """Fail-CLOSED, pinned rather than inherited.
+
+    Opts out of the autouse fixture by pointing at a path that does not exist.
+    An install whose fingerprint list was never generated cannot scan, and an
+    unscannable issue is not filed -- the direction scan_prose chose because
+    prose egress has no CI backstop to catch what it misses.
+    """
+    monkeypatch.setenv("GENESIS_RELEASE_FINGERPRINTS", str(tmp_path / "absent.txt"))
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "Entirely innocuous text.")
+    rc = _main(t, b, _scan_runner(calls))
+    assert rc == 2
+    # WHICH floor refused matters: on an interpreter where detect-secrets is
+    # also unreachable this would pass for the wrong reason and pin nothing
+    # about the fingerprint floor.
+    assert "fingerprint" in capsys.readouterr().err.lower()
+    assert calls == []
+# --- what gh POSTS is the snapshot, not the caller's file --------------------
+#
+# Codex P1: checking the draft and then letting gh reopen the path cannot
+# deliver "the posted bytes were scanned" — the window ends inside another
+# process. These replace two earlier tests that asserted a REFUSAL on edit;
+# under the snapshot an edit is simply irrelevant, which is the stronger
+# guarantee and needs the stronger assertion.
+
+
+def _body_file_arg(calls: list) -> str:
+    for c in calls:
+        if "issue" in c and "create" in c:
+            return c[c.index("--body-file") + 1]
+    raise AssertionError(f"no create call recorded: {calls}")
+
+
+def test_gh_is_handed_a_snapshot_not_the_callers_path(tmp_path, capsys):
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "Clean technical text.")
+    rc = _main(t, b, _scan_runner(calls))
+    assert rc == 0, capsys.readouterr().err
+    posted = _body_file_arg(calls)
+    assert posted != b, "gh was handed the caller's mutable path"
+    assert "issue-body-" in posted
+
+
+def test_an_edit_after_the_scan_cannot_change_what_is_posted(tmp_path, capsys):
+    """The bytes gh reads are the bytes that passed the scan.
+
+    The draft is rewritten mid-run with content the scan would have BLOCKED.
+    Under the old shape gh reopened that path; here it reads a snapshot taken
+    after the scan passed, so the edit reaches nothing.
+    """
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "Clean at scan time.")
+    inner = _scan_runner(calls)
+    tampered = "Now mentions /home/someoperator/secrets"
+
+    seen: dict = {}
+
+    def run(argv):
+        # Land the write once the tracker lookup starts — after the scan and
+        # after the snapshot, i.e. inside the window that used to be open.
+        if "isFork" in " ".join(argv):
+            Path(b).write_text(tampered, encoding="utf-8")
+        if "issue" in argv and "create" in argv:
+            # Read it HERE: the snapshot is removed in a finally, so reading
+            # after _main returns finds nothing (which is itself correct).
+            seen["bytes"] = Path(argv[argv.index("--body-file") + 1]).read_bytes()
+        return inner(argv)
+
+    rc = _main(t, b, run)
+    assert rc == 0, capsys.readouterr().err
+    posted_bytes = seen["bytes"]
+    assert b"Clean at scan time." in posted_bytes
+    assert tampered.encode() not in posted_bytes, "gh would have posted unscanned text"
+    # Guard-the-guard: the tamper really happened, or this asserts nothing.
+    assert Path(b).read_text() == tampered
+
+
+def test_the_snapshot_is_private_and_removed_afterwards(tmp_path, capsys):
+    """It holds a copy of the body, so it must not be readable by others and
+    must not outlive the run."""
+    calls: list = []
+    seen: dict = {}
+    t, b = _file(tmp_path, "A real title", "Clean technical text.")
+    inner = _scan_runner(calls)
+
+    def run(argv):
+        if "issue" in argv and "create" in argv:
+            path = Path(argv[argv.index("--body-file") + 1])
+            seen["file_mode"] = path.stat().st_mode & 0o777
+            seen["dir_mode"] = path.parent.stat().st_mode & 0o777
+            seen["dir"] = path.parent
+        return inner(argv)
+
+    assert _main(t, b, run) == 0, capsys.readouterr().err
+    assert seen["dir_mode"] == 0o700, f"snapshot dir is {oct(seen['dir_mode'])}"
+    assert seen["file_mode"] == 0o600, f"snapshot file is {oct(seen['file_mode'])}"
+    assert not seen["dir"].exists(), "the snapshot outlived the run"
+
+
+def test_the_snapshot_is_removed_when_the_post_fails(tmp_path, capsys):
+    """Cleanup is in a finally, so a refusal must not leave the body on disk."""
+    calls: list = []
+    seen: dict = {}
+    t, b = _file(tmp_path, "A real title", "Clean technical text.")
+
+    def run(argv):
+        calls.append(list(argv))
+        joined = " ".join(argv)
+        if "isFork" in joined:
+            return _proc(json.dumps({"isFork": False, "nameWithOwner": "Org/Repo", "parent": None}))
+        if "viewerPermission" in joined:
+            return _proc(json.dumps({"viewerPermission": "WRITE"}))
+        if "gh api" in joined:
+            # Fail the duplicate lookup: a Refused AFTER the snapshot exists.
+            return _proc(returncode=1, stderr="network down")
+        raise AssertionError(joined)
+
+    # Capture the directory by listing ~/tmp before and after.
+    parent = Path.home() / "tmp"
+    before = {p.name for p in parent.glob("issue-body-*")} if parent.exists() else set()
+    rc = _main(t, b, run)
+    after = {p.name for p in parent.glob("issue-body-*")} if parent.exists() else set()
+    assert rc == 2, capsys.readouterr().err
+    assert after == before, f"a refusal left snapshots behind: {after - before}"
+    seen.clear()
+
+
+# --- a refusal must not reproduce what it blocked ----------------------------
+
+
+def test_a_refusal_does_not_echo_the_matched_text(tmp_path, capsys):
+    """Codex P1. sanitize stores the first 120 chars of the offending LINE in
+    `detail`, and the email scanner puts the address in `message`.
+
+    A refusal goes to stderr, which lands in scrollback, session transcripts
+    and CI logs — so echoing the match takes a value successfully blocked from
+    a public tracker and writes it somewhere durable instead. The leak moved
+    one surface over rather than stopped.
+    """
+    calls: list = []
+    secret = "/home/someoperator/genesis/very-distinctive-path-fragment"
+    t, b = _file(tmp_path, "A real title", f"Repro: run it from {secret} and see.")
+    rc = _main(t, b, _scan_runner(calls))
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "privacy scan BLOCKED" in err
+    assert "very-distinctive-path-fragment" not in err, "the refusal reproduced the match"
+    assert secret not in err
+    # It must still be ACTIONABLE: name the rule and where, just not the value.
+    assert "content withheld" in err
+    assert "portability" in err.lower()
+
+
+def test_an_infrastructure_refusal_still_explains_itself(tmp_path, capsys, monkeypatch):
+    """The withholding is scoped to CONTENT findings.
+
+    A scanner-state failure carries no scanned text and is exactly what an
+    operator needs spelled out, because it is about the environment rather than
+    the draft. Suppressing it too would make the gate unactionable.
+    """
+    monkeypatch.setenv("GENESIS_RELEASE_FINGERPRINTS", str(tmp_path / "absent.txt"))
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "Entirely innocuous text.")
+    rc = _main(t, b, _scan_runner(calls))
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "fingerprint file not found" in err.lower()
+    assert "content withheld" not in err
+# --- the snapshot's creation is all-or-nothing -------------------------------
+
+
+def test_a_failed_snapshot_write_leaves_nothing_behind(tmp_path, monkeypatch):
+    """The caller learns the directory's name only from a successful RETURN, so
+    anything that fails after the mkdir must clean up before propagating — or
+    a copy of the body sits under ~/tmp with nothing knowing to remove it.
+    """
+    parent = Path.home() / "tmp"
+    before = {p.name for p in parent.glob("issue-body-*")} if parent.exists() else set()
+
+    def boom(*a, **k):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(fti.os, "write", boom)
+    with pytest.raises(OSError):
+        fti._snapshot(b"a body")
+    after = {p.name for p in parent.glob("issue-body-*")} if parent.exists() else set()
+    assert after == before, f"a failed snapshot leaked: {after - before}"
+
+
+def test_a_snapshot_interrupted_mid_write_leaves_nothing_behind(tmp_path, monkeypatch):
+    """BaseException, not Exception: a SIGINT between the mkdir and the write is
+    exactly when the leftover matters, and KeyboardInterrupt is not an
+    Exception, so an `except Exception` would not have caught it."""
+    parent = Path.home() / "tmp"
+    before = {p.name for p in parent.glob("issue-body-*")} if parent.exists() else set()
+
+    def interrupt(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(fti.os, "write", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        fti._snapshot(b"a body")
+    after = {p.name for p in parent.glob("issue-body-*")} if parent.exists() else set()
+    assert after == before, f"an interrupted snapshot leaked: {after - before}"
+
+
+def test_the_snapshot_is_never_world_readable_even_briefly(tmp_path):
+    """Created 0600 by os.open, not written-then-chmod'd.
+
+    A write-then-chmod leaves the body readable for the width of that window.
+    The 0700 directory makes it unreachable to other users, but the file mode
+    is the thing under test and defence in depth is the point of a 0600 here.
+    """
+    d, path = fti._snapshot(b"sensitive body")
+    try:
+        assert Path(path).stat().st_mode & 0o777 == 0o600
+        assert Path(d).stat().st_mode & 0o777 == 0o700
+        assert Path(path).read_bytes() == b"sensitive body"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# --- a refusal never carries an exception's text -----------------------------
+
+
+def test_a_staging_failure_names_the_type_not_the_path(tmp_path, capsys, monkeypatch):
+    """An OSError from os.mkdir/os.open carries the FILENAME, which is under the
+    operator's home — the same class of value the refusal machinery exists to
+    keep out of stderr. I removed `f.detail` from refusals for that reason and
+    then reintroduced the leak here, one function away.
+    """
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "Clean technical text.")
+
+    def boom(data):
+        raise OSError(28, "No space left on device", "/home/someoperator/tmp/issue-body-x")
+
+    monkeypatch.setattr(fti, "_snapshot", boom)
+    rc = _main(t, b, _scan_runner(calls))
+    err = capsys.readouterr().err
+    assert rc == 2, "nothing was posted, so this is a refusal (exit 2), not exit 1"
+    assert "OSError" in err
+    assert "/home/someoperator" not in err, "the refusal leaked the path"
+    assert "No space left" not in err
+
+
+def test_an_unreadable_draft_names_the_type_not_the_path(tmp_path, capsys):
+    """Same class, pre-existing, in a block this change rewrites. The draft path
+    is caller-supplied and routinely under a home directory."""
+    calls: list = []
+    t = tmp_path / "title.txt"
+    t.write_text("A real title", encoding="utf-8")
+    missing = "/home/someoperator/drafts/absent-body.md"
+    rc = _main(str(t), missing, _scan_runner(calls))
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "/home/someoperator" not in err, "the refusal leaked the draft path"
+    assert "FileNotFoundError" in err
+
+
+def test_no_refusal_this_pr_owns_interpolates_a_bare_exception(tmp_path):
+    """Catch a REGRESSION of the two refusals this change rewrote.
+
+    SCOPE, stated because the first version of this docstring overclaimed and a
+    reviewer took it at face value: the matcher keys on ONE spelling — an
+    f-string interpolating the NAME `exc` inside a `Refused()` call. That is
+    denylist polarity. It does NOT see `Refused(f"...{proc.stderr}...")`, of
+    which there are three, nor `_warn(f"...{exc}")` in the generic handlers,
+    which never touch the `Refused` constructor at all. `gh` stderr routinely
+    carries a path under the operator's home, so those are the same leak class
+    and they are FILED, not covered here.
+
+    What this does bind: reverting either rewritten site to `{exc}` fails it.
+
+    It is scoped to the refusals this change introduces or rewrites, and the
+    pre-existing ones are exempted BY MESSAGE rather than by line number, with
+    the reason recorded, so the exemption is a decision someone can argue with
+    rather than a silent hole:
+
+      * `_gh_json` / duplicate-check — JSONDecodeError, which carries no path.
+      * `create_issue` timeout — SubprocessError, whose text is our own argv.
+      * the privacy-scanner import — ImportError, a module name.
+      * `_lock_path` — REAL, and the worst of them: it interpolates `base`,
+        which IS Path.home()/.genesis/locks, so it writes a home path to
+        stderr outright. Pre-existing, out of this PR's scope by the
+        keep-the-PR-the-PR rule, and FILED rather than dropped.
+
+    A new refusal added later, in a block this test does cover, fails here.
+    """
+    src = _SCRIPT.read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    lines = src.splitlines()
+    exempt_markers = (
+        "unparseable JSON",
+        "did not complete",
+        "per-install lock directory",
+        "cannot import the privacy scanner",
+    )
+    offenders = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "Refused"):
+            continue
+        span = " ".join(lines[node.lineno - 1 : (node.end_lineno or node.lineno)])
+        if any(m in span for m in exempt_markers):
+            continue
+        for arg in node.args:
+            for sub in ast.walk(arg):
+                if (
+                    isinstance(sub, ast.FormattedValue)
+                    and isinstance(sub.value, ast.Name)
+                    and sub.value.id == "exc"
+                ):
+                    offenders.append(node.lineno)
+    assert not offenders, (
+        f"Refused() interpolates a bare exception at line(s) {sorted(set(offenders))} "
+        "— an OSError carries a filename; render type(exc).__name__ instead"
+    )
+# --- the sentinel contract, which nothing bound ------------------------------
+#
+# _INFRASTRUCTURE_DETAILS is a cross-MODULE string contract: the sentinels are
+# minted in src/genesis/contribution/sanitize.py and consumed here by string
+# equality. Renaming one on either side silently kills BOTH the message
+# pass-through and the interpreter hint together, and the operator with the
+# wrong interpreter is then told their draft contains a secret. This is the
+# whole replacement for the cut venv re-exec, and it had no test at all.
+
+
+def test_every_infrastructure_sentinel_is_still_minted_by_sanitize():
+    """ALLOWLIST polarity against the producer, derived not copied.
+
+    Asserts each sentinel this module keys on still appears as a `detail=`
+    value in sanitize.py. A rename there fails HERE, rather than degrading a
+    refusal into an unactionable one in production.
+    """
+    src = (
+        Path(__file__).resolve().parents[2] / "src" / "genesis" / "contribution" / "sanitize.py"
+    ).read_text(encoding="utf-8")
+    minted = set(re.findall(r'detail="([a-z_]+)"', src))
+    missing = fti._INFRASTRUCTURE_DETAILS - minted
+    assert not missing, (
+        f"sentinel(s) {sorted(missing)} are no longer minted by sanitize.py — "
+        "the message pass-through and the interpreter hint both go dead silently"
+    )
+
+
+@pytest.mark.parametrize("sentinel", sorted(fti._INFRASTRUCTURE_DETAILS))
+def test_each_infrastructure_sentinel_renders_its_message(sentinel):
+    """The whole point of the allowlist: these carry no scanned text, so their
+    message is what an operator needs. One case per sentinel, so adding one
+    without a rendering decision is visible."""
+    f = SimpleNamespace(
+        kind=SimpleNamespace(value="secret"),
+        message="a message the operator needs",
+        detail=sentinel,
+        scanner="detect-secrets",
+        line=1,
+    )
+    out = fti._describe_finding(f, "body")
+    assert "a message the operator needs" in out
+    assert "content withheld" not in out
+
+
+def test_a_content_finding_never_renders_its_message():
+    """The complement, and the security half. Any detail NOT in the allowlist
+    is treated as scanned text."""
+    f = SimpleNamespace(
+        kind=SimpleNamespace(value="portability"),
+        message="Portability hit: absolute /home/<user>/genesis path",
+        detail="Repro: run it from /home/someoperator/genesis",
+        scanner="portability",
+        line=3,
+    )
+    out = fti._describe_finding(f, "body")
+    assert "someoperator" not in out
+    assert "content withheld" in out
+    assert "in the body line 3" in out
+
+
+def test_the_interpreter_hint_keys_on_the_sentinel_not_the_wording():
+    """Keyed on `missing_binary`, so rewording sanitize's message cannot drop
+    the hint — the failure mode that made the earlier wording-based check
+    fragile."""
+    reworded = SimpleNamespace(
+        kind=SimpleNamespace(value="secret"),
+        message="completely different wording that omits the usual phrase",
+        detail="missing_binary",
+        scanner="detect-secrets",
+        line=1,
+    )
+    assert ".venv/bin/python" in fti._interpreter_hint([reworded])
+    other = SimpleNamespace(
+        kind=SimpleNamespace(value="portability"),
+        message="x",
+        detail="something else",
+        scanner="portability",
+        line=1,
+    )
+    assert fti._interpreter_hint([other]) == ""
+
+
+# --- the locator has to be right, because it is all that is left -------------
+
+
+def test_the_reported_line_is_native_to_the_field(tmp_path, capsys):
+    """Content is withheld by design, so the FIELD and the LINE carry the whole
+    actionability load — and they were wrong.
+
+    Concatenating title and body put the title on line 1 and shifted every body
+    line by one, so a hit on body line 3 was reported as line 4. The author
+    opens the draft, reads a clean line, and edits the wrong text. Scanning each
+    field separately makes the number native to the field it names.
+    """
+    calls: list = []
+    body = "line one is clean\nline two is clean\nRepro: /home/someoperator/genesis here"
+    t, b = _file(tmp_path, "A clean title", body)
+    rc = _main(t, b, _scan_runner(calls))
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "in the body line 3" in err, err
+    assert "line 4" not in err
+
+
+def test_a_title_finding_is_named_as_the_title(tmp_path, capsys):
+    """The other half of the same fix: a hit in the title says so, rather than
+    sending the author to line 1 of the body."""
+    calls: list = []
+    t, b = _file(tmp_path, "Broken on /home/someoperator/genesis", "A clean body.")
+    rc = _main(t, b, _scan_runner(calls))
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "in the title" in err, err
