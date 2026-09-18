@@ -169,11 +169,17 @@ class _GuardedCursor:
 
     async def execute(self, sql: str, parameters: Iterable[Any] | None = None) -> Any:
         self._owner._refuse_txn_control_sql(sql)
-        return await self._cur.execute(sql, parameters)
+        await self._cur.execute(sql, parameters)
+        # Return the GUARDED cursor, not ``self._cur``: aiosqlite's
+        # ``Cursor.execute`` returns the same cursor, so the chained form
+        # ``cur = await cur.execute(...)`` would otherwise rebind ``cur`` to the
+        # raw cursor and the next ``execute("COMMIT")`` would bypass the guard.
+        return self
 
     async def executemany(self, sql: str, parameters: Iterable[Iterable[Any]]) -> Any:
         self._owner._refuse_txn_control_sql(sql)
-        return await self._cur.executemany(sql, parameters)
+        await self._cur.executemany(sql, parameters)
+        return self
 
     async def executescript(self, sql: str) -> Any:
         # Refused wholesale, like the connection method: a script carries an
@@ -692,8 +698,6 @@ class SerializedConnection:
             )
             await _async_sleep(delay)
         try:
-            object.__setattr__(self, "_txn_owner", asyncio.current_task())
-            began = False
             try:
                 # Explicit IMMEDIATE: takes the write lock up front (no lazy
                 # read→write upgrade deadlock across processes) and makes the
@@ -701,7 +705,21 @@ class SerializedConnection:
                 # timing. A locked BEGIN opened no transaction, so _retry_locked
                 # re-running it is safe. Matches the migration runner's idiom.
                 await self._retry_locked(lambda: self._conn.execute("BEGIN IMMEDIATE"))
-                began = True
+            except BaseException:
+                # A cancelled (or otherwise failed) BEGIN await can still have
+                # LANDED on the aiosqlite worker — the thread runs the queued
+                # call to completion whether or not the Future was cancelled.
+                # Resolve the real outcome before cleaning up, or a live
+                # transaction escapes ownership and wedges the connection.
+                if await self._txn_is_open():
+                    await self._rollback_then_quarantine()
+                raise
+            # Ownership is claimed only AFTER BEGIN lands: _handle_lock_error
+            # suppresses reconnection while a transaction is OPEN, and a failed
+            # BEGIN is not one — claiming earlier would strand the caller on an
+            # unhealthy connection that can never recover.
+            object.__setattr__(self, "_txn_owner", asyncio.current_task())
+            try:
                 yield self
                 # COMMIT via the driver method, NOT execute("COMMIT"): under a WAL
                 # post-commit-autocheckpoint SQLITE_BUSY the commit frame is already
@@ -709,17 +727,19 @@ class SerializedConnection:
                 # .commit() no-ops (idempotent). execute("COMMIT") would instead
                 # raise "no transaction is active" and surface a SPURIOUS failure
                 # for an append that actually landed. (F-A)
-                await self._retry_locked(lambda: self._conn.commit())
+                try:
+                    await self._retry_locked(lambda: self._conn.commit())
+                except asyncio.CancelledError:
+                    # Same queued-op ambiguity as BEGIN: the commit may be
+                    # durable even though the await was cancelled. Roll back
+                    # only if the transaction is provably still open — a landed
+                    # commit must not be "rolled back" (it no-ops anyway) nor
+                    # reported as uncommitted.
+                    if await self._txn_is_open():
+                        await self._rollback_then_quarantine()
+                    raise
             except BaseException:
-                if began:
-                    try:
-                        await self._retry_locked(lambda: self._conn.rollback())
-                    except Exception:
-                        # A failed ROLLBACK must not mask the original error. The
-                        # connection may wedge in_transaction=True until the
-                        # reconnect threshold recovers it; log and re-raise the
-                        # real cause.
-                        logger.error("ROLLBACK after transaction() error failed", exc_info=True)
+                await self._rollback_then_quarantine()
                 raise
             finally:
                 # Clear ownership BEFORE the lock is released (the outer finally
@@ -728,6 +748,63 @@ class SerializedConnection:
                 object.__setattr__(self, "_txn_owner", None)
         finally:
             self._lock.release()
+
+    async def _txn_is_open(self) -> bool:
+        """Authoritative open-transaction check after a boundary call's await
+        was cancelled or failed.
+
+        aiosqlite runs queued calls on a worker thread that completes them even
+        when the awaiting Future was cancelled, so a cancelled ``BEGIN`` await
+        does NOT mean no transaction opened. This issues a serialized no-op —
+        every previously queued op lands before it on the same thread — and
+        only then reads ``in_transaction``, making the read safe even if the
+        task is cancelled again while draining.
+        """
+        probe = asyncio.ensure_future(self._conn.execute("SELECT 1"))
+        while not probe.done():
+            try:
+                await asyncio.wait([probe])
+            except asyncio.CancelledError:
+                continue  # keep draining; the queued BEGIN/COMMIT must settle first
+        if not probe.cancelled() and (exc := probe.exception()) is not None:
+            logger.debug("transaction(): settle probe failed", exc_info=exc)
+        return self._conn.in_transaction
+
+    async def _rollback_then_quarantine(self) -> None:
+        """Best-effort ROLLBACK; if it fails, quarantine the connection.
+
+        A rollback that fails after the body already wrote leaves a possibly
+        OPEN transaction on the connection — a later unrelated write+commit
+        could then commit the supposedly-abandoned partial unit. Rather than
+        returning that connection to normal callers, close it and reconnect so
+        the partial work can never be committed. The original error is never
+        masked: callers raise their own exception after this returns.
+        """
+        try:
+            await self._retry_locked(lambda: self._conn.rollback())
+            return
+        except asyncio.CancelledError:
+            # The rollback may still have landed on the worker thread; only a
+            # provably-open transaction needs quarantine, and the CancelledError
+            # must keep propagating either way.
+            if not await self._txn_is_open():
+                raise
+        except Exception:
+            logger.error("ROLLBACK after transaction() error failed", exc_info=True)
+        logger.error(
+            "transaction(): connection quarantined — a possibly-open transaction "
+            "must never be committed by a later caller; closing and reconnecting"
+        )
+        try:
+            await self._conn.close()
+        except Exception:
+            logger.debug("Close during quarantine failed", exc_info=True)
+        if self._reconnect_fn is not None:
+            try:
+                object.__setattr__(self, "_conn", await self._reconnect_fn())
+                object.__setattr__(self, "_consecutive_errors", 0)
+            except Exception:
+                logger.error("DB reconnect during quarantine failed", exc_info=True)
 
     # -- Async iteration support (used by some callers) --------------------
 

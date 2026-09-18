@@ -632,3 +632,140 @@ async def test_a_cursor_outside_a_transaction_is_unwrapped(sconn):
     # transaction-control SQL still passes through outside a transaction
     await sconn.execute("BEGIN")
     await sconn.execute("ROLLBACK")
+
+
+async def test_a_chained_cursor_stays_guarded(sconn):
+    """`cur = await cur.execute(...)` must not rebind to the RAW cursor —
+    aiosqlite's Cursor.execute returns the cursor itself, so returning it leaks
+    an unguarded handle that can COMMIT mid-transaction."""
+    async with sconn.transaction() as tx:
+        cur = await tx.execute("SELECT 1")
+        cur = await cur.execute("SELECT 1")
+        assert type(cur).__name__ == "_GuardedCursor"
+        with pytest.raises(RuntimeError, match="not allowed inside transaction"):
+            await cur.execute("COMMIT")
+        cur = await cur.executemany("INSERT INTO t (val) VALUES (?)", [("x",)])
+        assert type(cur).__name__ == "_GuardedCursor"
+
+
+async def test_a_landed_begin_is_rolled_back_when_the_await_was_cancelled(sconn):
+    """Cancelling the BEGIN await does not stop the aiosqlite worker: the BEGIN
+    can land anyway. The exit path must resolve that outcome and roll back —
+    not leave an open ownerless transaction."""
+    raw = sconn._conn
+    real_execute = raw.execute
+    fired = False
+
+    def begin_that_lands_anyway(sql, parameters=None):
+        nonlocal fired
+        if sql.startswith("BEGIN"):
+            fired = True
+
+            async def landed_then_cancelled():
+                await real_execute(sql, parameters)
+                raise asyncio.CancelledError()
+
+            return landed_then_cancelled()
+        return real_execute(sql, parameters)
+
+    import unittest.mock as mock
+
+    with (
+        mock.patch.object(raw, "execute", side_effect=begin_that_lands_anyway),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        async with sconn.transaction():
+            pass  # pragma: no cover
+    assert fired
+    assert not raw.in_transaction
+
+
+async def test_a_landed_commit_is_not_rolled_back_when_the_await_was_cancelled(sconn):
+    """The COMMIT analogue: a cancelled commit await whose op already landed
+    must NOT roll back durable work, and the CancelledError still propagates."""
+    raw = sconn._conn
+    real_commit = raw.commit
+    import unittest.mock as mock
+
+    async def commit_that_lands_anyway():
+        await real_commit()
+        raise asyncio.CancelledError()
+
+    await sconn.execute("INSERT INTO t (id, val) VALUES (42, 'kept')")
+    await sconn.commit()  # close the implicit transaction before patching commit
+    with (
+        mock.patch.object(raw, "commit", side_effect=commit_that_lands_anyway),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        async with sconn.transaction() as tx:
+            await tx.execute("UPDATE t SET val = 'kept' WHERE id = 42")
+    cur = await sconn.execute("SELECT val FROM t WHERE id = 42")
+    assert (await cur.fetchone())["val"] == "kept"
+
+
+async def test_a_failed_rollback_quarantines_the_connection(tmp_path):
+    """A rollback that fails after the body wrote must not return a possibly
+    open transaction to the pool: close it and swap in a reconnected one."""
+    import unittest.mock as mock
+
+    db = tmp_path / "q.db"
+    raw = await aiosqlite.connect(str(db))
+    await raw.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    await raw.commit()
+    replacement = await aiosqlite.connect(str(db))
+
+    async def reconnect():
+        return replacement
+
+    conn = SerializedConnection(raw, reconnect_fn=reconnect)
+    with (
+        mock.patch.object(
+            raw, "rollback", side_effect=sqlite3.OperationalError("cannot rollback")
+        ),
+        pytest.raises(ValueError),
+    ):
+        async with conn.transaction() as tx:
+            await tx.execute("INSERT INTO t (id) VALUES (1)")
+            raise ValueError("body blew up")
+    assert conn._conn is replacement
+
+
+async def test_a_failed_begin_still_allows_reconnection(tmp_path, monkeypatch):
+    """_txn_owner is claimed only after BEGIN lands, so a BEGIN that exhausts
+    its retries is not an 'open transaction' and the reconnect path still
+    fires."""
+    import genesis.db.connection as conn_mod
+
+    db = tmp_path / "r.db"
+    raw = await aiosqlite.connect(str(db))
+    replacement = await aiosqlite.connect(str(db))
+    reconnected = False
+
+    async def reconnect():
+        nonlocal reconnected
+        reconnected = True
+        return replacement
+
+    conn = SerializedConnection(raw, reconnect_fn=reconnect)
+    object.__setattr__(conn, "_max_errors", 1)
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(conn_mod, "_async_sleep", no_sleep)
+    real_execute = raw.execute
+    import unittest.mock as mock
+
+    def locked_begin(sql, parameters=None):
+        if sql.startswith("BEGIN"):
+            raise sqlite3.OperationalError("database is locked")
+        return real_execute(sql, parameters)
+
+    with (
+        mock.patch.object(raw, "execute", side_effect=locked_begin),
+        pytest.raises(sqlite3.OperationalError),
+    ):
+        async with conn.transaction():
+            pass  # pragma: no cover
+    assert reconnected
+    assert conn._conn is replacement
