@@ -27,6 +27,9 @@ Only explicit `quick_check` findings or SQLite's `SQLITE_CORRUPT` /
 `SQLITE_NOTADB` result families establish corruption. Operational failures such
 as lock contention or I/O errors remain indeterminate: backup and update still
 fail loudly, but Genesis is not permanently quarantined on that evidence alone.
+The same external marker also acts as a non-corruption restart fence when a
+restore has installed a candidate whose final verification could not complete;
+its `source` records `restore-final-verification-incomplete` for that case.
 
 The encrypted SQL artifact must then decrypt, import into a fresh mode-0600
 database, pass full integrity and foreign-key checks, and contain a non-empty

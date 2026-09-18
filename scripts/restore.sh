@@ -657,9 +657,27 @@ PY
                 _DB_STAGE=""
                 sync -f "$DB_FILE"
                 sync -f "$(dirname "$DB_FILE")"
-                PYTHONPATH="$_SCRIPT_DIR/../src" python3 -m genesis.db.integrity check \
-                    "$DB_FILE" --source restore-complete --quarantine-on-failure >/dev/null \
-                    || die "installed database failed final verification — quarantine retained"
+                _FINAL_CHECK_OUTPUT=""
+                if ! _FINAL_CHECK_OUTPUT=$( \
+                    PYTHONPATH="$_SCRIPT_DIR/../src" python3 -m genesis.db.integrity check \
+                        "$DB_FILE" --source restore-complete --quarantine-on-failure 2>&1
+                ); then
+                    # Explicit corruption already produced a marker. Operational
+                    # or otherwise indeterminate failure deliberately did not;
+                    # fence the installed inode without mislabelling it corrupt.
+                    if ! PYTHONPATH="$_SCRIPT_DIR/../src" python3 -c '
+import sys
+from genesis.db.integrity import database_is_quarantined
+raise SystemExit(0 if database_is_quarantined(sys.argv[1]) else 1)
+' "$DB_FILE"; then
+                        PYTHONPATH="$_SCRIPT_DIR/../src" python3 -m genesis.db.integrity mark \
+                            "$DB_FILE" --source restore-final-verification-incomplete \
+                            --detail "${_FINAL_CHECK_OUTPUT:-final integrity check failed without detail}" \
+                            >/dev/null \
+                            || die "installed database final verification failed and durable fence could not be established"
+                    fi
+                    die "installed database failed final verification — quarantine retained"
+                fi
                 _SQLITE_RESTORED=true
                 log "SQLite: restored and verified → $DB_FILE"
             else

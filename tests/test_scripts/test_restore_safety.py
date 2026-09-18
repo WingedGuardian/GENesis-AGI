@@ -289,6 +289,40 @@ def test_failed_final_check_quarantines_installed_inode(sandbox):
     assert marker["st_ino"] == installed.st_ino
 
 
+def test_indeterminate_final_check_fences_installed_inode(sandbox):
+    """Operational uncertainty fences restart without claiming corruption."""
+    real_python = sys.executable
+    _make_stub(
+        sandbox["bind"] / "python3",
+        "#!/usr/bin/env bash\n"
+        'case "$*" in\n'
+        '  *"-m genesis.db.integrity check"*"--source restore-complete"*)\n'
+        '    echo "quick_check could not complete (SQLITE_BUSY): database is locked" >&2\n'
+        "    exit 1 ;;\n"
+        "esac\n"
+        f'exec "{real_python}" "$@"\n',
+    )
+    _seed_live_db(sandbox["gd"])
+
+    proc = _run_restore(sandbox)
+
+    assert proc.returncode == 1, f"{proc.stdout}\n{proc.stderr}"
+    marker = json.loads((sandbox["home"] / ".genesis" / "db_quarantine.json").read_text())
+    installed_path = sandbox["gd"] / "data" / "genesis.db"
+    installed = installed_path.stat()
+    assert marker["source"] == "restore-final-verification-incomplete"
+    assert "SQLITE_BUSY" in marker["detail"]
+    assert marker["st_dev"] == installed.st_dev
+    assert marker["st_ino"] == installed.st_ino
+    value = subprocess.run(
+        ["sqlite3", str(installed_path), "SELECT x FROM t;"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert value == "42"
+
+
 # ── Deploy-in-progress marker (watchdog must not revive the server mid-restore) ──
 
 
