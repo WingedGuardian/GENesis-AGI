@@ -1279,7 +1279,9 @@ async def init(rt: GenesisRuntime) -> None:
                 from genesis.cc.foreground_reaper import reap_dark_foreground
 
                 await reap_dark_foreground(rt, dead_only=True)
-            except Exception:
+                rt.record_job_success("session_reaper_dead_pid")
+            except Exception as exc:
+                rt.record_job_failure("session_reaper_dead_pid", exc=exc)
                 logger.warning("Foreground dead-pid sweep failed", exc_info=True)
 
         from apscheduler.triggers.interval import IntervalTrigger
