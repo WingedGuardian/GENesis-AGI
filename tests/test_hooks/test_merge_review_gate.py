@@ -5567,3 +5567,203 @@ class TestPerLaneThreshold:
             "leaving it is the superset assumption that a force-push breaks"
         )
         assert len(reads) == 2
+
+
+class TestFindingsDistribution:
+    """The gate REPORTS where a round's findings land; it never renders a verdict.
+
+    Origin: a change whose round-one findings were 8-of-11 in one file — three of
+    them on code written to answer an earlier round — was about to be answered as
+    eleven separate patches. The concentration was computable from data the gate
+    already had and threw away. These tests pin both halves of the design: the
+    signal fires when there IS a seam, and stays quiet when there is not.
+    """
+
+    ER = "src/genesis/session_awareness/external_review.py"
+
+    def _real_round_one(self):
+        """The ACTUAL shape of the round that motivated this, not a stylised one."""
+        return (
+            [("P1", self.ER)] * 4
+            + [("P2", self.ER)] * 3
+            + [("CR", self.ER)]
+            + [("P2", "scripts/disk_hygiene.sh")] * 2
+            + [("P1", "scripts/systemd/genesis-external-review.timer.template")]
+            + [("P2", "scripts/external_review.py")]
+        )
+
+    def test_acceptance_replays_the_round_that_motivated_it(self, guard_module):
+        out = guard_module._findings_distribution(self._real_round_one())
+        assert "67%" in out, "the concentration must be stated as a number"
+        assert self.ER in out
+        assert "NOTE:" in out, "a two-thirds seam must raise the mechanism signal"
+        assert "4 P1" in out, "the severity mix per file is what distinguishes a seam"
+
+    def test_scattered_findings_get_data_but_NO_premise_push(self, guard_module):
+        """NEGATIVE CONTROL, and the load-bearing one. A gate that cried 'premise!'
+        every round would be tuned out, which costs more than it buys."""
+        out = guard_module._findings_distribution([("P2", f"src/mod_{i}.py") for i in range(8)])
+        assert "DISTRIBUTION:" in out, "the data is reported either way"
+        assert "NOTE:" not in out, "no seam, no mechanism signal"
+
+    def test_a_few_findings_cannot_be_concentrated(self, guard_module):
+        """2 of 3 is 67% and means nothing — a distribution needs points to have
+        a shape. Without this floor the signal fires on almost every small round."""
+        out = guard_module._findings_distribution(
+            [("P2", "a.py"), ("P2", "a.py"), ("P1", "b.py")]
+        )
+        assert "NOTE:" not in out
+
+    def test_the_authorisation_is_always_present(self, guard_module):
+        """The point is not the arithmetic — it is that stepping back reads as
+        in-scope. That line must not be conditional on concentration."""
+        for rows in (self._real_round_one(), [("P2", f"m{i}.py") for i in range(8)]):
+            out = guard_module._findings_distribution(rows)
+            assert "needs nobody's permission" in out
+            assert "lead, not a proof" in out, "conclusions must be sized to the data"
+
+    def test_no_findings_prints_nothing(self, guard_module):
+        assert guard_module._findings_distribution([]) == ""
+
+    def test_output_is_bounded_regardless_of_file_count(self, guard_module):
+        """This rides on a hook's stderr, so an unbounded report is a real hazard."""
+        out = guard_module._findings_distribution([("P2", f"f{i}.py") for i in range(400)])
+        assert len(out.splitlines()) <= 10
+        assert len(out) < 1500
+        assert "more file(s)" in out, "the elided remainder must be declared, not dropped"
+
+    def test_a_pathless_finding_is_still_counted(self, guard_module):
+        """A finding whose path the API omitted must not vanish from the total."""
+        out = guard_module._findings_distribution([("P1", ""), ("P2", "a.py")])
+        assert "2 scored finding(s)" in out
+        assert "(no path)" in out
+
+    def test_pathless_findings_do_not_get_buried_or_win_concentration(self, guard_module):
+        """Pathless findings are real work but prove nothing about WHICH file is
+        hot — an unknown anchor is not a seam. A pathless-only population must not
+        print a leader, and pathless weight must not pad a real leader's share."""
+        out = guard_module._findings_distribution(
+            [("P1", "") for _ in range(10)] + [("P2", "src/a.py")]
+        )
+        assert "(no path)" in out
+        assert "ONE file" not in out, "an unknown anchor cannot be 'the' seam"
+
+    def test_rename_aliases_report_under_one_name(self, guard_module):
+        """A renamed file must not split into two rows — the seam is the same
+        file on both sides of the rename (Codex P2, PR #2005)."""
+        out = guard_module._findings_distribution(
+            [("P1", "old/name.py"), ("P1", "new/name.py")],
+            renames={"old/name.py": "new/name.py"},
+        )
+        assert "new/name.py" in out
+        assert "old/name.py" not in out
+        assert "2 P1" in out
+
+    def test_tied_leaders_suppress_the_single_seam_note(self, guard_module):
+        """A tie means no plausible single seam — ranking order alone must not
+        crown one (Codex P2, PR #2005)."""
+        out = guard_module._findings_distribution(
+            [("P1", "src/a.py"), ("P1", "src/a.py"), ("P1", "src/b.py"), ("P1", "src/b.py")]
+        )
+        assert "ONE file" not in out, "a 2-2 tie has no concentrated leader"
+        assert "DISTRIBUTION:" in out  # the counts still print; the inference does not
+
+    def test_an_unreliable_scan_is_labeled_partial_and_suppresses_the_note(
+        self, guard_module
+    ):
+        """A truncated read makes every percentage a shape nobody measured —
+        provisional counts may print, the inference must not (Codex P2)."""
+        out = guard_module._findings_distribution(
+            [("P1", "src/a.py") for _ in range(6)], reliable=False
+        )
+        assert "PARTIAL" in out, "an unreliable scan must be labeled, not disguised"
+        assert "ONE file" not in out
+
+    def test_a_path_cannot_write_to_the_terminal(self, guard_module):
+        """Findings are quoted text: a path is API-supplied untrusted data, so it
+        must be rendered escaped, not raw — '\r' rewrites the line, '\x1b[' is an
+        escape sequence (CodeRabbit Minor, PR #2005)."""
+        out = guard_module._findings_distribution(
+            [("P1", "src/\x1b[2K\rweird\nname.py")]
+        )
+        assert "\x1b" not in out and "\r" not in out and "weird\nname" not in out
+        assert "\\u001b" in out, "the escape must be rendered visibly, not dropped"
+
+    def test_a_reported_round_is_now_the_unresolved_set(self, guard_module):
+        """The scorer accumulates across review submissions, so 'this round' was a
+        false claim about what was counted — the report describes all unresolved
+        findings (Codex P2, PR #2005)."""
+        out = guard_module._findings_distribution(
+            [("P1", "src/a.py") for _ in range(6)]
+        )
+        assert "unresolved findings" in out
+
+
+class TestFindingsDistributionIsWired:
+    """The report must actually REACH the reader.
+
+    Testing `_findings_distribution` alone proves the arithmetic and nothing about
+    whether the gate calls it — deleting the print would leave every test in the
+    class above green. This drives the REAL scan and reads stderr, so the wiring
+    is what is pinned. (Built is not wired: the repo's own taxonomy.)
+    """
+
+    _PATHS = ("src/seam.py", "src/other.py")
+
+    @pytest.fixture(autouse=True)
+    def _files_in_diff(self, monkeypatch):
+        # Every finding's path must be in the PR's changed-file set, or it is
+        # discounted as off-diff and the conftest offdiff_lock fails the test —
+        # which would make this pass for the wrong reason.
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            "\n".join(
+                json.dumps({"filename": p, "previous_filename": None}) for p in self._PATHS
+            ),
+        )
+
+    def _mock(self, guard_module, comments):
+        return patch.object(
+            guard_module.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0,
+                stdout="\n".join(json.dumps(c) for c in comments), stderr="",
+            ),
+        )
+
+    def test_the_scan_prints_the_distribution(self, guard_module, capsys):
+        """Four P2s on one file: concentrated, and below the floor so the scan
+        reaches the reporting path rather than returning on a P1."""
+        comments = [_codex_c(i, _P2_BODY, path="src/seam.py") for i in range(1, 5)]
+        with self._mock(guard_module, comments):
+            guard_module._check_inline_review_findings("100")
+        err = capsys.readouterr().err
+        assert "DISTRIBUTION:" in err, "the distribution must reach stderr, not just exist"
+        assert "src/seam.py" in err
+        assert "NOTE:" in err, "4-of-4 in one file is a seam"
+        assert "needs nobody's permission" in err
+
+    def test_a_clean_pr_prints_no_distribution(self, guard_module, capsys):
+        """No findings, no noise — the report must not appear on every merge."""
+        with self._mock(guard_module, []):
+            guard_module._check_inline_review_findings("100")
+        assert "DISTRIBUTION:" not in capsys.readouterr().err
+
+    def test_a_P1_reaches_the_distribution_through_the_real_scan(self, guard_module, capsys):
+        """VERIFY-RED ANCHOR, and it exists because a mutation SURVIVED without it.
+
+        The acceptance test above hands `_findings_distribution` a list it built
+        itself, and the wiring test uses only P2s — so deleting the P1 collection
+        site left both green while every share the report prints would have been
+        computed from incomplete data. This drives real P1 comment bodies through
+        the real scan and asserts the severity mix that only that site can produce.
+        """
+        comments = [_codex_c(i, _P1_BODY, path="src/seam.py") for i in range(1, 4)]
+        comments.append(_codex_c(9, _P2_BODY, path="src/seam.py"))
+        with self._mock(guard_module, comments):
+            guard_module._check_inline_review_findings("100")
+        err = capsys.readouterr().err
+        assert "3 P1" in err, "P1s must be collected, or every share is wrong"
+        assert "1 P2" in err
+        assert "4 scored finding(s)" in err
