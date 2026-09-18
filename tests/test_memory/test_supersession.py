@@ -306,6 +306,80 @@ async def test_an_infrastructure_failure_during_supersede_does_not_block_the_sto
 
 
 @pytest.mark.asyncio()
+async def test_a_failed_qdrant_marking_is_reported_not_claimed(store, db):
+    """update_payload raising must surface as superseded=False.
+
+    Vector recall excludes only points whose payload carries
+    ``deprecated=True``, so a swallowed failure leaves the old memory live
+    while the caller is told the supersede landed.
+    """
+    old_id = "old-memory-id"
+    outcome: dict = {}
+
+    with patch("genesis.memory.store.upsert_point"), \
+         patch(
+             "genesis.memory.store.update_payload",
+             side_effect=RuntimeError("qdrant down"),
+         ), \
+         patch("genesis.memory.store.memory_crud") as mock_mem, \
+         patch("genesis.memory.store.memory_links_crud") as mock_links:
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.resolve_id = AsyncMock(
+            side_effect=lambda _db, mid: ([mid], "passthrough")
+        )
+        mock_mem.get_metadata = AsyncMock(return_value={
+            "memory_id": old_id, "collection": "episodic_memory",
+            "embedding_status": "embedded", "deprecated": 0,
+            "superseded_by": None, "superseded_at": None,
+        })
+        mock_mem.mark_superseded = AsyncMock(return_value=True)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
+        mock_links.create = AsyncMock(return_value=(old_id, "new"))
+
+        result = await store.store(
+            "new content", "conversation",
+            supersedes=old_id, supersede_outcome=outcome,
+        )
+
+    assert isinstance(result, str)
+    assert outcome["superseded"] is False
+
+
+@pytest.mark.asyncio()
+async def test_a_failed_succeeded_by_link_is_reported_not_claimed(store, db):
+    """A non-UNIQUE link-create failure is an incomplete supersede — reported."""
+    old_id = "old-memory-id"
+    outcome: dict = {}
+
+    with patch("genesis.memory.store.upsert_point"), \
+         patch("genesis.memory.store.update_payload"), \
+         patch("genesis.memory.store.memory_crud") as mock_mem, \
+         patch("genesis.memory.store.memory_links_crud") as mock_links:
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.resolve_id = AsyncMock(
+            side_effect=lambda _db, mid: ([mid], "passthrough")
+        )
+        mock_mem.get_metadata = AsyncMock(return_value={
+            "memory_id": old_id, "collection": "episodic_memory",
+            "embedding_status": "embedded", "deprecated": 0,
+            "superseded_by": None, "superseded_at": None,
+        })
+        mock_mem.mark_superseded = AsyncMock(return_value=True)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
+        mock_links.create = AsyncMock(side_effect=RuntimeError("db down"))
+
+        result = await store.store(
+            "new content", "conversation",
+            supersedes=old_id, supersede_outcome=outcome,
+        )
+
+    assert isinstance(result, str)
+    assert outcome["superseded"] is False
+
+
+@pytest.mark.asyncio()
 @pytest.mark.parametrize(
     ("handle", "resolver_verdict"),
     [

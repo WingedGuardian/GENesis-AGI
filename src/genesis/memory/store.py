@@ -754,6 +754,9 @@ class MemoryStore:
         # fired a doomed update_payload on 'pending'/'failed' rows every time.
         meta = await memory_crud.get_metadata(self._db, old_id)
         if meta and meta["embedding_status"] == "embedded":
+            # A failed payload write is NOT benign: vector recall excludes only
+            # points carrying deprecated=True, so swallowing it would leave the
+            # old memory live while the caller is told the supersede landed.
             try:
                 await asyncio.to_thread(
                     update_payload,
@@ -767,6 +770,7 @@ class MemoryStore:
                     "Qdrant update_payload failed for superseded memory %s",
                     old_id, exc_info=True,
                 )
+                raise
 
         # Create succeeded_by link for graph traversal
         try:
@@ -779,12 +783,15 @@ class MemoryStore:
                 created_at=timestamp,
             )
         except Exception as link_exc:
-            # PK collision is fine (link already exists); log unexpected errors
+            # PK collision is fine (link already exists); anything else means
+            # the edge was never written and the supersede is incomplete — the
+            # caller decides what that is worth, so propagate rather than log.
             if "UNIQUE constraint" not in str(link_exc):
                 logger.warning(
                     "Failed to create succeeded_by link %s → %s: %s",
                     old_id, new_id, link_exc,
                 )
+                raise
         else:
             # The CRUD create does not invalidate (its callers do, by
             # convention) — and this caller previously didn't either, so every

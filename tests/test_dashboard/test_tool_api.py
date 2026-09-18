@@ -55,6 +55,7 @@ def test_tool_list_returns_all_registered_tools(client):
     assert "health_status" in tool_names
     assert "memory_recall" in tool_names
     assert "memory_store" in tool_names
+    assert "memory_supersede" in tool_names
     assert "knowledge_recall" in tool_names
     assert "outreach_send" in tool_names
     assert "web_fetch" in tool_names

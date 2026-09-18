@@ -46,7 +46,11 @@ def _build_tool_registry() -> dict[str, dict[str, Any]]:
 
     # Memory server tools — @mcp.tool() wraps these in FunctionTool,
     # so we unwrap to get the raw async function.
-    from genesis.mcp.memory.core import memory_recall, memory_store
+    from genesis.mcp.memory.core import (
+        memory_recall,
+        memory_store,
+        memory_supersede,
+    )
     from genesis.mcp.memory.knowledge import knowledge_recall
 
     # Outreach server tools — also FunctionTool-wrapped
@@ -56,6 +60,7 @@ def _build_tool_registry() -> dict[str, dict[str, Any]]:
         "health_status": {"fn": _impl_health_status, "method": "GET"},
         "memory_recall": {"fn": _unwrap_mcp_tool(memory_recall), "method": "POST"},
         "memory_store": {"fn": _unwrap_mcp_tool(memory_store), "method": "POST"},
+        "memory_supersede": {"fn": _unwrap_mcp_tool(memory_supersede), "method": "POST"},
         "knowledge_recall": {"fn": _unwrap_mcp_tool(knowledge_recall), "method": "POST"},
         "outreach_send": {"fn": _unwrap_mcp_tool(outreach_send), "method": "POST"},
         "web_fetch": {"fn": _impl_web_fetch, "method": "POST"},
