@@ -30,6 +30,7 @@ import asyncio
 import json
 import logging
 import re
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -74,6 +75,25 @@ GUARDIAN_HOST_PATHS = (
     "scripts/lib/host_swap.sh",
     "scripts/lib/cc_tmp_volume.sh",
 )
+
+# Resident daemons whose ExecStart is a repo script — keep in LOCKSTEP with
+# update.sh RESIDENT_UNIT_SCRIPTS (the restart heal; test-enforced). Values
+# are EVERY startup-loaded repo-relative file (ExecStart script + libraries
+# it sources at start + the rendered unit template — a template-only change
+# gets daemon-reload from bootstrap, no restart, so the running daemon would
+# keep its old directives until an unrelated bounce), resolved against
+# repo_root() at collection time.
+# Timer-fired oneshots re-exec their script every tick and are immune;
+# genesis-server/bridge have their own restart handling in update.sh;
+# genesis-code-intel-freeze is deliberately excluded (operator-armed kill
+# switch — auto-bouncing it would drop the very locks it exists to hold).
+RESIDENT_UNIT_SCRIPTS = {
+    "genesis-tmp-watchgod.service": (
+        "scripts/tmp_watchgod.sh",
+        "scripts/lib/alert_queue.sh",
+        "scripts/systemd/genesis-tmp-watchgod.service.template",
+    ),
+}
 
 _HOST_STATE_FILE = "host_gateway_state.json"
 
@@ -134,6 +154,119 @@ def collect_missing_units(template_dir: Path, unit_dir: Path) -> list[str] | Non
     except Exception:
         logger.debug("deploy_health: unit comparison failed", exc_info=True)
         return None
+
+
+def _probe_unit(unit: str) -> tuple[bool, float | None]:
+    """(active, ExecMainStart epoch) for a user unit. Local systemd IPC only
+    (no network — the module contract), budgeted like the git probes. Any
+    unreadable fact degrades to (False, None) / (True, None) rather than
+    raising; the caller treats None as "cannot judge"."""
+    # systemctl_env() first: under the genesis-server systemd sandbox,
+    # XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS may be absent and a raw
+    # environ copy cannot reach the user manager — every probe would then
+    # read "inactive" and RESOLVE a real drift alert. Then TZ=UTC pins the
+    # client-side timestamp render so the strptime below can attach UTC
+    # explicitly — same trick, same reason as update.sh's loop (ambiguous
+    # zone abbreviations and DST folds parse differently per install; the
+    # two halves must reach one verdict on the same facts).
+    from genesis.util.systemd import systemctl_env
+
+    utc_env = {**systemctl_env(), "TZ": "UTC"}
+    rc = subprocess.run(
+        ["systemctl", "--user", "is-active", "--quiet", unit],
+        capture_output=True,
+        timeout=_CHEAP_TIMEOUT_S,
+        env=utc_env,
+    ).returncode
+    if rc == 3:
+        return False, None  # cleanly inactive — nothing to judge
+    if rc != 0:
+        # Cannot contact the user manager / unit in an error state: UNKNOWN,
+        # never "inactive" — a probe outage must not read as health.
+        raise RuntimeError(f"systemctl is-active rc={rc} for {unit}")
+    out = subprocess.run(
+        ["systemctl", "--user", "show", unit, "-p", "ExecMainStartTimestamp", "--value"],
+        capture_output=True,
+        text=True,
+        timeout=_CHEAP_TIMEOUT_S,
+        env=utc_env,
+    )
+    ts = out.stdout.strip()
+    if out.returncode != 0 or not ts or ts == "n/a":
+        return True, None
+    try:
+        # Rendered under TZ=UTC above as "Thu 2026-09-04 21:53:58 UTC" —
+        # parse the date/time fields and attach UTC explicitly. stat()'s
+        # mtime is an absolute epoch, so the comparison is zone-free.
+        parts = ts.split()
+        dt = datetime.strptime(" ".join(parts[1:3]), "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+        return True, dt.timestamp()
+    except Exception:
+        return True, None
+
+
+def collect_stale_units(
+    unit_scripts: dict[str, tuple[Path, ...] | Path],
+    *,
+    probe: object = None,
+) -> list[str] | None:
+    """Resident daemons running code older than any startup-loaded file.
+
+    Verdict mirrors update.sh's ``_unit_restart_reason``: a unit is stale iff
+    it is ACTIVE and its ExecMainStart epoch predates the NEWEST mtime among
+    its listed files (mtime = when the code arrived on THIS install; a commit
+    timestamp is authored upstream and misses the started-between-commit-and-
+    pull window; multiple files because a daemon sources libraries once at
+    start). An unreadable or future-dated file mtime makes the whole unit
+    unjudgeable — skip it rather than decide on partial facts (a skipped
+    file would let a missing ExecStart read as "no change" while a newer
+    library forced a verdict). An ACTIVE unit whose start timestamp cannot
+    be read is likewise unjudgeable: when nothing else is stale the result
+    is ``None`` — "could not determine" — never a clean empty (fail-closed
+    data-access doctrine: an outage must not masquerade as health)."""
+    probe_fn = probe or _probe_unit
+    now_ts = _utcnow().timestamp()
+    try:
+        stale: list[str] = []
+        unknown = False
+        for unit, scripts in unit_scripts.items():
+            active, start_epoch = probe_fn(unit)
+            if not active:
+                continue
+            if start_epoch is None:
+                unknown = True
+                continue
+            paths = (scripts,) if isinstance(scripts, (str, Path)) else scripts
+            newest = None
+            unreadable = False
+            for script in paths:
+                try:
+                    m = Path(script).stat().st_mtime
+                except OSError:
+                    unreadable = True
+                    break
+                if m > now_ts:
+                    # Future-dated mtime (clock rollback, restored snapshot):
+                    # the file's arrival time is untrustworthy, so the unit
+                    # cannot be judged — same fail direction as unreadable.
+                    unreadable = True
+                    break
+                newest = m if newest is None else max(newest, m)
+            if unreadable:
+                continue
+            # Whole-second comparison, mirroring update.sh's `date +%s` /
+            # `stat -c %Y`: the systemd timestamp is rendered only to whole
+            # seconds, so a fractional mtime in the same second must not
+            # read as newer than the daemon's start.
+            if newest is not None and start_epoch < int(newest):
+                stale.append(unit)
+        if not stale and unknown:
+            return None
+        return sorted(stale)
+    except Exception:
+        logger.debug("deploy_health: stale-unit probe failed", exc_info=True)
+        return None
+
 
 
 #: A commit name as ``scripts/update.sh`` writes it into
@@ -344,6 +477,7 @@ STALE_UPDATE_COMMITS = 20
 def derive_findings(
     *,
     missing_units: list[str] | None,
+    stale_units: list[str] | None = None,
     tier2_pending: list[str] | None,
     host_gateway: dict,
     commits_behind: int | None,
@@ -361,6 +495,8 @@ def derive_findings(
     findings: list[str] = []
     if missing_units:
         findings.append("missing_units:" + ",".join(sorted(missing_units)))
+    if stale_units:
+        findings.append("stale_units:" + ",".join(sorted(stale_units)))
     if tier2_pending:
         findings.append(f"tier2_pending:{len(tier2_pending)}")
     if host_gateway.get("status") == "drift":
@@ -390,9 +526,16 @@ def _collect_sync(repo: Path, genesis_home_dir: Path) -> dict:
         Path.home() / ".config" / "systemd" / "user",
     )
     host_gateway = collect_host_gateway(repo, genesis_home_dir / _HOST_STATE_FILE)
+    stale_units = collect_stale_units(
+        {
+            unit: tuple(repo / script for script in scripts)
+            for unit, scripts in RESIDENT_UNIT_SCRIPTS.items()
+        }
+    )
     return {
         "git": git_facts,
         "missing_units": missing_units,
+        "stale_units": stale_units,
         "host_gateway": host_gateway,
     }
 
@@ -408,6 +551,7 @@ async def deploy_health(db: aiosqlite.Connection | None) -> dict:
         tier2 = await asyncio.to_thread(collect_tier2_pending, repo, update.get("new_commit"))
         findings = derive_findings(
             missing_units=collected["missing_units"],
+            stale_units=collected["stale_units"],
             tier2_pending=tier2,
             host_gateway=collected["host_gateway"],
             commits_behind=collected["git"].get("commits_behind_upstream"),
@@ -419,6 +563,7 @@ async def deploy_health(db: aiosqlite.Connection | None) -> dict:
             "last_update": update,
             "git": collected["git"],
             "missing_units": collected["missing_units"],
+            "stale_units": collected["stale_units"],
             "tier2_pending": tier2,
             "host_gateway": collected["host_gateway"],
         }
