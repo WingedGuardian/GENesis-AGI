@@ -118,8 +118,13 @@ def upsert_sync(
 ) -> None:
     """Sync heartbeat write for hooks. Best-effort, never raises."""
     try:
+        from genesis.db.integrity import assert_not_quarantined
+
+        assert_not_quarantined(db_path)
         now = datetime.now(UTC).isoformat()
-        conn = sqlite3.connect(db_path, timeout=timeout)
+        from genesis.db.connection import connect_sqlite_rw
+
+        conn = connect_sqlite_rw(db_path, timeout=timeout)
         try:
             conn.execute(
                 """INSERT INTO session_heartbeats
