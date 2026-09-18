@@ -19,7 +19,6 @@ import os
 import re
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 # The shared hook-input helper lives in scripts/hooks/; this script runs from
@@ -41,6 +40,36 @@ except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must b
         )
         sys.stderr.flush()
     except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
+
+try:
+    from native_approval import emit_native_ask  # noqa: E402
+except Exception as _approval_exc:  # noqa: BLE001 — missing new helper must block.
+    if __name__ != "__main__":
+        raise
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (review_enforcement_commit): native approval helper is "
+            "incompatible; BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:
+        pass
+    os._exit(2)
+
+try:
+    from review_deadline import Deadline, bounded_timeout  # noqa: E402
+except Exception as _deadline_exc:  # noqa: BLE001 — a broken deadline can fail open.
+    if __name__ != "__main__":
+        raise
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (review_enforcement_commit): deadline helper is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:
         pass
     os._exit(2)
 
@@ -387,9 +416,7 @@ def _staged_files(cwd: str | None, *, deadline: float | None = None) -> list[str
             args,
             capture_output=True,
             text=True,
-            timeout=max(0.001, min(10, deadline - time.monotonic()))
-            if deadline is not None
-            else 10,
+            timeout=bounded_timeout(deadline, 10),
         )
         if result.returncode != 0:
             return None
@@ -678,9 +705,7 @@ def _worktree_root(cwd: str, *, deadline: float | None = None) -> str:
             ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True,
-            timeout=max(0.001, min(5, deadline - time.monotonic()))
-            if deadline is not None
-            else 5,
+            timeout=bounded_timeout(deadline, 5),
         )
         root = r.stdout.strip()
         if r.returncode == 0 and root:
@@ -789,30 +814,7 @@ def _is_dispatched() -> bool:
 
 def _native_ask(reason: str) -> None:
     """Emit a native PreToolUse decision and exit successfully for CC to ask."""
-    # Nothing is discarded YET here — the decision is still open — so this warns
-    # about what DECLINING costs, which is the thing an approval dialog
-    # otherwise hides.
-    if discarded_write is not None:
-        # Cosmetic only — a stale module without prompt_note, or a failure inside
-        # it, must never take down the ask: a crash before the print exits
-        # non-zero, which is non-BLOCKING and would run the commit unapproved.
-        try:
-            extra = discarded_write.prompt_note()
-        except Exception:
-            extra = None
-        if extra:
-            reason = f"{reason}\n\n{extra}"
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "ask",
-                    "permissionDecisionReason": reason,
-                }
-            }
-        )
-    )
+    emit_native_ask(reason)
     sys.exit(0)
 
 
@@ -880,6 +882,7 @@ def _branch_review_budget(
     branch: str | None,
     *,
     budget_seconds: float = _COMMIT_BUDGET_LOOKUP_SECONDS,
+    deadline: Deadline | None = None,
 ) -> dict | None:
     """The current branch PR's shared budget; None means a proven no-open-PR.
 
@@ -892,7 +895,7 @@ def _branch_review_budget(
     """
     if not cwd or not branch:
         return _unknown_budget("commit_pr_identity_unknown")
-    deadline = time.monotonic() + budget_seconds
+    lookup_deadline = deadline or Deadline.after(budget_seconds)
     try:
         import review_budget
     except Exception:  # noqa: BLE001 — reverse version skew asks/denies.
@@ -905,8 +908,9 @@ def _branch_review_budget(
         repo = os.environ.get("_TEST_REVIEW_BUDGET_REPO", "owner/repo")
         if not test_pr.isdigit():
             return _unknown_budget("commit_pr_identity_unknown")
+        remaining = lookup_deadline.remaining()
         result = review_budget.evaluate_pr(
-            repo, test_pr, budget_seconds=max(0.0, deadline - time.monotonic())
+            repo, test_pr, budget_seconds=max(0.0, remaining or 0.0)
         )
         result["pr"] = int(test_pr)
         result["repo"] = repo
@@ -926,7 +930,7 @@ def _branch_review_budget(
             text=True,
             # Share the one deadline: a flat 8 here plus the evaluator's own
             # serial calls is exactly what overran the harness window.
-            timeout=max(0.001, min(8.0, deadline - time.monotonic())),
+            timeout=lookup_deadline.timeout(8.0),
             check=False,
         )
         if pr_read.returncode != 0:
@@ -937,8 +941,9 @@ def _branch_review_budget(
         if isinstance(identity, dict):
             return identity
         repo, number = identity
+        remaining = lookup_deadline.remaining()
         result = review_budget.evaluate_pr(
-            repo, number, budget_seconds=max(0.0, deadline - time.monotonic())
+            repo, number, budget_seconds=max(0.0, remaining or 0.0)
         )
         result["pr"] = number
         result["repo"] = repo
@@ -1040,7 +1045,8 @@ def main() -> None:
     # reads, then the budget lookup) could overrun the window in aggregate; every
     # probe below draws from this one deadline instead. The small reserve keeps
     # room to print the decision and exit before the kill lands.
-    hook_deadline = time.monotonic() + _COMMIT_HOOK_REGISTERED_TIMEOUT - 0.5
+    hook_budget = Deadline.after(_COMMIT_HOOK_REGISTERED_TIMEOUT - 0.5)
+    hook_deadline = hook_budget.expires_at
 
     # Resolve the dir the commit actually targets (git -C / the LAST cd before
     # the commit segment / payload cwd). A decoy `cd A && …; cd B && git commit`
@@ -1263,9 +1269,7 @@ def main() -> None:
     commit_segs = [s for s in segs if git_subcommand(s.argv) == "commit"]
 
     branch = get_current_branch(cwd=cwd, deadline=hook_deadline)
-    cloud_budget = _branch_review_budget(
-        cwd, branch, budget_seconds=max(0.001, hook_deadline - time.monotonic())
-    )
+    cloud_budget = _branch_review_budget(cwd, branch, deadline=hook_budget)
     pending_round_approval = bool(
         cloud_budget is not None
         and (

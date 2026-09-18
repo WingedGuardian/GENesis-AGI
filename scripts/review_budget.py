@@ -24,6 +24,8 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from review_deadline import Deadline
+
 SCHEMA_VERSION = 1
 CODEX_REVIEW_BOT = "chatgpt-codex-connector[bot]"
 MAX_PR_COMMITS_RESPONSE = 250
@@ -54,6 +56,7 @@ HOOK_SURFACE_FILES = frozenset(
         "scripts/review_scope.py",
         "scripts/review_state.py",
         "scripts/review_budget.py",
+        "scripts/review_deadline.py",
         "scripts/external_review.py",
         "scripts/lib/gate_menu.py",
         ".claude/settings.json",
@@ -428,7 +431,7 @@ def _evaluate_pr_inner(
             return _unknown(config_error)
 
     timeout_for = timeout_for or (lambda seconds: seconds)
-    deadline = None if budget_seconds is None else monotonic() + budget_seconds
+    deadline = Deadline.after(budget_seconds, monotonic=monotonic)
     # A call given less than this cannot complete a TLS handshake plus a GitHub
     # round trip, so issuing it would burn the remaining budget to arrive at the
     # same `unknown` — with the timeout landing INSIDE the caller's harness
@@ -436,9 +439,9 @@ def _evaluate_pr_inner(
     floor = 0.75
 
     def run(argv: list[str], seconds: float) -> tuple[int, str, str]:
-        if deadline is not None:
-            remaining = deadline - monotonic()
-            if remaining < floor:
+        remaining = deadline.remaining()
+        if remaining is not None:
+            if deadline.exhausted(minimum_useful=floor):
                 raise _BudgetExhausted
             seconds = min(seconds, remaining)
         try:

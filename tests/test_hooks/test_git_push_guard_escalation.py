@@ -262,6 +262,31 @@ def test_opaque_comment_body_cannot_bypass_an_approval_boundary(monkeypatch):
     assert _decision(body_file)[0] == "ask"
 
 
+def test_effective_comment_body_is_parsed_once(monkeypatch):
+    """Request detection and exact-head confirmation share one argv parse."""
+    _evidence(
+        monkeypatch,
+        [(HEADS[0], "COMMENTED"), (HEADS[1], "COMMENTED")],
+        head=HEADS[2],
+        files=("scripts/review_budget.py",),
+    )
+    marker = _mod._review_budget.confirmation_marker(HEADS[2])
+    original = _mod._comment_body
+    calls = 0
+
+    def counted(argv):
+        nonlocal calls
+        calls += 1
+        return original(argv)
+
+    monkeypatch.setattr(_mod, "_comment_body", counted)
+    assert _decision(f'gh pr comment 1372 --repo owner/repo --body "@codex review {marker}"') == (
+        "allow",
+        "",
+    )
+    assert calls == 1
+
+
 def test_opaque_gate_confirmation_cannot_claim_exact_head_marker(monkeypatch):
     _evidence(
         monkeypatch,

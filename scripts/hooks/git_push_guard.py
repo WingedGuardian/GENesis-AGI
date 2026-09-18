@@ -140,6 +140,21 @@ except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must b
         pass
     os._exit(2)
 
+try:
+    from native_approval import emit_native_ask  # noqa: E402
+except Exception as _approval_exc:  # noqa: BLE001 — missing new helper must block.
+    if __name__ != "__main__" or sys.argv[1:2] == ["--check-pr"]:
+        raise
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (git_push_guard): native approval helper is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:
+        pass
+    os._exit(2)
+
 # SOFT dependency (mirrors review_enforcement_commit.py's guard for the SAME
 # import): an unimportable review_state must degrade ONLY the round-escalation
 # advisory to its documented default — never crash this module at load time.
@@ -154,6 +169,14 @@ except Exception:  # noqa: BLE001 — ANY failure (absent OR broken: SyntaxError
     # and silently disables every fail-closed gate in this file (round-6 P1).
     ESCALATION_ROUND_CAP = 3  # the genesis-development SKILL.md prose cap
     FINAL_ROUND_CAP = 7  # keep in step with review_state.FINAL_ROUND_CAP
+
+try:
+    from review_deadline import bounded_timeout as _bounded_timeout  # noqa: E402
+except Exception:  # Reverse skew: retain a conservative fail-fast local fallback.
+    def _bounded_timeout(deadline, cap, *, monotonic=time.monotonic, floor=0.001):
+        if deadline is None:
+            return cap
+        return max(floor, min(cap, deadline - monotonic()))
 
 # The cloud-backed round budget is a newer soft dependency than this guard. A
 # missing/broken evaluator is UNKNOWN, never "zero rounds"; the request gate
@@ -617,12 +640,10 @@ def _gh_timeout(cap: float) -> float:
 
     ``cap`` when no merge deadline is set (every non-merge caller, and the tests, are
     unaffected). Under a deadline, the smaller of ``cap`` and the time remaining, floored
-    at 1s so a nearly-expired budget makes the call fail FAST — its caller's existing
+    at 1ms so an expired budget makes the call fail immediately — its caller's existing
     error path then returns its fail-closed/open value — rather than overrun the
     wall-clock and get the whole hook SIGKILLed mid-gate. Never raises."""
-    if _merge_deadline is None:
-        return cap
-    return max(1.0, min(cap, _merge_deadline - time.monotonic()))
+    return _bounded_timeout(_merge_deadline, cap)
 
 
 def _derive_repo_from_cwd(cwd: str) -> str | None:
@@ -3771,28 +3792,29 @@ def _comment_body(argv: list[str]) -> tuple[str | None, bool]:
     return inline_body, opaque
 
 
-def _comment_review_request_signal(argv: list[str]) -> bool | None:
-    """Whether a comment's body is visibly an ``@codex review`` request.
+def _comment_review_request(argv: list[str]) -> tuple[str | None, bool, bool | None]:
+    """Parse a comment body once and derive its ``@codex review`` signal.
 
-    ``None`` means the body is opaque at pre-execution time (body file, editor,
-    web flow, or an omitted body).  Opaque is evaluated as a possible request:
-    standing authorization may still allow it, while an approval boundary asks
-    or denies.  This avoids a body-file spelling becoming a cap bypass without
-    pretending a file cannot be rewritten earlier in the same shell command.
+    Returns ``(effective_inline_body, opaque, signal)``. A ``None`` signal means
+    the body is opaque at pre-execution time (body file, editor, web flow, or an
+    omitted body). Opaque is evaluated as a possible request: standing
+    authorization may still allow it, while an approval boundary asks or denies.
+    This avoids a body-file spelling becoming a cap bypass without pretending a
+    file cannot be rewritten earlier in the same shell command.
     """
     try:
         start = argv.index("comment") + 1
     except ValueError:
-        return False
+        return None, False, False
     inline_body, opaque = _comment_body(argv)
     delete_only = "--delete-last" in argv[start:]
     if inline_body is not None and "@codex review" in inline_body.lower():
-        return True
+        return inline_body, opaque, True
     if inline_body is not None:
-        return None if opaque else False
+        return inline_body, opaque, None if opaque else False
     if delete_only and not opaque and "--edit-last" not in argv[start:]:
-        return False
-    return None
+        return inline_body, opaque, False
+    return inline_body, opaque, None
 
 
 def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = None) -> tuple[str, str]:
@@ -3803,10 +3825,11 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
     user decision can authorize the action.
     """
     triggers = [
-        (seg, signal)
+        (seg, body, signal)
         for seg in segs
         if gh_pr_subcommand(seg.argv) == "comment"
-        if (signal := _comment_review_request_signal(seg.argv)) is not False
+        for body, _opaque, signal in (_comment_review_request(seg.argv),)
+        if signal is not False
     ]
     if not triggers:
         return "allow", ""
@@ -3817,7 +3840,7 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
 
     decisions: list[tuple[str, str]] = []
     exemption_used = False
-    for seg, body_signal in triggers:
+    for seg, effective_body, body_signal in triggers:
         unresolvable = _unresolvable_identity(seg.argv)
         if unresolvable is not None:
             return "deny", _unresolvable_identity_advisory(unresolvable)
@@ -3871,11 +3894,10 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
             # The marker must sit in the EFFECTIVE body — an overridden earlier
             # -b value never reaches GitHub, so argv-wide matching would exempt
             # a request that posts no marker at all.
-            eff_body, _eff_opaque = _comment_body(seg.argv)
             if (
                 body_signal is True
-                and eff_body is not None
-                and marker in eff_body
+                and effective_body is not None
+                and marker in effective_body
                 and not exemption_used
             ):
                 exemption_used = True
@@ -3905,7 +3927,7 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
         # (kept in _KNOWN_SIGILS so a compound stays order-independent) but
         # authorizes nothing — name that in the prompt so an old habit does not
         # read an ask as a gate misfire.
-        if any(has_trailing_override(seg.raw, "final-round-accept") for seg, _ in triggers):
+        if any(has_trailing_override(seg.raw, "final-round-accept") for seg, _, _ in triggers):
             reason += (
                 "\n\nNOTE: `# final-round-accept` is retired and no longer "
                 "authorizes any gate; only this native approval admits the request."
@@ -4040,6 +4062,7 @@ _HOOK_SURFACE_FILES = (
             "scripts/review_scope.py",  # substantiality classifier (feeds THIS gate)
             "scripts/review_state.py",  # escalation counter + review markers
             "scripts/review_budget.py",  # distinct-head policy evaluator
+            "scripts/review_deadline.py",  # aggregate hook timeout arithmetic
             "scripts/external_review.py",  # autonomous review-request boundary
             "scripts/lib/gate_menu.py",  # cap decision menu shown to the user
             ".claude/settings.json",  # hook wiring (inline blob + matchers)
@@ -8506,30 +8529,7 @@ def _ask(reason: str) -> int:
     """
     global _ASK_EMITTED
     _ASK_EMITTED = True
-    # Nothing is discarded YET here — the decision is still open — so this warns
-    # about what DECLINING costs, which is the thing a "block the push?" dialog
-    # otherwise hides.
-    if discarded_write is not None:
-        # Cosmetic only — a stale module without prompt_note, or a failure inside
-        # it, must never take down the ask: a crash before the print exits
-        # non-zero, which is non-BLOCKING and would run the command unapproved.
-        try:
-            extra = discarded_write.prompt_note()
-        except Exception:
-            extra = None
-        if extra:
-            reason = f"{reason}\n\n{extra}"
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "ask",
-                    "permissionDecisionReason": reason,
-                }
-            }
-        )
-    )
+    emit_native_ask(reason)
     return 0
 
 

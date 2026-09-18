@@ -51,7 +51,7 @@
 /.claude/hooks/                     @WingedGuardian
 /config/behavioral_rules/           @WingedGuardian
 
-# ── Named hook-surface files (mirrors _HOOK_SURFACE_FILES, all 27) ─────────
+# ── Named hook-surface files (mirrors _HOOK_SURFACE_FILES, all 34) ─────────
 /.claude/settings.json              @WingedGuardian
 /config/protected_paths.yaml        @WingedGuardian
 /config/repo_topology.yaml          @WingedGuardian
@@ -77,6 +77,7 @@
 /scripts/review_invalidate_on_commit.py @WingedGuardian
 /scripts/review_scope.py            @WingedGuardian
 /scripts/review_state.py            @WingedGuardian
+/scripts/review_deadline.py         @WingedGuardian
 /scripts/surface_open_prs.py        @WingedGuardian
 /scripts/surface_pr_updates.py      @WingedGuardian
 /config/external_review.yaml            @WingedGuardian

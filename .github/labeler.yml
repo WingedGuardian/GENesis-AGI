@@ -54,6 +54,7 @@ gate-surface:
           - 'scripts/review_invalidate_on_commit.py'
           - 'scripts/review_scope.py'
           - 'scripts/review_state.py'
+          - 'scripts/review_deadline.py'
           - 'scripts/surface_open_prs.py'
           - 'scripts/surface_pr_updates.py'
           - 'config/external_review.yaml'

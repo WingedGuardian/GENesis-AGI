@@ -64,6 +64,15 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+try:
+    from review_deadline import bounded_timeout
+except Exception:  # Reverse-version skew: keep state reads available and bounded.
+
+    def bounded_timeout(deadline, cap, *, monotonic=time.monotonic, floor=0.001):
+        if deadline is None:
+            return cap
+        return max(floor, min(cap, deadline - monotonic()))
+
 _MARKER_DIR = Path.home() / ".genesis" / "review_markers"
 # Per-worktree review-ROUND counter (escalation cap). Deliberately a SEPARATE store
 # from the marker above: review_invalidate_on_commit clears the marker after every
@@ -109,9 +118,7 @@ def _deadline_timeout(deadline: float | None, cap: float) -> float:
     immediately rather than granting a fresh 0.1s of post-deadline work —
     serial probes must not reach the host kill window, which fails OPEN.
     """
-    if deadline is None:
-        return cap
-    return max(0.001, min(cap, deadline - time.monotonic()))
+    return bounded_timeout(deadline, cap)
 
 
 def _worktree_root(cwd: str | None = None, *, deadline: float | None = None) -> str:
