@@ -71,11 +71,13 @@ if [ -f "$UPDATE_STATE" ]; then
         echo "  Recording crash recovery in update_history..."
         DB_PATH="$GENESIS_ROOT/data/genesis.db"
         if [ -f "$DB_PATH" ]; then
-            python3 -c "
+            PYTHONPATH="$GENESIS_ROOT/src" python3 -c "
 import sqlite3, uuid, json
 from datetime import datetime, timezone
+from genesis.db.integrity import assert_not_quarantined
 state = json.load(open('$UPDATE_STATE'))
 try:
+    assert_not_quarantined('$DB_PATH')
     con = sqlite3.connect('$DB_PATH', timeout=5)
     con.execute(
         'INSERT INTO update_history (id, old_tag, new_tag, old_commit, new_commit, status, '

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from genesis.env import db_busy_timeout_ms
+from genesis.env import db_busy_timeout_ms, genesis_db_path
 from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
@@ -32,7 +32,7 @@ _executor = None
 _db = None
 
 # DB path for fallback connections (matches manifest.py pattern)
-_DB_PATH = Path.home() / "genesis" / "data" / "genesis.db"
+_DB_PATH = genesis_db_path()
 
 # Allowed directories for plan files (must match dispatcher.py)
 _ALLOWED_PLAN_DIRS = [
@@ -72,10 +72,9 @@ async def _get_db() -> aiosqlite.Connection:
     # Standalone fallback connection. Not routed through get_raw_db() because
     # callers hold this connection across awaits (it's returned, not scoped to
     # a context manager); it sets the same pragmas get_raw_db() applies.
-    from genesis.db.integrity import assert_not_quarantined
+    from genesis.db.connection import connect_aiosqlite_rw
 
-    assert_not_quarantined(_DB_PATH)
-    db = await aiosqlite.connect(str(_DB_PATH))
+    db = await connect_aiosqlite_rw(_DB_PATH)
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute("PRAGMA synchronous=NORMAL")

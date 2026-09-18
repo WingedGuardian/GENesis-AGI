@@ -155,17 +155,21 @@ log()  { echo "$LOG_PREFIX $(date -Iseconds) $*"; }
 warn() { log "WARNING: $*"; _FAILURES+=("$*"); }
 die()  { log "FATAL: $*"; _FAILURES+=("$*"); exit 1; }
 
+# Serialize with scripts/update.sh as well as backup.sh. Both restore and update
+# stop services and own the same deploy marker. Acquire locks in the universal
+# order update → backup/restore: update.sh holds update while invoking backup,
+# so the reverse order here could deadlock an update against a restore.
+_UPDATE_LOCK_FILE="${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock"
+mkdir -p "$(dirname "$_UPDATE_LOCK_FILE")"
+exec {_RESTORE_UPDATE_LOCK_FD}>"$_UPDATE_LOCK_FILE"
+if ! flock -n "$_RESTORE_UPDATE_LOCK_FD"; then
+    die "Genesis update lock is held — refusing concurrent update+restore"
+fi
+
 # ── Mutual exclusion (SF5): backup↔restore share one whole-run lock ──
 # Counterpart of backup.sh's non-blocking skip. A restore is operator-driven,
-# so it WAITS (bounded) rather than skipping — the 6h backup timer firing
-# mid-restore would otherwise snapshot the half-built DB as the newest
-# COMPLETE backup. Acquired AFTER the EXIT trap above so a lock timeout is
-# recorded in restore_status.json as a real failure, and BEFORE the
-# repo-obtain below (backup.sh commits into the same clone this git-pulls).
-# The default 300s wait is deliberately shorter than a full off-site backup
-# run — dying with the holder named is the right behavior for an operator
-# script (wait for the backup, re-run); override for unattended DR flows.
-# Append-mode open: a losing contender must never truncate the holder line.
+# so it WAITS (bounded) rather than skipping. Acquired only after update.lock
+# to preserve the global lock order above.
 # shellcheck source=scripts/lib/dr_lock.sh
 source "$_SCRIPT_DIR/lib/dr_lock.sh"
 _LOCK_WAIT="${GENESIS_RESTORE_LOCK_WAIT:-300}"
@@ -175,16 +179,6 @@ if ! flock -w "$_LOCK_WAIT" "$DR_LOCK_FD"; then
     die "backup-restore lock still held by ${_holder:-unknown} after ${_LOCK_WAIT}s — a backup is likely running; wait for it to finish and re-run (or set GENESIS_RESTORE_LOCK_WAIT higher)"
 fi
 dr_lock_stamp restore
-
-# Serialize with scripts/update.sh as well as backup.sh. Both restore and update
-# stop services and own the same deploy marker; a check-then-write PID file is
-# not mutual exclusion by itself.
-_UPDATE_LOCK_FILE="${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock"
-mkdir -p "$(dirname "$_UPDATE_LOCK_FILE")"
-exec {_RESTORE_UPDATE_LOCK_FD}>"$_UPDATE_LOCK_FILE"
-if ! flock -n "$_RESTORE_UPDATE_LOCK_FD"; then
-    die "Genesis update lock is held — refusing concurrent update+restore"
-fi
 
 # Private-by-default for every plaintext this restore writes (SF7): gpg -d and
 # cp otherwise honor the inherited umask (typically 0022 → world-readable), so a
@@ -229,6 +223,16 @@ _quiesce_genesis_server() {
             _SERVER_WAS_STOPPED=true
         else
             die "could not confirm genesis-server stopped — live database left untouched"
+        fi
+    fi
+    # Older installs may still have the deprecated relay running with its own
+    # database handle. Stop it too; otherwise the open-handle fence below must
+    # abort an otherwise valid recovery.
+    if systemctl --user is-active --quiet genesis-bridge 2>/dev/null; then
+        log "Stopping legacy genesis-bridge before SQLite restore (will NOT auto-restart)..."
+        if ! systemctl --user stop genesis-bridge 2>/dev/null \
+            || systemctl --user is-active --quiet genesis-bridge 2>/dev/null; then
+            die "could not confirm genesis-bridge stopped — live database left untouched"
         fi
     fi
 }

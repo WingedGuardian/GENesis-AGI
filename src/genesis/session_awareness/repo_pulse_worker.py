@@ -238,12 +238,9 @@ def _evidence_names_pr(evidence: str | None, pr_number: int) -> bool:
 
 def _connect_rw(db_path: Path | str):
     """Return a writable connection only while the DB is not quarantined."""
-    import aiosqlite
+    from genesis.db.connection import connect_aiosqlite_rw
 
-    from genesis.db.integrity import assert_not_quarantined
-
-    assert_not_quarantined(db_path)
-    return aiosqlite.connect(str(db_path), timeout=10)
+    return connect_aiosqlite_rw(db_path, timeout=10)
 
 
 async def _record_telemetry(db_path: Path | str, status: str, detail: str) -> bool:
@@ -270,10 +267,7 @@ async def _record_run(db_path: Path | str, **kwargs) -> bool:
     tables, locked DB) — the caller must then leave the cursor alone.
     """
 
-    from genesis.db.integrity import assert_not_quarantined
-
     try:
-        assert_not_quarantined(db_path)
         async with _connect_rw(db_path) as db:
             await db.execute("PRAGMA busy_timeout=5000")
             return await pulse_crud.record_run(db, **kwargs)

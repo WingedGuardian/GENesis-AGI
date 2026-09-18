@@ -122,7 +122,9 @@ def upsert_sync(
 
         assert_not_quarantined(db_path)
         now = datetime.now(UTC).isoformat()
-        conn = sqlite3.connect(db_path, timeout=timeout)
+        from genesis.db.connection import connect_sqlite_rw
+
+        conn = connect_sqlite_rw(db_path, timeout=timeout)
         try:
             conn.execute(
                 """INSERT INTO session_heartbeats

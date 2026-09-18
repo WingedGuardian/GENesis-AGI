@@ -30,6 +30,27 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = genesis_db_path()
 
+
+def connect_sqlite_rw(
+    path: str | Path = DEFAULT_DB_PATH, *args: Any, **kwargs: Any
+) -> sqlite3.Connection:
+    """Return a synchronous RW connection after enforcing DB quarantine."""
+    from genesis.db.integrity import assert_not_quarantined
+
+    db_path = Path(path).expanduser().resolve()
+    assert_not_quarantined(db_path)
+    return sqlite3.connect(str(db_path), *args, **kwargs)
+
+
+def connect_aiosqlite_rw(path: str | Path = DEFAULT_DB_PATH, **kwargs: Any) -> aiosqlite.Connection:
+    """Return aiosqlite's awaitable/context-manager after quarantine guard."""
+    from genesis.db.integrity import assert_not_quarantined
+
+    db_path = Path(path).expanduser().resolve()
+    assert_not_quarantined(db_path)
+    return aiosqlite.connect(str(db_path), **kwargs)
+
+
 # Per-connection page cache. Negative = KiB (SQLite convention), so -262144 is
 # 256 MiB. SQLite's default is ~2 MiB, which forces hot read paths to keep
 # re-fetching pages instead of holding Genesis's working set resident. This is

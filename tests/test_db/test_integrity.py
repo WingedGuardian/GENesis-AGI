@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -28,9 +29,15 @@ def test_healthy_same_inode_remains_quarantined(tmp_path):
     marker = integrity.quarantine_path()
     marker.parent.mkdir(parents=True)
     stat = db.stat()
-    marker.write_text(json.dumps({
-        "db_path": str(db.resolve()), "st_dev": stat.st_dev, "st_ino": stat.st_ino,
-    }))
+    marker.write_text(
+        json.dumps(
+            {
+                "db_path": str(db.resolve()),
+                "st_dev": stat.st_dev,
+                "st_ino": stat.st_ino,
+            }
+        )
+    )
 
     with pytest.raises(integrity.DatabaseIntegrityError):
         integrity.require_healthy_database(db, source="test")
@@ -110,3 +117,133 @@ def test_malformed_marker_fails_closed(tmp_path, caplog):
     with pytest.raises(integrity.DatabaseIntegrityError):
         integrity.assert_not_quarantined(db)
     assert "unreadable" in caplog.text
+
+
+def test_stale_failed_check_cannot_quarantine_replacement(tmp_path, monkeypatch):
+    """A failure result is evidence about one inode, never its replacement."""
+    db = tmp_path / "genesis.db"
+    db.write_bytes(b"broken")
+    checked = integrity._fingerprint(db)
+
+    replacement = tmp_path / "replacement.db"
+    _healthy_db(replacement)
+
+    def stale_failure(path):
+        os.replace(replacement, path)
+        return integrity.IntegrityResult(
+            False,
+            "failure on the old inode",
+            checked_fingerprint=checked,
+        )
+
+    monkeypatch.setattr(integrity, "quick_check", stale_failure)
+    with pytest.raises(integrity.DatabaseIntegrityError):
+        integrity.require_healthy_database(db, source="race-test")
+
+    assert not integrity.quarantine_path().exists()
+    assert integrity.quick_check is stale_failure
+
+
+def test_quick_check_retries_inode_churn_without_binding_stale_result(tmp_path, monkeypatch):
+    db = tmp_path / "genesis.db"
+    _healthy_db(db)
+    real_connect = sqlite3.connect
+
+    class ChurningConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _sql):
+            replacement = tmp_path / "next.db"
+            with real_connect(replacement) as conn:
+                conn.execute("CREATE TABLE sample(id INTEGER PRIMARY KEY)")
+            os.replace(replacement, db)
+            return type("Rows", (), {"fetchall": lambda self: [("ok",)]})()
+
+    monkeypatch.setattr(integrity.sqlite3, "connect", lambda *_a, **_kw: ChurningConnection())
+    result = integrity.quick_check(db)
+    monkeypatch.setattr(integrity.sqlite3, "connect", real_connect)
+
+    assert result.healthy is False
+    assert result.checked_fingerprint is None
+    assert "identity changed repeatedly" in result.detail
+
+
+def test_indeterminate_check_never_quarantines_current_inode(tmp_path, monkeypatch):
+    db = tmp_path / "genesis.db"
+    _healthy_db(db)
+    monkeypatch.setattr(
+        integrity,
+        "quick_check",
+        lambda _path: integrity.IntegrityResult(False, "identity unstable"),
+    )
+
+    with pytest.raises(integrity.DatabaseIntegrityError):
+        integrity.require_healthy_database(db, source="race-test")
+
+    assert not integrity.quarantine_path().exists()
+
+
+def test_clear_cannot_unlink_marker_replaced_while_waiting_for_lock(tmp_path, monkeypatch):
+    """Clear re-reads under the mutation lock and preserves a newer marker."""
+    db = tmp_path / "genesis.db"
+    _healthy_db(db)
+    marker = integrity.quarantine_path()
+    marker.parent.mkdir(parents=True)
+    old = {"db_path": str(db.resolve()), "st_dev": 1, "st_ino": 2, "source": "old"}
+    newer = {
+        **integrity._fingerprint(db),
+        "source": "new",
+        "detail": "new failure",
+    }
+    marker.write_text(json.dumps(old))
+
+    original_lock = integrity._quarantine_mutation_lock
+
+    @integrity.contextlib.contextmanager
+    def replace_before_lock():
+        marker.write_text(json.dumps(newer))
+        with original_lock():
+            yield
+
+    monkeypatch.setattr(integrity, "_quarantine_mutation_lock", replace_before_lock)
+    integrity._clear_quarantine_for(db)
+
+    assert json.loads(marker.read_text())["source"] == "new"
+
+
+def test_connect_sqlite_rw_refuses_quarantined_database(tmp_path):
+    from genesis.db.connection import connect_sqlite_rw
+
+    db = tmp_path / "genesis.db"
+    _healthy_db(db)
+    integrity.quarantine_database(db, source="test", detail="known bad")
+
+    with pytest.raises(integrity.DatabaseIntegrityError):
+        connect_sqlite_rw(db)
+
+
+@pytest.mark.asyncio
+async def test_connect_aiosqlite_rw_preserves_await_and_context_manager(tmp_path):
+    from genesis.db.connection import connect_aiosqlite_rw
+
+    db = tmp_path / "genesis.db"
+    async with connect_aiosqlite_rw(db) as conn:
+        await conn.execute("CREATE TABLE sample(id INTEGER PRIMARY KEY)")
+        await conn.commit()
+
+    assert Path(db).exists()
+
+
+def test_connect_aiosqlite_rw_refuses_before_returning_connector(tmp_path):
+    from genesis.db.connection import connect_aiosqlite_rw
+
+    db = tmp_path / "genesis.db"
+    _healthy_db(db)
+    integrity.quarantine_database(db, source="test", detail="known bad")
+
+    with pytest.raises(integrity.DatabaseIntegrityError):
+        connect_aiosqlite_rw(db)

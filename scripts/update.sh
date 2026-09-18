@@ -243,14 +243,57 @@ echo "  Current: $OLD_TAG ($OLD_COMMIT)"
 echo ""
 
 # ── Pre-update backup ────────────────────────────────────
+PRE_UPDATE_DEGRADED=""
 if [ -x "$GENESIS_ROOT/scripts/backup.sh" ]; then
     echo "--- Pre-update backup ---"
-    if "$GENESIS_ROOT/scripts/backup.sh" 2>&1 | tail -3; then
-        echo "  Backup complete"
-    else
-        echo "  WARNING: backup failed (continuing anyway)"
-    fi
+    _backup_run_id="update-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    _backup_log=$(mktemp "${TMPDIR:-/tmp}/genesis-update-backup.XXXXXX")
+    _backup_rc=0
+    GENESIS_BACKUP_TRIGGER=update GENESIS_BACKUP_RUN_ID="$_backup_run_id" \
+        "$GENESIS_ROOT/scripts/backup.sh" >"$_backup_log" 2>&1 || _backup_rc=$?
+    # Never truncate diagnostics. A non-aborting backup failure must remain
+    # conspicuous and diagnosable in the update log.
+    cat "$_backup_log"
+    rm -f "$_backup_log"
+
+    _backup_gate=""
+    _backup_gate_rc=0
+    _backup_gate=$(python3 "$GENESIS_ROOT/scripts/lib/backup_status_gate.py" \
+        "${GENESIS_HOME:-$HOME/.genesis}/backup_status.json" "$_backup_run_id") || _backup_gate_rc=$?
+    case "$_backup_gate_rc" in
+        0)
+            if [ "$_backup_rc" -eq 0 ]; then
+                echo "  Backup complete and SQLite artifact verified"
+            else
+                PRE_UPDATE_DEGRADED="backup:process_exit"
+                echo ""
+                echo "  ================================================================"
+                echo "  BACKUP FAILED — UPDATE CONTINUING IN DEGRADED MODE"
+                echo "  Durable status proves the SQLite artifact, but backup exited $_backup_rc."
+                echo "  ================================================================"
+            fi
+            ;;
+        1)
+            PRE_UPDATE_DEGRADED="${_backup_gate#continue_degraded:}"
+            echo ""
+            echo "  ================================================================"
+            echo "  BACKUP FAILED — UPDATE CONTINUING IN DEGRADED MODE"
+            echo "  $_backup_gate"
+            echo "  ================================================================"
+            ;;
+        *)
+            echo ""
+            echo "  ================================================================" >&2
+            echo "  DATABASE BACKUP NOT VERIFIED — UPDATE ABORTED" >&2
+            echo "  ${_backup_gate:-abort_db:status_gate_failed} (backup rc=$_backup_rc)" >&2
+            echo "  ================================================================" >&2
+            exit 1
+            ;;
+    esac
     echo ""
+else
+    echo "  DATABASE BACKUP NOT VERIFIED — UPDATE ABORTED (backup.sh missing)" >&2
+    exit 1
 fi
 
 # ── Dirty-tree guard ─────────────────────────────────────
@@ -913,14 +956,21 @@ if [ -f "$DB_FILE" ]; then
     # mid-copy — which is exactly the file _do_rollback later restores. sqlite3
     # `.backup` takes a transactionally-consistent snapshot of a live database.
     if sqlite3 "$DB_FILE" ".backup '$DB_FILE.pre-update'" 2>/dev/null; then
-        echo "  DB snapshot: $DB_FILE.pre-update"
-        DB_SNAPSHOT_TAKEN=1
+        _snapshot_check=$(sqlite3 "$DB_FILE.pre-update" "PRAGMA quick_check;" 2>&1) || _snapshot_check=""
+        if [ "$_snapshot_check" = "ok" ]; then
+            echo "  DB snapshot: $DB_FILE.pre-update (verified)"
+            DB_SNAPSHOT_TAKEN=1
+        else
+            echo "  DATABASE SNAPSHOT FAILED VERIFICATION — UPDATE ABORTED" >&2
+            exit 1
+        fi
     else
         # Leave any stale $DB_FILE.pre-update on disk untouched — DB_SNAPSHOT_TAKEN
         # stays 0 so _do_rollback will NOT restore it (and will fail the rollback
         # loudly if this run then migrates). Removing it would erase a prior valid
         # snapshot for no gain.
-        echo "  WARNING: DB snapshot failed (continuing anyway)"
+        echo "  DATABASE SNAPSHOT FAILED — UPDATE ABORTED" >&2
+        exit 1
     fi
 fi
 
@@ -992,6 +1042,9 @@ _record_update_history() {
     local status="$1"           # success | failed | rolled_back | conflicts_pending
     local reason="${2:-}"
     local degraded="${3:-}"
+    if [ -n "${PRE_UPDATE_DEGRADED:-}" ]; then
+        degraded="${degraded:+$degraded,}$PRE_UPDATE_DEGRADED"
+    fi
     local db_path="$GENESIS_ROOT/data/genesis.db"
     [ -f "$db_path" ] || return 0
     [ -x "$VENV_DIR/bin/python" ] || return 0
@@ -1027,8 +1080,10 @@ import sys
 import uuid
 from datetime import UTC, datetime
 
+from genesis.db.connection import connect_sqlite_rw
+
 try:
-    con = sqlite3.connect(os.environ["GH_DB_PATH"], timeout=5.0)
+    con = connect_sqlite_rw(os.environ["GH_DB_PATH"], timeout=5.0)
     con.execute(
         "INSERT INTO update_history "
         "(id, old_tag, new_tag, old_commit, new_commit, status, rollback_tag, "
@@ -1527,8 +1582,8 @@ elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
         rm -f "$HOME/.genesis/last_update_failure.json"
         _record_update_history "success" "" "$HOST_CC_DEGRADED"
         echo "  Cleared stale update-failure marker (server healthy, code current)."
-    elif [ -n "$HOST_CC_DEGRADED" ]; then
-        echo "  NOTE: recording degraded subsystem: $HOST_CC_DEGRADED"
+    elif [ -n "$HOST_CC_DEGRADED" ] || [ -n "$PRE_UPDATE_DEGRADED" ]; then
+        echo "  NOTE: recording degraded subsystem: ${HOST_CC_DEGRADED:-$PRE_UPDATE_DEGRADED}"
         _record_update_history "success" "" "$HOST_CC_DEGRADED"
     fi
     echo ""

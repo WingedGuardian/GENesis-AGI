@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from genesis.db.connection import connect_sqlite_rw
 from genesis.env import genesis_db_path
 
 requires_operator = False
@@ -47,7 +48,7 @@ def _placeholders() -> str:
 
 def migrate() -> dict:
     """Delete job_health rows for every job in _RETIRED_JOBS; return purge count."""
-    db = sqlite3.connect(genesis_db_path(), timeout=30.0)
+    db = connect_sqlite_rw(genesis_db_path(), timeout=30.0)
     try:
         cur = db.execute(
             # noqa string interpolates only `?` placeholders; values stay

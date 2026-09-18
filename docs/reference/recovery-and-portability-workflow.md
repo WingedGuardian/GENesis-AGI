@@ -13,6 +13,41 @@ documentation.
 4. Confirm whether the Agent Zero tree is dirty before assuming any upstream
    version is compatible.
 
+## Database integrity, quarantine, and backup admission
+
+`scripts/backup.sh` verifies the live SQLite database through
+`genesis.db.integrity` before touching the backup clone. There is deliberately
+no raw `sqlite3 quick_check` fallback: if the inode-bound checker is unavailable
+or the database changes identity throughout the check, integrity is
+`indeterminate` and no new backup is admitted. A stable failure writes the
+external, mode-0600 `~/.genesis/db_quarantine.json` marker and stops
+`genesis-server.service` plus the legacy bridge writer. The marker is external
+because a damaged database cannot reliably store its own stop condition.
+
+The encrypted SQL artifact must then decrypt, import into a fresh mode-0600
+database, pass full integrity and foreign-key checks, and contain a non-empty
+schema. Temporary plaintext, the verification database, and all SQLite sidecars
+are trap-cleaned. `backup_status.json` binds the result to a per-run `run_id`
+and reports `db_integrity_status`, `sqlite_backup_verified`, `failure_class`,
+and `failure_stage`.
+
+`scripts/update.sh` admits only the status written for its exact requested run:
+
+- corrupt, quarantined, indeterminate, stale/malformed status, lock contention,
+  or an unverified SQLite artifact aborts before repository or schema changes;
+- non-database failures may continue because the verified SQLite recovery point
+  exists, but the full backup log and a prominent degraded-mode banner are
+  printed, and `backup:<failure_stage>` is persisted in `update_history`;
+- the separate pre-migration online snapshot must also pass `quick_check` or the
+  update aborts.
+
+Restore acquires locks in the global `update → backup/restore` order. A
+database-only recovery is available both as `scripts/restore.sh --database-only`
+and `python -m genesis restore --database-only`; the staged replacement is
+validated before atomic installation. A healthy replacement inode makes the old
+quarantine stale and permits service restart, while the failed original remains
+preserved as the pre-restore forensic copy.
+
 ## During Migration Work
 
 1. Keep Genesis changes on a dedicated hardening branch.

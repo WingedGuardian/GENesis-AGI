@@ -346,7 +346,8 @@ def _seed_wal_db(gd: Path) -> Path:
 
 def test_pre_restore_safety_copy_preserves_raw_database(sandbox):
     """The pre-restore DB is retained byte-for-byte for rollback/forensics."""
-    _seed_wal_db(sandbox["gd"])
+    live_db = _seed_wal_db(sandbox["gd"])
+    before = live_db.read_bytes()
     proc = _run_restore(sandbox)
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     copies = [
@@ -355,6 +356,7 @@ def test_pre_restore_safety_copy_preserves_raw_database(sandbox):
         if not c.name.endswith(("-wal", "-shm"))
     ]
     assert len(copies) == 1, f"expected exactly one pre-restore copy, got {copies}"
+    assert copies[0].read_bytes() == before
     integ = subprocess.run(
         ["sqlite3", str(copies[0]), "PRAGMA integrity_check;"], capture_output=True, text=True
     ).stdout.strip()

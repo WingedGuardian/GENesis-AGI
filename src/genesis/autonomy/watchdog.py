@@ -452,7 +452,7 @@ class WatchdogChecker:
         # A corrupt DB is a durable stop condition, not a crash to retry.  This
         # check precedes failure accounting so a quarantined database cannot
         # consume the restart/flap budget every watchdog tick.
-        if self._targets_server() and database_is_quarantined(genesis_db_path()):
+        if database_is_quarantined(genesis_db_path()):
             logger.critical(
                 "Database quarantine active — suppressing %s restart until a "
                 "verified replacement database is installed",

@@ -181,7 +181,7 @@ class TestDeployInProgress:
 
 
 class TestDatabaseQuarantine:
-    def test_matching_quarantine_suppresses_restart_without_failure_accounting(
+    def test_quarantine_suppresses_legacy_bridge_restart_without_failure_accounting(
         self, tmp_path: Path, stale_status: Path
     ):
         checker = _make_checker(tmp_path, stale_status)
@@ -192,7 +192,7 @@ class TestDatabaseQuarantine:
         }
 
         with (
-            patch.object(checker, "_targets_server", return_value=True),
+            patch.object(checker, "_targets_server", return_value=False),
             patch("genesis.autonomy.watchdog.database_is_quarantined", return_value=True),
         ):
             action = checker._restart_if_allowed(state, reason="target_inactive")
