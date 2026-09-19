@@ -965,22 +965,33 @@ read -r -d '' TMUX_WRAP_BLOCK <<'WRAPEOF' || true
 # SSH or closed browser tab just detaches the session — reattach with
 # `tmux attach -t cc-N`. Opt out: GENESIS_NO_TMUX_WRAP=1.
 claude() {
-    local arg
+    local arg genesis_root=__GENESIS_ROOT__
     for arg in "$@"; do
         case "$arg" in
             -p|--print|--version|-v|--help|-h) command claude "$@"; return $? ;;
         esac
     done
     if [ -t 0 ] && [ -t 1 ] && [ -z "${TMUX:-}" ] && [ -z "${GENESIS_NO_TMUX_WRAP:-}" ] \
-        && [ -x "$HOME/genesis/scripts/cc-slot.sh" ] \
+        && [ -x "$genesis_root/scripts/cc-slot.sh" ] \
         && command -v tmux >/dev/null 2>&1; then
-        "$HOME/genesis/scripts/cc-slot.sh" manual "$@"
+        "$genesis_root/scripts/cc-slot.sh" manual "$@"
     else
         command claude "$@"
     fi
 }
 # <<< genesis tmux-wrap <<<
 WRAPEOF
+_tmux_wrap_root=$(printf '%q' "$GENESIS_ROOT")
+_tmux_wrap_patsub_replacement_was_set=0
+if shopt -q patsub_replacement 2>/dev/null; then
+    _tmux_wrap_patsub_replacement_was_set=1
+    shopt -u patsub_replacement
+fi
+TMUX_WRAP_BLOCK="${TMUX_WRAP_BLOCK//__GENESIS_ROOT__/${_tmux_wrap_root}}"
+if [ "$_tmux_wrap_patsub_replacement_was_set" -eq 1 ]; then
+    shopt -s patsub_replacement
+fi
+unset _tmux_wrap_root _tmux_wrap_patsub_replacement_was_set
 touch "$BASHRC"
 if grep -qF "# >>> genesis tmux-wrap >>>" "$BASHRC" 2>/dev/null; then
     # Replace the existing block in place (idempotent update path). Capture the
