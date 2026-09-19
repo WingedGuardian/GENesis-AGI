@@ -165,13 +165,22 @@ def _extract_launch_line(script_text: str) -> str:
 
 def _run_cd_guard(script_text: str, root: str, canary: Path, fakebin: Path):
     """Run the REAL pane launch string with a fake `claude` (touches the canary)
-    and a `;`-terminated _OAUTH_SRC (mimics the real prefix). Returns (rc, canary_exists).
+    and a `;`-terminated _OAUTH_SRC (mimics the real prefix). Returns
+    (process, claude_canary_exists, capture_canary_exists).
     """
     launch = _extract_launch_line(script_text)
+    capture_canary = canary.with_name(f"{canary.name}_CAPTURE")
+    root_path = Path(root)
+    if root_path.is_dir():
+        capture_script = root_path / "scripts" / "cc_exit_capture.sh"
+        capture_script.parent.mkdir()
+        capture_script.write_text('#!/usr/bin/env bash\ntouch "$CDGUARD_CAPTURE_CANARY"\n')
+        capture_script.chmod(0o755)
     harness = f"""
 set -u
 export PATH="{fakebin}:/usr/bin:/bin"
 export CDGUARD_CANARY={str(canary)!r}
+export CDGUARD_CAPTURE_CANARY={str(capture_canary)!r}
 GENESIS_ROOT={root!r}
 _GENESIS_ROOT_Q=$(printf '%q' "$GENESIS_ROOT")
 _CC_EXIT_CAPTURE_Q=$(printf '%q' "$GENESIS_ROOT/scripts/cc_exit_capture.sh")
@@ -188,7 +197,7 @@ echo "PANE_EXIT=$?"
         capture_output=True,
         text=True,
     )
-    return proc, canary.exists()
+    return proc, canary.exists(), capture_canary.exists()
 
 
 def test_cd_guard_skips_claude_on_bad_cd(tmp_path, script_text):
@@ -203,21 +212,28 @@ def test_cd_guard_skips_claude_on_bad_cd(tmp_path, script_text):
 
     # bad cd → claude NOT run, pane exits with cd's failure code
     canary_bad = tmp_path / "PANE_RAN_BAD"
-    proc_bad, ran_bad = _run_cd_guard(
+    proc_bad, ran_bad, captured_bad = _run_cd_guard(
         script_text,
         str(tmp_path / "does-not-exist"),
         canary_bad,
         fakebin,
     )
     assert not ran_bad, f"claude ran despite a failed cd\n{proc_bad.stdout}\n{proc_bad.stderr}"
+    assert not captured_bad, "capture script ran for a checkout that could not be entered"
     assert "PANE_EXIT=0" not in proc_bad.stdout, proc_bad.stdout
 
     # good cd → claude DOES run, pane exits 0
     good_root = tmp_path / "good root"
     good_root.mkdir()
     canary_good = tmp_path / "PANE_RAN_GOOD"
-    proc_good, ran_good = _run_cd_guard(script_text, str(good_root), canary_good, fakebin)
+    proc_good, ran_good, captured_good = _run_cd_guard(
+        script_text, str(good_root), canary_good, fakebin
+    )
     assert ran_good, f"claude did not run on a good cd\n{proc_good.stdout}\n{proc_good.stderr}"
+    assert captured_good, (
+        "cc_exit_capture.sh did not run from a checkout path containing a space\n"
+        f"{proc_good.stdout}\n{proc_good.stderr}"
+    )
     assert "PANE_EXIT=0" in proc_good.stdout, proc_good.stdout
 
 
