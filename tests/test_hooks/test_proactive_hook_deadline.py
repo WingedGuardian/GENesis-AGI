@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
@@ -120,6 +121,43 @@ async def test_local_mode_stops_after_blocking_sync_phase_exhausts_deadline(
     assert elapsed < 0.2, "a later sync phase ran after the aggregate deadline"
     assert code_calls == []
     assert writer.lines == [("[Session trail] deferred", "session-metadata")]
+    assert not (tmp_path / ".genesis" / ".knowledge_retrieved_count_migrated").exists()
+
+
+@pytest.mark.asyncio
+async def test_failed_knowledge_migration_does_not_create_sentinel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A migration exception leaves the self-heal eligible for the next run."""
+    writer = _RecordingWriter()
+    db_path = tmp_path / "genesis.db"
+    db_path.touch()
+
+    def _interrupted_migration(*_args: object, **_kwargs: object) -> NoReturn:
+        """Simulate SQLite interrupting the migration in the caller path."""
+        raise sqlite3.OperationalError("interrupted")
+
+    monkeypatch.setattr(hook, "_OUT", writer)
+    monkeypatch.setattr(hook, "_RUN_DEADLINE_S", 1.0)
+    monkeypatch.setattr(hook, "_HOOK_MODE", "local")
+    monkeypatch.setattr(hook, "_DB_PATH", db_path)
+    monkeypatch.setattr(hook.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(hook, "_heartbeat_write", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(hook, "_heartbeat_read_and_inject", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(hook, "_extract_keywords", lambda *_args, **_kwargs: ["migration"])
+    monkeypatch.setattr(hook, "_update_and_format_trail", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(hook, "_extract_genesis_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(hook, "_load_recent_files", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(hook, "_ensure_knowledge_retrieved_count", _interrupted_migration)
+    monkeypatch.setattr(hook, "_compute_suppress_ids", lambda *_args, **_kwargs: frozenset())
+    monkeypatch.setattr(hook, "_search_fts5", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(hook, "_search_code_index", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(hook, "_record_activity", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(hook, "_record_detail", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(hook, "_ambient_fold", lambda *_args, **_kwargs: None)
+
+    await hook._run("retry migration", session_id="migration-session")
+
     assert not (tmp_path / ".genesis" / ".knowledge_retrieved_count_migrated").exists()
 
 
