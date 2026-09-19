@@ -762,6 +762,46 @@ def test_failed_swap_leaves_the_original_trio_intact(sandbox):
     )
 
 
+def test_failed_second_move_back_restores_the_first_sidecar(sandbox):
+    """REGRESSION 2026-09-19: a failure in the MOVE-ASIDE phase must roll back.
+
+    The sidecars are moved aside in a loop (wal, then shm). If the second move
+    fails, `die` exits — and the rollback written for the rename-failure path is
+    never reached, because the rename has not been attempted yet. The live main
+    database is then left present with its WAL already moved away: the de-fanged
+    state this whole block exists to prevent, and the SAME CLASS as the original
+    defect, reintroduced in a different phase.
+
+    The assertion is on all three files' bytes, not on their existence: the point
+    is that the live trio is exactly as it was.
+    """
+    db = _seed_live_db(sandbox["gd"])
+    data = sandbox["gd"] / "data"
+    wal, shm = data / "genesis.db-wal", data / "genesis.db-shm"
+    before = {"db": db.read_bytes(), "wal": wal.read_bytes(), "shm": shm.read_bytes()}
+
+    # Fail the SECOND move only — i.e. the shm, by source path. The wal has
+    # already been moved aside by the time this fires, which is what makes the
+    # rollback necessary.
+    _make_stub(
+        sandbox["bind"] / "mv",
+        f'#!/usr/bin/env bash\n[ "$1" = "{shm}" ] && exit 1\nexec /bin/mv "$@"\n',
+    )
+
+    proc = _run_restore(sandbox)
+
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"a failed move-aside must die\n{combined}"
+    assert db.exists(), "the live main database was lost"
+    assert wal.exists(), (
+        f"the WAL was moved aside and NOT moved back — the live database is de-fanged\n{combined}"
+    )
+    assert shm.exists(), "the SHM was lost"
+    assert db.read_bytes() == before["db"], "live database bytes changed"
+    assert wal.read_bytes() == before["wal"], "WAL bytes changed"
+    assert shm.read_bytes() == before["shm"], "SHM bytes changed"
+
+
 def test_failed_swap_with_no_sidecars_reports_the_pre_restore_copy(sandbox):
     """REGRESSION 2026-09-19: the swap-failure message must branch on what was
     RECORDED, not on the negation of the other flag pair.

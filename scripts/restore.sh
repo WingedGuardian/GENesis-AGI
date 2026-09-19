@@ -797,8 +797,28 @@ ${_HOLDER_OUT}"
                 for _sidecar in wal shm; do
                     [ -f "$DB_FILE-$_sidecar" ] || continue
                     if [ -n "$_PRE_RESTORE" ]; then
-                        mv "$DB_FILE-$_sidecar" "${_PRE_RESTORE}-${_sidecar}" \
-                            || die "could not move the live ${_sidecar} aside — quarantine retained"
+                        # A failed move must not exit before rolling back the ones
+                        # already moved: the live main DB would be left present
+                        # with its WAL/SHM gone — the de-fanged state this block
+                        # exists to prevent, and the same class as the original
+                        # defect, reintroduced in a different phase. A same-
+                        # directory mv is a rename, so it either moved or it did
+                        # not; there is no partial state to reason about.
+                        if ! mv "$DB_FILE-$_sidecar" "${_PRE_RESTORE}-${_sidecar}" 2>/dev/null; then
+                            _ROLLBACK_OK=true
+                            if $_MOVED_WAL; then
+                                mv "${_PRE_RESTORE}-wal" "$DB_FILE-wal" 2>/dev/null \
+                                    || _ROLLBACK_OK=false
+                            fi
+                            if $_MOVED_SHM; then
+                                mv "${_PRE_RESTORE}-shm" "$DB_FILE-shm" 2>/dev/null \
+                                    || _ROLLBACK_OK=false
+                            fi
+                            if $_ROLLBACK_OK; then
+                                die "could not move the live ${_sidecar} aside — the sidecars moved before it were moved back, so the live database is as it was. Quarantine retained."
+                            fi
+                            die "could not move the live ${_sidecar} aside AND a previously moved sidecar could not be moved back — the live DB is missing its WAL and/or SHM. Recover from ${_PRE_RESTORE}* before retrying. Quarantine retained."
+                        fi
                         # Record the ACTION, not whether the destination now exists:
                         # a stale artifact left at that path by an earlier run that
                         # shared the same epoch second would otherwise read as "we
