@@ -42,7 +42,9 @@ _EXPECTED_COLUMNS = {
 # _EXPECTED_COLUMNS — the parity check below asserts the canonical set is exactly
 # 0065's set plus these two approval columns, not that the two are identical.
 _APPROVAL_COLUMNS = {"approved_at", "approved_by"}
-_CANONICAL_COLUMNS = _EXPECTED_COLUMNS | _APPROVAL_COLUMNS
+# Added by 20260905155727_entity_adjudication_policy (MW-3 PR-2b).
+_POLICY_COLUMNS = {"policy"}
+_CANONICAL_COLUMNS = _EXPECTED_COLUMNS | _APPROVAL_COLUMNS | _POLICY_COLUMNS
 
 _BASE_ROW = {
     "id": "a-1",
@@ -141,7 +143,7 @@ async def test_fresh_canonical_parity(tmp_path):
         migrated_cols = await _columns(db)
     assert migrated_cols == _EXPECTED_COLUMNS
     assert fresh_cols == _CANONICAL_COLUMNS
-    assert fresh_cols == migrated_cols | _APPROVAL_COLUMNS
+    assert fresh_cols == migrated_cols | _APPROVAL_COLUMNS | _POLICY_COLUMNS
 
 
 @pytest.mark.asyncio
