@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import re
 import sqlite3
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Iterable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,68 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = genesis_db_path()
 
+
+def connect_sqlite_rw(
+    path: str | Path = DEFAULT_DB_PATH, *args: Any, **kwargs: Any
+) -> sqlite3.Connection:
+    """Return a synchronous RW connection after enforcing DB quarantine."""
+    from genesis.db.integrity import assert_not_quarantined
+
+    db_path = Path(path).expanduser().resolve()
+    assert_not_quarantined(db_path)
+    return sqlite3.connect(str(db_path), *args, **kwargs)
+
+
+class _GuardedAiosqliteConnector:
+    """Preserve aiosqlite's dual await/context API with open-time guards."""
+
+    def __init__(self, db_path: Path, kwargs: dict[str, Any]) -> None:
+        self._db_path = db_path
+        self._kwargs = kwargs
+        self._connection: aiosqlite.Connection | None = None
+
+    async def _open(self) -> aiosqlite.Connection:
+        from genesis.db.integrity import assert_not_quarantined
+
+        # Construction and opening are separate for aiosqlite.  Re-check here
+        # so a connector retained before quarantine cannot open afterward.
+        assert_not_quarantined(self._db_path)
+        connection = await aiosqlite.connect(str(self._db_path), **self._kwargs)
+        try:
+            # Quarantine may have become active while the worker thread opened
+            # SQLite.  Never return that newly opened writable handle.
+            assert_not_quarantined(self._db_path)
+        except BaseException as open_error:
+            try:
+                await connection.close()
+            except BaseException as close_error:
+                open_error.add_note(f"connection cleanup failed: {close_error!r}")
+            raise
+        self._connection = connection
+        return connection
+
+    def __await__(self) -> Generator[Any, None, aiosqlite.Connection]:
+        return self._open().__await__()
+
+    async def __aenter__(self) -> aiosqlite.Connection:
+        return await self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if self._connection is not None:
+            await self._connection.close()
+
+
+def connect_aiosqlite_rw(
+    path: str | Path = DEFAULT_DB_PATH, **kwargs: Any
+) -> _GuardedAiosqliteConnector:
+    """Return an awaitable/context-manager guarded through actual DB open."""
+    from genesis.db.integrity import assert_not_quarantined
+
+    db_path = Path(path).expanduser().resolve()
+    assert_not_quarantined(db_path)
+    return _GuardedAiosqliteConnector(db_path, kwargs)
+
+
 # Per-connection page cache. Negative = KiB (SQLite convention), so -262144 is
 # 256 MiB. SQLite's default is ~2 MiB, which forces hot read paths to keep
 # re-fetching pages instead of holding Genesis's working set resident. This is
@@ -45,10 +108,141 @@ CACHE_SIZE_KIB = -262144
 # pool cheap on small installs (64 MiB × a few connections stays comfortable).
 RO_CACHE_SIZE_KIB = -65536  # 64 MiB per read-only connection
 
-# Default read-pool size. Sized for the common "several concurrent CC sessions"
-# workload — reads are sub-second, so a handful of parallel readers clears the
-# checkout queue fast. Overridable via config; floor of 1 enforced in the pool.
-DEFAULT_READ_POOL_SIZE = 4
+# Default read-pool size — DERIVED from the host, not a fixed number.
+#
+# The previous fixed 4 was justified as "reads are sub-second, so a handful of
+# parallel readers clears the checkout queue fast". MEASURED 2026-09-08 on a live
+# install, that premise is false: reads are NOT sub-second under concurrency (the
+# recall stage alone reached ~2.4s at 6 concurrent recalls). MEASURED against the
+# then-shipped pool of 4, varying CONCURRENCY: 0 request-budget timeouts at 1, 2
+# and 4 concurrent recalls, 1/16 at 6, and 7/16 at 8, against a 4.5s route budget.
+#
+# STATE THE INFERENCE AS AN INFERENCE, because an earlier draft of this comment
+# did not: the experiment varied concurrency and held pool size FIXED at 4, so it
+# does not by itself establish that the knee sits AT the pool size — only that
+# timeouts begin once concurrency exceeds 4. That reading is strongly supported
+# by the mechanism (the (size+1)th recall blocks on checkout — designed
+# backpressure documented on ReadConnectionPool below, not a defect) and by the
+# `recall` stage scaling near-linearly with N while `embed` stays flat, which is
+# the serialisation signature. It is NOT supported by a pool-size sweep, because
+# none was run. A sweep varying size at fixed concurrency is what would close it.
+#
+# Each connection is one genuinely-parallel reader backed by one OS thread, so
+# CPU count is the honest driver: more readers than cores buys queueing, not
+# parallelism. Both bounds are explicit rather than implied:
+#   floor 4    — the previously shipped value, so a low-core box never REGRESSES.
+#   ceiling 12 — bounds the worst-case page cache (12 x RO_CACHE_SIZE_KIB =
+#                768 MiB) and covers observed session concurrency with headroom.
+#
+# The ceiling reads alarming next to the "a read pool multiplies the cache by its
+# size" note above, so the resident cost was MEASURED rather than assumed:
+# SQLite's cache_size is a LAZY ceiling, not an allocation. Against a ~88k-row
+# database driving real recall-shaped queries at full concurrency, a connection
+# costs ~0.65 MiB to open and ~5 MiB resident after sustained traffic — so 8
+# connections cost ~40 MiB, not 512 MiB. A much larger database or a wider scan
+# could push nearer the ceiling, which is why the ceiling exists at all.
+#
+# Overridable per install via GENESIS_RECALL_READ_POOL_SIZE; floor of 1 enforced
+# in the pool itself.
+MIN_READ_POOL_SIZE = 4
+MAX_READ_POOL_SIZE = 12
+
+# Per-SESSION read-pool size — a different ROLE, so a different number.
+#
+# There are exactly two pool constructors, and they have different CARDINALITY:
+#   runtime/init/memory.py    ONE per box  — the server, fielding EVERY session's
+#                             per-prompt recall against a 4.5s route budget.
+#   scripts/genesis_mcp_server.py  N per box — an MCP child per CC session,
+#                             serving that ONE session's explicit memory_recall
+#                             calls, which arrive essentially sequentially.
+# Sizing both from one host-derived default multiplies it by N: MEASURED with 6
+# live MCP children on an 8-core box, the derived size would open 7 x 8 = 56
+# pooled connections instead of 7 x 4 = 28 — roughly +140 MiB at the measured
+# ~5 MiB resident per connection, on a container already near its cgroup limit.
+# The core-bounded-parallelism argument does not survive that either: N
+# independent processes each sizing from the full host count share no budget.
+#
+# 2, and the number rests on the MEMORY arithmetic plus the bounded checkout
+# below — NOT on the two rationales a first draft gave, both of which were false
+# and are recorded here so they are not re-invented:
+#   "a session's MCP recalls are one-at-a-time" — FALSE. The MCP SDK starts a
+#     task per incoming message with no semaphore, and parallel subagents share
+#     the parent's MCP connection, so one child genuinely receives concurrent
+#     tool calls. Sequencing was an assumption about model behaviour, not a
+#     property of the system.
+#   "the second slot is headroom for a concurrent write-back" — IMPOSSIBLE. This
+#     pool is mode=ro; a write through a pooled handle raises SQLITE_READONLY,
+#     which tests/test_db/test_read_pool.py asserts directly. Write-backs run on
+#     the shared SerializedConnection. The second slot buys exactly the parallel
+#     read throughput that sentence denied.
+# What actually makes a small per-session pool safe is that checkout is BOUNDED
+# (DEFAULT_CHECKOUT_TIMEOUT_S): exhaustion degrades to the shared connection —
+# the pre-pool path — so a small pool costs LATENCY, never liveness. Without
+# that bound, halving the pool would have doubled the chance of an unbounded
+# wait in a process with no route timeout to catch it.
+# Net effect with 6 sessions: (6 x 2) + 8 = 20 connections, FEWER than today's 28,
+# while the central pool that actually hit the checkout knee doubles.
+DEFAULT_SESSION_READ_POOL_SIZE = 2
+
+# How long a caller waits for a free connection before taking the documented
+# fallback (the shared connection) instead of waiting longer.
+#
+# This exists because the pool's own class docstring outsources the bound to
+# "the route's own timeout", which is TRUE ONLY inside genesis-server. An MCP
+# child serves tool calls with no route budget, so an unbounded checkout there
+# waits forever — and a hung MCP tool call is effectively unrecoverable short of
+# the user interrupting, since the client-side tool timeout is enormous.
+#
+# 10s, and the two bounds that pick it:
+#   ABOVE normal contention. A recall's individual pooled reads are short; the
+#   slowest measured recall STAGE was ~2.4s and it spans several checkouts, so
+#   10s is far above anything a healthy holder needs. Timing out below that
+#   would thrash — every busy moment would abandon the pool.
+#   BELOW the busy_timeout a holder can legitimately absorb (15000ms in MCP
+#   children, per genesis_mcp_server.py; 5000ms default elsewhere). A reader
+#   parked behind a WAL checkpoint can hold its slot for that whole window; the
+#   right response for everyone BEHIND it is to stop waiting and use the shared
+#   connection, not to inherit its stall.
+# Falling back is cheap and correct: it is exactly the pre-pool code path, and
+# the pool is documented as an OPTIMISATION that must never make a read worse.
+DEFAULT_CHECKOUT_TIMEOUT_S = 10.0
+
+
+def available_cpu_count() -> int | None:
+    """CPUs available to THIS PROCESS, not to the host.
+
+    ``os.cpu_count()`` reports the host's logical CPUs, so inside a container
+    constrained by ``host-setup.sh --cpus N`` it OVERREPORTS: a 4-CPU container on
+    a 32-core host would size the pool from 32 and open the ceiling's worth of
+    readers, which is precisely the "more readers than cores buys queueing" case
+    the bounds exist to avoid. ``sched_getaffinity`` is what ``nproc`` reads.
+
+    Mirrors ``genesis.cc.session_cap._cpu_count``, whose docstring already
+    records this container behaviour. Deliberately DUPLICATED rather than
+    imported: ``db.connection`` is a low-level module and importing from
+    ``genesis.cc`` would invert the dependency direction. Worth consolidating
+    into a shared util if a third caller appears.
+    """
+    try:
+        return len(os.sched_getaffinity(0)) or None
+    except (AttributeError, OSError):
+        # Not Linux, or affinity unreadable — fall back to the host count.
+        return os.cpu_count()
+
+
+def derive_read_pool_size(cpu_count: int | None) -> int:
+    """Clamp a process-available CPU count into the read-pool bounds above.
+
+    A function rather than an inline expression so the derivation has a testable
+    seam: ``DEFAULT_READ_POOL_SIZE`` is evaluated at import time, so a test that
+    monkeypatches the count source and re-reads the constant measures nothing
+    (the module is already cached). ``cpu_count`` is passed in for the same
+    reason. ``None`` (an unknowable count) takes the floor, never 1.
+    """
+    return max(MIN_READ_POOL_SIZE, min(cpu_count or MIN_READ_POOL_SIZE, MAX_READ_POOL_SIZE))
+
+
+DEFAULT_READ_POOL_SIZE = derive_read_pool_size(available_cpu_count())
 
 # Schema migrations run rarely (deploy / server startup) but must win the write
 # lock even when other processes (concurrent CC-session MCP servers) are writing.
@@ -238,6 +432,7 @@ class SerializedConnection:
             "_max_errors",
             "_txn_owner",
             "_op_epoch",
+            "_db_path",
         }
     )
 
@@ -248,6 +443,7 @@ class SerializedConnection:
         conn: aiosqlite.Connection,
         *,
         reconnect_fn: Callable[[], Awaitable[aiosqlite.Connection]] | None = None,
+        db_path: Path | None = None,
     ) -> None:
         object.__setattr__(self, "_conn", conn)
         object.__setattr__(self, "_lock", asyncio.Lock())
@@ -267,6 +463,7 @@ class SerializedConnection:
         # nothing will ever close it). Without it the wait is progress-blind and
         # a busy connection is misreported as a wedge.
         object.__setattr__(self, "_op_epoch", 0)
+        object.__setattr__(self, "_db_path", db_path)
 
     # -- Attribute passthrough (e.g. row_factory, in_transaction) ----------
 
@@ -352,6 +549,10 @@ class SerializedConnection:
         slept = 0.0
         for attempt in range(1, attempts + 1):
             try:
+                if self._db_path is not None:
+                    from genesis.db.integrity import assert_not_quarantined
+
+                    assert_not_quarantined(self._db_path)
                 result = await fn()
                 self._reset_error_count()
                 # Progress signal for transaction()'s entry wait: every completed
@@ -526,6 +727,10 @@ class SerializedConnection:
         async def _locked() -> aiosqlite.Cursor:
             self._refuse_inside_txn("executescript")  # (F-B) — see _refuse_inside_txn
             async with self._lock:
+                if self._db_path is not None:
+                    from genesis.db.integrity import assert_not_quarantined
+
+                    assert_not_quarantined(self._db_path)
                 try:
                     result = await self._conn.executescript(sql)
                     self._reset_error_count()
@@ -563,6 +768,11 @@ class SerializedConnection:
         # raw cursor can issue COMMIT with nothing here able to observe it.
         # Guarding this method ALONE would be theatre — execute() hands out the
         # same class — so the wrapper is applied at every cursor-returning site.
+        # Union with main #2165: also refuse a cursor onto a quarantined DB file.
+        if self._db_path is not None:
+            from genesis.db.integrity import assert_not_quarantined
+
+            assert_not_quarantined(self._db_path)
         async with self._maybe_lock():
             return self._guard_cursor(await self._conn.cursor())
 
@@ -832,6 +1042,9 @@ async def get_db(
     deliberate, separate decision).
     """
     path = Path(path)
+    from genesis.db.integrity import assert_not_quarantined
+
+    assert_not_quarantined(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     async def _configure(conn: aiosqlite.Connection) -> None:
@@ -856,11 +1069,12 @@ async def get_db(
 
     # Build reconnect closure (SQLite-specific; replace for PostgreSQL)
     async def _reconnect() -> aiosqlite.Connection:
+        assert_not_quarantined(path)
         conn = await aiosqlite.connect(str(path))
         await _configure(conn)
         return conn
 
-    return SerializedConnection(db, reconnect_fn=_reconnect)
+    return SerializedConnection(db, reconnect_fn=_reconnect, db_path=path)
 
 
 @asynccontextmanager
@@ -881,6 +1095,9 @@ async def get_raw_db(
     shared across coroutines. Yields the connection and closes it on exit.
     """
     path = Path(path)
+    from genesis.db.integrity import assert_not_quarantined
+
+    assert_not_quarantined(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     db = await aiosqlite.connect(str(path))
     try:
@@ -967,10 +1184,12 @@ class ReadConnectionPool:
         *,
         size: int = DEFAULT_READ_POOL_SIZE,
         cache_size_kib: int = RO_CACHE_SIZE_KIB,
+        checkout_timeout_s: float = DEFAULT_CHECKOUT_TIMEOUT_S,
     ) -> None:
         self._path = str(Path(path))
         self._size = max(1, size)
         self._cache_size_kib = cache_size_kib
+        self._checkout_timeout_s = checkout_timeout_s
         self._queue: asyncio.Queue[aiosqlite.Connection] = asyncio.Queue()
         self._all: list[aiosqlite.Connection] = []
         self._closed = False
@@ -981,14 +1200,48 @@ class ReadConnectionPool:
         return self._size
 
     async def open(self) -> None:
-        """Open all connections and fill the checkout queue. Idempotent."""
+        """Open all connections and fill the checkout queue. Idempotent.
+
+        TRANSACTIONAL: if any connection fails to open, every one already opened
+        is closed before the error propagates. Without that, a partial open
+        leaked permanently — the caller
+        (``runtime/init/memory.py``) catches, logs "degraded, not broken", and
+        sets the pool reference to ``None``, so the half-built pool became
+        unreachable with live connections still open, and EACH aiosqlite
+        connection owns a running worker thread. A larger default makes the
+        partial case likelier (an fd or thread ceiling is reached mid-loop), which
+        is what turned a latent leak into a real one.
+
+        ``BaseException`` on purpose: a ``CancelledError`` during shutdown leaks
+        exactly the same way, and it is not an ``Exception``.
+        """
         if self._opened:
             return
-        for _ in range(self._size):
-            conn = await open_ro_connection(self._path, cache_size_kib=self._cache_size_kib)
-            self._all.append(conn)
-            self._queue.put_nowait(conn)
+        try:
+            for _ in range(self._size):
+                conn = await open_ro_connection(self._path, cache_size_kib=self._cache_size_kib)
+                self._all.append(conn)
+                self._queue.put_nowait(conn)
+        except BaseException:
+            await self._rollback_partial_open()
+            raise
         self._opened = True
+
+    async def _rollback_partial_open(self) -> None:
+        """Close and forget every connection opened by a failed :meth:`open`.
+
+        Leaves ``_closed`` False: the pool is simply UN-opened, so ``acquire``
+        raises ``ReadPoolClosed`` and callers take their documented fallback to
+        the shared connection. Marking it closed would be indistinguishable to
+        callers but would make a retry of ``open()`` impossible.
+        """
+        for conn in self._all:
+            with suppress(Exception):
+                await conn.close()
+        self._all.clear()
+        while not self._queue.empty():  # drop the handles we just closed
+            with suppress(asyncio.QueueEmpty):
+                self._queue.get_nowait()
 
     @asynccontextmanager
     async def acquire(self) -> AsyncIterator[aiosqlite.Connection]:
@@ -1000,10 +1253,29 @@ class ReadConnectionPool:
         is safe for autocommit ``mode=ro`` reads (no dangling transaction). If
         the pool was closed while the connection was held, it is dropped rather
         than returned (``close()`` closes every ``self._all`` connection).
+
+        CHECKOUT IS BOUNDED. The class docstring above outsources the bound to
+        "the route's own timeout", and that is only true inside genesis-server:
+        an MCP child serves tool calls with NO route budget, so a bare
+        ``queue.get()`` there waits forever. That matters because a pooled reader
+        can legitimately park for the full ``busy_timeout`` (15s in MCP children)
+        behind a WAL checkpoint — on a small pool two such readers hold every
+        slot, and everything behind them blocked with no timeout at any layer,
+        silently, since nothing logs contention.
+        Exhaustion now degrades to ``ReadPoolClosed``, which every caller already
+        handles by falling back to the shared connection — the pre-pool
+        behaviour. That is what keeps the pool's founding promise (an
+        OPTIMISATION, "never worse than without it") true under saturation
+        instead of only under failure, and it is what makes a SMALL pool cost
+        latency rather than liveness.
         """
         if self._closed or not self._opened:
             raise ReadPoolClosed
-        conn = await self._queue.get()
+        try:
+            conn = await asyncio.wait_for(self._queue.get(), timeout=self._checkout_timeout_s)
+        except TimeoutError:
+            # Not an error: the documented fallback, taken deliberately.
+            raise ReadPoolClosed from None
         try:
             yield conn
         finally:

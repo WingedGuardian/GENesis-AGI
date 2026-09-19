@@ -1,0 +1,1 @@
+- Merge gate: a duplicated CI dispatch no longer wedges the scheduled-review relief. When one commit carries both a cancelled and a successful run of the same job, the leaks relief now drops the superseded cancel exactly as the CI check already did, so a single `--check-pr` can no longer report CI green while telling you a green job is not green.

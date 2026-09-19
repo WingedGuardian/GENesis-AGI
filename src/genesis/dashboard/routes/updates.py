@@ -15,6 +15,7 @@ from pathlib import Path
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import blueprint
+from genesis.db.connection import connect_sqlite_rw
 from genesis.env import update_in_progress
 
 logger = logging.getLogger(__name__)
@@ -74,7 +75,7 @@ def _execute_db(sql: str, params: tuple = ()) -> bool:
         return False
     conn = None
     try:
-        conn = sqlite3.connect(str(_DB_PATH), timeout=5)
+        conn = connect_sqlite_rw(_DB_PATH, timeout=5)
         conn.execute(sql, params)
         conn.commit()
         return True
@@ -201,21 +202,31 @@ def update_check():
             "summary": None,
         })
 
-    # Different tags or no tags — count commits and build summary
-    commits_behind = 0
-    summary = None
-
-    if local_tag and origin_tag:
-        # Count between tags (meaningful range, ignores squash noise)
-        behind_str = _git("rev-list", "--count", f"{local_tag}..{origin_tag}")
-        commits_behind = int(behind_str) if behind_str and behind_str.isdigit() else 1
-        summary = _git("log", "--oneline", "--no-merges", f"{local_tag}..{origin_tag}")
-    else:
-        # Fallback to commit-based when tags are missing
-        behind_str = _git("rev-list", "--count", "HEAD..origin/main")
-        commits_behind = int(behind_str) if behind_str and behind_str.isdigit() else 0
-        if commits_behind > 0:
-            summary = _git("log", "--oneline", "--no-merges", "HEAD..origin/main")
+    # Different tags or no tags — count from the DEPLOYED COMMIT, never between
+    # the release tags. The second copy of the same defect: this endpoint feeds a
+    # dashboard card reading "N commit(s) behind", and counting tag-to-tag made
+    # that number describe the release span rather than the reader. See the note
+    # in learning/signals/genesis_version.py for the measurement; the correct
+    # shape is observability/snapshots/deploy_health.py's
+    # `commits_behind_upstream`.
+    behind_str = _git("rev-list", "--count", "HEAD..origin/main")
+    if behind_str is None or not behind_str.isdigit():
+        # A failed measurement is not a distance, and every number we could
+        # invent here is a lie in one direction or the other: 0 renders as "up
+        # to date" and CLEARS a known update, while 1 fabricates a distance
+        # nobody counted. Both wear the grammar of a measurement — the exact
+        # defect this endpoint was changed to stop telling. Report the failure
+        # through the same 502 the fetch failure above already uses, which the
+        # dashboard surfaces as "Check failed" and which cannot overwrite a
+        # previously detected update.
+        logger.error("git rev-list HEAD..origin/main failed; distance unknown")
+        return jsonify({"error": "could not measure distance from origin/main"}), 502
+    commits_behind = int(behind_str)
+    summary = (
+        _git("log", "--oneline", "--no-merges", "HEAD..origin/main")
+        if commits_behind > 0
+        else None
+    )
 
     return jsonify({
         "commits_behind": commits_behind,

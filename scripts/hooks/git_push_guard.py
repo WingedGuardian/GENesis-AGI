@@ -62,22 +62,23 @@ post a comment (issue comment) or PR review whose body contains a marker
 ``<!-- genesis-scheduled-review: head=<full-40-hex-sha> kind=<name> -->`` naming the exact
 head it reviewed AND which routine it was (``kind``). The merge gate
 (``_check_scheduled_claude_reviewed_head``) blocks unless an owner-authored marker for
-EVERY effective required kind (``_required_scheduled_review_kinds()`` — DEFAULT
-code-review + leaks, with the leak scanner irreducible; an install may relax the optional
-kinds to advisory via ``merge_gate.required_scheduled_reviews`` in genesis.yaml) names
+EVERY effective required kind (``_required_scheduled_review_kinds()`` — DEFAULT ``leaks``
+alone, which is also irreducible; ``code-review`` is ADVISORY by default because no
+routine emits its marker, and an install that runs one re-arms it via
+``merge_gate.required_scheduled_reviews`` in genesis.yaml) names
 the PR's CURRENT head — so if any required routine never ran, ran on a stale commit, or
 was rate-limited, the merge is blocked (naming the missing kinds). An ADVISORY routine
-(one relaxed out of the required set locally) still posts its review on the PR to be read
+still posts its review on the PR to be read
 and addressed, but its absence does not block. SCOPE: this gate
 enforces ONLY when the merge targets the configured PUBLIC repo — the declared
 ``github.user``/``github.public_repo`` in ``~/.genesis/config/genesis.yaml``
 (``_scheduled_gate_applies`` / ``_canonical_public_repo``). A merge to any OTHER repo
 (a private fork, the voice repo, backups) no-ops, since the required ``/schedule``
-routines run only on the public repo. Deployment note: on the public repo the required
-routines ARE configured (the deploy precondition); a clone that runs on its own public
-repo without a producer uses `# scheduled-review-override` (or relaxes the optional kinds
-via ``merge_gate.required_scheduled_reviews``) — the override valve is the escape by design, not an
-opt-in flag. Fail-closed on scope uncertainty: if the canonical repo is undeterminable
+routines run only on the public repo. Deployment note: on the public repo the leaks
+routine IS configured (the deploy precondition); a clone that runs on its own public
+repo without a producer uses `# scheduled-review-override` — since the only default kind
+is the irreducible one, config cannot relax it, and the override valve is the escape by
+design, not an opt-in flag. Fail-closed on scope uncertainty: if the canonical repo is undeterminable
 the gate ENGAGES rather than silently disarming.
 A DISMISSED or PENDING (draft) review no longer vouches (its marker is ignored), mirroring
 the Codex path. The marker means "ran CLEAN", not merely "ran": a review whose body carries a
@@ -100,7 +101,10 @@ not treat untrusted PR content as instructions when composing its comment body.
 from __future__ import annotations
 
 import base64
+import contextlib
+import datetime as _dt
 import hashlib
+import html
 import json
 import os
 import re
@@ -108,6 +112,7 @@ import shlex
 import subprocess
 import sys
 import time
+import unicodedata
 
 # Self-locate so `from hook_input import …` resolves both when CC runs this as a
 # script (sys.path[0] is this dir) AND when it is imported as a module for tests
@@ -116,7 +121,39 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # scripts/ (parent dir) for review_state — the shared escalation-cap constant, so
 # the Codex-round gate below and the commit gate's Rule 3 stop at the same N.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from hook_input import field, read_payload, run_guard  # noqa: E402
+try:
+    from hook_input import degraded_exit, field, read_payload, run_guard  # noqa: E402
+except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must block.
+    if __name__ != "__main__" or sys.argv[1:2] == ["--check-pr"]:
+        raise
+    # Reverse version skew: this guard may be newer than hook_input.py. Nothing
+    # imported from that older helper can recover us, so fail closed locally. Do
+    # not render the exception — even __str__ can raise — and use os._exit so a
+    # broken diagnostic stream cannot replace exit 2 during interpreter shutdown.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (git_push_guard): shared hook_input is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
+
+try:
+    from native_approval import emit_native_ask  # noqa: E402
+except Exception as _approval_exc:  # noqa: BLE001 — missing new helper must block.
+    if __name__ != "__main__" or sys.argv[1:2] == ["--check-pr"]:
+        raise
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (git_push_guard): native approval helper is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:
+        pass
+    os._exit(2)
 
 # SOFT dependency (mirrors review_enforcement_commit.py's guard for the SAME
 # import): an unimportable review_state must degrade ONLY the round-escalation
@@ -133,25 +170,103 @@ except Exception:  # noqa: BLE001 — ANY failure (absent OR broken: SyntaxError
     ESCALATION_ROUND_CAP = 3  # the genesis-development SKILL.md prose cap
     FINAL_ROUND_CAP = 7  # keep in step with review_state.FINAL_ROUND_CAP
 
-from shell_parse import (  # noqa: E402
-    analyze,
-    analyze_checked,
-    commit_skips_hooks,
-    gh_pr_subcommand,
-    git_subcommand,
-    has_trailing_override,
-    split_segments,
+try:
+    from review_deadline import bounded_timeout as _bounded_timeout  # noqa: E402
+except Exception:  # Reverse skew: retain a conservative fail-fast local fallback.
+    def _bounded_timeout(deadline, cap, *, monotonic=time.monotonic):
+        if deadline is None:
+            return cap
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise RuntimeError("aggregate review-gate deadline expired")
+        return min(cap, remaining)
+
+# The cloud-backed round budget is a newer soft dependency than this guard. A
+# missing/broken evaluator is UNKNOWN, never "zero rounds"; the request gate
+# turns that into a native ask (foreground) or a deny (autonomous).
+try:
+    import review_budget as _review_budget  # noqa: E402
+except Exception:  # noqa: BLE001 — reverse-skew must not crash every guard.
+    _review_budget = None
+
+# SOFT dependency, for the reason spelled out directly above: this module is
+# NEW, and audit LOGGING must never be able to disarm the gates it audits. If it
+# cannot be imported, logging degrades to a no-op (guarded in _flush_overrides)
+# rather than taking every fail-closed gate in this file down with it.
+try:
+    import audit_jsonl  # noqa: E402
+except Exception:  # noqa: BLE001 — see above: a load failure exits 1 = non-blocking.
+    audit_jsonl = None
+
+# DEGRADED-path mention set, defined ABOVE the guarded import so it survives that
+# import failing. It mirrors `_GATED_MENTION` below (same verbs and flags, same
+# deliberate breadth, same reasoning) and adds `gh` and `sqlite3`, because on this
+# path there is no parse to narrow with at all. Kept as its own literal rather than
+# shared: sharing would place the constant after the import it has to outlive.
+# Word-boundary rather than a trailing separator class, for the reason spelled out at
+# `_GATED_MENTION`: the anchor was a narrowing conjunct and every ordinary shell
+# separator starved it. Both copies carried it, so both were corrected — fixing the
+# degraded one alone would have left the LIVE net starved while the comment claimed
+# the class was closed.
+_DEGRADED_GATED = (
+    r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b"
+    r"|\b(?:push|merge)\b|\bgh\b|\bsqlite3\b"
 )
+
+try:
+    from shell_parse import (  # noqa: E402
+        _KNOWN_SIGILS,
+        analyze,
+        analyze_checked,
+        commit_skips_hooks,
+        gh_pr_subcommand,
+        git_subcommand,
+        has_trailing_override,
+        split_segments,
+    )
+except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
+    if __name__ != "__main__" or (len(sys.argv) >= 3 and sys.argv[1] == "--check-pr"):
+        # Two cases that must NOT degrade. A test importing a broken tree needs the
+        # real error. And `--check-pr` is a HUMAN-run CLI read that takes no stdin:
+        # degrading there would block on a terminal read and then exit 2 at someone
+        # who only asked a question. Let both see the traceback.
+        #
+        # The arity matches the REAL dispatch (`len(sys.argv) >= 3` at the bottom of
+        # this file), not just the flag. An earlier form tested the flag alone, so a
+        # bare `--check-pr` with no PR number took the CLI carve-out on a broken tree
+        # and the hook path on a healthy one — a carve-out whose boundary did not
+        # match the thing it was carving out.
+        raise
+    # No sigil is honoured on this path. That is now true of every caller — see
+    # degraded_exit, whose substring-based waiver was measured allowing two decoys —
+    # but it was decided FIRST here and for a stronger reason worth keeping: this
+    # file's sigils (stale-review-override, ci-override, merge-to-main-override …)
+    # authorise a PUBLISH past review gates, so honouring one with every gate in this
+    # file already proven absent is the precise combination the net exists to prevent.
+    degraded_exit("git_push_guard", gated=_DEGRADED_GATED, exc=_exc)
 
 # Mentions of a GATED operation, consulted ONLY on the un-parseable path where
 # analyze() has gone blind. Deliberately BROAD — both the gated verbs and the
-# destructive flags — because the outcome there is an approval PROMPT, not a
-# block: an over-match costs one confirmation, while an under-match silently
-# runs an unverified publish. (An earlier flag-only, hard-block version had to be
-# surgically precise, and precision is exactly what an unreliable parse cannot
-# deliver — every narrowing conjunct became a new way to starve the trigger.)
+# destructive flags.
+#
+# The breadth SURVIVES the 2026-09-08 ruling that made the outcome a DENY rather
+# than a prompt, and the reason has changed with it: an over-match now costs the
+# AGENT one rewrite that the deny message spells out, where it used to cost a
+# human one confirmation. An under-match still silently runs an unverified
+# publish. The asymmetry is intact, so do NOT narrow this — an earlier
+# flag-only, hard-block version had to be surgically precise, and precision is
+# exactly what an unreliable parse cannot deliver: every narrowing conjunct
+# became a new way to starve the trigger (measured).
+# THE TRAILING ANCHOR WAS ITSELF A NARROWING CONJUNCT — the exact thing the paragraph
+# above forbids, sitting inside the pattern it forbids it in. `(?:\s|=|$)` requires
+# whitespace, `=` or end-of-string AFTER the flag, so every ordinary shell separator
+# starved it. MEASURED on the literal pattern: `git commit --no-verify -m x` matched,
+# while `--no-verify;`, `--no-verify&`, `--no-verify|cat` and `(… --no-verify)` did
+# NOT. A word boundary asks the one thing that was meant — that the flag is a whole
+# token — without naming the characters that may follow it. MEASURED cost of the
+# widening over 74,282 real commands: 15,945 -> 15,995, i.e. +50 (+0.07%).
 _GATED_MENTION = re.compile(
-    r"(?:^|\s)(?:--force(?:-with-lease)?|--no-verify|--admin)(?:\s|=|$)|\b(?:push|merge)\b"
+    r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b|\b(?:push|merge)\b"
 )
 
 # `gh pr create` is the FOURTH gated operation (it can push or fork the branch —
@@ -170,6 +285,13 @@ _GATED_MENTION = re.compile(
 # nothing and would have measured 0 false positives by never firing at all.
 _GH_MENTION = re.compile(r"\bgh\b")
 _CREATE_MENTION = re.compile(r"\bcreate\b")
+
+#: The programs whose SUBCOMMAND this guard gates. Used on the blind path to ask
+#: whether a segment that resolved to one of them left its operation unreadable —
+#: the one blind-spot shape `_mentions_gated_op` structurally cannot see, because
+#: the operation's name is the missing part. Every gated op in this file is a
+#: subcommand of one of these two.
+_GATED_EXES = frozenset({"git", "gh"})
 
 
 def _mentions_gated_op(command: str) -> bool:
@@ -192,6 +314,12 @@ try:
 except Exception:  # noqa: BLE001 — see the review_state guard's rationale (108-114)
     push_allowlist = None
 
+try:
+    import discarded_write  # noqa: E402 — scripts/hooks is on sys.path[0]
+except Exception:  # noqa: BLE001 — same rationale: an unguarded import failure would
+    # abort module load → exit 1 → CC reads non-2 as NON-blocking → the push RUNS.
+    discarded_write = None
+
 # Sentinel: the effective cwd cannot be confidently resolved (a cd into a
 # variable/command-substitution, a subshell, or a target nested at depth>0).
 # Callers MUST fail closed on it — block the merge, do not soften a force push.
@@ -199,8 +327,23 @@ _CWD_UNKNOWN = object()
 
 # git global options that consume the FOLLOWING token as their value — used to
 # skip past `git -C <dir>` / `git -c KEY=VAL` when locating a push's positionals.
+# MEASURED against the installed binary, never `git -h` (which omits
+# `--attr-source` while git accepts it). A missing member is the fail-open
+# direction: the option's value is read as the subcommand, so a publish
+# preceded by it is never seen. Locked identical to the other three copies by
+# tests/test_hooks/test_value_flag_consistency.py.
 _GIT_GLOBAL_VALUE_FLAGS = frozenset(
-    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"}
+    {
+        "-C",
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--super-prefix",
+        "--config-env",
+        "--attr-source",
+        "--shallow-file",
+    }
 )
 
 
@@ -335,6 +478,18 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
     blocked (unless overridden). A detached HEAD ("") is left allowed.
     """
     # depth>0 merges cannot be associated with a top-level cwd → fail closed.
+    #
+    # DELIBERATELY NOT LOGGED, here or below. `# merge-to-main-override` waives a
+    # gate this function short-circuits BEFORE resolving the branch, so a row
+    # could only ever say "the ack was typed" — never that the gate would have
+    # fired. MEASURED on a real repo checked out at a feature branch, where the
+    # gate would have allowed the merge anyway: the row still claimed
+    # `waived: local-merge-into-main`, with pr, repo and head all empty. That
+    # asserts a waiver that was never consulted, in a store whose entire purpose
+    # is answering "was this escape reached for?", and the row carries nothing to
+    # reconcile it against. An honest row needs the branch resolved first; see
+    # the follow-up. `# escalation-ack` belongs to the local commit-streak gate;
+    # `# final-round-accept` is recognized only for stale-tree compatibility.
     for s in merge_git_segs:
         if getattr(s, "depth", 0) > 0 and not has_trailing_override(
             s.raw, "merge-to-main-override"
@@ -474,8 +629,12 @@ _MERGE_GATE_BUDGET_S = 45.0
 # Shared merge-path deadline (a monotonic() instant). main() sets it once before the
 # gh-pr-merge gates; every merge-path gh call reads it via _gh_timeout so the AGGREGATE
 # finishes with headroom under the hook's ~60s wall-clock. A module global is safe:
-# this PreToolUse hook is a SINGLE-SHOT process (one command, no concurrency), and it
-# stays None on every other path (push, the --check-pr report) → those use full caps.
+# this PreToolUse hook is a SINGLE-SHOT process, so one deadline per
+# invocation is the whole lifecycle. ARMED AT THE TOP OF
+# `_run_merge_and_push_gates` for EVERY path it guards — the push path
+# included, which used to inherit it only as a side effect of the escalation
+# gate. It stays None on the `--check-pr` reporting path, which is not a hook
+# invocation and has no registration to overrun, so that one uses full caps.
 _merge_deadline: float | None = None
 
 
@@ -483,13 +642,10 @@ def _gh_timeout(cap: float) -> float:
     """Per-call subprocess timeout under the shared merge-path deadline (``_merge_deadline``).
 
     ``cap`` when no merge deadline is set (every non-merge caller, and the tests, are
-    unaffected). Under a deadline, the smaller of ``cap`` and the time remaining, floored
-    at 1s so a nearly-expired budget makes the call fail FAST — its caller's existing
-    error path then returns its fail-closed/open value — rather than overrun the
-    wall-clock and get the whole hook SIGKILLed mid-gate. Never raises."""
-    if _merge_deadline is None:
-        return cap
-    return max(1.0, min(cap, _merge_deadline - time.monotonic()))
+    unaffected). Under a deadline, the smaller of ``cap`` and the time remaining.
+    An expired budget raises before another process starts; the outer fail-closed
+    guard or a caller's explicit error path then decides safely."""
+    return _bounded_timeout(_merge_deadline, cap, monotonic=time.monotonic)
 
 
 def _derive_repo_from_cwd(cwd: str) -> str | None:
@@ -689,8 +845,10 @@ _CI_PENDING_STATES = {"PENDING", "EXPECTED"}
 # almost always by a `concurrency: cancel-in-progress` supersession, which leaves
 # the cancelled dup attached to the head commit. It is red BY DEFAULT (it is also
 # in _CI_RED_CONCLUSIONS), and dropped ONLY when a check of the SAME identity
-# (name + workflowName, see _ci_identity) concluded SUCCESS at-or-after it on this
-# head (so a SUCCESS-then-cancel re-run on an unchanged head still blocks).
+# (name + workflowName, see _ci_identity) concluded SUCCESS STRICTLY AFTER it on this
+# head (so a SUCCESS-then-cancel re-run on an unchanged head still blocks, and so does
+# an EQUAL second-precision timestamp, which orders nothing — see
+# _drop_superseded_cancels for why an unprovable ordering fails closed).
 # Deliberately scoped to CANCELLED alone: FAILURE/TIMED_OUT/ACTION_REQUIRED/
 # STARTUP_FAILURE carry real verdicts and always block, even with a success sibling.
 _CI_CANCEL_CONCLUSIONS = {"CANCELLED"}
@@ -735,18 +893,152 @@ def _ci_identity(c: dict) -> tuple[str, str] | None:
     return None
 
 
+def _ci_completed_at(entry: dict) -> _dt.datetime | None:
+    """A check-run's ``completedAt`` as an OFFSET-AWARE datetime, or None.
+
+    None on anything that cannot be established: absent, blank, unparseable, or
+    parsed but NAIVE. A NON-STRING value is the one shape that does not return
+    None -- ``.strip()`` raises AttributeError out of this helper, which
+    ``run_guard`` converts to exit 2, a BLOCK. Unreachable from GitHub (the
+    ``DateTime`` scalar is string-or-null) and fail-closed either way, but the
+    enumeration above would otherwise be false. Every caller treats None as "cannot be compared", which on
+    this path means an unparseable SUCCESS supersedes nothing and an unparseable
+    CANCEL is kept — the fail-closed direction.
+
+    Naive is rejected rather than assumed UTC. Comparing a naive datetime against
+    an aware one raises TypeError, and the alternative to rejecting it is guessing
+    a zone, which is exactly the kind of assumption this function exists to stop
+    relying on. GitHub has always sent an offset; if it ever sends a bare value,
+    the gate should get stricter, not luckier.
+    """
+    raw = (entry.get("completedAt") or "").strip()
+    if not raw:
+        return None
+    try:
+        # `fromisoformat` accepts a literal `Z` from 3.11, but normalising first
+        # costs nothing and keeps this readable against older interpreters.
+        parsed = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _drop_superseded_cancels(checks: list) -> list:
+    """Return *checks* with superseded ``concurrency: cancel-in-progress`` duplicates
+    removed — a CANCELLED CheckRun is dropped ONLY when a SUCCESS of the EXACT same
+    ``(name, workflowName)`` identity completed STRICTLY AFTER it; every other entry is
+    returned unchanged, in order.
+
+    STRICTLY after, not at-or-after. ``completedAt`` is second-precision, so an EQUAL
+    timestamp does not order the two runs at all — it says only that they finished in
+    the same second, which is not evidence that the success came second. On a
+    supersession the successful run STARTS when the cancel fires and finishes a whole
+    job later, so a tie is not even the shape this drop exists to recognise; a tie is
+    far likelier to be two unrelated runs, or a genuinely-cancelled latest attempt.
+    An unprovable ordering therefore fails CLOSED, like every other unresolvable case
+    below. MEASURED before tightening (the Actions runs API over 400 runs / 2 days,
+    30 real cancelled jobs on 25 shas): 18/30 had a strictly-later success, 12/30 had
+    none, and **0/30 turned on a tie** — so this costs nothing observed, and 30 is a
+    small denominator, which is precisely why the direction matters more than the
+    rate: being wrong here over-blocks, it cannot wrong-green.
+
+    THE ONE home of that rule. It had two: ``_pr_ci_status`` (which has always
+    applied it) and ``_mechanical_scan_is_green`` (added later, which re-derived a
+    naive ``all(c == "SUCCESS")`` and never handled a cancel at all). A doubled
+    workflow dispatch — two ``pull_request`` runs for one sha, leaving EVERY
+    check-run as a success+cancelled pair — made the two disagree about one payload
+    inside ONE process: ``ci: green`` alongside "'leak-detector' is not green at
+    this head", a message that sends the reader to inspect a job that is green.
+    Deterministic for as long as that head stands, not a flake. Any FUTURE consumer
+    of check-run conclusions calls this rather than re-deriving it a third time.
+
+    Every condition below fails CLOSED — a cancel that cannot be PROVEN superseded
+    is returned, and the caller's own red/not-green logic then sees it:
+
+    * Only GitHub Actions CheckRuns with a resolvable identity AND a ``completedAt``
+      may serve as the superseding sibling (``_ci_identity`` → None for a legacy
+      StatusContext or a non-Actions check; a timestampless SUCCESS is skipped). So
+      a StatusContext SUCCESS can never drop a same-named CheckRun cancel.
+    * A cancel with no identity, no ``completedAt``, or no qualifying success STAYS.
+      That includes SUCCESS-then-cancel on an unchanged head: the latest attempt
+      never passed, so nothing supersedes the cancel.
+    * ONLY ``_CI_CANCEL_CONCLUSIONS`` (deliberately ``{"CANCELLED"}`` alone) is
+      droppable. FAILURE / TIMED_OUT / ACTION_REQUIRED / STARTUP_FAILURE / STALE
+      carry real verdicts and are never dropped, whatever completed beside them —
+      so this can never widen into "ignore anything that is not SUCCESS".
+    * Non-terminal entries (an in-flight re-run) are not conclusions and are never
+      touched; the caller still counts them PENDING.
+    * Entries that are not dicts are passed through untouched, so a caller's own
+      shape checks still see the payload it was given.
+
+    Comparison PARSES both ``completedAt`` values and compares datetimes, in both
+    passes. This is NOT the pulled #1420 finding-magnet, which sorted the WHOLE set
+    (including QUEUED runs with a null ``startedAt``) to pick a global "latest".
+
+    IT USED TO BE A LEXICOGRAPHIC STRING COMPARE, and the reason it no longer is
+    was written down here before it was acted on. GitHub's GraphQL ``completedAt``
+    is emitted as second-precision UTC with a literal ``Z`` (MEASURED 2017/2017
+    entries across 122 PR rollups — every one ``Z``-suffixed with no fractional
+    part). That is an OBSERVATION, not a contract: the schema documents the
+    ``DateTime`` scalar only as "An ISO-8601 encoded UTC date string", which
+    constrains neither sub-second precision nor the offset spelling. String order
+    equals chronological order only while EVERY value shares one format, and two
+    real shapes break it — a ``+00:00`` offset instead of ``Z``, and fractional
+    seconds (``'Z'`` sorts ABOVE ``'.'``, so a SUCCESS at ``:00Z`` compares as later
+    than a cancel at ``:00.9Z`` and wrongly drops it). The consequence is not
+    cosmetic: `_mechanical_scan_is_green` consumes this, so a reversed ordering
+    drops a real cancellation and carries an old leaks review forward — and under
+    ``# ci-override`` that relief is the only remaining check of the mechanical
+    layer. An observation is not a thing to gate on when parsing costs one call.
+
+    ``_ci_completed_at`` fails CLOSED on anything it cannot parse into an
+    OFFSET-AWARE datetime, including a naive value: an unparseable SUCCESS cannot
+    supersede anything, and an unparseable CANCEL is kept. Naive is excluded rather
+    than assumed-UTC because comparing naive against aware raises, and guessing a
+    zone to avoid that is how a wrong-green gets built.
+    """
+    # Pass 1: the latest completedAt among SUCCESS runs, per strict identity.
+    success_latest: dict[tuple[str, str], _dt.datetime] = {}
+    for c in checks:
+        if not isinstance(c, dict) or c.get("conclusion") not in _CI_GREEN:
+            continue
+        ident = _ci_identity(c)
+        ts = _ci_completed_at(c)
+        if ident is None or ts is None:
+            continue
+        known = success_latest.get(ident)
+        if known is None or ts > known:
+            success_latest[ident] = ts
+
+    # Pass 2: drop only the cancels pass 1 proves superseded. STRICTLY after, so a
+    # tie keeps the cancel: equal second-precision stamps make the ordering
+    # unprovable, and unprovable must not mean droppable.
+    kept: list = []
+    for c in checks:
+        if isinstance(c, dict) and c.get("conclusion") in _CI_CANCEL_CONCLUSIONS:
+            ident = _ci_identity(c)
+            cts = _ci_completed_at(c)
+            if ident is not None and cts is not None:
+                latest = success_latest.get(ident)
+                if latest is not None and latest > cts:
+                    continue
+        kept.append(c)
+    return kept
+
+
 def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]:
     """Classify a PR's CI check-runs.
 
     Returns ``(state, problem_checks)`` where state is one of:
       * ``"green"``   — every non-skipped check concluded SUCCESS
       * ``"red"``     — at least one check failed/timed-out, or was cancelled
-                        with NO same-identity SUCCESS completing at-or-after it.
+                        with NO same-identity SUCCESS completing STRICTLY AFTER it.
                         A CANCELLED CheckRun that a same (name, workflowName)
-                        SUCCESS completed at-or-after is a superseded
+                        SUCCESS completed strictly after is a superseded
                         `concurrency: cancel-in-progress` duplicate and is dropped
-                        (see _ci_identity + success_latest) — strict identity,
-                        terminal completedAt comparison only, fail-closed.
+                        by the SHARED _drop_superseded_cancels helper (see
+                        _ci_identity) — strict identity, terminal completedAt
+                        comparison only, fail-closed.
       * ``"pending"`` — a check is still queued/running (and none are red)
       * ``"absent"``  — a READABLE but genuinely EMPTY rollup (``[]``): zero checks
                         exist, i.e. CI has NOT run. A DEFINITE fact, not a read
@@ -816,26 +1108,76 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         # never fired (e.g. a conflicting branch suppresses the whole suite).
         return "absent", []
 
-    # First pass: for each strict identity (name, workflowName), the latest
-    # `completedAt` among its SUCCESS CheckRuns on this head. A CANCELLED entry is
-    # a superseded concurrency-cancel duplicate ONLY if a SUCCESS of the same
-    # identity completed AT OR AFTER it (see the drop branch). Only GitHub Actions
-    # CheckRuns with a resolvable identity AND a completedAt contribute; legacy
-    # StatusContexts, non-Actions checks, and timestampless successes never serve
-    # as siblings. This is NOT the #1420 finding-magnet: that sorted the WHOLE set
-    # (incl. QUEUED runs with null startedAt) to pick a global "latest"; here both
-    # sides of the comparison are terminal COMPLETED runs that always carry a
-    # completedAt, and every unresolvable case fails CLOSED (stays red).
-    success_latest: dict[tuple[str, str], str] = {}
-    for c in checks:
-        if not isinstance(c, dict) or c.get("conclusion") not in _CI_GREEN:
-            continue
-        ident = _ci_identity(c)
-        ts = (c.get("completedAt") or "").strip()
-        if ident is None or not ts:
-            continue
-        if ts > success_latest.get(ident, ""):
-            success_latest[ident] = ts
+    # Self-exclusion for the check-run form of this gate (issue #1670). The
+    # `genesis-merge-gate` check only MIRRORS this gate's verdict, so its
+    # entries must never classify — in ANY environment: under Actions a run
+    # would deadlock on its own IN_PROGRESS entry or inherit a stale FAILURE
+    # from an earlier run on the same head, and locally the mirror would
+    # double-count real blocks as `ci: red (genesis-merge-gate)` and demand a
+    # spurious ci-override on top of the genuine sigils. workflowName
+    # "merge-gate" covers the ambient job check. For API-published verdicts the
+    # NAME is the identity — `genesis-merge-gate` is OUR check name — measured
+    # on PR #1954: a published verdict was attached to a check suite owned by a
+    # DIFFERENT workflow ("Labeler"), because GitHub assigns the suite, not the
+    # publisher, so the empty-workflowName lane the first version relied on
+    # does not hold. The name lane is therefore gated on the check's detailsUrl
+    # pointing at this repo's run pages (name alone is not provenance — a
+    # same-named foreign check must still count).
+    # The GITHUB_WORKFLOW/GITHUB_JOB env lanes stay as a drift-proof backup for
+    # the ambient-run case where the workflow is renamed but the job is not.
+    self_wf = (os.environ.get("GITHUB_WORKFLOW") or "").strip().casefold()
+    self_job = (os.environ.get("GITHUB_JOB") or "").strip().casefold()
+
+    # Host-pinned to github.com: an arbitrary host could serve a run URL whose
+    # path carries this repo's slug — host + slug together are the provenance.
+    _run_url_re = re.compile(
+        r"^https?://github\.com/([^/]+/[^/]+)/(?:runs|actions/runs)/\d+", re.IGNORECASE
+    )
+
+    _self_repo = repo if repo is not None else _derive_repo_from_cwd(os.getcwd())
+
+    def _details_url_is_own_run(c: dict) -> bool:
+        m = _run_url_re.match((c.get("detailsUrl") or "").strip())
+        if not m:
+            return False
+        # Fail-CLOSED on unresolvable repo identity: a check we cannot prove is
+        # ours is not our mirror, so it must still classify.
+        return _self_repo is not None and m.group(1).casefold() == _self_repo.casefold()
+
+    def _is_self_check(c: object) -> bool:
+        if not isinstance(c, dict):
+            return False
+        wf = (c.get("workflowName") or "").strip().casefold()
+        name = (c.get("name") or "").strip().casefold()
+        if wf == "merge-gate" or (self_wf and wf == self_wf) or (self_job and wf == self_job):
+            return True
+        # Name alone is not provenance — check names are not unique identities.
+        # The mirror must also link into THIS repo's run pages: a same-named
+        # check from another app or workflow carries its own detailsUrl.
+        return name == "genesis-merge-gate" and _details_url_is_own_run(c)
+
+    checks = [c for c in checks if not _is_self_check(c)]
+    if not checks:
+        # The ONLY thing in the rollup is our own run: zero OTHER checks
+        # have run — the same definite "CI has not run" fact a genuinely
+        # empty rollup carries.
+        return "absent", []
+
+    # Drop superseded `concurrency: cancel-in-progress` duplicates via the SHARED
+    # primitive (_drop_superseded_cancels — read its docstring for the strict
+    # identity + strictly-after rule and every fail-closed case). Filtering here rather
+    # than branching inside the classify loop is behaviour-identical: a drop implies
+    # a same-identity SUCCESS in this very list, and that sibling sets
+    # `saw_recognized` and contributes the same casefolded `workflowName` to
+    # `workflows_ran` on its own. A cancel that is NOT dropped falls through to the
+    # red branch below, because CANCELLED is also in _CI_RED_CONCLUSIONS.
+    #
+    # Deliberately AFTER the empty-rollup "absent" return above, which reads the
+    # RAW payload: "zero checks exist" must stay a fact about what GitHub reported,
+    # never an artefact of our own filtering. (The filter cannot empty a non-empty
+    # list anyway — a drop requires a surviving SUCCESS sibling — but the ordering
+    # makes that independent of this helper's behaviour.)
+    checks = _drop_superseded_cancels(checks)
 
     red: list[str] = []
     pending: list[str] = []
@@ -857,30 +1199,16 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         if conclusion in _CI_SKIP_CONCLUSIONS:
             saw_recognized = True
             continue
-        if conclusion in _CI_CANCEL_CONCLUSIONS:
-            ident = _ci_identity(c)
-            cts = (c.get("completedAt") or "").strip()
-            if ident is not None and cts and success_latest.get(ident, "") >= cts:
-                # Superseded concurrency-cancel duplicate: a SUCCESS of this EXACT
-                # identity (name + workflowName) completed AT OR AFTER this cancel,
-                # so the cancelled entry is a `cancel-in-progress` leftover with no
-                # verdict of its own — drop it. Wrong-green-impossible:
-                # FAILURE/TIMED_OUT are not in _CI_CANCEL_CONCLUSIONS (still red);
-                # an in-flight re-run is a non-terminal entry that still counts
-                # pending below; and a cancel with no identity, no completedAt, or
-                # NO same-identity success at-or-after it (e.g. SUCCESS-then-cancel
-                # on an unchanged head) falls through and stays red.
-                saw_recognized = True
-                # A superseded duplicate implies a same-identity SUCCESS exists on
-                # this head, so the workflow demonstrably ran.
-                workflows_ran.add(wf_key)
-                continue
+        # Any CANCELLED entry still present here was NOT superseded (the shared
+        # filter above proved it, or could not) and falls through to the red branch,
+        # because CANCELLED is in _CI_RED_CONCLUSIONS. The dropped ones need no arm
+        # of their own: each implies a same-identity SUCCESS in this list, which
+        # sets saw_recognized and adds the identical workflowName to workflows_ran.
         if conclusion in _CI_RED_CONCLUSIONS or state in _CI_RED_STATES:
             saw_recognized = True
             red.append(name)
         elif conclusion in _CI_GREEN or state in _CI_GREEN:
-            # The ONLY branch (besides the superseded-cancel drop above, which implies
-            # a green sibling) that feeds workflows_ran: the required-identity check
+            # The ONLY branch that feeds workflows_ran: the required-identity check
             # runs only when nothing is red/pending (those return first, and already
             # block), so only PASSING verdicts can vouch that a required workflow ran.
             # A COMPLETED run with a null conclusion (the benign ignore below) carries
@@ -1015,12 +1343,29 @@ _CR_FINDING_SPLIT_RE = re.compile(r"^ {0,3}-{3,}\s*$", re.M)
 # path, so there is one score and one threshold to reason about.
 _CR_BLOCKING_WEIGHT = 1.0
 # Weighted review score for inline findings: a P1 is a full blocker (1.0), a P2
-# is half (0.5), so the gate blocks at any unresolved P1 OR >= 2 unresolved P2s.
+# is half (0.5). What that BUYS depends on the lane: see the per-lane thresholds
+# below. Two P2s block a `critical` change, four a `standard` one, six a `light`
+# one. The flat "any P1 OR >= 2 P2s" this line used to state is now true only in
+# the critical lane.
 # Doc-path and maintainer-replied (consciously-accepted) findings are excluded
 # from the score, exactly as for P1s. Fixed policy value that works on any clone —
 # deliberately not per-install configurable.
 _INLINE_P2_SCORE_WEIGHT = 0.5
-_INLINE_SCORE_BLOCK_THRESHOLD = 1.0
+# PER-LANE thresholds. The weights above are what a finding COSTS; these are what
+# a change can AFFORD before the merge stops, and they vary by how much it costs
+# to be wrong. MEASURED across this repo's review history: all 11 P1s ever raised
+# landed on guards / destructive paths / alerting / measurement, and ZERO on
+# ordinary features — so one global threshold either under-protects the first
+# group or over-blocks the second. `critical` keeps the historical 1.0 (any P1, or
+# two P2s); `standard` and `light` tolerate more before blocking, while the
+# always-fix floor (P1, leak/privacy, destructive) is a separate obligation this
+# score never governed.
+#
+# STILL "fixed policy values that work on any clone — deliberately not
+# per-install configurable", exactly as the note above says. Varying by LANE is a
+# property of the change; varying by INSTALL would be a property of the operator,
+# and only the second is what that sentence refuses. No config key is added.
+_INLINE_SCORE_BLOCK_THRESHOLDS = {"critical": 1.0, "standard": 2.0, "light": 3.0}
 _INLINE_REVIEW_BOTS = {
     "chatgpt-codex-connector[bot]",
     "github-advanced-security[bot]",
@@ -1034,6 +1379,10 @@ _INLINE_REVIEW_BOTS = {
 _MAINTAINER_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 # Badge/markup prefix stripped when rendering a finding's title line.
 _INLINE_MARKUP_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)|</?sub>|[*]{1,2}")
+# A finding title is a one-line PREVIEW in a list of them; the full body is on
+# the PR, so this bounds a pointer-backed value rather than cutting the only
+# copy. `_inline_title` states the cut when it makes one.
+_INLINE_TITLE_MAX_CHARS = 120
 
 # ── Documentation-path allowlist for review findings (ledger 54eb3752) ───────
 # A P1 inline finding on a DOCUMENTATION file is not a code defect and must not
@@ -1201,11 +1550,55 @@ def _is_sqlite_write(cmd: str) -> bool:
 
 
 def _inline_title(body: str) -> str:
-    """First readable line of an inline finding body."""
+    """First readable line of an inline finding body, SAFE to print.
+
+    Sanitising happens HERE, at the producer, rather than at each consumer.
+    Every title that reaches a terminal comes through this function —
+    ``_coderabbit_title`` delegates to it, the blocking message is built from
+    it, and so are the eight advisory ``print(..., file=sys.stderr)`` sites in
+    ``_check_inline_review_findings``. A fix applied per-consumer is a
+    CONVENTION each future call site has to remember, and this file already
+    has eight places that would have had to remember it.
+
+    MEASURED before the sanitising moved here: a LONE P2 — which scores 0.5,
+    does NOT block, and so renders on a run whose verdict the operator reads as
+    passing — printed its title raw. A title carrying CR + ``ESC[2K`` redrew the
+    line as a counterfeit ``merge-with :`` command with ``--match-head-commit``
+    absent, stripping the TOCTOU binding from a command the operator is told to
+    copy verbatim. The non-blocking path was the dangerous one.
+    """
     # split("\n") not splitlines(): a NEL (U+0085) inside the body must not shift
     # which line is shown as the title (consistent with the JSONL parser).
     first = _INLINE_MARKUP_RE.sub("", body).strip().split("\n")
-    return (first[0].strip() if first else "")[:120]
+    return _safe_title(first[0].strip() if first else "")
+
+
+def _safe_title(raw: str) -> str:
+    """Defang and bound one finding title. BOTH producers end here.
+
+    This exists because "sanitise at the producer" was implemented once and was
+    still wrong: `_inline_title` was treated as the single producer on the
+    strength of `_coderabbit_title` ENDING with `return _inline_title(body)`.
+    It has an EARLIER return for the bold-title line, which is the path a
+    CodeRabbit finding actually takes — so the common case never reached the
+    sanitiser. MEASURED: a hostile bold title came back through
+    `_coderabbit_title` with CR, ESC, RLO and ZWSP intact while the same body
+    through `_inline_title` came back clean (CodeRabbit Major, PR #1638, round 3
+    — on the fix for round 2's finding).
+
+    The lesson is in the shape, not the instance: a function ending in a
+    delegation does not delegate on every path, and "there is one producer" is a
+    claim about EVERY return statement. Both producers now converge here, and
+    `test_no_title_producer_returns_unsanitised_text` walks the AST to keep it
+    that way rather than trusting the next reader to notice.
+    """
+    safe = "".join(" " if _gate_text_unsafe(ch) else ch for ch in raw)
+    if len(safe) <= _INLINE_TITLE_MAX_CHARS:
+        return safe
+    # A title is a PREVIEW whose full text is one click away on the PR, so
+    # bounding it is a selection rather than an amputation — but say that a cut
+    # happened, so a clipped title is never read as the whole finding.
+    return safe[: _INLINE_TITLE_MAX_CHARS - 1].rstrip() + "…"
 
 
 def _cr_severity(body: str) -> tuple[str | None, bool]:
@@ -1274,7 +1667,26 @@ _CR_FENCE_RE = re.compile(r"^(`{3,}|~{3,})(.*)$")
 
 
 def _cr_markup_mask(body: str) -> list[bool]:
-    """Per line: True when it sits inside a fenced block or a ``<details>`` section.
+    """Per line: True when it sits inside a fenced block OR a ``<details>`` section.
+
+    The union, for callers that treat both as quoted content. A caller that must
+    keep ``<details>`` VISIBLE — the outside-diff parser, whose findings are
+    nested two levels deep inside them by construction — takes the fence half
+    alone from ``_cr_masks``. Both halves come from one implementation on
+    purpose: fence tracking is subtle (CommonMark close rules, the four-backtick
+    suggestion case, the unclosed-fence recovery), and a second copy of it is
+    how #1677 would come back on a surface nobody re-reads.
+    """
+    fence_mask, details_mask = _cr_masks(body)
+    return [f or d for f, d in zip(fence_mask, details_mask, strict=True)]
+
+
+def _cr_masks(
+    body: str, bq_depths: list[int] | None = None
+) -> tuple[list[bool], list[bool]]:
+    """``(fence_mask, details_mask)`` per line — the two kept SEPARATE.
+
+    Per line: True when it sits inside a fenced block or a ``<details>`` section.
 
     Shared by the splitter and the title extractor because they MUST agree about
     what is quoted content. They did not: the title extractor skipped fences while
@@ -1302,9 +1714,16 @@ def _cr_markup_mask(body: str) -> list[bool]:
     fence_char: str | None = None
     fence_len = 0
     fence_opened_at: int | None = None
+    # The blockquote depth the OPEN fence was opened at. A renderer scopes a
+    # fence to its container, so only a delimiter in the SAME container can
+    # close it; `bq_depths` is None for callers reading text that never had a
+    # quote prefix stripped, and every depth is then 0, which is exactly the
+    # previous behaviour.
+    fence_bq = 0
     details_depth = 0
     details_opened_at: int | None = None
     for idx, line in enumerate(lines):
+        depth = bq_depths[idx] if bq_depths is not None and idx < len(bq_depths) else 0
         stripped = line.strip()
         # CommonMark gives fence DELIMITERS at most three leading spaces; a
         # 4+-space-indented backtick run is code CONTENT. Stripping first and
@@ -1316,7 +1735,13 @@ def _cr_markup_mask(body: str) -> list[bool]:
             run, info = fence.group(1), fence.group(2).strip()
             if fence_char is None:
                 fence_char, fence_len, fence_opened_at = run[0], len(run), idx
-            elif run[0] == fence_char and len(run) >= fence_len and not info:
+                fence_bq = depth
+            elif (
+                depth == fence_bq
+                and run[0] == fence_char
+                and len(run) >= fence_len
+                and not info
+            ):
                 # CommonMark: a closing fence uses the SAME character, is at
                 # least as long as the opener, and carries NO info string.
                 # Toggling on any fence line broke on CodeRabbit's own output:
@@ -1370,7 +1795,7 @@ def _cr_markup_mask(body: str) -> list[bool]:
         # the same reason the fence recovery accepts it (Codex P2, PR #1677).
         for i in range(details_opened_at, len(lines)):
             details_mask[i] = False
-    return [f or d for f, d in zip(fence_mask, details_mask, strict=True)]
+    return fence_mask, details_mask
 
 
 def _cr_findings(body: str) -> list[str]:
@@ -1438,8 +1863,504 @@ def _coderabbit_title(body: str) -> str:
             continue
         stripped = line.strip()
         if stripped.startswith("**") and stripped.rstrip("*").strip():
-            return _INLINE_MARKUP_RE.sub("", stripped).strip().strip("*").strip()[:120]
+            # Through _safe_title, NOT a bare slice: this is the branch a real
+            # CodeRabbit finding takes, so it is the one that matters most.
+            return _safe_title(
+                _INLINE_MARKUP_RE.sub("", stripped).strip().strip("*").strip()
+            )
     return _inline_title(body)
+
+
+# ── CodeRabbit findings delivered in the REVIEW BODY, not inline ──
+#
+# When a finding's anchor line falls outside the PR's diff HUNKS, CodeRabbit
+# cannot create an inline review comment for it, so it puts the finding in the
+# review BODY under a collapsible section instead. NEITHER existing scan sees
+# these: `_check_inline_review_findings` reads `pulls/N/comments` (a different
+# endpoint entirely), and `_check_pr_review_findings` gates on `_REVIEW_BOTS`,
+# which does not contain CodeRabbit.
+#
+# MEASURED 2026-09-07, all 84 then-open non-draft PRs: 27 deduped findings
+# across 23 PRs — 15 Major, 12 Minor, 0 Critical — none of which any gate could
+# see. Two were floor-class: a silent-write-loss Major (#1806
+# `memory/store.py`) and a privacy Major (#1820 `inbox/monitor.py`), on PRs
+# that read `inline-findings: ok`.
+#
+# Three shapes the parser must survive, each verified against a live body:
+#   1. The section appears BLOCKQUOTED (`> <summary>…`) when nested inside an
+#      outer <details>, and bare otherwise — so nothing here anchors to `^`.
+#   2. A PR can carry SEVERAL CodeRabbit reviews and the section may exist in
+#      only one of them (#1834: absent from review 1, present in review 2), so
+#      every review is read, never just the newest.
+#   3. Section headers and FILE headers share the `<summary>NAME (N)</summary>`
+#      shape; the section names are a closed set, so a summary matching one is
+#      a section and anything else carrying a count is a file.
+_CR_SECTION_NAMES = (
+    "Outside diff range comments",
+    "Duplicate comments",
+    "Nitpick comments",
+    "Additional comments",
+)
+_CR_SECTION_RE = re.compile(
+    r"<summary>[^<>]*?(" + "|".join(re.escape(n) for n in _CR_SECTION_NAMES) + r")[^<>]*?</summary>"
+)
+# The declared count is read from the matched summary SEPARATELY rather than as
+# an optional group inside the pattern above: with lazy quantifiers on both
+# sides, an optional `(?:\((\d+)\))?` is simply skipped — the match succeeds and
+# the group is always None, so every count silently read as absent and the
+# reconciliation could never fire. Caught by its own test.
+_CR_SECTION_COUNT_RE = re.compile(r"\((\d+)\)")
+# A file header inside a section: `<summary>path/to/file.py (2)</summary>`.
+_CR_FILE_HEADER_RE = re.compile(r"<summary>([^<>]+?)\s+\((\d+)\)</summary>")
+# One finding entry: a backticked line or line-range, a colon, then the
+# severity header on the SAME line (unlike the inline form, where the header
+# occupies its own line). Example:
+#   `169-174`: _🗄️ Data Integrity_ | _🟠 Major_ | _🏗️ Heavy lift_
+# Anchored to line START (modulo whitespace): CodeRabbit emits the entry line
+# as its own line, and an UNanchored search also matched entry-shaped text
+# inside a finding's PROSE ("the source contains `99`: _cat_ | _🔴 Critical_"),
+# manufacturing a phantom finding (Codex P2, PR #1847). If the live format ever
+# gains a leading bullet this stops matching — and the declared-count
+# reconciliation then blocks LOUDLY on the shortfall rather than degrading.
+_CR_ENTRY_RE = re.compile(r"^\s*`(\d+(?:-\d+)?)`:\s*(.+)")
+# The <details> depth at which each role occurs. MEASURED over 23 live bodies
+# carrying an outside-diff section: every section summary sits at depth 1 and
+# every one of 113 file summaries at depth 2, with no exceptions.
+_CR_SECTION_DEPTH = 1
+_CR_FILE_DEPTH = 2
+# Line separators Python's str.split("\n") does NOT break on. `gh --jq` emits
+# U+0085 (NEL) literally inside JSON strings — `_fetch_comments_paged` splits on
+# "\n" only for exactly that reason — so it genuinely reaches this parser, and a
+# PR author can put one in a source file for the reviewer to quote back. Left
+# unnormalised, an entry lands on the SAME line as its file header, the header
+# branch consumes the line, and the finding is never seen. Normalised here (in
+# this caller, not in the shared mask, whose other consumers read inline comment
+# bodies where changing line-splitting would be a behaviour change in the
+# fail-open direction).
+_CR_LINE_SEPARATORS = ("", " ", " ")
+# A blockquote prefix, possibly repeated: `> `, `>> `, `   > `. MEASURED: 23 of
+# 23 live bodies carry blockquoted lines, and 74 real fence lines went UNMASKED
+# because `_cr_masks` matches `<details>` and fence delimiters with startswith on
+# the stripped line, which a `> ` prefix defeats. Stripped here so the shared
+# mask sees the structure it was written to read.
+_CR_BLOCKQUOTE_RE = re.compile(r"^(?:\s*>)+ ?")
+# A `<details …>` OPENER ending the text before a `<summary>`. HTML requires
+# <summary> to be the first child of its <details>, so this adjacency is what
+# separates real structure from a tag's text appearing in prose.
+_CR_DETAILS_OPEN_TAIL_RE = re.compile(r"<details[^<>]*>\s*$")
+
+# A backtick code span: a run of backticks closed by an equal run. CommonMark
+# lets a span contain a newline (it terminates at a blank line, not at a line
+# end), so `[^`]` deliberately does NOT exclude "\n" — an earlier revision did,
+# and a span broken across two lines then went entirely unmasked, re-opening
+# the depth-poisoning this mask exists to close. Masking is applied
+# paragraph-wise for the same reason.
+#
+# The failure direction of a mis-sized span is OVER-masking, which costs a
+# missed finding that the declared-count reconciliation then blocks on — never
+# a tag silently honoured.
+_CR_INLINE_CODE_RE = re.compile(r"(`+)[^`]*?\1")
+
+
+def _cr_mask_inline_code_lines(lines: list[str]) -> list[str]:
+    """``lines`` with backtick code spans blanked, LENGTH- AND LINE-PRESERVING.
+
+    A renderer treats ```</details>``` as text, not as a closing tag — but
+    ``str.count`` does not, so a finding whose PROSE quotes a tag in inline
+    code moved the document's depth. Everything after it then read at the
+    wrong level: the next genuine file header failed its depth test,
+    ``current_file`` kept the previous path, and a Critical on a real source
+    file was misattributed to a doc path and skipped — with declared ==
+    parsed, so the shortfall canary stayed quiet (Codex P1, PR #1847).
+
+    Spans become spaces of the same length rather than being removed, so every
+    index computed on a masked line (``find("<summary")`` positions, head
+    slices) still addresses the original text. Only the tag-structure readers
+    (`_cr_details_depths`, `_cr_summary_structural`) consume this — the ENTRY
+    regex depends on backticks (`` `169-174`: … ``) and keeps reading raw.
+
+    Masks over each BLANK-LINE-DELIMITED paragraph rather than per line,
+    because a code span may span a newline. Splitting first and masking each
+    line alone cannot see such a span at all, so it left the quoted tag inside
+    it live (adversarial-audit SHOULD-FIX, PR #1847). Line count and every
+    line's length are preserved, so all downstream indices still address the
+    original text.
+    """
+    masked: list[str] = []
+    para: list[str] = []
+
+    def flush() -> None:
+        if not para:
+            return
+        block = _CR_INLINE_CODE_RE.sub(
+            lambda m: re.sub(r"[^\n]", " ", m.group(0)), "\n".join(para)
+        )
+        masked.extend(block.split("\n"))
+        para.clear()
+
+    for line in lines:
+        if line.strip():
+            para.append(line)
+        else:
+            flush()
+            masked.append(line)
+    flush()
+    return masked
+
+
+def _cr_normalize_review_body(body: str) -> tuple[str, list[int]]:
+    """``(text, blockquote_depths)`` — separators and quote prefixes normalised.
+
+    Both normalisations are STRUCTURAL — they make the document read the way a
+    markdown renderer reads it — and both are applied BEFORE any mask or split,
+    so every downstream index (fence mask, depths, line list) stays aligned.
+
+    THE DEPTHS ARE RETURNED, NOT DISCARDED, and that is the whole point of the
+    second return value. Stripping the prefix is right — it is what let the
+    mask see structure that quoting had hidden — but the prefix also carries
+    the line's CONTAINER, and a renderer scopes a fence to its container. Drop
+    that and a quoted ``> ``` `` line, which a renderer treats as ordinary
+    CONTENT inside a document-level fence (it cannot close one: the ``>`` is
+    not indentation), becomes a valid closer here. The mask then INVERTS: the
+    real closer opens a phantom fence, everything after it is masked, and the
+    masked region includes the section header carrying the declared count — so
+    ``declared`` and ``parsed`` are both 0 and NO canary fires. Verified
+    end-to-end against a control: a floor-class Critical went from blocking to
+    not blocking, silently (adversarial audit, PR #1847). Depth travels with
+    the text so `_cr_masks` can bind each delimiter to the container that
+    opened it.
+
+    This remains far from the "never normalise before a blind-spot probe" case:
+    nothing here deletes evidence a probe looks for. The lesson is narrower and
+    sharper — normalising away a CONTAINER MARKER is not free, because the
+    marker is what scopes the constructs inside it.
+    """
+    for sep in _CR_LINE_SEPARATORS:
+        body = body.replace(sep, "\n")
+    lines = body.split("\n")
+    depths = []
+    stripped = []
+    for line in lines:
+        prefix = _CR_BLOCKQUOTE_RE.match(line)
+        depths.append(prefix.group(0).count(">") if prefix else 0)
+        stripped.append(_CR_BLOCKQUOTE_RE.sub("", line))
+    return "\n".join(stripped), depths
+
+
+def _cr_details_depths(lines: list[str], fence_mask: list[bool]) -> list[int]:
+    """The ``<details>`` nesting depth at each line's first ``<summary>``.
+
+    Depth alone does NOT identify a role, and an earlier revision of this parser
+    believed it did. An injected ``<summary>`` sitting in ordinary prose INSIDE a
+    genuine file block reports the same depth as that block's own header, so
+    depth-gating let it reassign the current file exactly as before. Depth
+    answers "which level", never "is this structure" — ``_cr_summary_structural``
+    answers the second question, and both must agree before a tag is honoured.
+
+    The depth reported for a line is the depth AT ITS FIRST ``<summary>``, not
+    after the whole line — only openers appearing BEFORE that tag are counted.
+    Live bodies put ``<details>`` on its own line, but a renderer does not care,
+    and counting the whole line would record depth 2 for a section summary the
+    moment CodeRabbit emitted ``<details><summary>…`` together. A parser that
+    silently matches NOTHING when its input is reformatted is a fail-open, so
+    the rule is anchored to the tag's position rather than to a layout.
+
+    Tags inside a fence are quoted content and move nothing — otherwise an
+    author could shift the document's depth from inside a suggestion block and
+    relocate every role by one level. Tags inside INLINE CODE are quoted
+    content too, at a smaller granularity the fence mask cannot see — masked
+    per line by ``_cr_mask_inline_code`` for the same reason.
+    """
+    # Casefold + mask ONCE, over the whole list, so a code span that crosses a
+    # newline is seen (a per-line mask cannot close one) and every index below
+    # still addresses the original text.
+    lines = _cr_mask_inline_code_lines([ln.casefold() for ln in lines])
+    depths: list[int] = []
+    depth = 0
+    for line, quoted in zip(lines, fence_mask, strict=True):
+        if quoted:
+            depths.append(depth)
+            continue
+        low = line
+        cut = low.find("<summary")
+        head = low if cut < 0 else low[:cut]
+        depths.append(depth + head.count("<details"))
+        depth = max(0, depth + low.count("<details") - low.count("</details"))
+    return depths
+
+
+def _cr_summary_structural(lines: list[str], fence_mask: list[bool]) -> list[bool]:
+    """Per line: True when its first ``<summary>`` is really a ``<details>`` header.
+
+    HTML requires ``<summary>`` to be the FIRST child of its ``<details>``, and
+    that is the invariant CodeRabbit's generator satisfies and an injection
+    cannot. Anything else carrying the tag's TEXT — a sentence quoting it, a
+    fenced example, a finding description that mentions it — has content between
+    the opener and the tag, so it is prose that looks like structure.
+
+    This is the check that actually closes the misattribution hole. Depth-gating
+    alone did not: a bare ``<summary>CHANGELOG.md (1)</summary>`` written in prose
+    INSIDE a real file block reports that block's own depth, so it passed the
+    depth test and still reassigned the current file — a real Critical was
+    attributed to a doc path, silently doc-skipped, and did not block, with
+    declared == parsed so the shortfall canary stayed quiet too.
+    """
+    # Same mask as `_cr_details_depths`, for the same reason and applied the
+    # same way — the two readers must never disagree about what is quoted.
+    lines = _cr_mask_inline_code_lines([ln.casefold() for ln in lines])
+    structural: list[bool] = []
+    prev_opener = False  # the previous non-blank unfenced line ENDS with a <details> opener
+    for line, quoted in zip(lines, fence_mask, strict=True):
+        low = line
+        cut = -1 if quoted else low.find("<summary")
+        if cut < 0:
+            structural.append(False)
+        else:
+            head = low[:cut].rstrip()
+            # Same line (`<details><summary>…`) or the line before (`<details>` alone).
+            structural.append(
+                bool(_CR_DETAILS_OPEN_TAIL_RE.search(head)) if head.strip() else prev_opener
+            )
+        stripped = low.strip()
+        if not quoted and stripped:
+            prev_opener = bool(_CR_DETAILS_OPEN_TAIL_RE.search(stripped))
+    return structural
+
+
+def _cr_outside_diff_entries(
+    body: str,
+) -> tuple[list[tuple[str, str, str, str]], int, bool]:
+    """Findings from the 'Outside diff range comments' sections of ONE review body.
+
+    Returns ``(entries, declared, declared_known)`` — the parsed findings, the
+    total this body's own section headers SAY it carries, and whether EVERY
+    matched section header actually stated a count. ``declared_known`` is what
+    licenses the SURPLUS comparison: with any count absent, ``declared`` is an
+    underestimate, so parsed-exceeds-declared would fire on well-formed input.
+    The shortfall comparison needs no such licence — an underestimate can only
+    make it more lenient, never false-positive. The format states its own counts
+    ("Outside diff range comments (3)"), which is the one closed-set fact
+    available about a third-party document nobody controls: it turns "did I
+    parse everything?" from an unanswerable question into a comparison. Reading
+    2 of 3 is the SILENT direction of failure on a merge gate, and every other
+    CodeRabbit helper here carries a canary for what it read but did not
+    recognise (``cr_unknown``, ``unmatched_bot``, ``header_seen``); without the
+    declared count this one would have none. ``declared`` is 0 when a header
+    omits its count — absent, not zero findings, and the caller only ever acts
+    on a SHORTFALL.
+
+    Each entry is ``(path, lines, severity, title)``, severity lower-cased
+    and drawn from the SAME vocabulary as the inline path (``_CR_SEVERITIES``)
+    so the two cannot drift into disagreeing about what 'major' means. A finding
+    whose severity cannot be read is returned with severity ``""`` — surfaced by
+    the caller as a canary, never silently dropped and never guessed at (the
+    ``cr_unknown`` contract, one section over).
+
+    The section runs from its own ``<summary>`` to the next SECTION summary or
+    to end-of-body, so the tail of a body whose outside-diff section comes last
+    gets walked — and MEASURED on live data that is the NORMAL case (3 of 5
+    bodies), not an edge.
+
+    What makes the tail walk safe is ONE guard, not two, and an earlier version
+    of this docstring claimed two. CodeRabbit's trailing furniture DOES carry
+    the file-header shape — ``<summary>📒 Files selected for processing (11)
+    </summary>`` matches ``_CR_FILE_HEADER_RE``, in 11 of 11 real reviews — so
+    ``current_file`` really is reassigned to a furniture heading on every live
+    run. The only thing preventing a phantom finding is that no furniture line
+    matches ``_CR_ENTRY_RE`` (a backticked line-range then a colon then a
+    severity). That is a thin margin held by a single condition, which is why
+    the declared-count reconciliation above exists: it monitors the margin
+    instead of asserting it.
+    """
+    out: list[tuple[str, str, str, str]] = []
+    declared = 0
+    declared_known = True
+    depth_drift: list[str] = []
+    body, bq_depths = _cr_normalize_review_body(body)
+    lines = body.split("\n")
+    # FENCE half only. A review body is a code-bearing document: it quotes diffs
+    # and embeds ```suggestion blocks, so a `<summary>` or an entry line inside a
+    # fence is QUOTED CONTENT, not structure. The DETAILS half is deliberately
+    # NOT applied — these findings sit two <details> deep by construction, so the
+    # union mask would hide every real one.
+    fence_mask, _details_mask = _cr_masks(body, bq_depths)
+    depths = _cr_details_depths(lines, fence_mask)
+    structural = _cr_summary_structural(lines, fence_mask)
+    current_file: str | None = None
+    in_section = False
+    for pos, line in enumerate(lines):
+        if fence_mask[pos]:
+            continue
+        # STRUCTURE IS ATTRIBUTED BY POSITION IN THE <details> TREE, never by
+        # matching tag text wherever it appears. Both roles were reconstructed
+        # from text before, and both were forgeable from content a PR author
+        # controls (their own source, quoted back by the reviewer):
+        #   - a bare `<summary>CHANGELOG.md (1)</summary>` in ORDINARY PROSE
+        #     reassigned the current file, so a real Critical was attributed to a
+        #     doc path, silently doc-skipped, and did not block — and because the
+        #     finding was still COUNTED, declared == parsed and the shortfall
+        #     canary could not see it either;
+        #   - a `<summary>Nitpick comments (9)</summary>` inside a fence ended the
+        #     section early and dropped every finding after it.
+        # MEASURED over 23 live bodies (113 file headers): section summaries occur
+        # at depth 1 and file summaries at depth 2, without exception. Injected
+        # text sits deeper, or inside a fence, and now matches neither role.
+        section = _CR_SECTION_RE.search(line)
+        if (
+            section
+            and structural[pos]
+            and depths[pos] != _CR_SECTION_DEPTH
+            and section.group(1) == "Outside diff range comments"
+        ):
+            # REAL STRUCTURE at an unexpected level. The depth pin is a
+            # MEASURED constant of a document nobody controls (23/23 live
+            # bodies put a section at depth 1), and the reconciliation cannot
+            # notice when it stops holding: `declared` is read from the same
+            # match that licenses parsing, so a section one <details> deeper
+            # yields declared == parsed == 0 — a silent clean read, on every
+            # PR, forever. That is the vacuous green this whole channel exists
+            # to remove, reintroduced one layer up (adversarial audit, #1847).
+            # Reported as a shortfall so the caller BLOCKS as unreadable.
+            # Prose and fenced mentions cannot reach here: `structural` already
+            # requires a real <details> opener adjacent to the tag.
+            depth_drift.append(f"outside-diff section at <details> depth {depths[pos]}")
+            continue
+        if section and structural[pos] and depths[pos] == _CR_SECTION_DEPTH:
+            in_section = section.group(1) == "Outside diff range comments"
+            current_file = None
+            if in_section:
+                count = _CR_SECTION_COUNT_RE.search(section.group(0))
+                if count:
+                    declared += int(count.group(1))
+                else:
+                    declared_known = False
+            continue
+        if not in_section:
+            continue
+        header = _CR_FILE_HEADER_RE.search(line)
+        if header and structural[pos] and depths[pos] == _CR_FILE_DEPTH:
+            # UNESCAPED, because this string is an IDENTITY, not display text:
+            # it is compared against the raw path GitHub returns, by `_off_diff`
+            # and `_is_doc_path`. A path holding a markup-significant character
+            # arrives HTML-escaped inside the summary (`docs/Q&amp;A.md`,
+            # `src/a&lt;b.py`), so the comparison failed and routed even a
+            # Critical to the non-scoring off-diff lane — a merge allowed on a
+            # finding that was read correctly and then attributed to nobody
+            # (Codex P2, PR #1847). `&` is the likely one in practice; `<` is
+            # the one that is obvious.
+            current_file = html.unescape(header.group(1).strip())
+            continue
+        entry = _CR_ENTRY_RE.search(line)
+        if entry and current_file is not None:
+            severity, _seen = _cr_severity_inline(entry.group(2))
+            # The title is the first BOLD line beneath the entry, and the search
+            # STOPS at the next entry or file header — a line bound alone is not
+            # enough. With only a distance bound, a titleless finding walks past
+            # the next entry line and adopts ITS title, so the report names the
+            # wrong defect at the right line: worse than no title, because it
+            # reads as information. An empty title is honest; a stolen one is not.
+            title = ""
+            budget = 5  # CONTENT lines, not raw lines
+            for offset in range(pos + 1, len(lines)):
+                if fence_mask[offset]:
+                    continue  # quoted bold is not this finding's title
+                if budget <= 0:
+                    break
+                budget -= 1
+                look = lines[offset]
+                if _CR_ENTRY_RE.search(look) or _CR_FILE_HEADER_RE.search(look):
+                    break
+                bold = _CR_INLINE_BOLD_RE.search(look)
+                if bold:
+                    title = bold.group(1).strip()[:120]
+                    break
+            out.append((current_file, entry.group(1), severity or "", title))
+    return out, declared, declared_known, depth_drift
+
+
+_CR_INLINE_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+# Severity ORDER, for merging one finding restated across several reviews.
+# A dedupe that assigns (`seen[key] = severity`) is last-write-wins, and reviews
+# arrive oldest-first — so a Critical restated later as Minor, or restated with
+# the severity field missing (a shape `_cr_severity`'s own docstring records),
+# silently stopped blocking. MEASURED before this: Critical-then-Minor -> no
+# block, Minor-then-Critical -> block; order decided the verdict, which is a
+# defect and not a policy. Merging by MAX makes the channel's severity rule
+# point the same way as its presence rule, which already keeps a finding that
+# stops being restated. `""` (unreadable) ranks LOWEST so it can never displace
+# a level that was actually read.
+_CR_SEVERITY_RANK = {"": 0, "info": 1, "trivial": 2, "minor": 3, "major": 4, "critical": 5}
+
+
+def _cr_severity_inline(text: str) -> tuple[str | None, bool]:
+    """Severity from an inline `… | _🟠 Major_ | …` header. (level, header_seen).
+
+    Mirrors ``_cr_severity``'s contract — the SAME field discipline and the
+    SAME ambiguity adjudication, not just the same vocabulary. An earlier
+    revision searched the whole text for the first severity-looking italic
+    span, and first-match-wins read `_Business Critical_ | _🟡 Minor_` as
+    Critical (a false block), while a category field containing `Major` could
+    demote a later real Critical to the non-blocking lane (Codex P2, PR #1847
+    — the exact shape `_cr_severity`'s own docstring already adjudicates).
+
+    So: split on `|`, accept only chunks that are COMPLETE italic fields
+    (`_CR_HEADER_FIELD_RE`, the anchored parser's own matcher), read each
+    field's LAST word, and adjudicate as `_cr_severity` does — exactly one
+    DISTINCT level wins (unanimous duplicates included); two distinct levels
+    are a format this code cannot adjudicate and land in the caller's
+    unknown-severity canary rather than being guessed into a weight.
+
+    One deliberate divergence from the anchored parser: a chunk that is NOT a
+    complete italic field is skipped rather than invalidating the whole read,
+    because an inline header can share its line with trailing prose the
+    whole-line parser never sees — requiring all-italic here would push every
+    such finding into the canary and weaken the channel, the fail-open
+    direction for a merge gate.
+    """
+    hits: list[str] = []
+    for chunk in text.split("|"):
+        fld = _CR_HEADER_FIELD_RE.match(chunk.strip())
+        if not fld:
+            continue
+        words = fld.group(1).split()
+        if words and words[-1].casefold() in _CR_SEVERITIES:
+            hits.append(words[-1].casefold())
+    if hits and len(set(hits)) == 1:
+        return hits[0], True
+    return None, bool(text.strip())
+
+
+def _pr_review_bodies(pr_num: str, repo: str | None = None) -> tuple[list[dict] | None, bool]:
+    """Every review's ``{login, body, state}`` for a PR, paginated and fail-closed.
+
+    Reuses ``_fetch_comments_paged`` for the hardened parts — page loop, the
+    shared merge-deadline check BETWEEN pages, NEL-safe JSONL splitting, and the
+    (None, False) / (partial, False) / (all, True) contract. Tests inject via
+    ``_TEST_GH_PR_REVIEW_BODIES`` (one JSON object per line) rather than through
+    the test suite's subprocess router, which dispatches on an endpoint ending
+    in ``/comments`` and would return NOTHING for this one — a silent empty read
+    is exactly the vacuous-green this scan exists to remove.
+    """
+    raw = os.environ.get("_TEST_GH_PR_REVIEW_BODIES")
+    if raw is not None:
+        objs: list[dict] = []
+        for line in raw.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except (ValueError, TypeError):
+                return None, False
+            if isinstance(parsed, dict):
+                objs.append(parsed)
+        return objs, True
+    return _fetch_comments_paged(
+        f"pulls/{pr_num}/reviews",
+        pr_num,
+        repo,
+        ".[] | {login: .user.login, body: .body, state: .state}",
+    )
 
 
 def _scan_unreadable(what: str) -> tuple[bool, str]:
@@ -1579,11 +2500,34 @@ def _check_inline_review_findings(
     force: bool = False,
     repo: str | None = None,
 ) -> tuple[bool, str]:
-    """Scan INLINE review comments for P1/P2 badge findings and apply a weighted score.
+    """Scan review findings from BOTH delivery channels and apply a weighted score.
+
+    Despite the name, this reads two endpoints. ``pulls/N/comments`` carries
+    findings anchored inside the diff. ``pulls/N/reviews`` carries the ones
+    CodeRabbit could NOT anchor inline (an "Outside diff range comments"
+    section in the review body) — a channel no gate could see until 2026-09-07,
+    when 27 findings across 23 open PRs were measured invisible, 15 of them
+    Major and two floor-class.
+
+    THE TWO CHANNELS ARE NOT SYMMETRIC. Only the INLINE channel feeds the score
+    and the threshold. The review-body channel is ADVISORY AT EVERY SEVERITY —
+    surfaced, never scored — and its incomplete-read canaries print a NOTE
+    rather than blocking. That is a deliberate design decision taken at the
+    escalation cap (2026-09-09): every fail-open this parser produced was
+    reachable only because a mis-read of a third-party rendered document could
+    move a blocking verdict, and the scoring path had never once fired on live
+    data (0 Criticals in those 27 findings). An earlier version of this
+    docstring described the symmetric design and outlived it by one commit —
+    which is the failure mode a stale contract statement always has: a
+    maintainer relies on enforcement the gate no longer provides.
+
 
     Returns (should_block, message). Each unresolved finding contributes to a review
-    score — P1 = 1.0, P2 = 0.5 — and the gate blocks when the score >= 1.0 (any P1, OR
-    >= 2 P2s). A finding is EXCLUDED from the score when its thread has a MAINTAINER
+    score — P1 = 1.0, P2 = 0.5 — and the gate blocks when the score reaches the
+    threshold FOR THIS PR'S LANE (`_INLINE_SCORE_BLOCK_THRESHOLDS`): critical 1.0,
+    standard 2.0, light 3.0. So two P2s stop a consequence surface, four ordinary
+    code, six prose-and-tests. A P1 blocks in EVERY lane via the always-fix floor,
+    before the score is consulted at all. A finding is EXCLUDED from the score when its thread has a MAINTAINER
     reply (engagement = consciously accepted), its path is documentation
     (``_is_doc_path``), or its path is OUTSIDE the PR's diff (issue #1728: a
     merge of main stamps base-branch findings onto the PR; scoring them makes
@@ -1792,6 +2736,173 @@ def _check_inline_review_findings(
             # the blindness. The point is that it can no longer be INVISIBLE.
             unmatched_bot.append((login, _inline_title(body)))
 
+    # ── The SECOND delivery channel: findings CodeRabbit could not post inline ──
+    # Read from pulls/N/reviews (a different endpoint from the loop above) and
+    # folded into THIS scan's accumulators rather than given a blocking path of
+    # their own — the one-score-one-threshold policy at `_CR_BLOCKING_WEIGHT`.
+    #
+    # SEVERITY POLICY, and it deliberately differs from the inline path: only
+    # Critical scores. A Major here is surfaced loudly and does NOT block, because
+    # an undelivered finding has NO COMMENT THREAD — the maintainer-reply
+    # engagement route that clears every other finding in this function does not
+    # exist for it. Making it block would create findings satisfiable only by
+    # fixing, never by disagreeing, on PRs anchored to lines they never touched.
+    # The floor (Critical) still binds, so the safety direction is kept while the
+    # disposition mechanism is built. MEASURED across the live queue when this
+    # shipped: 15 Major, 12 Minor, 0 Critical.
+    outside_critical: list[tuple[str, str]] = []  # surfaced, NEVER scored
+    outside_major: list[tuple[str, str]] = []  # Major — surfaced loudly, 0.0
+    # (label, path, severity) — the severity is carried so the report can
+    # name the level the reviewer gave rather than one bucket for all of them.
+    outside_minor: list[tuple[str, str, str]] = []  # below Major — surfaced, 0.0
+    # A body that declares more findings than this parser read: an INCOMPLETE
+    # scan, which blocks like any other incomplete read.
+    outside_shortfall: list[str] = []
+    reviews, reviews_complete = _pr_review_bodies(pr_num, repo=repo)
+    # An unreadable second channel still BLOCKS — but at the END, next to the
+    # incomplete-read check, not by returning from here. Returning early would
+    # discard every list the inline loop just built (p1, p2, cr_block,
+    # cr_unknown, off-diff, doc-skipped, unmatched_bot) BEFORE any of them is
+    # printed, so one transient `gh` failure would replace the whole pre-merge
+    # report with a single "UNREADABLE" line. Same fail direction, far less
+    # information — and this function's docstring promises nothing unaddressed
+    # is dropped.
+    reviews_unreadable = reviews is None
+    if reviews is None:
+        reviews = []
+    # Union across ALL non-dismissed reviews, deduped on (path, lines, title).
+    # CodeRabbit restates an undelivered finding on every re-review, so an
+    # undeduped count inflates; conversely a finding present in one review and
+    # absent from the next is KEPT, because "stopped restating" and "resolved"
+    # are indistinguishable from here and the safe reading of an ambiguity is
+    # the one that keeps the obligation. Over-surfacing costs a printed line;
+    # under-surfacing is the defect this whole scan exists to remove.
+    outside_seen: dict[tuple[str, str, str], str] = {}
+    for review in reviews:
+        # Same deadline discipline as the fetch loop this follows: the parse is
+        # the one CPU-bound phase here, and a PR with many re-reviews multiplies
+        # it. Measured at single-digit ms per body today, so this is consistency
+        # rather than a live risk — but a future change to the walk would
+        # otherwise lose the protection silently. Out of budget => the read is
+        # INCOMPLETE, which blocks below.
+        if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+            reviews_complete = False
+            break
+        if (review.get("state") or "").upper() == "DISMISSED":
+            # A dismissal is treated as engagement, and the bar is DELIBERATELY
+            # weaker than the inline path's maintainer-reply check — stated
+            # rather than implied, because the code cannot verify it. GitHub
+            # requires write access to dismiss a review, but the reviews API
+            # carries no dismisser, so honouring this rests entirely on that
+            # platform permission, not on anything checked here. Identifying the
+            # actor would need the timeline endpoint and another call on the
+            # merge clock; that trade is open, not settled.
+            continue
+        if (review.get("login") or "") not in _CODERABBIT_LOGINS:
+            continue
+        parsed, declared, declared_known, depth_drift = _cr_outside_diff_entries(
+            review.get("body") or ""
+        )
+        # A section found as REAL STRUCTURE at an unexpected <details> depth is
+        # a layout change in a document we do not control. Nothing else can see
+        # it — the count reconciliation reads its numbers from the very match
+        # this drift prevents — so it blocks as unreadable rather than letting
+        # the scan report clean.
+        outside_shortfall.extend(depth_drift)
+        if declared_known and len(parsed) > declared:
+            # The OTHER direction of the same reconciliation: more entries than
+            # the body's own headers declare means prose was mis-parsed as a
+            # finding — the phantom-Critical shape (Codex P2, PR #1847). We
+            # cannot tell WHICH entries are phantoms, so the read is unreliable
+            # rather than merely noisy, and it blocks as unreadable exactly
+            # like the shortfall — an explained stop beats a false block that
+            # names a finding nobody wrote. Only licensed when every section
+            # header stated its count (`declared_known`).
+            outside_shortfall.append(
+                f"outside-diff section declares {declared} finding(s) but "
+                f"{len(parsed)} were parsed — surplus entries indicate prose "
+                f"mis-read as findings"
+            )
+            # QUARANTINE the batch rather than merging it. Without this the
+            # entries still reached the score, and a phantom Critical among
+            # them returned the ordinary block message NAMING it as a real
+            # finding — the score branch returns before the shortfall check —
+            # so this check's own explained stop never surfaced in exactly the
+            # case it was written for. Both directions still block; what this
+            # buys is that the message is true. The asymmetry with the
+            # shortfall branch below is deliberate: an UNDER-parse's entries
+            # were read correctly and should still block on their own terms,
+            # while a SURPLUS means some entry in this batch is fictional and
+            # nothing here can say which.
+            continue
+        if declared > len(parsed):
+            # The body's own header says it carries more than this parser found,
+            # so the read is INCOMPLETE — and an incomplete finding scan blocks
+            # here exactly as `_scan_unreadable` does, rather than degrading to
+            # a note. Under-parsing is the fail-OPEN direction: a format shift,
+            # or content crafted to hide a finding from the parser, both surface
+            # as a quiet reduction in findings that looks just like a cleaner PR.
+            #
+            # This is also the backstop for the one suppression shape the fence
+            # mask cannot judge: a BALANCED fence spanning a real finding is
+            # indistinguishable from legitimately quoted content, so the mask
+            # correctly hides it — and the count is what notices it went missing.
+            outside_shortfall.append(
+                f"outside-diff section declares {declared} finding(s), parsed "
+                f"{len(parsed)}"
+            )
+        for path, line_range, severity, title in parsed:
+            key = (path, line_range, title)
+            prev = outside_seen.get(key)
+            if prev is None or _CR_SEVERITY_RANK.get(severity, 0) > _CR_SEVERITY_RANK.get(
+                prev, 0
+            ):
+                outside_seen[key] = severity
+    for (path, line_range, title), severity in outside_seen.items():
+        label = f"{title or '(untitled)'} ({path}:{line_range})"
+        if not severity:
+            cr_unknown.append(label)
+        elif severity == "critical":
+            outside_critical.append((label, path))
+        elif severity == "major":
+            outside_major.append((label, path))
+        else:
+            # Keep the level the reviewer actually assigned. Collapsing
+            # Info and Trivial into "Minor" costs nothing in SCORE — all three
+            # are 0.0 — but the report is an inventory, and an inventory that
+            # rounds a level UP overstates the reviewer and misinforms the
+            # operator deciding what to spend time on (Codex P3, PR #1847).
+            outside_minor.append((label, path, severity))
+
+    if outside_critical or outside_major or outside_minor:
+        # Count what this block ITEMISES, not every deduped finding: entries
+        # routed to the unknown-severity lane are reported by that lane's own
+        # NOTE, so `len(outside_seen)` would claim a total larger than the list
+        # beneath it and read as findings gone missing.
+        itemised = len(outside_critical) + len(outside_major) + len(outside_minor)
+        print(
+            f"NOTE: PR #{pr_num} — {itemised} CodeRabbit finding(s) delivered in "
+            f"the REVIEW BODY because their anchor falls outside this PR's diff "
+            f"hunks. These are invisible to the inline endpoint and are SURFACED, "
+            f"NEVER SCORED — read them and decide; this channel cannot block a "
+            f"merge. {len(outside_critical)} Critical, {len(outside_major)} Major, "
+            f"{len(outside_minor)} below-Major:",
+            file=sys.stderr,
+        )
+        # PRINT EVERY ONE. The inline channel can afford a display cap because
+        # its findings also reach a SCORE, so a clipped list still blocks. This
+        # channel scores nothing, so the printed inventory is its ONLY output —
+        # a silently dropped entry is a finding that never reaches the operator
+        # at all, which is precisely the amputation CLAUDE.md forbids: cutting
+        # the only copy. Bounded by what CodeRabbit chose to report, and 27
+        # findings across 23 PRs was the whole measured population.
+        for label, _p in outside_critical:
+            print(f"  [outside-diff Critical] {label}", file=sys.stderr)
+        for label, _p in outside_major:
+            print(f"  [outside-diff Major] {label}", file=sys.stderr)
+        for label, _p, sev in outside_minor:
+            print(f"  [outside-diff {sev.capitalize() or 'Minor'}] {label}", file=sys.stderr)
+
     if unmatched_bot:
         print(
             f"NOTE: PR #{pr_num} — {len(unmatched_bot)} review-bot comment(s) in a "
@@ -1870,10 +2981,23 @@ def _check_inline_review_findings(
         for title in doc_skipped_p2[:5]:
             print(f"  [doc P2] {title}", file=sys.stderr)
     # Weighted review score: P1 = 1.0 (full blocker), P2 = 0.5. Blocks at
-    # score >= threshold — any unresolved P1, OR >= 2 unresolved P2s. Doc-path
+    # score >= the LANE's threshold (critical 1.0 / standard 2.0 / light 3.0), so
+    # the P2 count that stops a merge is 2, 4 or 6 respectively. A P1 never
+    # reaches here — the always-fix floor above blocks it in every lane. Doc-path
     # and maintainer-replied findings were already excluded from p1/p2 above.
+    # The REVIEW-BODY channel contributes NOTHING to this sum, at any severity.
+    # It is surfaced and never scored — owner decision at the escalation cap,
+    # 2026-09-09. Every fail-open this parser produced across four review rounds
+    # was reachable only because a mis-read of a third-party rendered document
+    # could move a BLOCKING verdict; with no blocking verdict to move, the whole
+    # class is unreachable rather than patched. The measured cost is nil: 0
+    # Criticals in 27 findings across 23 PRs (2026-09-07, all 84 then-open
+    # non-draft PRs), so this path has never once fired on live data, while the
+    # surfacing keeps 100% of the value the channel was built for.
     score = (
-        len(p1) + _INLINE_P2_SCORE_WEIGHT * len(p2) + _CR_BLOCKING_WEIGHT * len(cr_block)
+        len(p1)
+        + _INLINE_P2_SCORE_WEIGHT * len(p2)
+        + _CR_BLOCKING_WEIGHT * len(cr_block)
     )
     if cr_advisory:
         print(
@@ -1895,33 +3019,115 @@ def _check_inline_review_findings(
     if p2:
         print(
             f"WARNING: PR #{pr_num} has {len(p2)} inline [P2] review finding(s) "
-            f"(each adds {_INLINE_P2_SCORE_WEIGHT} to the review score; the gate "
-            f"blocks at score >= {_INLINE_SCORE_BLOCK_THRESHOLD:.0f}, i.e. any P1 "
-            f"or {int(_INLINE_SCORE_BLOCK_THRESHOLD / _INLINE_P2_SCORE_WEIGHT)}+ P2s):",
+            f"(each adds {_INLINE_P2_SCORE_WEIGHT} to the review score; the "
+            f"threshold depends on this change's LANE and is named in the "
+            f"verdict below):",
             file=sys.stderr,
         )
         for title in p2[:8]:
             print(f"  [P2] {title}", file=sys.stderr)
-    if score >= _INLINE_SCORE_BLOCK_THRESHOLD:
+    # The lane is resolved ONLY when there is a score to compare, so a PR with no
+    # blocking findings still pays nothing — the same laziness `_scope_cache`
+    # above was built for. `_pr_changed_files` is memoized, and the pin-receipt
+    # gate has already asked it on this merge, so in practice this costs no API
+    # call at all.
+    lane = _pr_lane(pr_num, repo=repo) if score > 0 else "critical"
+    threshold = _INLINE_SCORE_BLOCK_THRESHOLDS[lane]
+    # THE ALWAYS-FIX FLOOR, in every lane, before the score is consulted.
+    #
+    # Severity floors; the lane governs VOLUME. A P1 or a CodeRabbit
+    # Critical/Major stops any merge whatever its lane, and the per-lane
+    # threshold only decides how many P2s may accumulate first.
+    #
+    # This is a RULE now because it used to be an accident. Before the lanes
+    # existed the single threshold was 1.0 and a P1 scores exactly 1.0, so the
+    # floor held by arithmetic — nothing named it, and nothing tested it. Raising
+    # the ordinary threshold to 2.0 would therefore have deleted it silently:
+    # a lone P1 on ordinary code would have scored 1.0 < 2.0 and passed a gate
+    # that has always stopped it.
+    #
+    # WHAT THIS ENFORCES IS NARROWER THAN THE DOCTRINE IT SERVES, and the two
+    # must not be conflated. The genesis-development skill's always-fix floor is
+    # severity AND KIND — "a P1, a security defect, anything destructive or
+    # fail-open". This check can only see the severity LABEL a reviewer attached,
+    # so a CodeRabbit MINOR naming a fail-open scores 0.0 and passes here. The
+    # mechanical floor is the labelled subset; the rest still rests on somebody
+    # reading the report.
+    floor_hits = len(p1) + len(cr_block)
+    if floor_hits:
         listing = "\n".join(
             [f"  [P1] {t}" for t in p1[:5]]
-            + [f"  [P2] {t}" for t in p2[:5]]
             + [f"  [CodeRabbit Critical/Major] {t}" for t in cr_block[:5]]
         )
         return True, (
-            f"review score {score:.1f} >= {_INLINE_SCORE_BLOCK_THRESHOLD:.1f} blocks "
-            f"(P1=1.0, P2={_INLINE_P2_SCORE_WEIGHT}, CodeRabbit Critical/Major="
-            f"{_CR_BLOCKING_WEIGHT:.0f} each): {len(p1)} unresolved [P1] + "
-            f"{len(p2)} unresolved [P2] + {len(cr_block)} CodeRabbit "
-            f"Critical/Major finding(s), none maintainer-replied:\n{listing}\n"
+            f"always-fix floor: {len(p1)} unresolved [P1] + {len(cr_block)} "
+            f"CodeRabbit Critical/Major finding(s), none maintainer-replied "
+            f"(review score {score:.1f}). Severity blocks in EVERY lane (this "
+            f"change is {lane.upper()}); the per-lane score threshold "
+            f"({threshold:.1f} here) governs how many P2s may accumulate, never "
+            f"whether a P1 counts:\n{listing}\n"
             f"Fix and reply in-thread, or append '# review-override' "
             f"to the merge command to acknowledge and proceed."
+        )
+    if score >= threshold:
+        # P1s and CodeRabbit Critical/Majors cannot reach here — the floor above
+        # returned on any of them — so this branch is purely a P2 accumulation,
+        # and naming the other two terms would describe counts that are provably
+        # zero.
+        listing = "\n".join(f"  [P2] {t}" for t in p2[:8])
+        return True, (
+            f"review score {score:.1f} >= {threshold:.1f} blocks this "
+            f"{lane.upper()} change: {len(p2)} unresolved [P2] finding(s) at "
+            f"{_INLINE_P2_SCORE_WEIGHT} each, none maintainer-replied. (A P1 or a "
+            f"CodeRabbit Critical/Major would have blocked at the always-fix "
+            f"floor, whatever the lane.)\n{listing}\n"
+            f"Fix and reply in-thread, or append '# review-override' "
+            f"to the merge command to acknowledge and proceed."
+        )
+    if score > 0:
+        # Below the bar, but the findings are real and the lane is why they did
+        # not stop the merge. Say both, or an operator reading a passing gate
+        # cannot tell a low score from a wide budget.
+        print(
+            f"NOTE: PR #{pr_num} — review score {score:.1f} is under the "
+            f"{threshold:.1f} threshold for a {lane.upper()} change, so the "
+            f"findings above do not block. A CRITICAL change (enforcement hooks, "
+            f"CI config, API surfaces, migrations) blocks at "
+            f"{_INLINE_SCORE_BLOCK_THRESHOLDS['critical']:.1f}. Read them anyway: "
+            f"'not blocking' describes the gate, not the finding.",
+            file=sys.stderr,
         )
     # No unresolved P1 among what we read. If the read is INCOMPLETE (a later page
     # failed), a P1 could exist on an unread page — fail per _scan_unreadable rather
     # than report a clean scan.
     if not complete:
         return _scan_unreadable("inline review comments (incomplete read)")
+    # The review-body read gets the SAME treatment: a later page that failed
+    # could carry the Critical this scan just reported not finding. Checked
+    # after the score so a finding already READ still blocks with its own
+    # message rather than being flattened into "unreadable".
+    # THE REVIEW-BODY CHANNEL NO LONGER BLOCKS ON AN INCOMPLETE READ, and that
+    # is a consequence of the advisory decision rather than a separate one. Every
+    # fail-closed check here — unreadable fetch, declared-count shortfall, count
+    # surplus, section-depth drift — existed for ONE reason: this channel could
+    # move a blocking verdict, so a mis-read had to stop the merge instead of
+    # quietly passing it. With the verdict gone the premise is gone, and keeping
+    # them would mean a third-party document's formatting could still hard-block
+    # a merge while contributing nothing to the decision — the fail-CLOSED twin
+    # of the defect being removed, and one this parser has already produced once
+    # (a file legitimately named after the section header tripped the drift
+    # canary and blocked as unreadable, Codex P2, #1847).
+    # They stay as NOTES: an operator still learns the channel may be
+    # under-reporting, which is the whole value a canary had here.
+    if reviews_unreadable or not reviews_complete or outside_shortfall:
+        detail = "; ".join(outside_shortfall) if outside_shortfall else "the read did not complete"
+        print(
+            f"NOTE: PR #{pr_num} — the CodeRabbit review-body channel may be "
+            f"UNDER-REPORTING ({detail}). It is advisory and never scored, so "
+            f"this does not affect the verdict; read the review bodies directly "
+            f"if this PR's outside-diff findings matter to you.",
+            file=sys.stderr,
+        )
     return False, ""
 
 
@@ -2271,8 +3477,7 @@ def _comment_positional(argv: list[str]) -> tuple[str | None, str | None]:
     the whole target and a later one is not a second candidate to fall back on.
     None means the request carries no positional at all
     (``gh pr comment --body …``, which resolves the PR from the checked-out
-    branch); that keeps its documented fail-open, since there is no target to
-    count against.
+    branch). The review-budget caller treats that as unknown identity.
 
     ``unreadable_flag`` is a dash token this walk does not model, encountered
     BEFORE any positional. It matters because an allowlist on the target's VALUE
@@ -2353,7 +3558,8 @@ def _comment_target(argv: list[str]) -> tuple[str | None, str | None]:
     OWNER/REPO (counting against the hook cwd's repo for a cross-repo URL could
     produce a wrong count and a FALSE block — Codex round-1 finding). An
     explicit ``--repo``/``-R`` flag wins over the URL-derived repo. A branch
-    target (non-numeric, non-URL positional) yields (None, …) → fail-open.
+    target (non-numeric, non-URL positional) yields (None, …); the caller treats
+    that unresolved identity as unknown evidence and asks/denies.
 
     Reads the FIRST positional only (``_comment_positional``), where this used
     to scan every one of them for something number-shaped. gh accepts at most
@@ -2399,9 +3605,10 @@ def _unresolvable_identity(argv: list[str]) -> str | None:
     present and future — is refused by construction, without this function
     knowing anything about shell expansion syntax.
 
-    Two fail-opens are DELIBERATELY kept, both documented and both locked by
-    tests: a request with NO positional at all (nothing to count against), and a
-    literal branch target (resolvable by anyone who cares to look it up).
+    A request with no positional and a literal branch target are syntactically
+    valid gh forms, but neither is a stable PR number at pre-execution time.
+    The caller therefore routes both through the unknown-evidence policy instead
+    of treating them as requests with nothing to count against.
 
     The cost, stated plainly because it is real: ``shell_parse._argv`` runs
     ``shlex.split`` first, so quoting is already gone by the time argv exists,
@@ -2516,222 +3723,232 @@ def _comment_repo(argv: list[str]) -> str | None:
     return val
 
 
-def _final_round_chained_advisory(pr_num: str) -> str:
-    """A second terminal-stage dispatch behind the SAME acceptance.
 
-    The sigil is matched command-wide so the documented nested form
-    (`bash -c '…' # final-round-accept`) keeps working, which also meant
-    `request && request # final-round-accept` could chain arbitrarily many rounds
-    behind one decision while the advisory promised "ONE more round".
-    """
+def _review_budget_message(pr_num: str, result: dict, repo: str) -> str:
+    """Native-approval reason for one review request; no self-issued sigil exists."""
+    if result.get("status") != "ok":
+        return (
+            f"Review evidence for PR #{pr_num} in {repo} could not be read reliably. "
+            "Treating the round budget as zero would silently reopen an exhausted "
+            "review loop. Approve this one request only if you have independently "
+            "checked the PR history."
+        )
+    count = int(result.get("count") or 0)
+    next_round = count + 1
+    if result.get("gate_surface"):
+        return (
+            f"PR #{pr_num} changes the review-gate surface and already has {count} "
+            f"distinct reviewed heads. Its expedited budget is two discovery rounds; "
+            f"this is another discovery request (round {next_round}). Approve only "
+            "after deciding that another gate-design round is worth the risk."
+        )
+    if result.get("strongly_discouraged"):
+        return (
+            f"PR #{pr_num} already has {count} distinct reviewed heads. Round "
+            f"{next_round} is strongly discouraged: stop, narrow or redesign the "
+            "change, accept documented residue, or abandon it. Approve only this "
+            "single request if continuing is still the least costly option."
+        )
     return (
-        f"BLOCKED: a second terminal-stage review request for PR #{pr_num} in the "
-        "same command. '# final-round-accept' authorises ONE dispatch — the user "
-        "directed one more round, not a chain of them.\n\n"
-        "Run the requests separately, each with its own decision behind it."
+        f"PR #{pr_num} already has {count} distinct reviewed heads; standing "
+        f"authorization ended after four. Approve this single round-{next_round} "
+        "request. Earlier approval does not carry forward to another request."
     )
 
 
-def _final_round_advisory(pr_num: str, rounds: int, repo: str | None = None) -> str:
-    """The terminal, stated for the DISPATCH side of the loop.
+def _comment_body(argv: list[str]) -> tuple[str | None, bool]:
+    """Effective inline body of a ``gh pr comment`` argv, plus opacity.
 
-    Counted from the PR's own review history rather than the local counter, so it
-    fires even when every round ran in the cloud and none was marked locally —
-    which is the case this gate exists for, and therefore the case the commit-side
-    terminal cannot see.
-
-    DELIBERATELY STATELESS, unlike the commit-side terminal. That one spends its
-    acceptance because it licenses a state change (a commit that lands work); this
-    one licenses a review REQUEST, which changes nothing on its own — a session
-    that can re-request reviews but cannot commit fixes achieves nothing, so the
-    commit gate remains the terminal that bites. Making an advisory, fail-open
-    gate carry per-branch consumption state would also contradict the
-    "stateless, authoritative" property the rest of this scan is built on. The
-    consequence is stated rather than hidden: the ack is required on EVERY
-    dispatch past the terminal, and it is not one-shot here.
-    """
-    repo_arg = f" --repo {repo}" if repo else ""
-    return (
-        f"BLOCKED: this would be Codex round {rounds + 1} on PR #{pr_num} — "
-        f"{rounds} rounds already ran on this PR, at or past the terminal "
-        f"({FINAL_ROUND_CAP}). Two full escalation cycles have run and each already "
-        "asked for a fresh decision. '# escalation-ack' does NOT clear this one; if "
-        "it did, the cycle would simply continue, which is what the terminal exists "
-        "to end.\n\n"
-        "There are exactly two ways out, and neither is this session's to choose "
-        "alone:\n"
-        "  (a) ACCEPT the outstanding findings and merge — document each one and why "
-        "it is acceptable in the PR body. The COMMIT gate is where that decision is "
-        "recorded, and there the acceptance is one-shot.\n"
-        "  (b) ABANDON the branch and restart from a design that does not need this "
-        "many rounds.\n\n"
-        "If the user directs ONE more round, that decision rides on this command:\n"
-        f"    gh pr comment {pr_num}{repo_arg} --body '@codex review'  # final-round-accept\n"
-        "Required on EVERY dispatch past the terminal — this gate keeps no state, so "
-        "the sigil is not spent here.\n\n"
-        "Take it to the user. A dispatched session with nobody reading cannot pick "
-        "any of these — surface it and stop."
-    )
-
-
-def _escalation_advisory(pr_num: str, rounds: int, repo: str | None = None) -> str:
-    repo_arg = f" --repo {repo}" if repo else ""
-    return (
-        f"BLOCKED: this would be Codex round {rounds + 1} on PR #{pr_num} — "
-        f"{rounds} rounds already ran (cap {ESCALATION_ROUND_CAP}). Repeated "
-        "rounds each finding NEW defects is the whack-a-mole signature: the "
-        "fixes themselves are becoming the bug source. STEP BACK before "
-        "requesting another round:\n"
-        "  1. TRIAGE every open finding FIRST — classify each as {live bug | "
-        "latent trap | hardening | observation}. Only live bugs and "
-        "cheaper-now-than-later traps may change already-reviewed code; "
-        "everything else gets a documented acceptance or routes to the PR that "
-        "owns that area. Findings are inputs to judgment, not a to-do list.\n"
-        "  2. Fix MECHANISMS, not instances — ask 'what made this bug "
-        "possible?' and remove that; patching the named instance leaves the "
-        "class alive for the next round to find.\n"
-        "  3. State-machine/queue/lifecycle code: enumerate EVERY status value "
-        "and trace your change under each one. Your tests encode your own "
-        "model of the states — they cannot catch the states you didn't "
-        "consider.\n"
-        "  4. Consider REVERTING a prior round's fix instead of patching it "
-        "again — less code is often the real fix.\n"
-        "  5. ESCALATE to the user with a minimize-change recommendation — "
-        "past the cap, standing approval is consumed; each extra round needs "
-        "a fresh, conscious decision.\n"
-        "After doing the above (triage table produced, user consulted), "
-        "re-run with a trailing shell comment (outside any quotes):\n"
-        f'  gh pr comment {pr_num}{repo_arg} --body "@codex review"  # escalation-ack'
-    )
-
-
-def _check_codex_round_escalation(segs) -> tuple[bool, str]:
-    """Block a ``gh pr comment … @codex review`` once the PR already carries
-    ``ESCALATION_ROUND_CAP`` Codex reviews, until a trailing ``# escalation-ack``.
-
-    Companion to the commit gate's Rule 3 (review_enforcement_commit.py): that
-    counter tracks LOCAL review→fix rounds and stays asleep when every local
-    review is clean while the loop churns through CODEX rounds on the PR — the
-    exact blind spot of the 2026-08-12 MW-3 #1372 whack-a-mole (5 Codex rounds,
-    local counter at 0). This gate counts the PR's actual Codex reviews from the
-    GitHub API (stateless, authoritative) at the one moment the groove happens:
-    requesting the next round.
-
-    FAIL-OPEN state table (advisory logic must never break workflow — the
-    opposite posture from the fail-closed merge gates, on purpose):
-      segment isn't `gh pr comment`               → untouched
-      comment without an '@codex review' body     → untouched (body-file/stdin
-        bodies are unresolvable here — documented coverage limit, fail-open;
-        blocking unresolvable bodies would false-block non-trigger comments)
-      '# escalation-ack' trailing ANY segment     → allow the whole command (a
-        nested `bash -c '…' # escalation-ack` carries the ack on the OUTER
-        segment; the ack is a conscious human-directed act, so one ack licenses
-        the command it trails) — BUT ONLY BELOW THE TERMINAL. At or past
-        FINAL_ROUND_CAP it does not clear the block; '# final-round-accept' does.
-        This is why the ack is no longer a top-of-function short-circuit: a
-        short-circuit could never see the count it needed to be bounded by.
-      rounds >= FINAL_ROUND_CAP, no final-accept → BLOCK with the terminal (an
-        escalation-ack here is deliberately not enough)
-      no positional / literal branch target       → that segment allows;
-        SCANNING CONTINUES (an allowed segment must not shield a later one)
-      identity not written literally (target OR
-        repo)                                     → BLOCK. The one fail-CLOSED
-        leg, and the ack does not clear it: `acked` is command-wide, so one
-        sigil on a loop would license a round on every PR it touches. See
-        `_unresolvable_identity` for why the accepted forms are an ALLOWLIST
-      gh/API/parse error (ids is None)            → that segment allows, scan on
-      rounds < ESCALATION_ROUND_CAP               → that segment allows, scan on
-      cap <= rounds < FINAL_ROUND_CAP, no ack    → BLOCK with the step-back order
-      any segment at rounds >= cap, no ack        → BLOCK with the step-back
-        order (URL targets carry their OWN repo into the count — counting the
-        hook cwd's repo for a cross-repo URL could produce a FALSE block)
-    Any unexpected exception → allow (caught here, NOT left to run_guard's
-    fail-closed exit-2, which would turn an advisory bug into a hard block).
+    Returns ``(body, opaque)``: the LAST ``-b``/``--body``/``--body=`` value
+    (gh string flags take the last supplied value, so earlier overridden
+    bodies never reach GitHub) and whether any opaque body channel is present
+    (body file, editor, web, or a missing -b value). ``(None, False)`` means a
+    body-free invocation.
     """
     try:
-        # Both sigils resolved up front, and the escalation-ack short-circuit is
-        # now CONDITIONAL on not having reached the terminal. It used to return
-        # before any counting, which meant this gate — the one that counts the
-        # PR's ACTUAL Codex rounds, and exists precisely because the local counter
-        # sleeps through them — could be re-acked forever. The commit-side terminal
-        # reads only that sleeping local counter, so it inherited the same blind
-        # spot: a review/fix loop driven entirely through cloud rounds never
-        # reached it.
-        acked = any(has_trailing_override(s.raw, "escalation-ack") for s in segs)
-        final_acked = any(has_trailing_override(s.raw, "final-round-accept") for s in segs)
-        # Bound this scan's gh (_codex_reviews) calls by the SHARED hook deadline,
-        # so a slow API + a compound command can't push the aggregate past the
-        # ~60s hook wall-clock and get the WHOLE hook SIGKILLed — which fails open
-        # on every gate (round-6 P1). Idempotent: a later merge gate reuses this
-        # same deadline (it arms only when None), never resets it.
-        global _merge_deadline
-        if _merge_deadline is None:
-            _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
-        # Earlier trigger segments in THIS command count toward the total: each
-        # segment sees the same pre-execution API count, so `request && request`
-        # at cap-1 would otherwise dispatch round N+1 unacknowledged (round-2
-        # finding). Keyed per (repo, pr) so distinct PRs don't cross-count.
-        in_cmd: dict[str, int] = {}
-        # One '# final-round-accept' authorises ONE dispatch across the whole
-        # command; see where it is spent below.
-        terminal_license_spent = False
-        for seg in segs:
-            # Stop scanning once the shared budget is drained. Past that point every
-            # remaining gh call still gets the 1.0s floor, so a long compound command
-            # against a hung API could walk the aggregate toward the hook wall-clock
-            # and get the WHOLE hook SIGKILLed — which fails open on every gate. The
-            # merge path already breaks here; this scan did not, and it now makes gh
-            # calls on acked commands that previously short-circuited before arming.
-            if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
-                break
-            if gh_pr_subcommand(seg.argv) != "comment":
+        start = argv.index("comment") + 1
+    except ValueError:
+        return None, False
+    inline_body: str | None = None
+    opaque = False
+    i = start
+    while i < len(argv):
+        tok = argv[i]
+        if tok in {"-b", "--body"}:
+            if i + 1 >= len(argv):
+                opaque = True
+            else:
+                inline_body = argv[i + 1]
+                i += 1
+        elif tok.startswith("--body="):
+            inline_body = tok.split("=", 1)[1]
+        elif tok.startswith("-b") and len(tok) > 2:
+            inline_body = tok[2:]
+        elif tok in {"-F", "--body-file", "-e", "--editor", "-w", "--web"}:
+            opaque = True
+            if tok in {"-F", "--body-file"} and i + 1 < len(argv):
+                i += 1
+        elif tok.startswith("--body-file=") or (tok.startswith("-F") and len(tok) > 2):
+            opaque = True
+        i += 1
+    # shell_parse preserves expansion spelling in argv rather than evaluating it.
+    # The eventual body is therefore unknowable when it contains parameter or
+    # command substitution. Treat it like a body-file/editor source. This is
+    # deliberately conservative for a single-quoted literal containing "$" or
+    # backticks: the process gate cannot recover quote provenance from argv, and
+    # asking at a spent budget is safer than treating dynamic content as ordinary.
+    if inline_body is not None and ("$" in inline_body or "`" in inline_body):
+        opaque = True
+    return inline_body, opaque
+
+
+def _comment_review_request(argv: list[str]) -> tuple[str | None, bool, bool | None]:
+    """Parse a comment body once and derive its ``@codex review`` signal.
+
+    Returns ``(effective_inline_body, opaque, signal)``. A ``None`` signal means
+    the body is opaque at pre-execution time (body file, editor, web flow, or an
+    omitted body). Opaque is evaluated as a possible request: standing
+    authorization may still allow it, while an approval boundary asks or denies.
+    This avoids a body-file spelling becoming a cap bypass without pretending a
+    file cannot be rewritten earlier in the same shell command.
+    """
+    try:
+        start = argv.index("comment") + 1
+    except ValueError:
+        return None, False, False
+    inline_body, opaque = _comment_body(argv)
+    delete_only = "--delete-last" in argv[start:]
+    if opaque:
+        return inline_body, True, None
+    if inline_body is not None and "@codex review" in inline_body.lower():
+        return inline_body, opaque, True
+    if inline_body is not None:
+        return inline_body, opaque, None if opaque else False
+    if delete_only and not opaque and "--edit-last" not in argv[start:]:
+        return inline_body, opaque, False
+    return inline_body, opaque, None
+
+
+def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = None) -> tuple[str, str]:
+    """Return (allow|ask|deny, reason) for Codex review requests.
+
+    Distinct reviewed heads are authoritative. Legacy escalation/final sigils
+    are intentionally ignored: at the approval boundary only the hook's native
+    user decision can authorize the action.
+    """
+    triggers = [
+        (seg, body, signal)
+        for seg in segs
+        if gh_pr_subcommand(seg.argv) == "comment"
+        for body, _opaque, signal in (_comment_review_request(seg.argv),)
+        if signal is not False
+    ]
+    if not triggers:
+        return "allow", ""
+
+    # One native decision must authorize exactly one request. Reject compounds
+    # before any network lookup or confirmation exemption so standing capacity,
+    # an exact-head marker, or opaque input cannot license a sibling request.
+    if len(triggers) > 1:
+        return (
+            "deny",
+            "BLOCKED: this command contains multiple review requests. Run each "
+            "request separately so every action receives its own policy decision.",
+        )
+
+    global _merge_deadline
+    if _merge_deadline is None:
+        _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
+
+    decisions: list[tuple[str, str]] = []
+    exemption_used = False
+    for seg, effective_body, body_signal in triggers:
+        unresolvable = _unresolvable_identity(seg.argv)
+        if unresolvable is not None:
+            return "deny", _unresolvable_identity_advisory(unresolvable)
+        pr_num, explicit_repo = _comment_target(seg.argv)
+        effective_cwd = _effective_cwd(cmd, payload or {}, seg=seg) if cmd else None
+        if effective_cwd is _CWD_UNKNOWN:
+            repo = explicit_repo
+        else:
+            repo = explicit_repo or _derive_repo_from_cwd(
+                effective_cwd if isinstance(effective_cwd, str) else os.getcwd()
+            )
+        if not pr_num:
+            # ``gh pr comment`` accepts both a literal branch and no target
+            # (current-branch inference).  Neither form gives this pre-execution
+            # guard a stable PR identity without another resolution protocol, so
+            # it is UNKNOWN evidence, not "no request".  Native approval is the
+            # safe foreground result; dispatched sessions are denied by main().
+            repo_label = repo or "the current repository"
+            decisions.append(
+                (
+                    "ask",
+                    f"The pull request targeted by this @codex review command in "
+                    f"{repo_label} could not be resolved to a literal PR number. "
+                    "Approve this one request only after checking its review history, "
+                    "or rewrite it with a literal PR number/URL so the round budget "
+                    "can be enforced automatically.",
+                )
+            )
+            continue
+        if not repo or _review_budget is None:
+            result = {"status": "unknown"}
+            repo_label = repo or "the current repository"
+        else:
+            repo_label = repo
+            try:
+                result = _review_budget.evaluate_pr(
+                    repo,
+                    pr_num,
+                    timeout_for=_gh_timeout,
+                )
+            except Exception:  # noqa: BLE001 - unknown asks/denies; never crashes open.
+                result = {"status": "unknown"}
+
+        if result.get("status") == "ok" and result.get("confirmation_exempt"):
+            marker = _review_budget.confirmation_marker(
+                str(result.get("current_head") or "")
+            )
+            # The exemption licenses ONE dispatch: every request is judged on
+            # pre-command state, so a second marked request in the same command
+            # would also read exempt. The first consumes it; the rest ask.
+            # The marker must sit in the EFFECTIVE body — an overridden earlier
+            # -b value never reaches GitHub, so argv-wide matching would exempt
+            # a request that posts no marker at all.
+            if (
+                body_signal is True
+                and effective_body is not None
+                and marker in effective_body
+                and not exemption_used
+            ):
+                exemption_used = True
+                decisions.append(("allow", ""))
                 continue
-            if not any("@codex review" in tok.lower() for tok in seg.argv):
-                continue
-            # BEFORE resolving the number, not after: a literal number with an
-            # unreadable `--repo` resolves fine and still counts the wrong repo,
-            # so a check gated on `not pr_num` would never see it.
-            unresolvable = _unresolvable_identity(seg.argv)
-            if unresolvable is not None:
-                return True, _unresolvable_identity_advisory(unresolvable)
-            pr_num, repo = _comment_target(seg.argv)
-            if not pr_num:
-                # A missing positional or a literal branch target keeps its
-                # documented fail-open; every other spelling was refused above.
-                continue
-            # Count ALL Codex review rounds — including DISMISSED, which still
-            # ran and consumed the budget (#1385 round-5). Freshness uses the
-            # dismissed-filtered ``_codex_review_commit_ids``; the cap does not.
-            reviews = _codex_reviews(pr_num, repo=repo)
-            if reviews is None:
-                continue
-            key = f"{repo or ''}|{pr_num}"
-            effective = len(reviews) + in_cmd.get(key, 0)
-            # TERMINAL tier, checked first and NOT clearable by the repeatable
-            # sigil — the whole point of a terminal is that the cycle cannot reach
-            # past it. Counted from the PR's real review history, so it holds even
-            # when every one of those rounds went unmarked locally.
-            if effective >= FINAL_ROUND_CAP:
-                if not final_acked:
-                    return True, _final_round_advisory(pr_num, effective, repo)
-                # ONE decision licenses ONE dispatch. `final_acked` is computed with
-                # any() over the whole command — deliberately, because a nested
-                # `bash -c '…' # final-round-accept` carries the sigil on the OUTER
-                # segment, so per-segment binding would break the documented nested
-                # form. But command-wide truth also let `request && request # sigil`
-                # chain arbitrarily many rounds behind a single decision, while the
-                # advisory promises the user is directing "ONE more round". Spending
-                # the license on first use keeps the nested form working and closes
-                # the chain.
-                if terminal_license_spent:
-                    return True, _final_round_chained_advisory(pr_num)
-                terminal_license_spent = True
-            elif effective >= ESCALATION_ROUND_CAP and not acked:
-                return True, _escalation_advisory(pr_num, effective, repo)
-            in_cmd[key] = in_cmd.get(key, 0) + 1
-    except Exception:
-        return False, ""
-    return False, ""
+            # The exemption is mechanically one-shot only when the request
+            # records its exact head. An unmarked request is indistinguishable
+            # from discovery and therefore needs the normal native approval.
+            decisions.append(("ask", _review_budget_message(pr_num, result, repo_label)))
+            continue
+        if result.get("status") != "ok" or result.get("approval_required"):
+            decisions.append(("ask", _review_budget_message(pr_num, result, repo_label)))
+        else:
+            decisions.append(("allow", ""))
+
+    asks = [reason for decision, reason in decisions if decision == "ask"]
+    if asks:
+        reason = asks[0]
+        # A stale worktree still emits the retired terminal sigil. It is parsed
+        # (kept in _KNOWN_SIGILS so a compound stays order-independent) but
+        # authorizes nothing — name that in the prompt so an old habit does not
+        # read an ask as a gate misfire.
+        if any(has_trailing_override(seg.raw, "final-round-accept") for seg, _, _ in triggers):
+            reason += (
+                "\n\nNOTE: `# final-round-accept` is retired and no longer "
+                "authorizes any gate; only this native approval admits the request."
+            )
+        return "ask", reason
+    return "allow", ""
 
 
 # A CLEAN Codex re-review is posted as an ISSUE COMMENT (not a review object): the body
@@ -2839,7 +4056,11 @@ def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str
 # config/behavioral_rules/ rides as a prefix: behavioral_linter.py loads every
 # YAML under it (decision config = enforcement surface, see the note in
 # _HOOK_SURFACE_FILES).
-_HOOK_SURFACE_PREFIXES = ("scripts/hooks/", ".claude/hooks/", "config/behavioral_rules/")
+_HOOK_SURFACE_PREFIXES = (
+    _review_budget.HOOK_SURFACE_PREFIXES
+    if _review_budget is not None
+    else ("scripts/hooks/", ".claude/hooks/", "config/behavioral_rules/")
+)
 # EVERY hook wired in .claude/settings.json is fence surface — not only the
 # blocking gates: any script auto-executing inside sessions is enforcement-
 # adjacent (architect SHOULD-FIX 2026-08-23: the named-list-as-sample trap this
@@ -2847,44 +4068,55 @@ _HOOK_SURFACE_PREFIXES = ("scripts/hooks/", ".claude/hooks/", "config/behavioral
 # original 4-file fence). Over-fencing costs only stricter review; a guardrail
 # test (test_git_push_guard_hook_surface.py) parses settings.json and FAILS CI
 # if a wired hook ever falls outside this fence, so the set is self-maintaining.
-_HOOK_SURFACE_FILES = frozenset(
-    {
-        "scripts/bash_safety_hook.sh",  # the global Bash chokepoint
-        "scripts/review_scope.py",  # substantiality classifier (feeds THIS gate)
-        "scripts/review_state.py",  # escalation counter + review markers
-        ".claude/settings.json",  # hook wiring (inline blob + matchers)
-        # scripts/-root hooks wired via .claude/hooks/genesis-hook (which
-        # resolves bare names as scripts/<name>); scripts/hooks/* wirings are
-        # covered by the prefix above.
-        "scripts/behavioral_linter.py",
-        "scripts/check_stale_pending.py",
-        "scripts/content_safety_hook.py",
-        "scripts/contribution_offer_hook.py",
-        "scripts/edit_failure_sensor.py",
-        "scripts/file_context_hook.py",
-        "scripts/file_modification_audit_hook.py",
-        "scripts/genesis_precompact.py",
-        "scripts/genesis_session_context.py",
-        "scripts/genesis_session_end.py",
-        "scripts/genesis_stop_hook.py",
-        "scripts/genesis_urgent_alerts.py",
-        "scripts/plan_bookmark_hook.py",
-        "scripts/pretool_check.py",
-        "scripts/proactive_memory_hook.py",
-        "scripts/procedure_advisor.py",
-        "scripts/review_enforcement_commit.py",
-        "scripts/review_enforcement_prompt.py",
-        "scripts/review_invalidate_on_commit.py",
-        "scripts/surface_open_prs.py",
-        "scripts/surface_pr_updates.py",
-        # Hook-owned DECISION CONFIGURATION (Codex P2, round 1): these files
-        # determine what the wired hooks enforce, and the ordinary
-        # substantiality classifier treats YAML as docs/config (review-trivial)
-        # — so a rewrite that removes blocking patterns could merge on a stale
-        # review. Config that drives enforcement is enforcement surface.
-        "config/protected_paths.yaml",  # pretool_check.py
-        "config/repo_topology.yaml",  # repo_routing_guard.py
-    }
+_HOOK_SURFACE_FILES = (
+    _review_budget.HOOK_SURFACE_FILES
+    if _review_budget is not None
+    else frozenset(
+        {
+            "scripts/bash_safety_hook.sh",  # the global Bash chokepoint
+            "scripts/review_scope.py",  # substantiality classifier (feeds THIS gate)
+            "scripts/review_state.py",  # escalation counter + review markers
+            "scripts/review_budget.py",  # distinct-head policy evaluator
+            "scripts/review_deadline.py",  # aggregate hook timeout arithmetic
+            "scripts/external_review.py",  # autonomous review-request boundary
+            "scripts/lib/gate_menu.py",  # cap decision menu shown to the user
+            ".claude/settings.json",  # hook wiring (inline blob + matchers)
+            # scripts/-root hooks wired via .claude/hooks/genesis-hook (which
+            # resolves bare names as scripts/<name>); scripts/hooks/* wirings are
+            # covered by the prefix above.
+            "scripts/behavioral_linter.py",
+            "scripts/check_stale_pending.py",
+            "scripts/content_safety_hook.py",
+            "scripts/contribution_offer_hook.py",
+            "scripts/edit_failure_sensor.py",
+            "scripts/file_context_hook.py",
+            "scripts/file_modification_audit_hook.py",
+            "scripts/genesis_precompact.py",
+            "scripts/genesis_session_context.py",
+            "scripts/genesis_session_end.py",
+            "scripts/genesis_stop_hook.py",
+            "scripts/genesis_urgent_alerts.py",
+            "scripts/plan_bookmark_hook.py",
+            "scripts/pretool_check.py",
+            "scripts/proactive_memory_hook.py",
+            "scripts/procedure_advisor.py",
+            "scripts/review_enforcement_commit.py",
+            "scripts/review_enforcement_prompt.py",
+            "scripts/review_invalidate_on_commit.py",
+            "scripts/surface_open_prs.py",
+            "scripts/surface_pr_updates.py",
+            # Hook-owned DECISION CONFIGURATION (Codex P2, round 1): these files
+            # determine what the wired hooks enforce, and the ordinary
+            # substantiality classifier treats YAML as docs/config (review-trivial)
+            # — so a rewrite that removes blocking patterns could merge on a stale
+            # review. Config that drives enforcement is enforcement surface.
+            "config/protected_paths.yaml",  # pretool_check.py
+            "config/repo_topology.yaml",  # repo_routing_guard.py
+            "config/external_review.yaml",  # external review identity + dispatch
+            "src/genesis/session_awareness/external_review.py",
+            "src/genesis/session_awareness/external_review_config.py",
+        }
+    )
 )
 
 
@@ -2907,6 +4139,312 @@ _MIN_OVERRIDE_EVIDENCE_CHARS = 200
 _MAX_OVERRIDE_EVIDENCE_READ = 65536
 
 
+#: Retention is NOT here. It is a size bound over the whole store, applied by
+#: ``scripts/prune_hook_audit_logs.py`` on the daily ``disk_hygiene.sh`` timer, which
+#: is where every other store in this repo bounds itself. An earlier version pruned
+#: in-hook, on the merge path, and that retention engine was the source of most of
+#: this feature's defects. An age window is deliberately gone too: at roughly three
+#: flushes a day the store answers "has this escape decayed into the routine path?"
+#: only over YEARS, and a 90-day window deleted exactly the signal it exists to hold.
+#: The row's field set is CLOSED, and the writer builds rows from THIS tuple — a
+#: caller cannot add a field by passing one. See the no-free-text constraint on
+#: ``_note_override``. ``base`` is deliberately absent: no gate on this path
+#: returns the base ref without a second API read, and a field that is empty on
+#: every real call is worse than no field (pr + repo resolve it after the fact).
+_OVERRIDE_LOG_FIELDS = ("ts", "sigil", "outcome", "waived", "pr", "repo", "head", "actor")
+#: Outcomes a row can carry. The log records override ATTEMPTS, tagged with what
+#: the command actually did — a sigil appended to a command that was then blocked
+#: by a DIFFERENT gate is a real signal (it says the escape was reached for), but
+#: it is not an override that took effect, and conflating the two would inflate
+#: every count drawn from this file.
+#:
+#: WHAT IT IS NOT: `outcome` is the GUARD'S OVERALL VERDICT on the command, not a
+#: statement that the sigil waived anything. A gate handed `force=True` returns
+#: without evaluating its condition, so a sigil that was not needed — e.g.
+#: `# scheduled-review-override` when every scheduled review is already present —
+#: produces a row identical to one that bypassed a failing gate. Counting
+#: "allowed" rows therefore counts commands that were allowed, and OVERSTATES how
+#: often an escape actually did work. Recording per-gate effectiveness needs each
+#: gate to report what it observed rather than short-circuit, which costs API
+#: calls on a budgeted path; that is filed as a follow-up, not approximated here.
+#:
+#: "asked" is NOT a spelling of "allowed". ``_ask`` returns 0 while emitting a
+#: permissionDecision the HUMAN may still deny, so the exit code alone cannot say
+#: whether the command ran; recording it as "allowed" would have the log assert a
+#: merge that may never have happened — the same conflation this field exists to
+#: prevent, one level down. "error" is the fail-closed wrapper's path.
+#:
+#: "asked" IS reachable, and an earlier version of this note claimed otherwise —
+#: wrongly, on the reasoning that the merge arm never asks. It does not ask, but it
+#: does not RETURN either: it falls through to the deferred approval prompt, and
+#: `gh pr create` is deliberately exempt from the "multiple publish/merge
+#: operations" refusal. MEASURED:
+#:   gh pr merge N --squash --admin --match-head-commit <sha>  # ci-override
+#:     && gh pr create --title x --body y
+#: emits an "ask" and writes the ci-override row with outcome "asked".
+#: Treat an "asked" row as a real, expected state — the command was handed to the
+#: user and may have been denied — not as an anomaly.
+#:
+#: ENFORCED, not just documented: ``_flush_overrides`` drops a row whose outcome
+#: is outside this tuple, the way ``sigil`` is checked against ``_KNOWN_SIGILS``.
+_OVERRIDE_OUTCOMES = ("allowed", "asked", "blocked", "error")
+
+#: Shapes a stored value may take. A row is metadata, so every field is either a
+#: closed set or matches one of these — see ``_note_override``. Without them
+#: ``head`` is whatever followed ``--match-head-commit`` on the command line,
+#: which is arbitrary text, which makes the no-free-text guarantee false.
+_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_REPO_RE = re.compile(r"^[\w.-]{1,100}/[\w.-]{1,100}$")
+#: ``waived`` names the gate CLASS a sigil targets. Every producer is a literal in
+#: this file (plus ``ci-status`` refined to ``ci:<state>``), so it is a closed set
+#: — enforced, because "the field set is closed" was only ever true of NAMES:
+#: MEASURED, a 311-character ``waived`` carrying quotes and a token-shaped string
+#: was written to the row while the docstring claimed every field was shape-checked.
+_WAIVED_RE = re.compile(r"^[a-z][a-z0-9:+-]{0,63}$")
+#: `pr` was the one field with no bound, and `str.isdigit()` was the wrong check
+#: twice over: it accepts non-ASCII digits (MEASURED: Arabic-Indic "١٢٣٤٥٦٧٨٩"
+#: stored verbatim) and imposes no length, so a PR token read off the command line
+#: could write an arbitrarily long row. ASCII digits, and no more than a PR number
+#: could plausibly be.
+_PR_RE = re.compile(r"^[0-9]{1,12}$")
+
+#: Rows noted during this invocation, flushed once the gate's verdict is known.
+#: Module-level because detection is spread across the merge gate while the
+#: outcome is only known at the end; ``main`` clears it on entry, so a second
+#: call in the same process (the tests, and only the tests) cannot inherit rows.
+_PENDING_OVERRIDES: list[dict] = []
+
+#: Set by :func:`_ask` when the guard hands the decision to the user. Read by the
+#: flush to tell an ask from an allow — both exit 0. Cleared by ``main`` on entry.
+_ASK_EMITTED = False
+
+
+def _actor() -> str:
+    """Who ran the command, from the passwd database — NOT from the environment.
+
+    ``getpass.getuser()`` is the obvious choice and is WRONG here: it consults
+    ``$LOGNAME``/``$USER``/``$LNAME``/``$USERNAME`` FIRST and only falls back to
+    passwd. MEASURED: with ``LOGNAME`` set, ``getpass.getuser()`` returned that
+    value — so an audited command could forge its own attribution
+    (``LOGNAME=someone-else gh pr merge … # ci-override``) in the one field whose
+    entire job is saying who did it. ``os.getuid()`` cannot be set by the command
+    being guarded.
+    """
+    try:
+        import pwd
+
+        return pwd.getpwuid(os.getuid()).pw_name
+    except Exception:  # noqa: BLE001 — attribution is best-effort, never fatal.
+        return str(os.getuid())
+
+
+def _override_log_dir() -> str:
+    """Directory holding the merge-gate override records, one file per flush.
+
+    Deliberately NOT inside ``_override_evidence_dir()``: that directory is a store
+    the gate READS AND VALIDATES (>=200 chars, must cite the head), so an audit row
+    living there could satisfy an evidence check, and a retention sweep there would
+    delete evidence the gate still needs. Kept separate, beside the discard guard's
+    own store, with which it shares its writer.
+
+    A RELATIVE override is refused in favour of the default: it would resolve
+    against the hook's cwd — the repo — putting durable audit files inside the
+    working tree, where they can be committed. That is the accident this guards.
+
+    It is NOT a guarantee that the store cannot land in the tree: an ABSOLUTE path
+    inside the repo is accepted as given. Refusing those would mean deciding which
+    absolute paths are "in a repo", which is a worse problem than the one being
+    solved, and an operator who spells out such a path has chosen it. The default is
+    what ``test_the_live_default_path_is_outside_any_repo`` keeps honest."""
+    # ONE resolver, shared with the other guard and the pruner. This rule
+    # was written out three times and the pruner's copy omitted the
+    # absolute-path refusal, so it trimmed an unrelated directory while the
+    # real store grew unbounded (Codex P2, PR #1609). See
+    # audit_jsonl.resolve_store_dir.
+    from audit_jsonl import resolve_store_dir
+
+    return resolve_store_dir("GENESIS_MERGE_OVERRIDE_DIR")
+
+
+def _note_override(
+    sigil: str,
+    *,
+    waived: str,
+    pr: str = "",
+    repo: str | None = None,
+    head: str | None = None,
+    **_ignored: object,
+) -> None:
+    """Note that an override sigil was invoked. METADATA ONLY; never raises.
+
+    The gate's own messages promise the operator that an override is "(logged)".
+    Until this existed that claim was false on every surface — no writer anywhere
+    under ``scripts/`` or ``src/genesis/``, and nothing on disk. A gate promising an
+    audit trail it does not keep is worse than one promising nothing: it invites use
+    of the escape on the belief that it is recorded.
+
+    The row is HELD until :func:`_flush_overrides` learns the gate's verdict, because
+    "the sigil was appended" and "the sigil let a merge through" are different facts
+    and only the second one is an override. Both are kept, distinguished by
+    ``outcome`` — see ``_OVERRIDE_OUTCOMES``.
+
+    NO COMMAND OR COMMENT TEXT EVER REACHES THIS ROW, and there is no "reason" field
+    to add. The constraint is inherited, not invented — ``git_discard_guard.py``'s
+    ``_record_snapshots`` refuses to persist the command because "the Bash payload can
+    carry credentials (``curl -H 'Authorization: …' && git checkout``) and this log is
+    durable". An override sigil IS a trailing comment on a Bash command, so the only
+    free text available here is command-line text, from a segment that may carry a
+    token. ``**_ignored`` exists so a caller cannot smuggle text in by passing an extra
+    keyword: the row is built from ``_OVERRIDE_LOG_FIELDS`` and nothing else.
+
+    ``sigil`` is validated against ``shell_parse._KNOWN_SIGILS`` — a closed set, never
+    free text. An unrecognised sigil notes nothing rather than persisting the caller's
+    string.
+
+    EVERY OTHER FIELD IS SHAPE-CHECKED for the same reason, because "the closed field
+    tuple stops free text" was only true of the field NAMES. ``head`` arrives as
+    whatever token followed ``--match-head-commit`` on the command line — arbitrary
+    text, of arbitrary length, which the operator typed — so it is stored only if it
+    looks like a sha, and ``repo`` only if it looks like ``owner/name``. Anything else
+    becomes empty: an unattributed row is a small loss, an arbitrary string written
+    durably to a file beside secrets is not.
+    """
+    if sigil not in _KNOWN_SIGILS:
+        return
+    head = (head or "").strip().lower()
+    repo = (repo or "").strip()
+    _PENDING_OVERRIDES.append(
+        {
+            "sigil": sigil,
+            "waived": waived if _WAIVED_RE.match(waived or "") else "",
+            # Digits-only by construction at every current producer, but bounded
+            # anyway — the docstring above claims EVERY field is shape-checked,
+            # and `pr` is the field a future caller is most likely to feed from a
+            # branch name. It is also the field that made an unbounded row (and
+            # therefore a log-erasing trim) reachable.
+            "pr": pr_s if _PR_RE.match(pr_s := str(pr or "")) else "",
+            "repo": repo if _REPO_RE.match(repo) else "",
+            "head": head if _SHA_RE.match(head) else "",
+            "actor": _actor(),
+        }
+    )
+
+
+def _valid_waived(value: str) -> str:
+    """``value`` if it matches the closed shape, else the empty string.
+
+    The single place `waived` is judged. Both writers of that field route through
+    the flush, so putting the check here means a future third writer cannot bypass
+    it the way `_amend_note` bypassed the check on `_note_override`.
+    """
+    return value if _WAIVED_RE.match(value or "") else ""
+
+
+def _amend_note(sigil: str, *, waived: str) -> None:
+    """Refine a noted row's ``waived`` once the gate knows more than the sigil did.
+
+    Sigils are noted BEFORE the gates run, so their ``waived`` starts as the gate
+    CLASS. A gate that then learns something specific (CI was red rather than
+    merely pending) says so here. If the command blocked before that gate ran,
+    the row simply keeps the class — which is the honest record, since the
+    specific fact was never established.
+    """
+    for row in _PENDING_OVERRIDES:
+        if row["sigil"] == sigil:
+            row["waived"] = waived
+
+
+def _flush_overrides(outcome: str) -> None:
+    """Write the noted rows with the verdict THIS GUARD returned.
+
+    Not "what the command actually got", which an earlier version of this line
+    claimed and the code does not deliver: ``outcome`` is derived solely from this
+    guard's own return, and several PreToolUse matchers are wired for Bash, plus
+    the harness's own permission prompt. Any of them can stop a command this guard
+    recorded as ``allowed``. So a row asserts "the sigil was accepted HERE", never
+    "the merge happened" — a distinction that matters precisely because this field
+    exists to separate overrides that took effect from overrides merely attempted,
+    and it only separates them within this guard's own chain.
+
+    Best-effort by contract: this runs on the merge path and a logging failure must
+    never break a merge, so nothing here propagates. It is NOT silent, though — the
+    shared writer reports failures on stderr. A logger that fails quietly is
+    indistinguishable from one that was never wired, which is the state this whole
+    change found the gate in.
+
+    NO OFF SWITCH, deliberately, and said out loud because the Generalizability
+    Gate asks every autonomous writer for an operator lever. This one ships a PATH
+    knob (``GENESIS_MERGE_OVERRIDE_DIR``) and no way to disable it: a gate whose
+    audit trail the same session can turn off records nothing an auditor can rely
+    on, and the write is a few hundred bytes on a path a human already chose to
+    take. The sibling discard store is the same by the same reasoning. Move the
+    store, or prune it harder; do not silence it.
+
+    Retention ships WITH the store (New-Store Gate) rather than as a follow-up —
+    which is how the existing unpruned stores under ``~/.genesis/`` got that way —
+    but it ships as a size bound on the daily timer
+    (``scripts/prune_hook_audit_logs.py``), NOT here. Pruning on the merge path was
+    the previous design, and its retention engine caused most of this feature's
+    defects; a verdict path should not also be doing file maintenance.
+    """
+    rows, _PENDING_OVERRIDES[:] = list(_PENDING_OVERRIDES), []
+    if not rows:
+        return
+    if audit_jsonl is None:
+        # Degraded, but NOT silent: the gate is still printing "(logged)" to the
+        # operator, and a quiet no-op here is indistinguishable from the
+        # never-wired state this whole change exists to end. Cannot use
+        # audit_jsonl.warn — that is the module we do not have.
+        #
+        # SUPPRESSED, and that matters: this runs in main()'s `finally`, so an
+        # unwritable stderr raising here escapes into run_guard, which fails
+        # CLOSED and converts it to exit 2 — turning an ALLOW into a BLOCK. The
+        # sibling guard wraps its own block print for exactly this reason.
+        with contextlib.suppress(Exception):
+            print(
+                f"[audit-log] audit_jsonl unavailable — {len(rows)} row(s) NOT recorded",
+                file=sys.stderr,
+            )
+        return
+    if outcome not in _OVERRIDE_OUTCOMES:
+        # The tuple is a contract, not a comment. A row whose verdict is outside
+        # it would be uncountable, and silently so.
+        audit_jsonl.warn(f"refusing {len(rows)} row(s) with unknown outcome {outcome!r}")
+        return
+    try:
+        ts = _dt.datetime.now(_dt.UTC).isoformat()
+        # ONE file for the whole flush, so a multi-sigil merge is one atomic record
+        # rather than N rows that a crash could split. Rows are built from the CLOSED
+        # field tuple, so an extra key on a noted row (or a future caller's stray
+        # kwarg) cannot reach disk.
+        #
+        # `waived` is re-validated HERE, at the chokepoint every row passes through,
+        # not only where it is first set. It has two writers — `_note_override` and
+        # `_amend_note` — and validating per call site is precisely the pattern that
+        # produced this feature's round-over-round defects: the shape check was added
+        # to the first writer and the second one silently bypassed it, so an
+        # unbounded string could still reach a durable row.
+        audit_jsonl.write_batch(
+            _override_log_dir(),
+            [
+                {
+                    k: _valid_waived(v) if k == "waived" else v
+                    for k, v in (
+                        (k, {"ts": ts, "outcome": outcome, **noted}.get(k, ""))
+                        for k in _OVERRIDE_LOG_FIELDS
+                    )
+                }
+                for noted in rows
+            ],
+            sort_keys=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — logging must never break a merge.
+        # Reported, not swallowed: audit_jsonl converts OSError, so anything
+        # reaching here is a bug in THIS function, and a silent one would look
+        # exactly like the no-writer state this change exists to end.
+        audit_jsonl.warn(f"override rows not written ({exc!r})")
+
+
 def _override_evidence_dir() -> str:
     """Directory holding fallback-review evidence files
     (``<repo>__<pr>__<base-tip-12>__<head-sha>.txt``).
@@ -2926,7 +4464,101 @@ def _pr_changed_files(pr_num: str, repo: str | None = None) -> list[str] | None:
     3000 entries; at the cap a hook file may sit beyond it → None (the caller
     fails closed). Tests inject via ``_TEST_GH_PR_FILES`` (one JSON object per
     line: ``{filename, previous_filename}``; the literal ``__error__`` simulates
-    an API error)."""
+    an API error).
+
+    MEMOIZED per (pr, repo) for the life of the process. Three call sites ask this
+    question on a single merge — the pin-receipt gate, the lane, and the inline
+    findings' off-diff scoping — and the first of those runs unconditionally
+    before the other two, so without a cache one merge paid for the same
+    ``pulls/N/files`` read more than once. Cleared between tests by
+    ``_reset_pr_files_cache``.
+
+    THE MEMO IS BOUND TO A HEAD, via ``_bind_pr_files_cache_head``. An earlier
+    version of this docstring argued the answer "cannot change mid-hook, because a
+    merge is bound to one head by ``--match-head-commit``". That was wrong, and the
+    correction is worth keeping: ``--match-head-commit`` constrains the MERGE, it
+    does not make an already-fetched ``pulls/N/files`` response describe that SHA.
+    The pin-receipt gate populates this memo BEFORE the freshness gate reads the
+    head, so a push landing in between left the lane and the off-diff scoping
+    judging the previous head's file set while the merge bound the new one — the
+    findings on files only the new head touches discounted as off-diff, and the
+    lane computed from a diff nobody was merging.
+    """
+    cache_key = (pr_num, repo, os.environ.get("_TEST_GH_PR_FILES"))
+    if cache_key in _PR_FILES_CACHE:
+        return _PR_FILES_CACHE[cache_key]
+    value = _pr_changed_files_uncached(pr_num, repo)
+    _PR_FILES_CACHE[cache_key] = value
+    return value
+
+
+# Keyed on the test seam as well as (pr, repo). That slot is permanently None in
+# production and exists for pytest, which is a real smell — it was reviewed as one
+# and the suggested remedy MEASURED as unworkable, so the reasoning is recorded
+# rather than the conclusion.
+#
+# The remedy proposed was an autouse fixture in tests/test_hooks/conftest.py
+# clearing the memo around every test, with the key narrowed to (pr, repo). It
+# cannot reach the cache: each test file builds its OWN `git_push_guard` object
+# via `importlib.util.spec_from_file_location` + `exec_module`, which does NOT
+# register in `sys.modules` (verified: `"git_push_guard" in sys.modules` is False
+# after that sequence). conftest has no handle on a per-file `guard_module`
+# fixture, so the clear is a silent no-op — and with the seam gone from the key,
+# tests reusing PR "100" under different `_TEST_GH_PR_FILES` values started
+# reading each other's fixtures. That surfaced as 23 failures whose message was
+# the off-diff lock firing, not a cache complaint, which is exactly how long this
+# would have taken to diagnose later.
+#
+# So the seam stays in the key. Removing it needs the module loading to change
+# first, in every test file that builds one.
+_PR_FILES_CACHE: dict[tuple[str, str | None, str | None], list[str] | None] = {}
+
+
+#: The head ``_PR_FILES_CACHE``'s entries describe, or None before any head has been
+#: established. Not part of the key: the memo holds at most one head's answers at a
+#: time, and a key would let two heads' file sets coexist — which is the state this
+#: exists to make unrepresentable.
+_PR_FILES_CACHE_HEAD: str | None = None
+
+
+def _bind_pr_files_cache_head(head: str) -> None:
+    """Bind the changed-file memo to *head*, dropping it if it described another.
+
+    Called from the single point where a head becomes authoritative (the freshness
+    gate, once it has read ``headRefOid``), so no downstream consumer has to
+    remember to invalidate: establishing the head IS the invalidation. A consumer
+    added later inherits the property without knowing it exists, which a
+    "remember to call reset first" convention could not give it.
+
+    Costs one extra ``pulls/N/files`` read per merge in the ordinary case, because
+    the pin-receipt gate's pre-freshness entry is always dropped (it was populated
+    when no head was known). MEASURED at 421-481ms against the merge arm's 45s
+    budget — about 1% — which is the right trade for scoping findings against the
+    head actually being merged.
+
+    WHAT THIS BUYS IS A LOWER BOUND, NOT AN IDENTITY. ``pulls/N/files`` takes no
+    SHA — it answers for whatever the head is at read time — so binding
+    establishes that the file list was fetched AFTER this head was read, not that
+    it describes it. A push inside that window yields a NEWER head's list, which
+    can only add paths and therefore only tighten the lane, and the merge is
+    rejected by ``--match-head-commit`` regardless. The bound is worth having; the
+    identity is not available from the endpoint and is not claimed.
+    """
+    global _PR_FILES_CACHE_HEAD
+    if head != _PR_FILES_CACHE_HEAD:
+        _PR_FILES_CACHE.clear()
+        _PR_FILES_CACHE_HEAD = head
+
+
+def _reset_pr_files_cache() -> None:
+    """Drop the memo AND its head binding. For tests; a hook process never needs it."""
+    global _PR_FILES_CACHE_HEAD
+    _PR_FILES_CACHE.clear()
+    _PR_FILES_CACHE_HEAD = None
+
+
+def _pr_changed_files_uncached(pr_num: str, repo: str | None = None) -> list[str] | None:
+    """The real read. See :func:`_pr_changed_files` for the contract."""
     raw = os.environ.get("_TEST_GH_PR_FILES")
     if raw == "__error__":
         return None
@@ -2943,14 +4575,17 @@ def _pr_changed_files(pr_num: str, repo: str | None = None) -> list[str] | None:
                 ],
                 capture_output=True,
                 text=True,
-                # Merge-path timeout budget (see main()): THREE consumers —
+                # Merge-path timeout budget (see main()): FOUR consumers —
                 # the hook-surface override check (rare override path),
-                # _pin_blob_unchanged (rare pin path), and the inline-findings
-                # diff scoping (#1728), which is on the hot merge path but
-                # LAZY: it reads only when a candidate blocking finding exists,
-                # at most once per scan. _gh_timeout clamps this call to the
-                # remaining merge deadline, and a timeout degrades to None →
-                # the scoping caller scores everything (status quo) + a NOTE.
+                # _pin_blob_unchanged (rare pin path), the inline-findings
+                # diff scoping (#1728), and the review LANE. The last two are on
+                # the hot merge path but LAZY: each reads only when a candidate
+                # blocking finding exists, and the memo in _pr_changed_files
+                # means all four share ONE underlying read per merge.
+                # _gh_timeout clamps this call to the remaining merge deadline,
+                # and a timeout degrades to None → the scoping caller scores
+                # everything (status quo) + a NOTE, and the lane fails closed to
+                # `critical`.
                 timeout=_gh_timeout(8),
             )
             if result.returncode != 0:
@@ -2991,6 +4626,40 @@ def _pr_changed_files(pr_num: str, repo: str | None = None) -> list[str] | None:
         # 3000-entry endpoint cap a hook file may be hidden beyond it.
         return None
     return files
+
+
+def _pr_lane(pr_num: str, repo: str | None = None) -> str:
+    """The consequence lane of PR *pr_num*: ``"critical" | "standard" | "light"``.
+
+    Settles the hook surface HERE — this module owns that fence — and delegates
+    the rest to ``review_scope.classify_lane``, the same split
+    ``_classify_post_review_delta`` already uses for substantiality.
+
+    FAIL-CLOSED twice over. An unreadable file list (``None``) and an import
+    failure both yield ``"critical"``, the strictest lane, so a change nobody can
+    classify is never given the benefit of a wider budget. That direction matters
+    more here than for substantiality, because the lane RELAXES a threshold: the
+    safe default is the one that relaxes nothing.
+    """
+    files = _pr_changed_files(pr_num, repo=repo)
+    if files is None:
+        return "critical"
+    try:
+        # review_scope lives in scripts/ (parent of scripts/hooks/). Lazy import ON
+        # PURPOSE and de-duped sys.path insert — the same idiom as
+        # _classify_post_review_delta, so a missing sibling degrades THIS
+        # classification rather than crashing the guard's module load and dropping
+        # every push/merge protection.
+        _scripts_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _scripts_dir not in sys.path:
+            sys.path.insert(0, _scripts_dir)
+        from review_scope import classify_lane
+    except Exception:  # noqa: BLE001 - unclassifiable is treated as consequential
+        return "critical"
+    try:
+        return classify_lane(files, hook_surface=any(_is_hook_surface_path(f) for f in files))
+    except Exception:  # noqa: BLE001 - same direction: never relax on an error
+        return "critical"
 
 
 def _hook_surface_override_check(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
@@ -3563,6 +5232,24 @@ def _check_codex_reviewed_head(
         # see it"). Skipping evidence on a fresh review would let a hook-surface PR
         # RETARGETED to a non-default base merge with no base-bound review. A fresh
         # head-review is NOT a substitute for base-bound evidence here.
+        # The force arm returns WITHOUT establishing a head, so it never reaches
+        # the binder below — and the inline gate downstream keys on a DIFFERENT
+        # sigil (`# review-override`), so it still runs, against whatever file
+        # list the pin-receipt gate cached earlier.
+        #
+        # An earlier version of this change left that alone and argued the risk
+        # was covered because a later head's file list is a SUPERSET, so it could
+        # only tighten the lane. THAT IS FALSE, and a reviewer was right to say
+        # so: a force-push, or a commit that deletes or renames a path, produces a
+        # list that is not a superset. A finding on a file only the new head
+        # touches would then be discarded as off-diff, or a newly-critical change
+        # would keep the old wider threshold — and this arm takes no
+        # `--match-head-commit` bind, so nothing downstream catches it either.
+        #
+        # Dropping the memo is the whole fix: the consumers re-read, against the
+        # head that is actually current when they ask. It costs one
+        # `pulls/N/files` call on an override path that is rare by construction.
+        _reset_pr_files_cache()
         blocked, msg = _hook_surface_override_check(pr_num, repo=repo)
         if blocked:
             return True, msg, None
@@ -3579,6 +5266,19 @@ def _check_codex_reviewed_head(
             None,
         )
     head = head.strip().lower()
+    # This is the one place a head becomes authoritative on the NON-FORCED arm, so
+    # it is where the changed-file memo gets bound to it. The pin-receipt gate has
+    # already populated that memo against whatever the head was when IT asked; the
+    # lane and the off-diff finding scoping run after this point and must judge the
+    # head this gate verifies and `--match-head-commit` then binds.
+    #
+    # SCOPE: the `force` arm above returns before reaching here. It does NOT
+    # simply skip this — it DROPS the memo instead, so its consumers re-read.
+    # An earlier version left the memo intact there and justified it with "a
+    # later head's files are a superset, so the lane can only tighten"; that
+    # reasoning was wrong (a force-push or a delete/rename breaks it) and the
+    # correction lives at that arm.
+    _bind_pr_files_cache_head(head)
     reviewed = _latest_codex_reviewed_sha(pr_num, repo=repo)
     if reviewed == head:
         return False, "", head
@@ -3727,9 +5427,37 @@ _SCHEDULED_REVIEW_ANYCASE_HEAD_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
 
 # Default scheduled-review kinds the merge gate REQUIRES at head. A PR merges only when
 # a valid owner-authored marker for EACH effective required kind names the current head.
-# The DEFAULT is the full set (shipped to every install, unchanged); an install may relax
-# the OPTIONAL kinds locally — see _required_scheduled_review_kinds() for the lever.
-_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
+# An install may EXPAND this set locally — see _required_scheduled_review_kinds().
+#
+# WHY code-review IS NOT IN THE DEFAULT. A required kind is a promise that some producer
+# emits its marker. For `code-review` no producer exists: measured 2026-09-16 over every
+# owner-authored comment and review on all 51 open non-draft PRs and the 40 most recently
+# merged ones, `leaks` markers appear 47 and 31 times respectively and `code-review`
+# markers appear ZERO times — not stale at an earlier head, never emitted at all. The gate
+# consequently blocked 51/51 open PRs on a kind nothing produces, so every one of those 40
+# merges necessarily carried `# scheduled-review-override`: a sigil that verifies NOTHING,
+# demoted by daily use from an exception valve to the standard merge incantation. That is
+# strictly worse than not requiring the kind, because it also disarms the override for the
+# leaks lane, where it is the only escape. Requiring a marker no routine writes does not
+# buy review; it buys a habit of waiving review.
+#
+# What is NOT lost: `code-review` is a QUALITY review, and per-head quality review is
+# already enforced by two other gates that do have live producers — Codex-at-head
+# freshness (_check_codex_reviewed_head) and the inline-finding thresholds
+# (_check_inline_review_findings). Nothing about LEAK protection changes: `leaks` stays
+# irreducible below, and the mechanical `leak-detector` CI job still runs per head.
+#
+# The kind remains KNOWN (_KNOWN_SCHEDULED_REVIEW_KINDS), so an install that DOES stand a
+# producer up re-arms it with one line of local config:
+#
+#     # ~/.genesis/config/genesis.yaml
+#     merge_gate:
+#       required_scheduled_reviews: [code-review, leaks]
+#
+# Accepted residue: while the kind is advisory, a `code-review` marker whose body carries a
+# blocking finding is not consulted — an advisory kind is neither required nor refusable.
+# Inert today (no producer), and the config line above is what makes it bind again.
+_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
 # The leak/secret scanner is IRREDUCIBLE: always required, never removable by config. A
 # secret reaching a public repo is irreversible, so no local policy may waive it.
 _IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
@@ -3763,19 +5491,40 @@ _IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
 # travel with a clone rather than describing one install. A suite named differently
 # simply finds no match, and no match means NO RELIEF -- the pre-relief behaviour, so
 # the failure direction of a wrong pin is a missing convenience, never a weaker gate.
+#
+# THE WORKFLOW HALF IS A DISPLAY NAME, AND A DISPLAY NAME IS NOT UNIQUE PROVENANCE.
+# GitHub does not require `name:` to be unique across workflow files (its workflow-syntax
+# reference states no such constraint; an OMITTED name falls back to the file path, which
+# is unique — an explicit one is not). So a second file declaring `name: CI` with a job
+# named `leak-detector` would share this tuple, and its SUCCESS could both supersede the
+# real scanner's CANCELLED in _drop_superseded_cancels and satisfy the pin below.
+# Real provenance exists in GraphQL (checkSuite.workflowRun.workflow.databaseId, or
+# checkSuite.workflowRun.file.path) but `gh pr view --json statusCheckRollup` does NOT
+# expose it — a rollup entry carries only __typename/completedAt/conclusion/detailsUrl/
+# name/startedAt/status/workflowName, and detailsUrl's RUN id cannot separate a decoy
+# from a legitimate re-run of the same file. Pinning on provenance therefore means
+# replacing this gate's read path with a raw GraphQL query.
+# Until then the PRECONDITION is closed instead of the consequence:
+# TestWorkflowDisplayNameIsUniqueProvenance fails CI if two workflow files ever share a
+# display name, or if this pin stops resolving to exactly one file. That is complete for
+# the reachable case — workflowName is populated only for Actions check-runs, and those
+# come from this repo's own workflow files; a non-Actions check-run has no workflowName,
+# so _ci_identity returns None and it is never a sibling.
 _MECHANICAL_RESCAN_BY_KIND = {"leaks": ("leak-detector", "CI")}
 # Every kind an install is ALLOWED to name in config. A configured kind outside this set
 # (a typo, a wrong type, a stale routine name) can never be satisfied by a real marker, so
-# the whole config is treated as invalid and we fail closed to the default rather than let
-# it either wedge merges forever or silently narrow the required set.
+# the whole config is treated as invalid and we fall back to the default rather than let it
+# wedge merges forever on a kind nothing can stamp. The fallback is announced (the NOTE in
+# _required_scheduled_review_kinds) because, the default being minimal, it can NARROW a
+# policy the operator declared.
 _KNOWN_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
 
 
 def _validate_configured_kinds(items: object) -> list[str] | None:
     """Lowercase + validate a configured kind list. Returns the cleaned list (possibly
     empty, meaning "only the irreducible kinds"), or None if ANYTHING is off — not a list,
-    a non-string element, a blank element, or an unknown kind. None makes the caller fail
-    CLOSED to the full default rather than honor a malformed/ambiguous relaxation."""
+    a non-string element, a blank element, or an unknown kind. None makes the caller fall
+    back to the default rather than honor a malformed/ambiguous policy."""
     if not isinstance(items, list):
         return None
     out: list[str] = []
@@ -3792,25 +5541,30 @@ def _validate_configured_kinds(items: object) -> list[str] | None:
 def _required_scheduled_review_kinds() -> tuple[str, ...]:
     """The scheduled-review kinds the merge gate REQUIRES at head, as a tuple.
 
-    Default is the full set (``code-review`` + ``leaks``) — shipped unchanged to every
-    install. An install MAY relax the OPTIONAL kinds (e.g. make the structural
-    code-review ADVISORY, so its absence no longer blocks — its review still posts on the
-    PR to be read/addressed if it ran) via LOCAL config, keeping install policy out of the
-    public default:
+    Default is ``leaks`` alone — the only kind with a producer that actually emits its
+    marker (see ``_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS`` for the measurement). An
+    install MAY name a LARGER set via LOCAL config, keeping install policy out of the
+    public default — e.g. one that runs a ``code-review`` routine re-arms it with:
 
         # ~/.genesis/config/genesis.yaml
         merge_gate:
-          required_scheduled_reviews: [leaks]
+          required_scheduled_reviews: [code-review, leaks]
 
     The leak/secret scanner (``_IRREDUCIBLE_...``) is ALWAYS unioned in and CANNOT be
-    dropped by config. Fail-CLOSED toward MORE review: a missing key / unreadable file /
+    dropped by config. Fail-CLOSED toward the default: a missing key / unreadable file /
     parse error / duplicate key / wrong-type / blank / unknown kind ALL fall back to the
-    full default set, never to fewer kinds. Configured kinds are validated against
-    ``_KNOWN_SCHEDULED_REVIEW_KINDS`` and lowercased to the marker grammar. Test seam:
-    ``_TEST_REQUIRED_SCHEDULED_REVIEWS`` (comma-separated) overrides the config file.
+    default set, and the irreducible kind survives every path. Because the default is now
+    MINIMAL rather than maximal, config EXPANDS it, so — exactly as in
+    ``_required_ci_workflows`` — a fallback can silently NARROW a stricter declared
+    policy. When the key is visibly present in the file but its value was discarded, a
+    NOTE names the substitution (the fallback itself is unchanged). Configured kinds are
+    validated against ``_KNOWN_SCHEDULED_REVIEW_KINDS`` and lowercased to the marker
+    grammar. Test seam: ``_TEST_REQUIRED_SCHEDULED_REVIEWS`` (comma-separated) overrides
+    the config file.
     """
     raw = os.environ.get("_TEST_REQUIRED_SCHEDULED_REVIEWS")
     configured: list[str] | None = None
+    key_seen_in_file = False
     if raw is not None:
         # Test seam: comma-list; empties dropped so "" means "only the irreducible kinds".
         configured = _validate_configured_kinds([k.strip() for k in raw.split(",") if k.strip()])
@@ -3821,6 +5575,13 @@ def _required_scheduled_review_kinds() -> tuple[str, ...]:
             path = os.path.expanduser("~/.genesis/config/genesis.yaml")
             with open(path) as fh:
                 text = fh.read()
+            # Did the operator DECLARE a policy we are about to substitute? With a
+            # minimal default that substitution can be a NARROWING, so it is worth a
+            # NOTE. Text scan FIRST, so a file yaml cannot parse at all still answers;
+            # the parsed structure overrides it below whenever there IS one, because
+            # the scan alone both misses a key written flow-style or quoted and fires
+            # on the key's own name appearing inside an unrelated block scalar.
+            key_seen_in_file = bool(re.search(r"(?m)^\s*required_scheduled_reviews\s*:", text))
             # yaml.safe_load silently keeps the LAST value for a repeated key, so a
             # badly-merged file (two merge_gate: or required_scheduled_reviews: lines)
             # could quietly narrow the required set. Catch the realistic cases with a
@@ -3831,11 +5592,24 @@ def _required_scheduled_review_kinds() -> tuple[str, ...]:
             ):
                 raise ValueError("duplicate merge_gate/required_scheduled_reviews key")
             cfg = yaml.safe_load(text) or {}
-            configured = _validate_configured_kinds(
-                (cfg.get("merge_gate") or {}).get("required_scheduled_reviews")
-            )
+            merge_gate = cfg.get("merge_gate") or {}
+            if not isinstance(merge_gate, dict):
+                merge_gate = {}
+            # The parse succeeded, so the STRUCTURE is what the operator declared --
+            # authoritative over the text scan in both directions.
+            key_seen_in_file = "required_scheduled_reviews" in merge_gate
+            configured = _validate_configured_kinds(merge_gate.get("required_scheduled_reviews"))
         except Exception:
-            configured = None  # fail-closed: fall back to the full default set below
+            configured = None  # fail-closed: fall back to the default set below
+    if configured is None and key_seen_in_file:
+        print(
+            "NOTE: merge_gate.required_scheduled_reviews in ~/.genesis/config/"
+            "genesis.yaml is present but unreadable/invalid (duplicate key, wrong type, "
+            "blank element, or unknown kind) — enforcing the DEFAULT required set "
+            f"{_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS} instead of your configured "
+            "value. Fix the config to restore your declared policy.",
+            file=sys.stderr,
+        )
     kinds = configured if configured is not None else list(_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS)
     # leaks (and any irreducible kind) is always required, even if config omits it.
     merged = list(dict.fromkeys([*kinds, *_IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS]))
@@ -3888,10 +5662,11 @@ def _required_ci_workflows() -> tuple[str, ...]:
     Fail-CLOSED toward the default: a missing key / unreadable file / parse error /
     duplicate key / wrong type / EMPTY list / blank element ALL fall back to the full
     default — there is no config value that disables the check. Because free-text
-    config can also EXPAND the required set (unlike the whitelist-relaxed scheduled
-    kinds, whose default is maximal), a fallback here can silently NARROW a stricter
-    declared policy — so when the key is visibly present but its value was discarded,
-    a NOTE is printed naming the substitution (the fallback itself is unchanged).
+    config can also EXPAND the required set, a fallback here can silently NARROW a
+    stricter declared policy — so when the key is visibly present but its value was
+    discarded, a NOTE is printed naming the substitution (the fallback itself is
+    unchanged). ``_required_scheduled_review_kinds`` carries the same NOTE for the
+    same reason.
     Test seam: ``_TEST_REQUIRED_CI_WORKFLOWS`` (comma-separated) overrides the config
     file; a blank seam parses to an empty (=invalid) list and also yields the
     default."""
@@ -4463,9 +6238,13 @@ def _mechanical_scan_is_green(
     class this file already documents at _ci_identity, and the whole point of
     this relief is that the mechanical layer really ran.
 
+    Superseded ``concurrency: cancel-in-progress`` duplicates are dropped first, by
+    the SHARED ``_drop_superseded_cancels`` — the same primitive ``_pr_ci_status``
+    uses, so the two gates cannot disagree about one rollup.
+
     Returns False on ANY doubt: a gh error, an unparseable payload, a head that
-    does not match, no entry with that identity, or any conclusion other than
-    SUCCESS. This feeds a merge gate that forces --admin, so an unreadable or
+    does not match, no entry with that identity, or any surviving conclusion other
+    than SUCCESS. This feeds a merge gate that forces --admin, so an unreadable or
     ambiguous scan must never read as a pass.
 
     Tests inject via ``_TEST_GH_ROLLUP_WITH_HEAD`` (a JSON object with
@@ -4516,6 +6295,20 @@ def _mechanical_scan_is_green(
     wanted_workflow = (workflow or "").strip().lower()
     if not wanted_workflow:
         return False  # an unpinned kind can never be established -> fail closed
+    # Drop superseded `concurrency: cancel-in-progress` duplicates FIRST, through the
+    # SAME primitive the CI gate uses (_drop_superseded_cancels — strict
+    # (name, workflowName) identity, a SUCCESS completing STRICTLY AFTER, fail-closed on
+    # every unresolvable case). This path used to have no cancel handling at all, so a
+    # doubled workflow dispatch — which leaves every check-run as a success+cancelled
+    # pair — made ONE `--check-pr` run report `ci: green` and, on the same rollup,
+    # "'leak-detector' is not green at this head", pointing the reader at a green job
+    # while relief stayed unreachable for as long as that head stood.
+    #
+    # Note what the drop does NOT do, because this is where it would be dangerous: it
+    # removes ONLY cancels proven superseded. FAILURE/TIMED_OUT/STALE and an
+    # unsuperseded cancel all survive into `conclusions` and still contradict SUCCESS,
+    # so the guarantee below is intact.
+    rollup = _drop_superseded_cancels(rollup)
     # Collect EVERY same-identity entry, never the first match. One head can carry
     # several runs of one job (a re-run after a ruleset change, a superseded
     # concurrency sibling), and rollup ORDER is not a guarantee -- _pr_ci_status
@@ -6296,6 +8089,92 @@ def _push_config_is_simple(remote: str | None, cwd: str | None = None) -> bool:
     return not (rc == 0 and out == "true")
 
 
+def _push_is_dry_run(seg) -> bool:
+    """Whether this ``git push`` segment only SIMULATES the push.
+
+    `-n` / `--dry-run` publish nothing, so none of the states the adjacency
+    prompt reports can result from them. `-n` also travels inside a short
+    bundle (`-un`), which is why this reads the letters rather than the token.
+    """
+    argv = getattr(seg, "argv", None) or []
+    for t in argv[1:]:
+        if t == "--dry-run" or t.split("=", 1)[0] == "--dry-run":
+            return True
+        if t.startswith("-") and not t.startswith("--") and len(t) > 1:
+            for ch in t[1:]:
+                if ch == "o":
+                    break
+                if ch == "n":
+                    return True
+    return False
+
+
+def _push_ref_positionals(argv: list[str]) -> list[str] | None:
+    """The positional tokens of a ``git push`` segment, or None if it is not a
+    plain ref-set-neutral push.
+
+    Separated from ``_push_targets_current_branch`` so the SCAN and the VERDICT
+    are not the same function: the scan answers "which tokens are refspecs", the
+    caller decides what that means. It was extracted for a second caller — the
+    duplicate-name enrichment — which has since been removed from this PR and
+    refiled; the separation is kept because a parser that returns data is worth
+    more than one that returns a verdict, and because the enrichment will need
+    it again.
+
+    None means "a flag here changes the ref set" (``--all``, ``--tags``,
+    ``--delete``, ``--mirror``, ``--stdin``, ``--repo``, a ``+refspec`` force
+    shorthand, or anything unknown). Both callers treat None as a refusal.
+    """
+    # Advance past git global options to the `push` token.
+    i = 1
+    while i < len(argv):
+        t = argv[i]
+        if t in _GIT_GLOBAL_VALUE_FLAGS:
+            i += 2
+            continue
+        if t.startswith("-"):
+            i += 1
+            continue
+        break
+    if i >= len(argv) or argv[i] != "push":
+        return None
+    i += 1
+    positionals: list[str] = []
+    while i < len(argv):
+        t = argv[i]
+        if t in _PUSH_SAFE_VALUE_FLAGS:
+            i += 2  # ref-neutral value flag: skip the flag and its value token
+            continue
+        if t.startswith("--"):
+            base = t.split("=", 1)[0]
+            if "=" in t and base in _PUSH_SAFE_VALUE_FLAGS:
+                i += 1  # --push-option=value etc.
+                continue
+            if "=" not in t and base in _PUSH_SAFE_LONG_FLAGS:
+                i += 1
+                continue
+            return None  # unknown/broadening long flag (or a =form of a no-value flag)
+        if t.startswith("+"):
+            return None  # +<refspec> force shorthand
+        if t.startswith("-") and len(t) > 1:
+            # Short single/bundle — every letter must be ref-neutral. An `o` starts a
+            # glued push-option value, so the rest of the token is that value.
+            safe = True
+            for ch in t[1:]:
+                if ch == "o":
+                    break
+                if ch not in _PUSH_SAFE_SHORT_LETTERS:
+                    safe = False
+                    break
+            if not safe:
+                return None
+            i += 1
+            continue
+        positionals.append(t)
+        i += 1
+    return positionals
+
+
 def _push_targets_current_branch(
     seg, cur: str | None, remote: str | None, cwd: str | None = None
 ) -> bool:
@@ -6322,54 +8201,9 @@ def _push_targets_current_branch(
     """
     if not cur:
         return False
-    argv = getattr(seg, "argv", None) or []
-    # Advance past git global options to the `push` token.
-    i = 1
-    while i < len(argv):
-        t = argv[i]
-        if t in _GIT_GLOBAL_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-"):
-            i += 1
-            continue
-        break
-    if i >= len(argv) or argv[i] != "push":
+    positionals = _push_ref_positionals(getattr(seg, "argv", None) or [])
+    if positionals is None:
         return False
-    i += 1
-    positionals: list[str] = []
-    while i < len(argv):
-        t = argv[i]
-        if t in _PUSH_SAFE_VALUE_FLAGS:
-            i += 2  # ref-neutral value flag: skip the flag and its value token
-            continue
-        if t.startswith("--"):
-            base = t.split("=", 1)[0]
-            if "=" in t and base in _PUSH_SAFE_VALUE_FLAGS:
-                i += 1  # --push-option=value etc.
-                continue
-            if "=" not in t and base in _PUSH_SAFE_LONG_FLAGS:
-                i += 1
-                continue
-            return False  # unknown/broadening long flag (or a =form of a no-value flag)
-        if t.startswith("+"):
-            return False  # +<refspec> force shorthand
-        if t.startswith("-") and len(t) > 1:
-            # Short single/bundle — every letter must be ref-neutral. An `o` starts a
-            # glued push-option value, so the rest of the token is that value.
-            safe = True
-            for ch in t[1:]:
-                if ch == "o":
-                    break
-                if ch not in _PUSH_SAFE_SHORT_LETTERS:
-                    safe = False
-                    break
-            if not safe:
-                return False
-            i += 1
-            continue
-        positionals.append(t)
-        i += 1
     if len(positionals) >= 3:
         return False  # multiple refspecs → not a single plain current-branch update
     if len(positionals) == 2:
@@ -6490,12 +8324,22 @@ def _remote_branch_sha(remote: str, branch: str, cwd: str | None = None) -> str 
     ref, which goes stale the moment a remote branch is deleted). Accepts only the
     line whose ref path is EXACTLY ``refs/heads/<branch>`` — a bare pattern
     tail-matches namespaced refs. Fail-safe: None on rc!=0 / timeout / any error /
-    absent branch — callers treat None as "not confirmed present". Bounded by a 10s
-    timeout inside the hook's 60s budget.
+    absent branch — callers treat None as "not confirmed present". Bounded by the
+    SHARED hook deadline (10s cap, less once the budget has drained), because the
+    aggregate across sequential probes is what overruns the registration, not any
+    single call.
     """
     try:
         args = ["git"] + (["-C", cwd] if cwd else []) + ["ls-remote", "--heads", remote, branch]
-        result = subprocess.run(args, capture_output=True, text=True, timeout=10)
+        # Under the SHARED deadline, like every other probe on this path. This
+        # is a NETWORK call sitting immediately upstream of them, and a flat cap
+        # here is what the arming comment cannot compensate for: the AGGREGATE
+        # is what overruns the hook's registration, and a SIGKILLed PreToolUse
+        # hook fails OPEN. `_gh_timeout` returns the full cap when no deadline
+        # is armed, so the --check-pr reporting path is unaffected.
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=_gh_timeout(10.0)
+        )
         if result.returncode != 0:
             return None
         target_ref = f"refs/heads/{branch}"
@@ -6524,6 +8368,169 @@ def _push_is_republish(remote: str | None, branch: str | None, cwd: str | None =
     return _remote_branch_sha(remote, branch, cwd=cwd) is not None
 
 
+def _open_pr_count_for_branch(
+    branch: str, cwd: str | None = None, push_urls: set[str] | None = None
+) -> int | None:
+    """How many OPEN PRs have ``branch`` as their head, or None if unknowable.
+
+    Distinguishing 0 from None is the point of the return type: 0 is a measured
+    "this public branch has no PR" — the state where CI and the leak-detector
+    never run, since ci.yml triggers on pull_request — while None is "the
+    question could not be answered" (no gh, no network, no auth). Callers treat
+    None as the status quo, never as 0: this feeds a HYGIENE prompt, not a
+    security verdict, and the first-push approval it modulates already happened.
+
+    COUNTS ONLY PRs TARGETING THE DEFAULT BRANCH, because the question is "does
+    CI run on this branch" and `ci.yml` triggers on `pull_request` filtered to
+    `main`. A PR onto a non-default base contributes no CI and no leak scan at
+    all (issue #2035), so counting it would silence the prompt in exactly the
+    state the prompt exists to report.
+
+    AND ONLY PRs FROM THIS REPOSITORY. `gh pr list --head` matches a bare branch
+    NAME and documents no `owner:branch` form, so a fork's PR from an
+    identically-named branch would otherwise answer for ours.
+
+    Subprocess timeout comes from ``_gh_timeout`` so these probes share the
+    push-path deadline rather than each holding an independent 10s — the
+    aggregate is what SIGKILLs a hook, and a killed PreToolUse hook fails OPEN.
+    """
+    try:
+        args = ["gh", "pr", "list", "--head", branch, "--state", "open",
+                "--json", "number,baseRefName,headRepositoryOwner,isCrossRepository",
+                "--limit", str(_PR_LIST_WINDOW)]
+        result = subprocess.run(
+            args, capture_output=True, text=True,
+            timeout=_gh_timeout(10.0), cwd=cwd or None,
+        )
+        if result.returncode != 0:
+            return None
+        rows = json.loads(result.stdout)
+        if not isinstance(rows, list):
+            return None
+        # DESTINATION FIRST, and before the empty-list shortcut. `gh pr list`
+        # asked the repo GH RESOLVES; if that is not where this push goes, the
+        # answer describes a different repository and an EMPTY result is not
+        # evidence of anything — least of all the measured 0 that turns a silent
+        # allow into an ask.
+        identity = None
+        if push_urls is not None:
+            identity = _base_repo_identity(cwd=cwd)
+            if identity is None or not _urls_name_repo(push_urls, identity[2]):
+                return None
+        # Now an empty list IS a measured 0, and needs no further lookup: no
+        # request has this head, whatever the default branch is called. When the
+        # caller passed no URLs there is nothing to verify against, so the
+        # shortcut still skips the second gh call — which matters because
+        # `_gh_timeout` floors at 1.0s once the budget drains, making that call
+        # the likelier of the two to fail.
+        if not rows:
+            return 0
+        # A response that FILLS the window is a truncated read, not a complete
+        # one: the qualifying request may sit past the cap, and the filters
+        # below would then sum to a confident 0 — the answer that downgrades
+        # the allow to an ask. Refuse to infer absence from it.
+        if len(rows) >= _PR_LIST_WINDOW:
+            return None
+        if identity is None:
+            identity = _base_repo_identity(cwd=cwd)
+            if identity is None:
+                return None
+        default, base_owner, _canonical = identity
+        return sum(
+            1
+            for pr in rows
+            if isinstance(pr, dict)
+            and pr.get("baseRefName") == default
+            # Filter by the head repo's OWNER, not `isCrossRepository`. The
+            # concern is SOMEONE ELSE'S fork answering for us, because
+            # `gh pr list --head` matches a bare branch name. `isCrossRepository`
+            # is true for any head-repo != base-repo, which in a fork-based
+            # clone is EVERY legitimate PR the contributor opens — the count
+            # would read 0 forever and the prompt would fire on every re-push
+            # while telling the user something false, since a fork PR onto the
+            # default branch does run CI.
+            and (pr.get("headRepositoryOwner") or {}).get("login") == base_owner
+        )
+    except Exception:
+        return None
+
+
+_PR_LIST_WINDOW = 100
+"""Rows requested from ``gh pr list``. A FULL window is treated as unanswerable
+rather than counted — see ``_open_pr_count_for_branch``."""
+
+
+def _repo_identity_from_url(url: str) -> tuple[str, str] | None:
+    """``(host, owner/repo)`` for a git remote URL, or None if it has neither.
+
+    Normalises the spellings of one remote so they compare equal: `https://`,
+    bare `git@host:owner/repo`, `ssh://git@host/owner/repo`, and a trailing
+    `.git` or `/` all reduce to the same pair. Any userinfo before the host is
+    dropped, since `git@` is not part of the destination's identity.
+    """
+    raw = url.strip().lower().rstrip("/")
+    raw = raw.removesuffix(".git")
+    if "://" in raw:
+        raw = raw.split("://", 1)[1]
+    elif ":" in raw and "/" not in raw.split(":", 1)[0]:
+        raw = raw.replace(":", "/", 1)            # git@host:owner/repo
+    if "@" in raw.split("/", 1)[0]:
+        raw = raw.split("@", 1)[1]                # strip userinfo
+    parts = [x for x in raw.split("/") if x]
+    if len(parts) < 3:
+        return None
+    host = parts[0].split(":", 1)[0]              # drop any :port
+    return host, "/".join(parts[-2:])
+
+
+def _urls_name_repo(urls: set[str], canonical: str) -> bool:
+    """Whether every URL in ``urls`` names the SAME repository as ``canonical``.
+
+    HOST IS PART OF THE IDENTITY. Comparing only the `owner/repo` tail would
+    make a remote on any other host — an enterprise instance, a mirror, or a
+    look-alike — compare equal to the repository gh answered about, and the
+    count would then be trusted for a destination it never described.
+
+    Deliberately ALL rather than ANY: a push that fans out to several remotes is
+    only answerable by one count if every destination is the same repository.
+    """
+    want = _repo_identity_from_url(canonical)
+    if not urls or want is None:
+        return False
+    return all(_repo_identity_from_url(u) == want for u in urls)
+
+
+def _base_repo_identity(cwd: str | None = None) -> tuple[str, str, str] | None:
+    """``(default_branch, owner_login, canonical_url)`` for the repo gh resolves, or None.
+
+    Both facts come from ONE round-trip. They are needed together and each is a
+    serialized subprocess on the push path, where the aggregate — not any single
+    call — is what overruns the hook's registration.
+
+    None is propagated rather than defaulted to "main": the caller's contract is
+    that an unanswerable question keeps the status quo, and guessing the base
+    name here would turn a failed lookup into a confident count.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "repo", "view", "--json", "defaultBranchRef,nameWithOwner,url",
+             "-q", ".defaultBranchRef.name + \"\\n\" + .nameWithOwner + \"\\n\" + .url"],
+            capture_output=True, text=True,
+            timeout=_gh_timeout(10.0), cwd=cwd or None,
+        )
+        if result.returncode != 0:
+            return None
+        parts = result.stdout.strip().split("\n")
+        if len(parts) != 3:
+            return None
+        branch, slug, url = (x.strip() for x in parts)
+        if not branch or "/" not in slug or not url:
+            return None
+        return branch, slug.split("/", 1)[0], url
+    except Exception:
+        return None
+
+
 def _ask(reason: str) -> int:
     """Emit a PreToolUse ``ask`` decision — a native approve/deny dialog.
 
@@ -6531,18 +8538,13 @@ def _ask(reason: str) -> int:
     permission prompt and runs the tool only on explicit approval — a gate the
     agent cannot self-satisfy. Verified to render in a wrapped child session
     2026-07-27.
+
+    Records that the decision was DEFERRED, so the override log does not report a
+    still-undecided command as allowed — see ``_OVERRIDE_OUTCOMES``.
     """
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "ask",
-                    "permissionDecisionReason": reason,
-                }
-            }
-        )
-    )
+    global _ASK_EMITTED
+    _ASK_EMITTED = True
+    emit_native_ask(reason)
     return 0
 
 
@@ -6665,10 +8667,86 @@ def _pr_create_would_publish(argv: list[str]) -> bool:
         return True  # fail-safe → gate
 
 
+def _main_with_note() -> int:
+    """``main`` plus the discarded-command note on every refusal.
+
+    ``main`` delegates to ``_run_merge_and_push_gates``, which holds 28 separate
+    ``return 2`` sites (AST count) and has no ``_deny`` chokepoint, so wrapping the
+    entry point is the only way to cover them all without editing 28 places — and
+    without a 29th being added noteless tomorrow, which is the failure this shape
+    exists to make impossible. ``main`` returns that code unchanged, so the wrapper
+    sees every one of them.
+
+    That delegation is NEW: when this wrapper was written, the 28 sites were inside
+    ``main`` itself and this docstring counted them there. The gates were extracted
+    in the interval, which moved every site out of the function named here while
+    leaving the wrapper correct — so the sentence explaining WHY the wrapper exists
+    described a function with none of them. Pinned now by
+    ``test_live_a_refusal_from_the_extracted_gates_carries_the_note``, because the
+    invariant that extraction could have broken silently — ``main`` returning the
+    gate's own rc — was locked by nothing but this prose.
+
+    The note is emitted ONLY on a refusal; every other verdict is passed through
+    untouched, and the return value is never altered.
+    """
+    try:
+        rc = main()
+    except BaseException:
+        # An EXCEPTION is also a refusal here: `run_guard` converts it to exit 2,
+        # so the whole command is discarded just as deliberately as on a `return
+        # 2` — but the reader only sees "GUARD ERROR ... failing CLOSED" and is
+        # told nothing about the write two steps earlier. MEASURED: a crash
+        # injected after the command is remembered gave rc=2 with the note
+        # ABSENT. `finally` would run on the allow path too, so the note is
+        # emitted here, on the raising path only.
+        if discarded_write is not None:
+            discarded_write.warn()
+        raise
+    if rc == 2 and discarded_write is not None:
+        discarded_write.warn()
+    return rc
+
+
 def main() -> int:
+    """Run the guard, then record any override sigils with the verdict they got.
+
+    The override log's rows are written HERE rather than where each sigil is
+    detected, because "the sigil was appended" is known early and "what the
+    command actually did" is only known at the end. One flush point covers every
+    return above — including the fail-closed conversion in ``run_guard``, which
+    reaches this wrapper as an exception.
+
+    ONE path is not covered, and an audit store owes it a sentence rather than a
+    silence: the ~60s hook wall-clock. A SIGKILL runs no ``finally``, so every
+    pending row is lost with no notice anywhere — the same overrun the merge-path
+    budget note below is built to avoid, seen from the logging side. That is the
+    single hole in "every override attempt leaves a row", and it fails in the
+    direction of a MISSING record, never a false one.
+    """
+    global _ASK_EMITTED
+    _PENDING_OVERRIDES.clear()  # a second call in-process must not inherit rows
+    _ASK_EMITTED = False
+    outcome = "error"
+    try:
+        rc = _run_merge_and_push_gates()
+        # rc == 0 is THREE states, not two: allowed outright, or handed to the
+        # user as a permission prompt they may yet deny.
+        outcome = "blocked" if rc == 2 else ("asked" if _ASK_EMITTED else "allowed")
+        return rc
+    finally:
+        _flush_overrides(outcome)
+
+
+def _run_merge_and_push_gates() -> int:
+    # An armed refusal must survive the malformed-payload exception tail.
+    blind_spot_deny: str | None = None
+    round_compound_deny: str | None = None
+    round_autonomous_deny: str | None = None
     try:
         payload = read_payload()
         cmd = field(payload, "command")
+        if discarded_write is not None:
+            discarded_write.remember(cmd)
         if not cmd:
             return 0
 
@@ -6686,101 +8764,73 @@ def main() -> int:
         create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
         merge_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"]
 
-        # ── Blind-spot net: unverifiable near a gated op → ask a human ──────
-        # analyze()/_argv degrade to a naive split SILENTLY, so an empty segment
-        # list is NOT evidence that no gated command is present: an ANSI-C
-        # `$'…\'…'` span, or an apostrophe in a here-doc body, is enough to drop
-        # a real, executing `git push --force` from the parse (reproduced on both
-        # guards). When the raw text names a gated op, the command will not
-        # tokenize, and the parse surfaced NO matching segment, the verdict is
-        # "unknown" — which earns a human decision, not a silent allow.
+        # ── Blind-spot net: unverifiable near a gated op → DENY ────────────
+        # Keep the broad raw-mention predicate: a failed parse cannot prove an
+        # operation absent. User ruling 2026-09-08: an ambiguous command costs
+        # the agent a rewrite, not the human an approval click. The only asks
+        # remain deliberate publishing. Current parser bounds still refuse.
+        # All FOUR parsed-operation exclusions matter: an already-published
+        # gh pr create must retain its normal allow path.
         #
-        # ASK rather than BLOCK is load-bearing. A refusal has to be surgically
-        # precise about which unparseable commands are real, and precision is
-        # exactly what an unreliable parse cannot deliver — every narrowing
-        # conjunct became a new way to starve the trigger, while over-blocking
-        # broke benign shapes. Asking inverts the costs: a false positive is one
-        # confirmation, a miss is the pre-existing status quo. That is what lets
-        # the predicate stay broad.
+        # `_mentions_gated_op` rests on an assumption that holds for every
+        # blind-spot cause but ONE: that the operation is still SPELLED in the
+        # raw text, and only the structure around it is unreadable. A segment
+        # resolving to git or gh with a verb the SHELL builds is the case where
+        # the unreadable part IS the operation's name — the text test is then
+        # asked about a word that is not there to find, and it answers "no gated
+        # op" with exactly the confidence it would have for a command that has
+        # none. Requiring it there would make this net's trigger depend on
+        # whoever wrote the command choosing to spell the operation out.
         #
-        # The reason is DEFERRED to the tail (like ask_reason / push_allow_reason
-        # above) so every hard block below — sqlite writes, --no-verify, the
-        # dispatched publish denies, the escalation cap — still takes precedence.
-        # Returning here would DOWNGRADE those to a prompt (measured).
-        # The segment check names ALL FOUR gated ops, not the three the first cut
-        # listed. `create_segs` is LOAD-BEARING — do not remove it.
+        # Read off the SEGMENT rather than off `blind`, deliberately: which
+        # programs are gated is this guard's question, and shell_parse keeps its
+        # BlindSpot to a single decision field for reasons its own class
+        # docstring measures. The exe test is what keeps the widening
+        # affordable — a segment whose PROGRAM is a variable is not established
+        # as git at all, and MEASURED over 129,179 real commands those are 1,845
+        # (interpreters and remote shells held in variables, plus prose) against
+        # 14 for the case this adds. Those 1,845 still reach this net through
+        # `_mentions_gated_op` whenever the operation is spelled, which is the
+        # honest split: an unreadable program naming a publish is worth
+        # refusing, an unreadable program naming nothing is a Tuesday.
+        hidden_gated_verb = any(s.verb_unresolved and s.exe in _GATED_EXES for s in segs)
+        # The two predicates are NOT suppressed by the same thing, and collapsing
+        # them into one `not (…parsed…)` guard was the defect.
         #
-        # An earlier version of this comment claimed the opposite: that it was
-        # symmetry only, and mutation-tested to change no verdict. That claim was
-        # WRONG, and wrong in the direction that invites deleting the conjunct.
-        # Its four cells varied parse state (interactive/dispatched x
-        # parsed-create x untokenizable) and held the GATE OUTCOME fixed, so they
-        # all assumed a create that was already gated. The axis that matters is
-        # whether the create is gated at all: for one the real gate ALLOWS (a
-        # branch already on the remote, so no publish risk), dropping this
-        # conjunct lets the net fire on an untokenizable-but-benign create and
-        # turns an allow into a prompt, or into a refusal when unattended.
+        # `_mentions_gated_op` reads the RAW TEXT, so a parsed gated segment
+        # EXPLAINS the mention — the ordinary gates own that operation and
+        # re-netting it would double-gate an already-published create. Its
+        # exclusion is right and stays.
         #
-        # A mutation test proves nothing about an axis its cells do not vary.
-        blind_spot_reason: str | None = None
-        if (
-            not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
-            and blind is not None
-            and _mentions_gated_op(cmd)
-        ):
-            if blind.bounds_induced:
-                # The DEPTH bound refuses outright, interactive or not, and the
-                # asymmetry between the two bounds is measured rather than felt.
-                # Across this install's history the deepest real nesting is 4
-                # against a bound of 5 — see the distribution recorded with
-                # `shell_parse.MAX_SUBSTITUTION_DEPTH`, which is the one place it
-                # is derived. Nothing legitimate reaches the bound, and a command
-                # that does is not a shape ordinary work produces. It is also the
-                # axis the decoy attacks use: a visible benign `git push` with a
-                # force push buried past the bound, which reaches an approval
-                # prompt describing the decoy. A human approving what looks like an
-                # ordinary push is not a gate on the operation actually hidden
-                # there. Length still asks — a long here-doc IS ordinary work.
-                print(
-                    f"BLOCKED: this command {blind.cause} and names a gated "
-                    "operation, so the guard cannot see every publish it would "
-                    "run. A command can carry a second, hidden one past the point "
-                    "the parser stops — approving the visible one would approve "
-                    f"that too.\nTo proceed: {blind.hint}.",
-                    file=sys.stderr,
-                )
-                return 2
-            if _is_dispatched():
-                # No human is present to answer a prompt, and an unverifiable
-                # gated command must not proceed unattended. Mirrors the
-                # dispatched deny legs on the push / pr-create asks below.
-                print(
-                    f"BLOCKED: this command {blind.cause} and names a gated "
-                    "operation. Autonomous sessions cannot proceed on an "
-                    "unverifiable command.\n"
-                    f"To proceed: {blind.hint}. If you are WRITING TEXT (a commit "
-                    "message, a plan, review notes) whose content merely mentions "
-                    "push or merge, use the Write tool instead of a here-doc. If "
-                    "you are RUNNING a git command, rewrite it in a "
-                    "directly-parseable form (plain quotes, or -F <file>).",
-                    file=sys.stderr,
-                )
-                # The advice above is load-bearing, not decoration. An
-                # unattended session cannot ask what it did wrong, so a refusal
-                # it cannot act on is a wall rather than a cost — which is the
-                # whole basis for refusing here at all. MEASURED: the dominant
-                # real shape that reaches this leg is prose-to-a-file, and the
-                # previous message's only suggestion ("rewrite it in a
-                # directly-parseable form") does not apply to it.
-                return 2
-            blind_spot_reason = (
-                f"This command {blind.cause} and mentions a gated operation "
-                "(push / merge / gh pr create / --force / --no-verify / --admin), "
-                "so the guard cannot verify what it would actually run. Approve "
-                f"only if you are sure. To avoid the prompt: {blind.hint}, or "
-                "rewrite it in a directly-parseable form (plain quotes, or "
-                "-F <file>)."
+        # `hidden_gated_verb` is a fact about a SPECIFIC segment, and a different
+        # segment parsing says nothing about it. Suppressing it that way let an
+        # unresolved publish ride a visible one: MEASURED on the merged tree,
+        # `git ${ACTION:-push} --force origin main && git push` on a published
+        # branch went BLOCK -> ASK interactively (dispatched stayed BLOCK), and
+        # the prompt it raised names the VISIBLE push — so a human approving it
+        # is told about the wrong command. The multiple-publish rejection is
+        # skipped too, since only one segment parses as a push.
+        if blind is not None and (
+            hidden_gated_verb
+            or (
+                not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
+                and _mentions_gated_op(cmd)
             )
+        ):
+            # Defer the syntax refusal so specific sqlite/no-verify blocks keep
+            # their sharper diagnostics. Bounds keep main's immediate refusal.
+            blind_spot_deny = (
+                f"BLOCKED: this command {blind.cause} and mentions a gated "
+                "operation, so the guard cannot verify what it would actually run.\n"
+                f"To proceed: {blind.hint}. If you are WRITING TEXT (a commit "
+                "message, a plan, review notes) whose content merely mentions "
+                "push or merge, use the Write tool instead of a here-doc. If "
+                "you are RUNNING a git command, rewrite it in a "
+                "directly-parseable form (plain quotes, or -F <file>)."
+            )
+            if blind.bounds_induced:
+                print(blind_spot_deny, file=sys.stderr)
+                return 2
 
         # Each git push / gh pr merge is a SEPARATE gated action. A single Bash
         # command carrying more than one would collapse into ONE ask/gate
@@ -6802,22 +8852,55 @@ def main() -> int:
             )
             return 2
 
-        # ── Codex round-escalation gate (`gh pr comment … @codex review`) ──
-        # Once a PR already carries ESCALATION_ROUND_CAP Codex reviews,
-        # requesting another round is the whack-a-mole moment — force the
-        # step-back (triage / mechanism / state-space) before round N+1.
-        # Fail-open inside the check; '# escalation-ack' is the conscious
-        # continue after a fresh user decision.
-        esc_block, esc_msg = _check_codex_round_escalation(segs)
-        if esc_block:
+        # ARM THE SHARED SUBPROCESS DEADLINE, once, for every gate below.
+        # The push path's wall-clock safety must not depend on a review request
+        # being present: its sequential network probes can otherwise outlive the
+        # hook registration, and a SIGKILLed PreToolUse hook fails open.
+        global _merge_deadline
+        if _merge_deadline is None:
+            _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
+
+        # ── Codex round-authorization gate (`gh pr comment … @codex review`) ──
+        # Distinct reviewed heads, including dismissed and clean-comment rounds,
+        # decide when standing authorization ends. A dispatched session cannot
+        # satisfy the native user decision; unreadable evidence takes the same
+        # safe direction rather than becoming zero rounds.
+        esc_decision, esc_msg = _check_codex_round_escalation(segs, cmd, payload)
+        if esc_decision == "deny":
             print(esc_msg, file=sys.stderr)
             return 2
+
+        if esc_decision == "ask" and _is_dispatched():
+            # Defer until the hard checks below have run. This remains a deny,
+            # but a force-push/no-verify/merge violation should retain its more
+            # specific diagnostic when both appear in one command.
+            round_autonomous_deny = esc_msg
+
+        if esc_decision == "ask":
+            other_gated_actions = [
+                s
+                for s in segs
+                if git_subcommand(s.argv) in {"commit", "push", "merge"}
+                or gh_pr_subcommand(s.argv) in {"create", "merge", "close"}
+            ]
+            if other_gated_actions:
+                # Defer this refusal to the tail. Specific hard checks below
+                # (force push, --no-verify, merge gates, sqlite) must retain
+                # precedence over a compound-action diagnostic.
+                round_compound_deny = (
+                    "BLOCKED: this review request needs its own fresh user approval, "
+                    "but the same command also contains a commit, push, merge, close, "
+                    "or PR-create action. Run the review request separately so one "
+                    "approval cannot authorize multiple actions."
+                )
 
         # An interactive push defers to a native approve/deny dialog at the END
         # of main(), so every hard-block below (merge-into-main, the pr-merge
         # gates, sqlite, --no-verify) still takes precedence — a compound
         # `git push && git commit --no-verify` blocks, never asks.
-        ask_reason: str | None = None
+        ask_reason: str | None = (
+            esc_msg if esc_decision == "ask" and round_autonomous_deny is None else None
+        )
         # A first-push-only re-push AUTO-ALLOW is ALSO deferred to the END (same
         # reason): emitting `_allow` inline would short-circuit the whole Bash
         # invocation before the hard-blocks run, so `git push <republish> && git
@@ -6958,6 +9041,54 @@ def main() -> int:
                             f"git push needs your approval before publishing externally "
                             f"(target: {branch or 'default'})."
                         )
+                    # A RE-PUSH earns its silence by having been approved at
+                    # first publication — but a public branch with NO OPEN PR is
+                    # outside CI and the leak-detector (ci.yml triggers on
+                    # pull_request), so its silence is the state this repo's
+                    # standing rule forbids: published, unchecked, and quietly
+                    # growing. Downgrade the silent allow to an ASK naming the
+                    # gap. A lookup that cannot answer (None) keeps the status
+                    # quo — this is a hygiene prompt on an already-approved
+                    # branch, not a security boundary, so an unanswerable
+                    # question must not manufacture prompts on every network
+                    # blip.
+                    # An earlier segment that CLOSES a PR invalidates the state
+                    # this allow is read from. The hook runs before any of the
+                    # command executes, so `gh pr close <n> && git push` sees the
+                    # PR still open, keeps the silent allow, and then publishes
+                    # into exactly the PR-less state the ask exists to report.
+                    # The count cannot see a close that has not happened yet, so
+                    # the command's own shape has to.
+                    closes_pr = any(
+                        gh_pr_subcommand(s.argv) == "close" for s in segs
+                    )
+                    if push_allow_reason and closes_pr:
+                        push_allow_reason = None
+                        ask_reason = (
+                            f"re-push to '{cur}': an earlier step in this command "
+                            f"CLOSES a pull request, so the push that follows may "
+                            f"land on a branch with no open PR — outside CI and "
+                            f"the leak scan. Run the close and the push as "
+                            f"separate commands so each is judged on the state it "
+                            f"actually runs in."
+                        )
+                    # A DRY RUN publishes nothing, so it cannot create the
+                    # unchecked-branch state this prompt reports. `-n` and
+                    # `--dry-run` are both accepted by the predicate above, so
+                    # they reach here; asking about them is pure friction on an
+                    # inspection command.
+                    elif (
+                        push_allow_reason
+                        and not _push_is_dry_run(push_segs[0])
+                        and _open_pr_count_for_branch(cur, cwd=pcwd, push_urls=urls) == 0
+                    ):
+                        push_allow_reason = None
+                        ask_reason = (
+                            f"re-push to '{cur}': this branch is PUBLIC but has "
+                            f"NO OPEN PR, so CI and the leak scan never run on "
+                            f"it. Approve to push, then open its PR "
+                            f"(gh pr create) — or close the branch out."
+                        )
                 else:
                     ask_reason = (
                         f"git push needs your approval before publishing externally "
@@ -7035,7 +9166,8 @@ def main() -> int:
             # Idempotent: the escalation gate may have already armed it for the same
             # command (round-6 P1) — reuse that deadline so the two gates share ONE
             # aggregate budget, never re-extend it here.
-            global _merge_deadline
+            # (armed at the top of this function; kept idempotent here so the
+            # merge path still works if it is ever reached another way)
             if _merge_deadline is None:
                 _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
             merge_repo = _merge_target_repo(merge_seg.argv, merge_seg.raw)
@@ -7087,6 +9219,66 @@ def main() -> int:
                 )
                 return 2
             if pr_num:
+                # The head an override row is ABOUT. Read from the command's own
+                # `--match-head-commit` (the cluster-safe parser the TOCTOU binding
+                # uses) rather than an extra API call on a budgeted path: GitHub
+                # enforces that value server-side, so when the merge succeeds it IS
+                # the merged sha. Empty when the merge is unbound — which the gates
+                # below then refuse anyway, except under a sigil that waives the
+                # binding, and "unbound" is itself the honest record for that row.
+                merge_head = _merge_match_head(merge_seg.argv) or ""
+                # Note every sigil on the merge segment HERE — before the first
+                # gate that can `return 2`. Noting at each gate's own site
+                # recorded nothing when an EARLIER gate blocked, which silently
+                # dropped exactly the attempts the log exists to count (MEASURED:
+                # a CONFLICTING mergeable with three sigils appended wrote zero
+                # rows). The verdict is attached later, by the flush.
+                #
+                # The three `return 2`s ABOVE this point are deliberately not
+                # covered: they fire when the command has no --admin, or when the
+                # repo or PR cannot be resolved at all. Those are malformed
+                # commands rather than override events, and a row could not name
+                # which PR it was about.
+                ci_override = has_trailing_override(merge_seg.raw, "ci-override")
+                stale_override = has_trailing_override(merge_seg.raw, "stale-review-override")
+                sched_override = has_trailing_override(
+                    merge_seg.raw, "scheduled-review-override"
+                )
+                # The FINDINGS waiver, read off the parsed segment rather than via
+                # has_trailing_override — which is why enumerating that helper's
+                # call sites missed the one sigil SKILL.md documents as logged.
+                force_override = merge_seg.override
+                for _sigil, _present, _waives in (
+                    ("ci-override", ci_override, "ci-status"),
+                    ("stale-review-override", stale_override, "codex-freshness+base-invariant"),
+                    ("review-override", force_override, "review-body+inline-findings"),
+                    ("scheduled-review-override", sched_override, "scheduled-claude-review"),
+                ):
+                    if _present:
+                        # `repo` is BLANK on one path, deliberately: a legacy
+                        # payload with no cwd leaves merge_repo None (see the
+                        # resolution block above — there is nothing to derive
+                        # from), and the gates then ran against the HOOK's own
+                        # cwd repo. Filling it in would mean calling
+                        # _derive_repo_from_cwd, which shells out to `gh repo
+                        # view` — a NETWORK call on the very path whose budget
+                        # note below says an overrun SIGKILLs the hook mid-gate
+                        # and disengages every merge gate at once. Spending that
+                        # on an audit field would trade a fail-OPEN for a
+                        # log nicety. Deriving it locally from `origin` instead
+                        # is cheap but resolves differently from gh on a fork,
+                        # and a row naming the WRONG repo is worse than one
+                        # naming none. So it stays blank here and the ambiguity
+                        # is recorded rather than papered over. Follow-up: fill
+                        # it from a repo already resolved earlier in the run,
+                        # which costs nothing extra.
+                        _note_override(
+                            _sigil,
+                            waived=_waives,
+                            pr=pr_num,
+                            repo=merge_repo,
+                            head=merge_head,
+                        )
                 # ── Merge-path gh TIMEOUT BUDGET ──────────────────────────
                 # This hook runs under a 60s CC wall-clock (settings.json). A
                 # wall-clock overrun SIGKILLs the hook MID-GATE, which "fails
@@ -7157,7 +9349,11 @@ def main() -> int:
                 # or dropped pull_request trigger can't slip an un-CI'd merge through
                 # (handled just below).
                 ci_state, ci_bad = _pr_ci_status(pr_num, repo=merge_repo)
-                ci_override = has_trailing_override(merge_seg.raw, "ci-override")
+                # ci_override was detected and noted above, before any gate could
+                # return — see the note block after merge_head. Now that the CI
+                # verdict is known, record WHICH state was waived.
+                if ci_override:
+                    _amend_note("ci-override", waived=f"ci:{ci_state}")
                 if ci_state in ("red", "pending") and not ci_override:
                     print(
                         f"BLOCKED: PR #{pr_num} CI is {ci_state.upper()} "
@@ -7231,15 +9427,15 @@ def main() -> int:
                         file=sys.stderr,
                     )
 
-                force_override = merge_seg.override
-                # The review-CONTEXT waiver (freshness + base gates) is a SEPARATE
-                # sigil from # review-override: the freshness gate is the
-                # high-traffic one (Codex never auto-re-reviews a push), and if its
-                # escape also waived the P1 finding scans, the path of least
-                # resistance would systematically disarm P1 enforcement (Codex P1 +
-                # architect SHOULD-FIX on #1366). One trailing comment may carry
-                # both sigils when both waivers are genuinely intended.
-                stale_override = has_trailing_override(merge_seg.raw, "stale-review-override")
+                # force_override / stale_override were detected and noted above,
+                # before any gate could return. The review-CONTEXT waiver
+                # (freshness + base gates) is a SEPARATE sigil from
+                # # review-override: the freshness gate is the high-traffic one
+                # (Codex never auto-re-reviews a push), and if its escape also
+                # waived the P1 finding scans, the path of least resistance would
+                # systematically disarm P1 enforcement (Codex P1 + architect
+                # SHOULD-FIX on #1366). One trailing comment may carry both
+                # sigils when both waivers are genuinely intended.
 
                 # Base-branch invariant: a PR retargeted AFTER Codex reviewed it
                 # keeps the SAME head oid, so head-freshness alone can't see the
@@ -7256,7 +9452,7 @@ def main() -> int:
                         f"BLOCKED: PR #{pr_num} — base branch is not the repo default.",
                         file=sys.stderr,
                     )
-                    print(base_msg, file=sys.stderr)
+                    print(_defang_gate_text(base_msg), file=sys.stderr)
                     return 2
 
                 # Pin receipts. This is the AUTHORITY for the two release gates
@@ -7282,7 +9478,7 @@ def main() -> int:
                         f"BLOCKED: PR #{pr_num} — CC pin gate refused this merge.",
                         file=sys.stderr,
                     )
-                    print(receipts_msg, file=sys.stderr)
+                    print(_defang_gate_text(receipts_msg), file=sys.stderr)
                     return 2
                 if receipts_msg.startswith("NOTE:"):
                     # A NOTE means the gate did NOT verify the receipts and is allowing the
@@ -7298,7 +9494,7 @@ def main() -> int:
                     # E2E line silently swallowed the pin gate's fail-open note —
                     # reintroducing, in miniature, the exact suppression the paragraph
                     # above records as measured (architect SHOULD-FIX, 2026-09-06).
-                    print(receipts_msg, file=sys.stderr)
+                    print(_defang_gate_text(receipts_msg), file=sys.stderr)
 
                 # E2E obligation (§8.12) — ADVISORY, never blocking (owner
                 # decision 2026-09-06, reversing the 2026-09-05 hard-fail call).
@@ -7374,7 +9570,7 @@ def main() -> int:
                         f"BLOCKED: PR #{pr_num} — Codex has not reviewed the current head.",
                         file=sys.stderr,
                     )
-                    print(fresh_msg, file=sys.stderr)
+                    print(_defang_gate_text(fresh_msg), file=sys.stderr)
                     return 2
 
                 # Bind the MERGE to the verified head (TOCTOU — Codex P1): a push
@@ -7413,12 +9609,18 @@ def main() -> int:
                         f"BLOCKED: PR #{pr_num} — review-body gate did not pass.",
                         file=sys.stderr,
                     )
-                    print(review_msg, file=sys.stderr)
+                    # Sanitised for the same reason the report path is: this stderr is
+                    # what a human reads when a merge is blocked, and it is the other
+                    # consumer of the same gate messages. (review_msg's tail is
+                    # hardcoded pattern strings today, not attacker text — routed
+                    # anyway so the two arms cannot drift apart again.)
+                    print(_sanitize_gate_text(review_msg), file=sys.stderr)
                     return 2
 
                 # Inline review comments (Codex P1/P2 badges) — separate
                 # endpoint, separate check. Weighted score: P1=1.0, P2=0.5;
-                # blocks at >= 1.0 (any P1, or 2+ unresolved P2s).
+                # blocks at the LANE's threshold (critical 1.0 / standard 2.0 /
+                # light 3.0), with any P1 blocking in every lane via the floor.
                 should_block, inline_msg = _check_inline_review_findings(
                     pr_num,
                     force=force_override,
@@ -7429,7 +9631,12 @@ def main() -> int:
                         f"BLOCKED: PR #{pr_num} — inline review gate did not pass.",
                         file=sys.stderr,
                     )
-                    print(inline_msg, file=sys.stderr)
+                    # inline_msg carries `_inline_title` output — attacker-influencable
+                    # PR-comment text — so it gets the same treatment as the report
+                    # path. `_inline_title` already guarantees no embedded \n, so this
+                    # arm could not forge a LINE; \r and ESC could still overwrite or
+                    # recolour the BLOCKED: line a human is reading to decide.
+                    print(_sanitize_gate_text(inline_msg), file=sys.stderr)
                     return 2
 
                 # Scheduled Claude review at HEAD — its OWN fail-closed gate with its OWN
@@ -7440,7 +9647,8 @@ def main() -> int:
                 # merge-gate deadline BLOCKS at whichever gate hits its 1s floor first —
                 # never a silent pass. Uses verified_head from the Codex gate (None under
                 # # stale-review-override → re-read).
-                sched_override = has_trailing_override(merge_seg.raw, "scheduled-review-override")
+                # sched_override was detected and noted above, before any gate
+                # could return.
                 # Provision-or-surface: the scheduled gate no-ops off the configured
                 # public repo (by design). A SILENT no-op would hide a drifted
                 # genesis.yaml (canonical != the real public repo) disarming the gate
@@ -7466,7 +9674,7 @@ def main() -> int:
                         f"missing at the current head.",
                         file=sys.stderr,
                     )
-                    print(sched_msg, file=sys.stderr)
+                    print(_defang_gate_text(sched_msg), file=sys.stderr)
                     return 2
 
         # ── sqlite3 write operations ────────────────────────────────
@@ -7514,8 +9722,15 @@ def main() -> int:
         # Reached only if no hard-block above returned. Dispatched sessions
         # were already denied inline; here, an interactive human session gets a
         # native approve/deny dialog for its push / PR-create.
-        if ask_reason is None and blind_spot_reason is not None:
-            ask_reason = blind_spot_reason
+        if blind_spot_deny is not None:
+            print(blind_spot_deny, file=sys.stderr)
+            return 2
+        if round_compound_deny is not None:
+            print(round_compound_deny, file=sys.stderr)
+            return 2
+        if round_autonomous_deny is not None:
+            print(round_autonomous_deny, file=sys.stderr)
+            return 2
         if ask_reason is not None:
             return _ask(ask_reason)
 
@@ -7538,6 +9753,9 @@ def main() -> int:
             )
 
     except (json.JSONDecodeError, KeyError):
+        if blind_spot_deny is not None:
+            print(blind_spot_deny, file=sys.stderr)
+            return 2
         # A malformed/partial payload is a parse-ambiguity fail-open (matches the
         # sibling guards). Any OTHER exception is an orchestration BUG and must
         # NOT silently allow a push/merge — it propagates to run_guard(), which
@@ -7577,6 +9795,164 @@ def _parse_check_pr_repo(argv: list[str]):
             # _merge_target_repo accepts it, so the report must too.
             return tok[2:]
     return None
+
+
+# Bounds and sanitisation for every surface that renders a gate message. A gate
+# message can carry text lifted from PR review comments (`_inline_title`), so it is
+# untrusted wherever it is printed — the REPORT's stdout and the merge-enforcement
+# arm's stderr alike. One sanitiser serves both: a fix applied to only one of two
+# consumers of the same untrusted data is the shape of bug this whole change exists
+# to remove.
+_GATE_TEXT_MAX_LINES = 40
+_GATE_TEXT_MAX_CHARS = 200
+# How many lines are kept from the END when the cap bites. A gate's recovery
+# instruction is the last thing it prints, so the tail is the half that must
+# survive; 8 covers the longest such trailer measured (the scheduled-review
+# marker explanation, 6 lines).
+_GATE_TEXT_TAIL_LINES = 8
+# Same reasoning one dimension down. A gate line puts its remediation at the END
+# ("… or append '# stale-review-override' to merge anyway."), so when a single
+# line runs past the cap the tail is the half worth keeping. 80 covers the
+# longest such trailer measured on a real message (the codex-at-head override
+# sentence, 62 characters).
+_GATE_TEXT_TAIL_CHARS = 80
+# Everything a terminal would ACT on rather than display, plus everything
+# CLASSIFIED, not enumerated. The previous version listed the ranges it knew
+# about, and an enumeration of a Unicode property is a list that is wrong the
+# moment the property has a member nobody listed: U+061C ARABIC LETTER MARK is a
+# bidi-formatting character and sat outside every range here, so a finding title
+# carrying it reached the operator's terminal able to reorder the line around it
+# (Codex P2, PR #1638). Widening the list by one range would have fixed that
+# character and left the class.
+#
+# What must be stripped, stated as the property rather than as codepoints:
+#   Cc  C0/C1 controls + DEL — includes \t (fake column alignment), \x1b (ESC:
+#       strips the lead byte of ANSI CSI/OSC sequences, leaving them inert text),
+#       \x0b/\x1c-\x1e and \u0085 NEL (all `splitlines()` breaks)
+#   Cf  every format character — the bidi embeddings/overrides/isolates that
+#       visually REORDER a line without changing its bytes, the zero-width
+#       family, LRM/RLM, ALM, the BOM, and the Unicode tag block
+#   Zl  U+2028 LINE SEPARATOR
+#   Zp  U+2029 PARAGRAPH SEPARATOR
+# `unicodedata` is the canonical answer to "which characters are these", and it
+# tracks the standard without anyone re-reading it.
+_GATE_TEXT_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+
+
+def _gate_text_unsafe(char: str) -> bool:
+    return unicodedata.category(char) in _GATE_TEXT_UNSAFE_CATEGORIES
+
+
+def _defang_gate_text(text: str) -> str:
+    """Neutralise terminal-acting characters WITHOUT bounding the length.
+
+    Two different risks travel in gate output and they want different answers.
+    FORGERY — a control character that makes a terminal redraw, reorder or hide
+    a line — is a property of any embedded untrusted value, so it is stripped
+    unconditionally, here and in ``_sanitize_gate_text`` alike. FLOODING — a
+    message so long it pushes the verdict off the screen — is a property of a
+    message an attacker CONTROLS END TO END, which a gate's own message is not.
+
+    So the enforcement arm gets this and the report gets the bounded variant.
+    A gate message is repo-authored prose whose LAST clause is the operator's
+    remediation route ("… or append '# stale-review-override' …"); bounding it
+    would cost something real to defend against nothing. What it does carry is
+    embedded untrusted VALUES — a scheduled-review marker's field quoted back
+    verbatim, a branch name from the API — and those can still act on a
+    terminal, which is exactly what this strips.
+
+    Splits on ``\\n`` first for the same reason ``_sanitize_gate_text`` does:
+    ``\\n`` is category Cc, so cleaning the raw string would flatten every
+    multi-line gate message into one line.
+    """
+    return "\n".join(
+        "".join(" " if _gate_text_unsafe(ch) else ch for ch in line)
+        for line in text.split("\n")
+    )
+
+
+def _sanitize_gate_text(text: str) -> str:
+    """Make an untrusted gate message safe to print, bounded in both dimensions.
+
+    Splits on ``\\n`` and NOT ``splitlines()``, deliberately, to match the producer:
+    ``_inline_title`` takes ``body.split("\\n")[0]`` precisely so that a NEL inside a
+    comment body cannot shift which line is treated as the title. Sanitising with the
+    wider ``splitlines()`` model would disagree with it, and that disagreement is
+    exploitable \u2014 a single finding title could forge an extra output line, and a
+    counterfeit ``merge-with :`` line WITHOUT ``--match-head-commit`` would strip the
+    TOCTOU binding from a command the operator is told to copy verbatim.
+
+    Returns the text with unsafe characters replaced by spaces, and BOTH dimensions
+    bounded the same way — head, a stated omission, tail — so a hostile message can
+    neither forge structure nor flood the verdict off the screen, and no bound ever
+    removes an operator's recovery instruction without saying it did.
+    """
+    def _clean(line: str) -> str:
+        cleaned = "".join(" " if _gate_text_unsafe(ch) else ch for ch in line)
+        if len(cleaned) <= _GATE_TEXT_MAX_CHARS:
+            return cleaned
+        # SELECT, do not amputate — the same rule the LINE dimension below already
+        # follows, applied to characters. A plain head-slice was silent and cut
+        # mid-word: MEASURED on the real codex-at-head message, a 532-char line
+        # arrived as 200 characters ending "…to merge without a", losing the
+        # '# stale-review-override' route it exists to hand the operator, with no
+        # marker to say anything had been dropped. A gate that tells someone they
+        # are blocked and not how to proceed has failed at the only job the detail
+        # line has.
+        kept = _GATE_TEXT_MAX_CHARS - _GATE_TEXT_TAIL_CHARS
+        omitted = len(cleaned) - kept - _GATE_TEXT_TAIL_CHARS
+        return (
+            f"{cleaned[:kept]} … {omitted} char(s) omitted … "
+            f"{cleaned[-_GATE_TEXT_TAIL_CHARS:]}"
+        )
+
+    lines = [_clean(ln) for ln in text.split("\n")]
+    if len(lines) <= _GATE_TEXT_MAX_LINES:
+        return "\n".join(lines)
+    # SELECT, do not amputate. A plain head-slice drops the TAIL, and the tail is
+    # where every gate puts its recovery instruction — the one line the operator
+    # needs. MEASURED shape: a PR with many stale/refused/malformed scheduled-review
+    # markers produces enough detail rows to push "Or append '# scheduled-review-
+    # override' to merge without the missing review(s)" past the cap, so the reader
+    # is told they are blocked and not how to proceed. Keeping both ends preserves
+    # the flood protection the cap exists for while losing nothing actionable, and
+    # the omission is STATED rather than silent.
+    head = _GATE_TEXT_MAX_LINES - _GATE_TEXT_TAIL_LINES - 1
+    omitted = len(lines) - head - _GATE_TEXT_TAIL_LINES
+    return "\n".join(
+        [
+            *lines[:head],
+            f"  … {omitted} more line(s) omitted here to bound this output …",
+            *lines[-_GATE_TEXT_TAIL_LINES:],
+        ]
+    )
+
+
+def _print_gate_detail(msg: str) -> None:
+    """Render lines 1+ of a gate message underneath its one-line report line.
+
+    Every blocking gate message follows the same shape: line 0 SUMMARIZES and the
+    lines below carry the actual diagnosis — which findings, which patterns, which
+    cause. `check_pr_report` prints only line 0, so a gate whose summary ends in a
+    colon reads as a sentence with its object cut off.
+
+    MEASURED 2026-09-02 on PR #1611: `inline-findings: BLOCK — review score 1.0 >=
+    1.0 blocks (...): 1 unresolved [P1] + 0 unresolved [P2] finding(s), none
+    maintainer-replied:` and then nothing. The P1's title is in `msg` line 1 and was
+    discarded. An operator is told a P1 blocks and never told WHICH — on the surface
+    that exists precisely to tell them what to act on.
+
+    Two gates already open-coded this loop (pin-receipts, scheduled-claude) and three
+    did not (review-body, inline-findings, codex-at-head) — which is the whole bug.
+    Every message-bearing gate goes through here so a new one inherits the behaviour
+    instead of re-deciding it; `TestReportRendersGateDetail` locks that in BOTH
+    directions (nobody re-implements the loop; nobody forgets to call it).
+
+    The message is untrusted — it can carry inline review-comment titles — so it goes
+    through `_sanitize_gate_text` first; see that function for what and why.
+    """
+    for line in _sanitize_gate_text(msg).split("\n")[1:]:
+        print("  " + line)
 
 
 def check_pr_report(pr_num: str, repo: str | None = None) -> int:
@@ -7627,6 +10003,8 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     # review published mid-run can't pass freshness with its P1s unscanned.
     blocked, msg = _check_base_is_default(pr_num, repo=repo)
     print(f"base-branch    : {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (default)'}")
+    if blocked:
+        _print_gate_detail(msg)
     failures += 1 if blocked else 0
     # Pin receipts: authoritative HERE, not in CI — the PR body is mutable after
     # a check run completes, so only a merge-time read describes the body that
@@ -7636,8 +10014,7 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         f"pin-receipts   : {'BLOCK — ' + msg.splitlines()[0] if blocked else msg.splitlines()[0]}"
     )
     if blocked:
-        for line in msg.splitlines()[1:]:
-            print(f"  {line}")
+        _print_gate_detail(msg)
     failures += 1 if blocked else 0
     # E2E obligation (§8.12) — ADVISORY. Reported so the declaration is visible
     # at merge time, but it NEVER contributes to `failures`: the enforcement arm
@@ -7647,10 +10024,13 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     undeclared, msg = _check_e2e_plan(pr_num, repo=repo)
     if undeclared:
         print(f"e2e-plan       : advisory — {msg.splitlines()[0]}")
-        # Indented tail, the same idiom pin-receipts and scheduled-review use —
-        # the remedy is the point of an advisory.
-        for line in msg.splitlines()[1:]:
-            print(f"  {line}")
+        # Through the chokepoint, not open-coded: `_print_gate_detail` is the
+        # single implementation of the indented-tail render, and
+        # `TestReportRendersGateDetail` fails any gate that copy-pastes the loop
+        # back. This gate and that lock landed on different branches and met
+        # here for the first time — the open-coded form was correct when it was
+        # written and is a violation now.
+        _print_gate_detail(msg)
     else:
         print(f"e2e-plan       : {msg.splitlines()[0]}")
     blocked, msg, verified_head = _check_codex_reviewed_head(pr_num, repo=repo)
@@ -7685,6 +10065,13 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         else:
             label = "ok (current)"
     print(f"codex-at-head  : {label}")
+    if blocked:
+        # The tail is the ONLY remediation text this gate gives: "@codex review then
+        # wait", the `# stale-review-override` route, and the `git log <reviewed>..<head>`
+        # command for inspecting the unreviewed commits. The merge-enforcement arm
+        # already prints the whole message, so dropping it here made the report and the
+        # gate disagree on exactly one gate.
+        _print_gate_detail(msg)
     failures += 1 if blocked else 0
     # Scheduled Claude review at HEAD — the SAME always-fail-closed gate the merge arm
     # enforces (shared function). A missing/stale/unreadable scheduled review is a
@@ -7726,18 +10113,21 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         # cause it was live on lines 1+. Printing only line 0 means every improvement to
         # them is invisible here, which is where the mistake was actually made.
         if sched_msg:
-            for line in sched_msg.splitlines()[1:]:
-                print(f"  {line}")
+            _print_gate_detail(sched_msg)
         failures += 1 if sched_msg else 0
     # Fail-closed (the only mode now): a scan that could not be READ (gh error/malformed)
     # shows as a failure here, never as "ok" — the report must not issue a false all-clear.
     blocked, msg = _check_pr_review_findings(pr_num, repo=repo)
     print(f"review-body    : {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok'}")
+    if blocked:
+        _print_gate_detail(msg)
     failures += 1 if blocked else 0
     blocked, msg = _check_inline_review_findings(pr_num, repo=repo)
     print(
         f"inline-findings: {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (P2s, if any, printed above)'}"
     )
+    if blocked:
+        _print_gate_detail(msg)
     failures += 1 if blocked else 0
     # Emit the actionable merge command ONLY when EVERY gate passed — printing it earlier
     # (right after codex-at-head) suggested a mergeable PR even when the scheduled or finding
@@ -7765,4 +10155,4 @@ if __name__ == "__main__":
             )
             sys.exit(2)
         sys.exit(check_pr_report(sys.argv[2], repo=_repo))
-    run_guard(main, "git_push_guard")
+    run_guard(_main_with_note, "git_push_guard")

@@ -12,8 +12,6 @@ import logging
 from datetime import UTC, datetime
 from typing import Protocol, runtime_checkable
 
-import aiosqlite
-
 from genesis.attention.types import AttentionEvent
 from genesis.db.crud import attention as attention_crud
 
@@ -106,7 +104,9 @@ class ShadowStoreConsumer:
             (r[id_idx], r[verdict_idx]) for r in self._rows if r[verdict_idx] is not None
         ]
         n = 0
-        conn = await aiosqlite.connect(self.db_path, timeout=self.timeout_s)
+        from genesis.db.connection import connect_aiosqlite_rw
+
+        conn = await connect_aiosqlite_rw(self.db_path, timeout=self.timeout_s)
         try:
             await conn.execute("PRAGMA busy_timeout=30000")
             n = await attention_crud.bulk_upsert_events(conn, self._rows)

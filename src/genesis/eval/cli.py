@@ -360,11 +360,10 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     db = None
     if not args.no_db:
         try:
-            import aiosqlite  # noqa: I001
-
+            from genesis.db.connection import connect_aiosqlite_rw
             from genesis.env import genesis_db_path
 
-            db = await aiosqlite.connect(str(genesis_db_path()))
+            db = await connect_aiosqlite_rw(genesis_db_path())
             await db.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")
         except Exception as e:
             print(f"warning: could not open DB ({e}), results won't be stored")
@@ -400,11 +399,10 @@ async def _cmd_gauntlet(args: argparse.Namespace) -> int:
     db = None
     if not args.no_db:
         try:
-            import aiosqlite  # noqa: I001
-
+            from genesis.db.connection import connect_aiosqlite_rw
             from genesis.env import genesis_db_path
 
-            db = await aiosqlite.connect(str(genesis_db_path()))
+            db = await connect_aiosqlite_rw(genesis_db_path())
             await db.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")
         except Exception as e:
             print(f"warning: could not open DB ({e}), results won't be stored")
@@ -453,11 +451,10 @@ async def _cmd_bench(args: argparse.Namespace) -> int:
     db = None
     if not args.no_db:
         try:
-            import aiosqlite  # noqa: I001
-
+            from genesis.db.connection import connect_aiosqlite_rw
             from genesis.env import genesis_db_path
 
-            db = await aiosqlite.connect(str(genesis_db_path()))
+            db = await connect_aiosqlite_rw(genesis_db_path())
             await db.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")
         except Exception as e:
             print(f"warning: could not open DB ({e}), results won't be stored")
@@ -525,10 +522,10 @@ async def _cmd_benchmark(args: argparse.Namespace) -> int:
     db = None
     if not args.no_db:
         try:
-            import aiosqlite  # noqa: I001
+            from genesis.db.connection import connect_aiosqlite_rw
             from genesis.env import genesis_db_path
 
-            db = await aiosqlite.connect(str(genesis_db_path()))
+            db = await connect_aiosqlite_rw(genesis_db_path())
             await db.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")
         except Exception as e:
             print(f"warning: could not open DB ({e}), results won't be stored")

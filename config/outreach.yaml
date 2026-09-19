@@ -1,9 +1,31 @@
 # Phase 8: Outreach pipeline configuration
 
 quiet_hours:
-  start: "22:00"
-  end: "07:00"
-  # timezone omitted — inherits genesis.yaml `timezone` via user_timezone()
+  # DISABLED by default. start == end is a zero-width window, which
+  # outreach/governance.py::_in_quiet_hours treats as "quiet hours off".
+  #
+  # Why off: the feature had no off switch and no way to say "send this anyway",
+  # so an explicitly-scheduled reminder due at 01:30 local was held until the
+  # window closed at 07:00. ALERT and BLOCKER always bypassed it; everything else
+  # (notification, digest, content, surplus, marketing) was delayed silently.
+  #
+  # To enable, set real local times — e.g. start "22:00", end "07:00" (a window
+  # that crosses midnight is handled). Times are local; the timezone is inherited
+  # from genesis.yaml `timezone` via user_timezone(), not set here.
+  #
+  # HAZARD, set BOTH keys together. The local-overlay merge
+  # (genesis/_config_overlay.py::_deep_merge) is PER-KEY, so an
+  # outreach.local.yaml containing only `quiet_hours: {end: "07:00"}` leaves
+  # start at 00:00 and yields a live 00:00–07:00 window — quiet hours silently
+  # back ON, with nothing announcing it. An explicit `enabled:` boolean would be
+  # immune; that is the proper redesign, deliberately deferred (issue #1958).
+  # Until then: re-enable by setting start AND end, and disable by setting them
+  # equal.
+  #
+  # A malformed value (not HH:MM) is treated as DISABLED and logged — it does not
+  # raise. Nothing validates this field yet, and raising here retried forever.
+  start: "00:00"
+  end: "00:00"
 
 channel_preferences:
   default: telegram

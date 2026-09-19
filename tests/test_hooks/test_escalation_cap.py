@@ -24,6 +24,7 @@ _REVIEW_STATE = _REPO_ROOT / "scripts" / "review_state.py"
 
 sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 sys.path.insert(0, str(_REPO_ROOT / "scripts" / "hooks"))
+import review_scope  # noqa: E402
 import review_state  # noqa: E402
 
 
@@ -55,6 +56,64 @@ def home(tmp_path: Path) -> Path:
 def _stage(repo: Path, content: str) -> None:
     (repo / "f.py").write_text(content)
     _git(repo, "add", "-A")
+
+
+def test_the_shared_review_state_name_is_not_hijacked():
+    """The premise every `monkeypatch.setattr(review_state, ...)` here rests on.
+
+    `review_enforcement_commit` imports `review_state` at CALL time, so a patch
+    applied in this file only reaches production code if this module's
+    `review_state` and `sys.modules["review_state"]` are the SAME object.
+
+    Other test modules load a private copy of that script under the shared name.
+    pytest imports every test module at COLLECTION, so the last registration
+    wins for the whole session: a module collected earlier keeps a reference to
+    the object it bound, while production resolves whatever is in `sys.modules`
+    now. The patch then lands on nobody and the real function runs — a failure
+    invisible in a single-file run and visible only in the full suite, in
+    collection order.
+
+    Asserting the premise directly means the next unrestored hijack fails HERE,
+    naming the cause, instead of surfacing as a bewildering assertion in an
+    unrelated test. `tests.conftest.private_module` is the supported way to load
+    a private copy without leaking the name.
+    """
+    assert sys.modules.get("review_state") is review_state, (
+        "sys.modules['review_state'] is not the module this file imported — "
+        "some test module loaded a private copy under the shared name and did "
+        "not restore it, so monkeypatching this module patches nothing that "
+        "production code will resolve. Load it via tests.conftest.private_module."
+    )
+
+
+def test_the_shared_review_scope_name_is_not_hijacked():
+    """The sibling lock, for the second name the commit gate imports at call time.
+
+    `review_scope` is resolved by a call-time import in five places, including
+    `review_enforcement_commit.classify_change_substantiality`, so the premise is
+    the same one the `review_state` lock above rests on: a patch applied to the
+    object THIS file holds only reaches production if it is the object
+    `sys.modules` hands the call-time import.
+
+    This file binds `review_scope` at module scope purely so that identity exists
+    to compare against — a canonical importer has to come from somewhere, and an
+    earlier revision of this lock concluded from its absence that PATH equality
+    was the best available check. It is not: two distinct module objects loaded
+    from the SAME path compare equal by path and differ by identity, so a private
+    copy left registered would pass a path assert while a `monkeypatch.setattr`
+    on the canonical object reached nobody. That is the exact divergence this
+    file exists to catch, and it is not hypothetical here —
+    `tests/test_scripts/test_check_review_depth.py` patches
+    `review_scope.classify_range_substantiality` against a call-time import at
+    `scripts/check_review_depth.py:60`.
+    """
+    assert sys.modules.get("review_scope") is review_scope, (
+        "sys.modules['review_scope'] is not the module this file imported — "
+        "some test module loaded a private copy under the shared name and did "
+        "not restore it. Same path is NOT sufficient: a same-path copy is a "
+        "different object, so patches land on one and production resolves the "
+        "other. Load it via tests.conftest.private_module."
+    )
 
 
 # ── Counter unit tests (review_state) ─────────────────────────────────────
@@ -120,6 +179,43 @@ def test_reset_clears(repo, _isolate_rounds):
     review_state.bump_review_round(cwd=str(repo), source="external")
     review_state.reset_review_round(cwd=str(repo))
     assert review_state.get_review_round(cwd=str(repo)) == 0
+
+
+def test_snapshot_accessor_agrees_with_the_two_it_replaces(repo, _isolate_rounds):
+    """`get_review_counters` exists so a reader deciding a TIER cannot assemble a pair
+    that never existed (two reads, a concurrent mark between them). That is only safe
+    while it reports the SAME values the individual accessors do — a drift here would
+    make every tier decision quietly wrong rather than loudly broken, so the agreement
+    is pinned across the states that actually differ: fresh, mid-streak, after a reset
+    (streak clears, lifetime does NOT), and on another branch.
+    """
+
+    def both():
+        return (
+            review_state.get_review_round(cwd=str(repo)),
+            review_state.get_review_lifetime(cwd=str(repo)),
+        )
+
+    assert review_state.get_review_counters(cwd=str(repo)) == both() == (0, 0)
+
+    _stage(repo, "a = 2\n")
+    review_state.bump_review_round(cwd=str(repo), source="external")
+    assert review_state.get_review_counters(cwd=str(repo)) == both()
+
+    _stage(repo, "a = 3\n")
+    review_state.bump_review_round(cwd=str(repo), source="external")
+    mid = review_state.get_review_counters(cwd=str(repo))
+    assert mid == both() and mid[0] > 0, mid
+
+    # The asymmetry the pair exists to carry: the ack clears the streak, never lifetime.
+    review_state.reset_review_round(cwd=str(repo))
+    after = review_state.get_review_counters(cwd=str(repo))
+    assert after == both(), after
+    assert after[0] == 0 and after[1] == mid[1], after
+
+    _git(repo, "commit", "-qm", "wip")
+    _git(repo, "checkout", "-q", "-b", "other-branch")
+    assert review_state.get_review_counters(cwd=str(repo)) == both() == (0, 0)
 
 
 def test_legacy_counter_without_last_source_is_discarded(repo, _isolate_rounds):
@@ -211,6 +307,7 @@ def _run_hook(command: str, repo: Path, home: Path) -> subprocess.CompletedProce
         }
     )
     env = {**os.environ, "HOME": str(home)}
+    env.setdefault("_TEST_REVIEW_BUDGET_PR", "none")
     return subprocess.run(
         [sys.executable, str(_HOOK)],
         input=payload,
@@ -928,244 +1025,9 @@ def test_lifetime_absent_in_legacy_file_reads_zero(repo, _isolate_rounds):
     assert review_state.get_review_lifetime(cwd=str(repo)) == 0
 
 
-def _reach_lifetime(repo: Path, home: Path, n: int) -> None:
-    """Drive the LIFETIME counter to n, resetting the streak as an ack would."""
-    for i in range(1, n + 1):
-        _stage(repo, f"life = {i}\n")
-        m = _mark(repo, home)
-        assert m.returncode == 0, m.stderr
-        if i % review_state.ESCALATION_ROUND_CAP == 0:
-            env = {**os.environ, "HOME": str(home)}
-            subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    f"import sys; sys.path.insert(0, {str(_REPO_ROOT / 'scripts')!r}); "
-                    f"import review_state as r; r.reset_review_round(cwd={str(repo)!r})",
-                ],
-                env=env,
-                check=True,
-                capture_output=True,
-                timeout=30,
-            )
-
-
-def test_commit_blocked_at_final_round(repo, home):
-    res_before = _run_hook('git commit -m "wip"', repo, home)
-    assert res_before.returncode == 0, "control: an unmarked branch must not block"
-    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
-    res = _run_hook('git commit -m "wip"', repo, home)
-    assert res.returncode == 2, res.stdout + res.stderr
-    assert "final" in res.stderr.lower()
-
-
-def test_escalation_ack_does_not_clear_the_final_round_block(repo, home):
-    """The whole point: the repeatable sigil must stop working at the terminal."""
-    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
-    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
-    assert res.returncode == 2, res.stdout + res.stderr
-    assert "final" in res.stderr.lower()
-
-
-def test_final_round_accept_allows_the_commit(repo, home):
-    """Carries its own negative control, because `returncode == 0` alone is vacuous.
-
-    A bare assertion that the acked commit passes would ALSO pass if the terminal
-    did not exist at all. The un-acked run in the same test is what makes the
-    green mean something: same state, same command, one sigil apart.
-    """
-    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
-    without = _run_hook('git commit -m "wip"', repo, home)
-    assert without.returncode == 2, "control: the terminal must be blocking here"
-    res = _run_hook('git commit -m "wip"  # final-round-accept', repo, home)
-    assert res.returncode == 0, res.stdout + res.stderr
-
-
-def test_final_round_accept_is_one_shot(repo, home):
-    """Chosen deliberately over a latch: the decision must END the loop.
-
-    An ack that kept working would be one more repeatable sigil, which is the
-    defect this gate exists to close.
-    """
-    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
-    first = _run_hook('git commit -m "wip"  # final-round-accept', repo, home)
-    assert first.returncode == 0, first.stderr
-    again = _run_hook('git commit -m "another"', repo, home)
-    assert again.returncode == 2, again.stdout + again.stderr
-    assert "final" in again.stderr.lower()
-
-
-def test_final_round_accept_cannot_be_reused(repo, home):
-    """The sigil must be CONSUMED, not merely re-required on every commit.
-
-    Its sibling above only retries WITHOUT the sigil, so it proves the block
-    returns — not that the acceptance was spent. Re-applying the same sigil is the
-    reuse path, and if it keeps working the terminal is just a fourth repeatable
-    escape hatch, which is the whole defect this tier exists to close.
-    """
-    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
-    first = _run_hook('git commit -m "accept"  # final-round-accept', repo, home)
-    assert first.returncode == 0, first.stderr
-    reused = _run_hook('git commit -m "more fixes"  # final-round-accept', repo, home)
-    assert reused.returncode == 2, reused.stdout + reused.stderr
-    assert "already used" in reused.stderr.lower(), reused.stderr
-
-
-def test_a_denied_command_does_not_spend_the_acceptance(repo, home):
-    """The token must be spent at the ALLOW, never inside the tier that honours it.
-
-    Rule 3a is checked FIRST, but four later rules can still deny the same command.
-    Consuming inside the tier burned the one-shot token on a commit that never ran,
-    and since the consuming tier is checked first on the retry, the branch became
-    permanently uncommittable. MEASURED before the fix, at streak 7 / lifetime 7 —
-    a state this gate's own comment calls reachable — every sigil combination
-    returned 2, including the one the block message itself prints.
-    """
-    _reach_rounds(repo, home, review_state.FINAL_ROUND_CAP)
-    # Terminal cleared, but the escalation cap still denies: both sigils are
-    # genuinely required in this state, so this command does NOT commit.
-    denied = _run_hook('git commit -m "accept"  # final-round-accept', repo, home)
-    assert denied.returncode == 2, denied.stdout + denied.stderr
-    assert "already used" not in denied.stderr.lower()
-    # The acceptance must still be available to the co-required form.
-    ok = _run_hook('git commit -m "accept"  # final-round-accept escalation-ack', repo, home)
-    assert ok.returncode == 0, ok.stdout + ok.stderr
-    # ...and only NOW is it spent.
-    after = _run_hook('git commit -m "more"  # final-round-accept escalation-ack', repo, home)
-    assert after.returncode == 2, after.stdout + after.stderr
-    assert "already used" in after.stderr.lower(), after.stderr
-
-
-def test_consumption_survives_a_later_external_round(repo, home):
-    """A new review round after the accept must not hand back a fresh acceptance.
-
-    `bump_review_round` rebuilds the state dict on every write, so a field that is
-    not explicitly carried is silently dropped — the exact way `last_source` was
-    lost once already. If the flag vanished here, running one more Codex round
-    would reopen the terminal, which is precisely the loop being ended.
-    """
-    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
-    assert _run_hook('git commit -m "accept"  # final-round-accept', repo, home).returncode == 0
-    _stage(repo, "after = 1\n")
-    m = _mark(repo, home)
-    assert m.returncode == 0, m.stderr
-    again = _run_hook('git commit -m "post-round"  # final-round-accept', repo, home)
-    # Assert the REASON, not just the code. A bare `returncode == 2` is satisfied by
-    # any of the sibling rules that can also block here, so it stays green even when
-    # the carry-through is deleted — measured, this exact test passed under that
-    # mutation until the message check was added.
-    assert again.returncode == 2, again.stdout + again.stderr
-    assert "already used" in again.stderr.lower(), again.stderr
-
-
-def test_a_new_branch_gets_a_fresh_acceptance(repo, home):
-    """Consumption is scoped to the change, not the machine.
-
-    Without this the flag would be a global latch that permanently disarms the
-    sigil for every future branch on the install.
-    """
-    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
-    assert _run_hook('git commit -m "accept"  # final-round-accept', repo, home).returncode == 0
-    subprocess.run(
-        ["git", "checkout", "-b", "a-different-change"], cwd=repo, check=True, capture_output=True
-    )
-    # ARM THE TERMINAL ON THE NEW BRANCH. Without this the test never reaches
-    # get_final_accept_consumed at all — a fresh branch has lifetime 0, so the tier
-    # is skipped entirely and the assertion passes on a GLOBAL latch too. Measured:
-    # deleting the branch check from that accessor left this test green.
-    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
-    res = _run_hook('git commit -m "fresh start"  # final-round-accept', repo, home)
-    assert res.returncode == 0, res.stdout + res.stderr
-    assert "already used" not in res.stderr.lower(), res.stderr
-
-
-def test_final_ack_inside_message_does_not_bypass(repo, home):
-    """A token buried in -m is not a trailing comment (mirrors the sibling acks)."""
-    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
-    res = _run_hook('git commit -m "wip # final-round-accept"', repo, home)
-    assert res.returncode == 2, res.stdout + res.stderr
-
-
-def test_below_final_round_the_normal_cycle_still_applies(repo, home):
-    """Guard the guard: below the terminal the ORDINARY escalation ack still works.
-
-    The first version of this test was VACUOUS and it is worth saying why.
-    It drove the counter with `_reach_lifetime`, which resets the streak on every
-    third round — so at n=3 it reset on its own last iteration and left the streak
-    at 1, where NOTHING gates. The commit passed because no rule fired, not because
-    the ack worked; deleting the sigil it names left it green. `_reach_rounds` does
-    not reset, and the un-acked control is what makes the pass mean something.
-    """
-    # NB: the counter is NOT readable in-process here. _ROUND_DIR resolves against
-    # the real $HOME at import time and only the unit tests monkeypatch it, so an
-    # in-process get_review_* in an integration test reads someone else's state —
-    # 0, which made an earlier `< FINAL_ROUND_CAP` assertion pass vacuously. State
-    # is asserted through the GATE'S BEHAVIOUR instead, which is what matters.
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)  # streak 3, no reset
-    without = _run_hook('git commit -m "wip"', repo, home)
-    assert without.returncode == 2, "control: the escalation cap must be blocking here"
-    assert "escalation cap" in without.stderr.lower()
-    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
-    assert res.returncode == 0, res.stdout + res.stderr
-
-
-def _refund_final_accept(repo: Path, home: Path) -> None:
-    """Clear the spent-acceptance flag so one test can exercise two acked commits.
-
-    Only for tests whose subject is something OTHER than consumption (sigil parse
-    order, message content). Consumption itself is covered by
-    test_final_round_accept_cannot_be_reused and friends, which must never call this.
-    """
-    env = {**os.environ, "HOME": str(home)}
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            f"import sys, json; sys.path.insert(0, {str(_REPO_ROOT / 'scripts')!r}); "
-            f"import review_state as r; st = r._load_round({str(repo)!r}); "
-            # Refuse to write back an empty counter: that would silently disarm the
-            # terminal and turn the caller GREEN while testing nothing.
-            "assert st.get('lifetime'), f'refund would blank the counter: {st!r}'; "
-            "st.pop('final_accept_consumed', None); "
-            f"r._write_round(st, {str(repo)!r})",
-        ],
-        env=env,
-        check=True,
-        capture_output=True,
-        timeout=30,
-    )
-
-
-def test_terminal_and_cap_together_accept_either_sigil_order(repo, home):
-    """streak>=3 AND lifetime>=7 is reachable, and BOTH sigils are then required.
-
-    This is the state the unregistered-sigil bug deadlocked in ONE token order:
-    an unlisted token reads as prose and ends the leading sigil run, so everything
-    written behind it is ignored. Order must not decide the verdict, and the
-    terminal's own message must not print the losing order.
-    """
-    # _reach_rounds never resets, so 7 marks leave streak AND lifetime at 7 — the
-    # state is asserted through behaviour below, not by reading the counter (see
-    # the note in test_below_final_round_the_normal_cycle_still_applies).
-    _reach_rounds(repo, home, review_state.FINAL_ROUND_CAP)
-    blocked = _run_hook('git commit -m "wip"', repo, home)
-    assert blocked.returncode == 2, "control: both tiers must be live here"
-    assert "FINAL ROUND" in blocked.stderr, "the terminal must be the one blocking"
-    for cmd in (
-        'git commit -m "wip"  # final-round-accept escalation-ack',
-        'git commit -m "wip"  # escalation-ack final-round-accept',
-    ):
-        # The first accepted commit SPENDS the acceptance, so without this the
-        # second order would be blocked by consumption rather than by parsing —
-        # a green/red that says nothing about the property under test.
-        _refund_final_accept(repo, home)
-        res = _run_hook(cmd, repo, home)
-        assert res.returncode == 0, f"{cmd} -> {res.returncode}: {res.stderr}"
-
-
-def test_terminal_message_names_the_co_required_sigil(repo, home):
-    """A block that prints an insufficient command teaches an unescapable loop."""
-    _reach_rounds(repo, home, review_state.FINAL_ROUND_CAP)
-    res = _run_hook('git commit -m "wip"', repo, home)
-    assert res.returncode == 2
-    assert "final-round-accept escalation-ack" in res.stderr
+def test_legacy_final_round_symbols_remain_for_stale_worktrees():
+    """Old hook trees may still import these names while a worktree is in flight."""
+    assert review_state.FINAL_ROUND_CAP == 7
+    assert callable(review_state.get_review_lifetime)
+    assert callable(review_state.get_final_accept_consumed)
+    assert callable(review_state.consume_final_accept)

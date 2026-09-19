@@ -46,6 +46,19 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 try:
+    from review_deadline import DeadlineExpired, propagate_deadline_timeout  # noqa: E402
+except Exception:  # Reverse-version skew: advisory scope reads must stay available.
+
+    class DeadlineExpired(RuntimeError):
+        """Local reverse-skew equivalent of the shared deadline exception."""
+
+    def propagate_deadline_timeout(deadline, error):
+        if deadline is not None:
+            raise DeadlineExpired(
+                "aggregate review-gate deadline expired during subprocess"
+            ) from error
+
+try:
     from review_enforcement_commit import _is_docs_or_config, _is_prompt_surface
 except ImportError:  # pragma: no cover - sibling always present in scripts/
 
@@ -301,17 +314,27 @@ def _specialists(scope_tags: set[str], diff_lines: int) -> list[str]:
 
 
 # ── git plumbing — fail-open, always timed ────────────────────────────────────
-def _git(args: list[str], cwd: str | None, deadline: float | None = None) -> str | None:
-    """Run a git command; return stdout, or None on ANY error (fail-open).
+def _git(
+    args: list[str],
+    cwd: str | None,
+    deadline: float | None = None,
+    *,
+    strict_deadline: bool = False,
+) -> str | None:
+    """Run a git command; return stdout, or None on an ordinary error.
 
     ``deadline`` (a ``time.monotonic()`` value) caps the per-call timeout by the
     time remaining in the manifest's total git budget — so several serial calls
-    can't collectively overrun the hook timeout. Past the deadline → None.
+    cannot collectively overrun the hook timeout. Past the deadline returns
+    ``None`` for advisory callers or raises ``DeadlineExpired`` for a strict
+    commit check.
     """
     timeout = _GIT_TIMEOUT
     if deadline is not None:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            if strict_deadline:
+                raise DeadlineExpired("aggregate review-gate deadline expired")
             return None
         timeout = min(_GIT_TIMEOUT, remaining)
     try:
@@ -322,7 +345,11 @@ def _git(args: list[str], cwd: str | None, deadline: float | None = None) -> str
             timeout=timeout,
             cwd=cwd,
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, UnicodeDecodeError):
+    except subprocess.TimeoutExpired as exc:
+        if strict_deadline:
+            propagate_deadline_timeout(deadline, exc)
+        return None
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
         # UnicodeDecodeError: text=True strict-decodes stdout; a filename with
         # invalid UTF-8 bytes would otherwise raise it (not an OSError subclass)
         # and crash a standalone `main()` call, violating the fail-open contract.
@@ -632,18 +659,364 @@ def _substantiality_level(records: list[dict], per_file: dict[str, int], binary:
     return "substantial" if substantial else "inline"
 
 
-def _classify_diff(diff_args: list[str], cwd: str | None) -> str:
+def _classify_diff(
+    diff_args: list[str], cwd: str | None, deadline: float | None = None
+) -> str:
     """Run the two -z diffs, parse, and classify — or ``"unknown"`` on any git error
     (fail OPEN: no fabricated depth requirement; the CI check is the backstop)."""
-    name_status = _git(["diff", *diff_args, "-z", "--name-status", "-M"], cwd)
-    numstat = _git(["diff", *diff_args, "-z", "--numstat", "-M"], cwd)
+    name_status = _git(
+        ["diff", *diff_args, "-z", "--name-status", "-M"],
+        cwd,
+        deadline,
+        strict_deadline=deadline is not None,
+    )
+    numstat = _git(
+        ["diff", *diff_args, "-z", "--numstat", "-M"],
+        cwd,
+        deadline,
+        strict_deadline=deadline is not None,
+    )
     if name_status is None or numstat is None:
         return "unknown"
     per_file, binary = _parse_numstat_perfile(numstat)
     return _substantiality_level(_parse_name_status_z(name_status), per_file, binary)
 
 
-def classify_change_substantiality(cwd: str | None = None) -> str:
+# ── review LANE — how much consequence a change carries ─────────────────────
+#
+# ORTHOGONAL to substantiality. Substantiality asks "is this big enough to need a
+# deep review"; the lane asks "how much does it cost to be wrong". A one-line edit
+# to an enforcement hook is `inline` and `critical` at once.
+#
+# ── the lane's OWN path vocabulary ───────────────────────────────────────────
+#
+# WHY THIS DOES NOT REUSE `_scope_tag` / `_DOMAIN_SENSITIVE_TAGS`, which is the
+# obvious economy and was the first two attempts at this lane.
+#
+# `_SCOPE_PATTERNS` is a Rails-flavoured taxonomy mirrored in from another
+# codebase, and it answers a DIFFERENT question: "what kind of file is this, in
+# Rails terms". The lane asks "how much does it cost to be wrong here". Building
+# the second on the first produced SEVEN distinct defects, every finding this
+# change has attracted from either reviewer or from its own author:
+#
+#   `auth` is 98% "session"      58 of 59 tagged files are CC-session machinery
+#   `prompts` is 100% wrong      matches 10 scorers, misses all 84 prompt surfaces
+#   `.txt` admits dependency pins  requirements.txt reached the light lane
+#   `api` globs miss `api.py`    outreach/api.py defines Flask routes, tagged backend
+#   `.markdown`/`.adoc` unreachable  listed, but `_category` calls them code first
+#   extensionless stems unreachable  same cause, found a round later
+#   `data_migrations` tags four ways  one directory, four different tags
+#
+# One class, seven faces: a vocabulary that does not describe this repo. Each fix
+# patched one word of it, and the next round found the next word. So the lane now
+# states its own consequence surfaces explicitly, for THIS repo, and the
+# distribution is re-measured rather than assumed (see `classify_lane`).
+#
+# The narrow, DELIBERATE exception is test/fixture detection below, which stays on
+# `_category`: that half keys on `_TEST_GLOBS`/`_TEST_DIRS`, which are ordinary
+# naming conventions rather than domain vocabulary, and no finding has ever
+# touched it.
+
+#: Directory prefixes whose contents are consequence surfaces. Anchored at a path
+#: boundary — a PREFIX, never a substring — so `src/genesis/db/migrations_notes/`
+#: does not match `.../migrations/` by accident.
+_LANE_CRITICAL_PREFIXES = (
+    ".github/",  # can disable a required check
+    "src/genesis/db/migrations/",  # schema
+    "src/genesis/db/data_migrations/",  # data; MISSED by the inherited glob
+    "src/genesis/dashboard/routes/",  # HTTP surface
+    "scripts/ci/",  # implementations behind required checks — see below
+)
+
+# `.github/**` is critical because a change there can disable a required check.
+# The IMPLEMENTATION behind that check disables it just as effectively, and until
+# this was added only the YAML layer was protected: MEASURED, all 15 scripts
+# `ci.yml` actually invokes — the leak scanner, the private-pattern scan, the
+# migration-prefix check, the review-depth gate — took the standard threshold,
+# so three unresolved P2s passed in a leak scanner where two would have blocked
+# in the workflow that merely calls it. Covered by `scripts/ci/` above plus the
+# `check_` basename prefix below; `test_required_check_implementations_are_critical`
+# re-derives the invocation list from `ci.yml` so a required check added later
+# fails that test until its path is covered here.
+
+
+# THE LANE CONSULTS NO `_scope_tag` VALUE AT ALL, and the third attempt at this
+# is the reason. The history is kept because each attempt looked correct:
+#
+#   1. Inherit `_DOMAIN_SENSITIVE_TAGS` wholesale -> seven defects, listed above.
+#   2. Replace the taxonomy entirely -> silently NARROWED the lane, because the
+#      `api` globs (`*controller*`, `*route*`, `*endpoint*`, `*/api/*`) reached
+#      HTTP surfaces no explicit rule here named.
+#   3. Re-admit `api` + `migrations`, the two the audit measured CLEAN -> BOTH
+#      over- and under-classifies. `*route*` is a NAME pattern, so it dragged in
+#      7 non-HTTP modules (`routing/router.py` is the LLM router;
+#      `reflection/output_router.py` routes reflection output), while `*/api/*`
+#      and `*/migrations/*` need a preceding path component, so a ROOT-level
+#      `api/` or `migrations/` directory would read `standard`.
+#
+# The audit behind attempt 3 said `api` was "57 files, clean". That was a COUNT,
+# checked by eye; it never asked whether those files were HTTP surfaces, which is
+# the same error the `auth` tag was indicted for (98% matching on `*session*`).
+#
+# MEASURED before deleting, both directions, which is what attempt 3 lacked:
+# dropping the tags leaves 58 of 58 route-defining modules in `critical` — zero
+# misses, because the prefixes and basenames above already cover them — and
+# removes all 7 over-classifications. This repo has no root-level `api/` or
+# `migrations/` directory, so that half costs nothing either. The tags were pure
+# cost by the time they were measured on both sides.
+#
+# So: a NAME pattern cannot answer "is this an HTTP surface". A path boundary can,
+# and `test_every_route_defining_module_is_critical` /
+# `test_no_non_HTTP_module_is_dragged_into_critical` hold both directions of that
+# claim against the tracked population rather than against remembered examples.
+
+#: Exact paths and basename shapes that are consequence surfaces wherever they sit.
+#: `_blueprint.py` is here rather than in the prefixes because it is a route
+#: registrar that lives beside ordinary dashboard code — see the enumeration test.
+_LANE_CRITICAL_BASENAMES = frozenset(
+    {
+        "api.py",
+        "auth.py",
+        "secrets.py",
+        "credentials.py",
+        "_blueprint.py",
+        # Required-check implementation that matches no prefix below.
+        "assemble_changelog.py",
+        # HTTP servers under `hosting/`. Named individually rather than fencing
+        # the subtree: only 3 of its 17 tracked files define routes, and the
+        # broad prefix put CSS, SVG assets, `types.py` and lifecycle adapters in
+        # the strictest lane. The list cannot go stale unnoticed —
+        # `test_every_route_defining_module_is_critical` enumerates route
+        # definitions across the tracked tree and fails if one is uncovered.
+        "standalone.py",
+        "completions.py",
+        "overlay.py",
+    }
+)
+
+#: Basename PREFIXES, on an executable extension. `.sh` counts as well as `.py`
+#: because two required checks are shell (`check_portability.sh`,
+#: `check_hook_versions_complete.sh`) — restricting this to `.py` would have left
+#: them behind exactly the way the YAML-only boundary left all 15 behind.
+#:
+#: MEASURED both directions before adding `check_`: the rules cover 15 of 15
+#: scripts `ci.yml` invokes with ZERO misses, and match 4 further tracked files
+#: that CI does not invoke — `check_cc_running_versions.sh`, `check_hook_versions.sh`,
+#: `check_stale_pending.py`, `scripts/ci/cc_pin_parse.py`. Those four are checkers
+#: and CI helpers themselves, i.e. the same KIND of surface, which is what makes
+#: this a boundary rather than the `*route*` shape that matched the LLM router.
+_LANE_CRITICAL_BASENAME_PREFIXES = ("api_", "auth_", "check_")
+_LANE_CRITICAL_BASENAME_EXTS = (".py", ".sh")
+
+#: TRUST BOUNDARIES — approval and outbound-action gates. Without this the lane
+#: RELAXES review on `autonomy/approval_gate.py`, `email_gate.py` and
+#: `cli_policy.py` from two unresolved P2s to four, because nothing else here
+#: matches them. That is the one direction this change must never move: the
+#: autonomous-CLI approval gate is a standing non-negotiable, and a lane that
+#: quietly widens its finding budget is a downgrade wearing a refactor.
+#:
+#: The asymmetry that decides the shape, and it is why a `_gate.py` suffix is
+#: acceptable here where a name pattern was rejected for HTTP surfaces: main runs
+#: a FLAT 1.0 threshold, so every file blocks at two P2s today. Over-matching
+#: therefore costs NOTHING relative to the status quo — it only withholds a
+#: relaxation — while under-matching is a live weakening. MEASURED: the rule takes
+#: 15 tracked modules, of which 4 (`version_gate`, `validation_gate`,
+#: `question_gate`, `rate_gate`) are flow-control rather than authorization. Those
+#: four keep today's bar; they are not made stricter than main, and saying that
+#: plainly is the point — this is a deliberate over-match, not an unnoticed one.
+_LANE_CRITICAL_BASENAME_SUFFIXES = ("_gate.py",)
+_LANE_CRITICAL_TRUST_BASENAMES = frozenset({"approval.py", "cli_policy.py"})
+
+#: Prose. `.txt` is NOT prose on its own — `requirements.txt` and
+#: `config/az-pip-constraints.txt` are dependency pins — so it counts only on a
+#: known documentation STEM, the same split `git_push_guard._is_doc_path` makes.
+#: Unlike the previous version these are matched DIRECTLY rather than behind
+#: `_category`, so every spelling listed is actually reachable.
+_LANE_PROSE_EXTS = frozenset({".md", ".rst", ".markdown", ".adoc"})
+_LANE_PROSE_STEMS = frozenset(
+    {"CHANGELOG", "README", "LICENSE", "NOTICE", "COPYING", "AUTHORS", "CONTRIBUTING"}
+)
+_LANE_PROSE_STEM_EXTS = _LANE_PROSE_EXTS | {".txt", ""}
+
+
+#: Fixture CORPORA — checked-in sample programs the eval harness loads as DATA.
+#: They read like source (`calc/api.py`, `statslib/core.py`) and are not: nothing
+#: here runs in production, and `gauntlet.py` loads the tree wholesale.
+#:
+#: ANCHORED as a directory prefix, never a substring or a `*fixture*` glob. A
+#: substring carve-out would exempt every continuation — `fixtures_live/`,
+#: `my_fixtures.py` — and this is the one rule in the lane that makes a change
+#: LIGHTER, so a loose spelling here is the only way this file can widen a budget
+#: by accident.
+#:
+#: MEASURED: 19 tracked files under this root reached standard (15), critical (1)
+#: and light (3). The CRITICAL one was `calc_longhorizon/calc/api.py`, pulled in by
+#: this module's OWN `api.py` basename rule — a sample program in the strictest
+#: lane, which is the same over-classification shape as the `*route*` glob, this
+#: time self-inflicted.
+_LANE_FIXTURE_ROOTS = ("src/genesis/eval/gauntlet_fixtures/",)
+
+
+def _is_lane_fixture_corpus(path: str) -> bool:
+    """Is *path* inside a declared fixture corpus? Prefix-anchored (see above)."""
+    return path.startswith(_LANE_FIXTURE_ROOTS)
+
+
+def _is_lane_critical_path(path: str) -> bool:
+    """Is this path a consequence surface — somewhere it costs a lot to be wrong?
+
+    PATH BOUNDARIES AND BASENAMES ONLY — no `_scope_tag` value is consulted, for
+    the reason set out at the constants above: a NAME pattern cannot answer "is
+    this an HTTP surface", and three rounds of findings on this function were all
+    that question being asked of one.
+
+    A path matching nothing here is ordinary, which is the safe direction: the
+    lane only ever RELAXES a threshold below critical, so a surface nobody thought
+    of is reviewed at the standard bar rather than the widest one.
+
+    NOT here, deliberately: destructive capability, external egress and financial
+    logic. Each is named in the lane's design as critical and none has a path
+    definition anywhere in this repo, so including them would mean inventing three
+    taxonomies inside this change. `config/` was briefly in the prefix list for the
+    same impulse and is gone for the same reason — config is ORDINARY, which is
+    what the instruction files this change also edits already say.
+    """
+    if _is_lane_fixture_corpus(path):
+        return False  # sample programs, not production surface
+    if any(path.startswith(prefix) for prefix in _LANE_CRITICAL_PREFIXES):
+        return True
+    base = os.path.basename(path)
+    if base in _LANE_CRITICAL_BASENAMES:
+        return True
+    if base in _LANE_CRITICAL_TRUST_BASENAMES or base.endswith(
+        _LANE_CRITICAL_BASENAME_SUFFIXES
+    ):
+        return True
+    return base.endswith(_LANE_CRITICAL_BASENAME_EXTS) and base.startswith(
+        _LANE_CRITICAL_BASENAME_PREFIXES
+    )
+
+
+def _is_lane_light(path: str) -> bool:
+    """Prose, tests and fixtures — the material a wider finding budget suits."""
+    if _is_lane_fixture_corpus(path):
+        return True
+    if _category(path) in ("test", "fixture"):
+        return True
+    base = os.path.basename(path)
+    stem, dot, ext = base.rpartition(".")
+    ext = f".{ext.lower()}" if dot else ""
+    if (stem if dot else base).upper() in _LANE_PROSE_STEMS:
+        return ext in _LANE_PROSE_STEM_EXTS
+    return ext in _LANE_PROSE_EXTS
+
+
+def classify_lane(paths: list[str], *, hook_surface: bool) -> str:
+    """The consequence lane of a change: ``"critical" | "standard" | "light"``.
+
+    *hook_surface* is passed IN rather than computed here. The authority for that
+    membership is ``_is_hook_surface_path`` in ``scripts/hooks/git_push_guard.py``,
+    which owns the constant, its AST-diff tests and its two declared mirrors
+    (``.github/labeler.yml``, CODEOWNERS). This module must not import the guard —
+    it is deliberately dependency-free (see the module docstring) — and a second
+    copy of that fence here would be the drift those mirrors exist to prevent.
+    This mirrors what ``git_push_guard._classify_post_review_delta`` already does:
+    settle the hook surface first, then ask this module.
+
+    FAIL-CLOSED on an unknown scope. An empty *paths* means the caller could not
+    read the change (a failed API call reaches us as ``[]``), and a change nobody
+    can see is treated as consequential rather than waved through.
+
+    MEASURED over the 40 most recently merged PRs (2026-09-13): critical 35.0%,
+    standard 20.0%, light 45.0%. The bar, set before measuring, was that critical
+    stay at or under 50% — a lane that calls everything critical decides nothing.
+
+    THE DENOMINATOR MOVES, so re-running this will not reproduce the figure and a
+    difference is not evidence of a regression. "The 40 most recently merged" is a
+    sliding window: the same probe read 32.5 / 22.5 / 45.0 an hour earlier, and the
+    2.5-point shift was entirely two PRs merging INTO the window (one of them
+    hook-surface, hence critical) — the classifier returned an identical lane for
+    every PR common to both runs. To compare classifiers, hold the PR set fixed and
+    diff the per-PR ASSIGNMENTS; comparing two totals taken at different times
+    measures the merge queue, not the code.
+
+    Against THE VERSION THIS REPLACES — the committed tag-based classifier, which
+    measures 30.0 / 60.0 / 10.0 over the same 40 PRs — TWO movements account for
+    the difference, both derived per-PR rather than inferred from the totals:
+
+    * **14 PRs moved standard -> light**, every one a PROMPT SURFACE (``SKILL.md``,
+      ``.claude/commands/*.md``, ``src/genesis/skills/**``) — which ``_category``
+      calls ``code`` and this vocabulary reads as prose. That is the intended
+      reading; rule-docs belong in the widest budget. It is also mostly INERT
+      rather than a loosening: 11 of the 14 contain nothing whose findings score
+      at all, because every path in them is a ``git_push_guard._is_doc_path`` and
+      that gate's ``doc_findings`` mode defaults to ``skip``. The 3 that do change
+      behaviour are prose-plus-tests PRs whose TEST findings now clear at 3.0
+      instead of 2.0.
+
+      That inertness is a DEFAULT, not a structural bound. ``doc_findings`` is
+      read from ``merge_gate`` in ``~/.genesis/config/genesis.yaml``, so an install
+      setting ``score`` gets the full 3.0 budget on prompt surfaces — including
+      ``src/genesis/identity/`` and the executor/sentinel prompt directories. This
+      repo's own rule for this shape says an exemption may cite a bound
+      configuration CANNOT change, never a default; so the honest version is that
+      the loosening is bounded on THIS install's settings, and that is the case to
+      think about before widening the prose set further.
+    * **1 PR moved standard -> critical** — #1874, which touches
+      ``src/genesis/hosting/standalone.py``, the module serving ``/genesis/login``.
+      That is the route-surface gap below arriving on a real merged PR rather than
+      only on a constructed one.
+
+    An intermediate, NEVER-COMMITTED draft additionally carried a blanket
+    ``config/`` critical prefix and measured 32.5 / 57.5 / 10.0; dropping that
+    prefix is what moved its one config PR back to standard. That figure is
+    narrative about a draft, not a delta against this diff's base — recorded
+    separately because stating it as "the previous measurement" is exactly the
+    permanent-record error this docstring is otherwise careful about.
+
+    A DISTRIBUTION IS NOT A COVERAGE PROOF, which is the lesson worth keeping:
+    critical sat unchanged across that draft while it had silently stopped
+    classifying ``*route*``/``*controller*``/``*endpoint*`` paths as critical.
+    Same percentage, different membership; only a constructed test case found it.
+    A LATER enumeration found four more the constructed cases also missed — route
+    definitions in ``src/genesis/hosting/`` and ``dashboard/_blueprint.py``, one of
+    them serving ``/genesis/login`` — which is why the lock for that class is an
+    enumeration over every tracked module rather than another example. The
+    always-fix floor still blocks a P1 or a CodeRabbit Critical/Major in every
+    lane regardless of any of this.
+    """
+    if not paths:
+        return "critical"
+    # EVERY consequence AUTHORITY is settled before the vendored heuristic,
+    # because `_is_vendored` strips a path from `reviewable` entirely and a
+    # stripped path can no longer be judged by anything below. MEASURED, both
+    # spellings: `scripts/hooks/generated/x.py` (hook surface) and
+    # `.github/generated/ci.yml` (CI config) are each `_is_vendored` via
+    # `*/generated/*`, and each returned `light` while these checks sat under
+    # the strip. The first was found by review and fixed HERE ONLY; the second
+    # was the same class one line away, and a reviewer had to find it too.
+    # Anything added below that must outrank a vendor glob belongs in THIS
+    # block, not after the strip.
+    if hook_surface:
+        return "critical"
+    # Consequence surfaces are tested against the FULL path list, not the
+    # vendor-stripped one, for the reason above: a vendor glob must not be able to
+    # hide one. `_is_lane_critical_path` is now the entire critical vocabulary, so
+    # nothing is left below the strip that needs to outrank it.
+    if any(_is_lane_critical_path(p) for p in paths):
+        return "critical"
+    reviewable = [p for p in paths if not _is_vendored(p)]
+    if not reviewable:
+        # Vendored-only: a lockfile refresh or a regenerated bundle.
+        return "light"
+    if all(_is_lane_light(p) for p in reviewable):
+        return "light"
+    return "standard"
+
+
+def classify_change_substantiality(
+    cwd: str | None = None, *, deadline: float | None = None
+) -> str:
     """Substantiality of the STAGED change (--cached) — for the commit-time depth gate.
 
     Uses the staged index so it shares the review marker's basis (which hashes
@@ -651,7 +1024,7 @@ def classify_change_substantiality(cwd: str | None = None) -> str:
     commit-time re-check disagree on a byte-identical staged diff. Returns
     ``"substantial"`` | ``"inline"`` | ``"unknown"``.
     """
-    return _classify_diff(["--cached"], cwd)
+    return _classify_diff(["--cached"], cwd, deadline)
 
 
 def classify_range_substantiality(base: str, cwd: str | None = None) -> str:

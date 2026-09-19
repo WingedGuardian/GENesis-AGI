@@ -190,7 +190,7 @@ class TestMediumDistributor:
         dist = MediumDistributor(browser=browser, username="testuser")
         await dist.publish("# Title\n\nalpha — beta gamma.")
         blob = "".join(c[1][0] for c in browser.calls if c[0] == "run_js")
-        assert json.dumps("alpha—beta")[1:-1] in blob          # collapsed (scrubbed)
+        assert json.dumps("alpha--beta")[1:-1] in blob         # rewritten to -- (scrubbed)
         assert json.dumps("alpha — beta")[1:-1] not in blob     # spaced form gone
 
     @pytest.mark.asyncio

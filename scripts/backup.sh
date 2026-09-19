@@ -27,6 +27,7 @@
 #                                each other's snapshots. Read symmetrically by
 #                                restore.sh to locate the source snapshot dir.
 set -euo pipefail
+umask 077
 
 # Resolve HOME when unset: stripped-env/systemd/sandbox invocations can leave
 # HOME unset, which under `set -u` aborts at the first ${HOME} use. Fall back
@@ -71,16 +72,28 @@ fi
 # pre-deploy backup while update.sh prints "Backup complete".
 # shellcheck source=scripts/lib/dr_lock.sh
 source "$_SCRIPT_DIR/lib/dr_lock.sh"
+_GENESIS_HOME="${GENESIS_HOME:-$HOME/.genesis}"
+_STATUS_FILE="$_GENESIS_HOME/backup_status.json"
+_RUN_ID="${GENESIS_BACKUP_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+_TRIGGER="${GENESIS_BACKUP_TRIGGER:-timer}"
 dr_lock_open
 if ! flock -n "$DR_LOCK_FD"; then
     _holder="$(cat "$DR_LOCK_FILE" 2>/dev/null || true)"
+    if [ "$_TRIGGER" = "update" ]; then
+        mkdir -p "$(dirname "$_STATUS_FILE")"
+        _safe_holder=$(printf '%s' "${_holder:-unknown}" | sed 's/\\/\\\\/g; s/"/\\"/g; s/[[:cntrl:]]/ /g')
+        cat > "$_STATUS_FILE" <<STATUSEOF
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":false,"sqlite_lines":0,"failure_reason":"backup-restore lock held by $_safe_holder","failure_class":"db_integrity","failure_stage":"lock_busy","db_integrity_status":"indeterminate","sqlite_backup_verified":false,"tier2_status":"unknown","tier2_backend":"none","tier1_pushed":false}
+STATUSEOF
+        echo "[genesis-backup] $(date -Iseconds) FAILED: backup-restore lock held by ${_holder:-unknown} — update backup not run" >&2
+        exit 73
+    fi
     echo "[genesis-backup] $(date -Iseconds) SKIPPED: backup-restore lock held by ${_holder:-unknown} — backup not run"
     exit 0
 fi
 dr_lock_stamp backup
 
 # ── Status tracking ──────────────────────────────────────────────────
-_STATUS_FILE="$HOME/.genesis/backup_status.json"
 _STARTED_AT=$(date +%s)
 _SQLITE_LINES=0
 _QDRANT_COUNT=0
@@ -89,6 +102,10 @@ _MEMORY_COUNT=0
 _SECRETS_OK=false
 _SUCCESS=false
 _FAILURE_REASON=""
+_FAILURE_CLASS="none"
+_FAILURE_STAGE=""
+_DB_INTEGRITY_STATUS="indeterminate"
+_SQLITE_BACKUP_VERIFIED=false
 # SF3 freshness tracking: only payloads regenerated THIS run may enter the
 # off-site dated snapshot — a leftover .gpg from a prior run must never be
 # re-badged under a fresh COMPLETE stamp (it silently misrepresents recency,
@@ -99,6 +116,9 @@ _SQL_ESCROW_DRIFT=false # env-decryptable but escrow stale → off-site DR degra
 _QDRANT_FRESH=""    # space-separated collections snapshotted+encrypted this run
 _QDRANT_FAILED=""   # collections that EXIST (HTTP 200) but failed to snapshot this run
 _SQL_TMP=""         # plaintext ~269MB dump temp — trap-cleaned (N2, credential-bearing)
+_SQL_ARTIFACT_TMP="" # encrypted candidate — promoted only after round-trip verification
+_SQL_VERIFY_TMP=""   # decrypted candidate used for exact restore validation
+_VERIFY_DB=""         # imported verification DB and sidecars — trap-cleaned
 # Tier-1 replication: true once the local repo is in sync with the GitHub remote.
 _TIER1_PUSHED=false
 # Off-site snapshot bookkeeping. _T2_SNAPSHOT_COUNT / _T2_PRUNED stay UNSET until
@@ -118,7 +138,7 @@ _write_status() {
     if [ "${_T2_STATUS:-}" = "ok" ]; then _offsite_confirmed=true; fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
 STATUSEOF
 }
 
@@ -157,7 +177,10 @@ _on_exit() {
     backend_cleanup || true
     # N2: the credential-bearing plaintext SQL dump must not outlive the script
     # if it died mid-section (before its inline rm).
-    rm -f "${_SQL_TMP:-}" 2>/dev/null || true
+    rm -f "${_SQL_TMP:-}" "${_SQL_ARTIFACT_TMP:-}" "${_SQL_VERIFY_TMP:-}" 2>/dev/null || true
+    if [ -n "${_VERIFY_DB:-}" ]; then
+        rm -f "$_VERIFY_DB" "$_VERIFY_DB-journal" "$_VERIFY_DB-wal" "$_VERIFY_DB-shm" 2>/dev/null || true
+    fi
     return 0
 }
 trap _on_exit EXIT
@@ -252,25 +275,38 @@ encrypt_file() {
 _GIT_NET_TIMEOUT="${GENESIS_BACKUP_GIT_TIMEOUT:-300}"
 _git_net() { timeout -k 10 "$_GIT_NET_TIMEOUT" git "$@"; }
 
-# _roundtrip_ok <passphrase> <artifact.gpg> [stderr_file] — decrypt-verify that
-# <artifact.gpg> decrypts with <passphrase> AND ends with the sqlite `.dump`
-# success marker `COMMIT;` (a mid-dump failure ends `ROLLBACK; -- due to
-# errors`). Returns 0 on verified, 1 otherwise. Streams (no plaintext temp).
-# Captures the decrypt tail into a var FIRST so `grep -q` matching early can't
-# SIGPIPE `tail` and flip the pipeline non-zero under pipefail on a good dump.
+# _roundtrip_ok <passphrase> <artifact.gpg> [stderr_file] — prove that the exact
+# encrypted candidate decrypts, imports into a new database, and passes full
+# integrity, foreign-key, and non-empty-schema checks.  Checking only the live
+# source before `.dump` leaves a race; checking only the dump's COMMIT trailer
+# misses broken UNIQUE indexes and other logical inconsistencies.
 _roundtrip_ok() {
-    local _pass="$1" _art="$2" _errf="${3:-/dev/null}" _tailf _rc _grc
-    _tailf=$(mktemp -p "$GENESIS_BIG_TMP")
-    # Real pipeline (NOT inside $()) so PIPESTATUS reflects gpg's own exit; tail
-    # buffers to a file (not piped into grep) so nothing can SIGPIPE gpg/tail and
-    # flip the result under pipefail. tail -5 reads to EOF, so gpg always runs
-    # fully and its exit at PIPESTATUS[1] (printf=0, gpg=1, tail=2) is authoritative.
-    printf '%s' "$_pass" | gpg --batch --passphrase-fd 0 -d "$_art" 2>"$_errf" | tail -5 > "$_tailf"
-    _rc=${PIPESTATUS[1]}
-    if [ "$_rc" -ne 0 ]; then rm -f "$_tailf"; return 1; fi
-    grep -q '^COMMIT;' "$_tailf"; _grc=$?
-    rm -f "$_tailf"
-    return "$_grc"
+    local _pass="$1" _art="$2" _errf="${3:-/dev/null}" _gpg_rc _sqlite_rc _ic _fk _schema
+    _VERIFY_DB=$(mktemp -p "$GENESIS_BIG_TMP")
+    rm -f "$_VERIFY_DB"
+    _SQL_VERIFY_TMP=$(mktemp -p "$GENESIS_BIG_TMP")
+    printf '%s' "$_pass" | gpg --batch --passphrase-fd 0 -d "$_art" \
+        >"$_SQL_VERIFY_TMP" 2>"$_errf"
+    _gpg_rc=${PIPESTATUS[1]}
+    if [ "$_gpg_rc" -eq 0 ]; then
+        sqlite3 "$_VERIFY_DB" ".bail on" ".read $_SQL_VERIFY_TMP" 2>>"$_errf"
+        _sqlite_rc=$?
+    else
+        _sqlite_rc=1
+    fi
+    if [ "$_gpg_rc" -ne 0 ] || [ "$_sqlite_rc" -ne 0 ]; then
+        rm -f "$_SQL_VERIFY_TMP" "$_VERIFY_DB" "$_VERIFY_DB-journal" "$_VERIFY_DB-wal" "$_VERIFY_DB-shm"
+        _SQL_VERIFY_TMP=""
+        _VERIFY_DB=""
+        return 1
+    fi
+    _ic=$(sqlite3 "$_VERIFY_DB" "PRAGMA integrity_check;" 2>>"$_errf") || _ic=""
+    _fk=$(sqlite3 "$_VERIFY_DB" "PRAGMA foreign_key_check;" 2>>"$_errf") || _fk="CHECK_FAILED"
+    _schema=$(sqlite3 "$_VERIFY_DB" "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%';" 2>>"$_errf") || _schema=0
+    rm -f "$_SQL_VERIFY_TMP" "$_VERIFY_DB" "$_VERIFY_DB-journal" "$_VERIFY_DB-wal" "$_VERIFY_DB-shm"
+    _SQL_VERIFY_TMP=""
+    _VERIFY_DB=""
+    [ "$_ic" = "ok" ] && [ -z "$_fk" ] && [ "${_schema:-0}" -gt 0 ]
 }
 
 # _verify_sql_roundtrip <artifact.gpg> — classify the freshly-encrypted SQL
@@ -295,14 +331,14 @@ _verify_sql_roundtrip() {
     if [ -n "$ESCROW_PASSPHRASE" ]; then _primary="$ESCROW_PASSPHRASE"; _have_escrow=true; fi
     if _roundtrip_ok "$_primary" "$_art" "$_errf"; then
         rm -f "$_errf"
-        echo RESTORABLE
+        ROUNDTRIP_VERDICT=RESTORABLE
         return 0
     fi
     # Primary failed. If the primary WAS escrow, an env-passphrase success means
     # drift (artifact good, escrow stale); env failure means genuine corruption.
     if $_have_escrow && _roundtrip_ok "$_BACKUP_PASSPHRASE" "$_art" /dev/null; then
         rm -f "$_errf"
-        echo DRIFT
+        ROUNDTRIP_VERDICT=DRIFT
         return 0
     fi
     # Surface the gpg error, sanitized to printable ASCII: _write_status only
@@ -312,9 +348,55 @@ _verify_sql_roundtrip() {
     # or JSONDecodeError (swallowed → suppresses the very CRITICAL this raises).
     ROUNDTRIP_DETAIL=$(LC_ALL=C tr -cd '[:print:]' < "$_errf" | cut -c1-200)
     rm -f "$_errf"
-    echo CORRUPT
+    ROUNDTRIP_VERDICT=CORRUPT
     return 0
 }
+
+# Refuse before touching the backup clone or any canonical artifact.  A dump
+# can sometimes finish despite index corruption, but promoting it would erase
+# the provenance boundary between a known-good backup and a damaged source.
+DB_FILE="$GENESIS_DIR/data/genesis.db"
+if [ ! -f "$DB_FILE" ]; then
+    die "SQLite source database not found at $DB_FILE"
+fi
+_DB_CHECK_OUTPUT=""
+_DB_CHECK_RC=0
+if [ -x "$GENESIS_DIR/.venv/bin/python" ] \
+    && [ -f "$GENESIS_DIR/src/genesis/db/integrity.py" ]; then
+    _DB_CHECK_OUTPUT=$(PYTHONPATH="$GENESIS_DIR/src" \
+        "$GENESIS_DIR/.venv/bin/python" -m genesis.db.integrity check \
+        "$DB_FILE" --source backup --quarantine-on-failure 2>&1) \
+        || _DB_CHECK_RC=$?
+else
+    _DB_INTEGRITY_STATUS="indeterminate"
+    _FAILURE_CLASS="db_integrity"
+    _FAILURE_STAGE="integrity_checker_unavailable"
+    die "SQLite integrity checker unavailable — refusing to create an unverified backup"
+fi
+if [ "$_DB_CHECK_RC" -ne 0 ] || [ "$_DB_CHECK_OUTPUT" != "OK" ]; then
+    _DB_CHECK_SAFE=$(printf '%s' "${_DB_CHECK_OUTPUT:-no output}" \
+        | LC_ALL=C tr -cd '[:print:]\n' | tr '\n' ';' | cut -c1-500)
+    _DB_INTEGRITY_STATUS="indeterminate"
+    _FAILURE_CLASS="db_integrity"
+    _FAILURE_STAGE="source_integrity"
+    # A stable failure creates the durable marker. Contain every long-lived
+    # writer only when that marker exists; an identity-race result is
+    # indeterminate evidence and must not claim that a replacement was corrupt.
+    if PYTHONPATH="$GENESIS_DIR/src" "$GENESIS_DIR/.venv/bin/python" -c '
+import sys
+from genesis.db.integrity import database_is_quarantined
+raise SystemExit(0 if database_is_quarantined(sys.argv[1]) else 1)
+' "$DB_FILE"; then
+        _DB_INTEGRITY_STATUS="corrupt"
+        for _svc in genesis-server.service genesis-bridge.service; do
+            systemctl --user stop "$_svc" 2>/dev/null \
+                || log "WARNING: could not stop $_svc after DB quarantine"
+        done
+    fi
+    die "SQLite source integrity check failed — last-known-good SQL artifact and NAS snapshots preserved ($_DB_CHECK_SAFE)"
+fi
+_DB_INTEGRITY_STATUS="healthy"
+log "SQLite source integrity check: ok"
 
 # --- Clone or pull backup repo ---
 if [ ! -d "$BACKUP_DIR/.git" ]; then
@@ -344,7 +426,6 @@ _git_net pull --rebase --quiet 2>/dev/null || log "WARNING: git pull failed, con
 # --- 1. SQLite dump (encrypted — may hold memory-stored credentials/PII) ---
 log "Backing up SQLite database..."
 mkdir -p data
-DB_FILE="$GENESIS_DIR/data/genesis.db"
 # Purge any pre-encryption plaintext dumps so they don't persist in the
 # backup repo alongside the new encrypted form.
 rm -f data/genesis.sql data/genesis.db
@@ -355,17 +436,23 @@ if [ -f "$DB_FILE" ]; then
         _SQL_TMP=$(mktemp -p "$GENESIS_BIG_TMP")  # ~269MB dump — keep off cc-tmp/RAM
         if sqlite3 "$DB_FILE" .dump > "$_SQL_TMP" 2>/dev/null; then
             _SQLITE_LINES=$(wc -l < "$_SQL_TMP")
-            if encrypt_file "$_SQL_TMP" data/genesis.sql.gpg; then
-                _SQL_FRESH=true
+            _SQL_ARTIFACT_TMP="data/.genesis.sql.gpg.partial.$$"
+            if encrypt_file "$_SQL_TMP" "$_SQL_ARTIFACT_TMP"; then
                 log "SQLite: $_SQLITE_LINES lines (encrypted)"
                 # SF4 round-trip: classify the fresh artifact's restorability
                 # (see _verify_sql_roundtrip). ROUNDTRIP_DETAIL is set (sanitized)
                 # only on CORRUPT. _SQL_RESTORABLE gates the OFF-SITE upload so a
                 # DR box never auto-selects a COMPLETE snapshot it can't decrypt.
                 ROUNDTRIP_DETAIL=""
-                case "$(_verify_sql_roundtrip data/genesis.sql.gpg)" in
+                ROUNDTRIP_VERDICT=""
+                _verify_sql_roundtrip "$_SQL_ARTIFACT_TMP"
+                case "$ROUNDTRIP_VERDICT" in
                     RESTORABLE)
+                        mv "$_SQL_ARTIFACT_TMP" data/genesis.sql.gpg
+                        _SQL_ARTIFACT_TMP=""
+                        _SQL_FRESH=true
                         _SQL_RESTORABLE=true
+                        _SQLITE_BACKUP_VERIFIED=true
                         log "SQLite: round-trip decrypt verified"
                         ;;
                     DRIFT)
@@ -377,22 +464,36 @@ if [ -f "$DB_FILE" ]; then
                         # pre-rotation passphrase == the escrow, stays restorable)
                         # and surface a distinct re-escrow alert via the off-site
                         # path (never CRITICAL "backup failed").
+                        mv "$_SQL_ARTIFACT_TMP" data/genesis.sql.gpg
+                        _SQL_ARTIFACT_TMP=""
+                        _SQL_FRESH=true
                         _SQL_RESTORABLE=false
+                        _SQLITE_BACKUP_VERIFIED=true
                         _SQL_ESCROW_DRIFT=true
                         log "WARNING: SQL round-trip failed with the ESCROWED passphrase but SUCCEEDED with the env one — escrow is stale (secrets.env rotated?). Local backup OK; off-site DR degraded until re-escrow."
                         ;;
                     *)  # CORRUPT
                         _SQL_RESTORABLE=false
+                        _FAILURE_CLASS="db_backup"
+                        _FAILURE_STAGE="sqlite_roundtrip"
                         _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }SQL archive failed round-trip decrypt with its own env passphrase (${ROUNDTRIP_DETAIL:-no gpg output}) — corrupt/unrestorable, withheld from off-site"
                         log "WARNING: $_FAILURE_REASON"
                         _SQLITE_LINES=0
+                        rm -f "$_SQL_ARTIFACT_TMP"
+                        _SQL_ARTIFACT_TMP=""
                         ;;
                 esac
             else
+                _FAILURE_CLASS="db_backup"
+                _FAILURE_STAGE="sqlite_encrypt"
                 log "WARNING: SQLite encryption failed"
                 _SQLITE_LINES=0
+                rm -f "$_SQL_ARTIFACT_TMP"
+                _SQL_ARTIFACT_TMP=""
             fi
         else
+            _FAILURE_CLASS="db_backup"
+            _FAILURE_STAGE="sqlite_dump"
             log "WARNING: sqlite3 dump failed"
         fi
         rm -f "$_SQL_TMP"
@@ -426,14 +527,16 @@ for collection in episodic_memory knowledge_base; do
         continue
     elif [ "$_probe_code" != "200" ]; then
         # Server unreachable/erroring (000/timeout/5xx) — we CANNOT confirm the
-        # collection exists, so this is NOT the audit's "collections exist but
-        # weren't captured" failure. Qdrant is rebuildable from the (round-trip-
-        # verified) SQLite dump, and restore.sh likewise treats an unreachable
-        # Qdrant as a skip — so degrade gracefully (WARNING, backup still
-        # succeeds) instead of paging CRITICAL every 6h forever on a host where
-        # Qdrant is optional, still booting, or briefly down. Only a REACHABLE
-        # collection (HTTP 200) that then fails to snapshot is a hard failure.
+        # collection exists. Qdrant is rebuildable from the verified SQL dump,
+        # so this does not invalidate the SQLite artifact and an update may
+        # continue. It is nevertheless an incomplete backup: persist and alert
+        # it as a non-DB failure instead of reporting a false success.
         log "WARNING: Qdrant unreachable probing $collection (HTTP $_probe_code) — skipping (rebuildable from SQL)"
+        _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }Qdrant unreachable probing $collection (HTTP $_probe_code)"
+        if [ "$_FAILURE_CLASS" = "none" ]; then
+            _FAILURE_CLASS="non_db"
+            _FAILURE_STAGE="qdrant_probe"
+        fi
         continue
     fi
     # Create snapshot via Qdrant API. --max-time 600: snapshot creation is a
@@ -486,6 +589,10 @@ done
 # the newest COMPLETE snapshot, so silence here would let stale-or-missing
 # vectors masquerade as current until a disaster surfaces it.
 if [ -n "$_QDRANT_FAILED" ]; then
+    if [ "$_FAILURE_CLASS" = "none" ]; then
+        _FAILURE_CLASS="non_db"
+        _FAILURE_STAGE="qdrant_snapshot"
+    fi
     _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }Qdrant backup failed for:${_QDRANT_FAILED}"
 fi
 
@@ -608,6 +715,124 @@ if [ -d "$_EVAL_DIR" ]; then
         _EVAL_COUNT=$(find eval -type f -name '*.gpg' 2>/dev/null | wc -l)
         log "Eval golden sets: $_EVAL_COUNT files (encrypted)"
     fi
+fi
+
+# --- 6d. Hook audit stores (Tier 1) ---
+# The merge gate's override records: which merges bypassed which gate, and on what
+# stated grounds. One small file per flush, own-user-only, and SELF-CONTAINED —
+# every field (sigil, waived gate, PR, repo, head sha) means the same thing on a
+# restored install, so the trail survives a rebuild intact. Plain copy, like the
+# infrastructure profile above: the backups repo is private, and the writer
+# refuses to persist command text, so these rows carry no credential material.
+#
+# The git-discard store is DELIBERATELY not here, and that is the whole reason this
+# block names one store instead of globbing ~/.genesis. Its recovery payload is a
+# `git stash create` sha that exists ONLY in the local repo's object store: such
+# objects are never pushed, git prunes unreachable ones (default two weeks), and
+# this script captures no object store at all. Restoring it onto a rebuilt
+# container yields a list of pointers to nothing — a trail that LOOKS recoverable
+# while every recovery attempt fails, which is worse than an absent one. At a live
+# install, of 76 recorded shas one was already unresolvable in the repo that wrote
+# it. Making it genuinely restorable means backing up the objects, not the records.
+# ASK the writer where the store is; do not assume the default. An install that
+# sets GENESIS_MERGE_OVERRIDE_DIR to a supported absolute path had its audit trail
+# silently excluded here and restored to the wrong place — the trail lost on
+# exactly the rebuild it exists for (Codex P2, PR #1609). One resolver, five
+# consumers: see audit_jsonl.resolve_store_dir.
+_OVERRIDE_STORE="$(python3 "$_SCRIPT_DIR/hooks/audit_jsonl.py" --store-dir GENESIS_MERGE_OVERRIDE_DIR 2>/dev/null \
+    || printf '%s' "$HOME/.genesis/merge_overrides")"
+if [ -d "$_OVERRIDE_STORE" ]; then
+    log "Backing up hook audit stores..."
+    mkdir -p audit/merge_overrides
+    _AUDIT_COUNT=0
+    _AUDIT_LIVE=""
+    # LIST FIRST, and keep the listing's exit status. `find … 2>/dev/null` inside a
+    # process substitution throws both away, so a store that cannot be listed — a
+    # mode change on the directory, an I/O error — yielded an EMPTY `_AUDIT_LIVE`,
+    # indistinguishable from a store with no records. The mirror loop below then
+    # read every mirrored record as "gone from the live store" and deleted the lot:
+    # the last known-good copies, destroyed by the very loop whose comment says that
+    # must not happen (CodeRabbit Major, PR #1609).
+    #
+    # This is the SAME generator as the per-file bug above — deriving state from
+    # whether work succeeded — one level up, at the listing instead of the copy.
+    # Enumerated the other four `find`s in this store's paths while fixing it; each
+    # of them fails toward doing LESS (no delete, no sweep, no restore, and
+    # `_backup_has_payload` returning 1 aborts), so this was the only destructive one.
+    _AUDIT_LIST="$(mktemp -p "$GENESIS_BIG_TMP")"
+    _AUDIT_LISTED=true
+    find "$_OVERRIDE_STORE" -maxdepth 1 -type f -name '*.jsonl' -print0 \
+        > "$_AUDIT_LIST" 2>/dev/null || _AUDIT_LISTED=false
+    while IFS= read -r -d '' _f; do
+        _base="$(basename "$_f")"
+        # The deletion set below is derived from THIS list — every name the live
+        # store holds — never from which copies happened to succeed. Deriving it
+        # from copy success meant a failed copy (a full backup filesystem is the
+        # realistic one) marked the record absent, so the mirror loop then deleted
+        # the last known-good copy of a record the local pruner may drop next
+        # (Codex P2, PR #1609). Copy failure must cost at most a stale mirror
+        # entry, never the entry.
+        _AUDIT_LIVE="$_AUDIT_LIVE$_base"$'\n'
+        # Stage and rename. A bare `cp` onto an existing destination TRUNCATES it
+        # before it can fail, so a mid-copy failure destroys the previous good
+        # mirror in place. rename(2) is atomic within the directory, so the
+        # destination is either the old copy or the new one — never a partial.
+        _tmp="audit/merge_overrides/.$_base.partial.$$"
+        # cp's own stderr is CAPTURED, not discarded: it carries the only statement
+        # of WHY (ENOSPC vs EACCES look identical without it), and the warning below
+        # otherwise names the mitigation and never the cause.
+        _AUDIT_ERR=""
+        if _AUDIT_ERR="$(cp "$_f" "$_tmp" 2>&1)" \
+            && _AUDIT_ERR="$(mv -f "$_tmp" "audit/merge_overrides/$_base" 2>&1)"; then
+            _AUDIT_COUNT=$(( _AUDIT_COUNT + 1 ))
+        else
+            rm -f "$_tmp" 2>/dev/null || true
+            log "WARNING: failed to copy $_base (${_AUDIT_ERR:-no error text}) — previous mirror copy, if any, left intact"
+        fi
+    done < "$_AUDIT_LIST"
+    rm -f "$_AUDIT_LIST" 2>/dev/null || true
+    # MIRROR the store, do not merely add to it. A copy-only loop left every
+    # record the daily pruner had deleted in the backup forever: the mirror grows
+    # past the 5 MB bound the store advertises, and a disaster restore
+    # REINTRODUCES every record retention removed (Codex P2, PR #1609). Deleting
+    # only names the live store no longer has keeps the backup a snapshot of the
+    # store rather than its union over time.
+    # ONLY when the live store was actually listed. Without that guard this loop
+    # cannot tell "no records" from "could not look", and the two call for opposite
+    # actions: delete everything, or touch nothing.
+    _AUDIT_DROPPED=0
+    if ! $_AUDIT_LISTED; then
+        log "WARNING: could not list $_OVERRIDE_STORE — mirror prune SKIPPED (existing backup copies kept)"
+    else
+        # Reconcile the two name sets in ONE pass. This used to run a fresh `grep`
+        # for every mirrored file, each rescanning the whole live-name string —
+        # quadratic in a store that is one file per flush, and the advertised 5 MB
+        # bound still holds tens of thousands of these small records. The cost
+        # arrived precisely at the boundary the store is supposed to support, and
+        # it delays the scheduled backup there (Codex P2, PR #1609).
+        declare -A _AUDIT_LIVE_SET=()
+        while IFS= read -r _ln; do
+            [ -n "$_ln" ] && _AUDIT_LIVE_SET["$_ln"]=1
+        done <<< "$_AUDIT_LIVE"
+        while IFS= read -r -d '' _b; do
+            _bbase="$(basename "$_b")"
+            if [ -z "${_AUDIT_LIVE_SET[$_bbase]:-}" ]; then
+                rm -f "$_b" && _AUDIT_DROPPED=$(( _AUDIT_DROPPED + 1 ))
+            fi
+        done < <(find audit/merge_overrides -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null)
+        unset _AUDIT_LIVE_SET
+    fi
+    # Sweep any staging scrap a KILLED EARLIER run left behind, so the mirror cannot
+    # grow a second, invisible store beside itself. Dot-prefixed, so the `*.jsonl`
+    # loop above never sees one and never mistakes one for a record.
+    #
+    # Scoped the way the write is scoped, plus an age floor. A manual run overlapping
+    # the 6h timer would otherwise delete the OTHER run's staged copy between its
+    # `cp` and its `mv`, turning a good copy into a spurious warning. Ours are
+    # already removed on the failure path above, so excluding `$$` costs nothing.
+    find audit/merge_overrides -maxdepth 1 -type f -name '.*.partial.*' \
+        ! -name "*.partial.$$" -mmin +60 -delete 2>/dev/null || true
+    log "Hook audit stores: $_AUDIT_COUNT file(s), $_AUDIT_DROPPED pruned from mirror"
 fi
 
 # --- 7. Secrets (encrypted with GPG symmetric) ---
@@ -927,7 +1152,7 @@ fi
 backend_cleanup
 
 # --- Ensure .gitignore excludes Tier 2 files ---
-# Tier 1 (git): memory/, config_overrides/, secrets/, infrastructure/
+# Tier 1 (git): memory/, config_overrides/, secrets/, infrastructure/, audit/
 # Tier 2 (off-site): data/, transcripts/
 if ! grep -q '^data/$' .gitignore 2>/dev/null; then
     cat >> .gitignore << 'GITIGNORE'
@@ -957,6 +1182,10 @@ else
             # Append, never overwrite — an earlier SF3/SF4 failure reason must
             # survive into the status file alongside the push failure.
             _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }git push failed — backup exists locally only (not replicated to remote)"
+            if [ "$_FAILURE_CLASS" = "none" ]; then
+                _FAILURE_CLASS="non_db"
+                _FAILURE_STAGE="git_push"
+            fi
             log "ERROR: git push failed — backup exists locally only (not replicated to remote)"
         else
             _TIER1_PUSHED=true
@@ -964,15 +1193,24 @@ else
         fi
     else
         _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }git commit failed (corrupt repo or index error)"
+        if [ "$_FAILURE_CLASS" = "none" ]; then
+            _FAILURE_CLASS="non_db"
+            _FAILURE_STAGE="git_commit"
+        fi
         log "ERROR: git commit failed — repository may need re-clone from remote"
     fi
 fi
 
-if [ "$_SQLITE_LINES" -gt 0 ] && [ -z "$_FAILURE_REASON" ]; then
+if [ "$_SQLITE_LINES" -gt 0 ] && [ "$_SQLITE_BACKUP_VERIFIED" = "true" ] \
+    && [ -z "$_FAILURE_REASON" ]; then
     _SUCCESS=true
 else
     if [ -z "$_FAILURE_REASON" ]; then
         _FAILURE_REASON="No SQLite data backed up"
+    fi
+    if [ "$_SQLITE_BACKUP_VERIFIED" != "true" ] && [ "$_FAILURE_CLASS" = "none" ]; then
+        _FAILURE_CLASS="db_backup"
+        _FAILURE_STAGE="sqlite_not_verified"
     fi
     log "WARNING: Backup incomplete — marking as failure (reason: $_FAILURE_REASON)"
 fi

@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import aiosqlite
 import pytest
 
 from genesis.autonomy.autonomous_dispatch import AutonomousDispatchDecision
 from genesis.cc.types import CCOutput
+from genesis.db.crud.prompt_versions import compute_prompt_hash
 from genesis.db.schema import create_all_tables
 from genesis.inbox.monitor import InboxMonitor, _extract_urls, _is_acknowledged
 from genesis.inbox.types import InboxConfig
@@ -22,13 +25,30 @@ from genesis.inbox.writer import ResponseWriter
 @dataclass
 class _FakeClock:
     """Controllable clock for tests."""
+
     now: datetime = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
 
     def __call__(self):
         return self.now
 
 
-def _success_output(text: str = "evaluation result") -> CCOutput:
+def _success_output(
+    # Default fake response echoes this file's fixture URLs the way the
+    # evaluation prompt now requires (**Source:** lines), so dispatch and
+    # lifecycle tests pass the per-URL coverage gate. A platform name alone
+    # is deliberately NOT coverage for a path-bearing URL — that rule has its
+    # own dedicated tests in test_url_failures.py.
+    text: str = (
+        "evaluation result\n"
+        "**Source:** https://example.com/article\n"
+        "**Source:** https://example.com/article-1\n"
+        "**Source:** https://example.com/article-2\n"
+        "**Source:** https://example.com/article-3\n"
+        "**Source:** https://example.com/first\n"
+        "**Source:** https://example.com/second\n"
+        "**Source:** https://www.linkedin.com/posts/foo-share-123-1G81/\n"
+    ),
+) -> CCOutput:
     return CCOutput(
         session_id="cc-sess-1",
         text=text,
@@ -104,7 +124,7 @@ def clock() -> _FakeClock:
 
 
 @pytest.fixture
-def monitor(db, mock_invoker, mock_session_manager, config, writer, clock, tmp_path):
+def monitor(db, mock_invoker, mock_session_manager, config, writer, clock):
     return InboxMonitor(
         db=db,
         invoker=mock_invoker,
@@ -112,7 +132,6 @@ def monitor(db, mock_invoker, mock_session_manager, config, writer, clock, tmp_p
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,  # no INBOX_EVALUATE.md → uses fallback
     )
 
 
@@ -133,6 +152,803 @@ def test_set_build_lane_wires_hook(monitor):
     sentinel = object()
     monitor.set_build_lane(sentinel)
     assert monitor._build_lane is sentinel
+
+
+@pytest.mark.asyncio
+async def test_silently_omitted_url_requeues_not_baselines(monitor, inbox_dir, db, mock_invoker):
+    """An evaluation that never MENTIONS one of its URLs must not complete.
+
+    Silent omission emits no give-up language, so _has_url_failures cannot
+    see it; before the coverage gate, the batch was marked completed and the
+    omitted URL's line was permanently absorbed into the baseline —
+    unrecoverable, invisible loss.
+    """
+    # This test pins ENFORCEMENT; the shipped default is shadow
+    # (see test_shadow_mode_logs_but_does_not_requeue). InboxConfig is frozen,
+    # so swap the whole config rather than mutating a field.
+    from dataclasses import replace as _replace
+
+    monitor._config = _replace(monitor._config, url_coverage_mode="enforce")
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text(
+        "https://alice:password@example.com/one-thing?token=secret-one "
+        "https://other.org/two-thing?sig=secret-two"
+    )
+    mock_invoker.run.return_value = _success_output(
+        "# Inbox Evaluation\n\n## one-thing\n"
+        "Thorough discussion of the example.com piece and nothing else.\n" + "x" * 300
+    )
+
+    await monitor.check_once()
+
+    row = await inbox_items.get_by_file_path(db, str(f))
+    assert row["status"] == "failed"
+    assert row["error_message"].startswith("partial_url_failure")
+    assert "url#" in row["error_message"]
+    assert "password" not in row["error_message"]
+    assert "secret-one" not in row["error_message"]
+    assert "secret-two" not in row["error_message"]
+    assert row["evaluated_content"] is None
+    assert row["retry_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_shadow_mode_logs_but_does_not_requeue(monitor, inbox_dir, db, mock_invoker, caplog):
+    """The SHIPPED default, and the contrast with the test above.
+
+    The coverage gate is NEW — `main` carries no such check — and a replay over
+    the completed-evaluation corpus says enforcing it would flag roughly half of
+    legacy-shaped responses on day one, into a retry path that parks a whole
+    file after max_retries with no user notification. That would trade a
+    silent-loss bug for a silent-stall one. So the gate computes its verdict,
+    says so in the log, and acts on nothing until compliance has been measured.
+    """
+    import logging
+
+    from genesis.db.crud import inbox_items
+
+    assert monitor._config.url_coverage_mode == "shadow", "the shipped default must be shadow"
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/one-thing?token=shadow-secret")
+    mock_invoker.run.return_value = _success_output(
+        "# Inbox Evaluation\n\n## one-thing\n"
+        "Thorough discussion of the example.com piece and nothing else.\n" + "x" * 300
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await monitor.check_once()
+
+    assert any("url-coverage SHADOW" in r.getMessage() for r in caplog.records), (
+        "shadow mode must say what it WOULD have done"
+    )
+    assert "shadow-secret" not in caplog.text
+    assert "url#" in caplog.text
+    row = await inbox_items.get_by_file_path(db, str(f))
+    assert row["status"] == "completed"  # acted on nothing
+    assert row["evaluated_content"] is not None
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_url_item_falls_through_to_coverage_gate(
+    monitor, inbox_dir, db, mock_invoker
+):
+    """A URL-bearing item classified Acknowledged must NOT baseline its URLs
+    unexamined — the Acknowledged fast-path is honored only for URL-free meta
+    notes; here the un-covering response re-queues instead."""
+    # This test pins ENFORCEMENT; the shipped default is shadow
+    # (see test_shadow_mode_logs_but_does_not_requeue). InboxConfig is frozen,
+    # so swap the whole config rather than mutating a field.
+    from dataclasses import replace as _replace
+
+    monitor._config = _replace(monitor._config, url_coverage_mode="enforce")
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/one-thing")
+    mock_invoker.run.return_value = _success_output(
+        "**Classification:** Acknowledged\nNoted, nothing to do."
+    )
+
+    await monitor.check_once()
+
+    row = await inbox_items.get_by_file_path(db, str(f))
+    assert row["status"] == "failed"
+    assert row["evaluated_content"] is None
+
+
+@pytest.mark.asyncio
+async def test_no_follow_ups_from_coverage_failed_eval(monitor, inbox_dir, db, mock_invoker):
+    """Follow-ups/build cards only fire for COMPLETED evals — acting on an
+    eval we just declared unevaluated would let dedup block the retry's
+    corrected verdict."""
+    # This test pins ENFORCEMENT; the shipped default is shadow
+    # (see test_shadow_mode_logs_but_does_not_requeue). InboxConfig is frozen,
+    # so swap the whole config rather than mutating a field.
+    from dataclasses import replace as _replace
+
+    monitor._config = _replace(monitor._config, url_coverage_mode="enforce")
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/one-thing https://other.org/two-thing")
+    mock_invoker.run.return_value = _success_output(
+        "# Inbox Evaluation\n\n## one-thing\nOnly this one.\n\n"
+        "### Recommendation\n```yaml\naction: ADOPT\n"
+        'next_step: "Try it"\nscope: V4\n```\n' + "x" * 300
+    )
+
+    await monitor.check_once()
+
+    rows = await db.execute_fetchall("SELECT id FROM follow_ups")
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_fully_covered_urls_complete_normally(monitor, inbox_dir, db, mock_invoker):
+    """Regression guard: full coverage behaves exactly as before the gate."""
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/one-thing https://other.org/two-thing")
+    mock_invoker.run.return_value = _success_output(
+        "# Inbox Evaluation\n\n## 1. one-thing\nGood piece.\n\n"
+        "## 2. two-thing\nAlso solid.\n" + "x" * 300
+    )
+
+    await monitor.check_once()
+
+    row = await inbox_items.get_by_file_path(db, str(f))
+    assert row["status"] == "completed"
+    assert row["evaluated_content"] is not None
+    assert "https://example.com/one-thing" in row["evaluated_content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled_sink", ["follow_ups", "build_lane"])
+async def test_cancellation_during_synchronous_side_effects_does_not_baseline(
+    monitor,
+    inbox_dir,
+    db,
+    mock_invoker,
+    mock_session_manager,
+    monkeypatch,
+    cancelled_sink,
+):
+    """A process exit during durable side effects must leave the item retriable."""
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/one-thing")
+    mock_invoker.run.return_value = _success_output(
+        "# Inbox Evaluation\n**Source:** https://example.com/one-thing\n" + "x" * 300
+    )
+    cancelled = AsyncMock(side_effect=asyncio.CancelledError)
+    if cancelled_sink == "follow_ups":
+        monkeypatch.setattr(monitor, "_create_follow_ups_from_eval", cancelled)
+    else:
+        monitor._build_lane = SimpleNamespace(handle_eval=cancelled)
+
+    with pytest.raises(asyncio.CancelledError):
+        await monitor.check_once()
+
+    row = await inbox_items.get_by_file_path(db, str(f))
+    assert row["status"] != "completed"
+    assert row["evaluated_content"] is None
+    mock_session_manager.complete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_supersede_does_not_burn_a_retry(monitor, inbox_dir, db):
+    """A superseded pending row keeps its retry_count.
+
+    Supersession ("the user edited the file before the old snapshot
+    dispatched") is not a failure of the item — burning a retry on it walked
+    repeatedly-edited files toward the max_retries exclusion for no reason,
+    and (because the superseded row then exceeded the reuse threshold)
+    accumulated duplicate rows instead of recycling one.
+    """
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/article")
+    # A stale pending row from an earlier scan of a previous file version.
+    await inbox_items.create(
+        db,
+        id="stale-pending",
+        file_path=str(f),
+        content_hash="0" * 64,
+        status="pending",
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+
+    await monitor.check_once()
+
+    rows = await db.execute_fetchall(
+        "SELECT id, status, retry_count FROM inbox_items WHERE file_path = ?",
+        (str(f),),
+    )
+    # The superseded row is recycled for the fresh delta (reuse_as_pending),
+    # evaluated, and completed — ONE row, retry budget untouched.
+    assert len(rows) == 1, [dict(r) for r in rows]
+    assert rows[0]["status"] == "completed"
+    assert rows[0]["retry_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_supersede_near_retry_cap_still_recycles(monitor, inbox_dir, db):
+    """At max_retries-1, a supersede must not push the row over the cap.
+
+    Before the fix, supersession incremented retry_count to the cap, the row
+    stopped being reusable, and a duplicate row was created for the fresh
+    delta while the old one sat as a permanent phantom 'failure'.
+    """
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/article")
+    await inbox_items.create(
+        db,
+        id="worn-pending",
+        file_path=str(f),
+        content_hash="0" * 64,
+        status="pending",
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    # Two genuine failures already on the clock (max_retries default is 3).
+    await inbox_items.update_status(db, "worn-pending", status="pending", retry_count=2)
+
+    await monitor.check_once()
+
+    rows = await db.execute_fetchall(
+        "SELECT id, status, retry_count FROM inbox_items WHERE file_path = ?",
+        (str(f),),
+    )
+    assert len(rows) == 1, [dict(r) for r in rows]
+    assert rows[0]["status"] == "completed"
+    assert rows[0]["retry_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_modified_file_supersedes_every_stale_pending_batch(
+    monitor, inbox_dir, db
+):
+    """A multi-item interrupted drop must not leave invisible pending siblings."""
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/article")
+    for index in range(2):
+        await inbox_items.create(
+            db,
+            id=f"stale-{index}",
+            file_path=str(f),
+            content_hash="0" * 64,
+            status="pending",
+            created_at=f"2026-01-01T00:00:0{index}+00:00",
+            drop_id="old-drop",
+        )
+
+    await monitor.check_once()
+
+    rows = await db.execute_fetchall(
+        "SELECT status FROM inbox_items WHERE file_path = ?",
+        (str(f),),
+    )
+    assert rows
+    assert all(row["status"] != "pending" for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_modified_vanished_file_retires_stale_pending_batches(
+    monitor, inbox_dir, db, monkeypatch
+):
+    """A vanished replacement must not strand its old batches."""
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/new")
+    await inbox_items.create(
+        db,
+        id="stale",
+        file_path=str(f),
+        content_hash="0" * 64,
+        status="pending",
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    monkeypatch.setattr(
+        "genesis.inbox.monitor.read_content",
+        Mock(side_effect=FileNotFoundError),
+    )
+
+    await monitor.check_once()
+
+    row = await inbox_items.get_by_id(db, "stale")
+    assert row["status"] == "failed"
+    assert row["error_message"] == "pending_restart_requeue"
+
+
+@pytest.mark.asyncio
+async def test_temporarily_unreadable_pending_batch_recovers_when_readable(
+    monitor, inbox_dir, db, monkeypatch, mock_invoker
+):
+    from genesis.db.crud import inbox_items
+    from genesis.inbox import monitor as monitor_module
+    from genesis.inbox.scanner import compute_hash
+
+    f = inbox_dir / "links.md"
+    content = "https://example.com/article"
+    f.write_text(content)
+    await inbox_items.create(
+        db,
+        id="pending",
+        file_path=str(f),
+        content_hash=compute_hash(f),
+        status="pending",
+        created_at="2026-01-01T00:00:00+00:00",
+        drop_id="drop",
+        batch_items=content,
+    )
+    original_read = monitor_module.read_content
+    monkeypatch.setattr(
+        "genesis.inbox.monitor.read_content",
+        Mock(side_effect=PermissionError),
+    )
+
+    await monitor.check_once()
+    assert (await inbox_items.get_by_id(db, "pending"))["status"] == "failed"
+    mock_invoker.run.assert_not_awaited()
+
+    monkeypatch.setattr("genesis.inbox.monitor.read_content", original_read)
+    await monitor.check_once()
+
+    assert (await inbox_items.get_by_id(db, "pending"))["status"] == "completed"
+    mock_invoker.run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unmarked_processing_batch_is_rederived_immediately_after_restart(
+    monitor, inbox_dir, db, mock_invoker,
+):
+    """A crash after the pre-dispatch claim must not wait for the 2h expiry."""
+    from genesis.db.crud import inbox_items
+    from genesis.inbox.scanner import compute_hash
+
+    f = inbox_dir / "links.md"
+    content = "https://example.com/article"
+    f.write_text(content)
+    await inbox_items.create(
+        db,
+        id="claimed",
+        file_path=str(f),
+        content_hash=compute_hash(f),
+        status="processing",
+        # Must be younger than expire_stuck_processing's two-hour fallback;
+        # otherwise the fixture never exercises immediate restart recovery.
+        created_at=datetime.now(UTC).isoformat(),
+        drop_id="drop",
+        batch_items=content,
+    )
+
+    result = await monitor.check_once()
+
+    assert result.batches_dispatched == 1
+    assert (await inbox_items.get_by_id(db, "claimed"))["status"] == "completed"
+    mock_invoker.run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_new_batch_is_marked_dispatching_before_cc_invocation(
+    monitor, inbox_dir, db, mock_invoker,
+):
+    """The durable phase marker must precede the external CC side effect."""
+    from genesis.db.crud import inbox_items
+
+    observed_markers = []
+
+    async def _observe_marker(_invocation):
+        cursor = await db.execute(
+            "SELECT status, error_message FROM inbox_items ORDER BY rowid DESC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        observed_markers.append((row["status"], row["error_message"]))
+        return _success_output()
+
+    mock_invoker.run.side_effect = _observe_marker
+    (inbox_dir / "links.md").write_text("https://example.com/article")
+
+    assert (await monitor.check_once()).batches_dispatched == 1
+    assert len(observed_markers) == 1
+    status, marker = observed_markers[0]
+    assert status == "processing"
+    assert marker.startswith(inbox_items.DISPATCHING_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_unrelated_modification_does_not_reset_exhausted_item_retry_budget(
+    monitor, inbox_dir, db, mock_invoker,
+):
+    """An exhausted URL stays terminal while genuinely new content is evaluated."""
+    from dataclasses import replace
+
+    from genesis.db.crud import inbox_items
+    from genesis.inbox.scanner import compute_hash
+
+    monitor._config = replace(
+        monitor._config,
+        evaluation_cooldown_seconds=0,
+        items_per_eval=1,
+    )
+    f = inbox_dir / "links.md"
+    evaluated = "https://example.com/already-done"
+    exhausted = "https://example.com/permanently-dead"
+    new = "https://example.com/new-item"
+    f.write_text(f"{evaluated}\n{exhausted}\n")
+    old_hash = compute_hash(f)
+
+    await inbox_items.create(
+        db,
+        id="completed",
+        file_path=str(f),
+        content_hash=old_hash,
+        status="completed",
+        created_at="2026-03-10T11:00:00+00:00",
+    )
+    await inbox_items.update_status(
+        db,
+        "completed",
+        status="completed",
+        processed_at="2026-03-10T11:00:00+00:00",
+        evaluated_content=evaluated,
+    )
+    # Three old exhausted siblings used to trip the file-wide storm guard and
+    # suppress even genuinely new work. Item-local terminal handling must keep
+    # all three out of the new drop without imposing a time window.
+    exhausted_ids = []
+    for index in range(monitor._config.max_retries):
+        row_id = f"exhausted-{index}"
+        exhausted_ids.append(row_id)
+        await inbox_items.create(
+            db,
+            id=row_id,
+            file_path=str(f),
+            content_hash=old_hash,
+            status="failed",
+            created_at=f"2020-01-0{index + 1}T00:00:00+00:00",
+            batch_items=exhausted,
+        )
+        await inbox_items.update_status(
+            db,
+            row_id,
+            status="failed",
+            processed_at=f"2020-01-0{index + 1}T00:01:00+00:00",
+            error_message="partial_url_failure",
+            retry_count=monitor._config.max_retries,
+        )
+
+    mock_invoker.run.return_value = _success_output(
+        f"# Inbox Evaluation\n**Source:** {new}\n" + "x" * 300
+    )
+    f.write_text(f"{evaluated}\n{exhausted}\n{new}\n")
+
+    result = await monitor.check_once()
+
+    assert result.batches_dispatched == 1
+    invocation = mock_invoker.run.await_args.args[0]
+    assert new in invocation.prompt
+    assert exhausted not in invocation.prompt
+    rows = await db.execute_fetchall(
+        "SELECT id, status, retry_count FROM inbox_items WHERE file_path = ?",
+        (str(f),),
+    )
+    exhausted_rows = [row for row in rows if row["retry_count"] >= monitor._config.max_retries]
+    assert [row["id"] for row in exhausted_rows] == exhausted_ids
+
+
+@pytest.mark.asyncio
+async def test_modern_terminal_content_does_not_hide_opaque_legacy_storm(
+    monitor, inbox_dir, db, mock_invoker,
+):
+    """Mixed rollout history keeps the legacy guard for unidentifiable rows."""
+    from dataclasses import replace
+
+    from genesis.db.crud import inbox_items
+    from genesis.inbox.scanner import compute_hash
+
+    monitor._config = replace(monitor._config, evaluation_cooldown_seconds=0)
+    f = inbox_dir / "links.md"
+    modern_terminal = "https://example.com/known-dead"
+    f.write_text(modern_terminal)
+    old_hash = compute_hash(f)
+    now_iso = datetime.now(UTC).isoformat()
+    await inbox_items.create(
+        db, id="modern", file_path=str(f), content_hash=old_hash,
+        status="failed", created_at=now_iso, batch_items=modern_terminal,
+        error_message="partial_url_failure", retry_count=monitor._config.max_retries,
+    )
+    for index in range(monitor._config.max_retries):
+        await inbox_items.create(
+            db, id=f"legacy-{index}", file_path=str(f), content_hash=old_hash,
+            status="failed", created_at=now_iso,
+            error_message="partial_url_failure", retry_count=monitor._config.max_retries,
+        )
+
+    f.write_text(f"{modern_terminal}\nhttps://example.com/new")
+    result = await monitor.check_once()
+
+    assert result.items_modified == 1
+    assert result.batches_dispatched == 0
+    mock_invoker.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_modern_terminal_siblings_do_not_block_distinct_retriable_batch(
+    monitor, inbox_dir, db, mock_invoker,
+):
+    """Item-local terminal state must also apply in the auto-retry lane."""
+    from dataclasses import replace
+
+    from genesis.db.crud import inbox_items
+    from genesis.inbox.scanner import compute_hash
+
+    monitor._config = replace(monitor._config, items_per_eval=1)
+    f = inbox_dir / "links.md"
+    terminal_urls = [f"https://example.com/dead-{index}" for index in range(3)]
+    retriable = "https://example.com/retry-me"
+    f.write_text("\n".join([*terminal_urls, retriable]))
+    content_hash = compute_hash(f)
+    now_iso = datetime.now(UTC).isoformat()
+    for index, url in enumerate(terminal_urls):
+        await inbox_items.create(
+            db, id=f"terminal-{index}", file_path=str(f),
+            content_hash=content_hash, status="failed", created_at=now_iso,
+            batch_items=inbox_items.serialize_batch_items([url]),
+            error_message="partial_url_failure",
+            retry_count=monitor._config.max_retries,
+        )
+    await inbox_items.create(
+        db, id="retriable", file_path=str(f), content_hash=content_hash,
+        status="failed", created_at=now_iso,
+        batch_items=inbox_items.serialize_batch_items([retriable]),
+        error_message="partial_url_failure", retry_count=1,
+    )
+    mock_invoker.run.return_value = _success_output(
+        f"# Inbox Evaluation\n**Source:** <{retriable}>\n" + "x" * 300
+    )
+
+    result = await monitor.check_once()
+
+    assert result.items_retried == 1
+    assert result.batches_dispatched == 1
+    invocation = mock_invoker.run.await_args.args[0]
+    assert retriable in invocation.prompt
+    assert all(url not in invocation.prompt for url in terminal_urls)
+    row = await inbox_items.get_by_id(db, "retriable")
+    assert row["status"] == "completed"
+    assert row["retry_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_recovery_abandons_path_replaced_by_directory(
+    monitor, inbox_dir, db, mock_invoker
+):
+    from genesis.db.crud import inbox_items
+
+    replacement = inbox_dir / "was-a-file.md"
+    replacement.mkdir()
+    await inbox_items.create(
+        db,
+        id="pending",
+        file_path=str(replacement),
+        content_hash="0" * 64,
+        status="pending",
+        created_at="2026-01-01T00:00:00+00:00",
+        drop_id="drop",
+        batch_items="https://example.com/article",
+    )
+
+    await monitor.check_once()
+    row = await inbox_items.get_by_id(db, "pending")
+
+    assert row["status"] == "failed"
+    assert row["error_message"] == (
+        f"{inbox_items.APPROVAL_INVALIDATED_PREFIX}source path is not a file"
+    )
+    await monitor.check_once()
+    mock_invoker.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_empty_modified_file_retires_stale_pending_batches(monitor, inbox_dir, db):
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("")
+    await inbox_items.create(
+        db,
+        id="stale",
+        file_path=str(f),
+        content_hash="0" * 64,
+        status="pending",
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+
+    await monitor.check_once()
+
+    assert (await inbox_items.get_by_id(db, "stale"))["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_cooldown_deferred_modification_retires_stale_pending_batches(
+    monitor, inbox_dir, db, mock_invoker
+):
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/new")
+    await inbox_items.create(
+        db,
+        id="completed",
+        file_path=str(f),
+        content_hash="1" * 64,
+        status="completed",
+        created_at="2026-03-10T11:59:00+00:00",
+    )
+    await inbox_items.update_status(
+        db,
+        "completed",
+        status="completed",
+        processed_at="2026-03-10T12:00:00+00:00",
+        evaluated_content="https://example.com/old",
+    )
+    await inbox_items.create(
+        db,
+        id="stale",
+        file_path=str(f),
+        content_hash="0" * 64,
+        status="pending",
+        created_at="2026-03-10T12:01:00+00:00",
+    )
+
+    await monitor.check_once()
+
+    assert (await inbox_items.get_by_id(db, "stale"))["status"] == "failed"
+    mock_invoker.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pending_batches_resume_after_crash_before_dispatch(
+    monitor, inbox_dir, db, monkeypatch, mock_invoker
+):
+    """Durable batch payload is the startup authority after a phase-boundary crash."""
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/article")
+    dispatch = monitor._phase_dispatch_batches
+    monkeypatch.setattr(
+        monitor,
+        "_phase_dispatch_batches",
+        AsyncMock(side_effect=asyncio.CancelledError),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await monitor.check_once()
+    pending = await inbox_items.query_pending(db)
+    assert len(pending) == 1
+
+    monkeypatch.setattr(monitor, "_phase_dispatch_batches", dispatch)
+    await monitor.check_once()
+
+    assert (await inbox_items.get_by_id(db, pending[0]["id"]))["status"] == "completed"
+    mock_invoker.run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_partial_drop_creation_crash_rebuilds_every_item(
+    monitor, inbox_dir, db, monkeypatch, mock_invoker
+):
+    """A durable prefix must never masquerade as a complete multi-batch drop."""
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    urls = [f"https://example.com/item-{index}" for index in range(3)]
+    f.write_text("\n".join(urls))
+    original_create = inbox_items.create
+    pending_creates = 0
+
+    async def crash_after_first_pending(*args, **kwargs):
+        nonlocal pending_creates
+        result = await original_create(*args, **kwargs)
+        if kwargs.get("status") == "pending":
+            pending_creates += 1
+            if pending_creates == 1:
+                raise asyncio.CancelledError
+        return result
+
+    monkeypatch.setattr(inbox_items, "create", crash_after_first_pending)
+    with pytest.raises(asyncio.CancelledError):
+        await monitor.check_once()
+    assert len(await inbox_items.query_pending(db)) == 1
+
+    monkeypatch.setattr(inbox_items, "create", original_create)
+    result = await monitor.check_once()
+
+    assert result.batches_dispatched == 3
+    assert mock_invoker.run.await_count == 3
+    baseline = await inbox_items.get_evaluated_content(db, str(f))
+    assert baseline is not None
+    assert all(url in baseline for url in urls)
+
+
+@pytest.mark.asyncio
+async def test_pending_recovery_restores_every_batch_in_a_drop(
+    monitor, inbox_dir, db, mock_invoker
+):
+    from genesis.db.crud import inbox_items
+    from genesis.inbox.scanner import compute_hash
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/one\nhttps://example.com/two")
+    content_hash = compute_hash(f)
+    for index, url in enumerate(
+        ("https://example.com/one", "https://example.com/two")
+    ):
+        await inbox_items.create(
+            db,
+            id=f"pending-{index}",
+            file_path=str(f),
+            content_hash=content_hash,
+            status="pending",
+            created_at=f"2026-01-01T00:00:0{index}+00:00",
+            drop_id="drop",
+            batch_items=url,
+        )
+
+    result = await monitor.check_once()
+
+    assert result.batches_dispatched == 2
+    assert mock_invoker.run.await_count == 2
+    statuses = [
+        (await inbox_items.get_by_id(db, f"pending-{index}"))["status"]
+        for index in range(2)
+    ]
+    assert statuses == ["completed", "completed"]
+
+
+@pytest.mark.asyncio
+async def test_pending_recovery_rebuilds_a_missing_durable_payload(
+    monitor, inbox_dir, db, mock_invoker
+):
+    from genesis.db.crud import inbox_items
+    from genesis.inbox.scanner import compute_hash
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/current")
+    await inbox_items.create(
+        db,
+        id="malformed",
+        file_path=str(f),
+        content_hash=compute_hash(f),
+        status="pending",
+        created_at="2026-01-01T00:00:00+00:00",
+        drop_id="drop",
+        batch_items="",
+        retry_count=2,
+    )
+
+    result = await monitor.check_once()
+
+    rebuilt = await inbox_items.get_by_id(db, "malformed")
+    assert rebuilt["status"] == "completed"
+    assert inbox_items.batch_items_for_dispatch(rebuilt["batch_items"]) == (
+        "https://example.com/current"
+    )
+    assert rebuilt["drop_id"] != "drop"
+    assert rebuilt["retry_count"] == 2
+    assert result.items_new == 1
+    assert result.batches_dispatched == 1
+    mock_invoker.run.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -195,6 +1011,7 @@ async def test_cc_error_marks_items_failed(monitor, inbox_dir, mock_invoker, db)
     assert "timeout" in result.errors[0]
     # Item should be marked failed in DB
     from genesis.db.crud import inbox_items
+
     pending = await inbox_items.query_pending(db)
     assert len(pending) == 0
 
@@ -210,7 +1027,10 @@ async def test_cc_exception_marks_items_failed(monitor, inbox_dir, mock_invoker)
 
 @pytest.mark.asyncio
 async def test_empty_output_text_marks_failed_no_response_file(
-    monitor, inbox_dir, mock_invoker, db,
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
 ):
     """Regression: empty CCOutput.text must not produce a frontmatter-only
     file. The blank files Genesis-4.genesis.md and "My todos &
@@ -229,13 +1049,16 @@ async def test_empty_output_text_marks_failed_no_response_file(
     assert "empty" in result.errors[0].lower()
 
     from genesis.db.crud import inbox_items
+
     pending = await inbox_items.query_pending(db)
     assert len(pending) == 0  # not pending — moved to failed
 
 
 @pytest.mark.asyncio
 async def test_whitespace_only_output_text_marks_failed(
-    monitor, inbox_dir, mock_invoker,
+    monitor,
+    inbox_dir,
+    mock_invoker,
 ):
     """Whitespace-only text is also empty for our purposes."""
     mock_invoker.run.return_value = _success_output(text="   \n\n\t  \n")
@@ -263,7 +1086,8 @@ async def test_empty_output_emits_error_event(monitor, inbox_dir, mock_invoker):
 
     # Find the empty_output event among all emitted events
     empty_calls = [
-        c for c in event_bus.emit.call_args_list
+        c
+        for c in event_bus.emit.call_args_list
         if len(c.args) >= 3 and c.args[2] == "evaluation.empty_output"
     ]
     assert len(empty_calls) == 1
@@ -286,31 +1110,19 @@ async def test_message_queue_entry_created(monitor, inbox_dir, db):
     (inbox_dir / "item.md").write_text("some content")
     await monitor.check_once()
     from genesis.db.crud import message_queue
+
     msgs = await message_queue.query_pending(db, target="cc_foreground")
     assert len(msgs) == 1
     assert "item.md" in msgs[0]["content"]
 
 
 @pytest.mark.asyncio
-async def test_system_prompt_loaded(monitor, tmp_path):
-    prompt_file = tmp_path / "INBOX_EVALUATE.md"
-    prompt_file.write_text("Custom system prompt here")
-    monitor._system_prompt = None  # reset cache
-    prompt = monitor._load_system_prompt()
-    assert prompt == "Custom system prompt here"
-
-
-@pytest.mark.asyncio
-async def test_system_prompt_fallback(monitor):
-    prompt = monitor._load_system_prompt()
-    assert "inbox evaluation" in prompt.lower()  # fallback mentions inbox evaluation
-
-
-@pytest.mark.asyncio
 async def test_missing_watch_path(db, mock_invoker, mock_session_manager, tmp_path):
     config = InboxConfig(watch_path=tmp_path / "nonexistent")
     mon = InboxMonitor(
-        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
+        db=db,
+        invoker=mock_invoker,
+        session_manager=mock_session_manager,
         config=config,
     )
     result = await mon.check_once()
@@ -350,17 +1162,27 @@ async def test_session_creation_failure(monitor, inbox_dir, mock_session_manager
 
 @pytest.mark.asyncio
 async def test_cooldown_skips_recently_evaluated(
-    db, mock_invoker, mock_session_manager, inbox_dir, tmp_path,
+    db,
+    mock_invoker,
+    mock_session_manager,
+    inbox_dir,
+    tmp_path,
 ):
     """Modified file within cooldown period should not be re-evaluated."""
     clock = _FakeClock()
     config = InboxConfig(
-        watch_path=inbox_dir, batch_size=5, evaluation_cooldown_seconds=3600,
+        watch_path=inbox_dir,
+        batch_size=5,
+        evaluation_cooldown_seconds=3600,
     )
     writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
     mon = InboxMonitor(
-        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
-        config=config, writer=writer, clock=clock, prompt_dir=tmp_path,
+        db=db,
+        invoker=mock_invoker,
+        session_manager=mock_session_manager,
+        config=config,
+        writer=writer,
+        clock=clock,
     )
     f = inbox_dir / "doc.md"
     f.write_text("version 1")
@@ -387,7 +1209,11 @@ async def test_cooldown_skips_recently_evaluated(
 
 @pytest.mark.asyncio
 async def test_cooldown_defers_without_dropping_modification(
-    db, mock_invoker, mock_session_manager, inbox_dir, tmp_path,
+    db,
+    mock_invoker,
+    mock_session_manager,
+    inbox_dir,
+    tmp_path,
 ):
     """A modification made within cooldown must still be evaluated once the
     cooldown elapses, even if the file is never edited again.
@@ -399,12 +1225,18 @@ async def test_cooldown_defers_without_dropping_modification(
     """
     clock = _FakeClock()
     config = InboxConfig(
-        watch_path=inbox_dir, batch_size=5, evaluation_cooldown_seconds=3600,
+        watch_path=inbox_dir,
+        batch_size=5,
+        evaluation_cooldown_seconds=3600,
     )
     writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
     mon = InboxMonitor(
-        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
-        config=config, writer=writer, clock=clock, prompt_dir=tmp_path,
+        db=db,
+        invoker=mock_invoker,
+        session_manager=mock_session_manager,
+        config=config,
+        writer=writer,
+        clock=clock,
     )
     f = inbox_dir / "doc.md"
 
@@ -424,15 +1256,17 @@ async def test_cooldown_defers_without_dropping_modification(
     # must now be picked up and evaluated (not stranded with the hash advanced).
     clock.now = clock.now + timedelta(hours=2)
     r3 = await mon.check_once()
-    assert r3.batches_dispatched == 1, (
-        "modification deferred during cooldown was never evaluated"
-    )
+    assert r3.batches_dispatched == 1, "modification deferred during cooldown was never evaluated"
     mock_invoker.run.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_e2e_url_repaste_different_tracking_not_reevaluated(
-    db, mock_invoker, mock_session_manager, inbox_dir, tmp_path,
+    db,
+    mock_invoker,
+    mock_session_manager,
+    inbox_dir,
+    tmp_path,
 ):
     """End-to-end via check_once: the same article re-pasted with different
     share/tracking params is detected as a file change but produces no new
@@ -440,12 +1274,18 @@ async def test_e2e_url_repaste_different_tracking_not_reevaluated(
     clock = _FakeClock()
     # cooldown=0 isolates the URL-dedup path from the cooldown defer.
     config = InboxConfig(
-        watch_path=inbox_dir, batch_size=5, evaluation_cooldown_seconds=0,
+        watch_path=inbox_dir,
+        batch_size=5,
+        evaluation_cooldown_seconds=0,
     )
     writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
     mon = InboxMonitor(
-        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
-        config=config, writer=writer, clock=clock, prompt_dir=tmp_path,
+        db=db,
+        invoker=mock_invoker,
+        session_manager=mock_session_manager,
+        config=config,
+        writer=writer,
+        clock=clock,
     )
     f = inbox_dir / "Genesis.md"
     base = "https://www.linkedin.com/posts/foo-share-123-1G81/"
@@ -467,7 +1307,11 @@ async def test_e2e_url_repaste_different_tracking_not_reevaluated(
 
 @pytest.mark.asyncio
 async def test_phantom_modified_within_cooldown_advances_hash(
-    db, mock_invoker, mock_session_manager, inbox_dir, tmp_path,
+    db,
+    mock_invoker,
+    mock_session_manager,
+    inbox_dir,
+    tmp_path,
 ):
     """A file modified within cooldown but with NO new content (empty delta)
     must write a completing row that ADVANCES the known hash, so it is not
@@ -479,12 +1323,18 @@ async def test_phantom_modified_within_cooldown_advances_hash(
     """
     clock = _FakeClock()
     config = InboxConfig(
-        watch_path=inbox_dir, batch_size=5, evaluation_cooldown_seconds=3600,
+        watch_path=inbox_dir,
+        batch_size=5,
+        evaluation_cooldown_seconds=3600,
     )
     writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
     mon = InboxMonitor(
-        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
-        config=config, writer=writer, clock=clock, prompt_dir=tmp_path,
+        db=db,
+        invoker=mock_invoker,
+        session_manager=mock_session_manager,
+        config=config,
+        writer=writer,
+        clock=clock,
     )
     f = inbox_dir / "Genesis.md"
     base = "https://www.linkedin.com/posts/foo-share-123-1G81/"
@@ -550,10 +1400,7 @@ def test_extract_urls_empty_content():
 
 def test_extract_urls_google_search():
     """Google search URLs with embedded query strings are captured."""
-    text = (
-        "https://www.google.com/search?client=firefox-b-1-m"
-        "&q=Selling%20AI%20Agents"
-    )
+    text = "https://www.google.com/search?client=firefox-b-1-m&q=Selling%20AI%20Agents"
     urls = _extract_urls(text)
     assert len(urls) == 1
     assert "google.com/search" in urls[0]
@@ -576,6 +1423,162 @@ async def test_build_prompt_enumerates_urls(monitor, inbox_dir):
     assert "1. https://example.com" in prompt
     assert "2. search.app/abc" in prompt
     assert "### Content:" in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "listed"),
+    [
+        # Balanced delimiters are URL-borne and must survive display trimming.
+        (
+            "https://en.wikipedia.org/wiki/Foo_(bar)",
+            "https://en.wikipedia.org/wiki/Foo_(bar)",
+        ),
+        # An IPv6 authority keeps its bracket -- the `[` is still open.
+        ("https://[::1]:8443/p", "https://[::1]:8443/p"),
+        # A markdown wrapper is NOT part of the URL and must not be requested.
+        ("[docs](https://example.com/foo)", "https://example.com/foo"),
+        # Nor is a surrounding quote, with or without trailing prose comma.
+        ('see "https://example.com/x", later', "https://example.com/x"),
+        # A code span around a URL is likewise presentation.
+        ("`https://example.com/y`.", "https://example.com/y"),
+        # A URL-shaped markdown LABEL is its own token and must not absorb
+        # `](https://...` -- this case reaches the bare-domain `]` stop, which
+        # the `[docs](...)` cases above never do.
+        ("[example.com/a](https://example.com/a)", "example.com/a"),
+    ],
+)
+async def test_build_prompt_lists_the_url_the_writer_meant(
+    monitor,
+    inbox_dir,
+    content,
+    listed,
+):
+    """The prompt asks for a fetchable URL, not the gate's lossless token.
+
+    The coverage grammar keeps every terminal character so the GATE can fail
+    closed on ambiguous punctuation. Handing that token to the evaluator asks
+    it to fetch a resource that does not exist -- MEASURED at 340 of 18,119
+    tokens (1.88%) ending in wrapper punctuation on this install's corpus,
+    falling to 11 (0.06%) once unmatched delimiters are trimmed.
+
+    Display trimming is structural: a paired delimiter is removed only when
+    the remainder leaves it unmatched. The gate accepts either rendering of
+    the SAME token, and no more -- see
+    ``test_a_truncated_sibling_still_cannot_vouch_for_another_url``.
+    """
+    from genesis.inbox.types import InboxItem
+
+    item = InboxItem(
+        id="display-url",
+        file_path=str(inbox_dir / "links.md"),
+        content=content,
+        content_hash="abc",
+        detected_at="2026-09-14",
+    )
+
+    prompt = monitor._build_prompt([item])
+    # Assert the WHOLE enumerated line. A bare ``in`` check is vacuous here:
+    # "1. https://example.com/foo" is a substring of the untrimmed
+    # "1. https://example.com/foo)", so it passes on the failure path too.
+    enumerated = [
+        re.sub(r"^\d+\. ", "", line)
+        for line in prompt.splitlines()
+        if re.fullmatch(r"\d+\. \S+", line)
+    ]
+    assert listed in enumerated, f"{listed!r} not enumerated; got {enumerated!r}"
+
+
+def test_citing_exactly_what_the_prompt_asked_for_covers_the_url():
+    """A compliant answer must be able to satisfy the gate.
+
+    The prompt shows ``_display_url(token)`` while the gate discovered
+    ``token``. If only the untrimmed form counted, every URL whose two
+    renderings differ would be permanently uncoverable -- a floor under the
+    shadow flag rate, which is the signal the enforce decision reads.
+    """
+    from genesis.inbox.monitor import _display_url, _uncovered_urls
+
+    source = '"https://example.com/q?x=1",'
+    assert _display_url('https://example.com/q?x=1",') == "https://example.com/q?x=1"
+
+    # What the prompt actually asked for.
+    assert _uncovered_urls("**Source:** <https://example.com/q?x=1>", source) == []
+    # The untrimmed token the gate discovered still counts too.
+    assert _uncovered_urls('**Source:** <https://example.com/q?x=1",>', source) == []
+
+
+def test_ambiguous_sentence_punctuation_is_never_trimmed_for_display():
+    """Round 3's fail-closed rule survives the display layer.
+
+    ``/path;`` and ``/q?x=1!`` are legal URLs. Nothing structurally proves the
+    terminal character is prose, so trimming it would ask the evaluator for a
+    DIFFERENT resource than the user saved -- and the gate would then accept
+    that answer, which is the silent loss this whole gate exists to prevent.
+    A trim only stands when it removed a paired delimiter.
+    """
+    from genesis.inbox.monitor import _display_url, _uncovered_urls
+
+    for ambiguous in ("https://example.com/path;", "https://example.com/q?x=1!"):
+        assert _display_url(ambiguous) == ambiguous
+        truncated = ambiguous[:-1]
+        assert _uncovered_urls(f"**Source:** {truncated}", ambiguous) == [ambiguous]
+
+
+def test_a_truncated_sibling_still_cannot_vouch_for_another_url():
+    """Accepting two renderings of ONE token must not widen to siblings.
+
+    This is the round-3 guarantee. ``/foo`` and ``/foo:bar`` are distinct
+    resources; neither one's display form is the other's identity, so citing
+    one must leave the other uncovered.
+    """
+    from genesis.inbox.monitor import _uncovered_urls
+
+    source = "https://example.com/foo\nhttps://example.com/foo:bar"
+
+    cited_prefix = "**Source:** <https://example.com/foo>"
+    assert _uncovered_urls(cited_prefix, source) == ["https://example.com/foo:bar"]
+
+    cited_longer = "**Source:** <https://example.com/foo:bar>"
+    assert _uncovered_urls(cited_longer, source) == ["https://example.com/foo"]
+
+
+def test_bare_domain_label_does_not_swallow_the_link_target():
+    """DISCOVERY must end a bare-domain token at `]`.
+
+    A URL-shaped markdown LABEL is its own token. Without the stop it absorbs
+    `](https://...` into one string that is neither URL and that no response
+    can ever cite. Asserted on the extractor directly: the display layer
+    trims the trailing `)` and would mask a regression here.
+    """
+    from genesis.inbox.monitor import _extract_coverage_input_urls
+
+    assert _extract_coverage_input_urls("[example.com/a](https://example.com/a)") == [
+        "example.com/a",
+        "https://example.com/a)",
+    ]
+
+
+def test_evidence_validation_keeps_bracketed_query_params():
+    """VALIDATION must NOT inherit discovery's `]` stop.
+
+    A Source field is already delimited, so there is no prose to end at.
+    Narrowing it would reject a legitimate schemeless citation carrying a
+    bracketed query parameter, and the URL would read as uncovered even
+    though the evaluator cited it exactly.
+    """
+    from genesis.inbox.monitor import _extract_coverage_input_urls, _extract_source_urls
+
+    cited = "example.com/s?f[0]=x"
+    assert _extract_source_urls(f"**Source:** {cited}") == [cited]
+
+    # DISCOVERY is the narrowed one, and deliberately so: scanning prose it
+    # stops the bare-domain form at `]`. A schemeless URL carrying a bracketed
+    # query parameter is therefore discovered truncated -- a known limit, not
+    # a regression from sharing one pattern. The scheme'd form is unaffected,
+    # and in practice such params are written with a scheme.
+    assert _extract_coverage_input_urls(cited) == ["example.com/s?f[0"]
+    assert _extract_coverage_input_urls(f"https://{cited}") == [f"https://{cited}"]
 
 
 @pytest.mark.asyncio
@@ -656,8 +1659,11 @@ async def test_build_prompt_injects_standing_directives(monitor, inbox_dir):
         "https://example.com/new-item\n"
     )
     item = InboxItem(
-        id="d1", file_path=str(src), content="https://example.com/new-item",
-        content_hash="h", detected_at="2026-07-27",
+        id="d1",
+        file_path=str(src),
+        content="https://example.com/new-item",
+        content_hash="h",
+        detected_at="2026-07-27",
     )
     prompt = monitor._build_prompt([item])
     assert "Standing bracketed lines" in prompt
@@ -672,8 +1678,11 @@ async def test_build_prompt_no_directive_section_without_brackets(monitor, inbox
     src = inbox_dir / "plain.md"
     src.write_text("just plain notes\nhttps://example.com/x\n")
     item = InboxItem(
-        id="p1", file_path=str(src), content="https://example.com/x",
-        content_hash="h", detected_at="2026-07-27",
+        id="p1",
+        file_path=str(src),
+        content="https://example.com/x",
+        content_hash="h",
+        detected_at="2026-07-27",
     )
     prompt = monitor._build_prompt([item])
     assert "Standing bracketed lines" not in prompt
@@ -685,8 +1694,11 @@ async def test_build_prompt_directives_missing_file_graceful(monitor, inbox_dir)
     from genesis.inbox.types import InboxItem
 
     item = InboxItem(
-        id="g1", file_path=str(inbox_dir / "does-not-exist.md"),
-        content="https://example.com/x", content_hash="h", detected_at="2026-07-27",
+        id="g1",
+        file_path=str(inbox_dir / "does-not-exist.md"),
+        content="https://example.com/x",
+        content_hash="h",
+        detected_at="2026-07-27",
     )
     prompt = monitor._build_prompt([item])  # must not raise
     assert "Standing bracketed lines" not in prompt
@@ -703,8 +1715,11 @@ async def test_build_prompt_directives_are_sanitized(monitor, inbox_dir):
     # whether it trips an injection pattern — a benign directive proves wrapping.
     src.write_text("[build everything in here by default]\nhttps://example.com/x\n")
     item = InboxItem(
-        id="s1", file_path=str(src), content="https://example.com/x",
-        content_hash="h", detected_at="2026-07-27",
+        id="s1",
+        file_path=str(src),
+        content="https://example.com/x",
+        content_hash="h",
+        detected_at="2026-07-27",
     )
     prompt = monitor._build_prompt([item])
     assert "Standing bracketed lines" in prompt
@@ -722,17 +1737,24 @@ async def test_build_prompt_multi_item_directives_per_file(monitor, inbox_dir):
     b.write_text("[directive beta]\nhttps://example.com/b\n")
     items = [
         InboxItem(
-            id="a", file_path=str(a), content="https://example.com/a",
-            content_hash="ha", detected_at="2026-07-27",
+            id="a",
+            file_path=str(a),
+            content="https://example.com/a",
+            content_hash="ha",
+            detected_at="2026-07-27",
         ),
         InboxItem(
-            id="b", file_path=str(b), content="https://example.com/b",
-            content_hash="hb", detected_at="2026-07-27",
+            id="b",
+            file_path=str(b),
+            content="https://example.com/b",
+            content_hash="hb",
+            detected_at="2026-07-27",
         ),
     ]
     prompt = monitor._build_prompt(items)
     assert "directive alpha" in prompt
     assert "directive beta" in prompt
+
 
 # --- Acknowledged classification tests ---
 
@@ -766,19 +1788,26 @@ def test_is_acknowledged_body_mention():
 
 @pytest.mark.asyncio
 async def test_acknowledged_no_file_written(
-    db, mock_invoker, mock_session_manager, inbox_dir, tmp_path,
+    db,
+    mock_invoker,
+    mock_session_manager,
+    inbox_dir,
+    tmp_path,
 ):
     """When CC classifies as Acknowledged, no response file is written."""
     clock = _FakeClock()
     config = InboxConfig(watch_path=inbox_dir, batch_size=1)
     writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
     mon = InboxMonitor(
-        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
-        config=config, writer=writer, clock=clock, prompt_dir=tmp_path,
+        db=db,
+        invoker=mock_invoker,
+        session_manager=mock_session_manager,
+        config=config,
+        writer=writer,
+        clock=clock,
     )
     mock_invoker.run.return_value = _success_output(
-        "**Classification:** Acknowledged\n"
-        "Noted: this file is user-specific context."
+        "**Classification:** Acknowledged\nNoted: this file is user-specific context."
     )
     (inbox_dir / "meta.md").write_text(
         "[This note is USER specific, generally not for researching]"
@@ -793,7 +1822,11 @@ async def test_acknowledged_no_file_written(
 
 @pytest.mark.asyncio
 async def test_acknowledged_stores_evaluated_content(
-    db, mock_invoker, mock_session_manager, inbox_dir, tmp_path,
+    db,
+    mock_invoker,
+    mock_session_manager,
+    inbox_dir,
+    tmp_path,
 ):
     """Acknowledged items store evaluated_content for delta computation."""
     from genesis.db.crud import inbox_items
@@ -802,8 +1835,12 @@ async def test_acknowledged_stores_evaluated_content(
     config = InboxConfig(watch_path=inbox_dir, batch_size=1)
     writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
     mon = InboxMonitor(
-        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
-        config=config, writer=writer, clock=clock, prompt_dir=tmp_path,
+        db=db,
+        invoker=mock_invoker,
+        session_manager=mock_session_manager,
+        config=config,
+        writer=writer,
+        clock=clock,
     )
     mock_invoker.run.return_value = _success_output(
         "**Classification:** Acknowledged\nNoted: context absorbed."
@@ -822,15 +1859,23 @@ async def test_acknowledged_stores_evaluated_content(
 
 @pytest.mark.asyncio
 async def test_ambiguous_note_gets_response(
-    db, mock_invoker, mock_session_manager, inbox_dir, tmp_path,
+    db,
+    mock_invoker,
+    mock_session_manager,
+    inbox_dir,
+    tmp_path,
 ):
     """Non-Acknowledged items still get a response file written."""
     clock = _FakeClock()
     config = InboxConfig(watch_path=inbox_dir, batch_size=1)
     writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
     mon = InboxMonitor(
-        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
-        config=config, writer=writer, clock=clock, prompt_dir=tmp_path,
+        db=db,
+        invoker=mock_invoker,
+        session_manager=mock_session_manager,
+        config=config,
+        writer=writer,
+        clock=clock,
     )
     mock_invoker.run.return_value = _success_output(
         "**Classification:** Question\n"
@@ -849,7 +1894,11 @@ async def test_ambiguous_note_gets_response(
 
 @pytest.mark.asyncio
 async def test_no_hard_eval_limit(
-    db, mock_invoker, mock_session_manager, inbox_dir, tmp_path,
+    db,
+    mock_invoker,
+    mock_session_manager,
+    inbox_dir,
+    tmp_path,
 ):
     """Files with many prior evaluations are still processed when content changes."""
     import uuid
@@ -860,8 +1909,12 @@ async def test_no_hard_eval_limit(
     config = InboxConfig(watch_path=inbox_dir, batch_size=1)
     writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
     mon = InboxMonitor(
-        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
-        config=config, writer=writer, clock=clock, prompt_dir=tmp_path,
+        db=db,
+        invoker=mock_invoker,
+        session_manager=mock_session_manager,
+        config=config,
+        writer=writer,
+        clock=clock,
     )
     f = inbox_dir / "notepad.md"
 
@@ -898,7 +1951,10 @@ def _make_dispatcher(decision: AutonomousDispatchDecision):
 
 @pytest.mark.asyncio
 async def test_blocked_pending_keeps_row_as_processing_with_marker(
-    monitor, inbox_dir, mock_invoker, db,
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
 ):
     """When the dispatcher returns blocked with a pending approval, the
     row must stay in 'processing' state with an awaiting_approval marker
@@ -918,9 +1974,16 @@ async def test_blocked_pending_keeps_row_as_processing_with_marker(
     mock_invoker.run.assert_not_called()
     assert result.batches_dispatched == 0  # dispatch was blocked
 
-    rows = [dict(r) for r in (await (await db.execute(
-        "SELECT * FROM inbox_items WHERE file_path LIKE '%pending.md'",
-    )).fetchall())]
+    rows = [
+        dict(r)
+        for r in (
+            await (
+                await db.execute(
+                    "SELECT * FROM inbox_items WHERE file_path LIKE '%pending.md'",
+                )
+            ).fetchall()
+        )
+    ]
     assert len(rows) == 1
     assert rows[0]["status"] == "processing"
     assert rows[0]["error_message"].startswith("awaiting_approval:")
@@ -929,7 +1992,10 @@ async def test_blocked_pending_keeps_row_as_processing_with_marker(
 
 @pytest.mark.asyncio
 async def test_blocked_rejected_marks_row_failed(
-    monitor, inbox_dir, mock_invoker, db,
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
 ):
     """When the approval was previously rejected, the row must be
     marked failed so it enters the normal permanent-failure flow."""
@@ -944,9 +2010,16 @@ async def test_blocked_rejected_marks_row_failed(
     await monitor.check_once()
 
     mock_invoker.run.assert_not_called()
-    rows = [dict(r) for r in (await (await db.execute(
-        "SELECT * FROM inbox_items WHERE file_path LIKE '%rejected.md'",
-    )).fetchall())]
+    rows = [
+        dict(r)
+        for r in (
+            await (
+                await db.execute(
+                    "SELECT * FROM inbox_items WHERE file_path LIKE '%rejected.md'",
+                )
+            ).fetchall()
+        )
+    ]
     assert len(rows) == 1
     assert rows[0]["status"] == "failed"
     # Error message is the generic "CLI fallback blocked: ..." not the marker
@@ -955,7 +2028,10 @@ async def test_blocked_rejected_marks_row_failed(
 
 @pytest.mark.asyncio
 async def test_blocked_policy_disabled_marks_row_failed(
-    monitor, inbox_dir, mock_invoker, db,
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
 ):
     """When CLI fallback is disabled by policy (no approval_request_id),
     mark failed as before."""
@@ -969,16 +2045,26 @@ async def test_blocked_policy_disabled_marks_row_failed(
     (inbox_dir / "disabled.md").write_text("policy disabled")
     await monitor.check_once()
 
-    rows = [dict(r) for r in (await (await db.execute(
-        "SELECT * FROM inbox_items WHERE file_path LIKE '%disabled.md'",
-    )).fetchall())]
+    rows = [
+        dict(r)
+        for r in (
+            await (
+                await db.execute(
+                    "SELECT * FROM inbox_items WHERE file_path LIKE '%disabled.md'",
+                )
+            ).fetchall()
+        )
+    ]
     assert len(rows) == 1
     assert rows[0]["status"] == "failed"
 
 
 @pytest.mark.asyncio
 async def test_resume_pass_redispatches_awaiting_row(
-    monitor, inbox_dir, mock_invoker, db,
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
 ):
     """On the NEXT scan after a pending-approval block, the resume pass
     must pick up the awaiting row, re-dispatch it, and — if the approval
@@ -995,9 +2081,16 @@ async def test_resume_pass_redispatches_awaiting_row(
     (inbox_dir / "resume.md").write_text("content awaiting approval")
     await monitor.check_once()
 
-    rows1 = [dict(r) for r in (await (await db.execute(
-        "SELECT * FROM inbox_items WHERE file_path LIKE '%resume.md'",
-    )).fetchall())]
+    rows1 = [
+        dict(r)
+        for r in (
+            await (
+                await db.execute(
+                    "SELECT * FROM inbox_items WHERE file_path LIKE '%resume.md'",
+                )
+            ).fetchall()
+        )
+    ]
     assert len(rows1) == 1
     assert rows1[0]["status"] == "processing"
 
@@ -1019,10 +2112,17 @@ async def test_resume_pass_redispatches_awaiting_row(
     mock_invoker.run.assert_called_once()
 
     # No duplicate rows were created — the same row id was reused
-    rows2 = [dict(r) for r in (await (await db.execute(
-        "SELECT * FROM inbox_items WHERE file_path LIKE '%resume.md' "
-        "ORDER BY created_at",
-    )).fetchall())]
+    rows2 = [
+        dict(r)
+        for r in (
+            await (
+                await db.execute(
+                    "SELECT * FROM inbox_items WHERE file_path LIKE '%resume.md' "
+                    "ORDER BY created_at",
+                )
+            ).fetchall()
+        )
+    ]
     assert len(rows2) == 1
     assert rows2[0]["id"] == rows1[0]["id"]
     assert rows2[0]["status"] == "completed"
@@ -1033,7 +2133,10 @@ async def test_resume_pass_redispatches_awaiting_row(
 
 @pytest.mark.asyncio
 async def test_resume_pass_invalidates_row_when_file_changed(
-    monitor, inbox_dir, mock_invoker, db,
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
 ):
     """If the user modifies the file while the approval is still pending,
     the original approval is no longer valid for the new content.  The
@@ -1057,16 +2160,20 @@ async def test_resume_pass_invalidates_row_when_file_changed(
     # the scanner should create a fresh row for the modified content.
     await monitor.check_once()
 
-    rows = [dict(r) for r in (await (await db.execute(
-        "SELECT id, status, error_message, content_hash "
-        "FROM inbox_items WHERE file_path LIKE '%changed.md' "
-        "ORDER BY created_at",
-    )).fetchall())]
+    rows = [
+        dict(r)
+        for r in (
+            await (
+                await db.execute(
+                    "SELECT id, status, error_message, content_hash "
+                    "FROM inbox_items WHERE file_path LIKE '%changed.md' "
+                    "ORDER BY created_at",
+                )
+            ).fetchall()
+        )
+    ]
     # Must have exactly two rows: the invalidated original and a fresh one
-    assert len(rows) == 2, (
-        f"expected original (invalidated) + fresh row, got {len(rows)}: "
-        f"{rows}"
-    )
+    assert len(rows) == 2, f"expected original (invalidated) + fresh row, got {len(rows)}: {rows}"
     # First row: invalidated due to content change — status=failed with
     # the approval_invalidated: prefix
     assert rows[0]["status"] == "failed"
@@ -1085,7 +2192,10 @@ async def test_resume_pass_invalidates_row_when_file_changed(
 
 @pytest.mark.asyncio
 async def test_resume_pass_invalidates_row_when_file_vanishes(
-    monitor, inbox_dir, mock_invoker, db,
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
 ):
     """If the file is deleted while approval is pending, invalidate the
     awaiting row."""
@@ -1104,10 +2214,17 @@ async def test_resume_pass_invalidates_row_when_file_vanishes(
     f.unlink()
     await monitor.check_once()
 
-    rows = [dict(r) for r in (await (await db.execute(
-        "SELECT status, error_message FROM inbox_items "
-        "WHERE file_path LIKE '%vanished.md'",
-    )).fetchall())]
+    rows = [
+        dict(r)
+        for r in (
+            await (
+                await db.execute(
+                    "SELECT status, error_message FROM inbox_items "
+                    "WHERE file_path LIKE '%vanished.md'",
+                )
+            ).fetchall()
+        )
+    ]
     assert len(rows) == 1
     assert rows[0]["status"] == "failed"
     assert "vanished" in (rows[0]["error_message"] or "")
@@ -1115,7 +2232,9 @@ async def test_resume_pass_invalidates_row_when_file_vanishes(
 
 @pytest.mark.asyncio
 async def test_dispatch_request_omits_volatile_context(
-    monitor, inbox_dir, mock_invoker,
+    monitor,
+    inbox_dir,
+    mock_invoker,
 ):
     """The dispatch request must pass context=None (or at least NOT
     include batch_id/item_count) so the approval key is content-stable
@@ -1151,7 +2270,9 @@ async def test_dispatch_request_omits_volatile_context(
 
 @pytest.mark.asyncio
 async def test_resume_does_not_reroute_across_scans(
-    monitor, inbox_dir, mock_invoker,
+    monitor,
+    inbox_dir,
+    mock_invoker,
 ):
     """A parked drop is dispatched DIRECTLY on resume — it does not re-enter
     ``route()`` — so re-scanning a pending item never fires a duplicate
@@ -1181,8 +2302,7 @@ async def test_resume_does_not_reroute_across_scans(
     await monitor.check_once()
 
     assert len(captured) == 1, (
-        f"expected 1 route() call (resume dispatches directly), "
-        f"got {len(captured)}"
+        f"expected 1 route() call (resume dispatches directly), got {len(captured)}"
     )
     req = captured[0]
     # The single request carries the stable-key inputs + null context that keep
@@ -1193,6 +2313,9 @@ async def test_resume_does_not_reroute_across_scans(
     assert req.approval_key_stable is True
     assert req.api_call_site_id is None
     assert req.context is None
+    system_message = req.messages[0]["content"]
+    assert system_message == req.cli_invocation.system_prompt
+    assert monitor._prompt_hash == compute_prompt_hash(system_message)
 
 
 @pytest.mark.asyncio
@@ -1209,16 +2332,24 @@ async def test_expire_stuck_processing_skips_awaiting_rows(db, inbox_dir):
     awaiting_id = str(_uuid.uuid4())
     stuck_id = str(_uuid.uuid4())
     await inbox_items.create(
-        db, id=awaiting_id, file_path=str(inbox_dir / "await.md"),
-        content_hash="h1", status="processing", created_at=stale_created_at,
+        db,
+        id=awaiting_id,
+        file_path=str(inbox_dir / "await.md"),
+        content_hash="h1",
+        status="processing",
+        created_at=stale_created_at,
     )
     await db.execute(
         "UPDATE inbox_items SET error_message = ? WHERE id = ?",
         ("awaiting_approval:req-xyz", awaiting_id),
     )
     await inbox_items.create(
-        db, id=stuck_id, file_path=str(inbox_dir / "stuck.md"),
-        content_hash="h2", status="processing", created_at=stale_created_at,
+        db,
+        id=stuck_id,
+        file_path=str(inbox_dir / "stuck.md"),
+        content_hash="h2",
+        status="processing",
+        created_at=stale_created_at,
     )
     await db.commit()
 
@@ -1243,8 +2374,12 @@ async def test_get_awaiting_approval_returns_only_marked_rows(db, inbox_dir):
     # Row 1: awaiting approval (should appear)
     id1 = str(_uuid.uuid4())
     await inbox_items.create(
-        db, id=id1, file_path=str(inbox_dir / "a.md"), content_hash="h1",
-        status="processing", created_at="2026-04-10T00:00:00+00:00",
+        db,
+        id=id1,
+        file_path=str(inbox_dir / "a.md"),
+        content_hash="h1",
+        status="processing",
+        created_at="2026-04-10T00:00:00+00:00",
     )
     await db.execute(
         "UPDATE inbox_items SET error_message = ? WHERE id = ?",
@@ -1254,15 +2389,23 @@ async def test_get_awaiting_approval_returns_only_marked_rows(db, inbox_dir):
     # Row 2: processing, no marker (should NOT appear)
     id2 = str(_uuid.uuid4())
     await inbox_items.create(
-        db, id=id2, file_path=str(inbox_dir / "b.md"), content_hash="h2",
-        status="processing", created_at="2026-04-10T00:01:00+00:00",
+        db,
+        id=id2,
+        file_path=str(inbox_dir / "b.md"),
+        content_hash="h2",
+        status="processing",
+        created_at="2026-04-10T00:01:00+00:00",
     )
 
     # Row 3: failed (should NOT appear)
     id3 = str(_uuid.uuid4())
     await inbox_items.create(
-        db, id=id3, file_path=str(inbox_dir / "c.md"), content_hash="h3",
-        status="failed", created_at="2026-04-10T00:02:00+00:00",
+        db,
+        id=id3,
+        file_path=str(inbox_dir / "c.md"),
+        content_hash="h3",
+        status="failed",
+        created_at="2026-04-10T00:02:00+00:00",
     )
     await db.execute(
         "UPDATE inbox_items SET error_message = ? WHERE id = ?",
@@ -1299,10 +2442,7 @@ def _make_wired_dispatcher(
     async def _find_site_pending(*, subsystem: str, policy_id: str):
         for row in pending_sites:
             ctx = row.get("_context", {})
-            if (
-                ctx.get("subsystem") == subsystem
-                and ctx.get("policy_id") == policy_id
-            ):
+            if ctx.get("subsystem") == subsystem and ctx.get("policy_id") == policy_id:
                 return row
         return None
 
@@ -1310,7 +2450,8 @@ def _make_wired_dispatcher(
         return approval_by_id.get(request_id)
 
     approval_manager = SimpleNamespace(
-        get_by_id=_get_by_id, cancel=AsyncMock(return_value=True),
+        get_by_id=_get_by_id,
+        cancel=AsyncMock(return_value=True),
     )
     # Use the PUBLIC accessor names: the resume pass walks
     # dispatcher.approval_gate.approval_manager via public properties
@@ -1365,7 +2506,10 @@ async def _seed_parked_row(
 
 @pytest.mark.asyncio
 async def test_precheck_skips_detection_when_site_blocked_no_new_files(
-    monitor, inbox_dir, mock_invoker, db,
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
 ):
     """When an inbox_evaluation approval is already pending (with a live
     parked row) and no new files were added, detection short-circuits —
@@ -1380,15 +2524,19 @@ async def test_precheck_skips_detection_when_site_blocked_no_new_files(
         },
     }
     decision = AutonomousDispatchDecision(
-        mode="blocked", reason="approval requested",
+        mode="blocked",
+        reason="approval requested",
         approval_request_id="req-already-pending",
     )
     monitor._autonomous_dispatcher = _make_wired_dispatcher(
         decision=decision,
         pending_sites=[pending_site_row],
-        approval_by_id={"req-already-pending": {
-            "id": "req-already-pending", "status": "pending",
-        }},
+        approval_by_id={
+            "req-already-pending": {
+                "id": "req-already-pending",
+                "status": "pending",
+            }
+        },
     )
     # A live parked row keeps the approval bound to real work (not orphaned).
     await _seed_parked_row(db, inbox_dir, request_id="req-already-pending")
@@ -1405,7 +2553,11 @@ async def test_precheck_skips_detection_when_site_blocked_no_new_files(
 
 @pytest.mark.asyncio
 async def test_precheck_cancels_orphaned_approval(
-    monitor, inbox_dir, mock_invoker, db, clock,
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
+    clock,
 ):
     """A pending inbox approval that NO live inbox row references is
     orphaned — it can never be dispatched, so the monitor cancels it for
@@ -1425,7 +2577,8 @@ async def test_precheck_cancels_orphaned_approval(
         },
     }
     decision = AutonomousDispatchDecision(
-        mode="blocked", reason="approval requested",
+        mode="blocked",
+        reason="approval requested",
         approval_request_id="req-orphan",
     )
     monitor._autonomous_dispatcher = _make_wired_dispatcher(
@@ -1447,7 +2600,11 @@ async def test_precheck_cancels_orphaned_approval(
 
 @pytest.mark.asyncio
 async def test_orphan_cancel_lost_race_holds_without_routing(
-    monitor, inbox_dir, mock_invoker, db, clock,
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
+    clock,
 ):
     """TOCTOU guard (Codex P1): if an orphaned approval is APPROVED by the user
     between find_site_pending() and cancel(), cancel() returns False (the row is
@@ -1462,10 +2619,13 @@ async def test_orphan_cancel_lost_race_holds_without_routing(
         "_context": {"subsystem": "inbox", "policy_id": "inbox_evaluation"},
     }
     decision = AutonomousDispatchDecision(
-        mode="blocked", reason="approval requested", approval_request_id="req-race",
+        mode="blocked",
+        reason="approval requested",
+        approval_request_id="req-race",
     )
     monitor._autonomous_dispatcher = _make_wired_dispatcher(
-        decision=decision, pending_sites=[pending_site_row],
+        decision=decision,
+        pending_sites=[pending_site_row],
     )
     # Simulate the race: by the time cancel() runs, the row is already resolved
     # (user approved it) -> resolve() matches 0 pending rows -> returns False.
@@ -1492,7 +2652,11 @@ async def test_orphan_cancel_lost_race_holds_without_routing(
 
 @pytest.mark.asyncio
 async def test_precheck_holds_approval_with_live_rows(
-    monitor, inbox_dir, mock_invoker, db, clock,
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
+    clock,
 ):
     """A pending approval that a live inbox row still references is HELD —
     never cancelled — no matter how old it is. This is 'block until
@@ -1510,7 +2674,8 @@ async def test_precheck_holds_approval_with_live_rows(
         },
     }
     decision = AutonomousDispatchDecision(
-        mode="blocked", reason="approval requested",
+        mode="blocked",
+        reason="approval requested",
         approval_request_id="req-held",
     )
     monitor._autonomous_dispatcher = _make_wired_dispatcher(
@@ -1532,7 +2697,11 @@ async def test_precheck_holds_approval_with_live_rows(
 
 @pytest.mark.asyncio
 async def test_pending_inbox_approval_blocks_without_reask(
-    monitor, inbox_dir, mock_invoker, db, clock,
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
+    clock,
 ):
     """The user's guarantee: a held inbox approval is re-asked ZERO times.
     Across many scans, with the clock advanced well past any historical
@@ -1549,7 +2718,8 @@ async def test_pending_inbox_approval_blocks_without_reask(
         },
     }
     decision = AutonomousDispatchDecision(
-        mode="blocked", reason="approval requested",
+        mode="blocked",
+        reason="approval requested",
         approval_request_id="req-quiet",
     )
     monitor._autonomous_dispatcher = _make_wired_dispatcher(
@@ -1567,6 +2737,7 @@ async def test_pending_inbox_approval_blocks_without_reask(
     disp.approval_gate.approval_manager.cancel.assert_not_called()
     disp.route.assert_not_called()
     from genesis.db.crud import inbox_items
+
     row = await inbox_items.get_by_id(db, "row-req-quiet")
     assert row["status"] == "processing"
     assert row["error_message"] == f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-quiet"
@@ -1574,7 +2745,10 @@ async def test_pending_inbox_approval_blocks_without_reask(
 
 @pytest.mark.asyncio
 async def test_precheck_refreshes_when_new_files_added_while_blocked(
-    monitor, inbox_dir, mock_invoker, db,
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
 ):
     """When an inbox_evaluation approval is pending but new files arrive,
     the approval is cancelled and files are detected so a fresh approval
@@ -1598,7 +2772,8 @@ async def test_precheck_refreshes_when_new_files_added_while_blocked(
     # After the stale approval is cancelled, the dispatch will create
     # a new approval request (blocked again with a new request id).
     decision = AutonomousDispatchDecision(
-        mode="blocked", reason="approval requested",
+        mode="blocked",
+        reason="approval requested",
         approval_request_id="req-fresh",
     )
     monitor._autonomous_dispatcher = _make_wired_dispatcher(
@@ -1611,12 +2786,18 @@ async def test_precheck_refreshes_when_new_files_added_while_blocked(
     await monitor.check_once()
 
     # The new file WAS detected and a row was created
-    rows = [dict(r) for r in (await (await db.execute(
-        "SELECT * FROM inbox_items WHERE file_path LIKE '%new-while-blocked%'",
-    )).fetchall())]
+    rows = [
+        dict(r)
+        for r in (
+            await (
+                await db.execute(
+                    "SELECT * FROM inbox_items WHERE file_path LIKE '%new-while-blocked%'",
+                )
+            ).fetchall()
+        )
+    ]
     assert len(rows) == 1, (
-        f"new file should have been detected after stale approval cancel, "
-        f"got: {rows}"
+        f"new file should have been detected after stale approval cancel, got: {rows}"
     )
     # Dispatch was attempted (creating a fresh approval)
     monitor._autonomous_dispatcher.route.assert_called_once()
@@ -1624,7 +2805,10 @@ async def test_precheck_refreshes_when_new_files_added_while_blocked(
 
 @pytest.mark.asyncio
 async def test_refresh_path_with_live_rows_folds_unchanged_sibling(
-    monitor, inbox_dir, mock_invoker, db,
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
 ):
     """Park-onto-pending (2026-08-18 idempotent-approval semantics): when an
     approval with LIVE parked rows is pending and genuinely-new content
@@ -1641,7 +2825,9 @@ async def test_refresh_path_with_live_rows_folds_unchanged_sibling(
     }
     # The gate's stable key re-attaches new drops to the SAME pending request.
     decision = AutonomousDispatchDecision(
-        mode="blocked", reason="approval pending", approval_request_id="req-a",
+        mode="blocked",
+        reason="approval pending",
+        approval_request_id="req-a",
     )
     monitor._autonomous_dispatcher = _make_wired_dispatcher(
         decision=decision,
@@ -1685,14 +2871,18 @@ async def test_refresh_path_with_live_rows_folds_unchanged_sibling(
 
 @pytest.mark.asyncio
 async def test_resume_pass_dispatches_on_pending_to_approved_transition(
-    monitor, inbox_dir, mock_invoker, db,
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
 ):
     """With a wired approval manager, the resume pass dispatches an
     awaiting row ONLY when the approval transitions from pending to
     approved.  While pending, it must not dispatch."""
     # Scan 1: wired dispatcher returns blocked-pending → row parked
     pending_decision = AutonomousDispatchDecision(
-        mode="blocked", reason="approval requested",
+        mode="blocked",
+        reason="approval requested",
         approval_request_id="req-transition-1",
     )
     monitor._autonomous_dispatcher = _make_wired_dispatcher(
@@ -1704,9 +2894,16 @@ async def test_resume_pass_dispatches_on_pending_to_approved_transition(
     (inbox_dir / "transition.md").write_text("content to approve")
     await monitor.check_once()
 
-    rows1 = [dict(r) for r in (await (await db.execute(
-        "SELECT * FROM inbox_items WHERE file_path LIKE '%transition.md'",
-    )).fetchall())]
+    rows1 = [
+        dict(r)
+        for r in (
+            await (
+                await db.execute(
+                    "SELECT * FROM inbox_items WHERE file_path LIKE '%transition.md'",
+                )
+            ).fetchall()
+        )
+    ]
     assert len(rows1) == 1
     assert rows1[0]["status"] == "processing"
     assert (rows1[0]["error_message"] or "").startswith("awaiting_approval:")
@@ -1716,10 +2913,12 @@ async def test_resume_pass_dispatches_on_pending_to_approved_transition(
     # return pending (resume pass will skip dispatch).  The test asserts
     # that NO dispatch happens this scan.
     pending_site_row = {
-        "id": "req-transition-1", "status": "pending",
+        "id": "req-transition-1",
+        "status": "pending",
         "action_type": "autonomous_cli_fallback",
         "_context": {
-            "subsystem": "inbox", "policy_id": "inbox_evaluation",
+            "subsystem": "inbox",
+            "policy_id": "inbox_evaluation",
         },
     }
     still_pending_dispatcher = _make_wired_dispatcher(
@@ -1735,9 +2934,16 @@ async def test_resume_pass_dispatches_on_pending_to_approved_transition(
     mock_invoker.run.assert_not_called()
 
     # Row still parked, not churned
-    rows2 = [dict(r) for r in (await (await db.execute(
-        "SELECT * FROM inbox_items WHERE file_path LIKE '%transition.md'",
-    )).fetchall())]
+    rows2 = [
+        dict(r)
+        for r in (
+            await (
+                await db.execute(
+                    "SELECT * FROM inbox_items WHERE file_path LIKE '%transition.md'",
+                )
+            ).fetchall()
+        )
+    ]
     assert len(rows2) == 1
     assert rows2[0]["id"] == rows1[0]["id"]
     assert rows2[0]["status"] == "processing"
@@ -1745,7 +2951,8 @@ async def test_resume_pass_dispatches_on_pending_to_approved_transition(
     # Scan 3: approval now approved.  Resume pass should detect the
     # transition, dispatch the item, and CC should run to completion.
     approved_decision = AutonomousDispatchDecision(
-        mode="cli_approved", reason="CLI fallback approved",
+        mode="cli_approved",
+        reason="CLI fallback approved",
         approval_request_id="req-transition-1",
     )
     transition_dispatcher = _make_wired_dispatcher(
@@ -1764,24 +2971,203 @@ async def test_resume_pass_dispatches_on_pending_to_approved_transition(
     mock_invoker.run.assert_called_once()
 
     # Row completed with no duplicates
-    rows3 = [dict(r) for r in (await (await db.execute(
-        "SELECT * FROM inbox_items WHERE file_path LIKE '%transition.md' "
-        "ORDER BY created_at",
-    )).fetchall())]
+    rows3 = [
+        dict(r)
+        for r in (
+            await (
+                await db.execute(
+                    "SELECT * FROM inbox_items WHERE file_path LIKE '%transition.md' "
+                    "ORDER BY created_at",
+                )
+            ).fetchall()
+        )
+    ]
     assert len(rows3) == 1
     assert rows3[0]["id"] == rows1[0]["id"]
     assert rows3[0]["status"] == "completed"
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "corrupt_payload",
+    [
+        "inbox-items-v2:not-json",
+        b"inbox-items-v2:not-json",
+    ],
+)
+async def test_resume_corrupt_v2_batch_rederives_without_full_file_replay(
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
+    corrupt_payload,
+):
+    """Corrupt structured storage is not the legacy full-file fallback."""
+    from genesis.db.crud import inbox_items
+
+    path, _ = await _seed_parked_row(
+        db,
+        inbox_dir,
+        request_id="req-corrupt",
+        filename="corrupt.md",
+        content="first item\n\nsecond item",
+    )
+    await db.execute(
+        "UPDATE inbox_items SET batch_items = ?, retry_count = ? WHERE id = ?",
+        (
+            corrupt_payload,
+            monitor._config.max_retries - 1,
+            "row-req-corrupt",
+        ),
+    )
+    await db.commit()
+
+    new_pending = AutonomousDispatchDecision(
+        mode="blocked",
+        reason="fresh approval required",
+        approval_request_id="req-fresh",
+    )
+    dispatcher = _make_wired_dispatcher(
+        decision=new_pending,
+        approval_by_id={
+            "req-corrupt": {"id": "req-corrupt", "status": "approved"},
+        },
+    )
+    dispatcher.approval_gate.mark_consumed = AsyncMock(return_value=True)
+    monitor._autonomous_dispatcher = dispatcher
+
+    result = await monitor.check_once()
+
+    assert result.batches_dispatched == 0
+    mock_invoker.run.assert_not_awaited()
+    corrupt = await inbox_items.get_by_id(db, "row-req-corrupt")
+    assert corrupt["status"] == "processing"
+    assert corrupt["error_message"] == (
+        f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-fresh"
+    )
+    assert corrupt["retry_count"] == monitor._config.max_retries - 1
+    assert inbox_items.batch_items_for_dispatch(corrupt["batch_items"]) == "first item"
+    dispatcher.approval_gate.mark_consumed.assert_awaited_once_with("req-corrupt")
+    rows = await db.execute_fetchall(
+        "SELECT id, status, error_message, batch_items FROM inbox_items "
+        "WHERE file_path = ? ORDER BY rowid",
+        (str(path),),
+    )
+    assert len(rows) == 2
+    assert all(row["status"] == "processing" for row in rows)
+    assert all(
+        row["error_message"] == f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-fresh"
+        for row in rows
+    )
+    assert [
+        inbox_items.batch_items_for_dispatch(row["batch_items"])
+        for row in rows
+    ] == ["first item", "second item"]
+
+
+@pytest.mark.asyncio
+async def test_corrupt_parked_batch_retries_after_healthy_sibling_completes(
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
+):
+    """A completed sibling must not strand a corrupt batch at the same hash."""
+    from genesis.db.crud import inbox_items
+
+    path, content_hash = await _seed_parked_row(
+        db,
+        inbox_dir,
+        request_id="req-siblings",
+        filename="corrupt-siblings.md",
+        content="first item\n\nsecond item",
+    )
+    corrupt_id = "row-req-siblings"
+    healthy_id = "row-req-siblings-healthy"
+    await db.execute(
+        "UPDATE inbox_items SET batch_items = ?, drop_id = ? WHERE id = ?",
+        (
+            f"{inbox_items.BATCH_ITEMS_V2_PREFIX}not-json",
+            "drop-siblings",
+            corrupt_id,
+        ),
+    )
+    await inbox_items.create(
+        db,
+        id=healthy_id,
+        file_path=str(path),
+        content_hash=content_hash,
+        status="processing",
+        created_at="2026-03-10T11:00:01+00:00",
+        drop_id="drop-siblings",
+        batch_items=inbox_items.serialize_batch_items(["second item"]),
+        error_message=f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-siblings",
+    )
+    await db.commit()
+
+    approved = AutonomousDispatchDecision(
+        mode="cli_approved",
+        reason="CLI fallback approved",
+        approval_request_id="req-siblings",
+    )
+    first_dispatcher = _make_wired_dispatcher(
+        decision=approved,
+        approval_by_id={
+            "req-siblings": {"id": "req-siblings", "status": "approved"},
+        },
+    )
+    first_dispatcher.approval_gate.mark_consumed = AsyncMock(return_value=True)
+    monitor._autonomous_dispatcher = first_dispatcher
+    mock_invoker.run.return_value = _success_output("healthy sibling evaluated")
+
+    first = await monitor.check_once()
+
+    assert first.batches_dispatched == 1
+    mock_invoker.run.assert_awaited_once()
+    assert "second item" in mock_invoker.run.await_args.args[0].prompt
+    assert "first item" not in mock_invoker.run.await_args.args[0].prompt
+    corrupt = await inbox_items.get_by_id(db, corrupt_id)
+    healthy = await inbox_items.get_by_id(db, healthy_id)
+    assert corrupt["status"] == "failed"
+    assert corrupt["error_message"] == "batch_items_corrupt_restart"
+    assert healthy["status"] == "completed"
+
+    mock_invoker.run.reset_mock()
+    fresh_pending = AutonomousDispatchDecision(
+        mode="blocked",
+        reason="fresh approval required",
+        approval_request_id="req-siblings-fresh",
+    )
+    monitor._autonomous_dispatcher = _make_wired_dispatcher(
+        decision=fresh_pending,
+    )
+
+    second = await monitor.check_once()
+
+    assert second.items_retried == 1
+    assert second.batches_dispatched == 0
+    mock_invoker.run.assert_not_awaited()
+    recovered = await inbox_items.get_by_id(db, corrupt_id)
+    assert recovered["status"] == "processing"
+    assert recovered["error_message"] == (
+        f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-siblings-fresh"
+    )
+    assert inbox_items.batch_items_for_dispatch(recovered["batch_items"]) == "first item"
+
+
+@pytest.mark.asyncio
 async def test_resume_pass_marks_row_failed_on_rejected_transition(
-    monitor, inbox_dir, mock_invoker, db,
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
 ):
     """When the wired approval manager reports the approval as rejected,
     the resume pass must mark the inbox row failed (with a rejection
     message) and not dispatch anything."""
     pending_decision = AutonomousDispatchDecision(
-        mode="blocked", reason="approval requested",
+        mode="blocked",
+        reason="approval requested",
         approval_request_id="req-rejected-1",
     )
     monitor._autonomous_dispatcher = _make_wired_dispatcher(
@@ -1805,9 +3191,16 @@ async def test_resume_pass_marks_row_failed_on_rejected_transition(
     rejected_dispatcher.route.assert_not_called()
     mock_invoker.run.assert_not_called()
 
-    rows = [dict(r) for r in (await (await db.execute(
-        "SELECT * FROM inbox_items WHERE file_path LIKE '%will-be-rejected%'",
-    )).fetchall())]
+    rows = [
+        dict(r)
+        for r in (
+            await (
+                await db.execute(
+                    "SELECT * FROM inbox_items WHERE file_path LIKE '%will-be-rejected%'",
+                )
+            ).fetchall()
+        )
+    ]
     assert len(rows) == 1
     assert rows[0]["status"] == "failed"
     assert "reject" in (rows[0]["error_message"] or "").lower()
@@ -1815,7 +3208,10 @@ async def test_resume_pass_marks_row_failed_on_rejected_transition(
 
 @pytest.mark.asyncio
 async def test_resume_pass_invalidates_row_on_missing_approval(
-    monitor, inbox_dir, mock_invoker, db,
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
 ):
     """When the approval row is missing entirely (approval_manager
     returns None), the inbox row must be invalidated with the
@@ -1824,7 +3220,8 @@ async def test_resume_pass_invalidates_row_on_missing_approval(
     from genesis.db.crud import inbox_items
 
     pending_decision = AutonomousDispatchDecision(
-        mode="blocked", reason="approval requested",
+        mode="blocked",
+        reason="approval requested",
         approval_request_id="req-gone-1",
     )
     monitor._autonomous_dispatcher = _make_wired_dispatcher(
@@ -1844,9 +3241,16 @@ async def test_resume_pass_invalidates_row_on_missing_approval(
     monitor._autonomous_dispatcher = gone_dispatcher
     await monitor.check_once()
 
-    rows = [dict(r) for r in (await (await db.execute(
-        "SELECT * FROM inbox_items WHERE file_path LIKE '%gone.md'",
-    )).fetchall())]
+    rows = [
+        dict(r)
+        for r in (
+            await (
+                await db.execute(
+                    "SELECT * FROM inbox_items WHERE file_path LIKE '%gone.md'",
+                )
+            ).fetchall()
+        )
+    ]
     # At least one row should be failed+invalidated.  The next scan may
     # also have created a fresh row for the re-detected file.
     failed = [r for r in rows if r["status"] == "failed"]
@@ -1859,29 +3263,37 @@ async def test_resume_pass_invalidates_row_on_missing_approval(
 
 def test_passes_coherence_check_valid():
     from genesis.inbox.monitor import _passes_coherence_check
-    evaluation = "# Inbox Evaluation\n\n**Classification:** Technology\n\nThis article from example.com " + "x" * 300
+
+    evaluation = (
+        "# Inbox Evaluation\n\n**Classification:** Technology\n\nThis article from example.com "
+        + "x" * 300
+    )
     source = "Check out https://example.com/article"
     assert _passes_coherence_check(evaluation, source) is True
 
 
 def test_coherence_check_rejects_empty():
     from genesis.inbox.monitor import _passes_coherence_check
+
     assert _passes_coherence_check("", "some source") is False
 
 
 def test_coherence_check_rejects_short():
     from genesis.inbox.monitor import _passes_coherence_check
+
     assert _passes_coherence_check("# Inbox Evaluation\nShort.", "src") is False
 
 
 def test_coherence_check_rejects_missing_heading():
     from genesis.inbox.monitor import _passes_coherence_check
+
     evaluation = "Some evaluation text " * 30  # >300 chars, no heading
     assert _passes_coherence_check(evaluation, "src") is False
 
 
 def test_coherence_check_rejects_no_url_mentions():
     from genesis.inbox.monitor import _passes_coherence_check
+
     evaluation = "# Inbox Evaluation\n\n" + "No URLs mentioned here " * 20
     source = "Check https://github.com/some/repo"
     assert _passes_coherence_check(evaluation, source) is False
@@ -1889,6 +3301,7 @@ def test_coherence_check_rejects_no_url_mentions():
 
 def test_coherence_check_passes_with_url_domain():
     from genesis.inbox.monitor import _passes_coherence_check
+
     evaluation = "# Inbox Evaluation\n\nThis article from github.com " + "x" * 300
     source = "Check https://github.com/some/repo"
     assert _passes_coherence_check(evaluation, source) is True
@@ -1896,6 +3309,7 @@ def test_coherence_check_passes_with_url_domain():
 
 def test_coherence_check_no_urls_in_source():
     from genesis.inbox.monitor import _passes_coherence_check
+
     # No URLs in source content — URL check is skipped, other checks pass
     evaluation = "# Inbox Evaluation\n\n" + "Analysis of the plain text content " * 15
     source = "Just some plain text with no links"
@@ -1905,7 +3319,11 @@ def test_coherence_check_no_urls_in_source():
 def test_coherence_check_passes_with_platform_name():
     """Evaluations use platform names ('LinkedIn') not raw domains ('www.linkedin.com')."""
     from genesis.inbox.monitor import _passes_coherence_check
-    evaluation = "# Inbox Evaluation\n\n**Classification:** Technology\n\nA LinkedIn post by Hao Hoang " + "x" * 300
+
+    evaluation = (
+        "# Inbox Evaluation\n\n**Classification:** Technology\n\nA LinkedIn post by Hao Hoang "
+        + "x" * 300
+    )
     source = "Check out https://www.linkedin.com/posts/some-post"
     assert _passes_coherence_check(evaluation, source) is True
 
@@ -1913,7 +3331,11 @@ def test_coherence_check_passes_with_platform_name():
 def test_coherence_check_passes_with_domain_stem_fallback():
     """Unknown domains still match via stem extraction (e.g. 'langchain' from 'langchain.com')."""
     from genesis.inbox.monitor import _passes_coherence_check
-    evaluation = "# Inbox Evaluation\n\n**Classification:** Technology\n\nLangChain's new feature " + "x" * 300
+
+    evaluation = (
+        "# Inbox Evaluation\n\n**Classification:** Technology\n\nLangChain's new feature "
+        + "x" * 300
+    )
     source = "https://www.langchain.com/blog/something"
     assert _passes_coherence_check(evaluation, source) is True
 
@@ -1926,6 +3348,7 @@ class TestMergeEvaluatedContent:
 
     def test_empty_prev_returns_source_lines(self):
         from genesis.inbox.monitor import _merge_evaluated_content
+
         result = _merge_evaluated_content(None, "alpha\nbeta\n")
         lines = result.splitlines()
         assert "alpha" in lines
@@ -1933,6 +3356,7 @@ class TestMergeEvaluatedContent:
 
     def test_empty_source_returns_prev_lines(self):
         from genesis.inbox.monitor import _merge_evaluated_content
+
         result = _merge_evaluated_content("alpha\nbeta\n", "")
         lines = result.splitlines()
         assert "alpha" in lines
@@ -1940,12 +3364,14 @@ class TestMergeEvaluatedContent:
 
     def test_union_of_both(self):
         from genesis.inbox.monitor import _merge_evaluated_content
+
         result = _merge_evaluated_content("alpha\nbeta", "beta\ngamma")
         lines = set(result.splitlines())
         assert lines == {"alpha", "beta", "gamma"}
 
     def test_deduplicates_stripped(self):
         from genesis.inbox.monitor import _merge_evaluated_content
+
         result = _merge_evaluated_content("  alpha  \nbeta", "alpha\n  beta  ")
         lines = result.splitlines()
         assert lines.count("alpha") == 1
@@ -1953,23 +3379,30 @@ class TestMergeEvaluatedContent:
 
     def test_blank_lines_excluded(self):
         from genesis.inbox.monitor import _merge_evaluated_content
+
         result = _merge_evaluated_content("\n\nalpha\n\n", "\n\nbeta\n\n")
         assert "" not in result.splitlines()
 
     def test_sorted_output(self):
         from genesis.inbox.monitor import _merge_evaluated_content
+
         result = _merge_evaluated_content("gamma\nalpha", "beta")
         assert result.splitlines() == ["alpha", "beta", "gamma"]
 
     def test_both_none_and_empty(self):
         from genesis.inbox.monitor import _merge_evaluated_content
+
         result = _merge_evaluated_content(None, "")
         assert result == ""
 
 
 @pytest.mark.asyncio
 async def test_baseline_guard_survives_file_clear(
-    db, mock_invoker, mock_session_manager, inbox_dir, tmp_path,
+    db,
+    mock_invoker,
+    mock_session_manager,
+    inbox_dir,
+    tmp_path,
 ):
     """evaluated_content preserves detection-time content even if the file
     is cleared during evaluation (the race condition that caused Genesis-19
@@ -1977,23 +3410,29 @@ async def test_baseline_guard_survives_file_clear(
     from genesis.db.crud import inbox_items
 
     clock = _FakeClock()
-    config = InboxConfig(watch_path=inbox_dir, batch_size=1)
+    # items_per_eval=3 pins this test's original single-batch scenario (the
+    # default is now 1); the guard under test is baseline-vs-file-clear, not
+    # batch grouping.
+    config = InboxConfig(watch_path=inbox_dir, batch_size=1, items_per_eval=3)
     writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
     mon = InboxMonitor(
-        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
-        config=config, writer=writer, clock=clock, prompt_dir=tmp_path,
+        db=db,
+        invoker=mock_invoker,
+        session_manager=mock_session_manager,
+        config=config,
+        writer=writer,
+        clock=clock,
     )
 
-    original_content = (
-        "Numenta\n\n"
-        "https://example.com/article-1\n\n"
-        "https://example.com/article-2\n"
-    )
+    original_content = "Numenta\n\nhttps://example.com/article-1\n\nhttps://example.com/article-2\n"
 
+    # One canned response serves BOTH evaluations in this test, so it must
+    # cover the second drop's URL (article-3) as well.
     mock_invoker.run.return_value = _success_output(
         "# Inbox Evaluation\n\n## 1. Numenta\nGood stuff.\n\n"
         "## 2. example.com/article-1\nInteresting.\n\n"
-        "## 3. example.com/article-2\nNoted.\n" + "x" * 300
+        "## 3. example.com/article-2\nNoted.\n\n"
+        "## 4. example.com/article-3\nAlso noted.\n" + "x" * 300
     )
 
     # Write file and do first evaluation
@@ -2003,7 +3442,8 @@ async def test_baseline_guard_survives_file_clear(
 
     # Verify evaluated_content was stored
     row = await inbox_items.get_by_file_path(
-        db, str(inbox_dir / "Genesis.md"),
+        db,
+        str(inbox_dir / "Genesis.md"),
     )
     assert row is not None
     stored = row["evaluated_content"]
@@ -2025,7 +3465,8 @@ async def test_baseline_guard_survives_file_clear(
 
     # Verify: evaluated_content now has BOTH old and new lines
     row2 = await inbox_items.get_by_file_path(
-        db, str(inbox_dir / "Genesis.md"),
+        db,
+        str(inbox_dir / "Genesis.md"),
     )
     stored2 = row2["evaluated_content"]
     assert "Numenta" in stored2, "Old content lost from baseline"
@@ -2036,7 +3477,11 @@ async def test_baseline_guard_survives_file_clear(
 
 @pytest.mark.asyncio
 async def test_baseline_guard_delta_only_new_items(
-    db, mock_invoker, mock_session_manager, inbox_dir, tmp_path,
+    db,
+    mock_invoker,
+    mock_session_manager,
+    inbox_dir,
+    tmp_path,
 ):
     """After a successful evaluation, adding new items to the file should
     produce a delta containing ONLY the new items, not previously evaluated ones."""
@@ -2047,13 +3492,16 @@ async def test_baseline_guard_delta_only_new_items(
     config = InboxConfig(watch_path=inbox_dir, batch_size=1)
     writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
     mon = InboxMonitor(
-        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
-        config=config, writer=writer, clock=clock, prompt_dir=tmp_path,
+        db=db,
+        invoker=mock_invoker,
+        session_manager=mock_session_manager,
+        config=config,
+        writer=writer,
+        clock=clock,
     )
 
     mock_invoker.run.return_value = _success_output(
-        "# Eval\n\n## 1. Article 1\nGood.\n\n"
-        "## 2. Article 2\nNoted.\n" + "x" * 300
+        "# Eval\n\n## 1. article-1\nGood.\n\n## 2. article-2\nNoted.\n" + "x" * 300
     )
 
     # Initial evaluation
@@ -2064,7 +3512,8 @@ async def test_baseline_guard_delta_only_new_items(
 
     # Get the stored baseline
     prev = await inbox_items.get_evaluated_content(
-        db, str(inbox_dir / "test.md"),
+        db,
+        str(inbox_dir / "test.md"),
     )
     assert prev is not None
 
