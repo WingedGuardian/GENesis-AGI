@@ -1119,6 +1119,43 @@ else
     # ${_TMPDIR_UNSET} would be unbound.)
     _TMPDIR_UNSET="unset TMPDIR CLAUDE_CODE_TMPDIR && "
 fi
+
+# Clear stale pane modes, and record what was found, before attaching. The
+# numeric-slot door reaches the same exposure as the lobby picker: `new-session
+# -A` ATTACHES to an existing slot, and attaching does NOT clear a mode — so if
+# that slot's pane is holding one (an operator pressed `Ctrl-b s` and
+# disconnected) the connection lands inside a stale chooser, the "frozen session
+# with the yellow line". Guarding BOTH entries is deliberate: the operator
+# reports it via the picker, but this path is the same class and would otherwise
+# stay broken while the picker got fixed.
+#
+# The guard only touches a pane with no client attached, which is both the
+# safety boundary and the bug's own precondition — see its header for the
+# measured mechanism.
+#
+# Resolved from this script's own location rather than ${GENESIS_ROOT}, which is
+# hardcoded to ${HOME}/genesis above and is wrong on a clone living elsewhere.
+#
+# SYNCHRONOUS, for the same reason as the lobby door: backgrounded, it would
+# race `new-session -A` and clear the mode after the operator had already been
+# dropped into it. The guard shares ONE 5s deadline across every tmux call it
+# makes. With no server running this costs nothing and starts nothing —
+# MEASURED: `list-panes` does not spawn a server (with a positive control where
+# `new-session` does), so the guard returns empty and exits silently, leaving
+# the `exec` below to start it exactly as before.
+# This file runs under `set -euo pipefail` (line 17), and an assignment whose
+# command substitution FAILS aborts the script — MEASURED: a failing `cd` inside
+# `_F="$(cd … && pwd)/x"` exits 1 and the next line never runs. On this path
+# "the next line" is the `exec tmux` below, so the operator would be locked out
+# of the box by a diagnostic. Split, with an explicit `|| _fc_dir=""`, so the
+# failure degrades to "skip the capture" instead of "skip the login".
+# (`[ -x … ] && cmd` as a standalone statement is separately MEASURED as
+# errexit-safe, so the guard itself was never the hazard.)
+_fc_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || _fc_dir=""
+if [ -n "$_fc_dir" ] && [ -x "${_fc_dir}/fleet_entry_guard.sh" ]; then
+    "${_fc_dir}/fleet_entry_guard.sh" "slot-${SLOT}" >/dev/null 2>&1 || true
+fi
+
 exec tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
     -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \
