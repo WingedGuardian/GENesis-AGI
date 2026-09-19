@@ -15,7 +15,36 @@
 # membership changes.
 #
 # Install the tool first:
-#   curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui
+#   bash scripts/lib/cbm_installer.sh — a pinned, sha256-verified upstream installer.
+
+# Machine-local kill switch. Registrations can survive process termination and
+# bootstrap can drift-heal them later, so the launcher itself must enforce the
+# disabled state. This is absent by default on new installations.
+_user_home="${HOME:-}"
+if [[ -z "$_user_home" ]]; then
+    while IFS=: read -r _name _password _uid _gid _gecos _home _shell; do
+        if [[ "$_uid" == "$EUID" ]]; then
+            _user_home="$_home"
+            break
+        fi
+    done < /etc/passwd
+fi
+_disable_file="${CODEBASE_MEMORY_MCP_DISABLE_FILE:-${_user_home:+${_user_home}/.genesis/codebase-memory-mcp.disabled}}"
+# shellcheck disable=SC2088  # matching a LITERAL ~/ prefix is the point: the
+# override arrived unexpanded, and this is where it gets expanded.
+if [[ "$_disable_file" == "~/"* ]]; then
+    # With no resolvable home this collapses to a relative path and the
+    # absolute-path check below fails closed.
+    _disable_file="${_user_home:+${_user_home}/}${_disable_file#\~/}"
+fi
+if [[ -z "$_disable_file" || "$_disable_file" != /* ]]; then
+    printf 'run-codebase-memory: disable-state path must be absolute\n' >&2
+    exit 1
+fi
+if [[ -e "$_disable_file" ]]; then
+    printf 'run-codebase-memory: disabled by %s\n' "$_disable_file" >&2
+    exit 1
+fi
 
 # Locate the binary WITHOUT depending on $HOME: some MCP clients
 # spawn servers with a scrubbed environment (no HOME/USER/XDG_RUNTIME_DIR),
@@ -37,7 +66,7 @@ MEM_MAX="${CODEBASE_MEMORY_MCP_MEMORY_MAX:-2G}"
 
 if [[ -z "$BINARY" || ! -x "$BINARY" ]]; then
     printf 'codebase-memory-mcp not installed.\n' >&2
-    printf 'Install: curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui\n' >&2
+    printf 'Install: bash scripts/lib/cbm_installer.sh (pinned, sha256-verified upstream installer)\n' >&2
     exit 1
 fi
 

@@ -24,7 +24,7 @@
 #   CC_VERSION             — Claude Code version to install (default from scripts/lib/cc_version.sh)
 #   GH_VERSION             — gh CLI version if pkg-mgr fails (default: 2.65.0)
 #   RIPGREP_VERSION        — ripgrep version if pkg-mgr fails (default: 14.1.1)
-#   NODE_MAJOR             — Node.js major version (default: 20)
+#   NODE_MAJOR             — Node.js major version (default: 22)
 #   GENESIS_INSTALL_STRICT — exit nonzero on any smoke failure/setup warning (default: 0; used by CI)
 
 set -euo pipefail
@@ -482,12 +482,18 @@ if ! command -v jq &>/dev/null; then
     echo "    + jq installed"
 fi
 
-# Node.js version check — returns 0 if installed version >= 20
-# Node 18 EOL'd Sep 2025. Node 20 is current LTS.
+# Node.js version check — the floor of the pinned Claude Code release (>= 22,
+# see scripts/lib/cc_version.sh) raised to the pinned GitNexus engine range
+# (^22.18.0 || >=24.11.0, see scripts/lib/gitnexus_version.sh) so an install does
+# not strand GitNexus on a Node its pin refuses.
 _node_version_ok() {
     command -v node &>/dev/null || return 1
-    local ver; ver=$(node --version 2>/dev/null | grep -oP '(?<=v)\d+' | head -1)
-    [ "${ver:-0}" -ge 20 ] 2>/dev/null
+    local ver; ver=$(node --version 2>/dev/null | sed 's/^v//') || ver=""
+    local major="${ver%%.*}" minor="${ver#*.}"; minor="${minor%%.*}"
+    [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+    { [[ "$major" -eq 22 && "$minor" -ge 18 ]] \
+        || [[ "$major" -eq 24 && "$minor" -ge 11 ]] \
+        || [[ "$major" -gt 24 ]]; } 2>/dev/null
 }
 
 # Install Node.js with full fallback chain: pkg-mgr → NodeSource → nvm
@@ -524,7 +530,7 @@ _install_node() {
 }
 
 # Node.js (REQUIRED — Claude Code will not run without it)
-NODE_MAJOR="${NODE_MAJOR:-20}"
+NODE_MAJOR="${NODE_MAJOR:-22}"
 if _node_version_ok; then
     echo "    . Node.js $(node --version)"
 else
@@ -534,7 +540,7 @@ else
     else
         echo ""
         echo "    ERROR: Node.js ${NODE_MAJOR}.x install failed by all methods."
-        echo "    Claude Code requires Node.js >= 20. Install manually, then re-run:"
+        echo "    Claude Code requires Node.js >= 22. Install manually, then re-run:"
         echo "      Ubuntu/Debian: curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | sudo -E bash - && sudo apt-get install -y nodejs"
         echo "      AL2023/RHEL:   curl -fsSL https://rpm.nodesource.com/setup_${NODE_MAJOR}.x | sudo bash - && sudo dnf install -y nodejs"
         echo "      Universal:     curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash"
@@ -645,28 +651,78 @@ done
 # Code intelligence tools (optional — enhance Claude Code sessions)
 echo "    Installing code intelligence tools..."
 
-# Always re-runs the upstream installer: it is idempotent and pulls the latest
-# release, so existing installs are upgraded in place.
-# --skip-config: the installer would otherwise register the RAW binary in
-# ~/.claude/.mcp.json, bypassing our 2G-capped launcher (_register_mcp below
-# registers the capped wrapper instead).
-curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui --skip-config 2>/dev/null \
-    && echo "    + codebase-memory-mcp installed/upgraded" \
-    || echo "    NOTE: codebase-memory-mcp unavailable (optional)"
+# The kill-switch path resolves through the ONE shared site — an override via
+# CODEBASE_MEMORY_MCP_DISABLE_FILE is honoured here the same way the launcher
+# and indexer honour it, and an UNRESOLVABLE path refuses rather than falling
+# through to an install the machine may have disabled.
+_cbm_disable=""
+if [ -r "$SCRIPT_DIR/lib/cbm_disable_file.sh" ]; then
+    # shellcheck source=lib/cbm_disable_file.sh
+    . "$SCRIPT_DIR/lib/cbm_disable_file.sh"
+    _cbm_disable="$(genesis_cbm_disable_file 2>/dev/null)" || _cbm_disable=""
+fi
+if [ -z "$_cbm_disable" ]; then
+    echo "    NOTE: codebase-memory-mcp kill-switch path unresolvable — refusing install (fail closed)"
+elif [ -e "$_cbm_disable" ]; then
+    echo "    . codebase-memory-mcp install/upgrade skipped (machine kill switch active)"
+else
+    # The pin, the digest and the install itself live in ONE place, shared with
+    # bootstrap.sh, so the commit and its digest cannot drift apart.
+    # shellcheck source=lib/cbm_installer.sh
+    . "$SCRIPT_DIR/lib/cbm_installer.sh"
+    _cbm_rc=0
+    genesis_cbm_install || _cbm_rc=$?
+    case "$_cbm_rc" in
+        0) echo "    + codebase-memory-mcp installed/upgraded" ;;
+        1) echo "    NOTE: codebase-memory-mcp installer download failed (optional)" ;;
+        3) echo "    ERROR: codebase-memory-mcp integrity check failed — the pinned installer does not match the committed digest (see above)" ;;
+        4) echo "    NOTE: codebase-memory-mcp install refused — machine kill switch active" ;;
+        *) echo "    NOTE: codebase-memory-mcp unavailable (optional) — see the error above" ;;
+    esac
+fi
 
-if _node_version_ok; then
-    # Exact pin to 1.6.8 — only ship versions we've actually verified. 1.6.8
-    # (stable): `analyze` works; text search (FTS) degrades gracefully when the
-    # LadybugDB extension is absent. The prior 1.6.4-rc line crashed `analyze`
-    # silently. Re-verify before bumping further.
-    if ! command -v gitnexus &>/dev/null; then
-        npm install -g gitnexus@1.6.8 2>/dev/null \
-            && echo "    + GitNexus installed ($(gitnexus --version 2>/dev/null))" \
-            || echo "    NOTE: GitNexus unavailable (optional)"
+_GITNEXUS_PIN_READY=0
+_gitnexus_pin_file="$SCRIPT_DIR/lib/gitnexus_version.sh"
+if [ -r "$_gitnexus_pin_file" ]; then
+    # shellcheck source=lib/gitnexus_version.sh
+    if source "$_gitnexus_pin_file"; then
+        if [[ "${GENESIS_GITNEXUS_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            && declare -F genesis_gitnexus_node_supported >/dev/null \
+            && declare -F genesis_gitnexus_resolve_binary >/dev/null \
+            && declare -F genesis_gitnexus_installed_version >/dev/null \
+            && declare -F genesis_gitnexus_installed_is_pinned >/dev/null \
+            && declare -F genesis_gitnexus_ensure_pin >/dev/null; then
+            _GITNEXUS_PIN_READY=1
+        fi
+    fi
+fi
+if [ "$_GITNEXUS_PIN_READY" -ne 1 ]; then
+    echo "    NOTE: GitNexus pin metadata unavailable — GitNexus skipped (optional)"
+elif ! genesis_gitnexus_node_supported; then
+    echo "    NOTE: GitNexus ${GENESIS_GITNEXUS_VERSION} requires Node ^22.18.0 or >=24.11.0; found $(node --version 2>/dev/null || echo unavailable) — skipped"
+else
+    # Exact, shared pin — GitNexus index storage formats can change between
+    # releases.  Installing an older binary after a newer rebuild makes the
+    # otherwise-healthy index unreadable.  Bump only after index + query E2E.
+    if ! genesis_gitnexus_resolve_binary >/dev/null; then
+        _gitnexus_action="installed"
     else
-        npm install -g gitnexus@1.6.8 2>/dev/null \
-            && echo "    + GitNexus pin enforced ($(gitnexus --version 2>/dev/null))" \
-            || echo "    NOTE: GitNexus pin enforcement skipped (already at 1.6.8 or failed)"
+        _gitnexus_action="aligned"
+    fi
+    if genesis_gitnexus_ensure_pin; then
+        echo "    + GitNexus ${_gitnexus_action} ($(genesis_gitnexus_installed_version 2>/dev/null))"
+    else
+        _gitnexus_rc=$?
+        if [ "$_gitnexus_rc" -eq 2 ]; then
+            echo "    NOTE: newer GitNexus $(genesis_gitnexus_installed_version 2>/dev/null || echo unknown) left installed; refusing automatic downgrade to ${GENESIS_GITNEXUS_VERSION}"
+        elif [ "$_gitnexus_rc" -eq 3 ]; then
+            echo "    NOTE: unrecognized GitNexus version output left installed; refusing unsafe replacement with ${GENESIS_GITNEXUS_VERSION}"
+        else
+            echo "    NOTE: GitNexus pin enforcement failed (wanted ${GENESIS_GITNEXUS_VERSION})"
+        fi
+    fi
+    if genesis_gitnexus_resolve_binary >/dev/null && ! genesis_gitnexus_installed_is_pinned; then
+        echo "    NOTE: stale GitNexus $(genesis_gitnexus_installed_version 2>/dev/null || echo unknown) remains on disk but will not be registered or indexed"
     fi
 fi
 
@@ -914,17 +970,23 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
     # can't spawn CC regardless; a later bootstrap.sh re-renders the units with
     # the correct path once CC is present.
     _cc_path="$(command -v claude 2>/dev/null || true)"
+    # The npm prefix is needed in BOTH branches: it is the bin dir that actually
+    # receives `npm install -g` (gitnexus, and claude itself when cc_ensure_local
+    # installs it). When _install_node fell back to nvm, that prefix is the nvm
+    # bin — while a pinned claude already on PATH (e.g. /usr/local/bin) answers
+    # `command -v` first, and rendering only claude's dir leaves GitNexus
+    # invisible to the units forever. (guarded so a missing npm can't abort
+    # under set -e)
+    _cc_prefix="$(npm config get prefix 2>/dev/null || true)"
+    [ -n "$_cc_prefix" ] || _cc_prefix="/usr/local"
+    [ "$_cc_prefix" = "/usr" ] && _cc_prefix="/usr/local"
     if [ -n "$_cc_path" ]; then
         CC_BIN_DIR="$(dirname "$_cc_path")"
     else
-        # Installed above but not on this (non-interactive) shell's PATH — a user
-        # npm prefix whose PATH export only fires in interactive shells. Resolve
-        # where npm placed it, matching cc_ensure_local's own target (guarded so
-        # a missing npm can't abort under set -e).
-        _cc_prefix="$(npm config get prefix 2>/dev/null || true)"
-        [ -n "$_cc_prefix" ] || _cc_prefix="/usr/local"
-        [ "$_cc_prefix" = "/usr" ] && _cc_prefix="/usr/local"
         CC_BIN_DIR="$_cc_prefix/bin"
+    fi
+    if [ "$_cc_prefix/bin" != "$CC_BIN_DIR" ]; then
+        CC_BIN_DIR="$CC_BIN_DIR:$_cc_prefix/bin"
     fi
 
     for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
@@ -1021,13 +1083,27 @@ if command -v claude &>/dev/null; then
     # (a re-run installer must re-point a stale registration, not skip it).
     # shellcheck source=lib/mcp_register.sh
     . "$SCRIPT_DIR/lib/mcp_register.sh"
-    command -v gitnexus &>/dev/null && \
-        _register_mcp "gitnexus" "user" "gitnexus" "mcp"
+    [ -x "$REPO_DIR/.claude/mcp/run-gitnexus" ] && \
+        _register_mcp "gitnexus" "user" "$REPO_DIR/.claude/mcp/run-gitnexus" "mcp"
     # Via the repo launcher (NOT the bare binary): wraps the server in a
     # systemd scope with MemoryMax=2G to contain upstream's unbounded memory
     # leak (DeusData/codebase-memory-mcp#581). Rationale in the launcher.
-    command -v codebase-memory-mcp &>/dev/null && \
+    if command -v codebase-memory-mcp &>/dev/null; then
+        # REGISTERED EVEN WHEN THE KILL SWITCH IS ACTIVE, deliberately. Registration
+        # does not start anything, and the launcher is fail-closed on the sentinel
+        # (.claude/mcp/run-codebase-memory exits 1 with "disabled by <file>"), so
+        # writing the registration while disabled cannot run the server.
+        #
+        # Skipping preserved the exact drift this helper exists to repair: a
+        # PRE-EXISTING registration pointing at the bare `codebase-memory-mcp`
+        # binary survives untouched, bypasses the launcher entirely, and starts the
+        # uncapped raw server in the next session — and stays uncapped after the
+        # sentinel is removed until somebody runs this again.
         _register_mcp "codebase-memory-mcp" "user" "$REPO_DIR/.claude/mcp/run-codebase-memory"
+        if [ -n "${_cbm_disable:-}" ] && [ -e "$_cbm_disable" ]; then
+            echo "    . codebase-memory-mcp registered to the launcher; kill switch active, so it will refuse to start"
+        fi
+    fi
     command -v serena &>/dev/null && \
         _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$REPO_DIR"
 fi

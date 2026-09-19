@@ -3033,6 +3033,178 @@ class TestPrCiStatus:
         assert guard_module._pr_ci_status("1") == ("unknown", [])
 
 
+class TestPrCiStatusSelfWorkflow:
+    """Actions self-exclusion (issue #1670): when the gate runs as a check run,
+    its own rollup entries are dropped — the check may never vouch for or block
+    on itself. Without it every run sees its own IN_PROGRESS and deadlocks, and
+    a same-head re-run inherits its predecessor's FAILURE. Conftest scrubs the
+    pair for all other tests; here we setenv per case."""
+
+    @staticmethod
+    def _actions(monkeypatch, workflow="merge-gate", job="genesis-merge-gate"):
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        monkeypatch.setenv("GITHUB_WORKFLOW", workflow)
+        monkeypatch.setenv("GITHUB_JOB", job)
+
+    def test_own_in_progress_run_does_not_pending(self, guard_module, monkeypatch):
+        # THE self-deadlock case: our own check is IN_PROGRESS while we classify.
+        self._actions(monkeypatch)
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "genesis-merge-gate", "workflowName": "merge-gate",
+             "status": "IN_PROGRESS", "conclusion": None},
+        ]))
+        assert guard_module._pr_ci_status("1") == ("green", [])
+
+    def test_own_prior_failure_does_not_red(self, guard_module, monkeypatch):
+        # Same-head re-run (a review/comment trigger): the predecessor run's
+        # FAILURE must not be inherited as our own verdict.
+        self._actions(monkeypatch)
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "genesis-merge-gate", "workflowName": "merge-gate",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+        ]))
+        assert guard_module._pr_ci_status("1") == ("green", [])
+
+    def test_other_workflow_still_classified(self, guard_module, monkeypatch):
+        # Only OUR workflow is excluded — a red "CI" check still blocks.
+        self._actions(monkeypatch)
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "genesis-merge-gate", "workflowName": "merge-gate",
+             "status": "IN_PROGRESS", "conclusion": None},
+        ]))
+        assert guard_module._pr_ci_status("1") == ("red", ["test"])
+
+    def test_only_own_run_is_absent(self, guard_module, monkeypatch):
+        # Rollup containing ONLY our own run = zero other checks ran — the same
+        # definite "CI has not run" fact as a literally-empty rollup.
+        self._actions(monkeypatch)
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": "merge-gate",
+             "status": "IN_PROGRESS", "conclusion": None},
+        ]))
+        assert guard_module._pr_ci_status("1") == ("absent", [])
+
+    def test_local_path_excludes_the_mirror_check(self, guard_module, monkeypatch):
+        # GITHUB_ACTIONS absent (interactive merge path): the advisory check is
+        # only a MIRROR of this gate's verdict, so it must never classify — a
+        # red mirror would double-count real blocks as `ci: red` and demand a
+        # spurious ci-override. Constant-name exclusion applies without the
+        # Actions env vars (conftest scrubs them for every hook test).
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": None,
+             "detailsUrl": "https://github.com/OWNER/REPO/runs/99",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]))
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("green", [])
+
+    def test_local_path_excludes_ambient_workflow_entries(self, guard_module, monkeypatch):
+        # The constant workflow-name lane applies locally too: ambient runs of
+        # the merge-gate workflow carry workflowName="merge-gate".
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": "merge-gate",
+             "status": "IN_PROGRESS", "conclusion": None},
+        ]))
+        assert guard_module._pr_ci_status("1") == ("absent", [])
+
+    def test_casefolded_workflow_match(self, guard_module, monkeypatch):
+        # workflowName matching is case-insensitive, like the rest of the gate.
+        self._actions(monkeypatch, workflow="Merge-Gate")
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "genesis-merge-gate", "workflowName": "merge-gate",
+             "status": "IN_PROGRESS", "conclusion": None},
+        ]))
+        assert guard_module._pr_ci_status("1") == ("green", [])
+
+    def test_api_check_run_filtered_by_job_name(self, guard_module, monkeypatch):
+        # A check run published via the check-runs API carries NO workflowName —
+        # it is identified by its NAME (= the job name). This is the
+        # comment-triggered re-evaluation case: the previous API-published
+        # FAILURE must not be inherited by its successor.
+        self._actions(monkeypatch, workflow="other-wf")
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "genesis-merge-gate", "workflowName": None,
+             "detailsUrl": "https://github.com/OWNER/REPO/runs/99",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+        ]))
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("green", [])
+
+    def test_unrelated_same_named_check_is_not_filtered(self, guard_module, monkeypatch):
+        # Name-based filtering keys on THIS job's name only — a different job's
+        # checks still classify normally.
+        self._actions(monkeypatch, job="genesis-merge-gate")
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "some-other-check", "workflowName": None,
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+        ]))
+        assert guard_module._pr_ci_status("1") == ("red", ["some-other-check"])
+
+    def test_api_published_run_in_foreign_suite_is_filtered(self, guard_module, monkeypatch):
+        # MEASURED on PR #1954: a `genesis-merge-gate` verdict published via the
+        # check-runs API was attached to a check suite owned by a DIFFERENT
+        # workflow ("Labeler") — GitHub assigns the suite, not the publisher, so
+        # an API-published mirror can carry ANY workflowName. The name plus a
+        # detailsUrl into this repo's run pages is the identity.
+        self._actions(monkeypatch, workflow="merge-gate", job="genesis-merge-gate")
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": "Labeler",
+             "detailsUrl": "https://github.com/OWNER/REPO/runs/105310955021",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]))
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("green", [])
+
+    def test_mirror_name_filtered_locally_under_any_workflow_name(self, guard_module, monkeypatch):
+        # Same lane on the interactive path: an API-published mirror carrying a
+        # foreign workflowName must not double-count as `ci: red`.
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": "Labeler",
+             "detailsUrl": "https://github.com/OWNER/REPO/runs/105310955021",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]))
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("green", [])
+
+    def test_same_name_foreign_details_url_still_counts(self, guard_module, monkeypatch):
+        # Name alone is not provenance: a same-named check whose detailsUrl
+        # points at ANOTHER repo's run page is a real verdict and still blocks.
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": "Other",
+             "detailsUrl": "https://github.com/OTHER/REPO/runs/42",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]))
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("red", ["genesis-merge-gate"])
+
+    def test_same_name_external_details_url_still_counts(self, guard_module, monkeypatch):
+        # A same-named check from another app carries its own external
+        # detailsUrl — not a mirror of this gate, still classifies.
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": None,
+             "detailsUrl": "https://example.com/checks/42",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]))
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("red", ["genesis-merge-gate"])
+
+    def test_same_slug_non_github_host_still_counts(self, guard_module, monkeypatch):
+        # Host is provenance too: a non-github.com URL whose PATH carries this
+        # repo's slug must not be accepted as our mirror.
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": None,
+             "detailsUrl": "https://evil.example.com/OWNER/REPO/runs/42",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]))
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("red", ["genesis-merge-gate"])
+
+
 class TestPrCiStatusRequiredWorkflows:
     """Required-CI-workflow identity (closes the #1484 P2 partial-rollup residual):
     a NON-empty rollup whose present checks are all green must still assert that every

@@ -97,8 +97,10 @@ Pick the tool by the question (full matrix + freshness model:
 **Serena** (Python LSP) for symbols/references/rename — **always live**, the
 default for "who calls X / what breaks if I change Z"; **codebase-memory-mcp**
 for architecture/graph; **GitNexus** for deep blast-radius/flows/coupling —
-**snapshot-based, so `gitnexus analyze` first** when freshness matters (it
-drifts after pulling merged PRs). Prefer these over manual reads for dependency
+**snapshot-based**. From the main checkout, refresh with
+`scripts/lib/code_intel_index.sh "$PWD" gitnexus fast` when freshness matters.
+Linked worktrees are deliberately not indexed; use Serena for live branch truth.
+GitNexus also drifts after pulling merged PRs. Prefer these over manual reads for dependency
 questions; none is a mandatory pre-edit gate.
 
 ## Skill Library

@@ -46,7 +46,15 @@ DRAFT="$(mktemp -d)"                       # per-invocation, never a shared path
 # write the title and body with an EDITOR TOOL, not by echoing through a shell
 #   $DRAFT/title.txt   $DRAFT/body.md
 
-python3 scripts/file_tracker_issue.py \
+# .venv/bin/python, NOT a bare `python3`: the script runs a privacy scan whose
+# detect-secrets floor is resolved from the interpreter's own bin directory, and
+# it is installed only in the venv. Under the system python the scan cannot find
+# it and REFUSES every issue — correctly, since an issue is a terminal egress
+# surface with no CI backstop, but the refusal is then about your interpreter
+# rather than about the draft, and it says so.
+# From a WORKTREE, spell the interpreter absolutely: a worktree has no .venv of
+# its own, so the relative path below resolves to nothing there.
+.venv/bin/python scripts/file_tracker_issue.py \
   --title-file "$DRAFT/title.txt" --body-file "$DRAFT/body.md" \
   --area area:memory --difficulty "help wanted" --dry-run   # drop --dry-run to post
 # KEEP $DRAFT until the real filing reaches a known outcome — see below

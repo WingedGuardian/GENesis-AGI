@@ -959,7 +959,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: d0627c854 2026-09-11
+verified: 640c4f2e3 2026-09-18
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -968,8 +968,15 @@ verified: d0627c854 2026-09-11
   only that method may tombstone). The conversational path
   (`knowledge_ingest_source` MCP) requires explicit user confirmation —
   contrast the intake bypass in entry 4.
-- **inbox/**: file-drop monitor with approval-gated dispatch; phase order
-  recover pending → resume approval → detect → create → dispatch;
+- **inbox/**: file-drop monitor with approval-gated dispatch. Before any DB,
+  approval, response, or baseline mutation, it composes and validates one
+  deterministic system prompt from `INBOX_EVALUATE.md`, the complete
+  `evaluate` skill, the complete `user_evaluate` skill, and an explicit
+  precedence footer. A missing, unreadable, or empty component fails the scan
+  closed without caching a partial prompt; a successful composite is reused
+  byte-for-byte by the approval route, CC invocation, and prompt-version hash.
+  The phase order is prompt preflight → recover pending → resume approval →
+  detect → create → dispatch;
   `approval_key_stable=True` (ONE
   site-level approval key). The refresh path folds parked files into the
   batch so approvals fire once (#914). A pending approval is HELD until the

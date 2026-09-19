@@ -15,6 +15,7 @@ import pytest
 
 from genesis.autonomy.autonomous_dispatch import AutonomousDispatchDecision
 from genesis.cc.types import CCOutput
+from genesis.db.crud.prompt_versions import compute_prompt_hash
 from genesis.db.schema import create_all_tables
 from genesis.inbox.monitor import InboxMonitor, _extract_urls, _is_acknowledged
 from genesis.inbox.types import InboxConfig
@@ -123,7 +124,7 @@ def clock() -> _FakeClock:
 
 
 @pytest.fixture
-def monitor(db, mock_invoker, mock_session_manager, config, writer, clock, tmp_path):
+def monitor(db, mock_invoker, mock_session_manager, config, writer, clock):
     return InboxMonitor(
         db=db,
         invoker=mock_invoker,
@@ -131,7 +132,6 @@ def monitor(db, mock_invoker, mock_session_manager, config, writer, clock, tmp_p
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,  # no INBOX_EVALUATE.md → uses fallback
     )
 
 
@@ -1117,21 +1117,6 @@ async def test_message_queue_entry_created(monitor, inbox_dir, db):
 
 
 @pytest.mark.asyncio
-async def test_system_prompt_loaded(monitor, tmp_path):
-    prompt_file = tmp_path / "INBOX_EVALUATE.md"
-    prompt_file.write_text("Custom system prompt here")
-    monitor._system_prompt = None  # reset cache
-    prompt = monitor._load_system_prompt()
-    assert prompt == "Custom system prompt here"
-
-
-@pytest.mark.asyncio
-async def test_system_prompt_fallback(monitor):
-    prompt = monitor._load_system_prompt()
-    assert "inbox evaluation" in prompt.lower()  # fallback mentions inbox evaluation
-
-
-@pytest.mark.asyncio
 async def test_missing_watch_path(db, mock_invoker, mock_session_manager, tmp_path):
     config = InboxConfig(watch_path=tmp_path / "nonexistent")
     mon = InboxMonitor(
@@ -1198,7 +1183,6 @@ async def test_cooldown_skips_recently_evaluated(
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,
     )
     f = inbox_dir / "doc.md"
     f.write_text("version 1")
@@ -1253,7 +1237,6 @@ async def test_cooldown_defers_without_dropping_modification(
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,
     )
     f = inbox_dir / "doc.md"
 
@@ -1303,7 +1286,6 @@ async def test_e2e_url_repaste_different_tracking_not_reevaluated(
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,
     )
     f = inbox_dir / "Genesis.md"
     base = "https://www.linkedin.com/posts/foo-share-123-1G81/"
@@ -1353,7 +1335,6 @@ async def test_phantom_modified_within_cooldown_advances_hash(
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,
     )
     f = inbox_dir / "Genesis.md"
     base = "https://www.linkedin.com/posts/foo-share-123-1G81/"
@@ -1824,7 +1805,6 @@ async def test_acknowledged_no_file_written(
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,
     )
     mock_invoker.run.return_value = _success_output(
         "**Classification:** Acknowledged\nNoted: this file is user-specific context."
@@ -1861,7 +1841,6 @@ async def test_acknowledged_stores_evaluated_content(
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,
     )
     mock_invoker.run.return_value = _success_output(
         "**Classification:** Acknowledged\nNoted: context absorbed."
@@ -1897,7 +1876,6 @@ async def test_ambiguous_note_gets_response(
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,
     )
     mock_invoker.run.return_value = _success_output(
         "**Classification:** Question\n"
@@ -1937,7 +1915,6 @@ async def test_no_hard_eval_limit(
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,
     )
     f = inbox_dir / "notepad.md"
 
@@ -2336,6 +2313,9 @@ async def test_resume_does_not_reroute_across_scans(
     assert req.approval_key_stable is True
     assert req.api_call_site_id is None
     assert req.context is None
+    system_message = req.messages[0]["content"]
+    assert system_message == req.cli_invocation.system_prompt
+    assert monitor._prompt_hash == compute_prompt_hash(system_message)
 
 
 @pytest.mark.asyncio
@@ -3442,7 +3422,6 @@ async def test_baseline_guard_survives_file_clear(
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,
     )
 
     original_content = "Numenta\n\nhttps://example.com/article-1\n\nhttps://example.com/article-2\n"
@@ -3519,7 +3498,6 @@ async def test_baseline_guard_delta_only_new_items(
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,
     )
 
     mock_invoker.run.return_value = _success_output(
