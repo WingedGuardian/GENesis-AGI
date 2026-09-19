@@ -33,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -213,6 +214,9 @@ _RECALL_ENDPOINT = f"{_SERVER_BASE}/api/genesis/hook/recall"
 # well inside the hook wrapper's 10s ceiling (.claude/settings.json).
 _SERVER_TIMEOUT_S = 4.75
 _SERVER_CONNECT_TIMEOUT_S = 0.25
+# Claude Code kills UserPromptSubmit hooks at 10 seconds. Keep the whole run
+# below that ceiling with enough room for the deferred flush and cut notice.
+_RUN_DEADLINE_S = 8.0
 
 # Kill-switch flag consumed by _compute_suppress_ids (H-1 shadow suppression set).
 _WS_GATE_DISABLED_FLAG = Path.home() / ".genesis" / "ws_gate_disabled"
@@ -1867,6 +1871,34 @@ def _heartbeat_read_and_inject(
 
 
 async def _run(prompt: str, session_id: str = "") -> None:
+    """Run the hook within one aggregate budget and always flush deferred lines."""
+    deferred_lines: list[str] = []
+    flushed = False
+
+    def _flush_deferred() -> None:
+        nonlocal flushed
+        if flushed:
+            return
+        flushed = True
+        out = _writer()
+        for line in deferred_lines:
+            out.emit(line, block="session-metadata")
+
+    try:
+        async with asyncio.timeout(_RUN_DEADLINE_S):
+            await _run_body(prompt, session_id, deferred_lines, _flush_deferred)
+    except TimeoutError:
+        return
+    finally:
+        _flush_deferred()
+
+
+async def _run_body(
+    prompt: str,
+    session_id: str,
+    deferred_lines: list[str],
+    _flush_deferred: Callable[[], None],
+) -> None:
     """Main async entry point."""
     start = time.monotonic()
 
@@ -1879,11 +1911,10 @@ async def _run(prompt: str, session_id: str = "") -> None:
 
     # ── Session intent trail (runs on every message, even short ones) ─
     # Buffer these — memories print first (more actionable), then metadata.
-    _deferred_lines: list[str] = []
     try:
         trail_line = _update_and_format_trail(session_id, keywords, prompt)
         if trail_line:
-            _deferred_lines.append(trail_line)
+            deferred_lines.append(trail_line)
     except Exception:
         pass  # Intent trail must never block the hook
 
@@ -1891,7 +1922,7 @@ async def _run(prompt: str, session_id: str = "") -> None:
     try:
         activity = _extract_genesis_summary(session_id)
         if activity:
-            _deferred_lines.append(f"[Recent activity] {activity}")
+            deferred_lines.append(f"[Recent activity] {activity}")
     except Exception:
         pass  # Never block
 
@@ -1899,11 +1930,6 @@ async def _run(prompt: str, session_id: str = "") -> None:
     # FTS terms; merged into the local keyword set for the degraded fallback.
     recent_files = _load_recent_files(session_id)
     file_keywords = _keywords_from_files(recent_files) if recent_files else []
-
-    def _flush_deferred() -> None:
-        out = _writer()
-        for line in _deferred_lines:
-            out.emit(line, block="session-metadata")
 
     # off mode: session-local awareness only (heartbeat/trail already ran).
     if _HOOK_MODE == "off":
