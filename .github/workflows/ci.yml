@@ -878,4 +878,11 @@ jobs:
         # The base is deliberately NOT re-derived from the merged tree: this is
         # a FLOOR, so a lagging base is conservative and can only under-catch,
         # never go falsely red.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23298
+        #
+        # UNION with the wrapper-arity lock's raise (its own measurement): its
+        # new suite collects 35 (`--collect-only -q` on the merged tree) and adds
+        # 2 environment-gated skips — one wrapper is not installed on the runner
+        # or the dev box, and `time` is excluded because bash's keyword and
+        # /usr/bin/time are different programs sharing a basename. So ceiling
+        # 99 -> 101 and collected 23298 -> 23333.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 101 --min-collected 23333
