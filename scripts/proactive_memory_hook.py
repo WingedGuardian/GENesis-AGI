@@ -1386,21 +1386,21 @@ def _enrich_with_metadata(results: list[dict], *, deadline: float | None = None)
         pass  # Best-effort enrichment — never block the hook
 
 
-def _ensure_knowledge_retrieved_count(db_path: Path, *, deadline: float | None = None) -> None:
-    """Self-healing migration: add retrieved_count to knowledge_units if missing."""
+def _ensure_knowledge_retrieved_count(db_path: Path, *, deadline: float | None = None) -> bool:
+    """Self-heal the knowledge schema and report whether it is ready."""
+    conn = _sqlite_connect(db_path, timeout=2, deadline=deadline)
     try:
-        conn = _sqlite_connect(db_path, timeout=2, deadline=deadline)
         try:
             conn.execute(
                 "ALTER TABLE knowledge_units ADD COLUMN retrieved_count INTEGER NOT NULL DEFAULT 0"
             )
             conn.commit()
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-        finally:
-            conn.close()
-    except Exception:
-        pass  # Never block
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+        return True
+    finally:
+        conn.close()
 
 
 def _liveness_detail() -> str:
@@ -2079,9 +2079,14 @@ async def _run_body(
     # Self-heal: ensure knowledge_units has retrieved_count column (once)
     _SENTINEL = Path.home() / ".genesis" / ".knowledge_retrieved_count_migrated"
     if not _SENTINEL.exists():
-        _ensure_knowledge_retrieved_count(_DB_PATH, deadline=deadline)
-        _SENTINEL.parent.mkdir(parents=True, exist_ok=True)
-        _SENTINEL.touch(exist_ok=True)
+        try:
+            migrated = _ensure_knowledge_retrieved_count(_DB_PATH, deadline=deadline)
+        except Exception as exc:
+            print(f"Knowledge retrieved_count migration skipped: {exc}", file=sys.stderr)
+            migrated = False
+        if migrated:
+            _SENTINEL.parent.mkdir(parents=True, exist_ok=True)
+            _SENTINEL.touch(exist_ok=True)
 
     if _deadline_expired(deadline):
         return

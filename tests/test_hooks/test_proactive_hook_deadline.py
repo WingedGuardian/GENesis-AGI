@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -54,7 +55,7 @@ async def test_run_flushes_deferred_lines_when_recall_exceeds_total_budget(
     )
     monkeypatch.setattr(hook, "_extract_genesis_summary", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(hook, "_load_recent_files", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(hook, "_ensure_knowledge_retrieved_count", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(hook, "_ensure_knowledge_retrieved_count", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(hook, "_compute_suppress_ids", lambda *_args, **_kwargs: frozenset())
 
     started = time.monotonic()
@@ -63,6 +64,7 @@ async def test_run_flushes_deferred_lines_when_recall_exceeds_total_budget(
 
     assert elapsed < 0.2, "the aggregate deadline did not stop the slow recall"
     assert writer.lines == [("[Session trail] deferred", "session-metadata")]
+    assert (tmp_path / ".genesis" / ".knowledge_retrieved_count_migrated").exists()
 
 
 @pytest.mark.asyncio
@@ -99,7 +101,7 @@ async def test_local_mode_stops_after_blocking_sync_phase_exhausts_deadline(
     )
     monkeypatch.setattr(hook, "_extract_genesis_summary", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(hook, "_load_recent_files", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(hook, "_ensure_knowledge_retrieved_count", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(hook, "_ensure_knowledge_retrieved_count", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(hook, "_compute_suppress_ids", lambda *_args, **_kwargs: frozenset())
     monkeypatch.setattr(hook, "_search_fts5", _blocking_fts)
     monkeypatch.setattr(hook, "_search_code_index", _code_search)
@@ -111,3 +113,47 @@ async def test_local_mode_stops_after_blocking_sync_phase_exhausts_deadline(
     assert elapsed < 0.2, "a later sync phase ran after the aggregate deadline"
     assert code_calls == []
     assert writer.lines == [("[Session trail] deferred", "session-metadata")]
+    assert not (tmp_path / ".genesis" / ".knowledge_retrieved_count_migrated").exists()
+
+
+def test_knowledge_migration_adds_missing_column(tmp_path: Path) -> None:
+    db_path = tmp_path / "genesis.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE knowledge_units (id INTEGER PRIMARY KEY)")
+
+    assert hook._ensure_knowledge_retrieved_count(db_path) is True
+
+    with sqlite3.connect(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(knowledge_units)")}
+    assert "retrieved_count" in columns
+
+
+def test_knowledge_migration_accepts_duplicate_column(tmp_path: Path) -> None:
+    db_path = tmp_path / "genesis.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE knowledge_units "
+            "(id INTEGER PRIMARY KEY, retrieved_count INTEGER NOT NULL DEFAULT 0)"
+        )
+
+    assert hook._ensure_knowledge_retrieved_count(db_path) is True
+
+
+def test_knowledge_migration_propagates_interrupted_alter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class _InterruptedConnection:
+        def execute(self, _sql: str) -> None:
+            raise sqlite3.OperationalError("interrupted")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        hook,
+        "_sqlite_connect",
+        lambda *_args, **_kwargs: _InterruptedConnection(),
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="interrupted"):
+        hook._ensure_knowledge_retrieved_count(tmp_path / "genesis.db")
