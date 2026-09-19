@@ -245,21 +245,82 @@ the tool wrapper SIGTERMs the whole call at its own `timeout` param (default
 120000ms → exit 143). To allow longer, set that `timeout` PARAMETER explicitly —
 **but you cannot exceed 600000ms.** A larger value does not buy more time; the
 call still dies at 10 minutes (MEASURED 2026-08-27: `timeout: 1600000` was killed
-at exactly `10m 0s`). Anything that might run past ten minutes therefore has only
-ONE correct form — `run_in_background: true`. Treat "raise the timeout" as a fix
-that tops out, not one that scales.
+at exactly `10m 0s`). Treat "raise the timeout" as a fix that tops out, not one
+that scales.
 
-For long or unbounded work — above all deploys (`scripts/update.sh`,
-`bootstrap.sh`, `host-setup.sh`: container align + guardian redeploy + host
-`update-node`/`update-cc`, run sequentially — routinely exceed 600s and so CANNOT
-be done in the foreground at any timeout value) — run via **`run_in_background: true`**
-(harness-tracked, notifies on completion, no timeout ceiling), NEVER a foreground
-timeout or `nohup … &` (detached but untracked → no completion signal, so you end
-up hand-polling anyway). `update.sh` has SIGTERM/INT rollback traps, so a mid-run
-kill is not a no-op — verify state (server active, no mid-rebase, pin, both CC
-versions) before re-running; it is idempotent. (A non-blocking PreToolUse advisory
-hook, `.claude/hooks/cc-deploy-timeout-guard`, nudges toward this when a deploy is
-run in the foreground.)
+For long or unbounded work generally, use **`run_in_background: true`** —
+harness-tracked, notifies on completion, and it does NOT inherit the 120s default
+(MEASURED 2026-09-16: a 400s background task completed clean, exit 0). Prefer it
+over a foreground timeout or `nohup … &` (detached but untracked → no completion
+signal, so you end up hand-polling anyway).
+
+**DEPLOYS ARE THE EXCEPTION, and this is the one to get right.**
+`scripts/update.sh`, `bootstrap.sh` and `host-setup.sh` (container align +
+guardian redeploy + host `update-node`/`update-cc`, run sequentially) must be
+**DETACHED FROM THE SESSION ENTIRELY** — not foregrounded, and not backgrounded.
+
+- Foreground is impossible: MEASURED 2026-09-16, a bare `update.sh` ran **1022s**,
+  1.7× the 600000ms hard ceiling, so no timeout value works. And the SIGTERM at the
+  ceiling is not a silent truncation — `update.sh` TRAPS INT/TERM (`:1253-1254`) and
+  responds by rolling back (`_on_signal` → `_do_rollback`), or before the merge by
+  restarting the services it stopped (`_on_signal_prestop`, `:708-709`). You unwind
+  a deploy that was going fine.
+- `run_in_background` is NOT the fix either, despite having no 120s ceiling: it is
+  tied to the SESSION's lifetime, and deploys launched that way were killed mid-run
+  on 2026-07-22 (leaving genesis-server DOWN during bootstrap) and 2026-09-16
+  (during the pre-update backup). Both left the harness's own `[killed]` marker and
+  ran NO trap — which is what SIGKILL looks like: no rollback, no restart, whatever
+  state the deploy was in. The precise kill mechanism is UNRESOLVED — three
+  candidates are eliminated in CC memory `deploy_detach_not_background`, and the
+  successor hypothesis there is explicitly hedged, not established. Detachment
+  removes the coupling to this session, which is what every remaining candidate
+  runs through. It is not immunity in general: an OOM kill reaches a systemd unit
+  just as readily.
+
+```bash
+systemd-run --user --collect --unit genesis-deploy-manual \
+  --working-directory=$HOME/genesis --setenv=PATH="$PATH" \
+  /bin/bash -c 'exec ./scripts/update.sh > ~/tmp/deploy-$(date +%Y%m%d-%H%M).log 2>&1'
+```
+
+`--setenv=PATH` is load-bearing: a `--user` unit otherwise gets systemd's default
+PATH, which on this box omits `~/.local/bin`, so bootstrap takes its
+`uv not found — installing…` branch rather than the branch an interactive run
+takes. The shipped code sidesteps this by passing the whole environment
+(`updates.py::_apply_direct` uses `env=os.environ.copy()`).
+
+**`systemd-run --user --scope` is NOT a substitute.** MEASURED 2026-09-16: a
+`--scope` child keeps the CALLER'S session id, so it is cgroup-isolated but still
+session-held. `_apply_direct` gets away with `--scope` only because its parent is
+genesis-server rather than a CC session. Use `--unit`.
+
+Then VERIFY it took — `systemctl --user is-active genesis-deploy-manual` must
+print `active`. `systemd-run` does NOT inherit the tool's cwd, so a bare relative
+path resolves under `$HOME`, bash exits instantly, `--collect` reaps the unit, and
+a failed launch is indistinguishable from a successful one. (It also reports
+`inactive` once the deploy has FINISHED, so check promptly and read the log for the
+outcome.) `genesis-server` going `inactive` mid-run is EXPECTED. When the server is
+up, `POST /api/genesis/updates/apply` with `{"supervised": false}` does the same job
+and passes the environment for you.
+
+**A mid-run kill is never a no-op, but what it does depends on the signal.** A
+SIGTERM/SIGINT runs update.sh's traps — a rollback after the merge, a service
+restart before it. A SIGKILL runs nothing, which is why it is the one that can
+leave the system in an arbitrary state, and it is what both background deploy
+kills look like. Note also that `_do_rollback` disarms INT/TERM as it starts, so a
+second signal lands mid-rollback with default disposition, and the rollback itself
+has failure exits that report `ROLLBACK INCOMPLETE`. Either way: verify state
+(server active, no mid-rebase, pin, both CC versions) before re-running; it is
+idempotent. (A non-blocking PreToolUse advisory hook,
+`.claude/hooks/cc-deploy-timeout-guard`, nudges toward this on any deploy that is
+not already detached.)
+
+**Why this paragraph is worded so defensively:** PR #1221 shipped both this policy
+and that hook on 2026-07-22 prescribing `run_in_background`, from a CC memory
+written two days earlier. An incident that same day refuted it. The correction
+landed only in a second CC memory on 07-23, both public surfaces kept the original,
+and a third deploy was killed by this advice 56 days later. A remedy is only as
+good as the case it was actually executed against.
 
 ### Verify Outcomes, Not Just Tests
 

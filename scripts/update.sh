@@ -1832,14 +1832,25 @@ fi
 # ── Restart services ──────────────────────────────────────
 # P5 GUARDRAIL: this final restart runs while the armed `_on_signal TERM` trap is
 # STILL live (disarmed only at the success `trap - ERR INT TERM` below). That is
-# safe TODAY only because the completing update path (the dashboard orchestrator)
-# is cgroup-isolated via `systemd-run --scope`, so `_start_genesis_server`'s
-# internal `systemctl stop`/`restart` does NOT signal this process. The
-# `_apply_direct` path (dashboard, supervised=False) does NOT scope-isolate and
-# stays in genesis-server.service's cgroup — a pre-existing bug. When P5 fixes
-# `_apply_direct`, the fix MUST be scope isolation (systemd-run --scope), NOT a
-# handler tweak: otherwise this restart's stop-phase would self-SIGTERM →
-# _on_signal → a SPURIOUS rollback of a healthy, fully-migrated deploy.
+# safe because every normal update path is cgroup-isolated, so
+# `_start_genesis_server`'s internal `systemctl stop`/`restart` does NOT signal
+# this process: the dashboard orchestrator uses `systemd-run --scope`, and
+# `_apply_direct` (dashboard, supervised=False) does too — see
+# `dashboard/routes/updates.py::_apply_direct`, which probes scope availability
+# before spawning. A manual CLI run must be launched detached the same way (see
+# the genesis-development skill's Timeout Policy).
+#
+# CORRECTED 2026-09-16: this comment previously stated that `_apply_direct` does
+# NOT scope-isolate and called it a pre-existing bug awaiting P5. That is no longer
+# true — it scope-isolates today — and the stale text misled anyone reasoning about
+# signal safety here.
+#
+# The REMAINING exposure is `_apply_direct`'s FALLBACK: when systemd-run is absent
+# or the user manager/D-Bus is unreachable it drops to `start_new_session`, which
+# changes only the session, not the cgroup, so the update stays in
+# genesis-server.service's cgroup. On that path this restart's stop-phase would
+# self-SIGTERM → _on_signal → a SPURIOUS rollback of a healthy, fully-migrated
+# deploy. Any fix there MUST be scope isolation, NOT a handler tweak.
 if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
     echo "--- Restarting services ---"
 

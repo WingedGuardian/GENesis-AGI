@@ -878,4 +878,8 @@ jobs:
         # The base is deliberately NOT re-derived from the merged tree: this is
         # a FLOOR, so a lagging base is conservative and can only under-catch,
         # never go falsely red.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23298
+        #
+        # MERGE UNION: main's 23298 plus +16 collected in this PR's grown
+        # test_bash_timeout_guidance.py (19 on the merged tree vs 3 on main,
+        # measured by --collect-only) = 23314.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23314
