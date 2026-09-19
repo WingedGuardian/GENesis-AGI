@@ -74,6 +74,27 @@ async def test_rejected_is_terminal_unlinks(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_held_is_terminal_unlinks(tmp_path, monkeypatch):
+    """An email-gated alert is HELD, and the hold OWNS delivery from there.
+
+    `pipeline._deliver` records a durable pending row and returns HELD; the WS-8
+    resolution watcher delivers it on approval. `submit_raw`'s dedup consults
+    DELIVERED history only, so it does NOT suppress a second hold — keeping the
+    entry mints a fresh pending row every tick, and approving them delivers the
+    same alert once per hold. That is the same duplicate-page class as #1781,
+    arriving through the gate instead of through a second retrier.
+
+    `resilience/outreach_recovery.py` already treats HELD as terminal and its
+    comment says it mirrors this drain; until now it did not.
+    """
+    root = tmp_path / "queue"
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
+    _enqueue(root, dedupe_key="backup:k1")
+    await alert_drain._make_drainer(_RT(pipeline=_FakePipeline(OutreachStatus.HELD)))()
+    assert q.list_queued(root) == []
+
+
+@pytest.mark.asyncio
 async def test_failed_keeps_for_retry(tmp_path, monkeypatch):
     root = tmp_path / "queue"
     monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
@@ -114,3 +135,26 @@ def test_wire_sets_drainer_when_loop_present():
 
     alert_drain.wire(_RT(loop=_Loop()))
     assert callable(installed.get("fn"))
+
+
+@pytest.mark.asyncio
+async def test_drain_request_opts_out_of_pipeline_deferral(tmp_path, monkeypatch):
+    """THE #1781 lock: the drain's request must carry defer_retry=False.
+
+    This queue is the alert's durable retrier (14-day file queue, retried
+    every awareness tick). If the pipeline ALSO defers a failed send to the
+    recovery worker, two independent retriers own one delivery — MEASURED
+    2026-09-05: recovery delivered the OOM alert at 08:31:57 and the kept
+    queue entry resent it at 08:35:42, one alert paged twice. The inverse
+    design (unlink the entry on deferral) was reviewed and REJECTED: recovery
+    discards a row after ~82 minutes of backoff, so it trades the duplicate
+    for a DROPPED page on any longer outage.
+    """
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: tmp_path)
+    _enqueue(tmp_path, dedupe_key="watchgod:oom:155")
+    pipeline = _FakePipeline(OutreachStatus.FAILED)
+    await alert_drain._make_drainer(_RT(pipeline=pipeline))()
+    (_, request) = pipeline.calls[0]
+    assert request.defer_retry is False
+    # And FAILED keeps the entry — this queue stays the single owner.
+    assert len(list(tmp_path.glob("*.json"))) == 1

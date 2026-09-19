@@ -181,7 +181,12 @@ async def _collect_detail(
             live = {
                 "slot": s.get("slot"),
                 "pid": s.get("pid"),
+                # rss_mb is the slot's whole process tree; proc_rss_mb is the
+                # root claude process. Both are surfaced so the dashboard can
+                # show where a slot's memory actually sits — reporting only the
+                # root is what made the fleet's ~2/3 share invisible.
                 "rss_mb": s.get("rss_mb"),
+                "proc_rss_mb": s.get("proc_rss_mb"),
                 "slot_status": s.get("status"),
                 "started_at": s.get("started_at"),
                 "stale_code": stale,
