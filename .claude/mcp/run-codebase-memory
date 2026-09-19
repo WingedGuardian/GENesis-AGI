@@ -57,7 +57,12 @@ if command -v systemd-run >/dev/null 2>&1 \
     # (tmp_watchgod.sh), and nothing could stop/freeze the scope by name.
     # $$ makes the name unique per launch (a fixed name collides with a stale
     # scope); the /bin/true probe above stays anonymous — it cannot OOM.
-    exec systemd-run --user --scope --quiet \
+    # --collect (Codex P2, #1790): failed transient scopes stay LOADED until
+    # collected, and $$ is unique only while its PID is live — after host PID
+    # reuse a later launch could request an existing cbm-mcp-<pid>.scope and
+    # fail here, never reaching the address-space fallback. --collect unloads
+    # the unit when it ends, even when failed.
+    exec systemd-run --user --scope --quiet --collect \
         --unit "cbm-mcp-$$" \
         --description="codebase-memory-mcp (MemoryMax=${MEM_MAX})" \
         -p "MemoryMax=${MEM_MAX}" -p "MemorySwapMax=0" \
