@@ -749,7 +749,7 @@ jobs:
           # NEITHER the -rf list nor the FAILURES block, so -rf alone leaves
           # the collection-time breakages -- the ones hardest to read off a
           # truncated log -- named nowhere.
-          pytest -rfE --durations=25 \
+          pytest -q -rfE --durations=25 \
             --ignore-glob='**/test_*az*.py' \
             --ignore-glob='**/test_*shim*.py' \
             --ignore=tests/test_ui/ \
