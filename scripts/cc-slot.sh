@@ -1133,10 +1133,15 @@ else
     # ${_TMPDIR_UNSET} would be unbound.)
     _TMPDIR_UNSET="unset TMPDIR CLAUDE_CODE_TMPDIR && "
 fi
+# The pane command is re-parsed by a fresh shell, so quote both paths before
+# interpolating them into its command string. `%q` preserves checkout paths
+# containing spaces, shell metacharacters, or newlines.
+_GENESIS_ROOT_Q=$(printf '%q' "$GENESIS_ROOT")
+_CC_EXIT_CAPTURE_Q=$(printf '%q' "$GENESIS_ROOT/scripts/cc_exit_capture.sh")
 exec tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
     -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \
     "${_TMPDIR_PIN[@]}" \
     -e "GENESIS_CC_SLOT_OAUTH=${_slot_oauth_mode}" \
     -e "LANG=$LANG" \
-    "${_OAUTH_SRC}cd ${GENESIS_ROOT} && ${_TMPDIR_UNSET:-}claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${GENESIS_ROOT}/scripts/cc_exit_capture.sh ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"
+    "${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${_CC_EXIT_CAPTURE_Q} ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"

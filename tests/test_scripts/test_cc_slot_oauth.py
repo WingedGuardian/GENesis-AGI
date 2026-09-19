@@ -72,7 +72,7 @@ def test_no_token_leak_via_tmux_e(script_text):
 
 def test_pane_command_interpolates_oauth_prefix(script_text):
     # The token-prep prefix runs BEFORE cd, leaving the `cd && claude` guard intact.
-    assert "${_OAUTH_SRC}cd ${GENESIS_ROOT} && ${_TMPDIR_UNSET:-}claude " in script_text
+    assert "${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}claude " in script_text
 
 
 def test_claude_stays_under_cd_guard(script_text):
@@ -87,7 +87,7 @@ def test_claude_stays_under_cd_guard(script_text):
     # than inherit the tmux server's stale values. The `:-` form matters — this
     # literal is extracted and evaluated under `set -u` by the cd-guard harness
     # below, where a bare ${_TMPDIR_UNSET} would be unbound.
-    assert "${_OAUTH_SRC}cd ${GENESIS_ROOT} && ${_TMPDIR_UNSET:-}claude " in script_text
+    assert "${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}claude " in script_text
     assert "&& { ${_OAUTH_SRC}claude" not in script_text  # not the brace-group shape
 
 
@@ -155,10 +155,10 @@ printf 'TOKEN=[%s]\\n' "${{CLAUDE_CODE_OAUTH_TOKEN:-}}"
 
 
 def _extract_launch_line(script_text: str) -> str:
-    """The tmux pane-command argument (the `"${_OAUTH_SRC}cd ${GENESIS_ROOT} && …"`
+    """The tmux pane-command argument (the `"${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && …"`
     string)."""
     for line in script_text.splitlines():
-        if line.lstrip().startswith('"${_OAUTH_SRC}cd ${GENESIS_ROOT} &&'):
+        if line.lstrip().startswith('"${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} &&'):
             return line.strip()
     raise AssertionError("could not find the exec-tmux pane command in cc-slot.sh")
 
@@ -173,6 +173,8 @@ set -u
 export PATH="{fakebin}:/usr/bin:/bin"
 export CDGUARD_CANARY={str(canary)!r}
 GENESIS_ROOT={root!r}
+_GENESIS_ROOT_Q=$(printf '%q' "$GENESIS_ROOT")
+_CC_EXIT_CAPTURE_Q=$(printf '%q' "$GENESIS_ROOT/scripts/cc_exit_capture.sh")
 _OAUTH_SRC="export CDGUARD_PREFIX_RAN=1; "
 CC_PERM_FLAG=""
 CLAUDE_ARGS_Q=""
@@ -211,7 +213,7 @@ def test_cd_guard_skips_claude_on_bad_cd(tmp_path, script_text):
     assert "PANE_EXIT=0" not in proc_bad.stdout, proc_bad.stdout
 
     # good cd → claude DOES run, pane exits 0
-    good_root = tmp_path / "good"
+    good_root = tmp_path / "good root"
     good_root.mkdir()
     canary_good = tmp_path / "PANE_RAN_GOOD"
     proc_good, ran_good = _run_cd_guard(script_text, str(good_root), canary_good, fakebin)
