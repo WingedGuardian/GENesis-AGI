@@ -139,6 +139,19 @@ Genesis to research, summarize, write content, or do non-Genesis tasks).
 
 ## Design Principles
 
+- **Adopt before you build** — Default order is ADOPT > ADAPT > build. "Build"
+  needs a specific stated reason, and *"nothing adoptable exists"* is a claim
+  that requires a LOGGED SEARCH, not an impression. Compare **user-visible
+  capability**, never architectural depth: "ours is more sophisticated" is a
+  reason to UPGRADE, never a reason to build — and the `evaluate` skill's
+  Overlap Comparison table exists precisely to replace the sentence "we already
+  have this". Genesis's own job is the **brain**: cognition, memory, judgment.
+  Tools that touch the outside world get adopted and wrapped in glue, and the
+  safety and due diligence go INTO that glue rather than into reimplementing the
+  component. State time-to-capability for every option — hours-to-adopt versus
+  weeks-to-build is a first-class factor beside cost and quality. Run
+  `/evaluate` when any candidate tool surfaces; the disposition is the user's
+  call, not one to preempt.
 - **Flexibility > lock-in** — Adapter patterns, generic interfaces, pluggable
   components. Every external dependency should be swappable.
 - **LLM-first solutions** — Code handles structure (timeouts, validation, event
@@ -621,6 +634,13 @@ behind the writer, and 7 were a guard since removed.
   trackers it executes) — format and rationale in the genesis-development
   skill, `references/plan-docs.md`. Task-executor plans (`/task`,
   `TASK_INTAKE.md`) keep their own section contract and are out of scope.
+  **A plan that
+  proposes new source files carries an `## Adopt / Adapt / Build` verdict** —
+  the `evaluate` skill's vocabulary (`ADOPT | WATCH | IGNORE | ADAPT`), naming
+  what was searched, what was found, and hours-to-capability for each option.
+  One line is enough when building is right (`BUILD — cognitive core, no
+  external substitute, searched: <terms>`); the point is that the question gets
+  asked BEFORE the effort, which is the only moment it is cheap to answer.
 - **Use subagents** to keep main context clean. One concern per subagent.
   **A MANDATED subagent is already the request** — when a gate's block message
   tells you to dispatch one, dispatch it; don't stop to ask. Ask only for
