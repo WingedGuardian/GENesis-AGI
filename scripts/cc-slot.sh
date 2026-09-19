@@ -33,7 +33,21 @@ export PATH="$HOME/.n/bin:$HOME/.bun/bin:$HOME/.npm-global/bin:$HOME/.local/bin:
 # renders every non-ASCII glyph as "_". Force a UTF-8 locale for the client.
 export LANG="${LANG:-C.UTF-8}"
 
-GENESIS_ROOT="${HOME}/genesis"
+# Resolve the checkout from this script's real location. SSH, a shell alias,
+# and the bootstrap-generated wrapper may each enter through a different path;
+# following links before taking the parent keeps all of them on the same repo.
+_CC_SLOT_SCRIPT="${BASH_SOURCE[0]}"
+while [ -L "$_CC_SLOT_SCRIPT" ]; do
+    _CC_SLOT_DIR="$(cd -P "$(dirname "$_CC_SLOT_SCRIPT")" 2>/dev/null && pwd)"
+    _CC_SLOT_TARGET="$(readlink "$_CC_SLOT_SCRIPT")"
+    case "$_CC_SLOT_TARGET" in
+        /*) _CC_SLOT_SCRIPT="$_CC_SLOT_TARGET" ;;
+        *)  _CC_SLOT_SCRIPT="$_CC_SLOT_DIR/$_CC_SLOT_TARGET" ;;
+    esac
+done
+_CC_SLOT_DIR="$(cd -P "$(dirname "$_CC_SLOT_SCRIPT")" 2>/dev/null && pwd)"
+GENESIS_ROOT="$(cd "$_CC_SLOT_DIR/.." 2>/dev/null && pwd)"
+unset _CC_SLOT_SCRIPT _CC_SLOT_DIR _CC_SLOT_TARGET
 SESSION_PREFIX="cc"
 
 # --- Parse slot number from hostname (or allocate one in manual mode) ---
