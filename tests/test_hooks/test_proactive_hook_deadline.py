@@ -54,7 +54,7 @@ async def test_run_flushes_deferred_lines_when_recall_exceeds_total_budget(
     )
     monkeypatch.setattr(hook, "_extract_genesis_summary", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(hook, "_load_recent_files", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(hook, "_ensure_knowledge_retrieved_count", lambda *_args: None)
+    monkeypatch.setattr(hook, "_ensure_knowledge_retrieved_count", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(hook, "_compute_suppress_ids", lambda *_args, **_kwargs: frozenset())
 
     started = time.monotonic()
@@ -62,4 +62,52 @@ async def test_run_flushes_deferred_lines_when_recall_exceeds_total_budget(
     elapsed = time.monotonic() - started
 
     assert elapsed < 0.2, "the aggregate deadline did not stop the slow recall"
+    assert writer.lines == [("[Session trail] deferred", "session-metadata")]
+
+
+@pytest.mark.asyncio
+async def test_local_mode_stops_after_blocking_sync_phase_exhausts_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A blocking local phase cannot make later sync phases run past the deadline."""
+    writer = _RecordingWriter()
+    db_path = tmp_path / "genesis.db"
+    db_path.touch()
+    code_calls: list[bool] = []
+
+    def _blocking_fts(*_args, **_kwargs):
+        time.sleep(0.05)
+        return []
+
+    def _code_search(*_args, **_kwargs):
+        code_calls.append(True)
+        time.sleep(0.2)
+        return []
+
+    monkeypatch.setattr(hook, "_OUT", writer)
+    monkeypatch.setattr(hook, "_RUN_DEADLINE_S", 0.01)
+    monkeypatch.setattr(hook, "_HOOK_MODE", "local")
+    monkeypatch.setattr(hook, "_DB_PATH", db_path)
+    monkeypatch.setattr(hook.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(hook, "_heartbeat_write", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(hook, "_heartbeat_read_and_inject", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(hook, "_extract_keywords", lambda *_args, **_kwargs: ["deadline"])
+    monkeypatch.setattr(
+        hook,
+        "_update_and_format_trail",
+        lambda *_args, **_kwargs: "[Session trail] deferred",
+    )
+    monkeypatch.setattr(hook, "_extract_genesis_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(hook, "_load_recent_files", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(hook, "_ensure_knowledge_retrieved_count", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(hook, "_compute_suppress_ids", lambda *_args, **_kwargs: frozenset())
+    monkeypatch.setattr(hook, "_search_fts5", _blocking_fts)
+    monkeypatch.setattr(hook, "_search_code_index", _code_search)
+
+    started = time.monotonic()
+    await hook._run("why did recall stall", session_id="deadline-session")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.2, "a later sync phase ran after the aggregate deadline"
+    assert code_calls == []
     assert writer.lines == [("[Session trail] deferred", "session-metadata")]

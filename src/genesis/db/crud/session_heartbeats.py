@@ -9,11 +9,30 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
 logger = logging.getLogger(__name__)
+
+
+def _sync_timeout(timeout: float, deadline: float | None) -> float:
+    if deadline is None:
+        return timeout
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("session heartbeat deadline expired")
+    return min(timeout, remaining)
+
+
+def _install_deadline_handler(conn: sqlite3.Connection, deadline: float | None) -> None:
+    if deadline is not None:
+        conn.set_progress_handler(
+            lambda: 1 if time.monotonic() >= deadline else 0,
+            1000,
+        )
+
 
 # Sessions not updated within this window are considered stale
 _STALE_THRESHOLD = timedelta(minutes=10)
@@ -61,8 +80,7 @@ async def upsert(
              genesis_summary = COALESCE(excluded.genesis_summary,
                                         session_heartbeats.genesis_summary),
              updated_at = excluded.updated_at""",
-        (cc_session_id, source_tag, model, topic, user_summary,
-         genesis_summary, now),
+        (cc_session_id, source_tag, model, topic, user_summary, genesis_summary, now),
     )
     await db.commit()
 
@@ -115,6 +133,7 @@ def upsert_sync(
     user_summary: str | None = None,
     genesis_summary: str | None = None,
     timeout: float = 1.0,
+    deadline: float | None = None,
 ) -> None:
     """Sync heartbeat write for hooks. Best-effort, never raises."""
     try:
@@ -124,7 +143,11 @@ def upsert_sync(
         now = datetime.now(UTC).isoformat()
         from genesis.db.connection import connect_sqlite_rw
 
-        conn = connect_sqlite_rw(db_path, timeout=timeout)
+        conn = connect_sqlite_rw(
+            db_path,
+            timeout=_sync_timeout(timeout, deadline),
+        )
+        _install_deadline_handler(conn, deadline)
         try:
             conn.execute(
                 """INSERT INTO session_heartbeats
@@ -140,8 +163,7 @@ def upsert_sync(
                      genesis_summary = COALESCE(excluded.genesis_summary,
                                                 session_heartbeats.genesis_summary),
                      updated_at = excluded.updated_at""",
-                (cc_session_id, source_tag, model, topic, user_summary,
-                 genesis_summary, now),
+                (cc_session_id, source_tag, model, topic, user_summary, genesis_summary, now),
             )
             conn.commit()
         finally:
@@ -177,6 +199,7 @@ def get_active_sync(
     exclude_session: str | None = None,
     timeout: float = 1.0,
     limit: int | None = None,
+    deadline: float | None = None,
 ) -> list[dict]:
     """Sync read of active heartbeats for hooks. Returns [] on any error.
 
@@ -196,7 +219,11 @@ def get_active_sync(
     from it saturates at one and states a precise, wrong total.
     """
     try:
-        conn = sqlite3.connect(db_path, timeout=timeout)
+        conn = sqlite3.connect(
+            db_path,
+            timeout=_sync_timeout(timeout, deadline),
+        )
+        _install_deadline_handler(conn, deadline)
         conn.row_factory = sqlite3.Row
         try:
             where, params = _active_filter(exclude_session)
@@ -228,6 +255,7 @@ def count_active_sync(
     *,
     exclude_session: str | None = None,
     timeout: float = 1.0,
+    deadline: float | None = None,
 ) -> int | None:
     """How many peers :func:`get_active_sync` would return UNLIMITED.
 
@@ -238,7 +266,11 @@ def count_active_sync(
     of a number it does not have.
     """
     try:
-        conn = sqlite3.connect(db_path, timeout=timeout)
+        conn = sqlite3.connect(
+            db_path,
+            timeout=_sync_timeout(timeout, deadline),
+        )
+        _install_deadline_handler(conn, deadline)
         try:
             where, params = _active_filter(exclude_session)
             row = conn.execute("SELECT COUNT(*)" + where, params).fetchone()

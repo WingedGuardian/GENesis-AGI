@@ -218,6 +218,36 @@ _SERVER_CONNECT_TIMEOUT_S = 0.25
 # below that ceiling with enough room for the deferred flush and cut notice.
 _RUN_DEADLINE_S = 8.0
 
+
+class _RunBudgetExpired(RuntimeError):
+    """Abort a best-effort synchronous phase once the aggregate budget is spent."""
+
+
+def _deadline_expired(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
+def _sqlite_connect(
+    db_path: Path | str,
+    *,
+    timeout: float,
+    deadline: float | None = None,
+    uri: bool = False,
+) -> sqlite3.Connection:
+    """Open SQLite with both lock-wait and query execution bounded by *deadline*."""
+    remaining = None if deadline is None else deadline - time.monotonic()
+    if remaining is not None and remaining <= 0:
+        raise _RunBudgetExpired
+    effective_timeout = timeout if remaining is None else min(timeout, remaining)
+    conn = sqlite3.connect(str(db_path), timeout=effective_timeout, uri=uri)
+    if deadline is not None:
+        conn.set_progress_handler(
+            lambda: 1 if time.monotonic() >= deadline else 0,
+            1000,
+        )
+    return conn
+
+
 # Kill-switch flag consumed by _compute_suppress_ids (H-1 shadow suppression set).
 _WS_GATE_DISABLED_FLAG = Path.home() / ".genesis" / "ws_gate_disabled"
 
@@ -557,6 +587,8 @@ def _record_pivot_observation(
     session_id: str,
     label: str,
     trigger: str,
+    *,
+    deadline: float | None = None,
 ) -> None:
     """Write a conversation_pivot observation to the DB."""
     try:
@@ -564,7 +596,7 @@ def _record_pivot_observation(
 
         now = datetime.now(UTC)
         expires_at = (now + timedelta(days=7)).isoformat()
-        conn = sqlite3.connect(str(db_path), timeout=2)
+        conn = _sqlite_connect(db_path, timeout=2, deadline=deadline)
         try:
             conn.execute(
                 "INSERT INTO observations"
@@ -593,6 +625,8 @@ def _update_and_format_trail(
     session_id: str,
     keywords: list[str],
     prompt: str,
+    *,
+    deadline: float | None = None,
 ) -> str | None:
     """Update intent trail and return formatted line for injection.
 
@@ -630,7 +664,13 @@ def _update_and_format_trail(
             "at_msg": trail["msg_count"],
         }
         trail["pivots"].append(pivot)
-        _record_pivot_observation(_DB_PATH, session_id, label, prompt)
+        _record_pivot_observation(
+            _DB_PATH,
+            session_id,
+            label,
+            prompt,
+            deadline=deadline,
+        )
 
     if prompt_keywords:
         trail["last_keywords"] = prompt_keywords
@@ -1123,7 +1163,12 @@ def _render_code_hint(sig: str, loc: str) -> str:
     return f"{head}{sig}{tail}"
 
 
-def _search_code_index(db_path: Path, keywords: list[str]) -> list[dict]:
+def _search_code_index(
+    db_path: Path,
+    keywords: list[str],
+    *,
+    deadline: float | None = None,
+) -> list[dict]:
     """Search code_modules/code_symbols for relevant code entities.
 
     Returns results in memory-like format for RRF fusion. ~5ms (SQLite).
@@ -1133,7 +1178,7 @@ def _search_code_index(db_path: Path, keywords: list[str]) -> list[dict]:
         return []
 
     try:
-        conn = sqlite3.connect(str(db_path), timeout=2)
+        conn = _sqlite_connect(db_path, timeout=2, deadline=deadline)
         try:
             conn.row_factory = sqlite3.Row
             # Search symbols by name match (exact prefix or contains)
@@ -1188,6 +1233,8 @@ def _search_fts5(
     keywords: list[str],
     collection: str | None = None,
     now_iso: str | None = None,
+    *,
+    deadline: float | None = None,
 ) -> list[dict]:
     """Search memory_fts using FTS5 with OR-joined keywords.
 
@@ -1221,7 +1268,7 @@ def _search_fts5(
         collection_params = (collection,)
 
     try:
-        conn = sqlite3.connect(str(db_path), timeout=2)
+        conn = _sqlite_connect(db_path, timeout=2, deadline=deadline)
         try:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
@@ -1289,7 +1336,7 @@ def _format_age(iso_str: str) -> str:
         return "?"
 
 
-def _enrich_with_metadata(results: list[dict]) -> None:
+def _enrich_with_metadata(results: list[dict], *, deadline: float | None = None) -> None:
     """Backfill created_at and wing from SQLite memory_metadata.
 
     After RRF fusion, results may come from FTS5 (which lacks wing/created_at)
@@ -1306,7 +1353,7 @@ def _enrich_with_metadata(results: list[dict]) -> None:
     if not ids:
         return
     try:
-        conn = sqlite3.connect(str(_DB_PATH), timeout=2)
+        conn = _sqlite_connect(_DB_PATH, timeout=2, deadline=deadline)
         try:
             conn.row_factory = sqlite3.Row
             placeholders = ",".join("?" for _ in ids)
@@ -1339,10 +1386,10 @@ def _enrich_with_metadata(results: list[dict]) -> None:
         pass  # Best-effort enrichment — never block the hook
 
 
-def _ensure_knowledge_retrieved_count(db_path: Path) -> None:
+def _ensure_knowledge_retrieved_count(db_path: Path, *, deadline: float | None = None) -> None:
     """Self-healing migration: add retrieved_count to knowledge_units if missing."""
     try:
-        conn = sqlite3.connect(str(db_path), timeout=2)
+        conn = _sqlite_connect(db_path, timeout=2, deadline=deadline)
         try:
             conn.execute(
                 "ALTER TABLE knowledge_units ADD COLUMN retrieved_count INTEGER NOT NULL DEFAULT 0"
@@ -1494,7 +1541,11 @@ async def _call_server(
 
 
 def _format_degraded(
-    results: list[dict], *, forced_local: bool = False, reason: str | None = None
+    results: list[dict],
+    *,
+    forced_local: bool = False,
+    reason: str | None = None,
+    deadline: float | None = None,
 ) -> str:
     """Render FTS5/code fallback hits with a visible degraded marker.
 
@@ -1508,7 +1559,7 @@ def _format_degraded(
     """
     if not results:
         return ""
-    _enrich_with_metadata(results)
+    _enrich_with_metadata(results, deadline=deadline)
     from genesis.security.sanitizer import strip_boundary_markers
 
     if forced_local:
@@ -1551,10 +1602,16 @@ def _format_degraded(
     return "\n".join(lines)
 
 
-def _record_activity(db_path: Path, latency_ms: float, success: bool) -> None:
+def _record_activity(
+    db_path: Path,
+    latency_ms: float,
+    success: bool,
+    *,
+    deadline: float | None = None,
+) -> None:
     """Write to activity_log — picked up by ProviderActivityTracker."""
     try:
-        conn = sqlite3.connect(str(db_path), timeout=1)
+        conn = _sqlite_connect(db_path, timeout=1, deadline=deadline)
         try:
             conn.execute(
                 "INSERT INTO activity_log (provider, latency_ms, success, cache_hit)"
@@ -1714,6 +1771,8 @@ def _heartbeat_write(
     db_path: Path,
     session_id: str,
     prompt: str,
+    *,
+    deadline: float | None = None,
 ) -> float:
     """Write session heartbeat. Returns elapsed ms. Best-effort."""
     hb_start = time.monotonic()
@@ -1727,7 +1786,7 @@ def _heartbeat_write(
         # eviction or an unreadable charter leaves the stored value alone rather
         # than wiping it.
         model = cached_model(session_id)
-        topic = resolve_topic(db_path, session_id)
+        topic = resolve_topic(db_path, session_id, deadline=deadline)
 
         from genesis.db.crud.session_heartbeats import upsert_sync
 
@@ -1738,6 +1797,7 @@ def _heartbeat_write(
             topic=topic,
             user_summary=user_summary,
             genesis_summary=genesis_summary,
+            deadline=deadline,
         )
     except Exception:
         pass  # Best-effort — never block
@@ -1745,7 +1805,12 @@ def _heartbeat_write(
     return (time.monotonic() - hb_start) * 1000
 
 
-def _active_peers(db_path: Path, session_id: str) -> tuple[list[dict], int | None]:
+def _active_peers(
+    db_path: Path,
+    session_id: str,
+    *,
+    deadline: float | None = None,
+) -> tuple[list[dict], int | None]:
     """The peers to render, and how many the limit hid.
 
     Returns ``(rows, hidden)`` where ``hidden`` is 0 when nothing was dropped and
@@ -1766,10 +1831,19 @@ def _active_peers(db_path: Path, session_id: str) -> tuple[list[dict], int | Non
     """
     from genesis.db.crud.session_heartbeats import count_active_sync, get_active_sync
 
-    rows = get_active_sync(str(db_path), exclude_session=session_id, limit=_MAX_PEERS_SHOWN)
+    rows = get_active_sync(
+        str(db_path),
+        exclude_session=session_id,
+        limit=_MAX_PEERS_SHOWN,
+        deadline=deadline,
+    )
     if len(rows) < _MAX_PEERS_SHOWN:
         return rows, 0
-    total = count_active_sync(str(db_path), exclude_session=session_id)
+    total = count_active_sync(
+        str(db_path),
+        exclude_session=session_id,
+        deadline=deadline,
+    )
     return rows, None if total is None else max(0, total - len(rows))
 
 
@@ -1800,6 +1874,8 @@ def _peer_closing_line(hidden: int | None) -> str:
 def _heartbeat_read_and_inject(
     db_path: Path,
     session_id: str,
+    *,
+    deadline: float | None = None,
 ) -> float:
     """Read concurrent sessions and print [Concurrent] tags. Returns elapsed ms."""
     hb_start = time.monotonic()
@@ -1807,7 +1883,7 @@ def _heartbeat_read_and_inject(
         return 0.0
 
     try:
-        active, hidden = _active_peers(db_path, session_id)
+        active, hidden = _active_peers(db_path, session_id, deadline=deadline)
 
         out = _writer()
         for s in active:
@@ -1884,9 +1960,20 @@ async def _run(prompt: str, session_id: str = "") -> None:
         for line in deferred_lines:
             out.emit(line, block="session-metadata")
 
+    deadline = time.monotonic() + _RUN_DEADLINE_S
+    loop_deadline = asyncio.get_running_loop().time() + max(
+        0.0,
+        deadline - time.monotonic(),
+    )
     try:
-        async with asyncio.timeout(_RUN_DEADLINE_S):
-            await _run_body(prompt, session_id, deferred_lines, _flush_deferred)
+        async with asyncio.timeout_at(loop_deadline):
+            await _run_body(
+                prompt,
+                session_id,
+                deferred_lines,
+                _flush_deferred,
+                deadline=deadline,
+            )
     except TimeoutError:
         return
     finally:
@@ -1898,21 +1985,41 @@ async def _run_body(
     session_id: str,
     deferred_lines: list[str],
     _flush_deferred: Callable[[], None],
+    *,
+    deadline: float | None = None,
 ) -> None:
     """Main async entry point."""
     start = time.monotonic()
 
     # ── Heartbeat ops (BEFORE memory recall — always complete) ─────
     heartbeat_ms = 0.0
-    heartbeat_ms += _heartbeat_write(_DB_PATH, session_id, prompt)
-    heartbeat_ms += _heartbeat_read_and_inject(_DB_PATH, session_id)
+    heartbeat_ms += _heartbeat_write(
+        _DB_PATH,
+        session_id,
+        prompt,
+        deadline=deadline,
+    )
+    if _deadline_expired(deadline):
+        return
+    heartbeat_ms += _heartbeat_read_and_inject(
+        _DB_PATH,
+        session_id,
+        deadline=deadline,
+    )
+    if _deadline_expired(deadline):
+        return
 
     keywords = _extract_keywords(prompt)
 
     # ── Session intent trail (runs on every message, even short ones) ─
     # Buffer these — memories print first (more actionable), then metadata.
     try:
-        trail_line = _update_and_format_trail(session_id, keywords, prompt)
+        trail_line = _update_and_format_trail(
+            session_id,
+            keywords,
+            prompt,
+            deadline=deadline,
+        )
         if trail_line:
             deferred_lines.append(trail_line)
     except Exception:
@@ -1930,6 +2037,8 @@ async def _run_body(
     # FTS terms; merged into the local keyword set for the degraded fallback.
     recent_files = _load_recent_files(session_id)
     file_keywords = _keywords_from_files(recent_files) if recent_files else []
+    if _deadline_expired(deadline):
+        return
 
     # off mode: session-local awareness only (heartbeat/trail already ran).
     if _HOOK_MODE == "off":
@@ -1970,9 +2079,12 @@ async def _run_body(
     # Self-heal: ensure knowledge_units has retrieved_count column (once)
     _SENTINEL = Path.home() / ".genesis" / ".knowledge_retrieved_count_migrated"
     if not _SENTINEL.exists():
-        _ensure_knowledge_retrieved_count(_DB_PATH)
+        _ensure_knowledge_retrieved_count(_DB_PATH, deadline=deadline)
         _SENTINEL.parent.mkdir(parents=True, exist_ok=True)
         _SENTINEL.touch(exist_ok=True)
+
+    if _deadline_expired(deadline):
+        return
 
     suppress_ids = _compute_suppress_ids(session_id)
     now_iso = datetime.now(UTC).isoformat()
@@ -1987,6 +2099,8 @@ async def _run_body(
             prompt, session_id, file_keywords, suppress_ids
         )
         server_ms = (time.monotonic() - _t_srv) * 1000
+        if _deadline_expired(deadline):
+            return
 
     if server_data is not None:
         # ── SERVER PATH: the engine owns recall, formatting, procedure
@@ -2014,7 +2128,11 @@ async def _run_body(
         code_hits: list[dict] = []
         if server_data.get("status") != "disabled":
             code_keywords = keywords + [k for k in file_keywords if k not in keywords]
-            for ch in _search_code_index(_DB_PATH, code_keywords)[:_MAX_RESULTS]:
+            for ch in _search_code_index(
+                _DB_PATH,
+                code_keywords,
+                deadline=deadline,
+            )[:_MAX_RESULTS]:
                 content = ch.get("content")
                 if content and _emit_tracked(out, content, "code-hints"):
                     code_hits.append(ch)
@@ -2047,10 +2165,21 @@ async def _run_body(
         embedding = server_data.get("embedding")
 
         _flush_deferred()
+        if _deadline_expired(deadline):
+            return
 
         ws_stats = _ws_measure(fused, session_id, surfaced_proc_id, now_iso, shadow=shadow)
+        if _deadline_expired(deadline):
+            return
         total_ms = (time.monotonic() - start) * 1000
-        _record_activity(_DB_PATH, total_ms, success=bool(fused))
+        _record_activity(
+            _DB_PATH,
+            total_ms,
+            success=bool(fused),
+            deadline=deadline,
+        )
+        if _deadline_expired(deadline):
+            return
         _record_detail(
             # On the server path the HOOK does zero local fts/vector search — the
             # server owns retrieval. Report 0/0 (fused_count + mode carry meaning);
@@ -2088,17 +2217,29 @@ async def _run_body(
         fallback_keywords,
         collection="episodic_memory",
         now_iso=now_iso,
+        deadline=deadline,
     )
+    if _deadline_expired(deadline):
+        return
     from genesis.memory.provenance import is_garbage
 
-    code_results = _search_code_index(_DB_PATH, fallback_keywords)
+    code_results = _search_code_index(
+        _DB_PATH,
+        fallback_keywords,
+        deadline=deadline,
+    )
+    if _deadline_expired(deadline):
+        return
     fused = [r for r in fts_results if not is_garbage(r.get("content", ""))][:_MAX_RESULTS]
     if len(fused) < _MAX_RESULTS and code_results:
         fused += code_results[: _MAX_RESULTS - len(fused)]
 
     if fused:
         output = _format_degraded(
-            fused, forced_local=(fallback_mode == "local"), reason=server_reason
+            fused,
+            forced_local=(fallback_mode == "local"),
+            reason=server_reason,
+            deadline=deadline,
         )
         # Unambiguous here, unlike the server path: _format_degraded renders the
         # whole set as ONE blob, so if that single emit does not land, NOTHING in
@@ -2107,6 +2248,8 @@ async def _run_body(
             fused = []
 
     _flush_deferred()
+    if _deadline_expired(deadline):
+        return
 
     # WS-3 gate 4 (injection) shadow record — DEGRADED PATH ONLY. The server
     # path emits server-side (mcp/memory/core.py::_proactive_impl); here the hook
@@ -2130,7 +2273,7 @@ async def _run_body(
                 )
             )
             if blockable:
-                conn = sqlite3.connect(str(_DB_PATH), timeout=2)
+                conn = _sqlite_connect(_DB_PATH, timeout=2, deadline=deadline)
                 try:
                     record_would_block_sync(
                         conn,
@@ -2144,9 +2287,20 @@ async def _run_body(
         except Exception as exc:
             print(f"Immunity shadow emit skipped: {exc}", file=sys.stderr)
 
+    if _deadline_expired(deadline):
+        return
     ws_stats = _ws_measure(fused, session_id, None, now_iso, shadow=None)
+    if _deadline_expired(deadline):
+        return
     total_ms = (time.monotonic() - start) * 1000
-    _record_activity(_DB_PATH, total_ms, success=bool(fused))
+    _record_activity(
+        _DB_PATH,
+        total_ms,
+        success=bool(fused),
+        deadline=deadline,
+    )
+    if _deadline_expired(deadline):
+        return
     _record_detail(
         fts_count=len(fts_results),
         vector_count=0,
