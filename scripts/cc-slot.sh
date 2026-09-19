@@ -38,14 +38,14 @@ export LANG="${LANG:-C.UTF-8}"
 # following links before taking the parent keeps all of them on the same repo.
 _CC_SLOT_SCRIPT="${BASH_SOURCE[0]}"
 while [ -L "$_CC_SLOT_SCRIPT" ]; do
-    _CC_SLOT_DIR="$(cd -P "$(dirname "$_CC_SLOT_SCRIPT")" 2>/dev/null && pwd)"
+    _CC_SLOT_DIR="$(cd -P "$(dirname "$_CC_SLOT_SCRIPT")" >/dev/null 2>&1 && pwd)"
     _CC_SLOT_TARGET="$(readlink "$_CC_SLOT_SCRIPT")"
     case "$_CC_SLOT_TARGET" in
         /*) _CC_SLOT_SCRIPT="$_CC_SLOT_TARGET" ;;
         *)  _CC_SLOT_SCRIPT="$_CC_SLOT_DIR/$_CC_SLOT_TARGET" ;;
     esac
 done
-_CC_SLOT_DIR="$(cd -P "$(dirname "$_CC_SLOT_SCRIPT")" 2>/dev/null && pwd)"
+_CC_SLOT_DIR="$(cd -P "$(dirname "$_CC_SLOT_SCRIPT")" >/dev/null 2>&1 && pwd)"
 GENESIS_ROOT="$(cd "$_CC_SLOT_DIR/.." 2>/dev/null && pwd)"
 unset _CC_SLOT_SCRIPT _CC_SLOT_DIR _CC_SLOT_TARGET
 SESSION_PREFIX="cc"
