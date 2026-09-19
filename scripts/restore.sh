@@ -698,7 +698,9 @@ PY
                 # offline boundary by other means can say so out loud rather
                 # than being refused.
                 #   auto  — uid 0, else `sudo -n`, else refuse (legacy behaviour)
-                #   plain — unprivileged scan; incomplete visibility refuses
+                #   plain — unprivileged scan; refuses when the scan REPORTS an
+                #           error, and refuses outright where procfs is mounted
+                #           with hidepid (where it cannot see every PID at all)
                 #   sudo  — require `sudo -n`; refuse if unavailable
                 #   none  — skip the scan; AUTHORITATIVE-BOUNDARY ASSUMED
                 _HOLDER_SCAN_MODE="${GENESIS_RESTORE_HOLDER_SCAN:-auto}"
@@ -721,13 +723,32 @@ PY
                     _HOLDER_RC=0
                     case "$_HOLDER_SCAN_MODE" in
                     plain)
-                        _HOLDER_OUT=$(find /proc/[0-9]*/fd -lname "$DB_FILE*" -print 2>/dev/null) \
-                            || _HOLDER_RC=$?
+                        # An unprivileged glob silently OMITS hidepid-hidden PID
+                        # directories, and find then exits 0 over the visible
+                        # subset — so "no error" is NOT "complete visibility" and
+                        # the guard would pass with a holder it cannot see. Under
+                        # hidepid this mode cannot deliver what it claims, so it
+                        # refuses rather than returning a clean-looking result.
+                        if grep -qE 'hidepid=[12]' /proc/mounts 2>/dev/null; then
+                            _HOLDER_RC=2
+                        else
+                            _HOLDER_OUT=$(find /proc/[0-9]*/fd -lname "$DB_FILE*" -print 2>/dev/null) \
+                                || _HOLDER_RC=$?
+                        fi
                         ;;
                     sudo)
                         if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-                            _HOLDER_OUT=$(sudo -n find /proc/[0-9]*/fd -lname "$DB_FILE*" -print 2>/dev/null) \
-                                || _HOLDER_RC=$?
+                            # The glob MUST expand inside the privileged shell.
+                            # `sudo find /proc/[0-9]*/fd ...` expands the bracket
+                            # in the CALLER, before sudo starts — so under
+                            # procfs `hidepid=2` the hidden PID directories are
+                            # absent from find's operands, find succeeds over the
+                            # visible subset, and the guard passes while an
+                            # unseen holder exists. That is a fail-open in the
+                            # exact direction this guard exists to prevent.
+                            _HOLDER_OUT=$(sudo -n sh -c \
+                                'find /proc/[0-9]*/fd -lname "$1*" -print 2>/dev/null' \
+                                _ "$DB_FILE") || _HOLDER_RC=$?
                         else
                             _HOLDER_RC=2
                         fi
@@ -737,8 +758,12 @@ PY
                             _HOLDER_OUT=$(find /proc/[0-9]*/fd -lname "$DB_FILE*" -print 2>/dev/null) \
                                 || _HOLDER_RC=$?
                         elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-                            _HOLDER_OUT=$(sudo -n find /proc/[0-9]*/fd -lname "$DB_FILE*" -print 2>/dev/null) \
-                                || _HOLDER_RC=$?
+                            # Glob inside the privileged shell — see the `sudo`
+                            # branch above: expanding it in the caller omits
+                            # hidepid-hidden PIDs and turns the guard fail-open.
+                            _HOLDER_OUT=$(sudo -n sh -c \
+                                'find /proc/[0-9]*/fd -lname "$1*" -print 2>/dev/null' \
+                                _ "$DB_FILE") || _HOLDER_RC=$?
                         else
                             # No uid that can see every /proc/<pid>/fd, and no
                             # non-interactive elevation to borrow one. Retrying
@@ -795,7 +820,16 @@ ${_HOLDER_OUT}"
                 # pre-restore copy there is nowhere to move them, and removing
                 # them is the only way to stop the replay.
                 for _sidecar in wal shm; do
-                    [ -f "$DB_FILE-$_sidecar" ] || continue
+                    # "Any pathname present", not "a regular file": `-f` is FALSE
+                    # for a dangling symlink and for a directory, so a `-f` guard
+                    # silently skips them where the base's unconditional `rm -f`
+                    # cleared whatever was there. A left-behind dangling `-wal`
+                    # symlink is not inert — SQLite cannot create the sidecar
+                    # through a dangling target, so the restored service fails to
+                    # open for writes while the read-only final check passes.
+                    if [ ! -e "$DB_FILE-$_sidecar" ] && [ ! -L "$DB_FILE-$_sidecar" ]; then
+                        continue
+                    fi
                     if [ -n "$_PRE_RESTORE" ]; then
                         # A failed move must not exit before rolling back the ones
                         # already moved: the live main DB would be left present

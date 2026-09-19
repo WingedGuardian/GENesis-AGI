@@ -78,7 +78,7 @@ offline boundary and declare it (below).
 | value | behaviour |
 |---|---|
 | `auto` (default) | uid 0, else `sudo -n`, else refuse |
-| `plain` | unprivileged scan; incomplete visibility still refuses |
+| `plain` | unprivileged scan; refuses when the scan reports an error, and refuses outright where procfs is mounted with `hidepid` |
 | `sudo` | require `sudo -n`; refuse if unavailable |
 | `none` | **skip the scan entirely** — see the warning below |
 

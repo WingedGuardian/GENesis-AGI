@@ -18,6 +18,7 @@ under test; ``systemctl`` is stubbed (and records its calls).
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -762,6 +763,98 @@ def test_failed_swap_leaves_the_original_trio_intact(sandbox):
     )
 
 
+def test_elevated_scan_finds_a_holder_through_the_privileged_shell(sandbox):
+    """The elevated scan must glob INSIDE the privileged command.
+
+    ``sudo find /proc/[0-9]*/fd ...`` expands the bracket in the CALLER, before
+    sudo starts. Under procfs ``hidepid=2`` the hidden PID directories are then
+    absent from find's operands, find succeeds over the visible subset, and the
+    guard passes while an unseen holder exists — a fail-open in the exact
+    direction this guard exists to prevent.
+
+    ``sudo`` is a pass-through stub here, so ``sudo -n sh -c 'find ...'`` really
+    executes and the assertion is about the scan finding the holder, not about
+    the spelling of the command.
+    """
+    db = _seed_live_db(sandbox["gd"])
+    argv_log = sandbox["tmp"] / "sudo.argv"
+    _make_stub(
+        sandbox["bind"] / "sudo",
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$@" >> "{argv_log}"\n'
+        'args=("$@")\n'
+        '[ "${args[0]:-}" = "-n" ] && args=("${args[@]:1}")\n'
+        '[ "${args[0]:-}" = "true" ] && exit 0\n'
+        'exec "${args[@]}"\n',
+    )
+    holder = subprocess.Popen(
+        ["bash", "-c", 'exec 3<"$1"; sleep 60', "_", str(db)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        _wait_for_fd_holder(holder.pid, db)
+        proc = _run_restore(sandbox, scan_mode="sudo")
+        combined = proc.stdout + proc.stderr
+        assert "open process handles" in combined, (
+            "the elevated scan did not find a real holder — the privileged "
+            f"command form is not inspecting /proc correctly\n{combined}"
+        )
+        assert proc.returncode != 0, "a refused restore must not exit 0"
+    finally:
+        holder.kill()
+        holder.wait()
+
+    # The functional assertion above is a SMOKE test, not a binding one: on a
+    # host without procfs `hidepid` the unprivileged expansion sees every PID, so
+    # the correct form and the caller-expanded one both find the holder and it
+    # passes either way.
+    #
+    # Bind the PROPERTY, not the spelling. An earlier version of this test
+    # asserted `"sudo -n find /proc/" not in src` — a denylist of one spelling,
+    # which MEASURED green against `sudo -n /usr/bin/find /proc/[0-9]*/fd ...`,
+    # the identical fail-open re-spelled. What matters is that no
+    # ALREADY-EXPANDED PID path reaches the privileged layer: observe the argv
+    # sudo actually receives, which binds on every host.
+    argv = argv_log.read_text() if argv_log.exists() else ""
+    expanded = re.findall(r"/proc/\d+/fd", argv)
+    assert not expanded, (
+        f"a PID-expanded /proc operand reached the privileged layer "
+        f"({expanded[:3]}) — the glob expanded in the unprivileged caller, so "
+        "hidepid-hidden holders would be omitted and the guard would fail open"
+    )
+
+
+def test_dangling_sidecar_symlinks_are_cleared(sandbox):
+    """REGRESSION 2026-09-19: `-f` is FALSE for a dangling symlink.
+
+    The base cleared the sidecars with an unconditional ``rm -f``, which removes
+    a dangling symlink. A ``[ -f ... ] || continue`` guard skips it instead,
+    leaving the pathname in place. That is not inert: SQLite cannot create the
+    sidecar through a dangling target, so the restored service fails to open for
+    writes while the read-only final integrity check still passes.
+    """
+    _seed_live_db(sandbox["gd"])
+    data = sandbox["gd"] / "data"
+    for suf in ("-wal", "-shm"):
+        p = data / f"genesis.db{suf}"
+        p.unlink()
+        p.symlink_to("/nonexistent/target")
+    assert not (data / "genesis.db-wal").exists(), "fixture is not dangling"
+    assert (data / "genesis.db-wal").is_symlink(), "fixture is not a symlink"
+
+    proc = _run_restore(sandbox)
+
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, f"{combined}"
+    for suf in ("-wal", "-shm"):
+        p = data / f"genesis.db{suf}"
+        assert not p.is_symlink() and not p.exists(), (
+            f"a dangling genesis.db{suf} symlink survived the swap — SQLite "
+            f"cannot create the sidecar through a dangling target\n{combined}"
+        )
+
+
 def test_failed_second_move_back_restores_the_first_sidecar(sandbox):
     """REGRESSION 2026-09-19: a failure in the MOVE-ASIDE phase must roll back.
 
@@ -792,6 +885,16 @@ def test_failed_second_move_back_restores_the_first_sidecar(sandbox):
 
     combined = proc.stdout + proc.stderr
     assert proc.returncode != 0, f"a failed move-aside must die\n{combined}"
+    # Pin the FAILURE SITE, not only the outcome. Measured: injecting a `die`
+    # before the move-aside loop leaves every other assertion here GREEN, because
+    # nothing was touched and the trio is trivially intact — the same vacuity
+    # this file's `_run_restore` docstring warns about.
+    assert "could not move the live shm aside" in combined, (
+        f"the run did not fail in the move-aside phase\n{combined}"
+    )
+    assert not list(data.glob("genesis.db.pre-restore.*-wal")), (
+        "the WAL was left aside instead of moved back"
+    )
     assert db.exists(), "the live main database was lost"
     assert wal.exists(), (
         f"the WAL was moved aside and NOT moved back — the live database is de-fanged\n{combined}"
