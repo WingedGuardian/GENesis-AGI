@@ -878,4 +878,8 @@ jobs:
         # The base is deliberately NOT re-derived from the merged tree: this is
         # a FLOOR, so a lagging base is conservative and can only under-catch,
         # never go falsely red.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23298
+        #
+        # MERGE UNION with the dashboard CSS-isolation suite: main's 23298 plus
+        # 76 collected (--collect-only on the merged tree, tinycss2 installed)
+        # in the two new test_dashboard files this PR adds = 23374.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23374
