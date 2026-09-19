@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GENESIS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Resolve the MAIN worktree root ONCE — used for BOTH the venv fallback and the
@@ -27,7 +27,7 @@ GENESIS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 _common_dir="$(cd "$GENESIS_ROOT" 2>/dev/null && env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR git rev-parse --git-common-dir 2>/dev/null)" || _common_dir=""
 MAIN_ROOT=""
 if [[ -n "$_common_dir" ]]; then
-    MAIN_ROOT="$(cd "$GENESIS_ROOT" 2>/dev/null && cd "$(dirname "$_common_dir")" 2>/dev/null && pwd)" || MAIN_ROOT=""
+    MAIN_ROOT="$(unset CDPATH; cd "$GENESIS_ROOT" 2>/dev/null && cd "$(dirname "$_common_dir")" 2>/dev/null && pwd)" || MAIN_ROOT=""
 fi
 # Trust MAIN_ROOT only if it actually looks like a Genesis checkout. A
 # `--separate-git-dir` clone makes `--git-common-dir` point at external metadata

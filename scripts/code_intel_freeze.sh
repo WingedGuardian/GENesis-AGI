@@ -49,7 +49,7 @@ fi
 REPO_PATH="${1:-}"
 if [ -z "$REPO_PATH" ]; then
     # Default to the repo this script ships in (scripts/ -> repo root).
-    REPO_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+    REPO_PATH="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 fi
 if [ ! -d "$REPO_PATH" ]; then
     printf '[code-intel-freeze] ERROR: repo path not a directory: %s\n' "$REPO_PATH" >&2
@@ -57,7 +57,7 @@ if [ ! -d "$REPO_PATH" ]; then
 fi
 # Physical path — the per-repo lock is keyed on it (must match the entrypoint's
 # `cd && pwd -P`, so a symlinked spelling maps to the same lock).
-REPO_PATH="$(cd "$REPO_PATH" && pwd -P)"
+REPO_PATH="$(unset CDPATH; cd "$REPO_PATH" && pwd -P)"
 
 GENESIS_HOME="${GENESIS_HOME:-$HOME/.genesis}"
 LOCK_DIR="$GENESIS_HOME/locks"

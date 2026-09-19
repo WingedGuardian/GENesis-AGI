@@ -122,7 +122,7 @@ if [ -z "${TMPDIR:-}" ]; then
 fi
 
 # ── Path setup ───────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_PATH="${VENV_PATH:-$REPO_DIR/.venv}"
 SECRETS_FILE="${SECRETS_PATH:-$REPO_DIR/secrets.env}"

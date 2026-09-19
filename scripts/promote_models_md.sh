@@ -34,7 +34,7 @@ if [ -z "${HOME:-}" ]; then
     export HOME
 fi
 
-REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+REPO_ROOT="$(unset CDPATH; cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 OVERLAY="${GENESIS_OUTPUT_DIR:-$HOME/.genesis/output}/models.md"
 TRACKED="$REPO_ROOT/docs/reference/models.md"
 

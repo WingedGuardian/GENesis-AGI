@@ -60,7 +60,7 @@ if [ -z "${HOME:-}" ]; then
     export HOME
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 VENV_PY="$REPO_DIR/.venv/bin/python"

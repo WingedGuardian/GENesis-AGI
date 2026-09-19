@@ -39,7 +39,7 @@ fi
 #
 # Returns non-zero (emitting nothing) when it cannot scrub, which the caller
 # turns into a withheld-tail marker. It must NEVER pass input through on error.
-_CC_HOOKS_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/hooks"
+_CC_HOOKS_DIR="$(unset CDPATH; cd "$(dirname "$0")" 2>/dev/null && pwd)/hooks"
 
 _cc_scrub_stdin() {
     [ -r "${_CC_HOOKS_DIR}/secret_scrub.py" ] || return 1

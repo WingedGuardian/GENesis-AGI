@@ -38,7 +38,7 @@ OOM_LOG="$(dirname "$LOG_FILE")/oom_events.log"
 # Durable alert queue (F.3) — emergency-tier events page Telegram via the
 # container drainer. Guarded: if the lib is ever not co-located, degrade to a
 # no-op so `set -e` can never take the service down over an alert.
-_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$_SCRIPT_DIR/lib/alert_queue.sh" ]]; then
     # shellcheck source=scripts/lib/alert_queue.sh
     source "$_SCRIPT_DIR/lib/alert_queue.sh"

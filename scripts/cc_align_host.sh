@@ -35,7 +35,7 @@ if [ -z "${HOME:-}" ]; then
     export HOME
 fi
 
-GENESIS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GENESIS_ROOT="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CC_ENV="$GENESIS_ROOT/scripts/lib/cc_version.sh"
 VENV_PY="$GENESIS_ROOT/.venv/bin/python"
 GUARDIAN_CONFIG="$HOME/.genesis/guardian_remote.yaml"

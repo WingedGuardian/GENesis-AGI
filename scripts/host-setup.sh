@@ -619,7 +619,7 @@ echo "  + limits.memory.swap enabled (memory spikes degrade into swap, not thras
 # has memory.swap.max=0 until a restart — the setting silently no-ops meanwhile.
 # Activate it live now so swap works without a disruptive restart.
 # shellcheck source=lib/container_swap.sh
-. "$(cd "$(dirname "$0")" && pwd)/lib/container_swap.sh"
+. "$(unset CDPATH; cd "$(dirname "$0")" && pwd)/lib/container_swap.sh"
 container_swap_activate_live "$CONTAINER_NAME"
 if [ -z "$(swapon --noheadings --show 2>/dev/null)" ]; then
     echo "  WARNING: this host has NO swap — limits.memory.swap has nothing to swap to."
@@ -682,7 +682,7 @@ fi
 # session, so it applies immediately; on a busy retrofit the lib skips (it won't
 # attach over a live session) and a later apply converges.
 # shellcheck source=lib/cc_tmp_volume.sh
-. "$(cd "$(dirname "$0")" && pwd)/lib/cc_tmp_volume.sh"
+. "$(unset CDPATH; cd "$(dirname "$0")" && pwd)/lib/cc_tmp_volume.sh"
 CCTMPVOL_CONTAINER="$CONTAINER_NAME"
 cc_tmp_volume_apply
 
@@ -1110,7 +1110,7 @@ echo "  Writing network identity into ~/.claude/CLAUDE.md..."
 # available, using the shared builder so the format can't drift from
 # update.sh's in-container refresh (which rewrites this block every run).
 # shellcheck source=lib/claude_md_blocks.sh
-. "$(cd "$(dirname "$0")" && pwd)/lib/claude_md_blocks.sh"
+. "$(unset CDPATH; cd "$(dirname "$0")" && pwd)/lib/claude_md_blocks.sh"
 _NET_LINES="$(build_network_identity_block \
     "$CONTAINER_IPV4" "$CONTAINER_IPV6" "$HOST_IPV4" "$HOST_IPV6" "$TS_IPV4")"
 
@@ -1177,7 +1177,7 @@ echo ""
 
 # Run install_guardian.sh from the LOCAL checkout (this repo).
 # install_guardian.sh copies code from its parent dir into ~/.local/share/genesis-guardian.
-_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+_SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
 _guardian_script="$_SCRIPT_DIR/install_guardian.sh"
 if [ -f "$_guardian_script" ]; then
     _guardian_flags="--container-name $CONTAINER_NAME"

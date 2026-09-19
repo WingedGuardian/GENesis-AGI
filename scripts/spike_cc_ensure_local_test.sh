@@ -30,7 +30,7 @@ PASS=0
 FAIL=0
 FAIL_DETAILS=()
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
 CC_ENV="$SCRIPT_DIR/lib/cc_version.sh"
 mkdir -p "$HOME/tmp"   # NEVER the default $TMPDIR (= CC's watchgod-policed cc-tmp)
 SANDBOX="$(mktemp -d -p "$HOME/tmp" cc_ensure_test.XXXXXX)"
