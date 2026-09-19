@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 def _sync_timeout(timeout: float, deadline: float | None) -> float:
+    """Cap a synchronous SQLite timeout at the remaining run deadline."""
     if deadline is None:
         return timeout
     remaining = deadline - time.monotonic()
@@ -27,6 +28,7 @@ def _sync_timeout(timeout: float, deadline: float | None) -> float:
 
 
 def _install_deadline_handler(conn: sqlite3.Connection, deadline: float | None) -> None:
+    """Interrupt SQLite query work once the optional deadline expires."""
     if deadline is not None:
         conn.set_progress_handler(
             lambda: 1 if time.monotonic() >= deadline else 0,

@@ -224,6 +224,7 @@ class _RunBudgetExpired(RuntimeError):
 
 
 def _deadline_expired(deadline: float | None) -> bool:
+    """Return whether the monotonic run deadline has elapsed."""
     return deadline is not None and time.monotonic() >= deadline
 
 
@@ -1952,6 +1953,7 @@ async def _run(prompt: str, session_id: str = "") -> None:
     flushed = False
 
     def _flush_deferred() -> None:
+        """Emit buffered session metadata at most once."""
         nonlocal flushed
         if flushed:
             return

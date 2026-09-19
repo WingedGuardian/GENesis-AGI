@@ -19,10 +19,14 @@ import proactive_memory_hook as hook  # noqa: E402
 
 
 class _RecordingWriter:
+    """Collect emitted hook lines for assertions."""
+
     def __init__(self) -> None:
+        """Initialize an empty emission record."""
         self.lines: list[tuple[str, str]] = []
 
     def emit(self, text: str, *, block: str) -> None:
+        """Record one emitted line and its output block."""
         self.lines.append((text, block))
 
 
@@ -36,6 +40,7 @@ async def test_run_flushes_deferred_lines_when_recall_exceeds_total_budget(
     db_path.touch()
 
     async def _slow_server(*_args, **_kwargs):
+        """Simulate server recall that exceeds the aggregate deadline."""
         await asyncio.sleep(0.25)
         return None, "slow recall"
 
@@ -78,10 +83,12 @@ async def test_local_mode_stops_after_blocking_sync_phase_exhausts_deadline(
     code_calls: list[bool] = []
 
     def _blocking_fts(*_args, **_kwargs):
+        """Simulate synchronous FTS work that overruns the deadline."""
         time.sleep(0.05)
         return []
 
     def _code_search(*_args, **_kwargs):
+        """Record whether a later code-search phase was reached."""
         code_calls.append(True)
         time.sleep(0.2)
         return []
@@ -117,6 +124,7 @@ async def test_local_mode_stops_after_blocking_sync_phase_exhausts_deadline(
 
 
 def test_knowledge_migration_adds_missing_column(tmp_path: Path) -> None:
+    """A missing retrieved-count column is added and reported as successful."""
     db_path = tmp_path / "genesis.db"
     with sqlite3.connect(db_path) as conn:
         conn.execute("CREATE TABLE knowledge_units (id INTEGER PRIMARY KEY)")
@@ -129,6 +137,7 @@ def test_knowledge_migration_adds_missing_column(tmp_path: Path) -> None:
 
 
 def test_knowledge_migration_accepts_duplicate_column(tmp_path: Path) -> None:
+    """An already-applied migration remains an idempotent success."""
     db_path = tmp_path / "genesis.db"
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -142,11 +151,17 @@ def test_knowledge_migration_accepts_duplicate_column(tmp_path: Path) -> None:
 def test_knowledge_migration_propagates_interrupted_alter(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """An interrupted ALTER TABLE is not mistaken for a duplicate column."""
+
     class _InterruptedConnection:
+        """Minimal connection double that interrupts the migration statement."""
+
         def execute(self, _sql: str) -> None:
+            """Raise the SQLite interruption reported by the progress handler."""
             raise sqlite3.OperationalError("interrupted")
 
         def close(self) -> None:
+            """Match the connection cleanup interface."""
             pass
 
     monkeypatch.setattr(
