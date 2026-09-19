@@ -60,6 +60,40 @@ guard remains in force for non-quarantined databases.
 If restore cannot determine that quarantine state (for example, the integrity
 checker cannot start), it aborts instead of treating the database as healthy.
 
+### Restore preconditions and the holder scan
+
+Database-only recovery refuses unless it can establish that no process still
+holds the database. Before replacing anything, `restore.sh` scans
+`/proc/<pid>/fd` for open handles on the live database and its sidecars.
+
+That scan needs visibility the invoking uid may not have: an unreadable
+`/proc/<pid>/fd` entry is an **unknown** holder, not an absent one, so the scan
+borrows authority — as uid 0, or via non-interactive `sudo` when available.
+With neither, the restore **refuses** rather than assuming no holder exists.
+Provide passwordless `sudo` for the scan, run as root, or establish a verified
+offline boundary and declare it (below).
+
+`GENESIS_RESTORE_HOLDER_SCAN` selects the mode:
+
+| value | behaviour |
+|---|---|
+| `auto` (default) | uid 0, else `sudo -n`, else refuse |
+| `plain` | unprivileged scan; incomplete visibility still refuses |
+| `sudo` | require `sudo -n`; refuse if unavailable |
+| `none` | **skip the scan entirely** — see the warning below |
+
+> **`none` removes the only holder check on this path.** It does not bypass the
+> quarantine marker, the staged-candidate validation, or the post-install
+> verification — but it *does* drop the check that no process holds the database
+> while it is replaced. Use it only when exclusion is established by other means,
+> such as a verified offline boundary; it exists so an operator who genuinely has
+> that boundary can proceed deliberately rather than being refused. It is not a
+> convenience switch for a busy machine.
+
+The scan is a **supplementary guard, never exclusion**: it cannot by itself
+prevent a holder appearing between inspection and replacement. Exclusion comes
+from whatever keeps holders out — not from this scan.
+
 ## During Migration Work
 
 1. Keep Genesis changes on a dedicated hardening branch.

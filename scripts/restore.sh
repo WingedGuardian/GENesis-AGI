@@ -643,27 +643,217 @@ PY
                 # marker is established before this scan, so all shared open
                 # paths refuse from here onward; any already-open handle would
                 # keep writing the old inode/WAL after swap and is fatal.
-                if find /proc/[0-9]*/fd -lname "$DB_FILE*" -print -quit \
-                    2>/dev/null | grep -q .; then
-                    die "SQLite database still has open process handles after server stop — quarantine retained"
+                #
+                # Output and exit status are captured SEPARATELY, and BOTH are
+                # refusals. The previous form — `find ... | grep -q .` under
+                # `set -o pipefail` — reported find's status, so any unreadable
+                # /proc entry (routine: other-uid processes are not inspectable
+                # from here) discarded grep's success and the guard could not
+                # fire at all. Measured with a guaranteed match, it still went
+                # silent: a no-op guard on any real box, in the one place built
+                # to prevent the corruption that took production down.
+                #
+                # An inspection that could not complete establishes NOTHING, so
+                # it refuses rather than warning. Descriptors are inherited and
+                # passable (SCM_RIGHTS), so no property of the current file
+                # narrows the holder set for us — visibility must be resolved
+                # operationally, by an inspector with sufficient authority or a
+                # verified offline boundary, and never assumed.
+                # Conclusive visibility needs AUTHORITY, not just a scan: from
+                # an unprivileged uid, /proc/<pid>/fd is unreadable for other-uid
+                # processes (measured here: 21 of 83 fd dirs), so a plain scan
+                # cannot tell "no holder" from "could not look". The narrow
+                # privileged read-only `find` below closes that gap — ONLY the
+                # scan is privileged; the restore itself never runs as root.
+                # Measured: as root, 0 of 86 fd dirs are unreadable and the scan
+                # exits clean. Without a way to inspect conclusively we refuse,
+                # because an unseen process is an UNKNOWN holder, not an absent
+                # one. Descriptors are inherited and passable (SCM_RIGHTS), so no
+                # property of the file narrows the holder set for us.
+                # Accept ONLY a complete scan: no holders AND no inspection
+                # errors. A pid vanishing between the glob and the traversal
+                # makes find exit nonzero, so a single attempt refuses roughly
+                # 1 in 10 legitimate restores on a healthy box (measured). We
+                # retry a bounded number of times rather than classifying error
+                # text: the wording differs between find implementations (this
+                # box's is bfs) and inferring permission-to-proceed from a
+                # message is exactly the fragility to avoid.
+                #
+                # HOLDERS ARE CHECKED FIRST, and a holder refuses regardless of
+                # any error reported alongside it — an incomplete scan that DID
+                # see a handle is still conclusive about that handle.
+                #
+                # Attempts are sized against a measured failure rate, not
+                # picked: a single scan refused ~1 in 10 times on an idle box,
+                # and a 3-attempt bound still failed during a full test suite
+                # where subprocess churn is heavy. 5 leaves a residual that is
+                # rare enough to be acceptable for a supplementary guard, and
+                # the cost is ~1s per retry, only on the failing path.
+                # Scan-mode seam. Default `auto` borrows the same authority as
+                # before; the other modes exist so a test can drive a branch
+                # explicitly instead of inheriting the host's sudoers (a suite
+                # gated on the host's privilege environment passes where sudo
+                # exists and silently stops exercising the guard where it does
+                # not), and so an operator who has established a verified
+                # offline boundary by other means can say so out loud rather
+                # than being refused.
+                #   auto  — uid 0, else `sudo -n`, else refuse (legacy behaviour)
+                #   plain — unprivileged scan; incomplete visibility refuses
+                #   sudo  — require `sudo -n`; refuse if unavailable
+                #   none  — skip the scan; AUTHORITATIVE-BOUNDARY ASSUMED
+                _HOLDER_SCAN_MODE="${GENESIS_RESTORE_HOLDER_SCAN:-auto}"
+                _HOLDER_ATTEMPTS=5
+                _HOLDER_ATTEMPT=0
+                _HOLDER_OUT=""
+                _HOLDER_RC=1
+                if [ "$_HOLDER_SCAN_MODE" = "none" ]; then
+                    # `log`, not `warn`: warn() appends to _FAILURES, which makes
+                    # the whole restore exit non-zero. Skipping the scan is an
+                    # explicit operator choice, not a failure of the run.
+                    log "SQLite: live-handle scan SKIPPED (GENESIS_RESTORE_HOLDER_SCAN=none). Sound only when exclusion is established by other means (a verified offline boundary); this scan is a supplementary guard, never exclusion."
+                    _HOLDER_RC=0
+                    _HOLDER_ATTEMPT=0
+                fi
+                while [ "$_HOLDER_SCAN_MODE" != "none" ] \
+                    && [ "$_HOLDER_ATTEMPT" -lt "$_HOLDER_ATTEMPTS" ]; do
+                    _HOLDER_ATTEMPT=$((_HOLDER_ATTEMPT + 1))
+                    _HOLDER_OUT=""
+                    _HOLDER_RC=0
+                    case "$_HOLDER_SCAN_MODE" in
+                    plain)
+                        _HOLDER_OUT=$(find /proc/[0-9]*/fd -lname "$DB_FILE*" -print 2>/dev/null) \
+                            || _HOLDER_RC=$?
+                        ;;
+                    sudo)
+                        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+                            _HOLDER_OUT=$(sudo -n find /proc/[0-9]*/fd -lname "$DB_FILE*" -print 2>/dev/null) \
+                                || _HOLDER_RC=$?
+                        else
+                            _HOLDER_RC=2
+                        fi
+                        ;;
+                    auto)
+                        if [ "$(id -u)" -eq 0 ]; then
+                            _HOLDER_OUT=$(find /proc/[0-9]*/fd -lname "$DB_FILE*" -print 2>/dev/null) \
+                                || _HOLDER_RC=$?
+                        elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+                            _HOLDER_OUT=$(sudo -n find /proc/[0-9]*/fd -lname "$DB_FILE*" -print 2>/dev/null) \
+                                || _HOLDER_RC=$?
+                        else
+                            # No uid that can see every /proc/<pid>/fd, and no
+                            # non-interactive elevation to borrow one. Retrying
+                            # cannot fix this, but the retry loop is bounded and
+                            # this branch simply exhausts it and refuses.
+                            _HOLDER_RC=2
+                        fi
+                        ;;
+                    *)
+                        die "unknown GENESIS_RESTORE_HOLDER_SCAN='${_HOLDER_SCAN_MODE}' (expected auto|plain|sudo|none) — quarantine retained"
+                        ;;
+                    esac
+                    if [ -n "$_HOLDER_OUT" ] || [ "$_HOLDER_RC" -eq 0 ]; then
+                        break
+                    fi
+                    [ "$_HOLDER_ATTEMPT" -lt "$_HOLDER_ATTEMPTS" ] && sleep 1
+                done
+                if [ -n "$_HOLDER_OUT" ]; then
+                    die "SQLite database still has open process handles after server stop — quarantine retained:
+${_HOLDER_OUT}"
+                fi
+                if [ "$_HOLDER_RC" -ne 0 ]; then
+                    die "SQLite holder inspection could NOT be completed conclusively after ${_HOLDER_ATTEMPT} attempt(s) (last rc=${_HOLDER_RC}) — refusing rather than assuming no holder exists. An unreadable /proc/<pid>/fd is an UNKNOWN holder, not an absent one. Resolve visibility (run this restore as a uid that can read every /proc/<pid>/fd, or provide passwordless sudo for the scan) or establish a verified offline boundary, then re-run. This scan is a supplementary guard, NOT exclusion: it cannot by itself prevent a new holder appearing between inspection and replacement. Quarantine retained."
                 fi
 
                 sync -f "$_DB_STAGE"
                 _PRE_RESTORE=""
+                _MOVED_WAL=false
+                _MOVED_SHM=false
+                _REMOVED_WAL=false
+                _REMOVED_SHM=false
                 if [ -f "$DB_FILE" ]; then
                     _PRE_RESTORE="${DB_FILE}.pre-restore.$(date +%s)"
                     # Hard-link the quiesced main file so DB_FILE remains valid
-                    # until the candidate's single atomic rename. Preserve raw
-                    # sidecars before removing them from the live basename.
+                    # until the candidate's single atomic rename.
                     ln "$DB_FILE" "$_PRE_RESTORE" \
                         || die "could not preserve pre-restore database — quarantine retained"
-                    if [ -f "$DB_FILE-wal" ]; then cp -p "$DB_FILE-wal" "${_PRE_RESTORE}-wal"; fi
-                    if [ -f "$DB_FILE-shm" ]; then cp -p "$DB_FILE-shm" "${_PRE_RESTORE}-shm"; fi
-                    log "SQLite: preserved raw pre-restore DB/WAL/SHM → $_PRE_RESTORE*"
                 fi
-                rm -f "$DB_FILE-wal" "$DB_FILE-shm"
-                mv "$_DB_STAGE" "$DB_FILE" \
-                    || die "SQLite atomic replacement failed; live DB remains available and quarantine is retained"
+                # The sidecars are cleared REGARDLESS of whether a pre-restore
+                # copy was taken. This is not a detail: a stale WAL surviving the
+                # rename REPLAYS onto the restored database, replacing its pages
+                # with the old database's — and it does so SILENTLY, because the
+                # result is self-consistent, so the post-install integrity check
+                # passes and the restore reports success. Sharing the
+                # `[ -f "$DB_FILE" ]` guard above would skip this whole block
+                # exactly when the main file is absent or is not a regular file,
+                # which is the case that needs it most.
+                #
+                # With somewhere to move them to, they are RENAMED ASIDE:
+                # a same-directory rename is atomic and preserves bytes exactly,
+                # so the failure path needs no copy and no verification, and a
+                # copy killed mid-write (measured: 1024 of 64189 bytes) can no
+                # longer leave a TRUNCATED sidecar at the live path. With no
+                # pre-restore copy there is nowhere to move them, and removing
+                # them is the only way to stop the replay.
+                for _sidecar in wal shm; do
+                    [ -f "$DB_FILE-$_sidecar" ] || continue
+                    if [ -n "$_PRE_RESTORE" ]; then
+                        mv "$DB_FILE-$_sidecar" "${_PRE_RESTORE}-${_sidecar}" \
+                            || die "could not move the live ${_sidecar} aside — quarantine retained"
+                        # Record the ACTION, not whether the destination now exists:
+                        # a stale artifact left at that path by an earlier run that
+                        # shared the same epoch second would otherwise read as "we
+                        # moved this one" and be moved back in its place.
+                        case "$_sidecar" in
+                        wal) _MOVED_WAL=true ;;
+                        shm) _MOVED_SHM=true ;;
+                        esac
+                    else
+                        rm -f "$DB_FILE-$_sidecar" \
+                            || die "could not remove the stale ${_sidecar} — quarantine retained"
+                        case "$_sidecar" in
+                        wal) _REMOVED_WAL=true ;;
+                        shm) _REMOVED_SHM=true ;;
+                        esac
+                    fi
+                done
+                if [ -n "$_PRE_RESTORE" ]; then
+                    _kept="DB"
+                    $_MOVED_WAL && _kept="${_kept}, WAL"
+                    $_MOVED_SHM && _kept="${_kept}, SHM"
+                    log "SQLite: preserved raw pre-restore artifacts (${_kept}) → $_PRE_RESTORE*"
+                fi
+                if $_REMOVED_WAL || $_REMOVED_SHM; then
+                    log "SQLite: no pre-restore main database (absent or not a regular file) — stale sidecars REMOVED, not moved aside, so a failed swap cannot move them back"
+                fi
+                # The sidecars were moved aside above, so the rename is the only
+                # remaining mutation. On failure each sidecar that was moved is
+                # moved BACK — a same-directory rename preserves bytes exactly,
+                # so there is nothing to copy and nothing to verify. Tracking is
+                # per-sidecar, so "there was nothing to restore" can never be
+                # reported as "restored and verified".
+                if ! mv "$_DB_STAGE" "$DB_FILE"; then
+                    _TRIO_OK=true
+                    if $_MOVED_WAL; then
+                        mv "${_PRE_RESTORE}-wal" "$DB_FILE-wal" 2>/dev/null || _TRIO_OK=false
+                    fi
+                    if $_MOVED_SHM; then
+                        mv "${_PRE_RESTORE}-shm" "$DB_FILE-shm" 2>/dev/null || _TRIO_OK=false
+                    fi
+                    if ! $_TRIO_OK; then
+                        die "SQLite atomic replacement failed AND a sidecar could not be moved back — the live DB is missing its WAL and/or SHM. Recover from ${_PRE_RESTORE:-<no pre-restore copy was taken>} before retrying. Quarantine retained."
+                    fi
+                    if $_MOVED_WAL || $_MOVED_SHM; then
+                        die "SQLite atomic replacement failed; the live DB and its sidecars were moved back into place unchanged — the live database is as it was. Quarantine retained."
+                    fi
+                    # Branch on what was RECORDED, not on the negation of the other
+                    # pair: `!(MOVED_WAL || MOVED_SHM)` does not imply there was no
+                    # pre-restore copy — a copy with no sidecars present leaves both
+                    # flags false, and that is the ordinary clean-shutdown shape.
+                    if $_REMOVED_WAL || $_REMOVED_SHM; then
+                        die "SQLite atomic replacement failed; there was no pre-restore copy, so the live -wal/-shm were REMOVED and cannot be restored. The live main database is as it was (absent or not a regular file) and now has no sidecars. Quarantine retained."
+                    fi
+                    die "SQLite atomic replacement failed; nothing was moved aside and nothing was removed, so the live database and its sidecars are as they were${_PRE_RESTORE:+ (pre-restore copy at ${_PRE_RESTORE})}. Quarantine retained."
+                fi
                 _DB_STAGE=""
                 sync -f "$DB_FILE"
                 sync -f "$(dirname "$DB_FILE")"

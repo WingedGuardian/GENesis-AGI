@@ -19,9 +19,11 @@ under test; ``systemctl`` is stubbed (and records its calls).
 import json
 import os
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -114,19 +116,68 @@ def _seed_backup(tmp_path: Path) -> Path:
     return bkp
 
 
-def _run_restore(sandbox, *extra_args: str):
+def _run_restore(sandbox, *extra_args: str, scan_mode: str = "none"):
+    """Run restore.sh hermetically.
+
+    ``scan_mode`` is passed explicitly so no test inherits the HOST's privilege
+    environment. The live-handle guard borrows authority (uid 0, else
+    ``sudo -n``); a suite that lets ``auto`` resolve means the guard's behaviour
+    under test depends on whether the machine running it happens to have
+    passwordless sudo. Measured: with a failing ``sudo`` on PATH, 11 of 19 tests
+    failed and one passed *vacuously* (it refused before reaching the swap, so
+    the bytes it asserted on were trivially unchanged). Tests that care about
+    the guard pass ``plain``/``sudo`` and drive that branch directly; the rest
+    use ``none``, which states that the guard is out of scope for them rather
+    than leaving it to resolve by accident.
+    """
     bkp = _seed_backup(sandbox["tmp"])
     env = dict(os.environ)
     env["HOME"] = str(sandbox["home"])
     env["GENESIS_DIR"] = str(sandbox["gd"])
     env["QDRANT_URL"] = "http://127.0.0.1:1"  # dead → Qdrant restore skips fast
     env["PATH"] = f"{sandbox['bind']}:{env['PATH']}"
+    env["GENESIS_RESTORE_HOLDER_SCAN"] = scan_mode
+    # An inherited off-site backend makes the suite attempt a real network pull
+    # and hang past the timeout, so the code under test is never reached.
+    env["GENESIS_BACKUP_TIER2_BACKEND"] = "none"
     return subprocess.run(
         ["bash", str(_RESTORE), "--from", str(bkp), "--force", *extra_args],
         env=env,
         capture_output=True,
         text=True,
         stdin=subprocess.DEVNULL,
+    )
+
+
+def _write_sudo_failing_then_ok(bind: Path, calls: Path, fail_times: int) -> None:
+    """A `sudo` whose FIND fails the first ``fail_times`` calls, then succeeds.
+
+    ``sudo`` is stubbed rather than ``find`` because sudo uses a secure PATH: a
+    PATH stub for find is bypassed and the guard silently succeeds, which is how
+    an earlier version of the incomplete-inspection test passed for entirely the
+    wrong reason. ``sudo -n true`` (the capability probe) always succeeds here so
+    the elevated branch is genuinely entered.
+    """
+    _make_stub(
+        bind / "sudo",
+        "#!/usr/bin/env bash\n"
+        'args=("$@")\n'
+        '[ "${args[0]:-}" = "-n" ] && args=("${args[@]:1}")\n'
+        '[ "${args[0]:-}" = "true" ] && exit 0\n'
+        f'n=$(cat "{calls}" 2>/dev/null || echo 0)\n'
+        f'if [ "$n" -lt {fail_times} ]; then echo $((n+1)) > "{calls}"; exit 1; fi\n'
+        # The success path forces rc 0. It deliberately does NOT exec the args:
+        # the stub runs unprivileged, and an unprivileged find over /proc exits
+        # non-zero on unreadable entries, so every attempt would fail by
+        # construction and the proceed path could never be exercised.
+        #
+        # This models "a scan that returns clean", NOT "a privileged scan": it
+        # says nothing about visibility, because an unprivileged scan on this box
+        # cannot produce rc 0 with empty output, so the stub's success state is
+        # not one the real unprivileged path reaches. The tests using this stub
+        # bind the retry bound and the rc capture; they do not test visibility.
+        '"${args[@]}" >/dev/null 2>&1 || true\n'
+        "exit 0\n",
     )
 
 
@@ -153,6 +204,98 @@ def test_restore_clears_stale_wal_shm(sandbox):
     assert not (sandbox["gd"] / "data" / "genesis.db-shm").exists(), "stale -shm not removed"
     out = subprocess.run(["sqlite3", str(db), "SELECT x FROM t;"], capture_output=True, text=True)
     assert out.stdout.strip() == "42", f"DB not restored from backup dump: {out.stdout!r}"
+
+
+def _capture_replayable_wal(tmp_path: Path) -> bytes:
+    """Bytes of a REAL, uncheckpointed WAL — one that actually replays.
+
+    ``_seed_live_db`` writes literal ASCII into the sidecars, and ASCII is not a
+    WAL, so it cannot replay: a test using it exercises file EXISTENCE only, never
+    the replay that the clearing exists to prevent. This captures a genuine WAL
+    by opening a WAL-mode database at a different path, committing, and reading
+    ``-wal`` while the connection is still open.
+    """
+    src = tmp_path / "foreign.db"
+    for suf in ("", "-wal", "-shm"):
+        Path(str(src) + suf).unlink(missing_ok=True)
+    conn = sqlite3.connect(str(src))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE t(x)")
+    conn.executemany("INSERT INTO t(x) VALUES(?)", [(1,), (999,)])
+    conn.commit()
+    try:
+        return Path(str(src) + "-wal").read_bytes()
+    finally:
+        conn.close()
+
+
+def test_stale_sidecars_cleared_when_main_db_is_absent(sandbox):
+    """REGRESSION 2026-09-19: sidecar clearing must NOT be conditional on the
+    main database existing.
+
+    A stale WAL surviving the swap REPLAYS onto the restored database, replacing
+    its pages with the old database's — and does so SILENTLY, because the result
+    is self-consistent: the post-install integrity check passes and the restore
+    reports success. The base script cleared the sidecars unconditionally; a
+    revision of this fix nested that clearing inside ``[ -f "$DB_FILE" ]``, which
+    skips it whenever that test is false: the main file absent, a dangling
+    symlink, a symlink to a directory, or a directory at that path. (``test -f``
+    FOLLOWS symlinks — it is true for a symlink to a regular file — so the
+    accurate statement is "not a regular file", which is what the script's own
+    comment says.)
+
+    Measured on that revision: rc=0, "Restore complete", and a live database
+    holding the FOREIGN database's rows instead of the backup's.
+
+    ``_seed_live_db`` always creates the main database, so no other test can
+    express this input — the gap was structurally invisible to the suite.
+
+    Two assertions, doing different jobs. The EXISTENCE assertion is the one that
+    bites for the ordering bug: a surviving `-wal` is the failure. The CONTENT
+    assertion is a second net for the outcome — file existence alone cannot
+    distinguish "cleared" from "replayed" — and to be meaningful it needs a WAL
+    that can actually replay, which is why the fixture captures a real one. (The
+    suite's other sidecar fixture writes literal ASCII, which is not a WAL and
+    cannot replay, so a test built on it can only exercise existence.)
+    """
+    db = _seed_live_db(sandbox["gd"])
+    data = sandbox["gd"] / "data"
+    real_wal = _capture_replayable_wal(sandbox["tmp"])
+
+    # NEGATIVE CONTROL: prove THIS wal really replays, so the content assertion
+    # below cannot be vacuous. The old ASCII fixture could not replay at all, so
+    # a test built on it exercised file existence and nothing else.
+    control = sandbox["tmp"] / "control.db"
+    subprocess.run(
+        ["sqlite3", str(control), "CREATE TABLE t(x); INSERT INTO t VALUES(42);"],
+        check=True,
+        capture_output=True,
+    )
+    Path(str(control) + "-wal").write_bytes(real_wal)
+    ctl = subprocess.run(
+        ["sqlite3", str(control), "SELECT x FROM t;"], capture_output=True, text=True
+    )
+    assert "999" in ctl.stdout, (
+        f"the control WAL does not replay ({ctl.stdout!r}) — this test would be "
+        "vacuous, so fix the fixture before trusting a pass below"
+    )
+
+    db.unlink()  # the precondition: no main database, sidecars present
+    (data / "genesis.db-wal").write_bytes(real_wal)
+
+    proc = _run_restore(sandbox)
+
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert not (data / "genesis.db-wal").exists(), (
+        "a stale -wal survived the swap with no main DB present — it replays onto "
+        "the restored database"
+    )
+    assert not (data / "genesis.db-shm").exists(), "a stale -shm survived the swap"
+    out = subprocess.run(["sqlite3", str(db), "SELECT x FROM t;"], capture_output=True, text=True)
+    assert out.stdout.strip() == "42", (
+        f"the restored database is not the backup's content: {out.stdout!r} — a stale "
+        "WAL has replayed over it"
+    )
 
 
 def test_database_only_restore_skips_every_non_database_payload(sandbox):
@@ -451,7 +594,6 @@ def test_restore_does_not_clobber_a_live_foreign_deploy_marker(sandbox):
 
 def _seed_wal_db(gd: Path) -> Path:
     """A clean WAL-mode SQLite DB (the live-writer shape restore quiesces)."""
-    import sqlite3
 
     db = gd / "data" / "genesis.db"
     conn = sqlite3.connect(str(db))
@@ -518,4 +660,253 @@ def test_the_audit_store_is_restored_after_secrets_so_its_path_can_be_configured
     assert "load_secrets_file" in window, (
         "secrets are restored but never loaded, so the resolver still reads an "
         "environment that does not carry GENESIS_MERGE_OVERRIDE_DIR"
+    )
+
+
+# ── Live-handle guard, and swap-failure recovery ─────────────────────
+#
+# Both regression tests below DRIVE the real script in the sandbox rather than
+# re-implementing its logic: an inline copy of the code under test grades itself,
+# and a hand-written intermediate hides exactly the seam where these defects live.
+
+
+def _wait_for_fd_holder(pid: int, db: Path, *, timeout: float = 10.0) -> None:
+    """Guard-the-guard: assert the fixture really holds an fd on *db*.
+
+    Without this the test could pass — or fail — for a reason other than the
+    guard, e.g. the holder dying before the scan or the fd not being established.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            for entry in Path(f"/proc/{pid}/fd").iterdir():
+                try:
+                    if entry.resolve() == db.resolve():
+                        return
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        time.sleep(0.05)
+    raise AssertionError(f"fixture never established an fd on {db} (pid {pid})")
+
+
+def test_open_handle_blocks_the_swap(sandbox):
+    """REGRESSION 2026-09-19: the live-handle guard could not fire at all.
+
+    ``find ... | grep -q .`` under ``set -o pipefail`` yields FIND's exit status,
+    so any unreadable ``/proc`` entry (permission-denied is routine) discards
+    grep's success and the ``if`` is false. Measured with a guaranteed match —
+    ``-lname /proc/self/exe`` — the guard still went silent, i.e. it was a no-op
+    on any real box, and the restore would have swapped the database out from
+    under a live writer. That is the precondition of the 2026-09-18 corruption.
+    """
+    db = _seed_live_db(sandbox["gd"])
+    holder = subprocess.Popen(
+        ["bash", "-c", 'exec 3<"$1"; sleep 60', "_", str(db)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        _wait_for_fd_holder(holder.pid, db)
+
+        # `plain` is sufficient and deliberate: the holder is this uid's own
+        # child, so an unprivileged scan sees it — which is exactly the claim
+        # being tested. Driving the mode explicitly keeps the assertion
+        # independent of the host's sudoers.
+        proc = _run_restore(sandbox, scan_mode="plain")
+
+        combined = proc.stdout + proc.stderr
+        assert "open process handles" in combined, (
+            "restore proceeded with a live handle on the database — the guard "
+            f"did not fire (rc={proc.returncode})\n{combined}"
+        )
+        assert proc.returncode != 0, "a refused restore must not exit 0"
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_failed_swap_leaves_the_original_trio_intact(sandbox):
+    """REGRESSION 2026-09-19: sidecars were removed BEFORE the rename.
+
+    ``restore.sh`` deleted ``-wal``/``-shm`` and only then moved the staged
+    candidate into place, so an ``mv`` that failed left the original main file
+    present but both sidecars gone — the live database de-fanged, with the
+    pre-restore copies on disk but nothing that restored from them. The die
+    message claimed the live DB "remains available" without mentioning them.
+    """
+    db = _seed_live_db(sandbox["gd"])
+    data = sandbox["gd"] / "data"
+    wal, shm = data / "genesis.db-wal", data / "genesis.db-shm"
+    before = {"db": db.read_bytes(), "wal": wal.read_bytes(), "shm": shm.read_bytes()}
+
+    # Fail `mv` only when the live database is a destination, so the rest of the
+    # script still behaves normally and we isolate the swap.
+    _make_stub(
+        sandbox["bind"] / "mv",
+        "#!/usr/bin/env bash\n"
+        f'for a in "$@"; do [ "$a" = "{db}" ] && exit 1; done\n'
+        'exec /bin/mv "$@"\n',
+    )
+
+    proc = _run_restore(sandbox)
+
+    assert proc.returncode != 0, "an injected swap failure must make the restore die"
+    assert db.read_bytes() == before["db"], "live database changed despite the failed swap"
+    assert wal.read_bytes() == before["wal"], (
+        "WAL sidecar was removed and not restored — the live trio is broken"
+    )
+    assert shm.read_bytes() == before["shm"], (
+        "SHM sidecar was removed and not restored — the live trio is broken"
+    )
+
+
+def test_failed_swap_with_no_sidecars_reports_the_pre_restore_copy(sandbox):
+    """REGRESSION 2026-09-19: the swap-failure message must branch on what was
+    RECORDED, not on the negation of the other flag pair.
+
+    ``!(MOVED_WAL || MOVED_SHM)`` does not imply there was no pre-restore copy. A
+    copy taken while NO sidecars were present leaves both flags false, and that is
+    the ordinary clean-shutdown shape — a cleanly closed WAL database keeps no
+    ``-wal``/``-shm``, which is exactly what quiescing the server produces. The
+    message then claimed "there was no pre-restore copy, so the live -wal/-shm
+    were REMOVED" — all three claims false, on a path an ordinary run reaches.
+
+    Harm is bounded to diagnosis (rc=1, quarantine retained, actions correct),
+    which is why this guards a message and not a data outcome.
+    """
+    db = _seed_live_db(sandbox["gd"])
+    data = sandbox["gd"] / "data"
+    (data / "genesis.db-wal").unlink()  # the clean-shutdown shape
+    (data / "genesis.db-shm").unlink()
+
+    _make_stub(
+        sandbox["bind"] / "mv",
+        "#!/usr/bin/env bash\n"
+        f'for a in "$@"; do [ "$a" = "{db}" ] && exit 1; done\n'
+        'exec /bin/mv "$@"\n',
+    )
+
+    proc = _run_restore(sandbox)
+
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"an injected swap failure must die\n{combined}"
+    assert "no pre-restore copy" not in combined, (
+        f"claimed there was no pre-restore copy when one was taken\n{combined}"
+    )
+    assert "were REMOVED" not in combined, (
+        f"claimed sidecars were removed when none existed\n{combined}"
+    )
+    assert "pre-restore copy at" in combined, (
+        f"the message did not name the pre-restore copy it actually took\n{combined}"
+    )
+
+
+def test_incomplete_proc_inspection_refuses(sandbox):
+    """REGRESSION 2026-09-19: an unreadable /proc must REFUSE, not warn.
+
+    The guard's job is "no process holds this database". When it cannot inspect
+    every process it has established nothing, so proceeding on a warning would
+    substitute an unsupported completeness claim for the check — the same defect
+    class as the pipeline bug it replaces. This drives the real script with a
+    `find` that reports failure, which is what an unreadable /proc entry
+    produces (routine: other-uid processes are unreadable from this uid).
+    """
+    _seed_live_db(sandbox["gd"])
+    # Force the genuinely-unavailable-authority state: `sudo -n true` must fail
+    # so the guard cannot borrow visibility into other-uid /proc entries.
+    #
+    # Do NOT stub `find` for this: sudo runs with a secure PATH, so a PATH stub
+    # is bypassed and the guard silently succeeds — which is how an earlier
+    # version of this test passed for entirely the wrong reason.
+    _make_stub(sandbox["bind"] / "sudo", "#!/usr/bin/env bash\nexit 1\n")
+
+    proc = _run_restore(sandbox, scan_mode="sudo")
+
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"an incomplete inspection must refuse\n{combined}"
+    assert "inspect" in combined.lower(), (
+        f"refusal did not say the inspection was incomplete\n{combined}"
+    )
+    # "Refused" must mean the swap did NOT happen. Without these two assertions a
+    # one-word `die` -> `warn` edit keeps the suite GREEN: warn() appends to
+    # _FAILURES so the run still exits non-zero and prints the same "inspect"
+    # text, but the script then PERFORMS THE SWAP under an unknown holder — the
+    # exact corruption class this guard exists to prevent. Measured: rc=1,
+    # "restored and verified" present, live DB replaced by the backup's 42.
+    assert "restored and verified" not in combined, (
+        f"the swap ran despite an inconclusive scan\n{combined}"
+    )
+    live = subprocess.run(
+        ["sqlite3", str(sandbox["gd"] / "data" / "genesis.db"), "SELECT x FROM t;"],
+        capture_output=True,
+        text=True,
+    )
+    assert live.stdout.strip() == "1", (
+        f"the live database was replaced despite an inconclusive scan: {live.stdout!r}"
+    )
+
+
+def test_holder_scan_retries_then_proceeds(sandbox):
+    """REGRESSION 2026-09-19: the bounded retry loop and the status capture.
+
+    Measured before this test existed: setting ``_HOLDER_ATTEMPTS=1``, or
+    deleting both ``|| _HOLDER_RC=$?`` captures, left the suite GREEN — so the
+    headline of the (a) fix could be reverted without a single test noticing.
+    A scan that fails transiently (a pid vanishes between glob expansion and
+    traversal) must be retried until a clean run is obtained, and the restore
+    must then proceed.
+    """
+    _seed_live_db(sandbox["gd"])
+    counter = sandbox["tmp"] / "sudo-count"
+    _write_sudo_failing_then_ok(sandbox["bind"], counter, fail_times=2)
+
+    proc = _run_restore(sandbox, scan_mode="sudo")
+
+    combined = proc.stdout + proc.stderr
+    # Exactly `fail_times` failed attempts: the counter is written on each
+    # failing call, so `exists()` alone would also be satisfied by a single
+    # attempt that never retried — which is the mutation this test exists to
+    # catch. Equality is what proves the retry actually happened.
+    attempts = counter.read_text().strip() if counter.exists() else ""
+    assert attempts == "2", (
+        f"expected exactly 2 failed scan attempts before the clean one, got {attempts!r}"
+    )
+    assert proc.returncode == 0, (
+        "a scan that succeeds on a later attempt must let the restore proceed; "
+        f"the retry loop did not (rc={proc.returncode})\n{combined}"
+    )
+
+
+def test_holder_scan_exhausts_and_refuses(sandbox):
+    """The other half of the pair: when EVERY attempt fails, refuse.
+
+    Paired with the retry test so neither can pass by the guard always refusing
+    or always proceeding — the failure mode that makes a suite green while the
+    mechanism it names is inert.
+    """
+    _seed_live_db(sandbox["gd"])
+    counter = sandbox["tmp"] / "sudo-count"
+    _write_sudo_failing_then_ok(sandbox["bind"], counter, fail_times=99)
+
+    proc = _run_restore(sandbox, scan_mode="sudo")
+
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"an exhausted scan must refuse\n{combined}"
+    assert "inspect" in combined.lower(), (
+        f"refusal did not say the inspection was incomplete\n{combined}"
+    )
+    # Same pair as the incomplete-inspection test: an exhausted scan must leave
+    # the live database untouched, not merely exit non-zero.
+    assert "restored and verified" not in combined, (
+        f"the swap ran despite an exhausted scan\n{combined}"
+    )
+    live = subprocess.run(
+        ["sqlite3", str(sandbox["gd"] / "data" / "genesis.db"), "SELECT x FROM t;"],
+        capture_output=True,
+        text=True,
+    )
+    assert live.stdout.strip() == "1", (
+        f"the live database was replaced despite an exhausted scan: {live.stdout!r}"
     )
