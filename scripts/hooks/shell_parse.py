@@ -1774,10 +1774,40 @@ _FUNCTION_DEF = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\(\)$")
 # as a filename. The bash set comes from ``bash --help``; the dash/sh set was
 # verified against the installed dash implementation, which also provides
 # ``sh`` on the supported Linux hosts.
+#: Option letters that consume the NEXT argv token as their value. Kept per
+#: interpreter, not as one global set: `-O shopt_option` is Bash-only, and dash
+#: rejects `dash -cxO extglob …` with "Illegal option -O" and runs nothing. A
+#: shared set made Bash-only syntax look valid for every nested shell, so a
+#: command the shell refuses was parsed as though it ran (Codex P2, PR #2112).
+_C_VALUE_TAKING = {
+    "bash": frozenset("oO"),
+    "zsh": frozenset("oO"),
+}
+#: Every other supported interpreter takes `-o option` but not `-O`.
+_C_VALUE_TAKING_DEFAULT = frozenset("o")
+
+#: Options that make the shell PARSE the script and not execute it. MEASURED on
+#: bash 5.2: `bash -n -c CMD`, `bash -D -c CMD` and `bash -o noexec -c CMD` all
+#: exit without running CMD. Walking past one and reporting the operand as an
+#: executed command is a false block on a command that provably does nothing —
+#: so they TERMINATE resolution instead of being transparent.
+#:
+#: `-D` is bash-only (dump translatable strings) but is harmless to treat as
+#: no-exec elsewhere: the cost of a false STOP is a command we do not report,
+#: and the pre-existing behaviour for an unrecognised shape is already to report
+#: nothing. Erring that way costs visibility we never had.
+_C_NO_EXEC_LETTERS = frozenset("nD")
+#: The `-o` VALUE that does the same thing.
+_C_NO_EXEC_OPTION_VALUES = frozenset({"noexec"})
+
 _C_BUNDLE_OPTIONS = {
     "bash": frozenset("abcefhiklmnprstuvxBCEHPTD"),
-    "sh": frozenset("abcefhilmnprstuvxCEIV"),
-    "dash": frozenset("abcefhilmnprstuvxCEIV"),
+    # MEASURED against the installed dash (and /usr/bin/sh, which IS dash here):
+    # `-h`, `-r` and `-t` are rejected with "Illegal option" and nothing runs.
+    # They were in this table, so the operand scan walked past them and reported
+    # a command the shell never executed — a false block.
+    "sh": frozenset("abcefilmnpsuvxCEIV"),
+    "dash": frozenset("abcefilmnpsuvxCEIV"),
     "ash": frozenset("abcefhilmnprstuvx"),
     "ksh": frozenset("abcefhilmnprstuvx"),
     "zsh": frozenset("Gabcefhilmnprstuvx"),
@@ -2683,6 +2713,7 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
     ``bash -cz`` is rejected by Bash and does not run a script.
     """
     allowed = _C_BUNDLE_OPTIONS[interpreter]
+    takes_value = _C_VALUE_TAKING.get(interpreter, _C_VALUE_TAKING_DEFAULT)
 
     for i, tok in enumerate(argv[1:], 1):
         if tok in {"-", "--"}:
@@ -2694,30 +2725,94 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
         if "c" not in options:
             continue
 
-        pos = tok.find("c")
-
-        # `-co` / `-Oc`: `o` / `O` consumes the next token as its value,
-        # so the script is the token after that value.
-        value_taking = (
-            (pos + 1 < len(tok) and tok[pos + 1] in {"o", "O"})
-            or (pos > 0 and tok[pos - 1] in {"o", "O"})
-        )
-
-        if value_taking:
-            option_letters = set(options) - {"o", "O"}
-            if not option_letters <= allowed:
-                continue
-            if i + 2 < len(argv):
-                return argv[i + 2]
+        # A value-taking letter ANYWHERE in the bundle consumes the next token,
+        # so the script comes after it. Position-independent on purpose: the
+        # original test only looked one character either side of `c`, so
+        # `-cxo pipefail` and `-oxc pipefail` fell through to the no-value path
+        # and `pipefail` was read as the script. MEASURED: bash runs both.
+        has_value = bool(set(options) & takes_value)
+        if not set(options) - takes_value <= allowed:
             continue
+        # The bundle carrying `-c` can itself suppress execution: `bash -cn CMD`
+        # parses CMD and runs nothing.
+        if set(options) & _C_NO_EXEC_LETTERS:
+            return ""
+        if has_value and i + 1 < len(argv) and argv[i + 1] in _C_NO_EXEC_OPTION_VALUES:
+            return ""
+        start = i + 2 if has_value else i + 1
 
-        if not set(options) <= allowed:
-            continue
-
-        if i + 1 < len(argv):
-            return argv[i + 1]
+        # ONCE A VALID `-c` BUNDLE OWNS SELECTION, its resolution is final.
+        # Resuming the outer scan let a LATER `-c` be read as a fresh command
+        # selector: `bash -c -z -c CMD` is rejected by bash and runs nothing,
+        # but the second `-c` was then treated as the real one and CMD reported.
+        # The first `-c` decides, and if its operand cannot be resolved the
+        # answer is "nothing", not "keep looking".
+        found, script = _first_operand(argv, start, allowed, takes_value)
+        return script if found else ""
 
     return ""
+
+
+def _first_operand(
+    argv: list[str], start: int, allowed: frozenset[str], takes_value: frozenset[str]
+) -> tuple[bool, str]:
+    """``(found, script)`` for the first OPERAND at or after ``start``.
+
+    WHY THIS EXISTS. ``_nested_script`` used to return ``argv[start]`` directly,
+    which is the script only when nothing sits between. It frequently does:
+    ``bash -c -- 'git push …'`` and ``bash -c -e 'git push …'`` both put an
+    option-shaped token there, so the parser handed back ``--`` (or ``-e``) as
+    the script and the real command was never parsed. MEASURED through the real
+    hooks before the fix: exit 0 (ALLOW) from git_push_guard for a command it
+    returns 2 for without the extra token.
+
+    WHY ``found`` IS SEPARATE FROM THE STRING. An empty string is a VALID ``-c``
+    command — ``bash -c '' -c 'git push …'`` runs nothing, exits 0, and the rest
+    becomes ``$0``/``$1``. A truthiness test conflated that with "no operand
+    here" and resumed scanning the positional arguments, reporting a nested
+    ``git push`` for a command that never runs (Codex P2).
+
+    ACCURACY, NOT GENEROSITY. An earlier version of this skipped every
+    option-shaped token on the theory that over-skipping is the safe direction.
+    It is not free: parsing a command the shell REFUSES makes a guard block
+    something that was never going to run. So each bundle is validated against
+    this interpreter's own ``allowed`` set, and an invocation the shell would
+    reject resolves to no operand.
+
+    The one place generosity is still right is the VALUE of ``-o``/``-O``. Its
+    validity depends on a shell- and version-specific option-name table, and
+    being wrong in the strict direction would hide a real command — a bypass —
+    whereas being wrong in the permissive direction only over-blocks an
+    invocation that fails anyway. So the value token is stepped over without
+    being checked, deliberately.
+    """
+    j = start
+    while j < len(argv):
+        tok = argv[j]
+        if tok == "--":
+            # END of option processing. The very next token IS the command
+            # string even when it looks like an option: `bash -c -- '-x' CMD`
+            # runs `-x` and makes CMD merely `$0`. Resuming the option scan here
+            # reported CMD as the script and blocked a command that never ran.
+            j += 1
+            return (True, argv[j]) if j < len(argv) else (False, "")
+        if tok.startswith("-") and len(tok) > 1:
+            letters = set(tok[1:])
+            if not letters - takes_value <= allowed:
+                return (False, "")  # the shell refuses this invocation
+            if letters & _C_NO_EXEC_LETTERS:
+                return (False, "")  # parsed but never executed
+            if (
+                letters & takes_value
+                and j + 1 < len(argv)
+                and argv[j + 1] in _C_NO_EXEC_OPTION_VALUES
+            ):
+                return (False, "")
+            j += 2 if letters & takes_value else 1
+            continue
+        return (True, tok)
+    return (False, "")
+
 
 # ── git-specific helpers ────────────────────────────────────────────────
 
