@@ -9,7 +9,12 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# A relative entrypoint puts CDPATH in play, and CDPATH is not merely noise here:
+# `cd` SEARCHES it, so this capture could both collect an extra echoed line and
+# resolve into a DIFFERENT checkout entirely. Clear CDPATH inside the
+# substitution — remove the cause rather than the symptom. stderr stays visible
+# so a genuine cd failure still speaks.
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GENESIS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # HOME may be unset in some container environments; derive from passwd (uid,
