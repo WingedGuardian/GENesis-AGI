@@ -309,6 +309,115 @@ async def find_approved_unconsumed(
     return dict(row) if row else None
 
 
+async def claim_approved_for_task(
+    db: aiosqlite.Connection, *, task_id: str, action_type: str,
+) -> str | None:
+    """Atomically CLAIM an approved, unconsumed resume approval for *task_id*.
+
+    Returns the claimed request id, or ``None`` when there is nothing to claim.
+
+    Claiming CONSUMES the row. Lookup and consumption are one operation on
+    purpose: the two resume call sites (``dispatcher.dispatch_cycle`` Path 1b
+    and ``dispatcher.recover_incomplete``) previously looked up a row and
+    dispatched WITHOUT consuming it, so the approval stayed approved-and-
+    unconsumed forever and a SECOND block on the same task resumed on the first
+    block's human decision. Exposing a find-only helper here would leave that
+    ordering up to each caller again; there is no such helper by design.
+
+    Matching is SEMANTIC (``json_extract``), not textual. The callers used
+    ``context LIKE '%"task_id": "<id>"%'``, which encodes ``json.dumps``'
+    default separators — a producer serialising compactly writes
+    ``{"task_id":"t1"}`` and the scan silently matched nothing, stranding the
+    task exactly as if no approval had been granted. ``request_approval``
+    takes ``context`` as an opaque ``str``, so both spellings are legal. The
+    ``json_valid`` guard mirrors :func:`find_approved_unconsumed`; a
+    non-JSON context is simply not a match rather than a SQL error.
+
+    *action_type* is REQUIRED and is matched too, so the id alone never
+    authorises a release. ``$.task_id`` is not a free namespace: an
+    autonomous-CLI-fallback approval for a task STEP carries the same task id
+    at ``$.extra.task_id`` (``executor/step_dispatcher.py`` builds it,
+    ``approval_gate`` nests it), and that is the id of the very task most
+    likely to block next. MEASURED: the textual scan this replaces DID match
+    that nested context, so an unconsumed CLI-fallback approval could release
+    a blocked task it was never granted for. Today the nesting alone would
+    hide it; requiring the type means correctness no longer rests on an
+    undocumented decision in another module.
+
+    Deliberately NO ``resolved_at`` window, unlike :func:`find_approved_unconsumed`.
+    That function's 24h window suits a short-lived autonomous-CLI grant; a
+    blocked task waits on a human who may answer days later, and expiring the
+    claim would re-strand the very task this exists to free.
+    """
+    _TASK_MATCH = """(CASE WHEN json_valid(context)
+                            THEN json_extract(context, '$.task_id') END) = ?"""
+
+    # Step 1: the NEWEST HUMAN ANSWER for this task, whatever it said.
+    # Filtering to status='approved' FIRST cannot enforce "the newest answer
+    # governs", because a later rejection or cancellation is excluded by the
+    # very filter that is supposed to be ranked. The user approving an older
+    # duplicate and then rejecting a newer one would leave the approval live
+    # and the rejection invisible. Ranking over ALL resolved rows is what
+    # makes the docstring true. Unresolved (pending) rows carry a NULL
+    # resolved_at and are excluded here -- an unanswered card is not an
+    # answer -- but they are retired in step 3.
+    cursor = await db.execute(
+        f"""SELECT id, status FROM approval_requests
+             WHERE consumed_at IS NULL
+               AND resolved_at IS NOT NULL
+               AND action_type = ?
+               AND {_TASK_MATCH}
+             ORDER BY resolved_at DESC
+             LIMIT 1""",
+        (action_type, task_id),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    request_id = row["id"] if isinstance(row, aiosqlite.Row) else row[0]
+    status = row["status"] if isinstance(row, aiosqlite.Row) else row[1]
+    if status != "approved":
+        # The newest answer was negative. Nothing is claimed and nothing is
+        # retired: a rejection is not a licence to invalidate other rows.
+        return None
+
+    now = datetime.now(UTC).isoformat()
+
+    # Step 2: claim it atomically. The consumed_at IS NULL predicate plus the
+    # rowcount check is what makes a concurrent claimer lose rather than
+    # produce a second dispatch of the same task. Inlined rather than calling
+    # mark_consumed because that helper COMMITS, which would split this claim
+    # into two transactions -- and a failure in between would leave the
+    # approval permanently spent with its siblings still live, i.e. the exact
+    # state this function exists to prevent.
+    cursor = await db.execute(
+        """UPDATE approval_requests SET consumed_at = ?
+            WHERE id = ? AND consumed_at IS NULL""",
+        (now, request_id),
+    )
+    if cursor.rowcount == 0:
+        await db.rollback()
+        return None
+
+    # Step 3: retire EVERY remaining sibling for this task, in the SAME
+    # transaction and regardless of status. Approved siblings would otherwise
+    # buy N free resumes; a PENDING sibling is worse, because it stays
+    # answerable -- the user taps it later, after the task has reached a
+    # DIFFERENT blocker, and that stale card releases a block nobody approved.
+    # The invariant: ONE human answer releases ONE block, and an answer to an
+    # earlier block never releases a later one.
+    await db.execute(
+        f"""UPDATE approval_requests
+               SET consumed_at = ?
+             WHERE consumed_at IS NULL
+               AND action_type = ?
+               AND {_TASK_MATCH}""",
+        (now, action_type, task_id),
+    )
+    await db.commit()
+    return request_id
+
+
 async def delete(db: aiosqlite.Connection, id: str) -> bool:
     cursor = await db.execute(
         "DELETE FROM approval_requests WHERE id = ?", (id,)
