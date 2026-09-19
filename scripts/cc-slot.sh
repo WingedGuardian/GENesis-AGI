@@ -1068,8 +1068,11 @@ if [ "$_SESSION_EXISTS" = "0" ] && [ "$_slot_oauth_mode" != "off" ] && [ "$_HAS_
         # blank credential), then echo the notice to stderr. The token flows
         # python-stdout → $(...) → a shell var → the process ENV, never any argv
         # (no ps/scrollback leak). `$(...)`, `\$`, and the literal single-quoted
-        # python defer to the pane shell; ${GENESIS_ROOT}/${_notice_q} expand here.
-        _OAUTH_SRC="_gt=\"\$(\"${GENESIS_ROOT}/.venv/bin/python\" -c 'import sys; from genesis.cc.login_health import read_fallback_token as r; sys.stdout.write(r() or str())' 2>/dev/null)\"; if [ -n \"\$_gt\" ]; then export CLAUDE_CODE_OAUTH_TOKEN=\"\$_gt\"; printf '%s\\n' ${_notice_q} >&2; fi; unset _gt; "
+        # python defer to the pane shell; the %q-quoted interpreter path and
+        # ${_notice_q} expand here. The path is quoted at BUILD time rather than
+        # embedded raw: the pane string is re-parsed, and a raw path inside its
+        # double quotes still permits `$(...)`, backticks, and a closing `"`.
+        _OAUTH_SRC="_gt=\"\$($(printf '%q' "${GENESIS_ROOT}/.venv/bin/python") -c 'import sys; from genesis.cc.login_health import read_fallback_token as r; sys.stdout.write(r() or str())' 2>/dev/null)\"; if [ -n \"\$_gt\" ]; then export CLAUDE_CODE_OAUTH_TOKEN=\"\$_gt\"; printf '%s\\n' ${_notice_q} >&2; fi; unset _gt; "
     fi
 fi
 
