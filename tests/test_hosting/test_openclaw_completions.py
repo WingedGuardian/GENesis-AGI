@@ -317,6 +317,66 @@ def test_adapter_is_idempotent():
     adapter.register_blueprints(app)
     completions_rules = [r for r in app.url_map.iter_rules() if "/v1/chat/completions" in r.rule]
     assert len(completions_rules) == 1
+class TestSharedParserMultipartBehaviour:
+    """The parser moved to genesis.hosting.openai_messages and is now shared.
+
+    That move CHANGED this endpoint's behaviour: it used to return at the first
+    text block, and now joins every block in order. The change is right -- in
+    the common [text, image, text] shape the trailing block is the instruction
+    that follows the attachment -- but every pre-existing parser test here uses
+    a SINGLE block, so nothing pinned the new behaviour on this side of the
+    shared helper. These do.
+    """
+
+    def test_all_text_blocks_are_joined_in_order(self):
+        from genesis.hosting.openclaw.completions import _extract_last_user_message
+
+        out = _extract_last_user_message(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "look at this"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}},
+                        {"type": "text", "text": "what is wrong with it"},
+                    ],
+                },
+            ]
+        )
+        assert out is not None
+        assert out.index("look at this") < out.index("what is wrong with it")
+
+    def test_control_a_single_block_is_unchanged(self):
+        """The pre-existing shape must behave exactly as before the move."""
+        from genesis.hosting.openclaw.completions import _extract_last_user_message
+
+        out = _extract_last_user_message(
+            [
+                {"role": "user", "content": [{"type": "text", "text": "just one"}]},
+            ]
+        )
+        assert out == "just one"
+
+    def test_control_plain_string_content_is_unchanged(self):
+        from genesis.hosting.openclaw.completions import _extract_last_user_message
+
+        out = _extract_last_user_message([{"role": "user", "content": "plain"}])
+        assert out == "plain"
+
+    def test_non_text_only_content_yields_nothing(self):
+        from genesis.hosting.openclaw.completions import _extract_last_user_message
+
+        out = _extract_last_user_message(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "x"}},
+                    ],
+                },
+            ]
+        )
+        assert out is None
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
