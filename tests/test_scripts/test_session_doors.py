@@ -26,6 +26,7 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CC_SLOT = _REPO_ROOT / "scripts" / "cc-slot.sh"
 _BOOTSTRAP = _REPO_ROOT / "scripts" / "bootstrap.sh"
+_BASH = shutil.which("bash") or "bash"
 
 _FAKE_TMUX = """#!/usr/bin/env bash
 # Records every invocation; simulates has-session against a session list file.
@@ -673,6 +674,30 @@ class TestBootstrapWrapper:
         text = _BOOTSTRAP.read_text()
         assert "printf '%q' \"$GENESIS_ROOT\"" in text
         assert 'TMUX_WRAP_BLOCK="${TMUX_WRAP_BLOCK//__GENESIS_ROOT__/' in text
+
+    def test_wrapper_root_substitution_preserves_ampersands_and_shopt_state(self):
+        text = _BOOTSTRAP.read_text()
+        start = text.index('_tmux_wrap_root=$(printf')
+        end = text.index('unset _tmux_wrap_root _tmux_wrap_patsub_replacement_was_set', start)
+        substitution = text[start:end]
+        checkout = "/tmp/genesis&slot"
+        script = f"""\
+set -euo pipefail
+shopt -s patsub_replacement
+GENESIS_ROOT={checkout!r}
+TMUX_WRAP_BLOCK='root=__GENESIS_ROOT__'
+{substitution}
+printf '%s\\n' \"$TMUX_WRAP_BLOCK\"
+shopt -q patsub_replacement
+"""
+        result = subprocess.run(
+            [_BASH, "-c", script],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        assert result.stdout == "root=/tmp/genesis\\&slot\n"
 
     def test_wrapper_keeps_passthrough_and_optout(self, block):
         assert "-p|--print|--version|-v|--help|-h" in block

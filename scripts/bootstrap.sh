@@ -982,8 +982,16 @@ claude() {
 # <<< genesis tmux-wrap <<<
 WRAPEOF
 _tmux_wrap_root=$(printf '%q' "$GENESIS_ROOT")
+_tmux_wrap_patsub_replacement_was_set=0
+if shopt -q patsub_replacement 2>/dev/null; then
+    _tmux_wrap_patsub_replacement_was_set=1
+    shopt -u patsub_replacement
+fi
 TMUX_WRAP_BLOCK="${TMUX_WRAP_BLOCK//__GENESIS_ROOT__/${_tmux_wrap_root}}"
-unset _tmux_wrap_root
+if [ "$_tmux_wrap_patsub_replacement_was_set" -eq 1 ]; then
+    shopt -s patsub_replacement
+fi
+unset _tmux_wrap_root _tmux_wrap_patsub_replacement_was_set
 touch "$BASHRC"
 if grep -qF "# >>> genesis tmux-wrap >>>" "$BASHRC" 2>/dev/null; then
     # Replace the existing block in place (idempotent update path). Capture the
