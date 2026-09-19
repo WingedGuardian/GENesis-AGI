@@ -1,32 +1,40 @@
-"""The CHANGELOG merge driver, pinned by behaviour rather than by its text.
+"""The ABSENCE of a CHANGELOG merge driver, pinned by behaviour and by its reason.
 
-Two branches that each add a bullet under the same ``[Unreleased]`` heading are
-not disagreeing — they are inserting at the same position. Git's default driver
-calls that a conflict. Measured 2026-09-04 against ``origin/main`` 2d5ea3dd: of
+CHANGELOG.md deliberately has no merge driver. A collision on it CONFLICTS, and
+that is the intended outcome: the failure this file guards against is the silent
+one, not the visible one.
+
+The collision is real. Two branches that each add a bullet under the same
+``[Unreleased]`` heading are not disagreeing — they are inserting at the same
+position, which git's default driver calls a conflict. Measured 2026-09-04: of
 49 open PRs, 21 could not merge, and 18 of those 21 conflicted on CHANGELOG.md
-and nothing else.
+and nothing else. The structural fix for that is one fragment per change in
+``changelog.d/``; see ``.gitattributes`` for the full argument.
 
-``.gitattributes`` fixes that with ``/CHANGELOG.md merge=union``. Note the
-leading slash: an unanchored pattern matches the basename at every depth, and
-that near-miss is the reason the scope tests exist at all.
+``merge=union`` was the obvious shortcut, was applied here, and was removed on
+2026-09-10 because it cannot express a REMOVAL: deleted lines come back, at exit
+0, with no conflict reported. A release cut moves every unreleased entry under a
+version heading, so every branch open across one is exposed — including branches
+that never touch CHANGELOG.md deliberately.
 
 Four tests, and NONE of them is redundant — read this before deleting one:
 
-* :func:`test_two_branches_appending_at_the_same_position_merge_without_conflict`
-  carries the BEHAVIOURAL guarantee. It copies the real artifact into a fresh
-  repo and runs a real merge.
-* :func:`test_without_the_attribute_the_same_merge_conflicts` is its negative
-  control. Without it the test above could pass for reasons having nothing to do
-  with the attribute, and would keep passing after the rule was deleted.
-* :func:`test_union_applies_to_exactly_one_tracked_path` grades SCOPE as an
-  equality over every tracked file, because a widened pattern captures precisely
+* :func:`test_a_changelog_collision_conflicts_rather_than_merging_silently`
+  carries the BEHAVIOURAL guarantee, by copying the real artifact into a fresh
+  repo and running a real merge.
+* :func:`test_a_union_driver_resurrects_a_deletion` is why the rule is gone, kept
+  executable so the reason cannot decay into a comment nobody trusts. It is also
+  the MOVING control for the test above: it is the case where this same harness
+  produces a clean exit-0 merge, which is what proves the conflict is a property
+  of the driver rather than of the fixture.
+* :func:`test_no_tracked_path_resolves_to_a_union_driver` grades SCOPE as an
+  equality over every tracked file, because a re-added pattern captures precisely
   the paths nobody would have thought to enumerate.
 * :func:`test_union_does_not_reach_paths_that_do_not_exist_yet` covers what that
   population check structurally CANNOT: paths absent from the tree. It is not a
-  weaker duplicate of the population check — it is the only test that fails on
-  an unanchored pattern today, since the one tracked ``CHANGELOG.md`` sits at
-  the root and satisfies both spellings. That is exactly the bug this rule
-  shipped with in review, and this is the test that would have caught it.
+  weaker duplicate — it is the test that fails on an unanchored pattern, since a
+  root-level ``CHANGELOG.md`` satisfies both spellings. That is exactly the bug
+  the original rule shipped with in review.
 
 The tests grade this repository's own attribute surface. A developer's local
 ``merge.default`` routes unspecified paths to a driver regardless; no committed
@@ -137,17 +145,27 @@ def _merge_attr(path: str, cwd: Path) -> str:
     return line[len(prefix) :]
 
 
-def _make_repo(tmp_path: Path, *, with_attributes: bool) -> Path:
+def _make_repo(tmp_path: Path, *, attributes: str) -> Path:
     """A repo whose trunk holds a CHANGELOG with an [Unreleased] heading.
 
+    ``attributes`` selects what lands at ``.gitattributes``:
+
+    * ``"real"``    — a copy of THIS repository's file. Grades the real artifact,
+      not a reconstruction: if a union line is ever re-added, this copy starts
+      carrying the driver and the conflict test goes red.
+    * ``"none"``    — no file at all.
+    * ``"union"``   — a SYNTHETIC union rule. Deliberately not the real file: the
+      point is to exercise the driver that was removed, so it has to be written
+      here rather than read from a tree that no longer contains it.
+
     ``_git`` already disables global and system config, so nothing ambient
-    reaches this repo — including the setting that actually decides the negative
-    control's outcome (a global ``merge.default=union`` would resolve the merge
-    in the WITHOUT-attributes repo and turn that control green, voiding the only
-    proof that the attribute resolves anything). An identity is set here because
+    reaches this repo — including the setting that would otherwise decide these
+    outcomes (a global ``merge.default=union`` resolves the merge even with no
+    attributes file, which would turn the conflict tests green for a reason
+    having nothing to do with this repository). An identity is set here because
     with global config off there is no longer one to inherit.
     """
-    repo = tmp_path / ("with_attrs" if with_attributes else "without_attrs")
+    repo = tmp_path / attributes
     repo.mkdir()
     _git_ok("init", "--quiet", "-b", "trunk", cwd=repo)
     _git_ok("config", "user.email", "test@example.invalid", cwd=repo)
@@ -156,11 +174,10 @@ def _make_repo(tmp_path: Path, *, with_attributes: bool) -> Path:
     (repo / "CHANGELOG.md").write_text(
         "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- a pre-existing entry\n"
     )
-    if with_attributes:
-        # Grade the REAL artifact, not a reconstruction of it. If the union line
-        # is deleted, misspelled, or its pattern stops matching CHANGELOG.md,
-        # this copy stops carrying the driver and the merge below conflicts.
+    if attributes == "real":
         shutil.copyfile(GITATTRIBUTES, repo / ".gitattributes")
+    elif attributes == "union":
+        (repo / ".gitattributes").write_text("/CHANGELOG.md merge=union\n")
     _git_ok("add", "-A", cwd=repo)
     _git_ok("commit", "--quiet", "-m", "base", cwd=repo)
     return repo
@@ -177,38 +194,30 @@ def _branch_adding_bullet(repo: Path, branch: str, bullet: str) -> None:
     _git_ok("commit", "--quiet", "-m", f"add {bullet}", cwd=repo)
 
 
-def test_two_branches_appending_at_the_same_position_merge_without_conflict(
+def _branch_removing_the_existing_entry(repo: Path, branch: str) -> None:
+    """The release-cut shape: an entry LEAVES the [Unreleased] list.
+
+    A real release cut moves entries under a version heading; from the merge's
+    point of view the part that matters is that the lines leave this hunk.
+    """
+    _git_ok("checkout", "--quiet", "-b", branch, "trunk", cwd=repo)
+    changelog = repo / "CHANGELOG.md"
+    changelog.write_text(changelog.read_text().replace("- a pre-existing entry\n", "", 1))
+    _git_ok("add", "CHANGELOG.md", cwd=repo)
+    _git_ok("commit", "--quiet", "-m", f"{branch}: cut the entry", cwd=repo)
+
+
+def test_a_changelog_collision_conflicts_rather_than_merging_silently(
     tmp_path: Path,
 ) -> None:
-    """The acceptance case: the real collision shape resolves, keeping BOTH."""
-    repo = _make_repo(tmp_path, with_attributes=True)
-    _branch_adding_bullet(repo, "feature-a", "entry from branch A")
-    _branch_adding_bullet(repo, "feature-b", "entry from branch B")
+    """The guarantee: with THIS repo's attributes, the collision is visible.
 
-    _git_ok("checkout", "--quiet", "trunk", cwd=repo)
-    _git_ok("merge", "--quiet", "--no-edit", "feature-a", cwd=repo)
-    second = _git("merge", "--no-edit", "feature-b", cwd=repo)
-
-    assert second.returncode == 0, (
-        "the second branch conflicted on CHANGELOG.md — the union merge driver "
-        f"is not in effect.\nstdout: {second.stdout}\nstderr: {second.stderr}"
-    )
-    merged = (repo / "CHANGELOG.md").read_text()
-    # Union keeps both sides. Neither entry may be dropped, and no conflict
-    # markers may survive into the merged file.
-    assert "entry from branch A" in merged
-    assert "entry from branch B" in merged
-    assert "a pre-existing entry" in merged
-    assert "<<<<<<<" not in merged and ">>>>>>>" not in merged
-
-
-def test_without_the_attribute_the_same_merge_conflicts(tmp_path: Path) -> None:
-    """Negative control: the driver is what resolves it, not the content shape.
-
-    Without this, the test above could pass for reasons having nothing to do
-    with ``.gitattributes`` and would keep passing after the rule was deleted.
+    A conflict here is the intended outcome, not a regression. It is resolved by
+    taking the base's CHANGELOG.md and moving the entry into a changelog.d/
+    fragment — see .gitattributes for why that is preferred to resolving it
+    automatically.
     """
-    repo = _make_repo(tmp_path, with_attributes=False)
+    repo = _make_repo(tmp_path, attributes="real")
     _branch_adding_bullet(repo, "feature-a", "entry from branch A")
     _branch_adding_bullet(repo, "feature-b", "entry from branch B")
 
@@ -217,12 +226,52 @@ def test_without_the_attribute_the_same_merge_conflicts(tmp_path: Path) -> None:
     second = _git("merge", "--no-edit", "feature-b", cwd=repo)
 
     assert second.returncode != 0, (
-        "expected a CHANGELOG conflict with no .gitattributes present; if this "
-        "passes, the acceptance test above proves nothing about the driver"
+        "the collision merged cleanly — a merge driver has been re-applied to "
+        "CHANGELOG.md. A driver that resolves this silently also resurrects "
+        "deletions; see test_a_union_driver_resurrects_a_deletion and "
+        f".gitattributes.\nstdout: {second.stdout}\nstderr: {second.stderr}"
     )
 
 
-def test_union_applies_to_exactly_one_tracked_path() -> None:
+def test_a_union_driver_resurrects_a_deletion(tmp_path: Path) -> None:
+    """WHY the driver is gone — kept executable so the reason cannot decay.
+
+    Doubles as the MOVING control for the test above: this is the one case where
+    the same fixture yields a clean exit-0 merge, which is what establishes that
+    the conflict there is a property of the driver and not of this harness.
+
+    Shape, which is the one a release cut produces: one side removes an entry,
+    the other inserts at the same position. Union takes lines from BOTH sides of
+    the conflicting hunk, so the removal is silently undone.
+    """
+    repo = _make_repo(tmp_path, attributes="union")
+    _branch_removing_the_existing_entry(repo, "release-cut")
+    _branch_adding_bullet(repo, "feature-b", "entry from branch B")
+
+    _git_ok("checkout", "--quiet", "trunk", cwd=repo)
+    _git_ok("merge", "--quiet", "--no-edit", "release-cut", cwd=repo)
+    assert "a pre-existing entry" not in (repo / "CHANGELOG.md").read_text(), (
+        "fixture error: the release-cut branch did not actually remove the entry"
+    )
+
+    second = _git("merge", "--no-edit", "feature-b", cwd=repo)
+
+    assert second.returncode == 0, (
+        "expected union to resolve this silently; if it conflicts, this test no "
+        f"longer demonstrates the hazard.\nstderr: {second.stderr}"
+    )
+    merged = (repo / "CHANGELOG.md").read_text()
+    assert "entry from branch B" in merged
+    # The finding: a line deliberately removed by the first merge is back, and
+    # nothing about the second merge said so.
+    assert "a pre-existing entry" in merged, (
+        "union no longer resurrects the deleted line — if git's union driver has "
+        "changed behaviour, re-examine whether .gitattributes should still "
+        "refuse it"
+    )
+
+
+def test_no_tracked_path_resolves_to_a_union_driver() -> None:
     """Grade the whole population, not a hand-picked sample.
 
     A negative list can only fail on paths a reviewer thought to enumerate, and
@@ -252,8 +301,9 @@ def test_union_applies_to_exactly_one_tracked_path() -> None:
     # -z output is a flat NUL-separated stream of (path, attribute, value).
     fields = proc.stdout.split("\0")
     union_paths = {fields[i] for i in range(0, len(fields) - 2, 3) if fields[i + 2] == "union"}
-    assert union_paths == {"CHANGELOG.md"}, (
-        f"merge=union must apply to CHANGELOG.md and nothing else; got {sorted(union_paths)}"
+    assert union_paths == set(), (
+        "no tracked path may resolve to merge=union — it resolves silently and "
+        f"cannot express a deletion; got {sorted(union_paths)}"
     )
 
 
