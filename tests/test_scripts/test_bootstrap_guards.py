@@ -11,12 +11,19 @@ functional bash test.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = REPO_ROOT / "scripts" / "bootstrap.sh"
+INSTALL = REPO_ROOT / "scripts" / "install.sh"
+CBM_INSTALLER = REPO_ROOT / "scripts" / "lib" / "cbm_installer.sh"
+CBM_DISABLE_LIB = REPO_ROOT / "scripts" / "lib" / "cbm_disable_file.sh"
 SETUP_LOCAL = REPO_ROOT / "scripts" / "setup-local-config.sh"
 
 
@@ -134,13 +141,160 @@ def test_b9_no_pipe_to_shell():
     assert "install.sh | bash" not in code
     assert "uv/install.sh | sh" not in code
     # … replaced by download-to-file then execute-from-file (full download first).
-    assert (
-        'curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh -o "$_cbm_installer"'
-        in code
-    )
-    assert 'bash "$_cbm_installer" --ui --skip-config' in code
     assert 'curl -LsSf https://astral.sh/uv/install.sh -o "$_uv_installer"' in code
     assert 'sh "$_uv_installer"' in code
+    # The codebase-memory installer moved to scripts/lib/cbm_installer.sh, shared
+    # with install.sh; bootstrap must reach it through that one site rather than
+    # growing a second copy of the fetch.
+    assert "raw.githubusercontent.com/DeusData/codebase-memory-mcp" not in code
+    assert '. "$SCRIPT_DIR/lib/cbm_installer.sh"' in code
+
+
+_CBM_PIN_RE = re.compile(
+    r'GENESIS_CBM_INSTALLER_COMMIT="(?P<commit>[0-9a-f]{40})"'
+)
+_CBM_DIGEST_RE = re.compile(r'GENESIS_CBM_INSTALLER_SHA256="(?P<digest>[0-9a-f]{64})"')
+
+
+def test_b9_cbm_installer_is_pinned_and_verified_from_one_site():
+    """`main` is mutable third-party code, so the installer is pinned to a
+    reviewed commit and carries a repository-owned digest.
+
+    The pin and the digest have to move together, and when they lived inline in
+    two scripts nothing bound them: bumping the commit in both while leaving the
+    digest stale in both passed every test and turned the install into a
+    permanent no-op behind a "non-critical" warning. One site removes the
+    question rather than policing it.
+
+    This is the CHEAP half — presence, a pinned URL, and stderr not discarded.
+    Whether the digest actually GATES execution is control flow, which no
+    character offset can see, so it is settled by running the thing:
+    ``test_b9_cbm_installer_is_not_executed_unverified``.
+    """
+    code = _code(CBM_INSTALLER)
+    assert _CBM_PIN_RE.search(code), "cbm installer is not pinned to a commit"
+    assert _CBM_DIGEST_RE.search(code), "cbm installer has no committed sha256"
+    assert (
+        "raw.githubusercontent.com/DeusData/codebase-memory-mcp/${GENESIS_CBM_INSTALLER_COMMIT}"
+        in code
+    ), "the fetch must build its URL from the pin, so the two cannot disagree"
+    # `-fsSL` carries `-S`, so curl explains its own failure — unless the fetch
+    # discards stderr, which is what turned a mistyped-but-40-hex commit (a 404,
+    # forever) into the same "download failed" line as a transient blip.
+    lines = code.splitlines()
+    first = next(i for i, ln in enumerate(lines) if "curl -fsSL" in ln)
+    last = next(i for i, ln in enumerate(lines) if i >= first and '-o "$installer"' in ln)
+    fetch = "\n".join(lines[first : last + 1])
+    assert "2>/dev/null" not in fetch, f"the fetch must not discard curl's error:\n{fetch}"
+    exec_line = next(ln for ln in code.splitlines() if 'bash "$installer"' in ln)
+    # Upstream reports a checksum mismatch, an unexpected archive member and a
+    # non-running binary on STDERR. Discarding it renders a release-integrity
+    # failure and "not available today" identically — which is how a rejected
+    # argument stayed invisible until the installer was read.
+    assert "2>/dev/null" not in exec_line, (
+        "the installer's stderr carries its integrity errors; do not discard it — "
+        f"{exec_line.strip()!r}"
+    )
+    # Both install paths reach the tool through this one site.
+    for script in (BOOTSTRAP, INSTALL):
+        assert '. "$SCRIPT_DIR/lib/cbm_installer.sh"' in _code(script), (
+            f"{script.name}: does not source the shared cbm installer"
+        )
+
+
+def _run_cbm_install(tmp_path: Path, payload: str, digest: str | None, label: str):
+    """Call the SHIPPED `genesis_cbm_install` with `curl` and `bash` stubbed.
+
+    `curl` writes ``payload`` to the requested path instead of fetching, and
+    `bash` records the argv it was handed instead of installing anything. The
+    real `sha256sum` does the checking. Returns ``(rc, argv)`` where argv is
+    None when the installer was never executed.
+    """
+    work = tmp_path / label
+    (work / "stub").mkdir(parents=True)
+    lib = work / "cbm_installer.sh"
+    body = CBM_INSTALLER.read_text()
+    if digest is not None:  # re-point the committed digest at this payload
+        body = _CBM_DIGEST_RE.sub(f'GENESIS_CBM_INSTALLER_SHA256="{digest}"', body)
+    lib.write_text(body)
+    # The installer sources its kill-switch resolver as a sibling file; the
+    # sandboxed copy needs it beside it or every call refuses as unresolvable.
+    (work / "cbm_disable_file.sh").write_text(CBM_DISABLE_LIB.read_text())
+    payload_file = work / "payload"
+    payload_file.write_text(payload)
+    argv_file = work / "argv"
+    (work / "stub" / "curl").write_text(
+        "#!/bin/sh\nout=''\n"
+        'while [ $# -gt 0 ]; do\n  if [ "$1" = "-o" ]; then out="$2"; fi\n  shift\ndone\n'
+        '[ -n "$out" ] || exit 1\ncat "$PAYLOAD_FILE" > "$out"\n'
+    )
+    (work / "stub" / "bash").write_text(
+        '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$ARGV_FILE"\nexit 0\n'
+    )
+    for stub in (work / "stub").iterdir():
+        stub.chmod(0o755)
+    # `set -euo pipefail` is what both real callers run under.
+    proc = subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            f'set -euo pipefail; . "{lib}"; rc=0; genesis_cbm_install || rc=$?; echo "rc=$rc"',
+        ],
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": f"{work / 'stub'}:/usr/bin:/bin",
+            "HOME": str(work),
+            "TMPDIR": str(work),  # never the session's own temp
+            "PAYLOAD_FILE": str(payload_file),
+            "ARGV_FILE": str(argv_file),
+        },
+    )
+    assert "rc=" in proc.stdout, proc.stdout + proc.stderr
+    rc = int(proc.stdout.strip().rsplit("rc=", 1)[1])
+    argv = argv_file.read_text().split() if argv_file.exists() else None
+    leftovers = [p.name for p in work.iterdir() if p.name.startswith("tmp")]
+    assert not leftovers, f"the downloaded installer was left behind: {leftovers}"
+    return rc, argv
+
+
+def test_b9_cbm_installer_is_not_executed_unverified(tmp_path):
+    """A digest mismatch must stop the installer REACHING bash.
+
+    No textual guard can establish this. A maintainer wanting a distinct warning
+    for a mismatch writes the check as its own statement with `|| echo …` above
+    an unchanged `bash "$installer"`: every ordering assertion still holds,
+    `bash -n` is clean, and an unverified third-party script runs. So the real
+    function is called here with `curl` and `bash` stubbed and the real
+    sha256sum deciding — a question about control flow, not character offsets.
+
+    The matching case is the control that moves: same call, same payload, with
+    the committed digest re-pointed at that payload. The installer must then run
+    with EXACTLY the argv the pinned upstream parser accepts. Containment is the
+    wrong relation for that — appending a flag leaves any substring intact, and
+    `--ui` exits 2 before the installer does any work, which is what made this a
+    silent no-op.
+    """
+    payload = "#!/bin/sh\n# not the reviewed installer\n"
+    rc, argv = _run_cbm_install(tmp_path, payload, digest=None, label="mismatch")
+    assert argv is None, "an installer failing its digest check still reached bash"
+    # A DISTINCT code, not the download failure's. Nothing offline can bind the
+    # committed digest to the bytes upstream actually serves, so a bump that
+    # moves the commit and forgets the digest stays possible — but a commit SHA
+    # is content-addressed, so a mismatch can only mean the repository's own two
+    # constants disagree. Folding that into the same "non-critical" warning as a
+    # network blip is what would make a wrong digest a permanent silent no-op on
+    # every machine; rc 3 is how it announces itself instead.
+    assert rc == 3, f"a digest mismatch must be distinguishable from a network failure, got rc {rc}"
+
+    matching = hashlib.sha256(payload.encode()).hexdigest()
+    rc, argv = _run_cbm_install(tmp_path, payload, digest=matching, label="match")
+    assert argv is not None, "a VERIFIED installer was not executed"
+    assert rc == 0, f"a successful install must report rc 0, got {rc}"
+    assert argv[1:] == ["--skip-config"], (
+        "the pinned installer accepts only --dir/--clients/--skip-config/--help; "
+        f"anything else hits its `-*)` case and exits 2 before doing any work. Got: {argv[1:]}"
+    )
 
 
 # ── S3: dead REPO_EXAMPLE var + phantom migration comment removed ───
@@ -156,7 +310,6 @@ def test_s3_dead_repo_example_removed():
 # ── OfficeCLI: provisioned binary for deliverable-builder (external, optional) ──
 # The render backend for high-fidelity .xlsx/.pptx. Security-critical: a pinned
 # version + a COMMITTED literal SHA256 (not a fetched SHA256SUMS, which is TOFU).
-import re  # noqa: E402
 
 
 def test_officecli_pins_committed_literal_sha256_both_arches():
@@ -328,3 +481,191 @@ def test_install_pkg_dnf_branch_reports_failures_too(tmp_path):
     assert "install failed (exit 1)" in r.stdout, r.stdout
     assert "No match for argument" in r.stdout
     assert r.returncode == 1
+
+
+def _direct_run(tmp_path: Path, label: str, env: dict[str, str]):
+    """Run the shared installer as a script, with `curl` recording its calls."""
+    work = tmp_path / label
+    (work / "stub").mkdir(parents=True)
+    called = work / "curl-called"
+    (work / "stub" / "curl").write_text(f'#!/bin/sh\n: > "{called}"\nexit 7\n')
+    (work / "stub" / "curl").chmod(0o755)
+    proc = subprocess.run(
+        ["/bin/bash", str(CBM_INSTALLER)],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{work / 'stub'}:/usr/bin:/bin", "TMPDIR": str(work), **env},
+    )
+    return proc, called.exists()
+
+
+def test_b9_direct_run_honours_the_kill_switch(tmp_path):
+    """The launcher sends operators here, so this path must refuse on its own.
+
+    Asserting the kill-switch string appears in the file is not a test of it:
+    that survives inverting the check to `[ ! -e ]` — installing exactly when
+    the machine says not to — and survives moving the check below the install.
+    So the script is run.
+
+    An unresolvable path fails CLOSED. With HOME unset the default used to
+    collapse to `/.genesis/…` — absolute, but not this machine's switch — so the
+    check came back false and the install proceeded. The launcher edited in the
+    same change refuses on that exact condition; this now matches it.
+    """
+    home = tmp_path / "home" / ".genesis"
+    home.mkdir(parents=True)
+    (home / "codebase-memory-mcp.disabled").touch()
+
+    proc, fetched = _direct_run(tmp_path, "switched-on", {"HOME": str(tmp_path / "home")})
+    assert proc.returncode == 4, proc.stderr
+    assert not fetched, "the kill switch is set and the installer was fetched anyway"
+    assert "kill switch is active" in proc.stderr
+
+    # Control that moves: same script, no switch file — it must get as far as
+    # the download (stubbed to fail, hence rc 1).
+    clear = tmp_path / "clear"
+    (clear / ".genesis").mkdir(parents=True)
+    proc, fetched = _direct_run(tmp_path, "switched-off", {"HOME": str(clear)})
+    assert proc.returncode == 1, proc.stderr
+    assert fetched, "with no kill switch the installer must actually be fetched"
+
+    # HOME unset, and a relative override: both unresolvable, both refuse.
+    proc, fetched = _direct_run(tmp_path, "no-home", {})
+    assert proc.returncode == 4 and not fetched, proc.stderr
+    proc, fetched = _direct_run(
+        tmp_path, "relative", {"HOME": str(clear), "CODEBASE_MEMORY_MCP_DISABLE_FILE": "rel/path"}
+    )
+    assert proc.returncode == 4 and not fetched, proc.stderr
+
+
+def _cbm_outcome_block(script: Path) -> str:
+    """The caller's whole outcome path: the source, the CALL, and the `case`.
+
+    Anchored on the source line rather than on `case`, because the wire between
+    them — `genesis_cbm_install || _cbm_rc=$?` — is the part most easily broken.
+    A slice that starts at `case` and injects `_cbm_rc` itself leaves that
+    assignment outside everything it executes.
+    """
+    lines = script.read_text().splitlines()
+    # Anchored on the kill-switch guard's `if [ -z "$_cbm_disable" ]` — the
+    # if/elif/else encloses the source line, the call wire and the `case`, so
+    # slicing from any inner line leaves an orphaned `fi`; `_cbm_disable` is
+    # pre-set by the caller to a nonexistent path so the else branch runs.
+    start = next(
+        i
+        for i, ln in enumerate(lines)
+        if ln.strip() == 'if [ -z "$_cbm_disable" ]; then'
+    )
+    end = next(i for i, ln in enumerate(lines) if i > start and ln.strip() == "esac")
+    end = next(i for i, ln in enumerate(lines) if i > end and ln.strip() == "fi")
+    return "\n".join(lines[start : end + 1]) + "\n"
+
+
+def test_b9_callers_render_a_digest_mismatch_distinctly(tmp_path):
+    """rc 3 exists so a wrong pin cannot hide inside a network-failure message.
+
+    That only holds if the CALLERS say something different for it, and if the
+    return actually reaches them. Both are exercised together: the real source
+    line, the real call and the real `case` are run against a stub library that
+    returns the code under test, so the `|| _cbm_rc=$?` wire is inside the
+    harness rather than bypassed by injecting `_cbm_rc` directly. MEASURED with
+    that wire replaced by `|| true`: install.sh rendered a pin/digest mismatch
+    as `+ codebase-memory-mcp installed/upgraded`.
+    """
+    for script in (BOOTSTRAP, INSTALL):
+        block = _cbm_outcome_block(script)
+        stub_root = tmp_path / script.stem
+        (stub_root / "lib").mkdir(parents=True)
+        (stub_root / "lib" / "cbm_installer.sh").write_text(
+            'genesis_cbm_install() { return "${FAKE_CBM_RC}"; }\n'
+        )
+        rendered = {}
+        for rc in ("0", "1", "2", "3"):
+            proc = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-c",
+                    f'set -euo pipefail\nSCRIPT_DIR="{stub_root}"\n'
+                    f'_cbm_disable="{stub_root}/no-sentinel-present"\n{block}',
+                ],
+                capture_output=True,
+                text=True,
+                env={"PATH": "/usr/bin:/bin", "FAKE_CBM_RC": rc},
+            )
+            assert proc.returncode == 0, proc.stderr
+            rendered[rc] = proc.stdout.strip()
+        assert "digest" in rendered["3"].lower(), (
+            f"{script.name}: a digest mismatch is not named — {rendered['3']!r}"
+        )
+        for other in ("0", "1", "2"):
+            assert rendered["3"] != rendered[other], (
+                f"{script.name}: a wrong pin renders identically to outcome {other} "
+                f"— {rendered['3']!r}"
+            )
+
+
+# ── CDPATH: `cd` SEARCHES it, and echoes what it resolves ────────────
+#
+# With CDPATH exported and a RELATIVE entrypoint, `cd` searches CDPATH for the
+# directory, so a `$(cd … && pwd)` capture can (a) collect an extra echoed line
+# and (b) resolve into a DIFFERENT checkout entirely. (b) is the dangerous one:
+# silencing the echo alone turns a loud failure into a silently wrong root. The
+# fix is to clear CDPATH inside the capture — and only running the shipped line
+# proves it is still there. Two arms, because the benign one cannot see (b):
+#   local — CDPATH=".": the directory is found locally; only the echo can bite.
+#   decoy — CDPATH=<other checkout>: a decoy holding the same relative path must
+#           NOT win. Without the CDPATH clear, the capture resolves there.
+
+_CD_CAPTURES = [
+    # (script, the variable the capture assigns, lines that must run first)
+    ("bootstrap.sh", "SCRIPT_DIR", ""),
+    ("cc-slot.sh", "_CC_SLOT_DIR", '_CC_SLOT_SCRIPT="${BASH_SOURCE[0]}"'),
+]
+
+
+@pytest.mark.parametrize("hostile", [False, True], ids=["local-cdpath", "decoy-cdpath"])
+@pytest.mark.parametrize(("script", "var", "prelude"), _CD_CAPTURES)
+def test_root_resolution_survives_cdpath(script, var, prelude, hostile, tmp_path):
+    text = (REPO_ROOT / "scripts" / script).read_text()
+    # The UNINDENTED assignment: cc-slot.sh has a second copy inside its symlink
+    # loop, and this is the one that runs on every invocation. Matched on shape
+    # (an unindented `var="$(… cd …)"`) rather than on the current spelling, so a
+    # different CDPATH remedy does not read as "capture not found".
+    pattern = re.compile(rf'^{var}="\$\(.*\bcd\b.*\)"$')
+    line = next(
+        (
+            ln.strip()
+            for ln in text.splitlines()
+            if not ln.startswith((" ", "\t")) and pattern.match(ln.strip())
+        ),
+        None,
+    )
+    assert line, f"no unconditional {var} capture found in {script}"
+
+    checkout = tmp_path / "checkout"
+    entry = checkout / "scripts" / script
+    entry.parent.mkdir(parents=True)
+    entry.write_text(f'set -u\n{prelude}\n{line}\nprintf %s "${{{var}}}"\n')
+
+    if hostile:
+        decoy = tmp_path / "decoy"
+        (decoy / "scripts").mkdir(parents=True)
+        cdpath = str(decoy)
+    else:
+        cdpath = "."
+
+    proc = subprocess.run(
+        ["bash", f"scripts/{script}"],  # relative, so CDPATH is consulted
+        cwd=str(checkout),
+        env={"PATH": "/usr/bin:/bin", "CDPATH": cdpath, "HOME": str(tmp_path)},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    expected = str(entry.parent.resolve())
+    assert "\n" not in proc.stdout, (
+        f"{script}: the capture holds more than one line — {proc.stdout!r}"
+    )
+    assert proc.stdout == expected, (
+        f"{script}: resolved {proc.stdout!r}, expected {expected!r} (CDPATH={cdpath})"
+    )

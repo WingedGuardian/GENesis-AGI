@@ -15,6 +15,7 @@ asserted as text.
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import subprocess
 import time
@@ -25,6 +26,7 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CC_SLOT = _REPO_ROOT / "scripts" / "cc-slot.sh"
 _BOOTSTRAP = _REPO_ROOT / "scripts" / "bootstrap.sh"
+_BASH = shutil.which("bash") or "bash"
 
 _FAKE_TMUX = """#!/usr/bin/env bash
 # Records every invocation; simulates has-session against a session list file.
@@ -112,10 +114,10 @@ exit 0
 """
 
 
-# Fake venv python: cc-slot resolves GENESIS_ROOT from HOME and consults a venv
-# python for the slot-map liveness verdict. Fake it so the map's annotation
-# branch can be driven directly; the probe's own logic is unit-tested in
-# tests/test_cc/test_slot_liveness.py.
+# Fake venv python: cc-slot resolves GENESIS_ROOT from its entrypoint and
+# consults a venv python for the slot-map liveness verdict. The fixture places
+# that checkout outside HOME so a HOME-based root cannot satisfy these tests.
+# The probe's own logic is unit-tested in tests/test_cc/test_slot_liveness.py.
 _FAKE_VENV_PY = """#!/usr/bin/env bash
 if [[ "$*" == *slot_liveness* ]]; then
   # Ordered call log (which probe ran, in which order) + an optional per-probe
@@ -195,8 +197,13 @@ def door(tmp_path):
 
     home = tmp_path / "home"
     home.mkdir()
-    venv_bin = home / "genesis" / ".venv" / "bin"
+    checkout = tmp_path / "checkout"
+    scripts_dir = checkout / "scripts"
+    venv_bin = checkout / ".venv" / "bin"
+    scripts_dir.mkdir(parents=True)
     venv_bin.mkdir(parents=True)
+    script_path = scripts_dir / "cc-slot.sh"
+    shutil.copy2(_CC_SLOT, script_path)
     fake_py = venv_bin / "python"
     fake_py.write_text(_FAKE_VENV_PY)
     fake_py.chmod(fake_py.stat().st_mode | stat.S_IEXEC)
@@ -263,7 +270,7 @@ def door(tmp_path):
         # run inside a cc slot, whose GENESIS_CC_PERMISSION_MODE / TMUX would
         # contaminate the branch under test.
         return subprocess.run(
-            ["bash", str(_CC_SLOT), *args],
+            ["bash", str(run.script_path), *args],
             env=env,
             capture_output=True,
             text=True,
@@ -271,6 +278,7 @@ def door(tmp_path):
         )
 
     run.env_fn = _env  # so the pty runner builds the IDENTICAL environment
+    run.script_path = script_path
     run.probe_log = probe_log  # ordered log of which slot-map probes ran
     run.snap = snap  # consent-block snapshot 1 (5-field lines)
     run.snap2 = snap2  # snapshot served from the SECOND call on (TOCTOU tests)
@@ -280,6 +288,7 @@ def door(tmp_path):
     run.claude_cwd = claude_cwd  # cwd that claude inherited from the bypass
     run.claude_env = claude_env  # TMPDIR claude inherited (unset vs empty)
     run.home = home  # so a test can make the temp-dir candidates unusable
+    run.checkout = checkout
     return run, log, sessions, listing, panes
 
 
@@ -290,6 +299,46 @@ def _new_session_line(log: Path) -> str:
 
 
 class TestManualMode:
+    def test_arbitrary_checkout_symlink_runs_probe_and_bypass_in_checkout(
+        self, door, tmp_path
+    ):
+        """The door must follow its entrypoint to the checkout it belongs to.
+
+        The fake venv deliberately lives outside HOME/genesis, and the script is
+        invoked through a symlink, so a HOME-based root silently skips the real
+        liveness probe and leaves the bypass in the caller's cwd.
+        """
+        run, _log, sessions, listing, panes = door
+        checkout = run.checkout
+        script_path = checkout / "scripts" / "cc-slot.sh"
+
+        link = tmp_path / "slot-door"
+        try:
+            link.symlink_to(script_path)
+        except OSError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                pytest.skip(
+                    "Windows symlink creation requires developer mode or "
+                    "SeCreateSymbolicLinkPrivilege"
+                )
+            raise
+        run.script_path = link
+
+        sessions.write_text("cc-1\n")
+        listing.write_text("cc-1|0|Thu Jul 16 20:00:00 2026\n")
+        panes.write_text("4242\n")
+        os.environ["_TEST_FAKE_LIVENESS"] = "ALIVE"
+        try:
+            proc = run("manual")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+        assert proc.returncode == 0, proc.stderr
+        assert run.probe_log.read_text().split() == ["liveness"], proc.stderr
+
+        proc = run("manual", "mcp", "list")
+        assert proc.returncode == 0, proc.stderr
+        assert run.claude_cwd.read_text().strip() == str(checkout)
+
     def test_first_free_slot_is_cc_1(self, door):
         run, log, _sessions, _listing, _panes = door
         result = run("manual")
@@ -619,6 +668,37 @@ class TestBootstrapWrapper:
         # The old design this replaces must not creep back.
         assert "cc-manual-" not in block
 
+    def test_wrapper_renders_the_bootstrap_checkout_path(self, block):
+        assert "local arg genesis_root=__GENESIS_ROOT__" in block
+        assert "$HOME/genesis/scripts/cc-slot.sh" not in block
+        text = _BOOTSTRAP.read_text()
+        assert "printf '%q' \"$GENESIS_ROOT\"" in text
+        assert 'TMUX_WRAP_BLOCK="${TMUX_WRAP_BLOCK//__GENESIS_ROOT__/' in text
+
+    def test_wrapper_root_substitution_preserves_ampersands_and_shopt_state(self):
+        text = _BOOTSTRAP.read_text()
+        start = text.index('_tmux_wrap_root=$(printf')
+        end = text.index('unset _tmux_wrap_root _tmux_wrap_patsub_replacement_was_set', start)
+        substitution = text[start:end]
+        checkout = "/tmp/genesis&slot"
+        script = f"""\
+set -euo pipefail
+shopt -s patsub_replacement
+GENESIS_ROOT={checkout!r}
+TMUX_WRAP_BLOCK='root=__GENESIS_ROOT__'
+{substitution}
+printf '%s\\n' \"$TMUX_WRAP_BLOCK\"
+shopt -q patsub_replacement
+"""
+        result = subprocess.run(
+            [_BASH, "-c", script],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        assert result.stdout == "root=/tmp/genesis\\&slot\n"
+
     def test_wrapper_keeps_passthrough_and_optout(self, block):
         assert "-p|--print|--version|-v|--help|-h" in block
         assert "GENESIS_NO_TMUX_WRAP" in block
@@ -672,7 +752,7 @@ def _run_door_pty(run, mode: str, feed: bytes, before_answer=None):
     pid, fd = pty.fork()
     if pid == 0:  # child: pty session leader
         try:
-            os.execve("/bin/bash", ["bash", str(_CC_SLOT), mode], env)  # noqa: S606
+            os.execve("/bin/bash", ["bash", str(run.script_path), mode], env)  # noqa: S606
         except Exception:  # noqa: BLE001
             os._exit(127)
     out = b""
@@ -1399,7 +1479,7 @@ class TestSubcommandBypass:
         result = run("manual", "mcp", "list")
         assert result.returncode == 0, result.stderr
         assert run.claude_cwd.exists(), "claude never recorded a cwd"
-        assert run.claude_cwd.read_text().strip() == str(run.home / "genesis")
+        assert run.claude_cwd.read_text().strip() == str(run.checkout)
 
     # ---- what must STILL get a slot ---------------------------------------
 
