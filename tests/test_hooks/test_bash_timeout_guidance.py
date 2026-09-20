@@ -329,6 +329,10 @@ class TestDeployGuardFiresOnTheDangerousInput:
             "echo systemd-run --unit u | bash scripts/update.sh",
             "systemd-run --unit x /bin/true & bash scripts/update.sh",
             "bash -c 'systemd-run --unit x bash scripts/update.sh'",
+            # `--unit` in the child's arguments or redirect target does not
+            # count — only systemd-run's own options are inspected.
+            "systemd-run --user --scope -- bash -c 'exec scripts/update.sh > /tmp/--unit.log'",
+            "systemd-run --user bash scripts/update.sh --unit=x",
         ):
             out = self._run(cmd, False)
             assert out.strip(), (

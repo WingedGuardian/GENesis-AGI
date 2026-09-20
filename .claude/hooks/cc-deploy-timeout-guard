@@ -90,13 +90,17 @@ while IFS= read -r _seg; do
             *) _held_script=update.sh ;;
         esac
     fi
-    # ALLOWLIST, on TOKENS — not substrings. Skip a leading run of VAR=val
-    # assignments; the first real word must be `systemd-run` AND a separate flag
-    # token must be `--unit` or `--unit=…`. A trailing `#`-comment, an env
-    # assignment mentioning a launcher, or a launcher quoted inside `-c '…'` all
-    # fail this check — every miss fires, which is the safe direction.
+    # ALLOWLIST, on TOKENS — not substrings, and only systemd-run's OWN options.
+    # Skip a leading run of VAR=val assignments; the first real word must be
+    # `systemd-run`. Then scan only the tokens BEFORE the `--` delimiter or the
+    # first non-flag operand (which begin the launched command): a `--unit` /
+    # `--unit=…` flag there is required, and a `--scope` / `--scope=…` flag
+    # disqualifies outright. `--unit` inside the child command or a redirect
+    # target does not count, a `#`-comment tail is stripped, and a launcher
+    # quoted inside `-c '…'` never reaches this walk — every miss fires.
     _first=""
     _has_unit=0
+    _has_scope=0
     _rest="${_seg%%#*}"
     for _tok in $_rest; do
         if [ -z "$_first" ]; then
@@ -104,12 +108,19 @@ while IFS= read -r _seg; do
                 *=*) continue ;;   # VAR=val assignment word
             esac
             _first="$_tok"
+            continue
         fi
         case "$_tok" in
+            --) break ;;
+            -*) : ;;
+            *) break ;;            # the command operand: stop scanning options
+        esac
+        case "$_tok" in
             --unit|--unit=*) _has_unit=1 ;;
+            --scope|--scope=*) _has_scope=1 ;;
         esac
     done
-    if [ "$_first" = "systemd-run" ] && [ "$_has_unit" -eq 1 ]; then
+    if [ "$_first" = "systemd-run" ] && [ "$_has_unit" -eq 1 ] && [ "$_has_scope" -eq 0 ]; then
         continue
     fi
     _held=1
