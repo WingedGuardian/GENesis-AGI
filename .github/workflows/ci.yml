@@ -905,15 +905,21 @@ jobs:
         #
         # So ceiling 99 -> 102.
         #
-        # The FLOOR moves too, 23333 -> 23336, and the reason is the same
+        # The FLOOR moves too, 23333 -> 23338, and it is the same
         # counted-before-the-last-edit trap one axis over. The floor was set at
-        # +35 when this file collected 35 cases; the review round that hardened
-        # the lock added three more, and the floor was not re-counted. MEASURED
-        # by collection, not by grepping for a def:
+        # +35 when this file collected 35 cases; a review round that hardened
+        # the lock added three more and it was not re-counted (Codex P2, round
+        # 4). MEASURED by collection, not by grepping for a def:
         #   pytest tests/test_hooks/test_wrapper_option_arity.py --collect-only -q
-        #   -> 38 tests collected
-        # The file is new on this branch, so all 38 are new cases and the floor
-        # is 23298 + 38. At +35 three of them could stop collecting while the
+        #   -> 40 tests collected
+        # The file is new on this branch, so all 40 are new cases and the floor
+        # is 23298 + 40. At +35 five of them could stop collecting while the
         # guard stayed green — the exact-fit invariant this block claims,
-        # quietly forfeited. (Codex P2, PR #1986, round 4.)
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23336
+        # quietly forfeited.
+        #
+        # Counted at 38 first, then re-counted at 40 after the ambiguity
+        # abstention added its two guard-the-guard tests. That is the FOURTH
+        # time this line has been set before the last test-adding edit, which
+        # is why the instruction above is shouted. Re-count LAST, after the
+        # final edit, never while writing it.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23338

@@ -152,6 +152,12 @@ _PAIR_GAP = re.compile(r"^,?\s*$")
 # keeps an ordinary capitalised description word out ("Reopen stdin as …" does
 # not match, because `R` is followed by a lowercase letter and no boundary).
 _REQUIRED_TAIL = re.compile(r"^(=\S| <[^>]+>| [A-Za-z][-A-Za-z0-9]*\b)")
+#: One spelling, two conflicting declarations in the same help text. NOT a
+#: fourth arity — a statement that this source cannot settle the question, so
+#: the lock abstains instead of grading against a coin flip. It is deliberately
+#: NOT equal to any real arity, so a caller that forgets to handle it fails the
+#: entry rather than silently accepting it.
+_AMBIGUOUS = "ambiguous"
 
 
 def _documented_arity(help_text: str) -> dict[str, str]:
@@ -171,15 +177,32 @@ def _documented_arity(help_text: str) -> dict[str, str]:
     entirely — and reading only the LONG form was an earlier blind spot of this
     same function, when the two entries that mattered were short ones.
 
-    A name seen more than once keeps the STRICTEST reading. That is what makes a
-    WRAPPED DESCRIPTION line harmless: ``xvfb-run`` continues the text for ``-a``
-    onto a line reading only ``--server-num``, which in isolation looks like a
-    boolean and would have failed the lock on a correct entry.
+    A name seen more than once with CONFLICTING readings is ``_AMBIGUOUS``, and
+    the caller abstains on it rather than grading against a guess. This used to
+    keep the STRICTEST reading, which is wrong in a measurable direction:
+    ``sudo`` documents ``-E, --preserve-env`` (bare) AND ``--preserve-env=list``,
+    so strictest reports ``required`` and adding that option to the table would
+    PASS the lock while the resolver ate the wrapped command (Codex P2, PR
+    #1986). The obvious repair — keep the WEAKEST — is equally wrong one entry
+    over: ``sudo`` also documents ``-h, --help`` and ``-h, --host=host``, and
+    ``-h`` IS correctly listed as value-consuming, so weakest fails a correct
+    entry. MEASURED across every table entry: flipping to weakest produced
+    exactly one new failure, ``sudo -h``.
+
+    Two structurally identical inputs needing opposite verdicts is not a rule
+    to tune — the disambiguating fact is not in the help text at all. So the
+    lock says so instead of guessing.
+
+    The wrapped-description case that motivated strictest-wins is handled a
+    layer up rather than here: ``xvfb-run`` continues the text for ``-a`` onto a
+    line reading only ``--server-num``, which conflicts with its own definition
+    line — but `_parser_arity` reads that tool's getopt spec and OVERRIDES this
+    reading entirely, so the ambiguity never reaches the caller. A tool whose
+    parser CAN be read is never abstained on; abstention is for prose alone.
 
     An option the help does not mention is absent from the result rather than
     guessed at — see the caller, which skips what it cannot measure.
     """
-    rank = {"zero": 0, "optional": 1, "required": 2}
     arity: dict[str, str] = {}
     for raw_line in help_text.splitlines():
         if not raw_line.strip().startswith("-"):
@@ -206,8 +229,13 @@ def _documented_arity(help_text: str) -> dict[str, str]:
             if _PAIR_GAP.match(gap):
                 kinds[idx] = kinds[idx + 1]
         for (_, _, name), kind in zip(hits, kinds, strict=True):
-            if name not in arity or rank[kind] > rank[arity[name]]:
+            if name not in arity:
                 arity[name] = kind
+            elif arity[name] != kind:
+                # CONFLICTING declarations for one spelling. Neither reading can
+                # be preferred, and picking one is wrong in a measurable
+                # direction whichever you pick — see `_AMBIGUOUS`.
+                arity[name] = _AMBIGUOUS
     return arity
 
 
@@ -343,6 +371,19 @@ class TestTableAgreesWithTheToolsThemselves:
         # entirely (see `_parser_arity`). Empty for every binary and builtin, so
         # this narrows nothing for the tools that have no spec to read.
         arity.update(_parser_arity(tool))
+        # ABSTAIN on a spelling the help declares two ways, and say which —
+        # the parser reading above has already resolved it wherever a parser
+        # could be read, so what remains is genuinely unsettleable from prose.
+        # Reported rather than dropped: an exclusion nobody can see is a hole,
+        # and this list is the honest statement of what the lock did NOT check.
+        abstained = sorted(opt for opt in sp._WRAPPER_SPEC[tool][0] if arity.get(opt) == _AMBIGUOUS)
+        if abstained:
+            print(
+                f"\nABSTAINED {tool}: {abstained} — the help declares each of these "
+                f"two ways and no parser was readable, so the lock cannot grade them. "
+                f"This is a KNOWN GAP, not a pass.",
+                file=sys.stderr,
+            )
         # An option neither source SAW is reported as unverified, not waved
         # through. Defaulting it to `required` was a hole in the lock itself:
         # `xargs` documents `-0, --null`, a numeric spelling the pattern skipped,
@@ -351,7 +392,7 @@ class TestTableAgreesWithTheToolsThemselves:
         wrong = sorted(
             (opt, arity.get(opt, "NOT FOUND in --help or the tool's own getopt spec"))
             for opt in sp._WRAPPER_SPEC[tool][0]
-            if arity.get(opt) != "required"
+            if arity.get(opt) != "required" and arity.get(opt) != _AMBIGUOUS
         )
         assert not wrong, (
             f"{tool}: {wrong} listed as value-consuming, but the tool documents no "
@@ -496,4 +537,48 @@ class TestTableAgreesWithTheToolsThemselves:
             "this test pins a DISAGREEMENT between the parser and its prose; if the help "
             "has since grown the option, the disagreement is gone and so is the need for "
             "the reader to outrank it here"
+        )
+
+    def test_a_spelling_declared_two_ways_is_AMBIGUOUS_not_guessed(self):
+        """Guard the guard: the sentinel must be distinct from every real arity.
+
+        Keeping the STRICTEST reading here let `sudo --preserve-env` report
+        `required`, so adding that option to the table would have PASSED the
+        lock while the resolver ate the wrapped command. Keeping the WEAKEST is
+        equally wrong for `sudo -h`, which IS correctly value-consuming. Neither
+        rule works, so neither is used (Codex P2, PR #1986).
+        """
+        arity = _documented_arity(
+            "  -E, --preserve-env      preserve the environment\n"
+            "      --preserve-env=list preserve specific variables\n"
+        )
+        assert arity["--preserve-env"] == _AMBIGUOUS
+        assert arity["--preserve-env"] not in ("zero", "optional", "required"), (
+            "the sentinel must not collide with a real arity, or a caller that "
+            "forgets to handle it silently accepts the entry"
+        )
+        # Not everything repeated is ambiguous: the SAME reading twice agrees.
+        agree = _documented_arity("  -f FILE  a file\n  -f FILE  the same file\n")
+        assert agree["-f"] == "required"
+
+    def test_a_readable_parser_RESOLVES_ambiguity_rather_than_abstaining(self):
+        """Abstention is for prose alone — it must not eat a tool we CAN measure.
+
+        `xvfb-run` continues the description for `-a` onto a line reading only
+        `--server-num`, which conflicts with that option's own definition line.
+        That conflict is exactly what strictest-wins was introduced to absorb,
+        so replacing strictest-wins with abstention would have silently dropped
+        a correct entry from the lock. It does not, because the getopt spec is
+        read first and outranks the prose.
+        """
+        if not shutil.which("xvfb-run"):
+            pytest.skip("xvfb-run is not installed here — the conflict cannot be measured")
+        from_help = _documented_arity(_help_text("xvfb-run") or "")
+        assert from_help.get("--server-num") == _AMBIGUOUS, (
+            "this test pins the prose CONFLICT; if the help stopped repeating the "
+            "name, the hazard is gone and so is what this test protects"
+        )
+        resolved = {**from_help, **_parser_arity("xvfb-run")}
+        assert resolved["--server-num"] == "required", (
+            "the parser must settle what the prose could not"
         )
