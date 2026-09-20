@@ -279,11 +279,12 @@ if [ "$HEALTH_OK" = true ] && systemctl --user is-active --quiet genesis-server;
     # means the TREE is the install), so a bare "deployed $SHA" would misname
     # what is serving. Deploy proceeds — with --no-pull that is the operator's
     # deliberate act — but the receipt must say so (Codex P2 / Devin, #1804).
-    # Untracked files are excluded: they cannot alter already-installed
-    # modules, and the main checkout legitimately carries local scratch.
-    # The probe fails CLOSED: a git error aborts the receipt via set -e (the
-    # EXIT trap then records deploy_failed), never a bare "deployed".
-    _DIRTY="$(git -C "$GENESIS_ROOT" status --porcelain --untracked-files=no)"
+    # deploy_tree_serving_diff also counts untracked files under code-bearing
+    # paths: an untracked module under src/ is importable by the serving
+    # install, not scratch (Codex P2, #1804). The probe fails CLOSED: a git
+    # error aborts the receipt via set -e (the EXIT trap then records
+    # deploy_failed), never a bare "deployed".
+    _DIRTY="$(deploy_tree_serving_diff "$GENESIS_ROOT")"
     if [ -n "$_DIRTY" ]; then
         append_deploy_receipt "deployed" "$SHA" "code-only" \
             "tracked-dirty tree — $SHA does not fully describe the served code"

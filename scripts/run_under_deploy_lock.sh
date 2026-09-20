@@ -109,6 +109,21 @@ if [ "$RECEIPT" -eq 1 ]; then
     # `set -e` abort here would kill a plain `-- make test` run over a value that
     # would never have been read (Kimi P3, 2026-09-06).
     SHA="$(git -C "$GENESIS_ROOT" rev-parse HEAD)"
+    # The receipt is a claim about the WHOLE run, so the tree must be clean at
+    # acquire time, not just at receipt time: a command that validates dirty
+    # modifications and then restores them (`pytest; git checkout -- .`) would
+    # otherwise record `validated` for a HEAD the tested code never matched
+    # (Codex P2, #1804). Same probe, same fail-closed contract as below.
+    _pre_dirty="$(deploy_tree_serving_diff "$GENESIS_ROOT")" || {
+        echo "ERROR: could not verify tree cleanliness (git status failed) — refusing the run." >&2
+        exit 1
+    }
+    if [ -n "$_pre_dirty" ]; then
+        echo "ERROR: the tree already carries uncommitted code — refusing the receipt run:" >&2
+        echo "       a validated receipt for $SHA would describe a tree that was never" >&2
+        echo "       served. Commit, stash, or restore first." >&2
+        exit 1
+    fi
 fi
 # Run the command WITHOUT the lock fd. The hold does not depend on inheritance —
 # this process keeps its own copy open for the whole wait — but inheritance is a
@@ -170,20 +185,21 @@ if [ "$RECEIPT" -eq 1 ] && [ "$cmd_rc" -eq 0 ]; then
     # (Codex P2, #1804). Verify the tree's identity AND cleanliness at receipt
     # time; refuse rather than record a claim we cannot stand behind. Both
     # probes fail CLOSED: a git error refuses the receipt, never waves one
-    # through. Untracked files are excluded: they cannot alter
-    # already-installed modules, and the main checkout legitimately carries
-    # local scratch (.local/, output dirs).
+    # through. deploy_tree_serving_diff counts tracked changes anywhere plus
+    # untracked files under code-bearing paths — an untracked module under
+    # src/ IS importable code (Codex P2, #1804); scratch outside those paths
+    # stays excluded.
     if [ "$(git -C "$GENESIS_ROOT" rev-parse HEAD)" != "$SHA" ]; then
         echo "ERROR: HEAD moved under the run (was $SHA) — refusing the receipt:" >&2
         echo "       the command validated a different tree than the one it started on." >&2
         exit 1
     fi
-    _dirty="$(git -C "$GENESIS_ROOT" status --porcelain --untracked-files=no)" || {
+    _dirty="$(deploy_tree_serving_diff "$GENESIS_ROOT")" || {
         echo "ERROR: could not verify tree cleanliness (git status failed) — refusing the receipt." >&2
         exit 1
     }
     if [ -n "$_dirty" ]; then
-        echo "ERROR: the tree has uncommitted TRACKED changes — refusing the receipt:" >&2
+        echo "ERROR: the tree has uncommitted code — refusing the receipt:" >&2
         echo "       the editable install serves those modifications, so $SHA does not" >&2
         echo "       describe what was validated. Commit, stash, or restore first." >&2
         exit 1

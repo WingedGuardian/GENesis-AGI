@@ -129,8 +129,10 @@ def test_ssh_calls_are_bounded_and_nonaborting(lib_text: str) -> None:
     # `if` is load-bearing beyond swallowing — it clears _GUARDIAN_PAUSED only on
     # success, so a failed resume keeps the flag set for the EXIT-trap retry.
     resume = _extract_func(lib_text, "_guardian_resume")
-    assert re.search(r"if\s+timeout[^\n]*\bssh\b", resume), (
-        "resume SSH must be guarded by an `if` (set -e-safe, non-aborting)"
+    # The resume ssh is captured for the owner-refusal check; `|| true` keeps it
+    # non-aborting under set -e exactly as the old `if`-guarded call did.
+    assert re.search(r"timeout\s+15\s+ssh[\s\S]*?\|\|\s*true", resume), (
+        "resume SSH must be bounded and `|| true`-guarded (set -e-safe)"
     )
     assert "return 0" in resume, "resume must `return 0` so a failed resume never aborts"
 
@@ -144,7 +146,14 @@ def test_wire_contract_pause_int_in_gateway_range(lib_text: str) -> None:
     EVERY value that can reach the wire is checked: the lib's `:=` default and each
     caller's literal override (deploy_code_only.sh uses a shorter window)."""
     pause = _extract_func(lib_text, "_guardian_pause")
-    assert '"pause $GUARDIAN_PAUSE_TTL"' in pause, "wire verb must be `pause <ttl>`"
+    # The owned form `pause <ttl> <token>` is tried first; the bare form is the
+    # fallback for gateways that predate the owner grammar.
+    assert '"pause $GUARDIAN_PAUSE_TTL $_GUARDIAN_TOKEN"' in pause, (
+        "wire verb must be `pause <ttl> <owner>`"
+    )
+    assert '"pause $GUARDIAN_PAUSE_TTL"' in pause, (
+        "the bare `pause <ttl>` fallback for pre-owner gateways must remain"
+    )
     m = re.search(r'^: "\$\{GUARDIAN_PAUSE_TTL:=(\d+)\}"$', lib_text, re.MULTILINE)
     assert m, "the lib must define GUARDIAN_PAUSE_TTL as a literal-integer := default"
     ttls = [int(m.group(1))]
@@ -193,6 +202,7 @@ def _harness(lib_text: str, tmp_path: Path, *, ssh_rc: int, pre_paused: bool = F
         'verb="${@: -1}"\n'
         f'echo "$verb" >> "{ssh_log}"\n'
         f"if [ \"$verb\" = paused ]; then echo '{_paused_json}'; fi\n"
+        f'case "$verb" in resume*) [ {ssh_rc} -eq 0 ] && echo \'{{"ok": true, "action": "resume"}}\' ;; esac\n'
         f"exit {ssh_rc}\n"
     )
     for f in ("timeout", "ssh"):
@@ -207,7 +217,7 @@ def _harness(lib_text: str, tmp_path: Path, *, ssh_rc: int, pre_paused: bool = F
             "#!/bin/bash\nset -euo pipefail\n"
             f'HOME="{home}"; VENV_DIR="{tmp_path}/venv"; GUARDIAN_PAUSE_TTL=1800\n'
             "GUARDIAN_PAUSE_RENEW_MAX=4\n"
-            '_GUARDIAN_PAUSED=""; _GUARDIAN_HOST=""; _GUARDIAN_KEY=""; _GUARDIAN_RENEW_PID=""\n'
+            '_GUARDIAN_PAUSED=""; _GUARDIAN_HOST=""; _GUARDIAN_KEY=""; _GUARDIAN_RENEW_PID=""; _GUARDIAN_TOKEN=""\n'
             f"{pause}\n{resume}\n{renew}\n{body}\necho REACHED_END\n"
         )
         env = {**os.environ, "PATH": f"{stub}:{os.environ['PATH']}"}
@@ -354,7 +364,7 @@ def test_lease_renewer_wired_and_bounded(lib_text: str) -> None:
     assert "_GUARDIAN_RENEW_PID=$!" in pause, "pause must capture the renewer PID"
     resume = _extract_func(lib_text, "_guardian_resume")
     assert 'kill "$_GUARDIAN_RENEW_PID"' in resume, "resume must kill the renewer"
-    assert resume.index("_GUARDIAN_RENEW_PID") < resume.index("resume >/dev/null"), (
+    assert resume.index("_GUARDIAN_RENEW_PID") < resume.index('"resume${'), (
         "the renewer must be killed BEFORE the resume SSH"
     )
 

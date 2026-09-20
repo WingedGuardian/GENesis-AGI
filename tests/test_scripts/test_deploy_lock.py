@@ -773,7 +773,9 @@ class TestRunUnderReceiptScope:
             text=True,
         )
         assert r.returncode == 1
-        assert "uncommitted TRACKED changes" in r.stderr
+        # The pre-run probe fires first: a tree dirty at acquire time can never
+        # produce an honest `validated <HEAD>` receipt (Codex P2, #1804).
+        assert "uncommitted" in r.stderr
         assert _receipts(env) == []
 
 
@@ -1156,3 +1158,87 @@ class TestReceiptsPrune:
         assert "_DEPLOY_RECEIPTS_KEEP" not in text, (
             "the cap belongs to the lib; a copy here would drift"
         )
+
+    def test_rewrite_failure_propagates_not_zero(self, station):
+        """A rewrite that cannot complete (the .tmp path is an orphaned
+        directory, the fs is full, mv is denied) must NOT return 0 — otherwise
+        disk_hygiene reports success daily while the ledger stays over cap
+        (Codex P2, #1804)."""
+        env = dict(station["env"])
+        receipts = Path(env["GENESIS_DEPLOY_RECEIPTS"])
+        receipts.write_text("".join(f'{{"n": {i}}}\n' for i in range(10)))
+        # A directory where the .tmp FILE must be: the tail redirect fails.
+        Path(str(receipts) + ".tmp").mkdir()
+        r = subprocess.run(
+            ["bash", "-c",
+             f'source "{_LIB}"; _DEPLOY_RECEIPTS_KEEP=5; prune_deploy_receipts'],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 1, (
+            f"a failed rewrite must surface nonzero — got {r.returncode}"
+        )
+        assert receipts.read_text().count("\n") == 10, "ledger must be untouched"
+
+
+class TestServingDiffAndPrecheck:
+    """The receipt probes must see everything the editable install serves:
+    tracked changes anywhere + UNTRACKED files under code-bearing paths —
+    and a --receipt run must refuse a tree that was dirty at ACQUIRE time,
+    not only at receipt time (Codex P2s, #1804)."""
+
+    def test_untracked_code_under_src_marks_the_tree_dirty(self, station):
+        root = station["root"]
+        (root / "src" / "genesis").mkdir(parents=True)
+        (root / "src" / "genesis" / "sneaky.py").write_text("x = 1\n")
+        r = subprocess.run(
+            ["bash", "-c", f'source "{_LIB}"; deploy_tree_serving_diff "$1"', "_", str(root)],
+            env=station["env"], capture_output=True, text=True,
+        )
+        assert r.returncode == 0
+        assert "sneaky.py" in r.stdout
+
+    def test_untracked_scratch_outside_code_paths_stays_excluded(self, station):
+        root = station["root"]
+        (root / "scratch-note.txt").write_text("local scratch\n")
+        r = subprocess.run(
+            ["bash", "-c", f'source "{_LIB}"; deploy_tree_serving_diff "$1"', "_", str(root)],
+            env=station["env"], capture_output=True, text=True,
+        )
+        assert r.returncode == 0
+        assert r.stdout.strip() == ""
+
+    def test_receipt_refused_when_tree_dirty_at_acquire(self, station):
+        """`pytest; git checkout -- .` used to pass the post-command probe —
+        the receipt then claimed HEAD for code HEAD never contained."""
+        env = station["env"]
+        tracked = station["root"] / "marker.txt"
+        tracked.write_text("v1\n")
+        subprocess.run(
+            ["git", "-C", str(station["root"]), "add", "marker.txt"], check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(station["root"]), "-c", "user.email=t@local",
+             "-c", "user.name=t", "commit", "-qm", "track marker"], check=True,
+        )
+        tracked.write_text("dirty\n")
+        r = subprocess.run(
+            ["bash", str(_RUN_UNDER), "--receipt", "--wait", "5", "--", "true"],
+            env=env, capture_output=True, text=True,
+        )
+        assert r.returncode == 1
+        assert "uncommitted" in r.stderr
+        assert _receipts(env) == []
+
+    def test_receipt_refused_when_untracked_code_added_mid_run(self, station):
+        env = station["env"]
+        r = subprocess.run(
+            ["bash", str(_RUN_UNDER), "--receipt", "--wait", "5", "--",
+             "bash", "-c",
+             'mkdir -p "$GENESIS_DEPLOY_ROOT/src/genesis" && echo x=1 > "$GENESIS_DEPLOY_ROOT/src/genesis/late.py"'],
+            env=env, capture_output=True, text=True,
+        )
+        assert r.returncode == 1
+        assert "uncommitted" in r.stderr
+        assert _receipts(env) == []

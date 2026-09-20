@@ -103,6 +103,25 @@ deploy_tree_is_linked_worktree() {
     [ -n "$gd" ] && [ -n "$gcd" ] && [ "$gd" != "$gcd" ]
 }
 
+# deploy_tree_serving_diff <root>
+#   Porcelain lines for everything that changes what an editable install
+#   serves or a wrapped validation runs: every TRACKED change in the tree,
+#   PLUS untracked files under code-bearing paths (src/, scripts/, tests/).
+#   An untracked module under src/genesis is importable code — a bare
+#   `--untracked-files=no` probe attributes it to HEAD, which the receipts
+#   exist to prevent (Codex P2, #1804). Untracked files OUTSIDE those paths
+#   stay excluded: the main checkout legitimately carries local scratch
+#   (.local/, output dirs). Prints nothing on a clean tree; returns nonzero
+#   when a git probe fails — callers must fail closed.
+deploy_tree_serving_diff() {
+    local root="$1"
+    git -C "$root" status --porcelain --untracked-files=no || return
+    # ls-files, not `status -- <paths>`: a pathspec with no match aborts
+    # status, while ls-files --others simply lists nothing — the code-bearing
+    # dirs may legitimately not exist in a fixture or sparse checkout.
+    git -C "$root" ls-files --others --exclude-standard -- src scripts tests | sed 's/^/?? /' || return
+}
+
 # append_deploy_receipt <status> <sha> <path> [note]
 #   status: deployed | deploy_failed | health_failed | deployed_not_started | validated
 #   path: code-only | update.sh | validation
@@ -179,8 +198,14 @@ prune_deploy_receipts() {
     local lines
     lines="$(wc -l < "$GENESIS_DEPLOY_RECEIPTS" 2>/dev/null || echo 0)"
     if [ "$lines" -gt "$_DEPLOY_RECEIPTS_KEEP" ]; then
-        tail -n "$_DEPLOY_RECEIPTS_KEEP" "$GENESIS_DEPLOY_RECEIPTS" > "$GENESIS_DEPLOY_RECEIPTS.tmp" \
-            && mv "$GENESIS_DEPLOY_RECEIPTS.tmp" "$GENESIS_DEPLOY_RECEIPTS"
+        # A rewrite failure (orphaned .tmp dir, full fs, denied mv) must reach
+        # the caller — returning 0 here made disk_hygiene report success on
+        # every run while the ledger grew past its cap (Codex P2, #1804).
+        if ! { tail -n "$_DEPLOY_RECEIPTS_KEEP" "$GENESIS_DEPLOY_RECEIPTS" > "$GENESIS_DEPLOY_RECEIPTS.tmp" \
+            && mv "$GENESIS_DEPLOY_RECEIPTS.tmp" "$GENESIS_DEPLOY_RECEIPTS"; }; then
+            rm -f "$GENESIS_DEPLOY_RECEIPTS.tmp"
+            return 1
+        fi
     fi
     return 0
 }

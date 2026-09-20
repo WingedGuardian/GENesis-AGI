@@ -1147,6 +1147,19 @@ _do_rollback() {
         _record_update_history "failed" "$reason (rollback incomplete)" "$degraded"
     fi
 
+    # Cross-path ledger (issue #1699): a failed full update belongs in the same
+    # ordered receipts the code-only path and validations write — without it the
+    # ledger shows a deploy followed by later validations with the intervening
+    # failed deploy invisible (Codex P2, #1804). The SHA names the tree AFTER
+    # the rollback attempt, which is what a later receipt correlates against;
+    # a git error degrades to "unknown", never aborts (append only warns).
+    _rollback_sha="$(git -C "$GENESIS_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+    if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && [ "$db_ok" = "true" ]; then
+        append_deploy_receipt "deploy_failed" "$_rollback_sha" "update.sh" "rolled back: $reason"
+    else
+        append_deploy_receipt "deploy_failed" "$_rollback_sha" "update.sh" "rollback incomplete: $reason"
+    fi
+
     echo ""
     echo "  To diagnose: discuss with Claude Code"
     echo "  Context: Update from $OLD_TAG to $NEW_TAG failed."

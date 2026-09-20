@@ -486,3 +486,60 @@ def test_update_node_verifies_by_node_version_not_apt(tmp_path):
     assert proc.returncode == 1, proc.stdout
     blob = proc.stdout + proc.stderr
     assert b"version mismatch after install" in blob, blob
+
+
+def _state_dir(home: Path) -> Path:
+    return home / ".local" / "state" / "genesis-guardian"
+
+
+def test_pause_records_owner_and_owned_resume_clears(stub_bin, tmp_path):
+    """`pause <ttl> <owner>` stamps paused.json; `resume <same-owner>` is the
+    only thing allowed to remove it (Codex P2, #1804)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    r = _run_verb(home, stub_bin, "pause 300 deploy-token-1")
+    assert r.returncode == 0 and '"ok": true' in r.stdout.decode()
+    doc = json.loads((_state_dir(home) / "paused.json").read_text())
+    assert doc["owner"] == "deploy-token-1"
+    r = _run_verb(home, stub_bin, "paused")
+    out = json.loads(r.stdout.decode())
+    assert out["paused"] is True and out["owner"] == "deploy-token-1"
+    r = _run_verb(home, stub_bin, "resume deploy-token-1")
+    assert r.returncode == 0
+    assert not (_state_dir(home) / "paused.json").exists()
+
+
+def test_resume_refuses_a_foreign_owner(stub_bin, tmp_path):
+    """An operator pause created mid-deploy must survive the deploy's
+    EXIT-trap resume: `resume <deploy-token>` on a pause owned by someone
+    else refuses and leaves the file."""
+    home = tmp_path / "home"
+    home.mkdir()
+    assert _run_verb(home, stub_bin, "pause 300 operator").returncode == 0
+    r = _run_verb(home, stub_bin, "resume deploy-token-2")
+    assert r.returncode != 0
+    assert "another holder" in r.stderr.decode()
+    doc = json.loads((_state_dir(home) / "paused.json").read_text())
+    assert doc["owner"] == "operator"
+
+
+def test_resume_with_owner_refuses_an_ownerless_pause(stub_bin, tmp_path):
+    """A legacy/operator pause has no owner field; a deploy's owned resume
+    must not delete it."""
+    home = tmp_path / "home"
+    home.mkdir()
+    assert _run_verb(home, stub_bin, "pause 300").returncode == 0
+    r = _run_verb(home, stub_bin, "resume deploy-token-3")
+    assert r.returncode != 0
+    assert (_state_dir(home) / "paused.json").exists()
+    # bare resume (operator / legacy path) still works
+    assert _run_verb(home, stub_bin, "resume").returncode == 0
+    assert not (_state_dir(home) / "paused.json").exists()
+
+
+def test_pause_rejects_bad_owner_chars(stub_bin, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    r = _run_verb(home, stub_bin, 'pause 300 "evil";rm -rf /"')
+    assert r.returncode != 0
+    assert not (_state_dir(home) / "paused.json").exists()
