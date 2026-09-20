@@ -44,8 +44,13 @@ import review_scope  # noqa: E402
 import review_state  # noqa: E402
 
 from genesis.session_awareness.zero_drop_git import (  # noqa: E402
-    _GIT_ENV_OVERRIDES as ZERO_DROP_COPY,
+    _GIT_ENV_UNSET as ZERO_DROP_UNSET,
 )
+
+#: Config FILE sources. NO copy may handle these, in either direction — unsetting
+#: loosens, and pinning removes ``safe.directory`` plus the remote-auth settings.
+#: The test below carries both measurements.
+_CONFIG_FILE_VARS = ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM")
 
 # ── the four copies must agree ────────────────────────────────────────────────
 
@@ -74,32 +79,85 @@ def _launcher_bash_list() -> tuple[str, ...]:
     return tuple(names)
 
 
-def test_all_four_copies_of_the_git_env_list_are_identical():
-    """The launcher's bash array, both hook-side Python tuples, and the original
-    frozenset in ``zero_drop_git`` must all hold the same names.
+def test_no_copy_anywhere_touches_the_config_FILE_variables():
+    """``GIT_CONFIG_GLOBAL``/``GIT_CONFIG_SYSTEM`` are handled in NEITHER
+    direction, in all four copies. Both directions were MEASURED to break
+    something, which is why this is asserted by NAME rather than left implicit.
 
-    FOUR copies, not three. ``zero_drop_git._GIT_ENV_OVERRIDES`` is the oldest of
-    them and was carrying 8 of the names when this lock was written — the exact
-    replica-drift this test exists to prevent, sitting unlocked in the module
-    that invented the pattern.
+    UNSETTING re-enables ``$HOME/.gitconfig``, so a scrub meant to isolate
+    loosens, and a caller that set ``/dev/null`` for isolation loses it.
+
+    PINNING to an empty file removes a CAPABILITY. ``safe.directory`` is readable
+    only from protected config, and repo-local config cannot restore it
+    (MEASURED: still rc=129), so under a uid mismatch — a bind-mounted
+    devcontainer, container CI, a hook under sudo — git REFUSES with empty
+    stdout and ``_staged_content_hash``'s empty-output sentinel is ``"clean"``:
+    NOTHING STAGED, over real staged work. Pinning also removes
+    ``credential.helper`` and ``url.*.insteadOf``, which ``zero_drop_git``'s env
+    feeds to ``git ls-remote`` and ``gh``.
+
+    And in the launcher specifically it breaks ``git_push_guard``, which PREDICTS
+    what a ``git push`` will do: MEASURED through the real
+    ``_push_config_is_simple``, with ``push.default = matching`` in
+    ``~/.gitconfig`` it returns False (prompts) when the config is visible and
+    True — ALLOWS SILENTLY — once the config is pinned away.
+
+    What closes the one config route measured to move a decision is a command
+    FLAG, pinned by ``test_a_global_attributes_file_cannot_downgrade_substantiality``.
+    """
+    copies = {
+        "launcher bash array": set(_launcher_bash_list()),
+        "review_state.GIT_ENV_UNSET": set(review_state.GIT_ENV_UNSET),
+        "review_scope._GIT_ENV_UNSET": set(review_scope._GIT_ENV_UNSET),
+        "zero_drop_git._GIT_ENV_UNSET": set(ZERO_DROP_UNSET),
+    }
+    for where, names in copies.items():
+        offenders = sorted(set(_CONFIG_FILE_VARS) & names)
+        assert not offenders, (
+            f"{where} now handles {offenders}. Unsetting them loosens; pinning "
+            "them removes safe.directory and lands these callers on the 'clean' "
+            "nothing-staged sentinel. Harden the COMMAND instead."
+        )
+
+
+def test_all_four_copies_of_the_git_env_list_are_identical():
+    """The launcher's bash array, both hook-side Python copies, and the original
+    frozenset in ``zero_drop_git`` must hold the same names.
+
+    FOUR copies. ``zero_drop_git._GIT_ENV_UNSET`` is the oldest of them and was
+    carrying 8 of the names when this lock was written — the exact replica-drift
+    this test exists to prevent, sitting unlocked in the module that invented the
+    pattern.
 
     SCOPE, stated so the count is not read as a claim about the repo: a FIFTH,
     narrower list exists in ``scripts/worktree_lifecycle.py`` (3 names, and its
-    own comment concedes it is incomplete). It is deliberately NOT in this
-    parity set — it is not a review-gate decision path — and is tracked
-    separately. This test pins the four copies that feed gate decisions. Compared as SETS because that copy is a frozenset;
-    the ordered copies are compared to each other as tuples below, so a reordering
-    is still visible.
+    own comment concedes it is incomplete). It is deliberately NOT in this parity
+    set — it is not a review-gate decision path — and is tracked separately.
+    Compared as SETS because one copy is a frozenset; the ordered copies are
+    compared to each other as tuples, so a reordering is still visible.
     """
     bash = _launcher_bash_list()
-    assert bash == review_state.GIT_ENV_OVERRIDES, (
-        "the launcher's bash array and review_state.GIT_ENV_OVERRIDES have drifted"
+    assert bash == review_state.GIT_ENV_UNSET, (
+        "the launcher's bash array and review_state.GIT_ENV_UNSET have drifted"
     )
-    assert review_scope._GIT_ENV_OVERRIDES == review_state.GIT_ENV_OVERRIDES, (
-        "review_scope._GIT_ENV_OVERRIDES and review_state.GIT_ENV_OVERRIDES have drifted"
+    assert review_scope._GIT_ENV_UNSET == review_state.GIT_ENV_UNSET, (
+        "review_scope._GIT_ENV_UNSET and review_state.GIT_ENV_UNSET have drifted"
     )
-    assert set(ZERO_DROP_COPY) == set(review_state.GIT_ENV_OVERRIDES), (
-        "zero_drop_git._GIT_ENV_OVERRIDES has drifted from review_state.GIT_ENV_OVERRIDES"
+    assert set(ZERO_DROP_UNSET) == set(review_state.GIT_ENV_UNSET), (
+        "zero_drop_git._GIT_ENV_UNSET has drifted from review_state.GIT_ENV_UNSET"
+    )
+
+
+def test_the_attributes_hardening_is_identical_in_both_copies():
+    """The flag pair is duplicated for the same reason the list is, so it gets
+    the same lock — a value that drifts between the two diff sites would leave
+    one classifier immune and the other not, and no list-equality test can see it.
+    """
+    assert review_scope._ATTRIBUTES_HARDENING == review_state._ATTRIBUTES_HARDENING, (
+        "the attributes hardening has drifted between review_scope and review_state"
+    )
+    assert review_state._ATTRIBUTES_HARDENING[0] == "-c", (
+        "the hardening must be a `-c` pair; git accepts it only BEFORE the subcommand"
     )
 
 
@@ -122,8 +180,19 @@ def test_the_list_covers_every_variable_measured_to_move_a_gate_decision():
         "GIT_INDEX_FILE",  # the staged hash
         "GIT_EXTERNAL_DIFF",  # the staged CONTENT hash -> the escalation counter
     }
-    missing = required - set(review_state.GIT_ENV_OVERRIDES)
+    missing = required - set(review_state.GIT_ENV_UNSET)
     assert not missing, f"scrub list lost a variable measured to move a gate: {sorted(missing)}"
+
+    # The pin half of the floor. GIT_CONFIG_GLOBAL is the one config source
+    # MEASURED to move a decision that `--no-ext-diff --no-textconv` does not
+    # reach (a global core.attributesFile marking *.py binary collapses the diff
+    # and the depth gate then reads `inline`), and it must be PINNED rather than
+    # merely listed — unsetting it re-enables $HOME/.gitconfig.
+    assert review_state._ATTRIBUTES_HARDENING[1].endswith(os.devnull), (
+        "the attributes hardening lost its empty-file target; a global "
+        "core.attributesFile can then mark source binary and the depth gate "
+        "reads `inline` over real staged work"
+    )
 
 
 def test_launcher_scrubs_for_the_child_not_only_for_its_own_discovery():
@@ -395,6 +464,8 @@ def test_harden_only_touches_diff_subcommands():
     which git rejects — turning every classifier into its fail-open path.
     """
     assert review_scope._harden(["diff", "-z", "--numstat"]) == [
+        "-c",
+        f"core.attributesFile={os.devnull}",
         "diff",
         "--no-ext-diff",
         "--no-textconv",
@@ -403,6 +474,14 @@ def test_harden_only_touches_diff_subcommands():
     ]
     for untouched in (["rev-parse", "HEAD"], ["merge-base", "a", "b"], []):
         assert review_scope._harden(untouched) == untouched
+
+    # ORDER is part of the contract, not cosmetic: git accepts `-c` only BEFORE
+    # the subcommand, so a `-c` pair appended after `diff` makes git reject the
+    # whole command — every classifier then takes its fail-open path.
+    hardened = review_scope._harden(["diff", "--cached"])
+    assert hardened.index("-c") < hardened.index("diff"), (
+        "the -c pair must precede the subcommand or git rejects the command"
+    )
 
 
 def test_a_repo_local_external_diff_cannot_empty_the_staged_content_hash(repos):
@@ -454,6 +533,52 @@ def test_a_repo_local_external_diff_cannot_downgrade_substantiality(repos):
 
     assert review_scope.classify_change_substantiality(cwd=cwd) == clean, (
         "a repo-local diff.external downgraded the substantiality classification"
+    )
+
+
+def test_a_global_attributes_file_cannot_downgrade_substantiality(repos, monkeypatch, tmp_path):
+    """The fail-open the PIN exists for — and the one the diff FLAGS do not reach.
+
+    MEASURED 2026-09-19 on 200 staged Python lines: a global
+    ``core.attributesFile`` marking ``*.py binary`` collapses ``--numstat`` to
+    ``-  -``, and ``classify_change_substantiality`` then reports ``inline``
+    instead of ``substantial`` — the depth gate demands LESS review. This is NOT
+    the ``diff.external`` class: ``--no-ext-diff --no-textconv`` do not touch it,
+    which is why the scrub list alone could never have closed it and why the pin
+    is protective rather than hygiene.
+
+    The assertion is on the pinned value's EFFECT, driven through the real
+    classifier with a real attributes file, rather than on ``GIT_ENV_PIN``'s
+    contents — a test that only read the constant would pass against a
+    ``_git_env`` that had stopped applying it.
+    """
+    a, _b = repos
+    cwd = str(a)
+
+    clean = review_scope.classify_change_substantiality(cwd=cwd)
+    assert clean == "substantial", f"baseline is not substantial ({clean!r})"
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    (fake_home / "attrs").write_text("*.py binary\n")
+    (fake_home / ".gitconfig").write_text(f"[core]\n\tattributesFile = {fake_home}/attrs\n")
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    assert review_scope.classify_change_substantiality(cwd=cwd) == "substantial", (
+        "a global core.attributesFile marking *.py binary downgraded the "
+        "substantiality classification — the attributes hardening is not applied"
+    )
+
+    # CONTROL, the same one the location `poison` fixture carries and for the
+    # same reason: prove the poison is LIVE in this process. Without it an
+    # attributes file that never reached git — an ambient GIT_CONFIG_GLOBAL in
+    # the runner, an XDG interaction, a future git that ignores attributesFile
+    # for --numstat — makes the assertion above pass while testing nothing.
+    monkeypatch.setattr(review_scope, "_ATTRIBUTES_HARDENING", ())
+    assert review_scope.classify_change_substantiality(cwd=cwd) == "inline", (
+        "the attributes poison is INERT here — with the hardening removed the "
+        "classification should collapse to `inline`, so the assertion above "
+        "proves nothing about the hardening"
     )
 
 

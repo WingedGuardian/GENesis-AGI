@@ -31,12 +31,29 @@ GENESIS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # staged-content hash returns its "nothing staged" sentinel and the escalation
 # cap stops counting rounds.
 #
-# This list is DUPLICATED in scripts/review_state.py (GIT_ENV_OVERRIDES),
-# scripts/review_scope.py, and src/genesis/session_awareness/zero_drop_git.py,
-# because bash cannot import Python. All FOUR copies are kept in step by
-# tests/test_hooks/test_git_env_scrub.py, which parses this array out of this
-# file and fails when any copy drifts. Add a variable in one place and that test
-# tells you about the other three.
+# This array is a SUBSET of the Python lists in scripts/review_state.py
+# (GIT_ENV_UNSET), scripts/review_scope.py and
+# src/genesis/session_awareness/zero_drop_git.py, because bash cannot import
+# Python. tests/test_hooks/test_git_env_scrub.py parses it out of this file and
+# fails when it drifts.
+#
+# IT MUST NOT GAIN GIT_CONFIG_GLOBAL OR GIT_CONFIG_SYSTEM, in either direction.
+# Those name config FILES the user legitimately owns; the two injection CHANNELS
+# below have no legitimate use in a hook's environment and are scrubbed.
+#
+# This launcher scrubs for all ~50 LAUNCHED hooks, and one of them —
+# git_push_guard — PREDICTS what a `git push` will do: its
+# _push_config_is_simple is an allowlist over the user's effective config
+# (remote.pushDefault, push.default, push.recurseSubmodules, …), where a
+# broadening value makes it return False and PROMPT. A guard that predicts a
+# command's effect has to see the config that command will see.
+#
+# MEASURED 2026-09-19 through the real function, with a control that moves: with
+# `push.default = matching` in ~/.gitconfig, is_simple is False (prompts) when
+# the config is visible and True (ALLOWS SILENTLY) under
+# GIT_CONFIG_GLOBAL=/dev/null. Unsetting breaks it the same way whenever a user
+# legitimately points GIT_CONFIG_GLOBAL at a custom file — so neither pinning nor
+# unsetting is safe HERE, and the parity test asserts their absence by name.
 _GIT_ENV_SCRUB=(
     -u GIT_DIR
     -u GIT_WORK_TREE
@@ -50,10 +67,14 @@ _GIT_ENV_SCRUB=(
     -u GIT_PREFIX
     -u GIT_EXTERNAL_DIFF
     -u GIT_DIFF_OPTS
+    # Config injected ENTIRELY through the environment. NOT the config FILE
+    # sources above: git_push_guard needs the user's real config, but nothing
+    # needs an injected KEY_n/VALUE_n pair, and this array is the only scrub the
+    # launched hooks that scrub nothing themselves ever get —
+    # scripts/review_enforcement_commit.py, the PreToolUse commit gate, makes
+    # three git calls with no env= of its own and depends on it entirely.
     -u GIT_CONFIG_COUNT
     -u GIT_CONFIG_PARAMETERS
-    -u GIT_CONFIG_GLOBAL
-    -u GIT_CONFIG_SYSTEM
 )
 _common_dir="$(cd "$GENESIS_ROOT" 2>/dev/null && env "${_GIT_ENV_SCRUB[@]}" git rev-parse --git-common-dir 2>/dev/null)" || _common_dir=""
 MAIN_ROOT=""

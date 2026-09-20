@@ -72,3 +72,47 @@ These supplement the general principles kept in CLAUDE.md:
   pins the copies to each other rather than trusting them. **The general rule:
   when a process hands work to a child, decide explicitly what the child's
   environment is — inheriting it is a decision too, just an unmade one.**
+- **Normalizing an environment removes CAPABILITIES as well as influence — and
+  `unset` is not the neutral option either.** Hardening a subprocess environment
+  looks like it can only subtract an attacker's reach. It also subtracts the
+  caller's, and both directions were MEASURED on one variable in one review round:
+  * UNSETTING `GIT_CONFIG_GLOBAL` re-enables `$HOME/.gitconfig` (it is git's own
+    documented way to say *read no global config*), so a scrub meant to isolate
+    LOOSENS, and a caller that set it to `/dev/null` for isolation loses that.
+  * PINNING it to an empty file removes `safe.directory`, which git reads ONLY
+    from protected config, by design, so a repo cannot self-approve — and
+    repo-local config cannot restore it. Under any uid mismatch (bind-mounted
+    devcontainer, container CI, a hook under sudo) git then REFUSES with empty
+    stdout. MEASURED end-to-end with a file staged: `get_current_diff_hash`
+    returned `'clean'` — the NOTHING-STAGED sentinel — which is the exact
+    fail-open the change was written to close. It also removes
+    `credential.helper` and `url.*.insteadOf`, which the same env feeds to
+    `git ls-remote` and `gh`.
+
+  So the rule is: **follow the tool's non-zero-exit path all the way to the
+  caller's sentinel before calling a hardening "strictly stronger".** An empty
+  result and a refusal are the same bytes, and a gate that treats empty as
+  "nothing to review" converts a refusal into a pass.
+- **Prefer a FLAG on the command over surgery on the environment.** The route
+  that actually moved a gate decision — a global `core.attributesFile` marking
+  `*.py binary`, which collapses `--numstat` to `-  -` so the depth gate reads
+  `inline` instead of `substantial` — is closed by
+  `-c core.attributesFile=/dev/null` on the diff, exactly as `diff.external` is
+  closed by `--no-ext-diff`. MEASURED: the flag closes the hole AND keeps
+  `safe.directory` working (rc=0), where the environment pin closes the hole and
+  breaks it (rc=129). The flag is also scoped to the one command that needs it,
+  so it cannot disarm a sibling consumer the way a shared env builder does.
+  `--text` is NOT a substitute (MEASURED: `--numstat` still reports `-  -`).
+- **A guard that PREDICTS what a command will do must see what that command will
+  see.** `git_push_guard._push_config_is_simple` is an allowlist over the user's
+  effective config (`remote.pushDefault`, `push.default`, …) where a broadening
+  value makes it PROMPT. MEASURED with a control that moves: with
+  `push.default = matching` in `~/.gitconfig` it returns False (prompts) when the
+  config is visible and True — allows silently — once `GIT_CONFIG_GLOBAL` is
+  pinned away. **Same shape as "never normalize before a blind-spot probe", one
+  layer up: there the normalizer and the probe sit in one script; here they sit
+  in different processes, which is why it stayed invisible.** The launcher
+  therefore scrubs the injection CHANNELS (`GIT_CONFIG_COUNT`,
+  `GIT_CONFIG_PARAMETERS`), which have no legitimate use in a hook's
+  environment, and never the config FILE variables, which name files the user
+  owns.

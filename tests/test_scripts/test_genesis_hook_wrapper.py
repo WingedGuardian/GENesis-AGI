@@ -231,6 +231,54 @@ def test_ambient_git_env_is_scrubbed_for_the_LAUNCHED_HOOK_too(tmp_path):
     )
 
 
+def test_the_launcher_passes_git_config_vars_THROUGH_to_the_launched_hook(tmp_path):
+    """The deliberate NON-scrub, asserted on the child rather than on the array.
+
+    The location variables above are removed; the config FILE variables must
+    NOT be, and that asymmetry is load-bearing rather than an oversight. The
+    launcher scrubs for every launched hook, and ``git_push_guard`` exists to
+    PREDICT what a ``git push`` will do: ``_push_config_is_simple`` is an
+    allowlist over the user's effective config, where a broadening value makes
+    it return False and PROMPT. MEASURED 2026-09-19 through that real function,
+    with a control that moves — with ``push.default = matching`` in
+    ``~/.gitconfig`` it returns False (prompts) when the config is visible and
+    True (ALLOWS SILENTLY) once GIT_CONFIG_GLOBAL is pinned to /dev/null. A
+    guard that predicts a command's effect has to see what that command sees.
+
+    ``tests/test_hooks/test_git_env_scrub.py`` pins the same rule from the other
+    end, by asserting those names are absent from the launcher's array. This is
+    the BEHAVIOURAL half: the array could be right while the ``exec`` line
+    scrubbed them some other way, and only the child's own environment can tell
+    the difference.
+    """
+    _main, wt = _make_main_and_worktree(tmp_path)
+    (_main / "scripts" / "probe.py").write_text(
+        "import json, os\n"
+        "print(json.dumps(sorted(k for k in os.environ if k.startswith('GIT_'))))\n"
+    )
+
+    passthrough = {
+        "GIT_CONFIG_GLOBAL": str(tmp_path / "gitconfig"),
+        "GIT_CONFIG_SYSTEM": str(tmp_path / "gitconfig"),
+    }
+    proc = _invoke(wt, cwd=wt, extra_env={**passthrough, "GIT_DIR": str(tmp_path / "decoy")})
+    assert proc.returncode == 0, proc.stderr
+    seen = set(json.loads(proc.stdout))
+
+    missing = sorted(set(passthrough) - seen)
+    assert not missing, (
+        f"the launcher stripped {missing} on the way to the hook. That re-introduces "
+        "a MEASURED fail-open: git_push_guard stops seeing the user's effective push "
+        "config and a broadening push.default becomes a silent allow."
+    )
+    # Control: the location scrub is still working in the SAME invocation, so a
+    # pass above is the asymmetry rather than a launcher that scrubs nothing.
+    assert "GIT_DIR" not in seen, (
+        "GIT_DIR survived — this test would pass vacuously against a launcher "
+        "whose scrub had stopped working altogether"
+    )
+
+
 def test_separate_git_dir_falls_back_to_own_scripts(tmp_path):
     """A `git init --separate-git-dir` checkout makes `--git-common-dir` return
     external metadata whose parent has no `scripts/`; the launcher must REJECT that

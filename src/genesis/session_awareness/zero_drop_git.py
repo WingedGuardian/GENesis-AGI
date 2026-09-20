@@ -204,15 +204,21 @@ def _git(root: str, *args: str) -> list[str]:
 # for the same reason `--no-optional-locks` lives in `_git()`: a guarantee every
 # caller must remember is a convention.
 #
-# FOUR COPIES OF THIS SET EXIST and are kept identical BY TEST, not by import:
-# here, `scripts/review_state.py`, `scripts/review_scope.py`, and the bash array
-# in `.claude/hooks/genesis-hook` (bash cannot import a Python frozenset). The
-# hook-side copies cannot import this module — hook scripts are stdlib-only, and
+# THREE COPIES OF THIS SET EXIST and are kept identical BY TEST, not by import:
+# here, `scripts/review_state.py`, and `scripts/review_scope.py`. The hook-side
+# copies cannot import this module — hook scripts are stdlib-only, and
 # `git_push_guard` already wraps its `review_state` import in `try/except`
 # because a module-load exception in a hook exits 1, which Claude Code treats as
 # NON-BLOCKING and which would silently disable every fail-closed gate in that
-# file. `tests/test_hooks/test_git_env_scrub.py` asserts all four are equal.
-_GIT_ENV_OVERRIDES = frozenset(
+# file. `tests/test_hooks/test_git_env_scrub.py` asserts all three are equal.
+#
+# The launcher's bash array in `.claude/hooks/genesis-hook` is NOT a fourth copy.
+# It scrubs for every LAUNCHED hook, including `git_push_guard`, which exists to
+# PREDICT what a `git push` will do and must therefore see the config that push
+# will see. MEASURED 2026-09-19: pinning global config there turns a prompting
+# push into a silent allow. It carries the LOCATION names only, and the parity
+# test asserts that asymmetry by name. Full reasoning on the `review_state` copy.
+_GIT_ENV_UNSET = frozenset(
     {
         # Repository LOCATION. MEASURED 2026-09-19: these three each redirect a
         # gate decision on their own (branch, staged-diff hash, worktree key).
@@ -246,15 +252,23 @@ _GIT_ENV_OVERRIDES = frozenset(
         # cannot be denylisted by name (MEASURED 2026-09-19).
         "GIT_CONFIG_COUNT",
         "GIT_CONFIG_PARAMETERS",
-        "GIT_CONFIG_GLOBAL",
-        "GIT_CONFIG_SYSTEM",
     }
 )
+
+#: GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM are deliberately NOT handled here, in
+#: either direction. Unsetting them re-enables `$HOME/.gitconfig`; PINNING them
+#: to an empty file removes `safe.directory` (readable only from protected
+#: config) and, for THIS builder specifically, also removes `credential.helper`,
+#: `url.*.insteadOf` and `http.*` — which live in global config by convention and
+#: which this env feeds to `git ls-remote` and to `gh` in `zero_drop_worker`.
+#: A local-read hardening must not quietly disarm a remote-auth path. The one
+#: config route measured to move a gate decision is closed by a command flag
+#: instead; see the `review_state` copy for both measurements.
 
 
 def scrubbed_git_env() -> dict[str, str]:
     """The ambient environment with git's repo-discovery overrides removed."""
-    return {k: v for k, v in os.environ.items() if k not in _GIT_ENV_OVERRIDES}
+    return {k: v for k, v in os.environ.items() if k not in _GIT_ENV_UNSET}
 
 
 async def default_runner(argv: list[str], timeout: float) -> tuple[int, str, str]:

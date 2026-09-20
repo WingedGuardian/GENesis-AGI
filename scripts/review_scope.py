@@ -332,7 +332,7 @@ def _specialists(scope_tags: set[str], diff_lines: int) -> list[str]:
 #: module-load failure path into the enforcement layer, which is what the copy
 #: exists to avoid. The per-variable measurements live on the ``review_state``
 #: copy; do not restate them here, where they would drift.
-_GIT_ENV_OVERRIDES = (
+_GIT_ENV_UNSET = (
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
@@ -345,26 +345,24 @@ _GIT_ENV_OVERRIDES = (
     "GIT_PREFIX",
     "GIT_EXTERNAL_DIFF",
     "GIT_DIFF_OPTS",
-    # Arbitrary git CONFIG through the environment. PRECAUTIONARY, and the
-    # honest framing matters here: the one config key measured to fail OPEN is
-    # `diff.external`, and what closes THAT is `--no-ext-diff` on the command,
-    # not this list — because the same key also arrives via a repo-local
-    # .git/config, which no environment scrub can reach. MEASURED 2026-09-19
-    # across nine keys: only `diff.noprefix` moved anything else, and it
-    # perturbs the hash in the fail-CLOSED direction (the marker stops matching,
-    # so MORE review is demanded). These four stay as defence in depth against
-    # keys nobody has enumerated. Dropping GIT_CONFIG_COUNT alone neuters the
-    # unbounded GIT_CONFIG_KEY_n/VALUE_n pairs, which cannot be listed by name.
+    # Config injected ENTIRELY through the environment — no FILE to point at a
+    # neutral value, so removal is the only available action.
     "GIT_CONFIG_COUNT",
     "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_SYSTEM",
 )
+
+#: GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM are deliberately handled in NEITHER
+#: direction — unsetting loosens, pinning removes `safe.directory` and lands this
+#: module's own callers on a fail-open. The one config route measured to move a
+#: decision is closed by a FLAG instead. Full reasoning and both measurements
+#: live on the ``review_state`` copy; do not restate them here, where they would
+#: drift.
+_ATTRIBUTES_HARDENING = ("-c", f"core.attributesFile={os.devnull}")
 
 
 def _git_env() -> dict[str, str]:
     """The ambient environment with git's own overrides removed."""
-    return {k: v for k, v in os.environ.items() if k not in _GIT_ENV_OVERRIDES}
+    return {k: v for k, v in os.environ.items() if k not in _GIT_ENV_UNSET}
 
 
 #: ``diff`` subcommands are hardened HERE, in the one runner, rather than at each
@@ -375,9 +373,14 @@ def _git_env() -> dict[str, str]:
 #: GIT_CONFIG_PARAMETERS, GIT_CONFIG_GLOBAL, and a repo-local .git/config that no
 #: environment scrub can reach at all. Only the flag closes the whole set.
 def _harden(args: list[str]) -> list[str]:
-    """Insert the diff-immunity flags when the subcommand is ``diff``."""
+    """Insert the diff-immunity flags and config when the subcommand is ``diff``.
+
+    ``_ATTRIBUTES_HARDENING`` is a `-c` pair and must lead the SUBCOMMAND, not
+    follow it — git only accepts `-c` before the subcommand — which is why it is
+    prepended here rather than added alongside the `--no-*` flags.
+    """
     if args and args[0] == "diff":
-        return ["diff", "--no-ext-diff", "--no-textconv", *args[1:]]
+        return [*_ATTRIBUTES_HARDENING, "diff", "--no-ext-diff", "--no-textconv", *args[1:]]
     return list(args)
 
 
