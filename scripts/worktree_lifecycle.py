@@ -1537,7 +1537,78 @@ def _trash_worktree(
 # ---------------------------------------------------------------------------
 
 
-def _recover(name: str, repo_root: Path) -> bool:
+def _describe_recovery(stored: Path) -> bool:
+    """Dry-run preview for a resolved trash entry: what recovery WOULD do.
+
+    Read-only. Reads the entry's ``.trash_meta.json`` — from the directory, or
+    from inside the archive in memory, without extracting anything to disk —
+    and prints the same facts a real recovery reports, in the conditional
+    tense: a dry-run that printed completed-actions prose would leave a reader
+    who missed the flag with no second signal that nothing happened (#2188).
+
+    The pre-flight refusals (missing metadata, incomplete metadata, an occupied
+    destination) are reported exactly as a real run would report them, so the
+    preview cannot promise a recovery the real run would refuse.
+    """
+    if stored.is_dir():
+        meta_path = stored / ".trash_meta.json"
+        if not meta_path.exists():
+            print(f"No .trash_meta.json in {stored}", file=sys.stderr)
+            return False
+        meta = json.loads(meta_path.read_text())
+        file_count = sum(
+            1 for p in stored.rglob("*") if p.is_file() and p != meta_path
+        )
+        consume_note = (
+            "WOULD CONSUME the trash entry "
+            "(directory form; recovery moves its contents back)"
+        )
+    else:
+        try:
+            with tarfile.open(stored, "r:gz") as tf:
+                members = tf.getmembers()
+                meta_member = next(
+                    (m for m in members
+                     if m.isfile() and m.name.endswith(".trash_meta.json")),
+                    None,
+                )
+                if meta_member is None:
+                    print(f"No .trash_meta.json in {stored}", file=sys.stderr)
+                    return False
+                meta = json.loads(tf.extractfile(meta_member).read())
+                file_count = sum(
+                    1 for m in members
+                    if m.isfile() and not m.name.endswith(".trash_meta.json")
+                )
+        except (OSError, tarfile.TarError, EOFError, json.JSONDecodeError) as e:
+            print(f"Failed to read {stored}: {e}", file=sys.stderr)
+            return False
+        consume_note = (
+            f"Archive would be KEPT at {stored} "
+            "(recovery copies; it does not consume)"
+        )
+
+    original_path = meta.get("original_path", "")
+    branch = meta.get("branch", "")
+    commit = meta.get("commit", "")
+    if not original_path or (not branch and not commit):
+        print(f"Incomplete metadata in {stored}", file=sys.stderr)
+        return False
+    if Path(original_path).exists():
+        print(f"Original path already exists: {original_path}", file=sys.stderr)
+        return False
+
+    if branch and not meta.get("detached", False):
+        ref_note = f"branch: {branch}"
+    else:
+        ref_note = f"detached at {commit[:8]}"
+    _log(f"WOULD RECOVER {original_path} ({ref_note})")
+    _log(f"WOULD RESTORE {file_count} untracked file(s) from {stored}")
+    _log(consume_note)
+    return True
+
+
+def _recover(name: str, repo_root: Path, *, dry_run: bool = False) -> bool:
     """Resolve a trash entry by name prefix and restore it.
 
     A stored entry is either a directory or a ``.tar.gz``. Archives are extracted
@@ -1550,6 +1621,10 @@ def _recover(name: str, repo_root: Path) -> bool:
     consumed instead: `_restore_from_dir` moves its contents back and removes the
     entry, because for those the trash directory IS the only copy and leaving a
     duplicate would double the disk for no benefit.
+
+    Under ``dry_run`` the entry is only resolved and described (see
+    `_describe_recovery`): no extraction, no ``git worktree add``, no moves —
+    the same "show, don't do" contract the reap path honours (#2188).
     """
     if not TRASH_DIR.exists():
         print(f"No trash directory found at {TRASH_DIR}", file=sys.stderr)
@@ -1580,6 +1655,11 @@ def _recover(name: str, repo_root: Path) -> bool:
         return False
 
     stored = matches[0]
+    if dry_run:
+        # Resolution and ambiguity checks above are read-only, so running them
+        # in dry-run keeps the preview's error messages identical to a real
+        # run's. Everything below this line writes.
+        return _describe_recovery(stored)
     if stored.is_dir():
         return _restore_from_dir(stored, repo_root)
 
@@ -2001,7 +2081,11 @@ def main() -> int:
     repo_root = _repo_root()
 
     if args.recover:
-        return 0 if _recover(args.recover, repo_root) else 1
+        # --dry-run must reach the recover path too (#2188): the flag's contract
+        # ("Show what would happen without doing it") is taught by the reap path
+        # ("WOULD TRASH ..."), so silently dropping it here would perform a full
+        # real recovery — thousands of files — under a no-op flag.
+        return 0 if _recover(args.recover, repo_root, dry_run=args.dry_run) else 1
 
     if args.report_json:
         try:

@@ -381,6 +381,52 @@ def test_recover_legacy_branch_entry(reaper_repo, tmp_path, monkeypatch):
     assert branch == "merged-br"
 
 
+def test_recover_dry_run_previews_and_writes_nothing(
+    reaper_repo, tmp_path, monkeypatch, capsys
+):
+    """`--recover --dry-run` previews the recovery and writes nothing (#2188).
+
+    `--dry-run` is honoured by the reap path ("WOULD TRASH ..."), so a recovery
+    that silently ignored it performed a full real restore under a flag whose
+    documented contract is "Show what would happen without doing it". The
+    preview reports in the conditional tense and leaves both sides untouched:
+    the destination is not recreated and the trash entry is not consumed.
+    """
+    import json
+
+    trash = tmp_path / "trash"
+    trash.mkdir()
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+
+    src = reaper_repo.wt_branch_merged
+    entry = trash / "wt_branch_merged-20260101"
+    subprocess.run(["mv", str(src), str(entry)], check=True)
+    _git(reaper_repo.repo, "worktree", "prune")
+    (entry / "notes.txt").write_text("untracked")
+    (entry / ".trash_meta.json").write_text(
+        json.dumps(
+            {
+                "original_path": str(src),
+                "branch": "merged-br",
+                "commit": reaper_repo.c0,
+                "trashed_at": "2026-01-01T00:00:00+00:00",
+            }
+        )
+    )
+
+    ok = wl._recover("wt_branch_merged", reaper_repo.repo, dry_run=True)
+    assert ok is True
+
+    out = capsys.readouterr().out
+    assert "WOULD RECOVER" in out
+    assert "merged-br" in out
+    assert "WOULD RESTORE" in out
+    # Nothing was written: destination absent, trash entry intact.
+    assert not src.exists()
+    assert entry.is_dir()
+    assert (entry / ".trash_meta.json").exists()
+
+
 # ─── detached reap predicate is ancestor-ONLY (Codex P1 findings B & C) ───────
 
 
