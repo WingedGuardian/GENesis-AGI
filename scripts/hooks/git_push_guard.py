@@ -2727,6 +2727,7 @@ def _check_inline_review_findings(
     *,
     force: bool = False,
     repo: str | None = None,
+    uncounted_out: list[dict[str, int]] | None = None,
 ) -> tuple[bool, str]:
     """Scan review findings from BOTH delivery channels and apply a weighted score.
 
@@ -2995,14 +2996,20 @@ def _check_inline_review_findings(
     # scan, which blocks like any other incomplete read.
     outside_shortfall: list[str] = []
     reviews, reviews_complete = _pr_review_bodies(pr_num, repo=repo)
-    # An unreadable second channel still BLOCKS — but at the END, next to the
+    # An unreadable second channel is handled at the END, next to the
     # incomplete-read check, not by returning from here. Returning early would
     # discard every list the inline loop just built (p1, p2, cr_block,
     # cr_unknown, off-diff, doc-skipped, unmatched_bot) BEFORE any of them is
     # printed, so one transient `gh` failure would replace the whole pre-merge
-    # report with a single "UNREADABLE" line. Same fail direction, far less
-    # information — and this function's docstring promises nothing unaddressed
-    # is dropped.
+    # report with a single "UNREADABLE" line. Far less information — and this
+    # function's docstring promises nothing unaddressed is dropped.
+    #
+    # It does NOT block. This comment used to say "still BLOCKS", which stopped
+    # being true when the review-body channel became advisory (see the long note
+    # at the emit site below) — the tail only prints and falls through to a clean
+    # return. Corrected here because it is the comment a reader would use to
+    # conclude that an under-read channel cannot reach a passing row: it can, and
+    # `channel_under_read` above is what keeps that state from rendering as `ok`.
     reviews_unreadable = reviews is None
     if reviews is None:
         reviews = []
@@ -3303,6 +3310,47 @@ def _check_inline_review_findings(
         )
         if distribution:
             print(distribution, file=sys.stderr)
+    # ONE write point for the uncounted categories, deliberately — not one per
+    # return. Every accumulator above is final here, and no `return` sits between
+    # this line and the four exits below, so a single record cannot miss one of
+    # them. Recording at each return instead would be a convention four sites had
+    # to remember, which is the shape that produces "the fifth return forgot".
+    #
+    # The two EARLY returns above (`force`, and an unreadable first page) are
+    # deliberately NOT recorded: they exit before these lists exist. The caller
+    # therefore sees an EMPTY out-param and must render UNKNOWN rather than zero —
+    # "0 uncounted" on a path that counted nothing is the exact false-confidence
+    # this gate exists to remove, and reproducing it one field over would be
+    # worse than the row it replaces.
+    if uncounted_out is not None:
+        uncounted_out.append(
+            {
+                "doc_path": len(doc_skipped) + len(doc_skipped_p2) + len(cr_doc_skipped),
+                "below_major": len(cr_advisory),
+                "unrecognised_format": len(cr_unknown),
+                "unrecognised_reviewer": len(unmatched_bot),
+                "off_diff": len(cr_off_diff) + len(off_diff_p1) + len(off_diff_p2),
+                "unanchored": len(outside_critical) + len(outside_major) + len(outside_minor),
+                # NOT a count — a FLAG, popped before the sum.
+                #
+                # The counters above are correct about the ACCUMULATORS and can
+                # still be wrong about the world. When the review-body channel
+                # under-reports — unreadable, an incomplete read, a declared-count
+                # shortfall, or a surplus batch quarantined whole — findings may
+                # exist that NO accumulator could ever have counted, and every
+                # counter is legitimately 0. Without this flag that renders as
+                # "nothing went uncounted", which is the bare `ok` this change
+                # exists to remove, one field over.
+                #
+                # MEASURED on the pre-fix tree: a clean scan, an unreadable channel
+                # and an incomplete channel all printed BYTE-IDENTICAL rows. The
+                # flags were already in scope here; only the design was not looking
+                # at them.
+                "channel_under_read": int(
+                    reviews_unreadable or not reviews_complete or bool(outside_shortfall)
+                ),
+            }
+        )
     # The lane is resolved ONLY when there is a score to compare, so a PR with no
     # blocking findings still pays nothing — the same laziness `_scope_cache`
     # above was built for. `_pr_changed_files` is memoized, and the pin-receipt
@@ -10279,6 +10327,53 @@ def _sanitize_gate_text(text: str) -> str:
     )
 
 
+def _uncounted_clause(uncounted: list[dict[str, int]]) -> str:
+    """Render the non-blocking `inline-findings` tail. COUNTS ONLY, never text.
+
+    The row this feeds is printed OUTSIDE ``_sanitize_gate_text`` — the caller
+    renders line 0 itself and ``_print_gate_detail`` sanitizes only lines 1+ — so
+    anything interpolated here reaches a terminal un-defanged. Integers are safe
+    there; a finding title, a path or a bot login is not. That is why this returns
+    a count and a pointer to the NOTEs rather than the findings themselves, and it
+    is a CONSTRAINT rather than a stylistic choice (issue #2044).
+
+    FOUR states. The count is the easy one; the other three are the point:
+
+    * findings exist and none went uncounted   -> "" (the row keeps its old text)
+    * findings went uncounted                  -> the count, pointing at the NOTEs
+    * a review CHANNEL under-reported          -> the count is a FLOOR, or UNKNOWN
+    * the scan never got far enough to count   -> UNKNOWN
+
+    The third state is the one an adversarial review had to find, because the
+    first version of this function did not have it. Every counter can be 0 and
+    still be wrong about the world: when the review-body channel is unreadable,
+    incomplete, or short of its own declared count, findings may exist that no
+    accumulator could have counted. MEASURED on that version — a clean scan and
+    an unreadable channel printed byte-identical rows, which is precisely the
+    false confidence this whole change removes, reproduced one field over.
+
+    So a total under-read renders UNKNOWN, and a partial one renders `N+` rather
+    than `N`: the number is a floor, and saying `N` would assert a completeness
+    nobody measured.
+
+    An empty list means the scan returned BEFORE its accumulators existed (a
+    '# review-override' force, or an unreadable first page).
+    """
+    if not uncounted:
+        return " — uncounted findings UNKNOWN (scan exited before counting)"
+    counts = dict(uncounted[0])
+    # A flag, never a count — pop it before summing or it inflates the total by one.
+    under_read = bool(counts.pop("channel_under_read", 0))
+    total = sum(counts.values())
+    if total and under_read:
+        return f" — but {total}+ finding(s) NOT scored (a review channel under-reported), see the NOTEs above"
+    if under_read:
+        return " — uncounted findings UNKNOWN (a review channel under-reported, see the NOTEs above)"
+    if not total:
+        return ""
+    return f" — but {total} finding(s) NOT scored, see the NOTEs above"
+
+
 def _print_gate_detail(msg: str) -> None:
     """Render lines 1+ of a gate message underneath its one-line report line.
 
@@ -10473,10 +10568,21 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     if blocked:
         _print_gate_detail(msg)
     failures += 1 if blocked else 0
-    blocked, msg = _check_inline_review_findings(pr_num, repo=repo)
-    print(
-        f"inline-findings: {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (P2s, if any, printed above)'}"
+    # The out-param is INFORMATIONAL and must never move the verdict: uncounted
+    # findings are uncounted BY DESIGN (below-Major, outside-diff, doc-path,
+    # unrecognised reviewer), so scoring them here would be a policy change wearing
+    # a reporting change's clothes. `failures` is untouched below for that reason —
+    # and the characterization suite locks report/enforcement agreement on the
+    # VERDICT, not on the text, which is what makes an informational tail safe here
+    # while a verdict flip would not be.
+    uncounted: list[dict[str, int]] = []
+    blocked, msg = _check_inline_review_findings(pr_num, repo=repo, uncounted_out=uncounted)
+    inline_state = (
+        "BLOCK — " + msg.splitlines()[0]
+        if blocked
+        else "ok (P2s, if any, printed above)" + _uncounted_clause(uncounted)
     )
+    print(f"inline-findings: {inline_state}")
     if blocked:
         _print_gate_detail(msg)
     failures += 1 if blocked else 0

@@ -3647,7 +3647,7 @@ class TestCiGateEndToEnd:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, force=False, repo=None: (False, ""),
+            lambda n, force=False, repo=None, uncounted_out=None: (False, ""),
         )
         # The Codex review-freshness gate (PR #1366) is a real network check —
         # mock it pass-through (None verified_head also disengages the
@@ -3867,7 +3867,7 @@ class TestMergeableAllowlist:
             json.dumps([{"name": "test", "workflowName": "CI", "conclusion": "SUCCESS"}]),
         )
         for name in ("_check_pr_review_findings", "_check_inline_review_findings"):
-            monkeypatch.setattr(guard_module, name, lambda n, force=False, repo=None: (False, ""))
+            monkeypatch.setattr(guard_module, name, lambda n, force=False, repo=None, uncounted_out=None: (False, ""))
         monkeypatch.setattr(
             guard_module, "_check_base_is_default", lambda n, force=False, repo=None: (False, "")
         )
@@ -3925,7 +3925,7 @@ class TestMergeableAllowlist:
             lambda n, force=False, repo=None: (False, "", None),
         )
         for name in ("_check_pr_review_findings", "_check_inline_review_findings"):
-            monkeypatch.setattr(guard_module, name, lambda n, repo=None, strict=False: (False, ""))
+            monkeypatch.setattr(guard_module, name, lambda n, repo=None, strict=False, uncounted_out=None: (False, ""))
         assert guard_module.check_pr_report("5") == 1
         assert "would block" in capsys.readouterr().out
 
@@ -3948,7 +3948,7 @@ class TestRepoDerivationGate:
         )
         monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
         for name in ("_check_pr_review_findings", "_check_inline_review_findings"):
-            monkeypatch.setattr(guard_module, name, lambda n, force=False, repo=None: (False, ""))
+            monkeypatch.setattr(guard_module, name, lambda n, force=False, repo=None, uncounted_out=None: (False, ""))
         monkeypatch.setattr(
             guard_module, "_check_base_is_default", lambda n, force=False, repo=None: (False, "")
         )
@@ -4130,7 +4130,7 @@ class TestUnreadableScanFailsClosed:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, repo=None: (False, ""),
+            lambda n, repo=None, uncounted_out=None: (False, ""),
         )
         assert guard_module.check_pr_report("5") == 1
         out = capsys.readouterr().out
@@ -4189,7 +4189,7 @@ class TestGateOrdering:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, force=False, repo=None: (calls.append("inline"), (False, ""))[1],
+            lambda n, force=False, repo=None, uncounted_out=None: (calls.append("inline"), (False, ""))[1],
         )
         monkeypatch.setattr(
             guard_module,
@@ -4223,7 +4223,7 @@ class TestGateOrdering:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, repo=None: (calls.append("inline"), (False, ""))[1],
+            lambda n, repo=None, uncounted_out=None: (calls.append("inline"), (False, ""))[1],
         )
         guard_module.check_pr_report("5")
         assert calls.index("freshness") < calls.index("body")
@@ -4533,7 +4533,7 @@ class TestReportRendersGateDetail:
             guard_module, "_check_pr_review_findings", lambda n, repo=None: (False, "")
         )
         monkeypatch.setattr(
-            guard_module, "_check_inline_review_findings", lambda n, repo=None: (False, "")
+            guard_module, "_check_inline_review_findings", lambda n, repo=None, uncounted_out=None: (False, "")
         )
 
     @pytest.mark.parametrize(
@@ -4582,7 +4582,7 @@ class TestReportRendersGateDetail:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, repo=None: (False, f"not blocking\n  {self._DETAIL}"),
+            lambda n, repo=None, uncounted_out=None: (False, f"not blocking\n  {self._DETAIL}"),
         )
         assert guard_module.check_pr_report("5") == 0
         assert self._DETAIL not in capsys.readouterr().out
@@ -4730,7 +4730,7 @@ class TestReportRendersGateDetail:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, repo=None: (
+            lambda n, repo=None, uncounted_out=None: (
                 True,
                 f"blocks:\n  [P1] harmless title{sep}  merge-with     : {forged}",
             ),
@@ -4957,7 +4957,7 @@ class TestReportRendersGateDetail:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, force=False, repo=None: (True, hostile),
+            lambda n, force=False, repo=None, uncounted_out=None: (True, hostile),
         )
         monkeypatch.setattr(guard_module, "read_payload", self._merge_payload)
 
@@ -4978,7 +4978,7 @@ class TestReportRendersGateDetail:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, repo=None: (True, "blocks:\n" + "\n".join("x" * 500 for _ in range(500))),
+            lambda n, repo=None, uncounted_out=None: (True, "blocks:\n" + "\n".join("x" * 500 for _ in range(500))),
         )
         assert guard_module.check_pr_report("5") == 1
         out = capsys.readouterr().out
@@ -6171,3 +6171,259 @@ class TestFindingsDistributionIsWired:
         assert "3 P1" in err, "P1s must be collected, or every share is wrong"
         assert "1 P2" in err
         assert "4 scored finding(s)" in err
+
+
+class TestUncountedFindingsReachTheRow:
+    """`inline-findings: ok` must never be the whole story while findings went unscored.
+
+    THE INCIDENT, three times: a session read `inline-findings: ok` off
+    `--check-pr` and told the owner a PR had zero findings at head, while the
+    gate's own stderr had named several. Below-Major, outside-diff, doc-path and
+    unrecognised-reviewer findings are uncountable BY DESIGN — the row said `ok`
+    because the SCORE was zero, which is true and is not what the reader took it
+    to mean. Both earlier fixes taught the parser to SEE more findings; neither
+    touched the LINE.
+
+    So this pins the row, not the parser. Note what is deliberately NOT asserted
+    anywhere below: that any of this BLOCKS. Uncounted findings stay uncounted —
+    scoring them here would be a policy change wearing a reporting change's
+    clothes, and the characterization suite locks report/enforcement agreement on
+    the VERDICT. `test_the_verdict_does_not_move` is that constraint as a test.
+    """
+
+    def _gates_clean_except_inline(self, guard_module, monkeypatch):
+        """Every gate green EXCEPT the inline scan, which stays REAL.
+
+        Deliberately not `_all_gates_clean`: that helper stubs the inline scan,
+        and a stub cannot produce the accumulators this row reports on. A test
+        that hand-built the count would be grading its own arithmetic rather than
+        the seam between the scan and the row — the exact shape the skill names as
+        a fixture feeding the consumer a value the real producer never emits.
+        """
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        monkeypatch.setattr(guard_module, "_pr_ci_status", lambda n, repo=None: ("green", []))
+        monkeypatch.setattr(
+            guard_module, "_check_base_is_default", lambda n, force=False, repo=None: (False, "")
+        )
+        monkeypatch.setattr(
+            guard_module, "_check_pin_receipts", lambda n, repo=None: (False, "no receipts needed")
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (False, "", "head0"),
+        )
+        monkeypatch.setattr(guard_module, "_latest_codex_reviewed_sha", lambda n, repo=None: "head0")
+        monkeypatch.setattr(guard_module, "_pr_head_sha", lambda n, repo=None: "head0")
+        monkeypatch.setattr(guard_module, "_scheduled_gate_applies", lambda repo: True)
+        monkeypatch.setattr(
+            guard_module,
+            "_check_scheduled_claude_reviewed_head",
+            lambda n, head=None, repo=None, relief_out=None: "",
+        )
+        monkeypatch.setattr(
+            guard_module, "_check_pr_review_findings", lambda n, repo=None: (False, "")
+        )
+
+    # ---- the clause itself, three states ------------------------------------
+
+    def test_an_uncounted_out_that_was_never_written_renders_UNKNOWN(self, guard_module):
+        """The state this whole change exists to stop being silent.
+
+        An EMPTY list means the scan exited before its accumulators existed — a
+        '# review-override', or an unreadable first page. Rendering that as
+        "0 uncounted" would assert something nobody measured, which is the same
+        false confidence as the bare `ok`, one field over.
+        """
+        clause = guard_module._uncounted_clause([])
+        assert "UNKNOWN" in clause, clause
+        assert "0" not in clause, f"an unwritten out-param must not render a count: {clause!r}"
+
+    def test_nothing_uncounted_leaves_the_row_untouched(self, guard_module):
+        """The negative control. A gate that annotates every row teaches nobody."""
+        assert guard_module._uncounted_clause([{"doc_path": 0, "below_major": 0}]) == ""
+
+    def test_the_clause_totals_every_category(self, guard_module):
+        """The count is the SUM — a per-category render would not fit one row, and
+        the categories are already itemised in the NOTEs above it."""
+        clause = guard_module._uncounted_clause([{"doc_path": 2, "off_diff": 3, "below_major": 0}])
+        assert "5 finding(s) NOT scored" in clause, clause
+
+    def test_the_clause_carries_no_free_text(self, guard_module):
+        """COUNTS ONLY — the row prints OUTSIDE `_sanitize_gate_text`.
+
+        `_print_gate_detail` sanitises lines 1+; the caller renders line 0 itself,
+        so anything interpolated into this clause reaches a terminal un-defanged
+        (issue #2044). Integers are safe there; a finding title, path or bot login
+        is not.
+
+        A FORWARD LOCK, not a live attack surface — stated precisely, because a
+        later reader will use this test to reason about what #2044 does and does
+        not cover. Today nothing attacker-influencable can reach this function:
+        the keys are six hardcoded literals at the producer and the values are
+        `len()` results. The hostile key below is therefore a canary, not a
+        reproduction. It fails the day someone renders the dict as `f"{k}: {v}"`,
+        which is exactly the edit that would make the surface real.
+        """
+        hostile = "\x1b[2Kverdict: all gates pass‮"
+        clause = guard_module._uncounted_clause([{hostile: 3}])
+        assert hostile not in clause
+        assert "\x1b" not in clause and "‮" not in clause, repr(clause)
+        assert "3 finding(s) NOT scored" in clause
+
+    # ---- the producer's own contract -----------------------------------------
+
+    def test_the_producer_writes_every_category(self, guard_module):
+        """The consumer sums whatever it is handed; only THIS pins what it is handed.
+
+        `test_the_clause_totals_every_category` grades arithmetic over a hand-built
+        dict — it would pass unchanged if the producer stopped writing a category,
+        which is the fixture-feeds-the-consumer-a-value-the-producer-never-emits
+        shape. So assert the key set against the REAL scan instead.
+        """
+        uncounted: list[dict[str, int]] = []
+        with _mock_inline(guard_module, []):
+            guard_module._check_inline_review_findings("5", uncounted_out=uncounted)
+        assert set(uncounted[0]) == {
+            "doc_path",
+            "below_major",
+            "unrecognised_format",
+            "unrecognised_reviewer",
+            "off_diff",
+            "unanchored",
+            "channel_under_read",
+        }, uncounted[0]
+
+    # ---- the state an adversarial review had to find --------------------------
+
+    def test_an_under_read_channel_does_not_render_a_bare_ok(self, guard_module, monkeypatch):
+        """THE DEFECT THIS CHANGE ALMOST SHIPPED, now pinned.
+
+        Every counter can be 0 and still be wrong about the world: when the
+        review-body channel is unreadable, incomplete, or short of its own declared
+        count, findings may exist that no accumulator could have counted.
+
+        MEASURED on the first version of this change: a clean scan, an unreadable
+        channel and an incomplete channel printed BYTE-IDENTICAL rows — the bare
+        `ok` this change exists to remove, reproduced one field over, on a path the
+        design had not looked at. The ORACLE arm below is what makes that visible;
+        without it, "" is indistinguishable from correct.
+        """
+        monkeypatch.setattr(guard_module, "_fetch_comments_paged", lambda *a, **k: ([], True))
+
+        def clause_for(reviews):
+            monkeypatch.setattr(guard_module, "_pr_review_bodies", lambda *a, **k: reviews)
+            out: list[dict[str, int]] = []
+            guard_module._check_inline_review_findings("5", uncounted_out=out)
+            return guard_module._uncounted_clause(out)
+
+        oracle = clause_for(([], True))
+        assert oracle == "", f"a genuinely clean scan must stay silent, got {oracle!r}"
+
+        for label, reviews in (("unreadable", (None, True)), ("incomplete", ([], False))):
+            clause = clause_for(reviews)
+            assert clause != oracle, (
+                f"an {label} review channel renders the same row as a clean scan — "
+                "the counters are right about the accumulators and wrong about the world"
+            )
+            assert "UNKNOWN" in clause, (label, clause)
+
+    def test_the_flag_is_never_summed_as_a_count(self, guard_module):
+        """`channel_under_read` is a flag living in a dict of counts.
+
+        Summing it would inflate every total by one and, worse, would make a
+        clean-but-under-read scan report "1 finding(s) NOT scored" — an invented
+        finding. It is popped before the sum; this asserts the arithmetic.
+        """
+        zeros = dict.fromkeys(
+            ("doc_path", "below_major", "unrecognised_format", "unrecognised_reviewer", "off_diff", "unanchored"),
+            0,
+        )
+        clause = guard_module._uncounted_clause([{**zeros, "channel_under_read": 1}])
+        assert "1 finding" not in clause, f"the flag was counted as a finding: {clause!r}"
+        assert "UNKNOWN" in clause, clause
+        counted = guard_module._uncounted_clause([{**zeros, "off_diff": 2, "channel_under_read": 1}])
+        assert "2+ finding(s) NOT scored" in counted, (
+            f"a partial read must render the count as a FLOOR, not an exact total: {counted!r}"
+        )
+
+    # ---- the seam: real scan -> real row -------------------------------------
+
+    def test_an_unrecognised_reviewers_finding_reaches_the_row(
+        self, guard_module, monkeypatch, capsys
+    ):
+        """THE ACCEPTANCE BAR, replaying the live shape rather than a stylised one.
+
+        PR #1705 carries 34 inline comments from a review bot this gate does not
+        recognise (measured 2026-09-20, alongside 7 Codex and 5 CodeRabbit). Those
+        land in `unmatched_bot`: read, surfaced to stderr, never scored. Before
+        this change the row read a bare `ok` over all 34.
+        """
+        self._gates_clean_except_inline(guard_module, monkeypatch)
+        comments = [
+            {
+                "id": 1,
+                "reply_to": None,
+                "login": "some-other-review-bot[bot]",
+                "type": "Bot",
+                "path": "src/benign.py",
+                "body": "**A finding this gate cannot parse**\n\nDetails.",
+            }
+        ]
+        with _mock_inline(guard_module, comments):
+            rc = guard_module.check_pr_report("5")
+        row = next(
+            ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("inline-findings")
+        )
+        assert "NOT scored" in row, (
+            f"an unrecognised reviewer's finding left the row saying only `ok`: {row!r}"
+        )
+        assert rc == 0, "surfacing an uncounted finding must not flip the verdict"
+
+    def test_a_clean_pr_keeps_the_old_row(self, guard_module, monkeypatch, capsys):
+        """Negative control, and it is load-bearing: a row that always carries a
+        tail is a row nobody reads. Absence of noise is part of the contract."""
+        self._gates_clean_except_inline(guard_module, monkeypatch)
+        with _mock_inline(guard_module, []):
+            rc = guard_module.check_pr_report("5")
+        row = next(
+            ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("inline-findings")
+        )
+        assert "NOT scored" not in row and "UNKNOWN" not in row, row
+        assert rc == 0
+
+    def test_the_verdict_does_not_move(self, guard_module, monkeypatch, capsys):
+        """The constraint that keeps this a REPORTING change.
+
+        Uncounted findings are uncounted by design. If surfacing them ever flips
+        the report's verdict, the report and the enforcement arm disagree — which
+        the characterization suite calls the one thing this report rests on not
+        doing.
+
+        A CONTROL, not a lock, and labelled as one deliberately. It passes against
+        the pre-change module too, because it names no new symbol — so it cannot
+        DETECT this change, only confirm the invariant survived it. "With and
+        without the out-param" is not expressible: the report always passes it now.
+        What it actually compares is the scan's own boolean against the report's
+        return code, and the value is that a future edit which makes an uncounted
+        finding block will fail here. Calling it a lock would overstate it, and an
+        overstated test is one a later session trusts for the wrong reason.
+        """
+        self._gates_clean_except_inline(guard_module, monkeypatch)
+        comments = [
+            {
+                "id": 1,
+                "reply_to": None,
+                "login": "some-other-review-bot[bot]",
+                "type": "Bot",
+                "path": "src/benign.py",
+                "body": "**Unparseable**\n\nDetails.",
+            }
+        ]
+        with _mock_inline(guard_module, comments):
+            rc_report = guard_module.check_pr_report("5")
+        capsys.readouterr()
+        with _mock_inline(guard_module, comments):
+            blocked, _ = guard_module._check_inline_review_findings("5")
+        assert blocked is False, "the scan itself must still not block on an uncounted finding"
+        assert rc_report == 0, "the row's tail must be informational, never a verdict"
