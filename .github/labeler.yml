@@ -54,8 +54,15 @@ gate-surface:
           - 'scripts/review_invalidate_on_commit.py'
           - 'scripts/review_scope.py'
           - 'scripts/review_state.py'
+          - 'scripts/review_deadline.py'
           - 'scripts/surface_open_prs.py'
           - 'scripts/surface_pr_updates.py'
+          - 'config/external_review.yaml'
+          - 'scripts/external_review.py'
+          - 'scripts/lib/gate_menu.py'
+          - 'scripts/review_budget.py'
+          - 'src/genesis/session_awareness/external_review.py'
+          - 'src/genesis/session_awareness/external_review_config.py'
 
 # CI and repository configuration: not hook surface, but a change here can
 # disable a required check as effectively as editing a gate.

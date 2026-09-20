@@ -56,10 +56,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -101,7 +103,6 @@ WRITE_PERMISSIONS = frozenset({"WRITE", "MAINTAIN", "ADMIN"})
 MAX_FORK_DEPTH = 10
 
 Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
-
 
 class Refused(Exception):
     """A precondition failed. NOTHING was posted — this is a hard guarantee."""
@@ -341,7 +342,7 @@ def _lock_path(slug: str) -> Path:
         base.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise Refused(
-            f"cannot establish the per-install lock directory ({base}): {exc}. "
+            f"cannot establish the per-install lock directory ({type(exc).__name__}). "
             "Refusing rather than using a TMPDIR-dependent fallback, which would "
             "let two sessions lock different files and both post."
         ) from exc
@@ -406,6 +407,213 @@ def _reconcile_uncertain_create(slug: str, title: str, cause: str, run: Runner) 
         f"{cause}. Reconciled against {slug}: no issue with this title exists, so "
         "nothing was posted. Safe to retry."
     )
+
+
+def privacy_scan(title: str, body: str) -> list[str]:
+    """Scan the issue text for things that must never reach a public tracker.
+
+    Returns the WARN-level messages (for display) and raises :class:`Refused`
+    on anything BLOCK-severity. Nothing is posted on a refusal, by the same
+    guarantee every other Refused carries.
+
+    WHY THIS EXISTS. CI's leak detector reads PR DIFFS and PR BODIES. Nothing
+    reads issue bodies — an issue is a terminal egress surface with no backstop
+    whatsoever, and until now this script's only defence was the author
+    remembering. ``scan_prose`` is the sanctioned reader for that shape: it runs
+    the raw-string detectors that are meaningful on prose (portability classes
+    such as IPs and ``/home/<user>`` paths, personal emails outside the
+    allowlist, install fingerprints, and the required ``detect-secrets`` floor)
+    and deliberately skips the diff-STRUCTURAL scanners, which describe a
+    unified diff's shape rather than prose.
+
+    Do NOT substitute ``scan_diff`` here. It routes through ``parse_diff``,
+    which drops every non-``+`` line, so plain text yields zero added lines and
+    returns ok=True regardless of content — a fail-OPEN hole through a
+    fail-CLOSED component. Its own docstring says so.
+
+    FAIL-CLOSED IS THE POINT, including when the scanner itself is missing: a
+    missing ``detect-secrets`` binary and a missing fingerprint file are both
+    BLOCK findings, so an install that cannot scan cannot file.
+
+    The commonest way to hit that is the interpreter, not the install.
+    ``detect-secrets`` is resolved from ``Path(sys.executable).parent`` and is
+    installed only in the repo venv, so a bare ``python3 scripts/…`` refuses
+    every issue — correctly, but for a reason that is about the invocation
+    rather than the draft. Run it as ``.venv/bin/python scripts/…``; the
+    refusal below says so. An earlier revision of this script tried to REPAIR
+    that by re-executing itself under the venv, and it was cut: the predicate
+    it needed ("am I already the right interpreter?") compared resolved
+    interpreter paths, and a ``--symlinks`` venv makes ``venv/bin/python``
+    resolve to the same real binary as ``/usr/bin/python3`` — so the test was
+    true exactly when the repair was needed, and the mechanism never fired on
+    any install. Do not reintroduce it without comparing UNRESOLVED bin
+    directories, and do not reintroduce it at all before asking whether the
+    documentation line is the real fix.
+    """
+    src = str(Path(__file__).resolve().parent.parent / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    try:
+        from genesis.contribution.sanitize import scan_prose
+    except ImportError as exc:
+        raise Refused(
+            f"cannot import the privacy scanner ({exc}). An issue is a public, "
+            "irreversible post with no CI backstop, so it is not filed unscanned. "
+            "Run from the repo with its venv: .venv/bin/python scripts/file_tracker_issue.py"
+        ) from exc
+
+    # Scanned SEPARATELY, one call per field, because the line number is the
+    # only locator a withheld finding leaves the author. Concatenating them put
+    # the title on line 1 and shifted every body line by one, so the refusal
+    # named a line the author would read as clean and edit the wrong text —
+    # confidently wrong is worse than absent when the content is withheld by
+    # design. Separate calls make each number native to the field it names, and
+    # they retire the question of whether a value could splice across the seam
+    # rather than answering it.
+    blocking: list[tuple[str, object]] = []
+    surfaced: list[tuple[str, object]] = []
+    for where, text in (("title", title), ("body", body)):
+        result = scan_prose(text)
+        blocking += [(where, f) for f in result.blocking()]
+        surfaced += [(where, f) for f in result.findings]
+    if blocking:
+        raise Refused(
+            f"privacy scan BLOCKED this issue ({len(blocking)} finding(s)): "
+            + "; ".join(_describe_finding(f, where) for where, f in blocking)
+            + _interpreter_hint([f for _, f in blocking])
+        )
+    return [_describe_finding(f, where) for where, f in surfaced]
+
+
+#: Findings whose ``detail`` is a fixed SENTINEL describing the scanner's own
+#: state rather than any scanned content. Only these may have their message
+#: rendered — see :func:`_describe_finding`.
+_INFRASTRUCTURE_DETAILS = frozenset(
+    {
+        "missing_binary",
+        "scan_error",
+        "nonzero_exit",
+        "missing_fingerprint_file",
+    }
+)
+
+
+def _describe_finding(f, where: str = "draft") -> str:
+    """Render a finding WITHOUT reproducing what it matched.
+
+    A refusal is printed to stderr, which on this system lands in terminal
+    scrollback, session transcripts and CI logs. Reproducing the matched text
+    there takes a value that was successfully blocked from a public tracker and
+    writes it somewhere durable instead — the leak the scan exists to prevent,
+    moved one surface over rather than stopped (Codex P1).
+
+    It is not hypothetical. ``sanitize.py`` stores the first 120 characters of
+    the offending LINE in ``detail`` for secrets, portability hits and
+    fingerprint matches, and the email scanner puts the address in ``message``.
+    An earlier version of this function interpolated both.
+
+    So: kind, scanner and line number only. The message survives ONLY for
+    findings whose detail is one of the fixed sentinels above, which describe
+    the scanner failing rather than anything it read — those carry no scanned
+    content and are exactly the ones an operator needs spelled out, because
+    they are about the environment rather than the draft.
+    """
+    if f.detail in _INFRASTRUCTURE_DETAILS:
+        return f"[{f.kind.value}] {f.message}"
+    # Deliberately no message and no detail: naming the RULE is actionable,
+    # quoting the MATCH is a second copy of the secret. The FIELD and the line
+    # are what is left, so they have to be right — see privacy_scan for why
+    # they are scanned separately.
+    at = f" line {f.line}" if f.line else ""
+    return f"[{f.kind.value}] matched by {f.scanner or 'a scanner'} in the {where}{at} (content withheld)"
+
+
+def _interpreter_hint(blocking) -> str:
+    """Name the invocation when the refusal is about the interpreter.
+
+    An operator reading "BLOCKED" about text they just wrote will edit the
+    text, which cannot help when the real cause is that this python has no
+    detect-secrets. Keyed on the SENTINEL rather than on message wording, so a
+    reworded message cannot silently drop the hint.
+    """
+    if any(f.detail == "missing_binary" for f in blocking):
+        return (
+            "  This one is about the INTERPRETER, not your draft: re-run as "
+            "`.venv/bin/python scripts/file_tracker_issue.py …`."
+        )
+    return ""
+
+
+def _snapshot(data: bytes) -> tuple[str, str]:
+    """Write *data* where only this process can reach it. Returns (dir, file).
+
+    This is what makes "the posted bytes are the scanned bytes" a STRUCTURAL
+    claim rather than a timing one. Handing gh the caller's path means gh
+    reopens a file we do not control, so an editor save or a symlink swap
+    between the last check and gh's open publishes text nothing scanned — and
+    no amount of re-checking closes that, because the window ends inside
+    another process (Codex P1).
+
+    Built WITHOUT ``tempfile``, deliberately, and not merely to satisfy the
+    import guard this module already carries. ``mkdtemp`` honours ``TMPDIR``,
+    and on this project a Claude Code session has ``TMPDIR`` pointed at a small
+    policed volume that must not be filled while a manual shell has ``/tmp`` —
+    the same caller-dependence that made a tempdir fallback wrong for the lock
+    path, plus a disk hazard, since a draft body has no size bound. A fixed
+    location under ``~/tmp`` is both stable and the documented home for large
+    transient files.
+
+    ``os.mkdir`` with an explicit 0700 creates-or-fails atomically, so the
+    directory cannot be pre-created or swapped by another user between here and
+    gh's read. The name carries 16 bytes of urandom rather than the pid alone,
+    which a peer could predict.
+
+    CREATION IS ALL-OR-NOTHING. Anything that fails after the directory exists
+    removes it before propagating, because the caller learns the directory's
+    name only from a successful RETURN — a partial write would otherwise leave
+    a copy of the body on disk that nothing knows to clean up (Devin, Codex P2).
+    ``BaseException``, not ``Exception``: a SIGINT or a disk-full landing
+    between the mkdir and the chmod is exactly when the leftover matters, and
+    KeyboardInterrupt is not an Exception.
+
+    Cleanup of the SUCCESSFUL case is the caller's, in a finally — and it must
+    never convert a successful post into a failure, which is why that removal
+    is suppressed.
+    """
+    parent = Path.home() / "tmp"
+    parent.mkdir(parents=True, exist_ok=True)
+    d = parent / f"issue-body-{os.getpid()}-{os.urandom(16).hex()}"
+    os.mkdir(d, 0o700)
+    try:
+        path = d / "body.md"
+        # Mode at CREATION, not after: a write-then-chmod leaves the body
+        # world-readable for the width of that window, under a 0700 directory
+        # that makes it unreachable but not unreadable to the owner's own
+        # processes. os.open with 0o600 closes it.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            # LOOP, because os.write returns a COUNT and a short write is not an
+            # error. Discarding that count lets gh post a TRUNCATED body while
+            # the script reports success — which would make this function's own
+            # guarantee ("the posted bytes are the scanned bytes") false in
+            # exactly the direction nothing detects: posted becomes a proper
+            # subset of scanned. I could not reproduce a short write on a
+            # regular file here, and did not try to fill the disk; the loop is
+            # correct on the API's contract rather than on an observation, and
+            # the `except BaseException` below covers only the RAISING form of
+            # disk-full, not this one.
+            written = 0
+            while written < len(data):
+                n = os.write(fd, data[written:])
+                if n <= 0:
+                    raise OSError(errno.EIO, "short write staging the scanned body")
+                written += n
+        finally:
+            os.close(fd)
+    except BaseException:
+        shutil.rmtree(d, ignore_errors=True)
+        raise
+    return str(d), str(path)
 
 
 def create_issue(
@@ -532,6 +740,7 @@ def _run_main(argv: Sequence[str] | None, run: Runner) -> int:
     args = ap.parse_args(argv)
 
     posted: str | None = None
+    snapshot_dir: str | None = None
     # Set the instant before the create is attempted. An interrupt between
     # that point and create_issue() returning leaves the outcome UNKNOWN, not
     # refused — the request may already have reached GitHub.
@@ -541,14 +750,25 @@ def _run_main(argv: Sequence[str] | None, run: Runner) -> int:
         try:
             with open(args.title_file, encoding="utf-8") as fh:
                 title = fh.read().strip()
-            with open(args.body_file, encoding="utf-8") as fh:
-                body = fh.read().strip()
+            # ONE read of the body, kept as bytes. These exact bytes are what
+            # gets scanned AND what gets posted — see the snapshot below.
+            body_bytes = Path(args.body_file).read_bytes()
+            body = body_bytes.decode("utf-8").strip()
         except (OSError, UnicodeDecodeError) as exc:
             # Unreadable or non-UTF-8 drafts are a "nothing was posted" outcome,
             # so they belong on exit 2 with everything else that refused — not on
             # the generic exit 1. UnicodeDecodeError is a ValueError, which no
             # handler here caught before.
-            raise Refused(f"cannot read the draft files: {exc}") from exc
+            # TYPE only — the same reasoning as the staging refusal below.
+            # An OSError here names the draft path, which is caller-supplied
+            # and routinely under a home directory. Pre-existing, but in a
+            # block this change rewrites and squarely the class this PR is
+            # about, so it is corrected rather than left as the one that got
+            # away.
+            raise Refused(
+                f"cannot read the draft files ({type(exc).__name__}) — check "
+                "--title-file and --body-file are readable UTF-8."
+            ) from exc
         if not title:
             raise Refused("title file is empty")
         if not body:
@@ -560,6 +780,32 @@ def _run_main(argv: Sequence[str] | None, run: Runner) -> int:
             )
         if "\n" in title or "\r" in title:
             raise Refused("title contains a newline — GitHub's handling of that is unverified")
+
+        # BEFORE the lock and before any network call. A refusal here must cost
+        # nothing and leave no trace on the tracker; running it after
+        # resolve_tracker would spend API calls to learn where not to post.
+        for warning in privacy_scan(title, body):
+            _warn(f"privacy scan: {warning}")
+        # Only now, once the bytes have PASSED, are they snapshotted for gh.
+        # Taking it before the scan would leave a scanned-clean snapshot on disk
+        # for a draft that was then refused.
+        try:
+            snapshot_dir, snapshot_path = _snapshot(body_bytes)
+        except OSError as exc:
+            # Nothing has been posted, so this belongs on exit 2 with every
+            # other refusal — not the generic exit 1 the module docstring
+            # reserves for an unexpected error. Same correction as the draft
+            # read above; a new failure path silently inherited the wrong code.
+            # TYPE only, never str(exc). An OSError from os.mkdir/os.open
+            # carries the FILENAME, and that path is under the operator's home
+            # — so interpolating it reproduces exactly the class of value this
+            # refusal machinery exists to keep out of stderr (CodeRabbit). I
+            # removed `f.detail` from the refusal for that reason and then
+            # reintroduced the same leak here, one function away.
+            raise Refused(
+                f"cannot stage the scanned body for posting ({type(exc).__name__}). "
+                "Check that ~/tmp is writable."
+            ) from exc
 
         labels = validate_labels(args.area, args.difficulty)
         slug = resolve_tracker(run)
@@ -578,8 +824,17 @@ def _run_main(argv: Sequence[str] | None, run: Runner) -> int:
             # has already happened — letting the print's OSError fall through to
             # the generic handler would report exit 1 for a CONFIRMED issue and
             # send the operator to retry into a duplicate.
+            # gh is handed a SNAPSHOT of the scanned bytes, never the caller's
+            # path. Checking the draft and then letting gh reopen it cannot
+            # deliver the guarantee this refusal claims: an editor save, a
+            # symlink swap or any other write between the check and gh's open
+            # publishes bytes nothing scanned (Codex P1). A re-check narrows
+            # that window; it does not close it, and only the caller's file can
+            # change underneath us. The snapshot is written once, by us, into a
+            # directory only this process can reach — so "the posted bytes are
+            # the scanned bytes" is true by CONSTRUCTION rather than by timing.
             create_attempted = True
-            posted = create_issue(slug, title, args.body_file, labels, run)
+            posted = create_issue(slug, title, snapshot_path, labels, run)
         # From here the issue EXISTS. Nothing below may report otherwise — see
         # the handlers, which all check `posted` first.
         try:
@@ -624,6 +879,25 @@ def _run_main(argv: Sequence[str] | None, run: Runner) -> int:
             return _finish(4)
         _warn(f"ERROR: {exc}")
         return _finish(1)
+    finally:
+        # The snapshot holds a copy of the body, so it does not outlive the run.
+        # Suppressed in BOTH directions: a cleanup failure must never convert a
+        # confirmed post into an error, and it must never replace a refusal's
+        # exit code either.
+        #
+        # BaseException, not OSError. A SIGINT arriving DURING this rmtree
+        # propagates out of the finally and replaces whatever main() was about
+        # to return — including a confirmed post, which would then be reported
+        # as an interrupt and send the operator to retry into a duplicate
+        # (Codex P2). The window is small and the consequence is the exact
+        # misreport this module is organised to prevent. A leftover directory
+        # is 0700 under ~/tmp and the daily hygiene timer reaps it once it is 7
+        # DAYS old (scripts/disk_hygiene.sh prune_tmp) — the timer is daily,
+        # the threshold is not; losing the
+        # correct exit code is not recoverable.
+        if snapshot_dir:
+            with contextlib.suppress(BaseException):
+                shutil.rmtree(snapshot_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -226,18 +226,58 @@ for line in "${_MARKERS[@]}"; do
             _log "lock held / host-frozen — kept marker for $repo"
             ;;
         3)
-            # A requested tool is missing from PATH (a persistent misconfig, not a
-            # transient). Keep the marker (the present tool still wants indexing)
-            # with no attempts penalty — but if this was an escalated full, back
-            # off full so it doesn't re-escalate a heavy cbm full EVERY idle tick;
-            # it degrades to cheap fast retries until PATH is fixed.
+            # Nothing indexed: a requested tool is missing or refused (a
+            # persistent condition, not a transient). Keep the marker with no
+            # attempts penalty — but if this was an escalated full, back off
+            # full so it doesn't re-escalate a heavy cbm full EVERY idle tick;
+            # it degrades to cheap fast retries until the condition is fixed.
             if [ "$run_mode" = "full" ]; then
                 action="restore_backoff"
             else
                 action="restore"
             fi
             _finish_outcome "$hash" "$action" "$claim_id" >/dev/null || exit 76
-            _log "requested tool missing (rc=3) — kept marker, no penalty: $repo"
+            _log "requested tool missing or refused (rc=3) — kept marker, no penalty: $repo"
+            ;;
+        4)
+            # cbm leg completed; the gitnexus leg did not (missing, wrong
+            # version, refused by admission control, or failed). Restoring the
+            # whole marker would rebuild cbm every idle tick forever, so consume
+            # cbm's durable work — and requeue a gitnexus-only marker FIRST, so
+            # the unfinished leg survives: its blocking condition (sentinel
+            # removed, install repaired, admission headroom) can clear without
+            # a new trigger ever writing a marker. Written before the consume
+            # so a runner death mid-branch restores the inflight "both" marker
+            # and coalesces — the pending work is never lost. A refused leg then
+            # retries like any rc-3 marker (no penalty); a failed leg retries
+            # with attempts counting, bounded by MAX_ATTEMPTS.
+            if ! _marker write --repo "$repo" --tools gitnexus --mode "$mode" >> "$LOG_FILE" 2>&1; then
+                _log "could not requeue gitnexus leg for $repo — restoring combined marker"
+                _finish_outcome "$hash" restore "$claim_id" >/dev/null || exit 76
+            elif [ "$run_mode" = "full" ]; then
+                _finish_outcome "$hash" consume_full "$claim_id" >/dev/null || exit 76
+                _log "cbm indexed; gitnexus leg did not complete (rc=4) — consumed cbm (full stamp), requeued gitnexus: $repo"
+            else
+                _finish_outcome "$hash" consume "$claim_id" >/dev/null || exit 76
+                _log "cbm indexed; gitnexus leg did not complete (rc=4) — consumed cbm, requeued gitnexus: $repo"
+            fi
+            ;;
+        5)
+            # gitnexus leg completed; the cbm leg did not (missing, kill-switch-
+            # skipped, or failed). Same split as rc 4: requeue a cbm-only marker
+            # before consuming so the skipped leg's request is not discarded
+            # when the sentinel is later removed. Consume, but NEVER
+            # consume_full: cbm never ran, so stamping the shared full-success
+            # clock would suppress its genuinely-needed full pass for the
+            # whole interval. The requeued fast marker re-escalates on its own
+            # next tick if a full is still due.
+            if ! _marker write --repo "$repo" --tools cbm --mode "$mode" >> "$LOG_FILE" 2>&1; then
+                _log "could not requeue cbm leg for $repo — restoring combined marker"
+                _finish_outcome "$hash" restore "$claim_id" >/dev/null || exit 76
+            else
+                _finish_outcome "$hash" consume "$claim_id" >/dev/null || exit 76
+                _log "gitnexus indexed; cbm leg did not complete (rc=5) — consumed gitnexus, requeued cbm, no full stamp: $repo"
+            fi
             ;;
         *)
             if [ "$run_mode" = "full" ] && [ "$mode" != "full" ]; then

@@ -4,6 +4,15 @@ Cross-tool agent entry point (Codex, Cursor, OpenCode, …). The canonical
 project instructions live in **CLAUDE.md** — read it first; everything below
 is supplementary.
 
+## Codex external-client boundary
+
+Codex connects to Genesis through the project `.codex/config.toml` as an
+external MCP client. It can request Genesis capabilities on demand, but it is
+not a Genesis foreground or background session: never register its transcript,
+create a charter for it, send its identifiers to session tools, or add lifecycle
+hooks that make Genesis manage the conversation. See
+`.agents/skills/genesis-external-client/SKILL.md` when working through Codex.
+
 ## Code Review Mandate (adversarial)
 
 When reviewing a diff or PR (including automated PR review), review ADVERSARIALLY,
@@ -108,8 +117,9 @@ This repo is indexed by GitNexus. The MCP tools (`impact`, `query`,
 and execution-flow answers that grep can't. Use them when they fit the
 question — **none is a mandatory pre-edit gate** (see CLAUDE.md → Code
 Intelligence for the tool-selection matrix; Serena is the live-symbol
-default, GitNexus is snapshot-based so run `node .gitnexus/run.cjs analyze`
-first when freshness matters).
+default, GitNexus is snapshot-based. From the main checkout, run
+`scripts/lib/code_intel_index.sh "$PWD" gitnexus fast` when freshness matters;
+linked worktrees deliberately skip indexing, so use Serena for live branch truth).
 
 Useful entry points:
 
