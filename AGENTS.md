@@ -16,12 +16,22 @@ hooks that make Genesis manage the conversation. See
 ## Genesis skill path resolution
 
 The generated "Genesis Capability Surface" below lists Genesis skill names, not
-their filesystem paths. For Tier 1 Genesis skills named there, load
-`.claude/skills/<skill-name>/SKILL.md` — `genesis-development` resolves to
-`.claude/skills/genesis-development/SKILL.md`. Do not infer that a skill listed
-in that inventory lives under `.agents/skills/`: only the external-client skill
-named above does, and reading the one path mentioned in this file as the general
-rule is the mistake this section exists to prevent.
+their filesystem paths, and the name does not always map to the path the same
+way. **Locate the file rather than constructing the path** — the exporter
+indexes recursively, so a name in that inventory can sit at any depth under
+`.claude/skills/`.
+
+Measured at the time of writing: 14 of the 20 Tier 1 skills are flat
+(`genesis-development` → `.claude/skills/genesis-development/SKILL.md`), and the
+six `gitnexus-*` skills are nested one level deeper
+(`gitnexus-cli` → `.claude/skills/gitnexus/gitnexus-cli/SKILL.md`, **not**
+`.claude/skills/gitnexus-cli/`). Treat those counts as a snapshot, not a
+contract — a new family can be added at a new depth without touching this file.
+
+Do not infer that a skill listed in that inventory lives under
+`.agents/skills/` either: only the external-client skill named above does.
+Both halves of this section are the same mistake — generalising a path rule
+from whichever example you happened to see first.
 
 ## Code Review Mandate (adversarial)
 
