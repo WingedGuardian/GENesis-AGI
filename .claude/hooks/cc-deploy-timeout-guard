@@ -73,6 +73,15 @@ esac
 # launcher text would vouch for the deploy it precedes.
 _SEGMENTS=$(printf '%s' "$CMD" | sed 's/&&/\n/g; s/||/\n/g; s/&/\n/g; s/|/\n/g; s/;/\n/g') || _SEGMENTS="$CMD"
 
+# A long-option check that honours systemd's unambiguous-prefix matching:
+# `--sc`, `--sco`, `--scop` all mean --scope to systemd-run, so matching only
+# the full spelling lets `--sco` past the disqualifier (CodeRabbit, #2095).
+_longopt_is() {  # $1: flag token with any =value stripped; $2: canonical --long
+    case "$1" in --?*) : ;; *) return 1 ;; esac
+    case "$2" in "$1"*) return 0 ;; esac
+    return 1
+}
+
 _held=0
 _held_script=""
 while IFS= read -r _seg; do
@@ -80,16 +89,6 @@ while IFS= read -r _seg; do
         *update.sh*|*bootstrap.sh*|*host-setup.sh*) : ;;
         *) continue ;;
     esac
-    # Which deploy entry point is session-held — the prescription below must
-    # name THIS script, because update.sh, bootstrap.sh and host-setup.sh are
-    # not interchangeable and host-setup takes host-specific arguments.
-    if [ -z "$_held_script" ]; then
-        case "$_seg" in
-            *bootstrap.sh*) _held_script=bootstrap.sh ;;
-            *host-setup.sh*) _held_script=host-setup.sh ;;
-            *) _held_script=update.sh ;;
-        esac
-    fi
     # ALLOWLIST, on TOKENS — not substrings, and only systemd-run's OWN options.
     # Skip a leading run of VAR=val assignments; the first real word must be
     # `systemd-run`. Then scan only the tokens BEFORE the `--` delimiter or the
@@ -115,15 +114,26 @@ while IFS= read -r _seg; do
             -*) : ;;
             *) break ;;            # the command operand: stop scanning options
         esac
-        case "$_tok" in
-            --unit|--unit=*) _has_unit=1 ;;
-            --scope|--scope=*) _has_scope=1 ;;
-        esac
+        _flag="${_tok%%=*}"
+        if _longopt_is "$_flag" --unit; then _has_unit=1
+        elif _longopt_is "$_flag" --scope; then _has_scope=1; fi
     done
     if [ "$_first" = "systemd-run" ] && [ "$_has_unit" -eq 1 ] && [ "$_has_scope" -eq 0 ]; then
         continue
     fi
     _held=1
+    # Which deploy entry point is session-held — the prescription below must
+    # name the script in the FAILING segment, not the first deploy mention:
+    # `systemd-run … update.sh && bash host-setup.sh` puts the held script
+    # second (CodeRabbit, #2095). update.sh, bootstrap.sh and host-setup.sh
+    # are not interchangeable and host-setup takes host-specific arguments.
+    if [ -z "$_held_script" ]; then
+        case "$_seg" in
+            *bootstrap.sh*) _held_script=bootstrap.sh ;;
+            *host-setup.sh*) _held_script=host-setup.sh ;;
+            *) _held_script=update.sh ;;
+        esac
+    fi
 done <<EOF
 $_SEGMENTS
 EOF

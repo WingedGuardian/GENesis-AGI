@@ -938,6 +938,7 @@ jobs:
         # caught it before the commit instead of in round 6. The habit is cheap;
         # the four prior instances each cost a review round.
         #
-        # UNION with this PR's own +16 collected tests (no new skips):
-        # floor 23342 -> 23358, ceiling holds at 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23358
+        # UNION with this PR's own collected tests (no new skips): 23342 + 16,
+        # then +3 for the abbreviated-flag and failing-segment tests added while
+        # answering review — floor 23358 -> 23361, ceiling holds at 102.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23361

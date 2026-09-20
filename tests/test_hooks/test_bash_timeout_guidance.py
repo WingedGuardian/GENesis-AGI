@@ -358,6 +358,45 @@ class TestDeployGuardFiresOnTheDangerousInput:
         )
         assert self._run(detached, background=False).strip() == ""
 
+    def test_fires_on_abbreviated_scope(self):
+        """systemd accepts any unambiguous long-option prefix: `--sc`, `--sco`,
+        `--scop` all mean --scope to systemd-run. Matching only the full
+        spelling let `--sco` slip past the disqualifier and read as detached."""
+        for cmd in (
+            "systemd-run --user --sco -- bash scripts/update.sh",
+            "systemd-run --user --scop=x -- bash scripts/update.sh",
+        ):
+            out = self._run(cmd, False)
+            assert out.strip(), (
+                f"guard went silent on `{cmd}` — an abbreviated --scope is "
+                "still --scope, and --scope does not leave the session"
+            )
+
+    def test_silent_on_abbreviated_unit(self):
+        """The prefix rule cuts both ways: `--un=x` is systemd's --unit spelling
+        and is genuinely detached, so it must stay quiet."""
+        detached = (
+            "systemd-run --user --collect --un=genesis-deploy-manual "
+            "--working-directory=$HOME/genesis /bin/bash -c "
+            "'exec ./scripts/update.sh > ~/tmp/d.log 2>&1'"
+        )
+        assert self._run(detached, background=False).strip() == ""
+
+    def test_prescription_names_the_FAILING_segment(self):
+        """_held_script used to latch onto the first segment MENTIONING a deploy
+        script — including one that passed the detachment check — so
+        `systemd-run … update.sh && bash host-setup.sh` prescribed update.sh to
+        the held host-setup invocation."""
+        cmd = (
+            "systemd-run --user --collect --unit x "
+            "--working-directory=$HOME/genesis /bin/bash -c 'exec ./scripts/update.sh'"
+            " && bash scripts/host-setup.sh --reinstall"
+        )
+        out = self._run(cmd, False)
+        context = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert "./scripts/host-setup.sh" in context
+        assert "./scripts/update.sh" not in context
+
     def test_always_exits_zero_even_if_the_caller_exported_errexit(self):
         """`read -d ''` returns non-zero at EOF. bash imports errexit from an
         exported SHELLOPTS, and settings.json spawns this hook as `bash <path>`,
