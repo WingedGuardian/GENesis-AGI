@@ -336,6 +336,14 @@ class TestDeployGuardFiresOnTheDangerousInput:
                 "non-leading does not detach the deploy"
             )
 
+    def test_prescription_names_the_held_entry_point(self):
+        """The three deploy scripts are not interchangeable — a bootstrap.sh
+        invocation must not be prescribed the update.sh command."""
+        out = self._run("bash scripts/bootstrap.sh", False)
+        context = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert "./scripts/bootstrap.sh" in context
+        assert "./scripts/update.sh" not in context
+
     def test_silent_on_unit_long_form(self):
         """`--unit=name` is a valid systemd-run spelling and must stay quiet —
         the token check is exact, not a substring."""

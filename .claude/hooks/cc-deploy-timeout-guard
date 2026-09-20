@@ -74,11 +74,22 @@ esac
 _SEGMENTS=$(printf '%s' "$CMD" | sed 's/&&/\n/g; s/||/\n/g; s/&/\n/g; s/|/\n/g; s/;/\n/g') || _SEGMENTS="$CMD"
 
 _held=0
+_held_script=""
 while IFS= read -r _seg; do
     case "$_seg" in
         *update.sh*|*bootstrap.sh*|*host-setup.sh*) : ;;
         *) continue ;;
     esac
+    # Which deploy entry point is session-held — the prescription below must
+    # name THIS script, because update.sh, bootstrap.sh and host-setup.sh are
+    # not interchangeable and host-setup takes host-specific arguments.
+    if [ -z "$_held_script" ]; then
+        case "$_seg" in
+            *bootstrap.sh*) _held_script=bootstrap.sh ;;
+            *host-setup.sh*) _held_script=host-setup.sh ;;
+            *) _held_script=update.sh ;;
+        esac
+    fi
     # ALLOWLIST, on TOKENS — not substrings. Skip a leading run of VAR=val
     # assignments; the first real word must be `systemd-run` AND a separate flag
     # token must be `--unit` or `--unit=…`. A trailing `#`-comment, an env
@@ -122,12 +133,22 @@ Detach it instead:
     --working-directory=$HOME/genesis --setenv=PATH="$PATH" \
     /bin/bash -c 'exec ./scripts/update.sh > ~/tmp/deploy-$(date +%Y%m%d-%H%M).log 2>&1'
 
+(Substitute the script that is actually held — bootstrap.sh and host-setup.sh are
+NOT interchangeable with update.sh, and host-setup.sh takes host-specific
+arguments the caller must keep.)
+
 Every part of that is load-bearing. --unit is what leaves the session ('systemd-run --user --scope' does NOT: a scope child keeps the caller's session id). --working-directory is required because systemd-run does not inherit this cwd. --setenv=PATH is required because a --user unit otherwise runs with systemd's default PATH, under which bootstrap takes different branches.
 
 Then VERIFY it took, because a failed launch is indistinguishable from a successful one: with a relative path and no --working-directory, bash exits instantly and --collect reaps the unit, leaving no trace. Run 'systemctl --user is-active genesis-deploy-manual' promptly — it must print 'active' (it also prints 'inactive' once the deploy has FINISHED). Then poll the log for the outcome. genesis-server going 'inactive' mid-run is EXPECTED, not a failure.
 
 Full rationale, measurements and incident history: the genesis-development skill's Timeout Policy.
 ADV
+
+# Point the prescription at the script that is actually held — the matched entry
+# point is not always update.sh, and the three deploy scripts are not
+# interchangeable. Only the `./scripts/…` path is rewritten, so the prose
+# mentions of update.sh elsewhere in the advisory are untouched.
+ADVISORY="${ADVISORY//.\/scripts\/update.sh/.\/scripts\/${_held_script:-update.sh}}"
 
 # jq builds valid JSON (escapes the message). If jq somehow fails, fall back to
 # stderr so the nudge is at least not lost, and still exit 0 (never block).
