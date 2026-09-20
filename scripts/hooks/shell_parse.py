@@ -79,7 +79,13 @@ _WRAPPER_SPEC = {
         0,
     ),
     "doas": ({"-u", "-C"}, 0),
-    "env": ({"-u", "--unset", "-C", "--chdir"}, 0),
+    # `-S`/`--split-string` carries a whole command line as ONE token. Listing it
+    # here is only half the job and would be WRONG on its own: it stops that token
+    # being read as the executable, but it also drops it, hiding the command
+    # instead of mis-naming it. The other half is `_env_carried_command`, which
+    # hands what it carries to the nested walk. Neither half ships without the
+    # other — that pairing is the whole content of this change.
+    "env": ({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}, 0),
     "nice": ({"-n", "--adjustment"}, 0),
     "ionice": ({"-c", "--class", "-n", "--classdata", "-p", "--pid"}, 0),
     "chrt": (set(), 1),
@@ -1497,6 +1503,16 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
     return segments, None
 
 
+def _is_assignment(token: str) -> bool:
+    """True for a leading ``VAR=value`` environment assignment.
+
+    Extracted rather than re-spelled at the second call site: the rule has three
+    parts (an ``=``, no leading dash, an identifier before it) and a second copy
+    is exactly the shape that drifts one part at a time.
+    """
+    return "=" in token and not token.startswith("-") and token.split("=", 1)[0].isidentifier()
+
+
 def _basename(token: str) -> str:
     """Executable basename: /usr/bin/git → git, ./foo → foo."""
     return token.rsplit("/", 1)[-1]
@@ -1666,7 +1682,7 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
         if tok in _CMD_POSITION_WORDS:
             i += 1  # reserved word / brace-group opener at command position
             continue
-        if "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
+        if _is_assignment(tok):
             i += 1  # leading VAR=value assignment
             continue
         if _basename(tok) in _RUN_CARRIERS:
@@ -2544,7 +2560,8 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
         override = _has_trailing_override(raw)
         # argv is tokenized from the redirect-STRIPPED source, so a redirect target
         # (incl. an expansion one) can never become argv[1] and spoof the subcommand.
-        argv = _strip_wrappers(_argv(seg.argv_src))
+        pre_strip = _argv(seg.argv_src)
+        argv = _strip_wrappers(pre_strip)
         exe = _basename(argv[0]) if argv else ""
         out.append(
             Segment(
@@ -2561,6 +2578,19 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
             script = _nested_script(argv, exe)
             if script:
                 nested.append(script)
+        # `env -S 'cmd'` RUNS cmd. Read from the PRE-strip argv, because stripping
+        # removes `env` together with this flag's operand, and only in COMMAND
+        # position: a token spelled `env` anywhere else is an argument, and
+        # `printf '%s' env -S 'git push …'` prints text without running git.
+        env_at = 0
+        while env_at < len(pre_strip) and _is_assignment(pre_strip[env_at]):
+            env_at += 1  # `FOO=1 env -S …` still has env in command position
+        if env_at < len(pre_strip) and _basename(pre_strip[env_at]) == "env":
+            carried = _env_carried_command(pre_strip[env_at:])
+            if carried:
+                nested.append(carried)
+        # $(...) / `...` bodies also execute — parsed from RAW, which STILL carries any
+        # expansion redirect target, so a nested command stays visible to the guards.
 
         nested.extend(_embedded_commands(_argv(seg.argv_src)))
         nested.extend(_substitutions(raw))
@@ -2673,6 +2703,159 @@ def _substitutions(text: str) -> list[str]:
                 continue
         i += 1
     return subs
+
+
+# `env -S`'s own escape language, MEASURED against the installed binary rather
+# than read off a manual — every row here was executed and its output observed.
+# `\c` is not in this map because it TERMINATES the string rather than producing
+# a character, and an escape absent from both is not "left alone": env refuses
+# the whole command (`invalid sequence '\q' in -S`, exit 125), which is why the
+# decoder returns None there instead of inventing a reading.
+_ENV_S_ESCAPES = {
+    "_": " ",
+    "t": "\t",
+    "n": "\n",
+    "r": "\r",
+    "f": "\f",
+    "v": "\v",
+    "\\": "\\",
+    "$": "$",
+    "#": "#",
+}
+# env's own options that consume the FOLLOWING field, when the split fields are
+# re-read as env arguments (`env -S '-u FOO cmd'` runs `cmd`).
+_ENV_VALUE_FLAGS = frozenset({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"})
+
+
+def _env_split_fields(text: str) -> list[str] | None:
+    """Split an ``env -S`` operand the way env does, or None if env would refuse it.
+
+    None is a real answer and not a failure: a string carrying an unknown escape
+    or an unterminated quote makes env exit before running anything, so there is
+    no command in it to reveal. Reporting one anyway would invent argv out of
+    input the system rejects — the mistake #1686 removed for unterminated ANSI-C
+    spans.
+
+    MEASURED behaviour this implements, all of it observed by running the form
+    and reading what the carried command printed:
+
+    * fields separate on runs of whitespace; leading whitespace is ignored.
+    * ``\\_`` is a SPACE inside a field — the whole point of the flag, since the
+      real separator cannot appear in one.
+    * ``\\t \\n \\r \\f \\v \\\\ \\$ \\#`` are the characters they name.
+    * ``\\c`` ENDS the string at that point, mid-field included.
+    * ``#`` starts a comment only at the START of a field: ``a#b`` is literal,
+      ``a #b`` drops the comment, and a leading ``#`` comments out everything.
+    * ``'`` and ``"`` group, and an unterminated one is refused by env.
+    * ``${VAR}`` is expanded by env and a bare ``$VAR`` is refused. Neither is
+      expanded here — the value is not knowable at parse time — so a field
+      containing ``${`` is left as written and simply will not match a gate.
+    """
+    fields: list[str] = []
+    buf: list[str] = []
+    started = False  # the current field has begun (so `#` is no longer a comment)
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in " \t\n":
+            if started:
+                fields.append("".join(buf))
+                buf, started = [], False
+            i += 1
+            continue
+        if ch == "#" and not started:
+            break  # comment runs to the end of the string
+        if ch == "\\":
+            if i + 1 >= n:
+                return None  # a trailing backslash is not a sequence env accepts
+            nxt = text[i + 1]
+            if nxt == "c":
+                break  # terminates the string, mid-field included
+            if nxt not in _ENV_S_ESCAPES:
+                return None  # env exits 125 rather than running anything
+            buf.append(_ENV_S_ESCAPES[nxt])
+            started = True
+            i += 2
+            continue
+        if ch in "'\"":
+            close = text.find(ch, i + 1)
+            if close == -1:
+                return None  # `no terminating quote in -S string`
+            buf.append(text[i + 1 : close])
+            started = True
+            i = close + 1
+            continue
+        buf.append(ch)
+        started = True
+        i += 1
+    if started:
+        fields.append("".join(buf))
+    return fields
+
+
+def _env_carried_command(argv: list[str]) -> str:
+    """The command line an ``env -S`` invocation runs, else ''.
+
+    ``argv`` is the segment's argv with ``env`` at index 0 — the CALLER is
+    responsible for that, and it matters: a bare token spelled ``env`` anywhere
+    else is an ARGUMENT, not the wrapper. ``printf '%s' env -S 'git push …'``
+    prints text and runs no git, and reading it as one would fabricate a command
+    for a gate to refuse.
+
+    Option processing stops where env stops it — MEASURED: at ``--``, at a
+    ``VAR=`` assignment and at a bare word, after each of which a later ``-S`` is
+    a file name (``env FOO=1 -S 'echo hi'`` exits 127, ``env: '-S': No such
+    file``). ``-S`` is also accepted as the LAST letter of a short bundle
+    (``-iS 'cmd'``), the same shape ``bash -ce`` has.
+
+    Operands after the operand are APPENDED to the carried command rather than
+    dropped: ``env -S 'echo a' b c`` prints ``a b c``.
+    """
+    i = 1
+    operand = None
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            return ""  # everything after is a command name, not an option
+        if not tok.startswith("-"):
+            return ""  # a bare word or VAR= assignment ends option processing
+        if tok in ("-S", "--split-string"):
+            if i + 1 >= len(argv):
+                return ""
+            operand, i = argv[i + 1], i + 2
+            break
+        if tok.startswith("--split-string="):
+            operand, i = tok[len("--split-string=") :], i + 1
+            break
+        if tok.startswith("-S") and len(tok) > 2:
+            operand, i = tok[2:], i + 1  # glued `-S'cmd'`
+            break
+        if not tok.startswith("--") and tok.endswith("S") and len(tok) > 2:
+            if i + 1 >= len(argv):
+                return ""
+            operand, i = argv[i + 1], i + 2  # short bundle `-iS 'cmd'`
+            break
+        i += 2 if tok in _ENV_VALUE_FLAGS else 1
+    if operand is None:
+        return ""
+    fields = _env_split_fields(operand)
+    if not fields:
+        return ""
+    # The split fields are re-read as env's OWN arguments before the command:
+    # `env -S '-i echo hi'` runs echo. Skip those the same way, then whatever
+    # remains is the command, with the outer operands appended to it.
+    j = 0
+    while j < len(fields):
+        f = fields[j]
+        if f.startswith("-"):
+            j += 2 if f in _ENV_VALUE_FLAGS else 1
+            continue
+        if "=" in f and not f.startswith("="):
+            j += 1  # VAR=value assignment
+            continue
+        break
+    command = fields[j:] + argv[i:]
+    return " ".join(shlex.quote(part) for part in command) if command else ""
 
 
 def _nested_script(argv: list[str], interpreter: str) -> str:
