@@ -203,16 +203,51 @@ def _git(root: str, *args: str) -> list[str]:
 # acked finding in them. Stripped in the runner rather than at each call site,
 # for the same reason `--no-optional-locks` lives in `_git()`: a guarantee every
 # caller must remember is a convention.
+#
+# FOUR COPIES OF THIS SET EXIST and are kept identical BY TEST, not by import:
+# here, `scripts/review_state.py`, `scripts/review_scope.py`, and the bash array
+# in `.claude/hooks/genesis-hook` (bash cannot import a Python frozenset). The
+# hook-side copies cannot import this module — hook scripts are stdlib-only, and
+# `git_push_guard` already wraps its `review_state` import in `try/except`
+# because a module-load exception in a hook exits 1, which Claude Code treats as
+# NON-BLOCKING and which would silently disable every fail-closed gate in that
+# file. `tests/test_hooks/test_git_env_scrub.py` asserts all four are equal.
 _GIT_ENV_OVERRIDES = frozenset(
     {
+        # Repository LOCATION. MEASURED 2026-09-19: these three each redirect a
+        # gate decision on their own (branch, staged-diff hash, worktree key).
         "GIT_DIR",
-        "GIT_COMMON_DIR",
         "GIT_WORK_TREE",
         "GIT_INDEX_FILE",
+        # Same documented class. MEASURED to have no effect in a standalone-repo
+        # configuration — which is NOT "proven irrelevant": GIT_COMMON_DIR inside
+        # a LINKED WORKTREE is the obvious untested case. Kept because adding to
+        # a scrub is the safe direction.
+        "GIT_COMMON_DIR",
         "GIT_OBJECT_DIRECTORY",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_CEILING_DIRECTORIES",
         "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+        # NOT location variables — they change what a diff REPORTS, which lands
+        # in the same place. MEASURED 2026-09-19: `GIT_EXTERNAL_DIFF=/bin/true`
+        # empties `git diff --cached`, so `review_state._staged_content_hash`
+        # returns its "clean" (nothing-staged) sentinel and
+        # `advance_review_round` then returns the current round WITHOUT
+        # advancing — the escalation cap stops counting. `GIT_DIFF_OPTS` was
+        # measured INERT here and is carried as its documented sibling only; do
+        # not cite it as measured.
+        "GIT_EXTERNAL_DIFF",
+        "GIT_DIFF_OPTS",
+        # Arbitrary git CONFIG injected through the environment — the same
+        # diff.external defeat by another door. Dropping GIT_CONFIG_COUNT
+        # alone neuters the unbounded GIT_CONFIG_KEY_n/VALUE_n pairs, which
+        # cannot be denylisted by name (MEASURED 2026-09-19).
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
     }
 )
 

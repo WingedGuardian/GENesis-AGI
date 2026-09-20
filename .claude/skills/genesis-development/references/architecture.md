@@ -52,3 +52,23 @@ These supplement the general principles kept in CLAUDE.md:
   `os.environ["CLAUDE_PROJECT_DIR"]` — it will be empty. Use the
   `.claude/hooks/genesis-hook` launcher, which self-locates from its
   filesystem position.
+- **A wrapper that sanitizes its OWN input has not sanitized its CHILD's.**
+  The launcher scrubbed git's location variables (`GIT_DIR`, `GIT_WORK_TREE`,
+  `GIT_INDEX_FILE`, …) for its own `git rev-parse` discovery long before it
+  scrubbed them for the hook it `exec`s — so it protected WHICH script runs and
+  not what that script's own git queries see. A launched hook inherited the
+  ambient overrides and resolved a foreign repository despite being handed an
+  explicit `cwd`. MEASURED 2026-09-17: all four decision inputs the enforcement
+  hooks share moved, every one in the FAIL-OPEN direction — branch
+  `main` → the other repo's branch, staged-diff hash → the `"clean"`
+  nothing-staged sentinel, worktree marker key → a marker that cannot exist, and
+  substantiality `substantial` → `inline`. Two layers close it and both are
+  needed: the launcher scrubs for the child (covers every launched hook,
+  including the ones that scrub nothing themselves), and `review_state` /
+  `review_scope` scrub at their own git runners (covers direct invocation from a
+  shell, which the launcher never sees — `git_push_guard.py --check-pr` is run by
+  hand constantly). The variable list is duplicated in all three places because
+  bash cannot import a Python tuple; `tests/test_hooks/test_git_env_scrub.py`
+  pins the copies to each other rather than trusting them. **The general rule:
+  when a process hands work to a child, decide explicitly what the child's
+  environment is — inheriting it is a decision too, just an unmade one.**

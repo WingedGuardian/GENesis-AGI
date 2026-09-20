@@ -8,6 +8,7 @@ hook in that worktree. Fixed by resolving the main worktree via
 `git rev-parse --git-common-dir` (no pipe). These tests lock that in.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -90,13 +91,15 @@ def _make_main_and_worktree(tmp_path):
     return main, wt
 
 
-def _invoke(root, *, dev_local=False):
+def _invoke(root, *, dev_local=False, cwd=None, extra_env=None):
     env = {k: v for k, v in os.environ.items() if k != "GENESIS_HOOK_DEV_LOCAL"}
     if dev_local:
         env["GENESIS_HOOK_DEV_LOCAL"] = "1"
+    env.update(extra_env or {})
     return subprocess.run(
         [str(root / ".claude" / "hooks" / "genesis-hook"), "probe.py"],
         stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env,
+        cwd=None if cwd is None else str(cwd),
     )
 
 
@@ -161,6 +164,71 @@ def test_ambient_git_dir_env_ignored_for_hook_discovery(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == "MAIN", f"ambient GIT_DIR leaked into discovery: {proc.stdout!r}"
+
+
+def test_ambient_git_env_is_scrubbed_for_the_LAUNCHED_HOOK_too(tmp_path):
+    """The mirror of the discovery test above, one layer down — and the layer that
+    was missing until 2026-09-17.
+
+    Scrubbing for the launcher's own ``git rev-parse`` protects WHICH script runs.
+    It says nothing about what that script's OWN git queries see: until the
+    ``exec`` line scrubbed as well, a launched hook inherited the ambient
+    ``GIT_DIR``/``GIT_WORK_TREE`` and resolved a foreign repository despite being
+    handed an explicit cwd. All four shared decision inputs the enforcement hooks
+    read were MEASURED to fail OPEN that way (see
+    ``tests/test_hooks/test_git_env_scrub.py``).
+
+    Asserted on the CHILD's own view, not on the launcher's text: the variables
+    must be absent from the hook's environment, and its git must resolve the
+    worktree it was invoked in rather than the foreign repo the poison names.
+    """
+    _main, wt = _make_main_and_worktree(tmp_path)
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    genv = {
+        **os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "init", "-q"], cwd=foreign, check=True, env=genv)
+
+    # The probe reports what the CHILD sees. Run through the default (main-tree)
+    # path so this exercises the same resolution a real session uses.
+    (_main / "scripts" / "probe.py").write_text(
+        "import json, os, subprocess\n"
+        "top = subprocess.run(['git', 'rev-parse', '--show-toplevel'],\n"
+        "                     capture_output=True, text=True)\n"
+        "print(json.dumps({\n"
+        "    'git_env': sorted(k for k in os.environ if k.startswith('GIT_')),\n"
+        "    'toplevel': top.stdout.strip(),\n"
+        "}))\n"
+    )
+    poison = {
+        "GIT_DIR": str(foreign / ".git"),
+        "GIT_WORK_TREE": str(foreign),
+        "GIT_INDEX_FILE": str(foreign / ".git" / "index"),
+    }
+
+    proc = _invoke(wt, cwd=wt, extra_env=poison)
+    assert proc.returncode == 0, proc.stderr
+    seen = json.loads(proc.stdout)
+
+    leaked = sorted(set(poison) & set(seen["git_env"]))
+    assert not leaked, f"ambient git env reached the launched hook: {leaked}"
+    assert Path(seen["toplevel"]).resolve() == wt.resolve(), (
+        f"the launched hook resolved a foreign repository: {seen['toplevel']!r}"
+    )
+
+    # Control: the same poison DOES redirect a child the launcher did not scrub,
+    # so a pass above is the scrub working rather than an inert fixture.
+    unscrubbed = subprocess.run(
+        [sys.executable, str(_main / "scripts" / "probe.py")],
+        cwd=str(wt), capture_output=True, text=True, env={**os.environ, **poison},
+    )
+    assert unscrubbed.returncode == 0, unscrubbed.stderr
+    assert Path(json.loads(unscrubbed.stdout)["toplevel"]).resolve() == foreign.resolve(), (
+        "the poisoned environment did not redirect an unscrubbed child — the "
+        "assertions above would pass vacuously"
+    )
 
 
 def test_separate_git_dir_falls_back_to_own_scripts(tmp_path):

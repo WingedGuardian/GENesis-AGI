@@ -20,11 +20,42 @@ GENESIS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # `git worktree list | head`: head closes the pipe after one line, so with many
 # worktrees git gets SIGPIPE, and under `set -euo pipefail` that silently kills
 # this launcher (exit 141, no stderr), breaking every hook in the worktree.
-# `env -u` scrubs ambient Git location overrides for THIS discovery: an exported
-# GIT_DIR / GIT_WORK_TREE / GIT_COMMON_DIR would otherwise resolve an UNRELATED repo
-# despite the `cd`, redirecting every hook (security gates included) to a foreign
+# Git's repository-LOCATION overrides, scrubbed in BOTH places below. An exported
+# GIT_DIR / GIT_WORK_TREE / GIT_COMMON_DIR resolves an UNRELATED repo despite the
+# `cd`, which would redirect every hook (security gates included) to a foreign
 # checkout's same-named script.
-_common_dir="$(cd "$GENESIS_ROOT" 2>/dev/null && env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR git rev-parse --git-common-dir 2>/dev/null)" || _common_dir=""
+#
+# The last two are NOT location overrides: they change what a diff REPORTS from
+# the right repository, which lands on the same decisions. MEASURED 2026-09-19:
+# GIT_EXTERNAL_DIFF=/bin/true empties `git diff --cached`, so review_state's
+# staged-content hash returns its "nothing staged" sentinel and the escalation
+# cap stops counting rounds.
+#
+# This list is DUPLICATED in scripts/review_state.py (GIT_ENV_OVERRIDES),
+# scripts/review_scope.py, and src/genesis/session_awareness/zero_drop_git.py,
+# because bash cannot import Python. All FOUR copies are kept in step by
+# tests/test_hooks/test_git_env_scrub.py, which parses this array out of this
+# file and fails when any copy drifts. Add a variable in one place and that test
+# tells you about the other three.
+_GIT_ENV_SCRUB=(
+    -u GIT_DIR
+    -u GIT_WORK_TREE
+    -u GIT_INDEX_FILE
+    -u GIT_COMMON_DIR
+    -u GIT_OBJECT_DIRECTORY
+    -u GIT_ALTERNATE_OBJECT_DIRECTORIES
+    -u GIT_CEILING_DIRECTORIES
+    -u GIT_DISCOVERY_ACROSS_FILESYSTEM
+    -u GIT_NAMESPACE
+    -u GIT_PREFIX
+    -u GIT_EXTERNAL_DIFF
+    -u GIT_DIFF_OPTS
+    -u GIT_CONFIG_COUNT
+    -u GIT_CONFIG_PARAMETERS
+    -u GIT_CONFIG_GLOBAL
+    -u GIT_CONFIG_SYSTEM
+)
+_common_dir="$(cd "$GENESIS_ROOT" 2>/dev/null && env "${_GIT_ENV_SCRUB[@]}" git rev-parse --git-common-dir 2>/dev/null)" || _common_dir=""
 MAIN_ROOT=""
 if [[ -n "$_common_dir" ]]; then
     MAIN_ROOT="$(cd "$GENESIS_ROOT" 2>/dev/null && cd "$(dirname "$_common_dir")" 2>/dev/null && pwd)" || MAIN_ROOT=""
@@ -79,4 +110,22 @@ if [[ ! -f "$SCRIPT_PATH" ]]; then
 fi
 
 shift
-exec "$PYTHON" "$SCRIPT_PATH" "$@"
+# Scrub for the CHILD, not just for the discovery above. Until this was added,
+# the launcher protected WHICH script runs and not what that script's own git
+# queries see: a launched hook inherited an ambient GIT_DIR/GIT_WORK_TREE and
+# resolved a foreign repository despite being handed an explicit cwd.
+#
+# MEASURED 2026-09-17, through this launcher, scratch repo A on `main` with 200
+# staged lines against an unrelated repo B on `feat/decoy`. All four of the
+# shared decision inputs the enforcement hooks rely on failed OPEN:
+#
+#   branch           main              -> feat/decoy   (defeats no-commits-to-main)
+#   diff hash        24049b3cb26ddf73  -> "clean"      (staged work reads as none)
+#   marker key       cb063e9bb05f      -> 5378b52a44c1 (a marker file that does not exist)
+#   substantiality   substantial       -> inline       (downgrades required review depth)
+#
+# The Python modules scrub at their own git runners too, which is what covers a
+# hook invoked directly from a shell rather than through this launcher. Both
+# layers are deliberate: this one is the only thing that helps a hook that does
+# NOT scrub, and that is every hook other than those two.
+exec env "${_GIT_ENV_SCRUB[@]}" "$PYTHON" "$SCRIPT_PATH" "$@"

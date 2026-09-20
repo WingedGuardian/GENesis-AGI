@@ -64,6 +64,103 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+#: Ambient git environment variables that change what THIS MODULE'S git reads
+#: report. Two kinds, and the second is why the name is not "location":
+#:
+#: 1. Repository LOCATION — each redirects git away from the directory a caller
+#:    explicitly passed as ``cwd``, so a decision derived from git describes a
+#:    DIFFERENT repository than the one being reviewed.
+#: 2. Diff BEHAVIOUR — the repository is right, but what the diff REPORTS is
+#:    not, which lands on the same sentinels and the same decisions.
+#:
+#: MEASURED 2026-09-19, each variable alone, scratch repo A on `main` with staged
+#: work against unrelated repo B on `feat/decoy`:
+#:
+#:   GIT_DIR            branch main -> feat/decoy, staged hash -> "clean"
+#:   GIT_WORK_TREE      worktree marker key changes
+#:   GIT_INDEX_FILE     staged hash -> "clean"
+#:   GIT_EXTERNAL_DIFF  _staged_content_hash -> "clean"   (kind 2)
+#:
+#: Every one fails OPEN. `"clean"` is this module's sentinel for NOTHING STAGED,
+#: so unreviewed work becomes invisible to the depth gate; the branch read
+#: defeats the no-commits-to-main check; the key change makes the gate consult a
+#: marker file that does not exist; and via `advance_review_round`, a "clean"
+#: content hash returns the CURRENT round without advancing, so the escalation
+#: cap silently stops counting. `review_scope`'s substantiality classifier moves
+#: `substantial` -> `inline` for the same reason.
+#:
+#: The REMAINING entries were measured to have NO effect in a standalone-repo
+#: configuration. That is not "proven irrelevant" — the configuration was a
+#: standalone repo, and GIT_COMMON_DIR inside a LINKED WORKTREE is the obvious
+#: untested case — so they stay, because adding to a scrub is the safe
+#: direction. Do not cite them as measured to matter; they are not.
+#:
+#: DUPLICATED, DELIBERATELY, rather than imported. FOUR copies of THIS list
+#: exist — here, `scripts/review_scope.py`,
+#: `src/genesis/session_awareness/zero_drop_git.py` (the original), and the bash
+#: array in `.claude/hooks/genesis-hook`, because bash cannot import a Python
+#: tuple. A FIFTH, NARROWER list lives in `scripts/worktree_lifecycle.py`
+#: (3 names, its own comment concedes it is incomplete); it is NOT part of this
+#: parity set and is tracked separately, so "four copies" is a claim about this
+#: list and not about every place in the repo that scrubs git env. This module is stdlib-only, and
+#: `git_push_guard` wraps its `review_state` import in `try/except` precisely
+#: because a module-load exception in a hook exits 1, which Claude Code treats as
+#: non-blocking — silently disabling every fail-closed gate in that file. Adding
+#: an import here would add exactly that failure mode to the layer this constant
+#: exists to harden. `tests/test_hooks/test_git_env_scrub.py` asserts all four
+#: copies are equal and fails when any drifts. The lock is the chokepoint; an
+#: import would be a liability.
+GIT_ENV_OVERRIDES = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_DIFF_OPTS",
+    # Arbitrary git CONFIG through the environment. PRECAUTIONARY, and the
+    # honest framing matters here: the one config key measured to fail OPEN is
+    # `diff.external`, and what closes THAT is `--no-ext-diff` on the command,
+    # not this list — because the same key also arrives via a repo-local
+    # .git/config, which no environment scrub can reach. MEASURED 2026-09-19
+    # across nine keys: only `diff.noprefix` moved anything else, and it
+    # perturbs the hash in the fail-CLOSED direction (the marker stops matching,
+    # so MORE review is demanded). These four stay as defence in depth against
+    # keys nobody has enumerated. Dropping GIT_CONFIG_COUNT alone neuters the
+    # unbounded GIT_CONFIG_KEY_n/VALUE_n pairs, which cannot be listed by name.
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+)
+
+
+def git_env(**overrides: str) -> dict[str, str]:
+    """The ambient environment with git's own overrides removed.
+
+    Every ``subprocess.run(["git", ...])`` in this module goes through here, so
+    scrubbing is a property of the module rather than something four call sites
+    each have to remember. ``overrides`` is for values a caller genuinely needs
+    to PIN — the staged-diff hash pins ``COLUMNS`` so its output is not
+    terminal-width sensitive.
+
+    THE SCRUB IS APPLIED LAST, DELIBERATELY. An earlier revision applied it
+    first and ``raise``d if an override would re-add a scrubbed name. That is
+    the wrong failure direction HERE: an exception out of this helper leaves the
+    hook process non-zero, which Claude Code treats as NON-BLOCKING — so the one
+    guard written to fail loudly would have failed the gate OPEN. Filtering
+    after the merge makes the guarantee structural instead: a caller simply
+    cannot re-add a scrubbed variable, there is no error path to catch, and no
+    call site has to remember anything.
+    """
+    return {k: v for k, v in {**os.environ, **overrides}.items() if k not in GIT_ENV_OVERRIDES}
+
+
 _MARKER_DIR = Path.home() / ".genesis" / "review_markers"
 # Per-worktree review-ROUND counter (escalation cap). Deliberately a SEPARATE store
 # from the marker above: review_invalidate_on_commit clears the marker after every
@@ -124,6 +221,7 @@ def _worktree_root(cwd: str | None = None) -> str:
             text=True,
             timeout=5,
             cwd=cwd,
+            env=git_env(),
         )
         root = result.stdout.strip()
         if root:
@@ -194,7 +292,25 @@ def get_current_diff_hash(cwd: str | None = None) -> str:
     """
     try:
         result = subprocess.run(
-            ["git", "diff", "--cached", "--raw", "--no-abbrev", "-z"],
+            # --no-ext-diff/--no-textconv here are CONSISTENCY, not protection,
+            # and the distinction is worth keeping straight. MEASURED
+            # 2026-09-19: the `--raw` format reports metadata rather than
+            # content, so no external diff driver runs and this hash held steady
+            # across all four injection routes while the plain-diff hash below
+            # fell to "clean". A mutation removing these two flags therefore
+            # SURVIVES the suite, correctly — there is no behaviour here to pin.
+            # They stay so both hashes are computed the same way. Also MEASURED
+            # byte-identical, so stored marker hashes remain valid.
+            [
+                "git",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--cached",
+                "--raw",
+                "--no-abbrev",
+                "-z",
+            ],
             capture_output=True,  # bytes (no text= → no newline/encoding munging)
             timeout=10,
             cwd=cwd,
@@ -207,7 +323,10 @@ def get_current_diff_hash(cwd: str | None = None) -> str:
             # 2026-08-11: identical index → 62e24043 @80/unset, cd67763b @120,
             # a3966055 @200). Pin the width so the hash is env-independent; 80
             # matches the unset default, so previously stored markers stay valid.
-            env={**os.environ, "COLUMNS": "80"},
+            # git_env(), not {**os.environ}: an ambient GIT_INDEX_FILE or
+            # GIT_DIR makes `--cached` describe a DIFFERENT index, and this hash
+            # is what binds a review marker to the staged content.
+            env=git_env(COLUMNS="80"),
         )
         content = result.stdout  # raw bytes; do NOT strip (would drop trailing-ws paths)
         if not content:
@@ -673,11 +792,24 @@ def _staged_content_hash(cwd: str | None = None) -> str:
     """
     try:
         result = subprocess.run(
-            ["git", "diff", "--cached"],
+            # --no-ext-diff is LOAD-BEARING, not hygiene. An external diff
+            # driver makes this command emit NOTHING, so this hash becomes
+            # the "clean" nothing-staged sentinel over real staged work, and
+            # advance_review_round then stops advancing the escalation cap.
+            # Scrubbing GIT_EXTERNAL_DIFF alone does NOT close that: MEASURED
+            # 2026-09-19, the same driver can be set through GIT_CONFIG_COUNT,
+            # GIT_CONFIG_PARAMETERS or GIT_CONFIG_GLOBAL, and through a
+            # repo-local .git/config that no environment scrub can reach. The
+            # flag asks git not to do the thing at all, which is the only
+            # form that does not depend on enumerating the ways in.
+            # --no-textconv closes the sibling; MEASURED byte-identical in the
+            # ordinary case, so it costs nothing.
+            ["git", "diff", "--no-ext-diff", "--no-textconv", "--cached"],
             capture_output=True,
             text=True,
             timeout=10,
             cwd=cwd,
+            env=git_env(),
         )
         content = result.stdout
         if not content.strip():
@@ -1023,6 +1155,7 @@ def get_current_branch(cwd: str | None = None) -> str:
             text=True,
             timeout=5,
             cwd=cwd,
+            env=git_env(),
         )
         return result.stdout.strip() or "unknown"
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):

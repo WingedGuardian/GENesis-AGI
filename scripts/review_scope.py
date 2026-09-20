@@ -301,6 +301,73 @@ def _specialists(scope_tags: set[str], diff_lines: int) -> list[str]:
 
 
 # ── git plumbing — fail-open, always timed ────────────────────────────────────
+
+#: Ambient git environment variables scrubbed from every git call below. Each
+#: either redirects git away from the ``cwd`` a caller passed explicitly, or
+#: changes what the diff REPORTS from the right repository. MEASURED 2026-09-17:
+#: ``classify_change_substantiality()`` moved ``substantial`` -> ``inline`` with
+#: an ambient GIT_DIR/GIT_WORK_TREE pointing elsewhere — that value decides how
+#: deep a review a change must have, so the failure direction is OPEN.
+#:
+#: KEPT IN STEP WITH ITS COPIES BY TEST, NOT BY IMPORT. FOUR copies of this list
+#: exist (a fifth, narrower one in `scripts/worktree_lifecycle.py` is deliberately
+#: outside the parity set and tracked separately): this one, ``review_state.GIT_ENV_OVERRIDES``,
+#: ``genesis.session_awareness.zero_drop_git._GIT_ENV_OVERRIDES``, and the
+#: launcher's bash array. ``tests/test_hooks/test_git_env_scrub.py`` asserts all
+#: four are equal. Importing from ``review_state`` instead would close a cycle —
+#: that module already imports THIS one at function scope — and would put a
+#: module-load failure path into the enforcement layer, which is what the copy
+#: exists to avoid. The per-variable measurements live on the ``review_state``
+#: copy; do not restate them here, where they would drift.
+_GIT_ENV_OVERRIDES = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_DIFF_OPTS",
+    # Arbitrary git CONFIG through the environment. PRECAUTIONARY, and the
+    # honest framing matters here: the one config key measured to fail OPEN is
+    # `diff.external`, and what closes THAT is `--no-ext-diff` on the command,
+    # not this list — because the same key also arrives via a repo-local
+    # .git/config, which no environment scrub can reach. MEASURED 2026-09-19
+    # across nine keys: only `diff.noprefix` moved anything else, and it
+    # perturbs the hash in the fail-CLOSED direction (the marker stops matching,
+    # so MORE review is demanded). These four stay as defence in depth against
+    # keys nobody has enumerated. Dropping GIT_CONFIG_COUNT alone neuters the
+    # unbounded GIT_CONFIG_KEY_n/VALUE_n pairs, which cannot be listed by name.
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+)
+
+
+def _git_env() -> dict[str, str]:
+    """The ambient environment with git's own overrides removed."""
+    return {k: v for k, v in os.environ.items() if k not in _GIT_ENV_OVERRIDES}
+
+
+#: ``diff`` subcommands are hardened HERE, in the one runner, rather than at each
+#: call site. An external diff driver empties a diff, and every classifier in this
+#: module reads a diff to decide how substantial a change is — so a caller who
+#: forgot the flag would silently classify real work as trivial. MEASURED
+#: 2026-09-19: the driver reaches git through GIT_EXTERNAL_DIFF, GIT_CONFIG_COUNT,
+#: GIT_CONFIG_PARAMETERS, GIT_CONFIG_GLOBAL, and a repo-local .git/config that no
+#: environment scrub can reach at all. Only the flag closes the whole set.
+def _harden(args: list[str]) -> list[str]:
+    """Insert the diff-immunity flags when the subcommand is ``diff``."""
+    if args and args[0] == "diff":
+        return ["diff", "--no-ext-diff", "--no-textconv", *args[1:]]
+    return list(args)
+
+
 def _git(args: list[str], cwd: str | None, deadline: float | None = None) -> str | None:
     """Run a git command; return stdout, or None on ANY error (fail-open).
 
@@ -316,11 +383,12 @@ def _git(args: list[str], cwd: str | None, deadline: float | None = None) -> str
         timeout = min(_GIT_TIMEOUT, remaining)
     try:
         result = subprocess.run(
-            ["git", *args],
+            ["git", *_harden(args)],
             capture_output=True,
             text=True,
             timeout=timeout,
             cwd=cwd,
+            env=_git_env(),
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError, UnicodeDecodeError):
         # UnicodeDecodeError: text=True strict-decodes stdout; a filename with
