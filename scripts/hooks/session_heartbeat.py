@@ -79,6 +79,19 @@ def _connect_with_deadline(
     """Open a read connection whose lock wait and query work share a deadline."""
     import sqlite3
 
+    if deadline is not None and deadline - time.monotonic() <= 0:
+        return None
+    # Admission fence at this module's connect chokepoint (fail-closed): a
+    # fenced database reads as "could not read" (None), which every caller's
+    # three-valued contract already preserves correctly. `remaining` is
+    # computed AFTER the fence check so its cost is charged to the deadline.
+    try:
+        from db_admission_check import database_is_fenced
+
+        if database_is_fenced(db_uri):
+            return None
+    except Exception:
+        return None
     remaining = None if deadline is None else deadline - time.monotonic()
     if remaining is not None and remaining <= 0:
         return None

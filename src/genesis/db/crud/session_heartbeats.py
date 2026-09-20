@@ -221,6 +221,18 @@ def get_active_sync(
     from it saturates at one and states a precise, wrong total.
     """
     try:
+        # Admission fence. These two sync readers open a RAW sqlite3
+        # connection (no ``mode=ro``) on the hook hot path, so before this
+        # they consulted nothing at all — MEASURED opening a QUARANTINED
+        # database on every prompt during the 2026-09-18 incident class.
+        # `database_is_fenced` (predicate, fail-closed) rather than
+        # `assert_admitted` (raises): these functions document "returns [] on
+        # any error", and a fenced database is exactly that — no peers
+        # readable, degrade quietly, self-heal on release.
+        from genesis.db.admission import database_is_fenced
+
+        if database_is_fenced(db_path):
+            return []
         conn = sqlite3.connect(
             db_path,
             timeout=_sync_timeout(timeout, deadline),
@@ -268,6 +280,19 @@ def count_active_sync(
     of a number it does not have.
     """
     try:
+        # Admission fence. These two sync readers open a RAW sqlite3
+        # connection (no ``mode=ro``) on the hook hot path, so before this
+        # they consulted nothing at all — MEASURED opening a QUARANTINED
+        # database on every prompt during the 2026-09-18 incident class.
+        # `database_is_fenced` (predicate, fail-closed) rather than
+        # `assert_admitted` (raises): this function documents "None — not 0 —
+        # when the count cannot be taken", and a fenced database is exactly
+        # that. Returning 0 here would assert "no peers", which is a precise
+        # wrong answer rather than an absent one.
+        from genesis.db.admission import database_is_fenced
+
+        if database_is_fenced(db_path):
+            return None
         conn = sqlite3.connect(
             db_path,
             timeout=_sync_timeout(timeout, deadline),
