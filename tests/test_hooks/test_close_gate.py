@@ -440,3 +440,34 @@ def test_publishing_create_plus_close_is_a_compound_block(repo):
         dispatched=None,
     )
     assert _verdict(r) == "block", f"{_verdict(r)}: {r.stdout}{r.stderr}"
+
+
+def test_close_with_unresolvable_repo_variable_blocks(repo):
+    """`gh pr close N --repo "$R"` names a repo the guard cannot read — it must
+    fail closed, not fall back to the cwd repo's review history."""
+    r = _run('gh pr close 1705 --repo "$R"', repo, dispatched=None)
+    assert _verdict(r) == "block", f"{_verdict(r)}: {r.stdout}{r.stderr}"
+    assert "repository" in (r.stderr or "").lower()
+
+
+def test_close_after_an_ambiguous_cd_blocks(repo):
+    """`cd <elsewhere> && gh pr close N` runs the close in another directory —
+    an unresolvable target cwd must fail closed rather than gate the hook's
+    own checkout."""
+    r = _run(f"cd '{repo}'; cd \"$(echo .)\" && gh pr close 42", repo, dispatched=None)
+    # $(echo .) is unresolvable statically → _CWD_UNKNOWN → fail closed
+    assert _verdict(r) == "block", f"{_verdict(r)}: {r.stdout}{r.stderr}"
+
+
+def test_a_push_of_another_branch_does_not_carry_the_create(repo):
+    """`git push origin feature/b && gh pr create` on feature/x: the push
+    publishes a DIFFERENT branch, so the create's publication hides behind
+    the push's prompt — the compound must be refused."""
+    subprocess.run(["git", "checkout", "-qb", "feature/other"], cwd=repo, check=True)
+    subprocess.run(["git", "checkout", "-q", "feature/x"], cwd=repo, check=True)
+    r = _run(
+        "git push origin feature/other && gh pr create --title x --body y",
+        repo,
+        dispatched=None,
+    )
+    assert _verdict(r) == "block", f"{_verdict(r)}: {r.stdout}{r.stderr}"

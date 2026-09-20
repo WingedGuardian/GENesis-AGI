@@ -4079,7 +4079,16 @@ def _close_target(argv: list[str]) -> tuple[str | None, str | None]:
             m = re.match(r"(?:[a-z]+://[^/\s]+/)?([^/\s]+/[^/\s]+)/pull/(\d+)\b", tok)
             if m:
                 url_repo, pr_num = m.group(1), m.group(2)
-    return pr_num, _comment_repo(argv) or url_repo
+    # An explicit --repo/-R that cannot normalize to OWNER/REPO (a shell
+    # variable, an enterprise host) is NOT "no repo given" — the close targets
+    # whatever that resolves to at runtime, so the terminal check must fail
+    # closed rather than silently apply the cwd repo's review history.
+    explicit = _comment_repo_value(argv)
+    if explicit:
+        return pr_num, _normalize_repo(explicit) or _REPO_UNRESOLVED
+    if url_repo:
+        return pr_num, _normalize_repo(url_repo) or _REPO_UNRESOLVED
+    return pr_num, None
 
 
 def _gh_api_opaque_body(argv: list[str]) -> bool:
@@ -4251,11 +4260,17 @@ def _gh_api_close_target(argv: list[str]) -> tuple[str | None, str | None]:
         m = re.search(r"(?:^|/)repos/([^/\s]+/[^/\s]+)/(?:pulls|issues)/(\d+)(?:/|\b)", tok)
         if m:
             return m.group(2), m.group(1)
+    # An explicit --repo/-R that cannot normalize to OWNER/REPO (a shell
+    # variable like `--repo "$R"`) must not read as "no repo given": the
+    # caller would then query the cwd repo's review history while gh closes
+    # a PR in whatever the variable resolves to — the wrong-repo class.
+    explicit = _comment_repo_value(argv)
+    _repo = (_normalize_repo(explicit) or _REPO_UNRESOLVED) if explicit else None
     for tok in argv:
         m = re.search(r"(?:^|/)(?:pulls|issues)/(\d+)(?:/|\b)", tok)
         if m:
-            return m.group(1), _comment_repo(argv)
-    return None, _comment_repo(argv)
+            return m.group(1), _repo
+    return None, _repo
 
 
 # Rebuild-commitment: closing a PR that reached the review TERMINAL is "back to
@@ -9217,6 +9232,41 @@ def _allow(reason: str) -> int:
     return 0
 
 
+def _push_carries_create(push_seg, create_seg, cmd: str, payload: dict) -> bool:
+    """Whether ``push_seg`` provably performs the publication ``create_seg`` would.
+
+    A `gh pr create` that would push its branch may ride a push's approval ONLY
+    when the push runs BEFORE it in the compound, is not a dry-run, executes in
+    the same effective cwd (same repo), and pushes the branch that is current
+    in the create's cwd. Any ambiguity — ordering, cwd resolution, refspec —
+    returns False, which counts the create as its own gated action.
+    """
+    if _push_is_dry_run(push_seg):
+        return False
+    # Ordering: only a push that runs FIRST can carry the publication.
+    try:
+        raws = [s.raw for s in split_segments(cmd)]
+        if raws.index(push_seg.raw) >= raws.index(create_seg.raw):
+            return False
+    except (ValueError, AttributeError):
+        return False
+    pcwd = _effective_cwd(cmd, payload, seg=push_seg)
+    ccwd = _effective_cwd(cmd, payload, seg=create_seg)
+    if pcwd is _CWD_UNKNOWN or ccwd is _CWD_UNKNOWN:
+        return False
+    if pcwd != ccwd:
+        # A different directory can be a different repo entirely; identical
+        # effective cwd is the only proof of same-repo we have without extra
+        # network calls — anything else is ambiguous and counts the create.
+        return False
+    cwd = pcwd if isinstance(pcwd, str) else None
+    branch = _current_branch(cwd=cwd)
+    if not branch:
+        return False
+    _remote, dest = _get_push_remote_and_branch(push_seg, cwd=cwd)
+    return dest is not None and dest == branch
+
+
 def _pr_create_head_raw(argv: list[str]) -> str | None:
     """The RAW ``--head``/``-H`` value (``owner:`` prefix intact), or None.
 
@@ -9498,8 +9548,13 @@ def _run_merge_and_push_gates() -> int:
         # publish: `git push && gh pr create` is ONE prompt for the push (the
         # create rides it), but `gh pr create && gh pr close N` on an unpushed
         # branch would hide the close behind the create's own prompt.
-        _publishing_creates = 0 if push_segs else sum(
-            1 for s in create_segs if _pr_create_would_publish(s.argv)
+        _publishing_creates = sum(
+            1
+            for s in create_segs
+            if _pr_create_would_publish(s.argv)
+            and not any(
+                _push_carries_create(p, s, cmd, payload) for p in push_segs
+            )
         )
         if (
             len(push_segs)
@@ -9836,16 +9891,45 @@ def _run_merge_and_push_gates() -> int:
                 return 2
             # Interactive. Resolve the PR; on the canonical repo, if it reached the
             # review terminal, a rebuild-commitment must exist before we even ask.
+            _close_seg = (close_pr_segs or close_via_api_segs)[0]
             if close_pr_segs:
                 _close_pr, _close_repo = _close_target(close_pr_segs[0].argv)
             else:
                 _close_pr, _close_repo = _gh_api_close_target(close_via_api_segs[0].argv)
+            if _close_repo is _REPO_UNRESOLVED:
+                # An explicit --repo/URL target we cannot resolve (a shell
+                # variable, an enterprise host). Closing is still the user's —
+                # but the terminal check cannot run against an unknown repo,
+                # and silently gating the cwd repo is the wrong-repo class.
+                print(
+                    "BLOCKED: cannot resolve the repository this close targets "
+                    "(a variable or non-github.com --repo/URL), so the "
+                    "review-terminal check cannot run.\n"
+                    "Re-run with a literal OWNER/REPO (e.g. "
+                    "`gh pr close 1579 --repo owner/repo`).",
+                    file=sys.stderr,
+                )
+                return 2
             # A bare close targets gh's cwd repo, not the hook's — derive it the
-            # way the merge gate does, or a private-fork close would apply the
-            # PUBLIC repo's terminal check (and the public repo's review
-            # history) to a repo it does not govern.
+            # way the merge gate does, from the close segment's OWN effective cwd
+            # (a top-level `cd` before the close changes it), or a private-fork
+            # close would apply the PUBLIC repo's terminal check (and the public
+            # repo's review history) to a repo it does not govern.
             if _close_repo is None:
-                _close_repo = _derive_repo_from_cwd(os.getcwd())
+                _close_cwd = _effective_cwd(cmd, payload, seg=_close_seg)
+                if _close_cwd is _CWD_UNKNOWN:
+                    print(
+                        "BLOCKED: cannot tell which directory this close runs in "
+                        "(a `cd` or `-C` before it is ambiguous), so the "
+                        "review-terminal check cannot run.\n"
+                        "Re-run the close with an explicit PR number and "
+                        "--repo OWNER/REPO.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                _close_repo = _derive_repo_from_cwd(
+                    _close_cwd if isinstance(_close_cwd, str) else os.getcwd()
+                )
             # A branch target (``gh pr close feature/x``) yields no number:
             # resolve it to its PR rather than skipping the terminal check.
             if _close_pr is None and close_pr_segs:
@@ -9867,16 +9951,44 @@ def _run_merge_and_push_gates() -> int:
                 return 2
             _close_commitment: str | None = None
             if _close_pr and _scheduled_gate_applies(_close_repo):
-                _reviews = _codex_reviews(_close_pr, repo=_close_repo)
-                # ``_reviews is None`` (API failure, or an /issues target that
-                # is a real issue — the 404 reads identically) stays a plain
-                # ask: the commitment is a forcing function layered on the
-                # unconditional ask, not a security boundary, and blocking every
-                # close on GitHub availability is the wrong failure mode. The
-                # genuine hardening here is the numberless/unresolvable-target
-                # block above, which is what kept this path reachable past the
-                # check entirely.
-                if _reviews is not None and len(_reviews) >= FINAL_ROUND_CAP:
+                # Count DISTINCT REVIEWED HEADS via the review-budget model —
+                # ``len(_codex_reviews)`` miscounts both ways: repeated review
+                # records on one head overcount, while heads evidenced only by
+                # clean-report comments or a configured external reviewer are
+                # omitted entirely.
+                _terminal = False
+                if os.environ.get("_TEST_GH_CODEX_REVIEWS") is not None:
+                    # Test seam: injected review objects stand in for the whole
+                    # evidence lookup — count them directly, matching the
+                    # evaluate_pr `count` these tests assert on.
+                    _reviews = _codex_reviews(_close_pr, repo=_close_repo)
+                    _terminal = (
+                        _reviews is not None and len(_reviews) >= FINAL_ROUND_CAP
+                    )
+                elif _review_budget is not None:
+                    try:
+                        _ev = _review_budget.evaluate_pr(
+                            _close_repo, _close_pr, timeout_for=_gh_timeout
+                        )
+                    except Exception:  # noqa: BLE001 — unknown stays a plain ask
+                        _ev = {"status": "unknown"}
+                    if _ev.get("status") == "ok":
+                        _terminal = int(_ev.get("count") or 0) >= FINAL_ROUND_CAP
+                else:
+                    _reviews = _codex_reviews(_close_pr, repo=_close_repo)
+                    _terminal = (
+                        _reviews is not None and len(_reviews) >= FINAL_ROUND_CAP
+                    )
+                # An UNREADABLE count (evaluate_pr status != ok, or the fallback
+                # _codex_reviews returning None — API failure, or an /issues
+                # target that is a real issue, whose 404 reads identically)
+                # stays a plain ask: the commitment is a forcing function
+                # layered on the unconditional ask, not a security boundary, and
+                # blocking every close on GitHub availability is the wrong
+                # failure mode. The genuine hardening is the
+                # numberless/unresolvable-target block above, which is what kept
+                # this path reachable past the check entirely.
+                if _terminal:
                     _close_commitment = _read_close_commitment(_close_repo, _close_pr)
                     if _close_commitment is None:
                         print(
