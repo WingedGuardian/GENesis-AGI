@@ -29,6 +29,7 @@ THE SPEC (JSON)
         "oracle": {"axes": {"remedy": "...", "state": "...", "shell": "..."}, "expect": "real"},
         "noop":   {"axes": {"remedy": "...", "state": "...", "shell": "..."}, "expect": "DECOY"}
       },
+      "proposed_remedy": {"remedy": "unset CDPATH"},
       "decision_rule": "adoptable iff every hostile cell classifies `real`"
     }
 
@@ -36,6 +37,38 @@ THE SPEC (JSON)
 sweep ends up testing the cases its author already believed in, which is the
 failure this exists to prevent — so the tool takes axes and enumerates, rather
 than taking a list of cells.
+
+A REMEDY MUST BE AN AXIS VALUE
+==============================
+`proposed_remedy` is a partial axis assignment naming the fix you intend to
+recommend. The tool then reports whether the sweep actually covered it, and how
+that slice of the table did.
+
+It exists because of an asymmetry nothing else catches. A premise check
+MEASURES its finding and ASSERTS its remedy: the protocol demands evidence for
+the finding, the fix arrives as a bonus, and nobody grades it. MEASURED n=3 on
+2026-09-20 — a `return "unknown"` that would have shipped a no-op, a `./`-prefix
+recommendation that breaks on an absolute `$0`, and a parser recommendation
+made before checking the parser could read that input. In all three the FINDING
+was sound, which is exactly what lends the bad remedy its credibility.
+
+A declared remedy whose values were never swept is labelled `UNVERIFIED`; it
+does not void the run. The instrument is sound and the finding is real — only
+the fix is unmeasured, and destroying good evidence over a separate claim would
+teach authors to omit the field rather than declare it. For the same reason the
+exit code is untouched: "did the cells match?" and "is the remedy measured?"
+are independent, and folding them into one integer would force a lie whenever
+they disagree. Omitting the field is reported too, as a stated absence rather
+than a silent one.
+
+THE LIMIT, because the tool must not oversell itself: this checks that the
+remedy was SWEPT, never that the axes were the right axes. Nothing here can
+tell you a hazard is missing from the table. MEASURED on the run that produced
+this feature — the CDPATH spec's `operand` axis did not carry the `./` prefix
+at all (so the recommendation was UNVERIFIED), and once it did, the sweep still
+had no axis for an absolute `$0`, which is the case the prefix actually breaks
+on. Adding it turned four cells red. The controls certify the instrument; the
+axis set remains a judgement, and it is the one this tool leaves with you.
 
 Each control arm pins EVERY axis and is substituted into the same ``cell``
 template, so it cannot exercise a different code path from the sweep it
@@ -165,6 +198,91 @@ def _check_controls(spec: dict[str, Any], rules: dict[str, str]) -> list[str]:
     return problems
 
 
+def _spec_problems(spec: dict[str, Any]) -> list[str]:
+    """Structural problems that make the spec unanswerable. Empty list is fine.
+
+    An EMPTY AXIS is here because the cross product of anything with nothing is
+    nothing: the controls still run and can hold, the sweep then enumerates zero
+    cells, and the tool reports `cells=0 NOT-matching=0` and exits 0 — a
+    vacuous pass wearing the grammar of a clean one, which is the single thing
+    this tool exists not to print.
+
+    A `proposed_remedy` naming an axis the sweep does not have is a SPEC bug
+    rather than an unverified remedy: nothing could ever verify it, and a typo'd
+    axis name would otherwise report as `UNVERIFIED` and read as an honest
+    measurement gap. Naming a real axis with an unswept VALUE is the opposite —
+    that is the case the feature exists to label, so it is not an error.
+    """
+    problems: list[str] = []
+    axes = spec["axes"]
+    for name, values in axes.items():
+        if not values:
+            problems.append(f"axis {name!r} has no values — the sweep would enumerate zero cells")
+    remedy = spec.get("proposed_remedy")
+    if remedy is None:
+        return problems
+    if not isinstance(remedy, dict) or not remedy:
+        problems.append(
+            "proposed_remedy must be a non-empty {axis: value} mapping, "
+            "the same shape as a control arm's `axes`"
+        )
+        return problems
+    unknown = sorted(set(remedy) - set(axes))
+    if unknown:
+        problems.append(
+            f"proposed_remedy names axes {unknown}, which the sweep does not "
+            f"have ({sorted(axes)}) — nothing could ever verify it"
+        )
+    return problems
+
+
+def _remedy_lines(spec: dict[str, Any], rows: list[tuple[dict[str, str], str, bool]]) -> list[str]:
+    """Report whether the fix the author intends to recommend was actually swept.
+
+    Printed AFTER the matrix on purpose. The refusal above works by withholding
+    the table, which cannot apply here — the table is legitimately real. What is
+    available instead is position: the reader who came for the table reads the
+    table, and this is the next thing under it.
+    """
+    remedy = spec.get("proposed_remedy")
+    lines = ["", "=== PROPOSED REMEDY ==="]
+    if remedy is None:
+        lines += [
+            "  none declared.",
+            "  Any fix recommended off this table is UNMEASURED unless it is one of",
+            "  the swept values above. Declaring `proposed_remedy` gets that checked",
+            "  instead of remembered.",
+        ]
+        return lines
+
+    shown = "  ".join(f"{k}={v}" for k, v in remedy.items())
+    lines.append(f"  {shown}")
+    unswept = {k: v for k, v in remedy.items() if v not in spec["axes"][k]}
+    if unswept:
+        for k, v in unswept.items():
+            lines.append(
+                f"  UNVERIFIED — {k}={v!r} is not among the swept values {spec['axes'][k]}"
+            )
+        lines += [
+            "  The sweep says nothing about this fix. Do not recommend it in the",
+            "  grammar of the finding: the finding is measured, this is not.",
+        ]
+        return lines
+
+    matching = [
+        (env, got, ok) for env, got, ok in rows if all(env[k] == v for k, v in remedy.items())
+    ]
+    missed = [(env, got) for env, got, ok in matching if not ok]
+    lines.append(
+        f"  MEASURED in {len(matching)} of {len(rows)} cells: "
+        f"{len(matching) - len(missed)} matched {spec['predicate']!r}, {len(missed)} did not"
+    )
+    for env, got in missed:
+        cells = "  ".join(f"{n}={v}" for n, v in env.items())
+        lines.append(f"    NOT {spec['predicate']}: {cells}  -> {got}")
+    return lines
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("spec", type=Path, help="JSON spec (see this file's docstring)")
@@ -179,6 +297,11 @@ def main() -> int:
     missing = [k for k in ("question", "axes", "cell", "classify", "predicate") if k not in spec]
     if missing:
         print(f"SPEC ERROR: missing {missing}", file=sys.stderr)
+        return 3
+    structural = _spec_problems(spec)
+    if structural:
+        for p in structural:
+            print(f"SPEC ERROR: {p}", file=sys.stderr)
         return 3
 
     rules: dict[str, str] = spec["classify"]
@@ -217,11 +340,13 @@ def main() -> int:
     combos = list(itertools.product(*(spec["axes"][n] for n in names)))
     width = max((len(n) for n in names), default=8)
     lines.append("=== RESULTS ===")
+    rows: list[tuple[dict[str, str], str, bool]] = []
     failed = 0
     for combo in combos:
         env = dict(zip(names, combo, strict=True))
         got = _run(spec["cell"].format(**env), rules)
         ok = got == spec["predicate"]
+        rows.append((env, got, ok))
         failed += 0 if ok else 1
         cells = "  ".join(f"{n}={v}" for n, v in env.items())
         lines.append(
@@ -231,6 +356,9 @@ def main() -> int:
     lines += [
         "",
         f"cells={len(combos)}  matching={len(combos) - failed}  NOT-matching={failed}",
+    ]
+    lines += _remedy_lines(spec, rows)
+    lines += [
         "",
         "Grade this against the DECISION RULE above — the one written before the",
         "table existed. The tool does not grade it for you on purpose.",

@@ -168,6 +168,99 @@ def test_the_decision_rule_is_echoed_and_NOT_graded(tmp_path):
     assert "does not grade it for you" in r.stdout
 
 
+def test_a_swept_remedy_reports_its_own_slice_of_the_table(tmp_path):
+    """The measured case: the fix the author intends to recommend is an axis
+    value, so the tool can say how it did rather than taking their word."""
+    r = _run(tmp_path, _spec(proposed_remedy={"arm": "good"}))
+    assert "=== PROPOSED REMEDY ===" in r.stdout
+    assert "MEASURED in 1 of 2 cells: 1 matched 'GOOD', 0 did not" in r.stdout
+    assert "UNVERIFIED" not in r.stdout
+
+
+def test_a_swept_remedy_that_FAILS_names_the_cell_it_failed_in(tmp_path):
+    """The `./`-prefix case, replayed.
+
+    MEASURED 2026-09-20: a premise check recommended prefixing `./` to a path
+    that could be absolute, producing `.//abs/path`. The finding it rode on was
+    sound, which is exactly what made the remedy credible. Had the remedy been
+    an axis value, the absolute-path cell would have printed a non-match — so
+    the tool must not summarise the slice as a bare count and hide which cell
+    broke it.
+    """
+    r = _run(tmp_path, _spec(proposed_remedy={"arm": "bad"}))
+    assert "MEASURED in 1 of 2 cells: 0 matched 'GOOD', 1 did not" in r.stdout
+    assert "NOT GOOD: arm=bad" in r.stdout
+
+
+def test_an_UNSWEPT_remedy_is_labelled_but_does_NOT_void_the_run(tmp_path):
+    """The asymmetry this feature exists for, and the limit of the response.
+
+    The instrument is sound and the finding is real — only the fix is
+    unmeasured. Voiding the run would destroy good evidence over a separate
+    claim and would teach authors to omit the field rather than declare it, so
+    the table stays and the exit code is untouched.
+    """
+    r = _run(tmp_path, _spec(proposed_remedy={"arm": "prefix-with-dot-slash"}))
+    assert "UNVERIFIED" in r.stdout
+    assert "is not among the swept values" in r.stdout
+    assert "=== RESULTS ===" in r.stdout, "the sweep's own finding survives an unmeasured remedy"
+    assert r.returncode == 1, (
+        "the exit code answers 'did the cells match?', which an unverified "
+        "remedy does not change — folding both into one integer would force a "
+        "lie whenever they disagree"
+    )
+
+
+def test_declaring_NO_remedy_is_reported_as_a_stated_absence(tmp_path):
+    """The tool cannot know you have a fix in mind, so the omission is the
+    escape hatch. It can at least make the omission visible instead of letting
+    silence read as 'nothing to check here'."""
+    r = _run(tmp_path, _spec())
+    assert "none declared" in r.stdout
+    assert "UNMEASURED unless it is one of" in r.stdout
+
+
+def test_a_void_run_reports_no_remedy_verdict_either(tmp_path):
+    """A verdict from a void instrument is the same lie as a matrix from one."""
+    spec = _spec(proposed_remedy={"arm": "good"})
+    spec["controls"]["noop"]["expect"] = "GOOD"
+    r = _run(tmp_path, spec)
+    assert r.returncode == 2
+    assert "=== PROPOSED REMEDY ===" not in r.stdout
+
+
+def test_a_remedy_naming_an_axis_that_does_not_exist_is_a_SPEC_error(tmp_path):
+    """Exit 3, not `UNVERIFIED`: nothing could ever verify it, and a typo'd axis
+    name reported as UNVERIFIED would read as an honest measurement gap."""
+    r = _run(tmp_path, _spec(proposed_remedy={"remdy": "good"}))
+    assert r.returncode == 3
+    assert "which the sweep does not have" in r.stderr
+    assert "=== RESULTS ===" not in r.stdout
+
+
+@pytest.mark.parametrize("bad", ["good", {}, []])
+def test_a_remedy_that_is_not_a_nonempty_mapping_is_a_SPEC_error(tmp_path, bad):
+    """A bare string would have to be matched against every axis at once, and
+    guessing which one the author meant is the ambiguity this tool refuses."""
+    r = _run(tmp_path, _spec(proposed_remedy=bad))
+    assert r.returncode == 3
+    assert "non-empty {axis: value} mapping" in r.stderr
+
+
+def test_an_axis_with_no_values_is_a_SPEC_error(tmp_path):
+    """The vacuous pass: controls pin concrete values so they still hold, the
+    cross product is then empty, and the run reports `cells=0 NOT-matching=0`
+    and exits 0 — a clean-looking result from a sweep that measured nothing."""
+    spec = _spec(axes={"arm": ["good", "bad"], "extra": []}, cell="echo {arm}{extra}")
+    spec["controls"] = {
+        "oracle": {"axes": {"arm": "good", "extra": "x"}, "expect": "GOOD"},
+        "noop": {"axes": {"arm": "bad", "extra": "x"}, "expect": "BAD"},
+    }
+    r = _run(tmp_path, spec)
+    assert r.returncode == 3
+    assert "would enumerate zero cells" in r.stderr
+
+
 def test_a_malformed_spec_is_distinguishable_from_a_void_run(tmp_path):
     """Exit 3, not 2: "your spec is broken" and "your instrument is broken" are
     different problems with different fixes, and collapsing them would hide the
