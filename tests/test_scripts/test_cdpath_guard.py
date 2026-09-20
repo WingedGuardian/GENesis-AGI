@@ -44,6 +44,24 @@ What the shape covers, and what it does not:
              which is true of the ARGUMENT and must not be read as "whatever the
              spelling" -- the list here is the difference.
 
+WHAT THE REMEDY DOES NOT COVER: a `readonly CDPATH`.
+
+`unset CDPATH` fails with "cannot unset: readonly variable" and returns 1; the
+capture's `cd` still runs, because the two are separated by `;`, so the search
+happens against the unchanged CDPATH and the fix is INERT. MEASURED: with
+CDPATH readonly and pointed at a decoy, the remediated capture resolves into the
+decoy exactly as the un-remediated one does.
+
+The guard accepts it anyway, and that is a deliberate, stated limit rather than
+an oversight: CDPATH is set nowhere in this repository, and `readonly CDPATH` is
+something an operator would have to add on purpose, so the case is a hardening
+gap rather than a live defect. The CDPATH-immune spelling is to normalize a
+relative dirname to `./...` before the `cd` (bash does not search CDPATH for a
+name beginning with `.`) -- measured working for a bare relative path, a
+`/..` form, and an absolute argument. It is not used here because it turns a
+one-token remedy into a multi-statement block at every site. Tracked by issue;
+if that issue is taken, this docstring is the thing to update.
+
 The scan is line-oriented WITHOUT quote handling, deliberately. An earlier
 attempt at this enumeration was quote-aware and silently skipped whole files
 wherever a comment carried an apostrophe, missing 14 real sites while reporting
@@ -84,7 +102,13 @@ _DIRNAME_ARG = re.compile(r'\bcd\s+(?:-\S+\s+)*"\$\(dirname\b')
 # `unset CDPATHX`, `MY_CDPATH=1`, and a remedy separated from a later unprotected
 # cd -- while flagging the valid `unset -v CDPATH`. Measured against the shipped
 # corpus this anchored form changes nothing: 0 of the fixed sites newly flagged.
-_REMEDY = re.compile(r"^\$\(\s*(?:unset\s+(?:-\w+\s+)*CDPATH\b|CDPATH=)")
+#
+# The `CDPATH=` alternative requires an ACTUALLY EMPTY assignment -- `(?=\s)`.
+# Without it the prefix matched `$(CDPATH=/decoy cd ...)`, which is not a remedy
+# at all: bash searches /decoy and can resolve into the wrong tree. That is a
+# FALSE NEGATIVE in this guard, i.e. exactly what it exists to prevent in future
+# code (Codex P2, PR #2171). The three spellings are pinned as table arms below.
+_REMEDY = re.compile(r"^\$\(\s*(?:unset\s+(?:-\w+\s+)*CDPATH\b|CDPATH=(?=\s))")
 
 # A site that MUST be found. If the matcher stops matching the corpus, this
 # disappears and the test fails LOUDLY instead of passing over an empty scan --
@@ -204,6 +228,10 @@ def test_the_scan_actually_looked_at_the_corpus():
         # --- the shape, already remediated: matches, must NOT be a finding ---
         ('X="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"', "compliant"),
         ('X="$(CDPATH= cd "$(dirname "$0")" && pwd)"', "compliant"),
+        # --- a NON-empty CDPATH assignment is NOT a remedy: bash searches it ---
+        ('X="$(CDPATH=/decoy cd "$(dirname "$0")" && pwd)"', "violation"),
+        ('X="$(CDPATH=$HOME cd "$(dirname "$0")" && pwd)"', "violation"),
+        ('X="$(CDPATH=. cd "$(dirname "$0")" && pwd)"', "violation"),
         # --- not the shape: a cd with no dirname is out of this guard's scope ---
         ('X="$(cd "$SCRIPT_DIR/.." && pwd)"', "ignored"),
         ('X="$(cd "$HOME/genesis" && pwd)"', "ignored"),
