@@ -1361,18 +1361,24 @@ class TestMergeDeadline:
         assert _mod._gh_timeout(8) == 8
         assert _mod._gh_timeout(6) == 6
 
-    def test_deadline_clamps_to_remaining(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "offset",
+        [3.0],
+        ids=["remaining-time"],
+    )
+    def test_deadline_clamps_without_granting_post_deadline_work(self, monkeypatch, offset):
         import time as _t
 
-        monkeypatch.setattr(_mod, "_merge_deadline", _t.monotonic() + 3)
-        # remaining ~3s < cap 8 → clamped toward remaining (not the full cap)
-        assert _mod._gh_timeout(8) <= 3.5
+        monkeypatch.setattr(_mod, "_merge_deadline", _t.monotonic() + offset)
+        timeout = _mod._gh_timeout(8)
+        assert 0 < timeout <= 3.5
 
-    def test_expired_deadline_floors_at_one(self, monkeypatch):
+    def test_expired_deadline_refuses_to_start_another_probe(self, monkeypatch):
         import time as _t
 
-        monkeypatch.setattr(_mod, "_merge_deadline", _t.monotonic() - 5)  # already past
-        assert _mod._gh_timeout(8) == 1.0  # fail FAST, never negative/zero
+        monkeypatch.setattr(_mod, "_merge_deadline", _t.monotonic() - 5.0)
+        with pytest.raises(RuntimeError, match="aggregate review-gate deadline expired"):
+            _mod._gh_timeout(8)
 
     def test_budget_under_wallclock(self):
         # The documented worst-case pre-binding aggregate must leave headroom under 60s.
@@ -1572,13 +1578,23 @@ class TestCleanCommentFreshness:
 
 
 class TestRequiredScheduledReviewKinds:
-    """The config lever: default = both required; leaks is irreducible; local config
-    (or the _TEST_ seam) may relax the OPTIONAL kinds to advisory. Fails CLOSED (to the
-    full default set) on any unreadable/malformed config."""
+    """The config lever: default = leaks alone (the only kind with a producer), which is
+    also the irreducible kind; local config (or the _TEST_ seam) may EXPAND the set.
+    Fails CLOSED to the default on any unreadable/malformed config, and says so when the
+    key was visibly declared."""
 
-    def test_default_is_both_when_unconfigured(self, monkeypatch, tmp_path):
+    def test_default_is_leaks_only_when_unconfigured(self, monkeypatch, tmp_path):
         monkeypatch.delenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", raising=False)
         monkeypatch.setenv("HOME", str(tmp_path))  # no genesis.yaml -> default
+        assert _mod._required_scheduled_review_kinds() == ("leaks",)
+
+    def test_config_can_expand_to_include_code_review(self, monkeypatch, tmp_path):
+        # An install that stands a code-review producer up re-arms the kind.
+        self._write_cfg(
+            tmp_path,
+            monkeypatch,
+            "merge_gate:\n  required_scheduled_reviews: [code-review, leaks]\n",
+        )
         assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
 
     def test_env_seam_relaxes_to_leaks_only(self, monkeypatch):
@@ -1589,6 +1605,18 @@ class TestRequiredScheduledReviewKinds:
         # config omits leaks -> still forced in (secret scanner never removable)
         monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "code-review")
         assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+
+    def test_default_never_drops_the_irreducible_kind(self):
+        # The shipped default and the irreducible floor must not drift apart: whatever
+        # the default is, it cannot be missing a kind no config may waive.
+        assert set(_mod._IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS) <= set(
+            _mod._DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS
+        )
+
+    def test_code_review_stays_a_known_kind(self):
+        # Advisory, not deleted: config must still be able to name it (and a marker
+        # carrying kind=code-review must still parse as a known kind, not as garbage).
+        assert "code-review" in _mod._KNOWN_SCHEDULED_REVIEW_KINDS
 
     def test_empty_config_is_leaks_only(self, monkeypatch):
         monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "")
@@ -1602,7 +1630,7 @@ class TestRequiredScheduledReviewKinds:
 
     def test_env_unknown_kind_fails_closed(self, monkeypatch):
         monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "bogus")
-        assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+        assert _mod._required_scheduled_review_kinds() == ("leaks",)
 
     @staticmethod
     def _write_cfg(tmp_path, monkeypatch, body):
@@ -1614,29 +1642,65 @@ class TestRequiredScheduledReviewKinds:
 
     def test_config_wrong_type_element_fails_closed(self, monkeypatch, tmp_path):
         self._write_cfg(tmp_path, monkeypatch, "merge_gate:\n  required_scheduled_reviews: [123]\n")
-        assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+        assert _mod._required_scheduled_review_kinds() == ("leaks",)
 
     def test_config_blank_element_fails_closed(self, monkeypatch, tmp_path):
         self._write_cfg(tmp_path, monkeypatch, "merge_gate:\n  required_scheduled_reviews: [' ']\n")
-        assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+        assert _mod._required_scheduled_review_kinds() == ("leaks",)
 
     def test_config_unknown_kind_fails_closed(self, monkeypatch, tmp_path):
         self._write_cfg(tmp_path, monkeypatch, "merge_gate:\n  required_scheduled_reviews: [foo]\n")
-        assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+        assert _mod._required_scheduled_review_kinds() == ("leaks",)
+
+    def test_a_discarded_declared_value_is_announced(self, monkeypatch, tmp_path, capsys):
+        # The default is MINIMAL, so falling back to it can NARROW a policy the operator
+        # declared. That substitution must never be silent.
+        self._write_cfg(tmp_path, monkeypatch, "merge_gate:\n  required_scheduled_reviews: [foo]\n")
+        _mod._required_scheduled_review_kinds()
+        err = capsys.readouterr().err
+        assert "required_scheduled_reviews" in err and "DEFAULT required set" in err
+
+    def test_an_absent_key_is_silent(self, monkeypatch, tmp_path, capsys):
+        # The normal install declared nothing, so there is no substitution to report.
+        self._write_cfg(tmp_path, monkeypatch, "github:\n  user: someone\n")
+        _mod._required_scheduled_review_kinds()
+        assert "required_scheduled_reviews" not in capsys.readouterr().err
+
+    def test_a_flow_style_declaration_is_announced(self, monkeypatch, tmp_path, capsys):
+        # A line scan for `^\s*required_scheduled_reviews\s*:` never sees the key here,
+        # so the declaration is only visible in the PARSED structure.
+        self._write_cfg(
+            tmp_path, monkeypatch, 'merge_gate: {"required_scheduled_reviews": [foo]}\n'
+        )
+        assert _mod._required_scheduled_review_kinds() == ("leaks",)
+        assert "DEFAULT required set" in capsys.readouterr().err
+
+    def test_the_key_name_inside_an_unrelated_scalar_is_not_a_declaration(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        # Converse of the above: the text is there, the KEY is not. Announcing a
+        # substitution for a policy nobody declared is the same class of lie.
+        self._write_cfg(
+            tmp_path,
+            monkeypatch,
+            "notes: |\n  required_scheduled_reviews: [code-review, leaks]\n",
+        )
+        assert _mod._required_scheduled_review_kinds() == ("leaks",)
+        assert "required_scheduled_reviews" not in capsys.readouterr().err
 
     def test_config_empty_list_is_leaks_only(self, monkeypatch, tmp_path):
         self._write_cfg(tmp_path, monkeypatch, "merge_gate:\n  required_scheduled_reviews: []\n")
         assert _mod._required_scheduled_review_kinds() == ("leaks",)
 
     def test_duplicate_key_fails_closed(self, monkeypatch, tmp_path):
-        # A badly-merged file with two merge_gate blocks whose last says [leaks] must
-        # NOT silently drop code-review; duplicate keys fail closed to the default.
+        # A badly-merged file with two merge_gate blocks: yaml.safe_load would silently
+        # keep the LAST value, so the line scan rejects the file and the default stands.
         body = (
             "merge_gate:\n  required_scheduled_reviews: [code-review, leaks]\n"
             "merge_gate:\n  required_scheduled_reviews: [leaks]\n"
         )
         self._write_cfg(tmp_path, monkeypatch, body)
-        assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+        assert _mod._required_scheduled_review_kinds() == ("leaks",)
 
     def test_reads_config_file(self, monkeypatch, tmp_path):
         monkeypatch.delenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", raising=False)
@@ -1652,7 +1716,7 @@ class TestRequiredScheduledReviewKinds:
         cfgdir.mkdir(parents=True)
         (cfgdir / "genesis.yaml").write_text("merge_gate: [unterminated\n")
         monkeypatch.setenv("HOME", str(tmp_path))
-        assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+        assert _mod._required_scheduled_review_kinds() == ("leaks",)
 
 
 class TestScheduledGateUsesRequiredKinds:

@@ -1243,7 +1243,7 @@ flows, route/tool maps, coupling/community analysis — but it is **snapshot-
 based**: its answers are only correct when the index matches the working tree,
 and it drifts after you pull merged PRs (its reindex fires on local commit, not
 on pull). So reach for GitNexus deliberately for its unique views, and run
-**`gitnexus analyze` first** when freshness matters; for live "who calls this"
+**from the main checkout, run `scripts/lib/code_intel_index.sh "$PWD" gitnexus fast` first** when freshness matters. Linked worktrees deliberately skip indexing; for live "who calls this"
 during active editing, prefer Serena. There is no "always run impact before
 every edit" mandate — that just gates work behind a tool that's stale-by-design.
 
@@ -1985,7 +1985,7 @@ thinking any of these, STOP — you are rationalizing a shortcut.
 | "I'll clean this up in the next commit" | Next commit never comes in autonomous sessions. Do it now, or file it — Genesis-repo work is a GitHub issue, not a local row. |
 | "This file is too large to read fully" | Read the relevant section. Partial reads lead to partial understanding and wrong fixes. |
 | "The linter is happy, ship it" | Linters catch syntax, not logic. Clean lint with broken behavior is worse than a warning with correct behavior. |
-| "This change is low-risk, no impact analysis needed" | Your confidence is based on what you know; checking callers reveals what you don't. Serena `find_referencing_symbols` is live — run it. For multi-hop blast radius, `gitnexus analyze` then `impact`. |
+| "This change is low-risk, no impact analysis needed" | Your confidence is based on what you know; checking callers reveals what you don't. Serena `find_referencing_symbols` is live — run it. For multi-hop blast radius from the main checkout, run `scripts/lib/code_intel_index.sh "$PWD" gitnexus fast`, then `impact`; in a linked worktree, use Serena for live branch truth. |
 | "I can skip the worktree, I'll be quick" | Concurrent session safety exists because "quick" commits have destroyed work before. Always worktree. |
 | "The error is transient, retry will fix it" | Diagnose first. Retrying a misdiagnosed error wastes tokens and masks root causes. |
 | "I'll add the follow-up later" | Records not created in-session are lost. File it now while context is fresh — Genesis-repo work as a GitHub issue, user-owned work as a follow-up. |
@@ -2579,58 +2579,41 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   narrow the test to what it can prove — a guard that cries wolf gets deleted by
   whoever hits it next.)
 
-  These three are backstopped by a **machine layer** with **two tiers, not one**.
-  The tier you hit FIRST is the one most sessions do not know exists:
+  These disciplines are backstopped by two complementary machine layers.
 
-  | Round | Gate | Demands | Sigil | Resets counter? |
-  |---|---|---|---|---|
-  | 2 (`cap-1`) | **MODE-SWITCH block** | Decide PREMISE-vs-POLISH first (`.claude/docs/premise-check.md`). If the premise is wrong: hand it back via `needs-architecture-session`, and do NOT ack past this block. If it holds: stop patching the named instance — dispatch a FRESH-CONTEXT adversarial subagent over the ENTIRE diff; READ authoritative docs/source for any domain semantics; fix the whole enumerated CLASS in one commit. | `# audit-ack` (attests the AUDIT happened — it is not an exit for the hand-back branch) | **No** |
-  | 3 (`cap`) | **HARD STOP** | The full round-ledger stop above. | `# escalation-ack` | **Yes** — which is what makes the cycle repeat |
-  | **7 (`FINAL_ROUND_CAP`, lifetime)** | **TERMINAL** | Two full cycles have already run. Decide: ACCEPT the outstanding findings and merge (document each in the PR body), or ABANDON and restart from a design that does not need seven rounds. | `# final-round-accept` | **No, and it is ONE-SHOT** |
+  The LOCAL defect-bearing streak keeps its established interventions:
 
-  **The first two tiers have no terminal, and that is the gap round 7 closes.**
-  Because `# escalation-ack` *resets* the streak, the cap is repeatable by
-  construction: rounds 1-2-3, ack, 4-5-6, ack, 7-8-9, ack, without end. A change
-  can consume fifteen external rounds and the machine never says "enough" — only
-  "enough, for now", once every three rounds. So a SECOND counter exists
-  (`review_state.get_review_lifetime`) that acks never reset; only a branch change
-  does. It counts the same rounds the streak does — EXTERNAL cross-model only, so
-  internal audits (including the one tier 2 mandates) stay free.
+  | Local streak | Gate | Required action |
+  |---|---|---|
+  | 2 | **MODE-SWITCH block** | Decide premise-vs-polish, run the fresh-context class audit, then use `# audit-ack` only if that audit happened. |
+  | 3 | **HARD STOP** | Hand back, redesign, narrow, or shelve. `# escalation-ack` records a fresh decision and resets only this local streak. |
 
-  At the terminal, `# escalation-ack` does **not** help: the lifetime check runs
-  BEFORE the streak check precisely because the streak has usually just been reset
-  by an earlier ack and would not fire. And `# final-round-accept` clears exactly
-  ONE commit — the block returns on the next one, and re-applying the sigil is
-  refused with "already used". That is deliberate: a sigil that kept working would
-  just be a fourth repeatable sigil, which is the defect being closed. The decision
-  has to actually end the loop.
+  Standing authorization is a separate GitHub-backed budget. It counts DISTINCT
+  REVIEWED HEADS, not local marks: Codex review objects including dismissed reviews,
+  Codex clean-review comments, and the configured external review identity all collapse
+  to one round when they name the same commit. Ordinary PRs carry standing authorization
+  through four reviewed heads. Starting with the fifth review request or the fix commit
+  after four reviewed heads, every action needs its own native user approval. At five
+  completed reviewed heads, round 6 and later are strongly discouraged: stop, narrow or
+  redesign, accept documented residue, or abandon before asking to continue.
 
-  **Both sigils can be required at once.** `streak >= 3` and `lifetime >= 7` is a
-  reachable state, so the co-required form is
-  `git commit -m "…"  # final-round-accept escalation-ack`; the terminal's own
-  message names the second sigil when it applies. The acceptance is spent at the
-  ALLOW, not when the tier honours it — a command another rule then denies does not
-  burn it.
+  This approval is never a shell sigil and is never persisted. `# escalation-ack` still
+  serves the local round-3 intervention; `# final-round-accept` is legacy syntax and
+  authorizes no current gate. An earlier "okay" cannot authorize a later request or
+  commit. Foreground sessions receive the native approval dialog at the action;
+  autonomous/dispatched sessions are denied because nobody is present to answer it.
+  Unreadable or ambiguous GitHub evidence takes the same ask/deny direction and never
+  becomes zero rounds. Multiple gated actions must be split so one approval cannot cover
+  several commits or review requests.
 
-  **THE SAME TERMINAL FIRES WHEN YOU REQUEST THE NEXT ROUND**, not only when you
-  commit. `git_push_guard._check_codex_round_escalation` counts the PR's ACTUAL
-  Codex reviews from the API, because the local counter above sleeps through rounds
-  that ran entirely in the cloud — the #1372 whack-a-mole was five Codex rounds with
-  the local counter at 0. Past `FINAL_ROUND_CAP` that gate blocks
-  `gh pr comment … @codex review`, `# escalation-ack` does not clear it, and
-  `# final-round-accept` does. **That gate keeps no state**, so unlike the commit
-  side the sigil is required on EVERY dispatch rather than being spent once — a
-  review request changes nothing on its own, and the commit gate remains the
-  terminal that actually bites. Within ONE command it licenses ONE dispatch:
-  `request && request  # final-round-accept` is refused, because the sigil is
-  matched command-wide (so the nested `bash -c '…' # sigil` form keeps working)
-  and that would otherwise chain arbitrarily many rounds behind one decision.
-
-  **A new branch starts clean, and that is the sanctioned way out.** `lifetime` is
-  per-branch, so `git checkout -b` resets the terminal. Read that as option (b) —
-  abandon and restart from a better design — not as a loophole: carrying the same
-  unconverged change across is the loop continuing under a new name, and the point
-  of the terminal is that a person decides which of the two is happening.
+  The native approval enforcement in this section is implemented at Claude Code's
+  `PreToolUse` hook boundary. The shared budget evaluator is reusable, but external
+  coding agents do not yet receive an equivalent approval prompt from this change and
+  must not be described as mechanically protected by it. Within Claude Code, keep each
+  protected action in its own command: a HEAD-moving `git switch`/`git checkout` cannot
+  share a command with `git commit`, and a command containing multiple possible review
+  requests is rejected before any request is sent. Inline comment bodies containing
+  shell expansion are opaque at the hook boundary and therefore take the ask/deny path.
 
   The round-2 block is not the round-3 cap arriving early — it is a different
   instruction. It says the *approach* is wrong (you are fixing instances, not the
@@ -2652,12 +2635,11 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   WARNING and will be rejected by that gate — re-write the evidence with concrete
   anchors rather than acking past it.
 
-  Backing all of it: `review_state.py` keeps TWO per-branch counters — `round`
-  (CONSECUTIVE defect-bearing rounds, reset by `# escalation-ack`) and `lifetime`
-  (the same rounds over the branch's whole life, which no ack resets). The commit
-  gate (`review_enforcement_commit.py`) HARD-BLOCKS at `ESCALATION_ROUND_CAP` (3)
-  pending `# escalation-ack`, and at `FINAL_ROUND_CAP` (7) pending a one-shot
-  `# final-round-accept`. Both counters advance on EXTERNAL rounds only.
+  `review_state.py` still keeps the local `round` streak and legacy lifetime
+  fields for stale-worktree compatibility. Current authorization uses
+  `scripts/review_budget.py`; the commit gate reads the local streak from one snapshot
+  only for the round-2/round-3 interventions. `FINAL_ROUND_CAP = 7` and the old lifetime
+  APIs remain import-compatible but current gates do not consult them.
 
   **THE COUNTER IS CROSS-MODEL ONLY.** The streak exists to catch *cross-model
   non-convergence* — an EXTERNAL reviewer finding NEW defects round after round. It does
@@ -2687,13 +2669,16 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   `_required_ci_workflows` / `_required_scheduled_review_kinds` / `_doc_findings_mode`
   all share, and all three then discard your configured value and take their DEFAULT.
   Say "default", not "fail closed" — the directions differ, which is the whole reason
-  it matters, and they differ two-to-one rather than the other way round. Only
-  `_required_scheduled_review_kinds` defaults to its MAXIMAL set, so a discard there
-  TIGHTENS. The other two can LOOSEN: `_doc_findings_mode` defaults to `skip`
-  (`_DEFAULT_DOC_FINDINGS_MODE`; cite the SYMBOL — the line this used to name now holds a sibling constant), scoring fewer findings and saying nothing about it; and
+  it matters, and all three can now LOOSEN: `_doc_findings_mode` defaults to `skip`
+  (`_DEFAULT_DOC_FINDINGS_MODE`; cite the SYMBOL — the line this used to name now holds a sibling constant), scoring fewer findings and saying nothing about it;
   `_required_ci_workflows` falls back to the shipped `("CI",)`, which is NARROWER than
   any larger required set an install declared — it does print a NOTE, so that one is
-  loud rather than silent, but it is still a relaxation (Codex P2, #1903). The rule below
+  loud rather than silent, but it is still a relaxation (Codex P2, #1903); and
+  `_required_scheduled_review_kinds` now defaults to the MINIMAL set `("leaks",)`
+  (⚠ it defaulted to the maximal `code-review` + `leaks` until the default was
+  narrowed, so a discard there TIGHTENED — it now narrows instead, and likewise
+  prints a NOTE when the key was visibly declared). The floor survives every
+  discard: `leaks` is irreducible. The rule below
   keys on this:
   - **`--source internal` (the default)** — a same-model self / genesis-architect /
     genesis-security / any-subagent review. It is free and shares the author-model's
@@ -2731,54 +2716,26 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   reviewer rounds because a standing "proceed once clean" silently carried
   through rounds 4–6.)
 
-  **The Codex-round twin of the cap** (`git_push_guard.py`
-  `_check_codex_round_escalation`): the local counter above is BLIND to a loop
-  that churns through CODEX rounds while every local review is clean — the
-  2026-08-12 MW-3 #1372 whack-a-mole shape (5 Codex rounds, local counter at 0,
-  and the round-4 "fix" of a non-bug introduced the only genuine liveness bug).
-  So `gh pr comment … "@codex review"` HARD-BLOCKS once the PR already carries
-  `ESCALATION_ROUND_CAP` Codex reviews (counted live from the GitHub API;
-  fail-open on any API error), until a trailing `# escalation-ack`. Before
-  acking, DO THE STEP-BACK the block prints: (1) triage every open finding —
-  {live bug | latent trap | hardening | observation}; only live bugs and
-  cheaper-now-than-later traps may change already-reviewed code, the rest get a
-  documented acceptance or route to the PR that owns the area; (2) fix
-  MECHANISMS, not instances; (3) for state-machine/queue code, enumerate EVERY
-  status value and trace the change under each (your tests encode your own
-  state model — they can't catch states you didn't consider); (4) consider
-  REVERTING a prior round's fix rather than patching it again; (5) escalate to
-  the user with a minimize-change recommendation. The ack asserts that
-  step-back happened — appending it without doing the work is the same
-  violation as falsifying `--clean`.
-- **GATE-FIX LANE — a hook-surface PR gets a wider round 1 and a hard stop at 2
-  (standing user rule, 2026-09-09).** "Two" counts DISCOVERY rounds — reviews run
-  to find defects. The confirming review of a terminal push (rule 4) is a gate
-  requirement rather than a discovery round and never counts toward it; without that
-  exemption stated HERE, where the cap is, the two rules read as a contradiction and
-  a session fixing a floor-class finding cannot satisfy both (Codex P2, #1903).
-  **The exemption is DOCTRINE ONLY — no code knows about it, and you will feel that.**
-  This lane's "two" is a rule for the session; the MACHINE counters underneath are
-  unchanged (3 / 7) and are deliberately not being touched. So when a confirming review
-  finds a floor-class defect and you stage the correction, `bump_review_round` sees a
-  distinct staged hash and makes it machine round 3, and the commit gate blocks until a
-  trailing `# escalation-ack` (`review_state.py:850-860`,
-  `review_enforcement_commit.py:1072-1088`). That block is CORRECT and expected: acking
-  it means doing the step-back the block prints, on a PR whose fix-code just produced a
-  floor finding — which is exactly the moment that step-back is worth most. It is not
-  the lane contradicting itself, and a session that has not been told will read it that
-  way (Codex P2, #1903). The gate's strictest path points at the gate
-  itself: a PR changing the rules must pass the rules it is changing, every fix moves
-  the head, and each moved head costs another manual review request. READ (#1824): four review PASSES to relax a gate — architect,
-  security, a cross-model reviewer, and a mandated fresh audit — of which the EXTERNAL
-  streak was 2. The count is stated that way deliberately: an earlier draft here said
-  "four rounds", which is the wrong denominator by this very file's definition, since
-  internal reviews are never rounds. The public record shows 3 review objects and 2
-  review requests; anyone re-deriving "four" from the PR alone will not find it. Meanwhile the fixes those PRs carry are what unblock
-  everything behind them, so a slow lane here is not a safe lane — it is a queue that
-  stops fixing itself.
+  **The Claude Code PR-side hook uses the same shared evaluator.** A review request reads the
+  distinct reviewed heads live from GitHub. Below four ordinary heads it proceeds under
+  standing authorization. At four or more it emits a native user approval for exactly
+  one request; at five or more its message strongly recommends stopping. API, parse,
+  prefix-resolution, changed-file, or PR-identity uncertainty asks in foreground and
+  denies in autonomous sessions. Dismissed reviews still count as spent rounds. A clean
+  review comment's abbreviated SHA is resolved against the PR's full commit list, and an
+  ambiguous prefix makes the result unknown.
+
+- **GATE-FIX LANE — a hook-surface PR gets two standing discovery rounds
+  (standing user rule, 2026-09-09).** The shared evaluator now enforces the distinction
+  mechanically. After exactly two reviewed heads, a current unreviewed head may receive
+  ONE confirmation request without another approval only when the request carries
+  `<!-- genesis-review-request head=<full-40-hex> kind=confirmation -->`. The marker is
+  dispatch evidence, never approval or review evidence. Once present, a repeated request
+  needs fresh approval. A review after that confirmation, or any further discovery
+  request, also needs fresh approval.
 
   **Scope: any PR whose diff touches the enforcement-hook surface** —
-  `_HOOK_SURFACE_PREFIXES` + `_HOOK_SURFACE_FILES` in `scripts/hooks/git_push_guard.py`.
+  `HOOK_SURFACE_PREFIXES` + `HOOK_SURFACE_FILES` in `scripts/review_budget.py`.
   Read those constants; do not copy them here — a hand-copied list is wrong the moment
   a hook is wired. `TestWiredHooksFenceGuardrail` keeps the WIRED-HOOK half
   self-maintaining FOR THE SPELLINGS IT RECOGNISES, by parsing
@@ -2860,9 +2817,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      instances (#1856, #1686, e7ae445a5): each a fail-open introduced BY fix-code
      written under review pressure, and each caught only by a later round. The danger is the fixing, not the
      reviewing.
-  4. **Round 2 is the TERMINAL.** Treat it as the round-7 menu arriving early —
-     the same two branches, but WITHOUT that tier's take-it-to-the-user
-     requirement, because here it is the FLOOR that routes to the owner (rule 5): accept
+  4. **Round 2 is the discovery stop.** The two branches are: accept
      and merge with every outstanding finding documented in the PR body, or abandon and
      re-cut from a design that does not need a third round. **The always-fix floor is
      never accepted** — a P1, a security defect, anything destructive or fail-open gets
@@ -2906,47 +2861,26 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      issue even when it sits in a file you already touch; this rule governs the reach of
      a fix you have already decided to make.
 
-  **This is DOCTRINE, not a gate change.** No edit to `git_push_guard.py`, and stopping
-  at 2 DISCOVERY rounds normally keeps you clear of the round-3 cap and the lifetime
-  terminal. "Normally" is doing work there, so say the exception out loud: the machine
-  counter is CLASS-BLIND. `bump_review_round` increments on a distinct staged diff and
-  records no notion of "confirming" versus "discovery" (`review_state.py`), so if the
-  confirming review returns a floor finding and you stage its fix as an external
-  defect-bearing round, that IS machine round 3 and the commit blocks pending
-  `# escalation-ack`. The doctrine's exemption is about which rounds you CHOOSE to run;
-  it cannot exempt you from a counter that cannot see the distinction. Ack it honestly
-  — the step-back it demands has by then genuinely happened — rather than being
-  surprised by it (Codex P2, #1903). Be precise about ONE tier though: the
-  machine layer's FIRST stop is the round-2 MODE-SWITCH block, and a run that takes two
-  defect-bearing external rounds DOES reach it, so the terminal commit may need
-  `# audit-ack`. That is honest rather than a bypass — the block demands a
-  fresh-context audit of the whole diff before the class-fix commit, which is exactly
-  what rule 3 already makes you do. That matters: a lane that required changing the
-  gate could only ship by passing the gate it changes, which is the trap this exists to
-  escape. Do NOT confuse this cap with `genesis-architect.md`'s "escalate after 3 failed
-  attempts" — same number, different rule, different subject.
+  **The machine implements this lane.** Gate-surface classification comes from the
+  shared `review_budget` path predicate, including rename sources and destinations.
+  The second-round fix is permitted, and the exact-head marked confirmation is the one
+  exempt request. If that confirmation finds another defect and a further fix is needed,
+  the commit requires fresh native approval. The independent local streak may still
+  demand its round-2 class audit or round-3 stop; those are process interventions rather
+  than substitutes for the per-action user decision.
 
   **Queue priority:** gate PRs get reviewed and driven before ordinary ones — read this
   as a THIRD standing justification alongside the two in "When to DRIVE a Merge" below,
   granted for the same reason those two are: a gate fix is what unblocks the PRs stacked
   behind it, so leaving one to bake is the queue declining to repair itself.
 
-  **On the word "round" here:** these are CALENDAR rounds — one head, sent out and come
-  back, however many reviewers saw it. That is deliberately not the same denominator as
-  the escalation counter (which counts marks) or `_check_codex_round_escalation` (which
-  counts Codex reviews via the API). A DEFECT-BEARING dual round 1 is one round in all
-  three. A CLEAN one is NOT: `--clean` writes the local streak to 0 while the API count
-  still reads 1, and a mark run before the fix is staged counts nothing locally at all.
-  So never infer one counter's value from another — read the counter you care about.
-  (Pushing between reviewers, which rule 3 forbids, is a further way to diverge them,
-  not the only one.)
+  **On the word "round" here:** one reviewed head is one round however many
+  recognized reviewers saw it. The shared evaluator deduplicates reviewer sources by
+  commit identity, so a dual round does not spend two rounds.
 
-  **A note for anyone reading only CLAUDE.md:** "hard stop at 2" is a rule you keep, not
-  a gate that stops you: nothing mechanical stops you REQUESTING a third round until
-  the machine cap at 3. A mechanical block DOES land earlier — the round-2 MODE-SWITCH
-  block on the COMMIT, four paragraphs up — which is a different thing acting on a
-  different verb, and is exactly why the stop has to be honoured deliberately rather
-  than waited for.
+  **A note for anyone reading only CLAUDE.md:** the shared evaluator now gates a third
+  discovery request mechanically. The local round-2 MODE-SWITCH still acts on commits
+  and remains a separate class-audit intervention.
 
 - **Some PRs are not a review problem — hand them to an architecture session.**
   When you ARE driving a PR toward green (per "When to DRIVE a Merge" below),
@@ -2959,9 +2893,9 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   spec at a significant level; it raises real questions about how Genesis
   operates, its architecture, or its infrastructure; its consequences are
   far-reaching or irreversible; or it is delicate enough that getting it wrong
-  damages a running Genesis. Treat arrival at any tier of the cap (the round-2
-  mode-switch, the round-3 hard stop, and certainly the round-7 terminal) as its
-  own trigger to ask whether this is that kind of PR rather than merely another
+  damages a running Genesis. Treat the local round-2 mode switch, the round-3 hard
+  stop, or a native approval after the standing reviewed-head budget as a trigger
+  to ask whether this is that kind of PR rather than merely another
   round — taking this exit does NOT discharge that tier's own stop, which is
   still owed; the handoff is the answer you bring to it, not a way around it.
   If you ARE the session with the user present, hold the conversation now. With
@@ -3028,12 +2962,14 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   hook-surface PR (verified: CHANGELOG-only → `inline`; a 1-line guard change →
   `substantial`). So it costs zero CODEX rounds — but not zero blocks, and the
   difference matters when you are budgeting the follow-up. On the canonical
-  public repo the SCHEDULED-review gate is head-pinned per kind, and only
-  `leaks` has ancestor relief (`_MECHANICAL_RESCAN_BY_KIND`); `code-review` has
-  none. So the push moves the head, the earlier `code-review` marker stops
-  counting, and that gate blocks until a fresh scheduled review lands at the new
-  head. Budget the follow-up as: one commit, no Codex round, one scheduled
-  `code-review` at the new head.
+  public repo the SCHEDULED-review gate is head-pinned per kind, and `leaks` —
+  the only kind required by default — has ancestor relief
+  (`_MECHANICAL_RESCAN_BY_KIND`): the carried marker still satisfies the gate
+  once `leak-detector` is green at the new head. Budget the follow-up as: one
+  commit, no Codex round, no new scheduled review. An install that has ADDED
+  `code-review` back via `merge_gate.required_scheduled_reviews` budgets one
+  more: that kind has no ancestor relief, so the push invalidates its marker and
+  the gate blocks until a fresh scheduled review lands at the new head.
   So: read every finding the report prints, fix the cheap ones, then merge.
   The read is what the standing merge-when-green policy is buying — a gate
   verdict of `ok` is not a report that there is nothing there.
@@ -3745,9 +3681,13 @@ findings below, a gated `gh pr merge`:
   must carry a marker `<!-- genesis-scheduled-review: head=<full-40-hex-sha> kind=<name> -->`
   naming the exact head it reviewed AND which routine it is (`kind`). The gate blocks
   unless an owner-authored marker for EVERY effective required kind
-  (`_required_scheduled_review_kinds()` — DEFAULT `code-review` + `leaks`; the leak/secret
-  scanner is irreducible and always required; an install may relax the OPTIONAL kinds to
-  ADVISORY via `merge_gate.required_scheduled_reviews: [<kinds>]` in local `genesis.yaml`)
+  (`_required_scheduled_review_kinds()` — DEFAULT `leaks` ALONE, which is also the
+  irreducible leak/secret scanner, so the default set and the floor coincide;
+  `code-review` is ADVISORY by default because no routine emits its marker — measured
+  2026-09-16, zero `code-review` markers across all 51 open non-draft PRs and the 40
+  most recently merged ones, against 47 and 31 `leaks` markers — and an install that
+  DOES run one re-arms it by naming a LARGER set in
+  `merge_gate.required_scheduled_reviews: [code-review, leaks]` in local `genesis.yaml`)
   names the PR's current head — so if any required routine never ran, ran on a stale
   commit, or was rate-limited, the merge blocks (naming the missing kinds). An ADVISORY
   routine still posts its review on the PR to be read/addressed, but its absence does not
@@ -4013,16 +3953,14 @@ The review-findings gate specifically:
    `shell_parse._KNOWN_SIGILS` is recorded either — `# depth-ack`, `# audit-ack`,
    `# discard-override` and `# full-suite-ok` belong to gates outside this guard
    and announce themselves on stderr only. The command-scoped acks
-   (`# merge-to-main-override`, `# escalation-ack`, `# final-round-accept`) are
+   (`# merge-to-main-override`, `# escalation-ack`) are
    NOT logged, for two different reasons. `# merge-to-main-override` waives a
    gate that short-circuits BEFORE the branch is resolved, so a row could only
-   say the ack was typed, never that it waived anything. The round-cap acks are
-   simply OUT OF SCOPE here: since #1680 they are honoured inside
-   `_check_codex_round_escalation`'s scan loop, where the PR number and the real
-   round count are resolved (`repo` only when the command carries `--repo` or a PR
-   URL), so a row naming a waiver that actually happened is now writable — whether
-   the store should carry ack-class sigils at all is an open decision, not a
-   settled no. Use only when findings are intentionally accepted.
+   say the ack was typed, never that it waived anything. The local
+   `# escalation-ack` is outside this guard. `# final-round-accept` remains
+   parser-compatible for stale worktrees but authorizes no current gate. Native round
+   approvals are decisions rather than sigils and are deliberately not written as
+   reusable receipts.
 6. **Read the PR's warning comments before merging — not just the hard gate.**
    Beyond Codex, a structural-review bot posts under the repo-owner account
    (review state COMMENTED) and emits **SOFT WARNINGs** (PII /

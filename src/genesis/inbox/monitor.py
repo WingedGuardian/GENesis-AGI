@@ -37,6 +37,20 @@ logger = logging.getLogger(__name__)
 
 _PROMPT_DIR = Path(__file__).resolve().parent.parent / "identity"
 _SYSTEM_PROMPT_FILE = "INBOX_EVALUATE.md"
+_INBOX_EVALUATION_SKILLS = ("evaluate", "user_evaluate")
+_PROMPT_PRECEDENCE_FOOTER = """## Inbox Composition Precedence
+
+`INBOX_EVALUATE.md` governs shared safety, classification, URL handling, and
+the inbox output structure. Apply the `evaluate` skill only to Genesis-relevant
+items and the `user_evaluate` skill only to user-relevant items. The standalone
+output templates in those skills do not apply in inbox sessions. Both complete
+skill bodies are already embedded above; do not invoke `Skill` or reread their
+files. Do not try to load either skill again.
+"""
+
+
+class InboxPromptLoadError(RuntimeError):
+    """A required inbox-evaluation prompt component could not be loaded."""
 
 
 def _eval_disallowed_tools() -> list[str]:
@@ -76,18 +90,6 @@ def _eval_disallowed_tools() -> list[str]:
     """
     return [t for t in SessionConfigBuilder().build_reflection_disallowed() if t != "Bash"]
 
-
-_FALLBACK_SYSTEM_PROMPT = (
-    "You are Genesis performing an inbox evaluation. "
-    "Use the filename as your first classification signal — like an email subject line. "
-    "Titles suggesting Genesis/AI/agents analysis get the four-lens framework "
-    "(How It Helps, How It Doesn't, How It COULD, What to Learn). "
-    "Titles suggesting a specific domain get analyzed in their own context. "
-    "Ambiguous or 'Untitled' titles — use your best judgment based on the content. "
-    "CRITICAL: When items contain URLs, you MUST attempt to fetch EVERY URL and "
-    "report the result individually. Never skip URLs or say 'I have what I need.' "
-    "Output readable markdown with per-item evaluation."
-)
 
 # URL extraction now lives in scanner.py (canonical). Kept as a module-level
 # alias because tests and call sites import ``_extract_urls`` from monitor.
@@ -555,21 +557,48 @@ class InboxMonitor:
         logger.info("Inbox monitor stopped")
 
     def _load_system_prompt(self) -> str:
-        """Load and cache the system prompt from identity directory."""
+        """Load, validate, compose, and cache the complete inbox prompt."""
         if self._system_prompt is not None:
             return self._system_prompt
         path = self._prompt_dir / _SYSTEM_PROMPT_FILE
-        if path.exists():
-            self._system_prompt = path.read_text()
-        else:
-            logger.warning("INBOX_EVALUATE.md not found at %s, using fallback", path)
-            self._system_prompt = _FALLBACK_SYSTEM_PROMPT
+        try:
+            inbox_policy = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise InboxPromptLoadError(
+                f"Required inbox prompt component {_SYSTEM_PROMPT_FILE} is unreadable: {path}"
+            ) from exc
+        if not inbox_policy.strip():
+            raise InboxPromptLoadError(
+                f"Required inbox prompt component {_SYSTEM_PROMPT_FILE} is empty: {path}"
+            )
+
+        from genesis.learning.skills.wiring import load_skill
+
+        skill_sections: list[str] = []
+        for skill_name in _INBOX_EVALUATION_SKILLS:
+            try:
+                skill_content = load_skill(skill_name)
+            except (OSError, UnicodeError) as exc:
+                raise InboxPromptLoadError(
+                    f"Required inbox skill {skill_name!r} is unreadable"
+                ) from exc
+            if not skill_content or not skill_content.strip():
+                raise InboxPromptLoadError(
+                    f"Required inbox skill {skill_name!r} is missing or empty"
+                )
+            skill_sections.append(f"## Skill: {skill_name}\n{skill_content.rstrip()}")
+
+        system_prompt = "\n\n".join(
+            [inbox_policy.rstrip(), *skill_sections, _PROMPT_PRECEDENCE_FOOTER.rstrip()]
+        ) + "\n"
+
         # Prompt versioning: record hash for outcome linkage
         from genesis.db.crud.prompt_versions import compute_prompt_hash
 
-        self._prompt_hash = compute_prompt_hash(self._system_prompt)
+        self._system_prompt = system_prompt
+        self._prompt_hash = compute_prompt_hash(system_prompt)
         self._prompt_version_recorded = False
-        return self._system_prompt
+        return system_prompt
 
     async def check_once(self) -> CheckResult:
         """Run a single inbox check cycle. Public for testing and manual trigger."""
@@ -582,11 +611,12 @@ class InboxMonitor:
         """Core check logic, called under _check_lock.
 
         Decomposed into phase methods for readability:
-        0. _phase_recover_pending — re-derive work interrupted by a prior crash
-        1. _phase_resume — process approval-parked items
-        2. _phase_detect_changes — scan for new/modified files
-        3. _phase_create_records — create DB rows for changed files
-        4. _phase_dispatch_batches — build batches, route, invoke CC
+        0. Prompt preflight — compose all required evaluation instructions
+        1. _phase_recover_pending — re-derive work interrupted by a prior crash
+        2. _phase_resume — process approval-parked items
+        3. _phase_detect_changes — scan for new/modified files
+        4. _phase_create_records — create DB rows for changed files
+        5. _phase_dispatch_batches — build batches, route, invoke CC
         """
         from genesis.db.crud import inbox_items
 
@@ -596,29 +626,35 @@ class InboxMonitor:
         if not watch.is_dir():
             return CheckResult(errors=[f"Watch path does not exist: {watch}"])
 
+        # Required instruction dependencies are preflighted before any DB,
+        # approval, response, or baseline mutation. A failed load remains
+        # retryable after the files are repaired because the cache is assigned
+        # only once the complete composite has validated.
+        system_prompt = self._load_system_prompt()
+
         await inbox_items.expire_stuck_processing(self._db)
 
         now = self._clock()
         now_iso = now.isoformat()
 
-        # Phase 0: recover batches made durable before a prior process exited.
+        # Phase 1: recover batches made durable before a prior process exited.
         # This must precede detection: stale rows are retired so they no longer
         # suppress the current file version in get_all_known().
         await self._phase_recover_pending(now_iso)
 
-        # Phase 1: Resume approval-parked items
+        # Phase 2: Resume approval-parked items
         resume_items, _resumed_ids, resumed_paths = await self._phase_resume(
             now,
             now_iso,
         )
 
-        # Phase 2: Detect new/modified files
+        # Phase 3: Detect new/modified files
         new_files, modified_files = await self._phase_detect_changes(
             watch,
             resumed_paths,
         )
 
-        # Phase 2b: partial-failure retry candidates — files with a stranded
+        # Phase 3b: partial-failure retry candidates — files with a stranded
         # retriable-failed batch and no in-flight row. They are NOT detected as
         # new/modified (a completed sibling keeps their hash "known"), so surface
         # them here and let _phase_create_records re-queue them independently of
@@ -646,7 +682,7 @@ class InboxMonitor:
                 ),
             )
 
-        # Phase 3: Create/update DB records for changed + retry-candidate files
+        # Phase 4: Create/update DB records for changed + retry-candidate files
         pending_items, items_retried = await self._phase_create_records(
             new_files,
             modified_files,
@@ -655,12 +691,13 @@ class InboxMonitor:
             now_iso,
         )
 
-        # Phase 4: Batch and dispatch
+        # Phase 5: Batch and dispatch
         batches_dispatched = await self._phase_dispatch_batches(
             resume_items,
             pending_items,
             now_iso,
             errors,
+            system_prompt,
         )
 
         return CheckResult(
@@ -1568,7 +1605,7 @@ class InboxMonitor:
             )
 
     # =================================================================
-    # Phase 4: Batch and dispatch
+    # Phase 5: Batch and dispatch
     # =================================================================
 
     async def _phase_dispatch_batches(
@@ -1577,6 +1614,7 @@ class InboxMonitor:
         pending_items: list[InboxItem],
         now_iso: str,
         errors: list[str],
+        system_prompt: str,
     ) -> int:
         """Dispatch evaluation batches to CC sessions.
 
@@ -1601,7 +1639,6 @@ class InboxMonitor:
             effort = EffortLevel(self._config.effort)
         except ValueError:
             effort = EffortLevel.MEDIUM
-        system_prompt = self._load_system_prompt()
         await self._record_prompt_version(system_prompt)
 
         batches_dispatched = 0
@@ -1722,9 +1759,9 @@ class InboxMonitor:
     def _build_invocation(self, prompt: str, model, effort, system_prompt: str):
         """Build a CCInvocation for an inbox evaluation.
 
-        ``system_prompt`` is passed in (loaded+hashed once per cycle in
-        ``_phase_dispatch_batches``) so the invocation's system prompt is the
-        SAME value used to build the approval request's message list.
+        ``system_prompt`` is passed in after the check-cycle preflight so the
+        invocation's system prompt is the SAME value used to build the approval
+        request's message list and prompt-version hash.
         """
         from genesis.cc.types import CCInvocation, background_session_dir
         from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED

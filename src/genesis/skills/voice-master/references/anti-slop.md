@@ -127,10 +127,13 @@ an exhaustive allowlist.
 ### Em dashes (hard rule)
 
 A spaced em dash (` — `) is the #1 AI punctuation tell. **Hard fail:** if
-` — ` appears anywhere in output, the audit failed. Never put spaces around an
-em dash. Prefer restructuring to a comma, period, colon, or semicolon; if an
-em dash is genuinely needed, use it unspaced (`word—word`). Max 1–2 per page,
-not per paragraph. Stacking them is an AI fingerprint.
+` — ` appears anywhere in output, the audit failed. Prefer restructuring to a
+comma, period, colon, or semicolon; when a dash is genuinely needed in
+published prose, write two hyphens closed up (`word--word`) — the true em
+dash reads typeset rather than typed, and the double hyphen is what people
+actually type (owner ruling 2026-09-16). Max 1–2 per page, not per paragraph.
+Stacking dashes is an AI fingerprint. (Conversational output is out of this
+file's scope and keeps its em dash, per `identity/CONVERSATION.md`.)
 
 ### Structural tells
 

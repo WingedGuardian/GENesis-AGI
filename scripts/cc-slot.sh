@@ -33,7 +33,21 @@ export PATH="$HOME/.n/bin:$HOME/.bun/bin:$HOME/.npm-global/bin:$HOME/.local/bin:
 # renders every non-ASCII glyph as "_". Force a UTF-8 locale for the client.
 export LANG="${LANG:-C.UTF-8}"
 
-GENESIS_ROOT="${HOME}/genesis"
+# Resolve the checkout from this script's real location. SSH, a shell alias,
+# and the bootstrap-generated wrapper may each enter through a different path;
+# following links before taking the parent keeps all of them on the same repo.
+_CC_SLOT_SCRIPT="${BASH_SOURCE[0]}"
+while [ -L "$_CC_SLOT_SCRIPT" ]; do
+    _CC_SLOT_DIR="$(unset CDPATH; cd -P "$(dirname "$_CC_SLOT_SCRIPT")" && pwd)"
+    _CC_SLOT_TARGET="$(readlink "$_CC_SLOT_SCRIPT")"
+    case "$_CC_SLOT_TARGET" in
+        /*) _CC_SLOT_SCRIPT="$_CC_SLOT_TARGET" ;;
+        *)  _CC_SLOT_SCRIPT="$_CC_SLOT_DIR/$_CC_SLOT_TARGET" ;;
+    esac
+done
+_CC_SLOT_DIR="$(unset CDPATH; cd -P "$(dirname "$_CC_SLOT_SCRIPT")" && pwd)"
+GENESIS_ROOT="$(cd "$_CC_SLOT_DIR/.." 2>/dev/null && pwd)"
+unset _CC_SLOT_SCRIPT _CC_SLOT_DIR _CC_SLOT_TARGET
 SESSION_PREFIX="cc"
 
 # --- Parse slot number from hostname (or allocate one in manual mode) ---
@@ -87,6 +101,45 @@ CLAUDE_EXTRA_ARGS=("$@")
 # would drop an interactive session on SSH disconnect.
 _CC_EPHEMERAL=(auth auto-mode doctor import install mcp plugin plugins project setup-token update upgrade)
 _CC_KEEPS_A_SLOT=(agents gateway ultrareview)
+
+# Resolve a USABLE temp directory into an exported TMPDIR, or leave both names
+# genuinely unset. Returns 0 when a candidate was accepted, 1 when none was.
+#
+# ONE temp-dir policy, called from both the subcommand bypass below and the slot
+# launch further down. It used to be two: the bypass tested `-d "$HOME/tmp"` and
+# exported it, which accepts a root-owned directory left by an earlier sudo run
+# and puts CC temp state somewhere this script never established is private.
+#
+# CREATING a directory does not make it USABLE: `mkdir -p` returns SUCCESS for
+# one that already exists, including one owned by someone else. So each
+# candidate must be created AND writable AND privatisable before it is
+# accepted. `-w` alone passes on a group/world-writable directory owned by
+# another user, where `chmod` then fails — swallowing that would leave session
+# temp state readable by others, so a failed chmod REJECTS the candidate.
+#
+# ACCEPTED RESIDUAL: the tests come before the repair, so a directory we DO own
+# whose mode already lacks u+w (reachable only under a pathological umask at
+# creation time) is rejected rather than repaired. Deliberate — ordering the
+# repair first would make the rejection path unreachable for any directory this
+# user owns, which is exactly the path the security case needs to keep.
+#
+# ~/tmp is a DEGRADED fallback (disk_hygiene.sh prunes it at 7 days), never an
+# equal one. Callers decide what to say about that; this function stays silent.
+_cc_resolve_tmpdir() {
+    local _cand
+    for _cand in "$HOME/.genesis/cc-tmp" "$HOME/tmp"; do
+        mkdir -p "$_cand" 2>/dev/null || continue
+        [ -w "$_cand" ] || continue
+        chmod 700 "$_cand" 2>/dev/null || continue
+        TMPDIR="$_cand"
+        export TMPDIR
+        return 0
+    done
+    # UNSET, never TMPDIR="". Blanking an ALREADY-EXPORTED variable keeps the
+    # export attribute, so a child would receive a literal `TMPDIR=`.
+    unset TMPDIR CLAUDE_CODE_TMPDIR
+    return 1
+}
 if [ "$MODE_ARG" = "manual" ] && [ "${#CLAUDE_EXTRA_ARGS[@]}" -gt 0 ]; then
     for _sub in "${_CC_EPHEMERAL[@]}"; do
         [ "${CLAUDE_EXTRA_ARGS[0]}" = "$_sub" ] || continue
@@ -103,9 +156,27 @@ if [ "$MODE_ARG" = "manual" ] && [ "${#CLAUDE_EXTRA_ARGS[@]}" -gt 0 ]; then
         # capture and so has the opposite polarity.
         cd "$GENESIS_ROOT" 2>/dev/null || true
         # The door resolves a persistent TMPDIR further down, which the bypass
-        # skips. Without this, `install`/`update` unpack into the ambient temp —
-        # typically /tmp, which this install keeps deliberately small.
-        [ -n "${TMPDIR:-}" ] || [ ! -d "${HOME}/tmp" ] || export TMPDIR="${HOME}/tmp"
+        # skips. Without one, `install`/`update` unpack into the ambient temp —
+        # typically /tmp, which this install keeps deliberately small. An
+        # explicit TMPDIR from the caller is theirs and is left alone; when we
+        # resolve one OURSELVES it goes through the same validation the slot
+        # path uses. NOT full parity, deliberately, and worth stating rather
+        # than blurring: the slot path unsets an inherited TMPDIR and re-resolves
+        # unconditionally, so a caller's value never survives it. Here it does,
+        # unvalidated — an operator who exported TMPDIR chose it, and this is a
+        # one-shot command rather than a long-lived session whose value gets
+        # pinned into a tmux server.
+        #
+        # `|| true` is load-bearing: without it `set -e` aborts before
+        # `exec claude` when no candidate is usable.
+        if [ -z "${TMPDIR:-}" ] && ! _cc_resolve_tmpdir; then
+            # The slot path says this out loud; the bypass used to exec in
+            # silence, which made the very case this block exists for —
+            # `install`/`update` unpacking into a small ambient temp —
+            # the one that fails undiagnosably.
+            echo "cc-slot: no usable temp dir (${HOME}/.genesis/cc-tmp or ${HOME}/tmp) —" >&2
+            echo "cc-slot: running '$_sub' on the system default temp." >&2
+        fi
         exec claude "${CLAUDE_EXTRA_ARGS[@]}"
     done
     unset _sub
@@ -890,30 +961,18 @@ echo "→ Slot ${SLOT} (session: ${SESSION_NAME}, live: ${existing})" >&2
 # the conditional `-e` pin further down via the ambient environment, on this
 # very path, and make the "system default" message a lie.
 unset TMPDIR CLAUDE_CODE_TMPDIR
-# TWIN: the in-tmux wrapper in scripts/bootstrap.sh carries this same
-# loop. It must be self-contained inside ~/.bashrc, so it cannot call
-# this one — keep the two in sync by hand, as with the other
-# deliberately-duplicated pairs in this repo.
-for _cand in "$HOME/.genesis/cc-tmp" "$HOME/tmp"; do
-    mkdir -p "$_cand" 2>/dev/null || continue
-    [ -w "$_cand" ] || continue
-    # A directory we cannot make PRIVATE is not a usable candidate: `-w` alone
-    # passes on a group/world-writable directory owned by SOMEONE ELSE, where
-    # `chmod` then fails — and swallowing that would put CC session temp state
-    # where other users can read it. So a failed chmod rejects the candidate.
-    # ACCEPTED RESIDUAL: the tests come before the repair, so a directory we DO
-    # own whose mode already lacks u+w (only reachable under a pathological
-    # umask like 077-and-worse at creation time) is rejected rather than
-    # repaired, and stays rejected. Deliberate: ordering the repair first would
-    # make the rejection path unreachable for any directory this user owns,
-    # which is exactly the path the security case needs to keep.
-    chmod 700 "$_cand" 2>/dev/null || continue
-    TMPDIR="$_cand"
-    break
-done
-unset _cand
-if [ -n "${TMPDIR:-}" ]; then
-    export TMPDIR
+# The candidate loop itself lives in _cc_resolve_tmpdir near the top, because
+# the subcommand bypass needs the identical validation and a second, weaker
+# copy of it was exactly the defect that moved it here.
+#
+# There used to be a TWIN note here claiming the in-tmux wrapper in
+# scripts/bootstrap.sh carries the same loop and must be hand-synced. It does
+# not, and has not since the note was written: that wrap block dispatches to
+# this script and contains no TMPDIR handling at all. Repo-wide this loop
+# exists only here. Removed rather than corrected — a comment inviting a third
+# hand-synced copy, four lines under the text explaining that a second copy was
+# the defect, is exactly how the next drift starts.
+if _cc_resolve_tmpdir; then
     [ "$TMPDIR" = "$HOME/.genesis/cc-tmp" ] \
         || echo "cc-slot: ${HOME}/.genesis/cc-tmp is unusable — using ${TMPDIR} instead." >&2
 else
@@ -1009,8 +1068,11 @@ if [ "$_SESSION_EXISTS" = "0" ] && [ "$_slot_oauth_mode" != "off" ] && [ "$_HAS_
         # blank credential), then echo the notice to stderr. The token flows
         # python-stdout → $(...) → a shell var → the process ENV, never any argv
         # (no ps/scrollback leak). `$(...)`, `\$`, and the literal single-quoted
-        # python defer to the pane shell; ${GENESIS_ROOT}/${_notice_q} expand here.
-        _OAUTH_SRC="_gt=\"\$(\"${GENESIS_ROOT}/.venv/bin/python\" -c 'import sys; from genesis.cc.login_health import read_fallback_token as r; sys.stdout.write(r() or str())' 2>/dev/null)\"; if [ -n \"\$_gt\" ]; then export CLAUDE_CODE_OAUTH_TOKEN=\"\$_gt\"; printf '%s\\n' ${_notice_q} >&2; fi; unset _gt; "
+        # python defer to the pane shell; the %q-quoted interpreter path and
+        # ${_notice_q} expand here. The path is quoted at BUILD time rather than
+        # embedded raw: the pane string is re-parsed, and a raw path inside its
+        # double quotes still permits `$(...)`, backticks, and a closing `"`.
+        _OAUTH_SRC="_gt=\"\$($(printf '%q' "${GENESIS_ROOT}/.venv/bin/python") -c 'import sys; from genesis.cc.login_health import read_fallback_token as r; sys.stdout.write(r() or str())' 2>/dev/null)\"; if [ -n \"\$_gt\" ]; then export CLAUDE_CODE_OAUTH_TOKEN=\"\$_gt\"; printf '%s\\n' ${_notice_q} >&2; fi; unset _gt; "
     fi
 fi
 
@@ -1074,10 +1136,15 @@ else
     # ${_TMPDIR_UNSET} would be unbound.)
     _TMPDIR_UNSET="unset TMPDIR CLAUDE_CODE_TMPDIR && "
 fi
+# The pane command is re-parsed by a fresh shell, so quote both paths before
+# interpolating them into its command string. `%q` preserves checkout paths
+# containing spaces, shell metacharacters, or newlines.
+_GENESIS_ROOT_Q=$(printf '%q' "$GENESIS_ROOT")
+_CC_EXIT_CAPTURE_Q=$(printf '%q' "$GENESIS_ROOT/scripts/cc_exit_capture.sh")
 exec tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
     -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \
     "${_TMPDIR_PIN[@]}" \
     -e "GENESIS_CC_SLOT_OAUTH=${_slot_oauth_mode}" \
     -e "LANG=$LANG" \
-    "${_OAUTH_SRC}cd ${GENESIS_ROOT} && ${_TMPDIR_UNSET:-}claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${GENESIS_ROOT}/scripts/cc_exit_capture.sh ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"
+    "${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${_CC_EXIT_CAPTURE_Q} ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"

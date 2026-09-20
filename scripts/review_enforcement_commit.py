@@ -14,6 +14,7 @@ Exit codes:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -42,6 +43,41 @@ except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must b
         pass
     os._exit(2)
 
+try:
+    from native_approval import emit_native_ask  # noqa: E402
+except Exception as _approval_exc:  # noqa: BLE001 — missing new helper must block.
+    if __name__ != "__main__":
+        raise
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (review_enforcement_commit): native approval helper is "
+            "incompatible; BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:
+        pass
+    os._exit(2)
+
+try:
+    from review_deadline import (  # noqa: E402
+        Deadline,
+        DeadlineExpired,
+        bounded_timeout,
+        propagate_deadline_timeout,
+    )
+except Exception as _deadline_exc:  # noqa: BLE001 — a broken deadline can fail open.
+    if __name__ != "__main__":
+        raise
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (review_enforcement_commit): deadline helper is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:
+        pass
+    os._exit(2)
+
 # DEGRADED-path mention set, defined ABOVE the guarded import so it survives that
 # import failing. Same single verb as `_COMMIT_PATTERN` further down; kept separate
 # because sharing would put the constant after the import it has to outlive. The
@@ -53,6 +89,7 @@ try:
     from shell_parse import (  # noqa: E402
         analyze_checked,
         commit_skips_hooks,
+        gh_pr_subcommand,
         git_subcommand,
         has_trailing_override,
         split_segments,
@@ -366,7 +403,7 @@ def _effective_diff_cwd(command: str, payload: dict, segs: list, commit_seg=None
     return _existing_dir_or_unknown(cur)
 
 
-def _staged_files(cwd: str | None) -> list[str] | None:
+def _staged_files(cwd: str | None, *, deadline: float | None = None) -> list[str] | None:
     """Staged paths for the pending commit, or None if the diff cannot be read.
 
     Uses ``--name-status -M`` so renames/copies surface BOTH sides (P2-E): a
@@ -380,7 +417,12 @@ def _staged_files(cwd: str | None) -> list[str] | None:
         args += ["-C", cwd]
     args += ["diff", "--cached", "--name-status", "-M"]
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=bounded_timeout(deadline, 10),
+        )
         if result.returncode != 0:
             return None
         paths: list[str] = []
@@ -397,6 +439,11 @@ def _staged_files(cwd: str | None) -> list[str] | None:
             elif len(parts) >= 2:
                 paths.append(parts[-1])
         return paths
+    except subprocess.TimeoutExpired as exc:
+        propagate_deadline_timeout(deadline, exc)
+        return None
+    except DeadlineExpired:
+        raise
     except Exception:
         return None
 
@@ -447,6 +494,30 @@ _COMMIT_SELECT_LONG = frozenset(
 )
 _COMMIT_ARG_SHORT = "mFCct"  # short flags consuming a value (t = --template)
 _COMMIT_SELECT_SHORT = "aiop"  # -a --all, -i --include, -o --only, -p --patch
+# Staging subcommands that put content in the index AFTER this hook has read it.
+# Named here rather than inline so the depth note can DERIVE its warning from the
+# same set the predicate decides on — see _content_selecting_forms().
+_STAGING_SUBCOMMANDS = ("add", "rm", "mv", "reset")
+
+
+def _content_selecting_forms() -> str:
+    """The forms that can put content in a commit beyond what ``--cached`` shows.
+
+    DERIVED from the predicate's own constants, never typed alongside them. The
+    depth note tells an author what to inspect before writing ``# depth-ack``,
+    and three separate review findings have now been the same defect: the NOTE
+    was narrower than the PREDICATE, so the gate permitted a form the advice
+    never warned about and the careful reader was the one who got caught. Adding
+    the missing form each time is predicate #4; deriving the sentence closes the
+    class, because a form added to `_COMMIT_SELECT_*` or `_STAGING_SUBCOMMANDS`
+    now appears in the warning automatically.
+    """
+    selectors = sorted(_COMMIT_SELECT_LONG) + [f"-{c}" for c in sorted(_COMMIT_SELECT_SHORT)]
+    staging = [f"git {v}" for v in _STAGING_SUBCOMMANDS] + ["git restore --staged"]
+    return (
+        f"{', '.join(selectors)} or a pathspec on the commit itself; "
+        f"{', '.join(staging)} earlier in the chain"
+    )
 
 
 def _commit_can_select_content(argv: list[str]) -> bool:
@@ -511,7 +582,7 @@ def _commit_may_add_content(segs: list) -> bool:
         if s is commit_seg:
             continue
         sub = git_subcommand(s.argv)
-        if sub in ("add", "rm", "mv", "reset"):
+        if sub in _STAGING_SUBCOMMANDS:
             return True
         if sub == "restore" and "--staged" in s.argv:
             return True
@@ -536,13 +607,12 @@ _UNRESOLVABLE_TARGET_CHARS = "$`*?[{\\()<>~"
 
 
 def _branch_mutation_risk(argv: list[str]) -> str | None:
-    """Whether a ``git switch``/``git checkout`` could move HEAD toward main/master or
-    an unverifiable branch.
+    """Whether a ``git switch``/``git checkout`` can move HEAD before a commit.
 
-    Returns ``"main"`` if it could land HEAD on main/master, ``"unknown"`` if the
-    target is unresolvable (a variable/subst/glob/``-`` previous-branch), else
-    ``None`` — a literal non-main branch (``checkout -b feature``) carries no
-    direct-to-main risk, and a FILE-RESTORE form moves no branch at all.
+    Returns ``"main"`` for main/master, ``"unknown"`` for an unresolvable target,
+    ``"branch"`` for another literal branch, and ``None`` only for a file-restore
+    form. The review budget is branch-specific, so every HEAD-moving form must run
+    separately from the commit; this hook can only inspect pre-command state.
 
     Only HEAD-MOVING forms are assessed, to avoid false-blocking file restores
     (``git checkout HEAD~1 -- f`` / ``git checkout main f.py``, which leave HEAD put):
@@ -630,10 +700,14 @@ def _branch_mutation_risk(argv: list[str]) -> str | None:
             return "main"
         if t == "-" or any(ch in t for ch in _UNRESOLVABLE_TARGET_CHARS):
             return "unknown"
-    return None
+    # Every valid `git switch` changes/selects HEAD. Even when option parsing
+    # cannot recover a target (`switch -- <branch>`, `switch --detach`, or a
+    # syntactically incomplete command), it cannot safely share a commit's
+    # pre-command branch budget. Checkout alone has file-restore forms.
+    return "branch" if sub == "switch" or targets else None
 
 
-def _worktree_root(cwd: str) -> str:
+def _worktree_root(cwd: str, *, deadline: float | None = None) -> str:
     """The git worktree ROOT that owns ``cwd`` (canonicalized), or ``realpath(cwd)``
     as a fallback. Two different SUBDIRECTORIES of one worktree — and a symlink alias
     of it — resolve to the same root, so a legitimate same-worktree commit chain
@@ -644,27 +718,38 @@ def _worktree_root(cwd: str) -> str:
             ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=bounded_timeout(deadline, 5),
         )
         root = r.stdout.strip()
         if r.returncode == 0 and root:
             return os.path.realpath(root)
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+    except subprocess.TimeoutExpired as exc:
+        propagate_deadline_timeout(deadline, exc)
+    except (FileNotFoundError, OSError):
         pass
     return os.path.realpath(cwd)
 
 
-def _merge_note(cwd: str | None) -> str:
-    """A hint appended to a cap/mode-switch denial when a merge is mid-flight.
+def _merge_note(
+    cwd: str | None, *, gate: str = "round", deadline: float | None = None
+) -> str:
+    """A hint appended to a denial when a merge is mid-flight.
 
-    ADVISORY TEXT ONLY. Deliberately NOT wired into the verdict or the round
-    counter: those sentinels are unauthenticated files that any actor with shell
-    access can create (``echo x > .git/MERGE_HEAD``), and `git merge --no-commit`
-    leaves one indefinitely without any forgery at all. Keying an EXEMPTION off
-    them would let the actor this gate exists to constrain silence it
-    permanently with one write — measured: a forged sentinel froze the counter
-    across three further distinct defect rounds. Telling the author what the
-    gate can see is safe; letting that state decide the verdict is not.
+    ``gate`` selects the consequence clause, because the two gates are misled by
+    a merge in DIFFERENT ways and a reader needs the one that applies: the round
+    counter sees another round, the depth gate sees a large authored change.
+    Sharing one wording would describe the wrong problem half the time.
+
+    ADVISORY TEXT ONLY. Deliberately NOT wired into the verdict, the round
+    counter, or the depth classification: those sentinels are unauthenticated
+    files that any actor with shell access can create (``echo x >
+    .git/MERGE_HEAD``), and `git merge --no-commit` leaves one indefinitely
+    without any forgery at all. Keying an EXEMPTION off them would let the actor
+    this gate exists to constrain silence it permanently with one write —
+    measured: a forged sentinel froze the counter across three further distinct
+    defect rounds. Telling the author what the gate can see is safe; letting that
+    state decide the verdict is not. Adding a second caller does not weaken that:
+    this still only ever returns TEXT.
     """
     try:
         out = subprocess.run(
@@ -672,27 +757,251 @@ def _merge_note(cwd: str | None) -> str:
             cwd=cwd,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=bounded_timeout(deadline, 5),
         )
         if out.returncode != 0 or not out.stdout.strip():
             return ""
         raw = out.stdout.strip()
         git_dir = Path(raw) if Path(raw).is_absolute() else Path(cwd or ".") / raw
         merging = (
-            any((git_dir / n).exists() for n in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"))
+            any(
+                (git_dir / n).exists()
+                for n in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "SQUASH_MSG")
+            )
             or (git_dir / "rebase-merge").exists()
             or (git_dir / "rebase-apply").exists()
         )
+    except DeadlineExpired:
+        return ""
     except (subprocess.SubprocessError, OSError, ValueError):
         return ""
     if not merging:
         return ""
+    if gate == "depth":
+        return (
+            "\n\nNOTE: a git integration sentinel is present — a merge, squash merge, rebase, "
+            "cherry-pick or revert is in progress. Content that operation brought "
+            "in counts toward substantiality exactly like code you wrote (via the "
+            "staged diff on a normal commit, via the recorded marker level on an "
+            "-a/pathspec one), which is why a commit that is only the operation "
+            "can land here.\n"
+            "That is NOT an exemption, and this hook cannot tell the two apart: "
+            "only content that arrived already reviewed on its own PR is somebody "
+            "else's audited work. A cherry-pick, a revert, and every conflict "
+            "resolution are YOURS and still need the audit — ack only once you "
+            "have inspected the PROSPECTIVE commit, which is not the same thing as "
+            "the index. For a plain index-only commit the staged set is the whole "
+            "story. Every one of these can add more, and this hook runs BEFORE any "
+            "of them, so none of it shows in `git diff --cached` yet:\n"
+            f"  {_content_selecting_forms()}\n"
+            "That list is GENERATED from the same constants the gate decides on, so "
+            "it cannot drift narrower than what the gate actually permits — which it "
+            "did three times, each time letting an honest ack cover content the "
+            "prescribed check never showed.\n"
+            "The ack clears THIS gate only. If the operation also left the review "
+            "marker no longer binding the staged diff — usual for a merge, but NOT "
+            "if you re-marked afterwards — the review-current gate blocks next and "
+            "the full ack is:  # depth-ack review-override\n"
+            "Add that second sigil ONLY once that gate actually fires: it records "
+            "findings as accepted, which is a false statement when there were none. "
+            "And sigils bind PER COMMIT SEGMENT: one comment at the very end of a "
+            "chain binds only the LAST segment, so the chain is refused. Do not "
+            "reach for a multi-line command to get a sigil onto each one — run each "
+            "commit as its OWN command instead. A shell comment ends at the physical "
+            "line, so the only way to carry a sigil per segment is a newline between "
+            "them — and a newline is not `&&`. `&&` short-circuits correctly; a "
+            "NEWLINE does not, so the second commit runs even when the first one "
+            "FAILED. Put `git commit -m …` and `git commit --amend --no-edit` on "
+            "two lines and a commit-msg rejection on the first leaves --amend "
+            "rewriting the PREVIOUS commit with this staged content, while the "
+            "whole command still exits 0. Separate commands keep each failure "
+            "visible and each sigil bound."
+        )
     return (
         "\n\nNOTE: a merge/rebase appears to be in progress. The round counter "
         "keys on the staged diff, so pulling upstream in to resolve a conflict "
         "reads as another round even though it adds no authored code. If this "
         "commit IS only that merge, say so in the ack rather than treating it "
         "as a real round."
+    )
+
+
+def _is_dispatched() -> bool:
+    """Whether this hook runs inside a Genesis autonomous CC session."""
+    return os.environ.get("GENESIS_CC_SESSION") == "1"
+
+
+def _native_ask(reason: str) -> None:
+    """Emit a native PreToolUse decision and exit successfully for CC to ask."""
+    emit_native_ask(reason)
+    sys.exit(0)
+
+
+def _unknown_budget(reason: str) -> dict:
+    return {
+        "status": "unknown",
+        "reason": "evidence_unknown",
+        "errors": [reason],
+        "approval_required": True,
+        "commit_approval_required": True,
+        "strongly_discouraged": True,
+    }
+
+
+def _current_branch_pr_identity(raw: str) -> tuple[str, int] | None | dict:
+    """Parse ``gh pr status --json`` for the current branch.
+
+    ``None`` is a positive no-open-PR result.  A dict is an unknown-budget
+    result.  The status command is used instead of ``pr list --head`` because
+    it follows GitHub CLI's current-branch/remotes resolution and therefore
+    also identifies cross-repository PRs and branches with unpushed commits.
+    """
+    try:
+        payload = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return _unknown_budget("commit_pr_status_malformed")
+    if not isinstance(payload, dict):
+        return _unknown_budget("commit_pr_status_malformed")
+    current = payload.get("currentBranch")
+    if current is None:
+        return None
+    if not isinstance(current, dict):
+        return _unknown_budget("commit_pr_status_malformed")
+    state = current.get("state")
+    if state in {"CLOSED", "MERGED"}:
+        # ``gh pr status`` exposes only the NEWEST match for the branch. A closed
+        # singular record does not prove no older OPEN PR exists for it, and an
+        # unseen open PR may already have exhausted its budget — so "closed" is
+        # unknown evidence, never proof of absence.
+        return _unknown_budget("commit_pr_status_closed_only")
+    number, url = current.get("number"), current.get("url")
+    if state != "OPEN" or not isinstance(number, int) or not isinstance(url, str):
+        return _unknown_budget("commit_pr_identity_malformed")
+    match = re.fullmatch(r"https?://[^/]+/([^/]+/[^/]+)/pull/(\d+)(?:[/?#].*)?", url)
+    if match is None or int(match.group(2)) != number:
+        return _unknown_budget("commit_pr_identity_malformed")
+    return match.group(1), number
+
+
+#: This hook is registered in .claude/settings.json with `"timeout": 10`, and an
+#: overrun SIGKILLs it -- which FAILS OPEN: the commit proceeds with neither the
+#: budget check nor the review-current and depth checks that run after it. The
+#: lookup is several serial GitHub calls of 6-8s each, so a degraded-but-not-dead
+#: GitHub keeps every individual call inside its own cap while the total runs far
+#: past 10s. These bound the whole lookup instead.
+#:
+#: The split leaves ~2.5s for everything else this hook does after the lookup
+#: (diff classification, marker reads, message rendering), all of it local.
+_COMMIT_HOOK_REGISTERED_TIMEOUT = 10.0
+_COMMIT_BUDGET_LOOKUP_SECONDS = 7.5
+_COMMIT_POST_LOOKUP_SECONDS = 2.0
+
+
+def _branch_review_budget(
+    cwd: str | None,
+    branch: str | None,
+    *,
+    budget_seconds: float = _COMMIT_BUDGET_LOOKUP_SECONDS,
+    deadline: Deadline | None = None,
+) -> dict | None:
+    """The current branch PR's shared budget; None means a proven no-open-PR.
+
+    A read/import/identity failure is an ``unknown`` result, never the same as
+    no pull request. So is running out of time: one aggregate deadline covers
+    every network call here, and exhausting it asks a human rather than letting
+    the harness kill the hook and allow the commit unchecked. Tests select a PR
+    with ``_TEST_REVIEW_BUDGET_PR`` and feed the shared evaluator through its
+    endpoint seams.
+    """
+    if not cwd or not branch:
+        return _unknown_budget("commit_pr_identity_unknown")
+    lookup_deadline = (
+        deadline.capped_after(budget_seconds, reserve=_COMMIT_POST_LOOKUP_SECONDS)
+        if deadline
+        else Deadline.after(budget_seconds)
+    )
+    try:
+        import review_budget
+    except Exception:  # noqa: BLE001 — reverse version skew asks/denies.
+        return _unknown_budget("review_budget_unavailable")
+
+    test_pr = os.environ.get("_TEST_REVIEW_BUDGET_PR")
+    if test_pr is not None:
+        if test_pr == "none":
+            return None
+        repo = os.environ.get("_TEST_REVIEW_BUDGET_REPO", "owner/repo")
+        if not test_pr.isdigit():
+            return _unknown_budget("commit_pr_identity_unknown")
+        remaining = lookup_deadline.remaining()
+        result = review_budget.evaluate_pr(
+            repo, test_pr, budget_seconds=max(0.0, remaining or 0.0)
+        )
+        result["pr"] = int(test_pr)
+        result["repo"] = repo
+        return result
+
+    try:
+        pr_read = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "status",
+                "--json",
+                "number,state,url",
+            ],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            # Share the one deadline: a flat 8 here plus the evaluator's own
+            # serial calls is exactly what overran the harness window.
+            timeout=lookup_deadline.timeout(8.0),
+            check=False,
+        )
+        if pr_read.returncode != 0:
+            return _unknown_budget("commit_pr_list_unreadable")
+        identity = _current_branch_pr_identity(pr_read.stdout)
+        if identity is None:
+            return None
+        if isinstance(identity, dict):
+            return identity
+        repo, number = identity
+        remaining = lookup_deadline.remaining()
+        result = review_budget.evaluate_pr(
+            repo, number, budget_seconds=max(0.0, remaining or 0.0)
+        )
+        result["pr"] = number
+        result["repo"] = repo
+        return result
+    except Exception:  # noqa: BLE001 — an uncertain budget cannot allow silently.
+        return _unknown_budget("commit_pr_lookup_failed")
+
+
+def _commit_budget_reason(result: dict) -> str:
+    if result.get("status") != "ok":
+        return (
+            "The open pull request's review history could not be read reliably. "
+            "Approve this one commit only if you independently verified that the "
+            "review budget permits it; autonomous sessions are denied."
+        )
+    pr = result.get("pr")
+    count = int(result.get("count") or 0)
+    if result.get("gate_surface"):
+        return (
+            f"PR #{pr} changes the review-gate surface and has {count} distinct "
+            "reviewed heads. Its two discovery rounds plus confirmation are spent. "
+            "Approve this one additional fix commit only; earlier approval does not "
+            "carry forward."
+        )
+    if result.get("strongly_discouraged"):
+        return (
+            f"PR #{pr} has {count} distinct reviewed heads. Further work is strongly "
+            "discouraged: stop, narrow or redesign, accept documented residue, or "
+            "abandon it. Approve only this single additional fix commit."
+        )
+    return (
+        f"PR #{pr} has {count} distinct reviewed heads; standing authorization ended "
+        "after four. Approve this single fix commit. A previous approval cannot "
+        "authorize another commit."
     )
 
 
@@ -752,6 +1061,17 @@ def main() -> None:
         )
         return
 
+    # One aggregate deadline for the WHOLE hook, opened before the first local
+    # git probe. The hook is registered with `"timeout": 10`, and an overrun is a
+    # SIGKILL — which FAILS OPEN: the commit proceeds with neither the budget
+    # check nor the review-current/depth checks behind it. Per-call subprocess
+    # caps each reset the clock, so serial local probes (worktree/branch/counter
+    # reads, then the budget lookup) could overrun the window in aggregate; every
+    # probe below draws from this one deadline instead. The small reserve keeps
+    # room to print the decision and exit before the kill lands.
+    hook_budget = Deadline.after(_COMMIT_HOOK_REGISTERED_TIMEOUT - 0.5)
+    hook_deadline = hook_budget.expires_at
+
     # Resolve the dir the commit actually targets (git -C / the LAST cd before
     # the commit segment / payload cwd). A decoy `cd A && …; cd B && git commit`
     # runs in B, and B is what we must inspect. An ambiguous cwd (variable /
@@ -768,12 +1088,8 @@ def main() -> None:
     try:
         from review_state import (
             ESCALATION_ROUND_CAP,
-            FINAL_ROUND_CAP,
-            consume_final_accept,
             get_current_branch,
-            get_final_accept_consumed,
-            get_review_lifetime,
-            get_review_round,
+            get_review_counters,
             has_code_changes,
             has_valid_review_marker,
             is_review_current,
@@ -835,10 +1151,10 @@ def main() -> None:
     # branch ONCE at hook time, before any segment runs. A `git switch main` /
     # `git checkout main` (or an unresolvable target) EARLIER in the chain than a
     # commit lands that commit on a branch this read cannot see — slipping the
-    # direct-to-main block. Fail closed when a pre-commit branch mutation could reach
-    # main/master or is unresolvable; a literal non-main target (`git checkout -b
-    # feature && git commit`, the flow this gate itself recommends) carries no
-    # direct-to-main risk and stays allowed.
+    # direct-to-main block and the per-branch review budget. Refuse every recognized
+    # HEAD-moving form before a commit: even a literal non-main target can have a
+    # different PR budget from the branch sampled at hook entry. File-restore forms
+    # still pass because they do not move HEAD.
     #
     # SCOPE IS CONSCIOUSLY BOUNDED — do NOT keep adding forms one at a time (user
     # decision 2026-08-12, after the escalation cap fired on this axis). This covers
@@ -859,9 +1175,8 @@ def main() -> None:
                 break
             if git_subcommand(s.argv) in _BRANCH_MUTATING_SUBCMDS and _branch_mutation_risk(s.argv):
                 _deny(
-                    "BLOCKED: this command switches branches (git switch/checkout to "
-                    "main/master or an unresolvable target) before a commit, so the "
-                    "guard cannot verify which branch the commit lands on. Run the "
+                    "BLOCKED: this command switches branches before a commit, so the "
+                    "guard cannot verify the destination branch's review budget. Run the "
                     "branch switch and the commit as SEPARATE commands."
                 )
                 return
@@ -880,7 +1195,9 @@ def main() -> None:
             )
             return
         seg_cwds.append(seg_cwd)
-        seg_branch = get_current_branch(cwd=seg_cwd if isinstance(seg_cwd, str) else None)
+        seg_branch = get_current_branch(
+            cwd=seg_cwd if isinstance(seg_cwd, str) else None, deadline=hook_deadline
+        )
         if seg_branch in ("main", "master"):
             _deny(
                 "BLOCKED: Direct commits to main are not allowed. "
@@ -901,7 +1218,10 @@ def main() -> None:
     # different-subdir case). Only resolved when ≥2 commits actually chain, to avoid
     # the extra git call on the common single-commit path.
     if len(all_commit_segs) >= 2:
-        distinct_dirs = {_worktree_root(c) if isinstance(c, str) else c for c in seg_cwds}
+        distinct_dirs = {
+            _worktree_root(c, deadline=hook_deadline) if isinstance(c, str) else c
+            for c in seg_cwds
+        }
         if len(distinct_dirs) > 1:
             _deny(
                 "BLOCKED: this command chains git commits into DIFFERENT worktrees, "
@@ -968,100 +1288,61 @@ def main() -> None:
     # chained sibling commit). NOTE: on a nested `bash -c 'git commit …'` the ack
     # must sit on the INNER command (the sigil isn't propagated to wrappers); the
     # documented `git commit … # escalation-ack` form is a plain segment.
-    round_n = get_review_round(cwd=cwd)
+    round_n, _local_lifetime = get_review_counters(cwd=cwd, deadline=hook_deadline)
     commit_segs = [s for s in segs if git_subcommand(s.argv) == "commit"]
 
-    # Set when Rule 3a honours a '# final-round-accept', SPENT only at an actual
-    # allow. The two must not be the same moment: Rule 3a is checked FIRST, but
-    # four later rules (the escalation cap, the mode-switch tier, the depth gate,
-    # Rule 2) can still deny the very same command — and consuming inside the tier
-    # burned the one-shot token on a commit that never ran. Because the consuming
-    # tier is then checked first on the retry, the branch became permanently
-    # uncommittable. MEASURED before this fix, at streak 7 / lifetime 7 (a state
-    # this file's own comment calls reachable): all four sigil combinations
-    # returned exit 2, including the one the block message itself prints.
-    spend_final_accept = False
+    branch = get_current_branch(cwd=cwd, deadline=hook_deadline)
+    cloud_budget = _branch_review_budget(cwd, branch, deadline=hook_budget)
+    pending_round_approval = bool(
+        cloud_budget is not None
+        and (
+            cloud_budget.get("status") != "ok"
+            or cloud_budget.get("commit_approval_required")
+        )
+    )
+
+    if pending_round_approval:
+        separately_gated = [
+            s
+            for s in segs
+            if git_subcommand(s.argv) in {"push", "merge"}
+            # EVERY ``gh pr comment`` counts separately: an inline body can hide a
+            # review request the argv scan sees, but a ``--body-file``/editor body
+            # is opaque here — gating on the visible ``@codex review`` token let one
+            # approval cover a request it never read.
+            or gh_pr_subcommand(s.argv) in {"create", "merge", "close", "comment"}
+        ]
+        if len(commit_segs) != 1 or separately_gated:
+            _deny(
+                "BLOCKED: this review-budget approval may authorize exactly one fix "
+                "commit. Run multiple commits and push/merge/close/PR-create/review "
+                "actions separately so each receives its own decision."
+            )
+            return
 
     def _allow() -> None:
-        """Exit 0, spending the acceptance only if one was actually honoured."""
-        if spend_final_accept:
-            consume_final_accept(cwd=cwd)
+        """Exit through the one approval chokepoint after all hard checks pass."""
+        # Defense in depth: even a future helper that accidentally degrades a
+        # deadline failure must not reach an allow after the hook budget expired.
+        hook_budget.timeout(0.001)
+        if pending_round_approval and cloud_budget is not None:
+            reason = _commit_budget_reason(cloud_budget)
+            # A stale worktree still emits the retired terminal sigil. It is
+            # parsed but authorizes nothing — name that so an old habit does
+            # not read the ask as a gate misfire.
+            if commit_segs and all(
+                has_trailing_override(s.raw, "final-round-accept") for s in commit_segs
+            ):
+                reason += (
+                    "\n\nNOTE: `# final-round-accept` is retired and no longer "
+                    "authorizes any gate; only this native approval admits the "
+                    "commit."
+                )
+            if _is_dispatched():
+                _deny("BLOCKED: " + reason)
+                return
+            _native_ask(reason)
         sys.exit(0)
-
-    # Rule 3a: the FINAL-ROUND terminal. Checked BEFORE the consecutive cap below,
-    # and that ordering is the entire point — at the terminal the round counter has
-    # typically just been reset by an earlier '# escalation-ack', so the cap would
-    # not fire and an escalation-ack must not be able to clear this.
-    #
-    # The cap below is REPEATABLE by construction: its ack calls
-    # reset_review_round, so a change can cycle 1-2-3-ack, 4-5-6-ack, without end.
-    # This tier is the terminal that cycle never reaches. It is deliberately NOT
-    # resettable by its own ack: '# final-round-accept' clears exactly ONE commit
-    # and the block returns on the next one. A sigil that kept working would just
-    # be a fourth repeatable sigil, which is the defect being closed.
-    #
-    # Counted the same way as the streak — EXTERNAL cross-model rounds only
-    # (see review_state.bump_review_round). Internal self/subagent audits stay
-    # free, including the one the mode-switch tier itself mandates; counting those
-    # would make the machine penalise the remedy it demands.
-    lifetime_n = get_review_lifetime(cwd=cwd)
-    if lifetime_n >= FINAL_ROUND_CAP:
-        final_acked = bool(commit_segs) and all(
-            has_trailing_override(s.raw, sigil="final-round-accept") for s in commit_segs
-        )
-        # "Clears exactly ONE commit" has to be RECORDED to be true. Re-requiring the
-        # sigil on every commit is not a terminal — a session under a mandate to make
-        # progress just appends it again, which is the fourth repeatable escape hatch
-        # this tier exists to remove. The acceptance is spent on first use and the
-        # branch cannot buy another.
-        if final_acked and get_final_accept_consumed(cwd=cwd):
-            _deny(
-                f"BLOCKED: the final-round acceptance for this branch was ALREADY USED "
-                f"(lifetime {lifetime_n} >= terminal {FINAL_ROUND_CAP}). It clears one "
-                "commit, once — re-applying the sigil does not buy another round, or it "
-                "would be the repeatable escape hatch this terminal replaced.\n\n"
-                "You accepted the outstanding findings and committed. If that commit "
-                "still needs work, the loop did not end, and continuing is no longer a "
-                "call this session makes:\n"
-                "  (a) TAKE IT TO THE USER — say what is still open and that the branch "
-                "is past its terminal. Only they can authorise more work here.\n"
-                "  (b) ABANDON the branch and restart from a design that does not need "
-                "seven rounds.\n\n"
-                "A dispatched session with nobody reading cannot choose either alone — "
-                "surface it and stop." + _merge_note(cwd)
-            )
-            return
-        if not final_acked:
-            # The terminal deliberately does NOT reset the streak, so streak>=3 and
-            # lifetime>=7 is a REACHABLE state in which BOTH sigils are genuinely
-            # required — the escalation cap below is still live once this one clears.
-            # Printing only one would send a session round a loop of alternating
-            # blocks, so name the co-required form when it applies.
-            escalation_hint = " escalation-ack" if round_n >= ESCALATION_ROUND_CAP else ""
-            _deny(
-                f"BLOCKED: FINAL ROUND reached — {lifetime_n} EXTERNAL cross-model review "
-                f"rounds on this branch (terminal {FINAL_ROUND_CAP}; internal same-model "
-                "audits are not counted). Two full escalation cycles have already run and "
-                "each already asked for a fresh decision; a change still surfacing new "
-                "defects from an independent reviewer after that is not converging, and "
-                "another round is not the answer.\n\n"
-                "This is a judgement call, and there are exactly two ways out:\n"
-                "  (a) ACCEPT the outstanding findings and merge — document each one and "
-                "why it is acceptable in the PR body, then:\n"
-                f'        git commit -m "your message"  # final-round-accept{escalation_hint}\n'
-                "      That clears ONE commit; the block returns on the next, so the "
-                "decision has to actually end the loop.\n"
-                "  (b) ABANDON the branch and restart from a design that does not need "
-                "seven rounds. No sigil — just stop committing here.\n\n"
-                "Take this to the user before choosing; neither option is yours to make "
-                "alone." + _merge_note(cwd)
-            )
-            return
-        # Acked = the accept decision was made. Deliberately NO reset: the counter
-        # stays at/above the terminal so the next commit blocks again. The spend is
-        # DEFERRED to the allow (see `_allow` above) — the later rules can still
-        # deny this command, and a token spent on a denied command bricks the branch.
-        spend_final_accept = True
 
     if round_n >= ESCALATION_ROUND_CAP:
         acked = bool(commit_segs) and all(
@@ -1104,7 +1385,7 @@ def main() -> None:
                 "streak — landing the work and erasing the evidence that stopped it. "
                 "Hand the branch off with the premise-check writeup instead. The streak "
                 "is per-branch, so whoever picks up the SAME branch inherits it: say so "
-                "in the handoff." + _merge_note(cwd)
+                "in the handoff." + _merge_note(cwd, deadline=hook_deadline)
             )
             return
         # Acked = a fresh decision to continue → reset the round budget so the next
@@ -1112,7 +1393,7 @@ def main() -> None:
         # life. Reset stands even if a later rule blocks THIS commit: the
         # acknowledgment was made, and erring toward less friction only happens
         # AFTER a conscious ack.
-        reset_review_round(cwd=cwd)
+        reset_review_round(cwd=cwd, deadline=hook_deadline)
     elif round_n == ESCALATION_ROUND_CAP - 1:
         # Tier 1 — MODE-SWITCH, one round BEFORE the hard stop. Two consecutive
         # defect-bearing rounds is the signature of fixing the INSTANCE a reviewer
@@ -1178,7 +1459,8 @@ def main() -> None:
                 "ATTESTS that the class-level audit happened — appending it because "
                 "you want to land something is falsifying it. Hand the branch off "
                 "with the evidence instead. (The streak is per-branch, so a builder "
-                "picking up the SAME branch inherits it: say so in the handoff.)" + _merge_note(cwd)
+                "picking up the SAME branch inherits it: say so in the handoff.)"
+                + _merge_note(cwd, deadline=hook_deadline)
             )
             return
 
@@ -1203,7 +1485,7 @@ def main() -> None:
     commit_may_add_content = _commit_may_add_content(segs)
 
     if not commit_may_add_content:
-        staged = _staged_files(cwd)
+        staged = _staged_files(cwd, deadline=hook_deadline)
         if staged and all(_is_docs_or_config(p) for p in staged):
             _allow()
 
@@ -1218,13 +1500,17 @@ def main() -> None:
     try:
         from review_scope import classify_change_substantiality
 
-        staged_level = classify_change_substantiality(cwd=cwd)
+        staged_level = classify_change_substantiality(cwd=cwd, deadline=hook_deadline)
+    except DeadlineExpired:
+        raise
     except Exception:  # noqa: BLE001 - depth is advisory; never crash the gate
         staged_level = "unknown"
     try:
         from review_state import get_marker_depth
 
-        marker_level, marker_adversarial = get_marker_depth(cwd=cwd)
+        marker_level, marker_adversarial = get_marker_depth(cwd=cwd, deadline=hook_deadline)
+    except DeadlineExpired:
+        raise
     except Exception:  # noqa: BLE001 - a marker-read error must not block on the add-chain
         # path (fail OPEN there); on the normal path the is_review_current() guard below
         # re-reads the marker and fails CLOSED, the safe direction for the stricter gate.
@@ -1250,7 +1536,9 @@ def main() -> None:
         # later substantial diff B that a '# review-override' then waives past Rule 2's
         # staleness block, when B was never audited (the integrity hole this gate closes).
         depth_level = staged_level
-        depth_is_adversarial = marker_adversarial and marker_content_current(cwd=cwd)
+        depth_is_adversarial = marker_adversarial and marker_content_current(
+            cwd=cwd, deadline=hook_deadline
+        )
 
     if depth_level == "substantial" and not depth_is_adversarial:
         depth_acked = bool(commit_segs) and all(
@@ -1278,6 +1566,7 @@ def main() -> None:
                 "escalation cap; no outcome flag needed\n"
                 "If the audit genuinely ran but its format isn't recognized, acknowledge with "
                 "a trailing shell comment (outside any quotes):  # depth-ack"
+                + _merge_note(cwd, gate="depth", deadline=hook_deadline)
             )
             return
 
@@ -1285,9 +1574,11 @@ def main() -> None:
     if commit_may_add_content:
         # The staged diff at hook time isn't what will be committed (staging deferred, -a,
         # a pathspec, …) — can't check the diff hash, so require a valid (unexpired) marker.
-        rule2_blocks = not has_valid_review_marker(cwd=cwd)
+        rule2_blocks = not has_valid_review_marker(cwd=cwd, deadline=hook_deadline)
     else:
-        rule2_blocks = has_code_changes(cwd=cwd) and not is_review_current(cwd=cwd)
+        rule2_blocks = has_code_changes(cwd=cwd, deadline=hook_deadline) and not is_review_current(
+            cwd=cwd, deadline=hook_deadline
+        )
 
     if rule2_blocks:
         # A trailing '# review-override' comment (outside quotes) acknowledges

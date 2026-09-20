@@ -31,6 +31,6 @@ Start cheap, escalate as needed:
 ## Availability
 
 - **Serena**: Always available. 1-2s init per session.
-- **GitNexus**: Requires index. Check freshness: `npx gitnexus status`.
+- **GitNexus**: Requires index. Check freshness: `.claude/mcp/run-gitnexus status`.
   PostToolUse hook auto-detects staleness after commits.
 - **`codebase_navigate`**: Always available (Genesis health MCP).

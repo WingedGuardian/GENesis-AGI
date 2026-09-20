@@ -24,7 +24,8 @@
 #   CC_VERSION             — Claude Code version to install (default from scripts/lib/cc_version.sh)
 #   GH_VERSION             — gh CLI version if pkg-mgr fails (default: 2.65.0)
 #   RIPGREP_VERSION        — ripgrep version if pkg-mgr fails (default: 14.1.1)
-#   NODE_MAJOR             — Node.js major version (default: 20)
+#   NODE_MAJOR             — Node.js major version (default: 22)
+#   GENESIS_INSTALL_STRICT — exit nonzero on any smoke failure/setup warning (default: 0; used by CI)
 
 set -euo pipefail
 
@@ -126,6 +127,19 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_PATH="${VENV_PATH:-$REPO_DIR/.venv}"
 SECRETS_FILE="${SECRETS_PATH:-$REPO_DIR/secrets.env}"
 SETUP_WARNINGS=0
+# Every setter of SETUP_WARNINGS goes through setup_warn, so the flag can name
+# its own causes. The flag alone made a strict-mode failure undiagnosable: the
+# exit line said only "SETUP_WARNINGS=1" while eight separate sites can set it,
+# several of which print no "WARNING:" text at all — so identifying the cause
+# meant grepping the script for setters and cross-reading a 900-line CI log.
+# A newline-joined string rather than an array: nothing else in this script uses
+# arrays, and an empty-array expansion under `set -u` is a bash-version trap.
+SETUP_WARNING_LOG=""
+setup_warn() {
+    SETUP_WARNINGS=1
+    SETUP_WARNING_LOG="${SETUP_WARNING_LOG}${SETUP_WARNING_LOG:+
+}    • $1"
+}
 TOTAL_STEPS=14
 
 echo ""
@@ -468,12 +482,18 @@ if ! command -v jq &>/dev/null; then
     echo "    + jq installed"
 fi
 
-# Node.js version check — returns 0 if installed version >= 20
-# Node 18 EOL'd Sep 2025. Node 20 is current LTS.
+# Node.js version check — the floor of the pinned Claude Code release (>= 22,
+# see scripts/lib/cc_version.sh) raised to the pinned GitNexus engine range
+# (^22.18.0 || >=24.11.0, see scripts/lib/gitnexus_version.sh) so an install does
+# not strand GitNexus on a Node its pin refuses.
 _node_version_ok() {
     command -v node &>/dev/null || return 1
-    local ver; ver=$(node --version 2>/dev/null | grep -oP '(?<=v)\d+' | head -1)
-    [ "${ver:-0}" -ge 20 ] 2>/dev/null
+    local ver; ver=$(node --version 2>/dev/null | sed 's/^v//') || ver=""
+    local major="${ver%%.*}" minor="${ver#*.}"; minor="${minor%%.*}"
+    [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+    { [[ "$major" -eq 22 && "$minor" -ge 18 ]] \
+        || [[ "$major" -eq 24 && "$minor" -ge 11 ]] \
+        || [[ "$major" -gt 24 ]]; } 2>/dev/null
 }
 
 # Install Node.js with full fallback chain: pkg-mgr → NodeSource → nvm
@@ -510,7 +530,7 @@ _install_node() {
 }
 
 # Node.js (REQUIRED — Claude Code will not run without it)
-NODE_MAJOR="${NODE_MAJOR:-20}"
+NODE_MAJOR="${NODE_MAJOR:-22}"
 if _node_version_ok; then
     echo "    . Node.js $(node --version)"
 else
@@ -520,7 +540,7 @@ else
     else
         echo ""
         echo "    ERROR: Node.js ${NODE_MAJOR}.x install failed by all methods."
-        echo "    Claude Code requires Node.js >= 20. Install manually, then re-run:"
+        echo "    Claude Code requires Node.js >= 22. Install manually, then re-run:"
         echo "      Ubuntu/Debian: curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | sudo -E bash - && sudo apt-get install -y nodejs"
         echo "      AL2023/RHEL:   curl -fsSL https://rpm.nodesource.com/setup_${NODE_MAJOR}.x | sudo bash - && sudo dnf install -y nodejs"
         echo "      Universal:     curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash"
@@ -631,28 +651,78 @@ done
 # Code intelligence tools (optional — enhance Claude Code sessions)
 echo "    Installing code intelligence tools..."
 
-# Always re-runs the upstream installer: it is idempotent and pulls the latest
-# release, so existing installs are upgraded in place.
-# --skip-config: the installer would otherwise register the RAW binary in
-# ~/.claude/.mcp.json, bypassing our 2G-capped launcher (_register_mcp below
-# registers the capped wrapper instead).
-curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui --skip-config 2>/dev/null \
-    && echo "    + codebase-memory-mcp installed/upgraded" \
-    || echo "    NOTE: codebase-memory-mcp unavailable (optional)"
+# The kill-switch path resolves through the ONE shared site — an override via
+# CODEBASE_MEMORY_MCP_DISABLE_FILE is honoured here the same way the launcher
+# and indexer honour it, and an UNRESOLVABLE path refuses rather than falling
+# through to an install the machine may have disabled.
+_cbm_disable=""
+if [ -r "$SCRIPT_DIR/lib/cbm_disable_file.sh" ]; then
+    # shellcheck source=lib/cbm_disable_file.sh
+    . "$SCRIPT_DIR/lib/cbm_disable_file.sh"
+    _cbm_disable="$(genesis_cbm_disable_file 2>/dev/null)" || _cbm_disable=""
+fi
+if [ -z "$_cbm_disable" ]; then
+    echo "    NOTE: codebase-memory-mcp kill-switch path unresolvable — refusing install (fail closed)"
+elif [ -e "$_cbm_disable" ]; then
+    echo "    . codebase-memory-mcp install/upgrade skipped (machine kill switch active)"
+else
+    # The pin, the digest and the install itself live in ONE place, shared with
+    # bootstrap.sh, so the commit and its digest cannot drift apart.
+    # shellcheck source=lib/cbm_installer.sh
+    . "$SCRIPT_DIR/lib/cbm_installer.sh"
+    _cbm_rc=0
+    genesis_cbm_install || _cbm_rc=$?
+    case "$_cbm_rc" in
+        0) echo "    + codebase-memory-mcp installed/upgraded" ;;
+        1) echo "    NOTE: codebase-memory-mcp installer download failed (optional)" ;;
+        3) echo "    ERROR: codebase-memory-mcp integrity check failed — the pinned installer does not match the committed digest (see above)" ;;
+        4) echo "    NOTE: codebase-memory-mcp install refused — machine kill switch active" ;;
+        *) echo "    NOTE: codebase-memory-mcp unavailable (optional) — see the error above" ;;
+    esac
+fi
 
-if _node_version_ok; then
-    # Exact pin to 1.6.8 — only ship versions we've actually verified. 1.6.8
-    # (stable): `analyze` works; text search (FTS) degrades gracefully when the
-    # LadybugDB extension is absent. The prior 1.6.4-rc line crashed `analyze`
-    # silently. Re-verify before bumping further.
-    if ! command -v gitnexus &>/dev/null; then
-        npm install -g gitnexus@1.6.8 2>/dev/null \
-            && echo "    + GitNexus installed ($(gitnexus --version 2>/dev/null))" \
-            || echo "    NOTE: GitNexus unavailable (optional)"
+_GITNEXUS_PIN_READY=0
+_gitnexus_pin_file="$SCRIPT_DIR/lib/gitnexus_version.sh"
+if [ -r "$_gitnexus_pin_file" ]; then
+    # shellcheck source=lib/gitnexus_version.sh
+    if source "$_gitnexus_pin_file"; then
+        if [[ "${GENESIS_GITNEXUS_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            && declare -F genesis_gitnexus_node_supported >/dev/null \
+            && declare -F genesis_gitnexus_resolve_binary >/dev/null \
+            && declare -F genesis_gitnexus_installed_version >/dev/null \
+            && declare -F genesis_gitnexus_installed_is_pinned >/dev/null \
+            && declare -F genesis_gitnexus_ensure_pin >/dev/null; then
+            _GITNEXUS_PIN_READY=1
+        fi
+    fi
+fi
+if [ "$_GITNEXUS_PIN_READY" -ne 1 ]; then
+    echo "    NOTE: GitNexus pin metadata unavailable — GitNexus skipped (optional)"
+elif ! genesis_gitnexus_node_supported; then
+    echo "    NOTE: GitNexus ${GENESIS_GITNEXUS_VERSION} requires Node ^22.18.0 or >=24.11.0; found $(node --version 2>/dev/null || echo unavailable) — skipped"
+else
+    # Exact, shared pin — GitNexus index storage formats can change between
+    # releases.  Installing an older binary after a newer rebuild makes the
+    # otherwise-healthy index unreadable.  Bump only after index + query E2E.
+    if ! genesis_gitnexus_resolve_binary >/dev/null; then
+        _gitnexus_action="installed"
     else
-        npm install -g gitnexus@1.6.8 2>/dev/null \
-            && echo "    + GitNexus pin enforced ($(gitnexus --version 2>/dev/null))" \
-            || echo "    NOTE: GitNexus pin enforcement skipped (already at 1.6.8 or failed)"
+        _gitnexus_action="aligned"
+    fi
+    if genesis_gitnexus_ensure_pin; then
+        echo "    + GitNexus ${_gitnexus_action} ($(genesis_gitnexus_installed_version 2>/dev/null))"
+    else
+        _gitnexus_rc=$?
+        if [ "$_gitnexus_rc" -eq 2 ]; then
+            echo "    NOTE: newer GitNexus $(genesis_gitnexus_installed_version 2>/dev/null || echo unknown) left installed; refusing automatic downgrade to ${GENESIS_GITNEXUS_VERSION}"
+        elif [ "$_gitnexus_rc" -eq 3 ]; then
+            echo "    NOTE: unrecognized GitNexus version output left installed; refusing unsafe replacement with ${GENESIS_GITNEXUS_VERSION}"
+        else
+            echo "    NOTE: GitNexus pin enforcement failed (wanted ${GENESIS_GITNEXUS_VERSION})"
+        fi
+    fi
+    if genesis_gitnexus_resolve_binary >/dev/null && ! genesis_gitnexus_installed_is_pinned; then
+        echo "    NOTE: stale GitNexus $(genesis_gitnexus_installed_version 2>/dev/null || echo unknown) remains on disk but will not be registered or indexed"
     fi
 fi
 
@@ -688,7 +758,7 @@ if [ ! -d "$VENV_PATH" ] || [ ! -x "$VENV_PATH/bin/python" ] || [ ! -x "$VENV_PA
     if ! "$VENV_PATH/bin/python" -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" 2>/dev/null; then
         echo "    WARNING: venv Python is $_venv_pyver but Genesis requires 3.12+"
         echo "    Install Python 3.12 and re-run this script."
-        SETUP_WARNINGS=1
+        setup_warn "venv Python is $_venv_pyver but Genesis requires 3.12+"
     fi
 fi
 
@@ -775,11 +845,23 @@ echo "    + CC temp: ${CC_TMP_DIR} (budget: 500MB, sacred: 150MB)"
 
 # Auto-cd to genesis on login so Claude Code finds the project (slash
 # commands, hooks, .claude/settings.json all depend on cwd = project root)
-if ! grep -q 'cd ~/genesis' "$HOME/.bashrc" 2>/dev/null; then
+# Guard on the comment, not on the path: the written line now carries the ACTUAL
+# repo directory, so a path-based guard would append a duplicate on every re-run
+# of an install that lives anywhere but ~/genesis. The comment is also what
+# existing installs already have, so this stays idempotent for them.
+if ! grep -q '# Auto-cd to Genesis project on login' "$HOME/.bashrc" 2>/dev/null; then
     echo '' >> "$HOME/.bashrc"
     echo '# Auto-cd to Genesis project on login' >> "$HOME/.bashrc"
-    echo '[ -d ~/genesis ] && cd ~/genesis' >> "$HOME/.bashrc"
-    echo "    + Auto-cd to ~/genesis on login"
+    # $REPO_DIR, not a hardcoded ~/genesis: the installer already knows where it
+    # was cloned, and a clone anywhere else got a login hook pointing at a
+    # directory that does not exist.
+    #
+    # printf %q, not fixed single quotes: a path containing an apostrophe would
+    # END the quoted string early, and the line would silently target a DIFFERENT
+    # directory (or fail to parse) with nothing to indicate it. %q produces a
+    # form the shell re-reads as exactly this path, whatever is in it.
+    echo "[ -d $(printf '%q' "$REPO_DIR") ] && cd $(printf '%q' "$REPO_DIR")" >> "$HOME/.bashrc"
+    echo "    + Auto-cd to $REPO_DIR on login"
 fi
 
 # Enable Genesis CC hooks on first launch. Without this flag,
@@ -835,7 +917,7 @@ if [ -d "$VENV_PATH" ]; then
         *)
             echo "    FAIL  pip install completed but Genesis is not importable."
             echo "    Re-run with verbose output: $VENV_PATH/bin/pip install -e $REPO_DIR --verbose"
-            SETUP_WARNINGS=1
+            setup_warn "Genesis is not importable after the editable install step"
             ;;
     esac
 else
@@ -858,7 +940,7 @@ if [ -f "$_cc_env" ]; then
     unset CC_SUPPRESSION_STATE
     if ! cc_ensure_local; then
         echo "    (will finalize at step 12; manual: npm install -g @anthropic-ai/claude-code@${CC_VERSION})"
-        SETUP_WARNINGS=1
+        setup_warn "Claude Code could not be installed/aligned before service generation"
     fi
     # cc_ensure_local's return code carries only the VERSION outcome; suppression
     # travels on CC_SUPPRESSION_STATE and used to be dropped here entirely. A
@@ -888,17 +970,23 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
     # can't spawn CC regardless; a later bootstrap.sh re-renders the units with
     # the correct path once CC is present.
     _cc_path="$(command -v claude 2>/dev/null || true)"
+    # The npm prefix is needed in BOTH branches: it is the bin dir that actually
+    # receives `npm install -g` (gitnexus, and claude itself when cc_ensure_local
+    # installs it). When _install_node fell back to nvm, that prefix is the nvm
+    # bin — while a pinned claude already on PATH (e.g. /usr/local/bin) answers
+    # `command -v` first, and rendering only claude's dir leaves GitNexus
+    # invisible to the units forever. (guarded so a missing npm can't abort
+    # under set -e)
+    _cc_prefix="$(npm config get prefix 2>/dev/null || true)"
+    [ -n "$_cc_prefix" ] || _cc_prefix="/usr/local"
+    [ "$_cc_prefix" = "/usr" ] && _cc_prefix="/usr/local"
     if [ -n "$_cc_path" ]; then
         CC_BIN_DIR="$(dirname "$_cc_path")"
     else
-        # Installed above but not on this (non-interactive) shell's PATH — a user
-        # npm prefix whose PATH export only fires in interactive shells. Resolve
-        # where npm placed it, matching cc_ensure_local's own target (guarded so
-        # a missing npm can't abort under set -e).
-        _cc_prefix="$(npm config get prefix 2>/dev/null || true)"
-        [ -n "$_cc_prefix" ] || _cc_prefix="/usr/local"
-        [ "$_cc_prefix" = "/usr" ] && _cc_prefix="/usr/local"
         CC_BIN_DIR="$_cc_prefix/bin"
+    fi
+    if [ "$_cc_prefix/bin" != "$CC_BIN_DIR" ]; then
+        CC_BIN_DIR="$CC_BIN_DIR:$_cc_prefix/bin"
     fi
 
     for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
@@ -909,10 +997,42 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
         if [ -f "$target" ]; then
             echo "    . $svc_name already exists (not overwriting)"
         else
-            sed -e "s|__HOME__|$HOME|g" \
-                -e "s|__VENV__|$VENV_PATH|g" \
-                -e "s|__REPO_DIR__|$REPO_DIR|g" \
-                -e "s|__CC_BIN_DIR__|$CC_BIN_DIR|g" \
+            # __AZ_ROOT__ (agent-zero.service.template's WorkingDirectory) was
+            # absent from this list, so that unit shipped with a literal
+            # placeholder where an absolute path belongs — systemd rejects it, and
+            # nothing noticed because install.sh never enables agent-zero. Default
+            # matches scripts/vendor_assets.sh's own AZ_ROOT default.
+            #
+            # EVERY value is escaped for use as a sed REPLACEMENT, not just the
+            # operator-configurable one. An unescaped `&` means "the whole
+            # matched text" to sed, so a repo at /tmp/R&D would render
+            # `ExecStart=/tmp/R__REPO_DIR__D/scripts/...`; a `|` is the delimiter
+            # here and makes sed reject the expression outright, aborting the
+            # install under `set -e`.
+            #
+            # An earlier revision escaped only AZ_ROOT, reasoning that "the other
+            # four are installer-derived paths, not user input". That is wrong for
+            # REPO_DIR, which is simply wherever the operator chose to clone — and
+            # this same PR had already demonstrated a shell injection through that
+            # exact value in the generated `genesis` wrapper. HOME, VENV_PATH and
+            # CC_BIN_DIR all derive from paths chosen outside this script too.
+            # Escaping the lot costs four lines and removes the judgement call.
+            #
+            # Replacement is `\\&` in the sed script: `\\` is a literal backslash
+            # and `&` the matched char, so each metacharacter gets exactly ONE
+            # backslash. `\\\\&` would emit TWO, leaving `&` still meaning "the
+            # whole match" — verified by hand, since it looks correct and is not.
+            _sed_repl_esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+            _home_esc=$(_sed_repl_esc "$HOME")
+            _venv_esc=$(_sed_repl_esc "$VENV_PATH")
+            _repo_esc=$(_sed_repl_esc "$REPO_DIR")
+            _ccbin_esc=$(_sed_repl_esc "$CC_BIN_DIR")
+            _az_root_esc=$(_sed_repl_esc "${AZ_ROOT:-$HOME/agent-zero}")
+            sed -e "s|__HOME__|$_home_esc|g" \
+                -e "s|__VENV__|$_venv_esc|g" \
+                -e "s|__REPO_DIR__|$_repo_esc|g" \
+                -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \
+                -e "s|__AZ_ROOT__|$_az_root_esc|g" \
                 "$template" > "$target"
             echo "    + $svc_name generated"
             SERVICES_GENERATED=1
@@ -963,13 +1083,27 @@ if command -v claude &>/dev/null; then
     # (a re-run installer must re-point a stale registration, not skip it).
     # shellcheck source=lib/mcp_register.sh
     . "$SCRIPT_DIR/lib/mcp_register.sh"
-    command -v gitnexus &>/dev/null && \
-        _register_mcp "gitnexus" "user" "gitnexus" "mcp"
+    [ -x "$REPO_DIR/.claude/mcp/run-gitnexus" ] && \
+        _register_mcp "gitnexus" "user" "$REPO_DIR/.claude/mcp/run-gitnexus" "mcp"
     # Via the repo launcher (NOT the bare binary): wraps the server in a
     # systemd scope with MemoryMax=2G to contain upstream's unbounded memory
     # leak (DeusData/codebase-memory-mcp#581). Rationale in the launcher.
-    command -v codebase-memory-mcp &>/dev/null && \
+    if command -v codebase-memory-mcp &>/dev/null; then
+        # REGISTERED EVEN WHEN THE KILL SWITCH IS ACTIVE, deliberately. Registration
+        # does not start anything, and the launcher is fail-closed on the sentinel
+        # (.claude/mcp/run-codebase-memory exits 1 with "disabled by <file>"), so
+        # writing the registration while disabled cannot run the server.
+        #
+        # Skipping preserved the exact drift this helper exists to repair: a
+        # PRE-EXISTING registration pointing at the bare `codebase-memory-mcp`
+        # binary survives untouched, bypasses the launcher entirely, and starts the
+        # uncapped raw server in the next session — and stays uncapped after the
+        # sentinel is removed until somebody runs this again.
         _register_mcp "codebase-memory-mcp" "user" "$REPO_DIR/.claude/mcp/run-codebase-memory"
+        if [ -n "${_cbm_disable:-}" ] && [ -e "$_cbm_disable" ]; then
+            echo "    . codebase-memory-mcp registered to the launcher; kill switch active, so it will refuse to start"
+        fi
+    fi
     command -v serena &>/dev/null && \
         _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$REPO_DIR"
 fi
@@ -987,7 +1121,7 @@ if [ -f "$REPO_DIR/scripts/lib/index_marker.py" ]; then
         echo "    + code intelligence: initial index queued (idle-gated runner)"
     else
         echo "    WARNING: could not queue initial code intelligence index (see $CI_LOG)"
-        SETUP_WARNINGS=1
+        setup_warn "initial code intelligence index could not be queued (see $CI_LOG)"
     fi
 fi
 
@@ -1005,15 +1139,16 @@ if curl -sf "$QDRANT_URL/collections" >/dev/null 2>&1; then
     if [ "$qdrant_ver" = "unknown" ]; then
         echo "    WARNING: Port 6333 responds but doesn't look like Qdrant"
         echo "    Another service may be using this port."
-        SETUP_WARNINGS=1
+        setup_warn "port 6333 responds but does not look like Qdrant (another service?)"
     else
         echo "    . Qdrant reachable at $QDRANT_URL (v${qdrant_ver})"
     fi
 elif command -v qdrant &>/dev/null; then
     echo "    . Qdrant binary found but not running"
-    SETUP_WARNINGS=1
+    setup_warn "Qdrant binary is present but not running"
 else
     echo "    Qdrant not found — attempting install (v${QDRANT_VERSION})..."
+    _qdrant_installed=0
     _qdrant_arch="x86_64"
     [ "$(uname -m)" = "aarch64" ] && _qdrant_arch="aarch64"
     _qdrant_url="https://github.com/qdrant/qdrant/releases/download/v${QDRANT_VERSION}/qdrant-${_qdrant_arch}-unknown-linux-musl.tar.gz"
@@ -1028,6 +1163,7 @@ else
                 export PATH="$HOME/.local/bin:$PATH"
                 echo "    + Qdrant ${QDRANT_VERSION} installed to ~/.local/bin/"
             fi
+            _qdrant_installed=1
             rm -f /tmp/qdrant.tar.gz
             # Create data dir and config
             mkdir -p "$HOME/.qdrant/storage"
@@ -1052,8 +1188,18 @@ QDCONF
     else
         echo "    WARNING: Could not download Qdrant from $_qdrant_url"
     fi
-    echo "    Genesis REQUIRES Qdrant for vector storage."
-    SETUP_WARNINGS=1
+    # Only a FAILED install warns. This used to warn unconditionally at the end
+    # of the branch, so a perfectly successful install printed "+ Qdrant
+    # installed" and then "Genesis REQUIRES Qdrant" — advice contradicting the
+    # line above it — and left SETUP_WARNINGS set. Invisible on every developer
+    # box, because a box that already has Qdrant takes the first branch and never
+    # reaches here; only a genuinely fresh machine does, which is why 12 weeks of
+    # installer changes went by without anyone seeing it. Found by the first run
+    # of the fresh-install CI check this PR adds.
+    if [ "$_qdrant_installed" != "1" ]; then
+        echo "    Genesis REQUIRES Qdrant for vector storage."
+        setup_warn "Qdrant install failed — Genesis requires it for vector storage"
+    fi
 fi
 
 # Ollama (optional)
@@ -1272,27 +1418,41 @@ if [ -f "$SYSTEMD_USER_DIR/genesis-tmp-watchgod.service" ]; then
     # D-Bus, a masked unit) while the service is already running from an earlier
     # install, so liveness alone would report success on a box where temp
     # protection will not survive a reboot.
+    # The STATE, not the exit code. `is-enabled` exits 0 for several states that
+    # do not mean what this check needs — `static`, `alias`, `indirect`,
+    # `generated`, `transient`, and above all `enabled-runtime`, which lives
+    # under /run and DISAPPEARS at reboot. A unit runtime-enabled by something
+    # earlier, plus a persistent `enable --now` that failed (a read-only user
+    # config directory, say), would otherwise be reported as durably enabled
+    # when its activation symlink is gone after the next boot. Only the literal
+    # `enabled` means the thing the operator is being told.
     _wg_enabled=0; _wg_active=0
-    systemctl --user is-enabled --quiet genesis-tmp-watchgod.service 2>/dev/null && _wg_enabled=1
+    _wg_state=$(systemctl --user is-enabled genesis-tmp-watchgod.service 2>/dev/null) || true
+    [ "$_wg_state" = "enabled" ] && _wg_enabled=1
     systemctl --user is-active --quiet genesis-tmp-watchgod.service 2>/dev/null && _wg_active=1
     if [ "$_wg_enabled" = "1" ] && [ "$_wg_active" = "1" ]; then
         echo "    + genesis-tmp-watchgod.service enabled + started"
     else
+        # setup_warn rather than a bare flag, and a DIFFERENT reason per branch:
+        # the strict-mode exit prints these back, and "temp protection is off"
+        # and "it will not survive a reboot" need different operator actions.
         if [ "$_wg_active" = "1" ]; then
-            echo "    WARNING: genesis-tmp-watchgod.service is running but NOT enabled —"
-            echo "             temp protection will not come back after a reboot"
+            echo "    WARNING: genesis-tmp-watchgod.service is running but not durably"
+            echo "             enabled (state: ${_wg_state:-unknown}) — temp protection"
+            echo "             will not come back after a reboot"
+            setup_warn "genesis-tmp-watchgod.service is running but not durably enabled (state: ${_wg_state:-unknown}) — temp protection will not survive a reboot"
         else
             echo "    WARNING: genesis-tmp-watchgod.service is NOT running — temp protection is OFF"
+            setup_warn "genesis-tmp-watchgod.service is not running — temp protection is OFF"
         fi
         # The reason, or the warning is undiagnosable — `enable --now` above
         # discards stderr, so this is the only place the cause surfaces.
         systemctl --user status genesis-tmp-watchgod.service --no-pager -n 5 2>&1 \
             | sed 's/^/      /' || true
-        SETUP_WARNINGS=1
     fi
 else
     echo "    WARNING: genesis-tmp-watchgod.service was not rendered — temp protection is OFF"
-    SETUP_WARNINGS=1
+    setup_warn "genesis-tmp-watchgod.service was not rendered — temp protection is OFF"
 fi
 
 # Enable AND start genesis-server (standalone)
@@ -1300,9 +1460,17 @@ if [ -f "$SYSTEMD_USER_DIR/genesis-server.service" ]; then
     systemctl --user enable genesis-server 2>/dev/null && \
         echo "    + genesis-server.service enabled" || true
     if ! systemctl --user is-active --quiet genesis-server 2>/dev/null; then
-        systemctl --user start genesis-server 2>/dev/null && \
-            echo "    + genesis-server started" || \
+        if systemctl --user start genesis-server 2>/dev/null; then
+            echo "    + genesis-server started"
+        else
+            # A dead primary service is the definition of a broken install, and
+            # this used to print and move on without touching either strict-mode
+            # counter — so a fresh-install check could pass with the server
+            # stopped, which is a false green of exactly the kind the check
+            # exists to prevent.
             echo "    WARNING: could not start genesis-server"
+            setup_warn "genesis-server did not start (journalctl --user -u genesis-server)"
+        fi
     fi
 fi
 
@@ -1382,17 +1550,39 @@ echo "  [12/$TOTAL_STEPS] Setting up Claude Code (v${CC_VERSION})..."
 unset CC_SUPPRESSION_STATE
 if ! cc_ensure_local; then
     echo "    Install manually: npm install -g @anthropic-ai/claude-code@${CC_VERSION}"
-    SETUP_WARNINGS=1
+    setup_warn "Claude Code could not be installed/aligned to the pin"
 fi
 cc_shadow_scan || true
 
 # Genesis wrapper — lets users type 'genesis' from anywhere inside the container
 # to launch Claude Code in the right directory with all hooks/MCP active.
 if [ ! -f /usr/local/bin/genesis ]; then
-    sudo tee /usr/local/bin/genesis >/dev/null <<'WRAPPER'
+    # Unquoted heredoc so $REPO_DIR is baked in at install time — the previous
+    # quoted form hardcoded ~/genesis, so on any clone elsewhere the `genesis`
+    # command was installed dead and every assertion about it still passed.
+    # "$@" is escaped so it survives to the generated script.
+    # printf %q, not fixed single quotes: an apostrophe in the path would end the
+    # quoted string early, so the GENERATED script would not even parse
+    # (`bash -n` fails on it) — and the failure would only show up the first time
+    # someone typed `genesis`. %q emits a form the shell re-reads as exactly this
+    # path.
+    #
+    # The path is interpolated EXACTLY ONCE, into a variable, and everything
+    # downstream reads that variable. An earlier form kept the raw `$REPO_DIR` in
+    # the diagnostic on the grounds that a message is "prose, not code" — it is
+    # not: the message lives inside a double-quoted string in a GENERATED shell
+    # script, so `%q` was protecting only the `cd` operand while the echo was
+    # still a substitution site. MEASURED with REPO_DIR='/home/u/x"; echo PWNED;
+    # echo "', the old form emitted
+    #     ... || { echo "Genesis repo not found at /home/u/x"; echo PWNED; echo ""; exit 1; }
+    # i.e. an injected command that runs the first time someone types `genesis`
+    # and the cd fails. This form emits the path as data and prints it verbatim.
+    _repo_q="$(printf '%q' "$REPO_DIR")"
+    sudo tee /usr/local/bin/genesis >/dev/null <<WRAPPER
 #!/bin/bash
-cd ~/genesis 2>/dev/null || { echo "Genesis repo not found at ~/genesis"; exit 1; }
-exec claude "$@"
+repo=$_repo_q
+cd "\$repo" 2>/dev/null || { echo "Genesis repo not found at \$repo"; exit 1; }
+exec claude "\$@"
 WRAPPER
     sudo chmod +x /usr/local/bin/genesis
     echo "    + genesis command installed (/usr/local/bin/genesis)"
@@ -1442,7 +1632,7 @@ else
     echo "    WARNING: Could not write CC settings in $_settings_file"
     echo "    Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\","
     echo "                            \"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\"}}"
-    SETUP_WARNINGS=1
+    setup_warn "could not write Claude Code settings in $_settings_file"
 fi
 
 # Login guidance (interactive only)
@@ -1733,7 +1923,11 @@ echo "  ────────────────────────
 if [ "$SMOKE_FAIL" -gt 0 ]; then
     echo "  Setup complete (with failures — see above)."
 elif [ "${SETUP_WARNINGS:-0}" = "1" ]; then
-    echo "  Setup complete (with warnings — see above)."
+    echo "  Setup complete (with warnings):"
+    # "see above" was the whole problem: the warning can be several hundred lines
+    # up a scrolling install, and two of the setters print no "WARNING:" text to
+    # scroll back and find. Restate them here, where the reader already is.
+    echo "$SETUP_WARNING_LOG"
 else
     echo "  Setup complete!"
 fi
@@ -1778,3 +1972,23 @@ if ! echo "$_os_name" | grep -qi 'ubuntu 24'; then
     echo "  Report issues: https://github.com/WingedGuardian/GENesis-AGI/issues"
 fi
 echo ""
+
+# Strict mode for CI (the install-test workflow): any smoke-test failure OR
+# setup warning must fail the run — SETUP_WARNINGS is where real breakage in
+# the Claude Code / venv / port-conflict paths lands (they only WARN for
+# humans, and a fresh-install test that greens through a broken CC install is
+# a false green). Kept off for humans — a partial install with a readable
+# summary beats a nonzero exit mid-setup.
+if [ "${GENESIS_INSTALL_STRICT:-0}" = "1" ] \
+   && { [ "${SMOKE_FAIL:-0}" -gt 0 ] || [ "${SETUP_WARNINGS:-0}" = "1" ]; }; then
+    echo "  STRICT: smoke failures=${SMOKE_FAIL:-0}, SETUP_WARNINGS=${SETUP_WARNINGS:-0} — exiting nonzero." >&2
+    if [ -n "$SETUP_WARNING_LOG" ]; then
+        # Name the causes. Without this the CI failure is a bare flag, and
+        # finding out which of eight setters fired means grepping the script and
+        # cross-reading the full job log — which is exactly what the first run of
+        # this workflow cost.
+        echo "  Setup warnings behind this exit:" >&2
+        echo "$SETUP_WARNING_LOG" >&2
+    fi
+    exit 1
+fi

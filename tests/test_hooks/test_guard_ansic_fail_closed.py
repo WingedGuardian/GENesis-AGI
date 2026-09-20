@@ -758,7 +758,11 @@ class TestCommitGuardProbeFailure:
         hooks = scripts / "hooks"
         hooks.mkdir(parents=True)
         (scripts / _COMMIT_GUARD.name).write_text(_COMMIT_GUARD.read_text())
-        (hooks / "hook_input.py").write_text((_HOOKS_DIR / "hook_input.py").read_text())
+        for dep in ("hook_input.py", "native_approval.py"):
+            (hooks / dep).write_text((_HOOKS_DIR / dep).read_text())
+        (scripts / "review_deadline.py").write_text(
+            (_WORKTREE / "scripts" / "review_deadline.py").read_text()
+        )
         (hooks / "shell_parse.py").write_text(
             "import importlib.util, sys\n"
             "_s = importlib.util.spec_from_file_location(\n"

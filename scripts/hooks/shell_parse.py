@@ -79,6 +79,13 @@ _WRAPPER_SPEC = {
         0,
     ),
     "doas": ({"-u", "-C"}, 0),
+    # `-S`/`--split-string` is deliberately ABSENT, and its absence is tracked
+    # rather than accidental. It carries a whole command line as ONE token, so
+    # listing it here would stop that token being read as the executable while
+    # HIDING what it carries — strictly worse than today's visible mis-read. It
+    # needs the nested walk, and `-S` has its own escape language, appends the
+    # arguments that follow it, and re-reads the split fields as env's own
+    # options. That is a grammar to model against the binary, not a table entry.
     "env": ({"-u", "--unset", "-C", "--chdir"}, 0),
     "nice": ({"-n", "--adjustment"}, 0),
     "ionice": ({"-c", "--class", "-n", "--classdata", "-p", "--pid"}, 0),
@@ -90,10 +97,19 @@ _WRAPPER_SPEC = {
     "time": ({"-o", "--output", "-f", "--format"}, 0),
     "command": (set(), 0),
     "exec": ({"-a"}, 0),
+    # `-e/--eof` and `-i/--replace` are NOT here, and their absence is the point.
+    # xargs gives them OPTIONAL values (`--eof[=END]`, `--replace[=R]`), so as a
+    # bare token they consume nothing — and listing them made this walk eat the
+    # command word instead. MEASURED: `xargs -i <cmd>` and `xargs -e <cmd>` both
+    # RUN <cmd>, while the parser resolved past it and the push guard exited 0 on
+    # a command it blocks when written plainly. This is the same failure
+    # `--isolated` taught the uv table: a wrongly-listed flag is the dangerous
+    # direction of a list like this, because it mis-parses a form that works
+    # rather than one that does not. `-E` and `-I` keep REQUIRED separate values
+    # (`-E END`, `-I R`) and stay.
     "xargs": (
         {
             "-I",
-            "-i",
             "-n",
             "--max-args",
             "-P",
@@ -107,9 +123,7 @@ _WRAPPER_SPEC = {
             "--delimiter",
             "-a",
             "--arg-file",
-            "-e",
-            "--eof",
-            "--replace",
+            "--process-slot-var",
         },
         0,
     ),
@@ -753,13 +767,9 @@ _KNOWN_SIGILS = (
     # missing declaration nor an unwarranted one can ship unnoticed.
     "merge-to-main-override",  # git_push_guard: local `git merge` onto main/master
     "full-suite-ok",  # full_suite_guard: run the whole pytest suite locally
-    # THIRD occurrence of the class the comment above describes, caught by that
-    # test rather than in review: the round-7 terminal shipped its sigil query
-    # without this line, and the terminal's own block message printed the losing
-    # token order. At streak>=3 AND lifetime>=7 — a reachable state, since the
-    # terminal does not reset the streak — `# final-round-accept escalation-ack`
-    # was refused while `# escalation-ack final-round-accept` passed.
-    "final-round-accept",  # review_enforcement_commit: the round-7 lifetime terminal
+    # Kept so stale worktrees parsing the former terminal sigil do not become
+    # order-dependent during an update. Current gates never authorize on it.
+    "final-round-accept",  # legacy review-terminal compatibility
 )
 
 
@@ -1015,6 +1025,15 @@ def untokenizable(command: str) -> bool:
     except ValueError:
         return True
 
+
+# Reserved words the segmenter does not model. CLOSED SET, and that is the whole
+# reason this list is safe where a list of command CARRIERS would not be: the
+# shell grammar fixes its reserved words, while the set of programs that take a
+# command as an argument grows forever. Enumerating the first converges;
+# enumerating the second is a race. Only words MEASURED to leave `analyze()`
+# without the inner command are here — `if`/`while`/`for`/`select` and the
+# grouping operators all resolve correctly and are deliberately absent, because
+# every entry costs a fallback to coarse matching.
 
 # WHY THIS MODULE HAS COST BOUNDS AT ALL
 #
@@ -1761,6 +1780,139 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
             result[0] = head + sep + name.split("@", 1)[0]
     return result
 
+_FUNCTION_DEF = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\(\)$")
+
+# Invocation-option letters that may share a short bundle with ``-c``.  These
+# are deliberately per interpreter: treating an unsupported letter as a script
+# carrier makes the parser recurse into an argument the shell rejects or treats
+# as a filename. The bash set comes from ``bash --help``; the dash/sh set was
+# verified against the installed dash implementation, which also provides
+# ``sh`` on the supported Linux hosts.
+_C_BUNDLE_OPTIONS = {
+    "bash": frozenset("abcefhiklmnprstuvxBCEHPTD"),
+    "sh": frozenset("abcefhilmnprstuvxCEIV"),
+    "dash": frozenset("abcefhilmnprstuvxCEIV"),
+    "ash": frozenset("abcefhilmnprstuvx"),
+    "ksh": frozenset("abcefhilmnprstuvx"),
+    "zsh": frozenset("Gabcefhilmnprstuvx"),
+}
+
+
+def _coproc_body(argv: list[str]) -> list[str]:
+    """The command run by ``coproc``, dropping its optional compound name."""
+    body = argv[1:]
+
+    # ``coproc NAME COMPOUND-COMMAND`` gives NAME to the coprocess. For
+    # ``coproc NAME command`` NAME is the command itself, so only strip it when
+    # the following token can open Bash's compound-command grammar.
+    if (
+        len(body) > 1
+        and (
+            body[1] in {
+                "{",
+                "(",
+                "if",
+                "while",
+                "until",
+                "for",
+                "case",
+                "select",
+                "function",
+            }
+            or body[1].startswith("(")
+        )
+        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", body[0])
+    ):
+        body = body[1:]
+
+    return body
+
+
+def _embedded_commands(
+    argv: list[str],
+    raw_argv: list[str] | None = None,
+) -> list[str]:
+    """Return command bodies embedded in shell constructs."""
+    if not argv:
+        return []
+
+    if raw_argv is None:
+        raw_argv = argv
+
+    if argv[0] == "case":
+        try:
+            start = raw_argv.index("in") + 1
+        except ValueError:
+            return []
+
+        for i, token in enumerate(raw_argv[start:], start):
+            if token.endswith(")") and i + 1 < len(raw_argv):
+                return [shlex.join(raw_argv[i + 1 :])]
+
+        return []
+
+    # A parenthesized case pattern such as `(b) git push ...` is stripped
+    # by `_strip_wrappers()` before reaching `argv`. Use the raw token so
+    # the pattern itself is not mistaken for the executable.
+    if (
+        len(raw_argv) > 1
+        and raw_argv[0].startswith("(")
+        and raw_argv[0].endswith(")")
+    ):
+        return [shlex.join(raw_argv[1:])]
+
+    if argv[0].endswith(")") and len(argv) > 1:
+        return [shlex.join(argv[1:])]
+
+    if argv[0] == "function" and len(argv) > 2:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", argv[1]):
+            return []
+
+        body_index = 2
+
+        # `function NAME () { ... }` is also valid Bash syntax.
+        if argv[2] == "()":
+            body_index = 3
+            if len(argv) <= body_index:
+                return []
+
+        if argv[body_index] in {
+            "{",
+            "(",
+            "if",
+            "while",
+            "until",
+            "for",
+            "case",
+            "select",
+        }:
+            if argv[body_index] == "{":
+                return [shlex.join(argv[body_index + 1 :])]
+            return [shlex.join(argv[body_index:])]
+
+        return []
+
+    if (
+        (
+            _FUNCTION_DEF.match(argv[0])
+            and len(argv) > 2
+            and argv[1] == "{"
+        )
+        or (
+            len(argv) > 3
+            and argv[0].isidentifier()
+            and argv[1] == "()"
+            and argv[2] == "{"
+        )
+    ):
+        start = 2 if argv[1] == "{" else 3
+        return [shlex.join(argv[start:])]
+
+    if argv[0] == "coproc" and len(argv) > 1:
+        return [shlex.join(_coproc_body(argv))]
+
+    return []
+
 
 #: Characters that make a shell WORD mean something other than what it spells.
 #: shlex implements quote removal and backslash escapes faithfully and implements
@@ -2420,11 +2572,11 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
         )
         nested = []
         if exe in _NESTED:
-            script = _nested_script(argv)
+            script = _nested_script(argv, exe)
             if script:
                 nested.append(script)
-        # $(...) / `...` bodies also execute — parsed from RAW, which STILL carries any
-        # expansion redirect target, so a nested command stays visible to the guards.
+
+        nested.extend(_embedded_commands(_argv(seg.argv_src)))
         nested.extend(_substitutions(raw))
         if not nested:
             continue
@@ -2537,34 +2689,49 @@ def _substitutions(text: str) -> list[str]:
     return subs
 
 
-def _nested_script(argv: list[str]) -> str:
+def _nested_script(argv: list[str], interpreter: str) -> str:
     """The script string passed to an interpreter's ``-c``, else ''.
 
-    For every interpreter in ``_NESTED`` the script is the NEXT argv token, and
-    where ``c`` sits inside a short bundle does not change that: ``-c 'script'``,
-    ``-lc 'script'`` and ``-ce 'script'`` all take it from the following token.
-
-    An earlier version read a bundle whose ``c`` was not last as an INLINE value
-    (``-ce`` → the script ``"e"``), which lost the real script entirely: the
-    parser then reported a segment whose executable was ``e``, and a guard keyed
-    on the nested command fell OPEN. Found by cross-model review, 2026-09-03.
-
-    MEASURED 2026-09-06 against the real interpreters, both directions:
-    ``bash -ce '<cmd>'`` and ``bash -cx '<cmd>'`` RUN ``<cmd>`` from the next
-    token, while the glued spelling that branch modelled is refused outright —
-    ``bash -c'<cmd>'`` prints "invalid option", ``sh``/``dash`` "Illegal option".
-    So the branch modelled a form none of these shells accepts and dropped one
-    they all do, and deleting it is strictly a widening.
+    Stops at ``--`` and a lone ``-``, which end option processing. A combined
+    option is accepted only when every letter is valid for this interpreter;
+    ``bash -cz`` is rejected by Bash and does not run a script.
     """
+    allowed = _C_BUNDLE_OPTIONS[interpreter]
+
     for i, tok in enumerate(argv[1:], 1):
-        if not tok.startswith("-") or tok.startswith("--"):
+        if tok in {"-", "--"}:
+            break
+        if not tok.startswith("-"):
             continue
-        if "c" not in tok[1:]:
+
+        options = tok[1:]
+        if "c" not in options:
             continue
+
+        pos = tok.find("c")
+
+        # `-co` / `-Oc`: `o` / `O` consumes the next token as its value,
+        # so the script is the token after that value.
+        value_taking = (
+            (pos + 1 < len(tok) and tok[pos + 1] in {"o", "O"})
+            or (pos > 0 and tok[pos - 1] in {"o", "O"})
+        )
+
+        if value_taking:
+            option_letters = set(options) - {"o", "O"}
+            if not option_letters <= allowed:
+                continue
+            if i + 2 < len(argv):
+                return argv[i + 2]
+            continue
+
+        if not set(options) <= allowed:
+            continue
+
         if i + 1 < len(argv):
             return argv[i + 1]
-    return ""
 
+    return ""
 
 # ── git-specific helpers ────────────────────────────────────────────────
 
