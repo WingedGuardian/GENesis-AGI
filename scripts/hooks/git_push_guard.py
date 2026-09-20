@@ -2506,61 +2506,66 @@ _CONCENTRATION_SHARE = 0.5
 _CONCENTRATION_MIN_FINDINGS = 4
 
 
-#: Raw-path budget before the tail is kept and the cut declared. Matches
-#: `_INLINE_TITLE_MAX_CHARS`'s role for titles; the value is measured against
-#: the report's own size bound by `test_output_survives_pathological_paths`.
+#: Content budget for one rendered path, and how much of it the tail keeps.
+#: Smaller than the gate-text budget because six of these share one report; the
+#: head still gets 40 characters, which is what keeps two same-basename paths
+#: apart. No second ENCODED budget: nothing expands any more (see below).
 _REPORT_PATH_MAX_CHARS = 80
-#: Backstop on the ENCODED form, for the control-dense case that expands past
-#: the raw budget even after clipping: an ESC byte becomes six characters.
-_REPORT_PATH_ENCODED_MAX_CHARS = 100
+_REPORT_PATH_TAIL_CHARS = 40
 
 
 def _safe_report_path(path: str) -> str:
-    """A path rendered safe for a terminal report: escaped, and BOUNDED.
+    """A path rendered safe for a terminal report: defanged, flattened, BOUNDED.
 
-    Finding paths are contributor-controlled strings: a reviewed file can be
-    named with ANSI escapes or carriage returns, and interpolating the raw value
-    would let it forge or conceal the surrounding gate output. JSON quoting
-    makes every control character visible and inert.
+    Composes the primitives this file already uses for every other untrusted
+    value it prints. It does NOT bring its own answer, and the history of it
+    doing so is the reason this docstring is long.
 
-    Escaping does not SHORTEN, which is the second half and was missing: a path
-    has no practical length limit and a control-dense one EXPANDS six-fold, so
-    six such rows blow the report's own size budget — the one
-    `test_output_is_bounded_regardless_of_file_count` already pins at 1500
-    chars. That test passes today only because its paths are short.
+    THE THREE EARLIER VERSIONS ALL ESCAPED WITH ``json.dumps``, and each drew a
+    finding in consecutive review rounds (PR #2005 rounds 1, 2, 3, 4). The cause
+    was not any one of the bugs: it was that ``json.dumps`` is a NON-LINEAR
+    length transform, expanding a non-ASCII or control character six-fold. That
+    forced a second budget on the encoded form, and a two-stage budget loses
+    information in a different way each time you look at it — a front-slice that
+    discarded the basename, then a clip that discarded IDENTITY, so two paths
+    differing only in their leading directory rendered as the same string.
 
-    The TAIL is what survives, unlike `_inline_title`, which keeps the opening
-    words: a path's basename is its informative end. The full value is one row
-    up in the findings list itself, so this is a selection, not an amputation —
-    but only while the cut is VISIBLE, which is why the ellipsis sits OUTSIDE
-    the quoting. An earlier version put it inside the string and `json.dumps`
-    escaped it to a literal backslash-u-2026, so the marker declaring the cut
-    was itself unreadable; the test for the marker is what caught that.
+    MEASURED, the three axes that decided this (``premise_probe_2005``):
 
-    Clipped BEFORE encoding, never after, and the RAW budget is what shrinks
-    when the encoded form overflows. Slicing the encoded string is what an
-    earlier version did, and it defeated the whole point: `json.dumps` expands
-    a non-ASCII or control character six-fold, so a path of multibyte
-    characters overflows the encoded budget, and a front-slice then discards
-    the TAIL — the basename this function exists to keep. MEASURED on
-    `"目录" * 40 + "/needle.py"`: rendered 101 chars with `needle.py` absent,
-    so the row named no file at all (Codex P2, PR #2005, round 2). Shrinking
-    the raw keep-length instead preserves the basename by construction,
-    because the tail is the part that is kept at every length.
+    ==================  ==========================  ====================
+    axis                ``json.dumps`` renderer     these primitives
+    ==================  ==========================  ====================
+    terminal threats    neutralised                 neutralised, 0/7 residue
+    characters kept     88% / 26% / 44%             100%
+    two paths, one tail identical  (the bug)        distinguishable
+    ==================  ==========================  ====================
 
-    The loop is bounded by the raw length and shrinks by a whole character each
-    pass, so it terminates; at zero characters kept the encoded form is `""`,
-    which fits any budget above two.
+    (kept: ASCII / CJK / control-dense. A non-ASCII path lost three quarters of
+    itself to escaping before any budget applied.)
+
+    ``_defang_gate_text`` classifies by unicodedata CATEGORY rather than
+    enumerating codepoints, which is why it holds U+061C and the rest of the
+    bidi family — a lesson that file paid for once already (Codex P2, PR #1638).
+    It is 1:1 on length, so no second budget exists to disagree with the first.
+
+    THE ONE THING IT DOES NOT DO is remove ``\\n``: it splits on newlines to
+    preserve multi-line gate messages. A path is one row, and a newline inside
+    one would forge another, so it is flattened here rather than in the shared
+    primitive, where it would corrupt every other caller.
+
+    Bounding is ``_bound_with_stated_omission`` at the path budget — head AND
+    tail, with the omission counted. Keeping the head is exactly what fixes the
+    identity defect; keeping the tail is what preserves the basename, which is a
+    path's informative end. An earlier docstring claimed the full value was "one
+    row up in the findings list": it is not. Those rows print ``_inline_title``
+    output, which is a title and carries no path, so this rendering is the only
+    one there is and losing information here loses it outright.
     """
-    clipped = len(path) > _REPORT_PATH_MAX_CHARS
-    keep = min(len(path), _REPORT_PATH_MAX_CHARS)
-    while True:
-        encoded = json.dumps(path[-keep:] if keep else "")
-        if len(encoded) <= _REPORT_PATH_ENCODED_MAX_CHARS or keep == 0:
-            break
-        keep -= 1
-        clipped = True
-    return f"…{encoded}" if clipped else encoded
+    return _bound_with_stated_omission(
+        _defang_gate_text(path).replace("\n", " "),
+        _REPORT_PATH_MAX_CHARS,
+        _REPORT_PATH_TAIL_CHARS,
+    )
 
 
 def _findings_distribution(
@@ -3056,7 +3061,14 @@ def _check_inline_review_findings(
             ):
                 outside_seen[key] = severity
     for (path, line_range, title), severity in outside_seen.items():
-        label = f"{title or '(untitled)'} ({path}:{line_range})"
+        # `title` is sanitised at its producer and `line_range` is safe by
+        # construction — `_CR_ENTRY_RE` captures `\d+(?:-\d+)?`, digits and one
+        # hyphen. `path` is neither: `_CR_FILE_HEADER_RE` captures `[^<>]+?`,
+        # which excludes angle brackets and NOTHING ELSE, so a file header can
+        # carry ESC, CR or bidi straight into this label. Rendered at display
+        # time because the raw value is still needed for the diff-scope match
+        # carried alongside it in the tuples below.
+        label = f"{title or '(untitled)'} ({_safe_report_path(path)}:{line_range})"
         if not severity:
             cr_unknown.append(label)
         elif severity == "critical":
@@ -3128,7 +3140,17 @@ def _check_inline_review_findings(
             file=sys.stderr,
         )
         for title, fpath in cr_off_diff[:8]:
-            print(f"  [off-diff CodeRabbit Critical/Major] {title} ({fpath})", file=sys.stderr)
+            # `title` is already safe — `_inline_title` sanitises at the PRODUCER.
+            # A path cannot follow that rule: the raw value is what `_off_diff`
+            # matches against the changed-file list and what the rename map keys
+            # on, so defanging at the producer would corrupt the comparison. It is
+            # therefore rendered at DISPLAY time, here and at every other site
+            # that prints one. See `_safe_report_path`.
+            print(
+                f"  [off-diff CodeRabbit Critical/Major] {title} "
+                f"({_safe_report_path(fpath)})",
+                file=sys.stderr,
+            )
     if off_diff_p1 or off_diff_p2:
         print(
             f"NOTE: PR #{pr_num} — {len(off_diff_p1)} [P1] + {len(off_diff_p2)} "
@@ -3138,9 +3160,9 @@ def _check_inline_review_findings(
             file=sys.stderr,
         )
         for title, fpath in off_diff_p1[:5]:
-            print(f"  [off-diff P1] {title} ({fpath})", file=sys.stderr)
+            print(f"  [off-diff P1] {title} ({_safe_report_path(fpath)})", file=sys.stderr)
         for title, fpath in off_diff_p2[:5]:
-            print(f"  [off-diff P2] {title} ({fpath})", file=sys.stderr)
+            print(f"  [off-diff P2] {title} ({_safe_report_path(fpath)})", file=sys.stderr)
     if cr_unknown:
         print(
             f"NOTE: PR #{pr_num} — {len(cr_unknown)} CodeRabbit finding(s) whose "
@@ -4817,6 +4839,17 @@ def _pr_changed_files_uncached(pr_num: str, repo: str | None = None) -> list[str
         except Exception:
             return None
     files: list[str] = []
+    # The rename pairing is KEPT from this parse rather than re-read. It is right
+    # here in the same rows, and discarding it used to cost a second, BYTE-IDENTICAL
+    # `pulls/N/files` call — same endpoint, same --paginate, same --jq, same
+    # _gh_timeout(8) — issued by `_pr_rename_map` purely to recover a field this
+    # loop already has in hand. That second call is what CodeRabbit's Major on PR
+    # #2005 caught the sharp edge of: when changed-file resolution has already
+    # failed, the "separate" lookup is a retry of a command that just failed,
+    # inside the merge deadline. Guarding the retry treats the symptom; not
+    # fetching twice removes it. Published through `_pr_rename_map`, which reads
+    # this cache and never calls out.
+    renames: dict[str, str] = {}
     rows = 0
     for line in (raw or "").splitlines():
         line = line.strip()
@@ -4843,67 +4876,51 @@ def _pr_changed_files_uncached(pr_num: str, repo: str | None = None) -> list[str
             if not isinstance(prev, str) or not prev:
                 return None
             files.append(prev)
+            renames[prev] = fname
     if rows >= 3000:
         # The cap applies to API ROWS, not the expanded path list (renames
         # contribute two paths per row — Codex P2, round 1): at the documented
         # 3000-entry endpoint cap a hook file may be hidden beyond it.
         return None
+    # Published ONLY on the success path, and only after the cap check, so a
+    # truncated or malformed read can never leave a half-built pairing behind for
+    # a later reader to mistake for a complete one. Keyed exactly as the file memo
+    # is, and cleared by the same `_reset_pr_files_cache`.
+    _PR_RENAME_CACHE[(pr_num, repo, os.environ.get("_TEST_GH_PR_FILES"))] = renames
     return files
 
 
-#: Rename aliases for the findings-distribution report: previous_filename ->
-#: current filename for every file this PR renamed. ``_pr_changed_files`` flattens
-#: both names into one list, so the pairing has to be read separately — an extra
-#: ``pulls/N/files`` call, paid only when a distribution is actually printed.
-#: Advisory data: any failure yields an empty map (the report degrades to raw
+#: previous_filename -> current filename for every file this PR renamed, written
+#: by ``_pr_changed_files_uncached`` as a by-product of the read it already makes.
+#: Advisory data: an absent entry yields an empty map (the report degrades to raw
 #: paths) rather than None, because there is no verdict here to fail closed on.
+#: Keyed and cleared exactly as ``_PR_FILES_CACHE`` is.
 _PR_RENAME_CACHE: dict[tuple[str, str | None, str | None], dict[str, str]] = {}
 
 
 def _pr_rename_map(pr_num: str, repo: str | None = None) -> dict[str, str]:
-    """previous_filename -> filename for this PR's renames, ``{}`` on any error."""
-    cache_key = (pr_num, repo, os.environ.get("_TEST_GH_PR_FILES"))
-    if cache_key in _PR_RENAME_CACHE:
-        return _PR_RENAME_CACHE[cache_key]
-    raw = os.environ.get("_TEST_GH_PR_FILES")
-    if raw == "__error__":
+    """previous_filename -> filename for this PR's renames, ``{}`` when unknown.
+
+    MAKES NO API CALL OF ITS OWN. It asks ``_pr_changed_files`` — memoized, so
+    free once anything on this merge has asked — and then reads the pairing that
+    read kept. An earlier version issued a second, byte-identical
+    ``pulls/N/files`` request to recover ``previous_filename``, a field the first
+    request had already fetched and thrown away.
+
+    Going through ``_pr_changed_files`` rather than reading the cache directly is
+    what makes this ORDER-INDEPENDENT. Reading the dict alone would return ``{}``
+    whenever this happened to run before the file list was needed — correctness
+    resting on call order, which is the kind of coupling that holds until someone
+    moves a caller.
+
+    The failure direction falls out for free and answers CodeRabbit's Major on PR
+    #2005 at the cause rather than the symptom: when changed-file resolution
+    fails, ``_pr_changed_files`` returns None, nothing was published, and this
+    returns ``{}`` having spent nothing. There is no separate lookup left to skip.
+    """
+    if _pr_changed_files(pr_num, repo=repo) is None:
         return {}
-    if raw is None:
-        try:
-            result = subprocess.run(
-                [
-                    "gh",
-                    "api",
-                    f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/files",
-                    "--paginate",
-                    "--jq",
-                    ".[] | {filename: .filename, previous_filename: .previous_filename}",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=_gh_timeout(8),
-            )
-            if result.returncode != 0:
-                return {}
-            raw = result.stdout
-        except Exception:
-            return {}
-    renames: dict[str, str] = {}
-    for line in (raw or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except Exception:
-            return {}  # malformed row → the map cannot be vouched for
-        if not isinstance(obj, dict):
-            return {}
-        fname, prev = obj.get("filename"), obj.get("previous_filename")
-        if isinstance(fname, str) and fname and isinstance(prev, str) and prev:
-            renames[prev] = fname
-    _PR_RENAME_CACHE[cache_key] = renames
-    return renames
+    return _PR_RENAME_CACHE.get((pr_num, repo, os.environ.get("_TEST_GH_PR_FILES")), {})
 
 
 def _pr_lane(pr_num: str, repo: str | None = None) -> str:
@@ -10149,6 +10166,42 @@ def _defang_gate_text(text: str) -> str:
     )
 
 
+def _bound_with_stated_omission(
+    text: str,
+    max_chars: int = _GATE_TEXT_MAX_CHARS,
+    tail_chars: int = _GATE_TEXT_TAIL_CHARS,
+) -> str:
+    """Bound one line to *max_chars*, keeping BOTH ends and naming what was cut.
+
+    SELECT, do not amputate. A plain head-slice was silent and cut mid-word:
+    MEASURED on the real codex-at-head message, a 532-char line arrived as 200
+    characters ending "…to merge without a", losing the '# stale-review-override'
+    route it exists to hand the operator, with no marker to say anything had been
+    dropped. A gate that tells someone they are blocked and not how to proceed has
+    failed at the only job the detail line has.
+
+    Keeping the HEAD as well as the tail is what preserves IDENTITY, and that is
+    why this is the right primitive for a file path too. Two paths that differ
+    only in their leading directory — ``services/alpha/…/handler.py`` and
+    ``services/bravo/…/handler.py`` — are distinguishable here and were NOT under
+    the tail-only renderer this replaced (Codex P2, PR #2005, round 4).
+
+    Defaults are the gate-text constants, so ``_sanitize_gate_text``'s three
+    callers are byte-identical to before this was lifted out of it. The body is a
+    pure function of its arguments plus those two constants, which is what made
+    the extraction safe rather than merely plausible.
+
+    NOTE the output may exceed *max_chars* by the marker's own width. That is
+    deliberate: the budget bounds the CONTENT, and a cut that did not announce
+    itself would be the very failure above.
+    """
+    if len(text) <= max_chars:
+        return text
+    kept = max_chars - tail_chars
+    omitted = len(text) - kept - tail_chars
+    return f"{text[:kept]} … {omitted} char(s) omitted … {text[-tail_chars:]}"
+
+
 def _sanitize_gate_text(text: str) -> str:
     """Make an untrusted gate message safe to print, bounded in both dimensions.
 
@@ -10166,22 +10219,8 @@ def _sanitize_gate_text(text: str) -> str:
     removes an operator's recovery instruction without saying it did.
     """
     def _clean(line: str) -> str:
-        cleaned = "".join(" " if _gate_text_unsafe(ch) else ch for ch in line)
-        if len(cleaned) <= _GATE_TEXT_MAX_CHARS:
-            return cleaned
-        # SELECT, do not amputate — the same rule the LINE dimension below already
-        # follows, applied to characters. A plain head-slice was silent and cut
-        # mid-word: MEASURED on the real codex-at-head message, a 532-char line
-        # arrived as 200 characters ending "…to merge without a", losing the
-        # '# stale-review-override' route it exists to hand the operator, with no
-        # marker to say anything had been dropped. A gate that tells someone they
-        # are blocked and not how to proceed has failed at the only job the detail
-        # line has.
-        kept = _GATE_TEXT_MAX_CHARS - _GATE_TEXT_TAIL_CHARS
-        omitted = len(cleaned) - kept - _GATE_TEXT_TAIL_CHARS
-        return (
-            f"{cleaned[:kept]} … {omitted} char(s) omitted … "
-            f"{cleaned[-_GATE_TEXT_TAIL_CHARS:]}"
+        return _bound_with_stated_omission(
+            "".join(" " if _gate_text_unsafe(ch) else ch for ch in line)
         )
 
     lines = [_clean(ln) for ln in text.split("\n")]

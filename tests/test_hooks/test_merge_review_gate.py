@@ -2671,6 +2671,49 @@ class TestOffDiffLockItself:
             "the lock is blind there and every vacuous test now passes silently"
         )
 
+    @pytest.mark.parametrize(
+        ("comment_factory", "label"),
+        [
+            (lambda p: _cr_c(1, _CR_MAJOR_BODY, path=p),
+             "[off-diff CodeRabbit Critical/Major]"),
+            (lambda p: _codex_c(1, _P1_BODY, path=p), "[off-diff P1]"),
+            (lambda p: _codex_c(1, _P2_BODY, path=p), "[off-diff P2]"),
+        ],
+        ids=["coderabbit_major", "codex_p1", "codex_p2"],
+    )
+    def test_an_off_diff_path_cannot_write_to_the_terminal(
+        self, guard_module, capsys, comment_factory, label
+    ):
+        """The REST of the population, found while fixing one member of it.
+
+        Codex's round-1 finding on PR #2005 was that a contributor-controlled
+        path interpolated into gate output can forge or conceal the surrounding
+        verdict. It was fixed in the findings distribution — and in NO other
+        site, though four more printed a path raw and predate that PR. Fixing a
+        class in one place is not fixing the population.
+
+        The exposure is the one this file's own `_safe_title` docstring records
+        as MEASURED: CR + `ESC[2K` redraws the line as a counterfeit
+        `merge-with :` command with `--match-head-commit` absent, stripping the
+        TOCTOU binding from a command the operator is told to copy verbatim.
+        These lanes are the NON-blocking ones, which the same docstring notes is
+        the dangerous half — the operator reads the verdict as passing.
+
+        Note the path must still be RECOGNISABLE afterwards: a renderer that
+        neutralised by deleting everything would pass a residue check while
+        making the note useless.
+        """
+        hostile = "src/\x1b[2K\rnot_in_the_diff.py"
+        with _mock_inline(guard_module, [comment_factory(hostile)]):
+            guard_module._check_inline_review_findings("100")
+        err = capsys.readouterr().err
+        assert label in err, "precondition: this lane still prints"
+        residue = [
+            c for c in err if guard_module._gate_text_unsafe(c) and c != "\n"
+        ]
+        assert not residue, f"terminal-acting characters reached the report: {residue!r}"
+        assert "not_in_the_diff.py" in err, "the path must still name its file"
+
     def test_an_in_diff_finding_trips_nothing(self, guard_module, capsys):
         """Negative control: without it, a MARKER of '' would pass the test above."""
         with _mock_inline(guard_module, [_codex_c(1, _P1_BODY, path="src/benign.py")]):
@@ -5680,14 +5723,47 @@ class TestFindingsDistribution:
         assert "ONE file" not in out
 
     def test_a_path_cannot_write_to_the_terminal(self, guard_module):
-        """Findings are quoted text: a path is API-supplied untrusted data, so it
-        must be rendered escaped, not raw — '\r' rewrites the line, '\x1b[' is an
-        escape sequence (CodeRabbit Minor, PR #2005)."""
-        out = guard_module._findings_distribution(
-            [("P1", "src/\x1b[2K\rweird\nname.py")]
+        """A path is API-supplied untrusted data: '\r' rewrites the line and
+        '\x1b[' starts an escape sequence (CodeRabbit Minor, PR #2005).
+
+        Pins the PROPERTY, not a spelling. An earlier version asserted the
+        literal `\\u001b`, which pinned `json.dumps` rather than safety and would
+        have failed any correct renderer that neutralises by another route. The
+        contract is that nothing a terminal ACTS on survives, so the assertion
+        asks the module's own classifier — the same one the gate's other
+        untrusted interpolations are cleaned with.
+        """
+        raw_path = "src/\x1b[2K\rweird\nname.py"
+        out = guard_module._findings_distribution([("P1", raw_path)])
+        residue = [c for c in out if guard_module._gate_text_unsafe(c) and c != "\n"]
+        assert not residue, f"terminal-acting characters survived: {residue!r}"
+        assert "weird\nname" not in out, "a path must not forge an extra row"
+        assert "name.py" in out, (
+            "neutralising must not cost the basename — the row has to still name a file"
         )
-        assert "\x1b" not in out and "\r" not in out and "weird\nname" not in out
-        assert "\\u001b" in out, "the escape must be rendered visibly, not dropped"
+
+    def test_two_paths_sharing_a_basename_stay_DISTINGUISHABLE(self, guard_module):
+        """Codex P2, PR #2005 round 4: the clip collapsed distinct paths into one.
+
+        Two long paths differing ONLY in their leading directory rendered
+        identically, because the renderer kept the tail and dropped the head.
+        Nothing else in the report carries the path — the findings list prints
+        `_inline_title` output, which is a title — so that was information lost
+        outright, not selected away.
+
+        Keeping both ends is what fixes it, which is why the shared
+        `_bound_with_stated_omission` is the right primitive rather than a
+        bespoke one.
+        """
+        p1 = "services/alpha/" + "x" * 70 + "/handler.py"
+        p2 = "services/bravo/" + "x" * 70 + "/handler.py"
+        r1, r2 = guard_module._safe_report_path(p1), guard_module._safe_report_path(p2)
+        assert r1 != r2, "two distinct paths must not render as the same string"
+        assert "alpha" in r1 and "bravo" in r2, "the distinguishing head must survive"
+        assert r1.endswith("handler.py") and r2.endswith("handler.py"), (
+            "and the basename must survive too — both ends, or the row is ambiguous "
+            "in one direction or uninformative in the other"
+        )
 
     def test_a_reported_round_is_not_described_as_a_round(self, guard_module):
         """The scorer accumulates across review submissions, so 'this round' was a
@@ -5755,16 +5831,25 @@ class TestFindingsDistribution:
         assert "2 more file(s)" not in out
         assert "the pathless bucket" in out, "the dropped bucket must be declared"
 
-    def test_the_basename_survives_an_ENCODED_overflow(self, guard_module):
-        """The regression my own bound introduced, and the reason the test above
-        did not catch it: `'a' * 500` does not expand under `json.dumps`, so the
-        encoded backstop never fired and the front-slice was never exercised.
+    #: The omission marker's own width: " … " + the count + " char(s) omitted … ".
+    #: The content budget bounds the CONTENT; a cut that did not announce itself
+    #: would be the failure the marker exists to prevent, so the marker is
+    #: overhead on top. 40 covers the count for any path length reachable here.
+    _MARKER_BUDGET = 40
 
-        A multibyte path DOES expand — six chars per character — so the encoded
-        form overflows even after the raw clip, and slicing it from the front
-        discarded the tail, which is the basename the clip exists to keep.
-        MEASURED before the fix on this exact input: 101 chars rendered, no
-        `needle.py` in them (Codex P2, PR #2005, round 2).
+    def test_the_basename_survives_every_expansion_class(self, guard_module):
+        """The basename is a path's informative end and must survive the bound.
+
+        Swept across three classes because a single fixture measured the branch
+        it constructed: an earlier version of this test used only `'a' * 500`,
+        which does not expand under `json.dumps`, so the encoded backstop of the
+        renderer it was testing never fired and its front-slice went unexercised
+        — while a multibyte path rendered 101 chars with `needle.py` absent
+        (Codex P2, PR #2005, round 2).
+
+        The sweep is kept although the renderer it caught is gone. The classes
+        are the right ones for ANY renderer, and a non-expanding one has to earn
+        the same result rather than inherit it.
         """
         for label, path in (
             ("multibyte", "目录" * 40 + "/needle.py"),
@@ -5773,18 +5858,25 @@ class TestFindingsDistribution:
         ):
             out = guard_module._safe_report_path(path)
             assert "needle.py" in out, f"{label}: the basename was discarded"
-            assert len(out) <= guard_module._REPORT_PATH_ENCODED_MAX_CHARS + 1, label
-            assert "…" in out, f"{label}: the cut must stay declared"
+            assert (
+                len(out) <= guard_module._REPORT_PATH_MAX_CHARS + self._MARKER_BUDGET
+            ), f"{label}: rendered {len(out)} chars"
+            assert "omitted" in out, f"{label}: the cut must stay declared"
 
-    def test_a_path_with_no_ascii_at_all_still_terminates_and_is_bounded(
+    def test_a_path_with_no_ascii_at_all_stays_bounded_and_inert(
         self, guard_module
     ):
-        """Guard the guard: the bound is now a shrink LOOP, so the pathological
-        input is one where every retained character expands. It must terminate
-        and stay bounded even when no prefix of the tail can fit."""
+        """Boundary: every character non-ASCII, and no basename to reward keeping.
+
+        Under the previous renderer this was the pathological input because the
+        bound was a shrink LOOP over an expanding encoding, and the question was
+        whether it terminated. There is no loop now — the transform is 1:1 — so
+        what this pins is what still matters: bounded, and carrying nothing a
+        terminal acts on, with no ASCII anywhere to make either outcome easy.
+        """
         out = guard_module._safe_report_path("目录" * 200)
-        assert len(out) <= guard_module._REPORT_PATH_ENCODED_MAX_CHARS + 1
-        assert not any(ord(c) < 32 for c in out)
+        assert len(out) <= guard_module._REPORT_PATH_MAX_CHARS + self._MARKER_BUDGET
+        assert not any(guard_module._gate_text_unsafe(c) for c in out)
 
     def test_the_concentration_denominator_is_named_as_SCORED(self, guard_module):
         """`total` is `len(scored_at)`, which excludes findings that are
@@ -5888,6 +5980,106 @@ class TestFindingsDistributionIsWired:
         with self._mock(guard_module, comments):
             guard_module._check_inline_review_findings("100")
         assert calls == ["100"], "a scan WITH findings must still resolve renames"
+
+    def test_the_rename_map_costs_NO_second_files_read(
+        self, guard_module, monkeypatch
+    ):
+        """CodeRabbit Major, PR #2005 round 4 — answered at the cause.
+
+        `_pr_rename_map` used to issue its own `pulls/N/files` request, BYTE-
+        IDENTICAL to the one `_pr_changed_files` makes: same endpoint, same
+        --paginate, same --jq, same `_gh_timeout(8)`. The first read already
+        fetches `previous_filename` and threw the pairing away.
+
+        CodeRabbit's remedy was to skip the second read when changed-file
+        resolution fails. That guards one state; this pins the property in every
+        state — there is no second read to skip.
+
+        The spy DELEGATES rather than replacing, because a fake would also skip
+        the cache write that is the whole mechanism, and the test would then pass
+        against a renderer that fetched twice.
+        """
+        rows = '{"filename": "new.py", "previous_filename": "old.py"}'
+        monkeypatch.setenv("_TEST_GH_PR_FILES", rows)
+        guard_module._reset_pr_files_cache()
+
+        real, reads = guard_module._pr_changed_files_uncached, []
+
+        def _spy(pr_num, repo=None):
+            reads.append(pr_num)
+            return real(pr_num, repo)
+
+        monkeypatch.setattr(guard_module, "_pr_changed_files_uncached", _spy)
+
+        # Rename map FIRST, deliberately: correctness must not depend on the file
+        # list happening to have been read already. Reading the cache directly
+        # would return {} here and the coupling would hold only until someone
+        # moved a caller.
+        assert guard_module._pr_rename_map("100") == {"old.py": "new.py"}
+        assert len(reads) == 1, f"the map must not add a read; reads={reads}"
+
+        assert guard_module._pr_changed_files("100") == ["new.py", "old.py"]
+        assert len(reads) == 1, "and the file list must still be served from the memo"
+
+    def test_a_failed_file_resolution_yields_an_empty_map_and_no_retry(
+        self, guard_module, monkeypatch
+    ):
+        """The exact state CodeRabbit named, pinned as a NON-event.
+
+        When changed-file resolution fails, the old code went on to issue the
+        second identical request — a retry of a command that had just failed,
+        inside the merge deadline. Now there is nothing left to retry, and the
+        advisory failure direction is preserved: `{}`, never None, because the
+        report degrades to raw paths rather than failing closed on data that
+        decides no verdict.
+        """
+        monkeypatch.setenv("_TEST_GH_PR_FILES", "__error__")
+        guard_module._reset_pr_files_cache()
+
+        real, reads = guard_module._pr_changed_files_uncached, []
+
+        def _spy(pr_num, repo=None):
+            reads.append(pr_num)
+            return real(pr_num, repo)
+
+        monkeypatch.setattr(guard_module, "_pr_changed_files_uncached", _spy)
+
+        assert guard_module._pr_changed_files("100") is None
+        assert guard_module._pr_rename_map("100") == {}
+        assert len(reads) == 1, f"the failed read must not be retried; reads={reads}"
+
+    def test_a_truncated_or_malformed_read_publishes_NO_pairing(
+        self, guard_module, monkeypatch
+    ):
+        """A half-built map must never outlive the read that failed to finish.
+
+        The pairing is published on the success path only, after the 3000-row
+        cap check. Were it written as rows were parsed, a malformed page or a
+        capped read would leave a partial map behind for a later caller to treat
+        as complete — the silent under-read this repo keeps paying for.
+
+        VERIFY-RED CAUGHT THIS TEST ASSERTING THROUGH THE WRONG MECHANISM. It
+        originally checked `_pr_rename_map(...) == {}`, which passes even when
+        the pairing IS published incrementally — because the `is None` fast path
+        returns `{}` before the cache is ever read. The mutation that publishes
+        inside the parse loop came back GREEN against it. Two protections
+        overlap here and only one was being exercised, so this now asserts on
+        the STORE directly, where the publish discipline is observable.
+        """
+        guard_module._reset_pr_files_cache()
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            '{"filename": "new.py", "previous_filename": "old.py"}\nnot-json',
+        )
+        assert guard_module._pr_changed_files("100") is None, "malformed page → None"
+        assert guard_module._PR_RENAME_CACHE == {}, (
+            "the pairing from the rows that DID parse must never be published — "
+            f"a later reader would take it for a complete map: "
+            f"{guard_module._PR_RENAME_CACHE!r}"
+        )
+        assert guard_module._pr_rename_map("100") == {}, (
+            "and the accessor agrees, by the independent fast path"
+        )
 
     def test_a_P1_reaches_the_distribution_through_the_real_scan(self, guard_module, capsys):
         """VERIFY-RED ANCHOR, and it exists because a mutation SURVIVED without it.
