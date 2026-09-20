@@ -614,6 +614,33 @@ behind the writer, and 7 were a guard since removed.
   with a single question — a Claude Code rendering bug rejects single-question
   calls. Always pass ≥2 questions; if only one is real, add a trivial/filler
   second question to satisfy the tool. Every time, no exceptions.
+- **A question you need answered gets ASKED, and carries what it takes to
+  answer it.** Two failures, and they compound — a question asked without
+  context gets no answer, and a question that gets no answer gets quietly
+  carried instead of re-asked.
+
+  **Prose questions get missed, so stop pretending they were asked.** A
+  question in the body of a message competes with everything else in that
+  message and loses; the user is not obliged to catch it. If an answer is
+  needed to proceed, use `AskUserQuestion`. If one was asked and no answer
+  came and the question still blocks, **RE-ASK it** — do not restate it each
+  turn as an open item and work around it. A question you keep mentioning and
+  never force is not a question, it is a status line, and it will sit
+  unanswered for as long as you are willing to narrate it. Being reluctant to
+  interrupt is not a reason; an unmade decision costs more than an
+  interruption.
+
+  **The user does not have your session state in their head.** Every question
+  carries the facts the decision actually turns on: current state VERIFIED NOW
+  rather than recalled from a plan, a prior summary, or a ledger row (those go
+  stale, and a decision made on stale state is one you caused); the concrete
+  cost of each option; and the cost of deciding nothing. Say which parts you
+  measured and which you did not. An option whose description does not say what
+  it costs is not an option — it is a label, and offering it asks the user to
+  supply the analysis you were supposed to do.
+
+  This governs any channel where a decision is being requested, not just the
+  tool: a dispatched session's report and a PR comment owe the same context.
 - **Plan mode by default** for any task with 3+ steps or architectural
   decisions. If something goes sideways — STOP and re-plan. A plan-mode
   document under `~/.claude/plans/` that will outlive one session opens with
