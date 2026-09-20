@@ -1,5 +1,3 @@
-### Added
-
 - `scripts/premise_sweep.py` — a harness for measuring a design question before
   redesigning against it, encoding the "Measure, Do Not Choose" doctrine clause
   by clause so each one is mechanical rather than remembered.
