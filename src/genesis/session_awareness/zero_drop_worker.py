@@ -71,6 +71,7 @@ from genesis.session_awareness.zero_drop import (
     neutralise as _neutralise,
 )
 from genesis.session_awareness.zero_drop_config import (
+    MODES,
     alert_priority,
     effective_mode,
     knob_int,
@@ -110,7 +111,7 @@ ALL_CLASSES = (*BRANCH_CLASSES, CLASS_DIRTY)
 # mode, so "did the lever come down?" can only be answered against the mode the
 # PREVIOUS run recorded — and that record is untrusted input, so an absent or
 # unrecognised mode must read as "no transition known" rather than raise.
-_MODE_LEVEL = {"off": 0, "observe": 1, "alert": 2}
+_MODE_LEVEL = {mode: level for level, mode in enumerate(MODES)}
 
 
 def _mode_level(mode: object) -> int | None:
@@ -127,6 +128,12 @@ def _mode_dropped(prior_mode: object, mode: str) -> bool:
     """
     before, after = _mode_level(prior_mode), _mode_level(mode)
     return before is not None and after is not None and after < before
+
+
+def _mode_changed(prior_mode: object, mode: str) -> bool:
+    """Whether the recorded and effective modes differ in either direction."""
+    before, after = _mode_level(prior_mode), _mode_level(mode)
+    return before is not None and after is not None and before != after
 
 
 def _mode_change_note(prior_mode: object, mode: str) -> str:
@@ -159,9 +166,10 @@ def _retire_pending(prior: dict, mode: str) -> bool:
     sweep, so it is retried on the same SHORT floor a failed sweep gets instead
     of unconditionally: a persistently failing resolve must not replay a
     network-touching ~14-20s sweep on every session boundary, which is exactly
-    why ``FAILED_RETRY_FLOOR_MINUTES`` exists. The mode is NOT rolled back for
-    this case (unlike the `off` transition, which measured nothing): this run
-    swept and measured under `observe`, and the record names the mode that ran.
+    why ``FAILED_RETRY_FLOOR_MINUTES`` exists. The prior mode stays in the run
+    record until retirement succeeds. That keeps the transition detectable;
+    the degraded status bounds retries to the same short floor as other failed
+    sweeps.
     """
     if mode != "observe":
         return False
@@ -1086,7 +1094,9 @@ async def _run(*, trigger: str, force: bool, db_path: Path | str, repo_path: str
             # obvious home is `run_zero_drop_worker`'s handler, but the lock is
             # released before the exception reaches it, so a concurrent sweep's
             # good record could be clobbered by this failure record.
-            _write_failure_record(trigger=trigger, mode=mode, exc=exc)
+            prior_mode = read_last_run().get("mode")
+            failure_mode = prior_mode if _mode_changed(prior_mode, mode) else mode
+            _write_failure_record(trigger=trigger, mode=failure_mode, exc=exc)
             raise
     finally:
         lock_fh.close()
@@ -1235,7 +1245,15 @@ async def _run_off_transition(
         "alert": findings_state,
         "blind_alert": blind_state,
     }
-    _atomic_write_json(last_run_path(), record)
+    try:
+        _atomic_write_json(last_run_path(), record)
+    except Exception as exc:  # noqa: BLE001 — preserve the prior transition key
+        logger.warning("zero_drop off-transition could not record completion", exc_info=True)
+        return {
+            "status": "degraded",
+            "mode": "off",
+            "degraded": {"off_transition_record": f"{type(exc).__name__}: {exc}"[:200]},
+        }
     return {
         "status": "ok",
         "mode": "off",
@@ -1254,6 +1272,7 @@ async def _run_locked(
     # swallow it: lowering `alert` -> `observe` has to retire the standing
     # findings alert NOW rather than whenever the interval next elapses.
     dropped = _mode_dropped(prior_mode, mode)
+    changed = _mode_changed(prior_mode, mode)
     if mode == "off":
         if not dropped:
             # Steady-state off: nothing to retire, and no reason to rewrite a
@@ -1281,12 +1300,15 @@ async def _run_locked(
     # while a transient fault still recovers in minutes instead of an hour.
     # A pending findings-alert retirement retries on the same floor, for the
     # same reason: the retry re-runs the whole sweep.
+    retry_pending = prior.get("status") == "failed" or _retire_pending(prior, mode)
     debounce_minutes = (
-        FAILED_RETRY_FLOOR_MINUTES
-        if prior.get("status") == "failed" or _retire_pending(prior, mode)
-        else knob_int(cfg, "min_interval_minutes")
+        FAILED_RETRY_FLOOR_MINUTES if retry_pending else knob_int(cfg, "min_interval_minutes")
     )
-    if not force and not dropped and _within_minutes(prior.get("computed_at"), debounce_minutes):
+    if (
+        not force
+        and not (changed and not retry_pending)
+        and _within_minutes(prior.get("computed_at"), debounce_minutes)
+    ):
         return {"status": "debounced"}
 
     run_id = uuid.uuid4().hex
@@ -1596,7 +1618,7 @@ async def _run_locked(
         "run_id": run_id,
         "computed_at": now_iso,
         "trigger": trigger,
-        "mode": mode,
+        "mode": prior_mode if dropped and alert_state == "resolve_failed" else mode,
         "status": status,
         "duration_s": duration_s,
         "base_ref": base_ref,

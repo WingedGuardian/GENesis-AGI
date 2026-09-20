@@ -1949,7 +1949,10 @@ async def test_raising_from_off_to_observe_records_the_new_mode(env, db_path, mo
     assert json.loads(w.last_run_path().read_text())["mode"] == "off"
 
     monkeypatch.setattr(w, "effective_mode", lambda: "observe")
-    await _run(db_path)
+    out = await w.run_zero_drop_worker(
+        trigger="session_start", force=False, db_path=db_path, repo_path="/repo"
+    )
+    assert out["status"] != "debounced", "raising the mode must take effect immediately"
     record = json.loads(w.last_run_path().read_text())
     assert record["mode"] == "observe"
     assert "stages" in record, "a running mode sweeps and measures again"
@@ -1990,7 +1993,7 @@ async def test_a_failed_retirement_retries_on_a_SHORT_floor_not_the_full_interva
     assert out["degraded"]["alert"] == "resolve_failed"
     assert len(await _open_observations(db_path, w.ALERT_SOURCE)) == 1, "still standing"
     record = json.loads(w.last_run_path().read_text())
-    assert record["mode"] == "observe", "the record names the mode that actually ran"
+    assert record["mode"] == "alert", "a failed transition must retain its prior mode"
     assert record["degraded"]["alert"] == "resolve_failed"
 
     # Within the floor a non-forced trigger waits — the retry is BOUNDED.
@@ -2011,3 +2014,62 @@ async def test_a_failed_retirement_retries_on_a_SHORT_floor_not_the_full_interva
     assert out["status"] != "debounced", "a pending retire must retry, not wait the interval"
     assert await _open_observations(db_path, w.ALERT_SOURCE) == []
     assert "alert" not in (json.loads(w.last_run_path().read_text())["degraded"] or {})
+
+
+async def test_off_transition_keeps_prior_mode_and_retries_failed_retirement(
+    env, db_path, monkeypatch
+):
+    from genesis.db.crud import observations as obs
+
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    await _run(db_path)
+    assert len(await _open_observations(db_path, w.ALERT_SOURCE)) == 1
+    real = obs.resolve_by_source_and_type
+
+    async def _boom(db, **kw):
+        if kw.get("source") == w.ALERT_SOURCE:
+            raise RuntimeError("resolve exploded")
+        return await real(db, **kw)
+
+    monkeypatch.setattr(obs, "resolve_by_source_and_type", _boom)
+    monkeypatch.setattr(w, "effective_mode", lambda: "off")
+    out = await _run(db_path)
+    assert out["status"] == "degraded"
+    assert len(await _open_observations(db_path, w.ALERT_SOURCE)) == 1
+    assert json.loads(w.last_run_path().read_text())["mode"] == "alert"
+
+    monkeypatch.setattr(obs, "resolve_by_source_and_type", real)
+    out = await w.run_zero_drop_worker(
+        trigger="session_start", force=False, db_path=db_path, repo_path="/repo"
+    )
+    assert out["status"] == "ok"
+    assert await _open_observations(db_path, w.ALERT_SOURCE) == []
+    assert json.loads(w.last_run_path().read_text())["mode"] == "off"
+
+
+async def test_off_transition_record_write_failure_keeps_prior_mode_and_retries(
+    env, db_path, monkeypatch
+):
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    await _run(db_path)
+    previous = json.loads(w.last_run_path().read_text())
+    real_write = w._atomic_write_json
+
+    def _fail_transition_record(path, data):
+        if path == w.last_run_path():
+            raise OSError("state disk temporarily unavailable")
+        return real_write(path, data)
+
+    monkeypatch.setattr(w, "_atomic_write_json", _fail_transition_record)
+    monkeypatch.setattr(w, "effective_mode", lambda: "off")
+    out = await _run(db_path)
+
+    assert out["status"] == "degraded"
+    assert json.loads(w.last_run_path().read_text()) == previous
+
+    monkeypatch.setattr(w, "_atomic_write_json", real_write)
+    out = await w.run_zero_drop_worker(
+        trigger="session_start", force=False, db_path=db_path, repo_path="/repo"
+    )
+    assert out["status"] == "ok"
+    assert json.loads(w.last_run_path().read_text())["mode"] == "off"
