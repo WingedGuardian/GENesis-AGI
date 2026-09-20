@@ -64,21 +64,28 @@ checker cannot start), it aborts instead of treating the database as healthy.
 
 Database-only recovery refuses unless it can establish that no process still
 holds the database. Before replacing anything, `restore.sh` scans
-`/proc/<pid>/fd` for open handles on the live database and its sidecars.
+`/proc/<pid>/fd` for open handles on exactly the live database artifacts —
+the main file, `-wal`, `-shm`, and `-journal`, matched by their **resolved**
+path and including their unlinked-but-still-open `` (deleted)`` forms. A handle on this
+script's own `.pre-restore.<epoch>` safety copies does not refuse a restore.
 
 That scan needs visibility the invoking uid may not have: an unreadable
 `/proc/<pid>/fd` entry is an **unknown** holder, not an absent one, so the scan
 borrows authority — as uid 0, or via non-interactive `sudo` when available.
 With neither, the restore **refuses** rather than assuming no holder exists.
-Provide passwordless `sudo` for the scan, run as root, or establish a verified
-offline boundary and declare it (below).
+Grant non-interactive `sudo` for the scan, run as root, or establish a verified
+offline boundary and declare it (below). The privileged scan is invoked as a
+`sh -c 'find /proc/[0-9]*/fd ...'` wrapper (the PID glob must expand inside the
+privileged shell), so a least-privilege sudoers rule must permit that `sh`
+invocation — there is no `sudo true` capability probe, and a rule granting
+exactly the scan command is sufficient.
 
 `GENESIS_RESTORE_HOLDER_SCAN` selects the mode:
 
 | value | behaviour |
 |---|---|
 | `auto` (default) | uid 0, else `sudo -n`, else refuse |
-| `plain` | unprivileged scan; refuses when the scan reports an error, and refuses outright where procfs is mounted with `hidepid` |
+| `plain` | unprivileged scan; refuses when the scan reports an error, and refuses outright where procfs is mounted with any enabled `hidepid` value (numeric or symbolic — anything not `0`/`off`) |
 | `sudo` | require `sudo -n`; refuse if unavailable |
 | `none` | **skip the scan entirely** — see the warning below |
 

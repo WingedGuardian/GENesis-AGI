@@ -156,8 +156,10 @@ def _write_sudo_failing_then_ok(bind: Path, calls: Path, fail_times: int) -> Non
     ``sudo`` is stubbed rather than ``find`` because sudo uses a secure PATH: a
     PATH stub for find is bypassed and the guard silently succeeds, which is how
     an earlier version of the incomplete-inspection test passed for entirely the
-    wrong reason. ``sudo -n true`` (the capability probe) always succeeds here so
-    the elevated branch is genuinely entered.
+    wrong reason. The stub still answers a bare ``true`` probe (exit 0) even
+    though the script no longer sends one — sudo authorization is
+    command-specific, so the scan itself is now the probe; the handling is kept
+    inert so this helper stays valid against older script revisions.
     """
     _make_stub(
         bind / "sudo",
@@ -1053,3 +1055,321 @@ def test_holder_scan_exhausts_and_refuses(sandbox):
     assert live.stdout.strip() == "1", (
         f"the live database was replaced despite an exhausted scan: {live.stdout!r}"
     )
+
+
+def test_command_specific_sudo_grant_is_accepted(sandbox):
+    """Sudo authorization is COMMAND-specific — a `true` probe must not gate.
+
+    A least-privilege sudoers rule granting exactly the privileged scan command
+    fails a ``sudo -n true`` capability probe, so probing with ``true`` refused
+    a restore that held precisely the authority it needed. The scan itself is
+    the probe. The stub models that grant: ``true`` is NOT authorized (exit 1),
+    everything else — i.e. the scan — succeeds with a clean empty result.
+    """
+    _seed_live_db(sandbox["gd"])
+    argv_log = sandbox["tmp"] / "sudo.argv"
+    _make_stub(
+        sandbox["bind"] / "sudo",
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$@" >> "{argv_log}"\n'
+        'args=("$@")\n'
+        '[ "${args[0]:-}" = "-n" ] && args=("${args[@]:1}")\n'
+        '[ "${args[0]:-}" = "true" ] && exit 1\n'
+        "exit 0\n",
+    )
+
+    proc = _run_restore(sandbox, scan_mode="sudo")
+
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, (
+        "a sudoers rule granting exactly the scan command was refused — a "
+        f"`true` capability probe is still gating the scan\n{combined}"
+    )
+    # Bind the property, not just the outcome: no bare `true` probe may reach
+    # sudo at all, or a least-privilege grant fails before the scan is tried.
+    argv = argv_log.read_text() if argv_log.exists() else ""
+    assert "\ntrue\n" not in f"\n{argv}", f"a `sudo -n true` capability probe reached sudo:\n{argv}"
+
+
+def test_holder_match_ignores_pre_restore_copies(sandbox):
+    """A holder of a .pre-restore.<ts> safety copy must NOT refuse the restore.
+
+    The prefix pattern ``"$DB_FILE*"`` also matched this script's own
+    ``genesis.db.pre-restore.<epoch>`` artifacts, so a forensic tool holding a
+    safety copy open read as a live-database holder — refusing a restore that
+    copy cannot affect. Matching is now exact (main/-wal/-shm, live and
+    deleted forms).
+    """
+    _seed_live_db(sandbox["gd"])
+    copy = sandbox["gd"] / "data" / "genesis.db.pre-restore.1700000000"
+    copy.write_bytes(b"forensic safety copy")
+    holder = subprocess.Popen(
+        ["bash", "-c", 'exec 3<"$1"; sleep 60', "_", str(copy)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        _wait_for_fd_holder(holder.pid, copy)
+        proc = _run_restore(sandbox, scan_mode="plain")
+        combined = proc.stdout + proc.stderr
+        # The binding assertion is the REASON, not the verdict: on a host with
+        # unreadable other-uid /proc entries the unprivileged scan may still
+        # refuse as INCONCLUSIVE, but it must never claim this safety-copy
+        # handle is a live-database holder.
+        assert "open process handles" not in combined, (
+            "a handle on a .pre-restore safety copy was treated as a live-"
+            f"database holder — the match pattern is still a prefix\n{combined}"
+        )
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_deleted_but_open_database_still_refuses(sandbox):
+    """An unlinked-but-open database handle is still a holder.
+
+    /proc fd links to an unlinked target read ``<path> (deleted)`` — the exact
+    shape of the 2026-09-18 incident (a server holding deleted sidecars). The
+    exact-match patterns must therefore include the `` (deleted)`` forms, or
+    tightening the match would have traded a false refusal for a fail-open.
+    """
+    db = _seed_live_db(sandbox["gd"])
+    holder = subprocess.Popen(
+        ["bash", "-c", 'exec 3<"$1"; sleep 60', "_", str(db)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        _wait_for_fd_holder(holder.pid, db)
+        db.unlink()  # AFTER the fd is established: the link text gains " (deleted)"
+        proc = _run_restore(sandbox, scan_mode="plain")
+        combined = proc.stdout + proc.stderr
+        assert "open process handles" in combined, (
+            "an unlinked-but-open database handle was not treated as a holder — "
+            f"the (deleted) form is not matched (rc={proc.returncode})\n{combined}"
+        )
+        assert proc.returncode != 0, "a refused restore must not exit 0"
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_symlinked_genesis_dir_still_sees_the_holder(sandbox):
+    """A symlinked component in DB_FILE must not blind the scan.
+
+    /proc fd links carry the RESOLVED target, while ``-lname`` matches the
+    pattern text literally — so a DB_FILE reached through a symlink never
+    matched, and the guard went blind exactly where paths are least canonical.
+    The scan now resolves DB_FILE first.
+    """
+    db = _seed_live_db(sandbox["gd"])
+    gd_link = sandbox["tmp"] / "gd-link"
+    gd_link.symlink_to(sandbox["gd"])
+    holder = subprocess.Popen(
+        ["bash", "-c", 'exec 3<"$1"; sleep 60', "_", str(db)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        _wait_for_fd_holder(holder.pid, db)
+        linked = dict(sandbox)
+        linked["gd"] = gd_link
+        proc = _run_restore(linked, scan_mode="plain")
+        combined = proc.stdout + proc.stderr
+        assert "open process handles" in combined, (
+            "a live holder was missed because GENESIS_DIR is a symlink — the "
+            f"scan matched the unresolved path (rc={proc.returncode})\n{combined}"
+        )
+        assert proc.returncode != 0, "a refused restore must not exit 0"
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def _write_proc_mounts_redirect(bind: Path, fake_mounts: Path) -> None:
+    """A `grep` that reads *fake_mounts* wherever the script names /proc/mounts.
+
+    Delegates every other invocation to the real grep unchanged, so the many
+    unrelated grep calls in restore.sh behave identically.
+    """
+    _make_stub(
+        bind / "grep",
+        "#!/usr/bin/env bash\n"
+        "args=()\n"
+        'for a in "$@"; do\n'
+        f'    [ "$a" = "/proc/mounts" ] && a="{fake_mounts}"\n'
+        '    args+=("$a")\n'
+        "done\n"
+        'exec /usr/bin/grep "${args[@]}"\n',
+    )
+
+
+def _write_find_proc_recorder(bind: Path, log: Path) -> None:
+    """A `find` that records /proc scans (returning a clean empty result) and
+    delegates every other invocation to the real find."""
+    _make_stub(
+        bind / "find",
+        "#!/usr/bin/env bash\n"
+        'case "${1:-}" in\n'
+        f'/proc/*) printf "%s\\n" "$@" >> "{log}"; exit 0 ;;\n'
+        "esac\n"
+        'exec /usr/bin/find "$@"\n',
+    )
+
+
+def test_hidepid_any_enabled_value_stops_the_unprivileged_scan(sandbox):
+    """`plain` must refuse under ANY enabled hidepid value, not just 1/2.
+
+    ``hidepid=[12]`` missed ``hidepid=4`` and the symbolic spellings
+    (``noaccess``, ``invisible``, ``ptraceable``): under those the unprivileged
+    glob silently omits hidden PID directories and find exits 0 over the
+    visible subset — a clean-looking pass with a holder it cannot see. Same
+    closed-set-of-values mistake scripts/check_cc_running_versions.sh already
+    corrected. The control run (hidepid=off) proves the scan DOES run when
+    visibility is not restricted — so this cannot pass by the guard refusing
+    everything.
+    """
+    _seed_live_db(sandbox["gd"])
+    fake_mounts = sandbox["tmp"] / "mounts"
+    find_log = sandbox["tmp"] / "find.argv"
+    _write_proc_mounts_redirect(sandbox["bind"], fake_mounts)
+    _write_find_proc_recorder(sandbox["bind"], find_log)
+
+    fake_mounts.write_text("proc /proc proc rw,nosuid,nodev,noexec,relatime,hidepid=noaccess 0 0\n")
+    proc = _run_restore(sandbox, scan_mode="plain")
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"plain scan proceeded under hidepid=noaccess\n{combined}"
+    assert not find_log.exists(), (
+        "the unprivileged scan RAN under an enabled hidepid value — it cannot "
+        f"see every PID there and must refuse without scanning:\n"
+        f"{find_log.read_text() if find_log.exists() else ''}"
+    )
+
+    # Control: with hidepid explicitly off the scan must actually run —
+    # otherwise the assertion above would also pass with a guard that simply
+    # refuses every plain scan.
+    fake_mounts.write_text("proc /proc proc rw,nosuid,nodev,noexec,relatime,hidepid=off 0 0\n")
+    proc = _run_restore(sandbox, scan_mode="plain")
+    assert find_log.exists() and "/proc/" in find_log.read_text(), (
+        "control failed: the plain scan did not run with hidepid=off — the "
+        "detection is refusing unconditionally, or the stubs are not wired"
+    )
+
+
+def test_journal_holder_still_refuses(sandbox):
+    """A holder of the rollback journal is a database holder.
+
+    SQLite's sidecar family is {-journal, -wal, -shm} — this script's own stage
+    cleanup enumerates all three. The old prefix pattern matched `-journal`
+    holders; the exact-match set must keep them, or tightening the match trades
+    a false refusal for a shrunk refusal surface.
+    """
+    db = _seed_live_db(sandbox["gd"])
+    journal = sandbox["gd"] / "data" / "genesis.db-journal"
+    journal.write_bytes(b"hot journal")
+    holder = subprocess.Popen(
+        ["bash", "-c", 'exec 3<"$1"; sleep 60', "_", str(journal)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        _wait_for_fd_holder(holder.pid, journal)
+        proc = _run_restore(sandbox, scan_mode="plain")
+        combined = proc.stdout + proc.stderr
+        assert "open process handles" in combined, (
+            "a -journal holder was not treated as a database holder — the "
+            f"exact-match set dropped the journal (rc={proc.returncode})\n{combined}"
+        )
+        assert proc.returncode != 0, "a refused restore must not exit 0"
+    finally:
+        holder.kill()
+        holder.wait()
+        db.unlink(missing_ok=True)
+
+
+def test_hidepid_reads_the_effective_overmounted_proc_line(sandbox):
+    """Only the LAST /proc mount line is the effective one.
+
+    /proc/mounts lists overmounts in order; with an older `hidepid=off` procfs
+    overmounted by a `hidepid=2` one, an any-line match finds the stale `off`
+    entry and scans anyway — a fail-open in exactly the direction the hidepid
+    refusal exists to prevent (measured during review).
+    """
+    _seed_live_db(sandbox["gd"])
+    fake_mounts = sandbox["tmp"] / "mounts"
+    find_log = sandbox["tmp"] / "find.argv"
+    _write_proc_mounts_redirect(sandbox["bind"], fake_mounts)
+    _write_find_proc_recorder(sandbox["bind"], find_log)
+
+    fake_mounts.write_text(
+        "proc /proc proc rw,nosuid,nodev,noexec,relatime,hidepid=off 0 0\n"
+        "proc /proc proc rw,nosuid,nodev,noexec,relatime,hidepid=2 0 0\n"
+    )
+    proc = _run_restore(sandbox, scan_mode="plain")
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, (
+        f"plain scan proceeded under an effective hidepid=2 overmount\n{combined}"
+    )
+    assert not find_log.exists(), (
+        "the unprivileged scan RAN although the EFFECTIVE (last) /proc mount "
+        "line enables hidepid — a stale hidepid=off line above it was matched:\n"
+        f"{find_log.read_text() if find_log.exists() else ''}"
+    )
+
+
+def test_db_file_directory_refuses_before_touching_anything(sandbox):
+    """A DB_FILE that is a DIRECTORY must refuse, not swallow the staged DB.
+
+    ``mv SOURCE DIR`` moves the source INSIDE a directory and exits 0, so the
+    swap would report success, final verification would fail against the
+    directory, and the staged database would be stranded inside it.
+    """
+    db_dir = sandbox["gd"] / "data" / "genesis.db"
+    db_dir.mkdir()
+
+    proc = _run_restore(sandbox, scan_mode="none")
+
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"restore onto a directory DB_FILE must die\n{combined}"
+    assert "is a directory" in combined, (
+        f"the refusal did not name the directory misconfiguration\n{combined}"
+    )
+    assert db_dir.is_dir() and not any(db_dir.iterdir()), (
+        f"something was moved INSIDE the directory at the DB path: "
+        f"{[p.name for p in db_dir.iterdir()]}"
+    )
+
+
+def test_first_sidecar_move_failure_reports_nothing_moved(sandbox):
+    """When the FIRST sidecar move fails, the message must not claim a rollback.
+
+    With nothing yet moved, the old message said the sidecars "moved before it
+    were moved back" — misstating the on-disk state to an operator reading it
+    mid-incident. The bytes were fine; the report was not.
+    """
+    db = _seed_live_db(sandbox["gd"])
+    data = sandbox["gd"] / "data"
+    wal, shm = data / "genesis.db-wal", data / "genesis.db-shm"
+    before = {"db": db.read_bytes(), "wal": wal.read_bytes(), "shm": shm.read_bytes()}
+
+    # Fail mv only for the WAL's move-aside destination (the FIRST move).
+    _make_stub(
+        sandbox["bind"] / "mv",
+        "#!/usr/bin/env bash\n"
+        'for a in "$@"; do case "$a" in *".pre-restore."*-wal) exit 1 ;; esac; done\n'
+        'exec /bin/mv "$@"\n',
+    )
+
+    proc = _run_restore(sandbox, scan_mode="none")
+
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, "an injected move-aside failure must make the restore die"
+    assert "nothing had been moved before it" in combined, (
+        f"the failure message does not state that nothing was moved\n{combined}"
+    )
+    assert "were moved back" not in combined, (
+        f"the failure message claims a rollback that never ran\n{combined}"
+    )
+    assert db.read_bytes() == before["db"], "live database changed"
+    assert wal.read_bytes() == before["wal"], "WAL changed despite a failed first move"
+    assert shm.read_bytes() == before["shm"], "SHM changed despite a failed first move"

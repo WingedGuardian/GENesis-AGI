@@ -708,6 +708,23 @@ PY
                 _HOLDER_ATTEMPT=0
                 _HOLDER_OUT=""
                 _HOLDER_RC=1
+                # /proc/<pid>/fd symlinks name the RESOLVED target (with
+                # " (deleted)" appended once the file is unlinked), and -lname
+                # matches its operand as a GLOB against that text. Three
+                # consequences, each a reviewed defect in the prefix pattern
+                # "$DB_FILE*" this replaces: a symlinked component in DB_FILE
+                # never matches the resolved link text (the guard goes blind); a
+                # glob metacharacter in the path matches the wrong files; and
+                # the prefix also matched this script's own
+                # .pre-restore.<epoch> safety copies, so a forensic tool
+                # holding one refused a restore that copy cannot affect. Match
+                # the RESOLVED path, glob-escaped, against exactly the live
+                # artifacts — main, -wal, -shm — each also in its " (deleted)"
+                # form, so an unlinked-but-still-open handle (the shape the
+                # 2026-09-18 incident actually had) still refuses.
+                _DB_SCAN_REAL=$(readlink -f -- "$DB_FILE" 2>/dev/null) \
+                    || _DB_SCAN_REAL="$DB_FILE"
+                _DB_SCAN_PAT=$(printf '%s' "$_DB_SCAN_REAL" | sed 's/[][\\*?]/\\&/g')
                 if [ "$_HOLDER_SCAN_MODE" = "none" ]; then
                     # `log`, not `warn`: warn() appends to _FAILURES, which makes
                     # the whole restore exit non-zero. Skipping the scan is an
@@ -729,41 +746,88 @@ PY
                         # the guard would pass with a holder it cannot see. Under
                         # hidepid this mode cannot deliver what it claims, so it
                         # refuses rather than returning a clean-looking result.
-                        if grep -qE 'hidepid=[12]' /proc/mounts 2>/dev/null; then
+                        # Match the OPTION, never an enumerated value list:
+                        # `hidepid=[12]` missed `hidepid=4` and the symbolic
+                        # spellings (`noaccess`, `invisible`, `ptraceable`) the
+                        # 5.8+ multi-instance procfs work introduced. Anything
+                        # not explicitly 0/off refuses — same RULE as
+                        # scripts/check_cc_running_versions.sh, which already
+                        # learned this closed-set-of-values mistake. One
+                        # deliberate divergence from its regex: only the LAST
+                        # /proc mount line is evaluated, because /proc/mounts
+                        # lists overmounts in order and an any-line match lets a
+                        # stale `hidepid=off` entry beneath the effective
+                        # hidepid mount stand the refusal down (measured in
+                        # review; the mirror still has that hole — tracked as a
+                        # follow-up issue).
+                        _HP_LINE=""
+                        _HP_LINE=$(grep -E '(^| )/proc proc ' /proc/mounts 2>/dev/null | tail -n 1) \
+                            || _HP_LINE=""
+                        if printf '%s' "$_HP_LINE" | grep -qE '(,| )hidepid=' \
+                            && ! printf '%s' "$_HP_LINE" | grep -qE '(,| )hidepid=(0|off)(,| )'; then
                             _HOLDER_RC=2
                         else
-                            _HOLDER_OUT=$(find /proc/[0-9]*/fd -lname "$DB_FILE*" -print 2>/dev/null) \
+                            _HOLDER_OUT=$(find /proc/[0-9]*/fd \( \
+                                -lname "$_DB_SCAN_PAT" -o -lname "$_DB_SCAN_PAT (deleted)" \
+                                -o -lname "$_DB_SCAN_PAT-wal" -o -lname "$_DB_SCAN_PAT-wal (deleted)" \
+                                -o -lname "$_DB_SCAN_PAT-shm" -o -lname "$_DB_SCAN_PAT-shm (deleted)" \
+                                -o -lname "$_DB_SCAN_PAT-journal" -o -lname "$_DB_SCAN_PAT-journal (deleted)" \
+                                \) -print 2>/dev/null) \
                                 || _HOLDER_RC=$?
                         fi
                         ;;
                     sudo)
-                        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-                            # The glob MUST expand inside the privileged shell.
-                            # `sudo find /proc/[0-9]*/fd ...` expands the bracket
-                            # in the CALLER, before sudo starts — so under
-                            # procfs `hidepid=2` the hidden PID directories are
-                            # absent from find's operands, find succeeds over the
-                            # visible subset, and the guard passes while an
-                            # unseen holder exists. That is a fail-open in the
-                            # exact direction this guard exists to prevent.
+                        # No `sudo -n true` pre-probe: sudo authorization is
+                        # COMMAND-specific, so a least-privilege sudoers rule
+                        # granting exactly the scan command below fails a `true`
+                        # probe and the restore refused with precisely the
+                        # authority it needed. The scan itself is the probe —
+                        # an unauthorized sudo makes it exit non-zero, which is
+                        # already the refusal path. Its stderr is suppressed so
+                        # a persistent authorization failure does not print a
+                        # password prompt error once per retry; the die message
+                        # names the sudoers requirement instead.
+                        #
+                        # The glob MUST expand inside the privileged shell.
+                        # `sudo find /proc/[0-9]*/fd ...` expands the bracket
+                        # in the CALLER, before sudo starts — so under
+                        # procfs `hidepid=2` the hidden PID directories are
+                        # absent from find's operands, find succeeds over the
+                        # visible subset, and the guard passes while an
+                        # unseen holder exists. That is a fail-open in the
+                        # exact direction this guard exists to prevent.
+                        if command -v sudo >/dev/null 2>&1; then
                             _HOLDER_OUT=$(sudo -n sh -c \
-                                'find /proc/[0-9]*/fd -lname "$1*" -print 2>/dev/null' \
-                                _ "$DB_FILE") || _HOLDER_RC=$?
+                                'find /proc/[0-9]*/fd \( -lname "$1" -o -lname "$1 (deleted)" -o -lname "$1-wal" -o -lname "$1-wal (deleted)" -o -lname "$1-shm" -o -lname "$1-shm (deleted)" -o -lname "$1-journal" -o -lname "$1-journal (deleted)" \) -print 2>/dev/null' \
+                                _ "$_DB_SCAN_PAT" 2>/dev/null) || _HOLDER_RC=$?
                         else
                             _HOLDER_RC=2
                         fi
                         ;;
                     auto)
                         if [ "$(id -u)" -eq 0 ]; then
-                            _HOLDER_OUT=$(find /proc/[0-9]*/fd -lname "$DB_FILE*" -print 2>/dev/null) \
+                            _HOLDER_OUT=$(find /proc/[0-9]*/fd \( \
+                                -lname "$_DB_SCAN_PAT" -o -lname "$_DB_SCAN_PAT (deleted)" \
+                                -o -lname "$_DB_SCAN_PAT-wal" -o -lname "$_DB_SCAN_PAT-wal (deleted)" \
+                                -o -lname "$_DB_SCAN_PAT-shm" -o -lname "$_DB_SCAN_PAT-shm (deleted)" \
+                                -o -lname "$_DB_SCAN_PAT-journal" -o -lname "$_DB_SCAN_PAT-journal (deleted)" \
+                                \) -print 2>/dev/null) \
                                 || _HOLDER_RC=$?
-                        elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+                        elif command -v sudo >/dev/null 2>&1; then
                             # Glob inside the privileged shell — see the `sudo`
                             # branch above: expanding it in the caller omits
                             # hidepid-hidden PIDs and turns the guard fail-open.
+                            # And no `sudo -n true` pre-probe, for the same
+                            # reason as that branch: authorization is command-
+                            # specific, so the scan itself is the probe. An
+                            # unauthorized sudo exits non-zero here, exhausts
+                            # the bounded retry loop, and refuses — the same
+                            # terminal state the old pre-probe reached, without
+                            # rejecting a least-privilege sudoers rule that
+                            # grants exactly this scan.
                             _HOLDER_OUT=$(sudo -n sh -c \
-                                'find /proc/[0-9]*/fd -lname "$1*" -print 2>/dev/null' \
-                                _ "$DB_FILE") || _HOLDER_RC=$?
+                                'find /proc/[0-9]*/fd \( -lname "$1" -o -lname "$1 (deleted)" -o -lname "$1-wal" -o -lname "$1-wal (deleted)" -o -lname "$1-shm" -o -lname "$1-shm (deleted)" -o -lname "$1-journal" -o -lname "$1-journal (deleted)" \) -print 2>/dev/null' \
+                                _ "$_DB_SCAN_PAT" 2>/dev/null) || _HOLDER_RC=$?
                         else
                             # No uid that can see every /proc/<pid>/fd, and no
                             # non-interactive elevation to borrow one. Retrying
@@ -786,9 +850,18 @@ PY
 ${_HOLDER_OUT}"
                 fi
                 if [ "$_HOLDER_RC" -ne 0 ]; then
-                    die "SQLite holder inspection could NOT be completed conclusively after ${_HOLDER_ATTEMPT} attempt(s) (last rc=${_HOLDER_RC}) — refusing rather than assuming no holder exists. An unreadable /proc/<pid>/fd is an UNKNOWN holder, not an absent one. Resolve visibility (run this restore as a uid that can read every /proc/<pid>/fd, or provide passwordless sudo for the scan) or establish a verified offline boundary, then re-run. This scan is a supplementary guard, NOT exclusion: it cannot by itself prevent a new holder appearing between inspection and replacement. Quarantine retained."
+                    die "SQLite holder inspection could NOT be completed conclusively after ${_HOLDER_ATTEMPT} attempt(s) (last rc=${_HOLDER_RC}) — refusing rather than assuming no holder exists. An unreadable /proc/<pid>/fd is an UNKNOWN holder, not an absent one. Resolve visibility (run this restore as a uid that can read every /proc/<pid>/fd, or grant non-interactive sudo for the scan — the privileged command is a \`sh -c 'find /proc/[0-9]*/fd ...'\` wrapper, so a sudoers rule must permit that sh invocation, not just \`find\`) or establish a verified offline boundary, then re-run. This scan is a supplementary guard, NOT exclusion: it cannot by itself prevent a new holder appearing between inspection and replacement. Quarantine retained."
                 fi
 
+                # `mv SOURCE DIR` moves the source INSIDE a directory and exits
+                # 0, so a DB_FILE that resolves to a directory would swallow the
+                # staged database, report a successful swap, and fail only at
+                # final verification — with the staged file stranded inside the
+                # directory. A directory here is a misconfiguration, never a
+                # database; refuse before touching anything.
+                if [ -d "$DB_FILE" ]; then
+                    die "DB_FILE '$DB_FILE' is a directory — a rename onto it would move the staged database INSIDE it and report success. Fix the path before restoring. Quarantine retained."
+                fi
                 sync -f "$_DB_STAGE"
                 _PRE_RESTORE=""
                 _MOVED_WAL=false
@@ -839,6 +912,14 @@ ${_HOLDER_OUT}"
                         # directory mv is a rename, so it either moved or it did
                         # not; there is no partial state to reason about.
                         if ! mv "$DB_FILE-$_sidecar" "${_PRE_RESTORE}-${_sidecar}" 2>/dev/null; then
+                            # Say what actually happened: when the FIRST move is
+                            # the one that failed, nothing was moved and nothing
+                            # was "moved back" — a message claiming a rollback
+                            # ran would misstate the on-disk state to the
+                            # operator reading it mid-incident.
+                            if ! $_MOVED_WAL && ! $_MOVED_SHM; then
+                                die "could not move the live ${_sidecar} aside — nothing had been moved before it, so the live database and its sidecars are as they were${_PRE_RESTORE:+ (pre-restore hard link at ${_PRE_RESTORE} retained)}. Quarantine retained."
+                            fi
                             _ROLLBACK_OK=true
                             if $_MOVED_WAL; then
                                 mv "${_PRE_RESTORE}-wal" "$DB_FILE-wal" 2>/dev/null \
