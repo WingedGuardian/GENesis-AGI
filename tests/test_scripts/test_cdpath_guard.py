@@ -103,12 +103,22 @@ _DIRNAME_ARG = re.compile(r'\bcd\s+(?:-\S+\s+)*"\$\(dirname\b')
 # cd -- while flagging the valid `unset -v CDPATH`. Measured against the shipped
 # corpus this anchored form changes nothing: 0 of the fixed sites newly flagged.
 #
-# The `CDPATH=` alternative requires an ACTUALLY EMPTY assignment -- `(?=\s)`.
-# Without it the prefix matched `$(CDPATH=/decoy cd ...)`, which is not a remedy
-# at all: bash searches /decoy and can resolve into the wrong tree. That is a
-# FALSE NEGATIVE in this guard, i.e. exactly what it exists to prevent in future
-# code (Codex P2, PR #2171). The three spellings are pinned as table arms below.
-_REMEDY = re.compile(r"^\$\(\s*(?:unset\s+(?:-\w+\s+)*CDPATH\b|CDPATH=(?=\s))")
+# The `CDPATH=` alternative requires an ACTUALLY EMPTY assignment -- a
+# whitespace lookahead or an explicit `''`/`""`. Without it the prefix matched
+# `$(CDPATH=/decoy cd ...)`, which is not a remedy at all: bash searches /decoy
+# and can resolve into the wrong tree. That is a FALSE NEGATIVE in this guard,
+# i.e. exactly what it exists to prevent in future code (Codex P2, PR #2171).
+# The spellings are pinned as table arms below.
+#
+# The `unset` alternative is restricted to the option that actually clears a
+# VARIABLE: bare `unset` or `-v` only. `unset -f CDPATH` targets a function and
+# leaves the variable set, `-n` removes the nameref attribute without clearing
+# the value, and an invalid option (`unset -x CDPATH`) fails outright -- while
+# the `;` still runs the `cd`, so each passed the guard while the capture stayed
+# hijackable (Codex P2 / CodeRabbit Major, PR #2171).
+_REMEDY = re.compile(
+    r"^\$\(\s*(?:unset\s+(?:-v\s+)*CDPATH\b|CDPATH=(?:''|\"\"|(?=\s)))"
+)
 
 # A site that MUST be found. If the matcher stops matching the corpus, this
 # disappears and the test fails LOUDLY instead of passing over an empty scan --
@@ -146,21 +156,66 @@ def _substitutions(line: str):
     i, n = 0, len(line)
     while i < n:
         if line.startswith("$(", i):
-            depth, j = 1, i + 2
-            while j < n and depth:
-                if line.startswith("$(", j):
-                    depth += 1
-                    j += 2
-                    continue
-                if line[j] == "(":
-                    depth += 1
-                elif line[j] == ")":
-                    depth -= 1
-                j += 1
+            j = _command_sub_end(line, i)
             yield line[i:j]
             i = j
             continue
         i += 1
+
+
+def _command_sub_end(line: str, i: int) -> int:
+    """Index one past the ``)`` closing the ``$(`` at ``i`` (or ``len(line)``).
+
+    Parens inside shell quoting are DATA, not structure: without this,
+    ``X="$(printf ')'; cd ...)"`` ends the span at printf's argument and the
+    unsafe cd is never seen (Codex P2, PR #2171). And quoting is a STACK, not a
+    flag -- ``"$(dirname "$0")"`` nests a substitution inside double quotes that
+    carries its own quoting, which a single state variable flattens and
+    mis-balances. Each nested ``$(`` therefore recurses with a fresh state.
+    """
+    j, n, depth = i + 2, len(line), 1
+    while j < n and depth:
+        ch = line[j]
+        if ch == "'":
+            k = line.find("'", j + 1)
+            j = n if k == -1 else k + 1
+            continue
+        if ch == "\\":
+            j += 2
+            continue
+        if ch == '"':
+            j = _dquote_end(line, j)
+            continue
+        if line.startswith("$(", j):
+            j = _command_sub_end(line, j)
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        j += 1
+    return j
+
+
+def _dquote_end(line: str, i: int) -> int:
+    """Index one past the ``"`` closing the ``"`` at ``i`` (or ``len(line)``).
+
+    Parens are literal inside double quotes; a nested ``$(`` still opens a
+    substitution and is stepped over with its own quoting state.
+    """
+    j, n = i + 1, len(line)
+    while j < n:
+        ch = line[j]
+        if ch == "\\":
+            j += 2
+            continue
+        if ch == '"':
+            return j + 1
+        if line.startswith("$(", j):
+            j = _command_sub_end(line, j)
+            continue
+        j += 1
+    return n
 
 
 def _violations():
@@ -232,6 +287,15 @@ def test_the_scan_actually_looked_at_the_corpus():
         ('X="$(CDPATH=/decoy cd "$(dirname "$0")" && pwd)"', "violation"),
         ('X="$(CDPATH=$HOME cd "$(dirname "$0")" && pwd)"', "violation"),
         ('X="$(CDPATH=. cd "$(dirname "$0")" && pwd)"', "violation"),
+        # --- an unset that does NOT clear the variable is NOT a remedy: the
+        # option makes unset miss CDPATH (or fail) while `;` still runs cd ---
+        ('X="$(unset -f CDPATH; cd "$(dirname "$0")" && pwd)"', "violation"),
+        ('X="$(unset -n CDPATH; cd "$(dirname "$0")" && pwd)"', "violation"),
+        ('X="$(unset -x CDPATH; cd "$(dirname "$0")" && pwd)"', "violation"),
+        ('X="$(unset -f -v CDPATH; cd "$(dirname "$0")" && pwd)"', "violation"),
+        # --- a quoted `)` is DATA, not the end of the substitution: if the span
+        # ends at printf's argument the unsafe cd is never seen at all ---
+        ('X="$(printf \')\'; cd "$(dirname "$0")" && pwd)"', "violation"),
         # --- not the shape: a cd with no dirname is out of this guard's scope ---
         ('X="$(cd "$SCRIPT_DIR/.." && pwd)"', "ignored"),
         ('X="$(cd "$HOME/genesis" && pwd)"', "ignored"),
