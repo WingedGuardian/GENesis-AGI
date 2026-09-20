@@ -43,7 +43,7 @@
 # Sourced by deploy_code_only.sh, run_under_deploy_lock.sh, update.sh
 # (receipts only), and disk_hygiene.sh (retention constant). Bash 4+.
 
-GENESIS_DEPLOY_LOCK="${GENESIS_DEPLOY_LOCK:-$HOME/.genesis/locks/update.lock}"
+GENESIS_DEPLOY_LOCK="${GENESIS_DEPLOY_LOCK:-${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock}"
 GENESIS_DEPLOY_RECEIPTS="${GENESIS_DEPLOY_RECEIPTS:-$HOME/.genesis/deploy_receipts.jsonl}"
 
 # Exit code for "the wait timed out with the lock still held" — mirrors

@@ -173,7 +173,7 @@ def _write_bootstrap_manifest_file(runtime: GenesisRuntime) -> None:
 
     manifest_file = Path.home() / ".genesis" / "bootstrap_manifest.json"
     payload = {
-        "bootstrapped": True,
+        "bootstrapped": runtime.is_bootstrapped,
         "manifest": dict(runtime._bootstrap_manifest),
         "persisted_at": datetime.now(UTC).isoformat(),
         "pid": os.getpid(),
@@ -194,3 +194,8 @@ def _write_bootstrap_manifest_file(runtime: GenesisRuntime) -> None:
         )
     except OSError:
         logger.error("Failed to write bootstrap manifest file", exc_info=True)
+
+
+def write_bootstrap_manifest_file(runtime: GenesisRuntime) -> None:
+    """Persist only the raw bootstrap result, including failed early boots."""
+    _write_bootstrap_manifest_file(runtime)

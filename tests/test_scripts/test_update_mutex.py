@@ -45,7 +45,10 @@ def test_the_shared_lock_constant_still_resolves_to_the_historical_path(text: st
         "update.sh must source the lib that defines the shared lock path"
     )
     lib = (REPO_ROOT / "scripts" / "lib" / "deploy_lock.sh").read_text()
-    assert 'GENESIS_DEPLOY_LOCK="${GENESIS_DEPLOY_LOCK:-$HOME/.genesis/locks/update.lock}"' in lib
+    assert (
+        'GENESIS_DEPLOY_LOCK="${GENESIS_DEPLOY_LOCK:-${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock}"'
+        in lib
+    ), "lib default must honour GENESIS_HOME, still resolving to the historical path"
 
 
 def test_nohup_fallback_closes_lock_fd(text: str) -> None:

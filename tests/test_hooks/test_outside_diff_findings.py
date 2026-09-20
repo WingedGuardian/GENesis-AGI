@@ -240,6 +240,43 @@ class TestGateBehaviour:
         assert "[outside-diff Critical] Data loss" in err, "and it must still be SEEN"
         assert "NEVER SCORED" in err
 
+    def test_a_hostile_FILE_HEADER_cannot_write_to_the_terminal(
+        self, guard_module, monkeypatch, no_inline, capsys
+    ):
+        """This channel's path is parsed from PROSE, and the capture is wide open.
+
+        `_CR_FILE_HEADER_RE` captures `[^<>]+?` from a `<summary>` line, which
+        excludes angle brackets and NOTHING ELSE — so a file header can carry
+        ESC, CR or bidi straight into the label this lane prints. The title
+        beside it is already safe (`_inline_title` sanitises at the producer);
+        the path was not, and unlike the title it cannot be fixed at the
+        producer, because the raw value is what the diff-scope match needs.
+
+        Added because verify-RED found the gap: the inline-channel test for the
+        same class drives `pulls/N/comments`, so unwrapping THIS site came back
+        GREEN against it. Two delivery channels, two tests — one test cannot
+        cover a site it never reaches.
+
+        The lane is advisory and never blocks, which is the dangerous half: the
+        operator reads a passing verdict while the line has been redrawn.
+        """
+        hostile = "src/\x1b[2Kevil.py"
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            json.dumps({"filename": hostile, "previous_filename": None}),
+        )
+        review = _review(_section(_entry(hostile, "1-2", "🟠 Major", "Forged")))
+        block, _ = self._run(guard_module, monkeypatch, no_inline, [review])
+        assert block is False, "precondition: this channel is advisory"
+        err = capsys.readouterr().err
+        assert "[outside-diff Major]" in err, "precondition: the lane printed"
+        residue = [c for c in err if guard_module._gate_text_unsafe(c) and c != "\n"]
+        assert not residue, f"terminal-acting characters reached the report: {residue!r}"
+        assert "evil.py" in err, (
+            "and the path must still name its file — a renderer that neutralised "
+            "by deleting everything would pass the check above and be useless"
+        )
+
     def test_a_lone_outside_diff_finding_produces_no_block_message_at_all(
         self, guard_module, monkeypatch, no_inline
     ):
