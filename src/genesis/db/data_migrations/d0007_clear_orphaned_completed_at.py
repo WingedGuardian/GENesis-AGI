@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 
+from genesis.db.connection import connect_sqlite_rw
 from genesis.env import genesis_db_path
 
 logger = logging.getLogger(__name__)
@@ -40,7 +41,7 @@ requires_operator = False
 
 def migrate() -> dict:
     """NULL completed_at on every non-terminal row that carries one."""
-    db = sqlite3.connect(genesis_db_path(), timeout=30.0)
+    db = connect_sqlite_rw(genesis_db_path(), timeout=30.0)
     try:
         cur = db.execute(
             "UPDATE follow_ups SET completed_at = NULL "

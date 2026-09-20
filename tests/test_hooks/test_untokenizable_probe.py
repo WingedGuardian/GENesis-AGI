@@ -379,8 +379,11 @@ class TestCommitGuardFailsClosedOnCrash:
         hooks = scripts / "hooks"
         hooks.mkdir(parents=True)
         (scripts / _COMMIT_GUARD.name).write_text(_COMMIT_GUARD.read_text())
-        for dep in ("hook_input.py", "shell_parse.py"):
+        for dep in ("hook_input.py", "shell_parse.py", "native_approval.py"):
             (hooks / dep).write_text((_HOOKS_DIR / dep).read_text())
+        (scripts / "review_deadline.py").write_text(
+            (_WORKTREE / "scripts" / "review_deadline.py").read_text()
+        )
         # Not an ImportError: the module is present and imports cleanly as a
         # FILE, but fails to compile. That is the case the narrow handler missed.
         (scripts / "review_state.py").write_text("def broken(:\n")
@@ -431,7 +434,11 @@ class TestEveryGuardConsultsTheChokepoint:
         # been a non-zero exit that looked like a wired guard.)
         target = (hooks if guard.parent.name == "hooks" else scripts) / guard.name
         target.write_text(guard.read_text())
-        (hooks / "hook_input.py").write_text((_HOOKS_DIR / "hook_input.py").read_text())
+        for dep in ("hook_input.py", "native_approval.py"):
+            (hooks / dep).write_text((_HOOKS_DIR / dep).read_text())
+        (scripts / "review_deadline.py").write_text(
+            (_WORKTREE / "scripts" / "review_deadline.py").read_text()
+        )
         (hooks / "shell_parse.py").write_text(
             "import importlib.util, sys\n"
             "_s = importlib.util.spec_from_file_location(\n"

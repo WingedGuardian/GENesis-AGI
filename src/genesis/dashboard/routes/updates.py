@@ -15,6 +15,7 @@ from pathlib import Path
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import blueprint
+from genesis.db.connection import connect_sqlite_rw
 from genesis.env import update_in_progress
 
 logger = logging.getLogger(__name__)
@@ -74,7 +75,7 @@ def _execute_db(sql: str, params: tuple = ()) -> bool:
         return False
     conn = None
     try:
-        conn = sqlite3.connect(str(_DB_PATH), timeout=5)
+        conn = connect_sqlite_rw(_DB_PATH, timeout=5)
         conn.execute(sql, params)
         conn.commit()
         return True
