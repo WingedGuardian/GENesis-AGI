@@ -5698,6 +5698,64 @@ class TestFindingsDistribution:
         )
         assert "unresolved findings" in out
 
+    def test_output_survives_pathological_paths(self, guard_module):
+        """The size bound above passes only because its paths are SHORT.
+
+        `json.dumps` escapes control characters but does not shorten, and a
+        control-dense path EXPANDS six-fold, so escaping alone left the report's
+        own 1500-char budget reachable by a single contributor-named file
+        (CodeRabbit Minor, PR #2005). MEASURED before the bound: the
+        control-dense case below rendered ~29,000 chars.
+        """
+        for label, rows in (
+            ("plain", [("P2", "d" * 4000 + f"/f{i}.py") for i in range(6)]),
+            ("control-dense", [("P2", ("\x1b[2K\r" * 800) + f"{i}.py") for i in range(6)]),
+            (
+                "concentrated",
+                [("P2", "z" * 4000 + "/hot.py")] * 5 + [("P1", "b" * 4000 + "/other.py")],
+            ),
+        ):
+            out = guard_module._findings_distribution(rows)
+            assert len(out) < 1500, f"{label}: {len(out)} chars"
+            assert len(out.splitlines()) <= 10, label
+            assert not any(ord(c) < 32 and c != "\n" for c in out), (
+                f"{label}: a raw control character reached the report"
+            )
+
+    def test_a_clipped_path_keeps_its_basename_and_declares_the_cut(self, guard_module):
+        """A path's informative end is its TAIL, unlike a title's opening words.
+
+        Clipping is a selection here — the full value is one row up in the
+        findings list — but only if the cut is visible and the filename survives.
+        """
+        out = guard_module._findings_distribution([("P1", "a" * 500 + "/needle.py")])
+        assert "needle.py" in out, "the basename is the part worth keeping"
+        assert "…" in out, "a silent cut reads as the whole path"
+        assert "a" * 200 not in out, "the head must not survive intact"
+
+    def test_the_elided_remainder_counts_files_not_buckets(self, guard_module):
+        """`len(ranked) - 6` counted the pathless bucket as an omitted FILE, so
+        seven files plus a pathless bucket reported '2 more file(s)' when one
+        file was omitted (Devin + CodeRabbit, independently, PR #2005).
+
+        The bucket is NAMED rather than folded away: it holds real findings, and
+        an undeclared omission is what the elision marker exists to prevent.
+        """
+        rows = [("P2", f"src/f{i}.py") for i in range(7)] + [("P1", "")]
+        out = guard_module._findings_distribution(rows)
+        assert "1 more file(s)" in out, "only ONE real file is omitted"
+        assert "2 more file(s)" not in out
+        assert "the pathless bucket" in out, "the dropped bucket must be declared"
+
+    def test_elision_with_no_pathless_bucket_says_only_files(self, guard_module):
+        """Negative control for the test above: the bucket clause must not appear
+        when there is no bucket, or the marker lies in the ordinary case."""
+        out = guard_module._findings_distribution(
+            [("P2", f"src/f{i}.py") for i in range(9)]
+        )
+        assert "3 more file(s)" in out
+        assert "pathless" not in out
+
 
 class TestFindingsDistributionIsWired:
     """The report must actually REACH the reader.
@@ -5749,6 +5807,33 @@ class TestFindingsDistributionIsWired:
         with self._mock(guard_module, []):
             guard_module._check_inline_review_findings("100")
         assert "DISTRIBUTION:" not in capsys.readouterr().err
+
+    def test_a_clean_pr_does_no_rename_lookup(self, guard_module, capsys, monkeypatch):
+        """Python evaluates arguments BEFORE the call, so passing the rename map
+        as an argument made a clean PR pay for a map no report would use (Devin,
+        PR #2005). `_findings_distribution` returning '' on empty input does not
+        prevent the fetch — only guarding the CALL SITE does.
+
+        Asserted on the real helper rather than on a subprocess count, because
+        the map has its own cache: a hit would make a call-counting test pass
+        while the first clean PR of the process still paid.
+        """
+        calls = []
+        monkeypatch.setattr(
+            guard_module,
+            "_pr_rename_map",
+            lambda pr_num, repo=None: calls.append(pr_num) or {},
+        )
+        with self._mock(guard_module, []):
+            guard_module._check_inline_review_findings("100")
+        assert calls == [], "a clean scan must not fetch a rename map"
+
+        # Positive control: the same seam DOES fetch when there is a report to
+        # build — otherwise this test would pass against a deleted call site.
+        comments = [_codex_c(i, _P2_BODY, path="src/seam.py") for i in range(1, 5)]
+        with self._mock(guard_module, comments):
+            guard_module._check_inline_review_findings("100")
+        assert calls == ["100"], "a scan WITH findings must still resolve renames"
 
     def test_a_P1_reaches_the_distribution_through_the_real_scan(self, guard_module, capsys):
         """VERIFY-RED ANCHOR, and it exists because a mutation SURVIVED without it.

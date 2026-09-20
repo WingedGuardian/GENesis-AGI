@@ -2477,15 +2477,55 @@ _CONCENTRATION_SHARE = 0.5
 _CONCENTRATION_MIN_FINDINGS = 4
 
 
+#: Raw-path budget before the tail is kept and the cut declared. Matches
+#: `_INLINE_TITLE_MAX_CHARS`'s role for titles; the value is measured against
+#: the report's own size bound by `test_output_survives_pathological_paths`.
+_REPORT_PATH_MAX_CHARS = 80
+#: Backstop on the ENCODED form, for the control-dense case that expands past
+#: the raw budget even after clipping: an ESC byte becomes six characters.
+_REPORT_PATH_ENCODED_MAX_CHARS = 100
+
+
 def _safe_report_path(path: str) -> str:
-    """A path rendered safe for a terminal report.
+    """A path rendered safe for a terminal report: escaped, and BOUNDED.
 
     Finding paths are contributor-controlled strings: a reviewed file can be
     named with ANSI escapes or carriage returns, and interpolating the raw value
     would let it forge or conceal the surrounding gate output. JSON quoting
     makes every control character visible and inert.
+
+    Escaping does not SHORTEN, which is the second half and was missing: a path
+    has no practical length limit and a control-dense one EXPANDS six-fold, so
+    six such rows blow the report's own size budget — the one
+    `test_output_is_bounded_regardless_of_file_count` already pins at 1500
+    chars. That test passes today only because its paths are short.
+
+    The TAIL is what survives, unlike `_inline_title`, which keeps the opening
+    words: a path's basename is its informative end. The full value is one row
+    up in the findings list itself, so this is a selection, not an amputation —
+    but only while the cut is VISIBLE, which is why the ellipsis sits OUTSIDE
+    the quoting. An earlier version put it inside the string and `json.dumps`
+    escaped it to a literal backslash-u-2026, so the marker declaring the cut
+    was itself unreadable; the test for the marker is what caught that.
+
+    Clipped BEFORE encoding, never after: slicing an encoded string can land
+    mid-escape and render an escape sequence as a truncated prefix, which is
+    wrong and misleading. Clipping first keeps every escape whole. The encoded
+    backstop below CAN cut mid-escape, and is still SAFE where it matters —
+    `json.dumps` has already replaced every control character, so no slice of
+    its ASCII-safe output can reintroduce one. That one is a size guarantee,
+    not a legibility one, and it is declared by the same ellipsis.
     """
-    return json.dumps(path)
+    clipped = len(path) > _REPORT_PATH_MAX_CHARS
+    if clipped:
+        path = path[-_REPORT_PATH_MAX_CHARS:]
+    encoded = json.dumps(path)
+    if len(encoded) > _REPORT_PATH_ENCODED_MAX_CHARS:
+        # Keep the opening quote and close it: the result may be a truncated
+        # escape, which is ugly and inert, never a control character.
+        encoded = encoded[: _REPORT_PATH_ENCODED_MAX_CHARS - 1] + '"'
+        clipped = True
+    return f"…{encoded}" if clipped else encoded
 
 
 def _findings_distribution(
@@ -2554,7 +2594,19 @@ def _findings_distribution(
             f"{_safe_report_path(path) if path is not None else '(no path)'}  [{mix}]"
         )
     if len(ranked) > 6:
-        lines.append(f"    … and {len(ranked) - 6} more file(s)")
+        # The elided remainder is counted in FILES, and the pathless bucket is
+        # not one — counting rows here would report "2 more file(s)" when one
+        # file and the pathless bucket were dropped. It is also named rather
+        # than silently folded away: it holds real findings, and an omission
+        # nobody declares is the thing the elision marker exists to prevent.
+        elided = ranked[6:]
+        elided_files = sum(1 for path, _ in elided if path is not None)
+        parts = []
+        if elided_files:
+            parts.append(f"{elided_files} more file(s)")
+        if elided_files != len(elided):  # at most one None bucket exists
+            parts.append("the pathless bucket")
+        lines.append(f"    … and {' + '.join(parts)}")
 
     # The single-seam note needs ONE file that actually dominates: a pathless
     # bucket is not a file, and a 2–2 tie names a lexicographic winner that does
@@ -3135,14 +3187,21 @@ def _check_inline_review_findings(
     # or a failed changed-file resolution makes every percentage below a shape
     # nobody actually measured, so a PARTIAL scan prints counts but never the
     # concentration inference.
-    reliable = complete and (not _scope_cache or _scope_cache[0] is not None)
-    distribution = _findings_distribution(
-        scored_at,
-        renames=_pr_rename_map(pr_num, repo=repo),
-        reliable=reliable,
-    )
-    if distribution:
-        print(distribution, file=sys.stderr)
+    # Guarded on `scored_at` rather than leaning on the empty-input early
+    # return inside `_findings_distribution`: Python evaluates arguments BEFORE
+    # the call, so the rename lookup — its own `pulls/N/files` fetch behind its
+    # own cache — would run on every clean PR to build a map for a report that
+    # is never rendered. This path also runs inside the merge hook, which has a
+    # wall-clock deadline, so a fetch for a discarded result is not free.
+    if scored_at:
+        reliable = complete and (not _scope_cache or _scope_cache[0] is not None)
+        distribution = _findings_distribution(
+            scored_at,
+            renames=_pr_rename_map(pr_num, repo=repo),
+            reliable=reliable,
+        )
+        if distribution:
+            print(distribution, file=sys.stderr)
     # The lane is resolved ONLY when there is a score to compare, so a PR with no
     # blocking findings still pays nothing — the same laziness `_scope_cache`
     # above was built for. `_pr_changed_files` is memoized, and the pin-receipt
