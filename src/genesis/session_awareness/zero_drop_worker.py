@@ -1287,12 +1287,16 @@ async def _run_locked(
     pending_reverted = isinstance(pending_mode, str) and pending_mode != mode
     changed = _mode_changed(prior_mode, mode) or pending_reverted
     if mode == "off":
-        if not dropped:
+        if not dropped and not pending_reverted:
             # Steady-state off: nothing to retire, and no reason to rewrite a
             # record the previous transition already stamped `off`.
             return {"status": "skipped_off"}
+        off_prior_mode = pending_mode if pending_reverted else prior_mode
         return await _run_off_transition(
-            trigger=trigger, db_path=db_path, repo_path=repo_path, prior_mode=prior_mode
+            trigger=trigger,
+            db_path=db_path,
+            repo_path=repo_path,
+            prior_mode=off_prior_mode,
         )
     # A FAILED prior debounces on a SHORT floor rather than the full interval.
     #

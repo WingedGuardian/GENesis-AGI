@@ -2108,3 +2108,45 @@ async def test_off_transition_record_write_failure_keeps_prior_mode_and_retries(
     )
     assert out["status"] == "ok"
     assert json.loads(w.last_run_path().read_text())["mode"] == "off"
+
+
+async def test_reverting_failed_off_to_alert_retires_alerts_immediately(env, db_path, monkeypatch):
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    await _run(db_path)
+    assert len(await _open_observations(db_path, w.ALERT_SOURCE)) == 1
+
+    monkeypatch.setattr(w, "effective_mode", lambda: "off")
+    await _run(db_path)
+    assert await _open_observations(db_path, w.ALERT_SOURCE) == []
+    assert json.loads(w.last_run_path().read_text())["mode"] == "off"
+
+    real_write = w._atomic_write_json
+    failed = False
+
+    def _fail_once(path, data):
+        nonlocal failed
+        if path == w.last_run_path() and not failed:
+            failed = True
+            raise OSError("state disk temporarily unavailable")
+        return real_write(path, data)
+
+    monkeypatch.setattr(w, "_atomic_write_json", _fail_once)
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    with pytest.raises(OSError, match="state disk temporarily unavailable"):
+        await _run(db_path)
+
+    record = json.loads(w.last_run_path().read_text())
+    assert record["mode"] == "off"
+    assert record["pending_mode"] == "alert"
+    assert len(await _open_observations(db_path, w.ALERT_SOURCE)) == 1
+
+    monkeypatch.setattr(w, "effective_mode", lambda: "off")
+    out = await w.run_zero_drop_worker(
+        trigger="session_start", force=False, db_path=db_path, repo_path="/repo"
+    )
+
+    assert out["status"] == "ok"
+    assert await _open_observations(db_path, w.ALERT_SOURCE) == []
+    record = json.loads(w.last_run_path().read_text())
+    assert record["mode"] == "off"
+    assert "pending_mode" not in record
