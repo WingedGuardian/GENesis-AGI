@@ -279,6 +279,27 @@ systemd-run --user --collect --unit genesis-deploy-manual \
   /bin/bash -c 'mkdir -p ~/tmp; exec ./scripts/update.sh > ~/tmp/deploy-$(date +%Y%m%d-%H%M).log 2>&1'
 ```
 
+substituting the checkout root you actually ran from for `$HOME/genesis` if it
+differs — `install.sh:1241-1247` supports noncanonical locations and `update.sh`
+derives its root from its own path, so the canonical path is an example, not a
+constant. (Keep the command itself pasteable — a literal `<placeholder>` in the
+value is a shell syntax error.)
+
+**Two preconditions, checked before detaching, not after:**
+
+- **Linger.** A `--user` unit dies with the user manager when your last login
+  session ends unless linger is enabled. `loginctl show-user $(id -u) -p Linger`
+  must print `Linger=yes`; if it does not, run `loginctl enable-linger $(id -u)`
+  first (one-time, needs sudo). Without it the "detached" deploy survives the CC
+  session only as long as you stay logged in — which is the same coupling, one
+  level up.
+- **Noninteractive sudo.** `update.sh` calls `bootstrap.sh` unconditionally
+  (`update.sh:1660`), and bootstrap calls `sudo`. The no-sudo claim covers only
+  `update.sh`'s own text, not its transitive calls. If sudo prompts anywhere on
+  this install, the detached deploy aborts mid-bootstrap. `sudo -n true` must
+  exit 0 — refresh the ticket with `sudo -v` in a real terminal before launching,
+  or run the deploy in that terminal instead.
+
 **`mkdir -p ~/tmp` is part of the command, not tidiness.** `~/tmp` is not
 guaranteed — `install.sh` and `bootstrap.sh` create it only when `/tmp` is small —
 and the shell opens the redirect *before* exec'ing `update.sh`, so a missing
@@ -310,8 +331,10 @@ sudo prompts it aborts partway through configuring the machine — and "sudo is
 passwordless here" is a fact about one box, not about the recipe. `host-setup.sh` is
 worse: interactive, run on the bare host VM, and at `:536-538` the recreate prompt
 treats EOF as the default `Y`, so detaching it stops and renames the existing
-container. `update.sh` is the only script in this family with **no sudo calls at
-all**, which is why it is the only one covered. Run the other two in a real terminal;
+container. `update.sh` is the only script in this family with **no sudo calls of
+its own** — it does invoke `bootstrap.sh` (`update.sh:1660`), which does call
+sudo, hence the noninteractive-sudo precondition above — and it remains the only
+one covered. Run the other two in a real terminal;
 the advisory no longer fires on them rather than offer a recipe that breaks them.
 
 Wrap **the command you actually ran** — `update.sh` and `bootstrap.sh` are not
