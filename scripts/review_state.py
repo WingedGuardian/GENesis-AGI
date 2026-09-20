@@ -84,7 +84,7 @@ from pathlib import Path
 #: Every one fails OPEN. `"clean"` is this module's sentinel for NOTHING STAGED,
 #: so unreviewed work becomes invisible to the depth gate; the branch read
 #: defeats the no-commits-to-main check; the key change makes the gate consult a
-#: marker file that does not exist; and via `advance_review_round`, a "clean"
+#: marker file that does not exist; and via `bump_review_round`, a "clean"
 #: content hash returns the CURRENT round without advancing, so the escalation
 #: cap silently stops counting. `review_scope`'s substantiality classifier moves
 #: `substantial` -> `inline` for the same reason.
@@ -95,37 +95,33 @@ from pathlib import Path
 #: untested case — so they stay, because adding to a scrub is the safe
 #: direction. Do not cite them as measured to matter; they are not.
 #:
-#: DUPLICATED, DELIBERATELY, rather than imported. THREE copies of THIS list
-#: exist — here, `scripts/review_scope.py`, and
-#: `src/genesis/session_awareness/zero_drop_git.py` (the original). A FIFTH,
-#: NARROWER list lives in `scripts/worktree_lifecycle.py` (3 names, its own
-#: comment concedes it is incomplete); it is NOT part of this parity set and is
-#: tracked separately. This module is stdlib-only, and
+#: DUPLICATED, DELIBERATELY, rather than imported. FOUR copies of THIS list
+#: exist and hold the SAME names — here, `scripts/review_scope.py`,
+#: `src/genesis/session_awareness/zero_drop_git.py` (the original), and the bash
+#: array in `.claude/hooks/genesis-hook`, because bash cannot import a Python
+#: tuple. A FIFTH, NARROWER list lives in `scripts/worktree_lifecycle.py`
+#: (3 names, its own comment concedes it is incomplete); it is NOT part of this
+#: parity set and is tracked separately. This module is stdlib-only, and
 #: `git_push_guard` wraps its `review_state` import in `try/except` precisely
 #: because a module-load exception in a hook exits 1, which Claude Code treats as
 #: non-blocking — silently disabling every fail-closed gate in that file. Adding
 #: an import here would add exactly that failure mode to the layer this constant
-#: exists to harden. `tests/test_hooks/test_git_env_scrub.py` asserts the three
-#: copies are equal and fails when any drifts. The lock is the chokepoint; an
+#: exists to harden. `tests/test_hooks/test_git_env_scrub.py` asserts all four
+#: copies are EQUAL and fails when any drifts. The lock is the chokepoint; an
 #: import would be a liability.
 #:
-#: THE LAUNCHER'S BASH ARRAY IS DELIBERATELY *NOT* A FOURTH COPY OF THIS LIST,
-#: and the asymmetry is the point rather than drift. `.claude/hooks/genesis-hook`
-#: scrubs for all ~50 LAUNCHED hooks, and one of them — `git_push_guard` — exists
-#: to PREDICT what a `git push` will do. Its `_push_config_is_simple` is an
-#: allowlist over the user's effective config (`remote.pushDefault`,
-#: `push.default`, `push.recurseSubmodules`, …): a broadening value makes it
-#: return False and PROMPT. A guard that predicts a command's effect must see the
-#: config that command will see, so the launcher must NOT touch the config
-#: variables at all — neither pinning nor unsetting them.
-#:
-#: MEASURED 2026-09-19 through the real function, with a control that moves:
-#: with `push.default = matching` in `~/.gitconfig`, `is_simple` is False
-#: (prompts) unpinned and True (ALLOWS SILENTLY) under `GIT_CONFIG_GLOBAL=/dev/null`
-#: — a fail-open in a push guard, manufactured by the remedy. Unsetting breaks it
-#: the same way whenever a user legitimately points GIT_CONFIG_GLOBAL at a custom
-#: file. The launcher therefore carries the LOCATION names only; the parity test
-#: asserts that asymmetry by name rather than asserting equality.
+#: The launcher carrying the same names is what the push guard needs too.
+#: `.claude/hooks/genesis-hook` scrubs for all ~50 LAUNCHED hooks, one of which
+#: — `git_push_guard` — PREDICTS what a `git push` will do: its
+#: `_push_config_is_simple` is an allowlist over the user's effective config
+#: (`remote.pushDefault`, `push.default`, `push.recurseSubmodules`, …) where a
+#: broadening value makes it return False and PROMPT. MEASURED 2026-09-19
+#: through the real function, with a control that moves: with
+#: `push.default = matching` in `~/.gitconfig` it returns False (prompts) when
+#: the config is visible and True — ALLOWS SILENTLY — once that config is
+#: scrubbed away. A guard that predicts a command's effect must see the config
+#: that command will see, which is the second reason no config channel appears
+#: in any of the four copies.
 GIT_ENV_UNSET = (
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -139,36 +135,37 @@ GIT_ENV_UNSET = (
     "GIT_PREFIX",
     "GIT_EXTERNAL_DIFF",
     "GIT_DIFF_OPTS",
-    # Config injected ENTIRELY through the environment: GIT_CONFIG_COUNT with
-    # its unbounded GIT_CONFIG_KEY_n/VALUE_n pairs (which cannot be listed by
-    # name), and GIT_CONFIG_PARAMETERS. There is no FILE to point at a neutral
-    # value, so removal is the only available action — unlike the two below.
-    "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_PARAMETERS",
 )
 
-#: GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM are DELIBERATELY absent from that
-#: list, and must not be added to it in either direction — neither unset nor
-#: pinned. Both break something, MEASURED:
+#: NO git CONFIG channel is handled here — not the FILE sources
+#: (GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM) and not the INJECTION channels
+#: (GIT_CONFIG_COUNT with its GIT_CONFIG_KEY_n/VALUE_n pairs,
+#: GIT_CONFIG_PARAMETERS). Three review rounds each found the same generator, so
+#: it is written out rather than left to be rediscovered a fourth time:
 #:
-#: * UNSETTING `GIT_CONFIG_GLOBAL` re-enables `$HOME/.gitconfig`, so a scrub
-#:   meant to isolate instead LOOSENS, and a caller that set it to `/dev/null`
-#:   for isolation silently loses that constraint.
-#: * PINNING it to `os.devnull` removes a CAPABILITY. `safe.directory` is
-#:   readable ONLY from protected config (system/global/command line) — by
-#:   design, so an untrusted repo cannot self-approve — and repo-local config
-#:   cannot restore it (MEASURED: still rc=129). So under any uid mismatch
-#:   (a bind-mounted devcontainer, container CI, a hook under sudo) git REFUSES
-#:   with EMPTY stdout, and `_staged_content_hash`'s empty-output sentinel is
-#:   `"clean"` — NOTHING STAGED. MEASURED end to end with a file staged:
-#:   `get_current_diff_hash` -> `'clean'`. That is this module's own fail-open,
-#:   reintroduced by the hardening meant to close it.
+#:   ALL FOUR ARE PROTECTED CONFIG, and protected config is the only place git
+#:   reads `safe.directory` from — deliberately, so an untrusted repository
+#:   cannot self-approve. Repo-local config CANNOT substitute (MEASURED: still
+#:   rc=129). So removing ANY of them removes that capability, and under a uid
+#:   mismatch — a bind-mounted devcontainer, container CI, a hook under sudo —
+#:   git REFUSES with EMPTY stdout. `_staged_content_hash` branches on output
+#:   alone, and its empty-output sentinel is "clean": NOTHING STAGED, over real
+#:   staged work.
 #:
-#: What closes the one config route MEASURED to move a decision is a FLAG on the
-#: command, not the environment — see `_ATTRIBUTES_HARDENING` below. Same shape
-#: as `--no-ext-diff`: the purpose-built instrument beats environment surgery,
-#: and it leaves `safe.directory`, `credential.helper` and `url.*.insteadOf`
-#: working for the callers that need them.
+#: MEASURED 2026-09-20, one file staged, uid mismatch, safe.directory supplied
+#: ONLY through GIT_CONFIG_COUNT (which is how a container or CI supplies it):
+#:   injected value present   rc=0    A staged.py
+#:   GIT_CONFIG_COUNT scrubbed rc=129  (empty stdout) -> hash reads "clean"
+#: The same measurement holds for GIT_CONFIG_GLOBAL via a config file.
+#:
+#: Unsetting a config channel is not neutral in the other direction either: it
+#: re-enables $HOME/.gitconfig, so a caller that set GIT_CONFIG_GLOBAL=/dev/null
+#: for isolation silently loses it.
+#:
+#: What hardens the config routes MEASURED to move a gate decision is a FLAG on
+#: the command — `--no-ext-diff` for `diff.external`, `_ATTRIBUTES_HARDENING`
+#: for `core.attributesFile`. A flag cannot remove a capability the way an
+#: environment edit does, and it is scoped to the one command that needs it.
 
 #: Hardening for git's ATTRIBUTES lookup, applied to the diff commands.
 #:
@@ -181,10 +178,19 @@ GIT_ENV_UNSET = (
 #: an empty file restores `200  0` AND keeps protected config readable, which is
 #: the whole reason this is a flag rather than a pin.
 #:
-#: RESIDUAL, stated rather than implied: attributes have three sources and this
+#: RESIDUAL, stated rather than implied: attributes have FOUR sources and this
 #: closes ONE. `.git/info/attributes` and a STAGED `.gitattributes` reach the
 #: same collapse — so a change can lower its own review depth — and no
 #: environment or command-line handling can close either. Tracked as an issue.
+#: The fourth is the SYSTEM file `/etc/gitattributes`, which git's own binary
+#: names alongside its off switch `GIT_ATTR_NOSYSTEM` (both MEASURED present in
+#: the git 2.43 binary; the file is absent on this install). Low reachability —
+#: it is root-owned — and unlike the other two it IS closable, via
+#: `git_env(GIT_ATTR_NOSYSTEM="1")`, which survives the filter because the
+#: override merge precedes it. Left alone on purpose: adding it would be a
+#: precautionary environment edit of exactly the kind three review rounds
+#: established as the thing that removes capabilities, and nothing has measured
+#: it moving a decision. Counted here so "three sources" is not read as complete.
 #: Not live in this repo today: the tracked `.gitattributes` carries only
 #: `/CHANGELOG.md merge=union`, no `binary`/`-diff` marker exists anywhere
 #: tracked, and `.git/info/attributes` is absent.
@@ -372,17 +378,25 @@ def get_current_diff_hash(cwd: str | None = None, *, deadline: float | None = No
     """
     try:
         result = subprocess.run(
-            # --no-ext-diff/--no-textconv here are CONSISTENCY, not protection,
-            # and the distinction is worth keeping straight. MEASURED
-            # 2026-09-19: the `--raw` format reports metadata rather than
-            # content, so no external diff driver runs and this hash held steady
-            # across all four injection routes while the plain-diff hash below
-            # fell to "clean". A mutation removing these two flags therefore
-            # SURVIVES the suite, correctly — there is no behaviour here to pin.
-            # They stay so both hashes are computed the same way. Also MEASURED
-            # byte-identical, so stored marker hashes remain valid.
+            # --no-ext-diff/--no-textconv here are CONSISTENCY, not protection.
+            # MEASURED 2026-09-19: the `--raw` format reports metadata rather
+            # than content, so no external diff driver runs and this hash held
+            # steady across all four injection routes while the plain-diff hash
+            # below fell to "clean". A mutation removing those two therefore
+            # SURVIVES the suite, correctly — there is no behaviour to pin.
+            #
+            # --no-replace-objects is DIFFERENT: it IS protection here, and this
+            # site is why the distinction had to be re-measured. MEASURED
+            # 2026-09-20: a `refs/replace` ref swapping HEAD for a commit whose
+            # tree equals the index empties the `--raw` output too, at rc=0 —
+            # so the "the raw format is immune" reasoning above is true of the
+            # DIFF-DRIVER class and false of this one. Replacement applies at
+            # object-read time, below the format layer, which is exactly why the
+            # format does not save it. No environment component, so no scrub
+            # could have reached it either.
             [
                 "git",
+                "--no-replace-objects",
                 "diff",
                 "--no-ext-diff",
                 "--no-textconv",
@@ -880,7 +894,7 @@ def _staged_content_hash(cwd: str | None = None, *, deadline: float | None = Non
             # --no-ext-diff is LOAD-BEARING, not hygiene. An external diff
             # driver makes this command emit NOTHING, so this hash becomes
             # the "clean" nothing-staged sentinel over real staged work, and
-            # advance_review_round then stops advancing the escalation cap.
+            # bump_review_round then stops advancing the escalation cap.
             # Scrubbing GIT_EXTERNAL_DIFF alone does NOT close that: MEASURED
             # 2026-09-19, the same driver can be set through GIT_CONFIG_COUNT,
             # GIT_CONFIG_PARAMETERS or GIT_CONFIG_GLOBAL, and through a
@@ -895,7 +909,15 @@ def _staged_content_hash(cwd: str | None = None, *, deadline: float | None = Non
             # direction. It is load-bearing at review_scope's --numstat site,
             # where the same attribute collapses the count and the depth gate
             # reads `inline`. Applied at both so the two are computed alike.
-            ["git", *_ATTRIBUTES_HARDENING, "diff", "--no-ext-diff", "--no-textconv", "--cached"],
+            [
+                "git",
+                *_ATTRIBUTES_HARDENING,
+                "--no-replace-objects",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--cached",
+            ],
             capture_output=True,
             text=True,
             timeout=_deadline_timeout(deadline, 10),

@@ -234,16 +234,24 @@ def test_ambient_git_env_is_scrubbed_for_the_LAUNCHED_HOOK_too(tmp_path):
 def test_the_launcher_passes_git_config_vars_THROUGH_to_the_launched_hook(tmp_path):
     """The deliberate NON-scrub, asserted on the child rather than on the array.
 
-    The location variables above are removed; the config FILE variables must
-    NOT be, and that asymmetry is load-bearing rather than an oversight. The
-    launcher scrubs for every launched hook, and ``git_push_guard`` exists to
-    PREDICT what a ``git push`` will do: ``_push_config_is_simple`` is an
-    allowlist over the user's effective config, where a broadening value makes
-    it return False and PROMPT. MEASURED 2026-09-19 through that real function,
-    with a control that moves — with ``push.default = matching`` in
-    ``~/.gitconfig`` it returns False (prompts) when the config is visible and
-    True (ALLOWS SILENTLY) once GIT_CONFIG_GLOBAL is pinned to /dev/null. A
-    guard that predicts a command's effect has to see what that command sees.
+    The location variables above are removed; NO git config channel may be, and
+    that split is load-bearing rather than an oversight. Two measured reasons.
+
+    All four config channels are PROTECTED config, which is the only place git
+    reads ``safe.directory`` from. MEASURED 2026-09-20 with that key supplied
+    only through ``GIT_CONFIG_COUNT`` — how a container or CI supplies it —
+    scrubbing the channel makes git refuse with rc=129 and empty stdout, which
+    the review gates read as "nothing staged" over real staged work.
+
+    And the launcher scrubs for every launched hook, one of which —
+    ``git_push_guard`` — PREDICTS what a ``git push`` will do:
+    ``_push_config_is_simple`` is an allowlist over the user's effective config,
+    where a broadening value makes it return False and PROMPT. MEASURED through
+    that real function, with a control that moves: with
+    ``push.default = matching`` in ``~/.gitconfig`` it returns False (prompts)
+    when the config is visible and True — ALLOWS SILENTLY — once the config is
+    scrubbed away. A guard that predicts a command's effect has to see what that
+    command will see.
 
     ``tests/test_hooks/test_git_env_scrub.py`` pins the same rule from the other
     end, by asserting those names are absent from the launcher's array. This is
@@ -260,6 +268,23 @@ def test_the_launcher_passes_git_config_vars_THROUGH_to_the_launched_hook(tmp_pa
     passthrough = {
         "GIT_CONFIG_GLOBAL": str(tmp_path / "gitconfig"),
         "GIT_CONFIG_SYSTEM": str(tmp_path / "gitconfig"),
+        # The INJECTION channels too, and for a second measured reason: a
+        # container or CI supplies `safe.directory` this way, and that key is
+        # readable only from protected config. Scrubbing it makes git refuse
+        # under a uid mismatch with empty stdout, which the gates read as
+        # "nothing staged".
+        #
+        # WELL-FORMED on purpose. `GIT_CONFIG_COUNT=1` without a matching
+        # KEY_0/VALUE_0 makes EVERY git command fail, which breaks the
+        # launcher's own discovery and fails this test for a reason that has
+        # nothing to do with passthrough — a fixture that does not build the
+        # shape it claims. (That degrades safely: discovery failing makes the
+        # launcher run its OWN scripts, the same fallback a separate-git-dir
+        # checkout takes.)
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": "*",
+        "GIT_CONFIG_PARAMETERS": "'safe.directory=*'",
     }
     proc = _invoke(wt, cwd=wt, extra_env={**passthrough, "GIT_DIR": str(tmp_path / "decoy")})
     assert proc.returncode == 0, proc.stderr

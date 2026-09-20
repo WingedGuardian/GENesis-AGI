@@ -9,7 +9,11 @@
   needs. A global `core.attributesFile` marking source files binary collapsed
   the staged diff to nothing countable, and the depth gate then treated a large
   change as a trivial one; the gates now ask Git to ignore that setting when
-  they measure a diff. The variables naming your own Git config files are left
-  alone in both directions — emptying them would take `safe.directory` and your
-  credential helper with them, and the push guard has to see the same
-  configuration as the push it is checking.
+  they measure a diff.
+- Leave your Git configuration alone. Nothing here removes `GIT_CONFIG_GLOBAL`,
+  `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_COUNT` or `GIT_CONFIG_PARAMETERS` from the
+  environment, because all four are where Git reads `safe.directory` from — and
+  on a box where the repository is owned by a different user, such as a
+  bind-mounted container or a CI job, removing them made Git refuse and the
+  review gates read that refusal as "nothing to review". The push guard also
+  needs to see the same configuration as the push it is checking.

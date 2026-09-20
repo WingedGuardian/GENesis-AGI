@@ -89,6 +89,15 @@ These supplement the general principles kept in CLAUDE.md:
     `credential.helper` and `url.*.insteadOf`, which the same env feeds to
     `git ls-remote` and `gh`.
 
+  **And the generator is the CHANNEL, not the variable — which took three review
+  rounds to stop paying for.** `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n` is protected
+  config too, and a container or CI supplies `safe.directory` exactly that way,
+  so scrubbing the injection channels has the identical defect as pinning the
+  file sources (MEASURED: injected value present rc=0; channel scrubbed rc=129,
+  empty stdout, gate reads `clean`). Rounds one and two each fixed the instance
+  in front of them. The rule that finally held is about the whole class: **no git
+  config channel is handled at all, in either direction, anywhere.**
+
   So the rule is: **follow the tool's non-zero-exit path all the way to the
   caller's sentinel before calling a hardening "strictly stronger".** An empty
   result and a refusal are the same bytes, and a gate that treats empty as
@@ -111,8 +120,18 @@ These supplement the general principles kept in CLAUDE.md:
   config is visible and True — allows silently — once `GIT_CONFIG_GLOBAL` is
   pinned away. **Same shape as "never normalize before a blind-spot probe", one
   layer up: there the normalizer and the probe sit in one script; here they sit
-  in different processes, which is why it stayed invisible.** The launcher
-  therefore scrubs the injection CHANNELS (`GIT_CONFIG_COUNT`,
-  `GIT_CONFIG_PARAMETERS`), which have no legitimate use in a hook's
-  environment, and never the config FILE variables, which name files the user
-  owns.
+  in different processes, which is why it stayed invisible.**
+- **And when a guard and the command it gates can resolve differently, picking
+  either one is a guess.** The launcher scrubs git's location variables for the
+  hook; the gated shell command is never scrubbed, so an ambient `GIT_DIR` sends
+  git elsewhere and the guard evaluates a different repository than the command
+  acts on. MEASURED in both directions, with the unreviewed work first in the
+  working directory and then in the ambient target: whichever way the guard
+  resolves, there is a configuration where it reads the wrong repository and
+  allows. Scrubbing is not "the fixed version" — it moves the fail-open from one
+  cell to the other, because the guard is one bit short and cannot tell an
+  accidental divergence from an intended one. The real answer is a third
+  verdict: detect the divergence and refuse. Two constraints on building it,
+  both already paid for here — it must be a VERDICT and never an exception (a
+  raising guard exits non-zero, which CC treats as non-blocking, so it fails
+  OPEN), and it must not become an ask an unattended session cannot answer.

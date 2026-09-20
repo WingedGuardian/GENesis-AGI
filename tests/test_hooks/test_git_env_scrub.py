@@ -47,10 +47,16 @@ from genesis.session_awareness.zero_drop_git import (  # noqa: E402
     _GIT_ENV_UNSET as ZERO_DROP_UNSET,
 )
 
-#: Config FILE sources. NO copy may handle these, in either direction — unsetting
-#: loosens, and pinning removes ``safe.directory`` plus the remote-auth settings.
-#: The test below carries both measurements.
-_CONFIG_FILE_VARS = ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM")
+#: Every git CONFIG channel — the FILE sources and the ENV-injection channels.
+#: No copy may handle any of them, in either direction. All four are PROTECTED
+#: config, which is the only place git reads ``safe.directory`` from. The test
+#: below carries the measurements.
+_CONFIG_VARS = (
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+)
 
 # ── the four copies must agree ────────────────────────────────────────────────
 
@@ -79,31 +85,37 @@ def _launcher_bash_list() -> tuple[str, ...]:
     return tuple(names)
 
 
-def test_no_copy_anywhere_touches_the_config_FILE_variables():
-    """``GIT_CONFIG_GLOBAL``/``GIT_CONFIG_SYSTEM`` are handled in NEITHER
-    direction, in all four copies. Both directions were MEASURED to break
-    something, which is why this is asserted by NAME rather than left implicit.
+def test_no_copy_anywhere_touches_any_git_config_channel():
+    """NO git config channel is handled, in any copy, in either direction.
 
-    UNSETTING re-enables ``$HOME/.gitconfig``, so a scrub meant to isolate
-    loosens, and a caller that set ``/dev/null`` for isolation loses it.
+    Three review rounds found the same generator, so the rule is asserted over
+    all four names rather than the two that were caught first.
 
-    PINNING to an empty file removes a CAPABILITY. ``safe.directory`` is readable
-    only from protected config, and repo-local config cannot restore it
-    (MEASURED: still rc=129), so under a uid mismatch — a bind-mounted
-    devcontainer, container CI, a hook under sudo — git REFUSES with empty
-    stdout and ``_staged_content_hash``'s empty-output sentinel is ``"clean"``:
-    NOTHING STAGED, over real staged work. Pinning also removes
-    ``credential.helper`` and ``url.*.insteadOf``, which ``zero_drop_git``'s env
-    feeds to ``git ls-remote`` and ``gh``.
+    ALL FOUR ARE PROTECTED CONFIG, and protected config is the only place git
+    reads ``safe.directory`` from — deliberately, so an untrusted repository
+    cannot self-approve; repo-local config cannot substitute (MEASURED: still
+    rc=129). Removing any of them removes that capability, so under a uid
+    mismatch — a bind-mounted devcontainer, container CI, a hook under sudo —
+    git REFUSES with empty stdout, and ``_staged_content_hash``'s empty-output
+    sentinel is ``"clean"``: NOTHING STAGED, over real staged work.
+
+    MEASURED 2026-09-20 with ``safe.directory`` supplied ONLY through
+    ``GIT_CONFIG_COUNT``, which is how a container or CI supplies it:
+    injected value present rc=0; ``GIT_CONFIG_COUNT`` scrubbed rc=129.
+
+    UNSETTING is not neutral in the other direction either: it re-enables
+    ``$HOME/.gitconfig``, so a caller that set ``GIT_CONFIG_GLOBAL=/dev/null``
+    for isolation silently loses it.
 
     And in the launcher specifically it breaks ``git_push_guard``, which PREDICTS
     what a ``git push`` will do: MEASURED through the real
     ``_push_config_is_simple``, with ``push.default = matching`` in
     ``~/.gitconfig`` it returns False (prompts) when the config is visible and
-    True — ALLOWS SILENTLY — once the config is pinned away.
+    True — ALLOWS SILENTLY — once that config is scrubbed away.
 
-    What closes the one config route measured to move a decision is a command
-    FLAG, pinned by ``test_a_global_attributes_file_cannot_downgrade_substantiality``.
+    What closes the config routes measured to move a decision are command FLAGS,
+    pinned by ``test_a_global_attributes_file_cannot_downgrade_substantiality``
+    and the external-diff route tests below.
     """
     copies = {
         "launcher bash array": set(_launcher_bash_list()),
@@ -112,11 +124,12 @@ def test_no_copy_anywhere_touches_the_config_FILE_variables():
         "zero_drop_git._GIT_ENV_UNSET": set(ZERO_DROP_UNSET),
     }
     for where, names in copies.items():
-        offenders = sorted(set(_CONFIG_FILE_VARS) & names)
+        offenders = sorted(set(_CONFIG_VARS) & names)
         assert not offenders, (
-            f"{where} now handles {offenders}. Unsetting them loosens; pinning "
-            "them removes safe.directory and lands these callers on the 'clean' "
-            "nothing-staged sentinel. Harden the COMMAND instead."
+            f"{where} now handles {offenders}. Every git config channel is "
+            "PROTECTED config, so removing one takes safe.directory with it and "
+            "lands these callers on the 'clean' nothing-staged sentinel under a "
+            "uid mismatch. Harden the COMMAND instead."
         )
 
 
@@ -390,7 +403,7 @@ def test_no_route_to_an_external_diff_can_empty_the_staged_content_hash(
     """An external diff driver empties ``git diff --cached``, whichever door it
     arrives through — and that lands on the ``"clean"`` NOTHING-STAGED sentinel.
 
-    Why that sentinel is the worst one to reach: ``advance_review_round`` treats
+    Why that sentinel is the worst one to reach: ``bump_review_round`` treats
     a ``"clean"`` content hash as "not a review round" and returns the CURRENT
     round without advancing, so an ambient value here does not merely mis-size a
     review — it stops the escalation cap counting rounds at all.
@@ -466,6 +479,7 @@ def test_harden_only_touches_diff_subcommands():
     assert review_scope._harden(["diff", "-z", "--numstat"]) == [
         "-c",
         f"core.attributesFile={os.devnull}",
+        "--no-replace-objects",
         "diff",
         "--no-ext-diff",
         "--no-textconv",
@@ -475,13 +489,15 @@ def test_harden_only_touches_diff_subcommands():
     for untouched in (["rev-parse", "HEAD"], ["merge-base", "a", "b"], []):
         assert review_scope._harden(untouched) == untouched
 
-    # ORDER is part of the contract, not cosmetic: git accepts `-c` only BEFORE
-    # the subcommand, so a `-c` pair appended after `diff` makes git reject the
-    # whole command — every classifier then takes its fail-open path.
+    # ORDER is part of the contract, not cosmetic: `-c` and --no-replace-objects
+    # are GLOBAL options, which git accepts only BEFORE the subcommand. Either
+    # one appended after `diff` makes git reject the whole command, and every
+    # classifier then takes its fail-open path.
     hardened = review_scope._harden(["diff", "--cached"])
-    assert hardened.index("-c") < hardened.index("diff"), (
-        "the -c pair must precede the subcommand or git rejects the command"
-    )
+    for global_opt in ("-c", "--no-replace-objects"):
+        assert hardened.index(global_opt) < hardened.index("diff"), (
+            f"{global_opt} must precede the subcommand or git rejects the command"
+        )
 
 
 def test_a_repo_local_external_diff_cannot_empty_the_staged_content_hash(repos):
@@ -534,6 +550,87 @@ def test_a_repo_local_external_diff_cannot_downgrade_substantiality(repos):
     assert review_scope.classify_change_substantiality(cwd=cwd) == clean, (
         "a repo-local diff.external downgraded the substantiality classification"
     )
+
+
+def test_a_replace_ref_cannot_empty_the_gates_reads(repos, monkeypatch):
+    """``refs/replace`` swaps the commit the staged diff is computed against.
+
+    No environment component at all, so no scrub could ever have reached it —
+    same threat class as the repo-local ``.git/config`` above, and the reason the
+    hardening is a FLAG. ``git replace`` writes ``refs/replace/<oid>``, and
+    replacement applies at object-read time, BELOW the diff format layer.
+
+    MEASURED 2026-09-20 on 200 staged lines: ``--numstat`` drops from ``200 0``
+    to EMPTY at rc=0, and so does the ``--raw`` output — which is why this test
+    covers BOTH gate reads. The ``--raw`` site's own comment had argued that
+    format was immune; true of the diff-DRIVER class, false of this one.
+    """
+    a, _b = repos
+    cwd = str(a)
+
+    base_hash = review_state.get_current_diff_hash(cwd=cwd)
+    base_staged = review_state._staged_content_hash(cwd=cwd)
+    base_level = review_scope.classify_change_substantiality(cwd=cwd)
+    assert base_hash not in ("clean", "unknown"), f"baseline hash is {base_hash!r}"
+    assert base_staged not in ("clean", "unknown"), f"baseline staged is {base_staged!r}"
+    assert base_level == "substantial", f"baseline is not substantial ({base_level!r})"
+
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=cwd, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    tree = subprocess.run(
+        ["git", "write-tree"], cwd=cwd, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    decoy = subprocess.run(
+        ["git", "commit-tree", tree, "-m", "decoy"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    ).stdout.strip()
+    subprocess.run(["git", "replace", "-f", head, decoy], cwd=cwd, capture_output=True, check=True)
+
+    assert review_state.get_current_diff_hash(cwd=cwd) == base_hash, (
+        "a replace ref emptied get_current_diff_hash's `--raw` read — the gate "
+        "would read 'clean' (nothing staged) over real staged work"
+    )
+    # The SECOND diff site in this module, and the one with the worse consequence.
+    # `get_current_diff_hash` reads `--raw`; `_staged_content_hash` reads the PLAIN
+    # diff, and `bump_review_round` treats its "clean" sentinel as "this was not a
+    # review round" — so emptying THIS one disarms the escalation cap silently.
+    # Locked separately because a per-site deletion is what a future edit does:
+    # MEASURED 2026-09-20, deleting --no-replace-objects from only this site left
+    # all 31 tests in this file green while the plain staged diff went 4476B -> 0B
+    # at rc=0. One hardened site does not lock its sibling.
+    assert review_state._staged_content_hash(cwd=cwd) == base_staged, (
+        "a replace ref emptied the PLAIN staged diff — _staged_content_hash would "
+        "return 'clean', and bump_review_round would stop counting the round"
+    )
+    assert review_scope.classify_change_substantiality(cwd=cwd) == base_level, (
+        "a replace ref downgraded the substantiality classification"
+    )
+
+    # CONTROL: prove the replace ref is LIVE in this repo, or the three assertions
+    # above pass against a fixture that changed nothing. Every diff FORM a gate
+    # reads is checked, because an assertion is only as good as the control for
+    # the form it depends on: the plain diff is what _staged_content_hash reads.
+    for form in ([], ["--raw"], ["--numstat"]):
+        unhardened = subprocess.run(
+            ["git", "diff", "--cached", *form], cwd=cwd, capture_output=True, text=True
+        )
+        assert unhardened.stdout.strip() == "", (
+            f"the replace ref is inert for `git diff --cached {' '.join(form)}` — "
+            "an unhardened read should be EMPTY here, so the assertion resting on "
+            "that form proves nothing about --no-replace-objects"
+        )
 
 
 def test_a_global_attributes_file_cannot_downgrade_substantiality(repos, monkeypatch, tmp_path):

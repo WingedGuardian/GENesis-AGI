@@ -324,8 +324,8 @@ def _specialists(scope_tags: set[str], diff_lines: int) -> list[str]:
 #:
 #: KEPT IN STEP WITH ITS COPIES BY TEST, NOT BY IMPORT. FOUR copies of this list
 #: exist (a fifth, narrower one in `scripts/worktree_lifecycle.py` is deliberately
-#: outside the parity set and tracked separately): this one, ``review_state.GIT_ENV_OVERRIDES``,
-#: ``genesis.session_awareness.zero_drop_git._GIT_ENV_OVERRIDES``, and the
+#: outside the parity set and tracked separately): this one, ``review_state.GIT_ENV_UNSET``,
+#: ``genesis.session_awareness.zero_drop_git._GIT_ENV_UNSET``, and the
 #: launcher's bash array. ``tests/test_hooks/test_git_env_scrub.py`` asserts all
 #: four are equal. Importing from ``review_state`` instead would close a cycle —
 #: that module already imports THIS one at function scope — and would put a
@@ -345,18 +345,16 @@ _GIT_ENV_UNSET = (
     "GIT_PREFIX",
     "GIT_EXTERNAL_DIFF",
     "GIT_DIFF_OPTS",
-    # Config injected ENTIRELY through the environment — no FILE to point at a
-    # neutral value, so removal is the only available action.
-    "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_PARAMETERS",
 )
 
-#: GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM are deliberately handled in NEITHER
-#: direction — unsetting loosens, pinning removes `safe.directory` and lands this
-#: module's own callers on a fail-open. The one config route measured to move a
-#: decision is closed by a FLAG instead. Full reasoning and both measurements
-#: live on the ``review_state`` copy; do not restate them here, where they would
-#: drift.
+#: NO git CONFIG channel is handled here — neither the FILE sources nor the
+#: injection channels. All four are PROTECTED config, which is the only place
+#: git reads `safe.directory` from, so removing any of them makes git refuse
+#: under a uid mismatch with empty stdout, and this module's classifiers then
+#: read that as a trivial change. The routes measured to move a gate decision
+#: are closed by FLAGS on the command instead. Full reasoning and the
+#: measurements live on the ``review_state`` copy; do not restate them here,
+#: where they would drift.
 _ATTRIBUTES_HARDENING = ("-c", f"core.attributesFile={os.devnull}")
 
 
@@ -375,12 +373,29 @@ def _git_env() -> dict[str, str]:
 def _harden(args: list[str]) -> list[str]:
     """Insert the diff-immunity flags and config when the subcommand is ``diff``.
 
-    ``_ATTRIBUTES_HARDENING`` is a `-c` pair and must lead the SUBCOMMAND, not
-    follow it — git only accepts `-c` before the subcommand — which is why it is
-    prepended here rather than added alongside the `--no-*` flags.
+    ``_ATTRIBUTES_HARDENING`` and ``--no-replace-objects`` are GLOBAL options and
+    must lead the SUBCOMMAND, not follow it — git accepts neither after ``diff``
+    — which is why they are prepended rather than added alongside the ``--no-*``
+    flags.
+
+    ``--no-replace-objects`` closes a route with NO environment component at all,
+    so no scrub could ever have reached it. ``git replace`` writes
+    ``refs/replace/<oid>``, and replacement applies at object-read time, so the
+    commit ``git diff --cached`` compares against can be swapped for one whose
+    tree already equals the index. MEASURED 2026-09-20 on 200 staged lines:
+    ``--numstat`` drops from ``200 0`` to EMPTY at rc=0, and every classifier
+    here then reads a trivial change. Same threat class as a repo-local
+    ``.git/config`` — repository CONTENT, not environment.
     """
     if args and args[0] == "diff":
-        return [*_ATTRIBUTES_HARDENING, "diff", "--no-ext-diff", "--no-textconv", *args[1:]]
+        return [
+            *_ATTRIBUTES_HARDENING,
+            "--no-replace-objects",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            *args[1:],
+        ]
     return list(args)
 
 
