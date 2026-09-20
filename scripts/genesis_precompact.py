@@ -232,6 +232,18 @@ def _update_charter(session_dir: Path, session_id: str, transcript_path: str) ->
         # Never create a DB as a side effect (fresh installs bootstrap it);
         # this boundary self-heals at the next compaction.
         return None
+    # Admission fence (lazy, fail-closed — this hook stays stdlib-only at
+    # import time): a quarantined or maintenance-fenced database is never
+    # written; the charter write self-heals at the next compaction.
+    _hooks = str(Path(__file__).resolve().parent / "hooks")
+    if _hooks not in sys.path:
+        sys.path.insert(0, _hooks)
+    try:
+        from db_admission_check import database_is_fenced
+    except Exception:
+        return None
+    if database_is_fenced(db_file):
+        return None
     now = datetime.now(UTC).isoformat()
     conn = sqlite3.connect(str(db_file), timeout=2)
     try:

@@ -80,6 +80,20 @@ def _process(data: dict) -> None:
     if not _DB_PATH.exists():
         return
 
+    # Admission fence (module import stays stdlib-only; the fence import is
+    # lazy and fail-closed): never write to a quarantined or maintenance-fenced
+    # database — hook writers bypassing quarantine is the 2026-09-18 incident
+    # class, and skipping one best-effort audit row is the designed degrade.
+    _hooks = str(Path(__file__).resolve().parent / "hooks")
+    if _hooks not in sys.path:
+        sys.path.insert(0, _hooks)
+    try:
+        from db_admission_check import database_is_fenced
+    except Exception:
+        return  # fence state unknowable -> treat as fenced
+    if database_is_fenced(_DB_PATH):
+        return
+
     try:
         conn = sqlite3.connect(str(_DB_PATH), timeout=2)
         conn.execute(

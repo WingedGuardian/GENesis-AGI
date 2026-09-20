@@ -239,6 +239,21 @@ def _sqlite_connect(
     remaining = None if deadline is None else deadline - time.monotonic()
     if remaining is not None and remaining <= 0:
         raise _RunBudgetExpired
+    # Admission fence at the single connect chokepoint (fail-closed): a
+    # quarantined or maintenance-fenced database is never opened. Raised as
+    # OperationalError so each caller degrades exactly as it does for a locked
+    # database — per-feature, never crashing the hook.
+    _fence_blocked = True
+    try:
+        from db_admission_check import database_is_fenced
+
+        _fence_blocked = database_is_fenced(db_path)
+    except Exception:
+        _fence_blocked = True
+    if _fence_blocked:
+        raise sqlite3.OperationalError(
+            "database fenced (quarantine/maintenance) — admission refused"
+        )
     effective_timeout = timeout if remaining is None else min(timeout, remaining)
     conn = sqlite3.connect(str(db_path), timeout=effective_timeout, uri=uri)
     if deadline is not None:

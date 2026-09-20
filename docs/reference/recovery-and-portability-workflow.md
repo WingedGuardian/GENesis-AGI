@@ -60,6 +60,18 @@ guard remains in force for non-quarantined databases.
 If restore cannot determine that quarantine state (for example, the integrity
 checker cannot start), it aborts instead of treating the database as healthy.
 
+Script-side hooks and workers (the audit trail, edit sensor, precompact,
+procedure advisor, proactive memory, session context/heartbeat/alerts, repo
+pulse, snapshot GC) consult the same admission fence before opening the
+database (`genesis.db.admission.database_is_fenced` — quarantine marker plus
+the path-scoped maintenance marker under `~/.genesis/db_admission/`). While a
+database is quarantined or held for maintenance they silently skip it and
+resume on their own after release — so a recovery in progress no longer takes
+stray hook writes. The check fails closed: if fence state cannot be
+established, the opener skips. The maintenance marker's write side (leases,
+`begin_maintenance`/`verify_and_release`) ships with the full admission
+module; until then the marker directory is normally empty.
+
 ## During Migration Work
 
 1. Keep Genesis changes on a dedicated hardening branch.
