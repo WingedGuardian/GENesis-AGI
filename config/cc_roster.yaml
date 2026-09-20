@@ -145,9 +145,9 @@ models:
 # and model ids are from the vendor's own reference (api-docs.deepseek.com,
 # "Using the Anthropic API" and "Your First API Call", read 2026-09-19):
 #
-#     deepseek-flash:
+#     "deepseek-flash[1m]":
 #       anthropic_base_url: "https://api.deepseek.com/anthropic"
-#       auth_env: API_KEY_DEEPSEEK
+#       auth_env: DEEPSEEK_CODING_API_KEY
 #       model_id: "deepseek-flash[1m]"
 #       failover_order: 2
 #
@@ -185,5 +185,5 @@ models:
 # that reads as authoritative. MEASURED on one gauntlet run against a per-token
 # peer: CC reported $1.1981 where the provider's dashboard billed about $0.05.
 # The direction depends on the peer, so do not treat 24x as a correction factor.
-# Read peer spend from the provider, never from `eval_runs`.
+# Read peer spend from the provider, never from `eval_results`.
 # ─────────────────────────────────────────────────────────────────────────────
