@@ -2720,7 +2720,7 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
     takes_value = _C_VALUE_TAKING.get(interpreter, _C_VALUE_TAKING_DEFAULT)
 
     for i, tok in enumerate(argv[1:], 1):
-        if tok in {"-", "--"}:
+        if tok in {"-", "--", "+"}:
             break
         if not tok.startswith("-"):
             continue
@@ -2734,16 +2734,21 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
         # original test only looked one character either side of `c`, so
         # `-cxo pipefail` and `-oxc pipefail` fell through to the no-value path
         # and `pipefail` was read as the script. MEASURED: bash runs both.
-        has_value = bool(set(options) & takes_value)
+        # Multiplicity matters too: EVERY occurrence of a value-taking letter
+        # consumes a token (`bash -coo pipefail errexit CMD` runs CMD).
+        n_values = sum(1 for ch in options if ch in takes_value)
         if not set(options) - takes_value <= allowed:
             continue
         # The bundle carrying `-c` can itself suppress execution: `bash -cn CMD`
         # parses CMD and runs nothing.
         if set(options) & _C_NO_EXEC_LETTERS:
             return ""
-        if has_value and i + 1 < len(argv) and argv[i + 1] in _C_NO_EXEC_OPTION_VALUES:
+        if any(
+            v in _C_NO_EXEC_OPTION_VALUES
+            for v in argv[i + 1 : i + 1 + n_values]
+        ):
             return ""
-        start = i + 2 if has_value else i + 1
+        start = i + 1 + n_values
 
         # ONCE A VALID `-c` BUNDLE OWNS SELECTION, its resolution is final.
         # Resuming the outer scan let a LATER `-c` be read as a fresh command
@@ -2793,26 +2798,37 @@ def _first_operand(
     j = start
     while j < len(argv):
         tok = argv[j]
-        if tok == "--":
+        if tok in ("-", "--", "+"):
             # END of option processing. The very next token IS the command
             # string even when it looks like an option: `bash -c -- '-x' CMD`
             # runs `-x` and makes CMD merely `$0`. Resuming the option scan here
             # reported CMD as the script and blocked a command that never ran.
+            # A LONE `-` or `+` terminates the same way: MEASURED, `bash -c - cmd`
+            # and `bash -c + cmd` both run cmd (bash and dash).
             j += 1
             return (True, argv[j]) if j < len(argv) else (False, "")
-        if tok.startswith("-") and len(tok) > 1:
-            letters = set(tok[1:])
-            if not letters - takes_value <= allowed:
+        if tok[:1] in ("-", "+") and len(tok) > 1:
+            # `+` bundles are option-DISABLES (`bash -c +e cmd` runs cmd);
+            # `+o`/`+O` consume a value token exactly like `-o` (measured:
+            # `bash -c +o foo cmd` never reaches cmd because foo is not a valid
+            # option name — bash refuses the whole invocation). The letter set
+            # is the same as for `-`: `set +x`/`set -x` are one option table.
+            # A `+` bundle can never enable noexec (`+n` REMOVES it), so the
+            # no-exec checks below apply to `-` bundles only.
+            letters = tok[1:]
+            letter_set = set(letters)
+            if not letter_set - takes_value <= allowed:
                 return (False, "")  # the shell refuses this invocation
-            if letters & _C_NO_EXEC_LETTERS:
-                return (False, "")  # parsed but never executed
-            if (
-                letters & takes_value
-                and j + 1 < len(argv)
-                and argv[j + 1] in _C_NO_EXEC_OPTION_VALUES
-            ):
-                return (False, "")
-            j += 2 if letters & takes_value else 1
+            n_values = sum(1 for ch in letters if ch in takes_value)
+            if tok[0] == "-":
+                if letter_set & _C_NO_EXEC_LETTERS:
+                    return (False, "")  # parsed but never executed
+                if any(
+                    v in _C_NO_EXEC_OPTION_VALUES
+                    for v in argv[j + 1 : j + 1 + n_values]
+                ):
+                    return (False, "")
+            j += 1 + n_values
             continue
         return (True, tok)
     return (False, "")

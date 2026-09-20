@@ -1080,7 +1080,19 @@ _EXECUTING_C_SHAPES = [
     "bash -cxo pipefail 'PAYLOAD'",
     "bash -oxc pipefail 'PAYLOAD'",
     "bash -c -o pipefail 'PAYLOAD'",
+    # Every OCCURRENCE of a value-taking letter consumes a token, not every
+    # distinct letter: a set() count read `errexit` as the script here.
+    "bash -coo pipefail errexit 'PAYLOAD'",
+    # `+` bundles are option-DISABLES the scan must also step past, and `+o`
+    # consumes a value exactly like `-o`.
+    "bash -c +e 'PAYLOAD'",
+    "bash -c +o pipefail 'PAYLOAD'",
+    # A lone `-` (and a lone `+`) ends option processing like `--`.
+    "bash -c - 'PAYLOAD'",
+    "bash -c + 'PAYLOAD'",
     "sh -c -- 'PAYLOAD'",
+    "sh -c - 'PAYLOAD'",
+    "sh -c +e 'PAYLOAD'",
 ]
 
 
@@ -1179,6 +1191,50 @@ def test_an_option_the_interpreter_rejects_yields_no_script():
     were valid made the parser report the command anyway."""
     segments, _ = sp.analyze_checked("bash -c -z 'git push origin main'")
     assert "git" not in [seg.exe for seg in segments], "parsed a command bash refuses"
+    # Same refusal through a `+` bundle: `bash -c +z CMD` exits 2.
+    segments, _ = sp.analyze_checked("bash -c +z 'git push origin main'")
+    assert "git" not in [seg.exe for seg in segments], "parsed a command bash refuses"
+
+
+def test_every_value_taking_letter_consumes_its_own_token():
+    """`bash -coo pipefail errexit CMD` runs CMD: EACH `o` eats a value, so a
+    set() membership count consumed one token too few and read `errexit` as
+    the script (Codex P2, PR #2112)."""
+    assert sp._nested_script(
+        ["bash", "-coo", "pipefail", "errexit", "git push origin main"], "bash"
+    ) == "git push origin main"
+    # In the post-`-c` operand scan as well.
+    found, script = sp._first_operand(
+        ["bash", "-c", "-oo", "pipefail", "errexit", "git push origin main"],
+        2,
+        sp._C_BUNDLE_OPTIONS["bash"],
+        sp._C_VALUE_TAKING["bash"],
+    )
+    assert (found, script) == (True, "git push origin main")
+
+
+def test_plus_bundles_are_options_the_scan_steps_past():
+    """`bash -c +e CMD` runs CMD: `+` bundles disable options rather than
+    enabling them, and `+o` consumes a value token just like `-o`. Reading
+    `+e` as the script hid the real command (Codex P2, PR #2112)."""
+    assert sp._nested_script(
+        ["bash", "-c", "+e", "git push origin main"], "bash"
+    ) == "git push origin main"
+    assert sp._nested_script(
+        ["bash", "-c", "+o", "pipefail", "git push origin main"], "bash"
+    ) == "git push origin main"
+
+
+def test_a_lone_minus_or_plus_ends_options_for_the_script():
+    """`bash -c - CMD` and `bash -c + CMD` both run CMD — a lone sign ends
+    option processing like `--`. Falling through to the operand case read
+    `-` itself as the script (Codex P2, PR #2112)."""
+    assert sp._nested_script(
+        ["bash", "-c", "-", "git push origin main"], "bash"
+    ) == "git push origin main"
+    assert sp._nested_script(
+        ["bash", "-c", "+", "git push origin main"], "bash"
+    ) == "git push origin main"
 
 
 def test_value_taking_letters_stay_interpreter_specific():
