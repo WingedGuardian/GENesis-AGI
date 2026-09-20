@@ -982,14 +982,34 @@ def test_end_to_end_an_attached_pane_survives_the_guard(tmp_path):
     try:
         tmux("new-session", "-d", "-s", "cc-8", "sleep", "60")
         # A real attached client, via a pty — `session_attached` counts clients,
-        # so there is no way to fake this one.
+        # so there is no way to fake this one. `tmux attach` refuses to run
+        # under a missing or `dumb` TERM (measured: exits before the server
+        # registers the client, leaving session_attached=0 and this test
+        # silently skipping), so pin a real terminal type for the client only.
+        attach_env = dict(env)
+        attach_env["TERM"] = "xterm"
         client = subprocess.Popen(
             ["script", "-qec", "tmux attach -t cc-8", "/dev/null"],
-            env=env,
+            env=attach_env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        time.sleep(2)
+        # Poll rather than sleep(2): the attach handshake is async, and a fixed
+        # nap races it on a loaded runner.
+        for _ in range(50):
+            state = tmux(
+                "list-panes", "-a", "-F", "#{pane_in_mode} #{session_attached}"
+            ).stdout
+            if "0 1" in state:
+                break
+            if client.poll() is not None:
+                break
+            time.sleep(0.2)
+        if "0 1" not in state:
+            pytest.skip(
+                f"attach client never registered "
+                f"(client rc={client.poll()}): {state!r}"
+            )
         tmux("choose-tree", "-Zs", "-t", "cc-8", check=False)
         state = tmux("list-panes", "-a", "-F", "#{pane_in_mode} #{session_attached}").stdout
         if "1 1" not in state:
