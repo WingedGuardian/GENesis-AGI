@@ -382,8 +382,9 @@ _genesis_mem_ceiling() {
         printf '%s' "$raw"
         return
     fi
-    local total_kb
-    total_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
+    local total_kb meminfo
+    meminfo="${CODE_INTEL_MEMINFO:-/proc/meminfo}"
+    total_kb="$(awk '/^MemTotal:/ {print $2}' "$meminfo" 2>/dev/null)"
     [ -n "$total_kb" ] && printf '%s' "$(( total_kb * 1024 ))"
 }
 
@@ -449,6 +450,7 @@ _genesis_mem_working_set_from() {
 # MemTotal-MemAvailable. Unreadable means the caller falls back to the floor.
 _genesis_mem_current() {
     if [ -n "${CODE_INTEL_MEM_CURRENT_BYTES:-}" ]; then
+        [[ "$CODE_INTEL_MEM_CURRENT_BYTES" =~ ^[0-9]+$ ]] || return 1
         printf '%s' "$CODE_INTEL_MEM_CURRENT_BYTES"
         return
     fi
@@ -467,9 +469,10 @@ _genesis_mem_current() {
         _genesis_mem_working_set_from "$raw" "$stat_path"
         return
     fi
-    local total_kb avail_kb
-    total_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
-    avail_kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)"
+    local total_kb avail_kb meminfo
+    meminfo="${CODE_INTEL_MEMINFO:-/proc/meminfo}"
+    total_kb="$(awk '/^MemTotal:/ {print $2}' "$meminfo" 2>/dev/null)"
+    avail_kb="$(awk '/^MemAvailable:/ {print $2}' "$meminfo" 2>/dev/null)"
     [ -n "$total_kb" ] && [ -n "$avail_kb" ] && [ "$total_kb" -gt "$avail_kb" ] \
         && printf '%s' "$(( (total_kb - avail_kb) * 1024 ))"
 }
@@ -486,10 +489,20 @@ CODE_INTEL_GITNEXUS_MIN_BYTES="${CODE_INTEL_GITNEXUS_MIN_BYTES:-$(( 4874166272 )
 # the surrounding services.
 CODE_INTEL_CBM_MIN_BYTES="${CODE_INTEL_CBM_MIN_BYTES:-$(( 2836 * 1024 * 1024 ))}"
 
+GENESIS_MEM_ENV_REFUSE=""
+if [ -n "${CODE_INTEL_MEM_CURRENT_BYTES:-}" ] \
+    && [[ ! "$CODE_INTEL_MEM_CURRENT_BYTES" =~ ^[0-9]+$ ]]; then
+    GENESIS_MEM_ENV_REFUSE="CODE_INTEL_MEM_CURRENT_BYTES is not a nonnegative integer"
+elif [[ ! "$CODE_INTEL_SIBLING_RESERVE_BYTES" =~ ^[0-9]+$ ]]; then
+    GENESIS_MEM_ENV_REFUSE="CODE_INTEL_SIBLING_RESERVE_BYTES is not a nonnegative integer"
+fi
+
 _genesis_ceiling_b="$(_genesis_mem_ceiling)"
 _genesis_want_b="$(_genesis_mem_bytes "$GITNEXUS_MEM_MAX")"
 GITNEXUS_MEM_REFUSE=""
-if [ -z "$_genesis_want_b" ]; then
+if [ -n "$GENESIS_MEM_ENV_REFUSE" ]; then
+    GITNEXUS_MEM_REFUSE="$GENESIS_MEM_ENV_REFUSE"
+elif [ -z "$_genesis_want_b" ]; then
     # Fail closed: an unparseable cap must not reach MemoryMax, and skipping the
     # admission check silently would run the job unbounded.
     GITNEXUS_MEM_REFUSE="CODE_INTEL_GITNEXUS_MEMORY_MAX='${GITNEXUS_MEM_MAX}' is not a parseable memory value — refusing rather than running unbounded"
@@ -641,7 +654,7 @@ fi
 # sometimes cannot reach the user manager even when systemd-run exists.
 _SCOPE_OK=0
 if command -v systemd-run >/dev/null 2>&1; then
-    if systemd-run --user --scope --quiet \
+    if systemd-run --user --scope --slice-inherit --quiet \
         -p "MemoryMax=${MEM_MAX}" -p "MemorySwapMax=0" \
         -p "IOWeight=${IO_WEIGHT}" -p "CPUQuota=${CPU_QUOTA}" \
         -- /bin/true 2>/dev/null; then
@@ -653,7 +666,7 @@ _run_capped() {
     if [ "$_SCOPE_OK" = "1" ]; then
         # _CI_SCOPE_UNIT (set by _run_with_watchdog) gives the scope a
         # deterministic name so the watchdog can freeze/thaw/stop it by unit.
-        systemd-run --user --scope --quiet \
+        systemd-run --user --scope --slice-inherit --quiet \
             ${_CI_SCOPE_UNIT:+--unit="$_CI_SCOPE_UNIT"} \
             -p "MemoryMax=${MEM_MAX}" -p "MemorySwapMax=0" \
             -p "IOWeight=${IO_WEIGHT}" -p "CPUQuota=${CPU_QUOTA}" \
@@ -802,12 +815,15 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
     elif command -v codebase-memory-mcp >/dev/null 2>&1; then
         CBM_MEM_REFUSE=""
         _cbm_want_b="$(_genesis_mem_bytes "$CBM_MEM_MAX")"
-        if [ -z "$_cbm_want_b" ]; then
+        if [ -n "$GENESIS_MEM_ENV_REFUSE" ]; then
+            CBM_MEM_REFUSE="$GENESIS_MEM_ENV_REFUSE"
+        elif [ -z "$_cbm_want_b" ]; then
             CBM_MEM_REFUSE="CODE_INTEL_CBM_MEMORY_MAX='${CBM_MEM_MAX}' is not a parseable memory value"
         elif [ "$_cbm_want_b" -lt "$CODE_INTEL_CBM_MIN_BYTES" ]; then
             CBM_MEM_REFUSE="configured cap ${CBM_MEM_MAX} is below the measured $(( CODE_INTEL_CBM_MIN_BYTES / 1024 / 1024 ))M Codebase Memory workload"
         elif [ "$CBM_MEM_EXPLICIT" != "1" ]; then
             _cbm_ceiling_b=""
+            _cbm_live_b="${CODE_INTEL_MEM_CURRENT_BYTES:-}"
             if [ -n "${CODE_INTEL_MEM_CEILING_BYTES:-}" ]; then
                 if [[ "$CODE_INTEL_MEM_CEILING_BYTES" =~ ^[0-9]+$ ]] \
                     && [ "$CODE_INTEL_MEM_CEILING_BYTES" -gt 0 ]; then
@@ -821,8 +837,24 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
                 CBM_MEM_REFUSE="$_GENESIS_CGROUP_ERROR"
             fi
 
+            if [ -z "$CBM_MEM_REFUSE" ] && [ -z "$_cbm_ceiling_b" ]; then
+                # An unlimited controller still sits on finite physical RAM.
+                # Measure that host bound directly; a missing meminfo cannot be
+                # treated as free headroom.
+                _cbm_meminfo="${CODE_INTEL_MEMINFO:-/proc/meminfo}"
+                _cbm_total_kb="$(awk '/^MemTotal:/ {print $2}' "$_cbm_meminfo" 2>/dev/null)"
+                _cbm_avail_kb="$(awk '/^MemAvailable:/ {print $2}' "$_cbm_meminfo" 2>/dev/null)"
+                if [[ "$_cbm_total_kb" =~ ^[0-9]+$ && "$_cbm_avail_kb" =~ ^[0-9]+$ ]]; then
+                    _cbm_ceiling_b=$(( _cbm_total_kb * 1024 ))
+                    if [ -z "$_cbm_live_b" ]; then
+                        _cbm_live_b=$(( (_cbm_total_kb - _cbm_avail_kb) * 1024 ))
+                    fi
+                else
+                    CBM_MEM_REFUSE="cannot read MemTotal/MemAvailable from $_cbm_meminfo"
+                fi
+            fi
+
             if [ -z "$CBM_MEM_REFUSE" ] && [ -n "$_cbm_ceiling_b" ]; then
-                _cbm_live_b="${CODE_INTEL_MEM_CURRENT_BYTES:-}"
                 _cbm_spare_b=""
                 if [ -z "$_cbm_live_b" ] && [ "${#_GENESIS_CGROUP_FINITE_DIRS[@]}" -gt 0 ]; then
                     for _cbm_i in "${!_GENESIS_CGROUP_FINITE_DIRS[@]}"; do

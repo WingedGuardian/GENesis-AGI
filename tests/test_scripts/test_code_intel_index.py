@@ -680,6 +680,7 @@ def test_scope_path_passes_all_properties(tmp_path):
     assert "IOWeight=20" in calls
     assert "CPUQuota=200%" in calls
     assert "--scope" in calls
+    assert "--slice-inherit" in calls
     assert "codebase-memory-mcp ARGS:" in log.read_text()  # tool actually ran
 
 
@@ -1115,6 +1116,29 @@ def test_cbm_refuses_when_v2_hierarchy_is_not_mounted(tmp_path):
     assert not log.exists() or "codebase-memory-mcp ARGS:" not in log.read_text()
 
 
+def test_cbm_refuses_malformed_current_usage_override(tmp_path):
+    gib = 1024**3
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    systemd_log = tmp_path / "systemd.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, systemd_log)
+    repo = _make_repo(tmp_path)
+    env = _fake_v2_cgroup(
+        tmp_path,
+        membership="/tenant",
+        limits={"tenant": str(9 * gib), "": None},
+    )
+    env["CODE_INTEL_MEM_CURRENT_BYTES"] = "unknown"
+
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}", env_extra=env,
+    )
+
+    assert res.returncode == 3
+    assert "CODE_INTEL_MEM_CURRENT_BYTES" in res.stdout
+    assert "codebase-memory-mcp cli index_repository" not in systemd_log.read_text()
+
+
 def test_cbm_accepts_authoritative_unlimited_v2_mount_root(tmp_path):
     fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
     systemd_log = tmp_path / "systemd.log"
@@ -1139,6 +1163,53 @@ def test_cbm_accepts_authoritative_unlimited_v2_mount_root(tmp_path):
     ]
     assert len(runs) == 1
     assert "MemoryMax=4G" in runs[0]
+
+
+def test_cbm_refuses_malformed_sibling_reserve(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_SIBLING_RESERVE_BYTES": "unknown"},
+    )
+
+    assert res.returncode == 3
+    assert "CODE_INTEL_SIBLING_RESERVE_BYTES" in res.stdout
+    assert not log.exists() or "codebase-memory-mcp ARGS:" not in log.read_text()
+
+
+def test_cbm_unlimited_hierarchy_still_uses_physical_headroom(tmp_path):
+    gib = 1024**3
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    systemd_log = tmp_path / "systemd.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, systemd_log)
+    repo = _make_repo(tmp_path)
+    env = _fake_v2_cgroup(
+        tmp_path,
+        membership="/tenant",
+        limits={"tenant": "max", "": None},
+    )
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(
+        f"MemTotal: {4 * gib // 1024} kB\n"
+        f"MemAvailable: {gib // 1024} kB\n"
+    )
+    env["CODE_INTEL_MEM_CURRENT_BYTES"] = ""
+    env["CODE_INTEL_MEMINFO"] = str(meminfo)
+
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}", env_extra=env,
+    )
+
+    assert res.returncode == 3
+    assert "below the measured" in res.stdout
+    assert "codebase-memory-mcp cli index_repository" not in systemd_log.read_text()
 
 
 def test_cbm_refuses_missing_v2_limit_below_mount_root(tmp_path):
