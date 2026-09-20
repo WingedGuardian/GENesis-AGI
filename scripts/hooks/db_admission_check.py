@@ -25,7 +25,7 @@ _SRC_DIR = Path(__file__).resolve().parents[2] / "src"
 
 
 def database_is_fenced(db_path) -> bool:
-    """True when *db_path* must not be touched (quarantine or maintenance).
+    """True when *db_path* must not be touched (quarantine).
 
     Fail-closed wrapper: an import failure or any unexpected error returns
     True. A one-line stderr note is emitted for the journal on the abnormal

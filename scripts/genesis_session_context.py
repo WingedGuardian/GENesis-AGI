@@ -40,9 +40,9 @@ from hook_output import HOOK_STDOUT_CAP, BoundedStdout, emit_cost, utf16_len  # 
 def _db_is_fenced(db_path) -> bool:
     """Admission fence, fail-closed: unknown state reads as fenced.
 
-    Session-context blocks are advisory; a fenced database degrades each
-    block to its own empty state rather than opening a quarantined or
-    maintenance-held file (the 2026-09-18 incident class).
+    Session-context blocks are advisory; a quarantined database degrades each
+    block to its own empty state rather than being opened (the 2026-09-18
+    incident class).
     """
     try:
         from db_admission_check import database_is_fenced

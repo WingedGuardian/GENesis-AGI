@@ -58,7 +58,7 @@ def emit(sha: str, subject: str) -> int:
     now = datetime.now(UTC).isoformat()
     obs_id = str(uuid.uuid4())
 
-    # Admission fence (fail-closed): a quarantined or maintenance-fenced
+    # Admission fence (fail-closed): a quarantined
     # database is never written; a skipped bugfix observation is recoverable.
     try:
         from db_admission_check import database_is_fenced

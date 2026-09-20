@@ -413,7 +413,7 @@ def _insert_rows(rows: list[tuple]) -> None:
     if not rows or not _DB_PATH.exists():
         return
     # Admission fence (lazy, fail-closed — module import stays stdlib-only):
-    # never write to a quarantined or maintenance-fenced database; skipping
+    # never write to a quarantined database; skipping
     # these best-effort outcome rows is the designed degrade.
     _hooks = str(Path(__file__).resolve().parent / "hooks")
     if _hooks not in sys.path:

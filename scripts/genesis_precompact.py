@@ -233,7 +233,7 @@ def _update_charter(session_dir: Path, session_id: str, transcript_path: str) ->
         # this boundary self-heals at the next compaction.
         return None
     # Admission fence (lazy, fail-closed — this hook stays stdlib-only at
-    # import time): a quarantined or maintenance-fenced database is never
+    # import time): a quarantined database is never
     # written; the charter write self-heals at the next compaction.
     _hooks = str(Path(__file__).resolve().parent / "hooks")
     if _hooks not in sys.path:

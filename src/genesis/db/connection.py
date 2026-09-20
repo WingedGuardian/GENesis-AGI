@@ -36,12 +36,14 @@ def connect_sqlite_rw(
 ) -> sqlite3.Connection:
     """Return a synchronous RW connection after enforcing DB admission.
 
-    Admission = quarantine (unchanged) OR an active maintenance fence. The
-    assertion takes the CALLER's spelling, deliberately before the
-    ``.resolve()`` below: a maintenance marker is published against the
-    configured path, which on a symlinked database is not the resolved one,
-    and resolving first would discard the very spelling the marker is under.
-    :func:`~genesis.db.admission.assert_admitted` checks both.
+    Admission is QUARANTINE — "this artifact failed an integrity check". It
+    is deliberately not more than that: a maintenance fence was built and
+    removed before shipping (see :mod:`genesis.db.admission`), so nothing here
+    protects a database an operator is replacing. Do not write recovery
+    procedure against a guarantee this does not make.
+
+    The assertion takes the caller's spelling, before the ``.resolve()``
+    below, so the path checked is the path the caller named.
     """
     from genesis.db.admission import assert_admitted
 
@@ -57,10 +59,9 @@ class _GuardedAiosqliteConnector:
         self, db_path: Path, kwargs: dict[str, Any], admission_path: Path | None = None
     ) -> None:
         self._db_path = db_path
-        # The caller's ORIGINAL spelling, kept for admission checks only. A
-        # maintenance marker is keyed on the configured path, which for a
-        # symlinked database differs from the resolved one used to connect;
-        # asserting on the resolved path alone would walk past that marker.
+        # The caller's ORIGINAL spelling, kept for admission checks only, so
+        # the path asserted is the path the caller named rather than whatever
+        # it resolves to.
         self._admission_path = admission_path if admission_path is not None else db_path
         self._kwargs = kwargs
         self._connection: aiosqlite.Connection | None = None
@@ -73,9 +74,8 @@ class _GuardedAiosqliteConnector:
         assert_admitted(self._admission_path)
         connection = await aiosqlite.connect(str(self._db_path), **self._kwargs)
         try:
-            # Quarantine or a maintenance fence may have become active while
-            # the worker thread opened SQLite.  Never return that newly opened
-            # writable handle.
+            # Quarantine may have become active while the worker thread
+            # opened SQLite.  Never return that newly opened writable handle.
             assert_admitted(self._admission_path)
         except BaseException as open_error:
             try:
@@ -699,11 +699,11 @@ async def open_ro_connection(
     need write access to the DB header and are no-ops (or raise
     ``SQLITE_READONLY`` on some builds) on a read-only handle.
 
-    Admission (quarantine or maintenance fence) is enforced here like every
-    other open-time factory. Read-only is not a reason to skip it: a reader
-    still opens the file and its ``-wal``, still holds a descriptor against a
-    database an operator is trying to replace, and still surfaces rows from an
-    artifact already judged untrustworthy. This was the one connect site in
+    Admission (quarantine) is enforced here like every other open-time
+    factory. Read-only is not a reason to skip it: a reader still opens the
+    file and its ``-wal``, still holds a descriptor on it, and still surfaces
+    rows from an artifact already judged untrustworthy. This was the one
+    connect site in
     this module guarded by nothing at all.
     """
     from genesis.db.admission import assert_admitted

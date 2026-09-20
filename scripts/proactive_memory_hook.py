@@ -240,7 +240,7 @@ def _sqlite_connect(
     if remaining is not None and remaining <= 0:
         raise _RunBudgetExpired
     # Admission fence at the single connect chokepoint (fail-closed): a
-    # quarantined or maintenance-fenced database is never opened. Raised as
+    # quarantined database is never opened. Raised as
     # OperationalError so each caller degrades exactly as it does for a locked
     # database — per-feature, never crashing the hook.
     _fence_blocked = True
@@ -252,7 +252,7 @@ def _sqlite_connect(
         _fence_blocked = True
     if _fence_blocked:
         raise sqlite3.OperationalError(
-            "database fenced (quarantine/maintenance) — admission refused"
+            "database quarantined — admission refused"
         )
     # Re-derive the remaining budget AFTER the fence check, which consumed
     # real time (MEASURED ~74ms on a cold hook process, ~0.3ms warm). The

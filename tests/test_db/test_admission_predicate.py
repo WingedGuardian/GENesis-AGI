@@ -22,6 +22,7 @@ on an ordinary install is a self-inflicted outage.
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -117,6 +118,33 @@ def test_symlink_loop_answers_by_marker_state_and_never_raises(scratch_db):
 
     quarantine_database(scratch_db, source="test", detail="probe")
     assert admission.database_is_fenced(loop) is True
+
+
+def test_path_beginning_with_file_colon_is_not_treated_as_a_uri(tmp_path, monkeypatch):
+    """``file:literal.db`` is a legal POSIX filename, not a URI.
+
+    Only a STRING may be a URI here. Stringifying a ``Path`` and sniffing the
+    prefix checked ``literal.db`` while the connection factories opened the
+    literal ``file:literal.db`` — so a quarantine marker on the real file was
+    missed and the seam was bypassable by a legal name. Both directions are
+    pinned: the Path must fence, and a genuine URI string must still decode.
+    """
+    home = tmp_path / "ghome"
+    home.mkdir()
+    monkeypatch.setenv("GENESIS_HOME", str(home))
+    (tmp_path / "file:literal.db").write_bytes(b"SQLite format 3\x00")
+    quarantine_database(tmp_path / "file:literal.db", source="test", detail="probe")
+
+    # RELATIVE on purpose. An absolute Path stringifies to "/tmp/.../file:..."
+    # which does not start with "file:", so it never reaches the URI branch
+    # and proves nothing — an earlier version of this test did exactly that
+    # and survived the mutation it was written to catch.
+    monkeypatch.chdir(tmp_path)
+    literal = Path("file:literal.db")
+
+    assert admission.database_is_fenced(literal) is True
+    with pytest.raises(DatabaseIntegrityError):
+        admission.assert_admitted(literal)
 
 
 def test_predicate_never_raises_when_the_quarantine_reader_fails(scratch_db, monkeypatch):

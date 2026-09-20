@@ -77,10 +77,16 @@ def _coerce_path(db_path) -> Path:
     pass URIs. So the URI is parsed to its underlying path (query dropped,
     percent-encoding decoded) before any check.
     """
-    text = str(db_path)
-    if text.startswith("file:"):
-        parts = urlsplit(text)
+    # Only a STRING may be a URI. A `Path` is always a filesystem path, and
+    # `file:literal.db` is a legal POSIX filename — stringifying a Path and
+    # sniffing the prefix would check `literal.db` while the factory opened
+    # the literal `file:literal.db`, so a quarantine marker on that real file
+    # is missed and the seam is bypassed by a legal name.
+    if isinstance(db_path, str) and db_path.startswith("file:"):
+        parts = urlsplit(db_path)
         text = url2pathname(parts.path) if parts.path else parts.netloc
+    else:
+        text = str(db_path)
     return Path(text).expanduser()
 
 

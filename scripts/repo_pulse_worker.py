@@ -53,7 +53,7 @@ def _print_verification_backlog(db_path: str | None) -> None:
         print(f"pr_verifications: no database at {resolved}")
         return
 
-    # Admission fence (fail-closed): a quarantined or maintenance-fenced
+    # Admission fence (fail-closed): a quarantined
     # database is not opened even read-only — this worker runs automatically
     # at session boundaries, exactly the entry class the fence exists to bind.
     try:
@@ -63,7 +63,7 @@ def _print_verification_backlog(db_path: str | None) -> None:
     except Exception:
         fenced = True
     if fenced:
-        print("pr_verifications: database fenced (quarantine/maintenance) — skipped")
+        print("pr_verifications: database quarantined — skipped")
         return
 
     async def _read() -> tuple[list[dict], dict]:

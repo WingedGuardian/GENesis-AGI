@@ -84,7 +84,7 @@ def _record_procedures_surfaced(proc_ids: list[str]) -> None:
         import sqlite3
         db_path = importlib.import_module("genesis.env").genesis_db_path()
         # Admission fence (fail-closed): surfaced-count bumps are advisory —
-        # never write to a quarantined or maintenance-fenced database.
+        # never write to a quarantined database.
         _hooks = str(Path(__file__).resolve().parent / "hooks")
         if _hooks not in sys.path:
             sys.path.insert(0, _hooks)

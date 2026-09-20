@@ -81,7 +81,7 @@ def _process(data: dict) -> None:
         return
 
     # Admission fence (module import stays stdlib-only; the fence import is
-    # lazy and fail-closed): never write to a quarantined or maintenance-fenced
+    # lazy and fail-closed): never write to a quarantined
     # database — hook writers bypassing quarantine is the 2026-09-18 incident
     # class, and skipping one best-effort audit row is the designed degrade.
     _hooks = str(Path(__file__).resolve().parent / "hooks")

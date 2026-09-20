@@ -663,7 +663,7 @@ async def _impl_job_health() -> dict:
         {
             "jobs": {job_name: {...}, ...},
             "note": None | str,
-            "source": "runtime" | "sqlite" | "missing_db" | "query_failed",
+            "source": "runtime" | "sqlite" | "missing_db" | "fenced_db" | "query_failed",
         }
 
     Callers can always read ``result["jobs"]`` and ``result["source"]``
@@ -772,7 +772,7 @@ async def job_health() -> dict:
           "jobs": {job_name: {last_run, last_success, last_failure,
                               last_error, consecutive_failures}},
           "note": null | "human-readable explanation",
-          "source": "runtime" | "sqlite" | "missing_db" | "query_failed"
+          "source": "runtime" | "sqlite" | "missing_db" | "fenced_db" | "query_failed"
         }
 
     ``note`` is null on the happy path; non-null when the check
