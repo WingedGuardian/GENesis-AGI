@@ -13,6 +13,16 @@ create a charter for it, send its identifiers to session tools, or add lifecycle
 hooks that make Genesis manage the conversation. See
 `.agents/skills/genesis-external-client/SKILL.md` when working through Codex.
 
+## Genesis skill path resolution
+
+The generated "Genesis Capability Surface" below lists Genesis skill names, not
+their filesystem paths. For Tier 1 Genesis skills named there, load
+`.claude/skills/<skill-name>/SKILL.md` — `genesis-development` resolves to
+`.claude/skills/genesis-development/SKILL.md`. Do not infer that a skill listed
+in that inventory lives under `.agents/skills/`: only the external-client skill
+named above does, and reading the one path mentioned in this file as the general
+rule is the mistake this section exists to prevent.
+
 ## Code Review Mandate (adversarial)
 
 When reviewing a diff or PR (including automated PR review), review ADVERSARIALLY,
