@@ -176,4 +176,14 @@ models:
 # Prove a peer before you depend on it: `gmodel --print-env <name>` to check the
 # env resolves, then `genesis eval gauntlet -m <name>` to confirm it can
 # actually drive a coding fix-loop. Record the date in `validated:` yourself.
+#
+# ONE THING THAT RUN WILL LIE TO YOU ABOUT: its reported `cost_usd` is not the
+# peer's bill. The invoker takes that figure verbatim from Claude Code's own
+# `total_cost_usd`, which CC computes from its Anthropic price table and cannot
+# know a third-party provider's rates — so the number is real arithmetic over
+# the right token counts at the wrong prices, which is exactly the kind of wrong
+# that reads as authoritative. MEASURED on one gauntlet run against a per-token
+# peer: CC reported $1.1981 where the provider's dashboard billed about $0.05.
+# The direction depends on the peer, so do not treat 24x as a correction factor.
+# Read peer spend from the provider, never from `eval_runs`.
 # ─────────────────────────────────────────────────────────────────────────────
