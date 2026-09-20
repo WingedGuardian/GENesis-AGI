@@ -254,6 +254,18 @@ def _sqlite_connect(
         raise sqlite3.OperationalError(
             "database fenced (quarantine/maintenance) — admission refused"
         )
+    # Re-derive the remaining budget AFTER the fence check, which consumed
+    # real time (MEASURED ~74ms on a cold hook process, ~0.3ms warm). The
+    # outer `asyncio.timeout_at` cannot interrupt the SYNCHRONOUS sqlite3 work
+    # below, so a stale `remaining` is the one that actually overruns the
+    # hook's aggregate budget. Same correction as `_connect_with_deadline` in
+    # scripts/hooks/session_heartbeat.py — the two connect chokepoints must
+    # agree, or the budget means something different depending on which one a
+    # caller happens to use.
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _RunBudgetExpired
     effective_timeout = timeout if remaining is None else min(timeout, remaining)
     conn = sqlite3.connect(str(db_path), timeout=effective_timeout, uri=uri)
     if deadline is not None:

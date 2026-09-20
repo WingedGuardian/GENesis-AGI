@@ -45,17 +45,23 @@ _SRC = _REPO / "src"
 _FENCE_CALL_NAMES = {"database_is_fenced", "_db_is_fenced", "_db_fenced"}
 
 # Openers allowed WITHOUT a fence check, each with the reason stated.
-# Path is relative to scripts/. PR-0 fences the AUTOMATIC entry points (hooks,
-# session-boundary workers, timer-driven maintenance) — the class the
-# 2026-09-18 incident's bypass writers belong to. OPERATOR-RUN one-off CLIs
-# are deliberately deferred to the raw-opener sweep PR (lease semantics,
-# per-tool judgment: some legitimately examine a quarantined database). A NEW
-# script added to scripts/ still fails this gate by default and must either
-# take the fence or be consciously classified here in review.
+# Path is relative to scripts/. This gate fences the AUTOMATIC entry points
+# (hooks, session-boundary workers, timer-driven maintenance) — the class the
+# 2026-09-18 incident's bypass writers belong to, and the line is drawn there
+# on purpose: an automatic opener runs with NO HUMAN PRESENT, which is what
+# makes a silent write to a fenced database possible in the first place.
+#
+# OPERATOR-RUN one-off CLIs stay out, and not as a deferral: a human is at the
+# keyboard, and several (the memory-integrity diagnostic above all)
+# legitimately need to examine a database precisely BECAUSE it is suspect.
+# Fencing those would remove the tool you reach for during an incident.
+#
+# A NEW script added to scripts/ still fails this gate by default and must
+# either take the fence or be consciously classified here in review.
 _OPERATOR_ONE_OFF = (
     "operator-run one-off (backfill/migration/cleanup/report) — not an "
-    "automatic entry point; the raw-opener sweep PR upgrades these to lease "
-    "semantics with per-tool judgment"
+    "automatic entry point; a human is present, and some of these must be "
+    "able to inspect a suspect database"
 )
 _ALLOWLIST: dict[str, str] = {
     "dev/mw2_classifier_probe.py": _OPERATOR_ONE_OFF,
