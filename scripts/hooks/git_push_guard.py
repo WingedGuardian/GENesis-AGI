@@ -2512,6 +2512,10 @@ _CONCENTRATION_MIN_FINDINGS = 4
 #: apart. No second ENCODED budget: nothing expands any more (see below).
 _REPORT_PATH_MAX_CHARS = 80
 _REPORT_PATH_TAIL_CHARS = 40
+#: Width of the identity tag appended when — and ONLY when — the rendering is
+#: lossy. Six hex characters is 16.7M buckets against a table that shows at most
+#: six rows; the job is telling two rows apart, not resisting a preimage attack.
+_REPORT_PATH_DIGEST_CHARS = 6
 
 
 def _safe_report_path(path: str) -> str:
@@ -2561,11 +2565,35 @@ def _safe_report_path(path: str) -> str:
     output, which is a title and carries no path, so this rendering is the only
     one there is and losing information here loses it outright.
     """
-    return _bound_with_stated_omission(
+    rendered = _bound_with_stated_omission(
         _defang_gate_text(path).replace("\n", " "),
         _REPORT_PATH_MAX_CHARS,
         _REPORT_PATH_TAIL_CHARS,
     )
+    # LOSSY RENDERING DESTROYS IDENTITY, and both transforms above are lossy in
+    # different ways. Defang is many-to-one — `src/a b.py` and `src/a\x1bb.py`
+    # both render `src/a b.py`. The bound drops the MIDDLE — two 90-character
+    # paths sharing a head and a basename produce the same text, the same
+    # omission count and the same tail. Either way the distribution groups by
+    # the RAW path but LABELS by this one, so two real buckets can print as the
+    # same row and the reader cannot tell which file is which.
+    #
+    # Rounds 1-4 of this PR were all one property (length under an expanding
+    # encoding). This is a DIFFERENT one, and it was latent the whole time —
+    # fixing the expansion is what made it visible. Codex and Devin found it
+    # independently at the same head and prescribed the same remedy.
+    #
+    # The equality test is the exact condition, not an approximation of it: if
+    # the rendering is byte-identical to its input then it IS the identifier and
+    # needs nothing. Only a rendering that actually changed something pays for a
+    # tag, so an ordinary path stays clean and the tag never becomes noise the
+    # reader learns to skip.
+    if rendered == path:
+        return rendered
+    # `surrogatepass` because a hash must never raise: paths arrive from JSON and
+    # can carry lone surrogates, which plain utf-8 encoding refuses.
+    digest = hashlib.sha256(path.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"{rendered} [#{digest[:_REPORT_PATH_DIGEST_CHARS]}]"
 
 
 def _findings_distribution(
@@ -2627,9 +2655,15 @@ def _findings_distribution(
 
     total = len(scored_at)
     n_files = sum(1 for k in by_file if k is not None)
+    # The pathless bucket sorts LAST unconditionally, not merely as a tiebreak.
+    # As a tiebreak it only lost to files with MORE findings, so five pathless
+    # findings outranked a file with three — and with six real files present the
+    # display cap then elided an actual file to make room for the bucket that is
+    # not a file at all (Devin, PR #2005, round 5). It is listed, because it
+    # holds real findings; it is just never allowed to displace a location.
     ranked = sorted(
         by_file.items(),
-        key=lambda kv: (-len(kv[1]), kv[0] is None, kv[0] or ""),
+        key=lambda kv: (kv[0] is None, -len(kv[1]), kv[0] or ""),
     )
     lines = [
         f"DISTRIBUTION: {total} scored finding(s) across {n_files} file(s)"

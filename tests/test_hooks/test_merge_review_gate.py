@@ -5760,10 +5760,83 @@ class TestFindingsDistribution:
         r1, r2 = guard_module._safe_report_path(p1), guard_module._safe_report_path(p2)
         assert r1 != r2, "two distinct paths must not render as the same string"
         assert "alpha" in r1 and "bravo" in r2, "the distinguishing head must survive"
-        assert r1.endswith("handler.py") and r2.endswith("handler.py"), (
+        # `in`, not `endswith`: round 5 appends an identity tag after the tail
+        # when the rendering is lossy, which these paths are. The property this
+        # test owns is that the basename SURVIVES, not that it sits last.
+        assert "handler.py" in r1 and "handler.py" in r2, (
             "and the basename must survive too — both ends, or the row is ambiguous "
             "in one direction or uninformative in the other"
         )
+
+    def test_a_LOSSY_rendering_carries_an_identity_tag(self, guard_module):
+        """Round 5, found independently by Codex and Devin at the same head.
+
+        Both transforms are lossy, in different ways, and the distribution
+        groups by the RAW path while labelling with the rendered one — so two
+        real buckets could print as the same row.
+
+        Rounds 1-4 were all ONE property (length under an expanding encoding).
+        This is a different one, latent throughout: fixing the expansion is what
+        made it visible. Both collision sources are driven here, because fixing
+        one and calling the class closed is how this PR reached round 5.
+        """
+        # Codex's case: defang is many-to-one — ESC and a space both become " ".
+        plain, escaped = "src/a b.py", "src/a\x1bb.py"
+        assert guard_module._safe_report_path(plain) != guard_module._safe_report_path(
+            escaped
+        ), "a defang collision must not render two paths as one row"
+
+        # Devin's case: the bound drops the MIDDLE, so the head, the omission
+        # count and the basename can all match while the paths differ.
+        p1 = "services/common/" + "a" * 70 + "/handler.py"
+        p2 = "services/common/" + "a" * 35 + "b" + "a" * 34 + "/handler.py"
+        r1, r2 = guard_module._safe_report_path(p1), guard_module._safe_report_path(p2)
+        assert r1 != r2, "an omitted-middle collision must not render as one row"
+        assert len(r1) == len(r2), (
+            "precondition: these differ ONLY in the elided middle, so the tag is "
+            "the only thing that can separate them"
+        )
+        # Identity is added, not traded for readability — both ends still show.
+        for rendered in (r1, r2):
+            assert rendered.startswith("services/common/")
+            assert "/handler.py" in rendered
+
+    def test_a_FAITHFUL_rendering_carries_no_tag(self, guard_module):
+        """Negative control: the tag must never become noise a reader learns to skip.
+
+        Without this, appending a digest unconditionally would satisfy the test
+        above while stamping every ordinary row with a hash nobody needs. The
+        condition is exact rather than approximate — a rendering byte-identical
+        to its input IS the identifier and needs nothing added.
+        """
+        for clean in (
+            "src/genesis/memory/store.py",
+            "a.py",
+            "tests/test_hooks/test_merge_review_gate.py",
+        ):
+            assert guard_module._safe_report_path(clean) == clean, (
+                f"a faithful rendering must be returned untouched: {clean}"
+            )
+
+    def test_the_pathless_bucket_never_displaces_a_FILE(self, guard_module):
+        """Devin, round 5: the bucket sorted last only as a TIEBREAK.
+
+        So five pathless findings outranked a file with three, and with six real
+        files present the display cap elided an actual location to make room for
+        a bucket that is not a file. It is still listed — it holds real findings
+        — it just cannot cost the report a file.
+        """
+        scored = [("P2", None)] * 5 + [
+            ("P2", f"src/f{i}.py") for i in range(6) for _ in range(3)
+        ]
+        out = guard_module._findings_distribution(scored)
+        shown = [ln for ln in out.split("\n") if ln.startswith("     ")]
+        assert not any("(no path)" in ln for ln in shown), (
+            "the pathless bucket must not occupy one of the six displayed rows "
+            "while a real file is elided"
+        )
+        assert all(f"src/f{i}.py" in out for i in range(6)), "every file must show"
+        assert "the pathless bucket" in out, "and its omission must be declared"
 
     def test_a_reported_round_is_not_described_as_a_round(self, guard_module):
         """The scorer accumulates across review submissions, so 'this round' was a
