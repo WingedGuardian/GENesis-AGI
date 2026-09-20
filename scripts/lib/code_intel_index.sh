@@ -430,6 +430,22 @@ _genesis_mem_ceiling() {
     [ -n "$total_kb" ] && printf '%s' "$(( total_kb * 1024 ))"
 }
 
+# MemTotal/MemAvailable in kB without awk — the rlimit/no-flock fallback path
+# exists for stripped-PATH environments where awk may not be installed, and
+# host admission must still work (and still fail closed) there.
+_genesis_meminfo_kb() {
+    local name val _
+    _GENESIS_MEMINFO_TOTAL_KB=""
+    _GENESIS_MEMINFO_AVAIL_KB=""
+    while read -r name val _ || [ -n "$name" ]; do
+        case "$name" in
+            MemTotal:) _GENESIS_MEMINFO_TOTAL_KB="$val" ;;
+            MemAvailable:) _GENESIS_MEMINFO_AVAIL_KB="$val" ;;
+        esac
+    done < "$1" 2>/dev/null
+    [[ "$_GENESIS_MEMINFO_TOTAL_KB" =~ ^[0-9]+$ && "$_GENESIS_MEMINFO_AVAIL_KB" =~ ^[0-9]+$ ]]
+}
+
 # Convert a cgroup's total charge into a conservative working-set estimate.
 # memory.current includes clean filesystem cache, which the kernel can reclaim
 # before an OOM. Counting every cached byte as permanently occupied starves the
@@ -883,17 +899,23 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
                 CBM_MEM_REFUSE="$_GENESIS_CGROUP_ERROR"
             fi
 
-            if [ -z "$CBM_MEM_REFUSE" ] && [ -z "$_cbm_ceiling_b" ]; then
-                # An unlimited controller still sits on finite physical RAM.
-                # Measure that host bound directly; a missing meminfo cannot be
-                # treated as free headroom.
+            # The host's physical bound applies regardless of what the cgroup
+            # reports: a controller limit can exceed installed RAM, and the OOM
+            # killer acts on the host's real headroom.
+            _cbm_host_spare_b=""
+            if [ -z "$CBM_MEM_REFUSE" ]; then
                 _cbm_meminfo="${CODE_INTEL_MEMINFO:-/proc/meminfo}"
-                _cbm_total_kb="$(awk '/^MemTotal:/ {print $2}' "$_cbm_meminfo" 2>/dev/null)"
-                _cbm_avail_kb="$(awk '/^MemAvailable:/ {print $2}' "$_cbm_meminfo" 2>/dev/null)"
-                if [[ "$_cbm_total_kb" =~ ^[0-9]+$ && "$_cbm_avail_kb" =~ ^[0-9]+$ ]]; then
-                    _cbm_ceiling_b=$(( _cbm_total_kb * 1024 ))
-                    if [ -z "$_cbm_live_b" ]; then
-                        _cbm_live_b=$(( (_cbm_total_kb - _cbm_avail_kb) * 1024 ))
+                if _genesis_meminfo_kb "$_cbm_meminfo"; then
+                    _cbm_total_kb="$_GENESIS_MEMINFO_TOTAL_KB"
+                    _cbm_avail_kb="$_GENESIS_MEMINFO_AVAIL_KB"
+                    [ "$_cbm_avail_kb" -gt "$_cbm_total_kb" ] && _cbm_avail_kb="$_cbm_total_kb"
+                    _cbm_host_spare_b=$(( (_cbm_avail_kb * 1024) - CODE_INTEL_SIBLING_RESERVE_BYTES ))
+                    if [ -z "$_cbm_ceiling_b" ]; then
+                        _cbm_ceiling_b=$(( _cbm_total_kb * 1024 ))
+                        if [ -z "$_cbm_live_b" ]; then
+                            _cbm_live_b=$(( (_cbm_total_kb - _cbm_avail_kb) * 1024 ))
+                            [ "$_cbm_total_kb" -lt "$_cbm_avail_kb" ] && _cbm_live_b=0
+                        fi
                     fi
                 else
                     CBM_MEM_REFUSE="cannot read MemTotal/MemAvailable from $_cbm_meminfo"
@@ -931,6 +953,11 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
                         _cbm_claimed_b=$(( _cbm_live_b + CODE_INTEL_SIBLING_RESERVE_BYTES ))
                     fi
                     _cbm_spare_b=$(( _cbm_ceiling_b - _cbm_claimed_b ))
+                fi
+                if [ -z "$_cbm_spare_b" ] \
+                    || { [ -n "$_cbm_host_spare_b" ] \
+                        && [ "$_cbm_host_spare_b" -lt "$_cbm_spare_b" ]; }; then
+                    _cbm_spare_b="$_cbm_host_spare_b"
                 fi
                 if [ -n "$CBM_MEM_REFUSE" ]; then
                     :

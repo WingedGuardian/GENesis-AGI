@@ -1212,6 +1212,37 @@ def test_cbm_unlimited_hierarchy_still_uses_physical_headroom(tmp_path):
     assert "codebase-memory-mcp cli index_repository" not in systemd_log.read_text()
 
 
+def test_cbm_finite_cgroup_above_physical_ram_still_bounds_by_host(tmp_path):
+    gib = 1024**3
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    systemd_log = tmp_path / "systemd.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, systemd_log)
+    repo = _make_repo(tmp_path)
+    env = _fake_v2_cgroup(
+        tmp_path,
+        membership="/tenant",
+        limits={"tenant": str(8 * gib), "": None},
+    )
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(
+        f"MemTotal: {4 * gib // 1024} kB\n"
+        f"MemAvailable: {gib // 1024} kB\n"
+    )
+    env["CODE_INTEL_MEM_CURRENT_BYTES"] = ""
+    env["CODE_INTEL_MEMINFO"] = str(meminfo)
+    cgroup = tmp_path / "cgroup2" / "tenant"
+    (cgroup / "memory.current").write_text(f"{512 * 1024**2}\n")
+
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}", env_extra=env,
+    )
+
+    assert res.returncode == 3
+    assert "below the measured" in res.stdout
+    assert "codebase-memory-mcp cli index_repository" not in systemd_log.read_text()
+
+
 def test_cbm_refuses_missing_v2_limit_below_mount_root(tmp_path):
     fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
     _fake_tools(fakebin, log)
