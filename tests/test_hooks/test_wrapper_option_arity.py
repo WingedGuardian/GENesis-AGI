@@ -158,6 +158,47 @@ _REQUIRED_TAIL = re.compile(r"^(=\S| <[^>]+>| [A-Za-z][-A-Za-z0-9]*\b)")
 #: NOT equal to any real arity, so a caller that forgets to handle it fails the
 #: entry rather than silently accepting it.
 _AMBIGUOUS = "ambiguous"
+#: Spellings this repo has REVIEWED and accepted as unsettleable from the tool's
+#: own help. An entry is a DECLARED known gap: the option is listed in
+#: `_WRAPPER_SPEC` and the lock does not grade it. Anything ambiguous that is NOT
+#: named here FAILS, so a new unsettleable spelling cannot enter the table
+#: silently.
+#:
+#: Polarity matters, and the previous shape had it backwards: it PRINTED the
+#: abstention from a PASSING test and carried on. MEASURED on this branch with
+#: CI's own flags (`pytest -rfE --junit-xml`): zero occurrences of that message
+#: in the log AND zero in the JUnit report, because pytest discards a passing
+#: test's captured output and `junit_logging` defaults to `no`. Adding a second
+#: ambiguous-but-invalid entry such as `sudo --preserve-env` therefore produced
+#: a completely green, silent build — a warning routed where its reader never
+#: looks (Codex P2, PR #1986 round 5).
+#:
+#: Anchored to an exact (tool, option) pair, never a prefix, and never shared
+#: across tools. An entry that STOPS being ambiguous — the tool's help changed —
+#: goes inert rather than stale: that option falls back to ordinary grading,
+#: which passes if the help now documents a required value and fails loudly if
+#: it does not. So a dead entry can hide nothing beyond the one ambiguity it
+#: names, and no staleness assertion is needed to keep it honest.
+#:
+#: `sudo -h` is the only member. The help declares `-h, --help` (zero) AND
+#: `-h, --host=host` (required). Strictest-wins reports `required`, which would
+#: wave through `--preserve-env` and let the resolver eat the wrapped command;
+#: weakest-wins fails `-h`, which IS correctly value-consuming. The
+#: disambiguating fact is not in the help text at all, and `sudo` is a binary,
+#: so `_parser_arity` cannot read its getopt spec either.
+_KNOWN_AMBIGUOUS: dict[str, frozenset[str]] = {"sudo": frozenset({"-h"})}
+
+
+def _unexpected_ambiguities(tool: str, arity: dict[str, str], listed) -> list[str]:
+    """Listed options this help declares two ways that are NOT a reviewed exception.
+
+    Extracted from the caller so the allowlist's polarity is directly testable:
+    the property that matters is that an UNLISTED ambiguity is returned (and so
+    fails), which a test driving the whole parametrized check could only observe
+    on a tool that happens to be ambiguous on this machine.
+    """
+    allowed = _KNOWN_AMBIGUOUS.get(tool, frozenset())
+    return sorted(opt for opt in listed if arity.get(opt) == _AMBIGUOUS and opt not in allowed)
 
 
 def _documented_arity(help_text: str) -> dict[str, str]:
@@ -371,19 +412,19 @@ class TestTableAgreesWithTheToolsThemselves:
         # entirely (see `_parser_arity`). Empty for every binary and builtin, so
         # this narrows nothing for the tools that have no spec to read.
         arity.update(_parser_arity(tool))
-        # ABSTAIN on a spelling the help declares two ways, and say which —
-        # the parser reading above has already resolved it wherever a parser
-        # could be read, so what remains is genuinely unsettleable from prose.
-        # Reported rather than dropped: an exclusion nobody can see is a hole,
-        # and this list is the honest statement of what the lock did NOT check.
-        abstained = sorted(opt for opt in sp._WRAPPER_SPEC[tool][0] if arity.get(opt) == _AMBIGUOUS)
-        if abstained:
-            print(
-                f"\nABSTAINED {tool}: {abstained} — the help declares each of these "
-                f"two ways and no parser was readable, so the lock cannot grade them. "
-                f"This is a KNOWN GAP, not a pass.",
-                file=sys.stderr,
-            )
+        # A spelling the help declares two ways cannot be graded here — the
+        # parser reading above has already resolved it wherever a parser could be
+        # read, so what remains is genuinely unsettleable from prose. That makes
+        # it a DECLARED exception or a failure, never a silent exclusion: see
+        # `_KNOWN_AMBIGUOUS` for why printing it instead reached nobody.
+        surprises = _unexpected_ambiguities(tool, arity, sp._WRAPPER_SPEC[tool][0])
+        assert not surprises, (
+            f"{tool}: {surprises} — the help declares each of these two ways and no "
+            f"parser was readable, so the lock cannot grade them. Settle the arity "
+            f"against the tool's real parser, or name it in _KNOWN_AMBIGUOUS with the "
+            f"measurement that justifies it. An ungraded entry is a KNOWN GAP, never "
+            f"a pass."
+        )
         # An option neither source SAW is reported as unverified, not waved
         # through. Defaulting it to `required` was a hole in the lock itself:
         # `xargs` documents `-0, --null`, a numeric spelling the pattern skipped,
@@ -582,3 +623,68 @@ class TestTableAgreesWithTheToolsThemselves:
         assert resolved["--server-num"] == "required", (
             "the parser must settle what the prose could not"
         )
+
+    def test_an_UNDECLARED_ambiguity_fails_instead_of_printing(self):
+        """Guard the guard: the polarity that the previous shape got backwards.
+
+        Abstention used to be a `print` from a passing test. MEASURED with CI's
+        own flags: zero occurrences in the log and zero in the JUnit report, so a
+        new ambiguous entry produced a green, silent build. An ambiguity the repo
+        has not reviewed must therefore be RETURNED — and so fail the caller's
+        assertion — not announced into a stream nobody reads.
+        """
+        assert _unexpected_ambiguities("xargs", {"-q": _AMBIGUOUS}, ["-q"]) == ["-q"]
+        # And the declared one is allowed, by name, so the lock stays green on
+        # the gap it has actually measured.
+        assert _unexpected_ambiguities("sudo", {"-h": _AMBIGUOUS}, ["-h"]) == []
+
+    def test_the_allowlist_is_anchored_to_an_exact_tool_and_option(self):
+        """Guard the guard: an exemption that widens by prefix exempts the world.
+
+        `-h` is excused for `sudo` and for nothing else, and only as the whole
+        option — a substring or prefix match would quietly excuse `-h`-prefixed
+        spellings on every tool in the table.
+        """
+        assert _unexpected_ambiguities("doas", {"-h": _AMBIGUOUS}, ["-h"]) == ["-h"], (
+            "the allowlist must not leak across tools"
+        )
+        assert _unexpected_ambiguities("sudo", {"-host": _AMBIGUOUS}, ["-host"]) == ["-host"], (
+            "the allowlist must match the whole option, not a prefix of it"
+        )
+
+    def test_the_caller_actually_FAILS_on_an_undeclared_ambiguity(self, monkeypatch):
+        """Wire-check: the helper's verdict must reach an assertion, not a variable.
+
+        The three tests above pin `_unexpected_ambiguities` itself, and all three
+        stay green if the caller computes it and throws it away — verify-RED
+        measured exactly that: stubbing `surprises = []` in the caller left the
+        whole file passing. No real tool on this machine carries an undeclared
+        ambiguity (that is the point), so the live parametrized case can never
+        exercise the failing branch on its own.
+
+        So inject the real defect Codex named — `sudo --preserve-env`, which the
+        help declares both bare and as `=list` — into the table and drive the
+        actual check. This is the acceptance bar kept as a test rather than run
+        once: before the fix the same injection produced a green, silent build.
+        """
+        if _help_text("sudo") is None:
+            pytest.skip("sudo is not installed here — the ambiguity cannot be measured")
+        opts, *rest = sp._WRAPPER_SPEC["sudo"]
+        monkeypatch.setitem(sp._WRAPPER_SPEC, "sudo", ({*opts, "--preserve-env"}, *rest))
+        with pytest.raises(AssertionError) as caught:
+            self.test_every_listed_option_documents_a_required_value("sudo")
+        assert "--preserve-env" in str(caught.value), (
+            "the failure must NAME the unsettleable option — an assertion that "
+            "fires without saying which entry is ungraded sends the reader back "
+            "to re-derive what the check already knew"
+        )
+
+    def test_a_gradeable_option_is_never_reported_as_an_ambiguity(self):
+        """Negative control: only the sentinel is excused, not every listed option.
+
+        Without this, a helper that returned its whole input would pass both
+        tests above while destroying the check it feeds.
+        """
+        listed = ["-h", "-u", "-E"]
+        arity = {"-h": _AMBIGUOUS, "-u": "required", "-E": "zero"}
+        assert _unexpected_ambiguities("xargs", arity, listed) == ["-h"]
