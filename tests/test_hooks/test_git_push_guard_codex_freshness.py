@@ -1361,18 +1361,24 @@ class TestMergeDeadline:
         assert _mod._gh_timeout(8) == 8
         assert _mod._gh_timeout(6) == 6
 
-    def test_deadline_clamps_to_remaining(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "offset",
+        [3.0],
+        ids=["remaining-time"],
+    )
+    def test_deadline_clamps_without_granting_post_deadline_work(self, monkeypatch, offset):
         import time as _t
 
-        monkeypatch.setattr(_mod, "_merge_deadline", _t.monotonic() + 3)
-        # remaining ~3s < cap 8 → clamped toward remaining (not the full cap)
-        assert _mod._gh_timeout(8) <= 3.5
+        monkeypatch.setattr(_mod, "_merge_deadline", _t.monotonic() + offset)
+        timeout = _mod._gh_timeout(8)
+        assert 0 < timeout <= 3.5
 
-    def test_expired_deadline_floors_at_one(self, monkeypatch):
+    def test_expired_deadline_refuses_to_start_another_probe(self, monkeypatch):
         import time as _t
 
-        monkeypatch.setattr(_mod, "_merge_deadline", _t.monotonic() - 5)  # already past
-        assert _mod._gh_timeout(8) == 1.0  # fail FAST, never negative/zero
+        monkeypatch.setattr(_mod, "_merge_deadline", _t.monotonic() - 5.0)
+        with pytest.raises(RuntimeError, match="aggregate review-gate deadline expired"):
+            _mod._gh_timeout(8)
 
     def test_budget_under_wallclock(self):
         # The documented worst-case pre-binding aggregate must leave headroom under 60s.

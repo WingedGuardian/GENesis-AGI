@@ -140,6 +140,21 @@ except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must b
         pass
     os._exit(2)
 
+try:
+    from native_approval import emit_native_ask  # noqa: E402
+except Exception as _approval_exc:  # noqa: BLE001 — missing new helper must block.
+    if __name__ != "__main__" or sys.argv[1:2] == ["--check-pr"]:
+        raise
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (git_push_guard): native approval helper is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:
+        pass
+    os._exit(2)
+
 # SOFT dependency (mirrors review_enforcement_commit.py's guard for the SAME
 # import): an unimportable review_state must degrade ONLY the round-escalation
 # advisory to its documented default — never crash this module at load time.
@@ -154,6 +169,25 @@ except Exception:  # noqa: BLE001 — ANY failure (absent OR broken: SyntaxError
     # and silently disables every fail-closed gate in this file (round-6 P1).
     ESCALATION_ROUND_CAP = 3  # the genesis-development SKILL.md prose cap
     FINAL_ROUND_CAP = 7  # keep in step with review_state.FINAL_ROUND_CAP
+
+try:
+    from review_deadline import bounded_timeout as _bounded_timeout  # noqa: E402
+except Exception:  # Reverse skew: retain a conservative fail-fast local fallback.
+    def _bounded_timeout(deadline, cap, *, monotonic=time.monotonic):
+        if deadline is None:
+            return cap
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise RuntimeError("aggregate review-gate deadline expired")
+        return min(cap, remaining)
+
+# The cloud-backed round budget is a newer soft dependency than this guard. A
+# missing/broken evaluator is UNKNOWN, never "zero rounds"; the request gate
+# turns that into a native ask (foreground) or a deny (autonomous).
+try:
+    import review_budget as _review_budget  # noqa: E402
+except Exception:  # noqa: BLE001 — reverse-skew must not crash every guard.
+    _review_budget = None
 
 # SOFT dependency, for the reason spelled out directly above: this module is
 # NEW, and audit LOGGING must never be able to disarm the gates it audits. If it
@@ -454,10 +488,8 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
     # asserts a waiver that was never consulted, in a store whose entire purpose
     # is answering "was this escape reached for?", and the row carries nothing to
     # reconcile it against. An honest row needs the branch resolved first; see
-    # the follow-up. `# escalation-ack` / `# final-round-accept` are likewise
-    # unlogged, but for a DIFFERENT reason now — see the note in
-    # `_check_codex_round_escalation`, where the short-circuit that made a row
-    # unattributable in principle no longer exists.
+    # the follow-up. `# escalation-ack` belongs to the local commit-streak gate;
+    # `# final-round-accept` is recognized only for stale-tree compatibility.
     for s in merge_git_segs:
         if getattr(s, "depth", 0) > 0 and not has_trailing_override(
             s.raw, "merge-to-main-override"
@@ -610,13 +642,10 @@ def _gh_timeout(cap: float) -> float:
     """Per-call subprocess timeout under the shared merge-path deadline (``_merge_deadline``).
 
     ``cap`` when no merge deadline is set (every non-merge caller, and the tests, are
-    unaffected). Under a deadline, the smaller of ``cap`` and the time remaining, floored
-    at 1s so a nearly-expired budget makes the call fail FAST — its caller's existing
-    error path then returns its fail-closed/open value — rather than overrun the
-    wall-clock and get the whole hook SIGKILLed mid-gate. Never raises."""
-    if _merge_deadline is None:
-        return cap
-    return max(1.0, min(cap, _merge_deadline - time.monotonic()))
+    unaffected). Under a deadline, the smaller of ``cap`` and the time remaining.
+    An expired budget raises before another process starts; the outer fail-closed
+    guard or a caller's explicit error path then decides safely."""
+    return _bounded_timeout(_merge_deadline, cap, monotonic=time.monotonic)
 
 
 def _derive_repo_from_cwd(cwd: str) -> str | None:
@@ -3669,8 +3698,7 @@ def _comment_positional(argv: list[str]) -> tuple[str | None, str | None]:
     the whole target and a later one is not a second candidate to fall back on.
     None means the request carries no positional at all
     (``gh pr comment --body …``, which resolves the PR from the checked-out
-    branch); that keeps its documented fail-open, since there is no target to
-    count against.
+    branch). The review-budget caller treats that as unknown identity.
 
     ``unreadable_flag`` is a dash token this walk does not model, encountered
     BEFORE any positional. It matters because an allowlist on the target's VALUE
@@ -3751,7 +3779,8 @@ def _comment_target(argv: list[str]) -> tuple[str | None, str | None]:
     OWNER/REPO (counting against the hook cwd's repo for a cross-repo URL could
     produce a wrong count and a FALSE block — Codex round-1 finding). An
     explicit ``--repo``/``-R`` flag wins over the URL-derived repo. A branch
-    target (non-numeric, non-URL positional) yields (None, …) → fail-open.
+    target (non-numeric, non-URL positional) yields (None, …); the caller treats
+    that unresolved identity as unknown evidence and asks/denies.
 
     Reads the FIRST positional only (``_comment_positional``), where this used
     to scan every one of them for something number-shaped. gh accepts at most
@@ -3797,9 +3826,10 @@ def _unresolvable_identity(argv: list[str]) -> str | None:
     present and future — is refused by construction, without this function
     knowing anything about shell expansion syntax.
 
-    Two fail-opens are DELIBERATELY kept, both documented and both locked by
-    tests: a request with NO positional at all (nothing to count against), and a
-    literal branch target (resolvable by anyone who cares to look it up).
+    A request with no positional and a literal branch target are syntactically
+    valid gh forms, but neither is a stable PR number at pre-execution time.
+    The caller therefore routes both through the unknown-evidence policy instead
+    of treating them as requests with nothing to count against.
 
     The cost, stated plainly because it is real: ``shell_parse._argv`` runs
     ``shlex.split`` first, so quoting is already gone by the time argv exists,
@@ -3914,244 +3944,232 @@ def _comment_repo(argv: list[str]) -> str | None:
     return val
 
 
-def _final_round_chained_advisory(pr_num: str) -> str:
-    """A second terminal-stage dispatch behind the SAME acceptance.
 
-    The sigil is matched command-wide so the documented nested form
-    (`bash -c '…' # final-round-accept`) keeps working, which also meant
-    `request && request # final-round-accept` could chain arbitrarily many rounds
-    behind one decision while the advisory promised "ONE more round".
-    """
+def _review_budget_message(pr_num: str, result: dict, repo: str) -> str:
+    """Native-approval reason for one review request; no self-issued sigil exists."""
+    if result.get("status") != "ok":
+        return (
+            f"Review evidence for PR #{pr_num} in {repo} could not be read reliably. "
+            "Treating the round budget as zero would silently reopen an exhausted "
+            "review loop. Approve this one request only if you have independently "
+            "checked the PR history."
+        )
+    count = int(result.get("count") or 0)
+    next_round = count + 1
+    if result.get("gate_surface"):
+        return (
+            f"PR #{pr_num} changes the review-gate surface and already has {count} "
+            f"distinct reviewed heads. Its expedited budget is two discovery rounds; "
+            f"this is another discovery request (round {next_round}). Approve only "
+            "after deciding that another gate-design round is worth the risk."
+        )
+    if result.get("strongly_discouraged"):
+        return (
+            f"PR #{pr_num} already has {count} distinct reviewed heads. Round "
+            f"{next_round} is strongly discouraged: stop, narrow or redesign the "
+            "change, accept documented residue, or abandon it. Approve only this "
+            "single request if continuing is still the least costly option."
+        )
     return (
-        f"BLOCKED: a second terminal-stage review request for PR #{pr_num} in the "
-        "same command. '# final-round-accept' authorises ONE dispatch — the user "
-        "directed one more round, not a chain of them.\n\n"
-        "Run the requests separately, each with its own decision behind it."
+        f"PR #{pr_num} already has {count} distinct reviewed heads; standing "
+        f"authorization ended after four. Approve this single round-{next_round} "
+        "request. Earlier approval does not carry forward to another request."
     )
 
 
-def _final_round_advisory(pr_num: str, rounds: int, repo: str | None = None) -> str:
-    """The terminal, stated for the DISPATCH side of the loop.
+def _comment_body(argv: list[str]) -> tuple[str | None, bool]:
+    """Effective inline body of a ``gh pr comment`` argv, plus opacity.
 
-    Counted from the PR's own review history rather than the local counter, so it
-    fires even when every round ran in the cloud and none was marked locally —
-    which is the case this gate exists for, and therefore the case the commit-side
-    terminal cannot see.
-
-    DELIBERATELY STATELESS, unlike the commit-side terminal. That one spends its
-    acceptance because it licenses a state change (a commit that lands work); this
-    one licenses a review REQUEST, which changes nothing on its own — a session
-    that can re-request reviews but cannot commit fixes achieves nothing, so the
-    commit gate remains the terminal that bites. Making an advisory, fail-open
-    gate carry per-branch consumption state would also contradict the
-    "stateless, authoritative" property the rest of this scan is built on. The
-    consequence is stated rather than hidden: the ack is required on EVERY
-    dispatch past the terminal, and it is not one-shot here.
-    """
-    repo_arg = f" --repo {repo}" if repo else ""
-    return (
-        f"BLOCKED: this would be Codex round {rounds + 1} on PR #{pr_num} — "
-        f"{rounds} rounds already ran on this PR, at or past the terminal "
-        f"({FINAL_ROUND_CAP}). Two full escalation cycles have run and each already "
-        "asked for a fresh decision. '# escalation-ack' does NOT clear this one; if "
-        "it did, the cycle would simply continue, which is what the terminal exists "
-        "to end.\n\n"
-        "There are exactly two ways out, and neither is this session's to choose "
-        "alone:\n"
-        "  (a) ACCEPT the outstanding findings and merge — document each one and why "
-        "it is acceptable in the PR body. The COMMIT gate is where that decision is "
-        "recorded, and there the acceptance is one-shot.\n"
-        "  (b) ABANDON the branch and restart from a design that does not need this "
-        "many rounds.\n\n"
-        "If the user directs ONE more round, that decision rides on this command:\n"
-        f"    gh pr comment {pr_num}{repo_arg} --body '@codex review'  # final-round-accept\n"
-        "Required on EVERY dispatch past the terminal — this gate keeps no state, so "
-        "the sigil is not spent here.\n\n"
-        "Take it to the user. A dispatched session with nobody reading cannot pick "
-        "any of these — surface it and stop."
-    )
-
-
-def _escalation_advisory(pr_num: str, rounds: int, repo: str | None = None) -> str:
-    repo_arg = f" --repo {repo}" if repo else ""
-    return (
-        f"BLOCKED: this would be Codex round {rounds + 1} on PR #{pr_num} — "
-        f"{rounds} rounds already ran (cap {ESCALATION_ROUND_CAP}). Repeated "
-        "rounds each finding NEW defects is the whack-a-mole signature: the "
-        "fixes themselves are becoming the bug source. STEP BACK before "
-        "requesting another round:\n"
-        "  1. TRIAGE every open finding FIRST — classify each as {live bug | "
-        "latent trap | hardening | observation}. Only live bugs and "
-        "cheaper-now-than-later traps may change already-reviewed code; "
-        "everything else gets a documented acceptance or routes to the PR that "
-        "owns that area. Findings are inputs to judgment, not a to-do list.\n"
-        "  2. Fix MECHANISMS, not instances — ask 'what made this bug "
-        "possible?' and remove that; patching the named instance leaves the "
-        "class alive for the next round to find.\n"
-        "  3. State-machine/queue/lifecycle code: enumerate EVERY status value "
-        "and trace your change under each one. Your tests encode your own "
-        "model of the states — they cannot catch the states you didn't "
-        "consider.\n"
-        "  4. Consider REVERTING a prior round's fix instead of patching it "
-        "again — less code is often the real fix.\n"
-        "  5. ESCALATE to the user with a minimize-change recommendation — "
-        "past the cap, standing approval is consumed; each extra round needs "
-        "a fresh, conscious decision.\n"
-        "After doing the above (triage table produced, user consulted), "
-        "re-run with a trailing shell comment (outside any quotes):\n"
-        f'  gh pr comment {pr_num}{repo_arg} --body "@codex review"  # escalation-ack'
-    )
-
-
-def _check_codex_round_escalation(segs) -> tuple[bool, str]:
-    """Block a ``gh pr comment … @codex review`` once the PR already carries
-    ``ESCALATION_ROUND_CAP`` Codex reviews, until a trailing ``# escalation-ack``.
-
-    Companion to the commit gate's Rule 3 (review_enforcement_commit.py): that
-    counter tracks LOCAL review→fix rounds and stays asleep when every local
-    review is clean while the loop churns through CODEX rounds on the PR — the
-    exact blind spot of the 2026-08-12 MW-3 #1372 whack-a-mole (5 Codex rounds,
-    local counter at 0). This gate counts the PR's actual Codex reviews from the
-    GitHub API (stateless, authoritative) at the one moment the groove happens:
-    requesting the next round.
-
-    FAIL-OPEN state table (advisory logic must never break workflow — the
-    opposite posture from the fail-closed merge gates, on purpose):
-      segment isn't `gh pr comment`               → untouched
-      comment without an '@codex review' body     → untouched (body-file/stdin
-        bodies are unresolvable here — documented coverage limit, fail-open;
-        blocking unresolvable bodies would false-block non-trigger comments)
-      '# escalation-ack' trailing ANY segment     → allow the whole command (a
-        nested `bash -c '…' # escalation-ack` carries the ack on the OUTER
-        segment; the ack is a conscious human-directed act, so one ack licenses
-        the command it trails) — BUT ONLY BELOW THE TERMINAL. At or past
-        FINAL_ROUND_CAP it does not clear the block; '# final-round-accept' does.
-        This is why the ack is no longer a top-of-function short-circuit: a
-        short-circuit could never see the count it needed to be bounded by.
-      rounds >= FINAL_ROUND_CAP, no final-accept → BLOCK with the terminal (an
-        escalation-ack here is deliberately not enough)
-      no positional / literal branch target       → that segment allows;
-        SCANNING CONTINUES (an allowed segment must not shield a later one)
-      identity not written literally (target OR
-        repo)                                     → BLOCK. The one fail-CLOSED
-        leg, and the ack does not clear it: `acked` is command-wide, so one
-        sigil on a loop would license a round on every PR it touches. See
-        `_unresolvable_identity` for why the accepted forms are an ALLOWLIST
-      gh/API/parse error (ids is None)            → that segment allows, scan on
-      rounds < ESCALATION_ROUND_CAP               → that segment allows, scan on
-      cap <= rounds < FINAL_ROUND_CAP, no ack    → BLOCK with the step-back order
-      any segment at rounds >= cap, no ack        → BLOCK with the step-back
-        order (URL targets carry their OWN repo into the count — counting the
-        hook cwd's repo for a cross-repo URL could produce a FALSE block)
-    Any unexpected exception → allow (caught here, NOT left to run_guard's
-    fail-closed exit-2, which would turn an advisory bug into a hard block).
+    Returns ``(body, opaque)``: the LAST ``-b``/``--body``/``--body=`` value
+    (gh string flags take the last supplied value, so earlier overridden
+    bodies never reach GitHub) and whether any opaque body channel is present
+    (body file, editor, web, or a missing -b value). ``(None, False)`` means a
+    body-free invocation.
     """
     try:
-        # Both sigils resolved up front, and the escalation-ack short-circuit is
-        # now CONDITIONAL on not having reached the terminal. It used to return
-        # before any counting, which meant this gate — the one that counts the
-        # PR's ACTUAL Codex rounds, and exists precisely because the local counter
-        # sleeps through them — could be re-acked forever. The commit-side terminal
-        # reads only that sleeping local counter, so it inherited the same blind
-        # spot: a review/fix loop driven entirely through cloud rounds never
-        # reached it.
-        #
-        # NEITHER SIGIL IS LOGGED to the override audit store this PR adds, and
-        # that is an OPEN scope question rather than a settled no. Both are
-        # resolved here with any() over every segment, and `escalation-ack` is
-        # SHARED with the commit gate (review_enforcement_commit.py prints it on
-        # `git commit` too), so the sigil's presence alone says nothing about
-        # which gate consulted it. Under the older BARE short-circuit — which
-        # returned here before any counting — a row was unattributable in
-        # principle: it fired for any Bash command carrying the ack and claimed a
-        # cap was waived that was never reached. The restructure above removes
-        # that objection, but only partly, and the remainder is worth stating
-        # rather than rounding off. Both sigils are now honoured only inside the
-        # scan loop below, at a segment whose PR NUMBER and real round count are
-        # resolved — so a row written AT THE HONOUR POINT would name a waiver that
-        # actually happened, which the old shape could not. `repo` is the part that
-        # is still not resolved there: `_comment_target` returns it only when the
-        # command carries `--repo`/`-R` or a PR URL, and a bare `gh pr comment 1234`
-        # — the form this gate's OWN advisory prints — yields None and counts
-        # against the hook cwd's repo. That is the same blank-`repo` case
-        # `_note_override`'s call site documents rather than papers over. Whether
-        # the audit store should carry ack-class sigils at all is a scope decision
-        # this PR does not take — see the follow-up.
-        acked = any(has_trailing_override(s.raw, "escalation-ack") for s in segs)
-        final_acked = any(has_trailing_override(s.raw, "final-round-accept") for s in segs)
-        # Bound this scan's gh (_codex_reviews) calls by the SHARED hook deadline,
-        # so a slow API + a compound command can't push the aggregate past the
-        # ~60s hook wall-clock and get the WHOLE hook SIGKILLed — which fails open
-        # on every gate (round-6 P1). Idempotent: a later merge gate reuses this
-        # same deadline (it arms only when None), never resets it.
-        global _merge_deadline
-        if _merge_deadline is None:
-            _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
-        # Earlier trigger segments in THIS command count toward the total: each
-        # segment sees the same pre-execution API count, so `request && request`
-        # at cap-1 would otherwise dispatch round N+1 unacknowledged (round-2
-        # finding). Keyed per (repo, pr) so distinct PRs don't cross-count.
-        in_cmd: dict[str, int] = {}
-        # One '# final-round-accept' authorises ONE dispatch across the whole
-        # command; see where it is spent below.
-        terminal_license_spent = False
-        for seg in segs:
-            # Stop scanning once the shared budget is drained. Past that point every
-            # remaining gh call still gets the 1.0s floor, so a long compound command
-            # against a hung API could walk the aggregate toward the hook wall-clock
-            # and get the WHOLE hook SIGKILLed — which fails open on every gate. The
-            # merge path already breaks here; this scan did not, and it now makes gh
-            # calls on acked commands that previously short-circuited before arming.
-            if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
-                break
-            if gh_pr_subcommand(seg.argv) != "comment":
+        start = argv.index("comment") + 1
+    except ValueError:
+        return None, False
+    inline_body: str | None = None
+    opaque = False
+    i = start
+    while i < len(argv):
+        tok = argv[i]
+        if tok in {"-b", "--body"}:
+            if i + 1 >= len(argv):
+                opaque = True
+            else:
+                inline_body = argv[i + 1]
+                i += 1
+        elif tok.startswith("--body="):
+            inline_body = tok.split("=", 1)[1]
+        elif tok.startswith("-b") and len(tok) > 2:
+            inline_body = tok[2:]
+        elif tok in {"-F", "--body-file", "-e", "--editor", "-w", "--web"}:
+            opaque = True
+            if tok in {"-F", "--body-file"} and i + 1 < len(argv):
+                i += 1
+        elif tok.startswith("--body-file=") or (tok.startswith("-F") and len(tok) > 2):
+            opaque = True
+        i += 1
+    # shell_parse preserves expansion spelling in argv rather than evaluating it.
+    # The eventual body is therefore unknowable when it contains parameter or
+    # command substitution. Treat it like a body-file/editor source. This is
+    # deliberately conservative for a single-quoted literal containing "$" or
+    # backticks: the process gate cannot recover quote provenance from argv, and
+    # asking at a spent budget is safer than treating dynamic content as ordinary.
+    if inline_body is not None and ("$" in inline_body or "`" in inline_body):
+        opaque = True
+    return inline_body, opaque
+
+
+def _comment_review_request(argv: list[str]) -> tuple[str | None, bool, bool | None]:
+    """Parse a comment body once and derive its ``@codex review`` signal.
+
+    Returns ``(effective_inline_body, opaque, signal)``. A ``None`` signal means
+    the body is opaque at pre-execution time (body file, editor, web flow, or an
+    omitted body). Opaque is evaluated as a possible request: standing
+    authorization may still allow it, while an approval boundary asks or denies.
+    This avoids a body-file spelling becoming a cap bypass without pretending a
+    file cannot be rewritten earlier in the same shell command.
+    """
+    try:
+        start = argv.index("comment") + 1
+    except ValueError:
+        return None, False, False
+    inline_body, opaque = _comment_body(argv)
+    delete_only = "--delete-last" in argv[start:]
+    if opaque:
+        return inline_body, True, None
+    if inline_body is not None and "@codex review" in inline_body.lower():
+        return inline_body, opaque, True
+    if inline_body is not None:
+        return inline_body, opaque, None if opaque else False
+    if delete_only and not opaque and "--edit-last" not in argv[start:]:
+        return inline_body, opaque, False
+    return inline_body, opaque, None
+
+
+def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = None) -> tuple[str, str]:
+    """Return (allow|ask|deny, reason) for Codex review requests.
+
+    Distinct reviewed heads are authoritative. Legacy escalation/final sigils
+    are intentionally ignored: at the approval boundary only the hook's native
+    user decision can authorize the action.
+    """
+    triggers = [
+        (seg, body, signal)
+        for seg in segs
+        if gh_pr_subcommand(seg.argv) == "comment"
+        for body, _opaque, signal in (_comment_review_request(seg.argv),)
+        if signal is not False
+    ]
+    if not triggers:
+        return "allow", ""
+
+    # One native decision must authorize exactly one request. Reject compounds
+    # before any network lookup or confirmation exemption so standing capacity,
+    # an exact-head marker, or opaque input cannot license a sibling request.
+    if len(triggers) > 1:
+        return (
+            "deny",
+            "BLOCKED: this command contains multiple review requests. Run each "
+            "request separately so every action receives its own policy decision.",
+        )
+
+    global _merge_deadline
+    if _merge_deadline is None:
+        _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
+
+    decisions: list[tuple[str, str]] = []
+    exemption_used = False
+    for seg, effective_body, body_signal in triggers:
+        unresolvable = _unresolvable_identity(seg.argv)
+        if unresolvable is not None:
+            return "deny", _unresolvable_identity_advisory(unresolvable)
+        pr_num, explicit_repo = _comment_target(seg.argv)
+        effective_cwd = _effective_cwd(cmd, payload or {}, seg=seg) if cmd else None
+        if effective_cwd is _CWD_UNKNOWN:
+            repo = explicit_repo
+        else:
+            repo = explicit_repo or _derive_repo_from_cwd(
+                effective_cwd if isinstance(effective_cwd, str) else os.getcwd()
+            )
+        if not pr_num:
+            # ``gh pr comment`` accepts both a literal branch and no target
+            # (current-branch inference).  Neither form gives this pre-execution
+            # guard a stable PR identity without another resolution protocol, so
+            # it is UNKNOWN evidence, not "no request".  Native approval is the
+            # safe foreground result; dispatched sessions are denied by main().
+            repo_label = repo or "the current repository"
+            decisions.append(
+                (
+                    "ask",
+                    f"The pull request targeted by this @codex review command in "
+                    f"{repo_label} could not be resolved to a literal PR number. "
+                    "Approve this one request only after checking its review history, "
+                    "or rewrite it with a literal PR number/URL so the round budget "
+                    "can be enforced automatically.",
+                )
+            )
+            continue
+        if not repo or _review_budget is None:
+            result = {"status": "unknown"}
+            repo_label = repo or "the current repository"
+        else:
+            repo_label = repo
+            try:
+                result = _review_budget.evaluate_pr(
+                    repo,
+                    pr_num,
+                    timeout_for=_gh_timeout,
+                )
+            except Exception:  # noqa: BLE001 - unknown asks/denies; never crashes open.
+                result = {"status": "unknown"}
+
+        if result.get("status") == "ok" and result.get("confirmation_exempt"):
+            marker = _review_budget.confirmation_marker(
+                str(result.get("current_head") or "")
+            )
+            # The exemption licenses ONE dispatch: every request is judged on
+            # pre-command state, so a second marked request in the same command
+            # would also read exempt. The first consumes it; the rest ask.
+            # The marker must sit in the EFFECTIVE body — an overridden earlier
+            # -b value never reaches GitHub, so argv-wide matching would exempt
+            # a request that posts no marker at all.
+            if (
+                body_signal is True
+                and effective_body is not None
+                and marker in effective_body
+                and not exemption_used
+            ):
+                exemption_used = True
+                decisions.append(("allow", ""))
                 continue
-            if not any("@codex review" in tok.lower() for tok in seg.argv):
-                continue
-            # BEFORE resolving the number, not after: a literal number with an
-            # unreadable `--repo` resolves fine and still counts the wrong repo,
-            # so a check gated on `not pr_num` would never see it.
-            unresolvable = _unresolvable_identity(seg.argv)
-            if unresolvable is not None:
-                return True, _unresolvable_identity_advisory(unresolvable)
-            pr_num, repo = _comment_target(seg.argv)
-            if not pr_num:
-                # A missing positional or a literal branch target keeps its
-                # documented fail-open; every other spelling was refused above.
-                continue
-            # Count ALL Codex review rounds — including DISMISSED, which still
-            # ran and consumed the budget (#1385 round-5). Freshness uses the
-            # dismissed-filtered ``_codex_review_commit_ids``; the cap does not.
-            reviews = _codex_reviews(pr_num, repo=repo)
-            if reviews is None:
-                continue
-            key = f"{repo or ''}|{pr_num}"
-            effective = len(reviews) + in_cmd.get(key, 0)
-            # TERMINAL tier, checked first and NOT clearable by the repeatable
-            # sigil — the whole point of a terminal is that the cycle cannot reach
-            # past it. Counted from the PR's real review history, so it holds even
-            # when every one of those rounds went unmarked locally.
-            if effective >= FINAL_ROUND_CAP:
-                if not final_acked:
-                    return True, _final_round_advisory(pr_num, effective, repo)
-                # ONE decision licenses ONE dispatch. `final_acked` is computed with
-                # any() over the whole command — deliberately, because a nested
-                # `bash -c '…' # final-round-accept` carries the sigil on the OUTER
-                # segment, so per-segment binding would break the documented nested
-                # form. But command-wide truth also let `request && request # sigil`
-                # chain arbitrarily many rounds behind a single decision, while the
-                # advisory promises the user is directing "ONE more round". Spending
-                # the license on first use keeps the nested form working and closes
-                # the chain.
-                if terminal_license_spent:
-                    return True, _final_round_chained_advisory(pr_num)
-                terminal_license_spent = True
-            elif effective >= ESCALATION_ROUND_CAP and not acked:
-                return True, _escalation_advisory(pr_num, effective, repo)
-            in_cmd[key] = in_cmd.get(key, 0) + 1
-    except Exception:
-        return False, ""
-    return False, ""
+            # The exemption is mechanically one-shot only when the request
+            # records its exact head. An unmarked request is indistinguishable
+            # from discovery and therefore needs the normal native approval.
+            decisions.append(("ask", _review_budget_message(pr_num, result, repo_label)))
+            continue
+        if result.get("status") != "ok" or result.get("approval_required"):
+            decisions.append(("ask", _review_budget_message(pr_num, result, repo_label)))
+        else:
+            decisions.append(("allow", ""))
+
+    asks = [reason for decision, reason in decisions if decision == "ask"]
+    if asks:
+        reason = asks[0]
+        # A stale worktree still emits the retired terminal sigil. It is parsed
+        # (kept in _KNOWN_SIGILS so a compound stays order-independent) but
+        # authorizes nothing — name that in the prompt so an old habit does not
+        # read an ask as a gate misfire.
+        if any(has_trailing_override(seg.raw, "final-round-accept") for seg, _, _ in triggers):
+            reason += (
+                "\n\nNOTE: `# final-round-accept` is retired and no longer "
+                "authorizes any gate; only this native approval admits the request."
+            )
+        return "ask", reason
+    return "allow", ""
 
 
 # A CLEAN Codex re-review is posted as an ISSUE COMMENT (not a review object): the body
@@ -4259,7 +4277,11 @@ def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str
 # config/behavioral_rules/ rides as a prefix: behavioral_linter.py loads every
 # YAML under it (decision config = enforcement surface, see the note in
 # _HOOK_SURFACE_FILES).
-_HOOK_SURFACE_PREFIXES = ("scripts/hooks/", ".claude/hooks/", "config/behavioral_rules/")
+_HOOK_SURFACE_PREFIXES = (
+    _review_budget.HOOK_SURFACE_PREFIXES
+    if _review_budget is not None
+    else ("scripts/hooks/", ".claude/hooks/", "config/behavioral_rules/")
+)
 # EVERY hook wired in .claude/settings.json is fence surface — not only the
 # blocking gates: any script auto-executing inside sessions is enforcement-
 # adjacent (architect SHOULD-FIX 2026-08-23: the named-list-as-sample trap this
@@ -4267,44 +4289,55 @@ _HOOK_SURFACE_PREFIXES = ("scripts/hooks/", ".claude/hooks/", "config/behavioral
 # original 4-file fence). Over-fencing costs only stricter review; a guardrail
 # test (test_git_push_guard_hook_surface.py) parses settings.json and FAILS CI
 # if a wired hook ever falls outside this fence, so the set is self-maintaining.
-_HOOK_SURFACE_FILES = frozenset(
-    {
-        "scripts/bash_safety_hook.sh",  # the global Bash chokepoint
-        "scripts/review_scope.py",  # substantiality classifier (feeds THIS gate)
-        "scripts/review_state.py",  # escalation counter + review markers
-        ".claude/settings.json",  # hook wiring (inline blob + matchers)
-        # scripts/-root hooks wired via .claude/hooks/genesis-hook (which
-        # resolves bare names as scripts/<name>); scripts/hooks/* wirings are
-        # covered by the prefix above.
-        "scripts/behavioral_linter.py",
-        "scripts/check_stale_pending.py",
-        "scripts/content_safety_hook.py",
-        "scripts/contribution_offer_hook.py",
-        "scripts/edit_failure_sensor.py",
-        "scripts/file_context_hook.py",
-        "scripts/file_modification_audit_hook.py",
-        "scripts/genesis_precompact.py",
-        "scripts/genesis_session_context.py",
-        "scripts/genesis_session_end.py",
-        "scripts/genesis_stop_hook.py",
-        "scripts/genesis_urgent_alerts.py",
-        "scripts/plan_bookmark_hook.py",
-        "scripts/pretool_check.py",
-        "scripts/proactive_memory_hook.py",
-        "scripts/procedure_advisor.py",
-        "scripts/review_enforcement_commit.py",
-        "scripts/review_enforcement_prompt.py",
-        "scripts/review_invalidate_on_commit.py",
-        "scripts/surface_open_prs.py",
-        "scripts/surface_pr_updates.py",
-        # Hook-owned DECISION CONFIGURATION (Codex P2, round 1): these files
-        # determine what the wired hooks enforce, and the ordinary
-        # substantiality classifier treats YAML as docs/config (review-trivial)
-        # — so a rewrite that removes blocking patterns could merge on a stale
-        # review. Config that drives enforcement is enforcement surface.
-        "config/protected_paths.yaml",  # pretool_check.py
-        "config/repo_topology.yaml",  # repo_routing_guard.py
-    }
+_HOOK_SURFACE_FILES = (
+    _review_budget.HOOK_SURFACE_FILES
+    if _review_budget is not None
+    else frozenset(
+        {
+            "scripts/bash_safety_hook.sh",  # the global Bash chokepoint
+            "scripts/review_scope.py",  # substantiality classifier (feeds THIS gate)
+            "scripts/review_state.py",  # escalation counter + review markers
+            "scripts/review_budget.py",  # distinct-head policy evaluator
+            "scripts/review_deadline.py",  # aggregate hook timeout arithmetic
+            "scripts/external_review.py",  # autonomous review-request boundary
+            "scripts/lib/gate_menu.py",  # cap decision menu shown to the user
+            ".claude/settings.json",  # hook wiring (inline blob + matchers)
+            # scripts/-root hooks wired via .claude/hooks/genesis-hook (which
+            # resolves bare names as scripts/<name>); scripts/hooks/* wirings are
+            # covered by the prefix above.
+            "scripts/behavioral_linter.py",
+            "scripts/check_stale_pending.py",
+            "scripts/content_safety_hook.py",
+            "scripts/contribution_offer_hook.py",
+            "scripts/edit_failure_sensor.py",
+            "scripts/file_context_hook.py",
+            "scripts/file_modification_audit_hook.py",
+            "scripts/genesis_precompact.py",
+            "scripts/genesis_session_context.py",
+            "scripts/genesis_session_end.py",
+            "scripts/genesis_stop_hook.py",
+            "scripts/genesis_urgent_alerts.py",
+            "scripts/plan_bookmark_hook.py",
+            "scripts/pretool_check.py",
+            "scripts/proactive_memory_hook.py",
+            "scripts/procedure_advisor.py",
+            "scripts/review_enforcement_commit.py",
+            "scripts/review_enforcement_prompt.py",
+            "scripts/review_invalidate_on_commit.py",
+            "scripts/surface_open_prs.py",
+            "scripts/surface_pr_updates.py",
+            # Hook-owned DECISION CONFIGURATION (Codex P2, round 1): these files
+            # determine what the wired hooks enforce, and the ordinary
+            # substantiality classifier treats YAML as docs/config (review-trivial)
+            # — so a rewrite that removes blocking patterns could merge on a stale
+            # review. Config that drives enforcement is enforcement surface.
+            "config/protected_paths.yaml",  # pretool_check.py
+            "config/repo_topology.yaml",  # repo_routing_guard.py
+            "config/external_review.yaml",  # external review identity + dispatch
+            "src/genesis/session_awareness/external_review.py",
+            "src/genesis/session_awareness/external_review_config.py",
+        }
+    )
 )
 
 
@@ -8789,24 +8822,7 @@ def _ask(reason: str) -> int:
     """
     global _ASK_EMITTED
     _ASK_EMITTED = True
-    # Nothing is discarded YET here — the decision is still open — so this warns
-    # about what DECLINING costs, which is the thing a "block the push?" dialog
-    # otherwise hides.
-    if discarded_write is not None:
-        extra = discarded_write.prompt_note()
-        if extra:
-            reason = f"{reason}\n\n{extra}"
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "ask",
-                    "permissionDecisionReason": reason,
-                }
-            }
-        )
-    )
+    emit_native_ask(reason)
     return 0
 
 
@@ -9002,6 +9018,8 @@ def main() -> int:
 def _run_merge_and_push_gates() -> int:
     # An armed refusal must survive the malformed-payload exception tail.
     blind_spot_deny: str | None = None
+    round_compound_deny: str | None = None
+    round_autonomous_deny: str | None = None
     try:
         payload = read_payload()
         cmd = field(payload, "command")
@@ -9112,35 +9130,55 @@ def _run_merge_and_push_gates() -> int:
             )
             return 2
 
-        # ── Codex round-escalation gate (`gh pr comment … @codex review`) ──
-        # Once a PR already carries ESCALATION_ROUND_CAP Codex reviews,
-        # requesting another round is the whack-a-mole moment — force the
-        # step-back (triage / mechanism / state-space) before round N+1.
-        # Fail-open inside the check; '# escalation-ack' is the conscious
-        # continue after a fresh user decision.
         # ARM THE SHARED SUBPROCESS DEADLINE, once, for every gate below.
-        # It was previously armed only as a SIDE EFFECT of the escalation gate,
-        # which is documented fail-open, wraps its whole body in `except
-        # Exception: return`, and has already once had a top-of-function
-        # short-circuit that returned before the arming. The push path's
-        # wall-clock safety must not depend on another gate's internals: without
-        # a deadline the probes below are five sequential 10s caps plus an
-        # ls-remote, over the hook's registration — and a SIGKILLed PreToolUse
-        # hook fails OPEN, disengaging every gate in the stack.
+        # The push path's wall-clock safety must not depend on a review request
+        # being present: its sequential network probes can otherwise outlive the
+        # hook registration, and a SIGKILLed PreToolUse hook fails open.
         global _merge_deadline
         if _merge_deadline is None:
             _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
 
-        esc_block, esc_msg = _check_codex_round_escalation(segs)
-        if esc_block:
+        # ── Codex round-authorization gate (`gh pr comment … @codex review`) ──
+        # Distinct reviewed heads, including dismissed and clean-comment rounds,
+        # decide when standing authorization ends. A dispatched session cannot
+        # satisfy the native user decision; unreadable evidence takes the same
+        # safe direction rather than becoming zero rounds.
+        esc_decision, esc_msg = _check_codex_round_escalation(segs, cmd, payload)
+        if esc_decision == "deny":
             print(esc_msg, file=sys.stderr)
             return 2
+
+        if esc_decision == "ask" and _is_dispatched():
+            # Defer until the hard checks below have run. This remains a deny,
+            # but a force-push/no-verify/merge violation should retain its more
+            # specific diagnostic when both appear in one command.
+            round_autonomous_deny = esc_msg
+
+        if esc_decision == "ask":
+            other_gated_actions = [
+                s
+                for s in segs
+                if git_subcommand(s.argv) in {"commit", "push", "merge"}
+                or gh_pr_subcommand(s.argv) in {"create", "merge", "close"}
+            ]
+            if other_gated_actions:
+                # Defer this refusal to the tail. Specific hard checks below
+                # (force push, --no-verify, merge gates, sqlite) must retain
+                # precedence over a compound-action diagnostic.
+                round_compound_deny = (
+                    "BLOCKED: this review request needs its own fresh user approval, "
+                    "but the same command also contains a commit, push, merge, close, "
+                    "or PR-create action. Run the review request separately so one "
+                    "approval cannot authorize multiple actions."
+                )
 
         # An interactive push defers to a native approve/deny dialog at the END
         # of main(), so every hard-block below (merge-into-main, the pr-merge
         # gates, sqlite, --no-verify) still takes precedence — a compound
         # `git push && git commit --no-verify` blocks, never asks.
-        ask_reason: str | None = None
+        ask_reason: str | None = (
+            esc_msg if esc_decision == "ask" and round_autonomous_deny is None else None
+        )
         # A first-push-only re-push AUTO-ALLOW is ALSO deferred to the END (same
         # reason): emitting `_allow` inline would short-circuit the whole Bash
         # invocation before the hard-blocks run, so `git push <republish> && git
@@ -9964,6 +10002,12 @@ def _run_merge_and_push_gates() -> int:
         # native approve/deny dialog for its push / PR-create.
         if blind_spot_deny is not None:
             print(blind_spot_deny, file=sys.stderr)
+            return 2
+        if round_compound_deny is not None:
+            print(round_compound_deny, file=sys.stderr)
+            return 2
+        if round_autonomous_deny is not None:
+            print(round_autonomous_deny, file=sys.stderr)
             return 2
         if ask_reason is not None:
             return _ask(ask_reason)

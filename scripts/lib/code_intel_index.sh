@@ -55,6 +55,61 @@
 
 set -u
 
+# Private child launcher. The supervising script owns admission, scope control,
+# pausing and cleanup; making that supervisor an OOM target can remove the only
+# process able to stop or thaw the heavy job. Apply the kernel's maximum
+# preference only in the disposable child, immediately before exec, and verify
+# the effective value. +1000 is maximally preferred among tasks eligible in the
+# applicable OOM domain; cgroup OOM-domain boundaries still govern eligibility.
+if [ "${1:-}" = "--exec-indexer-with-oom-adj" ]; then
+    shift
+    if [ "$#" -eq 0 ]; then
+        printf '%s\n' "code-intel: missing indexer command" >&2
+        exit 125
+    fi
+    if [ -n "${CODE_INTEL_INDEX_OOM_SCORE_ADJ:-}" ] \
+        && [ "$CODE_INTEL_INDEX_OOM_SCORE_ADJ" != "1000" ]; then
+        printf '%s\n' \
+            "code-intel: CODE_INTEL_INDEX_OOM_SCORE_ADJ requires 1000; refusing unsafe batch workload" >&2
+        exit 125
+    fi
+
+    # One-way failure injection: this can only make a test/refusal stricter. It
+    # cannot redirect the proof or let an unprotected workload execute.
+    if [ "${CODE_INTEL_TEST_FORCE_OOM_ADJ_FAILURE:-0}" = "1" ]; then
+        printf '%s\n' "code-intel: cannot establish oom_score_adj=1000; refusing batch workload" >&2
+        exit 125
+    fi
+    _oom_adj_file=/proc/self/oom_score_adj
+    if ! { printf '%s\n' 1000 > "$_oom_adj_file"; } 2>/dev/null; then
+        printf '%s\n' "code-intel: cannot establish oom_score_adj=1000; refusing batch workload" >&2
+        exit 125
+    fi
+    _oom_adj_actual=""
+    read -r _oom_adj_actual < "$_oom_adj_file" 2>/dev/null || _oom_adj_actual=""
+    if [ "$_oom_adj_actual" != "1000" ]; then
+        printf '%s\n' \
+            "code-intel: cannot establish oom_score_adj=1000 (read back '${_oom_adj_actual:-unavailable}'); refusing batch workload" >&2
+        exit 125
+    fi
+    exec "$@"
+fi
+
+_CODE_INTEL_ENTRYPOINT="${BASH_SOURCE[0]}"
+case "$_CODE_INTEL_ENTRYPOINT" in
+    /*) : ;;
+    */*)
+        _code_intel_entry_dir="${_CODE_INTEL_ENTRYPOINT%/*}"
+        _code_intel_entry_base="${_CODE_INTEL_ENTRYPOINT##*/}"
+        _code_intel_entry_dir="$(cd -P -- "$_code_intel_entry_dir" 2>/dev/null && pwd)" \
+            || { printf '%s\n' "code-intel: cannot resolve entrypoint path" >&2; exit 1; }
+        _CODE_INTEL_ENTRYPOINT="$_code_intel_entry_dir/$_code_intel_entry_base"
+        ;;
+    *)
+        _CODE_INTEL_ENTRYPOINT="$(pwd -P)/$_CODE_INTEL_ENTRYPOINT"
+        ;;
+esac
+
 # Resolve HOME when unset: stripped-env/systemd/sandbox invocations can leave
 # HOME unset, which under `set -u` aborts at the first ${HOME} use. Fall back
 # to the passwd entry for the current uid (same source Path.home() uses); fail
@@ -72,7 +127,7 @@ MODE="${3:-${CODE_INTEL_INDEX_MODE:-fast}}"
 _LEGACY_MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-}"
 CBM_MEM_MAX="${CODE_INTEL_CBM_MEMORY_MAX:-${_LEGACY_MEM_MAX:-2G}}"
 # Measured 2026-09-16: a forced full rebuild peaked at 4,874,166,272 bytes
-# (4.65 GiB) and completed under an 8 GiB, swapless scope. The old shared 2G
+# (4.54 GiB) and completed under an 8 GiB, swapless scope. The old shared 2G
 # cap killed it on the way up. Keep headroom for repository growth; admission
 # control and the pressure watchdog still decide when the job may run.
 GITNEXUS_MEM_MAX="${CODE_INTEL_GITNEXUS_MEMORY_MAX:-${_LEGACY_MEM_MAX:-8G}}"
@@ -241,7 +296,7 @@ _genesis_mem_current() {
 #: launched it. Below this the box is not able to host a rebuild safely.
 CODE_INTEL_SIBLING_RESERVE_BYTES="${CODE_INTEL_SIBLING_RESERVE_BYTES:-$(( 2 * 1024 * 1024 * 1024 ))}"
 #: MEASURED 2026-09-16: a forced full rebuild peaked at 4,874,166,272 bytes
-#: (4.65 GiB). A cap below the working set does not protect anything, it just
+#: (4.54 GiB). A cap below the working set does not protect anything, it just
 #: relocates the kill, so refuse instead of pretending.
 CODE_INTEL_GITNEXUS_MIN_BYTES="${CODE_INTEL_GITNEXUS_MIN_BYTES:-$(( 4874166272 ))}"
 
@@ -417,7 +472,7 @@ _run_capped() {
             -p "MemoryMax=${MEM_MAX}" -p "MemorySwapMax=0" \
             -p "IOWeight=${IO_WEIGHT}" -p "CPUQuota=${CPU_QUOTA}" \
             --description "code-intel index: $REPO_PATH" \
-            -- "$@"
+            -- /bin/bash "$_CODE_INTEL_ENTRYPOINT" --exec-indexer-with-oom-adj "$@"
     else
         # Fallback: polite scheduling + soft address-space cap. Mirrors the
         # run-codebase-memory launcher's degradation (never block on missing
@@ -432,9 +487,11 @@ _run_capped() {
         (
             [ -n "$mem_kb" ] && ulimit -v "$mem_kb" 2>/dev/null
             if command -v ionice >/dev/null 2>&1; then
-                exec nice -n 19 ionice -c 3 "$@"
+                exec nice -n 19 ionice -c 3 \
+                    /bin/bash "$_CODE_INTEL_ENTRYPOINT" --exec-indexer-with-oom-adj "$@"
             else
-                exec nice -n 19 "$@"
+                exec nice -n 19 \
+                    /bin/bash "$_CODE_INTEL_ENTRYPOINT" --exec-indexer-with-oom-adj "$@"
             fi
         )
     fi

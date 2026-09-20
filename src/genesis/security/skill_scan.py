@@ -430,11 +430,10 @@ def main(argv: list[str] | None = None) -> int:
 
             results = await _run(_noop, None)
         else:
-            import aiosqlite
-
+            from genesis.db.connection import connect_aiosqlite_rw
             from genesis.env import genesis_db_path
 
-            async with aiosqlite.connect(str(genesis_db_path())) as db:
+            async with connect_aiosqlite_rw(genesis_db_path()) as db:
                 await db.execute("PRAGMA busy_timeout=5000")
                 results = await _run(store_finding, db)
 
