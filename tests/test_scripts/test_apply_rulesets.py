@@ -325,16 +325,29 @@ def test_an_error_exits_two_not_zero(mod, monkeypatch, capsys):
 # next hook cannot be added to the frozenset and silently miss both files.
 
 
+#: The hook-surface constants now live in `scripts/review_budget.py`; the guard
+#: re-exports them behind an import fallback, which is a conditional expression
+#: and not statically readable. Read the AUTHORITY, not a re-export — a mirror
+#: check that parses the mirror proves nothing about the source of truth.
+_SURFACE_AUTHORITY = ("scripts", "review_budget.py")
+
+
 def _authoritative_surface() -> tuple[list[str], list[str]]:
-    """`_HOOK_SURFACE_PREFIXES` / `_HOOK_SURFACE_FILES`, read from the source.
+    """`HOOK_SURFACE_PREFIXES` / `HOOK_SURFACE_FILES`, read from the authority.
 
     Parsed rather than imported: importing the guard mutates `sys.path` at
     module scope and pulls in four sibling script modules, which is a large
     side effect for two literals.
+
+    The parse is why `_test_the_authority_stays_statically_readable` exists
+    below. An extractor that cannot read its source raises instead of
+    returning a short list, so this cannot silently degrade to an empty
+    comparison — but it CAN break the guardrail outright, which is what
+    happened when the constants moved behind an import fallback.
     """
     import ast
 
-    tree = ast.parse((_REPO / "scripts" / "hooks" / "git_push_guard.py").read_text())
+    tree = ast.parse((_REPO.joinpath(*_SURFACE_AUTHORITY)).read_text())
     prefixes: tuple[str, ...] = ()
     files: frozenset[str] = frozenset()
     for node in ast.walk(tree):
@@ -343,13 +356,72 @@ def _authoritative_surface() -> tuple[list[str], list[str]]:
         for target in node.targets:
             if not isinstance(target, ast.Name):
                 continue
-            if target.id == "_HOOK_SURFACE_PREFIXES":
+            if target.id == "HOOK_SURFACE_PREFIXES":
                 prefixes = ast.literal_eval(node.value)
-            elif target.id == "_HOOK_SURFACE_FILES":
+            elif target.id == "HOOK_SURFACE_FILES":
                 inner = node.value.args[0] if isinstance(node.value, ast.Call) else node.value
                 files = ast.literal_eval(inner)
-    assert prefixes and files, "could not read the hook-surface constants"
+    assert prefixes and files, (
+        f"could not read the hook-surface constants from {'/'.join(_SURFACE_AUTHORITY)} — "
+        "if they moved again, point _SURFACE_AUTHORITY at the new home"
+    )
     return list(prefixes), sorted(files)
+
+
+def test_the_guard_re_exports_the_authority_rather_than_restating_it():
+    """The guard must not keep its own copy of the surface set.
+
+    Two copies is how the mirrors drifted in the first place. The guard may
+    re-export (with an import fallback, so a partial checkout still runs), but
+    the fallback's contents must be a SUBSET of the authority — never an
+    independent list that can quietly diverge.
+    """
+    import ast
+
+    guard = ast.parse((_REPO / "scripts" / "hooks" / "git_push_guard.py").read_text())
+    prefixes, files = _authoritative_surface()
+    fallbacks: dict[str, tuple[str, set[str]]] = {}
+    for node in ast.walk(guard):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if not isinstance(target, ast.Name):
+                continue
+            if target.id not in ("_HOOK_SURFACE_PREFIXES", "_HOOK_SURFACE_FILES"):
+                continue
+            value = node.value
+            assert isinstance(value, ast.IfExp), (
+                f"{target.id} should re-export review_budget behind an import fallback; "
+                "a plain literal here is a second copy that will drift"
+            )
+            inner = value.orelse
+            if isinstance(inner, ast.Call):
+                inner = inner.args[0]
+            fallbacks[target.id] = (ast.unparse(value.body), set(ast.literal_eval(inner)))
+    assert set(fallbacks) == {"_HOOK_SURFACE_PREFIXES", "_HOOK_SURFACE_FILES"}, fallbacks
+    for name, (taken, fallback) in fallbacks.items():
+        authority = set(prefixes) if name.endswith("PREFIXES") else set(files)
+        # The taken branch must read the authority. Re-exporting some OTHER
+        # module satisfies every set comparison below while binding nothing.
+        assert taken == f"_review_budget.{name.lstrip('_')}", (
+            f"{name} must re-export review_budget, not {taken}"
+        )
+        # NON-EMPTY FIRST, and this is the whole point rather than a tidiness
+        # check: `set() <= anything` is True, so a subset assertion ALONE passes
+        # on an empty fallback. An empty fallback is the worst possible value —
+        # on the only install where it is ever used (import failed) the guard
+        # would classify NOTHING as gate surface and the push guard would fail
+        # OPEN, with this guardrail still green. VERIFY-RED: an empty fallback
+        # passed the first version of this test.
+        assert fallback, (
+            f"{name}'s fallback is EMPTY — on an install where importing "
+            "review_budget fails, the guard would treat no path as gate surface "
+            "and fail open"
+        )
+        assert fallback <= authority, (
+            f"the guard's {name} fallback names paths the authority does not: "
+            + ", ".join(sorted(fallback - authority))
+        )
 
 
 def test_the_labeler_globs_cover_every_hook_surface_path():

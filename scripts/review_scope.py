@@ -46,6 +46,19 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 try:
+    from review_deadline import DeadlineExpired, propagate_deadline_timeout  # noqa: E402
+except Exception:  # Reverse-version skew: advisory scope reads must stay available.
+
+    class DeadlineExpired(RuntimeError):
+        """Local reverse-skew equivalent of the shared deadline exception."""
+
+    def propagate_deadline_timeout(deadline, error):
+        if deadline is not None:
+            raise DeadlineExpired(
+                "aggregate review-gate deadline expired during subprocess"
+            ) from error
+
+try:
     from review_enforcement_commit import _is_docs_or_config, _is_prompt_surface
 except ImportError:  # pragma: no cover - sibling always present in scripts/
 
@@ -368,17 +381,27 @@ def _harden(args: list[str]) -> list[str]:
     return list(args)
 
 
-def _git(args: list[str], cwd: str | None, deadline: float | None = None) -> str | None:
-    """Run a git command; return stdout, or None on ANY error (fail-open).
+def _git(
+    args: list[str],
+    cwd: str | None,
+    deadline: float | None = None,
+    *,
+    strict_deadline: bool = False,
+) -> str | None:
+    """Run a git command; return stdout, or None on an ordinary error.
 
     ``deadline`` (a ``time.monotonic()`` value) caps the per-call timeout by the
     time remaining in the manifest's total git budget — so several serial calls
-    can't collectively overrun the hook timeout. Past the deadline → None.
+    cannot collectively overrun the hook timeout. Past the deadline returns
+    ``None`` for advisory callers or raises ``DeadlineExpired`` for a strict
+    commit check.
     """
     timeout = _GIT_TIMEOUT
     if deadline is not None:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            if strict_deadline:
+                raise DeadlineExpired("aggregate review-gate deadline expired")
             return None
         timeout = min(_GIT_TIMEOUT, remaining)
     try:
@@ -390,7 +413,11 @@ def _git(args: list[str], cwd: str | None, deadline: float | None = None) -> str
             cwd=cwd,
             env=_git_env(),
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, UnicodeDecodeError):
+    except subprocess.TimeoutExpired as exc:
+        if strict_deadline:
+            propagate_deadline_timeout(deadline, exc)
+        return None
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
         # UnicodeDecodeError: text=True strict-decodes stdout; a filename with
         # invalid UTF-8 bytes would otherwise raise it (not an OSError subclass)
         # and crash a standalone `main()` call, violating the fail-open contract.
@@ -700,11 +727,23 @@ def _substantiality_level(records: list[dict], per_file: dict[str, int], binary:
     return "substantial" if substantial else "inline"
 
 
-def _classify_diff(diff_args: list[str], cwd: str | None) -> str:
+def _classify_diff(
+    diff_args: list[str], cwd: str | None, deadline: float | None = None
+) -> str:
     """Run the two -z diffs, parse, and classify — or ``"unknown"`` on any git error
     (fail OPEN: no fabricated depth requirement; the CI check is the backstop)."""
-    name_status = _git(["diff", *diff_args, "-z", "--name-status", "-M"], cwd)
-    numstat = _git(["diff", *diff_args, "-z", "--numstat", "-M"], cwd)
+    name_status = _git(
+        ["diff", *diff_args, "-z", "--name-status", "-M"],
+        cwd,
+        deadline,
+        strict_deadline=deadline is not None,
+    )
+    numstat = _git(
+        ["diff", *diff_args, "-z", "--numstat", "-M"],
+        cwd,
+        deadline,
+        strict_deadline=deadline is not None,
+    )
     if name_status is None or numstat is None:
         return "unknown"
     per_file, binary = _parse_numstat_perfile(numstat)
@@ -1043,7 +1082,9 @@ def classify_lane(paths: list[str], *, hook_surface: bool) -> str:
     return "standard"
 
 
-def classify_change_substantiality(cwd: str | None = None) -> str:
+def classify_change_substantiality(
+    cwd: str | None = None, *, deadline: float | None = None
+) -> str:
     """Substantiality of the STAGED change (--cached) — for the commit-time depth gate.
 
     Uses the staged index so it shares the review marker's basis (which hashes
@@ -1051,7 +1092,7 @@ def classify_change_substantiality(cwd: str | None = None) -> str:
     commit-time re-check disagree on a byte-identical staged diff. Returns
     ``"substantial"`` | ``"inline"`` | ``"unknown"``.
     """
-    return _classify_diff(["--cached"], cwd)
+    return _classify_diff(["--cached"], cwd, deadline)
 
 
 def classify_range_substantiality(base: str, cwd: str | None = None) -> str:
