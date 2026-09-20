@@ -707,8 +707,10 @@ async def _impl_job_health() -> dict:
         return {
             "jobs": {},
             "note": (
-                f"Genesis database at {_DB_PATH} is quarantined; job health is "
-                "unavailable until the quarantine clears."
+                f"Genesis database at {_DB_PATH} was refused by the admission "
+                "check — it is quarantined, or its admission state could not be "
+                "established (the check fails closed). Job health is unavailable "
+                "until that clears."
             ),
             "source": "fenced_db",
         }

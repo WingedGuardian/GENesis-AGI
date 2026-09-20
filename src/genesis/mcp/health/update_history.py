@@ -70,8 +70,10 @@ async def _impl_update_history_recent(limit: int = _DEFAULT_LIMIT) -> dict:
             "success_rate": None,
             "entries": [],
             "note": (
-                f"Genesis database at {_DB_PATH} is quarantined; deploy history is "
-                "unavailable until the quarantine clears."
+                f"Genesis database at {_DB_PATH} was refused by the admission "
+                "check — it is quarantined, or its admission state could not be "
+                "established (the check fails closed). Deploy history is "
+                "unavailable until that clears."
             ),
             **base_meta,
         }

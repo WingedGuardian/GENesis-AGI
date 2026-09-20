@@ -323,19 +323,7 @@ def test_audit_hook_refuses_quarantined_database(tmp_path):
     """
     db = tmp_path / "genesis.db"
     _seed_audit_db(db)
-    home = tmp_path / ".genesis"
-    home.mkdir()
-    st = db.stat()
-    (home / "db_quarantine.json").write_text(
-        json.dumps(
-            {
-                "db_path": str(db.resolve()),
-                "st_dev": st.st_dev,
-                "st_ino": st.st_ino,
-                "source": "test",
-            }
-        )
-    )
+    _quarantine(db, tmp_path / ".genesis")
     proc = _run_audit_hook(tmp_path, db)
     assert proc.returncode == 0, f"a fenced hook must not crash: {proc.stderr}"
     assert _row_count(db) == 0, (
@@ -365,19 +353,42 @@ def test_audit_hook_refuses_quarantined_database(tmp_path):
 
 
 def _quarantine(db: Path, home: Path) -> None:
-    """Write a real inode-bound quarantine marker for *db* under *home*."""
+    """Quarantine *db* under *home* using the PRODUCTION writer.
+
+    Deliberately not a hand-built marker. A handcrafted file duplicates the
+    production filename and fingerprint fields, so if either the schema or the
+    reader changes, the handcrafted marker becomes unreadable — and because
+    the predicate fails CLOSED, an unreadable marker still reports "refused".
+    The replay would then keep passing while testing nothing: the hook would
+    be skipping for the wrong reason, and no assertion here could tell.
+
+    Routing through `quarantine_database` means the test can only pass against
+    a marker the production reader genuinely accepts.
+    """
     home.mkdir(parents=True, exist_ok=True)
-    stat_result = db.stat()
-    (home / "db_quarantine.json").write_text(
-        json.dumps(
-            {
-                "db_path": str(db.resolve()),
-                "st_dev": stat_result.st_dev,
-                "st_ino": stat_result.st_ino,
-                "source": "test",
-            }
-        )
-    )
+    if str(_SRC) not in sys.path:
+        sys.path.insert(0, str(_SRC))
+    from genesis.db.integrity import quarantine_database
+
+    # `quarantine_database` resolves the marker location through
+    # `genesis_home()`, which reads GENESIS_HOME at CALL time (no caching), so
+    # the variable only has to hold for this one call.
+    #
+    # Save and RESTORE rather than set-and-forget. A bare assignment here
+    # leaks the tmp path into every later test in the same process — measured:
+    # it broke four unrelated restore tests that resolve their own paths
+    # through the same variable. Popping is equally wrong when the variable was
+    # already set, because that deletes a real pre-existing value rather than
+    # putting it back.
+    previous = os.environ.get("GENESIS_HOME")
+    os.environ["GENESIS_HOME"] = str(home)
+    try:
+        quarantine_database(db, source="test", detail="incident replay")
+    finally:
+        if previous is None:
+            os.environ.pop("GENESIS_HOME", None)
+        else:
+            os.environ["GENESIS_HOME"] = previous
 
 
 def _run_script(

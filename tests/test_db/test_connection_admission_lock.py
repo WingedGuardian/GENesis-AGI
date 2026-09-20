@@ -120,19 +120,23 @@ def test_every_open_time_site_asserts_admission():
 
 
 def test_open_time_sites_do_not_use_the_quarantine_only_assert():
-    """No open-time factory may fall back to the narrower quarantine check.
+    """No open-time factory may call the quarantine assert directly.
 
-    ``assert_not_quarantined`` misses the maintenance fence entirely, which is
-    the exact hole this PR closes — a factory quietly reverted to it would
-    re-open that hole while still looking guarded.
+    ``assert_admitted`` currently delegates to ``assert_not_quarantined``
+    unchanged, so today the two are equivalent in effect — this is NOT a claim
+    that the narrower one misses something right now. The rule exists so that
+    every open-time factory goes through ONE named seam: when admission grows
+    a second condition, it lands in a single function instead of needing six
+    call sites to be found again. A factory reverted to the narrower assert
+    would silently opt out of that.
     """
     tree, parents = _parse()
     quarantine_only = _assert_calls(tree, parents, _QUARANTINE_ASSERT)
     regressed = sorted(_EXPECTED_OPEN_TIME_SITES & quarantine_only)
     assert not regressed, (
         f"open-time sites using {_QUARANTINE_ASSERT} instead of "
-        f"{_ADMISSION_ASSERT}: {regressed}. The narrower assert does not see a "
-        "maintenance fence."
+        f"{_ADMISSION_ASSERT}: {regressed}. Route them through the single named "
+        "seam so a later admission condition lands in one place."
     )
 
 
@@ -147,8 +151,8 @@ def test_per_call_reassert_sites_are_unchanged():
     quarantine_only = _assert_calls(tree, parents, _QUARANTINE_ASSERT)
     assert quarantine_only == _EXPECTED_PER_CALL_QUARANTINE_SITES, (
         "the quarantine-only assertion set changed. These are the "
-        "SerializedConnection per-call re-asserts, intentionally not promoted "
-        "to the maintenance fence yet. "
+        "SerializedConnection per-call re-asserts, intentionally left on the "
+        "direct quarantine assert rather than routed through the seam. "
         f"unexpected={sorted(quarantine_only - _EXPECTED_PER_CALL_QUARANTINE_SITES)} "
         f"missing={sorted(_EXPECTED_PER_CALL_QUARANTINE_SITES - quarantine_only)}"
     )
