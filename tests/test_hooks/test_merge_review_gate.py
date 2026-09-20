@@ -5689,14 +5689,22 @@ class TestFindingsDistribution:
         assert "\x1b" not in out and "\r" not in out and "weird\nname" not in out
         assert "\\u001b" in out, "the escape must be rendered visibly, not dropped"
 
-    def test_a_reported_round_is_now_the_unresolved_set(self, guard_module):
+    def test_a_reported_round_is_not_described_as_a_round(self, guard_module):
         """The scorer accumulates across review submissions, so 'this round' was a
-        false claim about what was counted — the report describes all unresolved
-        findings (Codex P2, PR #2005)."""
+        false claim about what was counted (Codex P2, PR #2005, round 1).
+
+        The replacement wording was ALSO wrong — "the unresolved findings"
+        overstates a denominator that is only `scored_at` (Codex P2, round 2) —
+        so this test now pins the property that survived both corrections
+        rather than either literal string it has held: the report must not
+        describe its contents as a round. The narrow positive claim is pinned
+        by `test_the_concentration_denominator_is_named_as_SCORED`.
+        """
         out = guard_module._findings_distribution(
             [("P1", "src/a.py") for _ in range(6)]
         )
-        assert "unresolved findings" in out
+        assert "this round's findings" not in out
+        assert "scored finding(s)" in out, "the header states the real denominator"
 
     def test_output_survives_pathological_paths(self, guard_module):
         """The size bound above passes only because its paths are SHORT.
@@ -5746,6 +5754,52 @@ class TestFindingsDistribution:
         assert "1 more file(s)" in out, "only ONE real file is omitted"
         assert "2 more file(s)" not in out
         assert "the pathless bucket" in out, "the dropped bucket must be declared"
+
+    def test_the_basename_survives_an_ENCODED_overflow(self, guard_module):
+        """The regression my own bound introduced, and the reason the test above
+        did not catch it: `'a' * 500` does not expand under `json.dumps`, so the
+        encoded backstop never fired and the front-slice was never exercised.
+
+        A multibyte path DOES expand — six chars per character — so the encoded
+        form overflows even after the raw clip, and slicing it from the front
+        discarded the tail, which is the basename the clip exists to keep.
+        MEASURED before the fix on this exact input: 101 chars rendered, no
+        `needle.py` in them (Codex P2, PR #2005, round 2).
+        """
+        for label, path in (
+            ("multibyte", "目录" * 40 + "/needle.py"),
+            ("control-dense", ("\x1b[2K\r" * 800) + "needle.py"),
+            ("ascii", "a" * 500 + "/needle.py"),
+        ):
+            out = guard_module._safe_report_path(path)
+            assert "needle.py" in out, f"{label}: the basename was discarded"
+            assert len(out) <= guard_module._REPORT_PATH_ENCODED_MAX_CHARS + 1, label
+            assert "…" in out, f"{label}: the cut must stay declared"
+
+    def test_a_path_with_no_ascii_at_all_still_terminates_and_is_bounded(
+        self, guard_module
+    ):
+        """Guard the guard: the bound is now a shrink LOOP, so the pathological
+        input is one where every retained character expands. It must terminate
+        and stay bounded even when no prefix of the tail can fit."""
+        out = guard_module._safe_report_path("目录" * 200)
+        assert len(out) <= guard_module._REPORT_PATH_ENCODED_MAX_CHARS + 1
+        assert not any(ord(c) < 32 for c in out)
+
+    def test_the_concentration_denominator_is_named_as_SCORED(self, guard_module):
+        """`total` is `len(scored_at)`, which excludes findings that are
+        unresolved but unscored — CodeRabbit below-Major, unrecognised bots,
+        off-diff and doc-path anchors. Calling that "the unresolved findings"
+        invites a class diagnosis from a denominator that never included them
+        (Codex P2, PR #2005, round 2). Two wordings have now been wrong here;
+        this pins the narrow one."""
+        out = guard_module._findings_distribution(
+            [("P2", "src/seam.py") for _ in range(4)]
+        )
+        assert "NOTE:" in out, "the fixture must actually reach the note"
+        assert "SCORED findings" in out
+        assert "unresolved findings" not in out
+        assert "this round's findings" not in out
 
     def test_elision_with_no_pathless_bucket_says_only_files(self, guard_module):
         """Negative control for the test above: the bucket clause must not appear

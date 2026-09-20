@@ -2508,22 +2508,28 @@ def _safe_report_path(path: str) -> str:
     escaped it to a literal backslash-u-2026, so the marker declaring the cut
     was itself unreadable; the test for the marker is what caught that.
 
-    Clipped BEFORE encoding, never after: slicing an encoded string can land
-    mid-escape and render an escape sequence as a truncated prefix, which is
-    wrong and misleading. Clipping first keeps every escape whole. The encoded
-    backstop below CAN cut mid-escape, and is still SAFE where it matters —
-    `json.dumps` has already replaced every control character, so no slice of
-    its ASCII-safe output can reintroduce one. That one is a size guarantee,
-    not a legibility one, and it is declared by the same ellipsis.
+    Clipped BEFORE encoding, never after, and the RAW budget is what shrinks
+    when the encoded form overflows. Slicing the encoded string is what an
+    earlier version did, and it defeated the whole point: `json.dumps` expands
+    a non-ASCII or control character six-fold, so a path of multibyte
+    characters overflows the encoded budget, and a front-slice then discards
+    the TAIL — the basename this function exists to keep. MEASURED on
+    `"目录" * 40 + "/needle.py"`: rendered 101 chars with `needle.py` absent,
+    so the row named no file at all (Codex P2, PR #2005, round 2). Shrinking
+    the raw keep-length instead preserves the basename by construction,
+    because the tail is the part that is kept at every length.
+
+    The loop is bounded by the raw length and shrinks by a whole character each
+    pass, so it terminates; at zero characters kept the encoded form is `""`,
+    which fits any budget above two.
     """
     clipped = len(path) > _REPORT_PATH_MAX_CHARS
-    if clipped:
-        path = path[-_REPORT_PATH_MAX_CHARS:]
-    encoded = json.dumps(path)
-    if len(encoded) > _REPORT_PATH_ENCODED_MAX_CHARS:
-        # Keep the opening quote and close it: the result may be a truncated
-        # escape, which is ugly and inert, never a control character.
-        encoded = encoded[: _REPORT_PATH_ENCODED_MAX_CHARS - 1] + '"'
+    keep = min(len(path), _REPORT_PATH_MAX_CHARS)
+    while True:
+        encoded = json.dumps(path[-keep:] if keep else "")
+        if len(encoded) <= _REPORT_PATH_ENCODED_MAX_CHARS or keep == 0:
+            break
+        keep -= 1
         clipped = True
     return f"…{encoded}" if clipped else encoded
 
@@ -2534,7 +2540,17 @@ def _findings_distribution(
     renames: dict[str, str] | None = None,
     reliable: bool = True,
 ) -> str:
-    """Where the unresolved findings LAND, as a report — never a verdict.
+    """Where the SCORED findings LAND, as a report — never a verdict.
+
+    The denominator is `scored_at` and the wording says so, because getting
+    this wrong is the same defect one level up. A scan routinely holds findings
+    that are unresolved and NOT scored — CodeRabbit below-Major, unrecognised
+    review bots, off-diff and documentation-path anchors — so "100% of the
+    unresolved findings" can be printed while unscored findings sit in other
+    files entirely, inviting a class diagnosis from a denominator that never
+    included them. Two earlier wordings were both wrong: "this round's
+    findings" (the scorer accumulates across rounds) and "the unresolved
+    findings" (it counts only the scored subset). Say the narrow thing.
 
     WHY THE GATE PRINTS THIS AT ALL, including on round one. A list of findings
     reads as a work queue, so the default response is to answer them one by one;
@@ -2623,7 +2639,7 @@ def _findings_distribution(
     if concentrated:
         top_path, top_sevs = known_ranked[0]
         lines.append(
-            f"  NOTE: {100.0 * len(top_sevs) / total:.0f}% of the unresolved findings are in ONE "
+            f"  NOTE: {100.0 * len(top_sevs) / total:.0f}% of the SCORED findings are in ONE "
             f"file ({_safe_report_path(top_path)}). Findings that concentrate on a single seam — or that land on "
             "code added to answer an EARLIER round — are a mechanism signal: they often share "
             "one cause, and fixing the cause retires them together while fixing them "
