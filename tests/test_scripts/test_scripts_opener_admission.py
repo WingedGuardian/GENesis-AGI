@@ -14,8 +14,12 @@ Two layers, matching ``tests/test_db/test_rw_connection_inventory.py`` for the
   otherwise evade the matcher. A rebound module object or getattr call is NOT
   detected — treat the matcher as the spellings checked so far, not a closed
   set. The gate also checks PRESENCE of a fence call in an enclosing scope,
-  not ordering or that the name resolves to the real fence — the behavior
-  replay below is the compensating control for the write path;
+  not ordering, and not that the name resolves to the real fence. That is not
+  a theoretical limit: an external reviewer built a script whose fence helper
+  returned False with the call placed AFTER the write, and this gate passed
+  it. The behaviour replays below are the compensating control, and they now
+  cover the WRITER scripts rather than one of them — a stubbed or mis-ordered
+  fence fails them. Read-only openers remain gate-only;
 * behavior tests driving the REAL hook entry points against a fenced scratch
   database — the 2026-09-18 incident replay: hook writers used to write to a
   QUARANTINED database, because nothing script-side consulted the marker.
@@ -227,22 +231,6 @@ def test_no_fence_on_fresh_state(admission, tmp_path):
     assert admission.database_is_fenced(db) is False
 
 
-def test_maintenance_marker_fences_and_survives_replacement(admission, tmp_path):
-    """The maintenance fence is PATH-bound: replacing the file keeps it."""
-    db = tmp_path / "x.db"
-    db.write_bytes(b"a")
-    marker = admission.maintenance_marker_path(db)
-    marker.parent.mkdir(parents=True)
-    marker.write_text("{}")
-    assert admission.database_is_fenced(db) is True
-    db.unlink()
-    db.write_bytes(b"b")  # atomic-replacement stand-in: new inode, same path
-    assert admission.database_is_fenced(db) is True, (
-        "a maintenance fence must survive file replacement — path-bound, "
-        "deliberately unlike the inode-bound quarantine marker"
-    )
-
-
 def test_quarantine_marker_fences(admission, tmp_path, monkeypatch):
     """The quarantine half routes through genesis.db.integrity."""
     db = tmp_path / "x.db"
@@ -254,12 +242,17 @@ def test_quarantine_marker_fences(admission, tmp_path, monkeypatch):
 
 
 def test_uri_and_path_spellings_share_one_fence(admission, tmp_path):
-    """file: URI callers must land on the same admission domain as the path."""
+    """file: URI callers must land on the same admission domain as the path.
+
+    Load-bearing: the quarantine reader resolves whatever it is handed, so a
+    raw URI string would resolve to a nonexistent path matching no marker —
+    silently un-fencing exactly the read-only script callers that use URIs.
+    """
     db = tmp_path / "x.db"
-    db.write_bytes(b"a")
-    marker = admission.maintenance_marker_path(db)
-    marker.parent.mkdir(parents=True)
-    marker.write_text("{}")
+    db.write_bytes(b"not a database")
+    from genesis.db import integrity
+
+    integrity.quarantine_database(db, source="test", detail="unit")
     assert admission.database_is_fenced(f"file:{db}?mode=ro") is True
 
 
@@ -351,18 +344,165 @@ def test_audit_hook_refuses_quarantined_database(tmp_path):
     )
 
 
-def test_audit_hook_refuses_maintenance_fenced_database(tmp_path, monkeypatch):
-    """The maintenance fence (path-scoped marker) refuses the same way."""
-    db = tmp_path / "genesis.db"
-    _seed_audit_db(db)
-    if str(_SRC) not in sys.path:
-        sys.path.insert(0, str(_SRC))
-    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / ".genesis"))
-    import genesis.db.admission as adm
+# ---------------------------------------------------------------------------
+# behaviour replay for the OTHER writer-class scripts
+#
+# Why these exist, stated plainly because the gap was DEMONSTRATED rather than
+# imagined: an external reviewer wrote a scratch script whose fence helper was
+# `def _db_is_fenced(p): return False`, placed the call AFTER the write, and
+# the AST gate above passed it (they ran it: 1 passed). The gate binds on the
+# PRESENCE of a fence-shaped call in an enclosing scope — not on ordering, and
+# not on the name resolving to the real predicate. A stubbed, mis-ordered or
+# purely decorative fence is invisible to it.
+#
+# The audit-hook replay above was the only compensating control, covering one
+# of ~15 fenced scripts. These extend it to the other WRITERS, which is where
+# a bypass actually corrupts something. Each is a PAIR: a control that must
+# write, and a quarantined run that must not. The control is what makes the
+# pair meaningful — without it a script that never writes at all would satisfy
+# the fenced assertion vacuously.
+# ---------------------------------------------------------------------------
 
-    marker = adm.maintenance_marker_path(db)
-    marker.parent.mkdir(parents=True)
-    marker.write_text(json.dumps({"reason": "test maintenance"}))
-    proc = _run_audit_hook(tmp_path, db)
+
+def _quarantine(db: Path, home: Path) -> None:
+    """Write a real inode-bound quarantine marker for *db* under *home*."""
+    home.mkdir(parents=True, exist_ok=True)
+    stat_result = db.stat()
+    (home / "db_quarantine.json").write_text(
+        json.dumps(
+            {
+                "db_path": str(db.resolve()),
+                "st_dev": stat_result.st_dev,
+                "st_ino": stat_result.st_ino,
+                "source": "test",
+            }
+        )
+    )
+
+
+def _run_script(
+    script: str, tmp_path: Path, db: Path, payload: dict | None
+) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env["HOME"] = str(tmp_path / "home")
+    env["GENESIS_HOME"] = str(tmp_path / ".genesis")
+    env["GENESIS_DB_PATH"] = str(db)
+    env["GENESIS_REPO_ROOT"] = str(tmp_path)
+    return subprocess.run(
+        [sys.executable, str(_SCRIPTS / script)],
+        input=json.dumps(payload) if payload is not None else "",
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def _seed_edit_outcomes(db: Path) -> Path:
+    """Schema + a transcript holding one Edit whose tool_result is an error."""
+    conn = sqlite3.connect(db)
+    try:
+        # Column set mirrors the sensor's own INSERT (scripts/
+        # edit_failure_sensor.py) — table name included. An earlier draft of
+        # this fixture invented `edit_outcomes`, and the CONTROL caught it:
+        # the sensor wrote nothing because the table it targets did not exist.
+        # That is the control earning its place on its first run.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS tool_call_outcomes (id INTEGER PRIMARY KEY, "
+            "session_id, tool_name, file_path, success, error_snippet, "
+            "timestamp, tool_use_id UNIQUE)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    transcript = db.parent / "transcript.jsonl"
+    rows = [
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_x1",
+                        "name": "Edit",
+                        "input": {
+                            "file_path": str(db.parent / "f.txt"),
+                            "old_string": "a",
+                            "new_string": "b",
+                        },
+                    }
+                ],
+            },
+            "timestamp": "2026-09-19T20:00:01Z",
+            "sessionId": "replay",
+        },
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_x1",
+                        "is_error": True,
+                        "content": "String to replace not found in file.",
+                    }
+                ],
+            },
+            "timestamp": "2026-09-19T20:00:02Z",
+            "sessionId": "replay",
+        },
+    ]
+    transcript.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    return transcript
+
+
+def _edit_outcome_count(db: Path) -> int:
+    conn = sqlite3.connect(db)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM tool_call_outcomes").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _edit_sensor_payload(tmp_path: Path, transcript: Path) -> dict:
+    return {
+        "session_id": "replay",
+        "hook_event_name": "Stop",
+        "transcript_path": str(transcript),
+        "cwd": str(tmp_path),
+    }
+
+
+def test_edit_sensor_control_writes_when_unfenced(tmp_path):
+    """CONTROL for the edit sensor — the half that makes the pair mean something."""
+    db = tmp_path / "genesis.db"
+    transcript = _seed_edit_outcomes(db)
+    proc = _run_script(
+        "edit_failure_sensor.py", tmp_path, db, _edit_sensor_payload(tmp_path, transcript)
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _edit_outcome_count(db) == 1, (
+        f"control failed: the edit sensor did not write unfenced (stderr: {proc.stderr})"
+    )
+
+
+def test_edit_sensor_refuses_quarantined_database(tmp_path):
+    """REPLAY: the edit sensor was a MEASURED post-quarantine writer.
+
+    Host syscall tracing on the affected install attributed writes to a
+    quarantined database to exactly two scripts — the audit hook (replayed
+    above) and this one.
+    """
+    db = tmp_path / "genesis.db"
+    transcript = _seed_edit_outcomes(db)
+    _quarantine(db, tmp_path / ".genesis")
+    proc = _run_script(
+        "edit_failure_sensor.py", tmp_path, db, _edit_sensor_payload(tmp_path, transcript)
+    )
     assert proc.returncode == 0, f"a fenced hook must not crash: {proc.stderr}"
-    assert _row_count(db) == 0, "the audit hook wrote through an active maintenance fence"
+    assert _edit_outcome_count(db) == 0, (
+        "the edit sensor WROTE to a quarantined database — the incident class "
+        "this fence exists to stop"
+    )

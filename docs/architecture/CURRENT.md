@@ -2519,30 +2519,46 @@ verified: f24c15e9 2026-09-05
   (shipped config default, not the live earned level). The persistent Overview
   **Readiness panel** that renders the tier rail + these enrichment chips (config-
   framed, refreshed on return to Overview) is **PR-B2b** — shipped.
-- **db/ ADMISSION (two fences, one seam):** every open-time connect in
-  `db/connection.py` — `connect_sqlite_rw`, the guarded aiosqlite connector,
-  `get_db` (+ its reconnect), `get_raw_db`, `open_ro_connection` — calls
-  `db/admission.assert_admitted`, which refuses on EITHER **quarantine**
-  (`db/integrity.py`, inode-bound, so a verified replacement clears it
-  naturally) or an **active maintenance fence** (`db/admission.py`, a marker
-  under `~/.genesis/db_admission/`, PATH-bound on purpose so it survives the
-  atomic swap it exists to protect). Script-side raw openers — CC hooks, which
-  are stdlib-only and cannot import `genesis` — consult the same predicate
-  through the `scripts/hooks/db_admission_check.py` shim, whose single policy
-  is "any failure to establish state reads as FENCED". That shim is a
-  COLOCATED helper: `sync-hooks.sh` installs it beside `emit_bugfix_audit.py`,
-  because the git hook runs the installed copy out of `$GIT_COMMON_DIR/hooks`
-  where a sibling import is the only import that resolves.
-  Two enforced boundaries, both AST-locked rather than conventional:
+- **db/ ADMISSION (one seam, quarantine only — read the residual):** every
+  open-time connect in `db/connection.py` — `connect_sqlite_rw`, the guarded
+  aiosqlite connector, `get_db` (+ its reconnect), `get_raw_db`,
+  `open_ro_connection` — calls `db/admission.assert_admitted`, which delegates
+  to **quarantine** (`db/integrity.py`, inode-bound, so a verified replacement
+  clears it naturally). Script-side raw openers — CC hooks, stdlib-only and
+  unable to import `genesis` — consult the same predicate through the
+  `scripts/hooks/db_admission_check.py` shim, whose single policy is "any
+  failure to establish state reads as FENCED". That shim is a COLOCATED
+  helper: `sync-hooks.sh` installs it beside `emit_bugfix_audit.py`, because
+  the git hook runs the installed copy out of `$GIT_COMMON_DIR/hooks` where a
+  sibling import is the only one that resolves.
+  Two AST-locked boundaries rather than conventional ones:
   `test_db/test_connection_admission_lock.py` pins the open-time connect set
-  (a NEW factory fails until classified — this exists because a hand
-  enumeration already missed `get_raw_db`), and
+  (a NEW factory fails until classified — it exists because a hand enumeration
+  already missed `get_raw_db`), and
   `test_scripts/test_scripts_opener_admission.py` roots at `scripts/`, which
-  the older RW inventory test does not reach. Deliberately NOT yet fenced: the
-  `SerializedConnection` PER-CALL re-asserts stay quarantine-only, and
-  quarantine is still declared only at startup — a live server meeting
-  `SQLITE_CORRUPT` does not trip it (the 2026-09-18 log-storm class). Both
-  land with the runtime corruption trip.
+  the older RW inventory test does not reach.
+  **THE PERIMETER IS NOT CLOSED, and a recovery procedure must not assume it
+  is.** Both gates check that a fence call is PRESENT, not that it runs before
+  the connect or resolves to the real predicate — demonstrated, not supposed:
+  a reviewer's script with a stubbed fence placed after the write passed the
+  scripts gate. Behaviour replays are the compensating control and cover the
+  WRITER scripts only. Separately, ~12 read-only openers under `src/genesis/`
+  bypass both gates entirely: the RW-mode ones were fenced individually (both
+  MCP health tools, `guardian/watchdog`, the dashboard update route) because a
+  read-write open can checkpoint a stale `-wal` into the main file on close,
+  but the RO set is tracked in issue #2180, not covered. The older
+  `test_rw_connection_inventory.py` cannot catch them — it skips any call whose
+  source text contains `mode=ro`, so a NEW read-only opener in `src/` fails no
+  test at all.
+  A **maintenance fence** (an operator holding the path during replacement)
+  was built here and deliberately REMOVED before shipping: its reader and
+  writer derived keys independently and could disagree, and the perimeter it
+  claimed did not exist. It returns with its write side (`restore.sh`), a
+  computed opener enumeration, and shared key derivation. Also still open:
+  `SerializedConnection`'s PER-CALL re-asserts, and the fact that quarantine
+  is declared only at startup — a live server meeting `SQLITE_CORRUPT` does
+  not trip it (the 2026-09-18 log-storm class). Both land with the runtime
+  corruption trip.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Two
   schema paths coexist: base DDL (`schema/_tables.py`, 117 CREATE TABLE, a count

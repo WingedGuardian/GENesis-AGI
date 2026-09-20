@@ -7,7 +7,6 @@ import logging
 import sqlite3
 from typing import TYPE_CHECKING
 
-from genesis.db.admission import DatabaseFencedError
 from genesis.db.integrity import DatabaseIntegrityError
 
 if TYPE_CHECKING:
@@ -32,23 +31,6 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._db = await init_db()
         logger.info("Genesis DB initialized")
-    except DatabaseFencedError:
-        # MUST precede the DatabaseIntegrityError clause — DatabaseFencedError
-        # is a subclass, and the generic message below ("failed startup
-        # integrity verification") is actively misleading here: nothing is
-        # corrupt. An operator is holding this path for replacement, and the
-        # moment they are most likely to read this log is mid-restore, when
-        # being told their database failed integrity is the worst possible
-        # wrong answer.
-        logger.critical(
-            "Genesis DB is under an active maintenance fence — startup refused. "
-            "This is not corruption: a maintenance owner holds the database path. "
-            "If no restore/maintenance is in progress, the marker is stale and "
-            "must be removed before the server can start.",
-            exc_info=True,
-        )
-        rt._db = None
-        raise
     except DatabaseIntegrityError:
         logger.critical("Genesis DB failed startup integrity verification", exc_info=True)
         rt._db = None

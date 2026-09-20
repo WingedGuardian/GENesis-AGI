@@ -694,6 +694,25 @@ async def _impl_job_health() -> dict:
             "source": "missing_db",
         }
 
+    # Admission fence. This runs in an MCP SERVER CHILD PROCESS — the same
+    # process class as the 2026-09-18 incident's bypass writers — and opens
+    # read-WRITE (no mode=ro), so a plain open+close can checkpoint a stale
+    # `-wal` into a quarantined main file. That is the recurrence mechanism
+    # itself, not a theoretical concern. Reported rather than silent: an
+    # operator asking for job health during an incident should be told the
+    # database is fenced, not handed an empty result that reads as "no jobs".
+    from genesis.db.admission import database_is_fenced
+
+    if database_is_fenced(_DB_PATH):
+        return {
+            "jobs": {},
+            "note": (
+                f"Genesis database at {_DB_PATH} is quarantined; job health is "
+                "unavailable until the quarantine clears."
+            ),
+            "source": "fenced_db",
+        }
+
     try:
         async with aiosqlite.connect(str(_DB_PATH)) as db:
             await db.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")
