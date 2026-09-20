@@ -1,0 +1,1 @@
+- Size Codebase Memory batch indexing from its measured working set, bounding the default 4 GiB scope against the smallest applicable cgroup limit instead of retaining the undersized 2 GiB cap.

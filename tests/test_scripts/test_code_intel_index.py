@@ -142,6 +142,61 @@ def _minimal_path(tmp_path: Path, *extra_tools: str) -> Path:
     return d
 
 
+def _fake_v2_cgroup(
+    tmp_path: Path,
+    *,
+    membership: str,
+    mount_root: str = "/",
+    limits: dict[str, str | None],
+) -> dict[str, str]:
+    mount = tmp_path / "cgroup2"
+    mount.mkdir()
+    for rel, value in limits.items():
+        directory = mount / rel.lstrip("/")
+        directory.mkdir(parents=True, exist_ok=True)
+        if value is not None:
+            (directory / "memory.max").write_text(f"{value}\n")
+    self_cgroup = tmp_path / "self.cgroup"
+    self_cgroup.write_text(f"0::{membership}\n")
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        f"35 24 0:31 {mount_root} {mount} rw,nosuid,nodev,noexec,relatime"
+        " - cgroup2 cgroup rw\n"
+    )
+    return {
+        "CODE_INTEL_MEM_CEILING_BYTES": "",
+        "CODE_INTEL_CGROUP_SELF": str(self_cgroup),
+        "CODE_INTEL_CGROUP_MOUNTINFO": str(mountinfo),
+    }
+
+
+def _fake_v1_cgroup(
+    tmp_path: Path,
+    *,
+    membership: str,
+    mount_root: str,
+    limits: dict[str, str],
+) -> dict[str, str]:
+    mount = tmp_path / "memory-controller"
+    mount.mkdir()
+    for rel, value in limits.items():
+        directory = mount / rel.lstrip("/")
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "memory.limit_in_bytes").write_text(f"{value}\n")
+    self_cgroup = tmp_path / "self.cgroup"
+    self_cgroup.write_text(f"7:cpu,memory:{membership}\n")
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        f"42 24 0:38 {mount_root} {mount} rw,nosuid,nodev,noexec,relatime"
+        " - cgroup cgroup rw,cpu,memory\n"
+    )
+    return {
+        "CODE_INTEL_MEM_CEILING_BYTES": "",
+        "CODE_INTEL_CGROUP_SELF": str(self_cgroup),
+        "CODE_INTEL_CGROUP_MOUNTINFO": str(mountinfo),
+    }
+
+
 # ── argument validation ───────────────────────────────────────────────────
 
 
@@ -522,11 +577,23 @@ def test_lock_held_skips_without_running(tmp_path):
     _fake_tools(fakebin, log)
     repo = _make_repo(tmp_path)
     lock_file = _lock_file_for(tmp_path, repo)
+    poison = tmp_path / "does-not-exist"
     with open(lock_file, "w") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        res = _run_entry(tmp_path, repo, "both", path=f"{fakebin}:{_SYSTEM_PATH}")
+        res = _run_entry(
+            tmp_path,
+            repo,
+            "both",
+            path=f"{fakebin}:{_SYSTEM_PATH}",
+            env_extra={
+                "CODE_INTEL_MEM_CEILING_BYTES": "",
+                "CODE_INTEL_CGROUP_SELF": str(poison),
+                "CODE_INTEL_CGROUP_MOUNTINFO": str(poison),
+            },
+        )
     assert res.returncode == 0, res.stderr
     assert "already running" in res.stdout
+    assert "cgroup" not in res.stdout.lower()
     assert not log.exists()
 
 
@@ -608,7 +675,7 @@ def test_scope_path_passes_all_properties(tmp_path):
     res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
     assert res.returncode == 0, res.stderr
     calls = slog.read_text()
-    assert "MemoryMax=2G" in calls
+    assert "MemoryMax=4G" in calls
     assert "MemorySwapMax=0" in calls
     assert "IOWeight=20" in calls
     assert "CPUQuota=200%" in calls
@@ -648,13 +715,13 @@ def test_env_overrides_reach_scope(tmp_path):
     repo = _make_repo(tmp_path)
     res = _run_entry(
         tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
-        env_extra={"CODE_INTEL_INDEX_MEMORY_MAX": "512M",
+        env_extra={"CODE_INTEL_INDEX_MEMORY_MAX": "5G",
                    "CODE_INTEL_INDEX_IO_WEIGHT": "5",
                    "CODE_INTEL_INDEX_CPU_QUOTA": "100%"},
     )
     assert res.returncode == 0, res.stderr
     calls = slog.read_text()
-    assert "MemoryMax=512M" in calls
+    assert "MemoryMax=5G" in calls
     assert "IOWeight=5" in calls
     assert "CPUQuota=100%" in calls
 
@@ -668,7 +735,7 @@ def test_probe_failure_falls_back_to_rlimit(tmp_path):
     res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
     assert res.returncode == 0, res.stderr
     assert slog.read_text().count("\n") == 1  # probe attempted exactly once
-    assert "ULIMIT_V:2097152" in log.read_text()  # 2G in KB
+    assert "ULIMIT_V:4194304" in log.read_text()  # 4G in KB
 
 
 def test_no_systemd_fallback_applies_rlimit(tmp_path):
@@ -678,7 +745,7 @@ def test_no_systemd_fallback_applies_rlimit(tmp_path):
     repo = _make_repo(tmp_path)
     res = _run_entry(tmp_path, repo, "cbm", path=str(minbin))
     assert res.returncode == 0, res.stderr
-    assert "ULIMIT_V:2097152" in log.read_text()
+    assert "ULIMIT_V:4194304" in log.read_text()
 
 
 # ── 4. pressure watchdog ──────────────────────────────────────────────────
@@ -839,6 +906,409 @@ def test_installer_does_not_claim_queue_success_after_writer_failure():
     assert "index_marker.py\" write" in queue
     assert "|| true" not in queue
     assert "WARNING: could not queue initial code intelligence index" in queue
+
+
+# ── Codebase Memory batch admission ───────────────────────────────────────
+
+
+def test_cbm_default_uses_the_measured_four_gibibyte_target(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    systemd_log = tmp_path / "systemd.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, systemd_log)
+    repo = _make_repo(tmp_path)
+
+    res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    runs = [
+        line for line in systemd_log.read_text().splitlines()
+        if "codebase-memory-mcp cli index_repository" in line
+    ]
+    assert len(runs) == 1
+    assert "MemoryMax=4G" in runs[0]
+
+
+def test_cbm_cap_is_trimmed_to_nested_v2_headroom(tmp_path):
+    gib = 1024**3
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    systemd_log = tmp_path / "systemd.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, systemd_log)
+    repo = _make_repo(tmp_path)
+    env = _fake_v2_cgroup(
+        tmp_path,
+        membership="/tenant/session",
+        limits={
+            "tenant/session": str(7 * gib),
+            "tenant": str(6 * gib),
+            "": None,
+        },
+    )
+    env["CODE_INTEL_MEM_CURRENT_BYTES"] = str(512 * 1024**2)
+
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}", env_extra=env,
+    )
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    expected = 6 * gib - 512 * 1024**2 - 2 * gib
+    runs = [
+        line for line in systemd_log.read_text().splitlines()
+        if "codebase-memory-mcp cli index_repository" in line
+    ]
+    assert len(runs) == 1
+    assert f"MemoryMax={expected}" in runs[0]
+
+
+def test_cbm_equal_nested_limits_account_for_parent_usage(tmp_path):
+    gib = 1024**3
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    systemd_log = tmp_path / "systemd.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, systemd_log)
+    repo = _make_repo(tmp_path)
+    env = _fake_v2_cgroup(
+        tmp_path,
+        membership="/tenant/session",
+        limits={
+            "tenant/session": str(8 * gib),
+            "tenant": str(8 * gib),
+            "": None,
+        },
+    )
+    env["CODE_INTEL_MEM_CURRENT_BYTES"] = ""
+    cgroup = tmp_path / "cgroup2"
+    (cgroup / "tenant" / "session" / "memory.current").write_text(f"{gib}\n")
+    (cgroup / "tenant" / "memory.current").write_text(f"{3 * gib}\n")
+
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}", env_extra=env,
+    )
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    runs = [
+        line for line in systemd_log.read_text().splitlines()
+        if "codebase-memory-mcp cli index_repository" in line
+    ]
+    assert len(runs) == 1
+    assert f"MemoryMax={3 * gib}" in runs[0]
+
+
+def test_cbm_accounts_for_pressure_at_every_finite_v2_ancestor(tmp_path):
+    gib = 1024**3
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    systemd_log = tmp_path / "systemd.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, systemd_log)
+    repo = _make_repo(tmp_path)
+    env = _fake_v2_cgroup(
+        tmp_path,
+        membership="/tenant/session",
+        limits={
+            "tenant/session": str(7 * gib),
+            "tenant": str(8 * gib),
+            "": None,
+        },
+    )
+    env["CODE_INTEL_MEM_CURRENT_BYTES"] = ""
+    cgroup = tmp_path / "cgroup2"
+    (cgroup / "tenant" / "session" / "memory.current").write_text(f"{gib}\n")
+    (cgroup / "tenant" / "memory.current").write_text(f"{5 * gib}\n")
+
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}", env_extra=env,
+    )
+
+    assert res.returncode == 3
+    assert "below the measured" in res.stdout
+    assert "codebase-memory-mcp cli index_repository" not in systemd_log.read_text()
+
+
+def test_cbm_refuses_unreadable_usage_at_a_finite_v2_ancestor(tmp_path):
+    gib = 1024**3
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    systemd_log = tmp_path / "systemd.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, systemd_log)
+    repo = _make_repo(tmp_path)
+    env = _fake_v2_cgroup(
+        tmp_path,
+        membership="/tenant/session",
+        limits={
+            "tenant/session": str(7 * gib),
+            "tenant": str(8 * gib),
+            "": None,
+        },
+    )
+    env["CODE_INTEL_MEM_CURRENT_BYTES"] = ""
+    cgroup = tmp_path / "cgroup2"
+    (cgroup / "tenant" / "session" / "memory.current").write_text(f"{gib}\n")
+
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}", env_extra=env,
+    )
+
+    assert res.returncode == 3
+    assert "cannot read current memory usage" in res.stdout
+    assert "codebase-memory-mcp cli index_repository" not in systemd_log.read_text()
+
+
+def test_cbm_admission_discounts_only_clean_cache_above_reserve(tmp_path):
+    gib = 1024**3
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    systemd_log = tmp_path / "systemd.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, systemd_log)
+    repo = _make_repo(tmp_path)
+    env = _fake_v2_cgroup(
+        tmp_path,
+        membership="/tenant",
+        limits={"tenant": str(9 * gib), "": None},
+    )
+    env["CODE_INTEL_MEM_CURRENT_BYTES"] = ""
+    cgroup = tmp_path / "cgroup2" / "tenant"
+    (cgroup / "memory.current").write_text(f"{5 * gib}\n")
+    (cgroup / "memory.stat").write_text(
+        f"inactive_file {2 * gib}\n"
+        f"active_file {gib}\n"
+        "file_dirty 0\n"
+        "file_writeback 0\n"
+    )
+
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}", env_extra=env,
+    )
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    runs = [
+        line for line in systemd_log.read_text().splitlines()
+        if "codebase-memory-mcp cli index_repository" in line
+    ]
+    assert len(runs) == 1
+    assert f"MemoryMax={3 * gib}" in runs[0]
+
+
+def test_cbm_refuses_when_v2_hierarchy_is_not_mounted(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    self_cgroup = tmp_path / "self.cgroup"
+    self_cgroup.write_text("0::/tenant/session\n")
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text("")
+
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={
+            "CODE_INTEL_MEM_CEILING_BYTES": "",
+            "CODE_INTEL_CGROUP_SELF": str(self_cgroup),
+            "CODE_INTEL_CGROUP_MOUNTINFO": str(mountinfo),
+        },
+    )
+
+    assert res.returncode == 3
+    assert "cannot resolve" in res.stdout
+    assert not log.exists() or "codebase-memory-mcp ARGS:" not in log.read_text()
+
+
+def test_cbm_accepts_authoritative_unlimited_v2_mount_root(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    systemd_log = tmp_path / "systemd.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, systemd_log)
+    repo = _make_repo(tmp_path)
+    env = _fake_v2_cgroup(
+        tmp_path,
+        membership="/",
+        mount_root="/tenant/session",
+        limits={"": None},
+    )
+
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}", env_extra=env,
+    )
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    runs = [
+        line for line in systemd_log.read_text().splitlines()
+        if "codebase-memory-mcp cli index_repository" in line
+    ]
+    assert len(runs) == 1
+    assert "MemoryMax=4G" in runs[0]
+
+
+def test_cbm_refuses_missing_v2_limit_below_mount_root(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    env = _fake_v2_cgroup(
+        tmp_path,
+        membership="/tenant/session",
+        limits={"tenant/session": None, "tenant": "max", "": None},
+    )
+
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}", env_extra=env,
+    )
+
+    assert res.returncode == 3
+    assert "memory.max" in res.stdout
+    assert not log.exists() or "codebase-memory-mcp ARGS:" not in log.read_text()
+
+
+def test_cbm_resolves_namespaced_comounted_v1_memory_controller(tmp_path):
+    gib = 1024**3
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    systemd_log = tmp_path / "systemd.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, systemd_log)
+    repo = _make_repo(tmp_path)
+    env = _fake_v1_cgroup(
+        tmp_path,
+        membership="/",
+        mount_root="/docker/demo",
+        limits={"": str(8 * gib)},
+    )
+    env["CODE_INTEL_MEM_CURRENT_BYTES"] = str(512 * 1024**2)
+
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}", env_extra=env,
+    )
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    runs = [
+        line for line in systemd_log.read_text().splitlines()
+        if "codebase-memory-mcp cli index_repository" in line
+    ]
+    assert len(runs) == 1
+    assert "MemoryMax=4G" in runs[0]
+
+
+def test_cbm_maps_host_relative_v1_membership_against_mount_root(tmp_path):
+    gib = 1024**3
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    systemd_log = tmp_path / "systemd.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, systemd_log)
+    repo = _make_repo(tmp_path)
+    env = _fake_v1_cgroup(
+        tmp_path,
+        membership="/docker/demo/child",
+        mount_root="/docker/demo",
+        limits={"child": str(7 * gib), "": str(6 * gib)},
+    )
+    env["CODE_INTEL_MEM_CURRENT_BYTES"] = str(512 * 1024**2)
+
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}", env_extra=env,
+    )
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    expected = 6 * gib - 512 * 1024**2 - 2 * gib
+    runs = [
+        line for line in systemd_log.read_text().splitlines()
+        if "codebase-memory-mcp cli index_repository" in line
+    ]
+    assert len(runs) == 1
+    assert f"MemoryMax={expected}" in runs[0]
+
+
+def test_cbm_accepts_v1_unlimited_sentinel(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    systemd_log = tmp_path / "systemd.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, systemd_log)
+    repo = _make_repo(tmp_path)
+    env = _fake_v1_cgroup(
+        tmp_path,
+        membership="/docker/demo",
+        mount_root="/docker/demo",
+        limits={"": "9223372036854771712"},
+    )
+
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}", env_extra=env,
+    )
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    runs = [
+        line for line in systemd_log.read_text().splitlines()
+        if "codebase-memory-mcp cli index_repository" in line
+    ]
+    assert len(runs) == 1
+    assert "MemoryMax=4G" in runs[0]
+
+
+def test_cbm_explicit_override_skips_unknown_cgroup_but_still_must_be_useful(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    poison = tmp_path / "does-not-exist"
+
+    accepted = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={
+            "CODE_INTEL_CBM_MEMORY_MAX": "5G",
+            "CODE_INTEL_MEM_CEILING_BYTES": "",
+            "CODE_INTEL_CGROUP_SELF": str(poison),
+            "CODE_INTEL_CGROUP_MOUNTINFO": str(poison),
+        },
+    )
+    refused = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={
+            "CODE_INTEL_INDEX_MEMORY_MAX": "2G",
+            "CODE_INTEL_MEM_CEILING_BYTES": "",
+            "CODE_INTEL_CGROUP_SELF": str(poison),
+            "CODE_INTEL_CGROUP_MOUNTINFO": str(poison),
+        },
+    )
+
+    assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+    assert "ULIMIT_V:5242880" in log.read_text()
+    assert refused.returncode == 3
+    assert "below" in refused.stdout and "measured" in refused.stdout
+
+
+def test_cbm_no_run_paths_do_not_read_cgroup_metadata(tmp_path):
+    poison = tmp_path / "does-not-exist"
+    env = {
+        "CODE_INTEL_MEM_CEILING_BYTES": "",
+        "CODE_INTEL_CGROUP_SELF": str(poison),
+        "CODE_INTEL_CGROUP_MOUNTINFO": str(poison),
+    }
+    disabled = _run_entry(
+        tmp_path,
+        tmp_path / "missing",
+        "cbm",
+        path=_SYSTEM_PATH,
+        env_extra={**env, "CODE_INTEL_INDEX_DISABLE": "1"},
+    )
+    invalid = _run_entry(
+        tmp_path, tmp_path / "missing", "wat", path=_SYSTEM_PATH, env_extra=env,
+    )
+    worktree_root = tmp_path / "worktree-case"
+    worktree_root.mkdir()
+    worktree = _make_repo(worktree_root, worktree=True)
+    skipped = _run_entry(
+        tmp_path, worktree, "cbm", path=_SYSTEM_PATH, env_extra=env,
+    )
+
+    assert disabled.returncode == 0
+    assert invalid.returncode == 1
+    assert skipped.returncode == 0
+    for result in (disabled, invalid, skipped):
+        assert "cgroup" not in result.stdout.lower()
 
 
 # ── the cap must be bounded by what the INSTALL has, not by a constant ───────

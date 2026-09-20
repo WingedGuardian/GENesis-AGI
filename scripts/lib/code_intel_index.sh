@@ -43,7 +43,7 @@
 #
 # Env overrides:
 #   CODE_INTEL_INDEX_MEMORY_MAX   legacy override for both tools
-#   CODE_INTEL_CBM_MEMORY_MAX     default 2G     (CBM batch scope)
+#   CODE_INTEL_CBM_MEMORY_MAX     default 4G     (measured/admitted CBM batch scope)
 #   CODE_INTEL_GITNEXUS_MEMORY_MAX default 8G    (measured GitNexus rebuild)
 #   CODE_INTEL_FILE_CACHE_RESERVE_BYTES default 2G (clean cache kept outside job)
 #   CODE_INTEL_INDEX_IO_WEIGHT    default 20     (1-10000; low = polite)
@@ -125,7 +125,14 @@ TOOLS="${2:-both}"
 MODE="${3:-${CODE_INTEL_INDEX_MODE:-fast}}"
 
 _LEGACY_MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-}"
-CBM_MEM_MAX="${CODE_INTEL_CBM_MEMORY_MAX:-${_LEGACY_MEM_MAX:-2G}}"
+CBM_MEM_EXPLICIT=0
+if [ -n "${CODE_INTEL_CBM_MEMORY_MAX:-}" ] || [ -n "$_LEGACY_MEM_MAX" ]; then
+    CBM_MEM_EXPLICIT=1
+fi
+# Measured 2026-09-09: a clean fast Codebase Memory index peaked at roughly
+# 2,836 MiB RSS. Four GiB retains about 40% growth headroom; admission below
+# trims it only when the remaining cap can still contain the measured workload.
+CBM_MEM_MAX="${CODE_INTEL_CBM_MEMORY_MAX:-${_LEGACY_MEM_MAX:-4G}}"
 # Measured 2026-09-16: a forced full rebuild peaked at 4,874,166,272 bytes
 # (4.54 GiB) and completed under an 8 GiB, swapless scope. The old shared 2G
 # cap killed it on the way up. Keep headroom for repository growth; admission
@@ -166,6 +173,181 @@ _genesis_mem_bytes() {  # "8G"/"512M"/"1024K"/"5.5G"/bytes -> bytes on stdout, o
                 || printf '%s' "$(( ${v%[Kk]} * 1024 ))" ;;
         *) printf '%s' "$v" ;;
     esac
+}
+
+# Resolve this process's memory-controller hierarchy from the two proc files
+# that define it. /proc/self/cgroup paths are relative to the process's cgroup
+# namespace root; mountinfo field 4 names the filesystem root exposed at field
+# 5. A host-relative membership can still include field 4, so accept both
+# representations and map them to the same visible mount.
+_genesis_cgroup_memory_resolve() {
+    local selfcg="${CODE_INTEL_CGROUP_SELF:-/proc/self/cgroup}"
+    local mountinfo="${CODE_INTEL_CGROUP_MOUNTINFO:-/proc/self/mountinfo}"
+    local line controllers v1_rel="" v2_rel=""
+    _GENESIS_CGROUP_ERROR=""
+    _GENESIS_CGROUP_VERSION=""
+    _GENESIS_CGROUP_MOUNT=""
+    _GENESIS_CGROUP_REL=""
+    _GENESIS_CGROUP_LIMIT_FILE=""
+
+    if [ ! -r "$selfcg" ]; then
+        _GENESIS_CGROUP_ERROR="cannot read the process cgroup membership"
+        return 1
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            0::*) v2_rel="${line#0::}" ;;
+            *:*:*)
+                controllers="${line#*:}"
+                controllers="${controllers%%:*}"
+                case ",$controllers," in
+                    *,memory,*) v1_rel="${line#*:*:}" ;;
+                esac
+                ;;
+        esac
+    done < "$selfcg"
+    case "$v1_rel" in *" (deleted)") v1_rel="${v1_rel% (deleted)}" ;; esac
+    case "$v2_rel" in *" (deleted)") v2_rel="${v2_rel% (deleted)}" ;; esac
+
+    if [ -z "$v1_rel" ] && [ -z "$v2_rel" ]; then
+        _GENESIS_CGROUP_ERROR="cannot find a memory-controller membership"
+        return 1
+    fi
+    if [ ! -r "$mountinfo" ]; then
+        _GENESIS_CGROUP_ERROR="cannot read mountinfo for the memory controller"
+        return 1
+    fi
+
+    local left right fs_type super_opts mount_root mount_point rel
+    local -a left_fields right_fields
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in *" - "*) ;; *) continue ;; esac
+        left="${line%% - *}"
+        right="${line#* - }"
+        read -r -a left_fields <<< "$left"
+        read -r -a right_fields <<< "$right"
+        [ "${#left_fields[@]}" -ge 6 ] || continue
+        [ "${#right_fields[@]}" -ge 3 ] || continue
+        mount_root="${left_fields[3]}"
+        mount_point="${left_fields[4]}"
+        fs_type="${right_fields[0]}"
+        super_opts="${right_fields[2]}"
+
+        if [ -n "$v1_rel" ]; then
+            [ "$fs_type" = "cgroup" ] || continue
+            case ",$super_opts," in *,memory,*) ;; *) continue ;; esac
+            rel="$v1_rel"
+            _GENESIS_CGROUP_VERSION="v1"
+            _GENESIS_CGROUP_LIMIT_FILE="memory.limit_in_bytes"
+        else
+            [ "$fs_type" = "cgroup2" ] || continue
+            rel="$v2_rel"
+            _GENESIS_CGROUP_VERSION="v2"
+            _GENESIS_CGROUP_LIMIT_FILE="memory.max"
+        fi
+
+        mount_root="${mount_root//\\040/ }"
+        mount_root="${mount_root//\\011/$'\t'}"
+        mount_root="${mount_root//\\012/$'\n'}"
+        mount_root="${mount_root//\\134/\\}"
+        mount_point="${mount_point//\\040/ }"
+        mount_point="${mount_point//\\011/$'\t'}"
+        mount_point="${mount_point//\\012/$'\n'}"
+        mount_point="${mount_point//\\134/\\}"
+        case "$mount_root:$mount_point:$rel" in /*:/*:/*) ;; *) continue ;; esac
+        case "/${mount_root#/}/:/${mount_point#/}/:/${rel#/}/" in
+            *"/../"*|*"/./"*) continue ;;
+        esac
+
+        if [ "$mount_root" != "/" ]; then
+            if [ "$rel" = "$mount_root" ]; then
+                rel="/"
+            else
+                case "$rel" in "$mount_root"/*) rel="${rel#"$mount_root"}" ;; esac
+            fi
+        fi
+        [ "$rel" = "/" ] && rel=""
+        _GENESIS_CGROUP_MOUNT="$mount_point"
+        _GENESIS_CGROUP_REL="$rel"
+        return 0
+    done < "$mountinfo"
+
+    _GENESIS_CGROUP_ERROR="cannot resolve the mounted memory-controller hierarchy"
+    return 1
+}
+
+_genesis_cgroup_memory_ceiling() {
+    _GENESIS_CGROUP_LIMIT_BYTES=""
+    _GENESIS_CGROUP_LIMIT_DIR=""
+    _GENESIS_CGROUP_FINITE_DIRS=()
+    _GENESIS_CGROUP_FINITE_LIMITS=()
+    _genesis_cgroup_memory_resolve || return 1
+
+    local dir="${_GENESIS_CGROUP_MOUNT}${_GENESIS_CGROUP_REL}"
+    local file value value_len
+    while :; do
+        file="$dir/$_GENESIS_CGROUP_LIMIT_FILE"
+        if [ ! -e "$file" ] \
+            && [ "$_GENESIS_CGROUP_VERSION" = "v2" ] \
+            && [ "$dir" = "$_GENESIS_CGROUP_MOUNT" ]; then
+            # The kernel exposes memory.max only on non-root cgroups. This is
+            # authoritative only after mountinfo proved this is the cgroup2
+            # mount root; a missing hierarchy or a missing child file is not
+            # "unlimited".
+            :
+        elif [ ! -r "$file" ]; then
+            _GENESIS_CGROUP_ERROR="cannot read $file"
+            return 1
+        else
+            value=""
+            read -r value < "$file" 2>/dev/null || true
+            case "$value" in
+                max)
+                    if [ "$_GENESIS_CGROUP_VERSION" != "v2" ]; then
+                        _GENESIS_CGROUP_ERROR="invalid v1 limit in $file"
+                        return 1
+                    fi
+                    ;;
+                -1)
+                    if [ "$_GENESIS_CGROUP_VERSION" != "v1" ]; then
+                        _GENESIS_CGROUP_ERROR="invalid v2 limit in $file"
+                        return 1
+                    fi
+                    ;;
+                ''|*[!0-9]*)
+                    _GENESIS_CGROUP_ERROR="malformed memory limit in $file"
+                    return 1
+                    ;;
+                *)
+                    value_len="${#value}"
+                    if [ "$_GENESIS_CGROUP_VERSION" = "v1" ] \
+                        && { [ "$value_len" -gt 16 ] \
+                            || { [ "$value_len" -eq 16 ] \
+                                && [ "$value" -gt 4503599627370496 ]; }; }; then
+                        :
+                    else
+                        _GENESIS_CGROUP_FINITE_DIRS+=("$dir")
+                        _GENESIS_CGROUP_FINITE_LIMITS+=("$value")
+                        if [ -z "$_GENESIS_CGROUP_LIMIT_BYTES" ] \
+                            || [ "$value" -le "$_GENESIS_CGROUP_LIMIT_BYTES" ]; then
+                            _GENESIS_CGROUP_LIMIT_BYTES="$value"
+                            _GENESIS_CGROUP_LIMIT_DIR="$dir"
+                        fi
+                    fi
+                    ;;
+            esac
+        fi
+
+        [ "$dir" = "$_GENESIS_CGROUP_MOUNT" ] && break
+        dir="${dir%/*}"
+        case "$dir" in
+            "$_GENESIS_CGROUP_MOUNT"|"$_GENESIS_CGROUP_MOUNT"/*) ;;
+            *)
+                _GENESIS_CGROUP_ERROR="resolved cgroup path escaped its mount"
+                return 1
+                ;;
+        esac
+    done
 }
 
 # The container's own ceiling. cgroup v2 first (what an LXC/Docker limit shows
@@ -299,6 +481,10 @@ CODE_INTEL_SIBLING_RESERVE_BYTES="${CODE_INTEL_SIBLING_RESERVE_BYTES:-$(( 2 * 10
 #: (4.54 GiB). A cap below the working set does not protect anything, it just
 #: relocates the kill, so refuse instead of pretending.
 CODE_INTEL_GITNEXUS_MIN_BYTES="${CODE_INTEL_GITNEXUS_MIN_BYTES:-$(( 4874166272 ))}"
+# MEASURED 2026-09-09: Codebase Memory's clean fast index peaked at roughly
+# 2,836 MiB. A smaller scope repeats the known self-kill instead of protecting
+# the surrounding services.
+CODE_INTEL_CBM_MIN_BYTES="${CODE_INTEL_CBM_MIN_BYTES:-$(( 2836 * 1024 * 1024 ))}"
 
 _genesis_ceiling_b="$(_genesis_mem_ceiling)"
 _genesis_want_b="$(_genesis_mem_bytes "$GITNEXUS_MEM_MAX")"
@@ -614,14 +800,84 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
         _log "codebase-memory-mcp disabled by $CBM_DISABLE_FILE — skipped"
         MISSING="${MISSING}cbm "
     elif command -v codebase-memory-mcp >/dev/null 2>&1; then
-        _log "indexing (codebase-memory-mcp, mode=$MODE): $REPO_PATH"
-        # Flag form (cbm >=0.9): --mode selects the pipeline depth (default here is
-        # fast — no similarity/semantic edges); --persistence writes the shareable
-        # .codebase-memory/graph.db.zst artifact so a wiped cache restores from it
-        # instead of a full 0->100 re-index.
-        MEM_MAX="$CBM_MEM_MAX" _run_with_watchdog cbm codebase-memory-mcp cli index_repository \
-            --repo-path "$REPO_PATH" --mode "$MODE" --persistence "$PERSISTENCE" \
-            && CBM_RAN=1 || _leg_failed
+        CBM_MEM_REFUSE=""
+        _cbm_want_b="$(_genesis_mem_bytes "$CBM_MEM_MAX")"
+        if [ -z "$_cbm_want_b" ]; then
+            CBM_MEM_REFUSE="CODE_INTEL_CBM_MEMORY_MAX='${CBM_MEM_MAX}' is not a parseable memory value"
+        elif [ "$_cbm_want_b" -lt "$CODE_INTEL_CBM_MIN_BYTES" ]; then
+            CBM_MEM_REFUSE="configured cap ${CBM_MEM_MAX} is below the measured $(( CODE_INTEL_CBM_MIN_BYTES / 1024 / 1024 ))M Codebase Memory workload"
+        elif [ "$CBM_MEM_EXPLICIT" != "1" ]; then
+            _cbm_ceiling_b=""
+            if [ -n "${CODE_INTEL_MEM_CEILING_BYTES:-}" ]; then
+                if [[ "$CODE_INTEL_MEM_CEILING_BYTES" =~ ^[0-9]+$ ]] \
+                    && [ "$CODE_INTEL_MEM_CEILING_BYTES" -gt 0 ]; then
+                    _cbm_ceiling_b="$CODE_INTEL_MEM_CEILING_BYTES"
+                else
+                    CBM_MEM_REFUSE="CODE_INTEL_MEM_CEILING_BYTES is not a positive integer"
+                fi
+            elif _genesis_cgroup_memory_ceiling; then
+                _cbm_ceiling_b="$_GENESIS_CGROUP_LIMIT_BYTES"
+            else
+                CBM_MEM_REFUSE="$_GENESIS_CGROUP_ERROR"
+            fi
+
+            if [ -z "$CBM_MEM_REFUSE" ] && [ -n "$_cbm_ceiling_b" ]; then
+                _cbm_live_b="${CODE_INTEL_MEM_CURRENT_BYTES:-}"
+                _cbm_spare_b=""
+                if [ -z "$_cbm_live_b" ] && [ "${#_GENESIS_CGROUP_FINITE_DIRS[@]}" -gt 0 ]; then
+                    for _cbm_i in "${!_GENESIS_CGROUP_FINITE_DIRS[@]}"; do
+                        _cbm_dir="${_GENESIS_CGROUP_FINITE_DIRS[$_cbm_i]}"
+                        _cbm_limit_b="${_GENESIS_CGROUP_FINITE_LIMITS[$_cbm_i]}"
+                        case "$_GENESIS_CGROUP_VERSION" in
+                            v1) _cbm_current_file="$_cbm_dir/memory.usage_in_bytes" ;;
+                            *) _cbm_current_file="$_cbm_dir/memory.current" ;;
+                        esac
+                        _cbm_stat_file="$_cbm_dir/memory.stat"
+                        _cbm_raw_b=""
+                        if [ -r "$_cbm_current_file" ]; then
+                            read -r _cbm_raw_b < "$_cbm_current_file" 2>/dev/null || _cbm_raw_b=""
+                        fi
+                        if [[ ! "$_cbm_raw_b" =~ ^[0-9]+$ ]]; then
+                            CBM_MEM_REFUSE="cannot read current memory usage from $_cbm_current_file"
+                            break
+                        fi
+                        _cbm_working_b="$(_genesis_mem_working_set_from "$_cbm_raw_b" "$_cbm_stat_file")"
+                        _cbm_candidate_b=$(( _cbm_limit_b - _cbm_working_b - CODE_INTEL_SIBLING_RESERVE_BYTES ))
+                        if [ -z "$_cbm_spare_b" ] || [ "$_cbm_candidate_b" -lt "$_cbm_spare_b" ]; then
+                            _cbm_spare_b="$_cbm_candidate_b"
+                        fi
+                    done
+                else
+                    _cbm_claimed_b="$CODE_INTEL_SIBLING_RESERVE_BYTES"
+                    if [[ "$_cbm_live_b" =~ ^[0-9]+$ ]]; then
+                        _cbm_claimed_b=$(( _cbm_live_b + CODE_INTEL_SIBLING_RESERVE_BYTES ))
+                    fi
+                    _cbm_spare_b=$(( _cbm_ceiling_b - _cbm_claimed_b ))
+                fi
+                if [ -n "$CBM_MEM_REFUSE" ]; then
+                    :
+                elif [ "$_cbm_spare_b" -lt "$CODE_INTEL_CBM_MIN_BYTES" ]; then
+                    CBM_MEM_REFUSE="the binding cgroup leaves $(( _cbm_spare_b / 1024 / 1024 ))M after live usage and reserve, below the measured $(( CODE_INTEL_CBM_MIN_BYTES / 1024 / 1024 ))M workload"
+                elif [ "$_cbm_spare_b" -lt "$_cbm_want_b" ]; then
+                    CBM_MEM_MAX="$_cbm_spare_b"
+                fi
+            fi
+        fi
+
+        if [ -n "$CBM_MEM_REFUSE" ]; then
+            _log "SKIP cbm: $CBM_MEM_REFUSE"
+            _log "      set CODE_INTEL_CBM_MEMORY_MAX explicitly only when the install's safe cap is known"
+            MISSING="${MISSING:+$MISSING }cbm"
+        else
+            _log "indexing (codebase-memory-mcp, mode=$MODE): $REPO_PATH"
+            # Flag form (cbm >=0.9): --mode selects the pipeline depth (default here is
+            # fast — no similarity/semantic edges); --persistence writes the shareable
+            # .codebase-memory/graph.db.zst artifact so a wiped cache restores from it
+            # instead of a full 0->100 re-index.
+            MEM_MAX="$CBM_MEM_MAX" _run_with_watchdog cbm codebase-memory-mcp cli index_repository \
+                --repo-path "$REPO_PATH" --mode "$MODE" --persistence "$PERSISTENCE" \
+                && CBM_RAN=1 || _leg_failed
+        fi
     else
         _log "codebase-memory-mcp not on PATH — skipped"
         MISSING="${MISSING}cbm "
