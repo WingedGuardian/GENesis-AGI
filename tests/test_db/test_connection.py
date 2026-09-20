@@ -19,7 +19,14 @@ async def sconn():
     await raw.commit()
     conn = SerializedConnection(raw)
     yield conn
-    await raw.close()
+    # Close the LIVE connection, not just the one handed in. `_conn` is
+    # replaced when the proxy quarantines and reconnects, so closing `raw`
+    # alone can leave the real one open — its aiosqlite worker thread then
+    # outlives the event loop and raises "Event loop is closed" from a
+    # teardown nobody is watching.
+    for handle in {id(raw): raw, id(conn._conn): conn._conn}.values():
+        with contextlib.suppress(Exception):
+            await handle.close()
 
 
 async def test_basic_execute_and_commit(sconn):
@@ -728,6 +735,14 @@ async def test_a_failed_rollback_quarantines_the_connection(tmp_path):
             await tx.execute("INSERT INTO t (id) VALUES (1)")
             raise ValueError("body blew up")
     assert conn._conn is replacement
+    # Both handles are closed because this test builds them itself rather than
+    # taking the fixture. Left open, each keeps an aiosqlite WORKER THREAD
+    # alive past the event loop and raises "Event loop is closed" from teardown
+    # — a warning attributed to whichever test happens to run last, which is
+    # why it stayed invisible until an unrelated change shifted the ordering.
+    for handle in (raw, replacement):
+        with contextlib.suppress(Exception):
+            await handle.close()
 
 
 async def test_a_failed_begin_still_allows_reconnection(tmp_path, monkeypatch):
@@ -769,3 +784,156 @@ async def test_a_failed_begin_still_allows_reconnection(tmp_path, monkeypatch):
             pass  # pragma: no cover
     assert reconnected
     assert conn._conn is replacement
+    for handle in (raw, replacement):  # see the note in the test above
+        with contextlib.suppress(Exception):
+            await handle.close()
+
+
+# ---------------------------------------------------------------------------
+# The transaction guard is SQLite's own AUTHORIZER, not a SQL-verb parser.
+#
+# Codex P1 x2, PR #1881: the wrapper forwarded aiosqlite's `Cursor.connection`,
+# so `await cur.connection.commit()` bypassed every guard; and the verb parser
+# mis-lexed prefixes SQLite accepts — `"; COMMIT"` is an empty statement then a
+# COMMIT, and a BOM after whitespace or a comment is skipped by SQLite but not
+# by a one-shot `lstrip`. Both are one class: a hand-rolled predicate that does
+# not match the real semantics of the thing it guards, over an OPEN set of
+# spellings, which is why each round produced another one.
+#
+# MEASURED before this change: SQLite's authorizer denies all of them by ACTION
+# (SQLITE_TRANSACTION, SQLITE_SAVEPOINT) — including the C-level
+# `Connection.commit()`, which no amount of SQL inspection can ever see.
+# ---------------------------------------------------------------------------
+
+
+async def test_the_guard_survives_a_failing_body(sconn):
+    """THE catastrophic failure mode, tested first and deliberately.
+
+    The guard is per-CONNECTION state on a SHARED connection. If a body raises
+    and the guard is not removed, every later caller inherits a connection that
+    can never commit — far worse than the bypass it prevents. The disarm has to
+    hold on the error path, not only the happy one.
+    """
+    with contextlib.suppress(RuntimeError):
+        async with sconn.transaction():
+            await sconn.execute("INSERT INTO t VALUES (1, 'x')")
+            raise RuntimeError("body blew up")
+    await sconn.execute("INSERT INTO t VALUES (2, 'after')")
+    await sconn.commit()
+    cur = await sconn.execute("SELECT val FROM t WHERE id = 2")
+    assert (await cur.fetchone())["val"] == "after"
+
+
+async def test_the_reachable_commit_hatch_is_closed(sconn):
+    """The escape hatch that ACTUALLY fires, and it is not the one reported.
+
+    Codex P1 named `await cur.connection.commit()`. MEASURED: that vector is
+    inert today — aiosqlite's `Cursor.connection` returns the RAW
+    `sqlite3.Connection`, which is thread-affine, so touching it from the event
+    loop raises `ProgrammingError` before any guard is consulted. Pinned
+    separately below, because it is an ACCIDENTAL defence.
+
+    The reachable one is the aiosqlite connection itself: MEASURED
+    `await sconn._conn.commit()` SUCCEEDED mid-transaction and ended the unit.
+    The authorizer denies it, and the assertion below matches "not authorized"
+    rather than a bare `DatabaseError` on purpose — `DatabaseError` would also
+    be satisfied by the thread-affinity error, i.e. by the guard doing nothing.
+    """
+    async with sconn.transaction():
+        await sconn.execute("INSERT INTO t VALUES (1, 'kept')")
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            await sconn._conn.commit()
+    cur = await sconn.execute("SELECT val FROM t WHERE id = 1")
+    assert (await cur.fetchone())["val"] == "kept", "the unit still committed once"
+
+
+async def test_the_raw_cursor_connection_vector_is_inert_by_thread_affinity(sconn):
+    """Pin an ACCIDENTAL defence so a later change cannot open it in silence.
+
+    Nothing in this module blocks `cur.connection`; SQLite's own thread check
+    does, because the object is the raw `sqlite3.Connection` and aiosqlite runs
+    it on a worker thread. That is not a guard — it is a property of a default
+    (`check_same_thread`) that someone could reasonably flip while tuning
+    performance, with no test objecting. This is that test.
+    """
+    async with sconn.transaction():
+        cur = await sconn.execute("SELECT 1")
+        raw = cur.connection
+        assert isinstance(raw, sqlite3.Connection), (
+            "if this becomes the aiosqlite Connection, the thread check no longer "
+            "applies and this vector needs the authorizer instead"
+        )
+        with pytest.raises(sqlite3.ProgrammingError, match="same thread"):
+            raw.commit()
+
+
+@pytest.mark.parametrize(
+    ("label", "sql", "caught_by"),
+    [
+        # The parser reads these correctly, so the caller gets its MESSAGE,
+        # which names the remedy. That is the only thing the parser is for now.
+        ("plain", "COMMIT", "parser"),
+        ("bom-at-zero", "﻿COMMIT", "parser"),
+        ("comment-first", "/*c*/ COMMIT", "parser"),
+        ("rollback", "ROLLBACK", "parser"),
+        ("begin", "BEGIN", "parser"),
+        ("savepoint", "SAVEPOINT sp", "parser"),
+        ("release", "RELEASE sp", "parser"),
+        # The parser MISSES these and always will — `"; COMMIT"` is an empty
+        # statement so it reads no verb at all, and SQLite skips a BOM after
+        # whitespace where a one-shot `lstrip` cannot. MEASURED: both reached
+        # the database before the authorizer existed. (Codex P1, PR #1881.)
+        ("empty-statement-first", "; COMMIT", "authorizer"),
+        ("bom-after-space", " ﻿COMMIT", "authorizer"),
+        # SQLITE_SAVEPOINT is a SEPARATE authorizer action from
+        # SQLITE_TRANSACTION, and every other savepoint row above is caught by
+        # the parser — so without a spelling that REACHES the authorizer,
+        # dropping that action code from the deny set would not fail a single
+        # test. MEASURED: denying only SQLITE_TRANSACTION leaves `SAVEPOINT s1`
+        # allowed. This row is what makes the second action code load-bearing.
+        ("empty-statement-then-savepoint", "; SAVEPOINT sp", "authorizer"),
+    ],
+)
+async def test_transaction_control_is_refused_however_it_is_spelled(sconn, label, sql, caught_by):
+    """Two layers with DIFFERENT jobs, and the test pins which one fires.
+
+    The parser is the front door: it produces a message naming the remedy, and
+    it is now ADVISORY — a spelling it misreads is no longer a bypass, which is
+    why its open-set imprecision stopped being a defect instead of needing yet
+    another prefix rule.
+
+    The authorizer is the guard: it refuses by SQLite ACTION after SQLite has
+    lexed the statement, so there is no spelling left to enumerate.
+
+    Asserting the LAYER, not just "refused", is deliberate. A test that only
+    checked for an exception would stay green if the authorizer silently
+    stopped being armed — the parser would cover the seven easy cases and hide
+    it. These two rows are the ones that prove the guard is live.
+    """
+    expected = RuntimeError if caught_by == "parser" else sqlite3.DatabaseError
+    match = "not allowed inside transaction" if caught_by == "parser" else "not authorized"
+    async with sconn.transaction():
+        with pytest.raises(expected, match=match):
+            await sconn.execute(sql)
+
+
+async def test_ordinary_statements_are_untouched_inside_a_transaction(sconn):
+    """Negative control. Without it an authorizer that denied EVERYTHING would
+    pass every test above."""
+    async with sconn.transaction():
+        await sconn.execute("INSERT INTO t VALUES (7, 'ok')")
+        cur = await sconn.execute("SELECT val FROM t WHERE id = 7")
+        assert (await cur.fetchone())["val"] == "ok"
+
+
+async def test_the_guard_is_removed_after_the_block(sconn):
+    """Ordinary commit/rollback must work again once the unit is over — the
+    disarm is what keeps the shared connection reusable."""
+    async with sconn.transaction():
+        await sconn.execute("INSERT INTO t VALUES (1, 'a')")
+    await sconn.execute("INSERT INTO t VALUES (2, 'b')")
+    await sconn.commit()  # would raise if the authorizer were still armed
+    await sconn.execute("INSERT INTO t VALUES (3, 'c')")
+    await sconn.rollback()
+    cur = await sconn.execute("SELECT COUNT(*) AS n FROM t")
+    assert (await cur.fetchone())["n"] == 2

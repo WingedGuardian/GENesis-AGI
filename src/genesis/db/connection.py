@@ -305,6 +305,43 @@ _LEADING_SQL_NOISE = re.compile(r"(?:\s+|--[^\n]*(?:\n|$)|/\*.*?\*/)*", re.S)
 # a conscious, separate decision.
 _TXN_CONTROL_VERBS = frozenset({"begin", "commit", "end", "rollback", "savepoint", "release"})
 
+#: SQLite authorizer action codes for transaction control. These are what the
+#: guard actually enforces; `_TXN_CONTROL_VERBS` above only shapes the error
+#: MESSAGE on the method surface (`commit()`, `rollback()`), where there is no
+#: statement for SQLite to authorize.
+#:
+#: WHY AN AUTHORIZER AND NOT A PARSER. Reading the leading verb means deciding,
+#: in Python, what SQLite will treat as the first statement — and that is an
+#: open set. Each review round produced another spelling it got wrong: a BOM at
+#: byte zero, then `"; COMMIT"` (an empty statement, so the parser read no verb
+#: at all), then a BOM after whitespace or a comment, which `lstrip` cannot
+#: reach. MEASURED: the authorizer refuses every one of those, plus the C-level
+#: `Connection.commit()` that no SQL inspection can see, because it fires on the
+#: ACTION after SQLite itself has lexed the statement. There is no spelling left
+#: to enumerate. (Codex P1 x2, PR #1881.)
+#:
+#: SQLITE_SAVEPOINT is a SEPARATE code from SQLITE_TRANSACTION and is included
+#: deliberately: `_TXN_CONTROL_VERBS` covered savepoint/release, and MEASURED,
+#: denying only SQLITE_TRANSACTION leaves `SAVEPOINT s1` ALLOWED. Dropping that
+#: coverage while deleting the parser would have been a silent narrowing.
+_TXN_AUTHORIZER_DENIED_ACTIONS = frozenset(
+    {
+        sqlite3.SQLITE_TRANSACTION,  # BEGIN / COMMIT / END / ROLLBACK
+        sqlite3.SQLITE_SAVEPOINT,  # SAVEPOINT / RELEASE
+    }
+)
+
+
+def _deny_txn_control(action: int, *_args: Any) -> int:
+    """Authorizer callback: refuse transaction control, allow everything else.
+
+    Runs on aiosqlite's worker thread for every statement SQLite prepares, so it
+    must stay trivial — no I/O, no locks, no logging. A raise here surfaces as a
+    generic authorization failure and would lose the reason, which is why the
+    refusal is a return value rather than an exception.
+    """
+    return sqlite3.SQLITE_DENY if action in _TXN_AUTHORIZER_DENIED_ACTIONS else sqlite3.SQLITE_OK
+
 
 def _leading_sql_verb(sql: str) -> str:
     """The statement's first keyword, lowercased (comments/whitespace skipped);
@@ -929,8 +966,30 @@ class SerializedConnection:
             # BEGIN is not one — claiming earlier would strand the caller on an
             # unhealthy connection that can never recover.
             object.__setattr__(self, "_txn_owner", asyncio.current_task())
+            # ARM the authorizer only now — after BEGIN has landed and ownership
+            # is claimed. Arming earlier would deny our OWN `BEGIN IMMEDIATE`
+            # above (MEASURED: it does), and the retry path re-runs that BEGIN.
+            #
+            # Safe on a SHARED connection because the lock is held for the whole
+            # block: a non-owner awaits it in `_maybe_lock`, and the owner's own
+            # statements are exactly the ones this is here to guard.
+            await self._conn.set_authorizer(_deny_txn_control)
             try:
-                yield self
+                try:
+                    yield self
+                finally:
+                    # DISARM before ANY boundary operation. Commit, rollback and
+                    # the quarantine path all issue transaction control, so an
+                    # armed authorizer would deny the primitive's OWN cleanup —
+                    # turning a recoverable body error into a wedged connection.
+                    #
+                    # In a `finally` around the yield specifically, so the error
+                    # path disarms too. The guard is per-CONNECTION state on a
+                    # SHARED connection: leaving it armed does not fail this
+                    # caller, it fails every LATER one, which is a far worse
+                    # outcome than the bypass it prevents and is why
+                    # `test_the_guard_survives_a_failing_body` is written first.
+                    await self._disarm_txn_authorizer()
                 # COMMIT via the driver method, NOT execute("COMMIT"): under a WAL
                 # post-commit-autocheckpoint SQLITE_BUSY the commit frame is already
                 # durable and in_transaction is False, so _retry_locked's retry of
@@ -958,6 +1017,32 @@ class SerializedConnection:
                 object.__setattr__(self, "_txn_owner", None)
         finally:
             self._lock.release()
+
+    async def _disarm_txn_authorizer(self) -> None:
+        """Remove the transaction guard, and QUARANTINE if it will not come off.
+
+        Failing to disarm is strictly worse than never arming: the authorizer is
+        per-connection state on a SHARED connection, so a stuck guard does not
+        fail this caller — it silently denies every later caller's commit, on a
+        connection that looks healthy. That is the same "a possibly-broken
+        connection must never be handed back" judgement `_rollback_then_
+        quarantine` already makes, so it gets the same answer rather than a log
+        line nobody reads.
+
+        Swallows nothing silently and masks no original error: callers raise
+        their own exception after this returns, exactly as with the rollback
+        path.
+        """
+        try:
+            await self._conn.set_authorizer(None)
+        except Exception:
+            logger.error(
+                "transaction(): could not remove the transaction authorizer — "
+                "quarantining, because a connection that cannot commit must not "
+                "be returned to other callers",
+                exc_info=True,
+            )
+            await self._quarantine_connection()
 
     async def _txn_is_open(self) -> bool:
         """Authoritative open-transaction check after a boundary call's await
@@ -1005,6 +1090,20 @@ class SerializedConnection:
             "transaction(): connection quarantined — a possibly-open transaction "
             "must never be committed by a later caller; closing and reconnecting"
         )
+        await self._quarantine_connection()
+
+    async def _quarantine_connection(self) -> None:
+        """Close the connection and replace it, so a suspect one is never reused.
+
+        Extracted rather than copied: two call sites now need it — a rollback
+        that could not be proven to have landed, and an authorizer that would
+        not come off. Both reach the same conclusion (this connection must not
+        be handed to another caller) and a second inline copy is how the two
+        would drift apart.
+
+        Best-effort throughout, and deliberately so: it runs while an error is
+        already propagating, and raising here would mask the original.
+        """
         try:
             await self._conn.close()
         except Exception:
