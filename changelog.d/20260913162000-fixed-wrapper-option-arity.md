@@ -9,7 +9,11 @@
   itself and the guards examined its first argument instead. Both
   forms run, and both reached a guard that would otherwise have refused them.
   The two wrong entries are gone, and a test re-derives the table from each tool's
-  own documentation on the machine it runs on, so an entry that stops matching
-  reality fails the build rather than going quiet. Replayed against 68,308 real
+  own option parser on the machine it runs on — falling back to its documentation
+  where the parser cannot be read — so an entry that stops matching reality fails
+  the build rather than going quiet. Reading the documentation alone was not
+  enough: one helper accepts an option that its own help text never mentions, and
+  a check that trusted the help would have condemned a correct entry and invited
+  a repair that reopened the hole. Replayed against 68,308 real
   commands from one install's history, 1,744 of which use these helpers: no
   command's reading changed except the ones this fixes.

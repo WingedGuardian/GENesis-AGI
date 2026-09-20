@@ -250,6 +250,74 @@ def _help_text(tool: str) -> str | None:
     return None
 
 
+#: A shell script's `getopt` call IS its option parser; `--help` is prose ABOUT
+#: that parser, and the two can disagree. MEASURED 2026-09-19 against xvfb
+#: 2:21.1.12: the installed `xvfb-run` carries `-w|--wait` in its
+#: `--options +ae:f:hn:lp:s:w:` spec, in its `--long …,wait:` spec and in its
+#: case block, taking a REQUIRED value each time — and documents neither
+#: spelling in `--help`. Checking that row against the help alone failed a
+#: CORRECT entry, which this file's own docstring calls worse than no lock; and
+#: the obvious repair, deleting the row, would have opened the fail-open hole
+#: the table exists to close (`xvfb-run -w 5 <cmd>` resolving `5` as the exe).
+#:
+#: So the parser outranks the prose wherever the parser can be read. This is
+#: also where `_WRAPPER_SPEC["xvfb-run"]` came from in the first place — its
+#: comment says "not from `--help` prose" — so until now the lock was grading
+#: that row against an authority the row had explicitly declined to use.
+_GETOPT_SHORT_AT = re.compile(r"--options[=\s]+\+?-?([A-Za-z0-9:]+)")
+_GETOPT_LONG_AT = re.compile(r"--long(?:options)?[=\s]+([A-Za-z0-9,:_-]+)")
+#: getopt's grammar: no colon takes nothing, one is required, two is optional.
+_ARITY_BY_COLONS = ("zero", "required", "optional")
+
+
+def _getopt_arity(script: str) -> dict[str, str]:
+    """Each option -> arity, read from a shell script's own ``getopt`` spec.
+
+    Returns ``{}`` when the script runs no ``getopt``, so a caller falls back to
+    the help text rather than reading silence as a clean bill of health.
+    """
+    arity: dict[str, str] = {}
+    short = _GETOPT_SHORT_AT.search(script)
+    if short:
+        spec = short.group(1)
+        i = 0
+        while i < len(spec):
+            name, i = spec[i], i + 1
+            colons = 0
+            while i < len(spec) and spec[i] == ":":
+                colons, i = colons + 1, i + 1
+            arity[f"-{name}"] = _ARITY_BY_COLONS[min(colons, 2)]
+    long_spec = _GETOPT_LONG_AT.search(script)
+    if long_spec:
+        for entry in long_spec.group(1).split(","):
+            name = entry.rstrip(":")
+            if name:
+                arity[f"--{name}"] = _ARITY_BY_COLONS[min(len(entry) - len(name), 2)]
+    return arity
+
+
+def _parser_arity(tool: str) -> dict[str, str]:
+    """The tool's own option parser, when it is a readable script running ``getopt``.
+
+    Empty for a builtin, for a tool that is not installed, and for a compiled
+    binary — none of those has a spec to read, and guessing at one would be the
+    hole this lock exists to close.
+    """
+    if tool in _SHELL_BUILTINS:
+        return {}
+    path = shutil.which(tool)
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            head = handle.read(65536)
+    except OSError:
+        return {}
+    if not head.startswith("#!"):
+        return {}
+    return _getopt_arity(head)
+
+
 class TestTableAgreesWithTheToolsThemselves:
     """Re-derive arity from each installed tool and fail on the FAIL-OPEN direction.
 
@@ -270,13 +338,18 @@ class TestTableAgreesWithTheToolsThemselves:
         if help_text is None:
             pytest.skip(f"{tool} is not installed here — arity cannot be measured")
         arity = _documented_arity(help_text)
-        # An option this parser never SAW is reported as unverified, not waved
+        # The tool's OWN parser wins wherever it can be read, because it is what
+        # actually runs; the help is prose about it and can omit an option
+        # entirely (see `_parser_arity`). Empty for every binary and builtin, so
+        # this narrows nothing for the tools that have no spec to read.
+        arity.update(_parser_arity(tool))
+        # An option neither source SAW is reported as unverified, not waved
         # through. Defaulting it to `required` was a hole in the lock itself:
         # `xargs` documents `-0, --null`, a numeric spelling the pattern skipped,
         # so adding that boolean to the table would have passed silently — the
         # exact regression this test exists to prevent, hidden by the test.
         wrong = sorted(
-            (opt, arity.get(opt, "NOT FOUND in --help"))
+            (opt, arity.get(opt, "NOT FOUND in --help or the tool's own getopt spec"))
             for opt in sp._WRAPPER_SPEC[tool][0]
             if arity.get(opt) != "required"
         )
@@ -376,3 +449,51 @@ class TestTableAgreesWithTheToolsThemselves:
         help_text = _help_text("exec")
         assert help_text is not None, "bash help must answer for a builtin"
         assert _documented_arity(help_text).get("-a") == "required"
+
+    def test_the_getopt_reader_separates_all_three_arities(self):
+        """Guard the guard: getopt's colon grammar is the whole contract.
+
+        One colon is a required value, two is optional, none takes nothing —
+        and reading a bare name as value-consuming is the fail-open direction,
+        so all three are pinned rather than only the one that mattered.
+        """
+        arity = _getopt_arity('ARGS=$(getopt --options +ae:f:: --long auto,err:,pad:: -- "$@")')
+        assert arity == {
+            "-a": "zero",
+            "-e": "required",
+            "-f": "optional",
+            "--auto": "zero",
+            "--err": "required",
+            "--pad": "optional",
+        }
+
+    def test_a_script_with_no_getopt_says_nothing_rather_than_passing_everything(self):
+        """An empty reading must not read as agreement.
+
+        If silence meant "fine", the reader would wave through every entry for
+        every script that parses its own argv by hand — the lock would still be
+        green and would be measuring nothing.
+        """
+        assert _getopt_arity("#!/bin/sh\nwhile [ $# -gt 0 ]; do shift; done\n") == {}
+        assert _parser_arity("definitely-not-an-installed-tool-xyz") == {}
+
+    def test_the_parser_outranks_a_help_that_omits_the_option(self):
+        """The defect that sent this lock after a correct entry.
+
+        `xvfb-run` takes `-w`/`--wait` with a REQUIRED value and documents
+        neither in `--help`. Skipped where the tool is absent, because a table
+        asserted about an uninstalled tool is what this lock exists to prevent.
+        """
+        if not shutil.which("xvfb-run"):
+            pytest.skip("xvfb-run is not installed here — the disagreement cannot be measured")
+        spec = _parser_arity("xvfb-run")
+        assert spec.get("-w") == "required", "the getopt spec must carry the short form"
+        assert spec.get("--wait") == "required", "and the long form"
+        help_text = _help_text("xvfb-run")
+        assert help_text is not None
+        documented = _documented_arity(help_text)
+        assert "-w" not in documented and "--wait" not in documented, (
+            "this test pins a DISAGREEMENT between the parser and its prose; if the help "
+            "has since grown the option, the disagreement is gone and so is the need for "
+            "the reader to outrank it here"
+        )
