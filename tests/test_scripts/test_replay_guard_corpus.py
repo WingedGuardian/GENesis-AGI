@@ -2357,7 +2357,16 @@ def test_an_unrenderable_cache_mtime_degrades_instead_of_aborting(cache, rgc, mo
     platform's range raises out of `time.localtime`.
     """
     cache.write_text('["echo one", "/tmp"]\n')
-    os.utime(cache, (2**62, 2**62))
+    # Inject the out-of-range mtime at the stat boundary, not via os.utime:
+    # ext4 silently clamps 2**62 to its ~2446 max, which RENDERS and lands in
+    # the future-mtime branch instead of this one — the utime version was
+    # green only on filesystems that store the value unclamped.
+    class _OutOfRangeStat:
+        st_mtime = 2**62
+
+    monkeypatch.setattr(
+        type(cache), "stat", lambda self, *a, **k: _OutOfRangeStat()
+    )
 
     line = rgc._cache_provenance()
 
