@@ -218,8 +218,17 @@ _genesis_cgroup_memory_resolve() {
         return 1
     fi
 
-    local left right fs_type super_opts mount_root mount_point rel
+    local left right fs_type super_opts mount_root mount_point rel mapped_rel candidate_dir
+    local host_mount="" host_rel="" host_root_len=-1
+    local namespace_mount="" namespace_rel="" namespace_count=0
     local -a left_fields right_fields
+    if [ -n "$v1_rel" ]; then
+        _GENESIS_CGROUP_VERSION="v1"
+        _GENESIS_CGROUP_LIMIT_FILE="memory.limit_in_bytes"
+    else
+        _GENESIS_CGROUP_VERSION="v2"
+        _GENESIS_CGROUP_LIMIT_FILE="memory.max"
+    fi
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in *" - "*) ;; *) continue ;; esac
         left="${line%% - *}"
@@ -237,13 +246,9 @@ _genesis_cgroup_memory_resolve() {
             [ "$fs_type" = "cgroup" ] || continue
             case ",$super_opts," in *,memory,*) ;; *) continue ;; esac
             rel="$v1_rel"
-            _GENESIS_CGROUP_VERSION="v1"
-            _GENESIS_CGROUP_LIMIT_FILE="memory.limit_in_bytes"
         else
             [ "$fs_type" = "cgroup2" ] || continue
             rel="$v2_rel"
-            _GENESIS_CGROUP_VERSION="v2"
-            _GENESIS_CGROUP_LIMIT_FILE="memory.max"
         fi
 
         mount_root="${mount_root//\\040/ }"
@@ -259,18 +264,55 @@ _genesis_cgroup_memory_resolve() {
             *"/../"*|*"/./"*) continue ;;
         esac
 
-        if [ "$mount_root" != "/" ]; then
-            if [ "$rel" = "$mount_root" ]; then
-                rel="/"
-            else
-                case "$rel" in "$mount_root"/*) rel="${rel#"$mount_root"}" ;; esac
+        mapped_rel="$rel"
+        if [ "$mount_root" = "/" ]; then
+            if [ "${#mount_root}" -gt "$host_root_len" ]; then
+                host_mount="$mount_point"
+                host_rel="$mapped_rel"
+                host_root_len="${#mount_root}"
             fi
+            continue
+        elif [ "$rel" = "$mount_root" ]; then
+            mapped_rel="/"
+        elif [[ "$rel" == "$mount_root/"* ]]; then
+            mapped_rel="${rel#"$mount_root"}"
+        else
+            [ "$mapped_rel" = "/" ] && candidate_dir="$mount_point" \
+                || candidate_dir="${mount_point}${mapped_rel}"
+            [ -d "$candidate_dir" ] || continue
+            namespace_count=$(( namespace_count + 1 ))
+            namespace_mount="$mount_point"
+            namespace_rel="$mapped_rel"
+            continue
         fi
-        [ "$rel" = "/" ] && rel=""
-        _GENESIS_CGROUP_MOUNT="$mount_point"
-        _GENESIS_CGROUP_REL="$rel"
-        return 0
+
+        [ "$mapped_rel" = "/" ] && candidate_dir="$mount_point" \
+            || candidate_dir="${mount_point}${mapped_rel}"
+        [ -d "$candidate_dir" ] || continue
+        if [ "${#mount_root}" -gt "$host_root_len" ]; then
+            host_mount="$mount_point"
+            host_rel="$mapped_rel"
+            host_root_len="${#mount_root}"
+        fi
     done < "$mountinfo"
+
+    if [ -n "$host_mount" ]; then
+        _GENESIS_CGROUP_MOUNT="$host_mount"
+        _GENESIS_CGROUP_REL="$host_rel"
+    elif [ "$namespace_count" -eq 1 ]; then
+        _GENESIS_CGROUP_MOUNT="$namespace_mount"
+        _GENESIS_CGROUP_REL="$namespace_rel"
+    elif [ "$namespace_count" -gt 1 ]; then
+        _GENESIS_CGROUP_ERROR="cgroup membership is ambiguous across visible mounts"
+        return 1
+    else
+        _GENESIS_CGROUP_ERROR="cannot resolve the mounted memory-controller hierarchy"
+        return 1
+    fi
+    [ "$_GENESIS_CGROUP_REL" = "/" ] && _GENESIS_CGROUP_REL=""
+    if [ -d "${_GENESIS_CGROUP_MOUNT}${_GENESIS_CGROUP_REL}" ]; then
+        return 0
+    fi
 
     _GENESIS_CGROUP_ERROR="cannot resolve the mounted memory-controller hierarchy"
     return 1
@@ -485,9 +527,11 @@ CODE_INTEL_SIBLING_RESERVE_BYTES="${CODE_INTEL_SIBLING_RESERVE_BYTES:-$(( 2 * 10
 #: relocates the kill, so refuse instead of pretending.
 CODE_INTEL_GITNEXUS_MIN_BYTES="${CODE_INTEL_GITNEXUS_MIN_BYTES:-$(( 4874166272 ))}"
 # MEASURED 2026-09-09: Codebase Memory's clean fast index peaked at roughly
-# 2,836 MiB. A smaller scope repeats the known self-kill instead of protecting
-# the surrounding services.
-CODE_INTEL_CBM_MIN_BYTES="${CODE_INTEL_CBM_MIN_BYTES:-$(( 2836 * 1024 * 1024 ))}"
+# 2,836 MiB RSS. MemoryMax also charges file cache, kernel memory, and the
+# supervising shell, so the safe floor adds a non-RSS allowance to the measured
+# workload instead of treating the RSS peak as a sufficient cgroup ceiling.
+CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES="${CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES:-$(( 128 * 1024 * 1024 ))}"
+CODE_INTEL_CBM_MIN_BYTES="${CODE_INTEL_CBM_MIN_BYTES:-$(( 2836 * 1024 * 1024 + CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES ))}"
 
 GENESIS_MEM_ENV_REFUSE=""
 if [ -n "${CODE_INTEL_MEM_CURRENT_BYTES:-}" ] \
@@ -496,6 +540,8 @@ if [ -n "${CODE_INTEL_MEM_CURRENT_BYTES:-}" ] \
 elif [[ ! "$CODE_INTEL_SIBLING_RESERVE_BYTES" =~ ^[0-9]+$ ]]; then
     GENESIS_MEM_ENV_REFUSE="CODE_INTEL_SIBLING_RESERVE_BYTES is not a nonnegative integer"
 fi
+_GENESIS_CGROUP_FINITE_DIRS=()
+_GENESIS_CGROUP_FINITE_LIMITS=()
 
 _genesis_ceiling_b="$(_genesis_mem_ceiling)"
 _genesis_want_b="$(_genesis_mem_bytes "$GITNEXUS_MEM_MAX")"

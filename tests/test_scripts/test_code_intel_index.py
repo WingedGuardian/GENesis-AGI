@@ -1288,6 +1288,49 @@ def test_cbm_maps_host_relative_v1_membership_against_mount_root(tmp_path):
     assert f"MemoryMax={expected}" in runs[0]
 
 
+def test_cbm_prefers_mount_root_that_contains_host_membership(tmp_path):
+    gib = 1024**3
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    systemd_log = tmp_path / "systemd.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, systemd_log)
+    repo = _make_repo(tmp_path)
+    wrong_mount = tmp_path / "wrong-cgroup2"
+    correct_mount = tmp_path / "correct-cgroup2"
+    (wrong_mount / "tenant" / "session").mkdir(parents=True)
+    (correct_mount / "session").mkdir(parents=True)
+    (wrong_mount / "tenant" / "session" / "memory.max").write_text(f"{5 * gib}\n")
+    (correct_mount / "session" / "memory.max").write_text(f"{8 * gib}\n")
+    self_cgroup = tmp_path / "self.cgroup"
+    self_cgroup.write_text("0::/tenant/session\n")
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        f"35 24 0:31 /other {wrong_mount} rw - cgroup2 cgroup rw\n"
+        f"36 24 0:31 /tenant {correct_mount} rw - cgroup2 cgroup rw\n"
+    )
+
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={
+            "CODE_INTEL_MEM_CEILING_BYTES": "",
+            "CODE_INTEL_MEM_CURRENT_BYTES": str(512 * 1024**2),
+            "CODE_INTEL_CGROUP_SELF": str(self_cgroup),
+            "CODE_INTEL_CGROUP_MOUNTINFO": str(mountinfo),
+        },
+    )
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    runs = [
+        line for line in systemd_log.read_text().splitlines()
+        if "codebase-memory-mcp cli index_repository" in line
+    ]
+    assert len(runs) == 1
+    assert "MemoryMax=4G" in runs[0]
+
+
 def test_cbm_accepts_v1_unlimited_sentinel(tmp_path):
     fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
     systemd_log = tmp_path / "systemd.log"
@@ -1349,6 +1392,55 @@ def test_cbm_explicit_override_skips_unknown_cgroup_but_still_must_be_useful(tmp
     assert "ULIMIT_V:5242880" in log.read_text()
     assert refused.returncode == 3
     assert "below" in refused.stdout and "measured" in refused.stdout
+
+
+def test_cbm_explicit_host_ceiling_initializes_cgroup_state(tmp_path):
+    gib = 1024**3
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    systemd_log = tmp_path / "systemd.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, systemd_log)
+    repo = _make_repo(tmp_path)
+    poison = tmp_path / "does-not-exist"
+
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={
+            "CODE_INTEL_MEM_CEILING_BYTES": str(8 * gib),
+            "CODE_INTEL_MEM_CURRENT_BYTES": "",
+            "CODE_INTEL_CGROUP_SELF": str(poison),
+            "CODE_INTEL_CGROUP_MOUNTINFO": str(poison),
+        },
+    )
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    runs = [
+        line for line in systemd_log.read_text().splitlines()
+        if "codebase-memory-mcp cli index_repository" in line
+    ]
+    assert len(runs) == 1
+    assert "MemoryMax=4G" in runs[0]
+
+
+def test_cbm_rss_peak_is_not_accepted_as_a_safe_scope_cap(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_CBM_MEMORY_MAX": "2900M"},
+    )
+
+    assert res.returncode == 3
+    assert "below" in res.stdout and "2964M" in res.stdout
+    assert not log.exists() or "codebase-memory-mcp ARGS:" not in log.read_text()
 
 
 def test_cbm_no_run_paths_do_not_read_cgroup_metadata(tmp_path):
