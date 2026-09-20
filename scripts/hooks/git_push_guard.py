@@ -2494,6 +2494,234 @@ def _fetch_comments_paged(
     return acc, False
 
 
+#: A single file holding at least this share of a round's scored findings is
+#: reported as CONCENTRATED. Not a threshold anything blocks on — it only decides
+#: whether the report adds the mechanism note, so being approximately right is
+#: enough and no value here can change a verdict.
+_CONCENTRATION_SHARE = 0.5
+
+#: …and below this many findings the share is noise (2 of 3 is 67% and means
+#: nothing). Concentration is a claim about a distribution; a distribution needs
+#: enough points to have a shape.
+_CONCENTRATION_MIN_FINDINGS = 4
+
+
+#: Content budget for one rendered path, and how much of it the tail keeps.
+#: Smaller than the gate-text budget because six of these share one report; the
+#: head still gets 40 characters, which is what keeps two same-basename paths
+#: apart. No second ENCODED budget: nothing expands any more (see below).
+_REPORT_PATH_MAX_CHARS = 80
+_REPORT_PATH_TAIL_CHARS = 40
+#: Width of the identity tag appended when — and ONLY when — the rendering is
+#: lossy. Six hex characters is 16.7M buckets against a table that shows at most
+#: six rows; the job is telling two rows apart, not resisting a preimage attack.
+_REPORT_PATH_DIGEST_CHARS = 6
+
+
+def _safe_report_path(path: str) -> str:
+    """A path rendered safe for a terminal report: defanged, flattened, BOUNDED.
+
+    Composes the primitives this file already uses for every other untrusted
+    value it prints. It does NOT bring its own answer, and the history of it
+    doing so is the reason this docstring is long.
+
+    THE THREE EARLIER VERSIONS ALL ESCAPED WITH ``json.dumps``, and each drew a
+    finding in consecutive review rounds (PR #2005 rounds 1, 2, 3, 4). The cause
+    was not any one of the bugs: it was that ``json.dumps`` is a NON-LINEAR
+    length transform, expanding a non-ASCII or control character six-fold. That
+    forced a second budget on the encoded form, and a two-stage budget loses
+    information in a different way each time you look at it — a front-slice that
+    discarded the basename, then a clip that discarded IDENTITY, so two paths
+    differing only in their leading directory rendered as the same string.
+
+    MEASURED, the three axes that decided this (``premise_probe_2005``):
+
+    ==================  ==========================  ====================
+    axis                ``json.dumps`` renderer     these primitives
+    ==================  ==========================  ====================
+    terminal threats    neutralised                 neutralised, 0/7 residue
+    characters kept     88% / 26% / 44%             100%
+    two paths, one tail identical  (the bug)        distinguishable
+    ==================  ==========================  ====================
+
+    (kept: ASCII / CJK / control-dense. A non-ASCII path lost three quarters of
+    itself to escaping before any budget applied.)
+
+    ``_defang_gate_text`` classifies by unicodedata CATEGORY rather than
+    enumerating codepoints, which is why it holds U+061C and the rest of the
+    bidi family — a lesson that file paid for once already (Codex P2, PR #1638).
+    It is 1:1 on length, so no second budget exists to disagree with the first.
+
+    THE ONE THING IT DOES NOT DO is remove ``\\n``: it splits on newlines to
+    preserve multi-line gate messages. A path is one row, and a newline inside
+    one would forge another, so it is flattened here rather than in the shared
+    primitive, where it would corrupt every other caller.
+
+    Bounding is ``_bound_with_stated_omission`` at the path budget — head AND
+    tail, with the omission counted. Keeping the head is exactly what fixes the
+    identity defect; keeping the tail is what preserves the basename, which is a
+    path's informative end. An earlier docstring claimed the full value was "one
+    row up in the findings list": it is not. Those rows print ``_inline_title``
+    output, which is a title and carries no path, so this rendering is the only
+    one there is and losing information here loses it outright.
+    """
+    rendered = _bound_with_stated_omission(
+        _defang_gate_text(path).replace("\n", " "),
+        _REPORT_PATH_MAX_CHARS,
+        _REPORT_PATH_TAIL_CHARS,
+    )
+    # LOSSY RENDERING DESTROYS IDENTITY, and both transforms above are lossy in
+    # different ways. Defang is many-to-one — `src/a b.py` and `src/a\x1bb.py`
+    # both render `src/a b.py`. The bound drops the MIDDLE — two 90-character
+    # paths sharing a head and a basename produce the same text, the same
+    # omission count and the same tail. Either way the distribution groups by
+    # the RAW path but LABELS by this one, so two real buckets can print as the
+    # same row and the reader cannot tell which file is which.
+    #
+    # Rounds 1-4 of this PR were all one property (length under an expanding
+    # encoding). This is a DIFFERENT one, and it was latent the whole time —
+    # fixing the expansion is what made it visible. Codex and Devin found it
+    # independently at the same head and prescribed the same remedy.
+    #
+    # The equality test is the exact condition, not an approximation of it: if
+    # the rendering is byte-identical to its input then it IS the identifier and
+    # needs nothing. Only a rendering that actually changed something pays for a
+    # tag, so an ordinary path stays clean and the tag never becomes noise the
+    # reader learns to skip.
+    if rendered == path:
+        return rendered
+    # `surrogatepass` because a hash must never raise: paths arrive from JSON and
+    # can carry lone surrogates, which plain utf-8 encoding refuses.
+    digest = hashlib.sha256(path.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"{rendered} [#{digest[:_REPORT_PATH_DIGEST_CHARS]}]"
+
+
+def _findings_distribution(
+    scored_at: list[tuple[str, str]],
+    *,
+    renames: dict[str, str] | None = None,
+    reliable: bool = True,
+) -> str:
+    """Where the SCORED findings LAND, as a report — never a verdict.
+
+    The denominator is `scored_at` and the wording says so, because getting
+    this wrong is the same defect one level up. A scan routinely holds findings
+    that are unresolved and NOT scored — CodeRabbit below-Major, unrecognised
+    review bots, off-diff and documentation-path anchors — so "100% of the
+    unresolved findings" can be printed while unscored findings sit in other
+    files entirely, inviting a class diagnosis from a denominator that never
+    included them. Two earlier wordings were both wrong: "this round's
+    findings" (the scorer accumulates across rounds) and "the unresolved
+    findings" (it counts only the scored subset). Say the narrow thing.
+
+    WHY THE GATE PRINTS THIS AT ALL, including on round one. A list of findings
+    reads as a work queue, so the default response is to answer them one by one;
+    the same findings arranged BY FILE can show something a list cannot — that
+    several of them share one seam and may therefore share one cause. That is
+    information the gate already holds (every finding is parsed with its path, to
+    diff-scope it) and used to discard. Printing it costs nothing and puts the
+    evidence in front of whoever is deciding what to do about the round.
+
+    DELIBERATELY NOT A VERDICT, and the distinction is the whole design. This
+    function states counts and, when one file dominates, names what that MIGHT
+    mean. It never concludes the approach is wrong — one round rarely carries
+    that, and a gate that cried "premise!" at every round would be tuned out
+    within a week, which would cost more than it bought. What it does instead is
+    grant permission explicitly, because the failure this exists for is not that
+    sessions cannot see concentration; it is that answering the findings feels
+    like the whole job and stepping back feels like exceeding the brief.
+
+    Origin, stated because it is the acceptance case: a change whose round-one
+    findings were 8-of-11 in one file, three of them on code written to answer an
+    earlier round, was about to be answered as eleven separate patches. One
+    question from a human — are the premises right? — turned it into a single
+    mechanism change, using facts that were already on the table.
+    """
+    if not scored_at:
+        return ""
+
+    # Findings with no path (outdated anchors, path omitted by the API) count in
+    # the total — they are real findings — but they are NOT a file: four of them
+    # bucketing together proves nothing about a shared seam, so the None bucket
+    # is listed (sorted last) and excluded from the concentration call below.
+    by_file: dict[str | None, list[str]] = {}
+    for severity, path in scored_at:
+        # A file renamed during the PR leaves older comments anchored to its
+        # previous name; fold the alias into the current path before grouping,
+        # or one logical file reads as two and its share is underreported.
+        by_file.setdefault(
+            (renames or {}).get(path, path) or None, []
+        ).append(severity)
+
+    total = len(scored_at)
+    n_files = sum(1 for k in by_file if k is not None)
+    # The pathless bucket sorts LAST unconditionally, not merely as a tiebreak.
+    # As a tiebreak it only lost to files with MORE findings, so five pathless
+    # findings outranked a file with three — and with six real files present the
+    # display cap then elided an actual file to make room for the bucket that is
+    # not a file at all (Devin, PR #2005, round 5). It is listed, because it
+    # holds real findings; it is just never allowed to displace a location.
+    ranked = sorted(
+        by_file.items(),
+        key=lambda kv: (kv[0] is None, -len(kv[1]), kv[0] or ""),
+    )
+    lines = [
+        f"DISTRIBUTION: {total} scored finding(s) across {n_files} file(s)"
+        + ("" if reliable else " — PARTIAL: the scan did not read everything, so this shape is provisional")
+        + " — read as a class before answering as a list:"
+    ]
+    for path, sevs in ranked[:6]:
+        share = 100.0 * len(sevs) / total
+        mix = ", ".join(f"{sevs.count(s)} {s}" for s in ("P1", "P2", "CR") if sevs.count(s))
+        lines.append(
+            f"    {len(sevs):>2} ({share:4.0f}%)  "
+            f"{_safe_report_path(path) if path is not None else '(no path)'}  [{mix}]"
+        )
+    if len(ranked) > 6:
+        # The elided remainder is counted in FILES, and the pathless bucket is
+        # not one — counting rows here would report "2 more file(s)" when one
+        # file and the pathless bucket were dropped. It is also named rather
+        # than silently folded away: it holds real findings, and an omission
+        # nobody declares is the thing the elision marker exists to prevent.
+        elided = ranked[6:]
+        elided_files = sum(1 for path, _ in elided if path is not None)
+        parts = []
+        if elided_files:
+            parts.append(f"{elided_files} more file(s)")
+        if elided_files != len(elided):  # at most one None bucket exists
+            parts.append("the pathless bucket")
+        lines.append(f"    … and {' + '.join(parts)}")
+
+    # The single-seam note needs ONE file that actually dominates: a pathless
+    # bucket is not a file, and a 2–2 tie names a lexicographic winner that does
+    # not exist. No concentration inference at all on a partial read — an
+    # unread page could hold the finding that changes the shape.
+    known_ranked = [(path, sevs) for path, sevs in ranked if path is not None]
+    concentrated = (
+        reliable
+        and bool(known_ranked)
+        and total >= _CONCENTRATION_MIN_FINDINGS
+        and len(known_ranked[0][1]) / total >= _CONCENTRATION_SHARE
+        and (len(known_ranked) == 1 or len(known_ranked[0][1]) > len(known_ranked[1][1]))
+    )
+    if concentrated:
+        top_path, top_sevs = known_ranked[0]
+        lines.append(
+            f"  NOTE: {100.0 * len(top_sevs) / total:.0f}% of the SCORED findings are in ONE "
+            f"file ({_safe_report_path(top_path)}). Findings that concentrate on a single seam — or that land on "
+            "code added to answer an EARLIER round — are a mechanism signal: they often share "
+            "one cause, and fixing the cause retires them together while fixing them "
+            "individually tends to produce the next round's findings."
+        )
+    lines.append(
+        "  Deciding this round is a CLASS rather than a list is part of answering it, not a "
+        "detour from it — and concluding the approach itself is wrong is a legitimate verdict "
+        "that needs nobody's permission. One round is a lead, not a proof: say what THIS "
+        "round's evidence supports, and no more. Method: .claude/docs/premise-check.md"
+    )
+    return "\n".join(lines)
+
+
 def _check_inline_review_findings(
     pr_num: str,
     *,
@@ -2581,6 +2809,11 @@ def _check_inline_review_findings(
     }
     p1: list[str] = []
     p2: list[str] = []
+    # (severity, path) for every finding that SCORES, kept alongside the title
+    # lists so the distribution below can be computed without a second fetch.
+    # The off-diff lists already carry (title, path) tuples for the same reason;
+    # this is that shape applied to the findings that actually count.
+    scored_at: list[tuple[str, str]] = []
     doc_skipped: list[str] = []  # P1s on doc paths — surfaced, never blocking
     doc_skipped_p2: list[str] = []  # P2s on doc paths — surfaced, excluded from score
     cr_block: list[str] = []  # CodeRabbit Critical/Major — 1.0 each
@@ -2688,6 +2921,7 @@ def _check_inline_review_findings(
                     cr_doc_skipped.append(_coderabbit_title(seg))
                     continue
                 cr_block.append(_coderabbit_title(seg))
+                scored_at.append(("CR", c.get("path") or ""))
             continue
         if _INLINE_P1_RE.search(body):
             if c.get("id") in replied_to:
@@ -2707,6 +2941,7 @@ def _check_inline_review_findings(
                 doc_skipped.append(_inline_title(body))
                 continue
             p1.append(_inline_title(body))
+            scored_at.append(("P1", c.get("path") or ""))
         elif _INLINE_P2_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — maintainer consciously accepted the P2
@@ -2722,6 +2957,7 @@ def _check_inline_review_findings(
                 doc_skipped_p2.append(_inline_title(body))
                 continue
             p2.append(_inline_title(body))
+            scored_at.append(("P2", c.get("path") or ""))
         else:
             # The silent-drop CLASS, not just its CodeRabbit instance. A comment
             # that reached this loop was authored by a Bot or an allowlisted review
@@ -2859,7 +3095,14 @@ def _check_inline_review_findings(
             ):
                 outside_seen[key] = severity
     for (path, line_range, title), severity in outside_seen.items():
-        label = f"{title or '(untitled)'} ({path}:{line_range})"
+        # `title` is sanitised at its producer and `line_range` is safe by
+        # construction — `_CR_ENTRY_RE` captures `\d+(?:-\d+)?`, digits and one
+        # hyphen. `path` is neither: `_CR_FILE_HEADER_RE` captures `[^<>]+?`,
+        # which excludes angle brackets and NOTHING ELSE, so a file header can
+        # carry ESC, CR or bidi straight into this label. Rendered at display
+        # time because the raw value is still needed for the diff-scope match
+        # carried alongside it in the tuples below.
+        label = f"{title or '(untitled)'} ({_safe_report_path(path)}:{line_range})"
         if not severity:
             cr_unknown.append(label)
         elif severity == "critical":
@@ -2931,7 +3174,17 @@ def _check_inline_review_findings(
             file=sys.stderr,
         )
         for title, fpath in cr_off_diff[:8]:
-            print(f"  [off-diff CodeRabbit Critical/Major] {title} ({fpath})", file=sys.stderr)
+            # `title` is already safe — `_inline_title` sanitises at the PRODUCER.
+            # A path cannot follow that rule: the raw value is what `_off_diff`
+            # matches against the changed-file list and what the rename map keys
+            # on, so defanging at the producer would corrupt the comparison. It is
+            # therefore rendered at DISPLAY time, here and at every other site
+            # that prints one. See `_safe_report_path`.
+            print(
+                f"  [off-diff CodeRabbit Critical/Major] {title} "
+                f"({_safe_report_path(fpath)})",
+                file=sys.stderr,
+            )
     if off_diff_p1 or off_diff_p2:
         print(
             f"NOTE: PR #{pr_num} — {len(off_diff_p1)} [P1] + {len(off_diff_p2)} "
@@ -2941,9 +3194,9 @@ def _check_inline_review_findings(
             file=sys.stderr,
         )
         for title, fpath in off_diff_p1[:5]:
-            print(f"  [off-diff P1] {title} ({fpath})", file=sys.stderr)
+            print(f"  [off-diff P1] {title} ({_safe_report_path(fpath)})", file=sys.stderr)
         for title, fpath in off_diff_p2[:5]:
-            print(f"  [off-diff P2] {title} ({fpath})", file=sys.stderr)
+            print(f"  [off-diff P2] {title} ({_safe_report_path(fpath)})", file=sys.stderr)
     if cr_unknown:
         print(
             f"NOTE: PR #{pr_num} — {len(cr_unknown)} CodeRabbit finding(s) whose "
@@ -3026,6 +3279,30 @@ def _check_inline_review_findings(
         )
         for title in p2[:8]:
             print(f"  [P2] {title}", file=sys.stderr)
+    # Printed with the findings themselves, not with the verdict, because this is
+    # for whoever is deciding what to do about them — and that decision is made
+    # while reading the list, before any threshold is consulted. Emitted on EVERY
+    # round including the first: one round is a lead rather than a proof, but a
+    # lead nobody is shown is a lead nobody follows.
+    # The report is only as good as the scan behind it: a truncated comment read
+    # or a failed changed-file resolution makes every percentage below a shape
+    # nobody actually measured, so a PARTIAL scan prints counts but never the
+    # concentration inference.
+    # Guarded on `scored_at` rather than leaning on the empty-input early
+    # return inside `_findings_distribution`: Python evaluates arguments BEFORE
+    # the call, so the rename lookup — its own `pulls/N/files` fetch behind its
+    # own cache — would run on every clean PR to build a map for a report that
+    # is never rendered. This path also runs inside the merge hook, which has a
+    # wall-clock deadline, so a fetch for a discarded result is not free.
+    if scored_at:
+        reliable = complete and (not _scope_cache or _scope_cache[0] is not None)
+        distribution = _findings_distribution(
+            scored_at,
+            renames=_pr_rename_map(pr_num, repo=repo),
+            reliable=reliable,
+        )
+        if distribution:
+            print(distribution, file=sys.stderr)
     # The lane is resolved ONLY when there is a score to compare, so a PR with no
     # blocking findings still pays nothing — the same laziness `_scope_cache`
     # above was built for. `_pr_changed_files` is memoized, and the pin-receipt
@@ -4547,6 +4824,7 @@ def _bind_pr_files_cache_head(head: str) -> None:
     global _PR_FILES_CACHE_HEAD
     if head != _PR_FILES_CACHE_HEAD:
         _PR_FILES_CACHE.clear()
+        _PR_RENAME_CACHE.clear()
         _PR_FILES_CACHE_HEAD = head
 
 
@@ -4554,6 +4832,7 @@ def _reset_pr_files_cache() -> None:
     """Drop the memo AND its head binding. For tests; a hook process never needs it."""
     global _PR_FILES_CACHE_HEAD
     _PR_FILES_CACHE.clear()
+    _PR_RENAME_CACHE.clear()
     _PR_FILES_CACHE_HEAD = None
 
 
@@ -4594,6 +4873,17 @@ def _pr_changed_files_uncached(pr_num: str, repo: str | None = None) -> list[str
         except Exception:
             return None
     files: list[str] = []
+    # The rename pairing is KEPT from this parse rather than re-read. It is right
+    # here in the same rows, and discarding it used to cost a second, BYTE-IDENTICAL
+    # `pulls/N/files` call — same endpoint, same --paginate, same --jq, same
+    # _gh_timeout(8) — issued by `_pr_rename_map` purely to recover a field this
+    # loop already has in hand. That second call is what CodeRabbit's Major on PR
+    # #2005 caught the sharp edge of: when changed-file resolution has already
+    # failed, the "separate" lookup is a retry of a command that just failed,
+    # inside the merge deadline. Guarding the retry treats the symptom; not
+    # fetching twice removes it. Published through `_pr_rename_map`, which reads
+    # this cache and never calls out.
+    renames: dict[str, str] = {}
     rows = 0
     for line in (raw or "").splitlines():
         line = line.strip()
@@ -4620,12 +4910,51 @@ def _pr_changed_files_uncached(pr_num: str, repo: str | None = None) -> list[str
             if not isinstance(prev, str) or not prev:
                 return None
             files.append(prev)
+            renames[prev] = fname
     if rows >= 3000:
         # The cap applies to API ROWS, not the expanded path list (renames
         # contribute two paths per row — Codex P2, round 1): at the documented
         # 3000-entry endpoint cap a hook file may be hidden beyond it.
         return None
+    # Published ONLY on the success path, and only after the cap check, so a
+    # truncated or malformed read can never leave a half-built pairing behind for
+    # a later reader to mistake for a complete one. Keyed exactly as the file memo
+    # is, and cleared by the same `_reset_pr_files_cache`.
+    _PR_RENAME_CACHE[(pr_num, repo, os.environ.get("_TEST_GH_PR_FILES"))] = renames
     return files
+
+
+#: previous_filename -> current filename for every file this PR renamed, written
+#: by ``_pr_changed_files_uncached`` as a by-product of the read it already makes.
+#: Advisory data: an absent entry yields an empty map (the report degrades to raw
+#: paths) rather than None, because there is no verdict here to fail closed on.
+#: Keyed and cleared exactly as ``_PR_FILES_CACHE`` is.
+_PR_RENAME_CACHE: dict[tuple[str, str | None, str | None], dict[str, str]] = {}
+
+
+def _pr_rename_map(pr_num: str, repo: str | None = None) -> dict[str, str]:
+    """previous_filename -> filename for this PR's renames, ``{}`` when unknown.
+
+    MAKES NO API CALL OF ITS OWN. It asks ``_pr_changed_files`` — memoized, so
+    free once anything on this merge has asked — and then reads the pairing that
+    read kept. An earlier version issued a second, byte-identical
+    ``pulls/N/files`` request to recover ``previous_filename``, a field the first
+    request had already fetched and thrown away.
+
+    Going through ``_pr_changed_files`` rather than reading the cache directly is
+    what makes this ORDER-INDEPENDENT. Reading the dict alone would return ``{}``
+    whenever this happened to run before the file list was needed — correctness
+    resting on call order, which is the kind of coupling that holds until someone
+    moves a caller.
+
+    The failure direction falls out for free and answers CodeRabbit's Major on PR
+    #2005 at the cause rather than the symptom: when changed-file resolution
+    fails, ``_pr_changed_files`` returns None, nothing was published, and this
+    returns ``{}`` having spent nothing. There is no separate lookup left to skip.
+    """
+    if _pr_changed_files(pr_num, repo=repo) is None:
+        return {}
+    return _PR_RENAME_CACHE.get((pr_num, repo, os.environ.get("_TEST_GH_PR_FILES")), {})
 
 
 def _pr_lane(pr_num: str, repo: str | None = None) -> str:
@@ -9871,6 +10200,42 @@ def _defang_gate_text(text: str) -> str:
     )
 
 
+def _bound_with_stated_omission(
+    text: str,
+    max_chars: int = _GATE_TEXT_MAX_CHARS,
+    tail_chars: int = _GATE_TEXT_TAIL_CHARS,
+) -> str:
+    """Bound one line to *max_chars*, keeping BOTH ends and naming what was cut.
+
+    SELECT, do not amputate. A plain head-slice was silent and cut mid-word:
+    MEASURED on the real codex-at-head message, a 532-char line arrived as 200
+    characters ending "…to merge without a", losing the '# stale-review-override'
+    route it exists to hand the operator, with no marker to say anything had been
+    dropped. A gate that tells someone they are blocked and not how to proceed has
+    failed at the only job the detail line has.
+
+    Keeping the HEAD as well as the tail is what preserves IDENTITY, and that is
+    why this is the right primitive for a file path too. Two paths that differ
+    only in their leading directory — ``services/alpha/…/handler.py`` and
+    ``services/bravo/…/handler.py`` — are distinguishable here and were NOT under
+    the tail-only renderer this replaced (Codex P2, PR #2005, round 4).
+
+    Defaults are the gate-text constants, so ``_sanitize_gate_text``'s three
+    callers are byte-identical to before this was lifted out of it. The body is a
+    pure function of its arguments plus those two constants, which is what made
+    the extraction safe rather than merely plausible.
+
+    NOTE the output may exceed *max_chars* by the marker's own width. That is
+    deliberate: the budget bounds the CONTENT, and a cut that did not announce
+    itself would be the very failure above.
+    """
+    if len(text) <= max_chars:
+        return text
+    kept = max_chars - tail_chars
+    omitted = len(text) - kept - tail_chars
+    return f"{text[:kept]} … {omitted} char(s) omitted … {text[-tail_chars:]}"
+
+
 def _sanitize_gate_text(text: str) -> str:
     """Make an untrusted gate message safe to print, bounded in both dimensions.
 
@@ -9888,22 +10253,8 @@ def _sanitize_gate_text(text: str) -> str:
     removes an operator's recovery instruction without saying it did.
     """
     def _clean(line: str) -> str:
-        cleaned = "".join(" " if _gate_text_unsafe(ch) else ch for ch in line)
-        if len(cleaned) <= _GATE_TEXT_MAX_CHARS:
-            return cleaned
-        # SELECT, do not amputate — the same rule the LINE dimension below already
-        # follows, applied to characters. A plain head-slice was silent and cut
-        # mid-word: MEASURED on the real codex-at-head message, a 532-char line
-        # arrived as 200 characters ending "…to merge without a", losing the
-        # '# stale-review-override' route it exists to hand the operator, with no
-        # marker to say anything had been dropped. A gate that tells someone they
-        # are blocked and not how to proceed has failed at the only job the detail
-        # line has.
-        kept = _GATE_TEXT_MAX_CHARS - _GATE_TEXT_TAIL_CHARS
-        omitted = len(cleaned) - kept - _GATE_TEXT_TAIL_CHARS
-        return (
-            f"{cleaned[:kept]} … {omitted} char(s) omitted … "
-            f"{cleaned[-_GATE_TEXT_TAIL_CHARS:]}"
+        return _bound_with_stated_omission(
+            "".join(" " if _gate_text_unsafe(ch) else ch for ch in line)
         )
 
     lines = [_clean(ln) for ln in text.split("\n")]
