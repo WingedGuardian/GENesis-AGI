@@ -30,8 +30,8 @@ re-reads.
 
 from __future__ import annotations
 
+import ast
 import importlib
-import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -44,7 +44,31 @@ TEMPLATE_DIR = SRC / "genesis/dashboard/templates"
 # visible act — unlike the discovery it would otherwise escape.
 _SEARCH_ROOTS = (SRC / "genesis/dashboard", SRC / "genesis/hosting")
 
-_LINK_MARKER = re.compile(r"""rel=["']?stylesheet""", re.I)
+def _module_emits_link(path: Path) -> bool:
+    """True when the module's source contains a string literal naming a
+    stylesheet — 'stylesheet' as a word inside any constant, however the link
+    tag around it is assembled.
+
+    The regex this replaced matched one SOURCE SPELLING (`rel=["']?stylesheet`),
+    so a page built as `rel = "stylesheet"`, a multi-token rel, or a tag
+    assembled from fragments read as "no emitter" while its page kept serving a
+    vendor sheet no check could see (Codex P2, #2038). Scanning the AST's string
+    constants instead asks the question that actually matters — does this module
+    contain the word at all — which survives every spelling of the markup, at
+    the stated cost of over-matching a module that only *mentions* the word in
+    a docstring; that resolves through the same explicit mapping table, which is
+    the mechanism's job.
+    """
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except SyntaxError:
+        return False
+    return any(
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and "stylesheet" in node.value.lower()
+        for node in ast.walk(tree)
+    )
 
 # module path (relative to src/) -> (import path, symbol) for a page this guard
 # reads, or None for one it deliberately does not, with the reason.
@@ -69,7 +93,7 @@ def _emitters() -> set[str]:
     found: set[str] = set()
     for root in _SEARCH_ROOTS:
         for path in root.rglob("*.py"):
-            if _LINK_MARKER.search(path.read_text(encoding="utf-8", errors="replace")):
+            if _module_emits_link(path):
                 found.add(path.relative_to(SRC).as_posix())
     return found
 

@@ -181,8 +181,8 @@ ROOT = Path(__file__).resolve().parents[2]
 WEBUI = ROOT / "src/genesis/dashboard/webui"
 TEMPLATE_DIR = ROOT / "src/genesis/dashboard/templates"
 
-# Genesis owns /css/*. Everything else a page links is inherited or vendored.
-OWNED_PREFIX = "/css/"
+# Genesis owns /css/* (the resolved path's parent — see `_owned_sheet_text`).
+# Everything else a page links is inherited or vendored.
 
 # Properties whose value decides where a box IS, rather than what it looks like.
 # A wrong colour is visible to whoever wrote it; a wrong `display` moves other
@@ -319,6 +319,11 @@ def _not_applied(attrs: dict[str, str], rel: list[str]) -> str | None:
         return "rel=alternate stylesheet — not applied unless the user picks it"
     if "disabled" in attrs:
         return "disabled"
+    mime = attrs.get("type", "").strip().lower()
+    if mime and mime not in {"text/css", "stylesheet", "text/css;charset=utf-8"}:
+        # `<style type="text/plain">` is a data block, not a sheet — the browser
+        # never parses it, so its declarations cannot answer anything.
+        return f"type={mime}"
     media = attrs.get("media", "").strip().lower()
     if media not in _APPLIES_UNCONDITIONALLY:
         return f"media={media}"
@@ -357,17 +362,29 @@ class _LinkCollector(HTMLParser):
         self.not_applied: list[str] = []
         self._in_style = False
         self._style_attrs: dict[str, str] = {}
+        # Depth inside inert containers. Content inside <template> is parsed
+        # into a document fragment and applies NOTHING until cloned into the
+        # document — a <style> or <link> there can never answer a leak.
+        self._inert_depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         a = {k.lower(): (v or "") for k, v in attrs}
+        if tag == "template":
+            self._inert_depth += 1
+            return
         if tag == "style":
             self._in_style = True
             self._style_attrs = a
+            if self._inert_depth:
+                self.not_applied.append("<style> (inside <template> — inert)")
             return
         if tag != "link":
             return
         rel = a.get("rel", "").lower().split()
         if "stylesheet" not in rel or not a.get("href"):
+            return
+        if self._inert_depth:
+            self.not_applied.append(f"{a['href']} (inside <template> — inert)")
             return
         why = _not_applied(a, rel)
         if why:
@@ -378,10 +395,14 @@ class _LinkCollector(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if tag == "style":
             self._in_style = False
+        elif tag == "template" and self._inert_depth:
+            self._inert_depth -= 1
 
     def handle_data(self, data: str) -> None:
         if not (self._in_style and data.strip()):
             return
+        if self._inert_depth:
+            return  # already named as inert at the start tag
         # THE SAME QUESTION, asked of a `<style>` as of a `<link>`. An earlier
         # version asked it of links only, so `<style media="print">` was recorded
         # as an unconditional answer while the browser applied it nowhere on
@@ -472,9 +493,18 @@ def _normalise(tokens: list) -> str:
             continue
         text = tinycss2.serialize([token])
         # An ident is a TYPE name only when nothing binds it to a class, id or
-        # pseudo. `.Panel` and `#App` keep their case; `DIV` does not.
+        # pseudo. `.Panel` and `#App` keep their case; `DIV` does not — provided
+        # it names an HTML element. ASCII case-insensitivity is a property of the
+        # HTML namespace ONLY: SVG/MathML element names are case-sensitive
+        # (`linearGradient` ≠ `lineargradient`), so folding an ident that is not
+        # a known HTML element name would collide two different foreign elements
+        # (Codex P2, #2038). Unknown mixed-case idents keep their case instead.
         prev = tinycss2.serialize([tokens[i - 1]]) if i else ""
-        if token.type == "ident" and prev not in {".", "#", ":", "::"}:
+        if (
+            token.type == "ident"
+            and prev not in {".", "#", ":", "::"}
+            and (token.lower_value in _HTML_ELEMENTS or token.value.islower())
+        ):
             text = text.lower()
         out.append(text)
     return "".join(out).strip()
@@ -485,6 +515,29 @@ def _is_combinator(token) -> bool:
     return token is not None and token.type == "literal" and token.value in {">", "+", "~"}
 
 
+# Type selectors that ASCII-fold in the HTML namespace. Everything else —
+# `linearGradient`, `feGaussianBlur`, `annotation` — is foreign-namespace and
+# case-SENSITIVE, so it is left alone rather than folded into a different name.
+_HTML_ELEMENTS = frozenset(
+    [
+        "a", "abbr", "address", "area", "article", "aside", "audio", "b", "base",
+        "bdi", "bdo", "blockquote", "body", "br", "button", "canvas", "caption",
+        "cite", "code", "col", "colgroup", "data", "datalist", "dd", "del",
+        "details", "dfn", "dialog", "div", "dl", "dt", "em", "embed",
+        "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3",
+        "h4", "h5", "h6", "head", "header", "hgroup", "hr", "html", "i",
+        "iframe", "img", "input", "ins", "kbd", "label", "legend", "li", "link",
+        "main", "map", "mark", "math", "menu", "meta", "meter", "nav",
+        "noscript", "object", "ol", "optgroup", "option", "output", "p",
+        "picture", "pre", "progress", "q", "rp", "rt", "ruby", "s", "samp",
+        "script", "section", "select", "slot", "small", "source", "span",
+        "strong", "style", "sub", "summary", "sup", "svg", "table", "tbody",
+        "td", "template", "textarea", "tfoot", "th", "thead", "time", "title",
+        "tr", "track", "u", "ul", "var", "video", "wbr",
+    ]
+)
+
+
 # ALLOWLIST, not a denylist of six names. The six-name version missed `:host()`,
 # `:host-context()`, `::slotted()` and `:nth-child(1 of .panel)` — all measured
 # shipping a live `.panel` leak. Polarity flipped for the same reason it was
@@ -493,7 +546,30 @@ def _is_combinator(token) -> bool:
 _TAKES_NO_SELECTOR = frozenset(
     {"lang", "dir", "nth-child", "nth-last-child", "nth-of-type", "nth-last-of-type"}
 )
-_FUNCTIONAL_PSEUDO = re.compile(r"::?([-\w]+)\(([^()]*(?:\([^()]*\)[^()]*)*)\)")
+
+
+def _functional_pseudo_args(selector: str) -> list[tuple[str, list]]:
+    """(lower name, argument tokens) for every functional pseudo in the text.
+
+    A token walk, because the regex this replaced counted parens in SERIALISED
+    text — and a quoted paren inside an attribute value
+    (`:is(.panel[data-slot="("])`) is not a delimiter, so the pattern desynced
+    on it and matched the tail as a selector (Codex P2, #2038). tinycss2 has
+    already resolved the nesting; a function token's `arguments` end where the
+    parser says they end, never where a character count does.
+    """
+    out: list[tuple[str, list]] = []
+    tokens = tinycss2.parse_component_value_list(selector)
+    for i, tok in enumerate(tokens):
+        if tok.type != "function":
+            continue
+        j = i - 1
+        while j >= 0 and tokens[j].type == "whitespace":
+            j -= 1
+        if j < 0 or tokens[j].type != "literal" or tokens[j].value not in {":", "::"}:
+            continue  # a plain function such as `var(…)`, not a pseudo
+        out.append((tok.lower_name, tok.arguments))
+    return out
 
 
 def _embedded_selectors(selector: str) -> list[str]:
@@ -517,14 +593,22 @@ def _embedded_selectors(selector: str) -> list[str]:
     treated as carrying one.
     """
     out: list[str] = []
-    for name, args in _FUNCTIONAL_PSEUDO.findall(selector):
-        lowered = name.lower()
-        if lowered in _TAKES_NO_SELECTOR:
-            if " of " not in args.lower():
+    for name, arg_tokens in _functional_pseudo_args(selector):
+        if name in _TAKES_NO_SELECTOR:
+            # `of S` — S is the selector list AFTER the `of` ident token, not a
+            # substring of the formula; `2n+ofx` cannot fake one.
+            plain = [t for t in arg_tokens if t.type != "whitespace"]
+            for k, t in enumerate(plain):
+                if t.type == "ident" and t.lower_value == "of":
+                    arg_tokens = plain[k + 1 :]
+                    break
+            else:
                 continue
-            args = args.lower().split(" of ", 1)[1]
-        if args.strip():
-            out.append(args.strip())
+        args = tinycss2.serialize(arg_tokens).strip()
+        if args:
+            out.append(args)
+        # Nested pseudos (`:is(:not(.x))`) carry their own selectors.
+        out.extend(_embedded_selectors(args))
     return out
 
 
@@ -791,6 +875,21 @@ def _is_external(href: str) -> bool:
 def _unresolvable(hrefs: list[str]) -> list[str]:
     """Hrefs that should name a file under webui/ and do not."""
     return [h for h in hrefs if not _is_external(h) and _resolve(h) is None]
+
+
+def _owned_sheet_text(href: str) -> str:
+    """The sheet's text when the RESOLVED path is an owned one, else "".
+
+    ONE ownership test for every collector: the resolved file's parent must be
+    webui/css — the same rule `_PageSheets` applies. The cross-page collector
+    used to classify from the href's literal prefix, so `/vendor/../css/x.css`
+    counted as owned there and as foreign in `_PageSheets`, and the two
+    disagreeing lists produced a false clear (Codex P2, #2038).
+    """
+    resolved = _resolve(href)
+    if resolved is None or resolved.parent != (WEBUI / "css"):
+        return ""
+    return resolved.read_text()
 
 
 class _PageSheets:
@@ -1142,15 +1241,7 @@ def test_a_vendor_rule_answered_on_one_page_is_answered_on_every_page():
     answered_somewhere: set[tuple[str, str]] = set()
     for _name, page_html in PAGES:
         for kind, value in _sheets(page_html)[0]:
-            text = (
-                value
-                if kind == "inline"
-                else (
-                    _resolve(value).read_text()
-                    if value.startswith(OWNED_PREFIX) and _resolve(value)
-                    else ""
-                )
-            )
+            text = value if kind == "inline" else _owned_sheet_text(value)
             for sel_key, props in _declarations(text).items() if text else ():
                 for prop, rules in props.items():
                     if prop in LAYOUT_PROPS and any(r["top"] for r in rules):
