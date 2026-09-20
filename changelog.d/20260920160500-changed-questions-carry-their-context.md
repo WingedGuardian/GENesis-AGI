@@ -1,5 +1,3 @@
-### Changed
-
 - A question needing an answer must be asked through the question tool, carry
   the context to answer it, and be **re-asked** if it goes unanswered while it
   still blocks. Two failures were compounding: a prose question in the body of
