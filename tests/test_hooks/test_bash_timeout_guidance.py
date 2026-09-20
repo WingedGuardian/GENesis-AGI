@@ -305,6 +305,47 @@ class TestDeployGuardFiresOnTheDangerousInput:
         out = self._run("systemd-run --user --scope -- bash scripts/update.sh", False)
         assert out.strip(), "guard went silent on --scope, which does not leave the session"
 
+    def test_fires_on_setsid_which_is_not_a_detacher(self):
+        """`setsid` was once on the allowlist. It starts a new SESSION but stays a
+        synchronous child of the Bash call, which still waits on it and still
+        kills it at the 600000ms ceiling — the exact kill this guard exists for."""
+        for cmd in (
+            "setsid bash scripts/update.sh",
+            "setsid -f bash scripts/update.sh",
+        ):
+            out = self._run(cmd, False)
+            assert out.strip(), (
+                f"guard went silent on `{cmd}` — setsid does not leave the "
+                "caller's cgroup or release the Bash call"
+            )
+
+    def test_substring_mentions_of_a_launcher_do_not_exempt(self):
+        """The old `*systemd-run*` / `*--unit*` substring allowlist vouched for a
+        deploy on the strength of TEXT, not a launched process. Every shape below
+        mentions a launcher without executing one."""
+        for cmd in (
+            "bash scripts/update.sh # systemd-run --unit x detaches it",
+            "NOTE=systemd-run CMD2=--unit bash scripts/update.sh",
+            "echo systemd-run --unit u | bash scripts/update.sh",
+            "systemd-run --unit x /bin/true & bash scripts/update.sh",
+            "bash -c 'systemd-run --unit x bash scripts/update.sh'",
+        ):
+            out = self._run(cmd, False)
+            assert out.strip(), (
+                f"guard went silent on `{cmd}` — a launcher that is mentioned or "
+                "non-leading does not detach the deploy"
+            )
+
+    def test_silent_on_unit_long_form(self):
+        """`--unit=name` is a valid systemd-run spelling and must stay quiet —
+        the token check is exact, not a substring."""
+        detached = (
+            "systemd-run --user --collect --unit=genesis-deploy-manual "
+            "--working-directory=$HOME/genesis /bin/bash -c "
+            "'exec ./scripts/update.sh > ~/tmp/d.log 2>&1'"
+        )
+        assert self._run(detached, background=False).strip() == ""
+
     def test_always_exits_zero_even_if_the_caller_exported_errexit(self):
         """`read -d ''` returns non-zero at EOF. bash imports errexit from an
         exported SHELLOPTS, and settings.json spawns this hook as `bash <path>`,

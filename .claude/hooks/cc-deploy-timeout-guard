@@ -15,11 +15,25 @@
 # the reader must DO.
 #
 # POLARITY: ALLOWLIST. A command segment mentioning a deploy script is treated as
-# session-held UNLESS that same segment carries a recognised detaching launcher
-# (`systemd-run … --unit …`, or `setsid`). Anything unrecognised — a new spelling,
-# an abbreviated flag, a form nobody anticipated — FIRES. The previous version was
-# a denylist that blacklisted `--scope`, and systemd's unambiguous-prefix matching
-# (`--scop`, `--sco`, `--sc`) walked straight past it.
+# session-held UNLESS that same segment's FIRST executable token is `systemd-run`
+# carrying a `--unit` flag — the only form measured to leave the caller's session
+# and cgroup. Anything unrecognised — a new spelling, an abbreviated flag, a form
+# nobody anticipated — FIRES. The previous version was a denylist that
+# blacklisted `--scope`, and systemd's unambiguous-prefix matching (`--scop`,
+# `--sco`, `--sc`) walked straight past it.
+#
+# `setsid` was on this allowlist once and is not a detaching launcher: a
+# foreground `setsid bash scripts/update.sh` starts a new session but stays a
+# synchronous child of the Bash call, which still waits on it and still kills it
+# at the 600000ms ceiling — the exact termination this guard exists to prevent.
+# Substring matching is gone for the same reason: `SETSID_NOTE=setsid`, a
+# trailing `# systemd-run --unit x` comment, or `echo systemd-run | bash
+# update.sh` all satisfied `*systemd-run*`/`--unit` text without detaching
+# anything. The check below reads TOKENS — leading VAR=val assignments are
+# skipped, the first real word must be `systemd-run`, and `--unit`/`--unit=…`
+# must appear as a flag token. A launcher hiding inside a quoted string or a
+# non-leading position does not count; that errs toward firing, which is the
+# safe direction for an advisory.
 #
 # `--scope` is NOT a detaching form and is not on the allowlist: MEASURED, a
 # `--scope` child keeps the CALLER'S session id, because a scope is registered for
@@ -52,9 +66,12 @@ case "$CMD" in
     *) exit 0 ;;
 esac
 
-# Split on the shell operators that separate independently-launched commands, then
-# ask of each segment that mentions a deploy script: is THIS segment detached?
-_SEGMENTS=$(printf '%s' "$CMD" | sed 's/&&/\n/g; s/||/\n/g; s/;/\n/g') || _SEGMENTS="$CMD"
+# Split on every operator that starts an independent simple command — && || ; |
+# and bare & — then ask of each segment that mentions a deploy script: is THIS
+# segment detached? `|` and `&` must be in the set: `echo systemd-run | bash
+# update.sh` is one segment under an &&/;/||-only split, so the pipe stage's
+# launcher text would vouch for the deploy it precedes.
+_SEGMENTS=$(printf '%s' "$CMD" | sed 's/&&/\n/g; s/||/\n/g; s/&/\n/g; s/|/\n/g; s/;/\n/g') || _SEGMENTS="$CMD"
 
 _held=0
 while IFS= read -r _seg; do
@@ -62,20 +79,28 @@ while IFS= read -r _seg; do
         *update.sh*|*bootstrap.sh*|*host-setup.sh*) : ;;
         *) continue ;;
     esac
-    # ALLOWLIST: recognised detaching launchers only.
-    case "$_seg" in
-        *setsid*) continue ;;
-    esac
-    case "$_seg" in
-        *systemd-run*)
-            # `--unit` is the flag that makes it a service, i.e. that leaves the
-            # session. Spelled in full on purpose: an abbreviation we do not
-            # recognise falls through and FIRES, which is the safe direction.
-            case "$_seg" in
-                *--unit*) continue ;;
+    # ALLOWLIST, on TOKENS — not substrings. Skip a leading run of VAR=val
+    # assignments; the first real word must be `systemd-run` AND a separate flag
+    # token must be `--unit` or `--unit=…`. A trailing `#`-comment, an env
+    # assignment mentioning a launcher, or a launcher quoted inside `-c '…'` all
+    # fail this check — every miss fires, which is the safe direction.
+    _first=""
+    _has_unit=0
+    _rest="${_seg%%#*}"
+    for _tok in $_rest; do
+        if [ -z "$_first" ]; then
+            case "$_tok" in
+                *=*) continue ;;   # VAR=val assignment word
             esac
-            ;;
-    esac
+            _first="$_tok"
+        fi
+        case "$_tok" in
+            --unit|--unit=*) _has_unit=1 ;;
+        esac
+    done
+    if [ "$_first" = "systemd-run" ] && [ "$_has_unit" -eq 1 ]; then
+        continue
+    fi
     _held=1
 done <<EOF
 $_SEGMENTS
