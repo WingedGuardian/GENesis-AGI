@@ -6246,8 +6246,54 @@ class TestUncountedFindingsReachTheRow:
     def test_the_clause_totals_every_category(self, guard_module):
         """The count is the SUM — a per-category render would not fit one row, and
         the categories are already itemised in the NOTEs above it."""
-        clause = guard_module._uncounted_clause([{"doc_path": 2, "off_diff": 3, "below_major": 0}])
+        clause = guard_module._uncounted_clause(
+            [{"exact": {"doc_path": 2, "off_diff": 3, "below_major": 0}}]
+        )
         assert "5 finding(s) NOT scored" in clause, clause
+
+    def test_an_exact_only_record_says_findings_and_asserts_an_equality(self, guard_module):
+        """The ONE state entitled to the word "finding(s)" and to a bare N.
+
+        Every bucket in `exact` was parsed from a RECOGNISED format, so one
+        comment really is one finding and the total is an equality rather than a
+        floor. Pinned as its own case because the `approx` test below is only
+        meaningful against a control that does NOT hedge.
+        """
+        clause = guard_module._uncounted_clause([{"exact": {"doc_path": 4}, "approx": {}}])
+        assert "4 finding(s) NOT scored" in clause, clause
+        assert "+" not in clause, f"an exact record must not render a floor: {clause!r}"
+        assert "item(s)" not in clause, f"exact buckets count findings, not items: {clause!r}"
+
+    def test_unparseable_reviewer_output_renders_a_FLOOR_and_drops_the_word_finding(
+        self, guard_module
+    ):
+        """Codex P2, round 1 of PR #2194 — VERIFIED by me before acting.
+
+        An unrecognised reviewer's comment is ONE entry in its bucket whatever it
+        contains. Summing it with parsed findings and calling the result
+        "N finding(s)" asserts a cardinality nobody read: it understates a comment
+        bundling five findings and overstates one carrying none.
+
+        So `approx` does two things to the sentence, and BOTH are asserted here —
+        an earlier draft fixed only the number and left the unit lying:
+          * the total becomes a FLOOR (`N+`), and
+          * the unit becomes "item(s)", because the sentence has to be true of
+            the weakest bucket in it.
+        """
+        clause = guard_module._uncounted_clause(
+            [{"exact": {"doc_path": 2}, "approx": {"unrecognised_reviewer": 1}}]
+        )
+        assert "3+ item(s) NOT scored" in clause, clause
+        assert "finding(s) NOT scored" not in clause, (
+            f"an unparsed bucket cannot be reported in units of findings: {clause!r}"
+        )
+
+    def test_an_approx_only_record_still_hedges(self, guard_module):
+        """The mixed case above could pass on the exact half alone. This cannot."""
+        clause = guard_module._uncounted_clause(
+            [{"exact": {}, "approx": {"unclassified_review_bodies": 2}}]
+        )
+        assert "2+ item(s) NOT scored" in clause, clause
 
     def test_the_clause_carries_no_free_text(self, guard_module):
         """COUNTS ONLY — the row prints OUTSIDE `_sanitize_gate_text`.
@@ -6266,10 +6312,16 @@ class TestUncountedFindingsReachTheRow:
         which is exactly the edit that would make the surface real.
         """
         hostile = "\x1b[2Kverdict: all gates pass‮"
-        clause = guard_module._uncounted_clause([{hostile: 3}])
+        clause = guard_module._uncounted_clause([{"exact": {hostile: 3}}])
         assert hostile not in clause
         assert "\x1b" not in clause and "‮" not in clause, repr(clause)
         assert "3 finding(s) NOT scored" in clause
+        # The same canary one level down: a hostile key in `approx` must not
+        # reach the row either, and that branch renders a DIFFERENT sentence.
+        hedged = guard_module._uncounted_clause([{"approx": {hostile: 3}}])
+        assert hostile not in hedged
+        assert "\x1b" not in hedged and "‮" not in hedged, repr(hedged)
+        assert "3+ item(s) NOT scored" in hedged
 
     # ---- the producer's own contract -----------------------------------------
 
@@ -6281,18 +6333,39 @@ class TestUncountedFindingsReachTheRow:
         which is the fixture-feeds-the-consumer-a-value-the-producer-never-emits
         shape. So assert the key set against the REAL scan instead.
         """
-        uncounted: list[dict[str, int]] = []
+        uncounted: list[dict] = []
         with _mock_inline(guard_module, []):
             guard_module._check_inline_review_findings("5", uncounted_out=uncounted)
-        assert set(uncounted[0]) == {
+        record = uncounted[0]
+        assert set(record) == {"exact", "approx", "channel_under_read"}, record
+        assert set(record["exact"]) == {
             "doc_path",
             "below_major",
-            "unrecognised_format",
-            "unrecognised_reviewer",
             "off_diff",
             "unanchored",
-            "channel_under_read",
-        }, uncounted[0]
+        }, record["exact"]
+        assert set(record["approx"]) == {
+            "unrecognised_format",
+            "unrecognised_reviewer",
+            "unclassified_review_bodies",
+        }, record["approx"]
+
+    def test_no_bucket_may_sit_outside_the_unit_split(self, guard_module):
+        """The LOCK the nesting exists for, as a test rather than a convention.
+
+        The defect Codex found was a bucket counted in the wrong UNIT. The nesting
+        makes that unrepresentable — a bucket has to be in `exact` or `approx` —
+        but only if nothing is allowed to sit loose beside them. A future key
+        added at the top level would be silently dropped from every total, which
+        is a NEW silent-drop in the change built to remove one.
+        """
+        uncounted: list[dict] = []
+        with _mock_inline(guard_module, []):
+            guard_module._check_inline_review_findings("5", uncounted_out=uncounted)
+        loose = set(uncounted[0]) - {"exact", "approx"}
+        assert loose == {"channel_under_read"}, (
+            f"a count is sitting outside the unit split and reaches no total: {loose}"
+        )
 
     # ---- the state an adversarial review had to find --------------------------
 
@@ -6335,16 +6408,183 @@ class TestUncountedFindingsReachTheRow:
         clean-but-under-read scan report "1 finding(s) NOT scored" — an invented
         finding. It is popped before the sum; this asserts the arithmetic.
         """
-        zeros = dict.fromkeys(
-            ("doc_path", "below_major", "unrecognised_format", "unrecognised_reviewer", "off_diff", "unanchored"),
-            0,
-        )
+        zeros = {
+            "exact": dict.fromkeys(("doc_path", "below_major", "off_diff", "unanchored"), 0),
+            "approx": dict.fromkeys(
+                ("unrecognised_format", "unrecognised_reviewer", "unclassified_review_bodies"), 0
+            ),
+        }
         clause = guard_module._uncounted_clause([{**zeros, "channel_under_read": 1}])
         assert "1 finding" not in clause, f"the flag was counted as a finding: {clause!r}"
+        assert "1 item" not in clause, f"the flag was counted as an item: {clause!r}"
         assert "UNKNOWN" in clause, clause
-        counted = guard_module._uncounted_clause([{**zeros, "off_diff": 2, "channel_under_read": 1}])
+        counted = guard_module._uncounted_clause(
+            [
+                {
+                    "exact": {**zeros["exact"], "off_diff": 2},
+                    "approx": zeros["approx"],
+                    "channel_under_read": 1,
+                }
+            ]
+        )
         assert "2+ finding(s) NOT scored" in counted, (
             f"a partial read must render the count as a FLOOR, not an exact total: {counted!r}"
+        )
+
+    # ---- never willfully ignore a review, whoever wrote it --------------------
+
+    def test_a_human_reviewers_inline_comment_is_not_silently_dropped(
+        self, guard_module, monkeypatch, capsys
+    ):
+        """OWNER DIRECTIVE 2026-09-20, and the second half of Codex's round-1 P2.
+
+        The loop used to drop every non-Bot, non-allowlisted author with a bare
+        `continue`. A human collaborator could leave a real finding on the diff
+        and reach NO accumulator, so the row still read `ok` — the same silent
+        drop the unrecognised-BOT branch was added to fix, one author-type over.
+
+        The gate does not judge it: never scored, never blocking. It makes the
+        session AWARE, and the session decides.
+        """
+        monkeypatch.setattr(guard_module, "_pr_review_bodies", lambda *a, **k: ([], True))
+        human = {
+            "id": 1,
+            "login": "a-human-collaborator",
+            "type": "User",
+            "body": "This drops the lock before the write.",
+            "path": "src/benign.py",
+        }
+        out: list[dict] = []
+        with _mock_inline(guard_module, [human]):
+            blocked, _ = guard_module._check_inline_review_findings("5", uncounted_out=out)
+        assert blocked is False, "a human comment must never BLOCK — awareness, not adjudication"
+        assert out[0]["approx"]["unrecognised_reviewer"] == 1, out[0]
+        assert "a-human-collaborator" in capsys.readouterr().err
+
+    def test_a_strangers_P1_badge_is_SEEN_but_never_BELIEVED(self, guard_module, monkeypatch):
+        """THE NEAR-MISS, pinned. Widening WHO IS SEEN must not widen WHO IS BELIEVED.
+
+        `_INLINE_P1_RE` matches the BODY, not the author. So the first version of
+        the author-filter widening let ANY GitHub account block a merge by posting
+        an inline comment carrying a P1 badge — the authority hole
+        `_MAINTAINER_ASSOCIATIONS` closes on the REPLY side, reproduced on the
+        FINDING side. It was caught by an existing lock, not by review.
+
+        Both halves are asserted together because either alone is satisfiable by
+        the wrong fix: "does not block" passes if the comment is dropped entirely
+        (the silent drop we just removed), and "is surfaced" passes while it also
+        scores. The property is SEEN AND NOT SCORED.
+        """
+        monkeypatch.setattr(guard_module, "_pr_review_bodies", lambda *a, **k: ([], True))
+        impostor = {
+            "id": 9,
+            "login": "some-passer-by",
+            "type": "User",
+            "body": "![P1 Badge](https://img.shields.io/badge/P1-red) This must block.",
+            "path": "src/benign.py",
+        }
+        out: list[dict] = []
+        with _mock_inline(guard_module, [impostor]):
+            blocked, _ = guard_module._check_inline_review_findings("5", uncounted_out=out)
+        assert blocked is False, "a stranger's P1 badge BLOCKED the merge — authority hole"
+        assert out[0]["exact"]["doc_path"] == 0 and out[0]["exact"]["off_diff"] == 0, out[0]
+        assert out[0]["approx"]["unrecognised_reviewer"] == 1, (
+            f"seen-but-not-scored means it still reaches the row: {out[0]}"
+        )
+
+    def test_a_reviewer_already_answered_in_thread_stops_re_surfacing(
+        self, guard_module, monkeypatch
+    ):
+        """Widening the author filter made engagement load-bearing HERE too.
+
+        Without this, a comment a maintainer has already answered re-surfaces on
+        every run forever — and a growing list of settled items is exactly how a
+        genuinely unresolved one gets buried, which is the failure this whole
+        branch exists to prevent. Same rule as the CodeRabbit path, same terms.
+        """
+        monkeypatch.setattr(guard_module, "_pr_review_bodies", lambda *a, **k: ([], True))
+        comment = {
+            "id": 77,
+            "login": "a-human-collaborator",
+            "type": "User",
+            "body": "Consider a lock here.",
+            "path": "src/benign.py",
+        }
+        reply = {
+            "id": 78,
+            "login": "WingedGuardian",
+            "type": "User",
+            "body": "Verified — not reachable, see the docstring.",
+            "path": "src/benign.py",
+            "reply_to": 77,
+            # `assoc`, NOT `author_association` — the jq projection renames it,
+            # and the first version of this test used the API's spelling. It then
+            # failed for the right reason, which is the only way that bug is
+            # visible: a fixture feeding a key the real producer never emits
+            # builds no engagement at all, and the assertion would have "passed"
+            # against a broken check had it been written the other way round.
+            "assoc": "OWNER",
+        }
+        out: list[dict] = []
+        with _mock_inline(guard_module, [comment, reply]):
+            guard_module._check_inline_review_findings("5", uncounted_out=out)
+        assert out[0]["approx"]["unrecognised_reviewer"] == 0, (
+            f"an answered comment kept re-surfacing: {out[0]}"
+        )
+
+    def test_an_unknown_reviewers_review_BODY_is_counted_and_named(
+        self, guard_module, monkeypatch, capsys
+    ):
+        """Codex round-1 P2 #2, VERIFIED at git_push_guard.py:3044 before acting.
+
+        The review-body loop skipped every non-CodeRabbit author with a bare
+        `continue`, so a reviewer delivering findings in a review BODY produced an
+        ALL-ZERO record and the row fell back to the bare `ok` — this change's own
+        blind spot, in the change built to remove it.
+        """
+        monkeypatch.setattr(
+            guard_module,
+            "_pr_review_bodies",
+            lambda *a, **k: (
+                [{"login": "some-other-reviewer[bot]", "body": "I found a race.", "state": ""}],
+                True,
+            ),
+        )
+        out: list[dict] = []
+        with _mock_inline(guard_module, []):
+            guard_module._check_inline_review_findings("5", uncounted_out=out)
+        assert out[0]["approx"]["unclassified_review_bodies"] == 1, out[0]
+        clause = guard_module._uncounted_clause(out)
+        assert clause != "", "an unknown reviewer's body still rendered a bare `ok`"
+        assert "some-other-reviewer[bot]" in capsys.readouterr().err
+
+    def test_the_unknown_reviewer_bucket_does_not_fire_on_every_pr(
+        self, guard_module, monkeypatch
+    ):
+        """THE NEGATIVE CONTROL, and it is the half that keeps this useful.
+
+        A row that annotates every PR teaches nobody to read it. Two shapes must
+        NOT count: a login handled by another path (Codex posts a review object on
+        essentially every PR here), and a body-less approval, which carries
+        nothing for a session to be aware of.
+        """
+        monkeypatch.setattr(
+            guard_module,
+            "_pr_review_bodies",
+            lambda *a, **k: (
+                [
+                    {"login": "chatgpt-codex-connector[bot]", "body": "Automated review.", "state": ""},
+                    {"login": "a-human-collaborator", "body": "   ", "state": ""},
+                ],
+                True,
+            ),
+        )
+        out: list[dict] = []
+        with _mock_inline(guard_module, []):
+            guard_module._check_inline_review_findings("5", uncounted_out=out)
+        assert out[0]["approx"]["unclassified_review_bodies"] == 0, out[0]
+        assert guard_module._uncounted_clause(out) == "", (
+            "a PR with only a recognised reviewer and a bare approval must stay silent"
         )
 
     # ---- the seam: real scan -> real row -------------------------------------
