@@ -296,9 +296,12 @@ value is a shell syntax error.)
 - **Noninteractive sudo.** `update.sh` calls `bootstrap.sh` unconditionally
   (`update.sh:1660`), and bootstrap calls `sudo`. The no-sudo claim covers only
   `update.sh`'s own text, not its transitive calls. If sudo prompts anywhere on
-  this install, the detached deploy aborts mid-bootstrap. `sudo -n true` must
-  exit 0 — refresh the ticket with `sudo -v` in a real terminal before launching,
-  or run the deploy in that terminal instead.
+  this install, the detached deploy aborts mid-bootstrap. Require NOPASSWD-style
+  sudo: sudo's per-terminal timestamps mean refreshing the credential in your
+  terminal does not authorize the no-TTY calls inside the unit, and a warm
+  cache expires mid-deploy anyway. Check `sudo -n true` from inside the
+  launched unit (or make it the unit's first step); if it fails, run the
+  deploy in a terminal instead.
 
 **`mkdir -p ~/tmp` is part of the command, not tidiness.** `~/tmp` is not
 guaranteed — `install.sh` and `bootstrap.sh` create it only when `/tmp` is small —

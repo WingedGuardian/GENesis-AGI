@@ -250,6 +250,18 @@ class TestDeployAdviceIsDetachment:
                 "session id — naming the flag is not the warning"
             )
 
+    def test_no_surface_prescribes_sudo_dash_v(self):
+        """`sudo -v` in the operator's terminal does not authorize the no-TTY
+        sudo calls a transient unit makes — per-terminal timestamps mean the
+        refresh never reaches the unit's context, and the cache expires
+        mid-deploy regardless. The precondition is NOPASSWD-style sudo checked
+        with `sudo -n` from the unit, so no surface may prescribe `sudo -v`."""
+        for rel, text in _advice_files():
+            assert "sudo -v" not in text, (
+                f"{rel} prescribes sudo -v as the detachment precondition — a "
+                "per-terminal credential refresh cannot cover a no-TTY unit"
+            )
+
     def test_surfaces_warn_that_setsid_does_not_detach(self):
         """MEASURED: `timeout 1 setsid bash -c 'sleep 4; …'` exits 124 with no
         output file. A new session id does not stop a parent from waiting.
