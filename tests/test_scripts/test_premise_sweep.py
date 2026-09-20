@@ -441,3 +441,63 @@ def test_a_spec_that_is_not_an_object_is_rejected_without_a_traceback(tmp_path):
     )
     assert r.returncode == 3
     assert "Traceback" not in r.stderr
+
+
+# ---------------------------------------------------------------- a runaway
+# cell must not take the harness (or the host) down with it
+
+
+def test_a_runaway_cell_is_bounded_and_never_classified(tmp_path):
+    """Unbounded capture is an OOM, not an untidiness.
+
+    `yes` in a cell fills the capture buffer until the OOM killer takes the
+    sweep — and on a swapless host, the machine, where the victim process is
+    not necessarily the guilty one and gets no error. The reader stops at the
+    cap and the cell is reported TRUNCATED.
+
+    TRUNCATED is an outcome, never a category: `_classify` returns the first
+    rule matching anywhere in the text, so a rule that would have matched past
+    the cap is silently missed. Classifying a clipped stream would be a
+    confident wrong answer, which is the one thing this tool may not produce.
+    """
+    spec = _spec(cell="yes good  # {arm}")
+    r = _run(tmp_path, spec, "--cell-timeout", "10")
+    assert r.returncode == 2, "the oracle cannot be measured, so the run is void"
+    assert "TRUNCATED" in r.stdout
+    assert "=== RESULTS ===" not in r.stdout
+
+
+def test_the_bound_holds_in_MEMORY_not_just_in_the_report(tmp_path):
+    """The report saying TRUNCATED proves nothing about what was retained.
+
+    A version that buffered everything and merely LABELLED it truncated would
+    pass the test above while still being the OOM. This measures the harness
+    process's own peak RSS across a cell emitting far more than the cap.
+    """
+    import resource
+
+    spec = _spec(cell="yes good  # {arm}")
+    p = tmp_path / "spec.json"
+    p.write_text(json.dumps(spec), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(_SWEEP), str(p), "--cell-timeout", "10"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    peak_kb = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    assert "TRUNCATED" in proc.stdout
+    assert peak_kb < 300_000, (
+        f"harness peak RSS {peak_kb} KiB — a 1 MiB cap should not need "
+        f"hundreds of MiB, so output is being retained past the bound"
+    )
+
+
+@pytest.mark.parametrize("field", ["decision_rule", "no_pass_disposition", "question"])
+def test_a_pre_registration_field_that_is_EMPTY_is_a_SPEC_error(tmp_path, field):
+    """Present is not supplied. An empty decision rule satisfies a presence
+    check and prints as an empty DECISION RULE line above a real matrix —
+    pre-registration in form and nothing in substance."""
+    r = _run(tmp_path, _spec(**{field: "   "}))
+    assert r.returncode == 3
+    assert "present but empty" in r.stderr

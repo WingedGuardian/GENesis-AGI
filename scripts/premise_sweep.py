@@ -145,6 +145,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -159,7 +160,18 @@ _CELL_TIMEOUT_S = 120
 _RAN = "ran"
 _ERR = "ERR"
 _TIMEOUT = "TIMEOUT"
-_RESERVED_LABELS = frozenset({_ERR, _TIMEOUT})
+_TRUNC = "TRUNCATED"
+_RESERVED_LABELS = frozenset({_ERR, _TIMEOUT, _TRUNC})
+
+#: Hard cap on one cell's captured stdout. A probe is expected to print a line
+#: or two; anything past this is a runaway. Unbounded capture is not merely
+#: untidy — `yes` in a cell fills memory until the OOM killer takes the sweep,
+#: or on a swapless host the whole machine, and the victim gets no error. The
+#: reader stops at the cap and kills the process group rather than growing.
+_MAX_CELL_OUTPUT = 1 << 20
+#: How long to wait for the drain thread after the child is gone. It only ever
+#: has a closed pipe left to notice, so this is a safety net, not a budget.
+_READER_JOIN_S = 5.0
 
 _REQUIRED_KEYS = (
     "question",
@@ -172,6 +184,63 @@ _REQUIRED_KEYS = (
     "decision_rule",
     "no_pass_disposition",
 )
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the cell's whole process group. pgid > 1 is CHECKED, not assumed.
+
+    `killpg(1, ...)` is `kill(-1, ...)` — every process this user owns, which on
+    a container is the session running the sweep. `start_new_session=True` makes
+    pgid == the child pid so the guard should be unreachable; an unreachable
+    branch in front of a whole-container kill is worth its two lines anyway.
+    """
+    with contextlib.suppress(ProcessLookupError, PermissionError, ValueError):
+        pgid = os.getpgid(proc.pid)
+        if pgid > 1:
+            os.killpg(pgid, signal.SIGKILL)
+        else:
+            proc.kill()
+
+
+class _BoundedReader(threading.Thread):
+    """Drain a pipe into a CAPPED buffer, discarding nothing silently.
+
+    A dedicated thread rather than `communicate()`: the cap has to be enforced
+    WHILE the child runs, not after it exits, because the failure being
+    prevented is the buffer growing without limit. On passing the cap it stops
+    accumulating and KILLS the process group immediately rather than letting a
+    firehose burn the whole timeout budget — a runaway probe is already a
+    broken probe, and there is nothing to learn from the next 120 seconds of it.
+    """
+
+    def __init__(self, pipe, proc: subprocess.Popen) -> None:
+        super().__init__(daemon=True)
+        self._pipe = pipe
+        self._proc = proc
+        self._chunks: list[str] = []
+        self._size = 0
+        self.truncated = False
+
+    def run(self) -> None:
+        try:
+            while chunk := self._pipe.read(65536):
+                if self._size < _MAX_CELL_OUTPUT:
+                    self._chunks.append(chunk)
+                    self._size += len(chunk)
+                    continue
+                if not self.truncated:
+                    self.truncated = True
+                    _kill_group(self._proc)
+        except (ValueError, OSError):
+            # The pipe was closed under us by the timeout kill. Whatever was
+            # read before that is still what the cell produced.
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                self._pipe.close()
+
+    def text(self) -> str:
+        return "".join(self._chunks)
 
 
 def _classify(out: str, rules: dict[str, str]) -> str:
@@ -214,26 +283,33 @@ def _run(
         cell,
         shell=True,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
         text=True,
         start_new_session=True,
     )
+    reader = _BoundedReader(proc.stdout, proc)
+    reader.start()
+    timed_out = False
     try:
-        out, _err = proc.communicate(timeout=timeout_s)
+        proc.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired:
-        # pgid > 1 is CHECKED, not assumed. `killpg(1, ...)` is `kill(-1, ...)`
-        # — every process this user owns, which on a container is the session
-        # running the sweep. `start_new_session=True` makes pgid == child pid so
-        # this should be unreachable; an unreachable branch guarding a
-        # whole-container kill is worth its two lines anyway.
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            pgid = os.getpgid(proc.pid)
-            if pgid > 1:
-                os.killpg(pgid, signal.SIGKILL)
-            else:
-                proc.kill()
-        proc.communicate()
+        _kill_group(proc)
+        timed_out = True
+    reader.join(_READER_JOIN_S)
+    # TRUNCATED is reported ahead of TIMEOUT. A firehose cell is killed BY the
+    # reader, so it can present as either depending on which noticed first, and
+    # "your probe emits unbounded output" is the actionable one — the timeout is
+    # a consequence of it, not an independent fact.
+    if reader.truncated:
+        # A probe that emits more than the cap is a broken probe, and its
+        # output CANNOT be classified soundly: `_classify` returns the first
+        # rule matching anywhere in the text, so a rule that would have matched
+        # past the cap is silently missed. Reported as an outcome, never as a
+        # category — the same reason ERR and TIMEOUT are not classifications.
+        return _TRUNC, ""
+    if timed_out:
         return _TIMEOUT, ""
+    out = reader.text()
     if proc.returncode not in ok_exits:
         # A nonzero exit is an ERROR, not a category — even when the cell
         # printed something first. `echo good; exit 42` used to classify as a
@@ -266,6 +342,16 @@ def _spec_problems(spec: Any) -> list[str]:
     if not isinstance(spec, dict):
         return ["spec must be a JSON object"]
     missing = [k for k in _REQUIRED_KEYS if k not in spec]
+    # PRESENT is not the same as SUPPLIED. `"decision_rule": ""` satisfies a
+    # presence check and then prints as an empty DECISION RULE line above a
+    # real matrix, which is pre-registration in form and nothing in substance.
+    blank = [
+        k
+        for k in ("question", "decision_rule", "no_pass_disposition", "predicate", "cell")
+        if k not in missing and (not isinstance(spec[k], str) or not spec[k].strip())
+    ]
+    if blank:
+        problems.append(f"field(s) present but empty or non-string: {sorted(blank)}")
     if missing:
         problems.append(f"missing required field(s): {missing}")
         # `decision_rule` and `no_pass_disposition` are required, not optional
