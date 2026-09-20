@@ -20,6 +20,8 @@ door, that it says what it always said, and that it CANNOT loop.
 from __future__ import annotations
 
 import json
+import sys
+import time
 
 import pytest
 
@@ -315,6 +317,24 @@ def test_a_NOT_ready_verdict_is_not_a_completion_claim(tmp_path, message, should
     assert bool(proc.stdout.strip()) is should_fire, message
 
 
+def test_the_evidence_scan_dedupes_sentences_it_already_checked():
+    """Codex P2, #1840: the per-match scan was quadratic on one long line.
+
+    N evidence phrases on ONE sentence used to recompute the same sentence's
+    bounds and re-scan its qualifiers N times. Deduped by sentence span, the
+    pathological corpus answer is unchanged and arrives in one pass over the
+    distinct sentences.
+    """
+    sys.path.insert(0, str(_SCRIPTS))
+    import genesis_stop_hook
+
+    message = "integration test failed " * 2500
+    start = time.monotonic()
+    answer = genesis_stop_hook._has_verification_evidence(message)
+    assert answer is False
+    assert time.monotonic() - start < 5.0
+
+
 @pytest.mark.parametrize(
     ("message", "should_fire"),
     [
@@ -403,6 +423,11 @@ def test_a_finishing_word_is_matched_WHOLE(tmp_path, message, should_fire):
         ("Ready to merge. The smoke test verified blocked users get a 403.", False),
         # Past-tense recovery ("passed", not only "passes").
         ("Ready to merge. The e2e test failed on the first try, but it passed on re-run.", False),
+        # A recovery rescues an OUTCOME qualifier, never a non-execution one:
+        # a DIFFERENT subject passing does not un-owe the run that never ran
+        # (Codex P2, #1840).
+        ("Ready to merge. The integration test did not run, but unit tests pass.", True),
+        ("Ready to merge. The e2e check did not run this session, but the unit suite is green.", True),
         # A negation cue never silences a NON-EXECUTION qualifier — "No I
         # didn't run it" is an admission, not a closed debt.
         ("Ready to merge. No I didn't run the integration test.", True),

@@ -471,6 +471,19 @@ _VERIFICATION_RECOVERY = re.compile(
     re.IGNORECASE,
 )
 
+# The qualifier families a recovery may rescue. A recovery re-binds an OUTCOME
+# or INABILITY qualifier to the past ("failed initially, but now passes").
+# It must NOT rescue a non-execution qualifier: "the integration test did not
+# run, but unit tests pass" matches a recovery marker while the integration
+# check never ran at all — a different subject's pass erased the admission
+# (Codex P2, #1840). Over-reminding a self-contradictory sentence ("did not
+# run, but now passes") is the safe direction for a reminder hook.
+_RECOVERY_RESCUABLE_QUALIFIER = re.compile(
+    r"^(?:failed|failing|timed\s+out|timeouts?|errored|blocked"
+    r"|could\s?n[o']?t|cannot|can'?t|unable\s+to)\b",
+    re.IGNORECASE,
+)
+
 # Sentence bounds, for scoping the qualifier above. A newline counts: these
 # messages are Markdown, where a list item is a sentence. So does `;`, which
 # joins two clauses that can be about different things ("the first attempt
@@ -505,8 +518,17 @@ def _has_verification_evidence(assistant_message: str) -> bool:
     as often as before it, so "the integration test failed" — the exact case the
     `failed` qualifier was added for — still bought silence.
     """
+    # Deduplicate by sentence before scanning: a pathological message with N
+    # evidence phrases on ONE long line used to recompute the same sentence's
+    # bounds and re-scan its qualifiers N times — quadratic for no reason
+    # (Codex P2, #1840).
+    seen: set[tuple[int, int]] = set()
     for m in _VERIFICATION_EVIDENCE.finditer(assistant_message):
-        left, right = _sentence_around(assistant_message, m.start(), m.end())
+        span = _sentence_around(assistant_message, m.start(), m.end())
+        if span in seen:
+            continue
+        seen.add(span)
+        left, right = span
         sentence = assistant_message[left:right]
         qualifiers = [
             q
@@ -522,11 +544,18 @@ def _has_verification_evidence(assistant_message: str) -> bool:
                 )
             )
         ]
+        if not qualifiers:
+            return True
         # A qualifier with a recovery marker in its sentence is historical
-        # ("failed initially, but now passes") — the evidence stands.
-        if qualifiers and not _VERIFICATION_RECOVERY.search(sentence):
-            continue
-        return True
+        # ("failed initially, but now passes") — the evidence stands. Only an
+        # outcome/inability qualifier can be rescued this way; a non-execution
+        # qualifier in a sentence that merely reports a DIFFERENT subject
+        # passing ("did not run the integration test, but unit tests pass")
+        # still means the verification is owed.
+        if all(
+            _RECOVERY_RESCUABLE_QUALIFIER.match(q.group()) for q in qualifiers
+        ) and _VERIFICATION_RECOVERY.search(sentence):
+            return True
     return False
 
 
