@@ -461,6 +461,26 @@ class TestAuditFindings:
         assert self._touches(command="cat ~/genesis/secrets.*")
         assert self._touches(command="cat ~/genesis/s*.env")
 
+    def test_quoted_bare_name_that_RESOLVES_still_does_not_gate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CodeRabbit Major, #1826: a quoted bare `secrets.env` in a cwd that
+        happens to contain one used to gate anyway — the stat SUCCEEDED, so
+        the basename fallback returned True without consulting `allow_bare`.
+        A mention that resolves is still a mention, not an operand."""
+        (tmp_path / "secrets.env").write_text("DUMMY=1\n")
+        monkeypatch.chdir(tmp_path)
+        assert not self._touches(command='grep -n "secrets.env" notes.md')
+        # The control: the same file as a real bare operand still counts.
+        assert self._touches(command="cat secrets.env")
+
+    def test_a_too_wild_glob_gates_instead_of_walking(self) -> None:
+        """CodeRabbit Major, #1826: iglob walks a deep subtree BETWEEN yields,
+        where neither the hit cap nor the deadline can see it — a walk past
+        the hook timeout is an ALLOW. Patterns beyond two wildcard segments
+        are refused by gating."""
+        assert self._touches(command="cat ~/x*/y*/secrets.*")
+
     # ── M-2: Path.stat raises ValueError, not OSError, on an embedded NUL ────
     def test_nul_byte_does_not_crash_the_hook(self, db: str) -> None:
         """An uncaught exception is exit 1 — a NON-blocking error, so the tool runs."""

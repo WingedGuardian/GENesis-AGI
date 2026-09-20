@@ -117,8 +117,16 @@ def _is_secret_path(raw: str, inodes: set[tuple[int, int]], *, allow_bare: bool 
         if (st.st_dev, st.st_ino) in inodes:
             return True
         # Not one of the known installs, but named like the real thing — a
-        # backup, a second checkout, a copy under another root. Still secrets.
-        return p.name in _SECRET_BASENAMES
+        # backup, a second checkout, a copy under another root. Still secrets —
+        # but only if the token is not a bare name: a separator-less token that
+        # RESOLVES against cwd hits the same ambiguity as the unresolvable case
+        # (a quoted "secrets.env" mention gates when an unrelated secrets.env
+        # sits in the working directory — CodeRabbit Major, #1826). The inode
+        # arm above stays unconditional: it identifies the real file.
+        if p.name not in _SECRET_BASENAMES:
+            return False
+        stripped = raw.rstrip("/")
+        return allow_bare or (os.sep in stripped or stripped.startswith("~"))
     except (OSError, ValueError):
         # Cannot stat: fall back to the NAME, so a path that does not exist yet
         # (a `cp … secrets.env` destination) is still recognised.
@@ -182,6 +190,12 @@ _HEREDOC = re.compile(r"<<-?\s*'?\"?(\w+)'?\"?\n.*?^\s*\1\s*$", re.DOTALL | re.M
 #: the same way everywhere else in this module.
 _GLOB_BUDGET_S = 0.15
 _GLOB_MAX_HITS = 500
+#: A pattern with many wildcard components walks an unbounded subtree BETWEEN
+#: iglob yields — where neither the hit cap nor the deadline can see it — and a
+#: walk past the hook's own timeout is a fail-open ALLOW (CodeRabbit Major,
+#: #1826). The supported relevant globs carry at most one wildcard segment;
+#: two preserves them, anything deeper is refused by gating.
+_GLOB_MAX_WILD_SEGMENTS = 2
 
 
 def _glob_hits_secret(tok: str, inodes: set[tuple[int, int]]) -> bool:
@@ -190,6 +204,9 @@ def _glob_hits_secret(tok: str, inodes: set[tuple[int, int]]) -> bool:
     # This is what keeps `ls /*/*/*/*` off the expensive path entirely.
     if not re.search(r"secret|\.env", tok, re.IGNORECASE):
         return False
+    wild = sum(1 for seg in tok.split(os.sep) if any(ch in seg for ch in "*?["))
+    if wild > _GLOB_MAX_WILD_SEGMENTS:
+        return True  # unwalkable within budget -> GATE
     deadline = time.monotonic() + _GLOB_BUDGET_S
     try:
         for n, hit in enumerate(glob.iglob(os.path.expanduser(tok))):

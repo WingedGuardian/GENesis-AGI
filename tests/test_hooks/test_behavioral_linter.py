@@ -842,3 +842,21 @@ class TestBashAuditFindings:
         cmd = f"rg needle src/\ncurl -X POST {self._ENDPOINT}"
         r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
         assert r.returncode == 2
+
+    def test_input_process_substitution_is_not_a_search(self):
+        """`<(cmd)` runs an arbitrary subcommand as the search's stdin — same
+        class as `find -exec`, reached through `_CHAINS`."""
+        cmd = f"rg needle <(curl -X POST {self._ENDPOINT})"
+        r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        assert r.returncode == 2
+
+    def test_explicit_port_and_embeddings_endpoints_are_blocked(self):
+        """A provider call is still a provider call with an explicit :443, and
+        OpenAI /v1/embeddings spends the same budget a completion does."""
+        for cmd in (
+            "curl -X POST https://api.openai.com:443/v1/responses -d @in.json",
+            "curl -X POST https://api.anthropic.com:443/v1/messages -d @in.json",
+            "curl https://api.openai.com/v1/embeddings -d @in.json",
+        ):
+            r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            assert r.returncode == 2, f"{cmd!r} was not blocked"

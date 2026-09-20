@@ -44,6 +44,7 @@ logging bug becomes a security hole.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import sys
@@ -112,7 +113,14 @@ def _record(action: str, detail: str, session: str) -> bool:
             content_hash=digest,
             origin_class="first_party",
         )
-    except Exception:  # noqa: BLE001 - see docstring: never break the guard
+    except Exception as _obs_exc:  # noqa: BLE001 - see docstring: never break the guard
+        # Swallow the failure, but not SILENTLY: a swallowed write leaves the
+        # operator unable to tell "no new signal" from "the audit row never
+        # landed". stderr only — the hook's verdict is unchanged either way.
+        with contextlib.suppress(Exception):
+            sys.stderr.write(
+                f"needs_user: critical observation write failed ({type(_obs_exc).__name__})\n"
+            )
         return False
 
 

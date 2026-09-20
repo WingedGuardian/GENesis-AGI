@@ -88,13 +88,13 @@ suggestion: >
   service is only cleared by permission that names it.
 
 patterns:
-  - regex: 'openrouter\.ai/api/v\d+/(chat/)?(completions|embeddings)'
+  - regex: 'openrouter\.ai(?::\d+)?/api/v\d+/(chat/)?(completions|embeddings)'
     context: "direct OpenRouter completion/embedding call — must go through a routing call site"
-  - regex: 'api\.mistral\.ai/v\d+/(chat/)?(completions|embeddings)'
+  - regex: 'api\.mistral\.ai(?::\d+)?/v\d+/(chat/)?(completions|embeddings)'
     context: "direct Mistral completion/embedding call — must go through a routing call site"
-  - regex: 'api\.groq\.com/\S*/(chat/)?completions'
+  - regex: 'api\.groq\.com(?::\d+)?/\S*/(chat/)?completions'
     context: "direct Groq completion call — must go through a routing call site"
-  - regex: 'api\.deepinfra\.com/v\d+/(openai/)?(chat/)?(completions|embeddings)'
+  - regex: 'api\.deepinfra\.com(?::\d+)?/v\d+/(openai/)?(chat/)?(completions|embeddings)'
     context: "direct DeepInfra completion/embedding call — must go through a routing call site"
   # Both Gemini and NVIDIA below require an API PATH, not a bare host. They were
   # host-only at first, which is the one shape that cannot distinguish CALLING an
@@ -103,13 +103,13 @@ patterns:
   # severity=block rule. That lands hardest on exactly the audit/review sessions
   # that need to grep for provider usage, and the 5,526-command corpus below did
   # not contain that class — so its 0.217% understates the cost for those.
-  - regex: 'generativelanguage\.googleapis\.com/v\d+\S*:(streamGenerateContent|generateContent|embedContent)'
+  - regex: 'generativelanguage\.googleapis\.com(?::\d+)?/v\d+\S*:(streamGenerateContent|generateContent|embedContent)'
     context: "direct Gemini API call — must go through a routing call site"
-  - regex: 'api\.anthropic\.com/v1/(messages|complete)'
+  - regex: 'api\.anthropic\.com(?::\d+)?/v1/(messages|complete)'
     context: "direct Anthropic API call — must go through a routing call site"
-  - regex: 'api\.openai\.com/v1/(responses|(chat/)?completions)'
+  - regex: 'api\.openai\.com(?::\d+)?/v1/(responses|embeddings|(chat/)?completions)'
     context: "direct OpenAI API call — must go through a routing call site"
-  - regex: 'api\.x\.ai/v1'
+  - regex: 'api\.x\.ai(?::\d+)?/v1'
     context: "direct xAI API call — must go through a routing call site"
-  - regex: 'integrate\.api\.nvidia\.com/v\d+/(chat/)?(completions|embeddings)'
+  - regex: 'integrate\.api\.nvidia\.com(?::\d+)?/v\d+/(chat/)?(completions|embeddings)'
     context: "direct NVIDIA NIM API call — must go through a routing call site"

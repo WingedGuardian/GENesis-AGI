@@ -38,9 +38,37 @@ import sys
 
 # Self-locate so sibling hook modules resolve whether run as a script or imported.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import read_payload, tool_input  # noqa: E402
-from needs_user import decide  # noqa: E402
-from secrets_target import touches_secrets  # noqa: E402
+try:
+    from hook_input import degraded_exit, read_payload, tool_input  # noqa: E402
+except Exception:  # noqa: BLE001 — hook_input itself failed; nothing imports it back.
+    if __name__ != "__main__":
+        raise
+    # Reverse version skew: this guard may be newer than hook_input.py. Fail
+    # closed locally — a bare exit 1 is NON-blocking to Claude Code. See
+    # hook_input.degraded_exit for the fail-open this shape prevents.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (secrets_env_access_guard): shared hook_input could "
+            "not be imported; BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
+
+# DEGRADED-path mention set, bound ABOVE the guarded imports. This guard also
+# fires on Read/Grep/Edit payloads that carry no `command`, and degraded_exit
+# blocks those outright — that is the intended direction: a credentials gate
+# whose helpers are missing must not let file reads through unjudged.
+_DEGRADED_GATED = r"secrets?|\.env"
+
+try:
+    from needs_user import decide  # noqa: E402
+    from secrets_target import touches_secrets  # noqa: E402
+except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
+    if __name__ != "__main__":
+        raise
+    degraded_exit("secrets_env_access_guard", gated=_DEGRADED_GATED, exc=_exc)
 
 #: Fields carrying a path across the tools this hook is wired to. Read/Edit/Write
 #: use `file_path`; Grep uses `path` AND `glob`; NotebookEdit uses

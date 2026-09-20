@@ -43,12 +43,43 @@ import sys
 from fnmatch import fnmatch
 from pathlib import Path
 
-import yaml
-
 # The shared hook-input helper lives in scripts/hooks/; this script runs from
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
-from hook_input import field, read_payload  # noqa: E402
+try:
+    from hook_input import degraded_exit, field, read_payload  # noqa: E402
+except Exception:  # noqa: BLE001 — hook_input itself failed; nothing imports it back.
+    if __name__ != "__main__":
+        raise
+    # Reverse version skew, as in the sibling guards: fail closed locally
+    # because a bare exit 1 is NON-blocking to Claude Code — the linter would
+    # silently stop enforcing. See hook_input.degraded_exit.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (behavioral_linter): shared hook_input could not be "
+            "imported; BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
+
+# DEGRADED-path mention set, bound ABOVE the guarded imports. It mirrors the
+# provider hostnames in config/behavioral_rules/no_raw_provider_calls.yaml — a
+# crude mention match standing in for a rule engine that cannot load; the
+# over-block is the intended direction while the tree is broken.
+_DEGRADED_GATED = (
+    r"api\.(?:openai|anthropic|mistral|groq|deepinfra|x)\.com"
+    r"|openrouter\.ai|generativelanguage\.googleapis\.com"
+    r"|integrate\.api\.nvidia\.com"
+)
+
+try:
+    import yaml  # noqa: E402
+except Exception as _exc:  # noqa: BLE001 — no yaml means NO rules load: same fail-open.
+    if __name__ != "__main__":
+        raise
+    degraded_exit("behavioral_linter", gated=_DEGRADED_GATED, exc=_exc)
 
 _RULES_DIR = Path(__file__).resolve().parent.parent / "config" / "behavioral_rules"
 
@@ -128,9 +159,11 @@ _READ_ONLY_VERBS = frozenset({"rg", "grep", "egrep", "fgrep", "ag", "ack"})
 
 #: Anything that could turn a search into something else. The exemption applies
 #: ONLY to a command with none of these: `rg foo && curl bar` is not a search,
-#: a redirect makes the command WRITE, a heredoc feeds it content, and a line
-#: feed is itself a command separator (`rg x\ncurl y` is two commands).
-_CHAINS = re.compile(r"(&&|\|\||[\n;|`>]|<<|\$\()")
+#: a redirect makes the command WRITE, a heredoc feeds it content, a line
+#: feed is itself a command separator (`rg x\ncurl y` is two commands), and
+#: input process substitution runs an arbitrary subcommand as the search's
+#: stdin (`rg needle <(curl <endpoint>)` — CodeRabbit Major, #1826).
+_CHAINS = re.compile(r"(&&|\|\||[\n;|`>]|<<|<\(|\$\()")
 
 
 def _is_read_only_command(command: str) -> bool:
