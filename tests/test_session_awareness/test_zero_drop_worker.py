@@ -1994,6 +1994,7 @@ async def test_a_failed_retirement_retries_on_a_SHORT_floor_not_the_full_interva
     assert len(await _open_observations(db_path, w.ALERT_SOURCE)) == 1, "still standing"
     record = json.loads(w.last_run_path().read_text())
     assert record["mode"] == "alert", "a failed transition must retain its prior mode"
+    assert record["pending_mode"] == "observe"
     assert record["degraded"]["alert"] == "resolve_failed"
 
     # Within the floor a non-forced trigger waits — the retry is BOUNDED.
@@ -2013,7 +2014,41 @@ async def test_a_failed_retirement_retries_on_a_SHORT_floor_not_the_full_interva
     )
     assert out["status"] != "debounced", "a pending retire must retry, not wait the interval"
     assert await _open_observations(db_path, w.ALERT_SOURCE) == []
-    assert "alert" not in (json.loads(w.last_run_path().read_text())["degraded"] or {})
+    record = json.loads(w.last_run_path().read_text())
+    assert "alert" not in (record["degraded"] or {})
+    assert "pending_mode" not in record
+
+
+async def test_reverting_pending_mode_runs_immediately_and_clears_pending_state(
+    env, db_path, monkeypatch
+):
+    from genesis.db.crud import observations as obs
+
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    await _run(db_path)
+    real = obs.resolve_by_source_and_type
+
+    async def _boom(db, **kw):
+        if kw.get("source") == w.ALERT_SOURCE:
+            raise RuntimeError("resolve exploded")
+        return await real(db, **kw)
+
+    monkeypatch.setattr(obs, "resolve_by_source_and_type", _boom)
+    monkeypatch.setattr(w, "effective_mode", lambda: "observe")
+    out = await _run(db_path)
+    assert out["degraded"]["alert"] == "resolve_failed"
+    assert json.loads(w.last_run_path().read_text())["pending_mode"] == "observe"
+
+    monkeypatch.setattr(obs, "resolve_by_source_and_type", real)
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    out = await w.run_zero_drop_worker(
+        trigger="session_start", force=False, db_path=db_path, repo_path="/repo"
+    )
+
+    assert out["status"] != "debounced", "reverting a pending transition must run now"
+    record = json.loads(w.last_run_path().read_text())
+    assert record["mode"] == "alert"
+    assert "pending_mode" not in record
 
 
 async def test_off_transition_keeps_prior_mode_and_retries_failed_retirement(

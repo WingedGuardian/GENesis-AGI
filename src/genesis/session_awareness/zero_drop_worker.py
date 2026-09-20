@@ -157,7 +157,7 @@ def _mode_change_note(prior_mode: object, mode: str) -> str:
 
 
 def _retire_pending(prior: dict, mode: str) -> bool:
-    """Did a previous run record that it could not retire the alert it drops?
+    """Did a previous run record a mode transition that still needs retrying?
 
     `observe` maintains no findings alert, so every observe sweep retires any
     that stands; when that resolve FAILS the row stays up and the run records
@@ -171,6 +171,8 @@ def _retire_pending(prior: dict, mode: str) -> bool:
     the degraded status bounds retries to the same short floor as other failed
     sweeps.
     """
+    if prior.get("pending_mode") == mode:
+        return True
     if mode != "observe":
         return False
     return (prior.get("degraded") or {}).get("alert") == "resolve_failed"
@@ -1094,15 +1096,24 @@ async def _run(*, trigger: str, force: bool, db_path: Path | str, repo_path: str
             # obvious home is `run_zero_drop_worker`'s handler, but the lock is
             # released before the exception reaches it, so a concurrent sweep's
             # good record could be clobbered by this failure record.
-            prior_mode = read_last_run().get("mode")
-            failure_mode = prior_mode if _mode_changed(prior_mode, mode) else mode
-            _write_failure_record(trigger=trigger, mode=failure_mode, exc=exc)
+            prior = read_last_run()
+            prior_mode = prior.get("mode")
+            transition_failed = _mode_changed(prior_mode, mode)
+            failure_mode = prior_mode if transition_failed else mode
+            _write_failure_record(
+                trigger=trigger,
+                mode=failure_mode,
+                pending_mode=mode if transition_failed else None,
+                exc=exc,
+            )
             raise
     finally:
         lock_fh.close()
 
 
-def _write_failure_record(*, trigger: str, mode: str, exc: BaseException) -> None:
+def _write_failure_record(
+    *, trigger: str, mode: str, exc: BaseException, pending_mode: str | None = None
+) -> None:
     """Replace the run record with one that says the sweep FAILED.
 
     Deliberately minimal on the MEASUREMENT keys: no ``stages``, no
@@ -1129,20 +1140,20 @@ def _write_failure_record(*, trigger: str, mode: str, exc: BaseException) -> Non
     the caller is about to return.
     """
     try:
-        _atomic_write_json(
-            last_run_path(),
-            {
-                "version": 1,
-                "computed_at": datetime.now(UTC).isoformat(),
-                "trigger": trigger,
-                "mode": mode,
-                "status": "failed",
-                "degraded": {"sweep_failed": f"{type(exc).__name__}: {exc}"[:300]},
-                "coverage": f"FROZEN: {','.join(ALL_CLASSES)}",
-                "frozen_classes": list(ALL_CLASSES),
-                "notes": ["record replaced by a FAILED sweep — nothing was measured"],
-            },
-        )
+        record = {
+            "version": 1,
+            "computed_at": datetime.now(UTC).isoformat(),
+            "trigger": trigger,
+            "mode": mode,
+            "status": "failed",
+            "degraded": {"sweep_failed": f"{type(exc).__name__}: {exc}"[:300]},
+            "coverage": f"FROZEN: {','.join(ALL_CLASSES)}",
+            "frozen_classes": list(ALL_CLASSES),
+            "notes": ["record replaced by a FAILED sweep — nothing was measured"],
+        }
+        if pending_mode is not None:
+            record["pending_mode"] = pending_mode
+        _atomic_write_json(last_run_path(), record)
     except Exception:
         logger.warning("zero_drop could not record its own failure", exc_info=True)
 
@@ -1272,7 +1283,9 @@ async def _run_locked(
     # swallow it: lowering `alert` -> `observe` has to retire the standing
     # findings alert NOW rather than whenever the interval next elapses.
     dropped = _mode_dropped(prior_mode, mode)
-    changed = _mode_changed(prior_mode, mode)
+    pending_mode = prior.get("pending_mode")
+    pending_reverted = isinstance(pending_mode, str) and pending_mode != mode
+    changed = _mode_changed(prior_mode, mode) or pending_reverted
     if mode == "off":
         if not dropped:
             # Steady-state off: nothing to retire, and no reason to rewrite a
@@ -1639,6 +1652,8 @@ async def _run_locked(
         "alert": alert_state,
         "blind_alert": blind_state,
     }
+    if dropped and alert_state == "resolve_failed":
+        record["pending_mode"] = mode
     _atomic_write_json(last_run_path(), record)
     return {
         "status": status,
