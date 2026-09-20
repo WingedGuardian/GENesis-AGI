@@ -293,7 +293,6 @@ def monitor(db, mock_invoker, mock_session_manager, config, writer, tmp_path):
         db=db, invoker=mock_invoker, session_manager=mock_session_manager,
         config=config, writer=writer,
         clock=lambda: datetime(2026, 3, 11, 12, 0, 0, tzinfo=UTC),
-        prompt_dir=tmp_path,
     )
 
 
@@ -911,7 +910,6 @@ async def test_triage_pipeline_fired_after_evaluation(
         db=db, invoker=mock_invoker, session_manager=mock_session_manager,
         config=config, writer=writer,
         clock=lambda: datetime(2026, 3, 14, 12, 0, 0, tzinfo=UTC),
-        prompt_dir=tmp_path,
         triage_pipeline=mock_triage,
     )
     (inbox_dir / "test.md").write_text("https://example.com")
@@ -937,7 +935,6 @@ async def test_triage_failure_does_not_crash_monitor(
         db=db, invoker=mock_invoker, session_manager=mock_session_manager,
         config=config, writer=writer,
         clock=lambda: datetime(2026, 3, 14, 12, 0, 0, tzinfo=UTC),
-        prompt_dir=tmp_path,
         triage_pipeline=mock_triage,
     )
     (inbox_dir / "test.md").write_text("some content")
@@ -981,7 +978,7 @@ async def test_eval_memory_persistence_fired_after_evaluation(
         db=db, invoker=mock_invoker, session_manager=mock_session_manager,
         config=config, writer=writer,
         clock=lambda: datetime(2026, 3, 14, 12, 0, 0, tzinfo=UTC),
-        prompt_dir=tmp_path, router=object(), memory_store=object(),
+        router=object(), memory_store=object(),
     )
     (inbox_dir / "test.md").write_text("https://example.com")
     result = await mon.check_once()
@@ -1012,7 +1009,7 @@ async def test_eval_memory_failure_does_not_crash_monitor(
         db=db, invoker=mock_invoker, session_manager=mock_session_manager,
         config=config, writer=writer,
         clock=lambda: datetime(2026, 3, 14, 12, 0, 0, tzinfo=UTC),
-        prompt_dir=tmp_path, router=object(), memory_store=object(),
+        router=object(), memory_store=object(),
     )
     (inbox_dir / "test.md").write_text("some content")
     result = await mon.check_once()

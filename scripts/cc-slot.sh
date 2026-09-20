@@ -33,7 +33,21 @@ export PATH="$HOME/.n/bin:$HOME/.bun/bin:$HOME/.npm-global/bin:$HOME/.local/bin:
 # renders every non-ASCII glyph as "_". Force a UTF-8 locale for the client.
 export LANG="${LANG:-C.UTF-8}"
 
-GENESIS_ROOT="${HOME}/genesis"
+# Resolve the checkout from this script's real location. SSH, a shell alias,
+# and the bootstrap-generated wrapper may each enter through a different path;
+# following links before taking the parent keeps all of them on the same repo.
+_CC_SLOT_SCRIPT="${BASH_SOURCE[0]}"
+while [ -L "$_CC_SLOT_SCRIPT" ]; do
+    _CC_SLOT_DIR="$(unset CDPATH; cd -P "$(dirname "$_CC_SLOT_SCRIPT")" && pwd)"
+    _CC_SLOT_TARGET="$(readlink "$_CC_SLOT_SCRIPT")"
+    case "$_CC_SLOT_TARGET" in
+        /*) _CC_SLOT_SCRIPT="$_CC_SLOT_TARGET" ;;
+        *)  _CC_SLOT_SCRIPT="$_CC_SLOT_DIR/$_CC_SLOT_TARGET" ;;
+    esac
+done
+_CC_SLOT_DIR="$(unset CDPATH; cd -P "$(dirname "$_CC_SLOT_SCRIPT")" && pwd)"
+GENESIS_ROOT="$(cd "$_CC_SLOT_DIR/.." 2>/dev/null && pwd)"
+unset _CC_SLOT_SCRIPT _CC_SLOT_DIR _CC_SLOT_TARGET
 SESSION_PREFIX="cc"
 
 # --- Parse slot number from hostname (or allocate one in manual mode) ---
@@ -1054,8 +1068,11 @@ if [ "$_SESSION_EXISTS" = "0" ] && [ "$_slot_oauth_mode" != "off" ] && [ "$_HAS_
         # blank credential), then echo the notice to stderr. The token flows
         # python-stdout → $(...) → a shell var → the process ENV, never any argv
         # (no ps/scrollback leak). `$(...)`, `\$`, and the literal single-quoted
-        # python defer to the pane shell; ${GENESIS_ROOT}/${_notice_q} expand here.
-        _OAUTH_SRC="_gt=\"\$(\"${GENESIS_ROOT}/.venv/bin/python\" -c 'import sys; from genesis.cc.login_health import read_fallback_token as r; sys.stdout.write(r() or str())' 2>/dev/null)\"; if [ -n \"\$_gt\" ]; then export CLAUDE_CODE_OAUTH_TOKEN=\"\$_gt\"; printf '%s\\n' ${_notice_q} >&2; fi; unset _gt; "
+        # python defer to the pane shell; the %q-quoted interpreter path and
+        # ${_notice_q} expand here. The path is quoted at BUILD time rather than
+        # embedded raw: the pane string is re-parsed, and a raw path inside its
+        # double quotes still permits `$(...)`, backticks, and a closing `"`.
+        _OAUTH_SRC="_gt=\"\$($(printf '%q' "${GENESIS_ROOT}/.venv/bin/python") -c 'import sys; from genesis.cc.login_health import read_fallback_token as r; sys.stdout.write(r() or str())' 2>/dev/null)\"; if [ -n \"\$_gt\" ]; then export CLAUDE_CODE_OAUTH_TOKEN=\"\$_gt\"; printf '%s\\n' ${_notice_q} >&2; fi; unset _gt; "
     fi
 fi
 
@@ -1156,10 +1173,15 @@ if [ -n "$_fc_dir" ] && [ -x "${_fc_dir}/fleet_entry_guard.sh" ]; then
     "${_fc_dir}/fleet_entry_guard.sh" "slot-${SLOT}" >/dev/null 2>&1 || true
 fi
 
+# The pane command is re-parsed by a fresh shell, so quote both paths before
+# interpolating them into its command string. `%q` preserves checkout paths
+# containing spaces, shell metacharacters, or newlines.
+_GENESIS_ROOT_Q=$(printf '%q' "$GENESIS_ROOT")
+_CC_EXIT_CAPTURE_Q=$(printf '%q' "$GENESIS_ROOT/scripts/cc_exit_capture.sh")
 exec tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
     -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \
     "${_TMPDIR_PIN[@]}" \
     -e "GENESIS_CC_SLOT_OAUTH=${_slot_oauth_mode}" \
     -e "LANG=$LANG" \
-    "${_OAUTH_SRC}cd ${GENESIS_ROOT} && ${_TMPDIR_UNSET:-}claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${GENESIS_ROOT}/scripts/cc_exit_capture.sh ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"
+    "${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${_CC_EXIT_CAPTURE_Q} ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"

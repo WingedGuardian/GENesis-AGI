@@ -13,6 +13,94 @@ documentation.
 4. Confirm whether the Agent Zero tree is dirty before assuming any upstream
    version is compatible.
 
+## Database integrity, quarantine, and backup admission
+
+`scripts/backup.sh` verifies the live SQLite database through
+`genesis.db.integrity` before touching the backup clone. There is deliberately
+no raw `sqlite3 quick_check` fallback: if the inode-bound checker is unavailable
+or the database changes identity throughout the check, integrity is
+`indeterminate` and no new backup is admitted. A stable failure writes the
+external, mode-0600 `~/.genesis/db_quarantine.json` marker and stops
+`genesis-server.service` plus the legacy bridge writer. The marker is external
+because a damaged database cannot reliably store its own stop condition.
+Only explicit `quick_check` findings or SQLite's `SQLITE_CORRUPT` /
+`SQLITE_NOTADB` result families establish corruption. Operational failures such
+as lock contention or I/O errors remain indeterminate: backup and update still
+fail loudly, but Genesis is not permanently quarantined on that evidence alone.
+The same external marker also acts as a non-corruption restart fence when a
+restore has installed a candidate whose final verification could not complete;
+its `source` records `restore-final-verification-incomplete` for that case.
+
+The encrypted SQL artifact must then decrypt, import into a fresh mode-0600
+database, pass full integrity and foreign-key checks, and contain a non-empty
+schema. Temporary plaintext, the verification database, and all SQLite sidecars
+are trap-cleaned. `backup_status.json` binds the result to a per-run `run_id`
+and reports `db_integrity_status`, `sqlite_backup_verified`, `failure_class`,
+and `failure_stage`.
+
+`scripts/update.sh` admits only the status written for its exact requested run:
+
+- corrupt, quarantined, indeterminate, stale/malformed status, lock contention,
+  or an unverified SQLite artifact aborts before repository or schema changes;
+- non-database failures may continue because the verified SQLite recovery point
+  exists, but the full backup log and a prominent degraded-mode banner are
+  printed, and `backup:<failure_stage>` is persisted in `update_history`;
+- the separate pre-migration online snapshot must also pass `quick_check` or the
+  update aborts.
+
+Restore acquires locks in the global `update → backup/restore` order. A
+database-only recovery is available both as `scripts/restore.sh --database-only`
+and `python -m genesis restore --database-only`; the staged replacement is
+validated before atomic installation. A healthy replacement inode makes the old
+quarantine stale and permits service restart, while the failed original remains
+preserved as the pre-restore forensic copy.
+When the live database is currently quarantined, database-only recovery may
+replace it even if the damaged file has a newer mtime; the newer-destination
+guard remains in force for non-quarantined databases.
+If restore cannot determine that quarantine state (for example, the integrity
+checker cannot start), it aborts instead of treating the database as healthy.
+
+### Restore preconditions and the holder scan
+
+Database-only recovery refuses unless it can establish that no process still
+holds the database. Before replacing anything, `restore.sh` scans
+`/proc/<pid>/fd` for open handles on exactly the live database artifacts —
+the main file, `-wal`, `-shm`, and `-journal`, matched by their **resolved**
+path and including their unlinked-but-still-open `` (deleted)`` forms. A handle on this
+script's own `.pre-restore.<epoch>` safety copies does not refuse a restore.
+
+That scan needs visibility the invoking uid may not have: an unreadable
+`/proc/<pid>/fd` entry is an **unknown** holder, not an absent one, so the scan
+borrows authority — as uid 0, or via non-interactive `sudo` when available.
+With neither, the restore **refuses** rather than assuming no holder exists.
+Grant non-interactive `sudo` for the scan, run as root, or establish a verified
+offline boundary and declare it (below). The privileged scan is invoked as a
+`sh -c 'find /proc/[0-9]*/fd ...'` wrapper (the PID glob must expand inside the
+privileged shell), so a least-privilege sudoers rule must permit that `sh`
+invocation — there is no `sudo true` capability probe, and a rule granting
+exactly the scan command is sufficient.
+
+`GENESIS_RESTORE_HOLDER_SCAN` selects the mode:
+
+| value | behaviour |
+|---|---|
+| `auto` (default) | uid 0, else `sudo -n`, else refuse |
+| `plain` | unprivileged scan; refuses when the scan reports an error, and refuses outright where procfs is mounted with any enabled `hidepid` value (numeric or symbolic — anything not `0`/`off`) |
+| `sudo` | require `sudo -n`; refuse if unavailable |
+| `none` | **skip the scan entirely** — see the warning below |
+
+> **`none` removes the only holder check on this path.** It does not bypass the
+> quarantine marker, the staged-candidate validation, or the post-install
+> verification — but it *does* drop the check that no process holds the database
+> while it is replaced. Use it only when exclusion is established by other means,
+> such as a verified offline boundary; it exists so an operator who genuinely has
+> that boundary can proceed deliberately rather than being refused. It is not a
+> convenience switch for a busy machine.
+
+The scan is a **supplementary guard, never exclusion**: it cannot by itself
+prevent a holder appearing between inspection and replacement. Exclusion comes
+from whatever keeps holders out — not from this scan.
+
 ## During Migration Work
 
 1. Keep Genesis changes on a dedicated hardening branch.

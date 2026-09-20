@@ -174,83 +174,14 @@ def test_the_MODE_SWITCH_tier_is_deliberately_NOT_covered(repo, home):
     assert _hook(_ask_payload(repo), repo, home).stdout == ""
 
 
-def test_at_the_FINAL_ROUND_terminal_the_cap_menu_is_NOT_shown(repo, home):
-    """THE TIER IS TWO COUNTERS, CHECKED IN ORDER — and nothing used to test the second.
-
-    The gate tests `lifetime >= FINAL_ROUND_CAP` FIRST, so above that line the live
-    block is normally the terminal, offering ACCEPT-and-merge / ABANDON. MEASURED before
-    this was fixed: at streak=3/lifetime=9 the gate blocked FINAL ROUND while this hook
-    served the CAP menu — omitting the only option that ends the loop and adding three
-    the live tier does not offer. The gate's own comment calls that state reachable.
-
-    "FIRST and returns" would be FALSE — the terminal falls through when the commit
-    already carries `# final-round-accept`. That cell is pinned separately by
-    `test_the_final_round_ACCEPT_cell_is_a_known_gap`; this test covers the bare
-    terminal, where the cap menu would be the wrong tier.
-
-    Reaching it the way the gate does: each cap ack resets the streak but PRESERVES
-    lifetime, so cycles of (cap, ack) accumulate lifetime without the streak sticking.
-    """
-    # TWO cycles, then one more round. A third ack would be REFUSED: each cycle adds
-    # ESCALATION_ROUND_CAP to lifetime, so by then lifetime has crossed FINAL_ROUND_CAP
-    # and the terminal correctly stops taking `# escalation-ack` at all. Getting this
-    # wrong is how the first version of this test failed -- which is itself evidence the
-    # terminal is a real, reachable tier and not a hypothetical.
+def test_branch_lifetime_no_longer_hides_the_local_cap_menu(repo, home):
+    """The legacy lifetime counter has no current authorization semantics."""
     for _ in range(2):
         _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
         acked = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
         assert acked.returncode == 0, acked.stdout + acked.stderr
     _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-
-    # The precondition is asserted through the GATE'S BEHAVIOUR, never an in-process
-    # counter read. `_ROUND_DIR` resolves against the REAL $HOME at import time while
-    # these subprocesses run with HOME=<fixture>, so an in-process `get_review_*` here
-    # reads someone else's state and returns 0 — which is exactly how a sibling
-    # assertion in this repo once passed vacuously.
-    blocked = _run_hook('git commit -m "wip"', repo, home)
-    assert blocked.returncode == 2
-    assert "FINAL ROUND" in blocked.stderr, (
-        "precondition: the TERMINAL must be the tier that blocked, not the cap. Got: "
-        f"{blocked.stderr[:200]!r}"
-    )
-    assert _hook(_ask_payload(repo), repo, home).stdout == "", (
-        "the cap menu must not be shown for a block the terminal is making"
-    )
-
-
-def test_the_final_round_ACCEPT_cell_is_a_known_gap(repo, home):
-    """PINS A GAP, not a guarantee — and that is the point.
-
-    The terminal does NOT unconditionally return: when the commit already carries
-    `# final-round-accept` the gate sets its spend flag and FALLS THROUGH to the cap
-    (`review_enforcement_commit.py:1027-1029`), which is why its own comment names the
-    co-required `# final-round-accept escalation-ack` form. So in this one cell the CAP
-    block is what the user reads while this hook stays silent.
-
-    NOT fixable by a better predicate: the deciding input is a sigil on a future Bash
-    commit command, which a PreToolUse hook on AskUserQuestion cannot see. The fail
-    direction is the safe one — no menu, the session relays by hand, exactly the
-    pre-change behaviour. This test exists so the gap is a RECORDED cost rather than a
-    surprise, and so that closing it by widening the predicate (which would show the cap
-    menu at the BARE terminal — the wrong-tier bug) reddens the test above.
-    """
-    for _ in range(2):
-        _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-        acked = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
-        assert acked.returncode == 0, acked.stdout + acked.stderr
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-
-    # THE CELL: terminal satisfied, so the gate falls through and the CAP is what blocks.
-    blocked = _run_hook('git commit -m "wip"  # final-round-accept', repo, home)
-    assert blocked.returncode == 2, blocked.stdout + blocked.stderr
-    assert "escalation cap reached" in blocked.stderr, (
-        "precondition: with the terminal sigil present the gate must fall through to "
-        f"the CAP. Got: {blocked.stderr[:200]!r}"
-    )
-    assert _hook(_ask_payload(repo), repo, home).stdout == "", (
-        "documented gap: the cap is the live block here, but the hook cannot see the "
-        "commit sigil that made it live, so it stays silent"
-    )
+    assert _hook(_ask_payload(repo), repo, home).stdout != ""
 
 
 def test_the_menu_stops_after_the_ack_BY_CONSTRUCTION(repo, home):
@@ -573,23 +504,10 @@ def test_malformed_or_irrelevant_payloads_emit_nothing(repo, home, payload):
     assert res.returncode == 0 and res.stdout == ""
 
 
-def test_the_two_counters_come_from_ONE_snapshot(tmp_path, repo, home):
-    """THE RACE, made deterministic — a behavioural test, not a structural one.
-
-    `get_review_round` and `get_review_lifetime` each perform their own file read AND
-    their own branch resolution. A concurrent `mark` landing between them hands the
-    caller a pair THAT NEVER EXISTED: the pre-update lifetime with the post-update
-    streak. Deciding a tier from that pair selects a tier the gate is not in — the
-    wrong-tier bug this hook was revised to remove, re-entering through a race.
-
-    Rather than try to lose a real race, the stand-in below makes it certain: the
-    snapshot accessor reports the CONSISTENT terminal state (menu must stay silent),
-    while the two separate accessors report the TORN pair that makes the cap look live
-    (menu would be shown). The two paths therefore disagree by construction, so this
-    test can only pass if the hook reads the snapshot. Asserting that the source
-    imports one name rather than two would pin spelling, not behaviour.
-    """
-    tree = tmp_path / "torn"
+def test_cap_menu_uses_the_snapshot_streak_and_ignores_legacy_lifetime(
+    tmp_path, repo, home
+):
+    tree = tmp_path / "snapshot"
     (tree / "scripts" / "hooks").mkdir(parents=True)
     (tree / "scripts" / "lib").mkdir(parents=True)
     (tree / "scripts" / "lib" / "gate_menu.py").write_text(
@@ -597,15 +515,8 @@ def test_the_two_counters_come_from_ONE_snapshot(tmp_path, repo, home):
     )
     (tree / "scripts" / "review_state.py").write_text(
         "ESCALATION_ROUND_CAP = 3\n"
-        "FINAL_ROUND_CAP = 7\n"
-        "# One snapshot: terminal is live, so the cap menu must NOT be shown.\n"
         "def get_review_counters(cwd=None):\n"
-        "    return (3, 9)\n"
-        "# The torn pair a racing reader would assemble: cap looks live, terminal clear.\n"
-        "def get_review_round(cwd=None):\n"
-        "    return 3\n"
-        "def get_review_lifetime(cwd=None):\n"
-        "    return 6\n"
+        "    return (3, 99)\n"
     )
     hook_copy = tree / "scripts" / "hooks" / "ask_gate_menu.py"
     hook_copy.write_text(_HOOK.read_text())
@@ -619,11 +530,7 @@ def test_the_two_counters_come_from_ONE_snapshot(tmp_path, repo, home):
         timeout=30,
     )
     assert res.returncode == 0
-    assert res.stdout == "", (
-        "the hook assembled a tier from two independent reads: it saw the torn "
-        "(round=3, lifetime=6) pair and offered the cap menu, while one consistent "
-        "read says the FINAL ROUND terminal is live"
-    )
+    assert res.stdout != ""
 
 
 def test_garbage_stdin_does_not_crash_the_hook(repo, home):
@@ -746,4 +653,4 @@ def test_nothing_in_the_gate_READS_the_menu_module_back():
     }
     assert not (banned & seen), f"the gate grew marker machinery again: {sorted(banned & seen)}"
     # Control: this must not pass on a file that stopped parsing or importing anything.
-    assert "get_review_round" in seen, "control: the gate must still read the counter"
+    assert "get_review_counters" in seen, "control: the gate must still read the counter"

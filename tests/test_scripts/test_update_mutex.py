@@ -27,7 +27,7 @@ def text() -> str:
 
 
 def test_flock_guard_present(text: str) -> None:
-    assert 'UPDATE_LOCK_FILE="$HOME/.genesis/locks/update.lock"' in text
+    assert 'UPDATE_LOCK_FILE="${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock"' in text
     assert 'exec {_UPDATE_LOCK_FD}>"$UPDATE_LOCK_FILE"' in text
     assert 'flock -n "$_UPDATE_LOCK_FD"' in text
 
