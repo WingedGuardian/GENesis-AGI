@@ -937,4 +937,8 @@ jobs:
         # was unwired and the fix for that added a 44th case. Re-counting last
         # caught it before the commit instead of in round 6. The habit is cheap;
         # the four prior instances each cost a review round.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23342
+        #
+        # UNION with the deploy-guidance docs PR (2095/2101 family): it added
+        # 21 collected tests over the pre-union base and no new skips, so the
+        # floor moves 23342 -> 23363 while the ceiling holds at 102.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23364
