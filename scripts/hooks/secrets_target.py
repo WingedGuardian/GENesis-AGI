@@ -115,6 +115,16 @@ def _is_secret_path(raw: str, inodes: set[tuple[int, int]], *, allow_bare: bool 
             return False
         st = p.resolve().stat()
         if (st.st_dev, st.st_ino) in inodes:
+            # A real secrets file — but a bare NAME is still ambiguous when the
+            # token was quoted: `git commit -m "rotate secrets.env"` in a cwd
+            # that holds a real secrets.env is a mention that happens to
+            # resolve, not an operand (Devin BUG finding, #1826). The quoted
+            # OPERAND `cat "secrets.env"` keeps allow_bare via the caller's
+            # single-token-quoted-span rule, so consent is still required for
+            # the real file; only embedded-in-prose mentions are exempt.
+            stripped = raw.rstrip("/")
+            if os.sep not in stripped and not stripped.startswith("~"):
+                return allow_bare
             return True
         # Not one of the known installs, but named like the real thing — a
         # backup, a second checkout, a copy under another root. Still secrets —
@@ -175,10 +185,20 @@ _SECRETISH = re.compile(
 )
 
 
-#: Heredoc bodies are DATA, not operands. `git commit -F - <<'EOF' … secrets.env
-#: … EOF` is a commit message discussing the file; nothing in it is opened. Left
-#: in, it fires the gate on this module's own commit message.
+#: Heredoc bodies are DATA, not operands — UNLESS the heredoc feeds an
+#: interpreter. `git commit -F - <<'EOF' … secrets.env … EOF` is a commit
+#: message discussing the file; nothing in it is opened. But `python3 <<'EOF'
+#: … cat secrets.env … EOF` EXECUTES the body — stripping it before the operand
+#: scan lets a nested credential read run without consent (Devin SEC finding,
+#: #1826). `_EXEC_HEREDOC` detects an interpreter/command-runner verb leading a
+#: `<<` introducer; when one is present the body is scanned like the rest of the
+#: command.
 _HEREDOC = re.compile(r"<<-?\s*'?\"?(\w+)'?\"?\n.*?^\s*\1\s*$", re.DOTALL | re.MULTILINE)
+_EXEC_HEREDOC = re.compile(
+    r"(?:^|[;&|]\s*)(?:sudo\s+|command\s+)?"
+    r"(?:python[0-9.]*|bash|zsh|dash|sh|node|nodejs|ruby|perl|php|lua|pwsh|powershell|"
+    r"ssh|docker\s+exec|kubectl\s+exec|podman\s+exec)\b[^|\n<>]*<<-?",
+)
 
 #: Ceilings on the glob walk below. A glob is expanded against the REAL
 #: filesystem, so a token like ``/*/*/*/*/*/*`` walks an unbounded subtree —
@@ -252,8 +272,10 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
     if not command:
         return False
 
-    # Heredoc bodies are data. Everything below reasons about operands.
-    scan = _HEREDOC.sub(" ", command)
+    # Heredoc bodies are data — unless the heredoc feeds an interpreter, in
+    # which case the body IS the executed payload and must be scanned.
+    exec_heredoc = _EXEC_HEREDOC.search(command) is not None
+    scan = command if exec_heredoc else _HEREDOC.sub(" ", command)
     # Quoted regions are DATA for the command-level arm too: a commit message
     # naming the file is not an operand. The declared shell-variable residual
     # (`f=secrets; cat $f.env`) is unquoted, so it survives stripping.
@@ -269,9 +291,19 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
     if secretish and _SUSPICIOUS.search(bare):
         return True
 
-    # Tokens that are NOT inside quotes. Used only to decide the bare-basename
-    # case; see the docstring.
-    unquoted = set(_tokens(strip_quoted(scan)))
+    # Tokens that are NOT inside quotes. A quoted bare name stays a MENTION
+    # even when the quoted span is exactly `secrets.env`: `cat "secrets.env"`
+    # is textually identical to `grep "secrets.env" file`, where the quoted
+    # string is a content pattern, and treating quoted spans as operands put
+    # the corpus's dominant false-positive class back (measured 1.558%).
+    # Operand-role parsing is the tar pit this module exists to avoid, so a
+    # quoted bare operand is accepted residue — paths with separators still
+    # gate regardless of quoting.
+    unquoted = set(_tokens(bare))
+    if exec_heredoc:
+        # Inside an executed heredoc a quoted string is a code operand —
+        # `open("secrets.env")` reads the file — not prose. Every token counts.
+        unquoted.update(_tokens(scan))
 
     for raw_tok in _tokens(scan):
         if not _PATHY.search(raw_tok):

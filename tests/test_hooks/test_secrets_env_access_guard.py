@@ -474,6 +474,43 @@ class TestAuditFindings:
         # The control: the same file as a real bare operand still counts.
         assert self._touches(command="cat secrets.env")
 
+    def test_quoted_bare_operand_is_accepted_residue(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Devin SEC finding, #1826, dispositioned: `cat "secrets.env"` quotes
+        the operand, but the quoted span is textually identical to
+        `grep "secrets.env" file` where it is a content pattern — the corpus's
+        dominant false-positive class (measured 1.558%). A bare name inside
+        quotes is a mention; paths with separators still gate."""
+        (tmp_path / "secrets.env").write_text("DUMMY=1\n")
+        monkeypatch.chdir(tmp_path)
+        assert not self._touches(command='cat "secrets.env"')
+        # The controls: unquoted operand and quoted PATH still count.
+        assert self._touches(command="cat secrets.env")
+        assert self._touches(command='cat "./secrets.env"')
+
+    def test_quoted_mention_of_a_real_secrets_inode_does_not_gate(
+        self, fake_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Devin BUG finding, #1826: a quoted bare `secrets.env` mention in a
+        cwd holding a REAL secrets file used to deny anyway — the known-inode
+        arm returned before `allow_bare` applied. A mention that resolves is
+        still a mention."""
+        monkeypatch.chdir(fake_home / "genesis")
+        assert not self._touches(command='git commit -m "rotate secrets.env"')
+        # The control: the same file as a real operand still counts.
+        assert self._touches(command="cat secrets.env")
+        assert self._touches(command="cat ./secrets.env")
+
+    def test_executor_heredoc_body_is_scanned(self) -> None:
+        """Devin SEC finding, #1826: `python3 <<'EOF' … EOF` EXECUTES its body —
+        stripping it as data let `cat secrets.env` inside run ungated."""
+        cmd = "python3 <<'PY'\nimport subprocess\nsubprocess.run(['cat', 'secrets.env'])\nPY"
+        assert self._touches(command=cmd)
+        # The control: a heredoc feeding a non-executor stays data.
+        msg = "git commit -F - <<'MSG'\nfeat: secrets.env is not a service\nMSG"
+        assert not self._touches(command=msg)
+
     def test_a_too_wild_glob_gates_instead_of_walking(self) -> None:
         """CodeRabbit Major, #1826: iglob walks a deep subtree BETWEEN yields,
         where neither the hit cap nor the deadline can see it — a walk past

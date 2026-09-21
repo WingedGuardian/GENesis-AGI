@@ -160,18 +160,27 @@ _READ_ONLY_VERBS = frozenset({"rg", "grep", "egrep", "fgrep", "ag", "ack"})
 #: Anything that could turn a search into something else. The exemption applies
 #: ONLY to a command with none of these: `rg foo && curl bar` is not a search,
 #: a redirect makes the command WRITE, a heredoc feeds it content, a line
-#: feed is itself a command separator (`rg x\ncurl y` is two commands), and
-#: input process substitution runs an arbitrary subcommand as the search's
-#: stdin (`rg needle <(curl <endpoint>)` — CodeRabbit Major, #1826).
-_CHAINS = re.compile(r"(&&|\|\||[\n;|`>]|<<|<\(|\$\()")
+#: feed is itself a command separator (`rg x\ncurl y` is two commands), a bare
+#: `&` backgrounds the search while a second command runs (`grep x & curl
+#: <endpoint>` — Devin SEC finding, #1826), and input process substitution runs
+#: an arbitrary subcommand as the search's stdin (`rg needle <(curl
+#: <endpoint>)` — CodeRabbit Major, #1826).
+_CHAINS = re.compile(r"(&|\|\||[\n;|`>]|<<|<\(|\$\()")
+
+#: Flags that turn a search verb into an EXECUTOR. `rg --pre <cmd>` runs the
+#: preprocessor on every matched file and `rg --hostname-bin <cmd>` runs it for
+#: hyperlink hostnames; `--pager` (ag/ack) spawns the named program. A search
+#: carrying one is `find -exec` in a trench coat (Devin SEC finding, #1826).
+_EXEC_FLAGS = ("--pre", "--hostname-bin", "--pager")
 
 
 def _is_read_only_command(command: str) -> bool:
     """A single search/inspect invocation with nothing chained onto it.
 
-    Deliberately narrow: first token in the allow-list AND no shell operator that
-    could smuggle a call in. `git` is admitted only as `git log`/`git grep`/
-    `git show`, never bare, because `git` also has subcommands that write.
+    Deliberately narrow: first token in the allow-list, no shell operator that
+    could smuggle a call in, and no flag that makes the search itself execute a
+    program. `git` is admitted only as `git log`/`git grep`/`git show`, never
+    bare, because `git` also has subcommands that write.
     """
     if _CHAINS.search(command):
         return False
@@ -180,7 +189,9 @@ def _is_read_only_command(command: str) -> bool:
         return False
     verb = os.path.basename(parts[0])
     if verb in _READ_ONLY_VERBS:
-        return True
+        return not any(
+            a == f or a.startswith(f + "=") for a in parts[1:] for f in _EXEC_FLAGS
+        )
     return verb == "git" and len(parts) > 1 and parts[1] in {"log", "grep", "show", "diff", "blame"}
 
 

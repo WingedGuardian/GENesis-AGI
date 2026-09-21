@@ -460,7 +460,7 @@ def create_sync(
     False as a reason to stop — recording is observability, never authorization.
     """
     try:
-        import sqlite3
+        from genesis.db.connection import connect_sqlite_rw
 
         created_at = datetime.now(UTC).isoformat()
         origin = _resolve_origin(origin_class, source)
@@ -488,7 +488,7 @@ def create_sync(
             origin,
         )
 
-        conn = sqlite3.connect(db_path, timeout=timeout)
+        conn = connect_sqlite_rw(db_path, timeout=timeout)
         try:
             if skip_if_duplicate and content_hash is not None:
                 cur = conn.execute(
