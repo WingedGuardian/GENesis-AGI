@@ -158,6 +158,15 @@ def test_surface_variants_combines_disjoint_dropped_spans():
     assert "A Beta G" in surface_variants("Alpha Beta Gamma", aliases)
 
 
+def test_surface_variants_deep_span_count_does_not_recurse():
+    """~1200 canonical occurrences exceed Python's recursion limit; the
+    iterative subset walk must still return the homogeneous form."""
+    aliases = {"CC": "Claude Code"}
+    content = " ".join(["Claude Code"] * 1200)
+    variants = surface_variants(content, aliases)
+    assert " ".join(["CC"] * 1200) in variants
+
+
 def test_surface_variants_no_match_returns_empty():
     assert surface_variants("nothing aliased here", {"CC": "Claude Code"}) == []
 

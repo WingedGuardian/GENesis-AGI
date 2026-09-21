@@ -248,21 +248,24 @@ def surface_variants(
     span_slots.sort(key=lambda p: (p[0], p[1]))
     sets_enumerated = 0
 
-    def _walk(i: int, covered_end: int, chosen: list[tuple[int, int, str]]) -> None:
-        nonlocal sets_enumerated
-        if sets_enumerated >= _SET_BUDGET or len(results) >= limit:
-            return
+    # Iterative DFS — a memory can carry ~1000 canonical occurrences, past
+    # Python's recursion limit. Stack entries are (index, covered_end,
+    # chosen-spans); include is pushed first so the exclude branch is popped
+    # and fully explored before it, matching exclude-before-include order.
+    stack: list[tuple[int, int, tuple[tuple[int, int, str], ...]]] = [(0, -1, ())]
+    while (
+        stack and sets_enumerated < _SET_BUDGET and len(results) < limit
+    ):
+        i, covered_end, chosen = stack.pop()
         if i == len(span_slots):
             if chosen:
                 sets_enumerated += 1
-                _enumerate(chosen)
-            return
-        _walk(i + 1, covered_end, chosen)  # exclude span_slots[i]
+                _enumerate(list(chosen))
+            continue
         start, end, canonical = span_slots[i]
         if start >= covered_end:
-            _walk(i + 1, end, chosen + [(start, end, canonical)])
-
-    _walk(0, -1, [])
+            stack.append((i + 1, end, chosen + ((start, end, canonical),)))
+        stack.append((i + 1, covered_end, chosen))
 
     return results
 
