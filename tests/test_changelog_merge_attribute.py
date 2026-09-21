@@ -17,7 +17,7 @@ and nothing else. The structural fix for that is one fragment per change in
 version heading, so every branch open across one is exposed — including branches
 that never touch CHANGELOG.md deliberately.
 
-Four tests, and NONE of them is redundant — read this before deleting one:
+Five tests, and NONE of them is redundant — read this before deleting one:
 
 * :func:`test_a_changelog_collision_conflicts_rather_than_merging_silently`
   carries the BEHAVIOURAL guarantee, by copying the real artifact into a fresh
@@ -35,6 +35,12 @@ Four tests, and NONE of them is redundant — read this before deleting one:
   weaker duplicate — it is the test that fails on an unanchored pattern, since a
   root-level ``CHANGELOG.md`` satisfies both spellings. That is exactly the bug
   the original rule shipped with in review.
+* :func:`test_a_pre_fix_branch_resurrects_once_on_its_first_catch_up_merge`
+  pins the transition window the removal cannot close: attributes resolve from
+  the CHECKED-OUT tree, so a branch created while union was in force union-merges
+  one last time on its first catch-up merge, and only then runs the default
+  driver. It asserts the hazard happens AND that it happens exactly once — both
+  halves are load-bearing.
 
 The tests grade this repository's own attribute surface. A developer's local
 ``merge.default`` routes unspecified paths to a driver regardless; no committed
@@ -268,6 +274,73 @@ def test_a_union_driver_resurrects_a_deletion(tmp_path: Path) -> None:
         "union no longer resurrects the deleted line — if git's union driver has "
         "changed behaviour, re-examine whether .gitattributes should still "
         "refuse it"
+    )
+
+
+def test_a_pre_fix_branch_resurrects_once_on_its_first_catch_up_merge(
+    tmp_path: Path,
+) -> None:
+    """The transition window: an old branch union-merges exactly once more.
+
+    Attributes resolve from the CHECKED-OUT tree, so a branch created while
+    ``merge=union`` was in force still runs the driver on its first merge of the
+    commit that removes it — the removal cannot protect the merge that carries
+    it. Residual risk, documented in .gitattributes; this test keeps it honest
+    in both directions: the resurrection happens, and it happens exactly once.
+    """
+    repo = _make_repo(tmp_path, attributes="union")
+    pre_fix = _git_ok("rev-parse", "trunk", cwd=repo).stdout.strip()
+
+    # The fix lands on trunk together with a release cut — the real shape: the
+    # attribute removal arrives inside a merge that also deletes entries.
+    changelog = repo / "CHANGELOG.md"
+    changelog.write_text(changelog.read_text().replace("- a pre-existing entry\n", "", 1))
+    (repo / ".gitattributes").write_text("# CHANGELOG.md: no merge driver\n")
+    _git_ok("add", "-A", cwd=repo)
+    _git_ok("commit", "--quiet", "-m", "release cut + remove union", cwd=repo)
+
+    # A branch cut BEFORE the fix still carries union in its checked-out
+    # .gitattributes, and its bullet lands in the hunk the release cut emptied.
+    _git_ok("checkout", "--quiet", "-b", "pre-fix-branch", pre_fix, cwd=repo)
+    changelog.write_text(
+        changelog.read_text().replace("### Fixed\n\n", "### Fixed\n\n- entry from branch\n", 1)
+    )
+    _git_ok("add", "CHANGELOG.md", cwd=repo)
+    _git_ok("commit", "--quiet", "-m", "branch bullet", cwd=repo)
+
+    first = _git("merge", "--no-edit", "trunk", cwd=repo)
+    assert first.returncode == 0, (
+        f"expected the stale union driver to resolve this silently.\nstderr: {first.stderr}"
+    )
+    assert "a pre-existing entry" in (repo / "CHANGELOG.md").read_text(), (
+        "the hazard did not fire — the checkout's stale union driver did not "
+        "resurrect the deleted line, so the transition window documented in "
+        ".gitattributes no longer exists and this test should be retired"
+    )
+
+    # The window is ONE merge wide: the attribute is gone from the checkout now.
+    assert _merge_attr("CHANGELOG.md", cwd=repo) != "union"
+
+    # …and the next overlapping change conflicts visibly under the default
+    # driver instead of resolving silently.
+    changelog.write_text(
+        changelog.read_text().replace(
+            "### Fixed\n\n", "### Fixed\n\n- second branch entry\n", 1
+        )
+    )
+    _git_ok("add", "CHANGELOG.md", cwd=repo)
+    _git_ok("commit", "--quiet", "-m", "second bullet", cwd=repo)
+    _git_ok("checkout", "--quiet", "trunk", cwd=repo)
+    changelog.write_text(changelog.read_text().replace("### Fixed\n\n", "", 1))
+    _git_ok("add", "CHANGELOG.md", cwd=repo)
+    _git_ok("commit", "--quiet", "-m", "trunk removes heading", cwd=repo)
+    _git_ok("checkout", "--quiet", "pre-fix-branch", cwd=repo)
+
+    second = _git("merge", "--no-edit", "trunk", cwd=repo)
+    assert second.returncode != 0, (
+        "the second catch-up merge still resolved silently — the union driver "
+        "outlived the merge that removed it\n"
+        f"stdout: {second.stdout}\nstderr: {second.stderr}"
     )
 
 
