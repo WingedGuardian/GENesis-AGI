@@ -64,6 +64,181 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+#: Ambient git environment variables that change what THIS MODULE'S git reads
+#: report. Two kinds, and the second is why the name is not "location":
+#:
+#: 1. Repository LOCATION — each redirects git away from the directory a caller
+#:    explicitly passed as ``cwd``, so a decision derived from git describes a
+#:    DIFFERENT repository than the one being reviewed.
+#: 2. Diff BEHAVIOUR — the repository is right, but what the diff REPORTS is
+#:    not, which lands on the same sentinels and the same decisions.
+#:
+#: MEASURED 2026-09-19, each variable alone, scratch repo A on `main` with staged
+#: work against unrelated repo B on `feat/decoy`:
+#:
+#:   GIT_DIR            branch main -> feat/decoy, staged hash -> "clean"
+#:   GIT_WORK_TREE      worktree marker key changes
+#:   GIT_INDEX_FILE     staged hash -> "clean"
+#:   GIT_EXTERNAL_DIFF  _staged_content_hash -> "clean"   (kind 2)
+#:
+#: Every one fails OPEN. `"clean"` is this module's sentinel for NOTHING STAGED,
+#: so unreviewed work becomes invisible to the depth gate; the branch read
+#: defeats the no-commits-to-main check; the key change makes the gate consult a
+#: marker file that does not exist; and via `bump_review_round`, a "clean"
+#: content hash returns the CURRENT round without advancing, so the escalation
+#: cap silently stops counting. `review_scope`'s substantiality classifier moves
+#: `substantial` -> `inline` for the same reason.
+#:
+#: The REMAINING entries were measured to have NO effect in a standalone-repo
+#: configuration. That is not "proven irrelevant" — the configuration was a
+#: standalone repo, and GIT_COMMON_DIR inside a LINKED WORKTREE is the obvious
+#: untested case — so they stay, because adding to a scrub is the safe
+#: direction. Do not cite them as measured to matter; they are not.
+#:
+#: DUPLICATED, DELIBERATELY, rather than imported. FOUR copies of THIS list
+#: exist and hold the SAME names — here, `scripts/review_scope.py`,
+#: `src/genesis/session_awareness/zero_drop_git.py` (the original), and the bash
+#: array in `.claude/hooks/genesis-hook`, because bash cannot import a Python
+#: tuple. A FIFTH, NARROWER list lives in `scripts/worktree_lifecycle.py`
+#: (3 names, its own comment concedes it is incomplete); it is NOT part of this
+#: parity set and is tracked separately. This module is stdlib-only, and
+#: `git_push_guard` wraps its `review_state` import in `try/except` precisely
+#: because a module-load exception in a hook exits 1, which Claude Code treats as
+#: non-blocking — silently disabling every fail-closed gate in that file. Adding
+#: an import here would add exactly that failure mode to the layer this constant
+#: exists to harden. `tests/test_hooks/test_git_env_scrub.py` asserts all four
+#: copies are EQUAL and fails when any drifts. The lock is the chokepoint; an
+#: import would be a liability.
+#:
+#: The launcher carrying the same names is what the push guard needs too.
+#: `.claude/hooks/genesis-hook` scrubs for all ~50 LAUNCHED hooks, one of which
+#: — `git_push_guard` — PREDICTS what a `git push` will do: its
+#: `_push_config_is_simple` is an allowlist over the user's effective config
+#: (`remote.pushDefault`, `push.default`, `push.recurseSubmodules`, …) where a
+#: broadening value makes it return False and PROMPT. MEASURED 2026-09-19
+#: through the real function, with a control that moves: with
+#: `push.default = matching` in `~/.gitconfig` it returns False (prompts) when
+#: the config is visible and True — ALLOWS SILENTLY — once that config is
+#: scrubbed away. A guard that predicts a command's effect must see the config
+#: that command will see, which is the second reason no config channel appears
+#: in any of the four copies.
+GIT_ENV_UNSET = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_DIFF_OPTS",
+)
+
+#: NO git CONFIG channel is handled here — not the FILE sources
+#: (GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM) and not the INJECTION channels
+#: (GIT_CONFIG_COUNT with its GIT_CONFIG_KEY_n/VALUE_n pairs,
+#: GIT_CONFIG_PARAMETERS). Three review rounds each found the same generator, so
+#: it is written out rather than left to be rediscovered a fourth time:
+#:
+#:   ALL FOUR ARE PROTECTED CONFIG, and protected config is the only place git
+#:   reads `safe.directory` from — deliberately, so an untrusted repository
+#:   cannot self-approve. Repo-local config CANNOT substitute (MEASURED: still
+#:   rc=129). So removing ANY of them removes that capability, and under a uid
+#:   mismatch — a bind-mounted devcontainer, container CI, a hook under sudo —
+#:   git REFUSES with EMPTY stdout. `_staged_content_hash` branches on output
+#:   alone, and its empty-output sentinel is "clean": NOTHING STAGED, over real
+#:   staged work.
+#:
+#: MEASURED 2026-09-20, one file staged, uid mismatch, safe.directory supplied
+#: ONLY through GIT_CONFIG_COUNT (which is how a container or CI supplies it):
+#:   injected value present   rc=0    A staged.py
+#:   GIT_CONFIG_COUNT scrubbed rc=129  (empty stdout) -> hash reads "clean"
+#: The same measurement holds for GIT_CONFIG_GLOBAL via a config file.
+#:
+#: Unsetting a config channel is not neutral in the other direction either: it
+#: re-enables $HOME/.gitconfig, so a caller that set GIT_CONFIG_GLOBAL=/dev/null
+#: for isolation silently loses it.
+#:
+#: What hardens the config routes MEASURED to move a gate decision is a FLAG on
+#: the command — `--no-ext-diff` for `diff.external`, `_ATTRIBUTES_HARDENING`
+#: for `core.attributesFile`. A flag cannot remove a capability the way an
+#: environment edit does, and it is scoped to the one command that needs it.
+
+#: Hardening for git's ATTRIBUTES lookup, applied to the diff commands.
+#:
+#: MEASURED 2026-09-19 on 200 staged Python lines: a global `core.attributesFile`
+#: marking `*.py binary` collapses `--numstat` to `-  -`, and
+#: `review_scope.classify_change_substantiality` then reports `inline` instead of
+#: `substantial` — the depth gate demands LESS review. `--no-ext-diff` and
+#: `--no-textconv` do NOT reach it (different mechanism), and neither does
+#: `--text` (MEASURED: `--numstat` still reports `-  -`). Pointing the lookup at
+#: an empty file restores `200  0` AND keeps protected config readable, which is
+#: the whole reason this is a flag rather than a pin.
+#:
+#: RESIDUAL, stated rather than implied: attributes have FOUR sources and this
+#: closes ONE. `.git/info/attributes` and a STAGED `.gitattributes` reach the
+#: same collapse — so a change can lower its own review depth — and no
+#: environment or command-line handling can close either. Tracked as an issue.
+#: The fourth is the SYSTEM file `/etc/gitattributes`, which git's own binary
+#: names alongside its off switch `GIT_ATTR_NOSYSTEM` (both MEASURED present in
+#: the git 2.43 binary; the file is absent on this install). Low reachability —
+#: it is root-owned — and unlike the other two it IS closable, via
+#: `git_env(GIT_ATTR_NOSYSTEM="1")`, which survives the filter because the
+#: override merge precedes it. Left alone on purpose: adding it would be a
+#: precautionary environment edit of exactly the kind three review rounds
+#: established as the thing that removes capabilities, and nothing has measured
+#: it moving a decision. Counted here so "three sources" is not read as complete.
+#: Not live in this repo today: the tracked `.gitattributes` carries only
+#: `/CHANGELOG.md merge=union`, no `binary`/`-diff` marker exists anywhere
+#: tracked, and `.git/info/attributes` is absent.
+_ATTRIBUTES_HARDENING = ("-c", f"core.attributesFile={os.devnull}")
+
+
+def git_env(**overrides: str) -> dict[str, str]:
+    """The ambient environment with git's own overrides removed.
+
+    Every ``subprocess.run(["git", ...])`` in this module goes through here, so
+    scrubbing is a property of the module rather than something four call sites
+    each have to remember. ``overrides`` is for values a caller genuinely needs
+    to PIN — the staged-diff hash pins ``COLUMNS`` so its output is not
+    terminal-width sensitive.
+
+    THE SCRUB IS APPLIED LAST, DELIBERATELY. An earlier revision applied it
+    first and ``raise``d if an override would re-add a scrubbed name. That is
+    the wrong failure direction HERE: an exception out of this helper leaves the
+    hook process non-zero, which Claude Code treats as NON-BLOCKING — so the one
+    guard written to fail loudly would have failed the gate OPEN. Filtering
+    after the merge makes the guarantee structural instead: a caller simply
+    cannot re-add a scrubbed variable, there is no error path to catch, and no
+    call site has to remember anything.
+    """
+    return {k: v for k, v in {**os.environ, **overrides}.items() if k not in GIT_ENV_UNSET}
+
+
+try:
+    from review_deadline import DeadlineExpired, bounded_timeout, propagate_deadline_timeout
+except Exception:  # Reverse-version skew: keep state reads available and bounded.
+
+    class DeadlineExpired(RuntimeError):
+        """Local reverse-skew equivalent of the shared deadline exception."""
+
+    def bounded_timeout(deadline, cap, *, monotonic=time.monotonic):
+        if deadline is None:
+            return cap
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise DeadlineExpired("aggregate review-gate deadline expired")
+        return min(cap, remaining)
+
+    def propagate_deadline_timeout(deadline, error):
+        if deadline is not None:
+            raise DeadlineExpired(
+                "aggregate review-gate deadline expired during subprocess"
+            ) from error
+
 _MARKER_DIR = Path.home() / ".genesis" / "review_markers"
 # Per-worktree review-ROUND counter (escalation cap). Deliberately a SEPARATE store
 # from the marker above: review_invalidate_on_commit clears the marker after every
@@ -74,23 +249,17 @@ _ROUND_DIR = Path.home() / ".genesis" / "review_rounds"
 # pending an explicit '# escalation-ack'. Mirrors the genesis-development SKILL.md
 # prose cap.
 ESCALATION_ROUND_CAP = 3
-# After this many rounds over the branch's WHOLE LIFE, the commit gate blocks
-# pending a '# final-round-accept' — and unlike the cap above, that block returns
-# on every subsequent commit.
-#
-# WHY A SECOND COUNTER EXISTS. `# escalation-ack` makes the gate call
-# reset_review_round, so the consecutive cap is indefinitely REPEATABLE:
-# rounds 1-2-3, ack, 4-5-6, ack, 7-8-9, ack, without end. A change can consume
-# fifteen external review rounds and the machine never says "enough" — only
-# "enough, for now", once every three rounds. The consecutive counter cannot
-# express a terminal because resetting it is exactly what the ack is for.
-#
-# 7 is the start of the THIRD cycle: two complete free/audit/stop cycles have
-# already run, each of which already demanded a fresh decision. A change still
-# surfacing new defects from an independent reviewer after that is not converging,
-# and the remaining question is a judgement call a machine should not keep
-# deferring — accept the outstanding findings and merge, or abandon the branch and
-# restart from a design that does not need seven rounds.
+# Standing authorization is measured from GitHub's distinct reviewed heads, not
+# from the local streak/lifetime store below.  Keep these constants here as the
+# compatibility import surface used by hook trees at different revisions.
+STANDING_REVIEWED_HEAD_LIMIT = 4
+GATE_DISCOVERY_ROUND_LIMIT = 2
+STRONGLY_DISCOURAGED_REVIEWED_HEADS = 5
+# Legacy compatibility only. Older hook trees import this name and may still
+# carry the one-shot final-accept state below. Current gates use GitHub-backed
+# distinct reviewed heads and native per-action approval; they do not consult
+# this constant or honor ``final-round-accept``. Keep the value at 7 so a stale
+# worktree does not activate its old sigil at the new four-head boundary.
 FINAL_ROUND_CAP = 7
 # Legacy single-file marker (pre per-worktree scoping). Only read as a fallback
 # so an in-flight review from before an upgrade isn't lost mid-session.
@@ -104,7 +273,19 @@ _MAX_EVIDENCE_AGE_SECONDS = 1800  # 30 minutes
 _GSTACK_ANALYTICS = Path.home() / ".gstack" / "analytics" / "skill-usage.jsonl"
 
 
-def _worktree_root(cwd: str | None = None) -> str:
+def _deadline_timeout(deadline: float | None, cap: float) -> float:
+    """Subprocess timeout bounded by an optional aggregate ``time.monotonic()`` deadline.
+
+    Callers running under a host kill-window (the commit/push hooks' registered
+    timeouts) pass one deadline so a stalled probe consumes the SAME budget the
+    later gates need instead of resetting it — a per-call cap alone lets serial
+    probes overrun the kill, which fails OPEN.
+    An already-elapsed deadline raises before another subprocess starts.
+    """
+    return bounded_timeout(deadline, cap)
+
+
+def _worktree_root(cwd: str | None = None, *, deadline: float | None = None) -> str:
     """Absolute worktree root used to key per-worktree state.
 
     Primary: ``git rev-parse --show-toplevel``. Fallback — git missing or timed out,
@@ -122,8 +303,9 @@ def _worktree_root(cwd: str | None = None) -> str:
             ["git", "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=_deadline_timeout(deadline, 5),
             cwd=cwd,
+            env=git_env(),
         )
         root = result.stdout.strip()
         if root:
@@ -131,7 +313,9 @@ def _worktree_root(cwd: str | None = None) -> str:
             # symlinks) for the SAME worktree — otherwise a git-success mark and a
             # git-failed hook check could compute different keys and disagree.
             return os.path.realpath(root)
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+    except subprocess.TimeoutExpired as exc:
+        propagate_deadline_timeout(deadline, exc)
+    except (FileNotFoundError, OSError):
         pass
     base = Path(cwd).resolve() if cwd else Path.cwd()
     for d in (base, *base.parents):
@@ -140,7 +324,7 @@ def _worktree_root(cwd: str | None = None) -> str:
     return str(base)
 
 
-def _worktree_key(cwd: str | None = None) -> str:
+def _worktree_key(cwd: str | None = None, *, deadline: float | None = None) -> str:
     """Stable, per-location key from the worktree root (see ``_worktree_root``).
 
     Concurrent CC sessions each work in their own git worktree; a single global
@@ -148,7 +332,7 @@ def _worktree_key(cwd: str | None = None) -> str:
     session A's marker mid-workflow). Keying by worktree root isolates them — and the
     key stays isolated even when git is briefly unavailable (no shared fallback).
     """
-    return hashlib.sha256(_worktree_root(cwd).encode()).hexdigest()[:12]
+    return hashlib.sha256(_worktree_root(cwd, deadline=deadline).encode()).hexdigest()[:12]
 
 
 def _evidence_file(cwd: str | None = None) -> Path:
@@ -160,12 +344,12 @@ def _evidence_file(cwd: str | None = None) -> Path:
     return _EVIDENCE_DIR / f"{_worktree_key(cwd)}.txt"
 
 
-def _state_file(cwd: str | None = None) -> Path:
+def _state_file(cwd: str | None = None, *, deadline: float | None = None) -> Path:
     """Per-worktree marker path (see ``_worktree_key``)."""
-    return _MARKER_DIR / f"{_worktree_key(cwd)}.json"
+    return _MARKER_DIR / f"{_worktree_key(cwd, deadline=deadline)}.json"
 
 
-def get_current_diff_hash(cwd: str | None = None) -> str:
+def get_current_diff_hash(cwd: str | None = None, *, deadline: float | None = None) -> str:
     """SHA-256 of ``git diff --cached --raw --no-abbrev -z`` output (staged only).
 
     Only staged changes trigger review enforcement.  Unstaged changes
@@ -194,9 +378,35 @@ def get_current_diff_hash(cwd: str | None = None) -> str:
     """
     try:
         result = subprocess.run(
-            ["git", "diff", "--cached", "--raw", "--no-abbrev", "-z"],
+            # --no-ext-diff/--no-textconv here are CONSISTENCY, not protection.
+            # MEASURED 2026-09-19: the `--raw` format reports metadata rather
+            # than content, so no external diff driver runs and this hash held
+            # steady across all four injection routes while the plain-diff hash
+            # below fell to "clean". A mutation removing those two therefore
+            # SURVIVES the suite, correctly — there is no behaviour to pin.
+            #
+            # --no-replace-objects is DIFFERENT: it IS protection here, and this
+            # site is why the distinction had to be re-measured. MEASURED
+            # 2026-09-20: a `refs/replace` ref swapping HEAD for a commit whose
+            # tree equals the index empties the `--raw` output too, at rc=0 —
+            # so the "the raw format is immune" reasoning above is true of the
+            # DIFF-DRIVER class and false of this one. Replacement applies at
+            # object-read time, below the format layer, which is exactly why the
+            # format does not save it. No environment component, so no scrub
+            # could have reached it either.
+            [
+                "git",
+                "--no-replace-objects",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--cached",
+                "--raw",
+                "--no-abbrev",
+                "-z",
+            ],
             capture_output=True,  # bytes (no text= → no newline/encoding munging)
-            timeout=10,
+            timeout=_deadline_timeout(deadline, 10),
             cwd=cwd,
             # --stat output is TERMINAL-WIDTH sensitive: git truncates long paths
             # to fit COLUMNS (honored even without a tty). The mark is written from
@@ -207,24 +417,30 @@ def get_current_diff_hash(cwd: str | None = None) -> str:
             # 2026-08-11: identical index → 62e24043 @80/unset, cd67763b @120,
             # a3966055 @200). Pin the width so the hash is env-independent; 80
             # matches the unset default, so previously stored markers stay valid.
-            env={**os.environ, "COLUMNS": "80"},
+            # git_env(), not {**os.environ}: an ambient GIT_INDEX_FILE or
+            # GIT_DIR makes `--cached` describe a DIFFERENT index, and this hash
+            # is what binds a review marker to the staged content.
+            env=git_env(COLUMNS="80"),
         )
         content = result.stdout  # raw bytes; do NOT strip (would drop trailing-ws paths)
         if not content:
             return "clean"
         return hashlib.sha256(content).hexdigest()[:16]
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+    except subprocess.TimeoutExpired as exc:
+        propagate_deadline_timeout(deadline, exc)
+        return "unknown"
+    except (FileNotFoundError, OSError):
         return "unknown"
 
 
-def has_code_changes(cwd: str | None = None) -> bool:
+def has_code_changes(cwd: str | None = None, *, deadline: float | None = None) -> bool:
     """Check if there are any uncommitted code changes."""
-    return get_current_diff_hash(cwd=cwd) not in ("clean", "unknown")
+    return get_current_diff_hash(cwd=cwd, deadline=deadline) not in ("clean", "unknown")
 
 
-def _load_marker(cwd: str | None = None) -> dict | None:
+def _load_marker(cwd: str | None = None, *, deadline: float | None = None) -> dict | None:
     """Read the per-worktree marker, falling back to the legacy global file."""
-    for path in (_state_file(cwd), _LEGACY_STATE_FILE):
+    for path in (_state_file(cwd, deadline=deadline), _LEGACY_STATE_FILE):
         try:
             if path.exists():
                 return json.loads(path.read_text())
@@ -233,16 +449,16 @@ def _load_marker(cwd: str | None = None) -> dict | None:
     return None
 
 
-def is_review_current(cwd: str | None = None) -> bool:
+def is_review_current(cwd: str | None = None, *, deadline: float | None = None) -> bool:
     """Check if the stored (per-worktree) marker matches current diff state."""
-    current = get_current_diff_hash(cwd=cwd)
+    current = get_current_diff_hash(cwd=cwd, deadline=deadline)
     if current in ("clean", "unknown"):
         return True  # No changes = no review needed
-    state = _load_marker(cwd)
+    state = _load_marker(cwd, deadline=deadline)
     return bool(state) and state.get("diff_hash") == current
 
 
-def marker_content_current(cwd: str | None = None) -> bool:
+def marker_content_current(cwd: str | None = None, *, deadline: float | None = None) -> bool:
     """Whether the marker's recorded FULL-content hash binds the CURRENT staged diff.
 
     A belt-and-suspenders companion to :func:`is_review_current`. Since ``diff_hash``
@@ -253,21 +469,21 @@ def marker_content_current(cwd: str | None = None) -> bool:
     IS the staged content (an audit of diff A must not clear a different diff B).
     Fails CLOSED: a real staged hash that mismatches / is absent / errors → False.
     """
-    current = _staged_content_hash(cwd=cwd)
+    current = _staged_content_hash(cwd=cwd, deadline=deadline)
     if current in ("clean", "unknown"):
         return False  # nothing concrete to bind (or a git error) — never clear on this
-    state = _load_marker(cwd)
+    state = _load_marker(cwd, deadline=deadline)
     return bool(state) and state.get("content_hash") == current
 
 
-def has_valid_review_marker(cwd: str | None = None) -> bool:
+def has_valid_review_marker(cwd: str | None = None, *, deadline: float | None = None) -> bool:
     """Check if a (per-worktree) review marker exists and is not expired.
 
     Unlike is_review_current(), this does NOT short-circuit on clean staged
     area. Used when the caller knows changes are about to be staged (e.g.
     git add && git commit in the same command).
     """
-    state = _load_marker(cwd)
+    state = _load_marker(cwd, deadline=deadline)
     if not state:
         return False
     try:
@@ -378,14 +594,16 @@ def _evidence_is_adversarial(text: str) -> tuple[bool, str]:
     return True, "adversarial-audit structure present"
 
 
-def get_marker_depth(cwd: str | None = None) -> tuple[str | None, bool]:
+def get_marker_depth(
+    cwd: str | None = None, *, deadline: float | None = None
+) -> tuple[str | None, bool]:
     """``(level, adversarial)`` recorded in the current marker; ``(None, False)`` if absent.
 
     Read by the commit gate's depth check. ``level`` is the computed
     substantiality at mark time; ``adversarial`` is the derived content-verify
     result — NEITHER is self-reported by the caller.
     """
-    state = _load_marker(cwd)
+    state = _load_marker(cwd, deadline=deadline)
     if not state:
         return None, False
     level = state.get("level")
@@ -655,12 +873,12 @@ def clear_all_markers() -> tuple[int, list[str]]:
 # advance it.
 
 
-def _round_file(cwd: str | None = None) -> Path:
+def _round_file(cwd: str | None = None, *, deadline: float | None = None) -> Path:
     """Per-worktree round-counter path (same worktree key as the marker)."""
-    return _ROUND_DIR / f"{_worktree_key(cwd)}.json"
+    return _ROUND_DIR / f"{_worktree_key(cwd, deadline=deadline)}.json"
 
 
-def _staged_content_hash(cwd: str | None = None) -> str:
+def _staged_content_hash(cwd: str | None = None, *, deadline: float | None = None) -> str:
     """SHA-256 of the FULL staged patch (``git diff --cached``).
 
     A belt-and-suspenders content bind for the depth gate. ``get_current_diff_hash``
@@ -673,17 +891,47 @@ def _staged_content_hash(cwd: str | None = None) -> str:
     """
     try:
         result = subprocess.run(
-            ["git", "diff", "--cached"],
+            # --no-ext-diff is LOAD-BEARING, not hygiene. An external diff
+            # driver makes this command emit NOTHING, so this hash becomes
+            # the "clean" nothing-staged sentinel over real staged work, and
+            # bump_review_round then stops advancing the escalation cap.
+            # Scrubbing GIT_EXTERNAL_DIFF alone does NOT close that: MEASURED
+            # 2026-09-19, the same driver can be set through GIT_CONFIG_COUNT,
+            # GIT_CONFIG_PARAMETERS or GIT_CONFIG_GLOBAL, and through a
+            # repo-local .git/config that no environment scrub can reach. The
+            # flag asks git not to do the thing at all, which is the only
+            # form that does not depend on enumerating the ways in.
+            # --no-textconv closes the sibling; MEASURED byte-identical in the
+            # ordinary case, so it costs nothing.
+            # _ATTRIBUTES_HARDENING is CONSISTENCY here rather than protection:
+            # a `binary` attribute changes this diff's TEXT, so the hash moves
+            # and a stored marker stops matching — MORE review, the fail-CLOSED
+            # direction. It is load-bearing at review_scope's --numstat site,
+            # where the same attribute collapses the count and the depth gate
+            # reads `inline`. Applied at both so the two are computed alike.
+            [
+                "git",
+                *_ATTRIBUTES_HARDENING,
+                "--no-replace-objects",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--cached",
+            ],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=_deadline_timeout(deadline, 10),
             cwd=cwd,
+            env=git_env(),
         )
         content = result.stdout
         if not content.strip():
             return "clean"
         return hashlib.sha256(content.encode()).hexdigest()[:16]
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+    except subprocess.TimeoutExpired as exc:
+        propagate_deadline_timeout(deadline, exc)
+        return "unknown"
+    except (FileNotFoundError, OSError):
         return "unknown"
 
 
@@ -705,7 +953,7 @@ def _coerce_finite_int(value: object, default: int = 0) -> int:
         return default
 
 
-def _load_round(cwd: str | None = None) -> dict:
+def _load_round(cwd: str | None = None, *, deadline: float | None = None) -> dict:
     """Read the round-counter file, normalizing shape AND the round VALUE.
 
     Validating once, here at the single load boundary, is the whole class-fix for
@@ -721,7 +969,7 @@ def _load_round(cwd: str | None = None) -> dict:
     Never raises.
     """
     try:
-        p = _round_file(cwd)
+        p = _round_file(cwd, deadline=deadline)
         if p.exists():
             data = json.loads(p.read_text())
             if isinstance(data, dict):
@@ -757,10 +1005,12 @@ def get_review_round(cwd: str | None = None) -> int:
     return _coerce_finite_int(state.get("round", 0))
 
 
-def _write_round(state: dict, cwd: str | None = None) -> None:
+def _write_round(
+    state: dict, cwd: str | None = None, *, deadline: float | None = None
+) -> None:
     """Persist the round-counter state (best-effort — never raises)."""
     try:
-        rf = _round_file(cwd)
+        rf = _round_file(cwd, deadline=deadline)
         rf.parent.mkdir(parents=True, exist_ok=True)
         rf.write_text(json.dumps(state, indent=2))
     except OSError:
@@ -871,7 +1121,7 @@ def bump_review_round(
 
 
 def get_final_accept_consumed(cwd: str | None = None) -> bool:
-    """True once this branch has spent its ONE final-round acceptance.
+    """Legacy stale-hook state: whether the branch spent final acceptance.
 
     Branch-scoped on purpose: a global latch would permanently disarm the sigil
     for every later change on the install. Never raises — an unreadable or
@@ -886,18 +1136,11 @@ def get_final_accept_consumed(cwd: str | None = None) -> bool:
 
 
 def consume_final_accept(cwd: str | None = None) -> None:
-    """Spend this branch's final-round acceptance. Best-effort, never raises.
+    """Legacy stale-hook API: spend a branch final acceptance. Never raises.
 
-    Recorded at the moment the gate ALLOWS the acked commit, because a PreToolUse
-    hook has no post-execution callback — there is no later point at which to
-    learn the commit succeeded. Burning it on allow is the deliberate direction:
-    if the commit then fails for an unrelated reason the change is stuck, and at
-    round seven "stuck" means "take it to the user", which is the intent.
-
-    No-ops when no same-branch counter exists. That state is unreachable from the
-    only caller — the terminal fires on ``lifetime >= FINAL_ROUND_CAP``, which
-    requires exactly such a counter — so writing a synthetic one here could only
-    invent a lifetime that was never counted.
+    Preserves the old one-shot state transition for a stale guard importing this
+    module. Current guards do not call it. No-ops when no same-branch counter
+    exists rather than inventing a lifetime that was never counted.
 
     ONE-SHOT IS NOT A HARD GUARANTEE, and the limit is worth naming: both this and
     ``get_final_accept_consumed`` compare against ``get_current_branch``, which
@@ -916,7 +1159,7 @@ def consume_final_accept(cwd: str | None = None) -> None:
 
 
 def get_review_lifetime(cwd: str | None = None) -> int:
-    """Counted review rounds over this branch's WHOLE life. Never raises.
+    """Legacy branch-lifetime count retained for stale hook trees. Never raises.
 
     Differs from ``get_review_round`` in exactly one way that matters: an
     ``# escalation-ack`` resets the consecutive streak and does NOT reset this.
@@ -931,7 +1174,9 @@ def get_review_lifetime(cwd: str | None = None) -> int:
     return _coerce_finite_int(state.get("lifetime", 0))
 
 
-def get_review_counters(cwd: str | None = None) -> tuple[int, int]:
+def get_review_counters(
+    cwd: str | None = None, *, deadline: float | None = None
+) -> tuple[int, int]:
     """``(round, lifetime)`` from ONE snapshot of the counter file. Never raises.
 
     WHY THIS EXISTS RATHER THAN TWO CALLS. Which enforcement tier is live is a
@@ -947,20 +1192,15 @@ def get_review_counters(cwd: str | None = None) -> tuple[int, int]:
     (one ``git branch --show-current``, not two) -- which matters for the hook-path
     callers that run on every question a session asks.
 
-    THE COMMIT GATE DOES NOT USE THIS YET, and saying otherwise would be exactly the
-    kind of claim this accessor exists to make checkable. ``review_enforcement_commit``
-    still reads ``get_review_round`` at :934 and ``get_review_lifetime`` at :970, so it
-    remains open to the same torn pair -- there it would print the wrong TIER'S BLOCK
-    MESSAGE rather than the wrong menu. That is a pre-existing defect in the gate, not
-    one this accessor introduces; converting the gate is tracked separately, alongside
-    the round file's atomic-write work, since both concern concurrent access to the
-    same file.
+    The current commit gate uses this snapshot for the local consecutive-streak
+    rule. The lifetime value remains in the tuple for compatibility but no longer
+    selects a current authorization tier.
 
     Same branch-scoping contract as the two accessors it replaces: a counter written
     for a different branch reads as ``(0, 0)``, because a new change starts fresh.
     """
-    state = _load_round(cwd)
-    if not state or state.get("branch") != get_current_branch(cwd=cwd):
+    state = _load_round(cwd, deadline=deadline)
+    if not state or state.get("branch") != get_current_branch(cwd=cwd, deadline=deadline):
         return (0, 0)
     return (
         _coerce_finite_int(state.get("round", 0)),
@@ -968,14 +1208,11 @@ def get_review_counters(cwd: str | None = None) -> tuple[int, int]:
     )
 
 
-def reset_review_round(cwd: str | None = None) -> None:
+def reset_review_round(cwd: str | None = None, *, deadline: float | None = None) -> None:
     """Reset the CONSECUTIVE streak, PRESERVING the lifetime count. Never raises.
 
-    Deliberately a rewrite rather than the unlink this used to do. The only
-    caller is the escalation-cap ack, whose purpose is to clear the streak so the
-    next stop is a fresh cap away — but deleting the file would take the lifetime
-    counter with it, and a terminal that its own ack erases is not a terminal.
-    So: streak to 0, lifetime and branch carried forward.
+    Deliberately preserves the legacy lifetime fields so stale hook trees remain
+    compatible while clearing the current consecutive-streak rule.
 
     ``last_hash`` is dropped on purpose. It exists to make a re-mark of the SAME
     staged diff idempotent within a streak; once the streak is reset, the next
@@ -989,7 +1226,7 @@ def reset_review_round(cwd: str | None = None) -> None:
     count with it and leaving the terminal unreachable. Only external rounds are
     ever counted, so a surviving lifetime implies external provenance.
     """
-    state = _load_round(cwd)
+    state = _load_round(cwd, deadline=deadline)
     lifetime = _coerce_finite_int(state.get("lifetime", 0)) if state else 0
     branch = state.get("branch") if state else None
     if not lifetime or not branch:
@@ -998,7 +1235,7 @@ def reset_review_round(cwd: str | None = None) -> None:
         import contextlib
 
         with contextlib.suppress(OSError):
-            _round_file(cwd).unlink(missing_ok=True)
+            _round_file(cwd, deadline=deadline).unlink(missing_ok=True)
         return
     _write_round(
         {
@@ -1011,21 +1248,26 @@ def reset_review_round(cwd: str | None = None) -> None:
             "final_accept_consumed": bool(state.get("final_accept_consumed")),
         },
         cwd,
+        deadline=deadline,
     )
 
 
-def get_current_branch(cwd: str | None = None) -> str:
+def get_current_branch(cwd: str | None = None, *, deadline: float | None = None) -> str:
     """Get current git branch name."""
     try:
         result = subprocess.run(
             ["git", "branch", "--show-current"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=_deadline_timeout(deadline, 5),
             cwd=cwd,
+            env=git_env(),
         )
         return result.stdout.strip() or "unknown"
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+    except subprocess.TimeoutExpired as exc:
+        propagate_deadline_timeout(deadline, exc)
+        return "unknown"
+    except (FileNotFoundError, OSError):
         return "unknown"
 
 

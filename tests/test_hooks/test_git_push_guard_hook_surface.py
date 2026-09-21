@@ -18,6 +18,7 @@ tests in test_git_push_guard_codex_freshness.py).
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import re
@@ -84,6 +85,28 @@ def _files_jsonl(*filenames, previous=None):
 
 
 class TestHookSurfaceMatcher:
+    def test_reverse_skew_fallback_matches_shared_canonical_surface(self):
+        tree = ast.parse((_HOOKS_DIR / "git_push_guard.py").read_text())
+        fallbacks = {}
+        for node in tree.body:
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if not isinstance(target, ast.Name) or target.id not in {
+                "_HOOK_SURFACE_PREFIXES",
+                "_HOOK_SURFACE_FILES",
+            }:
+                continue
+            fallback = node.value.orelse
+            if target.id == "_HOOK_SURFACE_FILES":
+                fallback = fallback.args[0]
+            fallbacks[target.id] = ast.literal_eval(fallback)
+
+        assert fallbacks["_HOOK_SURFACE_PREFIXES"] == _mod._review_budget.HOOK_SURFACE_PREFIXES
+        assert set(fallbacks["_HOOK_SURFACE_FILES"]) == set(
+            _mod._review_budget.HOOK_SURFACE_FILES
+        )
+
     @pytest.mark.parametrize(
         "path",
         [
@@ -93,6 +116,12 @@ class TestHookSurfaceMatcher:
             "scripts/bash_safety_hook.sh",
             "scripts/review_scope.py",
             "scripts/review_state.py",
+            "scripts/review_budget.py",
+            "scripts/external_review.py",
+            "scripts/lib/gate_menu.py",
+            "config/external_review.yaml",
+            "src/genesis/session_awareness/external_review.py",
+            "src/genesis/session_awareness/external_review_config.py",
             ".claude/settings.json",
             ".claude/hooks/genesis-hook",
         ],

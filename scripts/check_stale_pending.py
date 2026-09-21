@@ -26,6 +26,15 @@ def main() -> None:
     if not DB_PATH.exists():
         return
 
+    # Admission fence (fail-closed): session-start advisory read — a fenced
+    # database is never opened, and silence is the designed degrade.
+    try:
+        from db_admission_check import database_is_fenced
+    except Exception:
+        return
+    if database_is_fenced(DB_PATH):
+        return
+
     try:
         conn = sqlite3.connect(str(DB_PATH), timeout=3)
         cursor = conn.execute(

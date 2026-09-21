@@ -45,6 +45,7 @@
 #   CODE_INTEL_INDEX_MEMORY_MAX   legacy override for both tools
 #   CODE_INTEL_CBM_MEMORY_MAX     default 2G     (CBM batch scope)
 #   CODE_INTEL_GITNEXUS_MEMORY_MAX default 8G    (measured GitNexus rebuild)
+#   CODE_INTEL_FILE_CACHE_RESERVE_BYTES default 2G (clean cache kept outside job)
 #   CODE_INTEL_INDEX_IO_WEIGHT    default 20     (1-10000; low = polite)
 #   CODE_INTEL_INDEX_CPU_QUOTA    default 200%   (2 cores worth)
 #   CODE_INTEL_INDEX_MODE         default fast   (fast|moderate|full; 3rd arg wins)
@@ -53,6 +54,61 @@
 #   CODE_INTEL_INDEX_DISABLE=1    skip all indexing (escape hatch)
 
 set -u
+
+# Private child launcher. The supervising script owns admission, scope control,
+# pausing and cleanup; making that supervisor an OOM target can remove the only
+# process able to stop or thaw the heavy job. Apply the kernel's maximum
+# preference only in the disposable child, immediately before exec, and verify
+# the effective value. +1000 is maximally preferred among tasks eligible in the
+# applicable OOM domain; cgroup OOM-domain boundaries still govern eligibility.
+if [ "${1:-}" = "--exec-indexer-with-oom-adj" ]; then
+    shift
+    if [ "$#" -eq 0 ]; then
+        printf '%s\n' "code-intel: missing indexer command" >&2
+        exit 125
+    fi
+    if [ -n "${CODE_INTEL_INDEX_OOM_SCORE_ADJ:-}" ] \
+        && [ "$CODE_INTEL_INDEX_OOM_SCORE_ADJ" != "1000" ]; then
+        printf '%s\n' \
+            "code-intel: CODE_INTEL_INDEX_OOM_SCORE_ADJ requires 1000; refusing unsafe batch workload" >&2
+        exit 125
+    fi
+
+    # One-way failure injection: this can only make a test/refusal stricter. It
+    # cannot redirect the proof or let an unprotected workload execute.
+    if [ "${CODE_INTEL_TEST_FORCE_OOM_ADJ_FAILURE:-0}" = "1" ]; then
+        printf '%s\n' "code-intel: cannot establish oom_score_adj=1000; refusing batch workload" >&2
+        exit 125
+    fi
+    _oom_adj_file=/proc/self/oom_score_adj
+    if ! { printf '%s\n' 1000 > "$_oom_adj_file"; } 2>/dev/null; then
+        printf '%s\n' "code-intel: cannot establish oom_score_adj=1000; refusing batch workload" >&2
+        exit 125
+    fi
+    _oom_adj_actual=""
+    read -r _oom_adj_actual < "$_oom_adj_file" 2>/dev/null || _oom_adj_actual=""
+    if [ "$_oom_adj_actual" != "1000" ]; then
+        printf '%s\n' \
+            "code-intel: cannot establish oom_score_adj=1000 (read back '${_oom_adj_actual:-unavailable}'); refusing batch workload" >&2
+        exit 125
+    fi
+    exec "$@"
+fi
+
+_CODE_INTEL_ENTRYPOINT="${BASH_SOURCE[0]}"
+case "$_CODE_INTEL_ENTRYPOINT" in
+    /*) : ;;
+    */*)
+        _code_intel_entry_dir="${_CODE_INTEL_ENTRYPOINT%/*}"
+        _code_intel_entry_base="${_CODE_INTEL_ENTRYPOINT##*/}"
+        _code_intel_entry_dir="$(cd -P -- "$_code_intel_entry_dir" 2>/dev/null && pwd)" \
+            || { printf '%s\n' "code-intel: cannot resolve entrypoint path" >&2; exit 1; }
+        _CODE_INTEL_ENTRYPOINT="$_code_intel_entry_dir/$_code_intel_entry_base"
+        ;;
+    *)
+        _CODE_INTEL_ENTRYPOINT="$(pwd -P)/$_CODE_INTEL_ENTRYPOINT"
+        ;;
+esac
 
 # Resolve HOME when unset: stripped-env/systemd/sandbox invocations can leave
 # HOME unset, which under `set -u` aborts at the first ${HOME} use. Fall back
@@ -71,7 +127,7 @@ MODE="${3:-${CODE_INTEL_INDEX_MODE:-fast}}"
 _LEGACY_MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-}"
 CBM_MEM_MAX="${CODE_INTEL_CBM_MEMORY_MAX:-${_LEGACY_MEM_MAX:-2G}}"
 # Measured 2026-09-16: a forced full rebuild peaked at 4,874,166,272 bytes
-# (4.65 GiB) and completed under an 8 GiB, swapless scope. The old shared 2G
+# (4.54 GiB) and completed under an 8 GiB, swapless scope. The old shared 2G
 # cap killed it on the way up. Keep headroom for repository growth; admission
 # control and the pressure watchdog still decide when the job may run.
 GITNEXUS_MEM_MAX="${CODE_INTEL_GITNEXUS_MEMORY_MAX:-${_LEGACY_MEM_MAX:-8G}}"
@@ -149,6 +205,60 @@ _genesis_mem_ceiling() {
     [ -n "$total_kb" ] && printf '%s' "$(( total_kb * 1024 ))"
 }
 
+# Convert a cgroup's total charge into a conservative working-set estimate.
+# memory.current includes clean filesystem cache, which the kernel can reclaim
+# before an OOM. Counting every cached byte as permanently occupied starves the
+# indexer on a cache-heavy box even when anon+kernel memory is small. Do NOT use
+# anon alone: shmem, dirty/writeback pages and kernel memory still consume the
+# parent cgroup. Mirror read_container_memory_reclaimable(): the file LRU
+# counters exclude tmpfs/shmem, unlike the broad `file` counter. Discount only
+# clean LRU cache above a retained floor. Missing/malformed statistics fail
+# closed to the raw charge.
+_genesis_mem_working_set_from() {
+    local current="${1:-}" stat_path="${2:-}"
+    [[ "$current" =~ ^[0-9]+$ ]] || return 1
+    [ -r "$stat_path" ] || { printf '%s' "$current"; return; }
+
+    local fields inactive active dirty writeback v1_inactive v1_active v1_dirty v1_writeback reserve reclaimable discount
+    fields="$(awk '
+        $1 == "inactive_file" { inactive = $2 }
+        $1 == "active_file" { active = $2 }
+        $1 == "file_dirty" { dirty = $2 }
+        $1 == "file_writeback" { writeback = $2 }
+        $1 == "total_inactive_file" { v1_inactive = $2 }
+        $1 == "total_active_file" { v1_active = $2 }
+        $1 == "total_dirty" { v1_dirty = $2 }
+        $1 == "total_writeback" { v1_writeback = $2 }
+        END { printf "%s|%s|%s|%s|%s|%s|%s|%s", inactive, active, dirty, writeback, v1_inactive, v1_active, v1_dirty, v1_writeback }
+    ' "$stat_path" 2>/dev/null)" || { printf '%s' "$current"; return; }
+    IFS='|' read -r inactive active dirty writeback v1_inactive v1_active v1_dirty v1_writeback <<< "$fields"
+    # A v1 memory.stat includes both local unprefixed counters and hierarchical
+    # total_* counters. memory.usage_in_bytes is hierarchical too, so choose
+    # the matching total_* schema before considering a v2 schema.
+    if [[ "$v1_inactive" =~ ^[0-9]+$ && "$v1_active" =~ ^[0-9]+$ && "$v1_dirty" =~ ^[0-9]+$ && "$v1_writeback" =~ ^[0-9]+$ ]]; then
+        inactive="$v1_inactive"; active="$v1_active"; dirty="$v1_dirty"; writeback="$v1_writeback"
+    elif [[ "$inactive" =~ ^[0-9]+$ && "$active" =~ ^[0-9]+$ && "$dirty" =~ ^[0-9]+$ && "$writeback" =~ ^[0-9]+$ ]]; then
+        :  # cgroup v2 schema
+    else
+        printf '%s' "$current"
+        return
+    fi
+    for fields in "$inactive" "$active" "$dirty" "$writeback"; do
+        [[ "$fields" =~ ^[0-9]+$ ]] || { printf '%s' "$current"; return; }
+    done
+
+    reserve="${CODE_INTEL_FILE_CACHE_RESERVE_BYTES:-$(( 2 * 1024 * 1024 * 1024 ))}"
+    [[ "$reserve" =~ ^[0-9]+$ ]] || { printf '%s' "$current"; return; }
+    reclaimable=$(( inactive + active ))
+    [ "$(( dirty + writeback ))" -lt "$reclaimable" ] \
+        || { printf '%s' "$current"; return; }
+    reclaimable=$(( reclaimable - dirty - writeback ))
+    [ "$reclaimable" -gt "$reserve" ] || { printf '%s' "$current"; return; }
+    discount=$(( reclaimable - reserve ))
+    [ "$discount" -lt "$current" ] || { printf '%s' "$current"; return; }
+    printf '%s' "$(( current - discount ))"
+}
+
 # What everything on this box is using RIGHT NOW, job included — the fixed
 # reserve below is a floor for a machine whose live usage cannot be read. A
 # container where Genesis, Qdrant and the sessions already exceed that floor
@@ -160,14 +270,19 @@ _genesis_mem_current() {
         printf '%s' "$CODE_INTEL_MEM_CURRENT_BYTES"
         return
     fi
-    local raw=""
-    if [ -r /sys/fs/cgroup/memory.current ]; then
+    local raw="" stat_path=""
+    if [ -n "${CODE_INTEL_MEM_RAW_CURRENT_BYTES:-}" ]; then
+        raw="$CODE_INTEL_MEM_RAW_CURRENT_BYTES"
+        stat_path="${CODE_INTEL_MEM_STAT_PATH:-/sys/fs/cgroup/memory.stat}"
+    elif [ -r /sys/fs/cgroup/memory.current ]; then
         raw="$(cat /sys/fs/cgroup/memory.current 2>/dev/null)"
+        stat_path="${CODE_INTEL_MEM_STAT_PATH:-/sys/fs/cgroup/memory.stat}"
     elif [ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ]; then
         raw="$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null)"
+        stat_path="${CODE_INTEL_MEM_STAT_PATH:-/sys/fs/cgroup/memory/memory.stat}"
     fi
     if [ -n "$raw" ] && [ "$raw" -gt 0 ] 2>/dev/null; then
-        printf '%s' "$raw"
+        _genesis_mem_working_set_from "$raw" "$stat_path"
         return
     fi
     local total_kb avail_kb
@@ -181,7 +296,7 @@ _genesis_mem_current() {
 #: launched it. Below this the box is not able to host a rebuild safely.
 CODE_INTEL_SIBLING_RESERVE_BYTES="${CODE_INTEL_SIBLING_RESERVE_BYTES:-$(( 2 * 1024 * 1024 * 1024 ))}"
 #: MEASURED 2026-09-16: a forced full rebuild peaked at 4,874,166,272 bytes
-#: (4.65 GiB). A cap below the working set does not protect anything, it just
+#: (4.54 GiB). A cap below the working set does not protect anything, it just
 #: relocates the kill, so refuse instead of pretending.
 CODE_INTEL_GITNEXUS_MIN_BYTES="${CODE_INTEL_GITNEXUS_MIN_BYTES:-$(( 4874166272 ))}"
 
@@ -357,7 +472,7 @@ _run_capped() {
             -p "MemoryMax=${MEM_MAX}" -p "MemorySwapMax=0" \
             -p "IOWeight=${IO_WEIGHT}" -p "CPUQuota=${CPU_QUOTA}" \
             --description "code-intel index: $REPO_PATH" \
-            -- "$@"
+            -- /bin/bash "$_CODE_INTEL_ENTRYPOINT" --exec-indexer-with-oom-adj "$@"
     else
         # Fallback: polite scheduling + soft address-space cap. Mirrors the
         # run-codebase-memory launcher's degradation (never block on missing
@@ -372,9 +487,11 @@ _run_capped() {
         (
             [ -n "$mem_kb" ] && ulimit -v "$mem_kb" 2>/dev/null
             if command -v ionice >/dev/null 2>&1; then
-                exec nice -n 19 ionice -c 3 "$@"
+                exec nice -n 19 ionice -c 3 \
+                    /bin/bash "$_CODE_INTEL_ENTRYPOINT" --exec-indexer-with-oom-adj "$@"
             else
-                exec nice -n 19 "$@"
+                exec nice -n 19 \
+                    /bin/bash "$_CODE_INTEL_ENTRYPOINT" --exec-indexer-with-oom-adj "$@"
             fi
         )
     fi
