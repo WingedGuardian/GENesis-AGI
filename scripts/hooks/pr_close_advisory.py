@@ -75,7 +75,6 @@ from shell_parse import (  # noqa: E402
     _VERB_DISPATCHERS,
     _option_name,
     analyze_checked,
-    gh_pr_subcommand,
 )
 
 #: Cheap prefilter, same reasoning as `capped_read_advisory._GH_WORD`: this runs
@@ -130,11 +129,37 @@ _API_FIELD_FLAGS = frozenset({"-f", "--raw-field", "-F", "--field"})
 #: here a closing COMMENT whose text is a help flag would read as a help
 #: invocation and silence a real close -- a false NEGATIVE introduced by a
 #: false-positive fix, which is the worse of the two directions.
-_PR_CLOSE_VALUE_FLAGS = frozenset({"-c", "--comment", "-R", "--repo"})
+#: `-R/--repo` is deliberately NOT restated here. Duplicating it made the
+#: local table answer first, so the shared spec's hardened glued and attached
+#: spellings were never consulted and the reuse this file claims in two
+#: docstrings was behaviourally DEAD -- MEASURED: deleting both `_option_name`
+#: branches left the suite 89/89 green, and an exhaustive differential over
+#: 406,875 argv shapes found 0 disagreements. With the duplicate gone the
+#: shared spec is the only reader of the repo flag, the reuse is live, and
+#: deleting it correctly turns the suite red.
+_PR_CLOSE_VALUE_FLAGS = frozenset({"-c", "--comment"})
 
 #: MEASURED: `gh api repos/octocat/hello-world --help` prints help and issues no
 #: request, so a terminal help flag ANYWHERE means the command performs nothing.
 _HELP_FLAGS = frozenset({"--help", "-h"})
+
+#: Every value-taking flag this hook must step over, from ANY of the groups
+#: it reads. Unioned rather than applied per-position, because MEASURED
+#: against the real CLI that is what gh itself does: it accepts a
+#: subcommand-local value flag BEFORE the group and consumes the next token as
+#: its value. `gh -X PATCH api --help` and `gh -c note pr close --help` both
+#: resolve, and `gh -f pr create --help` FAILS with `unknown command
+#: "create"` -- gh having eaten `pr` as the value of `-f`. So a parser that
+#: does not step over these mislocates the group exactly where gh does not,
+#: and the union is the conservative reading of gh's own behaviour rather
+#: than a guess about it.
+#:
+#: This is still a per-subcommand model, not a widening of `shell_parse`'s
+#: shared spec: the same short flag means different things under different
+#: groups (`gh api -f` takes a value; `gh pr create -f` is `--fill` and takes
+#: none), so merging these into the shared table would mis-parse the latter
+#: for the fail-closed merge gate. Recurring class, filed separately.
+_VALUE_FLAGS = _API_VALUE_FLAGS | _PR_CLOSE_VALUE_FLAGS
 
 #: The mutation, tested against the VALUE of the `query` field rather than
 #: against rejoined argv. The previous form searched the whole command and so
@@ -154,7 +179,11 @@ _GRAPHQL_CLOSE = re.compile(r"\bmutation\b.*?closePullRequest", re.IGNORECASE | 
 #: Anchoring at the end also keeps the two MEASURED sub-resource negatives:
 #: `…/pulls/5/reviews` and `…/pulls/5?state=closed` are a listing and a filtered
 #: GET, neither of which closes anything.
-_REST_PATH = re.compile(r"(?:https?://[^/]+/)?repos/[^/\s]+/[^/\s]+/(?P<kind>pulls|issues)/\d+/?")
+#: The optional leading slash is MEASURED, not defensive: `gh api --help`
+#: (gh 2.101.0) demonstrates endpoints in exactly that spelling, so
+#: `gh api /repos/o/r/pulls/5 -X PATCH -f state=closed` is a documented close
+#: that the anchored pattern silently missed.
+_REST_PATH = re.compile(r"(?:https?://[^/]+/)?/?repos/[^/\s]+/[^/\s]+/(?P<kind>pulls|issues)/\d+/?")
 
 
 def _split_api_option(tok: str) -> tuple[str, str | None]:
@@ -169,8 +198,11 @@ def _split_api_option(tok: str) -> tuple[str, str | None]:
     if tok.startswith("--"):
         name, sep, val = tok.partition("=")
         return name, (val if sep else None)
-    if len(tok) > 2 and tok[:2] in _API_VALUE_FLAGS:
-        return tok[:2], tok[2:]
+    if len(tok) > 2 and tok[:2] in _VALUE_FLAGS:
+        # `-X=PATCH` as well as `-XPATCH`: the separator is optional in the
+        # shorthand form, and keeping the `=` in the value made the method
+        # compare as "=PATCH" and never match.
+        return tok[:2], tok[2:].lstrip("=") or None
     return tok, None
 
 
@@ -197,8 +229,17 @@ def _gh_group_at(argv: list[str]) -> tuple[int, str] | None:
         if skip_next:
             skip_next = False
             continue
+        # The shared spec FIRST, because it carries the hardened handling of
+        # the repo flag's glued and attached spellings -- the form that
+        # produced the original bypass. The union then covers the
+        # subcommand-local flags gh also accepts here, which the shared spec
+        # deliberately does not model.
         name, attached = _option_name(tok, spec)
         if not attached and name in spec.value_flags:
+            skip_next = True
+            continue
+        local, local_value = _split_api_option(tok)
+        if local_value is None and local in _VALUE_FLAGS:
             skip_next = True
             continue
         if not tok.startswith("-"):
@@ -210,6 +251,40 @@ def _gh_group(argv: list[str]) -> str | None:
     """The gh GROUP word (`pr`, `run`, `label`, …) for a gh argv, or None."""
     hit = _gh_group_at(argv)
     return hit[1] if hit else None
+
+
+def _positional_after(argv: list[str], start: int) -> str | None:
+    """The next POSITIONAL word after index `start`, stepping over flag values.
+
+    `gh_pr_subcommand` is not used for this any more, and the reason is a
+    MEASURED miss rather than a preference: its shared grammar consumes only
+    the repo flag, so `gh pr -c note close 1` read `note` as the subcommand
+    and a real close went unreported. `-c/--comment` is `gh pr close`'s own
+    flag, which the shared spec does not model and should not -- the same
+    per-subcommand split documented on `_VALUE_FLAGS`.
+
+    This is that spec EXTENDED, not replaced: the hardened repo-flag handling
+    still runs first, through `_option_name`, so the separated-value bypass it
+    was written for cannot come back through this door.
+    """
+    spec = _VERB_DISPATCHERS.get("gh")
+    skip_next = False
+    for tok in argv[start + 1 :]:
+        if skip_next:
+            skip_next = False
+            continue
+        if spec is not None:
+            name, attached = _option_name(tok, spec)
+            if not attached and name in spec.value_flags:
+                skip_next = True
+                continue
+        local, local_value = _split_api_option(tok)
+        if local_value is None and local in _VALUE_FLAGS:
+            skip_next = True
+            continue
+        if not tok.startswith("-"):
+            return tok
+    return None
 
 
 def _has_terminal_help(argv: list[str], value_flags: frozenset[str]) -> bool:
@@ -248,15 +323,25 @@ def _parse_api(argv: list[str]) -> _ApiCall | None:
     hit = _gh_group_at(argv)
     if hit is None or hit[1] != "api":
         return None
+    group_i = hit[0]
     endpoint: str | None = None
     fields: list[tuple[str, str]] = []
     method: str | None = None
     positional_only = False
-    i = hit[0] + 1
+    # The scan starts at argv[1], NOT after the group, because gh accepts
+    # api-local flags on BOTH sides of it -- MEASURED: `gh -X PATCH api ...`
+    # resolves. Starting after the group located `api` correctly and then
+    # never saw the method, so a real close read as a no-method request and
+    # went unreported. Only the ENDPOINT is positional-after-the-group; the
+    # options belong to the invocation wherever they sit.
+    i = 1
     while i < len(argv):
         tok = argv[i]
+        if i == group_i:
+            i += 1
+            continue
         if positional_only or not tok.startswith("-") or tok == "-":
-            if endpoint is None:
+            if endpoint is None and i > group_i:
                 endpoint = tok
             i += 1
             continue
@@ -265,7 +350,7 @@ def _parse_api(argv: list[str]) -> _ApiCall | None:
             i += 1
             continue
         name, value = _split_api_option(tok)
-        if value is None and name in _API_VALUE_FLAGS:
+        if value is None and name in _VALUE_FLAGS:
             i += 1
             value = argv[i] if i < len(argv) else None
         if value is not None:
@@ -284,9 +369,10 @@ def _parse_api(argv: list[str]) -> _ApiCall | None:
 #: rely on the check.
 _LIMIT = (
     "This note reads the command text only. A mutation supplied on stdin "
-    "(`--input -`) or from a file (`query=@file`) is not visible here and "
-    "produces no note — so silence is not evidence that a command leaves the "
-    "PR open."
+    "(`--input -`) or from a file (`query=@file`) is not visible here, nor is "
+    "a close reached through a shell alias, an expanded executable path, or "
+    "the body of a quoted heredoc — none of those produce a note, so silence "
+    "is not evidence that a command leaves the PR open."
 )
 
 
@@ -313,7 +399,8 @@ def _closes_a_pr(argv: list[str]) -> str | None:
     # operands happened to contain those words. An advisory additionally
     # requires the group to be the first positional, which is the only shape
     # that is really a `pr` subcommand.
-    if gh_pr_subcommand(argv) == "close" and _gh_group(argv) == "pr":
+    hit = _gh_group_at(argv)
+    if hit is not None and hit[1] == "pr" and _positional_after(argv, hit[0]) == "close":
         return "`gh pr close`"
     call = _parse_api(argv)
     if call is None or call.endpoint is None:
@@ -357,12 +444,16 @@ def _advisory(reasons: list[str], closes: int) -> str:
     """
     ambiguous = any("issue-or-pull-request" in r for r in reasons)
     singular = "pull request or issue" if ambiguous else "pull request"
-    plural = "pull requests or issues" if ambiguous else "pull requests"
     via = " and ".join(reasons)
+    # Counted in STEPS, and said that way. The number is how many parsed
+    # steps close something, which is not the number of PRs: a `for` loop is
+    # ONE step that may close many, and `a || b` is two steps of which at most
+    # one runs. Claiming a PR count from a step count was wrong in both
+    # directions at once.
     lead = (
         f"This command closes a {singular}, via {via}."
         if closes == 1
-        else f"This command closes {closes} {plural}, via {via}."
+        else f"This command has {closes} steps that close a {singular}, via {via}."
     )
     return (
         f"NOTE: {lead}\n"
@@ -401,6 +492,28 @@ def _process(payload: dict) -> None:
     reasons: list[str] = []
     closes = 0
     for seg in segments:
+        # depth>0 is substitution or a QUOTED-HEREDOC BODY. A quoted delimiter
+        # suppresses expansion in bash, so that text is prose the shell never
+        # runs -- `shell_parse` parses it anyway, which is the right
+        # fail-closed posture for a destructive guard and the wrong one for an
+        # advisory whose stated fatal failure is noise.
+        #
+        # MEASURED over 57,445 unique real Bash commands: 36 fire, and 4 of
+        # those are false positives, every one of them a heredoc or `$(...)`
+        # containing prose ABOUT closing a PR -- three of them written while
+        # developing this very hook. Skipping depth>0 removes 4 of 4 and loses
+        # 0 of 32 true positives on the same corpus.
+        #
+        # THE COST, stated rather than discovered later: a genuine
+        # `bash -c 'gh pr close 1'` or `X=$(gh pr close 1)` is also depth 1 and
+        # is now missed. Neither occurs in those 57,445 commands, but both are
+        # real shapes. Separating "nested but executed" from "nested inside a
+        # quoted heredoc" needs a distinction `shell_parse` does not model
+        # today, so this trades a measured noise class for an unmeasured
+        # coverage one -- the right direction for an advisory, and `_LIMIT`
+        # already tells the reader silence is not evidence.
+        if seg.depth:
+            continue
         why = _closes_a_pr(list(seg.argv or []))
         if not why:
             continue

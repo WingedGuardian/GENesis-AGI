@@ -15,6 +15,7 @@ enforcement design it replaces was abandoned.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -29,7 +30,11 @@ _HOOK = Path(__file__).resolve().parents[2] / "scripts" / "hooks" / "pr_close_ad
 _F = "-" + "f"
 
 
-def _run(command: str, payload: dict | None = None) -> subprocess.CompletedProcess:
+def _run(
+    command: str,
+    payload: dict | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
     body = payload if payload is not None else {"tool_input": {"command": command}}
     return subprocess.run(
         [sys.executable, str(_HOOK)],
@@ -37,6 +42,7 @@ def _run(command: str, payload: dict | None = None) -> subprocess.CompletedProce
         capture_output=True,
         text=True,
         timeout=60,
+        env={**os.environ, **(env or {})},
     )
 
 
@@ -136,7 +142,7 @@ SILENT = [
         id="a-pr-comment-mentioning-the-mutation",
     ),
     # A PATCH to a SUB-RESOURCE carrying a real state field. This is the case
-    # where the `(?![/\w])` boundary is load-bearing: the query-string cases
+    # where the endpoint `fullmatch` is load-bearing: the query-string cases
     # above are already silent because no TOKEN is a state field, so they never
     # exercised it and stayed green with the lookahead reverted.
     pytest.param(
@@ -242,10 +248,13 @@ def test_a_dispatched_session_is_advised_exactly_like_a_foreground_one():
     intended. Identical output is how that is held here — there is no
     session-type branch to drift."""
     fg = _run("gh pr close 1", payload={"tool_input": {"command": "gh pr close 1"}})
-    bg = _run(
-        "gh pr close 1",
-        payload={"tool_input": {"command": "gh pr close 1"}, "genesis_cc_session": True},
-    )
+    # GENESIS_CC_SESSION is an ENVIRONMENT variable, which is how every other
+    # consumer in this repo detects a dispatched session. The first version of
+    # this test passed `genesis_cc_session` as a PAYLOAD key -- a name nothing
+    # anywhere reads -- so it compared two identical payloads and the property
+    # in the docstring was untested. The hook reads no environment today, and
+    # that is the point: this fails the day someone adds the branch.
+    bg = _run("gh pr close 1", env={"GENESIS_CC_SESSION": "1"})
     assert fg.returncode == bg.returncode == 0
     assert _note(fg) == _note(bg) != ""
 
@@ -496,6 +505,51 @@ def test_help_INSIDE_a_value_does_not_silence_a_real_close(command):
     assert _fires(command) is True
 
 
+@pytest.mark.parametrize(
+    ("command", "fires"),
+    [
+        # Each of these is a REAL close that the first structured version
+        # missed — false NEGATIVES, where round 1's were false positives.
+        pytest.param(
+            "gh api /repos/o/r/pulls/5 -X PATCH " + _F + " state=closed",
+            True,
+            id="leading-slash-endpoint",
+        ),
+        pytest.param("gh pr -c note close 1", True, id="close-flag-before-the-subcommand"),
+        pytest.param(
+            "gh -X PATCH api repos/o/r/pulls/5 " + _F + " state=closed",
+            True,
+            id="api-flag-before-the-group",
+        ),
+        pytest.param(
+            "gh api repos/o/r/pulls/5 -X=PATCH " + _F + " state=closed",
+            True,
+            id="equals-in-a-shorthand-value",
+        ),
+        # The widened skip must not start EATING positionals it should see.
+        # These are the direction the widening could break, and they are the
+        # reason it is a measured union rather than "skip anything dashed".
+        pytest.param("gh pr list", False, id="still-silent-on-a-list"),
+        pytest.param("gh -R o/r pr list", False, id="still-silent-with-a-repo-flag"),
+        pytest.param(
+            "gh run list --workflow pr close", False, id="still-silent-on-a-workflow-named-pr"
+        ),
+        pytest.param("gh pr create -" + "f", False, id="a-valueless-short-under-another-group"),
+    ],
+)
+def test_gh_accepts_group_flags_out_of_order_and_so_must_this(command, fires):
+    """MEASURED against the real CLI, which is the only authority here.
+
+    `gh -X PATCH api --help` and `gh -c note pr close --help` both resolve,
+    and `gh -f pr create --help` FAILS with `unknown command "create"` — gh
+    having eaten `pr` as the value of `-f`. So gh steps over subcommand-local
+    value flags wherever they appear, and a parser that does not mislocates
+    the group exactly where gh does not. The union is a reading of gh's
+    behaviour, not a guess about it.
+    """
+    assert _fires(command) is fires
+
+
 def test_a_compound_close_reports_HOW_MANY_not_how_many_mechanisms():
     """Deduplicating by mechanism erased repetition.
 
@@ -506,7 +560,7 @@ def test_a_compound_close_reports_HOW_MANY_not_how_many_mechanisms():
     mechanisms are now counted separately.
     """
     note = _note(_run("gh pr close 1 && gh pr close 2"))
-    assert "closes 2 pull requests" in note, note
+    assert "has 2 steps that close a pull request" in note, note
 
 
 def test_one_close_still_reads_as_one():
@@ -536,6 +590,40 @@ def test_the_pulls_endpoint_is_still_unambiguous():
     note = _note(_run("gh api repos/o/r/pulls/5 -X PATCH " + _F + " state=closed"))
     assert "pull request or issue" not in note, note
     assert "closes a pull request," in note, note
+
+
+@pytest.mark.parametrize(
+    ("command", "fires"),
+    [
+        pytest.param(
+            "cat >> /tmp/notes.md <<'MDEOF'\nsee `gh pr close 1`\nMDEOF",
+            False,
+            id="prose-in-a-quoted-heredoc",
+        ),
+        pytest.param(
+            "out=$(gh pr list --json number)", False, id="a-substitution-that-closes-nothing"
+        ),
+        pytest.param("gh pr close 1", True, id="the-real-thing-still-fires"),
+    ],
+)
+def test_text_NESTED_inside_a_quoted_heredoc_is_prose_not_a_command(command, fires):
+    """A quoted heredoc delimiter suppresses expansion in bash, so the body is
+    text the shell never runs. `shell_parse` parses it anyway — the right
+    fail-closed posture for a destructive guard, the wrong one for an advisory
+    whose stated fatal failure is noise.
+
+    MEASURED over 57,445 unique real Bash commands: 36 fired and 4 were false
+    positives, every one of them prose ABOUT closing a PR inside a heredoc or
+    a substitution — three of them written while developing this very hook.
+    Skipping depth>0 removed 4 of 4 and lost 0 of 32 true positives.
+
+    The cost is real and stated in the code: a genuine `bash -c 'gh pr close
+    1'` is also depth 1 and is now missed. That trades a measured noise class
+    for an unmeasured coverage one, which is the right direction here and is
+    named in the advisory's own limit text.
+    """
+    note = _note(_run(command))
+    assert bool(note) is fires, note
 
 
 def test_the_hook_is_actually_wired():
