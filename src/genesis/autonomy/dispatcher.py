@@ -202,7 +202,39 @@ class TaskDispatcher:
         it can never fall through to a check after the try block -- and a
         cancellation that spends an approval silently is exactly the state
         this event exists to make visible.
+
+        A falsy executor result does NOT mean the task is still BLOCKED —
+        ``execute()`` returning False can follow a transition to FAILED
+        (missing plan file, unexpected exception) or CANCELLED. Report the
+        task's persisted phase so operators are not told to seek a new
+        approval for a terminal task (Devin P2, #2086); the "needs a new
+        approval" phrasing is only emitted when the task is actually blocked.
         """
+        phase = None
+        try:
+            from genesis.db.crud import task_states
+
+            row = await task_states.get_by_id(self._db, task_id)
+            if row:
+                phase = row.get("current_phase")
+        except Exception:
+            logger.debug("phase lookup for %s failed", task_id, exc_info=True)
+        if phase == TaskPhase.BLOCKED.value:
+            message = (
+                f"Task {task_id} stayed blocked after spending approval "
+                f"{claimed} ({reason})"
+            )
+        elif phase is None:
+            message = (
+                f"Resume of task {task_id} failed after spending approval "
+                f"{claimed} ({reason}); persisted phase unreadable"
+            )
+        else:
+            message = (
+                f"Resume of task {task_id} failed after spending approval "
+                f"{claimed} ({reason}); task is now {phase} — it does NOT "
+                f"need a new approval"
+            )
         if not self._event_bus:
             return
         try:
@@ -212,11 +244,11 @@ class TaskDispatcher:
                 Subsystem.AUTONOMY,
                 Severity.ERROR,
                 "task.resume_failed",
-                f"Task {task_id} stayed blocked after spending approval "
-                f"{claimed} ({reason})",
+                message,
                 task_id=task_id,
                 approval_request_id=claimed,
                 reason=reason,
+                phase=phase,
             )
         except Exception:
             logger.error("Failed to emit task.resume_failed event", exc_info=True)

@@ -352,67 +352,72 @@ async def claim_approved_for_task(
     _TASK_MATCH = """(CASE WHEN json_valid(context)
                             THEN json_extract(context, '$.task_id') END) = ?"""
 
-    # Step 1: the NEWEST HUMAN ANSWER for this task, whatever it said.
-    # Filtering to status='approved' FIRST cannot enforce "the newest answer
-    # governs", because a later rejection or cancellation is excluded by the
-    # very filter that is supposed to be ranked. The user approving an older
-    # duplicate and then rejecting a newer one would leave the approval live
-    # and the rejection invisible. Ranking over ALL resolved rows is what
-    # makes the docstring true. Unresolved (pending) rows carry a NULL
-    # resolved_at and are excluded here -- an unanswered card is not an
-    # answer -- but they are retired in step 3.
+    now = datetime.now(UTC).isoformat()
+
+    # Steps 1+2 in ONE statement: claim the newest RESOLVED row for this task,
+    # but only when that row is 'approved'. Selecting the candidate INSIDE the
+    # UPDATE makes the decision read and the claim indivisible — the subquery
+    # evaluates under the write lock this statement takes, so a rejection
+    # committed between a separate SELECT and the claim can no longer be
+    # missed (the old SELECT-then-UPDATE gap let an interleaved rejection leave
+    # the code consuming the OLDER approval anyway — Devin P1, #2086). When
+    # the newest answer is negative the subquery selects that row, the
+    # status='approved' predicate fails, rowcount is 0, and nothing is
+    # claimed or retired — a rejection is not a licence to invalidate other
+    # rows. Unresolved (pending) rows carry NULL resolved_at and are excluded
+    # from the candidate set — an unanswered card is not an answer — but they
+    # are retired in step 3. `id DESC` makes ties (same-second resolved_at)
+    # deterministic rather than arbitrary.
     cursor = await db.execute(
-        f"""SELECT id, status FROM approval_requests
+        f"""UPDATE approval_requests SET consumed_at = ?
              WHERE consumed_at IS NULL
-               AND resolved_at IS NOT NULL
-               AND action_type = ?
-               AND {_TASK_MATCH}
-             ORDER BY resolved_at DESC
-             LIMIT 1""",
-        (action_type, task_id),
+               AND status = 'approved'
+               AND id = (
+                   SELECT id FROM approval_requests
+                    WHERE consumed_at IS NULL
+                      AND resolved_at IS NOT NULL
+                      AND action_type = ?
+                      AND {_TASK_MATCH}
+                    ORDER BY resolved_at DESC, id DESC
+                    LIMIT 1
+               )
+             RETURNING id""",
+        (now, action_type, task_id),
     )
     row = await cursor.fetchone()
     if row is None:
-        return None
-    request_id = row["id"] if isinstance(row, aiosqlite.Row) else row[0]
-    status = row["status"] if isinstance(row, aiosqlite.Row) else row[1]
-    if status != "approved":
-        # The newest answer was negative. Nothing is claimed and nothing is
-        # retired: a rejection is not a licence to invalidate other rows.
-        return None
-
-    now = datetime.now(UTC).isoformat()
-
-    # Step 2: claim it atomically. The consumed_at IS NULL predicate plus the
-    # rowcount check is what makes a concurrent claimer lose rather than
-    # produce a second dispatch of the same task. Inlined rather than calling
-    # mark_consumed because that helper COMMITS, which would split this claim
-    # into two transactions -- and a failure in between would leave the
-    # approval permanently spent with its siblings still live, i.e. the exact
-    # state this function exists to prevent.
-    cursor = await db.execute(
-        """UPDATE approval_requests SET consumed_at = ?
-            WHERE id = ? AND consumed_at IS NULL""",
-        (now, request_id),
-    )
-    if cursor.rowcount == 0:
         await db.rollback()
         return None
+    request_id = row["id"] if isinstance(row, aiosqlite.Row) else row[0]
 
     # Step 3: retire EVERY remaining sibling for this task, in the SAME
-    # transaction and regardless of status. Approved siblings would otherwise
-    # buy N free resumes; a PENDING sibling is worse, because it stays
-    # answerable -- the user taps it later, after the task has reached a
-    # DIFFERENT blocker, and that stale card releases a block nobody approved.
+    # transaction. Resolved-but-unconsumed siblings (another approval, an old
+    # rejection) get consumed_at alone. PENDING siblings are worse — with only
+    # consumed_at they stayed in every pending queue AND answerable: a user
+    # tapping the stale card later "resolved" a row no claim could ever use,
+    # and could release a block nobody approved (Devin P2, #2086). They are
+    # transitioned to 'cancelled' — a terminal status — with system resolution
+    # metadata, so list_pending drops them and resolve() no-ops on them.
     # The invariant: ONE human answer releases ONE block, and an answer to an
     # earlier block never releases a later one.
     await db.execute(
         f"""UPDATE approval_requests
                SET consumed_at = ?
              WHERE consumed_at IS NULL
+               AND resolved_at IS NOT NULL
                AND action_type = ?
                AND {_TASK_MATCH}""",
         (now, action_type, task_id),
+    )
+    await db.execute(
+        f"""UPDATE approval_requests
+               SET consumed_at = ?, status = 'cancelled',
+                   resolved_at = ?, resolved_by = 'system:claim-sweep'
+             WHERE consumed_at IS NULL
+               AND resolved_at IS NULL
+               AND action_type = ?
+               AND {_TASK_MATCH}""",
+        (now, now, action_type, task_id),
     )
     await db.commit()
     return request_id

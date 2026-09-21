@@ -568,6 +568,18 @@ async def test_pending_sibling_is_retired_when_a_claim_wins(claim_db):
         == "d-ok"
     )
     assert await _consumed_at(claim_db, "d-pending") is not None
+    # consumed_at alone left the card pending and answerable — it must also be
+    # moved to a terminal status (Devin P2, #2086).
+    assert (await _row(claim_db, "d-pending"))["status"] == "cancelled"
+    assert all(r["id"] != "d-pending" for r in await ar_crud.list_pending(claim_db))
+    # And resolving it now no-ops: the stale card cannot be answered.
+    assert await ar_crud.resolve(
+        claim_db,
+        "d-pending",
+        status="approved",
+        resolved_at="2026-09-01T13:00:00+00:00",
+        resolved_by="user",
+    ) is False
 
 
 @pytest.mark.asyncio
@@ -633,6 +645,67 @@ async def test_claim_and_retirement_land_in_one_transaction(claim_db):
     assert claimed == "f-ok"
     assert commits == 1, f"claim spanned {commits} transactions, expected 1"
     assert await _consumed_at(claim_db, "f-sib") is not None
+@pytest.mark.asyncio
+async def test_a_newer_cancellation_beats_an_older_approval(claim_db):
+    """The interleaved-answer class is not rejection-specific: ANY newer
+    resolved row must beat the approval, including a cancellation."""
+    await _mk_req(
+        claim_db,
+        rid="g-old",
+        task_id="t-8",
+        status="approved",
+        resolved_at="2026-09-01T10:00:00+00:00",
+    )
+    await _mk_req(
+        claim_db,
+        rid="g-new",
+        task_id="t-8",
+        status="cancelled",
+        resolved_at="2026-09-01T12:00:00+00:00",
+    )
+
+    assert (
+        await ar_crud.claim_approved_for_task(
+            claim_db, task_id="t-8", action_type=TASK_UNBLOCK_ACTION_TYPE
+        )
+        is None
+    )
+    # The older approval is NOT consumed by the failed claim.
+    assert await _consumed_at(claim_db, "g-old") is None
+
+
+@pytest.mark.asyncio
+async def test_resume_failure_reports_the_persisted_phase():
+    """A falsy execute() does not mean BLOCKED: a task the executor moved to
+    FAILED must be reported as failed, not as 'stayed blocked / needs a new
+    approval' (Devin P2, #2086)."""
+    db = await _db()
+    try:
+        token = await task_states.create_intake_token(db)
+        await task_states.create(
+            db,
+            task_id="t-9",
+            description="task that fails during resume",
+            current_phase="failed",
+            intake_token=token,
+        )
+        executor = MagicMock()
+        executor.execute = AsyncMock(return_value=False)
+        executor._semaphore_released = set()
+        bus = MagicMock()
+        bus.emit = AsyncMock()
+        dispatcher = TaskDispatcher(db=db, executor=executor, event_bus=bus)
+
+        await dispatcher._emit_resume_failed("t-9", "r-9", reason="failed")
+
+        (_, _, event_name, message), kwargs = bus.emit.await_args
+        assert event_name == "task.resume_failed"
+        assert "failed" in message and "stayed blocked" not in message
+        assert kwargs["phase"] == "failed"
+    finally:
+        await db.close()
+
+
 @pytest.mark.asyncio
 async def test_generic_resolve_refuses_a_task_unblock_row():
     """Excluding a type from the BATCH sweep is not enough on its own.
