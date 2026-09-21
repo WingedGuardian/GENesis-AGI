@@ -66,7 +66,7 @@ import sys
 import tarfile
 import time
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 # Two lanes, by whether the work is already in main (owner ruling 2026-09-10).
 # MERGED work is a duplicate of main, so it drains fast. UNMERGED work may be the
@@ -1537,7 +1537,7 @@ def _trash_worktree(
 # ---------------------------------------------------------------------------
 
 
-def _describe_recovery(stored: Path) -> bool:
+def _describe_recovery(stored: Path, repo_root: Path) -> bool:
     """Dry-run preview for a resolved trash entry: what recovery WOULD do.
 
     Read-only. Reads the entry's ``.trash_meta.json`` — from the directory, or
@@ -1550,15 +1550,21 @@ def _describe_recovery(stored: Path) -> bool:
     destination) are reported exactly as a real run would report them, so the
     preview cannot promise a recovery the real run would refuse.
     """
+    candidates: list[str] = []
     if stored.is_dir():
         meta_path = stored / ".trash_meta.json"
         if not meta_path.exists():
             print(f"No .trash_meta.json in {stored}", file=sys.stderr)
             return False
         meta = json.loads(meta_path.read_text())
-        file_count = sum(
-            1 for p in stored.rglob("*") if p.is_file() and p != meta_path
-        )
+        # Same walk `_restore_from_dir` uses: symlinks and files only, `.git`
+        # and every `.trash_meta.json` basename excluded.
+        for item in stored.rglob("*"):
+            rel = item.relative_to(stored)
+            if ".git" in rel.parts or rel.name == ".trash_meta.json":
+                continue
+            if item.is_symlink() or item.is_file():
+                candidates.append(rel.as_posix())
         consume_note = (
             "WOULD CONSUME the trash entry "
             "(directory form; recovery moves its contents back)"
@@ -1567,19 +1573,37 @@ def _describe_recovery(stored: Path) -> bool:
         try:
             with tarfile.open(stored, "r:gz") as tf:
                 members = tf.getmembers()
+                # The entry's OWN metadata sits at depth two: `<name>/.trash_meta.json`.
+                # A worktree may legitimately contain a deeper file of the same
+                # name, so a bare endswith() search can bind the nested copy and
+                # report — or refuse — the wrong entry. Prefer the root member;
+                # fall back to the first match for archives laid out differently.
                 meta_member = next(
                     (m for m in members
-                     if m.isfile() and m.name.endswith(".trash_meta.json")),
+                     if m.isfile()
+                     and len(PurePosixPath(m.name).parts) == 2
+                     and m.name.endswith(".trash_meta.json")),
                     None,
                 )
+                if meta_member is None:
+                    meta_member = next(
+                        (m for m in members
+                         if m.isfile() and m.name.endswith(".trash_meta.json")),
+                        None,
+                    )
                 if meta_member is None:
                     print(f"No .trash_meta.json in {stored}", file=sys.stderr)
                     return False
                 meta = json.loads(tf.extractfile(meta_member).read())
-                file_count = sum(
-                    1 for m in members
-                    if m.isfile() and not m.name.endswith(".trash_meta.json")
-                )
+                for m in members:
+                    parts = PurePosixPath(m.name).parts
+                    if len(parts) < 2:
+                        continue  # the root dir member itself
+                    rel = PurePosixPath(*parts[1:])
+                    if ".git" in rel.parts or rel.name == ".trash_meta.json":
+                        continue
+                    if m.isfile() or m.issym() or m.islnk():
+                        candidates.append(rel.as_posix())
         except (OSError, tarfile.TarError, EOFError, json.JSONDecodeError) as e:
             print(f"Failed to read {stored}: {e}", file=sys.stderr)
             return False
@@ -1591,6 +1615,7 @@ def _describe_recovery(stored: Path) -> bool:
     original_path = meta.get("original_path", "")
     branch = meta.get("branch", "")
     commit = meta.get("commit", "")
+    detached = meta.get("detached", False)
     if not original_path or (not branch and not commit):
         print(f"Incomplete metadata in {stored}", file=sys.stderr)
         return False
@@ -1598,12 +1623,47 @@ def _describe_recovery(stored: Path) -> bool:
         print(f"Original path already exists: {original_path}", file=sys.stderr)
         return False
 
-    if branch and not meta.get("detached", False):
+    # A stored branch name does not mean the branch still EXISTS — the reaper's
+    # callers routinely `git branch -D` right after archiving, and a real run
+    # then retries DETACHED at the recorded commit. Preview what recovery would
+    # actually do, not what the metadata last recorded.
+    branch_exists = bool(branch) and _run_git(
+        repo_root,
+        ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        timeout=10,
+    ) is not None
+    if branch and not detached and branch_exists:
         ref_note = f"branch: {branch}"
+        checkout_ref = branch
+    elif branch and not detached:
+        ref_note = (
+            f"detached at {commit[:8]} — branch {branch!r} no longer exists"
+        )
+        checkout_ref = commit
     else:
         ref_note = f"detached at {commit[:8]}"
+        checkout_ref = commit
+
+    # `git worktree add` recreates TRACKED files; the restore step then fills in
+    # only what the checkout left missing (copy-only-missing). Count the files
+    # recovery would actually write — everything stored that is not tracked at
+    # the recovery ref — rather than everything stored, which labels tracked
+    # checkout files and `.git` as "untracked" and overstates the count by the
+    # size of the tree.
+    tracked: set[str] | None = None
+    if checkout_ref:
+        out = _run_git(
+            repo_root, ["ls-tree", "-r", "--name-only", checkout_ref], timeout=30
+        )
+        if out is not None:
+            tracked = set(out.splitlines())
+
     _log(f"WOULD RECOVER {original_path} ({ref_note})")
-    _log(f"WOULD RESTORE {file_count} untracked file(s) from {stored}")
+    if tracked is None:
+        _log(f"WOULD RESTORE up to {len(candidates)} file(s) from {stored}")
+    else:
+        restorable = sum(1 for c in candidates if c not in tracked)
+        _log(f"WOULD RESTORE {restorable} untracked file(s) from {stored}")
     _log(consume_note)
     return True
 
@@ -1659,7 +1719,7 @@ def _recover(name: str, repo_root: Path, *, dry_run: bool = False) -> bool:
         # Resolution and ambiguity checks above are read-only, so running them
         # in dry-run keeps the preview's error messages identical to a real
         # run's. Everything below this line writes.
-        return _describe_recovery(stored)
+        return _describe_recovery(stored, repo_root)
     if stored.is_dir():
         return _restore_from_dir(stored, repo_root)
 

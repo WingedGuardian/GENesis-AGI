@@ -420,7 +420,9 @@ def test_recover_dry_run_previews_and_writes_nothing(
     out = capsys.readouterr().out
     assert "WOULD RECOVER" in out
     assert "merged-br" in out
-    assert "WOULD RESTORE" in out
+    # Only notes.txt is restorable: checkout recreates tracked files, and `.git`
+    # / `.trash_meta.json` are never restored.
+    assert "WOULD RESTORE 1 untracked file(s)" in out
     # Nothing was written: destination absent, trash entry intact.
     assert not src.exists()
     assert entry.is_dir()
