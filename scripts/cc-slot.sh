@@ -1150,8 +1150,9 @@ fi
 # safety boundary and the bug's own precondition — see its header for the
 # measured mechanism.
 #
-# Resolved from this script's own location rather than ${GENESIS_ROOT}, which is
-# hardcoded to ${HOME}/genesis above and is wrong on a clone living elsewhere.
+# Resolved through ${GENESIS_ROOT}, which was already computed above by
+# following symlinks from the script's real location — `dirname $0` would name
+# the directory of a symlink entrypoint and silently skip the guard there.
 #
 # SYNCHRONOUS, for the same reason as the lobby door: backgrounded, it would
 # race `new-session -A` and clear the mode after the operator had already been
@@ -1168,9 +1169,8 @@ fi
 # failure degrades to "skip the capture" instead of "skip the login".
 # (`[ -x … ] && cmd` as a standalone statement is separately MEASURED as
 # errexit-safe, so the guard itself was never the hazard.)
-_fc_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || _fc_dir=""
-if [ -n "$_fc_dir" ] && [ -x "${_fc_dir}/fleet_entry_guard.sh" ]; then
-    "${_fc_dir}/fleet_entry_guard.sh" "slot-${SLOT}" >/dev/null 2>&1 || true
+if [ -n "${GENESIS_ROOT:-}" ] && [ -x "${GENESIS_ROOT}/scripts/fleet_entry_guard.sh" ]; then
+    "${GENESIS_ROOT}/scripts/fleet_entry_guard.sh" "slot-${SLOT}" >/dev/null 2>&1 || true
 fi
 
 # The pane command is re-parsed by a fresh shell, so quote both paths before

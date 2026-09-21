@@ -143,16 +143,22 @@ def test_both_doors_actually_invoke_the_guard():
 def test_the_doors_resolve_the_guard_without_assuming_a_fixed_repo_root():
     """Generalizability: both doors must work on a clone that is not ~/genesis.
 
-    cc-slot.sh hardcodes GENESIS_ROOT="${HOME}/genesis" for its own purposes (a
-    separate known defect, deliberately not fixed here) — so the risk is a
-    future edit reaching for that variable because it is right there.
+    cc-slot.sh resolves GENESIS_ROOT from the script's real location after
+    following symlinks, so referencing it is safe; the hazards are a hardcoded
+    root literal, and `dirname $0`, which names the symlink's directory rather
+    than the checkout's scripts/ when the door is launched through a link.
     """
     for door in ("lobby-door.sh", "cc-slot.sh"):
         text = (REPO_ROOT / "scripts" / door).read_text()
-        line = next(ln for ln in text.splitlines() if "fleet_entry_guard.sh" in ln)
-        assert "GENESIS_ROOT" not in line, (
-            f"scripts/{door} resolves the guard from a hardcoded root"
-        )
+        lines = [ln for ln in text.splitlines() if "fleet_entry_guard.sh" in ln]
+        for line in lines:
+            assert '"$HOME' not in line and "~/genesis" not in line, (
+                f"scripts/{door} resolves the guard from a hardcoded root"
+            )
+            assert 'dirname "$0"' not in line and "dirname $0" not in line, (
+                f"scripts/{door} resolves the guard beside the entry "
+                "symlink, not beside the script"
+            )
 
 
 def test_script_is_executable_and_parses():
