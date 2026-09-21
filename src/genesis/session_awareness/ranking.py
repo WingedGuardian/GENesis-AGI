@@ -190,12 +190,20 @@ async def rank_candidates(
                 entity_terms if entity_terms is not None
                 else entity_query.split()
             )
+            # Redirects are unioned, not gated on the singular lookup: an
+            # active same-norm entity of another type wins get_by_norm_name's
+            # ordering and would otherwise MASK every merged row carrying that
+            # old surface form (Devin BUG_0001, #1729). One scan for the whole
+            # term loop — same discipline as resolve_query_entities.
+            redirects = await entities_crud.merged_norm_redirects(db)
             for keyword in terms:
                 ent = await entities_crud.get_by_norm_name(
                     db, norm_name=keyword,
                 )
                 if ent and ent.get("status") == "active":
                     weights[ent["entity_id"]] = 1.0
+                for survivor_id in redirects.get(keyword, ()):
+                    weights.setdefault(survivor_id, 1.0)
             if weights:
                 reached = await entities_crud.connected_entities(
                     db, list(weights), max_depth=2, as_of=created_before,

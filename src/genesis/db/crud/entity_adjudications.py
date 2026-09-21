@@ -215,15 +215,26 @@ async def settled_pair_keys(db: aiosqlite.Connection) -> set[str]:
     rediscover the pair and the drainer re-adjudicate it — otherwise a stale pair
     would be a permanent dead end."""
     cursor = await db.execute(
-        # Pre-policy 'distinct' re-opens (MW-3 PR-2b): a NULL policy stamp
-        # means the verdict predates the Option-1 same-referent prompt, whose
-        # predecessor settled real qualifier-variant pairs as distinct under a
-        # sub-item-vs-parent rule. Excluding them lets the sweep re-nominate
-        # exactly that class; merge/proposed_merge rows stay settled whatever
-        # their stamp (re-running a merge decision buys nothing and risks
-        # churn). Self-limiting: re-judged rows get stamped by record_verdict.
+        # Re-open rule for 'distinct' verdicts, two axes:
+        # 1. STALE POLICY — a NULL stamp predates the Option-1 same-referent
+        #    prompt (MW-3 PR-2b); a non-NULL stamp that isn't POLICY_VERSION is
+        #    just as superseded after the next version bump — only
+        #    current-policy judgments stay settled (Devin BUG_0002, #1729).
+        # 2. HUMAN REJECTS — a pre-migration reject() wrote verdict='distinct'
+        #    with policy NULL but reasoning 'human-reject: …'. Reopening those
+        #    would have the sweep re-propose a merge a human already declined
+        #    and overwrite their recorded reasoning (Codex P2, #1729); the
+        #    prefix is the durable marker that survives the migration.
+        # merge/proposed_merge rows stay settled whatever their stamp
+        # (re-running a merge decision buys nothing and risks churn).
+        # Self-limiting: re-judged rows get stamped by record_verdict.
         "SELECT pair_key FROM entity_adjudications WHERE verdict != 'stale' "
-        "AND NOT (verdict = 'distinct' AND policy IS NULL)"
+        "AND NOT ("
+        "    verdict = 'distinct' "
+        "    AND (policy IS NULL OR policy != ?) "
+        "    AND (reasoning IS NULL OR reasoning NOT LIKE 'human-reject:%')"
+        ")",
+        (POLICY_VERSION,),
     )
     return {r[0] for r in await cursor.fetchall()}
 

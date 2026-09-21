@@ -878,4 +878,7 @@ jobs:
         # The base is deliberately NOT re-derived from the merged tree: this is
         # a FLOOR, so a lagging base is conservative and can only under-catch,
         # never go falsely red.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23298
+        #
+        # 23298 -> 23302: the stale-recheck/settled-predicate fixes added four
+        # tests to test_entity_adjudication.py. File-delta count, per the rule.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23302

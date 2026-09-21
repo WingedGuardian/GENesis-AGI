@@ -1404,3 +1404,106 @@ async def test_sweep_enqueued_counter_counts_only_real_insertions(db, monkeypatc
     pending = await dw_crud.query_pending(db, work_type=adj.WORK_TYPE, limit=100)
     assert len(pending) == 0
     assert result["enqueued"] == 0, "sweep reported an enqueue the gate suppressed"
+
+
+async def _enqueue_flagged(db, eid, similar):
+    """A queue row carrying the stale-recheck flag (as the apply path writes)."""
+    item_id = str(uuid.uuid4())
+    await dw_crud.create(
+        db,
+        id=item_id,
+        work_type=adj.WORK_TYPE,
+        priority=60,
+        payload_json=json.dumps(
+            {"entity_id": eid, "similar_entity_id": similar, "stale_recheck": True}
+        ),
+        deferred_at="2026-07-17T00:00:00+00:00",
+        deferred_reason="stale recheck — identity drifted under the prior approval",
+        created_at="2026-07-17T00:00:00+00:00",
+        call_site_id="entity_adjudication",
+    )
+    return item_id
+
+
+@pytest.mark.asyncio
+async def test_live_stale_recheck_never_auto_merges(db):
+    """Codex P1 (#1729): the apply path re-enqueues the re-resolved pair after
+    an approved proposal goes stale; that pair usually has NO verdict row, so
+    `existing is None` alone would route it into live auto-merge — a merge the
+    human never approved. The stale_recheck flag forces the proposal lane."""
+    a = await _mk_entity(db, "omega", "omega")
+    c = await _mk_entity(db, "omega new", "omega new")
+    await _enqueue_flagged(db, c, a)
+    router = _router({"entity_adjudication": "merge", "entity_adjudication_challenge": "merge"})
+
+    counts = await adj.run_adjudication_drain(db, router, mode="live", budget=10)
+
+    assert counts["merged"] == 0 and counts["proposed"] == 1
+    assert await _status(db, a) == "active" and await _status(db, c) == "active"
+    row = await adj_crud.get_by_pair(db, a, c)
+    assert row["verdict"] == "proposed_merge" and row["approved_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_stale_recheck_flag_survives_pending_dedup(db):
+    """Dedup must not drop the marker: a plain pending row for the same pair
+    still gets flagged, or the pair would auto-merge on the strength the stale
+    verdict just invalidated."""
+    a = await _mk_entity(db, "sig", "sig")
+    b = await _mk_entity(db, "sig2", "sig2")
+    assert await entities_crud.enqueue_adjudication(db, entity_id=a, similar_entity_id=b)
+    assert (
+        await entities_crud.enqueue_adjudication(
+            db, entity_id=a, similar_entity_id=b, stale_recheck=True
+        )
+        is False
+    )
+    rows = await dw_crud.query_pending(db, work_type=adj.WORK_TYPE)
+    assert len(rows) == 1
+    assert json.loads(rows[0]["payload_json"]).get("stale_recheck") in (True, 1)
+
+
+@pytest.mark.asyncio
+async def test_pre_migration_human_reject_stays_settled(db):
+    """reject() rows written BEFORE the policy column existed carry
+    verdict='distinct', policy=NULL, reasoning='human-reject: …' — human
+    decisions, not old-prompt LLM judgments; they must never reopen
+    (Codex P2, #1729)."""
+    a = await _mk_entity(db, "rho", "rho")
+    b = await _mk_entity(db, "rhoa", "rhoa")
+    key = adj_crud.pair_key(a, b)
+    await db.execute(
+        "INSERT INTO entity_adjudications (id, pair_key, entity_a, entity_b, "
+        "verdict, reasoning, created_at) "
+        "VALUES ('r-h', ?, ?, ?, 'distinct', 'human-reject: nope', 'x')",
+        (key, a, b),
+    )
+    await db.commit()
+    assert key in await adj_crud.settled_pair_keys(db)
+
+
+@pytest.mark.asyncio
+async def test_old_policy_version_reopens_unless_human_rejected(db):
+    """A distinct stamped with a superseded (non-NULL, non-current) policy
+    reopens on the next sweep — NULL was not the only stale stamp
+    (Devin BUG_0002, #1729) — while a human reject carrying the same old
+    stamp stays settled."""
+    a = await _mk_entity(db, "tau", "tau")
+    b = await _mk_entity(db, "taua", "taua")
+    c = await _mk_entity(db, "tauu", "tauu")
+    key_ab = adj_crud.pair_key(a, b)
+    key_ac = adj_crud.pair_key(a, c)
+    for rid, key, eb, reasoning in (
+        ("r-old", key_ab, b, "llm said so"),
+        ("r-hr", key_ac, c, "human-reject: declined under mw2"),
+    ):
+        await db.execute(
+            "INSERT INTO entity_adjudications (id, pair_key, entity_a, entity_b, "
+            "verdict, reasoning, policy, created_at) "
+            "VALUES (?, ?, ?, ?, 'distinct', ?, 'mw2-ancient', 'x')",
+            (rid, key, a, eb, reasoning),
+        )
+    await db.commit()
+    settled = await adj_crud.settled_pair_keys(db)
+    assert key_ab not in settled
+    assert key_ac in settled

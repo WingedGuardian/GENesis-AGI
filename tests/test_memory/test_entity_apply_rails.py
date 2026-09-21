@@ -80,16 +80,20 @@ async def test_get_by_norm_name_follows_chains_to_the_active_survivor(db):
 
 
 @pytest.mark.asyncio
-async def test_merge_entity_repoints_existing_chains(db):
-    """Union-find compaction: rows pointing at the loser point straight at the
-    new survivor after the merge, keeping write-side chains one hop."""
+async def test_merge_entity_preserves_existing_chains(db):
+    """Inbound redirects are NOT re-pointed: A→loser stays A→loser and the
+    read-side walk follows it to the new survivor. The old compaction rewrote
+    A→C without journaling A→B, so an unmerge could not restore the redirect
+    (Codex P2, #1729) — write-side chains may now be >1 hop, which the walks
+    are built for."""
     a = await _mk(db, "Alpha", "alpha")
     b = await _mk(db, "Beta", "beta")
     c = await _mk(db, "Gamma", "gamma")
     await _tombstone(db, a, b)  # pre-existing chain a→b
     await entities_crud.merge_entity(db, loser_id=b, survivor_id=c)
     row = await entities_crud.get_entity(db, a)
-    assert row["merged_into"] == c, "an old loser still pointed at the new tombstone"
+    assert row["merged_into"] == b, "the inbound redirect must survive the merge"
+    assert (await entities_crud.resolve_active(db, a))["entity_id"] == c
 
 
 # ── typed fold lookup ────────────────────────────────────────────────────

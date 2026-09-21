@@ -373,16 +373,24 @@ def _is_rejudgable(prior: dict | None) -> bool:
     """Single-row mirror of ``settled_pair_keys``' NOT-settled predicate.
 
     A pair may be (re-)judged when it was never judged, its verdict is
-    ``stale`` (identity drifted), or it carries a pre-policy ``distinct``
-    (policy IS NULL — the class the PR-2b policy re-open deliberately
-    unsettles). Every dedup that guards judgment work must use THIS, so the
-    sweep's nomination predicate and the processors' skip predicates cannot
-    drift apart (the drift is exactly what made the re-open inert once).
+    ``stale`` (identity drifted), or it carries a ``distinct`` stamped with
+    anything OTHER than the current policy — NULL (pre-stamp, the class the
+    PR-2b re-open deliberately unsettles) or an older version (the next bump
+    must reopen them too, not leave them settled forever — Devin BUG_0002,
+    #1729). A human reject is never reopened: the ``human-reject:`` reasoning
+    prefix is the durable marker (Codex P2, #1729). Every dedup that guards
+    judgment work must use THIS, so the sweep's nomination predicate and the
+    processors' skip predicates cannot drift apart (the drift is exactly what
+    made the re-open inert once).
     """
     return (
         prior is None
         or prior["verdict"] == "stale"
-        or (prior["verdict"] == "distinct" and prior["policy"] is None)
+        or (
+            prior["verdict"] == "distinct"
+            and prior.get("policy") != adj_crud.POLICY_VERSION
+            and not (prior.get("reasoning") or "").startswith("human-reject:")
+        )
     )
 
 
@@ -485,12 +493,16 @@ async def _process_row(
         return
 
     # verdict == merge
-    # Live auto-merge covers only NEVER-judged pairs. A RE-judgment — the prior
-    # verdict is `stale` (a norm drift just invalidated whatever human approval
-    # existed) or a reopened pre-policy `distinct` — must land as proposed_merge
-    # behind the approval gate regardless of mode: mark_stale cleared the
-    # approval precisely because the identities changed under it.
-    if mode == "live" and existing is None:
+    # Live auto-merge covers only NEVER-judged pairs enqueued by ordinary
+    # producers. A RE-judgment must land as proposed_merge behind the approval
+    # gate regardless of mode — either the prior verdict is `stale`/reopened
+    # (existing non-None), or the queue row carries stale_recheck: the apply
+    # path re-enqueues a pair whose proposal went stale UNDER approval, and
+    # that pair usually has NO verdict row — `existing is None` alone would
+    # route it into the auto-merge lane, applying a merge the human never
+    # approved (Codex P1, #1729). mark_stale cleared the approval precisely
+    # because the identities changed under it.
+    if mode == "live" and existing is None and not payload.get("stale_recheck"):
         # Extraction-race guard: profile-building + two LLM calls opened an await
         # gap since we resolved these. Re-resolve immediately before the
         # irreversible merge; if either side moved (merged/renamed/gone) or they
@@ -650,6 +662,12 @@ async def _apply_one_proposal(
                                     own,
                                     entity_id=ent_a["entity_id"],
                                     similar_entity_id=ent_b["entity_id"],
+                                    # The re-resolved pair has no verdict row
+                                    # (`existing is None` downstream), so the
+                                    # flag is the ONLY thing keeping it out of
+                                    # the live auto-merge lane — the human
+                                    # approved A/B, not A/C (Codex P1, #1729).
+                                    stale_recheck=True,
                                     _commit=False,
                                 )
                                 # Count only rows that actually landed — the
