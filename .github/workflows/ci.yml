@@ -938,6 +938,30 @@ jobs:
         # caught it before the commit instead of in round 6. The habit is cheap;
         # the four prior instances each cost a review round.
         #
-        # UNION with this PR's own +76 collected tests (no new skips):
-        # floor 23342 -> 23418, ceiling holds at 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23418
+        # UNION with this PR's own +77 collected tests (no new skips):
+        # floor 23342 -> 23419, ceiling holds at 102.
+        #
+        # 76 was wrong, and it is the SIXTH instance of the trap this block
+        # already shouts about, one axis over: the number came from collecting
+        # the two test files this PR touches, when the floor moves by the DELTA.
+        # test_panel_layout_neutralisation.py already existed and its 12 cases
+        # were already inside 23342, so counting them again added them twice.
+        # MEASURED, three collections rather than one:
+        #   test_dashboard_css_isolation.py        (new)     -> 77
+        #   test_panel_layout_neutralisation.py    (branch)  -> 12
+        #   test_panel_layout_neutralisation.py    (main)    -> 12   delta 0
+        # so the delta is 77 and the floor is 23342 + 77.
+        #
+        # 77 and not 64: the review round that found the double-count also
+        # found five layout leaks in the watched set, and answering those added
+        # thirteen cases. Note 23419 is ONE ABOVE the original wrong 23418 —
+        # a coincidence, arrived at from a different direction, and exactly the
+        # kind of near-miss that would let the next reader conclude the first
+        # number was basically fine.
+        #
+        # "Re-count LAST" is not sufficient on its own: both wrong counts were
+        # taken last. The missing half is WHAT to count — a changed file
+        # contributes its delta against main, never its total — and the count
+        # is only final once the last test-adding edit is in, which on this
+        # branch was two rounds after the line was first written.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23419

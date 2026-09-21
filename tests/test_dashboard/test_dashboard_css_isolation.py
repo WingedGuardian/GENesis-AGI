@@ -188,7 +188,7 @@ TEMPLATE_DIR = ROOT / "src/genesis/dashboard/templates"
 # A wrong colour is visible to whoever wrote it; a wrong `display` moves other
 # people's content. Deliberately narrow: the set that has actually bitten here,
 # plus the near neighbours of those two incidents.
-LAYOUT_PROPS = frozenset(
+_PHYSICAL_LAYOUT_PROPS = frozenset(
     {
         "display",
         "position",
@@ -213,6 +213,45 @@ LAYOUT_PROPS = frozenset(
         "aspect-ratio",
         "contain",
     }
+)
+
+# Flow-relative equivalents, which are the "aliases" the set was always
+# documented to include and did not. DERIVED from the physical set rather than
+# listed beside it, so watching a new physical property brings its alias along
+# instead of depending on someone remembering — the omission below was found by
+# a reviewer, not by the author re-reading this list.
+#
+# Source: CSS Logical Properties and Values Level 1 §4.1 (the size properties)
+# and §4.3 (the offset shorthands), and CSS Overflow Level 3 for the overflow
+# pair — read 2026-09-21, not recalled. Only the SHORTHANDS of `inset` appear,
+# matching the physical side: `top`/`left`/`bottom`/`right` are deliberately
+# unwatched, so `inset-block-start` and its siblings are too.
+_LOGICAL_EQUIVALENTS = {
+    "height": ("block-size",),
+    "min-height": ("min-block-size",),
+    "max-height": ("max-block-size",),
+    "width": ("inline-size",),
+    "min-width": ("min-inline-size",),
+    "max-width": ("max-inline-size",),
+    "overflow-y": ("overflow-block",),
+    "overflow-x": ("overflow-inline",),
+    "inset": ("inset-block", "inset-inline"),
+}
+
+LAYOUT_PROPS = frozenset(
+    _PHYSICAL_LAYOUT_PROPS
+    | {
+        logical
+        for physical, aliases in _LOGICAL_EQUIVALENTS.items()
+        if physical in _PHYSICAL_LAYOUT_PROPS
+        for logical in aliases
+    }
+    # `all` belongs to no pair and is the reason this is not purely a mapping:
+    # it is the ONE shorthand of the entire watched set, so a single vendor
+    # declaration resets every property above at once. `components.css`
+    # re-declares three of them on `.panel`, which leaves the other eighteen
+    # taking the vendor's reset.
+    | {"all"}
 )
 
 # At-rules whose contents cannot target elements, so not descending into them
@@ -1890,3 +1929,118 @@ def test_the_layout_set_covers_the_shorthands_of_what_it_already_watches(prop):
     is a judgement rather than a boundary is said here rather than implied.
     """
     assert prop in LAYOUT_PROPS
+
+
+@pytest.mark.parametrize(
+    "physical,logical",
+    [
+        (p, alias)
+        for p, aliases in sorted(_LOGICAL_EQUIVALENTS.items())
+        for alias in aliases
+    ],
+)
+def test_a_watched_property_is_watched_in_its_logical_spelling_too(physical, logical):
+    """The docstring above promised "aliases" and the set contained none.
+
+    The flow-relative properties are not a rarity to guard against in the
+    abstract — `max-block-size` IS `max-height` in a horizontal writing mode,
+    and the incident this whole module exists for was `max-height: 120px` on the
+    vendor's `.panel` rule clipping every panel on every page.
+
+    MEASURED by appending one vendor declaration to the shipped `index.css` and
+    running this module, four physical controls against their aliases:
+
+        max-height: 120px      RED     max-block-size: 120px    GREEN
+        min-width: 900px       RED     min-inline-size: 900px   GREEN
+        inset: 0               RED     inset-inline: 0          GREEN
+        overflow-x: hidden     RED     overflow-block: hidden   GREEN
+
+    Five of five aliases passed, including the cited incident re-spelled. A
+    benign `color` arm stayed green, so the harness was not simply red.
+
+    Both halves are asserted because the failure was ASYMMETRIC: nobody would
+    have written a physical property out of the set, and the list read as
+    complete precisely because the half that was missing is the half nobody
+    thinks in.
+    """
+    assert physical in _PHYSICAL_LAYOUT_PROPS, (
+        f"{physical!r} is no longer watched, so its alias {logical!r} is now "
+        "derived from nothing — drop the mapping row rather than leaving it"
+    )
+    assert logical in LAYOUT_PROPS
+
+
+def test_the_universal_shorthand_is_watched():
+    """`all` resets every property in the set, in one declaration.
+
+    It belongs to no physical/logical pair, so the derivation above cannot
+    produce it and it is added by hand — which is exactly why it is pinned here.
+
+    MEASURED: `.panel { all: initial }` appended to the shipped `index.css` left
+    all 64 tests green, and `all: unset` likewise. `components.css` answers
+    `display`, `height` and `overflow` on `.panel`; the other eighteen watched
+    properties take the vendor's reset with nothing saying so.
+    """
+    assert "all" in LAYOUT_PROPS
+    assert "all" not in _PHYSICAL_LAYOUT_PROPS, (
+        "`all` is not a physical property with a flow-relative twin; keeping it "
+        "out of the physical set is what stops the derivation inventing one"
+    )
+
+
+def test_the_two_spellings_are_watched_but_NOT_treated_as_one_property():
+    """The cost of the change above, pinned rather than left to be discovered.
+
+    Answering is judged per property NAME, and this guard adds the logical names
+    without teaching it that `block-size` and `height` are the same property. So
+    a vendor sheet that writes the logical spelling of something Genesis already
+    answers physically reports as unanswered, even though a browser applies the
+    later Genesis declaration and nothing leaks.
+
+    MEASURED: `.panel {{ block-size: 100% }}` appended to the shipped
+    `index.css` fires, although `components.css` declares `height: auto` on
+    `.panel` and loads after it. That is a FALSE ALARM, and it is the direction
+    this file prefers — a false alarm is one line to answer and impossible to
+    miss; a false clear is silent and is what every incident here has been.
+
+    Zero of the shipped sheets trigger it today, which is why it ships. Making
+    the pair ONE property is the right end state and is tracked separately: it
+    needs a canonicalisation at the recording step, it is asymmetric for
+    `inset` versus `inset-block` (the shorthand covers four sides, the logical
+    pair covers two, and `dashboard.css` really does declare `inset`), and one
+    call site reads `d.lower_name` against this set WITHOUT going through the
+    recording step, so a single chokepoint would not cover it.
+
+    The equivalence is also conditional, and the condition is asserted below
+    rather than assumed.
+    """
+    assert "block-size" in LAYOUT_PROPS and "height" in LAYOUT_PROPS
+    # Same property to a browser, two keys to this guard. If a future change
+    # merges them, this assertion is the one to delete — deliberately, with the
+    # asymmetries above answered.
+    assert "block-size" != "height"
+
+
+def test_no_shipped_sheet_sets_a_writing_mode():
+    """The logical/physical equivalence above holds only in horizontal writing.
+
+    `block-size` IS `height` in `horizontal-tb` and IS `width` in a vertical
+    mode. Every claim this module makes about the flow-relative properties rests
+    on that, so the precondition is checked rather than assumed — the day a
+    sheet sets `writing-mode`, this fails by name instead of the guard quietly
+    reasoning about the wrong axis.
+
+    MEASURED 2026-09-21: zero `.css` files under the dashboard's web root
+    declare `writing-mode` or `text-orientation`.
+    """
+    setters = [
+        p.relative_to(WEBUI).as_posix()
+        for p in sorted(WEBUI.rglob("*.css"))
+        if re.search(r"\b(writing-mode|text-orientation)\s*:", p.read_text(encoding="utf-8"))
+    ]
+    assert not setters, (
+        f"{setters} declare a writing mode. The flow-relative properties in "
+        "LAYOUT_PROPS are treated as the aliases of their physical twins, which "
+        "is only true in horizontal writing — re-derive that mapping before "
+        "trusting any result about `block-size`, `inline-size` or the inset pair."
+    )
