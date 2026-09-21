@@ -703,8 +703,19 @@ def test_a_cell_that_exits_NORMALLY_still_has_its_descendants_reaped(tmp_path):
     instead of the exceptional one.
     """
     pidfile = tmp_path / "descendant.pid"
-    spec = _spec(cell=f"echo {{arm}}; (sleep 45) & echo $! > {pidfile}")
-    _run(tmp_path, spec)
+    # The descendant must NOT inherit stdout. With it open the reader is still
+    # running at its deadline, so the cell resolves UNFINISHED and is reaped by
+    # THAT branch -- never by the `finally` this test is about. MEASURED: the
+    # first version of this fixture passed with the `finally` body replaced by
+    # `pass`, so it pinned nothing. Closing the descendant's stdio lets the
+    # cell reach RAN, which is the path the reap is for.
+    spec = _spec(cell=f"echo {{arm}}; (sleep 45 >/dev/null 2>&1 <&-) & echo $! > {pidfile}")
+    r = _run(tmp_path, spec)
+    assert "CONTROLS HELD" in r.stdout, (
+        "guard-the-guard: the cell must reach RAN. If it resolves UNFINISHED "
+        "the descendant is reaped by that branch instead, and this test stops "
+        "exercising the `finally` its docstring is about"
+    )
     assert pidfile.exists(), "guard-the-guard: the cell never recorded a descendant"
     pid = int(pidfile.read_text().strip())
     assert pid > 1, "guard-the-guard: a pid of 1 or 0 would make the check meaningless"
@@ -723,10 +734,257 @@ def test_a_remedy_selecting_only_INERT_cells_is_UNVERIFIED_not_measured_in_zero(
     """Every declared value can be a real axis value and still select NO live
     cell, when the remedy pins an environmental value the controls excluded.
 
+    The remedy names the CANDIDATE axis as well, because one that names only
+    environmental values is now a spec error in its own right — it would
+    select every candidate at once, the no-op control included, and call the
+    aggregate a measurement.
+
     "MEASURED in 0 of N live cells" is then a measurement claim resting on
     nothing, and it reads as a pass because nothing failed. The distinction
     this tool exists for is measured-versus-asserted.
     """
-    r = _run(tmp_path, _two_axis(proposed_remedy={"env": "inert"}))
+    r = _run(tmp_path, _two_axis(proposed_remedy={"arm": "good", "env": "inert"}))
     assert "UNVERIFIED: the remedy selects NO live cell" in r.stdout, r.stdout
     assert "MEASURED in 0" not in r.stdout
+
+
+# ----------------------------------------------- round 4: the things that made
+# the tool LIE, as opposed to the things that merely handle bad input badly
+
+
+def test_the_ORACLE_runs_even_in_a_cell_that_would_be_excluded_as_inert(tmp_path):
+    """Excluding a cell is a finding about the HAZARD. It says nothing about
+    the harness, and the two were being decided by one test.
+
+    The no-op used to be checked first and `continue` past the oracle, so a
+    cell where the no-op passes AND the known-good oracle fails was filed as
+    inert while the run printed CONTROLS HELD — the instrument certifying
+    itself in a cell where it demonstrably does not work. 'The oracle scores
+    100%' is a claim about the whole space, so a cell the oracle never
+    entered cannot be part of that evidence.
+    """
+    # env=broken: the no-op's own value prints GOOD (so the cell looks inert),
+    # but the ORACLE prints nothing a rule matches, so the harness is dead here.
+    spec = _spec(
+        axes={"arm": ["good", "bad"], "env": ["live", "broken"]},
+        cell=(
+            'if [ "{env}" = broken ]; then '
+            '  if [ "{arm}" = bad ]; then echo good; else echo WRECKED; fi; '
+            "else echo {arm}; fi"
+        ),
+    )
+    r = _run(tmp_path, spec)
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "oracle FAILED" in r.stdout + r.stderr
+    assert "excluded as inert" in r.stdout + r.stderr
+    assert "CONTROLS HELD" not in r.stdout
+
+
+def test_a_JSON_boolean_is_not_an_accepted_EXIT_CODE(tmp_path):
+    """`bool` is a SUBCLASS of `int`, so `isinstance(True, int)` is True and
+    the type gate waved `[true]` straight through.
+
+    `True == 1`, so the set then accepted exit status 1 as success: an oracle
+    that printed the predicate and exited 1 could certify the instrument and
+    produce an exit-0 report. This is the type gate's own class, recurring
+    because the gate was written against the obvious reading of `isinstance`.
+    """
+    r = _run(tmp_path, _spec(ok_exit_codes=[True]))
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "a JSON boolean is not an exit status" in r.stderr
+
+
+def test_a_remedy_must_name_the_CANDIDATE_axis(tmp_path):
+    """A remedy is a claim about a candidate.
+
+    One naming only environmental values selects every candidate in those
+    cells — the no-op control included — and the report then aggregates them
+    under a single verdict and calls it MEASURED.
+    """
+    r = _run(tmp_path, _two_axis(proposed_remedy={"env": "live"}))
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "does not assign the candidate axis" in r.stderr
+
+
+def test_a_NON_FINITE_cell_timeout_is_refused(tmp_path):
+    """`type=float` accepts `inf` and `nan`, and with either `wait()` never
+    reaches a deadline — so a hung cell wedges the sweep while the CLI's own
+    help promises the cell will be killed. A promise the flag cannot keep is
+    the same class as a status that cannot occur."""
+    for bad in ("inf", "nan", "0"):
+        r = _run(tmp_path, _spec(), "--cell-timeout", bad)
+        assert r.returncode == 3, f"{bad}: {r.stdout}{r.stderr}"
+        assert "finite positive number of seconds" in r.stderr
+
+
+def test_a_USAGE_error_is_not_reported_as_a_failed_CONTROL(tmp_path):
+    """Status 2 is documented as CONTROLS FAILED — a real experimental
+    outcome — and 3 as malformed input.
+
+    argparse exits 2 on a usage error by default, which made a non-numeric
+    timeout indistinguishable from a sweep whose instrument failed its own
+    control. That is the one distinction these exit codes exist to carry.
+    """
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(_spec()), encoding="utf-8")
+    r = subprocess.run(
+        [sys.executable, str(_SWEEP), str(spec_path), "--cell-timeout", "not-a-number"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "CONTROLS FAILED" not in r.stdout
+
+
+def test_the_EVIDENCE_file_is_REPLACED_rather_than_truncated_in_place(tmp_path):
+    """`write_text` truncates before it writes, so an interrupted write over a
+    previous run's evidence destroyed it and left a short file that still
+    reads as a complete report.
+
+    Asserted on the INODE, which is the observable difference between the two
+    implementations and the reason this test is not vacuous: writing over a
+    path in place keeps the inode, while writing a sibling and renaming makes
+    a new one (MEASURED both ways). An earlier version of this test checked
+    only that the content was replaced and no temp file was left behind —
+    both of which the truncating version also satisfies, so it passed against
+    the unfixed code and proved nothing.
+
+    What it still does NOT prove is the crash path itself: that the previous
+    evidence survives a signal mid-write. Reaching that needs a race this
+    suite should not run. The inode is the mechanism that makes the crash
+    path safe, so it is the honest thing to pin.
+    """
+    ev = tmp_path / "evidence.txt"
+    r1 = _run(tmp_path, _spec(), "--evidence", str(ev))
+    assert "=== RESULTS ===" in ev.read_text(encoding="utf-8"), r1.stdout
+    first_inode = os.stat(ev).st_ino
+    _run(tmp_path, _two_axis(), "--evidence", str(ev))
+    assert os.stat(ev).st_ino != first_inode, (
+        "the evidence file was written over IN PLACE — there is a window in "
+        "which the previous run's report is already destroyed and the new one "
+        "is not yet written, and a short file from that window still reads as "
+        "a complete report"
+    )
+    assert "=== RESULTS ===" in ev.read_text(encoding="utf-8")
+    leftovers = [p.name for p in tmp_path.iterdir() if ".partial." in p.name]
+    assert not leftovers, f"temporary evidence files left behind: {leftovers}"
+
+
+def test_a_reader_still_RUNNING_at_its_deadline_yields_no_classification(tmp_path):
+    """The shell exits, but a background descendant keeps stdout open.
+
+    `reader.join()` then returns with the reader alive, and what is buffered
+    is a PREFIX of unknown completeness. Classifying it reads the first
+    matching rule in a partial text, so a cell that prints the predicate and
+    then contradicts itself passes — the same silent-truncation class as the
+    byte cap and the decode error, and it gets the same treatment: an
+    outcome, not a classification.
+
+    The no-op arm reaches this first, and a no-op that did not RUN cannot
+    certify the instrument, so the run is VOID rather than a matrix.
+    """
+    r = _run(tmp_path, _spec(cell="echo {arm}; (sleep 30) &"))
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "UNFINISHED" in r.stdout + r.stderr, r.stdout + r.stderr
+    assert "=== RESULTS ===" not in r.stdout
+
+
+# ------------------------------------- from the mandated fresh-context audit
+
+
+def test_a_control_arm_that_CONTRADICTS_the_banner_voids_the_run(tmp_path):
+    """The BLOCKER, and it was the tool's founding defect reproduced inside it.
+
+    The control arms are swept TWICE — once by `_check_controls`, which prints
+    the banner, and again as ordinary candidate rows. Nothing compared the two,
+    so a cell carrying state from the first pass could print `CONTROLS HELD`
+    directly above a no-op row classified as the predicate. Once the control
+    row stopped counting as a failure, it did that while exiting 0: "a no-op
+    that passes, every cell clean", which is the one result this tool exists
+    to make impossible.
+
+    The harness is already holding both measurements; it only has to notice
+    they disagree. Voiding is the honest response, because WHICH reading is
+    true is exactly what it can no longer tell.
+    """
+    marker = tmp_path / "seen"
+    spec = _spec(cell=f"if [ -f {marker} ]; then echo good; else touch {marker}; echo {{arm}}; fi")
+    r = _run(tmp_path, spec)
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "RUN IS VOID" in r.stdout
+    assert "behaved DIFFERENTLY in the results" in r.stdout
+    assert "no-op did NOT match in the control sweep" in r.stdout
+
+
+def test_a_SOUND_spec_is_not_caught_by_the_drift_check(tmp_path):
+    """The guard-the-guard. A drift check that voided everything would satisfy
+    the test above perfectly while destroying the tool."""
+    r = _run(tmp_path, _spec())
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "RUN IS VOID" not in r.stdout
+
+
+@pytest.mark.parametrize(
+    "cell",
+    [
+        pytest.param("echo {arm} {}", id="auto-numbered-field"),
+        pytest.param("echo {arm:{arm}}", id="nested-format-spec"),
+        pytest.param("echo {arm:d}", id="type-code-the-value-cannot-satisfy"),
+        pytest.param("echo {arm!z}", id="unknown-conversion"),
+    ],
+)
+def test_a_template_that_PARSES_but_cannot_be_SUBSTITUTED_is_a_SPEC_error(tmp_path, cell):
+    """Reading the template's fields is not the same question as formatting it.
+
+    Each of these parses, so the field scan accepted them, and each then threw
+    out of `.format()` mid-sweep as an uncaught exception — which exits 1, the
+    status this CLI documents as a real non-match. Asking the real formatter
+    the real question is both shorter and complete.
+    """
+    r = _run(tmp_path, _spec(cell=cell))
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "cannot be substituted" in r.stderr or "not a valid format" in r.stderr
+
+
+def test_a_HARNESS_crash_does_not_masquerade_as_a_real_result(tmp_path):
+    """A bare `sys.exit(main())` makes exit 1 the catch-all, because that is
+    what CPython returns for an uncaught exception — and 1 is documented here
+    as "controls held; a real non-match".
+
+    So any harness bug read as an experimental finding. MEASURED reachable
+    through an `--evidence` path that cannot be written, which turned both a
+    sound run (0) and a VOID run (2) into 1. Exit 4 says the tool failed and
+    that nothing above it is a measurement.
+    """
+    r = _run(tmp_path, _spec(), "--evidence", "/proc/cannot/exist/report.txt")
+    assert r.returncode == 4, r.stdout + r.stderr
+    assert "HARNESS ERROR" in r.stderr
+
+
+def test_the_RAN_status_cannot_be_borrowed_as_a_label(tmp_path):
+    """`_RAN` sat under a comment saying a spec may not use these as labels,
+    and was the one status missing from the reserved set. No falsehood today,
+    because the status never renders — but an unenforced rule in a comment is
+    the shape every other sentinel in this file was reserved to prevent."""
+    r = _run(tmp_path, _spec(classify={"GOOD": "^good", "ran": "^bad"}))
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "RESERVED for an execution" in r.stderr
+
+
+def test_an_EMPTY_ok_exit_codes_is_a_SPEC_error_not_a_broken_instrument(tmp_path):
+    """With no accepted status every cell becomes ERR, and the run then reports
+    2 — the instrument is broken — when what is broken is the spec. The two
+    exit codes exist to tell those apart."""
+    r = _run(tmp_path, _spec(ok_exit_codes=[]))
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "no exit status could ever count as RAN" in r.stderr
+
+
+def test_the_two_CONTROL_arms_must_differ(tmp_path):
+    """One value cannot both demonstrate the harness works and demonstrate it
+    can fail. Left unchecked the run still voids, but with a message describing
+    the wrong problem — which costs the reader the actual diagnosis."""
+    r = _run(tmp_path, _spec(controls={"oracle": "good", "noop": "good"}))
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "are the same value" in r.stderr

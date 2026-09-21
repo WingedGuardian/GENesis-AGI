@@ -142,6 +142,7 @@ EXIT CODES
     1  controls held; at least one live cell did not match (a real result)
     2  CONTROLS FAILED — run is VOID, no matrix printed
     3  the spec itself is malformed
+    4  the HARNESS failed — not a result, and nothing above it is measured
 """
 
 from __future__ import annotations
@@ -150,12 +151,15 @@ import argparse
 import contextlib
 import itertools
 import json
+import math
 import os
 import re
 import signal
+import string
 import subprocess
 import sys
 import threading
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -172,13 +176,16 @@ _ERR = "ERR"
 _TIMEOUT = "TIMEOUT"
 _TRUNC = "TRUNCATED"
 _UNDECODABLE = "UNDECODABLE"
+#: The reader was still running when its join deadline passed, so the buffer
+#: holds a prefix of unknown completeness rather than the cell's output.
+_UNFINISHED = "UNFINISHED"
 #: The label `_classify` returns when NO rule matched. Reserved for the same
 #: reason the execution outcomes are: a spec could otherwise declare `other`
 #: as a classification AND name it as the predicate, at which point output
 #: matching none of the author's own rules SATISFIES the thing being measured.
 #: The fallback means "unclassified", and unclassified can never be a finding.
 _OTHER = "other"
-_RESERVED_LABELS = frozenset({_ERR, _TIMEOUT, _TRUNC, _UNDECODABLE, _OTHER})
+_RESERVED_LABELS = frozenset({_RAN, _ERR, _TIMEOUT, _TRUNC, _UNDECODABLE, _UNFINISHED, _OTHER})
 
 #: Hard cap on one cell's captured stdout. A probe is expected to print a line
 #: or two; anything past this is a runaway. Unbounded capture is not merely
@@ -346,6 +353,16 @@ def _run(
             _kill_group(proc)
             timed_out = True
         reader.join(_READER_JOIN_S)
+        if reader.is_alive():
+            # The shell exited but something still holds stdout open, so what
+            # is buffered right now is a PREFIX and nothing says it is the
+            # whole output. Classifying it reads the first matching rule in a
+            # partial text -- a cell that prints the predicate and then
+            # contradicts itself would pass. Same silent-truncation class as
+            # the byte cap and the decode error, so it gets the same treatment:
+            # an outcome, not a classification.
+            _reap_group(pgid)
+            return _UNFINISHED, ""
         if reader.undecodable:
             # Leads for the same reason TRUNCATED does: the output cannot be
             # classified soundly, and which way it broke is the actionable part.
@@ -504,8 +521,19 @@ def _spec_problems(spec: Any) -> list[str]:
         # An unknown {placeholder} used to raise KeyError mid-sweep; an axis
         # never referenced by the template is swept but changes nothing, which
         # silently multiplies the cell count without measuring anything.
+        # A DRY SUBSTITUTION, not a parse. Reading the template's fields misses
+        # every spelling that parses but cannot be FORMATTED -- an auto-numbered
+        # `{}`, a nested spec `{a:{a}}`, a type code the value does not satisfy
+        # like `{a:d}`, an unknown conversion `{a!z}`. Each traced out of
+        # `.format()` mid-sweep as an uncaught exception, which exits 1 -- the
+        # status this CLI documents as a real non-match. Asking the real
+        # formatter the real question is both shorter and complete.
         try:
-            fields = {f for _, f, _, _ in __import__("string").Formatter().parse(spec["cell"]) if f}
+            spec["cell"].format(**dict.fromkeys(axes, "x"))
+        except (IndexError, KeyError, ValueError, TypeError) as exc:
+            problems.append(f"cell cannot be substituted: {type(exc).__name__}: {exc}")
+        try:
+            fields = {f for _, f, _, _ in string.Formatter().parse(spec["cell"]) if f}
         except (ValueError, TypeError) as exc:
             problems.append(f"cell is not a valid format template: {exc}")
         else:
@@ -521,6 +549,15 @@ def _spec_problems(spec: Any) -> list[str]:
     if not isinstance(controls, dict) or set(controls) != {"oracle", "noop"}:
         problems.append("controls must be exactly {'oracle': <value>, 'noop': <value>}")
     elif cand in axes and isinstance(axes.get(cand), list):
+        if controls["oracle"] == controls["noop"]:
+            # One value cannot both demonstrate the harness works and
+            # demonstrate it can fail. Rejected explicitly, because the run
+            # otherwise voids with a message describing the wrong problem.
+            problems.append(
+                f"controls.oracle and controls.noop are the same value "
+                f"({controls['oracle']!r}) — one arm must match the predicate "
+                f"and the other must not, so they cannot be the same candidate"
+            )
         for arm in ("oracle", "noop"):
             if controls[arm] not in axes[cand]:
                 problems.append(
@@ -529,9 +566,30 @@ def _spec_problems(spec: Any) -> list[str]:
                     f"into the same template as the sweep"
                 )
 
-    for code in spec.get("ok_exit_codes", [0]):
-        if not isinstance(code, int):
-            problems.append(f"ok_exit_codes contains a non-integer: {code!r}")
+    ok_codes = spec.get("ok_exit_codes", [0])
+    if not isinstance(ok_codes, list):
+        problems.append("ok_exit_codes must be a LIST of integers")
+    elif not ok_codes:
+        # Every cell becomes ERR, and the run then reports 2 — the instrument
+        # is broken — when what is actually broken is the spec.
+        problems.append(
+            "ok_exit_codes is empty — no exit status could ever count as RAN, "
+            "so every cell would be an execution error"
+        )
+    else:
+        for code in ok_codes:
+            # `bool` is a SUBCLASS of `int`, so `isinstance(True, int)` is True
+            # and the old check waved `[true]` through. `True == 1`, so the set
+            # then accepted exit status 1 as success: an oracle that printed the
+            # predicate and exited 1 could certify the instrument and produce an
+            # exit-0 report. The bool test has to come FIRST, because every
+            # boolean also satisfies the int test.
+            if isinstance(code, bool) or not isinstance(code, int):
+                problems.append(
+                    f"ok_exit_codes contains a non-integer: {code!r} — note that "
+                    f"a JSON boolean is not an exit status, even though Python "
+                    f"counts one as an int"
+                )
 
     remedy = spec.get("proposed_remedy")
     if remedy is not None:
@@ -544,6 +602,18 @@ def _spec_problems(spec: Any) -> list[str]:
             problems.append(
                 f"proposed_remedy names axes {unknown_axes}, which the sweep "
                 f"does not have ({sorted(axes)}) — nothing could ever verify it"
+            )
+        elif spec["candidate_axis"] not in remedy:
+            # A remedy is a claim about a CANDIDATE. One naming only
+            # environmental values selects every candidate in those cells --
+            # the no-op control included -- and the report then aggregates
+            # them under a single verdict and calls it MEASURED. That is the
+            # tool asserting a measurement of something it never isolated.
+            problems.append(
+                f"proposed_remedy does not assign the candidate axis "
+                f"{spec['candidate_axis']!r} — a remedy names a candidate, and "
+                f"one that names only environmental values selects every "
+                f"candidate at once, which measures nothing about any of them"
             )
     return problems
 
@@ -598,14 +668,32 @@ def _check_controls(
                 f"so its non-match is an accident rather than a measurement"
             )
             continue
+        # THE ORACLE RUNS FIRST, IN EVERY CELL, INERT OR NOT. It used to run
+        # only where the no-op had already failed, so a cell where the no-op
+        # passes AND the known-good oracle fails was filed as "inert" and the
+        # run still printed CONTROLS HELD. That is the instrument certifying
+        # itself in a cell where it demonstrably does not work, and it is the
+        # exact claim the doctrine makes about an oracle: scoring 100% is a
+        # statement about the WHOLE space, so a cell the oracle never entered
+        # cannot be part of that evidence. Excluding a cell is a finding about
+        # the HAZARD; it says nothing about the harness, and the two were
+        # being decided by one test.
+        oracle = _run(
+            template.format(**{cand: spec["controls"]["oracle"]}, **env), rules, ok_exits, timeout_s
+        )
         if _matches(noop, predicate):
+            if not _matches(oracle, predicate):
+                problems.append(
+                    f"oracle FAILED at [{where}] -> {_render(oracle)}: this cell "
+                    f"would have been excluded as inert, but the oracle does not "
+                    f"work here either — so the exclusion is a fact about the "
+                    f"harness, not about the hazard"
+                )
+                continue
             # The hazard does not exist here, so no candidate earns credit for
             # surviving it. Named and excluded rather than voided or counted.
             inert.append(env)
             continue
-        oracle = _run(
-            template.format(**{cand: spec["controls"]["oracle"]}, **env), rules, ok_exits, timeout_s
-        )
         if not _matches(oracle, predicate):
             problems.append(
                 f"oracle FAILED at [{where}] -> {_render(oracle)}: the harness "
@@ -679,8 +767,41 @@ def _remedy_lines(
     return lines
 
 
+class _SpecArgumentParser(argparse.ArgumentParser):
+    """Exits 3 on a usage error, not argparse's default 2.
+
+    This CLI documents 2 as CONTROLS FAILED -- a real experimental outcome --
+    and 3 as malformed input. argparse's default made a missing argument or a
+    non-numeric timeout indistinguishable from a sweep whose instrument failed
+    its own control, which is the one distinction the exit codes exist to
+    carry.
+    """
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        self.print_usage(sys.stderr)
+        self.exit(3, f"{self.prog}: error: {message}\n")
+
+
+def _write_evidence(path: Path, out: str) -> None:
+    """Replace `path` atomically: write a sibling, then rename.
+
+    `write_text` truncates before it writes, so an interrupted write over a
+    previous run destroys it and leaves a short file that still reads as a
+    complete report. Extracted rather than inlined because there are TWO exit
+    paths that write evidence — the VOID path and the normal one — and the
+    first version of this fix only hardened the second. Fixing one of two call
+    sites is the instance-not-class failure this very PR keeps being reviewed
+    for, and the void report is the worse one to truncate: its refusal banner
+    is at the END, so a short write leaves the header and the FAIL lines with
+    the refusal missing.
+    """
+    tmp = path.with_name(path.name + f".partial.{os.getpid()}")
+    tmp.write_text(out + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap = _SpecArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("spec", type=Path, help="JSON spec (see this file's docstring)")
     ap.add_argument("--evidence", type=Path, help="write the full run here")
     ap.add_argument(
@@ -690,6 +811,17 @@ def main() -> int:
         help=f"seconds before one cell is killed and reported TIMEOUT (default {_CELL_TIMEOUT_S})",
     )
     args = ap.parse_args()
+    # `type=float` accepts `inf` and `nan`. With either, `Popen.wait()` never
+    # reaches a deadline, so a hung cell wedges the whole sweep while the
+    # CLI's own help promises the cell will be killed. A promise the flag
+    # cannot keep is the same class as a status that cannot occur.
+    if not math.isfinite(args.cell_timeout) or args.cell_timeout <= 0:
+        print(
+            f"--cell-timeout must be a finite positive number of seconds, "
+            f"not {args.cell_timeout!r}",
+            file=sys.stderr,
+        )
+        return 3
 
     try:
         spec = json.loads(args.spec.read_text(encoding="utf-8"))
@@ -728,7 +860,7 @@ def main() -> int:
         out = "\n".join(lines)
         print(out)
         if args.evidence:
-            args.evidence.write_text(out + "\n", encoding="utf-8")
+            _write_evidence(args.evidence, out)
         return 2
 
     env_cells = _env_cells(spec)
@@ -778,6 +910,54 @@ def main() -> int:
                 note = "" if ok else "   <-- not " + predicate
             lines.append(f"  {cells}  -> {_render(got)}{note}")
 
+    # THE CONTROL ARMS ARE SWEPT TWICE, SO THE TWO READINGS MUST AGREE.
+    # `_check_controls` printed CONTROLS HELD from its own runs; the results
+    # sweep then runs the same two arms again as ordinary candidates. Nothing
+    # compared them, so a cell with any state left over from the first pass
+    # could print `CONTROLS HELD` directly above a no-op row classified as the
+    # predicate — and, once the control row stopped counting as a failure,
+    # exit 0 while doing it.
+    #
+    # MEASURED on this file: a cell whose first invocation creates a marker
+    # and whose later ones short-circuit produced exactly that — "no-op 'bad':
+    # reproduced the hazard", "CONTROLS HELD", "arm=bad -> GOOD", exit 0. That
+    # is this tool's FOUNDING defect (a no-op that passes while every cell
+    # reads clean) reproduced inside the tool, which makes it the one result
+    # it must never print.
+    #
+    # The idempotence note in the docstring does not excuse it: the harness is
+    # already holding both measurements and only has to notice they disagree.
+    # Voiding is the honest response, because which reading is true is exactly
+    # what the harness can no longer tell.
+    oracle_v = spec["controls"]["oracle"]
+    noop_v = spec["controls"]["noop"]
+    drift = [
+        "  ".join(f"{n}={v}" for n, v in full.items())
+        + f"  -> {_render(got)}"
+        + ("   (oracle matched in the control sweep)" if full[cand] == oracle_v else "")
+        + ("   (no-op did NOT match in the control sweep)" if full[cand] == noop_v else "")
+        for full, got, ok in rows
+        if (full[cand] == oracle_v and not ok) or (full[cand] == noop_v and ok)
+    ]
+    if drift:
+        head = lines[: lines.index("=== RESULTS ===")]
+        head += [
+            "",
+            "RUN IS VOID. A control arm behaved DIFFERENTLY in the results",
+            "sweep than it did in the control sweep, so the two measurements",
+            "disagree and the harness cannot say which is true:",
+            *(f"    {d}" for d in drift),
+            "",
+            "The usual cause is a cell that is not idempotent — it leaves",
+            "state behind that changes the cells after it. See CELLS MUST BE",
+            "IDEMPOTENT in this tool's docstring.",
+        ]
+        out = "\n".join(head)
+        print(out)
+        if args.evidence:
+            _write_evidence(args.evidence, out)
+        return 2
+
     # `matching` is counted, not DERIVED from `len(rows) - failed`. Once the
     # no-op control stopped counting as a failure, that subtraction silently
     # credited the control's own non-match as a match -- MEASURED on a live
@@ -805,9 +985,29 @@ def main() -> int:
     out = "\n".join(lines)
     print(out)
     if args.evidence:
-        args.evidence.write_text(out + "\n", encoding="utf-8")
+        _write_evidence(args.evidence, out)
     return 0 if failed == 0 else 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # A bare `sys.exit(main())` makes exit 1 the CATCH-ALL, because that is what
+    # CPython returns for an uncaught exception -- and 1 is documented here as
+    # "controls held; a real non-match". So any harness bug read as a real
+    # experimental result, which is the same collision the usage-error exit
+    # fixed one door over. MEASURED reachable: an --evidence path that cannot be
+    # written turned both a sound run (0) and a VOID run (2) into 1.
+    #
+    # 4 rather than folding it into 3: a crash is not a malformed spec, and
+    # saying so is the whole point of having distinct statuses.
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException:  # noqa: BLE001 - the top-level boundary, re-raised below
+        traceback.print_exc()
+        print(
+            "\nHARNESS ERROR (exit 4): the tool itself failed. This is NOT a "
+            "result — no claim above it is measured.",
+            file=sys.stderr,
+        )
+        sys.exit(4)
