@@ -1172,7 +1172,7 @@ def test_the_token_after_a_terminator_is_the_command_even_if_it_looks_like_one()
     # start=2, which is where `_nested_script` begins for `bash -c …`: the token
     # after the `-c` bundle. That token IS the `--`, and the scan must stop
     # there and take the next one whole.
-    found, script = sp._first_operand(
+    found, script, _noexec, _sticky = sp._first_operand(
         ["bash", "-c", "--", "-x", "git push origin main"],
         2,
         sp._C_BUNDLE_OPTIONS["bash"],
@@ -1204,7 +1204,7 @@ def test_every_value_taking_letter_consumes_its_own_token():
         ["bash", "-coo", "pipefail", "errexit", "git push origin main"], "bash"
     ) == "git push origin main"
     # In the post-`-c` operand scan as well.
-    found, script = sp._first_operand(
+    found, script, _noexec, _sticky = sp._first_operand(
         ["bash", "-c", "-oo", "pipefail", "errexit", "git push origin main"],
         2,
         sp._C_BUNDLE_OPTIONS["bash"],
@@ -1253,7 +1253,7 @@ def test_an_empty_script_is_an_operand_not_a_miss():
     """An empty string is a VALID `-c` command: `bash -c '' -c CMD` runs nothing,
     exits 0, and CMD becomes a positional argument. A truthiness check treated
     that as 'no operand found' and kept scanning, reporting CMD as a script."""
-    found, script = sp._first_operand(
+    found, script, _noexec, _sticky = sp._first_operand(
         ["bash", "-c", "", "-c", "git push origin main"],
         2,
         sp._C_BUNDLE_OPTIONS["bash"],
@@ -1291,6 +1291,18 @@ def test_a_command_the_shell_never_runs_is_not_reported(template):
     shell refuses or neuters makes every downstream guard block something that
     was never going to run. Each of these was a real false block.
     """
+    # The guard-the-guard below reads the INNER shell's stdout, so it needs that
+    # shell to exist. When it does not, the outer bash reports the failure on
+    # stderr and leaves stdout EMPTY — which satisfies "did not print 42" for
+    # the wrong reason, and the test then proves nothing about whether the shape
+    # is inert. Keyed on the template's own interpreter rather than on `dash` by
+    # name, so an `ash`/`ksh`/`zsh` row added later cannot reintroduce this
+    # (CodeRabbit, PR #2112).
+    interpreter = template.split(None, 1)[0]
+    if not shutil.which(interpreter):
+        pytest.skip(
+            f"{interpreter} is not installed; the inertness probe needs the real shell"
+        )
     probe = subprocess.run(
         ["bash", "-c", template.replace("PAYLOAD", "echo $((6*7))")],
         capture_output=True,
@@ -1351,3 +1363,101 @@ def test_the_first_c_bundle_owns_the_decision():
     assert sp._nested_script(
         ["bash", "-c", "git push origin main"], "bash"
     ) == "git push origin main"
+
+
+#: Every no-exec spelling, in every position, with both signs — and the cases
+#: where execution is RESTORED. Each row is (argv-after-bash, runs?), and the
+#: `runs?` column is re-derived from the real shell below rather than trusted,
+#: so the corpus cannot quietly stop describing bash the way the option table
+#: did. MEASURED on bash 5.2 (PR #2112).
+#:
+#: The two letters do NOT behave alike, which is the defect these pin:
+#:   `n` is shell STATE      — `+n` clears it and the LAST occurrence wins
+#:   `D` is an invocation ACTION — either sign selects it, nothing clears it
+#: and the state is ONE scan across the whole option list, so an option BEFORE
+#: the `-c` bundle counts exactly as much as one after it.
+_NO_EXEC_MATRIX = [
+    (["-c", "PAYLOAD"], True),                                   # baseline
+    (["-n", "-c", "PAYLOAD"], False),                            # pre-selector -n
+    (["-o", "noexec", "-c", "PAYLOAD"], False),                  # the -o spelling
+    (["-D", "-c", "PAYLOAD"], False),                            # pre-selector -D
+    (["+D", "-c", "PAYLOAD"], False),                            # + sign, still inert
+    (["-c", "+D", "PAYLOAD"], False),                            # post-selector +D
+    (["-D", "+D", "-c", "PAYLOAD"], False),                      # D is STICKY
+    (["-D", "-c", "+D", "PAYLOAD"], False),                      # sticky across -c
+    (["+n", "-c", "PAYLOAD"], True),                             # +n enables
+    (["-n", "+n", "-c", "PAYLOAD"], True),                       # last wins -> runs
+    (["+n", "-n", "-c", "PAYLOAD"], False),                      # last wins -> inert
+    (["-n", "-c", "+n", "PAYLOAD"], True),                       # cleared ACROSS -c
+    (["-n", "-c", "-n", "PAYLOAD"], False),
+    (["-o", "noexec", "+o", "noexec", "-c", "PAYLOAD"], True),   # -o form, last wins
+    (["+o", "noexec", "-o", "noexec", "-c", "PAYLOAD"], False),
+    (["-o", "noexec", "-c", "+o", "noexec", "PAYLOAD"], True),   # cleared across -c
+    (["-o", "errexit", "-c", "PAYLOAD"], True),                  # unrelated -o runs
+    (["-en", "-c", "PAYLOAD"], False),                           # n inside a bundle
+    (["-ec", "PAYLOAD"], True),                                  # bundle without n
+    (["-e", "-z", "-c", "PAYLOAD"], False),                      # invalid opt: refused
+    (["-c", "PAYLOAD", "-z"], True),                             # invalid AFTER operand
+]
+
+
+@pytest.mark.parametrize("argv_tail,should_run", _NO_EXEC_MATRIX)
+def test_the_parser_reports_a_nested_command_exactly_when_bash_runs_it(
+    argv_tail, should_run
+):
+    """Both error directions at once, against the shell itself.
+
+    Reporting a command bash never runs is a FALSE BLOCK; failing to report one
+    it does run is a BYPASS. A single `-n`-anywhere rule would have produced the
+    second: `bash -n +n -c CMD` really does execute CMD.
+    """
+    # ORACLE: ask the real shell, so the expectation cannot drift from reality.
+    probe = subprocess.run(
+        ["bash", *[t.replace("PAYLOAD", "echo $((6*7))") for t in argv_tail]],
+        capture_output=True, text=True, timeout=30, env=_shell_oracle_env(),
+    )
+    really_runs = probe.stdout.strip().splitlines()[:1] == ["42"]
+    assert really_runs is should_run, (
+        f"the corpus says runs={should_run} for {argv_tail!r}, but the installed "
+        f"bash disagrees ({probe.stdout!r} / {probe.stderr.strip()[:80]!r}) — fix "
+        "the row, never the assertion below"
+    )
+
+    command = "bash " + " ".join(
+        f"'{t}'" if " " in t else t
+        for t in [x.replace("PAYLOAD", "git push origin main") for x in argv_tail]
+    )
+    reported = "git" in [seg.exe for seg in sp.analyze(command)]
+    assert reported is should_run, (
+        f"{command!r}: bash runs={should_run} but the parser reports={reported} — "
+        + ("a BYPASS" if should_run else "a FALSE BLOCK")
+    )
+
+
+def test_sh_carries_the_union_because_the_allowlist_is_keyed_on_a_basename():
+    """`sh` is not a shell, it is a NAME, and it does not name the same binary
+    everywhere.
+
+    The table is selected by the executable's basename. Here /bin/sh is dash, so
+    dash's strict set looked correct — but on a host where /bin/sh is Bash,
+    `sh -ch CMD` RUNS while the strict set rejected the bundle, `_nested_script`
+    returned "", and the nested command was invisible to every segment-based
+    guard. The two directions are not symmetric: too strict HIDES a live command,
+    too permissive costs a false block on an invocation that fails anyway.
+    """
+    sh_set = sp._C_BUNDLE_OPTIONS["sh"]
+    assert sp._C_BUNDLE_OPTIONS["bash"] <= sh_set, (
+        "sh must accept every bash bundle letter: where /bin/sh IS bash, a "
+        "letter missing here hides a command the shell really runs"
+    )
+    assert sp._C_BUNDLE_OPTIONS["dash"] <= sh_set, (
+        "sh must also accept every dash letter — the first attempt at this fix "
+        "used bash's set alone and dropped 'I'/'V', hiding `sh -cI CMD` on a "
+        "dash host: the same bypass in the opposite direction"
+    )
+    # Behaviour, not just the table: a bash-only bundle under the `sh` name.
+    assert "git" in [seg.exe for seg in sp.analyze("sh -ch 'git push origin main'")]
+    # CONTROL: `dash` under its OWN name keeps the strict set, where the
+    # basename really does identify the binary.
+    assert "h" not in sp._C_BUNDLE_OPTIONS["dash"]
+    assert "git" not in [seg.exe for seg in sp.analyze("dash -ch 'git push origin main'")]
