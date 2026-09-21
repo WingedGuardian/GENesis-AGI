@@ -932,11 +932,13 @@ async def memory_supersede(old_id: str, new_id: str) -> dict:
     hook prints and ``memory_expand`` accepts; an ambiguous handle is never
     guessed.
 
-    Nothing is written unless every check passes, so a failure here costs
-    nothing and is safe to retry once you have corrected the ids. It raises
-    rather than returning a verdict, because there is no stored content whose
-    fate you would have to interpret alongside the error — that asymmetry is
-    exactly why this exists as its own tool.
+    Nothing is written unless every check passes, so a rejection costs
+    nothing and is safe to retry once you have corrected the ids. Rejections
+    raise — there is no stored content whose fate you would have to interpret
+    alongside the error. A failure PARTWAY through the deprecation reports
+    ``superseded: false`` instead: the writes commit per store, so an earlier
+    layer may already be durable, and the remedy is simply to call this tool
+    again — every step is idempotent.
 
     Rejected, with nothing changed:
       * either id naming no memory, or a prefix naming several
@@ -952,8 +954,7 @@ async def memory_supersede(old_id: str, new_id: str) -> dict:
     memory_mod._require_init()
     assert memory_mod._store is not None
 
-    await memory_mod._store.supersede(old_id, new_id)
-    return {"superseded": True, "old_id": old_id, "new_id": new_id}
+    return await memory_mod._store.supersede(old_id, new_id)
 
 
 @mcp.tool()

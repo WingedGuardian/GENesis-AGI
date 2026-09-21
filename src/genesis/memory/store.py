@@ -597,16 +597,26 @@ class MemoryStore:
         new_handle: str,
         *,
         timestamp: str | None = None,
-    ) -> None:
+    ) -> dict:
         """Deprecate *old_handle*, recording *new_handle* as its correction.
 
         The supersede as its own operation, rather than a side effect of
         storing. That distinction is what makes this simple: BOTH ids are named
         by the caller, so both can be resolved and validated up front, and there
         is no content being written whose fate has to be reported alongside the
-        outcome. Every failure is a precondition failure, nothing is mutated,
-        and the caller can retry for free — so this raises rather than
-        returning a verdict to interpret.
+        outcome. Every REJECTION is a precondition failure — nothing is
+        mutated, so it raises, and the caller can fix the ids and retry.
+
+        The writes themselves are a different matter. ``_mark_superseded``
+        commits each store independently — SQLite first, then the Qdrant
+        payload, then the ``succeeded_by`` link — so a failure partway through
+        is partial: the deprecation can be durable in SQLite while the old
+        vector stays live in recall. Raising that case would report failure
+        for an operation whose first half already landed, so it is REPORTED
+        instead: ``{"superseded": False, ...}``. The remedy is the same call
+        again — every step is idempotent (the UPDATE re-marks, the payload
+        re-sets, the link dedups on its PK), so retry completes what failed
+        and duplicates nothing.
 
         Contrast ``store(supersedes=...)``, where the successor is whatever that
         call produces: the caller never names it, cannot see it, and a failure
@@ -615,9 +625,29 @@ class MemoryStore:
         old_id = await self._resolve_supersede_target(old_handle)
         new_id = await self._resolve_supersede_target(new_handle, role="new_id")
         await self._validate_supersede_pair(old_id, new_id)
-        await self._mark_superseded(
-            old_id, new_id, timestamp or datetime.now(UTC).isoformat(),
-        )
+        report: dict = {"superseded": True, "old_id": old_id, "new_id": new_id}
+        try:
+            await self._mark_superseded(
+                old_id, new_id, timestamp or datetime.now(UTC).isoformat(),
+            )
+        except SupersedeUnresolved:
+            # The mark_superseded rowcheck found the row gone between resolve
+            # and write — nothing landed, so this stays a plain rejection.
+            raise
+        except Exception:
+            logger.warning(
+                "Supersede of %s by %s failed partway through",
+                old_id, new_id, exc_info=True,
+            )
+            report["superseded"] = False
+            report["warning"] = (
+                "The deprecation failed partway through — earlier layers may "
+                "already be durable (see the server log). Do NOT store the "
+                "correction again; retry the SAME memory_supersede call: "
+                "every step is idempotent, so it finishes what failed and "
+                "duplicates nothing."
+            )
+        return report
 
     async def _apply_supersede(
         self,
