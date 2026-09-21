@@ -142,7 +142,7 @@ def surface_variants(
     *,
     limit: int = 16,
 ) -> list[str]:
-    """Return the raw spellings *content* could have been stored under.
+    r"""Return the raw spellings *content* could have been stored under.
 
     The inverse of :func:`normalize_content`: for each alias whose canonical
     form appears in *content* (same whole-word, case-insensitive matching),
@@ -152,9 +152,20 @@ def surface_variants(
     ``"claude-code"`` to ``"Claude Code"``, so the current write's own raw
     spelling is not the only one a legacy row can carry.
 
-    Substitution is replace-all per alias and iterates over the frontier, so
-    several distinct canonicals in one string produce their combinations; the
-    result is capped at *limit* (and never includes *content* itself).
+    Traversal is a bounded breadth-first fixed point over SINGLE-occurrence
+    rewrites — three cases demand all three properties:
+
+    * one occurrence at a time, because a legacy row can mix spellings
+      (``"CC reviews claude-code"`` is only reachable by rewriting the two
+      ``"Claude Code"`` occurrences independently);
+    * a fixed point over the whole mapping set, because an alias can chain
+      (``foo -> bar``, ``bar -> baz``): a rewrite can introduce a canonical
+      an already-visited mapping would rewrite;
+    * ``(?<!\w)``/``(?!\w)`` lookarounds instead of ``\b``, because a
+      canonical ending or starting with punctuation (``"C++"``) has no word
+      boundary on that side and would never match.
+
+    The result is capped at *limit* (and never includes *content* itself).
     Best-effort like ``normalize_content``: returns ``[]`` on any failure.
     """
     if aliases is None:
@@ -165,18 +176,23 @@ def surface_variants(
     import re
 
     variants: set[str] = {content}
-    frontier = [content]
-    for alias, canonical in aliases.items():
-        if alias == canonical:
-            continue
-        pattern = re.compile(r"\b" + re.escape(canonical) + r"\b", re.IGNORECASE)
-        for text in list(frontier):
-            replaced = pattern.sub(alias, text)
-            if replaced != text and replaced not in variants:
+    queue = [content]
+    while queue and len(variants) - 1 < limit:
+        text = queue.pop(0)
+        for alias, canonical in aliases.items():
+            if alias == canonical:
+                continue
+            pattern = re.compile(
+                r"(?<!\w)" + re.escape(canonical) + r"(?!\w)", re.IGNORECASE
+            )
+            for match in pattern.finditer(text):
+                replaced = text[: match.start()] + alias + text[match.end():]
+                if replaced in variants:
+                    continue
                 variants.add(replaced)
-                frontier.append(replaced)
-        if len(variants) - 1 >= limit:
-            break
+                queue.append(replaced)
+                if len(variants) - 1 >= limit:
+                    break
     variants.discard(content)
     return sorted(variants)[:limit]
 

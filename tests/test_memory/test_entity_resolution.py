@@ -69,6 +69,33 @@ def test_surface_variants_combines_distinct_canonicals():
     assert "CC uses an LLM" in variants
 
 
+def test_surface_variants_recovers_mixed_spellings_per_occurrence():
+    """A legacy row can use a different alias at EACH occurrence."""
+    aliases = {"CC": "Claude Code", "claude-code": "Claude Code"}
+    variants = surface_variants(
+        "Claude Code reviews Claude Code", aliases
+    )
+    assert "CC reviews claude-code" in variants
+    assert "claude-code reviews CC" in variants
+    assert "CC reviews CC" in variants
+
+
+def test_surface_variants_matches_punctuated_canonicals():
+    """Canonicals ending in punctuation have no word boundary — lookarounds."""
+    aliases = {"cpp": "C++", "cplusplus": "C++"}
+    variants = surface_variants("C++ guide", aliases)
+    assert "cpp guide" in variants
+    assert "cplusplus guide" in variants
+
+
+def test_surface_variants_follows_alias_chains_to_fixpoint():
+    """foo -> bar -> baz: normalized 'baz' must reach the 'foo' spelling."""
+    aliases = {"foo": "bar", "bar": "baz"}
+    variants = surface_variants("baz item", aliases)
+    assert "foo item" in variants
+    assert "bar item" in variants
+
+
 def test_surface_variants_no_match_returns_empty():
     assert surface_variants("nothing aliased here", {"CC": "Claude Code"}) == []
 
