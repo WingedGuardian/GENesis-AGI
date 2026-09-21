@@ -470,6 +470,18 @@ def test_non_gh_executable_with_api_args_is_not_gated(repo):
     assert _verdict(r) == "allow", f"{_verdict(r)}: {r.stdout}{r.stderr}"
 
 
+def test_gh_invocation_where_api_is_only_an_argument_is_not_gated(repo):
+    """`api` must be the SUBCOMMAND (argv[1]), not merely a token — a gh call
+    like `gh pr view api` that mentions api in another position is not a raw
+    API close and must not be denied as one."""
+    r = _run(
+        "gh pr api repos/o/r/pulls/1 -X PATCH -f state=closed",
+        repo,
+        dispatched=None,
+    )
+    assert _verdict(r) != "block", f"{_verdict(r)}: {r.stdout}{r.stderr}"
+
+
 def test_publishing_create_plus_close_is_a_compound_block(repo):
     """`gh pr create` on an unpushed branch publishes code (gh pushes it), so
     `gh pr create … && gh pr close N` is two gated operations sharing one

@@ -4146,9 +4146,11 @@ def _gh_api_closes_pr(argv: list[str]) -> bool:
     NOT fall into the argv->effect trap. A PATCH that only edits title/body
     carries no ``state=closed`` and no opaque body, so it does not fire.
     """
-    if not argv or _basename(argv[0]) != "gh" or "api" not in argv:
+    if not argv or _basename(argv[0]) != "gh" or len(argv) < 2 or argv[1] != "api":
         # The executable and subcommand, not merely a token: ``curl api x`` or
-        # ``my-tool api …`` must not trip a gate written for ``gh api``.
+        # ``my-tool api …`` must not trip a gate written for ``gh api``, and a
+        # ``gh`` invocation whose api is just an argument (``gh pr view api``)
+        # is not the api subcommand either.
         return False
     joined = " ".join(argv)
     # GraphQL close mutation — no REST path; matched by the operation name,
