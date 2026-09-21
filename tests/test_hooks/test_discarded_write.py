@@ -226,9 +226,11 @@ def _settings_bash_hooks() -> tuple[list[Path], list[str], list[str], list[Path]
     right for the refusal-note lock and WRONG for the ask-note lock: a hook that
     emits only an `ask` and never a hard refusal would be filtered out by
     construction, and that is precisely the hook most in need of the prompt note,
-    since it is all dialog. Measured today: 4 of 13 configured python Bash hooks
-    are excluded by the blocker filter, and none of them emits an ask — so the
-    hole is latent, not live. Inheriting the wrong filter is how it would stop
+    since it is all dialog. The advisory hooks excluded by the blocker filter are
+    enumerated and executed by
+    `test_import_time_degraded.py::test_every_bash_hook_declares_its_degrade_direction`
+    rather than counted here; none of them emits an ask — so the hole is latent,
+    not live. Inheriting the wrong filter is how it would stop
     being latent without anything failing.
     """
     settings = json.loads((_REPO / ".claude" / "settings.json").read_text())
@@ -363,15 +365,26 @@ def test_every_guard_with_an_ask_path_wires_the_prompt_note():
     # construction. That is the hook most in need of this note, since it is all
     # dialog and never a hard refusal.
     _, _, _, all_python = _settings_bash_hooks()
-    ask_guards = [p for p in all_python if '"permissionDecision": "ask"' in p.read_text()]
+    ask_guards = [
+        p
+        for p in all_python
+        if any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "emit_native_ask"
+            for node in ast.walk(ast.parse(p.read_text()))
+        )
+    ]
     assert ask_guards, (
         "no configured blocker emits an ask decision — either the walk is broken, "
         "or the repo has moved away from ask verdicts entirely, in which case "
         "prompt_note and _PROMPT_NOTE have no consumer and should be DELETED "
         "rather than left as an unwired entry point"
     )
-    missing = [p.name for p in ask_guards if not _calls(ast.parse(p.read_text()), "prompt_note")]
-    assert not missing, missing
+    helper = _HOOKS / "native_approval.py"
+    helper_tree = ast.parse(helper.read_text())
+    assert _calls(helper_tree, "prompt_note")
+    assert '"permissionDecision": "ask"' in helper.read_text()
 
 
 def test_git_push_guards_wrapper_is_actually_reached():
@@ -634,3 +647,25 @@ def test_live_the_ask_path_carries_the_prompt_note():
     reason = json.loads(buf.getvalue())["hookSpecificOutput"]["permissionDecisionReason"]
     assert "needs your approval" in reason
     assert "Declining also skips" in reason
+
+
+def test_both_review_guards_share_the_native_approval_wire_payload(capsys):
+    """Thin wrappers may differ in control flow, never in Claude Code JSON."""
+    spec = importlib.util.spec_from_file_location("gpg_shared_ask", _HOOKS / "git_push_guard.py")
+    push = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(push)
+
+    commit_path = _REPO / "scripts" / "review_enforcement_commit.py"
+    spec = importlib.util.spec_from_file_location("commit_shared_ask", commit_path)
+    commit = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(commit)
+
+    assert push._ask("same reason") == 0
+    push_payload = json.loads(capsys.readouterr().out)
+    with pytest.raises(SystemExit) as stopped:
+        commit._native_ask("same reason")
+    assert stopped.value.code == 0
+    commit_payload = json.loads(capsys.readouterr().out)
+    assert push_payload == commit_payload

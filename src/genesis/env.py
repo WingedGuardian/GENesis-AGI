@@ -233,8 +233,9 @@ def internal_api_token_path() -> Path:
 
     Trusted loopback/host callers read this to authenticate to ``/api`` mutation
     endpoints when a dashboard password is set (see the dashboard auth gate).
-    Distinct from the optional ``GENESIS_MCP_HTTP_TOKEN`` (voice API) — this one
-    always exists once the server has booted, so callers need no configuration.
+    Distinct from the optional ``GENESIS_MCP_HTTP_TOKEN`` (the voice, OpenClaw
+    and desk-brain HTTP surfaces) — this one always exists once the server has
+    booted, so callers need no configuration.
     Written by the dashboard auth layer with mode 0600.
     """
     return genesis_home() / "internal_api_token"

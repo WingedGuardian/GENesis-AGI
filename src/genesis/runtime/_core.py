@@ -55,7 +55,10 @@ if TYPE_CHECKING:
     from genesis.surplus.idle_detector import IdleDetector
     from genesis.surplus.scheduler import SurplusScheduler
 
-from genesis.runtime._capabilities import write_capabilities_file
+from genesis.runtime._capabilities import (
+    write_bootstrap_manifest_file,
+    write_capabilities_file,
+)
 from genesis.runtime._degradation import record_init_degradation
 from genesis.runtime._init_delegates import _InitDelegatesMixin
 from genesis.runtime._job_health import (
@@ -394,6 +397,10 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
 
         if self._db is None:
             logger.error("DB init failed — cannot continue bootstrap")
+            # The DB may be unable to persist its own failure.  Publish the
+            # failed manifest before the early return so out-of-process health
+            # readers see the real boot state.
+            write_bootstrap_manifest_file(self)
             return
 
         await self._run_init_step_async("tool_registry", self._init_tool_registry)

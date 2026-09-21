@@ -25,28 +25,10 @@ see it. The marker only ever answered ONE question -- which tier is live -- and 
 round counter already answers it, branch-scoped, with no lifecycle to get wrong. So the
 marker is gone rather than patched again.
 
-CAP TIER ONLY -- and "which tier is live" is TWO counters checked IN ORDER, not one.
-The gate tests `lifetime >= FINAL_ROUND_CAP` FIRST, so above that line the live block is
-normally the final-round terminal, whose options are ACCEPT-and-merge / ABANDON --
-neither of which is in this menu. An earlier revision of this hook keyed on the streak
-alone and therefore showed the CAP menu at the terminal: the user would have been handed
-a menu OMITTING the only option that ends the loop and carrying three the live tier does
-not offer. That is the founding incident arriving through the mechanism built to prevent
-it, and the gate's own comment calls that state reachable. Both counters are read here,
-in the gate's order.
-
-A KNOWN GAP, stated because an earlier draft of this paragraph said "FIRST and returns"
-and that is FALSE. The terminal returns only when the commit is NOT already carrying
-`# final-round-accept`; when it is, the gate sets its spend flag and FALLS THROUGH to
-the cap (`review_enforcement_commit.py:1027-1029`). So at streak >= cap AND lifetime >=
-terminal, with that sigil present, the CAP block is what the user sees while this hook
-stays silent -- uncovered, and it is exactly the state the gate's own comment names as
-needing both sigils. It is not fixed here and the fix is not a better predicate: the
-deciding input is a sigil on a future Bash commit command, which a PreToolUse hook on
-AskUserQuestion structurally cannot see. The fail direction is the safe one (no menu,
-session relays by hand = the pre-change behaviour), and `tests/test_hooks/
-test_gate_menu.py` pins the gap so nobody "fixes" it into showing the cap menu at the
-BARE terminal, which is the wrong-tier bug above.
+CAP TIER ONLY. The branch lifetime no longer creates a separate terminal: GitHub-backed
+distinct reviewed heads now trigger a native approval on the commit or review request
+itself. This menu remains scoped to the local three-consecutive-defect hard stop, whose
+remedies are different from that per-action approval.
 
 The round-2 mode-switch tier is excluded for a different and equally mechanical reason:
 `# audit-ack` deliberately does NOT reset the streak (a still-narrow fix must still
@@ -195,38 +177,19 @@ def _payload_cwd(payload: dict) -> str | None:
 def _cap_is_live(cwd: str | None) -> bool:
     """True when the escalation CAP tier is what the next commit would actually hit.
 
-    MIRRORS THE GATE'S ORDER, which is the whole correctness argument. The gate reads
-    two counters and the terminal wins:
-
-        lifetime_n = get_review_lifetime(cwd)
-        if lifetime_n >= FINAL_ROUND_CAP:   ... _deny(FINAL ROUND); return
-        if round_n >= ESCALATION_ROUND_CAP: ... _deny(cap)
-
-    So a menu keyed on the streak alone is WRONG above the terminal, not merely
-    incomplete -- it would show cap options for a block that is offering
-    ACCEPT-and-merge / ABANDON. Checking lifetime first is what keeps the menu and the
-    block talking about the same tier.
-
-    BOTH VALUES COME FROM ONE SNAPSHOT, and that is not a micro-optimisation. Two
-    independent reads let a concurrent `mark` land between them, yielding a pair that
-    never existed -- the pre-update lifetime with the post-update streak -- from which
-    this function would select a tier the gate is not in. That is the wrong-tier bug
-    above, re-entering through a race instead of through a missing check. Reading once
-    cannot produce an inconsistent pair.
+    Mirrors the commit gate's local streak rule. The cloud-backed per-action approval
+    has its own native dialog and does not use this AskUserQuestion substitution.
 
     `get_review_counters` is branch-scoped by construction -- it reads (0, 0) when the
     stored state belongs to a different branch -- so a menu never follows you onto
     unrelated work.
 
-    Every failure path returns False (no menu), including the one where the terminal
-    cannot be read: if we cannot PROVE the terminal is clear, we say nothing rather than
-    risk showing the wrong tier's options. Fail-open in the sense that matters -- a miss
-    costs a menu, never a gate.
+    Every failure path returns False (no menu). Fail-open in the sense that matters --
+    a miss costs a menu, never a gate.
     """
     try:
         from review_state import (
             ESCALATION_ROUND_CAP,
-            FINAL_ROUND_CAP,
             get_review_counters,
         )
     except Exception:  # noqa: BLE001 -- no counters, no menu. Never a refusal.
@@ -237,9 +200,7 @@ def _cap_is_live(cwd: str | None) -> bool:
         # reinstate the race this import exists to close. No menu is the better miss.
         return False
     try:
-        round_n, lifetime_n = get_review_counters(cwd=cwd)
-        if int(lifetime_n) >= FINAL_ROUND_CAP:
-            return False
+        round_n, _lifetime_n = get_review_counters(cwd=cwd)
         return int(round_n) >= ESCALATION_ROUND_CAP
     except Exception:  # noqa: BLE001
         return False

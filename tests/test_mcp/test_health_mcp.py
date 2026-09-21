@@ -831,3 +831,34 @@ async def test_no_creds_alert_when_all_ok(monkeypatch, tmp_path):
     finally:
         health_mcp_mod._service = old
         health_mcp_mod._alert_history = old_history
+
+
+async def test_provider_activity_falls_back_to_the_shared_db_when_memory_is_empty():
+    """An external client asks about SYSTEM-WIDE health, not this subprocess.
+
+    `summary()` reads the tracker's in-memory `_calls`, which records only what
+    the current process observed. The standalone server an external client
+    starts constructs a fresh tracker per subprocess, so a memory-only read
+    returns [] on the first call and shows only that subprocess's traffic
+    afterwards — a healthy-looking void reported as system health. The DB
+    fallback exists for exactly this; the tool simply never called it.
+    """
+    from genesis.mcp.health.provider import provider_activity as _tool
+    from genesis.observability.provider_activity import ProviderActivityTracker
+
+    # `@mcp.tool()` wraps the coroutine in a FunctionTool; `.fn` is the callable.
+    provider_activity = _tool.fn
+
+    tracker = ProviderActivityTracker()  # empty, as in a fresh subprocess
+    from_db = [{"provider": "llm.gemini_flash", "calls": 7, "errors": 0}]
+    tracker.summary_with_db_fallback = AsyncMock(return_value=from_db)
+
+    old_tracker = health_mcp_mod._activity_tracker
+    try:
+        health_mcp_mod._activity_tracker = tracker
+        assert await provider_activity() == from_db
+        tracker.summary_with_db_fallback.assert_awaited()
+        # The filtered shape stays a dict rather than silently becoming a list.
+        assert await provider_activity("llm.gemini_flash") == from_db[0]
+    finally:
+        health_mcp_mod._activity_tracker = old_tracker

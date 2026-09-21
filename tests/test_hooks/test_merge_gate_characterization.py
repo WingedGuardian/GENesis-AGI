@@ -80,12 +80,16 @@ def _pin_canonical_public_repo(monkeypatch):
     on every host. The off-public-repo NO-OP is exercised by its own case, which
     overrides this seam to a different repo.
 
-    Also pin ``_TEST_REQUIRED_SCHEDULED_REVIEWS`` to the DEFAULT policy
-    (code-review + leaks): the required-kinds are now config-driven from the same
-    ``genesis.yaml``, so without this pin the corpus (which asserts the default
-    both-required behavior) would read the host's real local override and go
-    non-deterministic. The relaxed/advisory path is covered by its own unit tests
-    in test_git_push_guard_codex_freshness.py."""
+    Also pin ``_TEST_REQUIRED_SCHEDULED_REVIEWS`` to the two-kind policy
+    (code-review + leaks): the required-kinds are config-driven from the same
+    ``genesis.yaml``, so without this pin the corpus (which asserts both-required
+    behavior) would read the host's real local override and go non-deterministic.
+    This is deliberately the EXPANDED policy an install declares, not the shipped
+    default (``leaks`` alone, ``_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS``) — the
+    corpus exists to characterize the multi-kind gate, and pinning the default
+    would leave the second-kind paths unexercised. The default itself, and the
+    advisory path, are covered by their own unit tests in
+    test_git_push_guard_codex_freshness.py."""
     monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", REPO)
     monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "code-review,leaks")
     # (The required-CI-workflow identity pin — _TEST_REQUIRED_CI_WORKFLOWS=CI,
@@ -126,8 +130,9 @@ def _scheduled_marker(
 ) -> str:
     """_TEST_GH_SCHEDULED_COMMENTS shape — one OWNER-authored comment/review row whose
     body carries one scheduled-review marker per ``kind`` naming ``head``. One JSON object
-    per line. The DEFAULT carries BOTH required kinds (code-review + leaks), so every
-    pre-existing case satisfies the gate; scheduled-gate cases pass explicit ``kinds``.
+    per line. The default argument carries BOTH kinds this corpus pins as required
+    (code-review + leaks), so every pre-existing case satisfies the gate;
+    scheduled-gate cases pass explicit ``kinds``.
 
     ``login``/``author_association`` model the trust check: a row is accepted only when
     ``login == <repo owner>`` OR ``author_association == "OWNER"``. The repo owner here is
@@ -1397,7 +1402,7 @@ def _report_env(monkeypatch, *, scheduled: str, head: str = HEAD):
         _mod, "_check_pr_review_findings", lambda n, repo=None, force=False: (False, "")
     )
     monkeypatch.setattr(
-        _mod, "_check_inline_review_findings", lambda n, repo=None, force=False: (False, "")
+        _mod, "_check_inline_review_findings", lambda n, repo=None, force=False, uncounted_out=None: (False, "")
     )
 
 

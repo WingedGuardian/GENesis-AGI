@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from genesis.db.connection import connect_sqlite_rw
 from genesis.db.data_migrations._util import commit_in_batches
 from genesis.ego.verification import (
     _resolve_path,
@@ -89,7 +90,7 @@ def migrate() -> dict:
     if not to_flip:
         return {"flipped": 0, "scanned": len(rows)}
 
-    db = sqlite3.connect(genesis_db_path(), timeout=30.0)
+    db = connect_sqlite_rw(genesis_db_path(), timeout=30.0)
 
     def _flip(conn: sqlite3.Connection, pid: object) -> None:
         conn.execute(
