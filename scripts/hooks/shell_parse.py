@@ -2785,7 +2785,21 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
     sticky_noexec = False  # `D`, either sign, never cleared
 
     for i, tok in enumerate(argv[1:], 1):
-        if tok in {"-", "--", "+"}:
+        # A LONE `+` IS NOT A TERMINATOR HERE, and treating it as one is a
+        # BYPASS. `-` and `--` really do end option processing, so the next
+        # token is the command and there is no `-c` script to find. `+` does
+        # not: the shell reads it as an empty option bundle, skips it, and
+        # keeps parsing — so `bash + -c CMD` runs CMD. MEASURED against the
+        # installed bash and dash: both print the payload at exit 0, while
+        # breaking here made `_nested_script` abandon an argv the shell really
+        # runs and every segment-based guard went blind to it.
+        #
+        # `+` WAS in this set, added with `-`/`--` to answer a review finding
+        # about the lone-hyphen case; the hyphen half was right and the plus
+        # half was not. `_first_operand` still treats a lone `+` as a
+        # terminator AFTER the selector, deliberately — see the non-mirror
+        # note there. The shell parses the two positions differently.
+        if tok in {"-", "--"}:
             break
         if not (tok[:1] in ("-", "+") and len(tok) > 1):
             continue

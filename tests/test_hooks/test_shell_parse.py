@@ -1398,6 +1398,17 @@ _NO_EXEC_MATRIX = [
     (["-ec", "PAYLOAD"], True),                                  # bundle without n
     (["-e", "-z", "-c", "PAYLOAD"], False),                      # invalid opt: refused
     (["-c", "PAYLOAD", "-z"], True),                             # invalid AFTER operand
+    # THE THREE TERMINATOR SPELLINGS, which do not behave alike. `-` and `--`
+    # really do end option processing, so the token after them is the command
+    # and no `-c` script exists to resolve. A lone `+` does NOT: the shell
+    # reads an empty option bundle, skips it, and keeps parsing to `-c`.
+    # Treating `+` like the other two made the pre-selector scan abandon an
+    # argv the shell runs, and every segment-based guard went blind to the
+    # payload — a BYPASS, and the reason these rows exist.
+    (["+", "-c", "PAYLOAD"], True),                              # + is NOT a terminator
+    (["+", "+n", "-c", "PAYLOAD"], True),                        # + skipped, +n enables
+    (["-", "-c", "PAYLOAD"], False),                             # - DOES terminate
+    (["--", "-c", "PAYLOAD"], False),                            # -- DOES terminate
 ]
 
 
