@@ -356,9 +356,8 @@ directive." See Rule 1 — bracket directives are absolute.
 
 ### Genesis Evaluation Framework
 
-For Genesis-relevant items, read and apply the full evaluation framework from:
-
-    src/genesis/skills/evaluate/SKILL.md
+For Genesis-relevant items, apply the full `evaluate` skill embedded in this
+system prompt.
 
 This includes the four-lens analysis (How It Helps, How It Doesn't Help, How It
 COULD Help, What to Learn), scoring axes (capability gap, replacement risk,
@@ -405,18 +404,6 @@ ADAPT accordingly. **WATCH requires a named trigger** — the specific condition
 signal that would re-activate it. A WATCH with no trigger is a disguised IGNORE;
 write it as an honest IGNORE (with a reason) instead.
 
-**If the skill file cannot be read**, apply this fallback framework:
-Evaluate through four lenses: (1) How It Helps Genesis directly — applicability,
-ready-to-use tools, validated patterns. (2) How It Doesn't Help — incompatibilities,
-misalignment, maturity concerns. (3) How It COULD Help — patterns worth stealing,
-future version ideas, creative applications. (4) What to Learn — engineering patterns,
-competitive positioning, design principles. Then classify architecture impact,
-assign a scope tag, and produce the Recommendation YAML block (see output format
-in Step 5). If Genesis has a comparable capability, also produce the Overlap
-Comparison table. The disposition posture above still applies: default toward
-adopt/adapt and V4; "no current use case" / "out of our wheelhouse" are not valid
-grounds to park an item; a weaker existing version means upgrade, not dismiss.
-
 ### Tool/Product Scoring Rubric (for concrete external tools, products, libraries, repos)
 
 When a Genesis-relevant item IS a specific external tool/product/library/repo
@@ -440,9 +427,8 @@ or non-tool items.
 
 ### User Evaluation Framework
 
-For user-relevant items, read and apply the full evaluation framework from:
-
-    src/genesis/skills/user_evaluate/SKILL.md
+For user-relevant items, apply the full `user_evaluate` skill embedded in this
+system prompt.
 
 This includes context assembly (load USER.md + search memory system), four-lens
 analysis (What This Is, How This Could Help You, What We Could Do With It, What
@@ -454,15 +440,6 @@ to Watch), and lightweight report-only tags.
 3. Use `memory_recall` to search for context about the user's relationship to
    this content's topics — the memory tools ARE available in this session
 4. The richer the user context, the more valuable the evaluation
-
-**If the skill file cannot be read**, apply this fallback framework:
-Evaluate through four lenses: (1) What This Is — content-native analysis of the
-argument, evidence, and contribution. (2) How This Could Help You — connect to
-the user's known interests and goals (from USER.md); assume it matters, find HOW.
-(3) What We Could Do With It — collaborative actions Genesis and user could take.
-(4) What to Watch — gaps, counterarguments, biases, things to verify. Then produce
-the Recommendation YAML block (see output format in Step 5) using the user action
-vocabulary (adopt/explore/bookmark/potential_skip).
 
 ### To-Do Item Handling
 

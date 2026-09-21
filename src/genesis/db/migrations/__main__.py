@@ -16,8 +16,6 @@ import os
 import sys
 from pathlib import Path
 
-import aiosqlite
-
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 
@@ -47,9 +45,9 @@ async def _run(args: argparse.Namespace) -> int:
         print(f"Database not found: {db_path}", file=sys.stderr)
         return 1
 
-    from genesis.db.connection import MIGRATION_BUSY_TIMEOUT_MS
+    from genesis.db.connection import MIGRATION_BUSY_TIMEOUT_MS, connect_aiosqlite_rw
 
-    async with aiosqlite.connect(str(db_path)) as db:
+    async with connect_aiosqlite_rw(db_path) as db:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute(f"PRAGMA busy_timeout={MIGRATION_BUSY_TIMEOUT_MS}")
         runner = MigrationRunner(db)

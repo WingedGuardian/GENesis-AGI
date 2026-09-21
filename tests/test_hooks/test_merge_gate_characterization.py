@@ -1402,7 +1402,7 @@ def _report_env(monkeypatch, *, scheduled: str, head: str = HEAD):
         _mod, "_check_pr_review_findings", lambda n, repo=None, force=False: (False, "")
     )
     monkeypatch.setattr(
-        _mod, "_check_inline_review_findings", lambda n, repo=None, force=False: (False, "")
+        _mod, "_check_inline_review_findings", lambda n, repo=None, force=False, uncounted_out=None: (False, "")
     )
 
 
