@@ -2671,6 +2671,49 @@ class TestOffDiffLockItself:
             "the lock is blind there and every vacuous test now passes silently"
         )
 
+    @pytest.mark.parametrize(
+        ("comment_factory", "label"),
+        [
+            (lambda p: _cr_c(1, _CR_MAJOR_BODY, path=p),
+             "[off-diff CodeRabbit Critical/Major]"),
+            (lambda p: _codex_c(1, _P1_BODY, path=p), "[off-diff P1]"),
+            (lambda p: _codex_c(1, _P2_BODY, path=p), "[off-diff P2]"),
+        ],
+        ids=["coderabbit_major", "codex_p1", "codex_p2"],
+    )
+    def test_an_off_diff_path_cannot_write_to_the_terminal(
+        self, guard_module, capsys, comment_factory, label
+    ):
+        """The REST of the population, found while fixing one member of it.
+
+        Codex's round-1 finding on PR #2005 was that a contributor-controlled
+        path interpolated into gate output can forge or conceal the surrounding
+        verdict. It was fixed in the findings distribution — and in NO other
+        site, though four more printed a path raw and predate that PR. Fixing a
+        class in one place is not fixing the population.
+
+        The exposure is the one this file's own `_safe_title` docstring records
+        as MEASURED: CR + `ESC[2K` redraws the line as a counterfeit
+        `merge-with :` command with `--match-head-commit` absent, stripping the
+        TOCTOU binding from a command the operator is told to copy verbatim.
+        These lanes are the NON-blocking ones, which the same docstring notes is
+        the dangerous half — the operator reads the verdict as passing.
+
+        Note the path must still be RECOGNISABLE afterwards: a renderer that
+        neutralised by deleting everything would pass a residue check while
+        making the note useless.
+        """
+        hostile = "src/\x1b[2K\rnot_in_the_diff.py"
+        with _mock_inline(guard_module, [comment_factory(hostile)]):
+            guard_module._check_inline_review_findings("100")
+        err = capsys.readouterr().err
+        assert label in err, "precondition: this lane still prints"
+        residue = [
+            c for c in err if guard_module._gate_text_unsafe(c) and c != "\n"
+        ]
+        assert not residue, f"terminal-acting characters reached the report: {residue!r}"
+        assert "not_in_the_diff.py" in err, "the path must still name its file"
+
     def test_an_in_diff_finding_trips_nothing(self, guard_module, capsys):
         """Negative control: without it, a MARKER of '' would pass the test above."""
         with _mock_inline(guard_module, [_codex_c(1, _P1_BODY, path="src/benign.py")]):
@@ -3031,6 +3074,178 @@ class TestPrCiStatus:
         # something but recognized no CI verdict) — NOT "absent" (which is zero checks).
         self._set(monkeypatch, [{"login": "codex", "body": "FAILURE somewhere"}])
         assert guard_module._pr_ci_status("1") == ("unknown", [])
+
+
+class TestPrCiStatusSelfWorkflow:
+    """Actions self-exclusion (issue #1670): when the gate runs as a check run,
+    its own rollup entries are dropped — the check may never vouch for or block
+    on itself. Without it every run sees its own IN_PROGRESS and deadlocks, and
+    a same-head re-run inherits its predecessor's FAILURE. Conftest scrubs the
+    pair for all other tests; here we setenv per case."""
+
+    @staticmethod
+    def _actions(monkeypatch, workflow="merge-gate", job="genesis-merge-gate"):
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        monkeypatch.setenv("GITHUB_WORKFLOW", workflow)
+        monkeypatch.setenv("GITHUB_JOB", job)
+
+    def test_own_in_progress_run_does_not_pending(self, guard_module, monkeypatch):
+        # THE self-deadlock case: our own check is IN_PROGRESS while we classify.
+        self._actions(monkeypatch)
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "genesis-merge-gate", "workflowName": "merge-gate",
+             "status": "IN_PROGRESS", "conclusion": None},
+        ]))
+        assert guard_module._pr_ci_status("1") == ("green", [])
+
+    def test_own_prior_failure_does_not_red(self, guard_module, monkeypatch):
+        # Same-head re-run (a review/comment trigger): the predecessor run's
+        # FAILURE must not be inherited as our own verdict.
+        self._actions(monkeypatch)
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "genesis-merge-gate", "workflowName": "merge-gate",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+        ]))
+        assert guard_module._pr_ci_status("1") == ("green", [])
+
+    def test_other_workflow_still_classified(self, guard_module, monkeypatch):
+        # Only OUR workflow is excluded — a red "CI" check still blocks.
+        self._actions(monkeypatch)
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "genesis-merge-gate", "workflowName": "merge-gate",
+             "status": "IN_PROGRESS", "conclusion": None},
+        ]))
+        assert guard_module._pr_ci_status("1") == ("red", ["test"])
+
+    def test_only_own_run_is_absent(self, guard_module, monkeypatch):
+        # Rollup containing ONLY our own run = zero other checks ran — the same
+        # definite "CI has not run" fact as a literally-empty rollup.
+        self._actions(monkeypatch)
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": "merge-gate",
+             "status": "IN_PROGRESS", "conclusion": None},
+        ]))
+        assert guard_module._pr_ci_status("1") == ("absent", [])
+
+    def test_local_path_excludes_the_mirror_check(self, guard_module, monkeypatch):
+        # GITHUB_ACTIONS absent (interactive merge path): the advisory check is
+        # only a MIRROR of this gate's verdict, so it must never classify — a
+        # red mirror would double-count real blocks as `ci: red` and demand a
+        # spurious ci-override. Constant-name exclusion applies without the
+        # Actions env vars (conftest scrubs them for every hook test).
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": None,
+             "detailsUrl": "https://github.com/OWNER/REPO/runs/99",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]))
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("green", [])
+
+    def test_local_path_excludes_ambient_workflow_entries(self, guard_module, monkeypatch):
+        # The constant workflow-name lane applies locally too: ambient runs of
+        # the merge-gate workflow carry workflowName="merge-gate".
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": "merge-gate",
+             "status": "IN_PROGRESS", "conclusion": None},
+        ]))
+        assert guard_module._pr_ci_status("1") == ("absent", [])
+
+    def test_casefolded_workflow_match(self, guard_module, monkeypatch):
+        # workflowName matching is case-insensitive, like the rest of the gate.
+        self._actions(monkeypatch, workflow="Merge-Gate")
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "genesis-merge-gate", "workflowName": "merge-gate",
+             "status": "IN_PROGRESS", "conclusion": None},
+        ]))
+        assert guard_module._pr_ci_status("1") == ("green", [])
+
+    def test_api_check_run_filtered_by_job_name(self, guard_module, monkeypatch):
+        # A check run published via the check-runs API carries NO workflowName —
+        # it is identified by its NAME (= the job name). This is the
+        # comment-triggered re-evaluation case: the previous API-published
+        # FAILURE must not be inherited by its successor.
+        self._actions(monkeypatch, workflow="other-wf")
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "genesis-merge-gate", "workflowName": None,
+             "detailsUrl": "https://github.com/OWNER/REPO/runs/99",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+        ]))
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("green", [])
+
+    def test_unrelated_same_named_check_is_not_filtered(self, guard_module, monkeypatch):
+        # Name-based filtering keys on THIS job's name only — a different job's
+        # checks still classify normally.
+        self._actions(monkeypatch, job="genesis-merge-gate")
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "some-other-check", "workflowName": None,
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+        ]))
+        assert guard_module._pr_ci_status("1") == ("red", ["some-other-check"])
+
+    def test_api_published_run_in_foreign_suite_is_filtered(self, guard_module, monkeypatch):
+        # MEASURED on PR #1954: a `genesis-merge-gate` verdict published via the
+        # check-runs API was attached to a check suite owned by a DIFFERENT
+        # workflow ("Labeler") — GitHub assigns the suite, not the publisher, so
+        # an API-published mirror can carry ANY workflowName. The name plus a
+        # detailsUrl into this repo's run pages is the identity.
+        self._actions(monkeypatch, workflow="merge-gate", job="genesis-merge-gate")
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": "Labeler",
+             "detailsUrl": "https://github.com/OWNER/REPO/runs/105310955021",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]))
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("green", [])
+
+    def test_mirror_name_filtered_locally_under_any_workflow_name(self, guard_module, monkeypatch):
+        # Same lane on the interactive path: an API-published mirror carrying a
+        # foreign workflowName must not double-count as `ci: red`.
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": "Labeler",
+             "detailsUrl": "https://github.com/OWNER/REPO/runs/105310955021",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]))
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("green", [])
+
+    def test_same_name_foreign_details_url_still_counts(self, guard_module, monkeypatch):
+        # Name alone is not provenance: a same-named check whose detailsUrl
+        # points at ANOTHER repo's run page is a real verdict and still blocks.
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": "Other",
+             "detailsUrl": "https://github.com/OTHER/REPO/runs/42",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]))
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("red", ["genesis-merge-gate"])
+
+    def test_same_name_external_details_url_still_counts(self, guard_module, monkeypatch):
+        # A same-named check from another app carries its own external
+        # detailsUrl — not a mirror of this gate, still classifies.
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": None,
+             "detailsUrl": "https://example.com/checks/42",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]))
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("red", ["genesis-merge-gate"])
+
+    def test_same_slug_non_github_host_still_counts(self, guard_module, monkeypatch):
+        # Host is provenance too: a non-github.com URL whose PATH carries this
+        # repo's slug must not be accepted as our mirror.
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": None,
+             "detailsUrl": "https://evil.example.com/OWNER/REPO/runs/42",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]))
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("red", ["genesis-merge-gate"])
 
 
 class TestPrCiStatusRequiredWorkflows:
@@ -3432,7 +3647,7 @@ class TestCiGateEndToEnd:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, force=False, repo=None: (False, ""),
+            lambda n, force=False, repo=None, uncounted_out=None: (False, ""),
         )
         # The Codex review-freshness gate (PR #1366) is a real network check —
         # mock it pass-through (None verified_head also disengages the
@@ -3652,7 +3867,7 @@ class TestMergeableAllowlist:
             json.dumps([{"name": "test", "workflowName": "CI", "conclusion": "SUCCESS"}]),
         )
         for name in ("_check_pr_review_findings", "_check_inline_review_findings"):
-            monkeypatch.setattr(guard_module, name, lambda n, force=False, repo=None: (False, ""))
+            monkeypatch.setattr(guard_module, name, lambda n, force=False, repo=None, uncounted_out=None: (False, ""))
         monkeypatch.setattr(
             guard_module, "_check_base_is_default", lambda n, force=False, repo=None: (False, "")
         )
@@ -3710,7 +3925,7 @@ class TestMergeableAllowlist:
             lambda n, force=False, repo=None: (False, "", None),
         )
         for name in ("_check_pr_review_findings", "_check_inline_review_findings"):
-            monkeypatch.setattr(guard_module, name, lambda n, repo=None, strict=False: (False, ""))
+            monkeypatch.setattr(guard_module, name, lambda n, repo=None, strict=False, uncounted_out=None: (False, ""))
         assert guard_module.check_pr_report("5") == 1
         assert "would block" in capsys.readouterr().out
 
@@ -3733,7 +3948,7 @@ class TestRepoDerivationGate:
         )
         monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
         for name in ("_check_pr_review_findings", "_check_inline_review_findings"):
-            monkeypatch.setattr(guard_module, name, lambda n, force=False, repo=None: (False, ""))
+            monkeypatch.setattr(guard_module, name, lambda n, force=False, repo=None, uncounted_out=None: (False, ""))
         monkeypatch.setattr(
             guard_module, "_check_base_is_default", lambda n, force=False, repo=None: (False, "")
         )
@@ -3915,7 +4130,7 @@ class TestUnreadableScanFailsClosed:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, repo=None: (False, ""),
+            lambda n, repo=None, uncounted_out=None: (False, ""),
         )
         assert guard_module.check_pr_report("5") == 1
         out = capsys.readouterr().out
@@ -3974,7 +4189,7 @@ class TestGateOrdering:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, force=False, repo=None: (calls.append("inline"), (False, ""))[1],
+            lambda n, force=False, repo=None, uncounted_out=None: (calls.append("inline"), (False, ""))[1],
         )
         monkeypatch.setattr(
             guard_module,
@@ -4008,7 +4223,7 @@ class TestGateOrdering:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, repo=None: (calls.append("inline"), (False, ""))[1],
+            lambda n, repo=None, uncounted_out=None: (calls.append("inline"), (False, ""))[1],
         )
         guard_module.check_pr_report("5")
         assert calls.index("freshness") < calls.index("body")
@@ -4318,7 +4533,7 @@ class TestReportRendersGateDetail:
             guard_module, "_check_pr_review_findings", lambda n, repo=None: (False, "")
         )
         monkeypatch.setattr(
-            guard_module, "_check_inline_review_findings", lambda n, repo=None: (False, "")
+            guard_module, "_check_inline_review_findings", lambda n, repo=None, uncounted_out=None: (False, "")
         )
 
     @pytest.mark.parametrize(
@@ -4367,7 +4582,7 @@ class TestReportRendersGateDetail:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, repo=None: (False, f"not blocking\n  {self._DETAIL}"),
+            lambda n, repo=None, uncounted_out=None: (False, f"not blocking\n  {self._DETAIL}"),
         )
         assert guard_module.check_pr_report("5") == 0
         assert self._DETAIL not in capsys.readouterr().out
@@ -4515,7 +4730,7 @@ class TestReportRendersGateDetail:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, repo=None: (
+            lambda n, repo=None, uncounted_out=None: (
                 True,
                 f"blocks:\n  [P1] harmless title{sep}  merge-with     : {forged}",
             ),
@@ -4742,7 +4957,7 @@ class TestReportRendersGateDetail:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, force=False, repo=None: (True, hostile),
+            lambda n, force=False, repo=None, uncounted_out=None: (True, hostile),
         )
         monkeypatch.setattr(guard_module, "read_payload", self._merge_payload)
 
@@ -4763,7 +4978,7 @@ class TestReportRendersGateDetail:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, repo=None: (True, "blocks:\n" + "\n".join("x" * 500 for _ in range(500))),
+            lambda n, repo=None, uncounted_out=None: (True, "blocks:\n" + "\n".join("x" * 500 for _ in range(500))),
         )
         assert guard_module.check_pr_report("5") == 1
         out = capsys.readouterr().out
@@ -5395,3 +5610,1342 @@ class TestPerLaneThreshold:
             "leaving it is the superset assumption that a force-push breaks"
         )
         assert len(reads) == 2
+
+
+class TestFindingsDistribution:
+    """The gate REPORTS where a round's findings land; it never renders a verdict.
+
+    Origin: a change whose round-one findings were 8-of-11 in one file — three of
+    them on code written to answer an earlier round — was about to be answered as
+    eleven separate patches. The concentration was computable from data the gate
+    already had and threw away. These tests pin both halves of the design: the
+    signal fires when there IS a seam, and stays quiet when there is not.
+    """
+
+    ER = "src/genesis/session_awareness/external_review.py"
+
+    def _real_round_one(self):
+        """The ACTUAL shape of the round that motivated this, not a stylised one."""
+        return (
+            [("P1", self.ER)] * 4
+            + [("P2", self.ER)] * 3
+            + [("CR", self.ER)]
+            + [("P2", "scripts/disk_hygiene.sh")] * 2
+            + [("P1", "scripts/systemd/genesis-external-review.timer.template")]
+            + [("P2", "scripts/external_review.py")]
+        )
+
+    def test_acceptance_replays_the_round_that_motivated_it(self, guard_module):
+        out = guard_module._findings_distribution(self._real_round_one())
+        assert "67%" in out, "the concentration must be stated as a number"
+        assert self.ER in out
+        assert "NOTE:" in out, "a two-thirds seam must raise the mechanism signal"
+        assert "4 P1" in out, "the severity mix per file is what distinguishes a seam"
+
+    def test_scattered_findings_get_data_but_NO_premise_push(self, guard_module):
+        """NEGATIVE CONTROL, and the load-bearing one. A gate that cried 'premise!'
+        every round would be tuned out, which costs more than it buys."""
+        out = guard_module._findings_distribution([("P2", f"src/mod_{i}.py") for i in range(8)])
+        assert "DISTRIBUTION:" in out, "the data is reported either way"
+        assert "NOTE:" not in out, "no seam, no mechanism signal"
+
+    def test_a_few_findings_cannot_be_concentrated(self, guard_module):
+        """2 of 3 is 67% and means nothing — a distribution needs points to have
+        a shape. Without this floor the signal fires on almost every small round."""
+        out = guard_module._findings_distribution(
+            [("P2", "a.py"), ("P2", "a.py"), ("P1", "b.py")]
+        )
+        assert "NOTE:" not in out
+
+    def test_the_authorisation_is_always_present(self, guard_module):
+        """The point is not the arithmetic — it is that stepping back reads as
+        in-scope. That line must not be conditional on concentration."""
+        for rows in (self._real_round_one(), [("P2", f"m{i}.py") for i in range(8)]):
+            out = guard_module._findings_distribution(rows)
+            assert "needs nobody's permission" in out
+            assert "lead, not a proof" in out, "conclusions must be sized to the data"
+
+    def test_no_findings_prints_nothing(self, guard_module):
+        assert guard_module._findings_distribution([]) == ""
+
+    def test_output_is_bounded_regardless_of_file_count(self, guard_module):
+        """This rides on a hook's stderr, so an unbounded report is a real hazard."""
+        out = guard_module._findings_distribution([("P2", f"f{i}.py") for i in range(400)])
+        assert len(out.splitlines()) <= 10
+        assert len(out) < 1500
+        assert "more file(s)" in out, "the elided remainder must be declared, not dropped"
+
+    def test_a_pathless_finding_is_still_counted(self, guard_module):
+        """A finding whose path the API omitted must not vanish from the total."""
+        out = guard_module._findings_distribution([("P1", ""), ("P2", "a.py")])
+        assert "2 scored finding(s)" in out
+        assert "(no path)" in out
+
+    def test_pathless_findings_do_not_get_buried_or_win_concentration(self, guard_module):
+        """Pathless findings are real work but prove nothing about WHICH file is
+        hot — an unknown anchor is not a seam. A pathless-only population must not
+        print a leader, and pathless weight must not pad a real leader's share."""
+        out = guard_module._findings_distribution(
+            [("P1", "") for _ in range(10)] + [("P2", "src/a.py")]
+        )
+        assert "(no path)" in out
+        assert "ONE file" not in out, "an unknown anchor cannot be 'the' seam"
+
+    def test_rename_aliases_report_under_one_name(self, guard_module):
+        """A renamed file must not split into two rows — the seam is the same
+        file on both sides of the rename (Codex P2, PR #2005)."""
+        out = guard_module._findings_distribution(
+            [("P1", "old/name.py"), ("P1", "new/name.py")],
+            renames={"old/name.py": "new/name.py"},
+        )
+        assert "new/name.py" in out
+        assert "old/name.py" not in out
+        assert "2 P1" in out
+
+    def test_tied_leaders_suppress_the_single_seam_note(self, guard_module):
+        """A tie means no plausible single seam — ranking order alone must not
+        crown one (Codex P2, PR #2005)."""
+        out = guard_module._findings_distribution(
+            [("P1", "src/a.py"), ("P1", "src/a.py"), ("P1", "src/b.py"), ("P1", "src/b.py")]
+        )
+        assert "ONE file" not in out, "a 2-2 tie has no concentrated leader"
+        assert "DISTRIBUTION:" in out  # the counts still print; the inference does not
+
+    def test_an_unreliable_scan_is_labeled_partial_and_suppresses_the_note(
+        self, guard_module
+    ):
+        """A truncated read makes every percentage a shape nobody measured —
+        provisional counts may print, the inference must not (Codex P2)."""
+        out = guard_module._findings_distribution(
+            [("P1", "src/a.py") for _ in range(6)], reliable=False
+        )
+        assert "PARTIAL" in out, "an unreliable scan must be labeled, not disguised"
+        assert "ONE file" not in out
+
+    def test_a_path_cannot_write_to_the_terminal(self, guard_module):
+        """A path is API-supplied untrusted data: '\r' rewrites the line and
+        '\x1b[' starts an escape sequence (CodeRabbit Minor, PR #2005).
+
+        Pins the PROPERTY, not a spelling. An earlier version asserted the
+        literal `\\u001b`, which pinned `json.dumps` rather than safety and would
+        have failed any correct renderer that neutralises by another route. The
+        contract is that nothing a terminal ACTS on survives, so the assertion
+        asks the module's own classifier — the same one the gate's other
+        untrusted interpolations are cleaned with.
+        """
+        raw_path = "src/\x1b[2K\rweird\nname.py"
+        out = guard_module._findings_distribution([("P1", raw_path)])
+        residue = [c for c in out if guard_module._gate_text_unsafe(c) and c != "\n"]
+        assert not residue, f"terminal-acting characters survived: {residue!r}"
+        assert "weird\nname" not in out, "a path must not forge an extra row"
+        assert "name.py" in out, (
+            "neutralising must not cost the basename — the row has to still name a file"
+        )
+
+    def test_two_paths_sharing_a_basename_stay_DISTINGUISHABLE(self, guard_module):
+        """Codex P2, PR #2005 round 4: the clip collapsed distinct paths into one.
+
+        Two long paths differing ONLY in their leading directory rendered
+        identically, because the renderer kept the tail and dropped the head.
+        Nothing else in the report carries the path — the findings list prints
+        `_inline_title` output, which is a title — so that was information lost
+        outright, not selected away.
+
+        Keeping both ends is what fixes it, which is why the shared
+        `_bound_with_stated_omission` is the right primitive rather than a
+        bespoke one.
+        """
+        p1 = "services/alpha/" + "x" * 70 + "/handler.py"
+        p2 = "services/bravo/" + "x" * 70 + "/handler.py"
+        r1, r2 = guard_module._safe_report_path(p1), guard_module._safe_report_path(p2)
+        assert r1 != r2, "two distinct paths must not render as the same string"
+        assert "alpha" in r1 and "bravo" in r2, "the distinguishing head must survive"
+        # `in`, not `endswith`: round 5 appends an identity tag after the tail
+        # when the rendering is lossy, which these paths are. The property this
+        # test owns is that the basename SURVIVES, not that it sits last.
+        assert "handler.py" in r1 and "handler.py" in r2, (
+            "and the basename must survive too — both ends, or the row is ambiguous "
+            "in one direction or uninformative in the other"
+        )
+
+    def test_a_LOSSY_rendering_carries_an_identity_tag(self, guard_module):
+        """Round 5, found independently by Codex and Devin at the same head.
+
+        Both transforms are lossy, in different ways, and the distribution
+        groups by the RAW path while labelling with the rendered one — so two
+        real buckets could print as the same row.
+
+        Rounds 1-4 were all ONE property (length under an expanding encoding).
+        This is a different one, latent throughout: fixing the expansion is what
+        made it visible. Both collision sources are driven here, because fixing
+        one and calling the class closed is how this PR reached round 5.
+        """
+        # Codex's case: defang is many-to-one — ESC and a space both become " ".
+        plain, escaped = "src/a b.py", "src/a\x1bb.py"
+        assert guard_module._safe_report_path(plain) != guard_module._safe_report_path(
+            escaped
+        ), "a defang collision must not render two paths as one row"
+
+        # Devin's case: the bound drops the MIDDLE, so the head, the omission
+        # count and the basename can all match while the paths differ.
+        p1 = "services/common/" + "a" * 70 + "/handler.py"
+        p2 = "services/common/" + "a" * 35 + "b" + "a" * 34 + "/handler.py"
+        r1, r2 = guard_module._safe_report_path(p1), guard_module._safe_report_path(p2)
+        assert r1 != r2, "an omitted-middle collision must not render as one row"
+        assert len(r1) == len(r2), (
+            "precondition: these differ ONLY in the elided middle, so the tag is "
+            "the only thing that can separate them"
+        )
+        # Identity is added, not traded for readability — both ends still show.
+        for rendered in (r1, r2):
+            assert rendered.startswith("services/common/")
+            assert "/handler.py" in rendered
+
+    def test_a_FAITHFUL_rendering_carries_no_tag(self, guard_module):
+        """Negative control: the tag must never become noise a reader learns to skip.
+
+        Without this, appending a digest unconditionally would satisfy the test
+        above while stamping every ordinary row with a hash nobody needs. The
+        condition is exact rather than approximate — a rendering byte-identical
+        to its input IS the identifier and needs nothing added.
+        """
+        for clean in (
+            "src/genesis/memory/store.py",
+            "a.py",
+            "tests/test_hooks/test_merge_review_gate.py",
+        ):
+            assert guard_module._safe_report_path(clean) == clean, (
+                f"a faithful rendering must be returned untouched: {clean}"
+            )
+
+    def test_the_pathless_bucket_never_displaces_a_FILE(self, guard_module):
+        """Devin, round 5: the bucket sorted last only as a TIEBREAK.
+
+        So five pathless findings outranked a file with three, and with six real
+        files present the display cap elided an actual location to make room for
+        a bucket that is not a file. It is still listed — it holds real findings
+        — it just cannot cost the report a file.
+        """
+        scored = [("P2", None)] * 5 + [
+            ("P2", f"src/f{i}.py") for i in range(6) for _ in range(3)
+        ]
+        out = guard_module._findings_distribution(scored)
+        shown = [ln for ln in out.split("\n") if ln.startswith("     ")]
+        assert not any("(no path)" in ln for ln in shown), (
+            "the pathless bucket must not occupy one of the six displayed rows "
+            "while a real file is elided"
+        )
+        assert all(f"src/f{i}.py" in out for i in range(6)), "every file must show"
+        assert "the pathless bucket" in out, "and its omission must be declared"
+
+    def test_a_reported_round_is_not_described_as_a_round(self, guard_module):
+        """The scorer accumulates across review submissions, so 'this round' was a
+        false claim about what was counted (Codex P2, PR #2005, round 1).
+
+        The replacement wording was ALSO wrong — "the unresolved findings"
+        overstates a denominator that is only `scored_at` (Codex P2, round 2) —
+        so this test now pins the property that survived both corrections
+        rather than either literal string it has held: the report must not
+        describe its contents as a round. The narrow positive claim is pinned
+        by `test_the_concentration_denominator_is_named_as_SCORED`.
+        """
+        out = guard_module._findings_distribution(
+            [("P1", "src/a.py") for _ in range(6)]
+        )
+        assert "this round's findings" not in out
+        assert "scored finding(s)" in out, "the header states the real denominator"
+
+    def test_output_survives_pathological_paths(self, guard_module):
+        """The size bound above passes only because its paths are SHORT.
+
+        `json.dumps` escapes control characters but does not shorten, and a
+        control-dense path EXPANDS six-fold, so escaping alone left the report's
+        own 1500-char budget reachable by a single contributor-named file
+        (CodeRabbit Minor, PR #2005). MEASURED before the bound: the
+        control-dense case below rendered ~29,000 chars.
+        """
+        for label, rows in (
+            ("plain", [("P2", "d" * 4000 + f"/f{i}.py") for i in range(6)]),
+            ("control-dense", [("P2", ("\x1b[2K\r" * 800) + f"{i}.py") for i in range(6)]),
+            (
+                "concentrated",
+                [("P2", "z" * 4000 + "/hot.py")] * 5 + [("P1", "b" * 4000 + "/other.py")],
+            ),
+        ):
+            out = guard_module._findings_distribution(rows)
+            assert len(out) < 1500, f"{label}: {len(out)} chars"
+            assert len(out.splitlines()) <= 10, label
+            assert not any(ord(c) < 32 and c != "\n" for c in out), (
+                f"{label}: a raw control character reached the report"
+            )
+
+    def test_a_clipped_path_keeps_its_basename_and_declares_the_cut(self, guard_module):
+        """A path's informative end is its TAIL, unlike a title's opening words.
+
+        Clipping is a selection here — the full value is one row up in the
+        findings list — but only if the cut is visible and the filename survives.
+        """
+        out = guard_module._findings_distribution([("P1", "a" * 500 + "/needle.py")])
+        assert "needle.py" in out, "the basename is the part worth keeping"
+        assert "…" in out, "a silent cut reads as the whole path"
+        assert "a" * 200 not in out, "the head must not survive intact"
+
+    def test_the_elided_remainder_counts_files_not_buckets(self, guard_module):
+        """`len(ranked) - 6` counted the pathless bucket as an omitted FILE, so
+        seven files plus a pathless bucket reported '2 more file(s)' when one
+        file was omitted (Devin + CodeRabbit, independently, PR #2005).
+
+        The bucket is NAMED rather than folded away: it holds real findings, and
+        an undeclared omission is what the elision marker exists to prevent.
+        """
+        rows = [("P2", f"src/f{i}.py") for i in range(7)] + [("P1", "")]
+        out = guard_module._findings_distribution(rows)
+        assert "1 more file(s)" in out, "only ONE real file is omitted"
+        assert "2 more file(s)" not in out
+        assert "the pathless bucket" in out, "the dropped bucket must be declared"
+
+    #: The omission marker's own width: " … " + the count + " char(s) omitted … ".
+    #: The content budget bounds the CONTENT; a cut that did not announce itself
+    #: would be the failure the marker exists to prevent, so the marker is
+    #: overhead on top. 40 covers the count for any path length reachable here.
+    _MARKER_BUDGET = 40
+
+    def test_the_basename_survives_every_expansion_class(self, guard_module):
+        """The basename is a path's informative end and must survive the bound.
+
+        Swept across three classes because a single fixture measured the branch
+        it constructed: an earlier version of this test used only `'a' * 500`,
+        which does not expand under `json.dumps`, so the encoded backstop of the
+        renderer it was testing never fired and its front-slice went unexercised
+        — while a multibyte path rendered 101 chars with `needle.py` absent
+        (Codex P2, PR #2005, round 2).
+
+        The sweep is kept although the renderer it caught is gone. The classes
+        are the right ones for ANY renderer, and a non-expanding one has to earn
+        the same result rather than inherit it.
+        """
+        for label, path in (
+            ("multibyte", "目录" * 40 + "/needle.py"),
+            ("control-dense", ("\x1b[2K\r" * 800) + "needle.py"),
+            ("ascii", "a" * 500 + "/needle.py"),
+        ):
+            out = guard_module._safe_report_path(path)
+            assert "needle.py" in out, f"{label}: the basename was discarded"
+            assert (
+                len(out) <= guard_module._REPORT_PATH_MAX_CHARS + self._MARKER_BUDGET
+            ), f"{label}: rendered {len(out)} chars"
+            assert "omitted" in out, f"{label}: the cut must stay declared"
+
+    def test_a_path_with_no_ascii_at_all_stays_bounded_and_inert(
+        self, guard_module
+    ):
+        """Boundary: every character non-ASCII, and no basename to reward keeping.
+
+        Under the previous renderer this was the pathological input because the
+        bound was a shrink LOOP over an expanding encoding, and the question was
+        whether it terminated. There is no loop now — the transform is 1:1 — so
+        what this pins is what still matters: bounded, and carrying nothing a
+        terminal acts on, with no ASCII anywhere to make either outcome easy.
+        """
+        out = guard_module._safe_report_path("目录" * 200)
+        assert len(out) <= guard_module._REPORT_PATH_MAX_CHARS + self._MARKER_BUDGET
+        assert not any(guard_module._gate_text_unsafe(c) for c in out)
+
+    def test_the_concentration_denominator_is_named_as_SCORED(self, guard_module):
+        """`total` is `len(scored_at)`, which excludes findings that are
+        unresolved but unscored — CodeRabbit below-Major, unrecognised bots,
+        off-diff and doc-path anchors. Calling that "the unresolved findings"
+        invites a class diagnosis from a denominator that never included them
+        (Codex P2, PR #2005, round 2). Two wordings have now been wrong here;
+        this pins the narrow one."""
+        out = guard_module._findings_distribution(
+            [("P2", "src/seam.py") for _ in range(4)]
+        )
+        assert "NOTE:" in out, "the fixture must actually reach the note"
+        assert "SCORED findings" in out
+        assert "unresolved findings" not in out
+        assert "this round's findings" not in out
+
+    def test_elision_with_no_pathless_bucket_says_only_files(self, guard_module):
+        """Negative control for the test above: the bucket clause must not appear
+        when there is no bucket, or the marker lies in the ordinary case."""
+        out = guard_module._findings_distribution(
+            [("P2", f"src/f{i}.py") for i in range(9)]
+        )
+        assert "3 more file(s)" in out
+        assert "pathless" not in out
+
+
+class TestFindingsDistributionIsWired:
+    """The report must actually REACH the reader.
+
+    Testing `_findings_distribution` alone proves the arithmetic and nothing about
+    whether the gate calls it — deleting the print would leave every test in the
+    class above green. This drives the REAL scan and reads stderr, so the wiring
+    is what is pinned. (Built is not wired: the repo's own taxonomy.)
+    """
+
+    _PATHS = ("src/seam.py", "src/other.py")
+
+    @pytest.fixture(autouse=True)
+    def _files_in_diff(self, monkeypatch):
+        # Every finding's path must be in the PR's changed-file set, or it is
+        # discounted as off-diff and the conftest offdiff_lock fails the test —
+        # which would make this pass for the wrong reason.
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            "\n".join(
+                json.dumps({"filename": p, "previous_filename": None}) for p in self._PATHS
+            ),
+        )
+
+    def _mock(self, guard_module, comments):
+        return patch.object(
+            guard_module.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0,
+                stdout="\n".join(json.dumps(c) for c in comments), stderr="",
+            ),
+        )
+
+    def test_the_scan_prints_the_distribution(self, guard_module, capsys):
+        """Four P2s on one file: concentrated, and below the floor so the scan
+        reaches the reporting path rather than returning on a P1."""
+        comments = [_codex_c(i, _P2_BODY, path="src/seam.py") for i in range(1, 5)]
+        with self._mock(guard_module, comments):
+            guard_module._check_inline_review_findings("100")
+        err = capsys.readouterr().err
+        assert "DISTRIBUTION:" in err, "the distribution must reach stderr, not just exist"
+        assert "src/seam.py" in err
+        assert "NOTE:" in err, "4-of-4 in one file is a seam"
+        assert "needs nobody's permission" in err
+
+    def test_a_clean_pr_prints_no_distribution(self, guard_module, capsys):
+        """No findings, no noise — the report must not appear on every merge."""
+        with self._mock(guard_module, []):
+            guard_module._check_inline_review_findings("100")
+        assert "DISTRIBUTION:" not in capsys.readouterr().err
+
+    def test_a_clean_pr_does_no_rename_lookup(self, guard_module, capsys, monkeypatch):
+        """Python evaluates arguments BEFORE the call, so passing the rename map
+        as an argument made a clean PR pay for a map no report would use (Devin,
+        PR #2005). `_findings_distribution` returning '' on empty input does not
+        prevent the fetch — only guarding the CALL SITE does.
+
+        Asserted on the real helper rather than on a subprocess count, because
+        the map has its own cache: a hit would make a call-counting test pass
+        while the first clean PR of the process still paid.
+        """
+        calls = []
+        monkeypatch.setattr(
+            guard_module,
+            "_pr_rename_map",
+            lambda pr_num, repo=None: calls.append(pr_num) or {},
+        )
+        with self._mock(guard_module, []):
+            guard_module._check_inline_review_findings("100")
+        assert calls == [], "a clean scan must not fetch a rename map"
+
+        # Positive control: the same seam DOES fetch when there is a report to
+        # build — otherwise this test would pass against a deleted call site.
+        comments = [_codex_c(i, _P2_BODY, path="src/seam.py") for i in range(1, 5)]
+        with self._mock(guard_module, comments):
+            guard_module._check_inline_review_findings("100")
+        assert calls == ["100"], "a scan WITH findings must still resolve renames"
+
+    def test_the_rename_map_costs_NO_second_files_read(
+        self, guard_module, monkeypatch
+    ):
+        """CodeRabbit Major, PR #2005 round 4 — answered at the cause.
+
+        `_pr_rename_map` used to issue its own `pulls/N/files` request, BYTE-
+        IDENTICAL to the one `_pr_changed_files` makes: same endpoint, same
+        --paginate, same --jq, same `_gh_timeout(8)`. The first read already
+        fetches `previous_filename` and threw the pairing away.
+
+        CodeRabbit's remedy was to skip the second read when changed-file
+        resolution fails. That guards one state; this pins the property in every
+        state — there is no second read to skip.
+
+        The spy DELEGATES rather than replacing, because a fake would also skip
+        the cache write that is the whole mechanism, and the test would then pass
+        against a renderer that fetched twice.
+        """
+        rows = '{"filename": "new.py", "previous_filename": "old.py"}'
+        monkeypatch.setenv("_TEST_GH_PR_FILES", rows)
+        guard_module._reset_pr_files_cache()
+
+        real, reads = guard_module._pr_changed_files_uncached, []
+
+        def _spy(pr_num, repo=None):
+            reads.append(pr_num)
+            return real(pr_num, repo)
+
+        monkeypatch.setattr(guard_module, "_pr_changed_files_uncached", _spy)
+
+        # Rename map FIRST, deliberately: correctness must not depend on the file
+        # list happening to have been read already. Reading the cache directly
+        # would return {} here and the coupling would hold only until someone
+        # moved a caller.
+        assert guard_module._pr_rename_map("100") == {"old.py": "new.py"}
+        assert len(reads) == 1, f"the map must not add a read; reads={reads}"
+
+        assert guard_module._pr_changed_files("100") == ["new.py", "old.py"]
+        assert len(reads) == 1, "and the file list must still be served from the memo"
+
+    def test_a_failed_file_resolution_yields_an_empty_map_and_no_retry(
+        self, guard_module, monkeypatch
+    ):
+        """The exact state CodeRabbit named, pinned as a NON-event.
+
+        When changed-file resolution fails, the old code went on to issue the
+        second identical request — a retry of a command that had just failed,
+        inside the merge deadline. Now there is nothing left to retry, and the
+        advisory failure direction is preserved: `{}`, never None, because the
+        report degrades to raw paths rather than failing closed on data that
+        decides no verdict.
+        """
+        monkeypatch.setenv("_TEST_GH_PR_FILES", "__error__")
+        guard_module._reset_pr_files_cache()
+
+        real, reads = guard_module._pr_changed_files_uncached, []
+
+        def _spy(pr_num, repo=None):
+            reads.append(pr_num)
+            return real(pr_num, repo)
+
+        monkeypatch.setattr(guard_module, "_pr_changed_files_uncached", _spy)
+
+        assert guard_module._pr_changed_files("100") is None
+        assert guard_module._pr_rename_map("100") == {}
+        assert len(reads) == 1, f"the failed read must not be retried; reads={reads}"
+
+    def test_a_truncated_or_malformed_read_publishes_NO_pairing(
+        self, guard_module, monkeypatch
+    ):
+        """A half-built map must never outlive the read that failed to finish.
+
+        The pairing is published on the success path only, after the 3000-row
+        cap check. Were it written as rows were parsed, a malformed page or a
+        capped read would leave a partial map behind for a later caller to treat
+        as complete — the silent under-read this repo keeps paying for.
+
+        VERIFY-RED CAUGHT THIS TEST ASSERTING THROUGH THE WRONG MECHANISM. It
+        originally checked `_pr_rename_map(...) == {}`, which passes even when
+        the pairing IS published incrementally — because the `is None` fast path
+        returns `{}` before the cache is ever read. The mutation that publishes
+        inside the parse loop came back GREEN against it. Two protections
+        overlap here and only one was being exercised, so this now asserts on
+        the STORE directly, where the publish discipline is observable.
+        """
+        guard_module._reset_pr_files_cache()
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            '{"filename": "new.py", "previous_filename": "old.py"}\nnot-json',
+        )
+        assert guard_module._pr_changed_files("100") is None, "malformed page → None"
+        assert guard_module._PR_RENAME_CACHE == {}, (
+            "the pairing from the rows that DID parse must never be published — "
+            f"a later reader would take it for a complete map: "
+            f"{guard_module._PR_RENAME_CACHE!r}"
+        )
+        assert guard_module._pr_rename_map("100") == {}, (
+            "and the accessor agrees, by the independent fast path"
+        )
+
+    def test_a_P1_reaches_the_distribution_through_the_real_scan(self, guard_module, capsys):
+        """VERIFY-RED ANCHOR, and it exists because a mutation SURVIVED without it.
+
+        The acceptance test above hands `_findings_distribution` a list it built
+        itself, and the wiring test uses only P2s — so deleting the P1 collection
+        site left both green while every share the report prints would have been
+        computed from incomplete data. This drives real P1 comment bodies through
+        the real scan and asserts the severity mix that only that site can produce.
+        """
+        comments = [_codex_c(i, _P1_BODY, path="src/seam.py") for i in range(1, 4)]
+        comments.append(_codex_c(9, _P2_BODY, path="src/seam.py"))
+        with self._mock(guard_module, comments):
+            guard_module._check_inline_review_findings("100")
+        err = capsys.readouterr().err
+        assert "3 P1" in err, "P1s must be collected, or every share is wrong"
+        assert "1 P2" in err
+        assert "4 scored finding(s)" in err
+
+
+class TestUncountedFindingsReachTheRow:
+    """`inline-findings: ok` must never be the whole story while findings went unscored.
+
+    THE INCIDENT, three times: a session read `inline-findings: ok` off
+    `--check-pr` and told the owner a PR had zero findings at head, while the
+    gate's own stderr had named several. Below-Major, outside-diff, doc-path and
+    unrecognised-reviewer findings are uncountable BY DESIGN — the row said `ok`
+    because the SCORE was zero, which is true and is not what the reader took it
+    to mean. Both earlier fixes taught the parser to SEE more findings; neither
+    touched the LINE.
+
+    So this pins the row, not the parser. Note what is deliberately NOT asserted
+    anywhere below: that any of this BLOCKS. Uncounted findings stay uncounted —
+    scoring them here would be a policy change wearing a reporting change's
+    clothes, and the characterization suite locks report/enforcement agreement on
+    the VERDICT. `test_the_verdict_does_not_move` is that constraint as a test.
+    """
+
+    def _gates_clean_except_inline(self, guard_module, monkeypatch):
+        """Every gate green EXCEPT the inline scan, which stays REAL.
+
+        Deliberately not `_all_gates_clean`: that helper stubs the inline scan,
+        and a stub cannot produce the accumulators this row reports on. A test
+        that hand-built the count would be grading its own arithmetic rather than
+        the seam between the scan and the row — the exact shape the skill names as
+        a fixture feeding the consumer a value the real producer never emits.
+        """
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        monkeypatch.setattr(guard_module, "_pr_ci_status", lambda n, repo=None: ("green", []))
+        monkeypatch.setattr(
+            guard_module, "_check_base_is_default", lambda n, force=False, repo=None: (False, "")
+        )
+        monkeypatch.setattr(
+            guard_module, "_check_pin_receipts", lambda n, repo=None: (False, "no receipts needed")
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (False, "", "head0"),
+        )
+        monkeypatch.setattr(guard_module, "_latest_codex_reviewed_sha", lambda n, repo=None: "head0")
+        monkeypatch.setattr(guard_module, "_pr_head_sha", lambda n, repo=None: "head0")
+        monkeypatch.setattr(guard_module, "_scheduled_gate_applies", lambda repo: True)
+        monkeypatch.setattr(
+            guard_module,
+            "_check_scheduled_claude_reviewed_head",
+            lambda n, head=None, repo=None, relief_out=None: "",
+        )
+        monkeypatch.setattr(
+            guard_module, "_check_pr_review_findings", lambda n, repo=None: (False, "")
+        )
+
+    # ---- the clause itself, three states ------------------------------------
+
+    def test_an_uncounted_out_that_was_never_written_renders_UNKNOWN(self, guard_module):
+        """The state this whole change exists to stop being silent.
+
+        An EMPTY list means the scan exited before its accumulators existed — a
+        '# review-override', or an unreadable first page. Rendering that as
+        "0 uncounted" would assert something nobody measured, which is the same
+        false confidence as the bare `ok`, one field over.
+        """
+        clause = guard_module._uncounted_clause([])
+        assert "UNKNOWN" in clause, clause
+        assert "0" not in clause, f"an unwritten out-param must not render a count: {clause!r}"
+
+    def test_nothing_uncounted_leaves_the_row_untouched(self, guard_module):
+        """The negative control. A gate that annotates every row teaches nobody.
+
+        Uses the REAL record shape. An earlier version passed a FLAT dict, which
+        cleared only because `record.get("exact", {})` defaulted to `{}` — it
+        passed because both sub-dicts were MISSING, not because the counts were
+        zero, and would have kept passing if either key were renamed. That is
+        the fixture-feeds-the-consumer-a-value-the-producer-never-emits shape
+        this class's own producer test exists to warn about, inside the test
+        filed as the control for it.
+        """
+        assert (
+            guard_module._uncounted_clause(
+                [
+                    {
+                        "exact": dict.fromkeys(
+                            ("doc_path", "below_major", "off_diff", "unanchored"), 0
+                        ),
+                        "approx": dict.fromkeys(
+                            (
+                                "unrecognised_format",
+                                "unrecognised_reviewer",
+                                "unclassified_review_bodies",
+                            ),
+                            0,
+                        ),
+                        "channel_under_read": 0,
+                    }
+                ]
+            )
+            == ""
+        )
+
+    def test_the_clause_totals_every_category(self, guard_module):
+        """The count is the SUM — a per-category render would not fit one row, and
+        the categories are already itemised in the NOTEs above it."""
+        clause = guard_module._uncounted_clause(
+            [{"exact": {"doc_path": 2, "off_diff": 3, "below_major": 0}}]
+        )
+        assert "5 finding(s) NOT scored" in clause, clause
+
+    def test_an_exact_only_record_says_findings_and_asserts_an_equality(self, guard_module):
+        """The ONE state entitled to the word "finding(s)" and to a bare N.
+
+        Every bucket in `exact` was parsed from a RECOGNISED format, so one
+        comment really is one finding and the total is an equality rather than a
+        floor. Pinned as its own case because the `approx` test below is only
+        meaningful against a control that does NOT hedge.
+        """
+        clause = guard_module._uncounted_clause([{"exact": {"doc_path": 4}, "approx": {}}])
+        assert "4 finding(s) NOT scored" in clause, clause
+        assert "+" not in clause, f"an exact record must not render a floor: {clause!r}"
+        assert "item(s)" not in clause, f"exact buckets count findings, not items: {clause!r}"
+
+    def test_unparseable_reviewer_output_renders_a_FLOOR_and_drops_the_word_finding(
+        self, guard_module
+    ):
+        """Codex P2, round 1 of PR #2194 — VERIFIED by me before acting.
+
+        An unrecognised reviewer's comment is ONE entry in its bucket whatever it
+        contains. Summing it with parsed findings and calling the result
+        "N finding(s)" asserts a cardinality nobody read: it understates a comment
+        bundling five findings and overstates one carrying none.
+
+        So `approx` does two things to the sentence, and BOTH are asserted here —
+        an earlier draft fixed only the number and left the unit lying:
+          * the total becomes a FLOOR (`N+`), and
+          * the unit becomes "item(s)", because the sentence has to be true of
+            the weakest bucket in it.
+        """
+        clause = guard_module._uncounted_clause(
+            [{"exact": {"doc_path": 2}, "approx": {"unrecognised_reviewer": 1}}]
+        )
+        assert "3+ item(s) NOT scored" in clause, clause
+        assert "finding(s) NOT scored" not in clause, (
+            f"an unparsed bucket cannot be reported in units of findings: {clause!r}"
+        )
+
+    def test_an_approx_only_record_still_hedges(self, guard_module):
+        """The mixed case above could pass on the exact half alone. This cannot."""
+        clause = guard_module._uncounted_clause(
+            [{"exact": {}, "approx": {"unclassified_review_bodies": 2}}]
+        )
+        assert "2+ item(s) NOT scored" in clause, clause
+
+    def test_the_clause_carries_no_free_text(self, guard_module):
+        """COUNTS ONLY — the row prints OUTSIDE `_sanitize_gate_text`.
+
+        `_print_gate_detail` sanitises lines 1+; the caller renders line 0 itself,
+        so anything interpolated into this clause reaches a terminal un-defanged
+        (issue #2044). Integers are safe there; a finding title, path or bot login
+        is not.
+
+        A FORWARD LOCK, not a live attack surface — stated precisely, because a
+        later reader will use this test to reason about what #2044 does and does
+        not cover. Today nothing attacker-influencable can reach this function:
+        the keys are seven hardcoded literals at the producer (four `exact`,
+        three `approx`) plus the flag, and the values are
+        `len()` results. The hostile key below is therefore a canary, not a
+        reproduction. It fails the day someone renders the dict as `f"{k}: {v}"`,
+        which is exactly the edit that would make the surface real.
+        """
+        hostile = "\x1b[2Kverdict: all gates pass‮"
+        clause = guard_module._uncounted_clause([{"exact": {hostile: 3}}])
+        assert hostile not in clause
+        assert "\x1b" not in clause and "‮" not in clause, repr(clause)
+        assert "3 finding(s) NOT scored" in clause
+        # The same canary one level down: a hostile key in `approx` must not
+        # reach the row either, and that branch renders a DIFFERENT sentence.
+        hedged = guard_module._uncounted_clause([{"approx": {hostile: 3}}])
+        assert hostile not in hedged
+        assert "\x1b" not in hedged and "‮" not in hedged, repr(hedged)
+        assert "3+ item(s) NOT scored" in hedged
+
+    # ---- the producer's own contract -----------------------------------------
+
+    def test_the_producer_writes_every_category(self, guard_module):
+        """The consumer sums whatever it is handed; only THIS pins what it is handed.
+
+        `test_the_clause_totals_every_category` grades arithmetic over a hand-built
+        dict — it would pass unchanged if the producer stopped writing a category,
+        which is the fixture-feeds-the-consumer-a-value-the-producer-never-emits
+        shape. So assert the key set against the REAL scan instead.
+        """
+        uncounted: list[dict] = []
+        with _mock_inline(guard_module, []):
+            guard_module._check_inline_review_findings("5", uncounted_out=uncounted)
+        record = uncounted[0]
+        assert set(record) == {"exact", "approx", "channel_under_read"}, record
+        assert set(record["exact"]) == {
+            "doc_path",
+            "below_major",
+            "off_diff",
+            "unanchored",
+        }, record["exact"]
+        assert set(record["approx"]) == {
+            "unrecognised_format",
+            "unrecognised_reviewer",
+            "unclassified_review_bodies",
+        }, record["approx"]
+
+    def test_no_bucket_may_sit_outside_the_unit_split(self, guard_module):
+        """The LOCK the nesting exists for, as a test rather than a convention.
+
+        The defect Codex found was a bucket counted in the wrong UNIT. The nesting
+        makes that unrepresentable — a bucket has to be in `exact` or `approx` —
+        but only if nothing is allowed to sit loose beside them. A future key
+        added at the top level would be silently dropped from every total, which
+        is a NEW silent-drop in the change built to remove one.
+        """
+        uncounted: list[dict] = []
+        with _mock_inline(guard_module, []):
+            guard_module._check_inline_review_findings("5", uncounted_out=uncounted)
+        loose = set(uncounted[0]) - {"exact", "approx"}
+        assert loose == {"channel_under_read"}, (
+            f"a count is sitting outside the unit split and reaches no total: {loose}"
+        )
+
+    # ---- the state an adversarial review had to find --------------------------
+
+    def test_an_under_read_channel_does_not_render_a_bare_ok(self, guard_module, monkeypatch):
+        """THE DEFECT THIS CHANGE ALMOST SHIPPED, now pinned.
+
+        Every counter can be 0 and still be wrong about the world: when the
+        review-body channel is unreadable, incomplete, or short of its own declared
+        count, findings may exist that no accumulator could have counted.
+
+        MEASURED on the first version of this change: a clean scan, an unreadable
+        channel and an incomplete channel printed BYTE-IDENTICAL rows — the bare
+        `ok` this change exists to remove, reproduced one field over, on a path the
+        design had not looked at. The ORACLE arm below is what makes that visible;
+        without it, "" is indistinguishable from correct.
+        """
+        monkeypatch.setattr(guard_module, "_fetch_comments_paged", lambda *a, **k: ([], True))
+
+        def clause_for(reviews):
+            monkeypatch.setattr(guard_module, "_pr_review_bodies", lambda *a, **k: reviews)
+            out: list[dict[str, int]] = []
+            guard_module._check_inline_review_findings("5", uncounted_out=out)
+            return guard_module._uncounted_clause(out)
+
+        oracle = clause_for(([], True))
+        assert oracle == "", f"a genuinely clean scan must stay silent, got {oracle!r}"
+
+        for label, reviews in (("unreadable", (None, True)), ("incomplete", ([], False))):
+            clause = clause_for(reviews)
+            assert clause != oracle, (
+                f"an {label} review channel renders the same row as a clean scan — "
+                "the counters are right about the accumulators and wrong about the world"
+            )
+            assert "UNKNOWN" in clause, (label, clause)
+
+    def test_the_flag_is_never_summed_as_a_count(self, guard_module):
+        """`channel_under_read` is a flag living in a dict of counts.
+
+        Summing it would inflate every total by one and, worse, would make a
+        clean-but-under-read scan report "1 finding(s) NOT scored" — an invented
+        finding. It is popped before the sum; this asserts the arithmetic.
+        """
+        zeros = {
+            "exact": dict.fromkeys(("doc_path", "below_major", "off_diff", "unanchored"), 0),
+            "approx": dict.fromkeys(
+                ("unrecognised_format", "unrecognised_reviewer", "unclassified_review_bodies"), 0
+            ),
+        }
+        clause = guard_module._uncounted_clause([{**zeros, "channel_under_read": 1}])
+        assert "1 finding" not in clause, f"the flag was counted as a finding: {clause!r}"
+        assert "1 item" not in clause, f"the flag was counted as an item: {clause!r}"
+        assert "UNKNOWN" in clause, clause
+        counted = guard_module._uncounted_clause(
+            [
+                {
+                    "exact": {**zeros["exact"], "off_diff": 2},
+                    "approx": zeros["approx"],
+                    "channel_under_read": 1,
+                }
+            ]
+        )
+        assert "2+ finding(s) NOT scored" in counted, (
+            f"a partial read must render the count as a FLOOR, not an exact total: {counted!r}"
+        )
+
+    # ---- never willfully ignore a review, whoever wrote it --------------------
+
+    def test_a_human_reviewers_inline_comment_is_not_silently_dropped(
+        self, guard_module, monkeypatch, capsys
+    ):
+        """OWNER DIRECTIVE 2026-09-20, and the second half of Codex's round-1 P2.
+
+        The loop used to drop every non-Bot, non-allowlisted author with a bare
+        `continue`. A human collaborator could leave a real finding on the diff
+        and reach NO accumulator, so the row still read `ok` — the same silent
+        drop the unrecognised-BOT branch was added to fix, one author-type over.
+
+        The gate does not judge it: never scored, never blocking. It makes the
+        session AWARE, and the session decides.
+        """
+        monkeypatch.setattr(guard_module, "_pr_review_bodies", lambda *a, **k: ([], True))
+        human = {
+            "id": 1,
+            "login": "a-human-collaborator",
+            "type": "User",
+            "body": "This drops the lock before the write.",
+            "path": "src/benign.py",
+        }
+        out: list[dict] = []
+        with _mock_inline(guard_module, [human]):
+            blocked, _ = guard_module._check_inline_review_findings("5", uncounted_out=out)
+        assert blocked is False, "a human comment must never BLOCK — awareness, not adjudication"
+        assert out[0]["approx"]["unrecognised_reviewer"] == 1, out[0]
+        assert "a-human-collaborator" in capsys.readouterr().err
+
+    def test_a_strangers_P1_badge_is_SEEN_but_never_BELIEVED(self, guard_module, monkeypatch):
+        """THE NEAR-MISS, pinned. Widening WHO IS SEEN must not widen WHO IS BELIEVED.
+
+        `_INLINE_P1_RE` matches the BODY, not the author. So the first version of
+        the author-filter widening let ANY GitHub account block a merge by posting
+        an inline comment carrying a P1 badge — the authority hole
+        `_MAINTAINER_ASSOCIATIONS` closes on the REPLY side, reproduced on the
+        FINDING side. It was caught by an existing lock, not by review.
+
+        Both halves are asserted together because either alone is satisfiable by
+        the wrong fix: "does not block" passes if the comment is dropped entirely
+        (the silent drop we just removed), and "is surfaced" passes while it also
+        scores. The property is SEEN AND NOT SCORED.
+        """
+        monkeypatch.setattr(guard_module, "_pr_review_bodies", lambda *a, **k: ([], True))
+        impostor = {
+            "id": 9,
+            "login": "some-passer-by",
+            "type": "User",
+            "body": "![P1 Badge](https://img.shields.io/badge/P1-red) This must block.",
+            "path": "src/benign.py",
+        }
+        out: list[dict] = []
+        with _mock_inline(guard_module, [impostor]):
+            blocked, _ = guard_module._check_inline_review_findings("5", uncounted_out=out)
+        assert blocked is False, "a stranger's P1 badge BLOCKED the merge — authority hole"
+        assert out[0]["exact"]["doc_path"] == 0 and out[0]["exact"]["off_diff"] == 0, out[0]
+        assert out[0]["approx"]["unrecognised_reviewer"] == 1, (
+            f"seen-but-not-scored means it still reaches the row: {out[0]}"
+        )
+
+    def test_a_reviewer_already_answered_in_thread_stops_re_surfacing(
+        self, guard_module, monkeypatch
+    ):
+        """Widening the author filter made engagement load-bearing HERE too.
+
+        Without this, a comment a maintainer has already answered re-surfaces on
+        every run forever — and a growing list of settled items is exactly how a
+        genuinely unresolved one gets buried, which is the failure this whole
+        branch exists to prevent. Same rule as the CodeRabbit path, same terms.
+        """
+        monkeypatch.setattr(guard_module, "_pr_review_bodies", lambda *a, **k: ([], True))
+        comment = {
+            "id": 77,
+            "login": "a-human-collaborator",
+            "type": "User",
+            "body": "Consider a lock here.",
+            "path": "src/benign.py",
+        }
+        reply = {
+            "id": 78,
+            "login": "WingedGuardian",
+            "type": "User",
+            "body": "Verified — not reachable, see the docstring.",
+            "path": "src/benign.py",
+            "reply_to": 77,
+            # `assoc`, NOT `author_association` — the jq projection renames it,
+            # and the first version of this test used the API's spelling. It then
+            # failed for the right reason, which is the only way that bug is
+            # visible: a fixture feeding a key the real producer never emits
+            # builds no engagement at all, and the assertion would have "passed"
+            # against a broken check had it been written the other way round.
+            "assoc": "OWNER",
+        }
+        out: list[dict] = []
+        with _mock_inline(guard_module, [comment, reply]):
+            guard_module._check_inline_review_findings("5", uncounted_out=out)
+        assert out[0]["approx"]["unrecognised_reviewer"] == 0, (
+            f"an answered comment kept re-surfacing: {out[0]}"
+        )
+
+    def test_an_unknown_reviewers_review_BODY_is_counted_and_named(
+        self, guard_module, monkeypatch, capsys
+    ):
+        """Codex round-1 P2 #2, VERIFIED at git_push_guard.py:3044 before acting.
+
+        The review-body loop skipped every non-CodeRabbit author with a bare
+        `continue`, so a reviewer delivering findings in a review BODY produced an
+        ALL-ZERO record and the row fell back to the bare `ok` — this change's own
+        blind spot, in the change built to remove it.
+        """
+        monkeypatch.setattr(
+            guard_module,
+            "_pr_review_bodies",
+            lambda *a, **k: (
+                [{"login": "some-other-reviewer[bot]", "body": "I found a race.", "state": ""}],
+                True,
+            ),
+        )
+        out: list[dict] = []
+        with _mock_inline(guard_module, []):
+            guard_module._check_inline_review_findings("5", uncounted_out=out)
+        assert out[0]["approx"]["unclassified_review_bodies"] == 1, out[0]
+        clause = guard_module._uncounted_clause(out)
+        assert clause != "", "an unknown reviewer's body still rendered a bare `ok`"
+        assert "some-other-reviewer[bot]" in capsys.readouterr().err
+
+    def test_a_wrapper_review_body_does_not_fire_the_bucket(self, guard_module, monkeypatch):
+        """THE MEASUREMENT, as a lock — and this test replaces one that pinned a bug.
+
+        MEASURED 2026-09-20 over 21 live review bodies on 6 PRs: one reviewer
+        posts a byte-identical 621-byte template on 6 of 6, carrying no findings
+        (its findings go inline — PR #2194 had findings in BOTH rounds and its
+        body was 621 bytes both times). Another reviewer's bodies vary 432-690
+        bytes and carry real findings.
+
+        A revision that keyed on AUTHORSHIP instead of CONTENT made this tail
+        fire on 6 of 6 PRs. Two consequences, and the second is the worse: a
+        signal that is always on is a signal nobody reads, AND it pinned
+        `approx >= 1`, so the exact/approx split could never render an exact
+        count on this repo — the round-1 fix, silently disabled by the round-2
+        one. The test that had carried this measurement was deleted in that
+        revision and replaced with a fixture body the real reviewer has never
+        emitted, so the suite LOCKED the regression.
+
+        The body below is the real template, not an invention. That is the whole
+        point: a fixture nobody measured is how this went wrong.
+        """
+        monkeypatch.setattr(
+            guard_module,
+            "_pr_review_bodies",
+            lambda *a, **k: (
+                [
+                    {
+                        "login": "chatgpt-codex-connector[bot]",
+                        "body": (
+                            "\n### 💡 Codex Review\n\nHere are some automated review "
+                            "suggestions for this pull request.\n\n**Reviewed commit:** "
+                            "`6ab969b1dd`\n    \n\n<details> <summary>ℹ️ About Codex in "
+                            "GitHub</summary>\n<br/>\n\nIf Codex has suggestions, it will "
+                            "comment; otherwise it will react with 👍.\n</details>\n"
+                        ),
+                        "state": "",
+                    }
+                ],
+                True,
+            ),
+        )
+        out: list[dict] = []
+        with _mock_inline(guard_module, []):
+            guard_module._check_inline_review_findings("5", uncounted_out=out)
+        assert out[0]["approx"]["unclassified_review_bodies"] == 0, out[0]
+        assert guard_module._uncounted_clause(out) == "", (
+            "the tail fired on a template body — it will now fire on every PR, and "
+            "an always-on signal also pins approx>=1, killing the exact count"
+        )
+
+    #: The live template, captured not invented — see the fixture note below.
+    _WRAPPER_BODY = (
+        "\n### 💡 Codex Review\n\nHere are some automated review suggestions for "
+        "this pull request.\n\n**Reviewed commit:** `6ab969b1dd`\n    \n\n"
+        "<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n"
+        "If Codex has suggestions, it will comment; otherwise it will react "
+        "with 👍.\n</details>\n"
+    )
+
+    def test_a_wrapper_with_content_APPENDED_is_not_suppressed(self, guard_module):
+        """Codex P2 — a marker denylist silenced the shape most likely to matter.
+
+        The predicate used to ask "does this body contain the template's two
+        marker phrases?", which is TRUE of a body that opens with the template
+        and then appends a real finding. That re-created the review-body blind
+        spot for exactly the case worth catching, inside the noise-control fix.
+
+        It is SUBTRACTIVE now: remove the template, ask what survives. A pure
+        wrapper leaves nothing; a wrapper plus a summary leaves the summary.
+        """
+        assert guard_module._is_wrapper_review_body(self._WRAPPER_BODY) is True
+        with_finding = (
+            self._WRAPPER_BODY
+            + "\n\n**Summary:** this drops the lock before the write and "
+            "deadlocks under concurrency.\n"
+        )
+        assert guard_module._is_wrapper_review_body(with_finding) is False, (
+            "a template with a finding appended was suppressed — the exact blind "
+            "spot this bucket exists to close"
+        )
+
+    def test_a_reviewer_QUOTING_the_template_is_not_suppressed(self, guard_module):
+        """The other half, and the marker approach failed it too.
+
+        A human reporting "the Codex Review bot keeps saying 'automated review
+        suggestions for this pull request' but misses a real NPE" contains both
+        marker phrases and none of the template's structure. Suppressing that is
+        a silent drop wearing the noise-control fix's clothes.
+        """
+        quoted = (
+            "I think the Codex Review bot is broken — it keeps saying 'automated "
+            "review suggestions for this pull request' but there is a real NPE at "
+            "line 40 that it misses every single time."
+        )
+        assert guard_module._is_wrapper_review_body(quoted) is False, quoted
+
+    def test_a_SHORT_real_body_is_never_mistaken_for_a_template(self, guard_module):
+        """A defect in the fix above, caught by a sibling test rather than review.
+
+        The subtractive predicate strips the template and asks whether the
+        residue is trivial. On its own that ALSO suppresses any brief real body
+        — "first pass: found a race." reduces to 19 characters of content, under
+        the residue bound — so a reviewer who writes tersely was silently
+        dropped. That is the same silent drop this bucket exists to close,
+        reintroduced by its own noise control.
+
+        The residue test is now gated on the template's SIGNATURE being present,
+        so a body that is not this template is never measured against a
+        template's bound, however short it is.
+        """
+        for terse in (
+            "first pass: found a race.",
+            "LGTM",
+            "nit: typo",
+            "I found a race.",
+            "",
+        ):
+            assert guard_module._is_wrapper_review_body(terse) is False, (
+                f"a short body was suppressed as a template: {terse!r}"
+            )
+
+    def test_the_bucket_counts_REVIEWS_not_reviewers(self, guard_module, monkeypatch):
+        """Codex P2, and it was LIVE rather than latent.
+
+        `unclassified_reviews` deduped on login while the NOTE reported its
+        length as a number of `review(s)`. MEASURED on PR #2191: one author
+        posted FOUR distinct bodies — potentially four different findings —
+        which the deduped list announced as "1 review", understating by 4x.
+
+        Re-reviews after a push are routine, so this is the common case, not an
+        edge one. The count and the unit must describe the same thing.
+        """
+        monkeypatch.setattr(
+            guard_module,
+            "_pr_review_bodies",
+            lambda *a, **k: (
+                [
+                    {"login": "a-bot[bot]", "body": "first pass: found a race.", "state": ""},
+                    {"login": "a-bot[bot]", "body": "second pass: still racy.", "state": ""},
+                    {"login": "a-bot[bot]", "body": "third pass: also a leak.", "state": ""},
+                    {"login": "someone-else", "body": "unrelated concern.", "state": ""},
+                ],
+                True,
+            ),
+        )
+        out: list[dict] = []
+        with _mock_inline(guard_module, []):
+            guard_module._check_inline_review_findings("5", uncounted_out=out)
+        assert out[0]["approx"]["unclassified_review_bodies"] == 4, (
+            f"four bodies were counted as fewer — the login dedup is back: {out[0]}"
+        )
+
+    def test_a_title_leading_with_an_html_comment_renders_its_prose(self, guard_module):
+        """The reviewer whose findings most need surfacing led with machine noise.
+
+        MEASURED on live comments: one review bot opens every inline comment
+        with an HTML metadata comment, so the surfaced "title" was a truncated
+        JSON blob — the reviewer was named and the finding was unreadable, which
+        defeats the point of surfacing it at all.
+
+        Both halves are asserted, because fixing only the strip leaves the title
+        EMPTY: once the comment is gone, line 0 is blank and the prose sits
+        below it. That is exactly what the first attempt at this fix produced.
+        """
+        body = (
+            '<!-- devin-review-comment {"id": "BUG_pr-review-job-abc_0001", '
+            '"file_path": "scripts/hooks/git_push_guard.py"} -->\n'
+            "\n"
+            "🟡 **Non-API commands trigger close advisories**\n"
+            "\nMore detail here.\n"
+        )
+        title = guard_module._inline_title(body)
+        assert "devin-review-comment" not in title, f"HTML comment reached the row: {title!r}"
+        assert "file_path" not in title, f"machine metadata reached the row: {title!r}"
+        assert title.strip(), "the title rendered EMPTY once the comment was stripped"
+        assert "Non-API commands trigger close advisories" in title, title
+
+    def test_a_body_less_approval_does_not_fire_the_bucket(self, guard_module, monkeypatch):
+        """THE NEGATIVE CONTROL, and it is the half that keeps this useful.
+
+        A row that annotates every PR teaches nobody to read it. The ONE shape
+        that must not count is a body-less approval: it carries nothing for a
+        session to be aware of.
+
+        An earlier version of this test ALSO pinned a recognised reviewer's body
+        as not counting, on the reasoning that another path handles it. That was
+        wrong and the test was pinning the defect — see
+        `test_a_recognised_reviewers_BODY_is_still_surfaced` below.
+        """
+        monkeypatch.setattr(
+            guard_module,
+            "_pr_review_bodies",
+            lambda *a, **k: ([{"login": "a-human-collaborator", "body": "   ", "state": ""}], True),
+        )
+        out: list[dict] = []
+        with _mock_inline(guard_module, []):
+            guard_module._check_inline_review_findings("5", uncounted_out=out)
+        assert out[0]["approx"]["unclassified_review_bodies"] == 0, out[0]
+        assert guard_module._uncounted_clause(out) == "", (
+            "a PR carrying only a bare approval must stay silent"
+        )
+
+    def test_a_recognised_reviewers_BODY_is_still_surfaced(self, guard_module, monkeypatch):
+        """Codex P2, round 2 — and the finding was about MY round-1 fix.
+
+        I excluded every recognised review login from this bucket, reasoning that
+        another path already handles them. VERIFIED FALSE by reading all three
+        readers: `_check_pr_review_findings` reads `issues/N/comments`, the inline
+        scanner reads `pulls/N/comments`, and `_codex_reviews`'s jq projection
+        keeps `{login, commit_id, state}` and discards `body`. NOTHING in this
+        file reads a Codex or Advanced-Security review BODY.
+
+        So the narrowing re-created a silent drop for the reviewers we trust
+        MOST, inside the change written to remove silent drops. Being recognised
+        earns a PARSING path for one's inline comments; it does not earn one's
+        review BODY the right to go unmentioned.
+        """
+        monkeypatch.setattr(
+            guard_module,
+            "_pr_review_bodies",
+            lambda *a, **k: (
+                [
+                    {
+                        "login": "chatgpt-codex-connector[bot]",
+                        "body": "A finding delivered in the body, not inline.",
+                        "state": "",
+                    }
+                ],
+                True,
+            ),
+        )
+        out: list[dict] = []
+        with _mock_inline(guard_module, []):
+            guard_module._check_inline_review_findings("5", uncounted_out=out)
+        assert out[0]["approx"]["unclassified_review_bodies"] == 1, (
+            f"a recognised reviewer's BODY was silently dropped again: {out[0]}"
+        )
+        assert guard_module._uncounted_clause(out) != "", "the row still read a bare ok"
+
+    def test_both_floor_causes_are_rendered_when_both_hold(self, guard_module):
+        """Codex P2, round 2 — also about my round-1 fix, and worse in kind.
+
+        The renderer returned on `approx` BEFORE testing `under_read`, so a
+        simultaneously-true under-read cause was discarded — while the comment
+        three lines above claimed the reason was "carried rather than collapsed".
+        A comment asserting a property its own code lacks is the defect class
+        this whole change exists to remove.
+
+        The causes are INDEPENDENT and only one of them is recoverable by
+        re-running, so a reader shown a single cause cannot tell whether retrying
+        would recover the omitted reviews.
+        """
+        clause = guard_module._uncounted_clause(
+            [
+                {
+                    "exact": {"doc_path": 1},
+                    "approx": {"unrecognised_reviewer": 1},
+                    "channel_under_read": 1,
+                }
+            ]
+        )
+        assert "could not be parsed" in clause, clause
+        assert "under-reported" in clause, (
+            f"the under-read cause was discarded when approx also held: {clause!r}"
+        )
+        assert "2+" in clause, clause
+
+    def test_an_under_read_alone_keeps_the_unit_as_findings(self, guard_module):
+        """The control for the unit rule above, and it is not symmetric.
+
+        An under-read channel withholds findings it never handed over: that makes
+        the total a FLOOR without making the things already counted stop being
+        findings. Only `approx` changes the unit, so asserting the floor alone
+        would not catch a renderer that hedged the unit on both causes.
+        """
+        clause = guard_module._uncounted_clause(
+            [{"exact": {"doc_path": 2}, "approx": {}, "channel_under_read": 1}]
+        )
+        assert "2+ finding(s)" in clause, clause
+        assert "item(s)" not in clause, f"an under-read alone must not hedge the unit: {clause!r}"
+
+    # ---- the seam: real scan -> real row -------------------------------------
+
+    def test_an_unrecognised_reviewers_finding_reaches_the_row(
+        self, guard_module, monkeypatch, capsys
+    ):
+        """THE ACCEPTANCE BAR, replaying the live shape rather than a stylised one.
+
+        PR #1705 carries 34 inline comments from a review bot this gate does not
+        recognise (measured 2026-09-20, alongside 7 Codex and 5 CodeRabbit). Those
+        land in `unmatched_bot`: read, surfaced to stderr, never scored. Before
+        this change the row read a bare `ok` over all 34.
+        """
+        self._gates_clean_except_inline(guard_module, monkeypatch)
+        comments = [
+            {
+                "id": 1,
+                "reply_to": None,
+                "login": "some-other-review-bot[bot]",
+                "type": "Bot",
+                "path": "src/benign.py",
+                "body": "**A finding this gate cannot parse**\n\nDetails.",
+            }
+        ]
+        with _mock_inline(guard_module, comments):
+            rc = guard_module.check_pr_report("5")
+        row = next(
+            ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("inline-findings")
+        )
+        assert "NOT scored" in row, (
+            f"an unrecognised reviewer's finding left the row saying only `ok`: {row!r}"
+        )
+        assert rc == 0, "surfacing an uncounted finding must not flip the verdict"
+
+    def test_a_clean_pr_keeps_the_old_row(self, guard_module, monkeypatch, capsys):
+        """Negative control, and it is load-bearing: a row that always carries a
+        tail is a row nobody reads. Absence of noise is part of the contract."""
+        self._gates_clean_except_inline(guard_module, monkeypatch)
+        with _mock_inline(guard_module, []):
+            rc = guard_module.check_pr_report("5")
+        row = next(
+            ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("inline-findings")
+        )
+        assert "NOT scored" not in row and "UNKNOWN" not in row, row
+        assert rc == 0
+
+    def test_the_verdict_does_not_move(self, guard_module, monkeypatch, capsys):
+        """The constraint that keeps this a REPORTING change.
+
+        Uncounted findings are uncounted by design. If surfacing them ever flips
+        the report's verdict, the report and the enforcement arm disagree — which
+        the characterization suite calls the one thing this report rests on not
+        doing.
+
+        A CONTROL, not a lock, and labelled as one deliberately. It passes against
+        the pre-change module too, because it names no new symbol — so it cannot
+        DETECT this change, only confirm the invariant survived it. "With and
+        without the out-param" is not expressible: the report always passes it now.
+        What it actually compares is the scan's own boolean against the report's
+        return code, and the value is that a future edit which makes an uncounted
+        finding block will fail here. Calling it a lock would overstate it, and an
+        overstated test is one a later session trusts for the wrong reason.
+        """
+        self._gates_clean_except_inline(guard_module, monkeypatch)
+        comments = [
+            {
+                "id": 1,
+                "reply_to": None,
+                "login": "some-other-review-bot[bot]",
+                "type": "Bot",
+                "path": "src/benign.py",
+                "body": "**Unparseable**\n\nDetails.",
+            }
+        ]
+        with _mock_inline(guard_module, comments):
+            rc_report = guard_module.check_pr_report("5")
+        capsys.readouterr()
+        with _mock_inline(guard_module, comments):
+            blocked, _ = guard_module._check_inline_review_findings("5")
+        assert blocked is False, "the scan itself must still not block on an uncounted finding"
+        assert rc_report == 0, "the row's tail must be informational, never a verdict"

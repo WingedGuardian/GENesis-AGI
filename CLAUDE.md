@@ -97,8 +97,10 @@ Pick the tool by the question (full matrix + freshness model:
 **Serena** (Python LSP) for symbols/references/rename — **always live**, the
 default for "who calls X / what breaks if I change Z"; **codebase-memory-mcp**
 for architecture/graph; **GitNexus** for deep blast-radius/flows/coupling —
-**snapshot-based, so `gitnexus analyze` first** when freshness matters (it
-drifts after pulling merged PRs). Prefer these over manual reads for dependency
+**snapshot-based**. From the main checkout, refresh with
+`scripts/lib/code_intel_index.sh "$PWD" gitnexus fast` when freshness matters.
+Linked worktrees are deliberately not indexed; use Serena for live branch truth.
+GitNexus also drifts after pulling merged PRs. Prefer these over manual reads for dependency
 questions; none is a mandatory pre-edit gate.
 
 ## Skill Library
@@ -625,6 +627,15 @@ behind the writer, and 7 were a guard since removed.
   with a single question — a Claude Code rendering bug rejects single-question
   calls. Always pass ≥2 questions; if only one is real, add a trivial/filler
   second question to satisfy the tool. Every time, no exceptions.
+- **A question you need answered gets ASKED, and carries what it takes to
+  answer it.** Prose questions in the body of a message get missed, so ask
+  through `AskUserQuestion` — and RE-ASK when one goes unanswered and still
+  blocks. A question you restate each turn and never force is a status line,
+  not a question. Carry the facts the decision turns on: state verified now
+  (not recalled from a plan or a ledger row — those go stale), what each option
+  costs, and the cost of deciding nothing. An option whose description doesn't
+  say what it costs is a label. Same obligation on any channel asking for a
+  decision — a dispatched session's report, a PR comment.
 - **Plan mode by default** for any task with 3+ steps or architectural
   decisions. If something goes sideways — STOP and re-plan. A plan-mode
   document under `~/.claude/plans/` that will outlive one session opens with
