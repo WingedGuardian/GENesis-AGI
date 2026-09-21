@@ -378,6 +378,14 @@ def test_no_tracked_path_resolves_to_a_union_driver() -> None:
         "no tracked path may resolve to merge=union — it resolves silently and "
         f"cannot express a deletion; got {sorted(union_paths)}"
     )
+    # The population check alone does not pin the ABSENCE: a future
+    # `/CHANGELOG.md merge=text` rule passes `union_paths == set()` while
+    # silently re-arming a non-default driver on exactly the path this file
+    # exists to leave alone.
+    assert _merge_attr("CHANGELOG.md", cwd=REPO_ROOT) == "unspecified", (
+        "CHANGELOG.md must resolve to NO merge driver — any explicit driver "
+        "substitutes for the conflict this file deliberately keeps"
+    )
 
 
 @pytest.mark.parametrize("path", MUST_NOT_BE_UNION)
