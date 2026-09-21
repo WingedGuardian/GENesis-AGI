@@ -63,11 +63,27 @@ from hook_input import field, read_payload, tool_input  # noqa: E402
 
 _STATE_DIR = Path.home() / ".genesis" / "adopt_first"
 
+#: Ambient GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR make every ``git`` query through
+#: ``_run`` answer about a FOREIGN checkout, ignoring the supplied ``cwd`` — the
+#: same poisoning the hook launcher scrubs at .claude/hooks/genesis-hook. With
+#: them inherited, a file existing only in the overridden tree reads as
+#: "already exists" here and the gate silently never fires.
+_GIT_ENV = {
+    k: v
+    for k, v in os.environ.items()
+    if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
+}
+
 #: A plan "proposes new source files" if it names a source path. Deliberately
 #: NOT a prose heuristic ("create", "new file") — those fire on any plan that
 #: discusses files at all, and a gate that fires on everything is one you learn
 #: to ack past. A concrete path is the honest signal that code is coming.
-_SOURCE_PATH = re.compile(r"\bsrc/[\w./-]+\.py\b")
+#: Genesis has first-party JavaScript/HTML/CSS under src/genesis/dashboard/, so
+#: the trigger is every source extension, not only .py — a plan that adds a
+#: dashboard module is exactly the "new capability" this question is for.
+_SOURCE_PATH = re.compile(
+    r"\bsrc/[\w./-]+\.(?:py|pyi|js|jsx|ts|tsx|mjs|cjs|html|css|sh)\b"
+)
 
 #: The verdict header, tolerant of the spellings a writer will actually use:
 #: "## Adopt / Adapt / Build", "## Adopt/Adapt/Build", "### ADOPT vs BUILD".
@@ -75,28 +91,47 @@ _VERDICT_HEADER = re.compile(
     r"^#{1,6}\s*adopt\s*[/|vs.．\- ]+\s*(adapt|build)", re.IGNORECASE | re.MULTILINE
 )
 
-#: The evaluate skill's vocabulary, matched in the section BODY only.
-#:
-#: An earlier version scanned the whole document and leaned on case-sensitivity
-#: to stop the heading satisfying its own requirement. That reasoning was wrong
-#: in both directions and both were reproduced: "### ADOPT vs BUILD" followed by
-#: "(tbd)" PASSED (the all-caps heading is itself a matching token), while a
-#: genuine lower-case prose verdict under "## Adopt / Adapt / Build" was BLOCKED.
-#: Slicing the body first is what makes the question well-posed, so this can now
-#: be case-insensitive and mean what it says.
+#: Fenced code blocks are quoted material, not proposals. A plan showing an
+#: example snippet that names a path is not proposing to create it. Both
+#: Markdown fence forms strip: ``` and ~~~, each up to three spaces indented,
+#: and an unclosed fence runs to EOF rather than exposing its contents.
+_FENCE = re.compile(
+    r"^[ \t]{0,3}`{3,}[^\n]*\n.*?(?:^[ \t]{0,3}`{3,}[ \t]*$|\Z)"
+    r"|^[ \t]{0,3}~{3,}[^\n]*\n.*?(?:^[ \t]{0,3}~{3,}[ \t]*$|\Z)",
+    re.DOTALL | re.MULTILINE,
+)
+
+#: Live plan content ends at the canonical superseded divider; everything below
+#: it is archaeology — old proposals cannot block a new exit and an old verdict
+#: cannot clear a new proposal.
+_SUPERSEDED = re.compile(r"^##\s*═+\s*SUPERSEDED BELOW\s*═+\s*$", re.MULTILINE)
+
+#: The evaluate skill's vocabulary. A verdict is still judged by WHERE the
+#: token appears (section body, non-placeholder, search evidence alongside) —
+#: this is the vocabulary scan, not the whole check.
 _VERDICT_TOKEN = re.compile(r"\b(ADOPT|ADAPT|BUILD|WATCH|IGNORE)\b", re.IGNORECASE)
 
-#: Fenced code blocks are quoted material, not proposals. A plan showing an
-#: example snippet that names a path is not proposing to create it.
-_FENCE = re.compile(r"^```.*?^```", re.DOTALL | re.MULTILINE)
-
-_GATED_PREFIX = "src/genesis/"
-
+#: "rename src/genesis/old.py to src/genesis/new.py" proposes a path that does
+#: not exist yet but adds no capability — the plan names both endpoints and the
+#: verb joining them is the tell.
+_RENAME = re.compile(
+    r"\b(?:rename|moves?|relocat\w*)\b[\s\S]{0,80}?(\S+)[\s\S]{0,40}?"
+    r"\b(?:to|into|as)\b[\s\S]{0,40}?(\S+)",
+    re.IGNORECASE,
+)
 
 # ── state: one record per (worktree, branch) ─────────────────────────────────
 def _run(args: list[str], cwd: str | None = None) -> str:
     try:
-        out = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=5, check=False)
+        out = subprocess.run(
+            args,
+            cwd=cwd,
+            env=_GIT_ENV,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
         return out.stdout.strip() if out.returncode == 0 else ""
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -150,17 +185,22 @@ def _already_nudged(cwd: str) -> bool:
         return False
 
 
-def _mark_nudged(cwd: str) -> None:
-    """Best-effort and atomic. Failing to record costs one extra nudge, which is
-    strictly better than failing the edit."""
+def _mark_nudged(cwd: str) -> bool:
+    """Create the sentinel atomically and report whether THIS call created it.
+
+    Best-effort: failing to record costs one extra nudge, which is strictly
+    better than failing the edit. The return value matters under concurrency —
+    two callers can both pass ``_already_nudged`` before either creates the
+    file, and O_EXCL decides which of them actually emits the advisory.
+    """
     try:
         _STATE_DIR.mkdir(parents=True, exist_ok=True)
-        # O_EXCL: two concurrent sessions race harmlessly, one wins, neither errors.
         os.close(os.open(_sentinel(cwd), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+        return True
     except FileExistsError:
-        pass
+        return False
     except OSError:
-        pass
+        return False
 
 
 # ── plan resolution ──────────────────────────────────────────────────────────
@@ -190,8 +230,18 @@ def _plan_path(payload: dict) -> str:
     plans = Path.home() / ".claude" / "plans"
     if plans.is_dir():
         try:
-            candidates = sorted(plans.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
-            if candidates:
+            candidates = sorted(
+                plans.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True
+            )
+            # Never guess another session's plan. Without an explicit path the
+            # only honest correlation is the session id in the filename; absent
+            # that, a single unambiguous file is the only safe pick.
+            sid = str(payload.get("session_id") or "")
+            if sid:
+                own = [p for p in candidates if sid in p.name]
+                if own:
+                    return str(own[0])
+            if len(candidates) == 1:
                 return str(candidates[0])
         except OSError:
             pass
@@ -250,11 +300,20 @@ _REMEDY = (
 
 
 def _has_verdict(content: str) -> bool:
-    """A verdict is a HEADER with a real answer UNDER it.
+    """A verdict is a HEADER with a real disposition and search evidence UNDER it.
 
     The body runs from the end of the header line to the next heading of the
     same-or-shallower depth, which is what makes "the section is empty" and "the
     section says BUILD" distinguishable at all.
+
+    A disposition is a verdict token carrying an actual answer, not vocabulary
+    occurring mid-prose: "Candidates: adopt A or build. Decision: TBD." mentions
+    the words and decides nothing. An unfilled copy of the template the remedy
+    prints is likewise not an answer, so angle-bracket placeholders are stripped
+    before the scan. And because the whole point of the gate is that a build
+    decision carry a logged search, the section must also name what was
+    searched — the documented contract ("Searched: <terms>") or equivalent
+    prose ("searched pypi and github").
     """
     m = _VERDICT_HEADER.search(content)
     if not m:
@@ -268,7 +327,27 @@ def _has_verdict(content: str) -> bool:
     rest = content[line_end + 1:] if line_end != -1 else ""
     nxt = re.search(rf"^#{{1,{max(depth, 1)}}}\s", rest, re.MULTILINE)
     body = rest[: nxt.start()] if nxt else rest
-    return bool(_VERDICT_TOKEN.search(body))
+
+    body = _FENCE.sub("", body)
+    # Strip <placeholder> spans so an unfilled copy of the emitted template
+    # (`<ADOPT|ADAPT|BUILD> — <why>. Searched: <terms>`) satisfies nothing.
+    body = re.sub(r"<[^>\n]*>", "", body)
+
+    # A bare placeholder decision is not a verdict even when the vocabulary and
+    # a "Searched:" field are both present.
+    if re.search(
+        r"(?im)^\s*(?:decision|verdict|disposition)\s*[:—-]?\s*(tbd|todo|tba)\b",
+        body,
+    ):
+        return False
+    # A disposition token alone proves nothing — "BUILD — custom is more
+    # sophisticated" is the unsearched-build failure this gate exists to catch,
+    # so the documented evidence contract (`Searched: <terms>`, or equivalent
+    # prose like "searched pypi and github") must appear with it.
+    return bool(
+        _VERDICT_TOKEN.search(body)
+        and re.search(r"\bsearch(?:ed|es|ing)?\b\s*[:—-]?\s*\w", body, re.IGNORECASE)
+    )
 
 
 def _check_plan(payload: dict) -> int:
@@ -280,7 +359,12 @@ def _check_plan(payload: dict) -> int:
     except OSError:
         return 0
 
-    named = sorted(set(_SOURCE_PATH.findall(_FENCE.sub('', content))))
+    # Plans are append-only documents: everything below the superseded divider
+    # is archaeology, so old proposals must not block the exit and old verdicts
+    # must not clear the current one.
+    live = _SUPERSEDED.split(content, maxsplit=1)[0]
+
+    named = sorted(set(_SOURCE_PATH.findall(_FENCE.sub('', live))))
     if not named:
         return 0  # proposes no source files — not this gate's business
 
@@ -304,11 +388,19 @@ def _check_plan(payload: dict) -> int:
     root = _repo_root(payload)
     if root is None:
         return 0  # cannot tell new from existing — never block on our own blindness
-    sources = [s for s in named if not (root / s).exists()]
+    existing = {s for s in named if (root / s).exists()}
+    sources = [s for s in named if s not in existing]
+    # A rename's destination reads as "does not exist yet" without being a new
+    # capability. When the plan describes a rename/move joining an existing
+    # source to the candidate, exclude it.
+    for rm in _RENAME.finditer(live):
+        if rm.group(1).strip("'`") in existing:
+            renamed = rm.group(2).strip("'`.,;:")
+            sources = [s for s in sources if s != renamed and not renamed.endswith("/" + s)]
     if not sources:
         return 0
 
-    if _has_verdict(content):
+    if _has_verdict(live):
         return 0
 
     shown = ", ".join(sources[:4]) + (" …" if len(sources) > 4 else "")
@@ -330,24 +422,37 @@ def _check_new_file(payload: dict) -> int:
     raw = field(payload, "file_path")
     if not raw:
         return 0
+    cwd = payload.get("cwd") or os.getcwd()
     try:
         path = Path(raw)
+        if not path.is_absolute():
+            path = Path(cwd) / path
+        resolved = path.resolve()
     except (ValueError, OSError):
         return 0
 
-    posix = path.as_posix()
-    if _GATED_PREFIX not in posix:
+    # Substring membership is not containment: `/tmp/other/src/genesis/x.py` or
+    # `not-src/genesis/example.py` are not modules of THIS repository, and an
+    # unrelated write must not consume the branch's one nudge. Resolve against
+    # the payload's repository root and require the source tree itself; when
+    # containment cannot be established, fail open and record nothing.
+    root = _repo_root(payload)
+    if root is None:
         return 0
-    if path.exists():
+    try:
+        resolved.relative_to(root.resolve() / "src" / "genesis")
+    except ValueError:
+        return 0
+    if resolved.exists():
         return 0  # an edit to existing code, not a new module
 
-    cwd = payload.get("cwd") or os.getcwd()
     if _already_nudged(cwd):
         return 0  # once per branch — this is the whole anti-annoyance design
 
-    _mark_nudged(cwd)
+    if not _mark_nudged(cwd):
+        return 0  # a concurrent caller created the sentinel; it emitted already
     nudge = (
-        f"New module: {posix}\n"
+        f"New module: {resolved.as_posix()}\n"
         "Before building it: is there something to adopt? Default order is "
         "ADOPT > ADAPT > build, and the effort belongs in the GLUE around what "
         "already exists. Run `/evaluate` on any candidate; compare user-visible "

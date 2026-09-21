@@ -150,7 +150,7 @@ def test_the_acceptance_bar_replay_the_real_defect(home: Path, repo: Path):
     assert "/evaluate" in r.stderr, "the remedy must point at the EXISTING skill"
 
 
-def test_a_verdict_clears_the_gate(home: Path):
+def test_a_verdict_clears_the_gate(home: Path, repo: Path):
     p = _plan(
         home,
         "# Plan\nAdd `src/genesis/autonomy/desktop_gate.py`.\n\n"
@@ -158,17 +158,26 @@ def test_a_verdict_clears_the_gate(home: Path):
         "BUILD — cognitive core, no external substitute. Searched: desktop\n"
         "automation, approval gate. Found: none applicable.\n",
     )
-    assert _run("--plan", _plan_payload(p), home).returncode == 0
+    # cwd pins the repo root so the verdict check is what clears the gate —
+    # without it _repo_root() inherits the checkout and the proposed file may
+    # already exist there, passing before _has_verdict() runs at all.
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
 
 
 @pytest.mark.parametrize(
     "heading",
     ["## Adopt / Adapt / Build", "## Adopt/Adapt/Build", "### ADOPT vs BUILD", "# adopt - build"],
 )
-def test_the_heading_spellings_a_writer_will_actually_use(home: Path, heading: str):
+def test_the_heading_spellings_a_writer_will_actually_use(
+    home: Path, repo: Path, heading: str
+):
     """A gate that only accepts one spelling teaches people to fight the gate."""
-    p = _plan(home, f"# Plan\nAdd `src/genesis/x.py`.\n\n{heading}\nADOPT — use the library.\n")
-    assert _run("--plan", _plan_payload(p), home).returncode == 0, heading
+    p = _plan(
+        home,
+        f"# Plan\nAdd `src/genesis/x.py`.\n\n{heading}\n"
+        "ADOPT — use the library. Searched: pypi.\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0, heading
 
 
 def test_a_plan_that_only_touches_EXISTING_modules_is_silent(home: Path, repo: Path):
@@ -289,6 +298,125 @@ def test_a_path_inside_a_code_fence_is_quoted_not_proposed(home: Path, repo: Pat
     assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
 
 
+def test_a_template_copy_or_tbd_is_not_a_verdict(home: Path, repo: Path):
+    """The section must contain a filled disposition, not the vocabulary.
+
+    `Candidates: adopt A or build. Decision: TBD.` mentions the tokens and
+    decides nothing, and an unfilled copy of the emitted template
+    (`<ADOPT|ADAPT|BUILD> — <why>. Searched: <terms>`) is a form, not an
+    answer. Both used to pass on a bare token match."""
+    for body in (
+        "Candidates: adopt A or build. Decision: TBD.\n",
+        "<ADOPT|ADAPT|BUILD> — <why>. Searched: <terms>. Found: <none>.\n",
+        "BUILD — TBD.\n",
+    ):
+        p = _plan(
+            home,
+            f"# Plan\nAdd `src/genesis/autonomy/new.py`.\n\n## Adopt / Adapt / Build\n{body}",
+        )
+        assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 2, body
+
+
+def test_a_verdict_without_search_evidence_does_not_clear(home: Path, repo: Path):
+    """`BUILD — custom is more sophisticated` alone is the unsearched-build
+    failure this gate exists to catch; a disposition needs the logged search
+    the remedy prescribes."""
+    p = _plan(
+        home,
+        "# Plan\nAdd `src/genesis/autonomy/new.py`.\n\n"
+        "## Adopt / Adapt / Build\nBUILD — custom is more sophisticated.\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 2
+
+
+def test_a_tilde_fenced_path_is_quoted_not_proposed(home: Path, repo: Path):
+    """~~~ fences quote material exactly like ``` fences."""
+    p = _plan(
+        home,
+        "# Plan\nUpdate the docs.\n\n~~~python\n"
+        "# e.g. src/genesis/autonomy/example_only.py\n~~~\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
+
+def test_an_unclosed_fence_runs_to_eof(home: Path, repo: Path):
+    p = _plan(
+        home,
+        "# Plan\nUpdate the docs.\n\n```python\n"
+        "src/genesis/autonomy/example_only.py\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
+
+def test_superseded_content_decides_nothing(home: Path, repo: Path):
+    """Below the `## ═══ SUPERSEDED BELOW ═══` divider is archaeology: an old
+    proposal cannot block the live plan, and an old verdict cannot clear one."""
+    old_proposal = _plan(
+        home,
+        "# Plan\nUpdate documentation only.\n\n"
+        "## ═══ SUPERSEDED BELOW ═══\nAdd `src/genesis/never_built.py`.\n",
+    )
+    assert (
+        _run("--plan", {**_plan_payload(old_proposal), "cwd": str(repo)}, home).returncode == 0
+    )
+    old_verdict = _plan(
+        home,
+        "# Plan\nAdd `src/genesis/autonomy/new.py`.\n\n"
+        "## ═══ SUPERSEDED BELOW ═══\n"
+        "## Adopt / Adapt / Build\nADOPT — x. Searched: y.\n",
+    )
+    assert (
+        _run("--plan", {**_plan_payload(old_verdict), "cwd": str(repo)}, home).returncode == 2
+    )
+
+
+def test_a_rename_is_not_a_new_capability(home: Path, repo: Path):
+    """Moving `old.py` to `new.py` proposes a path that does not exist yet but
+    adds nothing — the basename already being named as an existing file is the
+    tell."""
+    src = repo / "src" / "genesis" / "autonomy" / "old.py"
+    src.write_text("x = 1\n", encoding="utf-8")
+    p = _plan(
+        home,
+        "# Plan\nRename `src/genesis/autonomy/old.py` to\n"
+        "`src/genesis/autonomy/new.py`.\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
+
+def test_the_plan_gate_sees_non_python_sources(home: Path, repo: Path):
+    """Genesis has first-party JS/HTML/CSS under src/genesis/dashboard/ — a plan
+    adding a dashboard module is a new capability too."""
+    p = _plan(home, "# Plan\nAdd `src/genesis/dashboard/webui/js/new_panel.js`.\n")
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 2
+
+
+def test_git_env_overrides_cannot_spoof_the_repo(home: Path, repo: Path, tmp_path: Path):
+    """Inherited GIT_DIR pointing at a foreign checkout must not answer any of
+    this gate's git queries."""
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=foreign, check=True, capture_output=True)
+    (foreign / "src" / "genesis" / "exists.py").parent.mkdir(parents=True)
+    (foreign / "src" / "genesis" / "exists.py").write_text("x = 1\n")
+    p = _plan(home, "# Plan\nAdd `src/genesis/autonomy/new.py`.\n")
+    body = {"tool_name": "ExitPlanMode", **_plan_payload(p), "cwd": str(repo)}
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "GIT_DIR": str(foreign / ".git"),
+        "GIT_WORK_TREE": str(foreign),
+    }
+    r = subprocess.run(
+        [sys.executable, str(_HOOK), "--plan"],
+        input=json.dumps({"hook_event_name": "PreToolUse", "session_id": "t", **body}),
+        capture_output=True, text=True, env=env, timeout=30,
+    )
+    # The payload repo lacks src/genesis/autonomy/new.py: still blocked —
+    # the override must not redirect discovery to the foreign tree.
+    assert r.returncode == 2
+
+
 def test_the_authoritative_plan_field_wins_over_prose(home: Path, repo: Path):
     """MEASURED: `planFilePath` is present in 1862/1862 real payloads, but `plan`
     (the full markdown) serializes FIRST — so a blob-wide regex could return a
@@ -366,6 +494,23 @@ def test_files_outside_the_source_tree_are_silent(home: Path, repo: Path):
             home,
         )
         assert r.stdout.strip() == "", rel
+
+
+def test_a_foreign_src_genesis_path_neither_nudges_nor_marks(home: Path, repo: Path, tmp_path: Path):
+    """`/tmp/other/src/genesis/x.py` merely CONTAINS `src/genesis/` — it is not a
+    module of this repository, and an unrelated write must not consume this
+    branch's one nudge."""
+    foreign = tmp_path / "other" / "src" / "genesis"
+    foreign.mkdir(parents=True)
+    r = _run(
+        "--new-file",
+        {"tool_name": "Write", "tool_input": {"file_path": str(foreign / "x.py")}, "cwd": str(repo)},
+        home,
+    )
+    assert r.stdout.strip() == ""
+    assert not (home / ".genesis" / "adopt_first").exists(), (
+        "a path outside the repo must not create the branch sentinel"
+    )
 
 
 # ── wiring: a hook nobody registered is a hook that does nothing ─────────────
