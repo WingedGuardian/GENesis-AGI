@@ -227,32 +227,50 @@ def surface_variants(
         for alias in names:
             _emit(pattern.sub(alias, content))
 
-    slots = [(s, e, c) for (s, e, c) in slots_all if spellings[c]]
-    choice_lists = [[None, *spellings[c]] for (_, _, c) in slots]
     _CANDIDATE_BUDGET = 512
-    for picks in islice(product(*choice_lists), _CANDIDATE_BUDGET):
-        if all(p is None for p in picks):
+
+    def _enumerate(slot_list: list[tuple[int, int, str]]) -> None:
+        """Product over one mutually-disjoint slot set (None = keep canonical)."""
+        slot_list = [(s, e, c) for (s, e, c) in slot_list if spellings[c]]
+        choice_lists = [[None, *spellings[c]] for (_, _, c) in slot_list]
+        for picks in islice(product(*choice_lists), _CANDIDATE_BUDGET):
+            if all(p is None for p in picks):
+                continue
+            out: list[str] = []
+            cursor = 0
+            for (start, end, _c), pick in zip(slot_list, picks, strict=True):
+                out.append(content[cursor:start])
+                out.append(pick if pick is not None else content[start:end])
+                cursor = end
+            out.append(content[cursor:])
+            _emit("".join(out))
+            if len(results) >= limit:
+                return
+
+    _enumerate(slots_all)
+
+    # A span dropped to an overlap can still combine with every kept span it
+    # does not intersect: "New YC and F" needs the dropped "York City" slot
+    # plus the disjoint "Foo" slot. Re-enumerate per dropped span over the
+    # compatible set (spans in slots_all are already mutually disjoint).
+    kept_spans = {(s, e) for s, e, _ in slots_all}
+    for d_start, d_end, d_canonical in positions:
+        if (d_start, d_end) in kept_spans:
             continue
-        out: list[str] = []
-        cursor = 0
-        for (start, end, _c), pick in zip(slots, picks, strict=True):
-            out.append(content[cursor:start])
-            out.append(pick if pick is not None else content[start:end])
-            cursor = end
-        out.append(content[cursor:])
-        _emit("".join(out))
+        if not spellings.get(d_canonical):
+            continue
+        dropped = (d_start, d_end, d_canonical)
+        compat = sorted(
+            [dropped]
+            + [
+                s
+                for s in slots_all
+                if not (s[0] < d_end and d_start < s[1])
+            ]
+        )
+        _enumerate(compat)
         if len(results) >= limit:
             break
-
-    # Slots dropped to an overlap still get their single-substitution forms:
-    # "X Code" inside a kept "Claude Code" span is a spelling a legacy row
-    # could carry even though it cannot slot-combine with the kept span.
-    kept_spans = {(s, e) for s, e, _ in slots_all}
-    for start, end, canonical in positions:
-        if (start, end) in kept_spans:
-            continue
-        for alias in spellings.get(canonical, []):
-            _emit(content[:start] + alias + content[end:])
 
     return results
 

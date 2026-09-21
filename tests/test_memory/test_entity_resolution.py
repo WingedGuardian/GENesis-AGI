@@ -143,6 +143,14 @@ def test_surface_variants_prefers_longest_nested_canonical():
     assert "X Code and Claude" in variants
 
 
+def test_surface_variants_combines_dropped_slot_with_disjoint_slots():
+    """An overlap-dropped span still combines with non-overlapping slots:
+    "New YC and F" needs the dropped "York City" plus the kept "Foo"."""
+    aliases = {"NY": "New York", "YC": "York City", "F": "Foo"}
+    variants = surface_variants("New York City and Foo", aliases)
+    assert "New YC and F" in variants
+
+
 def test_surface_variants_no_match_returns_empty():
     assert surface_variants("nothing aliased here", {"CC": "Claude Code"}) == []
 
