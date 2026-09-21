@@ -155,7 +155,9 @@ def _run_block(
     restart_fails: bool = False,
     future_mtime: bool = False,
     restart_crashloops: bool = False,
-) -> tuple[str, list[str]]:
+    operator_stops: bool = False,
+    installed_unit_differs: bool = False,
+) -> tuple[str, list[str], Path]:
     """Run the extracted block against a stub systemctl + a real tmp script."""
     root = tmp_path / "root"
     (root / "scripts" / "lib").mkdir(parents=True)
@@ -164,6 +166,21 @@ def _run_block(
     lib = root / "scripts" / "lib" / "alert_queue.sh"
     template = root / "scripts" / "systemd" / "genesis-tmp-watchgod.service.template"
     import os
+
+    # The block sources the shared renderer — install the real one.
+    render_lib = (
+        _UPDATE.parent / "lib" / "render_systemd_template.sh"
+    )
+    (root / "scripts" / "lib" / "render_systemd_template.sh").write_text(
+        render_lib.read_text()
+    )
+    # HOME is redirected: the render step writes the installed unit under
+    # ~/.config/systemd/user — never the real home.
+    home = tmp_path / "home"
+    installed_unit = home / ".config" / "systemd" / "user" / "genesis-tmp-watchgod.service"
+    if installed_unit_differs:
+        installed_unit.parent.mkdir(parents=True)
+        installed_unit.write_text("# OLD installed unit\n")
 
     if script_exists:
         script.write_text("#!/bin/bash\n")
@@ -187,18 +204,35 @@ def _run_block(
     stub = stub_dir / "systemctl"
     # is-active: the probe reads `active`; after a try-restart that crashed
     # the unit, the post-restart liveness recheck must see it inactive.
+    stop_marker = tmp_path / "unit_stopped"
     if restart_crashloops:
         is_active_case = (
             f'  *is-active*) [ -f "{dead_marker}" ] && exit 3 || exit {"0" if active else "3"} ;;\n'
         )
         restart_case = f'  *try-restart*) touch "{dead_marker}" ;;\n'
+    elif operator_stops:
+        # First is-active (the probe) reads active; every later call reads
+        # stopped — an operator stop landing in the is-active→act race. The
+        # try-restart no-ops (rc 0, no new invocation): ExecMainStartTimestamp
+        # keeps the OLD value below, and the unit must NOT be degraded.
+        is_active_case = (
+            f'  *is-active*) [ -f "{stop_marker}" ] && exit 3 '
+            f'|| {{ touch "{stop_marker}"; exit 0; }} ;;\n'
+        )
+        restart_case = ""
     else:
         is_active_case = f'  *is-active*) exit {"0" if active else "3"} ;;\n'
         restart_case = '  *try-restart*) exit 1 ;;\n' if restart_fails else ""
     show_line = (
         "  *ExecMainStartTimestamp*) exit 1 ;;\n"
         if show_fails
-        else f'  *ExecMainStartTimestamp*) echo "$(date -d @{start_epoch} "+%a %F %T %Z")" ;;\n'
+        else (
+            # A REAL restart produces a new main invocation: after
+            # dead_marker exists, report a NEWER start timestamp.
+            f'  *ExecMainStartTimestamp*) if [ -f "{dead_marker}" ]; then '
+            f'date -d @{start_epoch + 1} "+%a %F %T %Z"; else '
+            f'date -d @{start_epoch} "+%a %F %T %Z"; fi ;;\n'
+        )
     )
     stub.write_text(
         "#!/bin/bash\n"
@@ -217,6 +251,7 @@ def _run_block(
         "set -euo pipefail\n"
         f'PATH="{stub_dir}:$PATH"\n'
         f'GENESIS_ROOT="{root}"\n'
+        f'HOME="{home}"\n'
         "_RU_SETTLE_S=0\n"
         'RESIDENT_UNIT_SCRIPTS="genesis-tmp-watchgod.service:scripts/tmp_watchgod.sh,scripts/lib/alert_queue.sh,scripts/systemd/genesis-tmp-watchgod.service.template"\n'
         + _extract_func(text, "_unit_restart_reason")
@@ -227,7 +262,7 @@ def _run_block(
     )
     r = subprocess.run(["bash", "-c", harness], capture_output=True, text=True, timeout=20)
     assert r.returncode == 0, f"block must not fail under set -e: {r.stderr}"
-    return r.stdout, calls.read_text().splitlines()
+    return r.stdout, calls.read_text().splitlines(), installed_unit
 
 
 class TestRestartLoop:
@@ -235,7 +270,7 @@ class TestRestartLoop:
         """A probe failure must not abort the run under set -e (the guards
         are load-bearing — this pins them RED-verifiably) and must fail
         OPEN: no timestamp, no restart."""
-        out, calls = _run_block(
+        out, calls, _unit = _run_block(
             text, tmp_path, active=True, start_epoch=1000, script_mtime=2000,
             show_fails=True,
         )
@@ -243,7 +278,7 @@ class TestRestartLoop:
         assert not any("restart" in c for c in calls), calls
 
     def test_missing_script_is_survived_and_restarts_nothing(self, text: str, tmp_path: Path) -> None:
-        out, calls = _run_block(
+        out, calls, _unit = _run_block(
             text, tmp_path, active=True, start_epoch=1000, script_mtime=2000,
             script_exists=False, lib_mtime=500,
         )
@@ -253,17 +288,17 @@ class TestRestartLoop:
     def test_stale_running_daemon_is_restarted(self, text: str, tmp_path: Path) -> None:
         """Acceptance bar — the incident shape: daemon started (epoch 1000)
         before the script's code arrived (mtime 2000) → one restart call."""
-        _out, calls = _run_block(text, tmp_path, active=True, start_epoch=1000, script_mtime=2000)
+        _out, calls, _unit = _run_block(text, tmp_path, active=True, start_epoch=1000, script_mtime=2000)
         assert any("restart genesis-tmp-watchgod.service" in c for c in calls), calls
 
     def test_fresh_daemon_not_restarted(self, text: str, tmp_path: Path) -> None:
-        _out, calls = _run_block(text, tmp_path, active=True, start_epoch=3000, script_mtime=2000)
+        _out, calls, _unit = _run_block(text, tmp_path, active=True, start_epoch=3000, script_mtime=2000)
         assert not any("restart" in c for c in calls), calls
 
     def test_sourced_lib_change_alone_triggers_restart(self, text: str, tmp_path: Path) -> None:
         """A pull touching only the sourced library must restart the daemon —
         it loaded that code once at startup (external finding)."""
-        _out, calls = _run_block(
+        _out, calls, _unit = _run_block(
             text, tmp_path, active=True, start_epoch=1500,
             script_mtime=1000, lib_mtime=2000,
         )
@@ -272,21 +307,21 @@ class TestRestartLoop:
     def test_restart_failure_marks_degraded(self, text: str, tmp_path: Path) -> None:
         """A failed heal is a degraded deployment, never a silent clean
         (external finding: the accumulator contract at the function head)."""
-        out, _calls = _run_block(
+        out, _calls, _u = _run_block(
             text, tmp_path, active=True, start_epoch=1000, script_mtime=2000,
             restart_fails=True,
         )
         assert "unit_restart_genesis-tmp-watchgod" in out
 
     def test_inactive_unit_not_started(self, text: str, tmp_path: Path) -> None:
-        _out, calls = _run_block(text, tmp_path, active=False, start_epoch=1000, script_mtime=2000)
+        _out, calls, _unit = _run_block(text, tmp_path, active=False, start_epoch=1000, script_mtime=2000)
         assert not any("restart" in c for c in calls), calls
 
     def test_missing_main_script_never_restarts_on_partial_facts(self, text: str, tmp_path: Path) -> None:
         """External finding: an unreadable ExecStart must void the unit's
         whole verdict — a newer readable LIBRARY must not restart on
         incomplete freshness facts."""
-        out, calls = _run_block(
+        out, calls, _unit = _run_block(
             text, tmp_path, active=True, start_epoch=1000, script_mtime=2000,
             script_exists=False, lib_mtime=3000,
         )
@@ -296,7 +331,7 @@ class TestRestartLoop:
     def test_future_dated_file_never_restarts(self, text: str, tmp_path: Path) -> None:
         """A future-dated mtime (clock rollback, restored snapshot) is
         untrustworthy like an unreadable one — skip the unit."""
-        out, calls = _run_block(
+        out, calls, _unit = _run_block(
             text, tmp_path, active=True, start_epoch=1000, script_mtime=2000,
             future_mtime=True,
         )
@@ -306,7 +341,7 @@ class TestRestartLoop:
     def test_restart_uses_try_restart(self, text: str, tmp_path: Path) -> None:
         """try-restart preserves an operator-stopped unit across the
         is-active→act race (external finding)."""
-        _out, calls = _run_block(text, tmp_path, active=True, start_epoch=1000, script_mtime=2000)
+        _out, calls, _unit = _run_block(text, tmp_path, active=True, start_epoch=1000, script_mtime=2000)
         assert any("try-restart genesis-tmp-watchgod.service" in c for c in calls), calls
         assert not any("--user restart" in c for c in calls), calls
 
@@ -314,9 +349,38 @@ class TestRestartLoop:
         """try-restart exits 0 while the unit sits in activating
         (auto-restart) — the post-restart liveness check must turn that
         into a degraded deployment, not a clean one (external finding)."""
-        out, calls = _run_block(
+        out, calls, _unit = _run_block(
             text, tmp_path, active=True, start_epoch=1000, script_mtime=2000,
             restart_crashloops=True,
         )
         assert any("try-restart genesis-tmp-watchgod.service" in c for c in calls), calls
         assert "unit_restart_genesis-tmp-watchgod" in out
+
+    def test_operator_stopped_unit_not_marked_degraded(self, text: str, tmp_path: Path) -> None:
+        """try-restart exits 0 WITHOUT acting on a unit an operator stopped
+        in the is-active→act race — the old ExecMainStartTimestamp proves no
+        new invocation, so the intentional stop must not record a degraded
+        restart (external finding)."""
+        out, calls, _unit = _run_block(
+            text, tmp_path, active=True, start_epoch=1000, script_mtime=2000,
+            operator_stops=True,
+        )
+        assert any("try-restart genesis-tmp-watchgod.service" in c for c in calls), calls
+        assert "unit_restart_genesis-tmp-watchgod" not in out
+
+    def test_changed_template_is_rendered_before_restart(
+        self, text: str, tmp_path: Path
+    ) -> None:
+        """On the no-op path bootstrap never rendered the newer template, so
+        a bare restart would load the OLD directives while the fresh start
+        time masked the drift — the heal re-renders + daemon-reloads first
+        (external finding)."""
+        out, calls, installed = _run_block(
+            text, tmp_path, active=True, start_epoch=1000, script_mtime=2000,
+            installed_unit_differs=True,
+        )
+        assert "RC=0" in out
+        assert installed.read_text() == "# template\n"
+        reloads = [i for i, c in enumerate(calls) if "daemon-reload" in c]
+        restarts = [i for i, c in enumerate(calls) if "try-restart" in c]
+        assert reloads and restarts and reloads[0] < restarts[-1], calls

@@ -252,9 +252,11 @@ def test_stale_units_fresh_and_inactive_and_unreadable(tmp_path):
     # Unreadable start time on an ACTIVE unit → "could not determine",
     # never a clean [] that resolves a live alert.
     assert collect_stale_units({"u.service": script}, probe=lambda u: (True, None)) is None
-    # Missing script file → that unit is unjudgeable, skipped (no flag).
+    # Missing script file on an ACTIVE unit → "could not determine",
+    # same as an unreadable timestamp — never a clean [] that resolves a
+    # live alert on missing evidence.
     gone = tmp_path / "missing.sh"
-    assert collect_stale_units({"u.service": gone}, probe=lambda u: (True, 1000.0)) == []
+    assert collect_stale_units({"u.service": gone}, probe=lambda u: (True, 1000.0)) is None
 
 
 def test_stale_units_unreadable_sibling_voids_unit_verdict(tmp_path):
@@ -270,7 +272,7 @@ def test_stale_units_unreadable_sibling_voids_unit_verdict(tmp_path):
     os.utime(lib, (3000, 3000))
     assert collect_stale_units(
         {"u.service": (gone, lib)}, probe=lambda u: (True, 1000.0)
-    ) == []
+    ) is None
 
 
 def test_stale_units_whole_second_precision(tmp_path):
@@ -298,7 +300,25 @@ def test_stale_units_future_dated_file_skips_unit(tmp_path):
 
     fut = int(time.time()) + 10**6
     os.utime(script, (fut, fut))
-    assert collect_stale_units({"u.service": script}, probe=lambda u: (True, 1000.0)) == []
+    assert collect_stale_units({"u.service": script}, probe=lambda u: (True, 1000.0)) is None
+
+
+def test_stale_units_unknown_does_not_hide_a_real_stale(tmp_path):
+    """An unjudgeable unit must not mask a stale SIBLING — the stale list
+    still reports, and the unknown one does not convert it to None."""
+    stale_script = tmp_path / "stale.sh"
+    stale_script.write_text("#!/bin/bash\n")
+    import os
+
+    os.utime(stale_script, (2000, 2000))
+    gone = tmp_path / "missing.sh"
+
+    def probe(unit: str):
+        return (True, 1000.0) if unit == "a.service" else (True, 3000.0)
+
+    assert collect_stale_units(
+        {"a.service": stale_script, "b.service": gone}, probe=probe
+    ) == ["a.service"]
 
 
 def test_stale_units_probe_error_returns_none(tmp_path):

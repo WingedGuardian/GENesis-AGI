@@ -724,6 +724,36 @@ _sync_deploy_targets() {
         _ru_reason=$(_unit_restart_reason "$_ru_active" "$_ru_start_epoch" "$_ru_script_epoch" "$_ru_unit") || _ru_reason=""
         if [ -n "$_ru_reason" ]; then
             echo "  $_ru_reason"
+            # A newer unit TEMPLATE is not healed by the restart alone:
+            # try-restart loads the INSTALLED unit, which only bootstrap
+            # renders — and on the no-op path bootstrap never ran, so the
+            # daemon would bounce onto the OLD directives while its fresh
+            # start time masks the drift (render + daemon-reload first, same
+            # substitutions bootstrap uses — a render failure is degraded,
+            # not a masked restart).
+            if [ -f "$GENESIS_ROOT/scripts/lib/render_systemd_template.sh" ]; then
+                # shellcheck source=lib/render_systemd_template.sh
+                . "$GENESIS_ROOT/scripts/lib/render_systemd_template.sh"
+                for _ru_one in ${_ru_script//,/ }; do
+                    case "$_ru_one" in
+                        *.template)
+                            _ru_target="$HOME/.config/systemd/user/$(basename "$_ru_one" .template)"
+                            _ru_rendered=""
+                            _ru_rendered=$(render_systemd_template "$GENESIS_ROOT/$_ru_one" 2>/dev/null) || _ru_rendered=""
+                            if [ -z "$_ru_rendered" ]; then
+                                HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}unit_render_${_ru_unit%%.service}"
+                            elif [ "$_ru_rendered" != "$(cat "$_ru_target" 2>/dev/null)" ]; then
+                                if mkdir -p "$(dirname "$_ru_target")" \
+                                    && printf '%s\n' "$_ru_rendered" > "$_ru_target"; then
+                                    systemctl --user daemon-reload 2>/dev/null || true
+                                else
+                                    HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}unit_render_${_ru_unit%%.service}"
+                                fi
+                            fi
+                            ;;
+                    esac
+                done
+            fi
             # try-restart, not restart: closes the is-active→act race so an
             # operator-stopped unit STAYS stopped — starting it is
             # bootstrap's enablement decision, the same invariant the
@@ -744,8 +774,18 @@ _sync_deploy_targets() {
                 # covers the exec→die window, overridable for tests).
                 sleep "${_RU_SETTLE_S:-3}" 2>/dev/null || true
                 if ! systemctl --user is-active --quiet "$_ru_unit" 2>/dev/null; then
-                    echo "  WARNING: $_ru_unit is not active after restart — still running old code or crash-looping"
-                    HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}unit_restart_${_ru_unit%%.service}"
+                    # try-restart also exits 0 doing NOTHING on a unit an
+                    # operator stopped in the is-active→act race — flagging
+                    # unit_restart_* there records an intentional stop as a
+                    # failed deploy. Only a restart that produced a NEW main
+                    # invocation is this heal's to judge: ExecMainStartTimestamp
+                    # changes on a real start, stays put on a no-op.
+                    _ru_post_ts=""
+                    _ru_post_ts=$(TZ=UTC systemctl --user show "$_ru_unit" -p ExecMainStartTimestamp --value 2>/dev/null) || _ru_post_ts=""
+                    if [ -z "$_ru_post_ts" ] || [ "$_ru_post_ts" != "$_ru_start_ts" ]; then
+                        echo "  WARNING: $_ru_unit is not active after restart — still running old code or crash-looping"
+                        HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}unit_restart_${_ru_unit%%.service}"
+                    fi
                 fi
             fi
         fi

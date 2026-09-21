@@ -218,9 +218,9 @@ def collect_stale_units(
     timestamp is authored upstream and misses the started-between-commit-and-
     pull window; multiple files because a daemon sources libraries once at
     start). An unreadable or future-dated file mtime makes the whole unit
-    unjudgeable — skip it rather than decide on partial facts (a skipped
-    file would let a missing ExecStart read as "no change" while a newer
-    library forced a verdict). An ACTIVE unit whose start timestamp cannot
+    unjudgeable — UNKNOWN, not clean: a skipped file would let a missing
+    ExecStart read as "no change" while a newer library forced a verdict.
+    An ACTIVE unit whose start timestamp cannot
     be read is likewise unjudgeable: when nothing else is stale the result
     is ``None`` — "could not determine" — never a clean empty (fail-closed
     data-access doctrine: an outage must not masquerade as health)."""
@@ -253,6 +253,10 @@ def collect_stale_units(
                     break
                 newest = m if newest is None else max(newest, m)
             if unreadable:
+                # An unreadable/future-dated startup file makes the unit
+                # unjudgeable — that is UNKNOWN, not clean: skipping it
+                # silently would let a stat outage resolve a live alert.
+                unknown = True
                 continue
             # Whole-second comparison, mirroring update.sh's `date +%s` /
             # `stat -c %Y`: the systemd timestamp is rendered only to whole
@@ -557,8 +561,17 @@ async def deploy_health(db: aiosqlite.Connection | None) -> dict:
             commits_behind=collected["git"].get("commits_behind_upstream"),
             update_age_days=update.get("age_days"),
         )
+        # Collector uncertainty must survive in the status: a None collector
+        # could not answer, so the snapshot is "unknown", never a fake
+        # "healthy" — the awareness check only recovers alerts on confirmed
+        # healthy, so an outage no longer resolves a live alert.
+        unknown = (
+            collected["missing_units"] is None
+            or collected["stale_units"] is None
+            or tier2 is None
+        )
         return {
-            "status": "attention" if findings else "healthy",
+            "status": "attention" if findings else ("unknown" if unknown else "healthy"),
             "findings": findings,
             "last_update": update,
             "git": collected["git"],

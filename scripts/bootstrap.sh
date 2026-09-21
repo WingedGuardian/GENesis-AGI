@@ -1122,40 +1122,17 @@ SERVICES_UPDATED=0
 
 if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
     mkdir -p "$SYSTEMD_USER_DIR"
-    # Detect Claude Code binary directory for systemd PATH injection
-    # Resolve the Claude Code binary dir. `dirname ""` collapses to "." and
-    # exits 0 when claude isn't on PATH yet, so split the pipeline and resolve
-    # the real npm prefix explicitly.
-    _cc_path="$(command -v claude 2>/dev/null || true)"
-    # Needed in both branches: the npm prefix's bin is where `npm install -g`
-    # (gitnexus, and claude via cc_ensure_local in scripts/lib/cc_version.sh)
-    # actually lands — nvm's bin after an nvm fallback, ~/.npm-global, or a
-    # system prefix. A pinned claude already on PATH (e.g. /usr/local/bin)
-    # resolves `command -v` while GitNexus lands in the nvm bin; rendering only
-    # claude's dir would leave it invisible to the units. Same empty/`/usr`
-    # guards as install.sh; hardcoding ~/.npm-global would miss nvm.
-    _cc_prefix="$(npm config get prefix 2>/dev/null || true)"
-    [ -n "$_cc_prefix" ] || _cc_prefix="/usr/local"
-    [ "$_cc_prefix" = "/usr" ] && _cc_prefix="/usr/local"
-    if [[ -n "$_cc_path" ]]; then
-        CC_BIN_DIR="$(dirname "$_cc_path")"
-    else
-        CC_BIN_DIR="$_cc_prefix/bin"
-    fi
-    if [[ "$_cc_prefix/bin" != "$CC_BIN_DIR" ]]; then
-        CC_BIN_DIR="$CC_BIN_DIR:$_cc_prefix/bin"
-    fi
+    # Shared render — update.sh's resident-unit heal renders a changed unit
+    # template with this same substitution set before restarting a daemon.
+    # shellcheck source=lib/render_systemd_template.sh
+    . "$SCRIPT_DIR/lib/render_systemd_template.sh"
 
     for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
         [[ -f "$template" ]] || continue
         svc_name=$(basename "$template" .template)
 
         target="$SYSTEMD_USER_DIR/$svc_name"
-        rendered=$(sed -e "s|__HOME__|$HOME|g" \
-                       -e "s|__VENV__|$GENESIS_ROOT/.venv|g" \
-                       -e "s|__REPO_DIR__|$GENESIS_ROOT|g" \
-                       -e "s|__CC_BIN_DIR__|$CC_BIN_DIR|g" \
-                       "$template")
+        rendered=$(render_systemd_template "$template")
         if [[ -f "$target" ]]; then
             current=$(cat "$target")
             if [[ "$rendered" != "$current" ]]; then

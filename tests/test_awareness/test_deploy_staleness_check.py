@@ -53,9 +53,10 @@ def _snap(
     stale_units=None,
     tier2=None,
     host_status="ok",
+    status=None,
 ):
     return {
-        "status": "attention" if findings else "healthy",
+        "status": status or ("attention" if findings else "healthy"),
         "findings": findings,
         "last_update": {"age_days": age_days, "new_commit": "abc", "completed_at": "x"},
         "git": {"head": "abc", "commits_behind_upstream": behind, "fetch_age_hours": 1.0},
@@ -265,6 +266,22 @@ async def test_partial_recovery_retires_missing_unit_anchors(db, monkeypatch):
     rows = await _rows(db)
     assert len(rows) == 1
     assert rows[0]["priority"] == "high"
+
+
+async def test_unknown_snapshot_does_not_resolve_alert(db, monkeypatch):
+    """A collector that could not answer (unit probe failed, startup file
+    unreadable, baseline lost) must leave a live alert alone — resolving it
+    would convert an outage into a false all-clear (external finding)."""
+    _patch_snapshot(monkeypatch, _snap(["tier2_pending:2"], tier2=["a", "b"]))
+    await loop._check_deploy_staleness(db)
+    assert len(await _rows(db)) == 1
+    # Now the snapshot cannot judge (stale_units collector returned None):
+    # empty findings AND status unknown — the alert must stay active.
+    unknown = _snap([], status="unknown")
+    unknown["stale_units"] = None
+    _patch_snapshot(monkeypatch, unknown)
+    await loop._check_deploy_staleness(db)
+    assert len(await _rows(db)) == 1
 
 
 async def test_snapshot_error_is_quiet(db, monkeypatch):

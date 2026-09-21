@@ -1225,7 +1225,13 @@ async def _check_deploy_staleness(db) -> None:
             return
         findings = snap.get("findings") or []
         if not findings:
-            await _resolve_deploy_staleness(db)
+            # Only a CONFIRMED-clean snapshot recovers alerts. "unknown"
+            # means a collector could not answer (unit probe failed, a
+            # startup file was unreadable, the update baseline is lost) —
+            # resolving a live alert on missing evidence converts an outage
+            # into a false all-clear.
+            if snap.get("status") == "healthy":
+                await _resolve_deploy_staleness(db)
             return
 
         # Alert identity keys on the finding CLASSES, not the raw keys —
