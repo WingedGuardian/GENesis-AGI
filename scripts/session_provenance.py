@@ -238,14 +238,25 @@ def _gh_head_name(ref: str) -> str:
     return ref
 
 
-def _merged_pr_heads(ref: str) -> list[str]:
-    """Head OIDs of merged PRs whose head name matches ``ref``, newest-ish
-    first; [] when gh cannot answer."""
+# A branch NAME can be reused across many merged PRs, so the head list is
+# bounded — but a list returned AT the cap is evidence of truncation, not
+# completeness. Callers must treat it as such: an omitted squash tip reads as
+# unlanded work that shipped.
+_MERGED_PR_LIMIT = 200
+
+
+def _merged_pr_heads(ref: str) -> tuple[list[str], bool]:
+    """(Head OIDs of merged PRs whose head name matches ``ref``, complete).
+
+    ``complete`` is False when the response filled the page exactly — there may
+    be heads GitHub never sent — and when gh could not answer at all.
+    """
     try:
         r = subprocess.run(
             [
                 "gh", "pr", "list", "--head", _gh_head_name(ref),
-                "--base", "main", "--state", "merged", "--limit", "20",
+                "--base", "main", "--state", "merged",
+                "--limit", str(_MERGED_PR_LIMIT),
                 "--json", "number,headRefOid",
             ],
             capture_output=True,
@@ -254,11 +265,15 @@ def _merged_pr_heads(ref: str) -> list[str]:
             timeout=30,
         )
         if r.returncode != 0:
-            return []
-        return [str(pr.get("headRefOid") or "") for pr in json.loads(r.stdout)]
+            return [], False
+        rows = json.loads(r.stdout)
+        return (
+            [str(pr.get("headRefOid") or "") for pr in rows],
+            len(rows) < _MERGED_PR_LIMIT,
+        )
     except (subprocess.TimeoutExpired, FileNotFoundError,
             json.JSONDecodeError, OSError, ValueError):
-        return []
+        return [], False
 
 
 def _is_ancestor(a: str, b: str) -> bool:
@@ -301,8 +316,10 @@ def _is_patch_merged(branch: str) -> bool:
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
         pass
     tip = _git("rev-parse", branch).strip()
-    if tip and tip in _merged_pr_heads(branch):
-        return True
+    if tip:
+        heads, _ = _merged_pr_heads(branch)
+        if tip in heads:
+            return True
     out = _git("cherry", "main", branch)
     if not out:
         return False
@@ -627,40 +644,54 @@ def cmd_session(session_id: str, limit: int) -> int:
         return 1
     # Local AND remote-tracking refs: work pushed then deleted locally is still
     # unlanded work, and a heads-only scan used to omit it silently. Dedupe on
-    # the TIP OBJECT, not the name — `foo` and `origin/foo` sharing a tip are
-    # one branch; the same name at different tips are two.
-    seen_tips: set[str] = set()
+    # the TIP OBJECT — `foo` and `origin/foo` sharing a tip are one branch — but
+    # keep ALL the names, not the first: merged-PR evidence is keyed by name,
+    # and the name GitHub knows may be the alias the dedupe would have dropped.
+    tips: dict[str, list[str]] = {}
     for line in refs.splitlines():
         b, _, tip = line.partition(" ")
         b = b.strip()
         tip = tip.strip()
         if not b or b in ("main", "origin/main") or b.endswith("/HEAD"):
             continue
-        if tip in seen_tips:
-            continue
-        seen_tips.add(tip)
-        if _is_patch_merged(b):
+        tips.setdefault(tip, []).append(b)
+
+    for tip, names in tips.items():
+        b = names[0]  # display name; classification below uses every alias
+        merged_heads: list[str] = []
+        heads_complete = True
+        for name in names:
+            heads, complete = _merged_pr_heads(name)
+            merged_heads.extend(h for h in heads if h)
+            heads_complete &= complete
+        # A tip is merged when ANY name proves it — the alias GitHub knows may
+        # not be the one that survived dedupe.
+        if _is_ancestor(tip, "main") or tip in merged_heads:
             # This repo SQUASH-merges, so a merged branch's original commits are
-            # not ancestors of main and `main..<branch>` still returns them.
+            # not ancestors of main and `main..<tip>` still returns them.
             # Reporting those as "unlanded" is the opposite of this tool's job:
             # it would manufacture lost work out of work that shipped.
             continue
+        cherry = _git("cherry", "main", tip)
+        if cherry and not any(ln.startswith("+") for ln in cherry.splitlines()):
+            continue  # every commit's patch is upstream — patch-equivalent merge
+        if not heads_complete:
+            # A full page means heads GitHub never sent may exist — one of them
+            # could be this tip. Classifying from a truncated list resurrects
+            # shipped work, so the branch is INCOMPLETE, not unlanded.
+            incomplete.append(b)
+            continue
         # A branch that ADVANCED past a squash merge still carries the shipped
-        # originals on `main..<branch>`, and a session confined to that merged
+        # originals on `main..<tip>`, and a session confined to that merged
         # prefix would be reported unlanded. Bound the scan at the latest merged
-        # PR head that is still an ancestor of the tip — commits after it are
-        # the branch's actually-unlanded work.
+        # PR head (across ALL the tip's names) that is an ancestor of the tip.
         base = "main"
-        tip = _git("rev-parse", b).strip()
-        ancestors = [
-            h for h in _merged_pr_heads(b)
-            if h and _is_ancestor(h, tip)
-        ] if tip else []
+        ancestors = [h for h in merged_heads if _is_ancestor(h, tip)]
         if ancestors:
             latest = _git("merge-base", "--independent", *ancestors).split()
             if latest:
                 base = latest[0]
-        branch_commits = scan(f"{base}..{b}")
+        branch_commits = scan(f"{base}..{tip}")
         if branch_commits is None:
             # A failed branch scan is not an empty one. Swallowing it here would
             # report a SHORTER list of unlanded work than actually exists, which

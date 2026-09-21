@@ -636,7 +636,8 @@ def test_an_advanced_branch_only_counts_commits_past_the_merge(repo, monkeypatch
     _git(repo, "checkout", "-q", "main")
 
     monkeypatch.setattr(
-        sp, "_merged_pr_heads", lambda ref: [merged_head] if ref == "advancing" else []
+        sp, "_merged_pr_heads",
+        lambda ref: ([merged_head], True) if ref == "advancing" else ([], True),
     )
     rc = sp.cmd_session("22222222", 50)
     out = capsys.readouterr().out
@@ -662,3 +663,49 @@ def test_file_provenance_follows_a_rename(repo, capsys):
     assert rc == 0
     assert "22222222" in out
     assert "11111111" in out, "the creating session is still the file's provenance"
+
+
+# ─── Devin Review round 2, each pinned ───────────────────────────────────────
+
+
+def test_a_tip_is_merged_when_ANY_alias_names_a_merged_pr(repo, monkeypatch, capsys):
+    """Dedupe by tip must not discard the NAME GitHub knows.
+
+    `backup` and `origin/feature` share one tip; only `feature` names the merged
+    PR. Keeping the first-seen alias and dropping the other made a shipped
+    multi-commit squash read as unlanded.
+    """
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "f1.txt", "feat: one\n\nGenesis-Session: 22222222\n")
+    _commit(repo, "f2.txt", "feat: two\n\nGenesis-Session: 22222222\n")
+    tip = _git(repo, "rev-parse", "feature").strip()
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "branch", "backup", tip)
+    _git(repo, "update-ref", "refs/remotes/origin/feature", tip)
+    _git(repo, "branch", "-D", "feature")
+
+    monkeypatch.setattr(
+        sp, "_merged_pr_heads",
+        lambda ref: ([tip], True) if sp._gh_head_name(ref) == "feature" else ([], True),
+    )
+    rc = sp.cmd_session("22222222", 50)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "unlanded branches" not in out, (
+        "the tip is merged because an ALIAS name proves it — discarding the "
+        "alias resurrects shipped work"
+    )
+
+
+def test_a_full_merged_pr_page_marks_the_branch_incomplete(repo, monkeypatch, capsys):
+    """A head list returned AT the cap may be missing this branch's tip —
+    classifying from it resurrects shipped work."""
+    _git(repo, "checkout", "-q", "-b", "reused")
+    _commit(repo, "f.txt", "feat: work\n\nGenesis-Session: 22222222\n")
+    _git(repo, "checkout", "-q", "main")
+
+    monkeypatch.setattr(sp, "_merged_pr_heads", lambda ref: (["0" * 40], False))
+    rc = sp.cmd_session("22222222", 50)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "INCOMPLETE" in err
