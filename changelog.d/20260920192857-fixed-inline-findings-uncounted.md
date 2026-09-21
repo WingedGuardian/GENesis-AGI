@@ -4,8 +4,10 @@
   outside the diff or on a documentation path — and the row said `ok` because the
   score was zero, which is true and is not what it was read to mean. It now
   carries how many were not scored, pointing at the detail already printed above
-  it. When the scan exits before it can count anything, the row says so rather
-  than reporting a zero it never measured.
+  it. Where a count cannot be trusted — some reviewer output cannot be parsed
+  into findings, or a review channel under-reported — the number is shown as a
+  floor rather than an exact total, and both causes are named when both apply,
+  because only one of them is recoverable by re-running.
 - A review is no longer silently ignored because the gate does not recognise who
   wrote it. A second bot, or a human collaborator, could leave a finding on the
   diff or in a review body and reach nothing the report mentioned, so the row

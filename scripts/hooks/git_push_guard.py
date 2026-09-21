@@ -1370,12 +1370,32 @@ _INLINE_REVIEW_BOTS = {
     "chatgpt-codex-connector[bot]",
     "github-advanced-security[bot]",
 }
-#: Every review author this file recognises ANYWHERE, so the review-body loop can
-#: tell "handled by another path" from "nobody has ever looked at this author".
-#: DERIVED from the three sets rather than hand-listed: a login added to any of
-#: them must not silently become "unclassified" here, and a fourth hand-copy is
-#: the replica-drift shape this repo has paid for repeatedly.
-_KNOWN_REVIEW_LOGINS = _REVIEW_BOTS | _CODERABBIT_LOGINS | _INLINE_REVIEW_BOTS
+#: Markers of a review body that is a TEMPLATE rather than a findings channel.
+#: ALL must be present, so a body merely quoting one phrase is not suppressed.
+#: Chosen by measurement over 21 live review bodies from 3 reviewers on 6 PRs:
+#: this pair suppressed 6/6 wrapper bodies and 0/15 findings-bearing ones.
+_WRAPPER_REVIEW_BODY_MARKERS = (
+    "Codex Review",
+    "automated review suggestions for this pull request",
+)
+
+
+def _is_wrapper_review_body(body: str) -> bool:
+    """True when a review BODY is a template carrying no findings of its own.
+
+    Used to keep the uncounted tail from annotating every PR. The alternative —
+    a list of logins whose bodies are wrappers — was measured WORSE on fail
+    direction, not on accuracy: when the template changes this predicate stops
+    matching and the body is surfaced (noise, visible), where a login list would
+    silently drop a body that had started carrying findings.
+
+    Substring tests rather than a regex, deliberately: this runs on a hook path,
+    the input is third-party text, and a super-linear scan there is a fail-open
+    because a killed hook does not block. Two `in` checks cannot backtrack.
+    """
+    return all(marker in body for marker in _WRAPPER_REVIEW_BODY_MARKERS)
+
+
 # A reply "engages" (silences) an inline P1 finding ONLY when authored by someone with
 # repository authority — otherwise any GitHub account (a throwaway, or the PR author on
 # their own PR) could post a one-word reply and clear a real P1 (PR #1434 security
@@ -1384,7 +1404,7 @@ _KNOWN_REVIEW_LOGINS = _REVIEW_BOTS | _CODERABBIT_LOGINS | _INLINE_REVIEW_BOTS
 # NOT count as acknowledgement.
 _MAINTAINER_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 # Badge/markup prefix stripped when rendering a finding's title line.
-_INLINE_MARKUP_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)|</?sub>|[*]{1,2}")
+_INLINE_MARKUP_RE = re.compile(r"<!--.*?-->|!\[[^\]]*\]\([^)]*\)|</?sub>|[*]{1,2}", re.S)
 # A finding title is a one-line PREVIEW in a list of them; the full body is on
 # the PR, so this bounds a pointer-backed value rather than cutting the only
 # copy. `_inline_title` states the cut when it makes one.
@@ -1575,6 +1595,15 @@ def _inline_title(body: str) -> str:
     """
     # split("\n") not splitlines(): a NEL (U+0085) inside the body must not shift
     # which line is shown as the title (consistent with the JSONL parser).
+    #
+    # Line 0 of the STRIPPED text, which is load-bearing and was nearly
+    # over-engineered away: one review bot opens every comment with an HTML
+    # metadata comment, and a first attempt at fixing that added a scan for the
+    # first NON-EMPTY line, on the belief that removing the comment left line 0
+    # blank. MEASURED over 35 real comments from that bot: the scan and plain
+    # line 0 agree on 35/35 and neither renders empty, because `.strip()`
+    # already removes the leading newlines the comment left behind. The scan was
+    # justified by an artifact of the probe that "found" it, not by the data.
     first = _INLINE_MARKUP_RE.sub("", body).strip().split("\n")
     return _safe_title(first[0].strip() if first else "")
 
@@ -3103,17 +3132,59 @@ def _check_inline_review_findings(
             # NOT a silent drop any more. An author this scan cannot parse still
             # gets NAMED, so the session knows the input exists.
             #
-            # Two narrowings, both deliberate, so the signal does not become
-            # noise that trains sessions to ignore the row:
-            #   * a login recognised ELSEWHERE (Codex, the inline review bots) is
-            #     already handled by its own path — counting its review object
-            #     here would fire on every PR and mean nothing;
-            #   * an EMPTY body carries no information to be aware of (a bare
-            #     approval), so there is nothing for the session to judge.
-            # Deduped on login: one reviewer re-reviewing is one reviewer.
+            # Narrowed by CONTENT, never by AUTHORSHIP. An empty body is a bare
+            # approval; a WRAPPER body is a template that carries no findings by
+            # construction. Deduped on login: one reviewer re-reviewing is one.
+            #
+            # MEASURED 2026-09-20 over 21 live review bodies on 6 PRs — which is
+            # the step whose absence caused both of this change's regressions:
+            #   * one reviewer posts a byte-identical 621-byte template on 6 of 6
+            #     PRs. Its findings go INLINE; the body is a wrapper. PR #2194
+            #     itself carried findings in BOTH rounds and its body was 621
+            #     bytes both times, so the body is constant regardless.
+            #   * another reviewer's bodies vary 432-690 bytes and say things
+            #     like "found 3 potential issues" and "1 flag NOT posted on this
+            #     PR" — a finding that never reached the PR at all, which is
+            #     exactly the invisible-finding class this scan exists to expose.
+            # So AUTHORSHIP does not predict whether a body carries findings, and
+            # an earlier revision that excluded every recognised login made this
+            # tail fire on 6 of 6 PRs — a signal that is always on is a signal
+            # nobody reads, and it also pinned `approx >= 1`, which meant the
+            # exact/approx split could never render an exact count on this repo.
+            #
+            # FAIL DIRECTION, and it is why this is a content test rather than a
+            # list of logins: if the template changes, this stops matching and
+            # the body is SURFACED — noise, visible, recoverable. A login list
+            # fails the other way, silently dropping a body that started
+            # carrying findings, which is the defect class this change removes.
+            #
+            # Substring tests, not a regex: this runs on a hook path where a
+            # super-linear scan over third-party text is a fail-open, and two
+            # `in` checks cannot backtrack.
+            #
+            # ⚠ A SECOND narrowing was here and was WRONG — Codex P2, round 2,
+            # confirmed by reading all three readers. It skipped every recognised
+            # review login on the grounds that they are "already handled by
+            # another path". They are not, for BODIES: `_check_pr_review_findings`
+            # reads `issues/N/comments`, the inline scanner reads
+            # `pulls/N/comments`, and `_codex_reviews`'s jq projection keeps
+            # `{login, commit_id, state}` and discards `body` entirely. So NOTHING
+            # in this file reads a Codex or Advanced-Security review BODY, and
+            # excluding them re-created a silent drop for the reviewers we trust
+            # MOST — inside the change written to remove silent drops.
+            #
+            # Recognised or not, an unparsed body is surfaced. The noise this was
+            # meant to avoid is bounded by the empty-body test above: a routine
+            # boilerplate approval has no body to surface. Surfacing a Codex body
+            # that DOES carry prose is the correct outcome, not noise.
+            #
+            # This still SURFACES rather than PARSES. Reading a review body for
+            # findings is a different capability and a different risk (see the
+            # filed issue); awareness is the contract here.
+            review_body = (review.get("body") or "").strip()
             if (
-                (review.get("body") or "").strip()
-                and review_login not in _KNOWN_REVIEW_LOGINS
+                review_body
+                and not _is_wrapper_review_body(review_body)
                 and review_login not in unclassified_reviews
             ):
                 unclassified_reviews.append(review_login)
@@ -3419,11 +3490,20 @@ def _check_inline_review_findings(
     # to remember, which is the shape that produces "the fifth return forgot".
     #
     # The two EARLY returns above (`force`, and an unreadable first page) are
-    # deliberately NOT recorded: they exit before these lists exist. The caller
-    # therefore sees an EMPTY out-param and must render UNKNOWN rather than zero —
-    # "0 uncounted" on a path that counted nothing is the exact false-confidence
-    # this gate exists to remove, and reproducing it one field over would be
-    # worse than the row it replaces.
+    # deliberately NOT recorded: they exit before these lists exist, so the
+    # caller sees an EMPTY out-param and must render UNKNOWN rather than zero.
+    # "0 uncounted" on a path that counted nothing is the false confidence this
+    # gate exists to remove, and reproducing it one field over would be worse
+    # than the row it replaces.
+    #
+    # ⚠ THAT STATE IS A FORWARD GUARD, NOT A LIVE ONE, and saying so is the
+    # point — an earlier revision described it as shipped behaviour and put that
+    # claim in a public changelog. VERIFIED: exactly one caller passes
+    # `uncounted_out` (`check_pr_report`) and it never passes `force`, while the
+    # unreadable-first-page return goes through `_scan_unreadable`, which blocks,
+    # so the row renders BLOCK and the clause is never called. `_uncounted_clause
+    # ([])` is therefore unreachable from production TODAY. The branch stays
+    # because it is right for the next caller; the claim about it does not.
     if uncounted_out is not None:
         uncounted_out.append(
             {
@@ -10505,26 +10585,36 @@ def _uncounted_clause(uncounted: list[dict[str, int]]) -> str:
     exact = sum(record.get("exact", {}).values())
     approx = sum(record.get("approx", {}).values())
     total = exact + approx
-    # Either cause makes the number a LOWER BOUND, and they are not the same
-    # cause, so the reason is carried rather than collapsed: `approx` means the
-    # scan READ some input and cannot count the findings inside it, while
-    # `under_read` means a channel did not deliver everything it had. A reader
-    # who cannot tell those apart cannot tell whether re-running would help.
-    if total and approx:
-        return (
-            f" — but {total}+ item(s) NOT scored (some reviewer output could not be "
-            "parsed into findings), see the NOTEs above"
-        )
-    if total and under_read:
-        return (
-            f" — but {total}+ finding(s) NOT scored (a review channel "
-            "under-reported), see the NOTEs above"
-        )
+    # Either cause makes the number a LOWER BOUND, and they are INDEPENDENT, so
+    # both are rendered when both hold: `approx` means the scan READ some input
+    # and cannot count the findings inside it, while `under_read` means a channel
+    # did not deliver everything it had. Only the second is recoverable by
+    # re-running, so a reader shown one cause cannot tell whether retrying helps.
+    #
+    # An earlier version returned on `approx` FIRST and silently discarded a
+    # simultaneously-true `under_read` — while the sentence above it claimed the
+    # reason was "carried rather than collapsed". Codex P2, round 2. A comment
+    # asserting a property the code three lines below does not have is the defect
+    # class this whole change exists to remove, reproduced in its own renderer.
+    if total:
+        causes = []
+        if approx:
+            causes.append("some reviewer output could not be parsed into findings")
+        if under_read:
+            causes.append("a review channel under-reported")
+        if not causes:
+            return f" — but {total} finding(s) NOT scored, see the NOTEs above"
+        # The UNIT follows `approx` alone: an under-read channel withholds
+        # findings it never handed over, which makes the total a floor without
+        # making the things already counted stop being findings.
+        unit = "item(s)" if approx else "finding(s)"
+        return f" — but {total}+ {unit} NOT scored ({'; '.join(causes)}), see the NOTEs above"
+    # Reached only when `total` is 0 — the branch above returns on every path.
     if under_read:
         return " — uncounted findings UNKNOWN (a review channel under-reported, see the NOTEs above)"
-    if not total:
-        return ""
-    return f" — but {total} finding(s) NOT scored, see the NOTEs above"
+    # Nothing uncounted and nothing under-read: leave the row exactly as it was.
+    # A gate that annotates every row teaches nobody to read the annotation.
+    return ""
 
 
 def _print_gate_detail(msg: str) -> None:
