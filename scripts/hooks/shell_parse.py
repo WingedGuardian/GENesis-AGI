@@ -1788,10 +1788,84 @@ _FUNCTION_DEF = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\(\)$")
 # as a filename. The bash set comes from ``bash --help``; the dash/sh set was
 # verified against the installed dash implementation, which also provides
 # ``sh`` on the supported Linux hosts.
+#: Option letters that consume the NEXT argv token as their value. Kept per
+#: interpreter, not as one global set: `-O shopt_option` is Bash-only, and dash
+#: rejects `dash -cxO extglob …` with "Illegal option -O" and runs nothing. A
+#: shared set made Bash-only syntax look valid for every nested shell, so a
+#: command the shell refuses was parsed as though it ran (Codex P2, PR #2112).
+_C_VALUE_TAKING = {
+    "bash": frozenset("oO"),
+    "zsh": frozenset("oO"),
+    # `sh` is keyed on a BASENAME that does not name the same binary
+    # everywhere — the same argument the bundle table makes below, and this is
+    # its SIBLING TABLE. Unioning one and not the other left half the bypass
+    # open on exactly the host the fix was written for: MEASURED with
+    # /bin/sh -> bash, `sh -O extglob -c CMD` RUNS while the parser, falling
+    # back to `{o}`, could not classify `O` and reported no nested command.
+    # Two tables keyed on one name must move together or the fix is a claim
+    # rather than a closure.
+    "sh": frozenset("oO"),
+}
+#: Every other supported interpreter takes `-o option` but not `-O`.
+_C_VALUE_TAKING_DEFAULT = frozenset("o")
+
+#: Options that make the shell PARSE the script and not execute it. MEASURED on
+#: bash 5.2: `bash -n -c CMD`, `bash -D -c CMD` and `bash -o noexec -c CMD` all
+#: exit without running CMD. Walking past one and reporting the operand as an
+#: executed command is a false block on a command that provably does nothing —
+#: so they TERMINATE resolution instead of being transparent.
+#:
+#: `-D` is bash-only (dump translatable strings) but is harmless to treat as
+#: no-exec elsewhere: the cost of a false STOP is a command we do not report,
+#: and the pre-existing behaviour for an unrecognised shape is already to report
+#: nothing. Erring that way costs visibility we never had.
+#:
+#: SPLIT BY SIGN BEHAVIOUR, because the two letters do not behave alike and
+#: treating them as one set was a false block. MEASURED on bash 5.2, every cell:
+#:
+#:   bash -n -c CMD          no exec      bash +n -c CMD           RUNS
+#:   bash -n +n -c CMD       RUNS         bash +n -n -c CMD        no exec
+#:   bash -D -c CMD          no exec      bash +D -c CMD           no exec
+#:   bash -c -D CMD          no exec      bash -c +D CMD           no exec
+#:   bash -D +D -c CMD       no exec
+#:
+#: So `n` is ordinary shell state: `+n` REMOVES it and the LAST occurrence wins.
+#: `D` is an invocation ACTION, not state — either sign selects dump mode and
+#: nothing later can clear it. Reported as a false block on `+D` (PR #2112).
+_C_NO_EXEC_STATE_LETTERS = frozenset("n")
+#: Sign-independent and STICKY: once seen, execution cannot be restored.
+_C_NO_EXEC_ACTION_LETTERS = frozenset("D")
+#: The `-o` VALUE that does the same thing. Ordinary state like `n`: MEASURED,
+#: `-o noexec +o noexec -c CMD` RUNS and `+o noexec -o noexec -c CMD` does not.
+_C_NO_EXEC_OPTION_VALUES = frozenset({"noexec"})
+
 _C_BUNDLE_OPTIONS = {
     "bash": frozenset("abcefhiklmnprstuvxBCEHPTD"),
-    "sh": frozenset("abcefhilmnprstuvxCEIV"),
-    "dash": frozenset("abcefhilmnprstuvxCEIV"),
+    # MEASURED against the installed dash (and /usr/bin/sh, which IS dash here):
+    # `-h`, `-r` and `-t` are rejected with "Illegal option" and nothing runs.
+    # They were in this table, so the operand scan walked past them and reported
+    # a command the shell never executed — a false block.
+    # `sh` gets the PERMISSIVE union, deliberately, and this is the one entry
+    # where the strict-is-safer instinct is backwards. The allowlist is selected
+    # by the executable BASENAME, not by the binary `sh` resolves to. Here
+    # /bin/sh -> dash (MEASURED: `sh -ch CMD` exits 2, "Illegal option -h"), but
+    # on a clone where /bin/sh is Bash those same bundles RUN. With dash's set,
+    # `_nested_script` returned "" for them and the nested command was invisible
+    # to every segment-based guard — a BYPASS on those hosts.
+    #
+    # The two error directions are not symmetric. Too strict here HIDES a
+    # command that runs; too permissive reports a command the shell refuses,
+    # which costs a false block on an invocation that was never going to
+    # execute. So `sh` carries the UNION of both shells' letters, and `dash`
+    # keeps the strict set under its own name, where the basename really does
+    # name the binary. (CodeRabbit Major, PR #2112.)
+    #
+    # UNION, not bash's set: the first attempt used bash's letters alone and
+    # dropped `I` and `V`, which dash ACCEPTS — so `sh -cI CMD` became
+    # invisible on a dash host, the same bypass in the opposite direction.
+    # Caught by the existing dash-bundle tests.
+    "sh": frozenset("abcefhiklmnprstuvxBCEHPTD") | frozenset("abcefilmnpsuvxCEIV"),
+    "dash": frozenset("abcefilmnpsuvxCEIV"),
     "ash": frozenset("abcefhilmnprstuvx"),
     "ksh": frozenset("abcefhilmnprstuvx"),
     "zsh": frozenset("Gabcefhilmnprstuvx"),
@@ -2697,41 +2771,222 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
     ``bash -cz`` is rejected by Bash and does not run a script.
     """
     allowed = _C_BUNDLE_OPTIONS[interpreter]
+    takes_value = _C_VALUE_TAKING.get(interpreter, _C_VALUE_TAKING_DEFAULT)
+
+    # No-exec is ONE left-to-right scan over the whole option list, not a
+    # property of the `-c` bundle. MEASURED across the selector (bash 5.2):
+    # `-n -c +n CMD` RUNS, `-n -c -n CMD` does not, `-o noexec -c +o noexec CMD`
+    # RUNS, `-D -c +D CMD` does not. So state carries in BOTH directions and the
+    # last occurrence wins, while `D` is sticky. Tracking it only on the bundle
+    # that carries `c` ignored every option before it: `bash -n -c CMD` parses
+    # and runs NOTHING, and was reported as an executed command — a false block
+    # on an inert invocation (PR #2112).
+    state_noexec = False  # `-n` / `-o noexec`, cleared by the `+` forms
+    sticky_noexec = False  # `D`, either sign, never cleared
 
     for i, tok in enumerate(argv[1:], 1):
+        # A LONE `+` IS NOT A TERMINATOR HERE, and treating it as one is a
+        # BYPASS. `-` and `--` really do end option processing, so the next
+        # token is the command and there is no `-c` script to find. `+` does
+        # not: the shell reads it as an empty option bundle, skips it, and
+        # keeps parsing — so `bash + -c CMD` runs CMD. MEASURED against the
+        # installed bash and dash: both print the payload at exit 0, while
+        # breaking here made `_nested_script` abandon an argv the shell really
+        # runs and every segment-based guard went blind to it.
+        #
+        # `+` WAS in this set, added with `-`/`--` to answer a review finding
+        # about the lone-hyphen case; the hyphen half was right and the plus
+        # half was not. `_first_operand` still treats a lone `+` as a
+        # terminator AFTER the selector, deliberately — see the non-mirror
+        # note there. The shell parses the two positions differently.
         if tok in {"-", "--"}:
             break
-        if not tok.startswith("-"):
+        if not (tok[:1] in ("-", "+") and len(tok) > 1):
+            continue
+        if tok.startswith("--") and tok != "--":
+            # A GNU LONG OPTION IS NOT A SHORT BUNDLE, and treating it as one
+            # is a bypass. `tok[1:]` makes `--posix` the pseudo-bundle
+            # `-posix`, whose leading `-` is in no allowlist, so the validity
+            # test below reads it as "the shell refuses this invocation" and
+            # abandons an argv bash really runs. MEASURED over a 58-shape
+            # token-form sweep against the installed bash: EIGHT long options
+            # (`--posix --login --noprofile --noediting --verbose --debugger
+            # --pretty-print`, and `--init-file VALUE`) executed their `-c`
+            # payload while the parser reported no nested command at all.
+            #
+            # Skipping is the deliberately crude answer. Classifying them needs
+            # a per-interpreter long-option table WITH value arity — the
+            # treadmill `_RUN_CARRIER_VALUE_FLAGS` and the `sudo -S` note
+            # already refused twice — and getting arity wrong there consumes
+            # the command word, which is the same bypass one layer over. The
+            # cost of skipping is a false block on the few long options that
+            # suppress execution (`--help`, `--dump-strings`): an invocation
+            # that runs nothing, reported as though it might, which is the
+            # direction this module's own docstring says to err in.
             continue
 
         options = tok[1:]
-        if "c" not in options:
+        if "c" not in options or tok[0] != "-":
+            # A bundle that does not select the script still carries option
+            # state, and an invalid one makes the shell refuse the whole
+            # invocation.
+            #
+            # ⚠ `+c` IS A SELECTOR and this branch declines it anyway. MEASURED:
+            # `bash +c 'echo X'` and `dash +c 'echo X'` both print X, so the
+            # payload runs while nothing here reports it — a live fail-open in
+            # the `+` spelling. It PRE-DATES this change (the previous scan
+            # skipped `+` tokens entirely and missed it too), and closing it
+            # means deciding what a `+` bundle does to the operand scan, which
+            # is its own measured question rather than a character deleted from
+            # a condition. Tracked as its own issue; NOT closed here, because
+            # widening a gate-surface diff to chase a spelling nothing emits is
+            # how the round budget gets spent. An earlier revision of this
+            # comment asserted the opposite ("`+` DISABLES, so it can never
+            # introduce the command string") — that was false and is the reason
+            # the claim is now stated with its measurement attached.
+            if not set(options) - takes_value <= allowed:
+                return ""  # the shell refuses this invocation; nothing runs
+            n_values = sum(1 for ch in options if ch in takes_value)
+            values = argv[i + 1 : i + 1 + n_values]
+            if set(options) & _C_NO_EXEC_ACTION_LETTERS:
+                sticky_noexec = True
+            if set(options) & _C_NO_EXEC_STATE_LETTERS or any(
+                v in _C_NO_EXEC_OPTION_VALUES for v in values
+            ):
+                state_noexec = tok[0] == "-"
             continue
 
-        pos = tok.find("c")
+        # A value-taking letter ANYWHERE in the bundle consumes the next token,
+        # so the script comes after it. Position-independent on purpose: the
+        # original test only looked one character either side of `c`, so
+        # `-cxo pipefail` and `-oxc pipefail` fell through to the no-value path
+        # and `pipefail` was read as the script. MEASURED: bash runs both.
+        # Multiplicity matters too: EVERY occurrence of a value-taking letter
+        # consumes a token (`bash -coo pipefail errexit CMD` runs CMD).
+        n_values = sum(1 for ch in options if ch in takes_value)
+        if not set(options) - takes_value <= allowed:
+            continue
+        # The bundle carrying `-c` can itself suppress execution: `bash -cn CMD`
+        # parses CMD and runs nothing. It folds into the same running state as
+        # every other bundle rather than short-circuiting, because a LATER `+n`
+        # can still clear it (`bash -cn +n CMD` runs).
+        if set(options) & _C_NO_EXEC_ACTION_LETTERS:
+            sticky_noexec = True
+        if set(options) & _C_NO_EXEC_STATE_LETTERS or any(
+            v in _C_NO_EXEC_OPTION_VALUES
+            for v in argv[i + 1 : i + 1 + n_values]
+        ):
+            state_noexec = True
+        start = i + 1 + n_values
 
-        # `-co` / `-Oc`: `o` / `O` consumes the next token as its value,
-        # so the script is the token after that value.
-        value_taking = (
-            (pos + 1 < len(tok) and tok[pos + 1] in {"o", "O"})
-            or (pos > 0 and tok[pos - 1] in {"o", "O"})
+        # ONCE A VALID `-c` BUNDLE OWNS SELECTION, its resolution is final.
+        # Resuming the outer scan let a LATER `-c` be read as a fresh command
+        # selector: `bash -c -z -c CMD` is rejected by bash and runs nothing,
+        # but the second `-c` was then treated as the real one and CMD reported.
+        # The first `-c` decides, and if its operand cannot be resolved the
+        # answer is "nothing", not "keep looking".
+        found, script, state_noexec, sticky_noexec = _first_operand(
+            argv, start, allowed, takes_value, state_noexec, sticky_noexec
         )
-
-        if value_taking:
-            option_letters = set(options) - {"o", "O"}
-            if not option_letters <= allowed:
-                continue
-            if i + 2 < len(argv):
-                return argv[i + 2]
-            continue
-
-        if not set(options) <= allowed:
-            continue
-
-        if i + 1 < len(argv):
-            return argv[i + 1]
+        if not found or state_noexec or sticky_noexec:
+            return ""
+        return script
 
     return ""
+
+
+def _first_operand(
+    argv: list[str],
+    start: int,
+    allowed: frozenset[str],
+    takes_value: frozenset[str],
+    state_noexec: bool = False,
+    sticky_noexec: bool = False,
+) -> tuple[bool, str, bool, bool]:
+    """``(found, script)`` for the first OPERAND at or after ``start``.
+
+    WHY THIS EXISTS. ``_nested_script`` used to return ``argv[start]`` directly,
+    which is the script only when nothing sits between. It frequently does:
+    ``bash -c -- 'git push …'`` and ``bash -c -e 'git push …'`` both put an
+    option-shaped token there, so the parser handed back ``--`` (or ``-e``) as
+    the script and the real command was never parsed. MEASURED through the real
+    hooks before the fix: exit 0 (ALLOW) from git_push_guard for a command it
+    returns 2 for without the extra token.
+
+    WHY ``found`` IS SEPARATE FROM THE STRING. An empty string is a VALID ``-c``
+    command — ``bash -c '' -c 'git push …'`` runs nothing, exits 0, and the rest
+    becomes ``$0``/``$1``. A truthiness test conflated that with "no operand
+    here" and resumed scanning the positional arguments, reporting a nested
+    ``git push`` for a command that never runs (Codex P2).
+
+    ACCURACY, NOT GENEROSITY. An earlier version of this skipped every
+    option-shaped token on the theory that over-skipping is the safe direction.
+    It is not free: parsing a command the shell REFUSES makes a guard block
+    something that was never going to run. So each bundle is validated against
+    this interpreter's own ``allowed`` set, and an invocation the shell would
+    reject resolves to no operand.
+
+    The one place generosity is still right is the VALUE of ``-o``/``-O``. Its
+    validity depends on a shell- and version-specific option-name table, and
+    being wrong in the strict direction would hide a real command — a bypass —
+    whereas being wrong in the permissive direction only over-blocks an
+    invocation that fails anyway. So the value token is stepped over without
+    being checked, deliberately.
+    """
+    j = start
+    while j < len(argv):
+        tok = argv[j]
+        if tok in ("-", "--", "+"):
+            # END of option processing. The very next token IS the command
+            # string even when it looks like an option: `bash -c -- '-x' CMD`
+            # runs `-x` and makes CMD merely `$0`. Resuming the option scan here
+            # reported CMD as the script and blocked a command that never ran.
+            # A LONE `-` or `+` terminates the same way: MEASURED, `bash -c - cmd`
+            # and `bash -c + cmd` both run cmd (bash and dash).
+            j += 1
+            if j < len(argv):
+                return (True, argv[j], state_noexec, sticky_noexec)
+            return (False, "", state_noexec, sticky_noexec)
+        # NOTE: `_nested_script`'s long-option skip is deliberately NOT mirrored
+        # here, and the asymmetry is measured rather than an oversight. BEFORE
+        # the selector, a long option is something bash processes on its way to
+        # `-c`, so abandoning the argv hides a command that runs. AFTER it, the
+        # long option can itself end the invocation — `bash -c --help CMD` and
+        # `bash -c --dump-strings CMD` exit without running CMD — so resolving
+        # PAST it and reporting the operand is a false block. Mirroring the skip
+        # here produced exactly that: 13 new false blocks across the token-shape
+        # sweep, every one in this position. Declining to resolve is correct.
+        if tok[:1] in ("-", "+") and len(tok) > 1:
+            # `+` bundles are option-DISABLES (`bash -c +e cmd` runs cmd);
+            # `+o`/`+O` consume a value token exactly like `-o` (measured:
+            # `bash -c +o foo cmd` never reaches cmd because foo is not a valid
+            # option name — bash refuses the whole invocation). The letter set
+            # is the same as for `-`: `set +x`/`set -x` are one option table.
+            #
+            # The no-exec checks used to apply to `-` bundles only, on the
+            # rationale that `+` can never ENABLE no-exec. True of `n`, FALSE of
+            # `D`: MEASURED, `bash -c +D CMD` and `bash +D -c CMD` both exit
+            # without running CMD, because `D` selects dump mode as an
+            # invocation ACTION rather than setting shell state (PR #2112).
+            letters = tok[1:]
+            letter_set = set(letters)
+            if not letter_set - takes_value <= allowed:
+                # the shell refuses this invocation
+                return (False, "", state_noexec, sticky_noexec)
+            n_values = sum(1 for ch in letters if ch in takes_value)
+            if letter_set & _C_NO_EXEC_ACTION_LETTERS:
+                sticky_noexec = True  # either sign, never cleared
+            if letter_set & _C_NO_EXEC_STATE_LETTERS or any(
+                v in _C_NO_EXEC_OPTION_VALUES
+                for v in argv[j + 1 : j + 1 + n_values]
+            ):
+                # last occurrence wins: `-n` sets, `+n` clears
+                state_noexec = tok[0] == "-"
+            j += 1 + n_values
+            continue
+        return (True, tok, state_noexec, sticky_noexec)
+    return (False, "", state_noexec, sticky_noexec)
+
 
 # ── git-specific helpers ────────────────────────────────────────────────
 
