@@ -70,7 +70,14 @@ PROJECTS_DIR = Path.home() / ".claude" / "projects"
 # emits exactly one column-zero trailer line; anything else is prose.
 _SESSION_RE = re.compile(r"^Genesis-Session:[ \t]*([0-9a-fA-F]{8})[ \t]*$", re.MULTILINE)
 _INSTALL_RE = re.compile(r"^Install:[ \t]*([0-9a-fA-F]{8})[ \t]*$", re.MULTILINE)
-_PR_RE = re.compile(r"\(#(\d+)\)\s*$")
+# A squash-merge subject can end with SEVERAL parenthesized PR refs — GitHub
+# appends one per stacked PR (measured: subjects ending `(#2152) (#2153)` exist
+# on main). Collapsing to the LAST one makes the earlier numbers undiscoverable
+# offline, so the tail run is captured as a whole and each ref inside it kept.
+# Anchored to the END on purpose: a `(#1234)` mid-subject is prose, not a merge
+# attribution.
+_PR_TAIL_RE = re.compile(r"(?:\(#\d+\)\s*)+$")
+_PR_NUM_RE = re.compile(r"\(#(\d+)\)")
 # The hook shape-constrains ids to exactly 8 lowercase hex; anything else reaching
 # a glob or a SQL GLOB is a pattern, not an identifier.
 _SESSION_ID_RE = re.compile(r"[0-9a-f]{8}")
@@ -138,11 +145,18 @@ def installs_in(text: str) -> list[str]:
 
 
 def scan(
-    rev_range: str, limit: int | None = None, path: str | None = None
+    rev_range: str,
+    limit: int | None = None,
+    path: str | None = None,
+    follow: bool = False,
 ) -> list[dict] | None:
     """Commits in ``rev_range``, each with the sessions stamped in its message.
 
-    ``path`` restricts the walk to commits touching that file.
+    ``path`` restricts the walk to commits touching that file. ``follow`` asks
+    git to continue the walk across a rename, so a file's earlier provenance
+    under its old name is not silently truncated; it only ever applies to the
+    single path this tool passes, and git itself cannot follow copies or
+    complex rename chains, so even with it the answer can end early.
 
     Returns None when GIT ITSELF FAILED, and [] only when the range is genuinely
     empty. Collapsing those two was a fail-open: a timeout made ``cmd_pr`` report
@@ -156,6 +170,8 @@ def scan(
         "--format=%H%x00%ad%x00%s%x00%B",
         "--date=short",
     ]
+    if follow and path is not None:
+        args.append("--follow")
     if limit is not None:
         # A nonpositive limit previously OMITTED the bound entirely, so the scan
         # silently became unbounded while every message still described it as
@@ -181,14 +197,20 @@ def scan(
         if not sha:
             dropped += 1
             continue
-        pr = _PR_RE.search(subject)
+        tail = _PR_TAIL_RE.search(subject)
+        prs = (
+            [int(m.group(1)) for m in _PR_NUM_RE.finditer(tail.group(0))]
+            if tail
+            else []
+        )
         out.append(
             {
                 "sha": sha,
                 "short": sha[:9],
                 "date": date,
                 "subject": subject,
-                "pr": int(pr.group(1)) if pr else None,
+                "pr": prs[-1] if prs else None,
+                "prs": prs,
                 "sessions": sessions_in(body),
                 "installs": installs_in(body),
             }
@@ -200,6 +222,57 @@ def scan(
             file=sys.stderr,
         )
     return out
+
+
+def _gh_head_name(ref: str) -> str:
+    """The GitHub head name for a local ref.
+
+    A remote-tracking ref is `origin/<branch>` locally but `<branch>` on
+    GitHub, so `gh pr list --head origin/foo` queries a name that does not
+    exist and a merged remote-tracking branch reads as unlanded. Strip only
+    the remote prefix here; the full ref stays in use for local git lookups.
+    """
+    for prefix in ("refs/remotes/origin/", "origin/"):
+        if ref.startswith(prefix):
+            return ref[len(prefix):]
+    return ref
+
+
+def _merged_pr_heads(ref: str) -> list[str]:
+    """Head OIDs of merged PRs whose head name matches ``ref``, newest-ish
+    first; [] when gh cannot answer."""
+    try:
+        r = subprocess.run(
+            [
+                "gh", "pr", "list", "--head", _gh_head_name(ref),
+                "--base", "main", "--state", "merged", "--limit", "20",
+                "--json", "number,headRefOid",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+            timeout=30,
+        )
+        if r.returncode != 0:
+            return []
+        return [str(pr.get("headRefOid") or "") for pr in json.loads(r.stdout)]
+    except (subprocess.TimeoutExpired, FileNotFoundError,
+            json.JSONDecodeError, OSError, ValueError):
+        return []
+
+
+def _is_ancestor(a: str, b: str) -> bool:
+    """`git merge-base --is-ancestor`, False on any error."""
+    try:
+        r = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", a, b],
+            capture_output=True,
+            cwd=str(REPO_ROOT),
+            timeout=10,
+        )
+        return r.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
+        return False
 
 
 def _is_patch_merged(branch: str) -> bool:
@@ -228,26 +301,8 @@ def _is_patch_merged(branch: str) -> bool:
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
         pass
     tip = _git("rev-parse", branch).strip()
-    if tip:
-        try:
-            r = subprocess.run(
-                [
-                    "gh", "pr", "list", "--head", branch, "--base", "main",
-                    "--state", "merged", "--limit", "10",
-                    "--json", "number,headRefOid",
-                ],
-                capture_output=True,
-                text=True,
-                cwd=str(REPO_ROOT),
-                timeout=30,
-            )
-            if r.returncode == 0:
-                for pr in json.loads(r.stdout):
-                    if pr.get("headRefOid") == tip:
-                        return True
-        except (subprocess.TimeoutExpired, FileNotFoundError,
-                json.JSONDecodeError, OSError, ValueError):
-            pass
+    if tip and tip in _merged_pr_heads(branch):
+        return True
     out = _git("cherry", "main", branch)
     if not out:
         return False
@@ -369,7 +424,7 @@ def cmd_pr(number: int, limit: int | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    hits = [c for c in commits if c["pr"] == number]
+    hits = [c for c in commits if number in c["prs"]]
     if hits:
         c = hits[0]
         print(f"PR #{number} — merged as {c['short']} on {c['date']}")
@@ -590,7 +645,22 @@ def cmd_session(session_id: str, limit: int) -> int:
             # Reporting those as "unlanded" is the opposite of this tool's job:
             # it would manufacture lost work out of work that shipped.
             continue
-        branch_commits = scan(f"main..{b}")
+        # A branch that ADVANCED past a squash merge still carries the shipped
+        # originals on `main..<branch>`, and a session confined to that merged
+        # prefix would be reported unlanded. Bound the scan at the latest merged
+        # PR head that is still an ancestor of the tip — commits after it are
+        # the branch's actually-unlanded work.
+        base = "main"
+        tip = _git("rev-parse", b).strip()
+        ancestors = [
+            h for h in _merged_pr_heads(b)
+            if h and _is_ancestor(h, tip)
+        ] if tip else []
+        if ancestors:
+            latest = _git("merge-base", "--independent", *ancestors).split()
+            if latest:
+                base = latest[0]
+        branch_commits = scan(f"{base}..{b}")
         if branch_commits is None:
             # A failed branch scan is not an empty one. Swallowing it here would
             # report a SHORTER list of unlanded work than actually exists, which
@@ -636,7 +706,7 @@ def cmd_file(path: str, line: int | None, limit: int) -> int:
             return 0
         return cmd_commit(first)
 
-    commits = scan("main", limit=limit, path=path)
+    commits = scan("main", limit=limit, path=path, follow=True)
     if commits is None:
         print(f"could not read history for {path}", file=sys.stderr)
         return 1

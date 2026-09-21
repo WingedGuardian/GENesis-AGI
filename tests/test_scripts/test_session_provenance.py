@@ -556,3 +556,109 @@ def test_a_capped_ambiguity_count_says_at_least(repo):
     """LIMIT-ed rows can only prove "at least N", and said "N" exactly."""
     assert "at least" in sp._describe({"id": "x", "db": {"ambiguous": 3, "capped": True}})
     assert "at least" not in sp._describe({"id": "x", "db": {"ambiguous": 2, "capped": False}})
+
+
+# ─── Devin Review round, each pinned ─────────────────────────────────────────
+
+
+def test_every_terminal_pr_number_is_recorded(repo, monkeypatch, capsys):
+    """A subject can end with several `(#N)` refs — one per stacked PR.
+
+    Collapsing to the LAST number made the earlier ones undiscoverable offline:
+    the merge commit was in the clone but `--pr <earlier>` could not use it.
+    """
+    _commit(repo, "a.txt", "feat: stacked (#2152) (#2153)\n\nGenesis-Session: 11111111\n")
+    found = sp.scan("main", limit=1)
+    assert found[0]["prs"] == [2152, 2153]
+    # And a mid-subject ref is prose, not merge attribution.
+    _commit(repo, "b.txt", "fix: revisit (#1) in passing\n\nGenesis-Session: 22222222\n")
+    assert sp.scan("main", limit=1)[0]["prs"] == []
+
+    def _boom(n):
+        raise AssertionError("gh must not be needed — the answer is local")
+
+    monkeypatch.setattr(sp, "_pr_lookup", _boom)
+    rc = sp.cmd_pr(2152)
+    out = capsys.readouterr().out
+    assert rc == 0 and "merged as" in out
+
+
+def test_a_remote_tracking_ref_queries_its_github_head_name(repo, monkeypatch):
+    """`origin/foo` is the LOCAL name; GitHub knows the head as `foo`.
+
+    Asking `--head origin/foo` found nothing, so a merged remote-tracking
+    branch read as unlanded. The gh query gets the stripped name; git keeps
+    the full ref.
+    """
+    _git(repo, "checkout", "-q", "-b", "feat/x")
+    _commit(repo, "f.txt", "feat: work\n\nGenesis-Session: 22222222\n")
+    tip = _git(repo, "rev-parse", "feat/x").strip()
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "update-ref", "refs/remotes/origin/feat/x", tip)
+    _git(repo, "branch", "-D", "feat/x")
+
+    seen: list[str] = []
+    real_run = subprocess.run
+
+    def _fake_gh(args, **kwargs):
+        if args[:1] == ["gh"]:
+            seen.append(args[args.index("--head") + 1])
+            import json as _json
+            return subprocess.CompletedProcess(
+                args=[], returncode=0,
+                stdout=_json.dumps([{"number": 7, "headRefOid": tip}]), stderr="",
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(sp.subprocess, "run", _fake_gh)
+    assert sp._is_patch_merged("origin/feat/x") is True
+    assert seen and all(h == "feat/x" for h in seen), (
+        f"gh must be asked for 'feat/x', not the remote-tracking name: {seen}"
+    )
+
+
+def test_an_advanced_branch_only_counts_commits_past_the_merge(repo, monkeypatch, capsys):
+    """A squash-merged branch that ADVANCES still carries its shipped originals.
+
+    `main..<branch>` includes them, so a session confined to the merged prefix
+    read as unlanded. The scan must be bounded at the latest merged PR head.
+    """
+    _commit(repo, "base.txt", "feat: base\n\nGenesis-Session: 11111111\n")
+    _git(repo, "checkout", "-q", "-b", "advancing")
+    _commit(repo, "f1.txt", "feat: one\n\nGenesis-Session: 22222222\n")
+    merged_head = _git(repo, "rev-parse", "advancing").strip()
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "merge", "--squash", "advancing")
+    _git(repo, "commit", "-q", "-m", "feat: squashed (#9)")
+    # The same branch then picks up new, genuinely unlanded work.
+    _git(repo, "checkout", "-q", "advancing")
+    _commit(repo, "f2.txt", "feat: two\n\nGenesis-Session: 33333333\n")
+    _git(repo, "checkout", "-q", "main")
+
+    monkeypatch.setattr(
+        sp, "_merged_pr_heads", lambda ref: [merged_head] if ref == "advancing" else []
+    )
+    rc = sp.cmd_session("22222222", 50)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "unlanded branches" not in out, (
+        "the merged prefix is not unlanded work for its session"
+    )
+    rc = sp.cmd_session("33333333", 50)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "advancing" in out, "the post-merge suffix IS unlanded work"
+
+
+def test_file_provenance_follows_a_rename(repo, capsys):
+    """Without --follow, `git log -- new.py` stops at the rename commit and the
+    file's earlier provenance under its old name is truncated away."""
+    _commit(repo, "old.txt", "feat: create\n\nGenesis-Session: 11111111\n")
+    _git(repo, "mv", "old.txt", "new.txt")
+    _git(repo, "commit", "-q", "-m", "feat: rename\n\nGenesis-Session: 22222222\n")
+
+    rc = sp.cmd_file("new.txt", None, 50)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "22222222" in out
+    assert "11111111" in out, "the creating session is still the file's provenance"
