@@ -9,8 +9,10 @@
   the same short handles as the rest of the system, and because the caller names
   both, both can be checked before anything is written: a handle naming no
   memory, an ambiguous prefix, a memory asked to replace itself, or a successor
-  that is itself deprecated are all rejected with nothing changed. A failed call
-  is a no-op that is safe to retry.
+  that is itself deprecated are all rejected with nothing changed. If the
+  deprecation itself fails partway through, the call reports `superseded:
+  false` rather than raising — the earlier stores may already be durable, and
+  retrying the same call is safe because every step is idempotent.
 
   `memory_store(supersedes=...)` keeps working and is still the right call when
   the correction is new content.

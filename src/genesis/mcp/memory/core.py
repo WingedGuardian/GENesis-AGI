@@ -824,8 +824,19 @@ async def memory_store(
     room: str | None = None,
     collection: str | None = None,
     supersedes: str | None = None,
-) -> str:
+) -> str | dict:
     """Store memory with source metadata and type tag. Returns memory_id.
+
+    Return shape depends on ``supersedes``, which the caller controls: without
+    it you get the memory_id string, exactly as before. WITH it you get a dict
+    ``{"memory_id", "superseded", ...}``, because the deprecation can fail on
+    its own after the content is safely stored, and reporting only the id is
+    what let that failure go unnoticed.
+
+    A supersede whose target cannot be resolved, or whose pair cannot express a
+    correction, RAISES instead — nothing is written in those cases, so there is
+    no half-done operation to describe. The dict exists for the one outcome
+    that is genuinely partial: the memory landed and the deprecation did not.
 
     Args:
         memory_class: Optional classification — "rule", "fact", or "reference".
@@ -836,7 +847,11 @@ async def memory_store(
             collection routing when provided (e.g. "knowledge_base").
         supersedes: Memory ID that this new memory replaces. The old memory
             will be marked as deprecated with a ``succeeded_by`` link to the
-            new one. Use when correcting stale facts.
+            new one. Use when correcting stale facts. Accepts the same short
+            ``id:<8-char>`` handles the proactive hook prints; an ambiguous one
+            is never guessed. If both memories already exist, use
+            ``memory_supersede`` instead — this parameter is for the case where
+            the correction is new content.
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
@@ -848,7 +863,21 @@ async def memory_store(
     # "conversation" pipeline. None (foreground/unset) → pipeline-derived.
     from genesis.memory.provenance import session_origin_from_env
 
-    return await memory_mod._store.store(
+    # An empty or all-whitespace handle is not a request. The store's own guard
+    # is a truthiness test, so "" and "   " deprecate nothing — while an
+    # `is None` test here would treat them as a requested supersede and report a
+    # success for an operation that never ran. Normalized ONCE, so the two
+    # layers cannot disagree about what counts as a request. MCP and
+    # `POST /api/t/memory_store` both accept a string, so an empty one arrives
+    # without any client bug.
+    supersedes = supersedes.strip() if supersedes else None
+
+    # Out-param: the store writes whether the deprecation actually landed. It
+    # cannot come back as an exception — the memory is durable by then, and
+    # raising reads as "the store failed" and invites a duplicating retry.
+    outcome: dict = {}
+
+    memory_id = await memory_mod._store.store(
         content,
         source,
         memory_type=memory_type,
@@ -861,7 +890,32 @@ async def memory_store(
         room=room,
         collection=collection,
         supersedes=supersedes,
+        supersede_outcome=outcome,
     )
+
+    if not supersedes:
+        return memory_id
+
+    report: dict = {
+        "memory_id": memory_id,
+        "superseded": outcome.get("superseded", False),
+        "supersedes_requested": supersedes,
+    }
+    if not report["superseded"]:
+        # ONE failure case and ONE remedy, because the supersede is now a
+        # standalone operation. The advice used to branch by reason and none of
+        # its branches could actually be carried out — there was no way to
+        # complete a supersede without re-storing the content, which is how the
+        # duplicating retry loop kept running.
+        report["warning"] = (
+            f"The memory WAS stored ({memory_id}), but the deprecation did NOT "
+            "happen (an unexpected error — see the server log). The old memory "
+            "is probably still live in recall. Do NOT re-send this as a new "
+            f"memory. Complete it with memory_supersede({supersedes!r}, "
+            f"{memory_id!r}), which does only the deprecation and duplicates "
+            "nothing."
+        )
+    return report
 
 
 @mcp.tool()
@@ -878,11 +932,13 @@ async def memory_supersede(old_id: str, new_id: str) -> dict:
     hook prints and ``memory_expand`` accepts; an ambiguous handle is never
     guessed.
 
-    Nothing is written unless every check passes, so a failure here costs
-    nothing and is safe to retry once you have corrected the ids. It raises
-    rather than returning a verdict, because there is no stored content whose
-    fate you would have to interpret alongside the error — that asymmetry is
-    exactly why this exists as its own tool.
+    Nothing is written unless every check passes, so a rejection costs
+    nothing and is safe to retry once you have corrected the ids. Rejections
+    raise — there is no stored content whose fate you would have to interpret
+    alongside the error. A failure PARTWAY through the deprecation reports
+    ``superseded: false`` instead: the writes commit per store, so an earlier
+    layer may already be durable, and the remedy is simply to call this tool
+    again — every step is idempotent.
 
     Rejected, with nothing changed:
       * either id naming no memory, or a prefix naming several
@@ -898,8 +954,7 @@ async def memory_supersede(old_id: str, new_id: str) -> dict:
     memory_mod._require_init()
     assert memory_mod._store is not None
 
-    await memory_mod._store.supersede(old_id, new_id)
-    return {"superseded": True, "old_id": old_id, "new_id": new_id}
+    return await memory_mod._store.supersede(old_id, new_id)
 
 
 @mcp.tool()

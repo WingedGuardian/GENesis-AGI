@@ -185,6 +185,7 @@ class MemoryStore:
         life_domain: str | None = None,
         project_type: str | None = None,
         supersedes: str | None = None,
+        supersede_outcome: dict | None = None,  # out-param: see below
         origin_class: str | None = None,
         speech_act: str | None = None,
         speech_act_confidence: float | None = None,
@@ -269,19 +270,10 @@ class MemoryStore:
                 # earlier. Same validator memory_supersede uses; nothing is
                 # written if it rejects.
                 await self._validate_supersede_pair(resolved_supersedes, existing)
-                try:
-                    await self._mark_superseded(
-                        resolved_supersedes, existing, datetime.now(UTC).isoformat(),
-                    )
-                except Exception:
-                    # Mirrors the normal supersede path below: a failure once
-                    # the pair is validated is infrastructure, and it must not
-                    # turn a durable store into a raised error — that reads as
-                    # "the store failed" and invites a duplicating retry.
-                    logger.warning(
-                        "Failed to mark memory %s as superseded by %s",
-                        resolved_supersedes, existing, exc_info=True,
-                    )
+                await self._apply_supersede(
+                    resolved_supersedes, existing,
+                    datetime.now(UTC).isoformat(), supersede_outcome,
+                )
             return existing
 
         # Surface form normalization: expand known aliases before embedding
@@ -593,13 +585,9 @@ class MemoryStore:
         # above, so anything that fails here is an infrastructure fault rather
         # than a bad handle.
         if resolved_supersedes:
-            try:
-                await self._mark_superseded(resolved_supersedes, memory_id, now_iso)
-            except Exception:
-                logger.warning(
-                    "Failed to mark memory %s as superseded by %s",
-                    resolved_supersedes, memory_id, exc_info=True,
-                )
+            await self._apply_supersede(
+                resolved_supersedes, memory_id, now_iso, supersede_outcome,
+            )
 
         return memory_id
 
@@ -609,16 +597,26 @@ class MemoryStore:
         new_handle: str,
         *,
         timestamp: str | None = None,
-    ) -> None:
+    ) -> dict:
         """Deprecate *old_handle*, recording *new_handle* as its correction.
 
         The supersede as its own operation, rather than a side effect of
         storing. That distinction is what makes this simple: BOTH ids are named
         by the caller, so both can be resolved and validated up front, and there
         is no content being written whose fate has to be reported alongside the
-        outcome. Every failure is a precondition failure, nothing is mutated,
-        and the caller can retry for free — so this raises rather than
-        returning a verdict to interpret.
+        outcome. Every REJECTION is a precondition failure — nothing is
+        mutated, so it raises, and the caller can fix the ids and retry.
+
+        The writes themselves are a different matter. ``_mark_superseded``
+        commits each store independently — SQLite first, then the Qdrant
+        payload, then the ``succeeded_by`` link — so a failure partway through
+        is partial: the deprecation can be durable in SQLite while the old
+        vector stays live in recall. Raising that case would report failure
+        for an operation whose first half already landed, so it is REPORTED
+        instead: ``{"superseded": False, ...}``. The remedy is the same call
+        again — every step is idempotent (the UPDATE re-marks, the payload
+        re-sets, the link dedups on its PK), so retry completes what failed
+        and duplicates nothing.
 
         Contrast ``store(supersedes=...)``, where the successor is whatever that
         call produces: the caller never names it, cannot see it, and a failure
@@ -627,9 +625,67 @@ class MemoryStore:
         old_id = await self._resolve_supersede_target(old_handle)
         new_id = await self._resolve_supersede_target(new_handle, role="new_id")
         await self._validate_supersede_pair(old_id, new_id)
-        await self._mark_superseded(
-            old_id, new_id, timestamp or datetime.now(UTC).isoformat(),
-        )
+        report: dict = {"superseded": True, "old_id": old_id, "new_id": new_id}
+        try:
+            await self._mark_superseded(
+                old_id, new_id, timestamp or datetime.now(UTC).isoformat(),
+            )
+        except SupersedeUnresolved:
+            # The mark_superseded rowcheck found the row gone between resolve
+            # and write — nothing landed, so this stays a plain rejection.
+            raise
+        except Exception:
+            logger.warning(
+                "Supersede of %s by %s failed partway through",
+                old_id, new_id, exc_info=True,
+            )
+            report["superseded"] = False
+            report["warning"] = (
+                "The deprecation failed partway through — earlier layers may "
+                "already be durable (see the server log). Do NOT store the "
+                "correction again; retry the SAME memory_supersede call: "
+                "every step is idempotent, so it finishes what failed and "
+                "duplicates nothing."
+            )
+        return report
+
+    async def _apply_supersede(
+        self,
+        old_id: str,
+        new_id: str,
+        timestamp: str,
+        outcome: dict | None,
+    ) -> None:
+        """Run a VALIDATED supersede and record whether it landed.
+
+        By the time this runs, both ids are resolved and the pair has been
+        checked, so anything that throws here is infrastructure — a locked
+        database, a dead connection — not a bad request. Two consequences, and
+        they pull in opposite directions:
+
+        * It must NOT raise. The new memory is already durable, and an exception
+          reads to a caller as "the store failed", which invites the retry that
+          duplicates the memory. That retry was measured twice on 2026-09-06.
+        * It must NOT be silent either. Logging alone is what let a session be
+          told its correction had landed while the stale memory stayed live in
+          recall — the defect this whole change exists to close, arriving by a
+          different door.
+
+        So it swallows and REPORTS. ``outcome`` is written on both branches
+        rather than only on failure: "absent means fine" is the kind of default
+        that goes wrong quietly the first time a new path forgets to set it.
+        """
+        try:
+            await self._mark_superseded(old_id, new_id, timestamp)
+            applied = True
+        except Exception:
+            applied = False
+            logger.warning(
+                "Failed to mark memory %s as superseded by %s",
+                old_id, new_id, exc_info=True,
+            )
+        if outcome is not None:
+            outcome["superseded"] = applied
 
     async def _validate_supersede_pair(self, old_id: str, new_id: str) -> None:
         """Reject a pair that cannot express a correction. Reads only.
@@ -728,6 +784,9 @@ class MemoryStore:
         # fired a doomed update_payload on 'pending'/'failed' rows every time.
         meta = await memory_crud.get_metadata(self._db, old_id)
         if meta and meta["embedding_status"] == "embedded":
+            # A failed payload write is NOT benign: vector recall excludes only
+            # points carrying deprecated=True, so swallowing it would leave the
+            # old memory live while the caller is told the supersede landed.
             try:
                 await asyncio.to_thread(
                     update_payload,
@@ -741,6 +800,7 @@ class MemoryStore:
                     "Qdrant update_payload failed for superseded memory %s",
                     old_id, exc_info=True,
                 )
+                raise
 
         # Create succeeded_by link for graph traversal
         try:
@@ -753,12 +813,15 @@ class MemoryStore:
                 created_at=timestamp,
             )
         except Exception as link_exc:
-            # PK collision is fine (link already exists); log unexpected errors
+            # PK collision is fine (link already exists); anything else means
+            # the edge was never written and the supersede is incomplete — the
+            # caller decides what that is worth, so propagate rather than log.
             if "UNIQUE constraint" not in str(link_exc):
                 logger.warning(
                     "Failed to create succeeded_by link %s → %s: %s",
                     old_id, new_id, link_exc,
                 )
+                raise
         else:
             # The CRUD create does not invalidate (its callers do, by
             # convention) — and this caller previously didn't either, so every

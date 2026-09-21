@@ -158,6 +158,10 @@ _UNIVERSAL_DISALLOW = [
     "mcp__genesis-memory__memory_store",
     "mcp__genesis-memory__memory_synthesize",
     "mcp__genesis-memory__memory_extract",
+    # memory_supersede mutates the same vector store (deprecates a Qdrant
+    # point) — the remedy for a partial supersede belongs to foreground
+    # sessions, never a background profile.
+    "mcp__genesis-memory__memory_supersede",
     # Knowledge ingestion requires explicit user authorization.
     "mcp__genesis-memory__knowledge_ingest",
     "mcp__genesis-memory__knowledge_ingest_batch",
