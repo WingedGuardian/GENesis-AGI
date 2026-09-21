@@ -1,13 +1,9 @@
 providers:
-  ollama-3b:
-    type: ollama
-    model: qwen2.5:3b
-    profile: qwen2.5-3b
-    base_url: ${OLLAMA_URL:-http://localhost:11434}
-    free: true
-    enabled: ${GENESIS_ENABLE_OLLAMA:-true}
-    keep_alive: -1
-    open_duration_s: 60
+  # NOTE: a local `ollama-3b` chat rung was removed here. It was wired into no
+  # call site, so removing it changes no routing. OLLAMA ITSELF IS STILL A
+  # SUPPORTED PROVIDER TYPE — an install that wants to run a local model can add
+  # its own entry under `type: ollama` (base_url plus the model tag), and
+  # `ollama-embedding` below still ships. Only this one unused rung is gone.
   ollama-embedding:
     type: ollama
     model: ${OLLAMA_EMBEDDING_MODEL:-qwen3-embedding:0.6b-fp16}
@@ -414,6 +410,18 @@ call_sites:
     # (free ~40 RPM per-model, historically flaky).
     - openrouter-gemma4
     - nvidia-nim-deepseek
+    # PAID LAST RESORT, 2026-09-21 — at the TRUE end of the chain, so it fires
+    # only after every free rung above has failed. It was first inserted ABOVE
+    # gemma4/nim, which would have spent money while a free rung was still
+    # available, and would have falsified the comment directly above (those two
+    # exist precisely so this site survives a free-tier outage WITHOUT paid
+    # fallback). DeepSeek V4.1 Flash leads at $0.15/$0.60 per MTok (measured),
+    # MiniMax backs it up at $0.30/$1.20. A `qwen-plus` rung was dropped on the
+    # same date: chaining it would make the `qwen` provider TYPE
+    # chain-referenced, widening onboarding's derived LLM-key set with the
+    # DashScope EMBEDDING key.
+    - openrouter-deepseek-flash
+    - minimax
     retry_profile: background
   4_light_reflection:
     chain:
@@ -464,6 +472,14 @@ call_sites:
     - groq-free
     - gemini-free
     - openrouter-free
+    # PAID LAST RESORT, appended 2026-09-21. This chain was all-free, so once
+    # every free provider failed it had no rung left. DeepSeek V4.1 Flash leads
+    # at $0.15/$0.60 per MTok (measured), MiniMax backs it up at $0.30/$1.20.
+    # A `qwen-plus` rung was dropped from this tail on the same date: chaining
+    # it would make the `qwen` provider TYPE chain-referenced, which widens
+    # onboarding's derived LLM-key set with the DashScope EMBEDDING key.
+    - openrouter-deepseek-flash
+    - minimax
     retry_profile: background
   12_surplus_brainstorm:
     chain:
@@ -481,6 +497,14 @@ call_sites:
     - groq-free
     - gemini-free
     - openrouter-free
+    # PAID LAST RESORT, appended 2026-09-21. This chain was all-free, so once
+    # every free provider failed it had no rung left. DeepSeek V4.1 Flash leads
+    # at $0.15/$0.60 per MTok (measured), MiniMax backs it up at $0.30/$1.20.
+    # A `qwen-plus` rung was dropped from this tail on the same date: chaining
+    # it would make the `qwen` provider TYPE chain-referenced, which widens
+    # onboarding's derived LLM-key set with the DashScope EMBEDDING key.
+    - openrouter-deepseek-flash
+    - minimax
   14_weekly_self_assessment:
     chain:
     - openrouter-opus
@@ -510,6 +534,14 @@ call_sites:
   18_meta_prompting:
     chain:
     - openrouter-free
+    # PAID LAST RESORT, appended 2026-09-21. This chain was all-free, so once
+    # every free provider failed it had no rung left. DeepSeek V4.1 Flash leads
+    # at $0.15/$0.60 per MTok (measured), MiniMax backs it up at $0.30/$1.20.
+    # A `qwen-plus` rung was dropped from this tail on the same date: chaining
+    # it would make the `qwen` provider TYPE chain-referenced, which widens
+    # onboarding's derived LLM-key set with the DashScope EMBEDDING key.
+    - openrouter-deepseek-flash
+    - minimax
     default_paid: true
   20_adversarial_counterargument:
     chain:
@@ -526,6 +558,14 @@ call_sites:
     - groq-free
     - gemini-free
     - openrouter-free
+    # PAID LAST RESORT, appended 2026-09-21. This chain was all-free, so once
+    # every free provider failed it had no rung left. DeepSeek V4.1 Flash leads
+    # at $0.15/$0.60 per MTok (measured), MiniMax backs it up at $0.30/$1.20.
+    # A `qwen-plus` rung was dropped from this tail on the same date: chaining
+    # it would make the `qwen` provider TYPE chain-referenced, which widens
+    # onboarding's derived LLM-key set with the DashScope EMBEDDING key.
+    - openrouter-deepseek-flash
+    - minimax
     retry_profile: background
   # V4 placeholder: entity extraction / metadata tagging for the knowledge graph.
   # No live consumers today; chain is prep for future memory-consolidation pipeline.
@@ -534,6 +574,14 @@ call_sites:
     - mistral-small-free
     - groq-free
     - openrouter-free
+    # PAID LAST RESORT, appended 2026-09-21. This chain was all-free, so once
+    # every free provider failed it had no rung left. DeepSeek V4.1 Flash leads
+    # at $0.15/$0.60 per MTok (measured), MiniMax backs it up at $0.30/$1.20.
+    # A `qwen-plus` rung was dropped from this tail on the same date: chaining
+    # it would make the `qwen` provider TYPE chain-referenced, which widens
+    # onboarding's derived LLM-key set with the DashScope EMBEDDING key.
+    - openrouter-deepseek-flash
+    - minimax
   # Dream cycle: cluster-merge synthesis for episodic memory consolidation.
   # Free-tier only. Separate from 22_tagging (entity extraction).
   dream_cycle_synthesis:
@@ -589,6 +637,15 @@ call_sites:
     - mistral-large-free
     - mistral-medium-free
     - openrouter-gemma4
+    # PAID LAST RESORT (2026-09-21), deliberately WITHOUT openrouter-deepseek-flash.
+    # `dream_cycle_entity_challenge` carries that model, and the pairwise
+    # invariant in test_config_invariants requires the base and challenge chains
+    # to resolve to DISJOINT model sets — otherwise an outage routes both to one
+    # model and the challenge approves its own base output. MiniMax is absent
+    # from the challenge chain, so this fallback stays legal.
+    # Placed AFTER gemma4 so it is genuinely last: at the insertion point this
+    # block first landed on, a free rung still followed it.
+    - minimax
     retry_profile: background
   # MW-2 relationship classifier — coarse relationship judgment
   # (duplicate/contradicts/succeeded_by/distinct) between candidate memory pairs.
@@ -604,6 +661,14 @@ call_sites:
     - mistral-large-free
     - mistral-medium-free
     - openrouter-gemma4
+    # PAID LAST RESORT, appended 2026-09-21. This chain was all-free, so once
+    # every free provider failed it had no rung left. DeepSeek V4.1 Flash leads
+    # at $0.15/$0.60 per MTok (measured), MiniMax backs it up at $0.30/$1.20.
+    # A `qwen-plus` rung was dropped from this tail on the same date: chaining
+    # it would make the `qwen` provider TYPE chain-referenced, which widens
+    # onboarding's derived LLM-key set with the DashScope EMBEDDING key.
+    - openrouter-deepseek-flash
+    - minimax
     retry_profile: background
   # Adversarial challenge of entity "duplicate" verdicts. Flipped pairing:
   # DeepSeek challenges the entity_check's judgments (which lead with groq-free).
@@ -623,6 +688,13 @@ call_sites:
     - mistral-large-free
     - mistral-medium-free
     - openrouter-gemma4
+    # PAID LAST RESORT (2026-09-21), deliberately WITHOUT openrouter-deepseek-flash.
+    # `entity_adjudication_challenge` carries that model, and the two chains must
+    # resolve to DISJOINT model sets so an outage cannot route both to one model
+    # and let the challenge approve the merge verdict it is meant to check — the
+    # gate that guards merge_entity. MiniMax is absent from the
+    # challenge chain, so this fallback stays legal.
+    - minimax
     retry_profile: background
   # Adversarial challenge of an entity-node "merge" verdict. Flipped pairing
   # (DeepSeek challenges the groq-free-led adjudication) so a single model's
@@ -669,6 +741,14 @@ call_sites:
     - lmstudio-30b
     - mistral-large-free
     - mistral-medium-free
+    # PAID LAST RESORT, appended 2026-09-21. This chain was all-free, so once
+    # every free provider failed it had no rung left. DeepSeek V4.1 Flash leads
+    # at $0.15/$0.60 per MTok (measured), MiniMax backs it up at $0.30/$1.20.
+    # A `qwen-plus` rung was dropped from this tail on the same date: chaining
+    # it would make the `qwen` provider TYPE chain-referenced, which widens
+    # onboarding's derived LLM-key set with the DashScope EMBEDDING key.
+    - openrouter-deepseek-flash
+    - minimax
     default_paid: true
     retry_profile: background
   31_outcome_classification:
@@ -692,6 +772,14 @@ call_sites:
     - nvidia-nim-deepseek
     - mistral-large-free
     - mistral-medium-free
+    # PAID LAST RESORT, appended 2026-09-21. This chain was all-free, so once
+    # every free provider failed it had no rung left. DeepSeek V4.1 Flash leads
+    # at $0.15/$0.60 per MTok (measured), MiniMax backs it up at $0.30/$1.20.
+    # A `qwen-plus` rung was dropped from this tail on the same date: chaining
+    # it would make the `qwen` provider TYPE chain-referenced, which widens
+    # onboarding's derived LLM-key set with the DashScope EMBEDDING key.
+    - openrouter-deepseek-flash
+    - minimax
     description: LLM-driven skill improvement proposals
   34_research_synthesis:
     chain:
@@ -700,6 +788,14 @@ call_sites:
     - mistral-large-free
     - mistral-medium-free
     - nvidia-nim-deepseek
+    # PAID LAST RESORT, appended 2026-09-21. This chain was all-free, so once
+    # every free provider failed it had no rung left. DeepSeek V4.1 Flash leads
+    # at $0.15/$0.60 per MTok (measured), MiniMax backs it up at $0.30/$1.20.
+    # A `qwen-plus` rung was dropped from this tail on the same date: chaining
+    # it would make the `qwen` provider TYPE chain-referenced, which widens
+    # onboarding's derived LLM-key set with the DashScope EMBEDDING key.
+    - openrouter-deepseek-flash
+    - minimax
     description: Synthesize research results into concise summaries
   38_procedure_extraction:
     chain:
@@ -745,6 +841,14 @@ call_sites:
     - groq-free
     - mistral-small-free
     - gemini-free
+    # PAID LAST RESORT, appended 2026-09-21. This chain was all-free, so once
+    # every free provider failed it had no rung left. DeepSeek V4.1 Flash leads
+    # at $0.15/$0.60 per MTok (measured), MiniMax backs it up at $0.30/$1.20.
+    # A `qwen-plus` rung was dropped from this tail on the same date: chaining
+    # it would make the `qwen` provider TYPE chain-referenced, which widens
+    # onboarding's derived LLM-key set with the DashScope EMBEDDING key.
+    - openrouter-deepseek-flash
+    - minimax
     description: "Unified cognitive loop focus selector — picks ego attention direction from pending signals"
   43_task_retrospective:
     chain:
@@ -800,6 +904,14 @@ call_sites:
     - mistral-large-free
     - mistral-medium-free
     - openrouter-free
+    # PAID LAST RESORT, appended 2026-09-21. This chain was all-free, so once
+    # every free provider failed it had no rung left. DeepSeek V4.1 Flash leads
+    # at $0.15/$0.60 per MTok (measured), MiniMax backs it up at $0.30/$1.20.
+    # A `qwen-plus` rung was dropped from this tail on the same date: chaining
+    # it would make the `qwen` provider TYPE chain-referenced, which widens
+    # onboarding's derived LLM-key set with the DashScope EMBEDDING key.
+    - openrouter-deepseek-flash
+    - minimax
     description: Draft content for various platforms
   23_outreach_review:
     chain:
@@ -807,7 +919,15 @@ call_sites:
     - groq-free
     - mistral-large-free
     - mistral-medium-free
-    description: "Outreach pre-send cross-vendor review (free chain). Renamed from 23_fresh_eyes_review 2026-05-10 (disambiguates from executor Gate 2 at 17_executor_review)."
+    # PAID LAST RESORT, appended 2026-09-21. This chain was all-free, so once
+    # every free provider failed it had no rung left. DeepSeek V4.1 Flash leads
+    # at $0.15/$0.60 per MTok (measured), MiniMax backs it up at $0.30/$1.20.
+    # A `qwen-plus` rung was dropped from this tail on the same date: chaining
+    # it would make the `qwen` provider TYPE chain-referenced, which widens
+    # onboarding's derived LLM-key set with the DashScope EMBEDDING key.
+    - openrouter-deepseek-flash
+    - minimax
+    description: "Outreach pre-send cross-vendor review. Free providers first, paid last-resort tail. Renamed from 23_fresh_eyes_review 2026-05-10 (disambiguates from executor Gate 2 at 17_executor_review)."
   36_code_auditor:
     chain:
     - kimi
@@ -847,6 +967,14 @@ call_sites:
     - gemini-free
     - groq-free
     - openrouter-free
+    # PAID LAST RESORT, appended 2026-09-21. This chain was all-free, so once
+    # every free provider failed it had no rung left. DeepSeek V4.1 Flash leads
+    # at $0.15/$0.60 per MTok (measured), MiniMax backs it up at $0.30/$1.20.
+    # A `qwen-plus` rung was dropped from this tail on the same date: chaining
+    # it would make the `qwen` provider TYPE chain-referenced, which widens
+    # onboarding's derived LLM-key set with the DashScope EMBEDDING key.
+    - openrouter-deepseek-flash
+    - minimax
     retry_profile: background
     description: "Resume review Pass 1 — native LLM structural analysis"
   42_resume_review_pass2:
@@ -856,6 +984,14 @@ call_sites:
     - gemini-free
     - groq-free
     - openrouter-free
+    # PAID LAST RESORT, appended 2026-09-21. This chain was all-free, so once
+    # every free provider failed it had no rung left. DeepSeek V4.1 Flash leads
+    # at $0.15/$0.60 per MTok (measured), MiniMax backs it up at $0.30/$1.20.
+    # A `qwen-plus` rung was dropped from this tail on the same date: chaining
+    # it would make the `qwen` provider TYPE chain-referenced, which widens
+    # onboarding's derived LLM-key set with the DashScope EMBEDDING key.
+    - openrouter-deepseek-flash
+    - minimax
     retry_profile: background
     description: "Resume review Pass 2 — knowledge-augmented critique"
   contingency_foreground:
@@ -898,6 +1034,14 @@ call_sites:
     - mistral-medium-free
     - groq-free
     - gemini-free
+    # PAID LAST RESORT, appended 2026-09-21. This chain was all-free, so once
+    # every free provider failed it had no rung left. DeepSeek V4.1 Flash leads
+    # at $0.15/$0.60 per MTok (measured), MiniMax backs it up at $0.30/$1.20.
+    # A `qwen-plus` rung was dropped from this tail on the same date: chaining
+    # it would make the `qwen` provider TYPE chain-referenced, which widens
+    # onboarding's derived LLM-key set with the DashScope EMBEDDING key.
+    - openrouter-deepseek-flash
+    - minimax
     default_paid: true
     description: Analyze CC version changes for impact on Genesis
   outreach_email_triage:
@@ -951,12 +1095,23 @@ call_sites:
     - gemini-free
     - mistral-large-free
     - mistral-medium-free
+    # PAID LAST RESORT, appended 2026-09-21. This chain was all-free, so once
+    # every free provider failed it had no rung left. DeepSeek V4.1 Flash leads
+    # at $0.15/$0.60 per MTok (measured), MiniMax backs it up at $0.30/$1.20.
+    # A `qwen-plus` rung was dropped from this tail on the same date: chaining
+    # it would make the `qwen` provider TYPE chain-referenced, which widens
+    # onboarding's derived LLM-key set with the DashScope EMBEDDING key.
+    - openrouter-deepseek-flash
+    - minimax
     default_paid: false
     retry_profile: user_facing
     dispatch: api
-    description: "Voice channel conversation \u2014 low-latency free-tier chain\
+    description: "Voice channel conversation \u2014 low-latency chain\
       \ for HA voice assistant. Groq first for speed (~1s), Gemini/Mistral\
-      \ as fallbacks."
+      \ as free fallbacks, then a two-rung paid last resort (DeepSeek V4.1\
+      \ Flash, MiniMax) that fires only after every free provider above has\
+      \ failed. This site is dispatch=api + user_facing, so it IS a spend\
+      \ path once the free tier is exhausted."
   desk_primary:
     chain:
     - openrouter-deepseek-v4

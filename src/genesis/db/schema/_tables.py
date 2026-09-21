@@ -2775,10 +2775,25 @@ DEPTH_THRESHOLDS_SEED = [
     ("Strategic", 0.40, 604800, 1, 604800),  # floor 7d, max 1/wk
 ]
 
+# Raised 2026-09-21 from 2/10/30. The routing change in the same PR added a paid
+# last-resort rung to the 19 call-site chains that had NO paid provider at all —
+# chains that previously could not spend by construction. Those rungs fire only
+# after every free provider has failed, and the lead rung (DeepSeek V4.1 Flash)
+# is $0.15/$0.60 per MTok, so the per-call cost is small; the reason for the
+# raise is the CONSEQUENCE of crossing the cap rather than the spend itself.
+# `router.py:373` responds to an exceeded budget by skipping every non-free
+# provider at EVERY call site — including the contingency lane that exists for
+# exactly that moment — so a single bad free-tier day on those 19 sites would
+# darken the paid lane system-wide. $2/day left no headroom for that.
+#
+# SEED ONLY: this reaches installs created from here on. Existing installs keep
+# whatever their operators set, deliberately — a budget is a spend control, and
+# raising it silently on machines whose operators never asked would override
+# that choice. No migration accompanies this.
 BUDGET_SEED = [
-    ("budget_daily", "daily", 2.00, 0.80, "2026-01-01T00:00:00", "2026-01-01T00:00:00"),
-    ("budget_weekly", "weekly", 10.00, 0.80, "2026-01-01T00:00:00", "2026-01-01T00:00:00"),
-    ("budget_monthly", "monthly", 30.00, 0.80, "2026-01-01T00:00:00", "2026-01-01T00:00:00"),
+    ("budget_daily", "daily", 5.00, 0.80, "2026-01-01T00:00:00", "2026-01-01T00:00:00"),
+    ("budget_weekly", "weekly", 15.00, 0.80, "2026-01-01T00:00:00", "2026-01-01T00:00:00"),
+    ("budget_monthly", "monthly", 50.00, 0.80, "2026-01-01T00:00:00", "2026-01-01T00:00:00"),
 ]
 
 DRIVE_WEIGHTS_SEED = [
