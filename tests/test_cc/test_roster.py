@@ -423,6 +423,15 @@ def test_shipped_examples_obey_the_key_equals_model_id_rule() -> None:
     at them — and the Kimi example shipped violating the rule stated four lines
     above it. A rule that only exists as prose is a rule the next example
     breaks; this makes it a check instead.
+
+    A key spelling the parser does not model is the failure mode this test has
+    already had once: the DeepSeek example quotes its key (``"…[1m]"``, because
+    the brackets are YAML-significant), the first version of ``key_re`` accepted
+    only bare word characters, and the example was therefore SKIPPED — the test
+    went green over a pair it never compared. So the parser accepts the quoted
+    spelling AND the count of parsed pairs is reconciled against the ``model_id:``
+    lines in the file, which have one fixed spelling. An unmodelled key now fails
+    loudly instead of quietly dropping its example out of scope.
     """
     import re
     from pathlib import Path
@@ -430,8 +439,17 @@ def test_shipped_examples_obey_the_key_equals_model_id_rule() -> None:
     src = Path(__file__).resolve().parents[2] / "config" / "cc_roster.yaml"
     lines = src.read_text(encoding="utf-8").splitlines()
 
-    key_re = re.compile(r"^#\s{4,}([A-Za-z0-9][A-Za-z0-9._-]*):\s*$")
+    # A key is quoted when it carries YAML-significant characters. Both sides of
+    # the comparison are de-quoted, because `"x"` and `x` are the same key to a
+    # YAML parser and a spelling difference to `==`.
+    quoted = r"\"[^\"\n]+\"|'[^'\n]+'"
+    key_re = re.compile(rf"^#\s{{4,}}({quoted}|[A-Za-z0-9][A-Za-z0-9._-]*):\s*$")
     mid_re = re.compile(r"^#\s+model_id:\s*(\S+)\s*$")
+
+    def dequote(value: str) -> str:
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            return value[1:-1]
+        return value
 
     pairs: list[tuple[int, str, str | None]] = []
     for i, line in enumerate(lines):
@@ -448,17 +466,33 @@ def test_shipped_examples_obey_the_key_equals_model_id_rule() -> None:
             if mm:
                 model_id = mm.group(1)
                 break
-        pairs.append((i + 1, m.group(1), model_id))
+        pairs.append((i + 1, dequote(m.group(1)), model_id))
 
     assert pairs, (
         "no commented example peers found — the parser drifted from the file's "
         "format, so this test is silently checking nothing"
     )
+
+    # Completeness, not just correctness. `model_id:` has exactly one spelling in
+    # this file, so counting those lines gives a denominator the key parser cannot
+    # influence: if a key form goes unrecognised, its model_id is still counted and
+    # the totals disagree. Without this, the only symptom of a missed key is a test
+    # that passes.
+    declared = sum(1 for line in lines if mid_re.match(line))
+    parsed = sum(1 for _, _, model_id in pairs if model_id is not None)
+    assert parsed == declared, (
+        f"cc_roster.yaml declares {declared} commented `model_id:` line(s) but "
+        f"this test matched only {parsed} to an example key. A key spelling the "
+        "parser does not model is skipped SILENTLY, so the example it belongs to "
+        "stops being checked while this test still passes. Teach `key_re` the new "
+        "spelling rather than leaving the example out of scope."
+    )
+
     for lineno, key, model_id in pairs:
         assert model_id is not None, (
             f"example peer {key!r} at cc_roster.yaml:{lineno} declares no model_id"
         )
-        assert key == model_id, (
+        assert key == dequote(model_id), (
             f"example peer at cc_roster.yaml:{lineno} has key {key!r} but "
             f"model_id {model_id!r}. The file's own EXAMPLE PEERS note requires "
             "them to match: a copied peer whose key differs never persists its "
