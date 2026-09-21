@@ -663,7 +663,7 @@ async def _impl_job_health() -> dict:
         {
             "jobs": {job_name: {...}, ...},
             "note": None | str,
-            "source": "runtime" | "sqlite" | "missing_db" | "query_failed",
+            "source": "runtime" | "sqlite" | "missing_db" | "fenced_db" | "query_failed",
         }
 
     Callers can always read ``result["jobs"]`` and ``result["source"]``
@@ -692,6 +692,27 @@ async def _impl_job_health() -> dict:
             "jobs": {},
             "note": (f"Genesis database not found at {_DB_PATH}; no job health data available."),
             "source": "missing_db",
+        }
+
+    # Admission fence. This runs in an MCP SERVER CHILD PROCESS — the same
+    # process class as the 2026-09-18 incident's bypass writers — and opens
+    # read-WRITE (no mode=ro), so a plain open+close can checkpoint a stale
+    # `-wal` into a quarantined main file. That is the recurrence mechanism
+    # itself, not a theoretical concern. Reported rather than silent: an
+    # operator asking for job health during an incident should be told the
+    # database is fenced, not handed an empty result that reads as "no jobs".
+    from genesis.db.admission import database_is_fenced
+
+    if database_is_fenced(_DB_PATH):
+        return {
+            "jobs": {},
+            "note": (
+                f"Genesis database at {_DB_PATH} was refused by the admission "
+                "check — it is quarantined, or its admission state could not be "
+                "established (the check fails closed). Job health is unavailable "
+                "until that clears."
+            ),
+            "source": "fenced_db",
         }
 
     try:
@@ -753,7 +774,7 @@ async def job_health() -> dict:
           "jobs": {job_name: {last_run, last_success, last_failure,
                               last_error, consecutive_failures}},
           "note": null | "human-readable explanation",
-          "source": "runtime" | "sqlite" | "missing_db" | "query_failed"
+          "source": "runtime" | "sqlite" | "missing_db" | "fenced_db" | "query_failed"
         }
 
     ``note`` is null on the happy path; non-null when the check

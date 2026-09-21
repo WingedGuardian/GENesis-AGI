@@ -58,9 +58,19 @@ def _load_feedback_files() -> list[dict]:
     return results
 
 
+def _db_fenced() -> bool:
+    """Admission fence, fail-closed: unknown state reads as fenced."""
+    try:
+        from db_admission_check import database_is_fenced
+
+        return database_is_fenced(_GENESIS_DB)
+    except Exception:
+        return True
+
+
 def _load_db_rules() -> list[dict]:
     """Load rule-class memories from SQLite."""
-    if not _GENESIS_DB.exists():
+    if not _GENESIS_DB.exists() or _db_fenced():
         return []
     try:
         with sqlite3.connect(str(_GENESIS_DB), timeout=2) as db:
@@ -91,7 +101,7 @@ def _load_db_rules() -> list[dict]:
 
 def _load_procedures() -> list[dict]:
     """Load active procedures from SQLite."""
-    if not _GENESIS_DB.exists():
+    if not _GENESIS_DB.exists() or _db_fenced():
         return []
     try:
         with sqlite3.connect(str(_GENESIS_DB), timeout=2) as db:

@@ -35,33 +35,49 @@ DEFAULT_DB_PATH = genesis_db_path()
 def connect_sqlite_rw(
     path: str | Path = DEFAULT_DB_PATH, *args: Any, **kwargs: Any
 ) -> sqlite3.Connection:
-    """Return a synchronous RW connection after enforcing DB quarantine."""
-    from genesis.db.integrity import assert_not_quarantined
+    """Return a synchronous RW connection after enforcing DB admission.
 
-    db_path = Path(path).expanduser().resolve()
-    assert_not_quarantined(db_path)
-    return sqlite3.connect(str(db_path), *args, **kwargs)
+    Admission is QUARANTINE — "this artifact failed an integrity check". It
+    is deliberately not more than that: a maintenance fence was built and
+    removed before shipping (see :mod:`genesis.db.admission`), so nothing here
+    protects a database an operator is replacing. Do not write recovery
+    procedure against a guarantee this does not make.
+
+    The assertion takes the caller's spelling, before the ``.resolve()``
+    below, so the path checked is the path the caller named.
+    """
+    from genesis.db.admission import assert_admitted
+
+    admission_path = Path(path).expanduser()
+    assert_admitted(admission_path)
+    return sqlite3.connect(str(admission_path.resolve()), *args, **kwargs)
 
 
 class _GuardedAiosqliteConnector:
     """Preserve aiosqlite's dual await/context API with open-time guards."""
 
-    def __init__(self, db_path: Path, kwargs: dict[str, Any]) -> None:
+    def __init__(
+        self, db_path: Path, kwargs: dict[str, Any], admission_path: Path | None = None
+    ) -> None:
         self._db_path = db_path
+        # The caller's ORIGINAL spelling, kept for admission checks only, so
+        # the path asserted is the path the caller named rather than whatever
+        # it resolves to.
+        self._admission_path = admission_path if admission_path is not None else db_path
         self._kwargs = kwargs
         self._connection: aiosqlite.Connection | None = None
 
     async def _open(self) -> aiosqlite.Connection:
-        from genesis.db.integrity import assert_not_quarantined
+        from genesis.db.admission import assert_admitted
 
         # Construction and opening are separate for aiosqlite.  Re-check here
-        # so a connector retained before quarantine cannot open afterward.
-        assert_not_quarantined(self._db_path)
+        # so a connector retained before admission changed cannot open after.
+        assert_admitted(self._admission_path)
         connection = await aiosqlite.connect(str(self._db_path), **self._kwargs)
         try:
-            # Quarantine may have become active while the worker thread opened
-            # SQLite.  Never return that newly opened writable handle.
-            assert_not_quarantined(self._db_path)
+            # Quarantine may have become active while the worker thread
+            # opened SQLite.  Never return that newly opened writable handle.
+            assert_admitted(self._admission_path)
         except BaseException as open_error:
             try:
                 await connection.close()
@@ -86,11 +102,12 @@ def connect_aiosqlite_rw(
     path: str | Path = DEFAULT_DB_PATH, **kwargs: Any
 ) -> _GuardedAiosqliteConnector:
     """Return an awaitable/context-manager guarded through actual DB open."""
-    from genesis.db.integrity import assert_not_quarantined
+    from genesis.db.admission import assert_admitted
 
-    db_path = Path(path).expanduser().resolve()
-    assert_not_quarantined(db_path)
-    return _GuardedAiosqliteConnector(db_path, kwargs)
+    admission_path = Path(path).expanduser()
+    assert_admitted(admission_path)
+    db_path = admission_path.resolve()
+    return _GuardedAiosqliteConnector(db_path, kwargs, admission_path=admission_path)
 
 
 # Per-connection page cache. Negative = KiB (SQLite convention), so -262144 is
@@ -1171,9 +1188,9 @@ async def get_db(
     deliberate, separate decision).
     """
     path = Path(path)
-    from genesis.db.integrity import assert_not_quarantined
+    from genesis.db.admission import assert_admitted
 
-    assert_not_quarantined(path)
+    assert_admitted(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     async def _configure(conn: aiosqlite.Connection) -> None:
@@ -1198,7 +1215,7 @@ async def get_db(
 
     # Build reconnect closure (SQLite-specific; replace for PostgreSQL)
     async def _reconnect() -> aiosqlite.Connection:
-        assert_not_quarantined(path)
+        assert_admitted(path)
         conn = await aiosqlite.connect(str(path))
         await _configure(conn)
         return conn
@@ -1224,9 +1241,9 @@ async def get_raw_db(
     shared across coroutines. Yields the connection and closes it on exit.
     """
     path = Path(path)
-    from genesis.db.integrity import assert_not_quarantined
+    from genesis.db.admission import assert_admitted
 
-    assert_not_quarantined(path)
+    assert_admitted(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     db = await aiosqlite.connect(str(path))
     try:
@@ -1264,7 +1281,17 @@ async def open_ro_connection(
     Deliberately does NOT run ``journal_mode=WAL`` or ``synchronous`` — those
     need write access to the DB header and are no-ops (or raise
     ``SQLITE_READONLY`` on some builds) on a read-only handle.
+
+    Admission (quarantine) is enforced here like every other open-time
+    factory. Read-only is not a reason to skip it: a reader still opens the
+    file and its ``-wal``, still holds a descriptor on it, and still surfaces
+    rows from an artifact already judged untrustworthy. This was the one
+    connect site in
+    this module guarded by nothing at all.
     """
+    from genesis.db.admission import assert_admitted
+
+    assert_admitted(Path(path))
     uri = f"file:{Path(path)}?mode=ro"
     conn = await aiosqlite.connect(uri, uri=True)
     conn.row_factory = aiosqlite.Row

@@ -1370,6 +1370,66 @@ _INLINE_REVIEW_BOTS = {
     "chatgpt-codex-connector[bot]",
     "github-advanced-security[bot]",
 }
+#: The template's distinctive sentence. A body that does not contain it is NOT
+#: this template and is never suppressed, however short it is — see the gate at
+#: the top of `_is_wrapper_review_body`, which exists because the residue test
+#: alone silently dropped brief real findings.
+_WRAPPER_REVIEW_BODY_SIGNATURE = "automated review suggestions for this pull request"
+#: Pieces of the known review TEMPLATE, removed one at a time to see whether
+#: anything a human would read is left. Order does not matter; each is deleted
+#: wherever it appears. The `<details>` block is matched non-greedily and its
+#: content is vendor chrome ("About Codex in GitHub"), not review output.
+_WRAPPER_REVIEW_BODY_PARTS = (
+    re.compile(r"<details>.*?</details>", re.S),
+    re.compile(r"^#+.*Codex Review.*$", re.M),
+    re.compile(r"Here are some automated review suggestions for this pull request\.?"),
+    re.compile(r"\*\*Reviewed commit:\*\*\s*`?[0-9a-f]{7,40}`?"),
+)
+#: Below this many characters of residue, what is left of a stripped template is
+#: punctuation and whitespace rather than content. MEASURED: the live template
+#: leaves 0 characters; the smallest real finding body in the same corpus is
+#: over 400. Any value in that gap behaves identically, so this is a threshold
+#: with a measured margin either side rather than a number chosen to fit.
+_WRAPPER_RESIDUE_MAX_CHARS = 24
+
+
+def _is_wrapper_review_body(body: str) -> bool:
+    """True when a review BODY is a template carrying no findings of its own.
+
+    SUBTRACTIVE, not a marker denylist. An earlier revision asked "does this
+    body contain the template's two marker phrases?", which suppressed anything
+    that OPENED with the template and then appended real content — re-creating
+    the review-body blind spot for the one shape most likely to carry a finding
+    (Codex P2, and its own suggested remedy). This instead REMOVES the template
+    and asks what survives: a pure wrapper leaves nothing, a wrapper with a
+    summary bolted on leaves the summary, and the summary is what gets surfaced.
+
+    Used to keep the uncounted tail from annotating every PR. A list of logins
+    whose bodies are wrappers was measured WORSE on fail direction, not on
+    accuracy: when the template changes this predicate stops matching and the
+    body is SURFACED (noise, visible, recoverable), where a login list silently
+    drops a body that had started carrying findings.
+
+    Bounded work: each pattern is anchored to a literal and the `<details>`
+    match is non-greedy, so this is linear in the body. That matters because it
+    runs on a hook path, where a scan an author can make slow is a fail-open —
+    a killed hook does not block.
+    """
+    # GATE ON THE SIGNATURE FIRST. Without this the residue test alone suppresses
+    # any SHORT body — "first pass: found a race." reduces to 19 characters of
+    # content and would be silently dropped. Caught by its own test, and it is
+    # the same silent-drop class this bucket exists to close: a threshold that
+    # cannot tell "a template with nothing left" from "a brief real finding".
+    if _WRAPPER_REVIEW_BODY_SIGNATURE not in body:
+        return False
+    residue = body
+    for part in _WRAPPER_REVIEW_BODY_PARTS:
+        residue = part.sub("", residue)
+    # Strip markdown furniture the template leaves behind so residue measures
+    # CONTENT, not the punctuation between removed pieces.
+    return len(re.sub(r"[\s*_`>#|:\-]", "", residue)) <= _WRAPPER_RESIDUE_MAX_CHARS
+
+
 # A reply "engages" (silences) an inline P1 finding ONLY when authored by someone with
 # repository authority — otherwise any GitHub account (a throwaway, or the PR author on
 # their own PR) could post a one-word reply and clear a real P1 (PR #1434 security
@@ -1378,7 +1438,7 @@ _INLINE_REVIEW_BOTS = {
 # NOT count as acknowledgement.
 _MAINTAINER_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 # Badge/markup prefix stripped when rendering a finding's title line.
-_INLINE_MARKUP_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)|</?sub>|[*]{1,2}")
+_INLINE_MARKUP_RE = re.compile(r"<!--.*?-->|!\[[^\]]*\]\([^)]*\)|</?sub>|[*]{1,2}", re.S)
 # A finding title is a one-line PREVIEW in a list of them; the full body is on
 # the PR, so this bounds a pointer-backed value rather than cutting the only
 # copy. `_inline_title` states the cut when it makes one.
@@ -1569,6 +1629,15 @@ def _inline_title(body: str) -> str:
     """
     # split("\n") not splitlines(): a NEL (U+0085) inside the body must not shift
     # which line is shown as the title (consistent with the JSONL parser).
+    #
+    # Line 0 of the STRIPPED text, which is load-bearing and was nearly
+    # over-engineered away: one review bot opens every comment with an HTML
+    # metadata comment, and a first attempt at fixing that added a scan for the
+    # first NON-EMPTY line, on the belief that removing the comment left line 0
+    # blank. MEASURED over 35 real comments from that bot: the scan and plain
+    # line 0 agree on 35/35 and neither renders empty, because `.strip()`
+    # already removes the leading newlines the comment left behind. The scan was
+    # justified by an artifact of the probe that "found" it, not by the data.
     first = _INLINE_MARKUP_RE.sub("", body).strip().split("\n")
     return _safe_title(first[0].strip() if first else "")
 
@@ -2494,11 +2563,240 @@ def _fetch_comments_paged(
     return acc, False
 
 
+#: A single file holding at least this share of a round's scored findings is
+#: reported as CONCENTRATED. Not a threshold anything blocks on — it only decides
+#: whether the report adds the mechanism note, so being approximately right is
+#: enough and no value here can change a verdict.
+_CONCENTRATION_SHARE = 0.5
+
+#: …and below this many findings the share is noise (2 of 3 is 67% and means
+#: nothing). Concentration is a claim about a distribution; a distribution needs
+#: enough points to have a shape.
+_CONCENTRATION_MIN_FINDINGS = 4
+
+
+#: Content budget for one rendered path, and how much of it the tail keeps.
+#: Smaller than the gate-text budget because six of these share one report; the
+#: head still gets 40 characters, which is what keeps two same-basename paths
+#: apart. No second ENCODED budget: nothing expands any more (see below).
+_REPORT_PATH_MAX_CHARS = 80
+_REPORT_PATH_TAIL_CHARS = 40
+#: Width of the identity tag appended when — and ONLY when — the rendering is
+#: lossy. Six hex characters is 16.7M buckets against a table that shows at most
+#: six rows; the job is telling two rows apart, not resisting a preimage attack.
+_REPORT_PATH_DIGEST_CHARS = 6
+
+
+def _safe_report_path(path: str) -> str:
+    """A path rendered safe for a terminal report: defanged, flattened, BOUNDED.
+
+    Composes the primitives this file already uses for every other untrusted
+    value it prints. It does NOT bring its own answer, and the history of it
+    doing so is the reason this docstring is long.
+
+    THE THREE EARLIER VERSIONS ALL ESCAPED WITH ``json.dumps``, and each drew a
+    finding in consecutive review rounds (PR #2005 rounds 1, 2, 3, 4). The cause
+    was not any one of the bugs: it was that ``json.dumps`` is a NON-LINEAR
+    length transform, expanding a non-ASCII or control character six-fold. That
+    forced a second budget on the encoded form, and a two-stage budget loses
+    information in a different way each time you look at it — a front-slice that
+    discarded the basename, then a clip that discarded IDENTITY, so two paths
+    differing only in their leading directory rendered as the same string.
+
+    MEASURED, the three axes that decided this (``premise_probe_2005``):
+
+    ==================  ==========================  ====================
+    axis                ``json.dumps`` renderer     these primitives
+    ==================  ==========================  ====================
+    terminal threats    neutralised                 neutralised, 0/7 residue
+    characters kept     88% / 26% / 44%             100%
+    two paths, one tail identical  (the bug)        distinguishable
+    ==================  ==========================  ====================
+
+    (kept: ASCII / CJK / control-dense. A non-ASCII path lost three quarters of
+    itself to escaping before any budget applied.)
+
+    ``_defang_gate_text`` classifies by unicodedata CATEGORY rather than
+    enumerating codepoints, which is why it holds U+061C and the rest of the
+    bidi family — a lesson that file paid for once already (Codex P2, PR #1638).
+    It is 1:1 on length, so no second budget exists to disagree with the first.
+
+    THE ONE THING IT DOES NOT DO is remove ``\\n``: it splits on newlines to
+    preserve multi-line gate messages. A path is one row, and a newline inside
+    one would forge another, so it is flattened here rather than in the shared
+    primitive, where it would corrupt every other caller.
+
+    Bounding is ``_bound_with_stated_omission`` at the path budget — head AND
+    tail, with the omission counted. Keeping the head is exactly what fixes the
+    identity defect; keeping the tail is what preserves the basename, which is a
+    path's informative end. An earlier docstring claimed the full value was "one
+    row up in the findings list": it is not. Those rows print ``_inline_title``
+    output, which is a title and carries no path, so this rendering is the only
+    one there is and losing information here loses it outright.
+    """
+    rendered = _bound_with_stated_omission(
+        _defang_gate_text(path).replace("\n", " "),
+        _REPORT_PATH_MAX_CHARS,
+        _REPORT_PATH_TAIL_CHARS,
+    )
+    # LOSSY RENDERING DESTROYS IDENTITY, and both transforms above are lossy in
+    # different ways. Defang is many-to-one — `src/a b.py` and `src/a\x1bb.py`
+    # both render `src/a b.py`. The bound drops the MIDDLE — two 90-character
+    # paths sharing a head and a basename produce the same text, the same
+    # omission count and the same tail. Either way the distribution groups by
+    # the RAW path but LABELS by this one, so two real buckets can print as the
+    # same row and the reader cannot tell which file is which.
+    #
+    # Rounds 1-4 of this PR were all one property (length under an expanding
+    # encoding). This is a DIFFERENT one, and it was latent the whole time —
+    # fixing the expansion is what made it visible. Codex and Devin found it
+    # independently at the same head and prescribed the same remedy.
+    #
+    # The equality test is the exact condition, not an approximation of it: if
+    # the rendering is byte-identical to its input then it IS the identifier and
+    # needs nothing. Only a rendering that actually changed something pays for a
+    # tag, so an ordinary path stays clean and the tag never becomes noise the
+    # reader learns to skip.
+    if rendered == path:
+        return rendered
+    # `surrogatepass` because a hash must never raise: paths arrive from JSON and
+    # can carry lone surrogates, which plain utf-8 encoding refuses.
+    digest = hashlib.sha256(path.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"{rendered} [#{digest[:_REPORT_PATH_DIGEST_CHARS]}]"
+
+
+def _findings_distribution(
+    scored_at: list[tuple[str, str]],
+    *,
+    renames: dict[str, str] | None = None,
+    reliable: bool = True,
+) -> str:
+    """Where the SCORED findings LAND, as a report — never a verdict.
+
+    The denominator is `scored_at` and the wording says so, because getting
+    this wrong is the same defect one level up. A scan routinely holds findings
+    that are unresolved and NOT scored — CodeRabbit below-Major, unrecognised
+    review bots, off-diff and documentation-path anchors — so "100% of the
+    unresolved findings" can be printed while unscored findings sit in other
+    files entirely, inviting a class diagnosis from a denominator that never
+    included them. Two earlier wordings were both wrong: "this round's
+    findings" (the scorer accumulates across rounds) and "the unresolved
+    findings" (it counts only the scored subset). Say the narrow thing.
+
+    WHY THE GATE PRINTS THIS AT ALL, including on round one. A list of findings
+    reads as a work queue, so the default response is to answer them one by one;
+    the same findings arranged BY FILE can show something a list cannot — that
+    several of them share one seam and may therefore share one cause. That is
+    information the gate already holds (every finding is parsed with its path, to
+    diff-scope it) and used to discard. Printing it costs nothing and puts the
+    evidence in front of whoever is deciding what to do about the round.
+
+    DELIBERATELY NOT A VERDICT, and the distinction is the whole design. This
+    function states counts and, when one file dominates, names what that MIGHT
+    mean. It never concludes the approach is wrong — one round rarely carries
+    that, and a gate that cried "premise!" at every round would be tuned out
+    within a week, which would cost more than it bought. What it does instead is
+    grant permission explicitly, because the failure this exists for is not that
+    sessions cannot see concentration; it is that answering the findings feels
+    like the whole job and stepping back feels like exceeding the brief.
+
+    Origin, stated because it is the acceptance case: a change whose round-one
+    findings were 8-of-11 in one file, three of them on code written to answer an
+    earlier round, was about to be answered as eleven separate patches. One
+    question from a human — are the premises right? — turned it into a single
+    mechanism change, using facts that were already on the table.
+    """
+    if not scored_at:
+        return ""
+
+    # Findings with no path (outdated anchors, path omitted by the API) count in
+    # the total — they are real findings — but they are NOT a file: four of them
+    # bucketing together proves nothing about a shared seam, so the None bucket
+    # is listed (sorted last) and excluded from the concentration call below.
+    by_file: dict[str | None, list[str]] = {}
+    for severity, path in scored_at:
+        # A file renamed during the PR leaves older comments anchored to its
+        # previous name; fold the alias into the current path before grouping,
+        # or one logical file reads as two and its share is underreported.
+        by_file.setdefault(
+            (renames or {}).get(path, path) or None, []
+        ).append(severity)
+
+    total = len(scored_at)
+    n_files = sum(1 for k in by_file if k is not None)
+    # The pathless bucket sorts LAST unconditionally, not merely as a tiebreak.
+    # As a tiebreak it only lost to files with MORE findings, so five pathless
+    # findings outranked a file with three — and with six real files present the
+    # display cap then elided an actual file to make room for the bucket that is
+    # not a file at all (Devin, PR #2005, round 5). It is listed, because it
+    # holds real findings; it is just never allowed to displace a location.
+    ranked = sorted(
+        by_file.items(),
+        key=lambda kv: (kv[0] is None, -len(kv[1]), kv[0] or ""),
+    )
+    lines = [
+        f"DISTRIBUTION: {total} scored finding(s) across {n_files} file(s)"
+        + ("" if reliable else " — PARTIAL: the scan did not read everything, so this shape is provisional")
+        + " — read as a class before answering as a list:"
+    ]
+    for path, sevs in ranked[:6]:
+        share = 100.0 * len(sevs) / total
+        mix = ", ".join(f"{sevs.count(s)} {s}" for s in ("P1", "P2", "CR") if sevs.count(s))
+        lines.append(
+            f"    {len(sevs):>2} ({share:4.0f}%)  "
+            f"{_safe_report_path(path) if path is not None else '(no path)'}  [{mix}]"
+        )
+    if len(ranked) > 6:
+        # The elided remainder is counted in FILES, and the pathless bucket is
+        # not one — counting rows here would report "2 more file(s)" when one
+        # file and the pathless bucket were dropped. It is also named rather
+        # than silently folded away: it holds real findings, and an omission
+        # nobody declares is the thing the elision marker exists to prevent.
+        elided = ranked[6:]
+        elided_files = sum(1 for path, _ in elided if path is not None)
+        parts = []
+        if elided_files:
+            parts.append(f"{elided_files} more file(s)")
+        if elided_files != len(elided):  # at most one None bucket exists
+            parts.append("the pathless bucket")
+        lines.append(f"    … and {' + '.join(parts)}")
+
+    # The single-seam note needs ONE file that actually dominates: a pathless
+    # bucket is not a file, and a 2–2 tie names a lexicographic winner that does
+    # not exist. No concentration inference at all on a partial read — an
+    # unread page could hold the finding that changes the shape.
+    known_ranked = [(path, sevs) for path, sevs in ranked if path is not None]
+    concentrated = (
+        reliable
+        and bool(known_ranked)
+        and total >= _CONCENTRATION_MIN_FINDINGS
+        and len(known_ranked[0][1]) / total >= _CONCENTRATION_SHARE
+        and (len(known_ranked) == 1 or len(known_ranked[0][1]) > len(known_ranked[1][1]))
+    )
+    if concentrated:
+        top_path, top_sevs = known_ranked[0]
+        lines.append(
+            f"  NOTE: {100.0 * len(top_sevs) / total:.0f}% of the SCORED findings are in ONE "
+            f"file ({_safe_report_path(top_path)}). Findings that concentrate on a single seam — or that land on "
+            "code added to answer an EARLIER round — are a mechanism signal: they often share "
+            "one cause, and fixing the cause retires them together while fixing them "
+            "individually tends to produce the next round's findings."
+        )
+    lines.append(
+        "  Deciding this round is a CLASS rather than a list is part of answering it, not a "
+        "detour from it — and concluding the approach itself is wrong is a legitimate verdict "
+        "that needs nobody's permission. One round is a lead, not a proof: say what THIS "
+        "round's evidence supports, and no more. Method: .claude/docs/premise-check.md"
+    )
+    return "\n".join(lines)
+
+
 def _check_inline_review_findings(
     pr_num: str,
     *,
     force: bool = False,
     repo: str | None = None,
+    uncounted_out: list[dict[str, int]] | None = None,
 ) -> tuple[bool, str]:
     """Scan review findings from BOTH delivery channels and apply a weighted score.
 
@@ -2581,6 +2879,11 @@ def _check_inline_review_findings(
     }
     p1: list[str] = []
     p2: list[str] = []
+    # (severity, path) for every finding that SCORES, kept alongside the title
+    # lists so the distribution below can be computed without a second fetch.
+    # The off-diff lists already carry (title, path) tuples for the same reason;
+    # this is that shape applied to the findings that actually count.
+    scored_at: list[tuple[str, str]] = []
     doc_skipped: list[str] = []  # P1s on doc paths — surfaced, never blocking
     doc_skipped_p2: list[str] = []  # P2s on doc paths — surfaced, excluded from score
     cr_block: list[str] = []  # CodeRabbit Critical/Major — 1.0 each
@@ -2625,10 +2928,38 @@ def _check_inline_review_findings(
     for c in raw:
         login, utype = c.get("login") or "", c.get("type") or ""
         body = c.get("body") or ""
-        if utype != "Bot" and login not in _INLINE_REVIEW_BOTS:
-            continue
+        # NO AUTHOR FILTER. This used to drop every non-Bot, non-allowlisted
+        # author with a bare `continue`, so a human collaborator's inline review
+        # comment reached no accumulator and the row could still read `ok`.
+        #
+        # OWNER DIRECTIVE 2026-09-20: never willfully ignore a review that offers
+        # to help — another bot, or just another GitHub user. The gate's job is to
+        # make the session AWARE the input exists; judging it is the session's.
+        # These land in the unrecognised bucket below: surfaced, never scored,
+        # never blocking, and they make the rendered total a FLOOR rather than an
+        # equality, because nothing here read their finding cardinality.
+        #
+        # `pulls/N/comments` carries DIFF-ANCHORED comments only — PR chatter
+        # lives on the issue endpoint, which this scan never reads — so the
+        # population widened to is review-shaped by the endpoint's own contract,
+        # not by an assumption about who wrote it.
         if c.get("reply_to"):
             continue  # replies aren't findings
+        # WHOSE OUTPUT MAY BE PARSED FOR SEVERITY — deliberately the SAME
+        # population the removed filter used to admit: a Bot, or an allowlisted
+        # review account. Widening WHO IS SEEN must not widen WHO IS BELIEVED.
+        #
+        # This distinction is load-bearing and its absence was caught by an
+        # existing lock (`test_human_inline_comments_ignored`) rather than by
+        # review: `_INLINE_P1_RE` matches the BODY, not the author, so simply
+        # deleting the filter let ANY GitHub account block a merge by posting a
+        # comment carrying a P1 badge. That is the authority hole
+        # `_MAINTAINER_ASSOCIATIONS` exists to prevent on the reply side,
+        # reproduced on the finding side.
+        #
+        # So an unrecognised author skips the matchers entirely and falls to the
+        # unrecognised branch: SURFACED, never scored, never blocking.
+        parseable = utype == "Bot" or login in _INLINE_REVIEW_BOTS
         if login in _CODERABBIT_LOGINS:
             # Engagement is checked ONCE, for the whole comment, BEFORE severity —
             # not per-severity below. It used to sit inside the blocking branch, so
@@ -2688,8 +3019,9 @@ def _check_inline_review_findings(
                     cr_doc_skipped.append(_coderabbit_title(seg))
                     continue
                 cr_block.append(_coderabbit_title(seg))
+                scored_at.append(("CR", c.get("path") or ""))
             continue
-        if _INLINE_P1_RE.search(body):
+        if parseable and _INLINE_P1_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — treated as acknowledged
             if _off_diff(c.get("path")):
@@ -2707,7 +3039,8 @@ def _check_inline_review_findings(
                 doc_skipped.append(_inline_title(body))
                 continue
             p1.append(_inline_title(body))
-        elif _INLINE_P2_RE.search(body):
+            scored_at.append(("P1", c.get("path") or ""))
+        elif parseable and _INLINE_P2_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — maintainer consciously accepted the P2
             if _off_diff(c.get("path")):
@@ -2722,6 +3055,7 @@ def _check_inline_review_findings(
                 doc_skipped_p2.append(_inline_title(body))
                 continue
             p2.append(_inline_title(body))
+            scored_at.append(("P2", c.get("path") or ""))
         else:
             # The silent-drop CLASS, not just its CodeRabbit instance. A comment
             # that reached this loop was authored by a Bot or an allowlisted review
@@ -2734,6 +3068,16 @@ def _check_inline_review_findings(
             # Surfaced, never scored: recognising a format is what earns a weight,
             # and guessing a severity from an unknown format would be worse than
             # the blindness. The point is that it can no longer be INVISIBLE.
+            #
+            # ENGAGEMENT applies here too, and it became load-bearing when the
+            # author filter above was removed: without it, a comment a maintainer
+            # has already answered in-thread keeps re-surfacing on every run
+            # forever. That is the same burial this branch exists to prevent —
+            # "a growing list of already-settled advisories is how a genuinely
+            # unresolved one gets buried", two comments up — so the rule that
+            # protects the CodeRabbit path protects this one on the same terms.
+            if c.get("id") in replied_to:
+                continue
             unmatched_bot.append((login, _inline_title(body)))
 
     # ── The SECOND delivery channel: findings CodeRabbit could not post inline ──
@@ -2758,15 +3102,40 @@ def _check_inline_review_findings(
     # A body that declares more findings than this parser read: an INCOMPLETE
     # scan, which blocks like any other incomplete read.
     outside_shortfall: list[str] = []
+    # Review bodies from an author this scan does not recognise — another bot, or
+    # a human collaborator. Until this existed the loop below dropped them with a
+    # bare `continue`, so a reviewer who delivered findings in a review BODY
+    # contributed NOTHING to any accumulator and the row fell back to a bare
+    # `ok` — the exact blind spot this change exists to remove, one channel over.
+    #
+    # OWNER DIRECTIVE 2026-09-20: never willfully ignore a review that offers to
+    # help, whoever wrote it. The gate's job here is AWARENESS, not adjudication —
+    # it makes the session aware the input exists and lets the session judge it.
+    # So these are SURFACED and make the total a floor; they are never SCORED,
+    # because guessing a severity from an unrecognised reviewer would be worse
+    # than the blindness, and never BLOCK, because a human comment is not a gate.
+    # ONE ENTRY PER REVIEW, not per reviewer. Deduping on login understated the
+    # input and mislabelled its own unit (Codex P2): re-reviews are routine after
+    # a push, and MEASURED on PR #2191 a single author posted FOUR distinct
+    # bodies — potentially four different findings — which a login-deduped list
+    # announced as "1 review". The count and the unit have to describe the same
+    # thing, which is the defect class this whole change exists to remove.
+    unclassified_reviews: list[str] = []  # one login per REVIEW, order preserved
     reviews, reviews_complete = _pr_review_bodies(pr_num, repo=repo)
-    # An unreadable second channel still BLOCKS — but at the END, next to the
+    # An unreadable second channel is handled at the END, next to the
     # incomplete-read check, not by returning from here. Returning early would
     # discard every list the inline loop just built (p1, p2, cr_block,
     # cr_unknown, off-diff, doc-skipped, unmatched_bot) BEFORE any of them is
     # printed, so one transient `gh` failure would replace the whole pre-merge
-    # report with a single "UNREADABLE" line. Same fail direction, far less
-    # information — and this function's docstring promises nothing unaddressed
-    # is dropped.
+    # report with a single "UNREADABLE" line. Far less information — and this
+    # function's docstring promises nothing unaddressed is dropped.
+    #
+    # It does NOT block. This comment used to say "still BLOCKS", which stopped
+    # being true when the review-body channel became advisory (see the long note
+    # at the emit site below) — the tail only prints and falls through to a clean
+    # return. Corrected here because it is the comment a reader would use to
+    # conclude that an under-read channel cannot reach a passing row: it can, and
+    # `channel_under_read` above is what keeps that state from rendering as `ok`.
     reviews_unreadable = reviews is None
     if reviews is None:
         reviews = []
@@ -2798,7 +3167,63 @@ def _check_inline_review_findings(
             # actor would need the timeline endpoint and another call on the
             # merge clock; that trade is open, not settled.
             continue
-        if (review.get("login") or "") not in _CODERABBIT_LOGINS:
+        review_login = review.get("login") or ""
+        if review_login not in _CODERABBIT_LOGINS:
+            # NOT a silent drop any more. An author this scan cannot parse still
+            # gets NAMED, so the session knows the input exists.
+            #
+            # Narrowed by CONTENT, never by AUTHORSHIP. An empty body is a bare
+            # approval; a WRAPPER body is a template that carries no findings by
+            # construction. Deduped on login: one reviewer re-reviewing is one.
+            #
+            # MEASURED 2026-09-20 over 21 live review bodies on 6 PRs — which is
+            # the step whose absence caused both of this change's regressions:
+            #   * one reviewer posts a byte-identical 621-byte template on 6 of 6
+            #     PRs. Its findings go INLINE; the body is a wrapper. PR #2194
+            #     itself carried findings in BOTH rounds and its body was 621
+            #     bytes both times, so the body is constant regardless.
+            #   * another reviewer's bodies vary 432-690 bytes and say things
+            #     like "found 3 potential issues" and "1 flag NOT posted on this
+            #     PR" — a finding that never reached the PR at all, which is
+            #     exactly the invisible-finding class this scan exists to expose.
+            # So AUTHORSHIP does not predict whether a body carries findings, and
+            # an earlier revision that excluded every recognised login made this
+            # tail fire on 6 of 6 PRs — a signal that is always on is a signal
+            # nobody reads, and it also pinned `approx >= 1`, which meant the
+            # exact/approx split could never render an exact count on this repo.
+            #
+            # FAIL DIRECTION, and it is why this is a content test rather than a
+            # list of logins: if the template changes, this stops matching and
+            # the body is SURFACED — noise, visible, recoverable. A login list
+            # fails the other way, silently dropping a body that started
+            # carrying findings, which is the defect class this change removes.
+            #
+            # Substring tests, not a regex: this runs on a hook path where a
+            # super-linear scan over third-party text is a fail-open, and two
+            # `in` checks cannot backtrack.
+            #
+            # ⚠ A SECOND narrowing was here and was WRONG — Codex P2, round 2,
+            # confirmed by reading all three readers. It skipped every recognised
+            # review login on the grounds that they are "already handled by
+            # another path". They are not, for BODIES: `_check_pr_review_findings`
+            # reads `issues/N/comments`, the inline scanner reads
+            # `pulls/N/comments`, and `_codex_reviews`'s jq projection keeps
+            # `{login, commit_id, state}` and discards `body` entirely. So NOTHING
+            # in this file reads a Codex or Advanced-Security review BODY, and
+            # excluding them re-created a silent drop for the reviewers we trust
+            # MOST — inside the change written to remove silent drops.
+            #
+            # Recognised or not, an unparsed body is surfaced. The noise this was
+            # meant to avoid is bounded by the empty-body test above: a routine
+            # boilerplate approval has no body to surface. Surfacing a Codex body
+            # that DOES carry prose is the correct outcome, not noise.
+            #
+            # This still SURFACES rather than PARSES. Reading a review body for
+            # findings is a different capability and a different risk (see the
+            # filed issue); awareness is the contract here.
+            review_body = (review.get("body") or "").strip()
+            if review_body and not _is_wrapper_review_body(review_body):
+                unclassified_reviews.append(review_login)
             continue
         parsed, declared, declared_known, depth_drift = _cr_outside_diff_entries(
             review.get("body") or ""
@@ -2859,7 +3284,14 @@ def _check_inline_review_findings(
             ):
                 outside_seen[key] = severity
     for (path, line_range, title), severity in outside_seen.items():
-        label = f"{title or '(untitled)'} ({path}:{line_range})"
+        # `title` is sanitised at its producer and `line_range` is safe by
+        # construction — `_CR_ENTRY_RE` captures `\d+(?:-\d+)?`, digits and one
+        # hyphen. `path` is neither: `_CR_FILE_HEADER_RE` captures `[^<>]+?`,
+        # which excludes angle brackets and NOTHING ELSE, so a file header can
+        # carry ESC, CR or bidi straight into this label. Rendered at display
+        # time because the raw value is still needed for the diff-scope match
+        # carried alongside it in the tuples below.
+        label = f"{title or '(untitled)'} ({_safe_report_path(path)}:{line_range})"
         if not severity:
             cr_unknown.append(label)
         elif severity == "critical":
@@ -2905,13 +3337,47 @@ def _check_inline_review_findings(
 
     if unmatched_bot:
         print(
-            f"NOTE: PR #{pr_num} — {len(unmatched_bot)} review-bot comment(s) in a "
-            f"format this gate does not recognise. NOT scored; listed so an "
-            f"unrecognised reviewer cannot be silently invisible:",
+            f"NOTE: PR #{pr_num} — {len(unmatched_bot)} inline review comment(s) in a "
+            f"format this gate does not recognise, or from an author it does not "
+            f"know. NOT scored — read them yourself; listed so a reviewer cannot "
+            f"be silently invisible:",
             file=sys.stderr,
         )
         for bot_login, title in unmatched_bot[:5]:
             print(f"  [unrecognised: {bot_login}] {title}", file=sys.stderr)
+        if len(unmatched_bot) > 5:
+            print(
+                f"  … and {len(unmatched_bot) - 5} more (listing bounded to 5; the "
+                f"count above is the total)",
+                file=sys.stderr,
+            )
+    if unclassified_reviews:
+        # The SECOND channel's version of the same silent drop. Logins only — no
+        # body text: this NOTE's line 0 is not the one `check_pr_report` renders
+        # raw, but the whole block is untrusted third-party content and a login
+        # is the smallest thing that still makes the input findable.
+        # BOTH numbers, because they answer different questions and reporting
+        # either alone misleads: the REVIEW count is how many bodies went
+        # unread, the REVIEWER count is how many distinct sources they came
+        # from. A login-deduped total announced four bodies as one review.
+        distinct = sorted(set(unclassified_reviews))
+        print(
+            f"NOTE: PR #{pr_num} — {len(unclassified_reviews)} review(s) from "
+            f"{len(distinct)} reviewer(s), delivered in a review BODY this gate "
+            f"cannot parse. NOT scored and NOT blocking — go read them; a review "
+            f"that offers to help is never willfully ignored here, whoever wrote it:",
+            file=sys.stderr,
+        )
+        for who in distinct[:5]:
+            count = unclassified_reviews.count(who)
+            suffix = f" ×{count}" if count > 1 else ""
+            print(f"  [unclassified reviewer: {who}{suffix}]", file=sys.stderr)
+        if len(distinct) > 5:
+            print(
+                f"  … and {len(distinct) - 5} more reviewer(s) (listing bounded to 5; "
+                f"the counts above are the totals)",
+                file=sys.stderr,
+            )
     if _scope_cache and _scope_cache[0] is None:
         # Resolution was ATTEMPTED (a candidate finding consulted it) and
         # failed — say so loudly, because from here the scan behaves exactly
@@ -2931,7 +3397,17 @@ def _check_inline_review_findings(
             file=sys.stderr,
         )
         for title, fpath in cr_off_diff[:8]:
-            print(f"  [off-diff CodeRabbit Critical/Major] {title} ({fpath})", file=sys.stderr)
+            # `title` is already safe — `_inline_title` sanitises at the PRODUCER.
+            # A path cannot follow that rule: the raw value is what `_off_diff`
+            # matches against the changed-file list and what the rename map keys
+            # on, so defanging at the producer would corrupt the comparison. It is
+            # therefore rendered at DISPLAY time, here and at every other site
+            # that prints one. See `_safe_report_path`.
+            print(
+                f"  [off-diff CodeRabbit Critical/Major] {title} "
+                f"({_safe_report_path(fpath)})",
+                file=sys.stderr,
+            )
     if off_diff_p1 or off_diff_p2:
         print(
             f"NOTE: PR #{pr_num} — {len(off_diff_p1)} [P1] + {len(off_diff_p2)} "
@@ -2941,9 +3417,9 @@ def _check_inline_review_findings(
             file=sys.stderr,
         )
         for title, fpath in off_diff_p1[:5]:
-            print(f"  [off-diff P1] {title} ({fpath})", file=sys.stderr)
+            print(f"  [off-diff P1] {title} ({_safe_report_path(fpath)})", file=sys.stderr)
         for title, fpath in off_diff_p2[:5]:
-            print(f"  [off-diff P2] {title} ({fpath})", file=sys.stderr)
+            print(f"  [off-diff P2] {title} ({_safe_report_path(fpath)})", file=sys.stderr)
     if cr_unknown:
         print(
             f"NOTE: PR #{pr_num} — {len(cr_unknown)} CodeRabbit finding(s) whose "
@@ -3026,6 +3502,106 @@ def _check_inline_review_findings(
         )
         for title in p2[:8]:
             print(f"  [P2] {title}", file=sys.stderr)
+    # Printed with the findings themselves, not with the verdict, because this is
+    # for whoever is deciding what to do about them — and that decision is made
+    # while reading the list, before any threshold is consulted. Emitted on EVERY
+    # round including the first: one round is a lead rather than a proof, but a
+    # lead nobody is shown is a lead nobody follows.
+    # The report is only as good as the scan behind it: a truncated comment read
+    # or a failed changed-file resolution makes every percentage below a shape
+    # nobody actually measured, so a PARTIAL scan prints counts but never the
+    # concentration inference.
+    # Guarded on `scored_at` rather than leaning on the empty-input early
+    # return inside `_findings_distribution`: Python evaluates arguments BEFORE
+    # the call, so the rename lookup — its own `pulls/N/files` fetch behind its
+    # own cache — would run on every clean PR to build a map for a report that
+    # is never rendered. This path also runs inside the merge hook, which has a
+    # wall-clock deadline, so a fetch for a discarded result is not free.
+    if scored_at:
+        reliable = complete and (not _scope_cache or _scope_cache[0] is not None)
+        distribution = _findings_distribution(
+            scored_at,
+            renames=_pr_rename_map(pr_num, repo=repo),
+            reliable=reliable,
+        )
+        if distribution:
+            print(distribution, file=sys.stderr)
+    # ONE write point for the uncounted categories, deliberately — not one per
+    # return. Every accumulator above is final here, and no `return` sits between
+    # this line and the four exits below, so a single record cannot miss one of
+    # them. Recording at each return instead would be a convention four sites had
+    # to remember, which is the shape that produces "the fifth return forgot".
+    #
+    # The two EARLY returns above (`force`, and an unreadable first page) are
+    # deliberately NOT recorded: they exit before these lists exist, so the
+    # caller sees an EMPTY out-param and must render UNKNOWN rather than zero.
+    # "0 uncounted" on a path that counted nothing is the false confidence this
+    # gate exists to remove, and reproducing it one field over would be worse
+    # than the row it replaces.
+    #
+    # ⚠ THAT STATE IS A FORWARD GUARD, NOT A LIVE ONE, and saying so is the
+    # point — an earlier revision described it as shipped behaviour and put that
+    # claim in a public changelog. VERIFIED: exactly one caller passes
+    # `uncounted_out` (`check_pr_report`) and it never passes `force`, while the
+    # unreadable-first-page return goes through `_scan_unreadable`, which blocks,
+    # so the row renders BLOCK and the clause is never called. `_uncounted_clause
+    # ([])` is therefore unreachable from production TODAY. The branch stays
+    # because it is right for the next caller; the claim about it does not.
+    if uncounted_out is not None:
+        uncounted_out.append(
+            {
+                # TWO SUB-DICTS, and the split is the POINT — it is a lock, not
+                # tidiness. Every bucket here is a count of something the scan
+                # did not score, but they do NOT share a UNIT, and an earlier
+                # version summed them into one number labelled "finding(s)".
+                #
+                # `exact` holds buckets where one comment IS one finding, because
+                # the format was RECOGNISED and its cardinality read.
+                #
+                # `approx` holds review output whose finding cardinality is
+                # UNKNOWN — an unrecognised format, or an unrecognised author. One
+                # such comment may carry five findings or none, so its length is a
+                # count of COMMENTS and can never be a count of findings. Anything
+                # in here makes the rendered total a FLOOR, never an equality.
+                #
+                # Nesting rather than a flat dict plus a remembered list: a new
+                # bucket cannot be added without choosing a side, so "which of
+                # these were exact again?" is not a question a later reader has to
+                # answer correctly from memory. That question is exactly what
+                # produced the defect — the convention-not-chokepoint shape.
+                "exact": {
+                    "doc_path": len(doc_skipped) + len(doc_skipped_p2) + len(cr_doc_skipped),
+                    "below_major": len(cr_advisory),
+                    "off_diff": len(cr_off_diff) + len(off_diff_p1) + len(off_diff_p2),
+                    "unanchored": (
+                        len(outside_critical) + len(outside_major) + len(outside_minor)
+                    ),
+                },
+                "approx": {
+                    "unrecognised_format": len(cr_unknown),
+                    "unrecognised_reviewer": len(unmatched_bot),
+                    "unclassified_review_bodies": len(unclassified_reviews),
+                },
+                # NOT a count — a FLAG, popped before the sum.
+                #
+                # The counters above are correct about the ACCUMULATORS and can
+                # still be wrong about the world. When the review-body channel
+                # under-reports — unreadable, an incomplete read, a declared-count
+                # shortfall, or a surplus batch quarantined whole — findings may
+                # exist that NO accumulator could ever have counted, and every
+                # counter is legitimately 0. Without this flag that renders as
+                # "nothing went uncounted", which is the bare `ok` this change
+                # exists to remove, one field over.
+                #
+                # MEASURED on the pre-fix tree: a clean scan, an unreadable channel
+                # and an incomplete channel all printed BYTE-IDENTICAL rows. The
+                # flags were already in scope here; only the design was not looking
+                # at them.
+                "channel_under_read": int(
+                    reviews_unreadable or not reviews_complete or bool(outside_shortfall)
+                ),
+            }
+        )
     # The lane is resolved ONLY when there is a score to compare, so a PR with no
     # blocking findings still pays nothing — the same laziness `_scope_cache`
     # above was built for. `_pr_changed_files` is memoized, and the pin-receipt
@@ -4547,6 +5123,7 @@ def _bind_pr_files_cache_head(head: str) -> None:
     global _PR_FILES_CACHE_HEAD
     if head != _PR_FILES_CACHE_HEAD:
         _PR_FILES_CACHE.clear()
+        _PR_RENAME_CACHE.clear()
         _PR_FILES_CACHE_HEAD = head
 
 
@@ -4554,6 +5131,7 @@ def _reset_pr_files_cache() -> None:
     """Drop the memo AND its head binding. For tests; a hook process never needs it."""
     global _PR_FILES_CACHE_HEAD
     _PR_FILES_CACHE.clear()
+    _PR_RENAME_CACHE.clear()
     _PR_FILES_CACHE_HEAD = None
 
 
@@ -4594,6 +5172,17 @@ def _pr_changed_files_uncached(pr_num: str, repo: str | None = None) -> list[str
         except Exception:
             return None
     files: list[str] = []
+    # The rename pairing is KEPT from this parse rather than re-read. It is right
+    # here in the same rows, and discarding it used to cost a second, BYTE-IDENTICAL
+    # `pulls/N/files` call — same endpoint, same --paginate, same --jq, same
+    # _gh_timeout(8) — issued by `_pr_rename_map` purely to recover a field this
+    # loop already has in hand. That second call is what CodeRabbit's Major on PR
+    # #2005 caught the sharp edge of: when changed-file resolution has already
+    # failed, the "separate" lookup is a retry of a command that just failed,
+    # inside the merge deadline. Guarding the retry treats the symptom; not
+    # fetching twice removes it. Published through `_pr_rename_map`, which reads
+    # this cache and never calls out.
+    renames: dict[str, str] = {}
     rows = 0
     for line in (raw or "").splitlines():
         line = line.strip()
@@ -4620,12 +5209,51 @@ def _pr_changed_files_uncached(pr_num: str, repo: str | None = None) -> list[str
             if not isinstance(prev, str) or not prev:
                 return None
             files.append(prev)
+            renames[prev] = fname
     if rows >= 3000:
         # The cap applies to API ROWS, not the expanded path list (renames
         # contribute two paths per row — Codex P2, round 1): at the documented
         # 3000-entry endpoint cap a hook file may be hidden beyond it.
         return None
+    # Published ONLY on the success path, and only after the cap check, so a
+    # truncated or malformed read can never leave a half-built pairing behind for
+    # a later reader to mistake for a complete one. Keyed exactly as the file memo
+    # is, and cleared by the same `_reset_pr_files_cache`.
+    _PR_RENAME_CACHE[(pr_num, repo, os.environ.get("_TEST_GH_PR_FILES"))] = renames
     return files
+
+
+#: previous_filename -> current filename for every file this PR renamed, written
+#: by ``_pr_changed_files_uncached`` as a by-product of the read it already makes.
+#: Advisory data: an absent entry yields an empty map (the report degrades to raw
+#: paths) rather than None, because there is no verdict here to fail closed on.
+#: Keyed and cleared exactly as ``_PR_FILES_CACHE`` is.
+_PR_RENAME_CACHE: dict[tuple[str, str | None, str | None], dict[str, str]] = {}
+
+
+def _pr_rename_map(pr_num: str, repo: str | None = None) -> dict[str, str]:
+    """previous_filename -> filename for this PR's renames, ``{}`` when unknown.
+
+    MAKES NO API CALL OF ITS OWN. It asks ``_pr_changed_files`` — memoized, so
+    free once anything on this merge has asked — and then reads the pairing that
+    read kept. An earlier version issued a second, byte-identical
+    ``pulls/N/files`` request to recover ``previous_filename``, a field the first
+    request had already fetched and thrown away.
+
+    Going through ``_pr_changed_files`` rather than reading the cache directly is
+    what makes this ORDER-INDEPENDENT. Reading the dict alone would return ``{}``
+    whenever this happened to run before the file list was needed — correctness
+    resting on call order, which is the kind of coupling that holds until someone
+    moves a caller.
+
+    The failure direction falls out for free and answers CodeRabbit's Major on PR
+    #2005 at the cause rather than the symptom: when changed-file resolution
+    fails, ``_pr_changed_files`` returns None, nothing was published, and this
+    returns ``{}`` having spent nothing. There is no separate lookup left to skip.
+    """
+    if _pr_changed_files(pr_num, repo=repo) is None:
+        return {}
+    return _PR_RENAME_CACHE.get((pr_num, repo, os.environ.get("_TEST_GH_PR_FILES")), {})
 
 
 def _pr_lane(pr_num: str, repo: str | None = None) -> str:
@@ -9871,6 +10499,42 @@ def _defang_gate_text(text: str) -> str:
     )
 
 
+def _bound_with_stated_omission(
+    text: str,
+    max_chars: int = _GATE_TEXT_MAX_CHARS,
+    tail_chars: int = _GATE_TEXT_TAIL_CHARS,
+) -> str:
+    """Bound one line to *max_chars*, keeping BOTH ends and naming what was cut.
+
+    SELECT, do not amputate. A plain head-slice was silent and cut mid-word:
+    MEASURED on the real codex-at-head message, a 532-char line arrived as 200
+    characters ending "…to merge without a", losing the '# stale-review-override'
+    route it exists to hand the operator, with no marker to say anything had been
+    dropped. A gate that tells someone they are blocked and not how to proceed has
+    failed at the only job the detail line has.
+
+    Keeping the HEAD as well as the tail is what preserves IDENTITY, and that is
+    why this is the right primitive for a file path too. Two paths that differ
+    only in their leading directory — ``services/alpha/…/handler.py`` and
+    ``services/bravo/…/handler.py`` — are distinguishable here and were NOT under
+    the tail-only renderer this replaced (Codex P2, PR #2005, round 4).
+
+    Defaults are the gate-text constants, so ``_sanitize_gate_text``'s three
+    callers are byte-identical to before this was lifted out of it. The body is a
+    pure function of its arguments plus those two constants, which is what made
+    the extraction safe rather than merely plausible.
+
+    NOTE the output may exceed *max_chars* by the marker's own width. That is
+    deliberate: the budget bounds the CONTENT, and a cut that did not announce
+    itself would be the very failure above.
+    """
+    if len(text) <= max_chars:
+        return text
+    kept = max_chars - tail_chars
+    omitted = len(text) - kept - tail_chars
+    return f"{text[:kept]} … {omitted} char(s) omitted … {text[-tail_chars:]}"
+
+
 def _sanitize_gate_text(text: str) -> str:
     """Make an untrusted gate message safe to print, bounded in both dimensions.
 
@@ -9888,22 +10552,8 @@ def _sanitize_gate_text(text: str) -> str:
     removes an operator's recovery instruction without saying it did.
     """
     def _clean(line: str) -> str:
-        cleaned = "".join(" " if _gate_text_unsafe(ch) else ch for ch in line)
-        if len(cleaned) <= _GATE_TEXT_MAX_CHARS:
-            return cleaned
-        # SELECT, do not amputate — the same rule the LINE dimension below already
-        # follows, applied to characters. A plain head-slice was silent and cut
-        # mid-word: MEASURED on the real codex-at-head message, a 532-char line
-        # arrived as 200 characters ending "…to merge without a", losing the
-        # '# stale-review-override' route it exists to hand the operator, with no
-        # marker to say anything had been dropped. A gate that tells someone they
-        # are blocked and not how to proceed has failed at the only job the detail
-        # line has.
-        kept = _GATE_TEXT_MAX_CHARS - _GATE_TEXT_TAIL_CHARS
-        omitted = len(cleaned) - kept - _GATE_TEXT_TAIL_CHARS
-        return (
-            f"{cleaned[:kept]} … {omitted} char(s) omitted … "
-            f"{cleaned[-_GATE_TEXT_TAIL_CHARS:]}"
+        return _bound_with_stated_omission(
+            "".join(" " if _gate_text_unsafe(ch) else ch for ch in line)
         )
 
     lines = [_clean(ln) for ln in text.split("\n")]
@@ -9926,6 +10576,88 @@ def _sanitize_gate_text(text: str) -> str:
             *lines[-_GATE_TEXT_TAIL_LINES:],
         ]
     )
+
+
+def _uncounted_clause(uncounted: list[dict[str, int]]) -> str:
+    """Render the non-blocking `inline-findings` tail. COUNTS ONLY, never text.
+
+    The row this feeds is printed OUTSIDE ``_sanitize_gate_text`` — the caller
+    renders line 0 itself and ``_print_gate_detail`` sanitizes only lines 1+ — so
+    anything interpolated here reaches a terminal un-defanged. Integers are safe
+    there; a finding title, a path or a bot login is not. That is why this returns
+    a count and a pointer to the NOTEs rather than the findings themselves, and it
+    is a CONSTRAINT rather than a stylistic choice (issue #2044).
+
+    FIVE states. The count is the easy one; the other four are the point:
+
+    * findings exist and none went uncounted   -> "" (the row keeps its old text)
+    * findings went uncounted, all countable   -> the exact count, "finding(s)"
+    * some reviewer output could not be PARSED -> a FLOOR, and the unit is
+                                                  "item(s)" rather than findings
+    * a review CHANNEL under-reported          -> a FLOOR, or UNKNOWN
+    * the scan never got far enough to count   -> UNKNOWN
+
+    The UNIT matters as much as the number, and conflating them was a real defect
+    here rather than a hypothetical: an unrecognised reviewer's comment is ONE
+    entry in its bucket whatever it contains, so summing it with parsed findings
+    and labelling the result "N finding(s)" asserts a cardinality nobody read. It
+    can understate a bundle of five and overstate a comment carrying none. Hence
+    the producer's `exact`/`approx` split, and hence "item(s)" whenever `approx`
+    contributes: the sentence has to be true of the weakest bucket in it.
+
+    The third state is the one an adversarial review had to find, because the
+    first version of this function did not have it. Every counter can be 0 and
+    still be wrong about the world: when the review-body channel is unreadable,
+    incomplete, or short of its own declared count, findings may exist that no
+    accumulator could have counted. MEASURED on that version — a clean scan and
+    an unreadable channel printed byte-identical rows, which is precisely the
+    false confidence this whole change removes, reproduced one field over.
+
+    So a total under-read renders UNKNOWN, and a partial one renders `N+` rather
+    than `N`: the number is a floor, and saying `N` would assert a completeness
+    nobody measured.
+
+    An empty list means the scan returned BEFORE its accumulators existed (a
+    '# review-override' force, or an unreadable first page).
+    """
+    if not uncounted:
+        return " — uncounted findings UNKNOWN (scan exited before counting)"
+    record = uncounted[0]
+    # A flag, never a count — read separately, so it can never inflate a total.
+    under_read = bool(record.get("channel_under_read", 0))
+    exact = sum(record.get("exact", {}).values())
+    approx = sum(record.get("approx", {}).values())
+    total = exact + approx
+    # Either cause makes the number a LOWER BOUND, and they are INDEPENDENT, so
+    # both are rendered when both hold: `approx` means the scan READ some input
+    # and cannot count the findings inside it, while `under_read` means a channel
+    # did not deliver everything it had. Only the second is recoverable by
+    # re-running, so a reader shown one cause cannot tell whether retrying helps.
+    #
+    # An earlier version returned on `approx` FIRST and silently discarded a
+    # simultaneously-true `under_read` — while the sentence above it claimed the
+    # reason was "carried rather than collapsed". Codex P2, round 2. A comment
+    # asserting a property the code three lines below does not have is the defect
+    # class this whole change exists to remove, reproduced in its own renderer.
+    if total:
+        causes = []
+        if approx:
+            causes.append("some reviewer output could not be parsed into findings")
+        if under_read:
+            causes.append("a review channel under-reported")
+        if not causes:
+            return f" — but {total} finding(s) NOT scored, see the NOTEs above"
+        # The UNIT follows `approx` alone: an under-read channel withholds
+        # findings it never handed over, which makes the total a floor without
+        # making the things already counted stop being findings.
+        unit = "item(s)" if approx else "finding(s)"
+        return f" — but {total}+ {unit} NOT scored ({'; '.join(causes)}), see the NOTEs above"
+    # Reached only when `total` is 0 — the branch above returns on every path.
+    if under_read:
+        return " — uncounted findings UNKNOWN (a review channel under-reported, see the NOTEs above)"
+    # Nothing uncounted and nothing under-read: leave the row exactly as it was.
+    # A gate that annotates every row teaches nobody to read the annotation.
+    return ""
 
 
 def _print_gate_detail(msg: str) -> None:
@@ -10122,10 +10854,21 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     if blocked:
         _print_gate_detail(msg)
     failures += 1 if blocked else 0
-    blocked, msg = _check_inline_review_findings(pr_num, repo=repo)
-    print(
-        f"inline-findings: {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (P2s, if any, printed above)'}"
+    # The out-param is INFORMATIONAL and must never move the verdict: uncounted
+    # findings are uncounted BY DESIGN (below-Major, outside-diff, doc-path,
+    # unrecognised reviewer), so scoring them here would be a policy change wearing
+    # a reporting change's clothes. `failures` is untouched below for that reason —
+    # and the characterization suite locks report/enforcement agreement on the
+    # VERDICT, not on the text, which is what makes an informational tail safe here
+    # while a verdict flip would not be.
+    uncounted: list[dict[str, int]] = []
+    blocked, msg = _check_inline_review_findings(pr_num, repo=repo, uncounted_out=uncounted)
+    inline_state = (
+        "BLOCK — " + msg.splitlines()[0]
+        if blocked
+        else "ok (P2s, if any, printed above)" + _uncounted_clause(uncounted)
     )
+    print(f"inline-findings: {inline_state}")
     if blocked:
         _print_gate_detail(msg)
     failures += 1 if blocked else 0

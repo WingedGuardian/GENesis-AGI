@@ -128,6 +128,45 @@ _SANDBOX_HOME_TD = tempfile.TemporaryDirectory(prefix="guard-suite-home-")
 _SANDBOX_HOME = _SANDBOX_HOME_TD.name
 
 
+def _assert_basetemp_is_outside_any_repo(cwd: str) -> None:
+    """Fail loudly if the scratch cwd sits inside a git repository.
+
+    The isolation these tests need is "a guard run in the scratch dir resolves
+    NO repository". That used to be bought with GIT_CEILING_DIRECTORIES; the
+    gates now scrub that variable (correctly — see the caller), so the property
+    has to be established by the filesystem instead of by the environment.
+
+    Deliberately not a fix-up: making the scratch dir a repo of its own would
+    also satisfy the walk, but it would change what the guards SEE (a repo, on
+    some branch) and quietly alter what these cases are testing. Refusing is the
+    honest option — it tells whoever moved --basetemp exactly what broke.
+    """
+    probe = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+    )
+    if probe.returncode != 0:
+        return  # no repository anywhere above — the property already holds
+    toplevel = Path(probe.stdout.strip()).resolve()
+    here = Path(cwd).resolve()
+    if toplevel == here:
+        # Resolving to the scratch dir ITSELF is the normal case — several of
+        # these cases `git init` their own cwd on purpose, and a repo standing
+        # where git starts terminates the walk regardless of any environment.
+        # (`here.is_relative_to(toplevel)` was also tested here and is dead:
+        # a toplevel discovered FROM `here` always contains it.)
+        return
+    raise AssertionError(
+        f"the scratch cwd ({here}) sits inside an ANCESTOR git repository "
+        f"({toplevel}), so these guards evaluate repo-state rules against that "
+        "repo instead of against nothing. GIT_CEILING_DIRECTORIES no longer "
+        "prevents this — the gates scrub it. Point --basetemp outside any repo."
+    )
+
+
 def _child_env(cwd: str | None = None, dispatched: str | None = None) -> dict[str, str]:
     """The ONE place that decides what a guard child may see.
 
@@ -154,6 +193,23 @@ def _child_env(cwd: str | None = None, dispatched: str | None = None) -> dict[st
         # "Direct commits to main are not allowed". A ceiling stops git walking
         # up out of the scratch dir. It must be the PARENT: naming the directory
         # itself does not stop the walk that starts there.
+        #
+        # ⚠ THE CEILING IS NO LONGER SUFFICIENT ON ITS OWN, since 2026-09-19.
+        # The gates now scrub git's ambient environment — GIT_CEILING_DIRECTORIES
+        # included — before every git call they make (review_state.git_env /
+        # review_scope._git_env, and the launcher's exec). That scrub is correct
+        # for production, where an ambient ceiling would make git find nothing
+        # and the gate fail OPEN. But it means a ceiling set HERE no longer
+        # reaches the reads these guards perform through review_state, so this
+        # line protects less than it used to and cannot be relied on alone.
+        #
+        # It stays because it still covers the guards' own direct git calls. The
+        # check below is what actually holds the property now: rather than
+        # blocking the walk, ensure there is nothing up there to find. MEASURED
+        # 2026-09-19: no ancestor of the pytest temp root on this install is a
+        # git repo, so this is inert today and exists to fail LOUDLY the day
+        # someone points --basetemp somewhere that changes it.
+        _assert_basetemp_is_outside_any_repo(cwd)
         env["GIT_CEILING_DIRECTORIES"] = str(Path(cwd).parent)
     if dispatched is not None:
         env["GENESIS_CC_SESSION"] = dispatched

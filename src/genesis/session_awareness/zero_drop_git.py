@@ -203,23 +203,66 @@ def _git(root: str, *args: str) -> list[str]:
 # acked finding in them. Stripped in the runner rather than at each call site,
 # for the same reason `--no-optional-locks` lives in `_git()`: a guarantee every
 # caller must remember is a convention.
-_GIT_ENV_OVERRIDES = frozenset(
+#
+# FOUR COPIES OF THIS SET EXIST and are kept identical BY TEST, not by import:
+# here, `scripts/review_state.py`, `scripts/review_scope.py`, and the bash array
+# in `.claude/hooks/genesis-hook`. The hook-side copies cannot import this module
+# — hook scripts are stdlib-only, and `git_push_guard` already wraps its
+# `review_state` import in `try/except` because a module-load exception in a hook
+# exits 1, which Claude Code treats as NON-BLOCKING and which would silently
+# disable every fail-closed gate in that file.
+# `tests/test_hooks/test_git_env_scrub.py` asserts all four are EQUAL.
+#
+# The launcher carrying the same names is also what `git_push_guard` needs: it
+# PREDICTS what a `git push` will do and must see the config that push will see.
+# MEASURED 2026-09-19: scrubbing the user's config there turns a prompting push
+# into a silent allow. Full reasoning on the `review_state` copy.
+_GIT_ENV_UNSET = frozenset(
     {
+        # Repository LOCATION. MEASURED 2026-09-19: these three each redirect a
+        # gate decision on their own (branch, staged-diff hash, worktree key).
         "GIT_DIR",
-        "GIT_COMMON_DIR",
         "GIT_WORK_TREE",
         "GIT_INDEX_FILE",
+        # Same documented class. MEASURED to have no effect in a standalone-repo
+        # configuration — which is NOT "proven irrelevant": GIT_COMMON_DIR inside
+        # a LINKED WORKTREE is the obvious untested case. Kept because adding to
+        # a scrub is the safe direction.
+        "GIT_COMMON_DIR",
         "GIT_OBJECT_DIRECTORY",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_CEILING_DIRECTORIES",
         "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+        # NOT location variables — they change what a diff REPORTS, which lands
+        # in the same place. MEASURED 2026-09-19: `GIT_EXTERNAL_DIFF=/bin/true`
+        # empties `git diff --cached`, so `review_state._staged_content_hash`
+        # returns its "clean" (nothing-staged) sentinel and
+        # `bump_review_round` then returns the current round WITHOUT
+        # advancing — the escalation cap stops counting. `GIT_DIFF_OPTS` was
+        # measured INERT here and is carried as its documented sibling only; do
+        # not cite it as measured.
+        "GIT_EXTERNAL_DIFF",
+        "GIT_DIFF_OPTS",
     }
 )
+
+#: NO git CONFIG channel is handled here — not the FILE sources
+#: (GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM) and not the injection channels
+#: (GIT_CONFIG_COUNT / GIT_CONFIG_PARAMETERS). All four are PROTECTED config,
+#: the only place git reads `safe.directory` from, so removing any of them makes
+#: git refuse under a uid mismatch — and for THIS builder specifically they also
+#: carry `credential.helper`, `url.*.insteadOf` and `http.*`, which this env
+#: feeds to `git ls-remote` and to `gh` in `zero_drop_worker`. A local-read
+#: hardening must not quietly disarm a remote-auth path. The config routes
+#: measured to move a gate decision are closed by command flags instead; see the
+#: `review_state` copy for the measurements.
 
 
 def scrubbed_git_env() -> dict[str, str]:
     """The ambient environment with git's repo-discovery overrides removed."""
-    return {k: v for k, v in os.environ.items() if k not in _GIT_ENV_OVERRIDES}
+    return {k: v for k, v in os.environ.items() if k not in _GIT_ENV_UNSET}
 
 
 async def default_runner(argv: list[str], timeout: float) -> tuple[int, str, str]:

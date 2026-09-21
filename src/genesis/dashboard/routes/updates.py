@@ -56,8 +56,20 @@ def _git_result(*args: str, timeout: int = 10) -> tuple[str | None, str]:
 
 
 def _query_db(sql: str, params: tuple = ()) -> list[dict]:
-    """Run a read-only query against genesis.db. Returns list of row dicts."""
+    """Run a read-only query against genesis.db. Returns list of row dicts.
+
+    Read-only by intent but NOT by mode: this opens read-write (no
+    ``mode=ro``), so despite the name it can checkpoint a stale ``-wal`` into
+    the main file on close. The write helper directly below already refuses a
+    quarantined database via ``connect_sqlite_rw``; this one consults the same
+    admission check so the route does not leave a read-write handle open on a
+    database the write path is refusing.
+    """
     if not _DB_PATH.is_file():
+        return []
+    from genesis.db.admission import database_is_fenced
+
+    if database_is_fenced(_DB_PATH):
         return []
     try:
         conn = sqlite3.connect(str(_DB_PATH), timeout=5)
