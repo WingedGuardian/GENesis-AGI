@@ -424,75 +424,125 @@ def test_shipped_examples_obey_the_key_equals_model_id_rule() -> None:
     above it. A rule that only exists as prose is a rule the next example
     breaks; this makes it a check instead.
 
-    A key spelling the parser does not model is the failure mode this test has
-    already had once: the DeepSeek example quotes its key (``"…[1m]"``, because
-    the brackets are YAML-significant), the first version of ``key_re`` accepted
-    only bare word characters, and the example was therefore SKIPPED — the test
-    went green over a pair it never compared. So the parser accepts the quoted
-    spelling AND the count of parsed pairs is reconciled against the ``model_id:``
-    lines in the file, which have one fixed spelling. An unmodelled key now fails
-    loudly instead of quietly dropping its example out of scope.
+    KEYS ARE READ BY YAML, NOT BY A REGEX, and that is the whole design. Two
+    rounds of review went to spellings a pattern did not model, and each fix
+    only moved the blind spot:
+
+    * the DeepSeek example quotes its key (``"…[1m]"``, the brackets being
+      YAML-significant) and the first pattern accepted only bare word
+      characters, so the example was SKIPPED — the test went green over a pair
+      it never compared;
+    * the repair widened the pattern and reconciled the count against
+      ``model_id:`` lines, and a reviewer reproduced a case where BOTH patterns
+      miss together (``vendor/alias:`` with ``model_id: vendor/model # tier``),
+      so the audit shared its auditee's blind spot and every assertion passed.
+
+    A third pattern would move it again. YAML already knows every spelling a key
+    can take — quoted, bracketed, slashed, with a trailing inline comment — so
+    the block is de-commented one layer and handed to ``yaml.safe_load``.
+
+    What is left to anchor is finding the blocks at all, and that rests on an
+    asymmetry worth stating: the KEY is author-chosen and open-ended, while
+    ``model_id`` is a FIELD NAME fixed by the roster schema, so a loose match on
+    it is a denominator no future example can slip past. Every line that matches
+    it must then resolve to a pair — a block this reader cannot parse is an
+    assertion failure, never a skip. That is what stops the check quietly
+    narrowing.
     """
     import re
     from pathlib import Path
 
+    import yaml
+
     src = Path(__file__).resolve().parents[2] / "config" / "cc_roster.yaml"
     lines = src.read_text(encoding="utf-8").splitlines()
 
-    # A key is quoted when it carries YAML-significant characters. Both sides of
-    # the comparison are de-quoted, because `"x"` and `x` are the same key to a
-    # YAML parser and a spelling difference to `==`.
-    quoted = r"\"[^\"\n]+\"|'[^'\n]+'"
-    key_re = re.compile(rf"^#\s{{4,}}({quoted}|[A-Za-z0-9][A-Za-z0-9._-]*):\s*$")
-    mid_re = re.compile(r"^#\s+model_id:\s*(\S+)\s*$")
+    # The field name is fixed by the schema; only its quoting and spacing vary.
+    mid_field = re.compile(r"""^\s*["']?model_id["']?\s*:""")
 
-    def dequote(value: str) -> str:
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            return value[1:-1]
-        return value
+    def uncomment(line: str) -> str | None:
+        """The line's content with exactly ONE comment layer removed.
 
-    pairs: list[tuple[int, str, str | None]] = []
-    for i, line in enumerate(lines):
-        m = key_re.match(line)
-        if not m:
-            continue
-        model_id = None
-        # The block is a handful of commented lines; stop at the first
-        # non-comment or the next example key.
-        for nxt in lines[i + 1 : i + 12]:
-            if not nxt.lstrip().startswith("#") or key_re.match(nxt):
-                break
-            mm = mid_re.match(nxt)
-            if mm:
-                model_id = mm.group(1)
-                break
-        pairs.append((i + 1, dequote(m.group(1)), model_id))
+        One layer, deliberately: the GLM example carries doubly-commented
+        alternative lines, and those must stay comments so YAML ignores them.
+        """
+        stripped = line.lstrip()
+        if not stripped.startswith("#"):
+            return None
+        body = stripped[1:]
+        return body[1:] if body.startswith(" ") else body
 
-    assert pairs, (
-        "no commented example peers found — the parser drifted from the file's "
-        "format, so this test is silently checking nothing"
+    def width(text: str) -> int:
+        return len(text) - len(text.lstrip())
+
+    declared = [
+        i
+        for i, line in enumerate(lines)
+        if (c := uncomment(line)) is not None and mid_field.match(c)
+    ]
+    assert declared, (
+        "no commented example peers found — the example block's format has "
+        "drifted from what this reader expects, so the test is checking nothing"
     )
 
-    # Completeness, not just correctness. `model_id:` has exactly one spelling in
-    # this file, so counting those lines gives a denominator the key parser cannot
-    # influence: if a key form goes unrecognised, its model_id is still counted and
-    # the totals disagree. Without this, the only symptom of a missed key is a test
-    # that passes.
-    declared = sum(1 for line in lines if mid_re.match(line))
-    parsed = sum(1 for _, _, model_id in pairs if model_id is not None)
-    assert parsed == declared, (
-        f"cc_roster.yaml declares {declared} commented `model_id:` line(s) but "
-        f"this test matched only {parsed} to an example key. A key spelling the "
-        "parser does not model is skipped SILENTLY, so the example it belongs to "
-        "stops being checked while this test still passes. Teach `key_re` the new "
-        "spelling rather than leaving the example out of scope."
+    pairs: list[tuple[int, str, str]] = []
+    for i in declared:
+        own = uncomment(lines[i])
+        assert own is not None  # `declared` only holds commented lines
+        block = [own]
+        key_line = None
+        j = i - 1
+        while j >= 0:
+            above = uncomment(lines[j])
+            if above is None or not above.strip():
+                break
+            if width(above) < width(own) and above.rstrip().endswith(":"):
+                key_line = above
+                break
+            if width(above) >= width(own):
+                block.append(above)
+            j -= 1
+
+        where = f"cc_roster.yaml:{i + 1}"
+        assert key_line is not None, (
+            f"the `model_id` at {where} sits under no example key this reader "
+            "could find. Either the example is malformed or the block layout "
+            "changed; an unreadable example must not silently leave the check."
+        )
+        try:
+            doc = yaml.safe_load(
+                "\n".join(
+                    [key_line.strip()] + ["  " + b.strip() for b in reversed(block)]
+                )
+            )
+        except yaml.YAMLError as exc:
+            raise AssertionError(
+                f"the example block at {where} does not parse as YAML "
+                f"({type(exc).__name__}). A reader that cannot parse an example "
+                "must fail, never skip — skipping is how this check went green "
+                "over an example it was not looking at."
+            ) from exc
+        assert isinstance(doc, dict) and len(doc) == 1, (
+            f"the example block at {where} did not read as a single keyed peer"
+        )
+        ((key, value),) = doc.items()
+        assert isinstance(value, dict) and "model_id" in value, (
+            f"the example block at {where} carries no model_id under its key"
+        )
+        pairs.append((i + 1, str(key), str(value["model_id"])))
+
+    # A backstop, not a tautology — MEASURED: replacing the "no enclosing key"
+    # assertion above with a `continue` makes THIS the line that fires. The two
+    # together are what keep an unreadable example from leaving the check
+    # quietly, which is the failure this test has had twice.
+    assert len(pairs) == len(declared), (
+        f"{len(declared)} commented `model_id:` line(s) in cc_roster.yaml but "
+        f"only {len(pairs)} resolved to an example peer. An example this reader "
+        "skips is an example nothing checks."
     )
 
     for lineno, key, model_id in pairs:
-        assert model_id is not None, (
-            f"example peer {key!r} at cc_roster.yaml:{lineno} declares no model_id"
-        )
-        assert key == dequote(model_id), (
+        assert key == model_id, (
             f"example peer at cc_roster.yaml:{lineno} has key {key!r} but "
             f"model_id {model_id!r}. The file's own EXAMPLE PEERS note requires "
             "them to match: a copied peer whose key differs never persists its "
