@@ -12,7 +12,7 @@ import logging
 import os
 import random
 import sqlite3
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Iterable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
@@ -29,6 +29,85 @@ from genesis.env import db_busy_timeout_ms, genesis_db_path
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = genesis_db_path()
+
+
+def connect_sqlite_rw(
+    path: str | Path = DEFAULT_DB_PATH, *args: Any, **kwargs: Any
+) -> sqlite3.Connection:
+    """Return a synchronous RW connection after enforcing DB admission.
+
+    Admission is QUARANTINE — "this artifact failed an integrity check". It
+    is deliberately not more than that: a maintenance fence was built and
+    removed before shipping (see :mod:`genesis.db.admission`), so nothing here
+    protects a database an operator is replacing. Do not write recovery
+    procedure against a guarantee this does not make.
+
+    The assertion takes the caller's spelling, before the ``.resolve()``
+    below, so the path checked is the path the caller named.
+    """
+    from genesis.db.admission import assert_admitted
+
+    admission_path = Path(path).expanduser()
+    assert_admitted(admission_path)
+    return sqlite3.connect(str(admission_path.resolve()), *args, **kwargs)
+
+
+class _GuardedAiosqliteConnector:
+    """Preserve aiosqlite's dual await/context API with open-time guards."""
+
+    def __init__(
+        self, db_path: Path, kwargs: dict[str, Any], admission_path: Path | None = None
+    ) -> None:
+        self._db_path = db_path
+        # The caller's ORIGINAL spelling, kept for admission checks only, so
+        # the path asserted is the path the caller named rather than whatever
+        # it resolves to.
+        self._admission_path = admission_path if admission_path is not None else db_path
+        self._kwargs = kwargs
+        self._connection: aiosqlite.Connection | None = None
+
+    async def _open(self) -> aiosqlite.Connection:
+        from genesis.db.admission import assert_admitted
+
+        # Construction and opening are separate for aiosqlite.  Re-check here
+        # so a connector retained before admission changed cannot open after.
+        assert_admitted(self._admission_path)
+        connection = await aiosqlite.connect(str(self._db_path), **self._kwargs)
+        try:
+            # Quarantine may have become active while the worker thread
+            # opened SQLite.  Never return that newly opened writable handle.
+            assert_admitted(self._admission_path)
+        except BaseException as open_error:
+            try:
+                await connection.close()
+            except BaseException as close_error:
+                open_error.add_note(f"connection cleanup failed: {close_error!r}")
+            raise
+        self._connection = connection
+        return connection
+
+    def __await__(self) -> Generator[Any, None, aiosqlite.Connection]:
+        return self._open().__await__()
+
+    async def __aenter__(self) -> aiosqlite.Connection:
+        return await self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if self._connection is not None:
+            await self._connection.close()
+
+
+def connect_aiosqlite_rw(
+    path: str | Path = DEFAULT_DB_PATH, **kwargs: Any
+) -> _GuardedAiosqliteConnector:
+    """Return an awaitable/context-manager guarded through actual DB open."""
+    from genesis.db.admission import assert_admitted
+
+    admission_path = Path(path).expanduser()
+    assert_admitted(admission_path)
+    db_path = admission_path.resolve()
+    return _GuardedAiosqliteConnector(db_path, kwargs, admission_path=admission_path)
+
 
 # Per-connection page cache. Negative = KiB (SQLite convention), so -262144 is
 # 256 MiB. SQLite's default is ~2 MiB, which forces hot read paths to keep
@@ -271,6 +350,7 @@ class SerializedConnection:
             "_reconnect_fn",
             "_consecutive_errors",
             "_max_errors",
+            "_db_path",
         }
     )
 
@@ -281,12 +361,14 @@ class SerializedConnection:
         conn: aiosqlite.Connection,
         *,
         reconnect_fn: Callable[[], Awaitable[aiosqlite.Connection]] | None = None,
+        db_path: Path | None = None,
     ) -> None:
         object.__setattr__(self, "_conn", conn)
         object.__setattr__(self, "_lock", asyncio.Lock())
         object.__setattr__(self, "_reconnect_fn", reconnect_fn)
         object.__setattr__(self, "_consecutive_errors", 0)
         object.__setattr__(self, "_max_errors", self._MAX_LOCK_ERRORS)
+        object.__setattr__(self, "_db_path", db_path)
 
     # -- Attribute passthrough (e.g. row_factory, in_transaction) ----------
 
@@ -365,6 +447,10 @@ class SerializedConnection:
         slept = 0.0
         for attempt in range(1, attempts + 1):
             try:
+                if self._db_path is not None:
+                    from genesis.db.integrity import assert_not_quarantined
+
+                    assert_not_quarantined(self._db_path)
                 result = await fn()
                 self._reset_error_count()
                 return result
@@ -452,6 +538,10 @@ class SerializedConnection:
         # idempotent. Keeps the pre-retry behavior: count + re-raise.
         async def _locked() -> aiosqlite.Cursor:
             async with self._lock:
+                if self._db_path is not None:
+                    from genesis.db.integrity import assert_not_quarantined
+
+                    assert_not_quarantined(self._db_path)
                 try:
                     result = await self._conn.executescript(sql)
                     self._reset_error_count()
@@ -483,6 +573,10 @@ class SerializedConnection:
 
     async def cursor(self) -> aiosqlite.Cursor:
         async with self._lock:
+            if self._db_path is not None:
+                from genesis.db.integrity import assert_not_quarantined
+
+                assert_not_quarantined(self._db_path)
             return await self._conn.cursor()
 
     # -- Async iteration support (used by some callers) --------------------
@@ -511,6 +605,9 @@ async def get_db(
     deliberate, separate decision).
     """
     path = Path(path)
+    from genesis.db.admission import assert_admitted
+
+    assert_admitted(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     async def _configure(conn: aiosqlite.Connection) -> None:
@@ -535,11 +632,12 @@ async def get_db(
 
     # Build reconnect closure (SQLite-specific; replace for PostgreSQL)
     async def _reconnect() -> aiosqlite.Connection:
+        assert_admitted(path)
         conn = await aiosqlite.connect(str(path))
         await _configure(conn)
         return conn
 
-    return SerializedConnection(db, reconnect_fn=_reconnect)
+    return SerializedConnection(db, reconnect_fn=_reconnect, db_path=path)
 
 
 @asynccontextmanager
@@ -560,6 +658,9 @@ async def get_raw_db(
     shared across coroutines. Yields the connection and closes it on exit.
     """
     path = Path(path)
+    from genesis.db.admission import assert_admitted
+
+    assert_admitted(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     db = await aiosqlite.connect(str(path))
     try:
@@ -597,7 +698,17 @@ async def open_ro_connection(
     Deliberately does NOT run ``journal_mode=WAL`` or ``synchronous`` — those
     need write access to the DB header and are no-ops (or raise
     ``SQLITE_READONLY`` on some builds) on a read-only handle.
+
+    Admission (quarantine) is enforced here like every other open-time
+    factory. Read-only is not a reason to skip it: a reader still opens the
+    file and its ``-wal``, still holds a descriptor on it, and still surfaces
+    rows from an artifact already judged untrustworthy. This was the one
+    connect site in
+    this module guarded by nothing at all.
     """
+    from genesis.db.admission import assert_admitted
+
+    assert_admitted(Path(path))
     uri = f"file:{Path(path)}?mode=ro"
     conn = await aiosqlite.connect(uri, uri=True)
     conn.row_factory = aiosqlite.Row

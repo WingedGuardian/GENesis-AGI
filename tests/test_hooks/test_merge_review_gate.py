@@ -2671,6 +2671,49 @@ class TestOffDiffLockItself:
             "the lock is blind there and every vacuous test now passes silently"
         )
 
+    @pytest.mark.parametrize(
+        ("comment_factory", "label"),
+        [
+            (lambda p: _cr_c(1, _CR_MAJOR_BODY, path=p),
+             "[off-diff CodeRabbit Critical/Major]"),
+            (lambda p: _codex_c(1, _P1_BODY, path=p), "[off-diff P1]"),
+            (lambda p: _codex_c(1, _P2_BODY, path=p), "[off-diff P2]"),
+        ],
+        ids=["coderabbit_major", "codex_p1", "codex_p2"],
+    )
+    def test_an_off_diff_path_cannot_write_to_the_terminal(
+        self, guard_module, capsys, comment_factory, label
+    ):
+        """The REST of the population, found while fixing one member of it.
+
+        Codex's round-1 finding on PR #2005 was that a contributor-controlled
+        path interpolated into gate output can forge or conceal the surrounding
+        verdict. It was fixed in the findings distribution — and in NO other
+        site, though four more printed a path raw and predate that PR. Fixing a
+        class in one place is not fixing the population.
+
+        The exposure is the one this file's own `_safe_title` docstring records
+        as MEASURED: CR + `ESC[2K` redraws the line as a counterfeit
+        `merge-with :` command with `--match-head-commit` absent, stripping the
+        TOCTOU binding from a command the operator is told to copy verbatim.
+        These lanes are the NON-blocking ones, which the same docstring notes is
+        the dangerous half — the operator reads the verdict as passing.
+
+        Note the path must still be RECOGNISABLE afterwards: a renderer that
+        neutralised by deleting everything would pass a residue check while
+        making the note useless.
+        """
+        hostile = "src/\x1b[2K\rnot_in_the_diff.py"
+        with _mock_inline(guard_module, [comment_factory(hostile)]):
+            guard_module._check_inline_review_findings("100")
+        err = capsys.readouterr().err
+        assert label in err, "precondition: this lane still prints"
+        residue = [
+            c for c in err if guard_module._gate_text_unsafe(c) and c != "\n"
+        ]
+        assert not residue, f"terminal-acting characters reached the report: {residue!r}"
+        assert "not_in_the_diff.py" in err, "the path must still name its file"
+
     def test_an_in_diff_finding_trips_nothing(self, guard_module, capsys):
         """Negative control: without it, a MARKER of '' would pass the test above."""
         with _mock_inline(guard_module, [_codex_c(1, _P1_BODY, path="src/benign.py")]):
@@ -3095,10 +3138,11 @@ class TestPrCiStatusSelfWorkflow:
         # Actions env vars (conftest scrubs them for every hook test).
         monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
             {"name": "genesis-merge-gate", "workflowName": None,
+             "detailsUrl": "https://github.com/OWNER/REPO/runs/99",
              "status": "COMPLETED", "conclusion": "FAILURE"},
             {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
         ]))
-        assert guard_module._pr_ci_status("1") == ("green", [])
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("green", [])
 
     def test_local_path_excludes_ambient_workflow_entries(self, guard_module, monkeypatch):
         # The constant workflow-name lane applies locally too: ambient runs of
@@ -3129,9 +3173,10 @@ class TestPrCiStatusSelfWorkflow:
         monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
             {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
             {"name": "genesis-merge-gate", "workflowName": None,
+             "detailsUrl": "https://github.com/OWNER/REPO/runs/99",
              "status": "COMPLETED", "conclusion": "FAILURE"},
         ]))
-        assert guard_module._pr_ci_status("1") == ("green", [])
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("green", [])
 
     def test_unrelated_same_named_check_is_not_filtered(self, guard_module, monkeypatch):
         # Name-based filtering keys on THIS job's name only — a different job's
@@ -3143,17 +3188,64 @@ class TestPrCiStatusSelfWorkflow:
         ]))
         assert guard_module._pr_ci_status("1") == ("red", ["some-other-check"])
 
-    def test_same_name_in_other_workflow_is_not_filtered(self, guard_module, monkeypatch):
-        # The name lane applies ONLY to workflowName-less (API-published) runs —
-        # a check coincidentally named after this job inside another workflow is
-        # a real verdict and still counts (CodeRabbit: scope the name filter).
+    def test_api_published_run_in_foreign_suite_is_filtered(self, guard_module, monkeypatch):
+        # MEASURED on PR #1954: a `genesis-merge-gate` verdict published via the
+        # check-runs API was attached to a check suite owned by a DIFFERENT
+        # workflow ("Labeler") — GitHub assigns the suite, not the publisher, so
+        # an API-published mirror can carry ANY workflowName. The name plus a
+        # detailsUrl into this repo's run pages is the identity.
         self._actions(monkeypatch, workflow="merge-gate", job="genesis-merge-gate")
         monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
-            {"name": "genesis-merge-gate", "workflowName": "CI",
+            {"name": "genesis-merge-gate", "workflowName": "Labeler",
+             "detailsUrl": "https://github.com/OWNER/REPO/runs/105310955021",
              "status": "COMPLETED", "conclusion": "FAILURE"},
             {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
         ]))
-        assert guard_module._pr_ci_status("1") == ("red", ["genesis-merge-gate"])
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("green", [])
+
+    def test_mirror_name_filtered_locally_under_any_workflow_name(self, guard_module, monkeypatch):
+        # Same lane on the interactive path: an API-published mirror carrying a
+        # foreign workflowName must not double-count as `ci: red`.
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": "Labeler",
+             "detailsUrl": "https://github.com/OWNER/REPO/runs/105310955021",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]))
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("green", [])
+
+    def test_same_name_foreign_details_url_still_counts(self, guard_module, monkeypatch):
+        # Name alone is not provenance: a same-named check whose detailsUrl
+        # points at ANOTHER repo's run page is a real verdict and still blocks.
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": "Other",
+             "detailsUrl": "https://github.com/OTHER/REPO/runs/42",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]))
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("red", ["genesis-merge-gate"])
+
+    def test_same_name_external_details_url_still_counts(self, guard_module, monkeypatch):
+        # A same-named check from another app carries its own external
+        # detailsUrl — not a mirror of this gate, still classifies.
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": None,
+             "detailsUrl": "https://example.com/checks/42",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]))
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("red", ["genesis-merge-gate"])
+
+    def test_same_slug_non_github_host_still_counts(self, guard_module, monkeypatch):
+        # Host is provenance too: a non-github.com URL whose PATH carries this
+        # repo's slug must not be accepted as our mirror.
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps([
+            {"name": "genesis-merge-gate", "workflowName": None,
+             "detailsUrl": "https://evil.example.com/OWNER/REPO/runs/42",
+             "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]))
+        assert guard_module._pr_ci_status("1", repo="owner/repo") == ("red", ["genesis-merge-gate"])
 
 
 class TestPrCiStatusRequiredWorkflows:
@@ -5518,3 +5610,564 @@ class TestPerLaneThreshold:
             "leaving it is the superset assumption that a force-push breaks"
         )
         assert len(reads) == 2
+
+
+class TestFindingsDistribution:
+    """The gate REPORTS where a round's findings land; it never renders a verdict.
+
+    Origin: a change whose round-one findings were 8-of-11 in one file — three of
+    them on code written to answer an earlier round — was about to be answered as
+    eleven separate patches. The concentration was computable from data the gate
+    already had and threw away. These tests pin both halves of the design: the
+    signal fires when there IS a seam, and stays quiet when there is not.
+    """
+
+    ER = "src/genesis/session_awareness/external_review.py"
+
+    def _real_round_one(self):
+        """The ACTUAL shape of the round that motivated this, not a stylised one."""
+        return (
+            [("P1", self.ER)] * 4
+            + [("P2", self.ER)] * 3
+            + [("CR", self.ER)]
+            + [("P2", "scripts/disk_hygiene.sh")] * 2
+            + [("P1", "scripts/systemd/genesis-external-review.timer.template")]
+            + [("P2", "scripts/external_review.py")]
+        )
+
+    def test_acceptance_replays_the_round_that_motivated_it(self, guard_module):
+        out = guard_module._findings_distribution(self._real_round_one())
+        assert "67%" in out, "the concentration must be stated as a number"
+        assert self.ER in out
+        assert "NOTE:" in out, "a two-thirds seam must raise the mechanism signal"
+        assert "4 P1" in out, "the severity mix per file is what distinguishes a seam"
+
+    def test_scattered_findings_get_data_but_NO_premise_push(self, guard_module):
+        """NEGATIVE CONTROL, and the load-bearing one. A gate that cried 'premise!'
+        every round would be tuned out, which costs more than it buys."""
+        out = guard_module._findings_distribution([("P2", f"src/mod_{i}.py") for i in range(8)])
+        assert "DISTRIBUTION:" in out, "the data is reported either way"
+        assert "NOTE:" not in out, "no seam, no mechanism signal"
+
+    def test_a_few_findings_cannot_be_concentrated(self, guard_module):
+        """2 of 3 is 67% and means nothing — a distribution needs points to have
+        a shape. Without this floor the signal fires on almost every small round."""
+        out = guard_module._findings_distribution(
+            [("P2", "a.py"), ("P2", "a.py"), ("P1", "b.py")]
+        )
+        assert "NOTE:" not in out
+
+    def test_the_authorisation_is_always_present(self, guard_module):
+        """The point is not the arithmetic — it is that stepping back reads as
+        in-scope. That line must not be conditional on concentration."""
+        for rows in (self._real_round_one(), [("P2", f"m{i}.py") for i in range(8)]):
+            out = guard_module._findings_distribution(rows)
+            assert "needs nobody's permission" in out
+            assert "lead, not a proof" in out, "conclusions must be sized to the data"
+
+    def test_no_findings_prints_nothing(self, guard_module):
+        assert guard_module._findings_distribution([]) == ""
+
+    def test_output_is_bounded_regardless_of_file_count(self, guard_module):
+        """This rides on a hook's stderr, so an unbounded report is a real hazard."""
+        out = guard_module._findings_distribution([("P2", f"f{i}.py") for i in range(400)])
+        assert len(out.splitlines()) <= 10
+        assert len(out) < 1500
+        assert "more file(s)" in out, "the elided remainder must be declared, not dropped"
+
+    def test_a_pathless_finding_is_still_counted(self, guard_module):
+        """A finding whose path the API omitted must not vanish from the total."""
+        out = guard_module._findings_distribution([("P1", ""), ("P2", "a.py")])
+        assert "2 scored finding(s)" in out
+        assert "(no path)" in out
+
+    def test_pathless_findings_do_not_get_buried_or_win_concentration(self, guard_module):
+        """Pathless findings are real work but prove nothing about WHICH file is
+        hot — an unknown anchor is not a seam. A pathless-only population must not
+        print a leader, and pathless weight must not pad a real leader's share."""
+        out = guard_module._findings_distribution(
+            [("P1", "") for _ in range(10)] + [("P2", "src/a.py")]
+        )
+        assert "(no path)" in out
+        assert "ONE file" not in out, "an unknown anchor cannot be 'the' seam"
+
+    def test_rename_aliases_report_under_one_name(self, guard_module):
+        """A renamed file must not split into two rows — the seam is the same
+        file on both sides of the rename (Codex P2, PR #2005)."""
+        out = guard_module._findings_distribution(
+            [("P1", "old/name.py"), ("P1", "new/name.py")],
+            renames={"old/name.py": "new/name.py"},
+        )
+        assert "new/name.py" in out
+        assert "old/name.py" not in out
+        assert "2 P1" in out
+
+    def test_tied_leaders_suppress_the_single_seam_note(self, guard_module):
+        """A tie means no plausible single seam — ranking order alone must not
+        crown one (Codex P2, PR #2005)."""
+        out = guard_module._findings_distribution(
+            [("P1", "src/a.py"), ("P1", "src/a.py"), ("P1", "src/b.py"), ("P1", "src/b.py")]
+        )
+        assert "ONE file" not in out, "a 2-2 tie has no concentrated leader"
+        assert "DISTRIBUTION:" in out  # the counts still print; the inference does not
+
+    def test_an_unreliable_scan_is_labeled_partial_and_suppresses_the_note(
+        self, guard_module
+    ):
+        """A truncated read makes every percentage a shape nobody measured —
+        provisional counts may print, the inference must not (Codex P2)."""
+        out = guard_module._findings_distribution(
+            [("P1", "src/a.py") for _ in range(6)], reliable=False
+        )
+        assert "PARTIAL" in out, "an unreliable scan must be labeled, not disguised"
+        assert "ONE file" not in out
+
+    def test_a_path_cannot_write_to_the_terminal(self, guard_module):
+        """A path is API-supplied untrusted data: '\r' rewrites the line and
+        '\x1b[' starts an escape sequence (CodeRabbit Minor, PR #2005).
+
+        Pins the PROPERTY, not a spelling. An earlier version asserted the
+        literal `\\u001b`, which pinned `json.dumps` rather than safety and would
+        have failed any correct renderer that neutralises by another route. The
+        contract is that nothing a terminal ACTS on survives, so the assertion
+        asks the module's own classifier — the same one the gate's other
+        untrusted interpolations are cleaned with.
+        """
+        raw_path = "src/\x1b[2K\rweird\nname.py"
+        out = guard_module._findings_distribution([("P1", raw_path)])
+        residue = [c for c in out if guard_module._gate_text_unsafe(c) and c != "\n"]
+        assert not residue, f"terminal-acting characters survived: {residue!r}"
+        assert "weird\nname" not in out, "a path must not forge an extra row"
+        assert "name.py" in out, (
+            "neutralising must not cost the basename — the row has to still name a file"
+        )
+
+    def test_two_paths_sharing_a_basename_stay_DISTINGUISHABLE(self, guard_module):
+        """Codex P2, PR #2005 round 4: the clip collapsed distinct paths into one.
+
+        Two long paths differing ONLY in their leading directory rendered
+        identically, because the renderer kept the tail and dropped the head.
+        Nothing else in the report carries the path — the findings list prints
+        `_inline_title` output, which is a title — so that was information lost
+        outright, not selected away.
+
+        Keeping both ends is what fixes it, which is why the shared
+        `_bound_with_stated_omission` is the right primitive rather than a
+        bespoke one.
+        """
+        p1 = "services/alpha/" + "x" * 70 + "/handler.py"
+        p2 = "services/bravo/" + "x" * 70 + "/handler.py"
+        r1, r2 = guard_module._safe_report_path(p1), guard_module._safe_report_path(p2)
+        assert r1 != r2, "two distinct paths must not render as the same string"
+        assert "alpha" in r1 and "bravo" in r2, "the distinguishing head must survive"
+        # `in`, not `endswith`: round 5 appends an identity tag after the tail
+        # when the rendering is lossy, which these paths are. The property this
+        # test owns is that the basename SURVIVES, not that it sits last.
+        assert "handler.py" in r1 and "handler.py" in r2, (
+            "and the basename must survive too — both ends, or the row is ambiguous "
+            "in one direction or uninformative in the other"
+        )
+
+    def test_a_LOSSY_rendering_carries_an_identity_tag(self, guard_module):
+        """Round 5, found independently by Codex and Devin at the same head.
+
+        Both transforms are lossy, in different ways, and the distribution
+        groups by the RAW path while labelling with the rendered one — so two
+        real buckets could print as the same row.
+
+        Rounds 1-4 were all ONE property (length under an expanding encoding).
+        This is a different one, latent throughout: fixing the expansion is what
+        made it visible. Both collision sources are driven here, because fixing
+        one and calling the class closed is how this PR reached round 5.
+        """
+        # Codex's case: defang is many-to-one — ESC and a space both become " ".
+        plain, escaped = "src/a b.py", "src/a\x1bb.py"
+        assert guard_module._safe_report_path(plain) != guard_module._safe_report_path(
+            escaped
+        ), "a defang collision must not render two paths as one row"
+
+        # Devin's case: the bound drops the MIDDLE, so the head, the omission
+        # count and the basename can all match while the paths differ.
+        p1 = "services/common/" + "a" * 70 + "/handler.py"
+        p2 = "services/common/" + "a" * 35 + "b" + "a" * 34 + "/handler.py"
+        r1, r2 = guard_module._safe_report_path(p1), guard_module._safe_report_path(p2)
+        assert r1 != r2, "an omitted-middle collision must not render as one row"
+        assert len(r1) == len(r2), (
+            "precondition: these differ ONLY in the elided middle, so the tag is "
+            "the only thing that can separate them"
+        )
+        # Identity is added, not traded for readability — both ends still show.
+        for rendered in (r1, r2):
+            assert rendered.startswith("services/common/")
+            assert "/handler.py" in rendered
+
+    def test_a_FAITHFUL_rendering_carries_no_tag(self, guard_module):
+        """Negative control: the tag must never become noise a reader learns to skip.
+
+        Without this, appending a digest unconditionally would satisfy the test
+        above while stamping every ordinary row with a hash nobody needs. The
+        condition is exact rather than approximate — a rendering byte-identical
+        to its input IS the identifier and needs nothing added.
+        """
+        for clean in (
+            "src/genesis/memory/store.py",
+            "a.py",
+            "tests/test_hooks/test_merge_review_gate.py",
+        ):
+            assert guard_module._safe_report_path(clean) == clean, (
+                f"a faithful rendering must be returned untouched: {clean}"
+            )
+
+    def test_the_pathless_bucket_never_displaces_a_FILE(self, guard_module):
+        """Devin, round 5: the bucket sorted last only as a TIEBREAK.
+
+        So five pathless findings outranked a file with three, and with six real
+        files present the display cap elided an actual location to make room for
+        a bucket that is not a file. It is still listed — it holds real findings
+        — it just cannot cost the report a file.
+        """
+        scored = [("P2", None)] * 5 + [
+            ("P2", f"src/f{i}.py") for i in range(6) for _ in range(3)
+        ]
+        out = guard_module._findings_distribution(scored)
+        shown = [ln for ln in out.split("\n") if ln.startswith("     ")]
+        assert not any("(no path)" in ln for ln in shown), (
+            "the pathless bucket must not occupy one of the six displayed rows "
+            "while a real file is elided"
+        )
+        assert all(f"src/f{i}.py" in out for i in range(6)), "every file must show"
+        assert "the pathless bucket" in out, "and its omission must be declared"
+
+    def test_a_reported_round_is_not_described_as_a_round(self, guard_module):
+        """The scorer accumulates across review submissions, so 'this round' was a
+        false claim about what was counted (Codex P2, PR #2005, round 1).
+
+        The replacement wording was ALSO wrong — "the unresolved findings"
+        overstates a denominator that is only `scored_at` (Codex P2, round 2) —
+        so this test now pins the property that survived both corrections
+        rather than either literal string it has held: the report must not
+        describe its contents as a round. The narrow positive claim is pinned
+        by `test_the_concentration_denominator_is_named_as_SCORED`.
+        """
+        out = guard_module._findings_distribution(
+            [("P1", "src/a.py") for _ in range(6)]
+        )
+        assert "this round's findings" not in out
+        assert "scored finding(s)" in out, "the header states the real denominator"
+
+    def test_output_survives_pathological_paths(self, guard_module):
+        """The size bound above passes only because its paths are SHORT.
+
+        `json.dumps` escapes control characters but does not shorten, and a
+        control-dense path EXPANDS six-fold, so escaping alone left the report's
+        own 1500-char budget reachable by a single contributor-named file
+        (CodeRabbit Minor, PR #2005). MEASURED before the bound: the
+        control-dense case below rendered ~29,000 chars.
+        """
+        for label, rows in (
+            ("plain", [("P2", "d" * 4000 + f"/f{i}.py") for i in range(6)]),
+            ("control-dense", [("P2", ("\x1b[2K\r" * 800) + f"{i}.py") for i in range(6)]),
+            (
+                "concentrated",
+                [("P2", "z" * 4000 + "/hot.py")] * 5 + [("P1", "b" * 4000 + "/other.py")],
+            ),
+        ):
+            out = guard_module._findings_distribution(rows)
+            assert len(out) < 1500, f"{label}: {len(out)} chars"
+            assert len(out.splitlines()) <= 10, label
+            assert not any(ord(c) < 32 and c != "\n" for c in out), (
+                f"{label}: a raw control character reached the report"
+            )
+
+    def test_a_clipped_path_keeps_its_basename_and_declares_the_cut(self, guard_module):
+        """A path's informative end is its TAIL, unlike a title's opening words.
+
+        Clipping is a selection here — the full value is one row up in the
+        findings list — but only if the cut is visible and the filename survives.
+        """
+        out = guard_module._findings_distribution([("P1", "a" * 500 + "/needle.py")])
+        assert "needle.py" in out, "the basename is the part worth keeping"
+        assert "…" in out, "a silent cut reads as the whole path"
+        assert "a" * 200 not in out, "the head must not survive intact"
+
+    def test_the_elided_remainder_counts_files_not_buckets(self, guard_module):
+        """`len(ranked) - 6` counted the pathless bucket as an omitted FILE, so
+        seven files plus a pathless bucket reported '2 more file(s)' when one
+        file was omitted (Devin + CodeRabbit, independently, PR #2005).
+
+        The bucket is NAMED rather than folded away: it holds real findings, and
+        an undeclared omission is what the elision marker exists to prevent.
+        """
+        rows = [("P2", f"src/f{i}.py") for i in range(7)] + [("P1", "")]
+        out = guard_module._findings_distribution(rows)
+        assert "1 more file(s)" in out, "only ONE real file is omitted"
+        assert "2 more file(s)" not in out
+        assert "the pathless bucket" in out, "the dropped bucket must be declared"
+
+    #: The omission marker's own width: " … " + the count + " char(s) omitted … ".
+    #: The content budget bounds the CONTENT; a cut that did not announce itself
+    #: would be the failure the marker exists to prevent, so the marker is
+    #: overhead on top. 40 covers the count for any path length reachable here.
+    _MARKER_BUDGET = 40
+
+    def test_the_basename_survives_every_expansion_class(self, guard_module):
+        """The basename is a path's informative end and must survive the bound.
+
+        Swept across three classes because a single fixture measured the branch
+        it constructed: an earlier version of this test used only `'a' * 500`,
+        which does not expand under `json.dumps`, so the encoded backstop of the
+        renderer it was testing never fired and its front-slice went unexercised
+        — while a multibyte path rendered 101 chars with `needle.py` absent
+        (Codex P2, PR #2005, round 2).
+
+        The sweep is kept although the renderer it caught is gone. The classes
+        are the right ones for ANY renderer, and a non-expanding one has to earn
+        the same result rather than inherit it.
+        """
+        for label, path in (
+            ("multibyte", "目录" * 40 + "/needle.py"),
+            ("control-dense", ("\x1b[2K\r" * 800) + "needle.py"),
+            ("ascii", "a" * 500 + "/needle.py"),
+        ):
+            out = guard_module._safe_report_path(path)
+            assert "needle.py" in out, f"{label}: the basename was discarded"
+            assert (
+                len(out) <= guard_module._REPORT_PATH_MAX_CHARS + self._MARKER_BUDGET
+            ), f"{label}: rendered {len(out)} chars"
+            assert "omitted" in out, f"{label}: the cut must stay declared"
+
+    def test_a_path_with_no_ascii_at_all_stays_bounded_and_inert(
+        self, guard_module
+    ):
+        """Boundary: every character non-ASCII, and no basename to reward keeping.
+
+        Under the previous renderer this was the pathological input because the
+        bound was a shrink LOOP over an expanding encoding, and the question was
+        whether it terminated. There is no loop now — the transform is 1:1 — so
+        what this pins is what still matters: bounded, and carrying nothing a
+        terminal acts on, with no ASCII anywhere to make either outcome easy.
+        """
+        out = guard_module._safe_report_path("目录" * 200)
+        assert len(out) <= guard_module._REPORT_PATH_MAX_CHARS + self._MARKER_BUDGET
+        assert not any(guard_module._gate_text_unsafe(c) for c in out)
+
+    def test_the_concentration_denominator_is_named_as_SCORED(self, guard_module):
+        """`total` is `len(scored_at)`, which excludes findings that are
+        unresolved but unscored — CodeRabbit below-Major, unrecognised bots,
+        off-diff and doc-path anchors. Calling that "the unresolved findings"
+        invites a class diagnosis from a denominator that never included them
+        (Codex P2, PR #2005, round 2). Two wordings have now been wrong here;
+        this pins the narrow one."""
+        out = guard_module._findings_distribution(
+            [("P2", "src/seam.py") for _ in range(4)]
+        )
+        assert "NOTE:" in out, "the fixture must actually reach the note"
+        assert "SCORED findings" in out
+        assert "unresolved findings" not in out
+        assert "this round's findings" not in out
+
+    def test_elision_with_no_pathless_bucket_says_only_files(self, guard_module):
+        """Negative control for the test above: the bucket clause must not appear
+        when there is no bucket, or the marker lies in the ordinary case."""
+        out = guard_module._findings_distribution(
+            [("P2", f"src/f{i}.py") for i in range(9)]
+        )
+        assert "3 more file(s)" in out
+        assert "pathless" not in out
+
+
+class TestFindingsDistributionIsWired:
+    """The report must actually REACH the reader.
+
+    Testing `_findings_distribution` alone proves the arithmetic and nothing about
+    whether the gate calls it — deleting the print would leave every test in the
+    class above green. This drives the REAL scan and reads stderr, so the wiring
+    is what is pinned. (Built is not wired: the repo's own taxonomy.)
+    """
+
+    _PATHS = ("src/seam.py", "src/other.py")
+
+    @pytest.fixture(autouse=True)
+    def _files_in_diff(self, monkeypatch):
+        # Every finding's path must be in the PR's changed-file set, or it is
+        # discounted as off-diff and the conftest offdiff_lock fails the test —
+        # which would make this pass for the wrong reason.
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            "\n".join(
+                json.dumps({"filename": p, "previous_filename": None}) for p in self._PATHS
+            ),
+        )
+
+    def _mock(self, guard_module, comments):
+        return patch.object(
+            guard_module.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0,
+                stdout="\n".join(json.dumps(c) for c in comments), stderr="",
+            ),
+        )
+
+    def test_the_scan_prints_the_distribution(self, guard_module, capsys):
+        """Four P2s on one file: concentrated, and below the floor so the scan
+        reaches the reporting path rather than returning on a P1."""
+        comments = [_codex_c(i, _P2_BODY, path="src/seam.py") for i in range(1, 5)]
+        with self._mock(guard_module, comments):
+            guard_module._check_inline_review_findings("100")
+        err = capsys.readouterr().err
+        assert "DISTRIBUTION:" in err, "the distribution must reach stderr, not just exist"
+        assert "src/seam.py" in err
+        assert "NOTE:" in err, "4-of-4 in one file is a seam"
+        assert "needs nobody's permission" in err
+
+    def test_a_clean_pr_prints_no_distribution(self, guard_module, capsys):
+        """No findings, no noise — the report must not appear on every merge."""
+        with self._mock(guard_module, []):
+            guard_module._check_inline_review_findings("100")
+        assert "DISTRIBUTION:" not in capsys.readouterr().err
+
+    def test_a_clean_pr_does_no_rename_lookup(self, guard_module, capsys, monkeypatch):
+        """Python evaluates arguments BEFORE the call, so passing the rename map
+        as an argument made a clean PR pay for a map no report would use (Devin,
+        PR #2005). `_findings_distribution` returning '' on empty input does not
+        prevent the fetch — only guarding the CALL SITE does.
+
+        Asserted on the real helper rather than on a subprocess count, because
+        the map has its own cache: a hit would make a call-counting test pass
+        while the first clean PR of the process still paid.
+        """
+        calls = []
+        monkeypatch.setattr(
+            guard_module,
+            "_pr_rename_map",
+            lambda pr_num, repo=None: calls.append(pr_num) or {},
+        )
+        with self._mock(guard_module, []):
+            guard_module._check_inline_review_findings("100")
+        assert calls == [], "a clean scan must not fetch a rename map"
+
+        # Positive control: the same seam DOES fetch when there is a report to
+        # build — otherwise this test would pass against a deleted call site.
+        comments = [_codex_c(i, _P2_BODY, path="src/seam.py") for i in range(1, 5)]
+        with self._mock(guard_module, comments):
+            guard_module._check_inline_review_findings("100")
+        assert calls == ["100"], "a scan WITH findings must still resolve renames"
+
+    def test_the_rename_map_costs_NO_second_files_read(
+        self, guard_module, monkeypatch
+    ):
+        """CodeRabbit Major, PR #2005 round 4 — answered at the cause.
+
+        `_pr_rename_map` used to issue its own `pulls/N/files` request, BYTE-
+        IDENTICAL to the one `_pr_changed_files` makes: same endpoint, same
+        --paginate, same --jq, same `_gh_timeout(8)`. The first read already
+        fetches `previous_filename` and threw the pairing away.
+
+        CodeRabbit's remedy was to skip the second read when changed-file
+        resolution fails. That guards one state; this pins the property in every
+        state — there is no second read to skip.
+
+        The spy DELEGATES rather than replacing, because a fake would also skip
+        the cache write that is the whole mechanism, and the test would then pass
+        against a renderer that fetched twice.
+        """
+        rows = '{"filename": "new.py", "previous_filename": "old.py"}'
+        monkeypatch.setenv("_TEST_GH_PR_FILES", rows)
+        guard_module._reset_pr_files_cache()
+
+        real, reads = guard_module._pr_changed_files_uncached, []
+
+        def _spy(pr_num, repo=None):
+            reads.append(pr_num)
+            return real(pr_num, repo)
+
+        monkeypatch.setattr(guard_module, "_pr_changed_files_uncached", _spy)
+
+        # Rename map FIRST, deliberately: correctness must not depend on the file
+        # list happening to have been read already. Reading the cache directly
+        # would return {} here and the coupling would hold only until someone
+        # moved a caller.
+        assert guard_module._pr_rename_map("100") == {"old.py": "new.py"}
+        assert len(reads) == 1, f"the map must not add a read; reads={reads}"
+
+        assert guard_module._pr_changed_files("100") == ["new.py", "old.py"]
+        assert len(reads) == 1, "and the file list must still be served from the memo"
+
+    def test_a_failed_file_resolution_yields_an_empty_map_and_no_retry(
+        self, guard_module, monkeypatch
+    ):
+        """The exact state CodeRabbit named, pinned as a NON-event.
+
+        When changed-file resolution fails, the old code went on to issue the
+        second identical request — a retry of a command that had just failed,
+        inside the merge deadline. Now there is nothing left to retry, and the
+        advisory failure direction is preserved: `{}`, never None, because the
+        report degrades to raw paths rather than failing closed on data that
+        decides no verdict.
+        """
+        monkeypatch.setenv("_TEST_GH_PR_FILES", "__error__")
+        guard_module._reset_pr_files_cache()
+
+        real, reads = guard_module._pr_changed_files_uncached, []
+
+        def _spy(pr_num, repo=None):
+            reads.append(pr_num)
+            return real(pr_num, repo)
+
+        monkeypatch.setattr(guard_module, "_pr_changed_files_uncached", _spy)
+
+        assert guard_module._pr_changed_files("100") is None
+        assert guard_module._pr_rename_map("100") == {}
+        assert len(reads) == 1, f"the failed read must not be retried; reads={reads}"
+
+    def test_a_truncated_or_malformed_read_publishes_NO_pairing(
+        self, guard_module, monkeypatch
+    ):
+        """A half-built map must never outlive the read that failed to finish.
+
+        The pairing is published on the success path only, after the 3000-row
+        cap check. Were it written as rows were parsed, a malformed page or a
+        capped read would leave a partial map behind for a later caller to treat
+        as complete — the silent under-read this repo keeps paying for.
+
+        VERIFY-RED CAUGHT THIS TEST ASSERTING THROUGH THE WRONG MECHANISM. It
+        originally checked `_pr_rename_map(...) == {}`, which passes even when
+        the pairing IS published incrementally — because the `is None` fast path
+        returns `{}` before the cache is ever read. The mutation that publishes
+        inside the parse loop came back GREEN against it. Two protections
+        overlap here and only one was being exercised, so this now asserts on
+        the STORE directly, where the publish discipline is observable.
+        """
+        guard_module._reset_pr_files_cache()
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            '{"filename": "new.py", "previous_filename": "old.py"}\nnot-json',
+        )
+        assert guard_module._pr_changed_files("100") is None, "malformed page → None"
+        assert guard_module._PR_RENAME_CACHE == {}, (
+            "the pairing from the rows that DID parse must never be published — "
+            f"a later reader would take it for a complete map: "
+            f"{guard_module._PR_RENAME_CACHE!r}"
+        )
+        assert guard_module._pr_rename_map("100") == {}, (
+            "and the accessor agrees, by the independent fast path"
+        )
+
+    def test_a_P1_reaches_the_distribution_through_the_real_scan(self, guard_module, capsys):
+        """VERIFY-RED ANCHOR, and it exists because a mutation SURVIVED without it.
+
+        The acceptance test above hands `_findings_distribution` a list it built
+        itself, and the wiring test uses only P2s — so deleting the P1 collection
+        site left both green while every share the report prints would have been
+        computed from incomplete data. This drives real P1 comment bodies through
+        the real scan and asserts the severity mix that only that site can produce.
+        """
+        comments = [_codex_c(i, _P1_BODY, path="src/seam.py") for i in range(1, 4)]
+        comments.append(_codex_c(9, _P2_BODY, path="src/seam.py"))
+        with self._mock(guard_module, comments):
+            guard_module._check_inline_review_findings("100")
+        err = capsys.readouterr().err
+        assert "3 P1" in err, "P1s must be collected, or every share is wrong"
+        assert "1 P2" in err
+        assert "4 scored finding(s)" in err

@@ -5,7 +5,7 @@
 # local config overlays, and secrets.
 #
 # Usage:
-#   scripts/restore.sh [--from <backup-repo-url>] [--dry-run] [--force]
+#   scripts/restore.sh [--from <backup-repo-url>] [--dry-run] [--force] [--database-only]
 #
 # Environment variables (match backup.sh):
 #   GENESIS_BACKUP_REPO        — Git URL (used when a fresh clone is needed)
@@ -28,7 +28,8 @@
 #
 # Behavior:
 #   - Skips destinations that already exist AND are newer than the backup
-#     (avoid clobbering live data). Override with --force.
+#     (avoid clobbering live data). Override with --force. Database-only recovery
+#     may replace a currently quarantined DB regardless of its meaningless mtime.
 #   - Reads both encrypted (*.gpg) and legacy plaintext forms for backward
 #     compatibility with backups predating the encryption hardening.
 #   - Writes ~/.genesis/restore_status.json on every run (success or failure).
@@ -54,11 +55,13 @@ source "$_SCRIPT_DIR/lib/backup_backends.sh"
 BACKUP_REPO_OVERRIDE=""
 DRY_RUN=false
 FORCE=false
+DATABASE_ONLY=false
 while [ $# -gt 0 ]; do
     case "$1" in
         --from) BACKUP_REPO_OVERRIDE="$2"; shift 2 ;;
         --dry-run) DRY_RUN=true; shift ;;
         --force) FORCE=true; shift ;;
+        --database-only) DATABASE_ONLY=true; shift ;;
         -h|--help)
             grep -E '^#( |$)' "$0" | sed 's/^# //; s/^#//'
             exit 0 ;;
@@ -110,8 +113,8 @@ _acquire_deploy_marker() {
         local _other
         _other="$(cat "$_UPDATE_PID_FILE" 2>/dev/null || true)"
         if [[ "$_other" =~ ^[0-9]+$ ]] && [ "$_other" -gt 1 ] && kill -0 "$_other" 2>/dev/null; then
-            warn "a deploy already holds $_UPDATE_PID_FILE (pid $_other) — not overwriting; a concurrent update+restore is unsafe, verify the result"
-            return 0
+            log "ERROR: a deploy already holds $_UPDATE_PID_FILE (pid $_other) — refusing concurrent update+restore"
+            return 1
         fi
     fi
     echo "$$" > "$_UPDATE_PID_FILE"
@@ -130,7 +133,13 @@ _release_deploy_marker() {
 # trap-protect them. (Empty-string default → no-op before they're assigned.)
 _SQL_TMP=""
 _QDRANT_TMP=""
-_cleanup_plaintext() { rm -f "${_SQL_TMP:-}" "${_QDRANT_TMP:-}" 2>/dev/null || true; }
+_DB_STAGE=""
+_cleanup_plaintext() {
+    rm -f "${_SQL_TMP:-}" "${_QDRANT_TMP:-}" 2>/dev/null || true
+    if [ -n "${_DB_STAGE:-}" ]; then
+        rm -f "$_DB_STAGE" "$_DB_STAGE-journal" "$_DB_STAGE-wal" "$_DB_STAGE-shm" 2>/dev/null || true
+    fi
+}
 trap '_write_status; _release_deploy_marker; backend_cleanup; _cleanup_plaintext' EXIT
 
 # ── Setup ────────────────────────────────────────────────────────────
@@ -147,17 +156,21 @@ log()  { echo "$LOG_PREFIX $(date -Iseconds) $*"; }
 warn() { log "WARNING: $*"; _FAILURES+=("$*"); }
 die()  { log "FATAL: $*"; _FAILURES+=("$*"); exit 1; }
 
+# Serialize with scripts/update.sh as well as backup.sh. Both restore and update
+# stop services and own the same deploy marker. Acquire locks in the universal
+# order update → backup/restore: update.sh holds update while invoking backup,
+# so the reverse order here could deadlock an update against a restore.
+_UPDATE_LOCK_FILE="${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock"
+mkdir -p "$(dirname "$_UPDATE_LOCK_FILE")"
+exec {_RESTORE_UPDATE_LOCK_FD}>"$_UPDATE_LOCK_FILE"
+if ! flock -n "$_RESTORE_UPDATE_LOCK_FD"; then
+    die "Genesis update lock is held — refusing concurrent update+restore"
+fi
+
 # ── Mutual exclusion (SF5): backup↔restore share one whole-run lock ──
 # Counterpart of backup.sh's non-blocking skip. A restore is operator-driven,
-# so it WAITS (bounded) rather than skipping — the 6h backup timer firing
-# mid-restore would otherwise snapshot the half-built DB as the newest
-# COMPLETE backup. Acquired AFTER the EXIT trap above so a lock timeout is
-# recorded in restore_status.json as a real failure, and BEFORE the
-# repo-obtain below (backup.sh commits into the same clone this git-pulls).
-# The default 300s wait is deliberately shorter than a full off-site backup
-# run — dying with the holder named is the right behavior for an operator
-# script (wait for the backup, re-run); override for unattended DR flows.
-# Append-mode open: a losing contender must never truncate the holder line.
+# so it WAITS (bounded) rather than skipping. Acquired only after update.lock
+# to preserve the global lock order above.
 # shellcheck source=scripts/lib/dr_lock.sh
 source "$_SCRIPT_DIR/lib/dr_lock.sh"
 _LOCK_WAIT="${GENESIS_RESTORE_LOCK_WAIT:-300}"
@@ -200,16 +213,27 @@ _quiesce_genesis_server() {
     # may have crashed. Gating the marker on is-active (as an earlier draft did)
     # would leave that highest-risk case — the multi-minute .read — unprotected.
     # Only the stop ACTION below is gated on liveness.
-    _acquire_deploy_marker
+    _acquire_deploy_marker || die "another live deploy owns the deploy marker — live database left untouched"
     if systemctl --user is-active --quiet genesis-server 2>/dev/null; then
         log "Stopping genesis-server before SQLite restore (will NOT auto-restart)..."
         # Only record "stopped" if the stop actually succeeded — otherwise the
         # end-of-run note would tell the operator to restart a server that never
         # stopped (and is still holding the DB).
-        if systemctl --user stop genesis-server 2>/dev/null; then
+        if systemctl --user stop genesis-server 2>/dev/null \
+            && ! systemctl --user is-active --quiet genesis-server 2>/dev/null; then
             _SERVER_WAS_STOPPED=true
         else
-            warn "could not stop genesis-server — proceeding (a live writer may still hold the DB; verify before trusting the restore)"
+            die "could not confirm genesis-server stopped — live database left untouched"
+        fi
+    fi
+    # Older installs may still have the deprecated relay running with its own
+    # database handle. Stop it too; otherwise the open-handle fence below must
+    # abort an otherwise valid recovery.
+    if systemctl --user is-active --quiet genesis-bridge 2>/dev/null; then
+        log "Stopping legacy genesis-bridge before SQLite restore (will NOT auto-restart)..."
+        if ! systemctl --user stop genesis-bridge 2>/dev/null \
+            || systemctl --user is-active --quiet genesis-bridge 2>/dev/null; then
+            die "could not confirm genesis-bridge stopped — live database left untouched"
         fi
     fi
 }
@@ -287,10 +311,12 @@ confirm() {
 }
 
 # ── Obtain backup repo ───────────────────────────────────────────────
+_EXPLICIT_LOCAL_SOURCE=false
 if [ -n "$BACKUP_REPO_OVERRIDE" ]; then
     if [ -d "$BACKUP_REPO_OVERRIDE/.git" ] || [ -d "$BACKUP_REPO_OVERRIDE" ]; then
         # Treat as local path
         BACKUP_DIR="$BACKUP_REPO_OVERRIDE"
+        _EXPLICIT_LOCAL_SOURCE=true
         log "Using backup source: $BACKUP_DIR"
     else
         log "Cloning backup repo from $BACKUP_REPO_OVERRIDE..."
@@ -461,7 +487,12 @@ _pull_from_offsite() {
         done < <(backend_list "$snap/$_sub" 2>/dev/null | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u)
     done
 }
-_pull_from_offsite
+if $DATABASE_ONLY && $_EXPLICIT_LOCAL_SOURCE \
+    && { [ -f "$BACKUP_DIR/data/genesis.sql.gpg" ] || [ -f "$BACKUP_DIR/data/genesis.sql" ]; }; then
+    log "database-only: using explicit local SQL payload without off-site replacement"
+else
+    _pull_from_offsite
+fi
 
 # N5: a restore that finds NO payloads at all (empty/wrong BACKUP_DIR, no
 # off-site) used to log "no payload" per section and exit 0 "success" having
@@ -511,6 +542,11 @@ _backup_has_payload() {
 if ! $DRY_RUN && ! _backup_has_payload; then
     die "no restorable payloads found under $BACKUP_DIR (empty or wrong backup source, and no off-site snapshot pulled) — nothing to restore"
 fi
+if $DATABASE_ONLY \
+    && [ ! -f "$BACKUP_DIR/data/genesis.sql.gpg" ] \
+    && [ ! -f "$BACKUP_DIR/data/genesis.sql" ]; then
+    die "database-only restore requires a SQLite payload"
+fi
 
 # Check encrypted payloads exist without passphrase → fail fast.
 _has_encrypted=false
@@ -531,7 +567,31 @@ log "--- SQLite ---"
 DB_FILE="$GENESIS_DIR/data/genesis.db"
 if resolve_payload "$BACKUP_DIR/data/genesis.sql"; then
     src="$__PAYLOAD_SRC"
-    if [ -f "$DB_FILE" ] && [ "$DB_FILE" -nt "$src" ] && ! $FORCE; then
+    _RECOVERING_QUARANTINED_DB=false
+    if $DATABASE_ONLY && [ -f "$DB_FILE" ]; then
+        _QUARANTINE_CHECK_OUTPUT=""
+        _QUARANTINE_CHECK_RC=0
+        _QUARANTINE_CHECK_OUTPUT=$(PYTHONPATH="$_SCRIPT_DIR/../src" python3 - "$DB_FILE" <<'PY'
+import sys
+
+from genesis.db.integrity import database_is_quarantined
+
+raise SystemExit(0 if database_is_quarantined(sys.argv[1]) else 1)
+PY
+        ) || _QUARANTINE_CHECK_RC=$?
+        case "$_QUARANTINE_CHECK_RC" in
+            0)
+                _RECOVERING_QUARANTINED_DB=true
+                log "SQLite: live database is quarantined; verified recovery may replace it regardless of mtime"
+                ;;
+            1) ;;
+            *)
+                die "could not determine live database quarantine state (${_QUARANTINE_CHECK_OUTPUT:-checker unavailable})"
+                ;;
+        esac
+    fi
+    if [ -f "$DB_FILE" ] && [ "$DB_FILE" -nt "$src" ] \
+        && ! $FORCE && ! $_RECOVERING_QUARANTINED_DB; then
         log "SQLite: destination is newer than backup — skipping (use --force to override)"
     else
         if $DRY_RUN; then
@@ -545,56 +605,418 @@ if resolve_payload "$BACKUP_DIR/data/genesis.sql"; then
                 cp "$src" "$_SQL_TMP"
             fi
             if [ -s "$_SQL_TMP" ]; then
-                # Fresh DB from the SQL dump. Stop the live writer FIRST — both
-                # the pre-restore safety copy AND the new DB must be taken with
-                # no open WAL connection, or they are torn/stale.
+                command -v sqlite3 >/dev/null \
+                    || die "SQLite: sqlite3 binary not installed — live database left untouched"
+
+                # Import and validate away from the live path. No failure before
+                # the final rename is allowed to alter the current DB trio.
+                _DB_STAGE="${DB_FILE}.restore-stage.$$"
+                rm -f "$_DB_STAGE"
+                sqlite3 "$_DB_STAGE" ".read $_SQL_TMP" \
+                    || die "SQLite .read failed in staging — live database left untouched"
+                _ic=$(sqlite3 "$_DB_STAGE" "PRAGMA integrity_check;" 2>&1) \
+                    || die "SQLite staged integrity_check could not complete — live database left untouched"
+                [ "$_ic" = "ok" ] \
+                    || die "SQLite staged integrity_check FAILED (${_ic:-no output}) — live database left untouched"
+                _fk=$(sqlite3 "$_DB_STAGE" "PRAGMA foreign_key_check;" 2>&1) \
+                    || die "SQLite staged foreign_key_check could not complete — live database left untouched"
+                [ -z "$_fk" ] \
+                    || die "SQLite staged foreign_key_check FAILED — live database left untouched"
+                _schema_count=$(sqlite3 "$_DB_STAGE" \
+                    "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%';")
+                [ "${_schema_count:-0}" -gt 0 ] \
+                    || die "SQLite staged database has no application schema — live database left untouched"
+                log "SQLite: staged candidate passed integrity, foreign-key, and schema checks"
+
                 _quiesce_genesis_server
-                # Back up the existing DB before we overwrite it. Taken AFTER
-                # quiescing and via `sqlite3 .backup` (WAL-aware) so the undo
-                # artifact is a consistent snapshot — the old behavior did a
-                # plain `cp` of only the main db file BEFORE quiescing, missing
-                # the -wal, so the sole rollback copy was torn exactly when an
-                # operator needs it to undo a bad restore. Fall back to copying
-                # the db + its sidecars together if sqlite3 is unavailable.
+                # Durable crash fence. If power is lost anywhere in the swap,
+                # startup fails closed instead of creating an empty DB at a
+                # temporarily missing path. A verified replacement inode clears
+                # this marker below.
+                PYTHONPATH="$_SCRIPT_DIR/../src" python3 -m genesis.db.integrity mark \
+                    "$DB_FILE" --source restore-in-progress \
+                    --detail "validated candidate staged; database swap in progress" \
+                    >/dev/null \
+                    || die "could not establish durable database quarantine — live database left untouched"
+
+                # Session-scoped MCP processes can outlive genesis-server. The
+                # marker is established before this scan, so all shared open
+                # paths refuse from here onward; any already-open handle would
+                # keep writing the old inode/WAL after swap and is fatal.
+                #
+                # Output and exit status are captured SEPARATELY, and BOTH are
+                # refusals. The previous form — `find ... | grep -q .` under
+                # `set -o pipefail` — reported find's status, so any unreadable
+                # /proc entry (routine: other-uid processes are not inspectable
+                # from here) discarded grep's success and the guard could not
+                # fire at all. Measured with a guaranteed match, it still went
+                # silent: a no-op guard on any real box, in the one place built
+                # to prevent the corruption that took production down.
+                #
+                # An inspection that could not complete establishes NOTHING, so
+                # it refuses rather than warning. Descriptors are inherited and
+                # passable (SCM_RIGHTS), so no property of the current file
+                # narrows the holder set for us — visibility must be resolved
+                # operationally, by an inspector with sufficient authority or a
+                # verified offline boundary, and never assumed.
+                # Conclusive visibility needs AUTHORITY, not just a scan: from
+                # an unprivileged uid, /proc/<pid>/fd is unreadable for other-uid
+                # processes (measured here: 21 of 83 fd dirs), so a plain scan
+                # cannot tell "no holder" from "could not look". The narrow
+                # privileged read-only `find` below closes that gap — ONLY the
+                # scan is privileged; the restore itself never runs as root.
+                # Measured: as root, 0 of 86 fd dirs are unreadable and the scan
+                # exits clean. Without a way to inspect conclusively we refuse,
+                # because an unseen process is an UNKNOWN holder, not an absent
+                # one. Descriptors are inherited and passable (SCM_RIGHTS), so no
+                # property of the file narrows the holder set for us.
+                # Accept ONLY a complete scan: no holders AND no inspection
+                # errors. A pid vanishing between the glob and the traversal
+                # makes find exit nonzero, so a single attempt refuses roughly
+                # 1 in 10 legitimate restores on a healthy box (measured). We
+                # retry a bounded number of times rather than classifying error
+                # text: the wording differs between find implementations (this
+                # box's is bfs) and inferring permission-to-proceed from a
+                # message is exactly the fragility to avoid.
+                #
+                # HOLDERS ARE CHECKED FIRST, and a holder refuses regardless of
+                # any error reported alongside it — an incomplete scan that DID
+                # see a handle is still conclusive about that handle.
+                #
+                # Attempts are sized against a measured failure rate, not
+                # picked: a single scan refused ~1 in 10 times on an idle box,
+                # and a 3-attempt bound still failed during a full test suite
+                # where subprocess churn is heavy. 5 leaves a residual that is
+                # rare enough to be acceptable for a supplementary guard, and
+                # the cost is ~1s per retry, only on the failing path.
+                # Scan-mode seam. Default `auto` borrows the same authority as
+                # before; the other modes exist so a test can drive a branch
+                # explicitly instead of inheriting the host's sudoers (a suite
+                # gated on the host's privilege environment passes where sudo
+                # exists and silently stops exercising the guard where it does
+                # not), and so an operator who has established a verified
+                # offline boundary by other means can say so out loud rather
+                # than being refused.
+                #   auto  — uid 0, else `sudo -n`, else refuse (legacy behaviour)
+                #   plain — unprivileged scan; refuses when the scan REPORTS an
+                #           error, and refuses outright where procfs is mounted
+                #           with hidepid (where it cannot see every PID at all)
+                #   sudo  — require `sudo -n`; refuse if unavailable
+                #   none  — skip the scan; AUTHORITATIVE-BOUNDARY ASSUMED
+                _HOLDER_SCAN_MODE="${GENESIS_RESTORE_HOLDER_SCAN:-auto}"
+                _HOLDER_ATTEMPTS=5
+                _HOLDER_ATTEMPT=0
+                _HOLDER_OUT=""
+                _HOLDER_RC=1
+                # /proc/<pid>/fd symlinks name the RESOLVED target (with
+                # " (deleted)" appended once the file is unlinked), and -lname
+                # matches its operand as a GLOB against that text. Three
+                # consequences, each a reviewed defect in the prefix pattern
+                # "$DB_FILE*" this replaces: a symlinked component in DB_FILE
+                # never matches the resolved link text (the guard goes blind); a
+                # glob metacharacter in the path matches the wrong files; and
+                # the prefix also matched this script's own
+                # .pre-restore.<epoch> safety copies, so a forensic tool
+                # holding one refused a restore that copy cannot affect. Match
+                # the RESOLVED path, glob-escaped, against exactly the live
+                # artifacts — main, -wal, -shm — each also in its " (deleted)"
+                # form, so an unlinked-but-still-open handle (the shape the
+                # 2026-09-18 incident actually had) still refuses.
+                _DB_SCAN_REAL=$(readlink -f -- "$DB_FILE" 2>/dev/null) \
+                    || _DB_SCAN_REAL="$DB_FILE"
+                _DB_SCAN_PAT=$(printf '%s' "$_DB_SCAN_REAL" | sed 's/[][\\*?]/\\&/g')
+                if [ "$_HOLDER_SCAN_MODE" = "none" ]; then
+                    # `log`, not `warn`: warn() appends to _FAILURES, which makes
+                    # the whole restore exit non-zero. Skipping the scan is an
+                    # explicit operator choice, not a failure of the run.
+                    log "SQLite: live-handle scan SKIPPED (GENESIS_RESTORE_HOLDER_SCAN=none). Sound only when exclusion is established by other means (a verified offline boundary); this scan is a supplementary guard, never exclusion."
+                    _HOLDER_RC=0
+                    _HOLDER_ATTEMPT=0
+                fi
+                while [ "$_HOLDER_SCAN_MODE" != "none" ] \
+                    && [ "$_HOLDER_ATTEMPT" -lt "$_HOLDER_ATTEMPTS" ]; do
+                    _HOLDER_ATTEMPT=$((_HOLDER_ATTEMPT + 1))
+                    _HOLDER_OUT=""
+                    _HOLDER_RC=0
+                    case "$_HOLDER_SCAN_MODE" in
+                    plain)
+                        # An unprivileged glob silently OMITS hidepid-hidden PID
+                        # directories, and find then exits 0 over the visible
+                        # subset — so "no error" is NOT "complete visibility" and
+                        # the guard would pass with a holder it cannot see. Under
+                        # hidepid this mode cannot deliver what it claims, so it
+                        # refuses rather than returning a clean-looking result.
+                        # Match the OPTION, never an enumerated value list:
+                        # `hidepid=[12]` missed `hidepid=4` and the symbolic
+                        # spellings (`noaccess`, `invisible`, `ptraceable`) the
+                        # 5.8+ multi-instance procfs work introduced. Anything
+                        # not explicitly 0/off refuses — same RULE as
+                        # scripts/check_cc_running_versions.sh, which already
+                        # learned this closed-set-of-values mistake. One
+                        # deliberate divergence from its regex: only the LAST
+                        # /proc mount line is evaluated, because /proc/mounts
+                        # lists overmounts in order and an any-line match lets a
+                        # stale `hidepid=off` entry beneath the effective
+                        # hidepid mount stand the refusal down (measured in
+                        # review; the mirror still has that hole — tracked as a
+                        # follow-up issue).
+                        _HP_LINE=""
+                        _HP_LINE=$(grep -E '(^| )/proc proc ' /proc/mounts 2>/dev/null | tail -n 1) \
+                            || _HP_LINE=""
+                        if printf '%s' "$_HP_LINE" | grep -qE '(,| )hidepid=' \
+                            && ! printf '%s' "$_HP_LINE" | grep -qE '(,| )hidepid=(0|off)(,| )'; then
+                            _HOLDER_RC=2
+                        else
+                            _HOLDER_OUT=$(find /proc/[0-9]*/fd \( \
+                                -lname "$_DB_SCAN_PAT" -o -lname "$_DB_SCAN_PAT (deleted)" \
+                                -o -lname "$_DB_SCAN_PAT-wal" -o -lname "$_DB_SCAN_PAT-wal (deleted)" \
+                                -o -lname "$_DB_SCAN_PAT-shm" -o -lname "$_DB_SCAN_PAT-shm (deleted)" \
+                                -o -lname "$_DB_SCAN_PAT-journal" -o -lname "$_DB_SCAN_PAT-journal (deleted)" \
+                                \) -print 2>/dev/null) \
+                                || _HOLDER_RC=$?
+                        fi
+                        ;;
+                    sudo)
+                        # No `sudo -n true` pre-probe: sudo authorization is
+                        # COMMAND-specific, so a least-privilege sudoers rule
+                        # granting exactly the scan command below fails a `true`
+                        # probe and the restore refused with precisely the
+                        # authority it needed. The scan itself is the probe —
+                        # an unauthorized sudo makes it exit non-zero, which is
+                        # already the refusal path. Its stderr is suppressed so
+                        # a persistent authorization failure does not print a
+                        # password prompt error once per retry; the die message
+                        # names the sudoers requirement instead.
+                        #
+                        # The glob MUST expand inside the privileged shell.
+                        # `sudo find /proc/[0-9]*/fd ...` expands the bracket
+                        # in the CALLER, before sudo starts — so under
+                        # procfs `hidepid=2` the hidden PID directories are
+                        # absent from find's operands, find succeeds over the
+                        # visible subset, and the guard passes while an
+                        # unseen holder exists. That is a fail-open in the
+                        # exact direction this guard exists to prevent.
+                        if command -v sudo >/dev/null 2>&1; then
+                            _HOLDER_OUT=$(sudo -n sh -c \
+                                'find /proc/[0-9]*/fd \( -lname "$1" -o -lname "$1 (deleted)" -o -lname "$1-wal" -o -lname "$1-wal (deleted)" -o -lname "$1-shm" -o -lname "$1-shm (deleted)" -o -lname "$1-journal" -o -lname "$1-journal (deleted)" \) -print 2>/dev/null' \
+                                _ "$_DB_SCAN_PAT" 2>/dev/null) || _HOLDER_RC=$?
+                        else
+                            _HOLDER_RC=2
+                        fi
+                        ;;
+                    auto)
+                        if [ "$(id -u)" -eq 0 ]; then
+                            _HOLDER_OUT=$(find /proc/[0-9]*/fd \( \
+                                -lname "$_DB_SCAN_PAT" -o -lname "$_DB_SCAN_PAT (deleted)" \
+                                -o -lname "$_DB_SCAN_PAT-wal" -o -lname "$_DB_SCAN_PAT-wal (deleted)" \
+                                -o -lname "$_DB_SCAN_PAT-shm" -o -lname "$_DB_SCAN_PAT-shm (deleted)" \
+                                -o -lname "$_DB_SCAN_PAT-journal" -o -lname "$_DB_SCAN_PAT-journal (deleted)" \
+                                \) -print 2>/dev/null) \
+                                || _HOLDER_RC=$?
+                        elif command -v sudo >/dev/null 2>&1; then
+                            # Glob inside the privileged shell — see the `sudo`
+                            # branch above: expanding it in the caller omits
+                            # hidepid-hidden PIDs and turns the guard fail-open.
+                            # And no `sudo -n true` pre-probe, for the same
+                            # reason as that branch: authorization is command-
+                            # specific, so the scan itself is the probe. An
+                            # unauthorized sudo exits non-zero here, exhausts
+                            # the bounded retry loop, and refuses — the same
+                            # terminal state the old pre-probe reached, without
+                            # rejecting a least-privilege sudoers rule that
+                            # grants exactly this scan.
+                            _HOLDER_OUT=$(sudo -n sh -c \
+                                'find /proc/[0-9]*/fd \( -lname "$1" -o -lname "$1 (deleted)" -o -lname "$1-wal" -o -lname "$1-wal (deleted)" -o -lname "$1-shm" -o -lname "$1-shm (deleted)" -o -lname "$1-journal" -o -lname "$1-journal (deleted)" \) -print 2>/dev/null' \
+                                _ "$_DB_SCAN_PAT" 2>/dev/null) || _HOLDER_RC=$?
+                        else
+                            # No uid that can see every /proc/<pid>/fd, and no
+                            # non-interactive elevation to borrow one. Retrying
+                            # cannot fix this, but the retry loop is bounded and
+                            # this branch simply exhausts it and refuses.
+                            _HOLDER_RC=2
+                        fi
+                        ;;
+                    *)
+                        die "unknown GENESIS_RESTORE_HOLDER_SCAN='${_HOLDER_SCAN_MODE}' (expected auto|plain|sudo|none) — quarantine retained"
+                        ;;
+                    esac
+                    if [ -n "$_HOLDER_OUT" ] || [ "$_HOLDER_RC" -eq 0 ]; then
+                        break
+                    fi
+                    [ "$_HOLDER_ATTEMPT" -lt "$_HOLDER_ATTEMPTS" ] && sleep 1
+                done
+                if [ -n "$_HOLDER_OUT" ]; then
+                    die "SQLite database still has open process handles after server stop — quarantine retained:
+${_HOLDER_OUT}"
+                fi
+                if [ "$_HOLDER_RC" -ne 0 ]; then
+                    die "SQLite holder inspection could NOT be completed conclusively after ${_HOLDER_ATTEMPT} attempt(s) (last rc=${_HOLDER_RC}) — refusing rather than assuming no holder exists. An unreadable /proc/<pid>/fd is an UNKNOWN holder, not an absent one. Resolve visibility (run this restore as a uid that can read every /proc/<pid>/fd, or grant non-interactive sudo for the scan — the privileged command is a \`sh -c 'find /proc/[0-9]*/fd ...'\` wrapper, so a sudoers rule must permit that sh invocation, not just \`find\`) or establish a verified offline boundary, then re-run. This scan is a supplementary guard, NOT exclusion: it cannot by itself prevent a new holder appearing between inspection and replacement. Quarantine retained."
+                fi
+
+                # `mv SOURCE DIR` moves the source INSIDE a directory and exits
+                # 0, so a DB_FILE that resolves to a directory would swallow the
+                # staged database, report a successful swap, and fail only at
+                # final verification — with the staged file stranded inside the
+                # directory. A directory here is a misconfiguration, never a
+                # database; refuse before touching anything.
+                if [ -d "$DB_FILE" ]; then
+                    die "DB_FILE '$DB_FILE' is a directory — a rename onto it would move the staged database INSIDE it and report success. Fix the path before restoring. Quarantine retained."
+                fi
+                sync -f "$_DB_STAGE"
+                _PRE_RESTORE=""
+                _MOVED_WAL=false
+                _MOVED_SHM=false
+                _REMOVED_WAL=false
+                _REMOVED_SHM=false
                 if [ -f "$DB_FILE" ]; then
                     _PRE_RESTORE="${DB_FILE}.pre-restore.$(date +%s)"
-                    if command -v sqlite3 >/dev/null && sqlite3 "$DB_FILE" ".backup '$_PRE_RESTORE'" 2>/dev/null; then
-                        log "SQLite: pre-restore safety copy → $_PRE_RESTORE (sqlite3 .backup, WAL-correct)"
-                    else
-                        cp "$DB_FILE" "$_PRE_RESTORE"
-                        [ -f "$DB_FILE-wal" ] && cp "$DB_FILE-wal" "${_PRE_RESTORE}-wal"
-                        [ -f "$DB_FILE-shm" ] && cp "$DB_FILE-shm" "${_PRE_RESTORE}-shm"
-                        log "SQLite: pre-restore safety copy → $_PRE_RESTORE (cp + sidecars; sqlite3 unavailable)"
-                    fi
+                    # Hard-link the quiesced main file so DB_FILE remains valid
+                    # until the candidate's single atomic rename.
+                    ln "$DB_FILE" "$_PRE_RESTORE" \
+                        || die "could not preserve pre-restore database — quarantine retained"
                 fi
-                # Clear stale WAL/SHM sidecars — a leftover -wal would replay
-                # onto the new DB and corrupt it.
-                rm -f "$DB_FILE" "$DB_FILE-wal" "$DB_FILE-shm"
-                if command -v sqlite3 >/dev/null; then
-                    if sqlite3 "$DB_FILE" ".read $_SQL_TMP"; then
-                        _SQLITE_RESTORED=true
-                        log "SQLite: restored → $DB_FILE"
-                        # Verify the restored DB is structurally sound — loud on failure.
-                        # 2>&1 so a sqlite3 error (can't open, etc.) surfaces in the warn.
-                        # `|| true`: a HARD sqlite3 error (can't reopen the DB)
-                        # fails the pipeline; under set -e the assignment would
-                        # abort the script BEFORE the warn below, skipping the
-                        # rest of the restore. Capture the error text (2>&1) as
-                        # _ic and let the not-"ok" branch surface it. (N6)
-                        _ic=$(sqlite3 "$DB_FILE" "PRAGMA integrity_check;" 2>&1 | head -1) || true
-                        if [ "$_ic" = "ok" ]; then
-                            log "SQLite: integrity_check ok"
-                        else
-                            warn "SQLite: integrity_check FAILED (${_ic:-no output}) — restored DB may be corrupt; inspect ${DB_FILE}.pre-restore.*"
+                # The sidecars are cleared REGARDLESS of whether a pre-restore
+                # copy was taken. This is not a detail: a stale WAL surviving the
+                # rename REPLAYS onto the restored database, replacing its pages
+                # with the old database's — and it does so SILENTLY, because the
+                # result is self-consistent, so the post-install integrity check
+                # passes and the restore reports success. Sharing the
+                # `[ -f "$DB_FILE" ]` guard above would skip this whole block
+                # exactly when the main file is absent or is not a regular file,
+                # which is the case that needs it most.
+                #
+                # With somewhere to move them to, they are RENAMED ASIDE:
+                # a same-directory rename is atomic and preserves bytes exactly,
+                # so the failure path needs no copy and no verification, and a
+                # copy killed mid-write (measured: 1024 of 64189 bytes) can no
+                # longer leave a TRUNCATED sidecar at the live path. With no
+                # pre-restore copy there is nowhere to move them, and removing
+                # them is the only way to stop the replay.
+                for _sidecar in wal shm; do
+                    # "Any pathname present", not "a regular file": `-f` is FALSE
+                    # for a dangling symlink and for a directory, so a `-f` guard
+                    # silently skips them where the base's unconditional `rm -f`
+                    # cleared whatever was there. A left-behind dangling `-wal`
+                    # symlink is not inert — SQLite cannot create the sidecar
+                    # through a dangling target, so the restored service fails to
+                    # open for writes while the read-only final check passes.
+                    if [ ! -e "$DB_FILE-$_sidecar" ] && [ ! -L "$DB_FILE-$_sidecar" ]; then
+                        continue
+                    fi
+                    if [ -n "$_PRE_RESTORE" ]; then
+                        # A failed move must not exit before rolling back the ones
+                        # already moved: the live main DB would be left present
+                        # with its WAL/SHM gone — the de-fanged state this block
+                        # exists to prevent, and the same class as the original
+                        # defect, reintroduced in a different phase. A same-
+                        # directory mv is a rename, so it either moved or it did
+                        # not; there is no partial state to reason about.
+                        if ! mv "$DB_FILE-$_sidecar" "${_PRE_RESTORE}-${_sidecar}" 2>/dev/null; then
+                            # Say what actually happened: when the FIRST move is
+                            # the one that failed, nothing was moved and nothing
+                            # was "moved back" — a message claiming a rollback
+                            # ran would misstate the on-disk state to the
+                            # operator reading it mid-incident.
+                            if ! $_MOVED_WAL && ! $_MOVED_SHM; then
+                                die "could not move the live ${_sidecar} aside — nothing had been moved before it, so the live database and its sidecars are as they were${_PRE_RESTORE:+ (pre-restore hard link at ${_PRE_RESTORE} retained)}. Quarantine retained."
+                            fi
+                            _ROLLBACK_OK=true
+                            if $_MOVED_WAL; then
+                                mv "${_PRE_RESTORE}-wal" "$DB_FILE-wal" 2>/dev/null \
+                                    || _ROLLBACK_OK=false
+                            fi
+                            if $_MOVED_SHM; then
+                                mv "${_PRE_RESTORE}-shm" "$DB_FILE-shm" 2>/dev/null \
+                                    || _ROLLBACK_OK=false
+                            fi
+                            if $_ROLLBACK_OK; then
+                                die "could not move the live ${_sidecar} aside — the sidecars moved before it were moved back, so the live database is as it was. Quarantine retained."
+                            fi
+                            die "could not move the live ${_sidecar} aside AND a previously moved sidecar could not be moved back — the live DB is missing its WAL and/or SHM. Recover from ${_PRE_RESTORE}* before retrying. Quarantine retained."
                         fi
+                        # Record the ACTION, not whether the destination now exists:
+                        # a stale artifact left at that path by an earlier run that
+                        # shared the same epoch second would otherwise read as "we
+                        # moved this one" and be moved back in its place.
+                        case "$_sidecar" in
+                        wal) _MOVED_WAL=true ;;
+                        shm) _MOVED_SHM=true ;;
+                        esac
                     else
-                        warn "SQLite .read failed — inspect ${DB_FILE}.pre-restore.*"
+                        rm -f "$DB_FILE-$_sidecar" \
+                            || die "could not remove the stale ${_sidecar} — quarantine retained"
+                        case "$_sidecar" in
+                        wal) _REMOVED_WAL=true ;;
+                        shm) _REMOVED_SHM=true ;;
+                        esac
                     fi
-                else
-                    warn "SQLite: sqlite3 binary not installed — cannot apply dump. Install sqlite3 and re-run."
+                done
+                if [ -n "$_PRE_RESTORE" ]; then
+                    _kept="DB"
+                    $_MOVED_WAL && _kept="${_kept}, WAL"
+                    $_MOVED_SHM && _kept="${_kept}, SHM"
+                    log "SQLite: preserved raw pre-restore artifacts (${_kept}) → $_PRE_RESTORE*"
                 fi
+                if $_REMOVED_WAL || $_REMOVED_SHM; then
+                    log "SQLite: no pre-restore main database (absent or not a regular file) — stale sidecars REMOVED, not moved aside, so a failed swap cannot move them back"
+                fi
+                # The sidecars were moved aside above, so the rename is the only
+                # remaining mutation. On failure each sidecar that was moved is
+                # moved BACK — a same-directory rename preserves bytes exactly,
+                # so there is nothing to copy and nothing to verify. Tracking is
+                # per-sidecar, so "there was nothing to restore" can never be
+                # reported as "restored and verified".
+                if ! mv "$_DB_STAGE" "$DB_FILE"; then
+                    _TRIO_OK=true
+                    if $_MOVED_WAL; then
+                        mv "${_PRE_RESTORE}-wal" "$DB_FILE-wal" 2>/dev/null || _TRIO_OK=false
+                    fi
+                    if $_MOVED_SHM; then
+                        mv "${_PRE_RESTORE}-shm" "$DB_FILE-shm" 2>/dev/null || _TRIO_OK=false
+                    fi
+                    if ! $_TRIO_OK; then
+                        die "SQLite atomic replacement failed AND a sidecar could not be moved back — the live DB is missing its WAL and/or SHM. Recover from ${_PRE_RESTORE:-<no pre-restore copy was taken>} before retrying. Quarantine retained."
+                    fi
+                    if $_MOVED_WAL || $_MOVED_SHM; then
+                        die "SQLite atomic replacement failed; the live DB and its sidecars were moved back into place unchanged — the live database is as it was. Quarantine retained."
+                    fi
+                    # Branch on what was RECORDED, not on the negation of the other
+                    # pair: `!(MOVED_WAL || MOVED_SHM)` does not imply there was no
+                    # pre-restore copy — a copy with no sidecars present leaves both
+                    # flags false, and that is the ordinary clean-shutdown shape.
+                    if $_REMOVED_WAL || $_REMOVED_SHM; then
+                        die "SQLite atomic replacement failed; there was no pre-restore copy, so the live -wal/-shm were REMOVED and cannot be restored. The live main database is as it was (absent or not a regular file) and now has no sidecars. Quarantine retained."
+                    fi
+                    die "SQLite atomic replacement failed; nothing was moved aside and nothing was removed, so the live database and its sidecars are as they were${_PRE_RESTORE:+ (pre-restore copy at ${_PRE_RESTORE})}. Quarantine retained."
+                fi
+                _DB_STAGE=""
+                sync -f "$DB_FILE"
+                sync -f "$(dirname "$DB_FILE")"
+                _FINAL_CHECK_OUTPUT=""
+                if ! _FINAL_CHECK_OUTPUT=$( \
+                    PYTHONPATH="$_SCRIPT_DIR/../src" python3 -m genesis.db.integrity check \
+                        "$DB_FILE" --source restore-complete --quarantine-on-failure 2>&1
+                ); then
+                    # Explicit corruption already produced a marker. Operational
+                    # or otherwise indeterminate failure deliberately did not;
+                    # fence the installed inode without mislabelling it corrupt.
+                    if ! PYTHONPATH="$_SCRIPT_DIR/../src" python3 -c '
+import sys
+from genesis.db.integrity import database_is_quarantined
+raise SystemExit(0 if database_is_quarantined(sys.argv[1]) else 1)
+' "$DB_FILE"; then
+                        PYTHONPATH="$_SCRIPT_DIR/../src" python3 -m genesis.db.integrity mark \
+                            "$DB_FILE" --source restore-final-verification-incomplete \
+                            --detail "${_FINAL_CHECK_OUTPUT:-final integrity check failed without detail}" \
+                            >/dev/null \
+                            || die "installed database final verification failed and durable fence could not be established"
+                    fi
+                    die "installed database failed final verification — quarantine retained"
+                fi
+                _SQLITE_RESTORED=true
+                log "SQLite: restored and verified → $DB_FILE"
             else
-                warn "SQLite: dump payload is empty — backup may have been produced before sqlite3 was installed. Re-run backup.sh."
+                die "SQLite: dump payload is empty — live database left untouched"
             fi
             rm -f "$_SQL_TMP"
         else
@@ -603,6 +1025,21 @@ if resolve_payload "$BACKUP_DIR/data/genesis.sql"; then
     fi
 else
     log "SQLite: no backup payload found (neither genesis.sql.gpg nor genesis.sql)"
+fi
+
+if $DATABASE_ONLY; then
+    if $DRY_RUN; then
+        _SUCCESS=true
+        log "Database-only restore dry-run complete"
+        exit 0
+    fi
+    $_SQLITE_RESTORED || die "database-only restore did not install a database"
+    if [ ${#_FAILURES[@]} -ne 0 ]; then
+        exit 1
+    fi
+    _SUCCESS=true
+    log "Database-only restore complete; genesis-server remains stopped for operator verification"
+    exit 0
 fi
 
 # ── 2. Qdrant ────────────────────────────────────────────────────────
