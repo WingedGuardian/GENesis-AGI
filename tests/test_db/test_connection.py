@@ -705,9 +705,9 @@ async def test_a_landed_commit_is_not_rolled_back_when_the_await_was_cancelled(s
         pytest.raises(asyncio.CancelledError),
     ):
         async with sconn.transaction() as tx:
-            await tx.execute("UPDATE t SET val = 'kept' WHERE id = 42")
+            await tx.execute("UPDATE t SET val = 'mutated' WHERE id = 42")
     cur = await sconn.execute("SELECT val FROM t WHERE id = 42")
-    assert (await cur.fetchone())["val"] == "kept"
+    assert (await cur.fetchone())["val"] == "mutated"
 
 
 async def test_a_failed_rollback_quarantines_the_connection(tmp_path):
@@ -937,3 +937,127 @@ async def test_the_guard_is_removed_after_the_block(sconn):
     await sconn.rollback()
     cur = await sconn.execute("SELECT COUNT(*) AS n FROM t")
     assert (await cur.fetchone())["n"] == 2
+
+
+async def test_a_disarm_failure_never_commits_the_replacement(tmp_path):
+    """If the authorizer will not come off, the connection is quarantined and
+    swapped — committing afterward would run on the replacement (whose queue is
+    empty) while the block reports success. The unit must surface an error
+    instead (Devin BUG, #1881)."""
+    import unittest.mock as mock
+
+    db = tmp_path / "d.db"
+    raw = await aiosqlite.connect(str(db))
+    await raw.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    await raw.commit()
+    replacement = await aiosqlite.connect(str(db))
+
+    async def reconnect():
+        return replacement
+
+    real_set_authorizer = raw.set_authorizer
+
+    async def set_authorizer(cb):
+        if cb is None:
+            raise sqlite3.OperationalError("authorizer stuck")
+        return await real_set_authorizer(cb)
+
+    conn = SerializedConnection(raw, reconnect_fn=reconnect)
+    with (
+        mock.patch.object(raw, "set_authorizer", side_effect=set_authorizer),
+        pytest.raises(RuntimeError, match="transaction guard"),
+    ):
+        async with conn.transaction() as tx:
+            await tx.execute("INSERT INTO t (id) VALUES (1)")
+    assert conn._conn is replacement
+    # The swapped-in connection never carried the unit.
+    cur = await replacement.execute("SELECT COUNT(*) AS n FROM t")
+    assert (await cur.fetchone())[0] == 0
+    for handle in {id(raw): raw, id(conn._conn): conn._conn}.values():
+        with contextlib.suppress(Exception):
+            await handle.close()
+
+
+async def test_a_failed_authorizer_arm_rolls_back_and_clears_ownership(tmp_path):
+    """set_authorizer sits AFTER BEGIN: if it raises, the open transaction must
+    still be rolled back and _txn_owner cleared — otherwise the lock releases
+    with ownership stranded (Devin BUG, #1881)."""
+    import unittest.mock as mock
+
+    db = tmp_path / "a.db"
+    raw = await aiosqlite.connect(str(db))
+    await raw.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    await raw.commit()
+    conn = SerializedConnection(raw)
+    with (
+        mock.patch.object(
+            raw, "set_authorizer", side_effect=sqlite3.OperationalError("no auth")
+        ),
+        pytest.raises(sqlite3.OperationalError),
+    ):
+        async with conn.transaction() as tx:
+            await tx.execute("INSERT INTO t (id) VALUES (1)")
+    assert conn._txn_owner is None
+    assert not raw.in_transaction
+    # The connection is healthy again: a normal write commits.
+    await conn.execute("INSERT INTO t (id) VALUES (2)")
+    await conn.commit()
+    cur = await conn.execute("SELECT COUNT(*) AS n FROM t")
+    assert (await cur.fetchone())[0] == 1
+    with contextlib.suppress(Exception):
+        await conn._conn.close()
+
+
+async def test_a_cancelled_rollback_still_propagates_cancellation(tmp_path):
+    """When the cleanup rollback await is cancelled AND the transaction stayed
+    open, quarantine must run AND the CancelledError must still propagate —
+    returning normally would let the caller's bare `raise` surface the wrong
+    exception (Codex P2, #1881)."""
+    import unittest.mock as mock
+
+    db = tmp_path / "c.db"
+    raw = await aiosqlite.connect(str(db))
+    await raw.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    await raw.commit()
+    conn = SerializedConnection(raw)
+    with (
+        mock.patch.object(
+            raw, "rollback", side_effect=asyncio.CancelledError()
+        ),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        async with conn.transaction() as tx:
+            await tx.execute("INSERT INTO t (id) VALUES (1)")
+            raise ValueError("body blew up")
+    with contextlib.suppress(Exception):
+        await conn._conn.close()
+
+
+async def test_a_cursor_rechecks_quarantine_after_the_lock_wait(tmp_path):
+    """cursor() quarantine-checks BEFORE _maybe_lock; if the database is
+    quarantined while the call waits behind a held transaction, the cursor must
+    still be refused — the check is repeated after the wait (Codex P1, #1881)."""
+    from genesis.db.integrity import (
+        DatabaseIntegrityError,
+        _clear_quarantine_for,
+        quarantine_database,
+    )
+
+    db = tmp_path / "q2.db"
+    raw = await aiosqlite.connect(str(db))
+    await raw.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    await raw.commit()
+    conn = SerializedConnection(raw, db_path=db)
+    await conn._lock.acquire()
+    try:
+        task = asyncio.create_task(conn.cursor())
+        await asyncio.sleep(0)  # let cursor() pass the pre-check and block
+        quarantine_database(db, source="test", detail="simulated corruption")
+        conn._lock.release()
+        with pytest.raises(DatabaseIntegrityError):
+            await task
+    finally:
+        conn._lock.release() if conn._lock.locked() else None
+        _clear_quarantine_for(db)
+        with contextlib.suppress(Exception):
+            await conn._conn.close()

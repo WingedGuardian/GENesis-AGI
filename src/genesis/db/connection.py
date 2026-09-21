@@ -811,6 +811,11 @@ class SerializedConnection:
 
             assert_not_quarantined(self._db_path)
         async with self._maybe_lock():
+            # Recheck AFTER the wait: the lock can queue behind a held
+            # transaction, and an integrity check may quarantine the database
+            # while we wait — a cursor onto it must not be handed out anyway.
+            if self._db_path is not None:
+                assert_not_quarantined(self._db_path)
             return self._guard_cursor(await self._conn.cursor())
 
     # -- Multi-statement atomic transaction --------------------------------
@@ -973,8 +978,13 @@ class SerializedConnection:
             # Safe on a SHARED connection because the lock is held for the whole
             # block: a non-owner awaits it in `_maybe_lock`, and the owner's own
             # statements are exactly the ones this is here to guard.
-            await self._conn.set_authorizer(_deny_txn_control)
+            #
+            # The arming call sits INSIDE the try whose except rolls back: a
+            # set_authorizer failure after BEGIN must not skip cleanup — the
+            # transaction is open and `_txn_owner` is already claimed, so an
+            # unhandled raise would strand ownership while the lock releases.
             try:
+                await self._conn.set_authorizer(_deny_txn_control)
                 try:
                     yield self
                 finally:
@@ -989,7 +999,17 @@ class SerializedConnection:
                     # caller, it fails every LATER one, which is a far worse
                     # outcome than the bypass it prevents and is why
                     # `test_the_guard_survives_a_failing_body` is written first.
-                    await self._disarm_txn_authorizer()
+                    disarmed = await self._disarm_txn_authorizer()
+                # If disarming quarantined the connection, the REAL transaction
+                # died with the old handle — committing the fresh replacement
+                # would no-op while this block reports success, silently losing
+                # the body's writes. Surface that instead of committing.
+                if not disarmed:
+                    raise RuntimeError(
+                        "transaction(): the transaction guard could not be "
+                        "removed and the connection was quarantined — the "
+                        "transaction closed uncommitted with it"
+                    )
                 # COMMIT via the driver method, NOT execute("COMMIT"): under a WAL
                 # post-commit-autocheckpoint SQLITE_BUSY the commit frame is already
                 # durable and in_transaction is False, so _retry_locked's retry of
@@ -1029,9 +1049,9 @@ class SerializedConnection:
         quarantine` already makes, so it gets the same answer rather than a log
         line nobody reads.
 
-        Swallows nothing silently and masks no original error: callers raise
-        their own exception after this returns, exactly as with the rollback
-        path.
+        Returns False when the connection was quarantined: the caller must
+        then NOT commit, because the real transaction died with the old handle
+        and the replacement has nothing to commit.
         """
         try:
             await self._conn.set_authorizer(None)
@@ -1043,6 +1063,8 @@ class SerializedConnection:
                 exc_info=True,
             )
             await self._quarantine_connection()
+            return False
+        return True
 
     async def _txn_is_open(self) -> bool:
         """Authoritative open-transaction check after a boundary call's await
@@ -1080,10 +1102,18 @@ class SerializedConnection:
             return
         except asyncio.CancelledError:
             # The rollback may still have landed on the worker thread; only a
-            # provably-open transaction needs quarantine, and the CancelledError
-            # must keep propagating either way.
-            if not await self._txn_is_open():
-                raise
+            # provably-open transaction needs quarantine — and the
+            # CancelledError must keep propagating EITHER WAY (quarantining and
+            # then returning would swallow it, and the caller's bare `raise`
+            # would surface the wrong exception).
+            if await self._txn_is_open():
+                logger.error(
+                    "transaction(): connection quarantined — a possibly-open "
+                    "transaction must never be committed by a later caller; "
+                    "closing and reconnecting"
+                )
+                await self._quarantine_connection()
+            raise
         except Exception:
             logger.error("ROLLBACK after transaction() error failed", exc_info=True)
         logger.error(
