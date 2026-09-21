@@ -671,6 +671,14 @@ _NOT_WIRED = {
     # wrapped, because there the failed module is the one that would read the payload
     # and there is no matcher to choose — no token, no trade, no exemption.
     "background_pipe_guard.py": "only token is `|` at 70.30% — would wedge the repair",
+    # adopt_first_gate's documented contract is FAIL-OPEN — its own docstring:
+    # "a crash here must not wedge planning or editing. Nothing in this file is
+    # a safety boundary." A poisoned tree making it exit 1 and vanish costs a
+    # missed advisory or an unenforced plan verdict; wiring a local refuse would
+    # instead block EVERY Write/Edit/ExitPlanMode until repair — the worse
+    # direction for a gate whose whole measured design property is that it must
+    # never become the thing that wedges the work.
+    "adopt_first_gate.py": "fail-open by contract — refusing would wedge every edit and plan exit",
 }
 
 
