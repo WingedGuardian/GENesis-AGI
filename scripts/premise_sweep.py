@@ -127,6 +127,16 @@ printed a result and then exited nonzero be read as a clean success. A cell
 matches only when it RAN (an accepted exit status) and its output classifies as
 `predicate`. Declare `ok_exit_codes` when a nonzero status is legitimate data.
 
+CELLS MUST BE IDEMPOTENT, AND THE TOOL CANNOT ENFORCE IT
+A cell is a shell snippet, so the harness cannot sandbox one without becoming
+a different tool. The controls run before the result cells and in the same
+environment, so a cell that mutates shared state -- a file outside its own
+mktemp dir, an exported variable, a running service -- can change the answer
+of the cells that follow it. Write cells that set up and tear down their own
+state. The harness reaps each cell's process group on every exit path, which
+stops a lingering DESCENDANT from writing into the next cell, but it cannot
+undo a write that already happened.
+
 EXIT CODES
     0  controls held and every live cell matched `predicate`
     1  controls held; at least one live cell did not match (a real result)
@@ -161,7 +171,14 @@ _RAN = "ran"
 _ERR = "ERR"
 _TIMEOUT = "TIMEOUT"
 _TRUNC = "TRUNCATED"
-_RESERVED_LABELS = frozenset({_ERR, _TIMEOUT, _TRUNC})
+_UNDECODABLE = "UNDECODABLE"
+#: The label `_classify` returns when NO rule matched. Reserved for the same
+#: reason the execution outcomes are: a spec could otherwise declare `other`
+#: as a classification AND name it as the predicate, at which point output
+#: matching none of the author's own rules SATISFIES the thing being measured.
+#: The fallback means "unclassified", and unclassified can never be a finding.
+_OTHER = "other"
+_RESERVED_LABELS = frozenset({_ERR, _TIMEOUT, _TRUNC, _UNDECODABLE, _OTHER})
 
 #: Hard cap on one cell's captured stdout. A probe is expected to print a line
 #: or two; anything past this is a runaway. Unbounded capture is not merely
@@ -184,6 +201,22 @@ _REQUIRED_KEYS = (
     "decision_rule",
     "no_pass_disposition",
 )
+
+
+def _reap_group(pgid: int) -> None:
+    """SIGKILL a process group by pgid, tolerating a group that is already gone.
+
+    The `pgid > 1` guard is the house `process_kill_safety` procedure, and it
+    is not defensive noise: signalling process-group ONE is equivalent to
+    signalling every process this user owns -- the whole container, from a
+    harness that was only trying to clean up after one probe. A mock whose pid
+    was never set reports exactly that value on Python 3.12, so the guard is
+    what stands between a test double and the box.
+    """
+    if pgid <= 1:
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.killpg(pgid, signal.SIGKILL)
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
@@ -220,6 +253,7 @@ class _BoundedReader(threading.Thread):
         self._chunks: list[str] = []
         self._size = 0
         self.truncated = False
+        self.undecodable = False
 
     def run(self) -> None:
         try:
@@ -231,6 +265,16 @@ class _BoundedReader(threading.Thread):
                 if not self.truncated:
                     self.truncated = True
                     _kill_group(self._proc)
+        except UnicodeDecodeError:
+            # NOT swallowed with the rest, and the ordering is the whole point:
+            # UnicodeDecodeError IS a ValueError, so the broad handler below
+            # used to catch it, keep the valid PREFIX, and hand that prefix to
+            # `_classify` as though it were the entire output. A rule that
+            # would have matched past the bad bytes was then silently missed --
+            # the same silent-truncation failure the byte cap exists to make
+            # loud, arriving through a different door.
+            self.undecodable = True
+            _kill_group(self._proc)
         except (ValueError, OSError):
             # The pipe was closed under us by the timeout kill. Whatever was
             # read before that is still what the cell produced.
@@ -253,7 +297,7 @@ def _classify(out: str, rules: dict[str, str]) -> str:
     for label, pattern in rules.items():
         if re.search(pattern, out, re.MULTILINE):
             return label
-    return "other"
+    return _OTHER
 
 
 def _run(
@@ -287,37 +331,56 @@ def _run(
         text=True,
         start_new_session=True,
     )
+    # `start_new_session=True` above makes the child a process-group LEADER,
+    # so its pgid IS its pid. Captured here while the child is certainly
+    # alive, because `os.getpgid` cannot answer once it has been reaped -- and
+    # the descendants that outlive it are exactly what needs reaping.
+    pgid = proc.pid
     reader = _BoundedReader(proc.stdout, proc)
     reader.start()
     timed_out = False
     try:
-        proc.wait(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        _kill_group(proc)
-        timed_out = True
-    reader.join(_READER_JOIN_S)
-    # TRUNCATED is reported ahead of TIMEOUT. A firehose cell is killed BY the
-    # reader, so it can present as either depending on which noticed first, and
-    # "your probe emits unbounded output" is the actionable one — the timeout is
-    # a consequence of it, not an independent fact.
-    if reader.truncated:
-        # A probe that emits more than the cap is a broken probe, and its
-        # output CANNOT be classified soundly: `_classify` returns the first
-        # rule matching anywhere in the text, so a rule that would have matched
-        # past the cap is silently missed. Reported as an outcome, never as a
-        # category — the same reason ERR and TIMEOUT are not classifications.
-        return _TRUNC, ""
-    if timed_out:
-        return _TIMEOUT, ""
-    out = reader.text()
-    if proc.returncode not in ok_exits:
-        # A nonzero exit is an ERROR, not a category — even when the cell
-        # printed something first. `echo good; exit 42` used to classify as a
-        # clean GOOD, so a setup failure occurring AFTER an early result line
-        # produced evidence that read as success. A spec that legitimately
-        # expects a nonzero status says so in `ok_exit_codes`.
-        return _ERR, ""
-    return _RAN, _classify(out, rules)
+        try:
+            proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            _kill_group(proc)
+            timed_out = True
+        reader.join(_READER_JOIN_S)
+        if reader.undecodable:
+            # Leads for the same reason TRUNCATED does: the output cannot be
+            # classified soundly, and which way it broke is the actionable part.
+            return _UNDECODABLE, ""
+        # TRUNCATED is reported ahead of TIMEOUT. A firehose cell is killed BY the
+        # reader, so it can present as either depending on which noticed first, and
+        # "your probe emits unbounded output" is the actionable one — the timeout is
+        # a consequence of it, not an independent fact.
+        if reader.truncated:
+            # A probe that emits more than the cap is a broken probe, and its
+            # output CANNOT be classified soundly: `_classify` returns the first
+            # rule matching anywhere in the text, so a rule that would have matched
+            # past the cap is silently missed. Reported as an outcome, never as a
+            # category — the same reason ERR and TIMEOUT are not classifications.
+            return _TRUNC, ""
+        if timed_out:
+            return _TIMEOUT, ""
+        out = reader.text()
+        if proc.returncode not in ok_exits:
+            # A nonzero exit is an ERROR, not a category — even when the cell
+            # printed something first. `echo good; exit 42` used to classify as a
+            # clean GOOD, so a setup failure occurring AFTER an early result line
+            # produced evidence that read as success. A spec that legitimately
+            # expects a nonzero status says so in `ok_exit_codes`.
+            return _ERR, ""
+        return _RAN, _classify(out, rules)
+    finally:
+        # EVERY exit path reaps the group, not only the timeout. Before this,
+        # `_kill_group` ran solely under `TimeoutExpired`, so an interrupt --
+        # or any other exception out of `wait` -- left the whole tree running;
+        # and a cell that exited NORMALLY still left backgrounded descendants
+        # behind, free to write into the cells that followed it. The kill uses
+        # the captured pgid rather than a fresh `getpgid`, which the reaped
+        # child can no longer answer.
+        _reap_group(pgid)
 
 
 def _matches(result: tuple[str, str], predicate: str) -> bool:
@@ -361,9 +424,40 @@ def _spec_problems(spec: Any) -> list[str]:
         # the doctrine exists to prevent.
         return problems
 
+    # TYPES BEFORE SEMANTICS, and this ordering is the fix rather than an
+    # extra check. Every test below performs an OPERATION on a field -- a
+    # membership test, `re.compile`, a set difference -- and an operation on
+    # the wrong type does not return a problem STRING, it RAISES. MEASURED: a
+    # list-valued `candidate_axis` raised TypeError from the membership test,
+    # because a list is unhashable. This CLI documents its exit 1 as "controls
+    # held; a real non-match", so a malformed spec crashed its way into being
+    # recordable as experimental evidence -- the one outcome the whole tool
+    # exists to prevent. Returning EARLY is the load-bearing part: a semantic
+    # check on a value of the wrong type has no defined answer to report.
+    mistyped: list[str] = []
+    if not isinstance(spec["candidate_axis"], str):
+        mistyped.append("candidate_axis must be a STRING naming one of the axes")
+    if not isinstance(spec["classify"], dict) or not spec["classify"]:
+        mistyped.append("classify must be a non-empty {label: regex} mapping")
+    elif bad := sorted(
+        repr(k)
+        for k, v in spec["classify"].items()
+        if not isinstance(k, str) or not isinstance(v, str)
+    ):
+        mistyped.append(
+            f"classify must map a string label to a string regex; malformed entries: {bad}"
+        )
+    if not isinstance(spec.get("ok_exit_codes", []), list):
+        mistyped.append("ok_exit_codes must be a LIST of integers")
+    if mistyped:
+        return problems + mistyped
+
     axes = spec["axes"]
     if not isinstance(axes, dict) or not axes:
-        return ["axes must be a non-empty {name: [values]} mapping"]
+        # `problems +` and not a bare list: the emptiness checks above have
+        # already found real faults, and returning only this one would hide
+        # them behind the first structural complaint.
+        return problems + ["axes must be a non-empty {name: [values]} mapping"]
     for name, values in axes.items():
         # A bare string is iterable, so a spec writing `"state": "hostile"`
         # would sweep eight single-character cells without complaint.
@@ -371,6 +465,16 @@ def _spec_problems(spec: Any) -> list[str]:
             problems.append(f"axis {name!r} must be a NON-EMPTY list of values")
         elif not all(isinstance(v, str) for v in values):
             problems.append(f"axis {name!r} has non-string values")
+        elif len(set(values)) != len(values):
+            # A repeated value runs the same cell twice and counts it twice,
+            # so it silently WEIGHTS one arm of the sweep against the others
+            # while the cell count still reads as the size of the space.
+            dupes = sorted({v for v in values if values.count(v) > 1})
+            problems.append(
+                f"axis {name!r} repeats value(s) {dupes} — a repeated value "
+                f"is the same cell counted twice, which weights the result "
+                f"without changing what was measured"
+            )
 
     cand = spec["candidate_axis"]
     if cand not in axes:
@@ -481,6 +585,19 @@ def _check_controls(
         noop = _run(
             template.format(**{cand: spec["controls"]["noop"]}, **env), rules, ok_exits, timeout_s
         )
+        # The no-op has to have RUN before its verdict means anything. Any
+        # non-RAN outcome -- ERR, TIMEOUT, TRUNCATED, UNDECODABLE -- fails
+        # `_matches` for the wrong reason, so a CRASHED no-op used to read as
+        # "the arm correctly did not match" and certify the instrument. This
+        # arm exists to prove the harness can FAIL; a broken arm proves only
+        # that it can break.
+        if noop[0] != _RAN:
+            problems.append(
+                f"no-op arm did not RUN at [{where}] -> {_render(noop)}: the "
+                f"arm that must prove the harness can fail did not execute, "
+                f"so its non-match is an accident rather than a measurement"
+            )
+            continue
         if _matches(noop, predicate):
             # The hazard does not exist here, so no candidate earns credit for
             # surviving it. Named and excluded rather than voided or counted.
@@ -540,6 +657,17 @@ def _remedy_lines(
         return lines
 
     matching = [r for r in rows if all(r[0][k] == v for k, v in remedy.items())]
+    if not matching:
+        # Every declared value can be a real axis value and still select NO
+        # live cell -- when the remedy pins an environmental value whose cells
+        # the controls all classified inert. "MEASURED in 0 of N live cells"
+        # is then a measurement claim resting on nothing, and it reads as a
+        # pass because nothing failed. The distinction this tool exists for is
+        # exactly measured-versus-asserted, so an empty slice is UNVERIFIED.
+        return lines + [
+            "  UNVERIFIED: the remedy selects NO live cell — every cell it "
+            "names was excluded as inert, so the sweep never exercised it.",
+        ]
     missed = [(env, got) for env, got, ok in matching if not ok]
     lines.append(
         f"  MEASURED in {len(matching)} of {len(rows)} live cells: "
@@ -627,18 +755,45 @@ def main() -> int:
     rows: list[tuple[dict[str, str], tuple[str, str], bool]] = []
     failed = 0
     for value in spec["axes"][cand]:
+        # The NO-OP is a value of the candidate axis, so it is swept here
+        # like any other -- and by construction it does not match, because
+        # `_check_controls` has just REQUIRED that of every live cell. Counting
+        # it as a failure made `failed` at least 1 on every sound run, so the
+        # documented "0 = every cell matched" exit was unreachable whenever the
+        # instrument was working. Its row stays in the table, because the
+        # negative control is evidence a reader should see; it is labelled and
+        # left out of the count.
+        is_control = value == spec["controls"]["noop"]
         for env in live:
             full = {cand: value, **env}
             got = _run(spec["cell"].format(**full), rules, ok_exits, args.cell_timeout)
             ok = _matches(got, predicate)
             rows.append((full, got, ok))
-            failed += 0 if ok else 1
+            if not is_control:
+                failed += 0 if ok else 1
             cells = "  ".join(f"{n}={v}" for n, v in full.items())
-            lines.append(f"  {cells}  -> {_render(got)}{'' if ok else '   <-- not ' + predicate}")
+            if is_control:
+                note = "   <-- no-op CONTROL, not counted"
+            else:
+                note = "" if ok else "   <-- not " + predicate
+            lines.append(f"  {cells}  -> {_render(got)}{note}")
 
+    # `matching` is counted, not DERIVED from `len(rows) - failed`. Once the
+    # no-op control stopped counting as a failure, that subtraction silently
+    # credited the control's own non-match as a match -- MEASURED on a live
+    # run that printed `matching=2` over a table containing exactly one match.
+    # The three numbers now describe disjoint sets, and the control row is
+    # named so the reader can see why they do not sum to the row count.
+    controls_shown = sum(1 for full, _got, _ok in rows if full[cand] == spec["controls"]["noop"])
+    matched = sum(1 for full, _got, ok in rows if ok and full[cand] != spec["controls"]["noop"])
     lines += [
         "",
-        f"live cells={len(rows)}  matching={len(rows) - failed}  NOT-matching={failed}"
+        f"live cells={len(rows)}  matching={matched}  NOT-matching={failed}"
+        + (
+            f"  ({controls_shown} no-op control row(s) shown, not counted)"
+            if controls_shown
+            else ""
+        )
         + (f"  (excluding {len(inert)} inert environmental cell(s))" if inert else ""),
     ]
     lines += _remedy_lines(spec, rows)

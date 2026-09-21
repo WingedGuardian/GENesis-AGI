@@ -24,8 +24,12 @@ clauses rather than by that findings list, because the list was a sample.
 from __future__ import annotations
 
 import json
+import os
+import re
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -88,8 +92,43 @@ def test_a_sound_spec_prints_the_matrix(tmp_path):
     r = _run(tmp_path, _spec())
     assert "=== RESULTS ===" in r.stdout
     assert "CONTROLS HELD" in r.stdout
-    assert r.returncode == 1, "the no-op candidate is in the sweep and legitimately fails"
+    assert r.returncode == 0, (
+        "the documented `0 = every live cell matched` must be REACHABLE. The "
+        "no-op is required to be a candidate-axis value AND required by the "
+        "controls not to match, so counting it made exit 1 the only possible "
+        "outcome of a sound run — a status that is constant carries no "
+        "information at all."
+    )
     assert "live cells=2" in r.stdout
+    assert "no-op CONTROL, not counted" in r.stdout, (
+        "excluded from the COUNT, not from the TABLE — the negative control is "
+        "evidence the reader should see, and dropping the row to fix the "
+        "count would hide it"
+    )
+
+
+def test_a_REAL_candidate_failing_still_exits_1(tmp_path):
+    """The other half of the exit contract, and the reason the four baselines
+    above could move safely.
+
+    Excluding the no-op from the count buys a reachable 0 — and a change that
+    simply stopped counting anything would buy the same 0 while destroying the
+    signal. This spec adds a THIRD candidate that is not a control and does
+    not match, so 1 has to come back.
+    """
+    r = _run(
+        tmp_path,
+        _spec(
+            axes={"arm": ["good", "bad", "alsobad"]},
+            classify={"GOOD": "^good", "BAD": "^bad|^alsobad"},
+        ),
+    )
+    assert r.returncode == 1, (
+        "a non-control candidate did not match, which is precisely what exit "
+        "1 is documented to mean"
+    )
+    assert "no-op CONTROL, not counted" in r.stdout
+    assert "alsobad" in r.stdout
 
 
 def test_the_sweep_is_a_full_cross_product(tmp_path):
@@ -284,7 +323,7 @@ def test_INERT_cells_are_named_and_excluded_rather_than_counted(tmp_path):
     over conditions that were merely irrelevant.
     """
     r = _run(tmp_path, _two_axis())
-    assert r.returncode == 1
+    assert r.returncode == 0, "no real candidate fails here; see the exit-contract test"
     assert "INERT — 1 of 2 environmental cell(s) are EXCLUDED" in r.stdout
     assert "env=inert" in r.stdout
     assert "live cells=2" in r.stdout, "2 candidates x 1 live env cell, not 4"
@@ -311,7 +350,7 @@ def test_a_spec_may_DECLARE_a_nonzero_status_as_legitimate_data(tmp_path):
     """Refusing every nonzero exit would break probes whose subject legitimately
     refuses — the refusal IS the data. It must be declared, not assumed."""
     r = _run(tmp_path, _spec(cell="echo {arm}; exit 42", ok_exit_codes=[0, 42]))
-    assert r.returncode == 1
+    assert r.returncode == 0, "no real candidate fails here; see the exit-contract test"
     assert "CONTROLS HELD" in r.stdout
     assert "-> ERR" not in r.stdout
 
@@ -381,10 +420,12 @@ def test_an_UNSWEPT_remedy_is_labelled_but_does_NOT_void_the_run(tmp_path):
     assert "UNVERIFIED" in r.stdout
     assert "is not among the swept values" in r.stdout
     assert "=== RESULTS ===" in r.stdout, "the sweep's own finding survives an unmeasured remedy"
-    assert r.returncode == 1, (
+    assert r.returncode == 0, (
         "the exit code answers 'did the cells match?', which an unverified "
         "remedy does not change — folding both into one integer would force a "
-        "lie whenever they disagree"
+        "lie whenever they disagree. The baseline is 0 rather than 1 only "
+        "because the no-op control no longer counts as a failing cell; the "
+        "property under test is that the remedy verdict did not move it."
     )
 
 
@@ -467,28 +508,68 @@ def test_a_runaway_cell_is_bounded_and_never_classified(tmp_path):
     assert "=== RESULTS ===" not in r.stdout
 
 
+#: Measuring the sweep's peak memory needs a process whose child-rusage counter
+#: STARTS AT ZERO. ``resource.getrusage(RUSAGE_CHILDREN).ru_maxrss`` is a monotonic
+#: HIGH-WATER MARK over every child the calling process has ever reaped, so read
+#: from the pytest process it reports the largest child ANY test in the session
+#: spawned. MEASURED: after one unrelated 400 MiB child the counter stays at
+#: 400 MiB for every small child that follows — it never falls back. That is not
+#: hypothetical here: this test passed in a targeted run and failed in CI at
+#: 1,005,096 KiB, attributed to a sweep that actually peaks near 16 MiB.
+#: This wrapper is a FRESH process, so its counter covers the sweep alone — and it
+#: still sees the sweep's own descendants, which is exactly what the bound is about
+#: (MEASURED: a wrapper reports a grandchild's 400 MiB, not just a child's).
+#: The peak goes to a FILE rather than a stream because the sweep writes to both.
+_RSS_WRAPPER = (
+    "import resource,subprocess,sys;"
+    "peak=sys.argv[1];"
+    "r=subprocess.run([sys.executable]+sys.argv[2:],capture_output=True,text=True);"
+    "sys.stdout.write(r.stdout);sys.stderr.write(r.stderr);"
+    "open(peak,'w').write(str(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss))"
+)
+
+
 def test_the_bound_holds_in_MEMORY_not_just_in_the_report(tmp_path):
     """The report saying TRUNCATED proves nothing about what was retained.
 
     A version that buffered everything and merely LABELLED it truncated would
-    pass the test above while still being the OOM. This measures the harness
-    process's own peak RSS across a cell emitting far more than the cap.
-    """
-    import resource
+    pass the test above while still being the OOM. This measures the peak RSS of
+    the sweep process itself across a cell emitting far more than the cap.
 
+    THE THRESHOLD IS DERIVED, NOT PICKED. The sweep peaks at 16,384-16,652 KiB on
+    this cell (MEASURED, 3 runs), so 300 MiB leaves ~18x headroom for a slower or
+    differently-configured runner. A version that retained the stream would hold
+    the whole ``yes`` firehose for the cell's lifetime — orders of magnitude above
+    the line, which is what makes the exact threshold uncritical in both
+    directions. See ``_RSS_WRAPPER`` for why the reading cannot be taken here.
+    """
     spec = _spec(cell="yes good  # {arm}")
     p = tmp_path / "spec.json"
     p.write_text(json.dumps(spec), encoding="utf-8")
+    peak_file = tmp_path / "peak_kb"
     proc = subprocess.run(
-        [sys.executable, str(_SWEEP), str(p), "--cell-timeout", "10"],
+        [
+            sys.executable,
+            "-c",
+            _RSS_WRAPPER,
+            str(peak_file),
+            str(_SWEEP),
+            str(p),
+            "--cell-timeout",
+            "10",
+        ],
         capture_output=True,
         text=True,
         timeout=120,
     )
-    peak_kb = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    assert peak_file.exists(), (
+        f"the RSS wrapper never wrote its reading, so nothing was measured; "
+        f"wrapper stderr: {proc.stderr[-2000:]}"
+    )
+    peak_kb = int(peak_file.read_text())
     assert "TRUNCATED" in proc.stdout
     assert peak_kb < 300_000, (
-        f"harness peak RSS {peak_kb} KiB — a 1 MiB cap should not need "
+        f"sweep peak RSS {peak_kb} KiB — a 1 MiB cap should not need "
         f"hundreds of MiB, so output is being retained past the bound"
     )
 
@@ -501,3 +582,151 @@ def test_a_pre_registration_field_that_is_EMPTY_is_a_SPEC_error(tmp_path, field)
     r = _run(tmp_path, _spec(**{field: "   "}))
     assert r.returncode == 3
     assert "present but empty" in r.stderr
+
+
+# ------------------------------------------------- the spec is validated BY
+# TYPE before any semantic test operates on it
+
+
+def test_the_summary_counts_describe_DISJOINT_sets_that_sum_to_the_rows(tmp_path):
+    """`matching` used to be DERIVED as `len(rows) - failed`.
+
+    Once the no-op control stopped counting as a failure that subtraction
+    silently credited the control's own non-match as a match — MEASURED on a
+    live run that printed `matching=2` over a table containing exactly one
+    match. A derived count agrees with its inputs by construction and so can
+    never disagree loudly; this asserts the three numbers against the table
+    they summarise instead.
+    """
+    r = _run(tmp_path, _two_axis())
+    summary = next(ln for ln in r.stdout.splitlines() if ln.startswith("live cells="))
+    total = int(re.search(r"live cells=(\d+)", summary).group(1))
+    matching = int(re.search(r"matching=(\d+)", summary).group(1))
+    not_matching = int(re.search(r"NOT-matching=(\d+)", summary).group(1))
+    controls = int(re.search(r"\((\d+) no-op control row\(s\)", summary).group(1))
+    assert matching + not_matching + controls == total, summary
+    body = r.stdout.split("=== RESULTS ===")[1].split("live cells=")[0]
+    rows = [ln for ln in body.splitlines() if "->" in ln]
+    assert len(rows) == total, f"{total} claimed, {len(rows)} rows printed"
+
+
+def test_a_MISTYPED_field_is_a_SPEC_error_not_a_crash(tmp_path):
+    """Types before semantics, and the ordering is the fix.
+
+    Every later check performs an OPERATION on a field — a membership test,
+    `re.compile`, a set difference — and an operation on the wrong type does
+    not return a problem string, it RAISES. A list-valued `candidate_axis`
+    raised TypeError from `cand not in axes`, because a list is unhashable.
+    This CLI documents exit 1 as "controls held; a real non-match", so a
+    malformed spec crashed its way into being recordable as experimental
+    evidence — the one outcome the whole tool exists to prevent.
+    """
+    r = _run(tmp_path, _spec(candidate_axis=["arm"]))
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "candidate_axis must be a STRING" in r.stderr
+
+
+def test_a_MISTYPED_classify_entry_is_a_SPEC_error_not_a_crash(tmp_path):
+    """The same class one field over: a non-string pattern reaches
+    `re.compile`, which raises TypeError rather than `re.error`, so the
+    invalid-regex handler never sees it."""
+    r = _run(tmp_path, _spec(classify={"GOOD": ["^good"]}))
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "string label to a string regex" in r.stderr
+
+
+def test_a_REPEATED_axis_value_is_a_SPEC_error(tmp_path):
+    """A repeated value runs the same cell twice and counts it twice, so it
+    weights one arm of the sweep while the cell count still reads as the size
+    of the space."""
+    r = _run(tmp_path, _spec(axes={"arm": ["good", "good", "bad"]}))
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "repeats value(s)" in r.stderr
+
+
+# ------------------------------------------- an execution outcome can never
+# be a classification, and `other` is one too
+
+
+def test_the_implicit_other_label_cannot_be_the_predicate(tmp_path):
+    """`_classify` returns `other` when NO rule matched.
+
+    Left unreserved, a spec could declare an `other` regex AND name `other`
+    as its predicate — at which point output matching none of the author's
+    own rules SATISFIES the thing being measured. The fallback means
+    "unclassified", and unclassified can never be the finding.
+    """
+    r = _run(tmp_path, _spec(classify={"GOOD": "^good", "other": "^bad"}))
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "RESERVED for an execution" in r.stderr
+
+
+def test_a_CRASHED_no_op_does_not_certify_the_instrument(tmp_path):
+    """The no-op arm exists to prove the harness can FAIL.
+
+    Any non-RAN outcome fails `_matches` for the wrong reason, so a no-op
+    that ERRORED used to read as "the arm correctly did not match" and
+    certify the controls. A broken arm proves only that it can break.
+    """
+    r = _run(
+        tmp_path,
+        _spec(cell='if [ "{arm}" = bad ]; then exit 99; else echo good; fi'),
+    )
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "no-op arm did not RUN" in r.stdout + r.stderr
+    assert "=== RESULTS ===" not in r.stdout, "a void run prints no matrix"
+
+
+def test_output_that_cannot_be_DECODED_is_an_outcome_not_a_silent_prefix(tmp_path):
+    """UnicodeDecodeError IS a ValueError.
+
+    So the reader's broad handler caught it, kept the valid PREFIX, and handed
+    that prefix to `_classify` as though it were the whole output — a rule
+    that would have matched past the bad bytes was silently missed. That is
+    the same silent-truncation failure the byte cap exists to make loud,
+    arriving through a different door.
+    """
+    r = _run(tmp_path, _spec(cell="printf '{arm}\\n'; printf '\\377\\376'"))
+    assert "UNDECODABLE" in r.stdout + r.stderr, r.stdout + r.stderr
+
+
+# ------------------------------------------------------- process hygiene and
+# the honesty of the remedy slice
+
+
+def test_a_cell_that_exits_NORMALLY_still_has_its_descendants_reaped(tmp_path):
+    """Before this, `_kill_group` ran only under `TimeoutExpired`.
+
+    A cell that exited normally left its backgrounded descendants running,
+    free to write into the cells that followed it — which is the corruption
+    the timeout kill was added to prevent, reached by the ordinary path
+    instead of the exceptional one.
+    """
+    pidfile = tmp_path / "descendant.pid"
+    spec = _spec(cell=f"echo {{arm}}; (sleep 45) & echo $! > {pidfile}")
+    _run(tmp_path, spec)
+    assert pidfile.exists(), "guard-the-guard: the cell never recorded a descendant"
+    pid = int(pidfile.read_text().strip())
+    assert pid > 1, "guard-the-guard: a pid of 1 or 0 would make the check meaningless"
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return  # reaped, which is the property
+        time.sleep(0.1)
+    os.kill(pid, signal.SIGKILL)  # do not leak it out of the test either
+    raise AssertionError(f"descendant {pid} survived the sweep")
+
+
+def test_a_remedy_selecting_only_INERT_cells_is_UNVERIFIED_not_measured_in_zero(tmp_path):
+    """Every declared value can be a real axis value and still select NO live
+    cell, when the remedy pins an environmental value the controls excluded.
+
+    "MEASURED in 0 of N live cells" is then a measurement claim resting on
+    nothing, and it reads as a pass because nothing failed. The distinction
+    this tool exists for is measured-versus-asserted.
+    """
+    r = _run(tmp_path, _two_axis(proposed_remedy={"env": "inert"}))
+    assert "UNVERIFIED: the remedy selects NO live cell" in r.stdout, r.stdout
+    assert "MEASURED in 0" not in r.stdout
