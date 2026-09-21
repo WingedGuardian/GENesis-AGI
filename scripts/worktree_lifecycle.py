@@ -1664,17 +1664,38 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
     # previewed as the plain-directory fallback a real run may not take.
     # `cat-file -e`, not `rev-parse --verify`: the latter echoes a well-formed
     # sha back with rc 0 whether or not the object exists.
-    ref_state = "unknown"
-    if checkout_ref:
+    def _ref_state(ref: str) -> str:
+        """'resolves' | 'missing' | 'unknown' — only a completed nonzero
+        `cat-file` PROVES the object is gone; a timeout or spawn failure is
+        unknown and must not be previewed as a fallback a real run may not take.
+        `cat-file -e`, not `rev-parse --verify`: the latter echoes a well-formed
+        sha back with rc 0 whether or not the object exists."""
         try:
             probe = subprocess.run(
-                ["git", "cat-file", "-e", f"{checkout_ref}^{{commit}}"],
+                ["git", "cat-file", "-e", f"{ref}^{{commit}}"],
                 capture_output=True, cwd=str(repo_root), timeout=15,
                 env=_git_env(),
             )
-            ref_state = "resolves" if probe.returncode == 0 else "missing"
+            return "resolves" if probe.returncode == 0 else "missing"
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            ref_state = "unknown"
+            return "unknown"
+
+    ref_state = "unknown"
+    if checkout_ref:
+        ref_state = _ref_state(checkout_ref)
+        # The real run retries the recorded COMMIT after the branch's worktree
+        # add fails — a missing or unverifiable branch does not by itself mean
+        # plain-directory fallback. Probe the commit before calling it that.
+        if ref_state == "missing" and branch and not detached and commit \
+                and checkout_ref != commit:
+            commit_state = _ref_state(commit)
+            if commit_state == "resolves":
+                checkout_ref = commit
+                ref_state = "resolves"
+                ref_note = (
+                    f"detached at {commit[:8]} — branch {branch!r} does not "
+                    "resolve, recovery would retry the recorded commit"
+                )
 
     # `git worktree add` recreates TRACKED files; the restore step then fills in
     # only what the checkout left missing (copy-only-missing). Count the files
@@ -1753,14 +1774,15 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
                 return _link_escapes(prefix, seen | {link_path})
         return False
 
-    def _blocked_by_link(c: str) -> bool | None:
-        """Whether the checkout's tree makes a stored file unrestorable.
+    def _classify(c: str) -> str:
+        """'restorable' | 'collides' | 'escapes' | 'unknown', from the tree.
 
-        Two blockers, both invisible to a bare name comparison: a tracked
-        NON-directory ancestor (`a` is a file or link while the archive holds
-        `a/b` — the checkout occupies `a` and the restore cannot descend it),
-        and a tracked symlink ancestor whose target escapes the worktree
-        (`_restore_from_dir` invariant 2). None = could not be determined."""
+        'collides': a tracked NON-directory ancestor (`a` is a regular file
+        while the archive holds `a/b`) — recovery does NOT skip it; mkdir on the
+        existing file RAISES and aborts the restore partway, so it is reported
+        separately rather than silently discounted. 'escapes': a tracked
+        symlink ancestor resolves outside the worktree (invariant 2 — skipped).
+        'unknown': an ancestor's escape could not be determined."""
         for i in range(1, c.count("/") + 1):
             ancestor = c.rsplit("/", i)[0]
             if ancestor not in tree[0]:
@@ -1768,10 +1790,10 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
             if ancestor in tree[1]:
                 escapes = _link_escapes(ancestor, frozenset())
                 if escapes is not False:
-                    return escapes
+                    return "escapes" if escapes else "unknown"
                 continue  # in-tree link — the write still lands inside
-            return True  # tracked regular file in the way
-        return False
+            return "collides"  # tracked regular file in the way
+        return "restorable"
 
     _log(f"WOULD RECOVER {original_path} ({ref_note})")
     if ref_state == "missing":
@@ -1789,18 +1811,28 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
     else:
         restorable = 0
         uncertain = False
+        collisions: list[str] = []
         for c in candidates:
             if c in tree[0]:
                 continue
-            blocked = _blocked_by_link(c)
-            if blocked is None:
-                uncertain = True
-            elif not blocked:
+            kind = _classify(c)
+            if kind == "restorable":
                 restorable += 1
+            elif kind == "unknown":
+                uncertain = True
+            elif kind == "collides":
+                collisions.append(c)
         if uncertain:
             _log(f"WOULD RESTORE up to {len(candidates)} file(s) from {stored}")
         else:
             _log(f"WOULD RESTORE {restorable} untracked file(s) from {stored}")
+        if collisions:
+            _log(
+                f"  WARNING {len(collisions)} stored file(s) sit under a path "
+                f"the checkout recreates as a non-directory (e.g. "
+                f"{collisions[0]}) — a real recovery RAISES on mkdir there and "
+                "aborts partway"
+            )
     _log(consume_note)
     return True
 
