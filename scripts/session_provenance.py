@@ -660,7 +660,10 @@ def cmd_session(session_id: str, limit: int) -> int:
         b = names[0]  # display name; classification below uses every alias
         merged_heads: list[str] = []
         heads_complete = True
-        for name in names:
+        for name in dict.fromkeys(_gh_head_name(n) for n in names):
+            # Dedupe on the GitHub head name: `feature` and `origin/feature`
+            # issue the identical query, so a failure on the redundant second
+            # call would invalidate a complete result already obtained.
             heads, complete = _merged_pr_heads(name)
             merged_heads.extend(h for h in heads if h)
             heads_complete &= complete
