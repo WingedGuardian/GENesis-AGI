@@ -1146,6 +1146,55 @@ every edit" mandate — that just gates work behind a tool that's stale-by-desig
 Full syntax and Cypher examples: `.claude/docs/code-intelligence-guide.md`;
 tool-selection decision matrix: `.claude/docs/code-intelligence.md`
 
+### Advisory is the default; a BLOCK is what needs the argument
+
+Before the fail-direction question below, there is a prior one, and it is the
+one that gets skipped: **should this refuse at all?**
+
+**Advisory is the default and the first step.** Escalating to a BLOCK needs a
+specific, credible, MEASURED reason — the risk is that severe, or that frequent.
+*"For safety"* and *"defense in depth"* are not reasons. Neither is having just
+been bitten once: an n=1 incident earns a COUNTER, not a gate.
+
+**Fail-open is not an automatic defect — but say WHICH question you are
+answering, because there are two and they get opposite defaults.** (1) The
+VERDICT question: when a guard evaluates successfully, should its design be an
+advisory or a block? Advisory by default, per the above. (2) The DEGRADE
+question — what a guard does when it CANNOT evaluate — is decided per boundary
+by the section below, and many of this repo's Bash hooks are REQUIRED to fail
+closed there by the degrade-direction contract test
+(`test_every_bash_hook_declares_its_degrade_direction`); nothing in this
+section loosens that, and satisfying it with a false advisory claim in the
+exemption list is the named failure, not compliance. The claim here is about
+(1): a control that fights the operator daily against a harm that is usually
+hypothetical is a cost, not a defense. Ask which direction THIS boundary should
+fail in — open, closed, or open-and-loud — from consequence, never from which
+one sounds safer.
+
+⚠ **This governs GUARDS — advisory nudges and friction hooks — never APPROVAL
+BOUNDARIES.** Anything that gates autonomy expansion, spending, destruction of
+data, or publication to an external surface is a sovereignty boundary, not
+friction to be tuned: never a downgrade candidate, and proposing to relax one
+is itself the failure. The autonomous-CLI gate, ego proposals, per-transaction
+financial approval and destructive-command confirmation are canonical members
+of that class, not an exhaustive list — classify by what the boundary GATES,
+never by whether it appears here.
+
+Two consequences worth stating, because they are easy to get backwards:
+
+- **Blocking stops foreground and background equally; advisory stops neither.
+  Both are fine.** What is NOT fine is an ask that reaches an UNATTENDED
+  session — an ask with no human present is a block nobody intended — or a
+  block that impedes background work nobody meant to impede. An ask leg is
+  legitimate exactly where the shipped ones sit: at an approval boundary in a
+  foreground flow, degrading to a DEFINED verdict when dispatched (the push
+  guard's ask converts to deny under `_is_dispatched()`) rather than hanging.
+- **A guard is written for the agent, not the user.** Nine times in ten the user
+  need not know it fired.
+
+This is a design axiom, not a preference: changing it is a redesign
+conversation, not a session's call.
+
 ### Guard failure semantics — the third option is fail OPEN, LOUDLY
 
 Every guard has TWO INDEPENDENT axes when it cannot evaluate, and collapsing
