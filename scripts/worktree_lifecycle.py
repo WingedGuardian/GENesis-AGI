@@ -1582,13 +1582,14 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
                     (m for m in members
                      if m.isfile()
                      and len(PurePosixPath(m.name).parts) == 2
-                     and m.name.endswith(".trash_meta.json")),
+                     and PurePosixPath(m.name).name == ".trash_meta.json"),
                     None,
                 )
                 if meta_member is None:
                     meta_member = next(
                         (m for m in members
-                         if m.isfile() and m.name.endswith(".trash_meta.json")),
+                         if m.isfile()
+                         and PurePosixPath(m.name).name == ".trash_meta.json"),
                         None,
                     )
                 if meta_member is None:
@@ -1627,13 +1628,25 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
     # callers routinely `git branch -D` right after archiving, and a real run
     # then retries DETACHED at the recorded commit. Preview what recovery would
     # actually do, not what the metadata last recorded.
-    branch_exists = bool(branch) and _run_git(
-        repo_root,
-        ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
-        timeout=10,
-    ) is not None
-    if branch and not detached and branch_exists:
+    # Three states here too: a completed nonzero rev-parse PROVES the branch is
+    # absent; an exception (timeout, no git) only says we could not ask.
+    branch_state = "absent"
+    if branch:
+        try:
+            bp = subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet",
+                 f"refs/heads/{branch}"],
+                capture_output=True, cwd=str(repo_root), timeout=10,
+                env=_git_env(),
+            )
+            branch_state = "exists" if bp.returncode == 0 else "absent"
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            branch_state = "unknown"
+    if branch and not detached and branch_state == "exists":
         ref_note = f"branch: {branch}"
+        checkout_ref = branch
+    elif branch and not detached and branch_state == "unknown":
+        ref_note = f"branch: {branch} (existence could not be verified)"
         checkout_ref = branch
     elif branch and not detached:
         ref_note = (
@@ -1717,8 +1730,10 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
                 )
             except (UnicodeDecodeError, ValueError):
                 out = None
-            lines = out.splitlines() if out is not None else []
-            link_target_cache[link_path] = lines[0].strip() if lines else None
+            # Verbatim blob content — a symlink target is raw bytes to POSIX:
+            # newlines and spaces are legal characters in it, so splitting or
+            # stripping changes which path the link actually names.
+            link_target_cache[link_path] = out
         target = link_target_cache[link_path]
         if target is None or not target:
             return None
@@ -1739,17 +1754,23 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
         return False
 
     def _blocked_by_link(c: str) -> bool | None:
-        """A tracked SYMLINK ancestor whose target leaves the worktree makes a
-        stored file unrestorable — `_restore_from_dir` refuses to write through
-        it (invariant 2). An in-tree link target restores normally. None = an
-        ancestor's escape could not be determined."""
+        """Whether the checkout's tree makes a stored file unrestorable.
+
+        Two blockers, both invisible to a bare name comparison: a tracked
+        NON-directory ancestor (`a` is a file or link while the archive holds
+        `a/b` — the checkout occupies `a` and the restore cannot descend it),
+        and a tracked symlink ancestor whose target escapes the worktree
+        (`_restore_from_dir` invariant 2). None = could not be determined."""
         for i in range(1, c.count("/") + 1):
             ancestor = c.rsplit("/", i)[0]
-            if ancestor not in tree[1]:
+            if ancestor not in tree[0]:
                 continue
-            escapes = _link_escapes(ancestor, frozenset())
-            if escapes is not False:
-                return escapes
+            if ancestor in tree[1]:
+                escapes = _link_escapes(ancestor, frozenset())
+                if escapes is not False:
+                    return escapes
+                continue  # in-tree link — the write still lands inside
+            return True  # tracked regular file in the way
         return False
 
     _log(f"WOULD RECOVER {original_path} ({ref_note})")
