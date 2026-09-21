@@ -3477,11 +3477,23 @@ real-world life — so the issue carries technical detail only. Borderline, in
 either direction? Ask. See CLAUDE.md, "Where deferred work goes".
 
 **The exception that is NEVER waived: a security defect is not filed publicly
-before it is fixed.** An unpatched bypass, a credential exposure, anything
-exploitable — that goes to a private record under `~/.genesis/output/` plus a
-`follow_up_create` row, and nothing about it reaches a public surface — the
-relaxed filing rule above does not touch this one. If a finding is both adjacent and a live bypass,
-the security rule wins.
+before it is fixed.** It goes to a private record under `~/.genesis/output/`
+plus a `follow_up_create` row, and nothing about it reaches a public surface —
+the relaxed filing rule above does not touch this one.
+
+**The test is WHO GAINS, not the word "bypass"** (see CLAUDE.md, "Where
+deferred work goes", for the full rule this mirrors). Security-class means
+disclosure hands someone a capability they do not already have: a credential
+exposure, an auth or privilege bypass, an injection path, anything reachable by
+a party with LESS access than it grants. A fail-open in a LOCAL development
+guard is usually not that — it runs only where an install wires it, whoever can
+trigger it already has commit access to that checkout, and the worst case is
+typically an under-reviewed change reaching a PR that still waits on maintainer
+approval. Apply the test rather than the label; the catch-all phrasing this
+replaces swept in most of what this repo builds. The exception the test catches
+and the label does not: a guard whose job is stopping a SECRET or PRIVATE DATA
+from reaching a public surface is security-class however local it is, because a
+branch on a public repo is public the moment it is pushed, merged or not.
 
 Write the issue while the context is in your head — the measurement, the
 file:line, the falsifier, and why it was out of scope for the PR. An issue that
