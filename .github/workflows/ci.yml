@@ -779,4 +779,8 @@ jobs:
         # does not. That asymmetry is the trap: an under-set floor still passes,
         # so the guard quietly forfeits the exact fit it exists to hold and
         # nothing says a word.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23217
+        #
+        # 23217 -> 23219: the claim-sweep fix added two tests to
+        # test_blocked_task_resume.py (newer-cancellation arm, persisted-phase
+        # reporting). Counted by the diff's file delta, per this comment's rule.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23219
