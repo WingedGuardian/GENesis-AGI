@@ -1259,6 +1259,7 @@ _ADVISORY_BY_DESIGN = {
     "hooks/capped_read_advisory.py": "ADVISORY ONLY.",
     "hooks/credential_surface_hook.py": "Exit 0 always — advisory, never blocks.",
     "hooks/pipe_status_guard.py": "ADVISORY, never blocking:",
+    "hooks/pr_close_advisory.py": "Say so; never block it.",
     "hooks/pre_push_privacy_review.py": "NON-BLOCKING.",
     "hooks/tmux_kill_server_guard.py": "which is exactly why this is ADVISORY, never a block",
     "procedure_advisor.py": "surfaces relevant procedures as advisory context.",

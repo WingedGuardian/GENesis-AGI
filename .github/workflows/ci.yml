@@ -878,4 +878,63 @@ jobs:
         # The base is deliberately NOT re-derived from the merged tree: this is
         # a FLOOR, so a lagging base is conservative and can only under-catch,
         # never go falsely red.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23298
+        #
+        # UNION with the wrapper-arity lock's raise (its own measurement): its
+        # new suite collects 35 (`--collect-only -q` on the merged tree) and adds
+        # 3 environment-gated skips, not 2 — the first count of this was wrong
+        # by one and turned CI red, which is the trap this block already warns
+        # about twice above. MEASURED on the runner rather than reasoned about,
+        # by diffing the skip SETS of two junit reports (main 8a465c7b1 vs this
+        # branch): main skips 99, this branch skips 102, and the difference is
+        # exactly these three parametrisations of the arity lock —
+        #
+        #   test_every_listed_option_documents_a_required_value[doas]
+        #   test_every_listed_option_documents_a_required_value[time]
+        #   test_every_listed_option_documents_a_required_value[uvx]
+        #
+        # TWO wrappers are absent from the runner, not one (`doas` and `uvx`),
+        # and `time` is excluded because bash's keyword and /usr/bin/time are
+        # different programs sharing a basename. All three skips are BY DESIGN:
+        # the lock declines to grade a table against a tool it cannot run, since
+        # a table written from memory about an uninstalled tool is the thing it
+        # exists to prevent.
+        #
+        # Count on the RUNNER, never the dev box: which wrappers are installed
+        # differs between them, so a local "N skipped" is the wrong denominator
+        # for this line. That is how the off-by-one got in.
+        #
+        # So ceiling 99 -> 102.
+        #
+        # The FLOOR moves too, 23333 -> 23338, and it is the same
+        # counted-before-the-last-edit trap one axis over. The floor was set at
+        # +35 when this file collected 35 cases; a review round that hardened
+        # the lock added three more and it was not re-counted (Codex P2, round
+        # 4). MEASURED by collection, not by grepping for a def:
+        #   pytest tests/test_hooks/test_wrapper_option_arity.py --collect-only -q
+        #   -> 40 tests collected
+        # The file is new on this branch, so all 40 are new cases and the floor
+        # is 23298 + 40. At +35 five of them could stop collecting while the
+        # guard stayed green — the exact-fit invariant this block claims,
+        # quietly forfeited.
+        #
+        # Counted at 38 first, then re-counted at 40 after the ambiguity
+        # abstention added its two guard-the-guard tests. That is the FOURTH
+        # time this line has been set before the last test-adding edit, which
+        # is why the instruction above is shouted. Re-count LAST, after the
+        # final edit, never while writing it.
+        #
+        # 23338 -> 23342, the FIFTH move: round 5 replaced the print-only
+        # abstention with an allowlist and four guard-the-guard cases.
+        # Re-counted after the LAST edit, not before it:
+        #   pytest tests/test_hooks/test_wrapper_option_arity.py --collect-only -q
+        #   -> 44 tests collected
+        # so the floor is 23298 + 44. The ceiling does NOT move: the allowlist
+        # changes which entries are graded, never which tools are skipped, and
+        # the file still skips exactly the same two here.
+        #
+        # This is also the first time the shouted instruction above WORKED. The
+        # line was written at 43, then verify-RED showed the caller's assertion
+        # was unwired and the fix for that added a 44th case. Re-counting last
+        # caught it before the commit instead of in round 6. The habit is cheap;
+        # the four prior instances each cost a review round.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23342
