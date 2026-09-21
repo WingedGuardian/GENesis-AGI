@@ -92,6 +92,7 @@ async def find_exact_duplicate(
     db: aiosqlite.Connection,
     *,
     content: str,
+    source_subsystem: str | None = None,
 ) -> str | None:
     """Return memory_id if exact content already exists and is RECALLABLE.
 
@@ -115,6 +116,14 @@ async def find_exact_duplicate(
 
     A row missing its metadata is treated as VISIBLE, which keeps the dedup
     working on legacy rows rather than letting a metadata gap mint duplicates.
+
+    *source_subsystem* scopes the candidate pool to the write's own recall
+    scope. A foreground write (``None``) dedups only against user-visible
+    rows. An automated write dedups only against rows its OWN subsystem wrote
+    (``m.source_subsystem = <name>``): ``only_subsystem`` recall excludes both
+    user rows and other subsystems' rows, so a hit outside its own scope would
+    hand back an id its readers can never see — while excluding the pool
+    entirely would mint a fresh copy on every identical retry.
     """
     if not content:
         return None
@@ -127,16 +136,23 @@ async def find_exact_duplicate(
 
     as_of = _dt.now(UTC).isoformat()  # same spelling `search()` uses below
     prefix = content[:200]
+    params: list = [len(content), prefix]
+    if source_subsystem is None:
+        scope_clause = "AND m.source_subsystem IS NULL "
+    else:
+        scope_clause = "AND m.source_subsystem = ? "
+        params.append(source_subsystem)
+    params.append(as_of)
     rows = await db.execute_fetchall(
         "SELECT f.memory_id, f.content FROM memory_fts f "
         "LEFT JOIN memory_metadata m ON m.memory_id = f.memory_id "
         "WHERE length(f.content) = ? "
         "AND substr(f.content, 1, 200) = ? "
-        "AND m.source_subsystem IS NULL "
-        "AND (m.deprecated IS NULL OR m.deprecated = 0) "
+        + scope_clause
+        + "AND (m.deprecated IS NULL OR m.deprecated = 0) "
         "AND (m.invalid_at IS NULL OR m.invalid_at > ?) "
         "LIMIT 200",
-        (len(content), prefix, as_of),
+        params,
     )
     for row in rows:
         if row[1] == content:

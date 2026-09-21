@@ -159,3 +159,46 @@ async def test_a_row_with_NO_metadata_is_still_a_duplicate(db):
     await memory.create(db, memory_id="bare-1", content="a legacy row with no meta")
 
     assert await memory.find_exact_duplicate(db, content="a legacy row with no meta") == "bare-1"
+
+
+# ── Scope: the pool a write dedups against is the pool its readers see ──────
+#
+# `only_subsystem` recall returns ONLY rows from the named subsystem — user
+# content and other subsystems are both excluded. So an automated write whose
+# dedup pool were the user-visible rows would mint a copy on every identical
+# retry, and one whose pool were all rows could suppress onto a row its own
+# readers can never see. The scope is the write's `source_subsystem`.
+
+
+async def test_a_subsystem_write_dedups_within_its_own_scope(db):
+    """A second identical write from the same subsystem finds its prior row."""
+    await memory.create(db, memory_id="ref-1", content="the gate blocks on P1")
+    await _meta(db, "ref-1", source_subsystem="reflection")
+
+    assert await memory.find_exact_duplicate(
+        db, content="the gate blocks on P1", source_subsystem="reflection",
+    ) == "ref-1"
+
+
+async def test_a_subsystem_write_ignores_other_subsystems_rows(db):
+    """A different subsystem's row is outside this write's recall scope."""
+    await memory.create(db, memory_id="ego-1", content="the gate blocks on P1")
+    await _meta(db, "ego-1", source_subsystem="ego")
+
+    assert await memory.find_exact_duplicate(
+        db, content="the gate blocks on P1", source_subsystem="reflection",
+    ) is None
+
+
+async def test_a_subsystem_write_ignores_user_rows(db):
+    """A user-visible row cannot suppress a subsystem write.
+
+    `only_subsystem` recall excludes NULL-subsystem rows, so deduping the
+    write onto one would return an id the subsystem's own readers never see.
+    """
+    await memory.create(db, memory_id="usr-1", content="the gate blocks on P1")
+    await _meta(db, "usr-1")
+
+    assert await memory.find_exact_duplicate(
+        db, content="the gate blocks on P1", source_subsystem="reflection",
+    ) is None

@@ -57,7 +57,7 @@ async def test_dedup_lookup_sees_the_normalized_text(store):
 
     seen: dict[str, str] = {}
 
-    async def spy(_db, *, content):
+    async def spy(_db, *, content, source_subsystem=None):
         seen["content"] = content
         # ALWAYS short-circuit, so the full write pipeline never runs and the
         # only thing that can fail is the assertion below.
@@ -92,7 +92,7 @@ async def test_normalization_failure_still_lets_the_store_proceed(store):
     def boom():
         raise RuntimeError("alias file unreadable")
 
-    async def spy(_db, *, content):
+    async def spy(_db, *, content, source_subsystem=None):
         seen["content"] = content
         return "pre-existing-id"
 
@@ -122,7 +122,7 @@ async def test_a_duplicate_still_performs_the_requested_supersession(store):
 
     marked: dict[str, str] = {}
 
-    async def hit(_db, *, content):
+    async def hit(_db, *, content, source_subsystem=None):
         return "pre-existing-id"
 
     async def resolve(handle):
@@ -131,9 +131,19 @@ async def test_a_duplicate_still_performs_the_requested_supersession(store):
     async def mark(old_id, new_id, _stamp, **_kw):
         marked["old"], marked["new"] = old_id, new_id
 
+    # The pair validation now runs for real: the duplicate row must present
+    # as a live successor (not deprecated, not expired, not tombstoned).
     with (
         patch.object(er, "load_aliases", lambda: ALIASES),
         patch.object(store_mod.memory_crud, "find_exact_duplicate", hit),
+        patch.object(
+            store_mod.memory_crud, "get_metadata",
+            AsyncMock(return_value={"deprecated": 0, "invalid_at": None}),
+        ),
+        patch(
+            "genesis.memory.delete_tombstones.has_open_tombstone",
+            AsyncMock(return_value=False),
+        ),
         patch.object(store, "_resolve_supersede_target", resolve),
         patch.object(store, "_mark_superseded", mark),
     ):
@@ -160,7 +170,7 @@ async def test_a_duplicate_without_supersedes_marks_nothing(store):
 
     calls: list[object] = []
 
-    async def hit(_db, *, content):
+    async def hit(_db, *, content, source_subsystem=None):
         return "pre-existing-id"
 
     async def mark(*a, **kw):
@@ -199,7 +209,7 @@ async def test_an_unresolvable_pair_raises_without_writing_a_duplicate(store):
     import genesis.memory.store as store_mod
     from genesis.memory.store import SupersedeUnresolved
 
-    async def hit(_db, *, content):
+    async def hit(_db, *, content, source_subsystem=None):
         return "pre-existing-id"
 
     async def resolve(handle):
@@ -212,6 +222,14 @@ async def test_an_unresolvable_pair_raises_without_writing_a_duplicate(store):
     with (
         patch.object(er, "load_aliases", lambda: ALIASES),
         patch.object(store_mod.memory_crud, "find_exact_duplicate", hit),
+        patch.object(
+            store_mod.memory_crud, "get_metadata",
+            AsyncMock(return_value={"deprecated": 0, "invalid_at": None}),
+        ),
+        patch(
+            "genesis.memory.delete_tombstones.has_open_tombstone",
+            AsyncMock(return_value=False),
+        ),
         patch.object(store, "_resolve_supersede_target", resolve),
         patch.object(store, "_mark_superseded", mark),
         pytest.raises(SupersedeUnresolved),
@@ -237,7 +255,7 @@ async def test_the_raw_form_is_checked_when_the_normalized_form_misses(store):
 
     queried: list[str] = []
 
-    async def by_form(_db, *, content):
+    async def by_form(_db, *, content, source_subsystem=None):
         queried.append(content)
         # Only the RAW text is in the index — the row predates the alias.
         return "legacy-raw-id" if content == RAW else None
@@ -267,7 +285,7 @@ async def test_a_normalized_hit_does_not_also_query_the_raw_form(store):
 
     queried: list[str] = []
 
-    async def by_form(_db, *, content):
+    async def by_form(_db, *, content, source_subsystem=None):
         queried.append(content)
         return "canonical-id"
 
@@ -279,3 +297,83 @@ async def test_a_normalized_hit_does_not_also_query_the_raw_form(store):
 
     assert queried == [CANONICAL], "the normalized hit settles it"
     assert returned == "canonical-id"
+
+
+# ── The pair must still be a legal supersession ─────────────────────────────
+#
+# The normal path's successor is a fresh uuid, so `old == new` is unreachable
+# there. The dedup path's successor is the PRE-EXISTING row it just matched —
+# so `store(content=<what X already says>, supersedes=X)` resolves the target
+# to the duplicate itself, and marking it would deprecate the only copy while
+# pointing it at itself. `_validate_supersede_pair` already rejects that pair;
+# these pin that this path runs it.
+
+
+@pytest.mark.asyncio()
+async def test_a_duplicate_that_resolves_to_itself_is_rejected(store):
+    """`supersedes` naming the duplicate itself must raise, not self-deprecate.
+
+    The REAL `_validate_supersede_pair` runs — only the resolution and the
+    marker are patched, so a mutation deleting the validation call turns this
+    red by reaching the marker.
+    """
+    import genesis.memory.entity_resolution as er
+    import genesis.memory.store as store_mod
+    from genesis.memory.store import SupersedeUnresolved
+
+    async def hit(_db, *, content, source_subsystem=None):
+        return "pre-existing-id"
+
+    async def resolve(handle):
+        return "pre-existing-id"  # the supersedes handle IS the duplicate
+
+    marked: list[tuple] = []
+
+    async def mark(old_id, new_id, _stamp, **_kw):
+        marked.append((old_id, new_id))
+
+    with (
+        patch.object(er, "load_aliases", lambda: ALIASES),
+        patch.object(store_mod.memory_crud, "find_exact_duplicate", hit),
+        patch.object(store, "_resolve_supersede_target", resolve),
+        patch.object(store, "_mark_superseded", mark),
+        pytest.raises(SupersedeUnresolved) as excinfo,
+    ):
+        await store.store(RAW, "conversation", supersedes="pre-existing-id")
+
+    assert excinfo.value.reason == "self_supersede"
+    assert marked == [], "a rejected pair must never reach the marker"
+    store.embedding_provider.embed.assert_not_awaited()
+
+
+# ── The lookup is scoped to the write's own recall scope ────────────────────
+#
+# `find_exact_duplicate` suppresses a write, so its candidate pool must be the
+# pool the writer's readers can see. `only_subsystem` recall excludes both
+# user rows and other subsystems' rows, so an automated write dedups only
+# against its own subsystem — otherwise an identical retry mints a copy every
+# time, or suppresses onto a row `only_subsystem` recall cannot return.
+
+
+@pytest.mark.asyncio()
+async def test_the_dedup_lookup_is_scoped_to_the_writes_subsystem(store):
+    """A `source_subsystem` store queries within that subsystem's pool."""
+    import genesis.memory.store as store_mod
+
+    seen: dict[str, object] = {}
+
+    async def hit(_db, *, content, source_subsystem=None):
+        seen["scope"] = source_subsystem
+        return "subsys-id"
+
+    with patch.object(store_mod.memory_crud, "find_exact_duplicate", hit):
+        returned = await store.store(
+            RAW, "reflection", source_subsystem="reflection",
+        )
+
+    assert returned == "subsys-id"
+    assert seen["scope"] == "reflection", (
+        "a subsystem write's dedup must match its own subsystem's rows — "
+        "scoping it to user-visible rows means every identical retry misses "
+        "its prior row and mints another copy"
+    )

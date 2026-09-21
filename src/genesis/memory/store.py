@@ -383,12 +383,16 @@ class MemoryStore:
         # Querying only the normalized form would miss that row and mint the
         # very duplicate normalizing-first exists to prevent.
         try:
+            # Scoped to the write's own recall scope: a subsystem write
+            # dedups against its own subsystem's rows, a foreground write
+            # against user-visible ones (see find_exact_duplicate).
             existing = await memory_crud.find_exact_duplicate(
-                self._db, content=content,
+                self._db, content=content, source_subsystem=source_subsystem,
             )
             if not existing and raw_content != content:
                 existing = await memory_crud.find_exact_duplicate(
                     self._db, content=raw_content,
+                    source_subsystem=source_subsystem,
                 )
             if existing:
                 # A duplicate does NOT discharge the supersession. The caller
@@ -404,9 +408,25 @@ class MemoryStore:
                 # nothing has been written at this point either.
                 if supersedes:
                     resolved = await self._resolve_supersede_target(supersedes)
-                    await self._mark_superseded(
-                        resolved, existing, datetime.now(UTC).isoformat(),
-                    )
+                    # The pair still has to be a legal supersession. The
+                    # normal path's successor is a fresh uuid, so it cannot
+                    # collide with the target; here the successor is the
+                    # PRE-EXISTING duplicate row, so `resolved == existing` is
+                    # reachable and would deprecate the only copy while
+                    # pointing it at itself. Check equality BEFORE locking —
+                    # taking `memory_id_lock` twice on the same id deadlocks —
+                    # then lock the pair and run the same validation
+                    # `supersede()` does before mutating.
+                    if resolved == existing:
+                        raise SupersedeUnresolved(
+                            resolved, "self_supersede", existing
+                        )
+                    first, second = sorted((resolved, existing))
+                    async with memory_id_lock(first), memory_id_lock(second):
+                        await self._validate_supersede_pair(resolved, existing)
+                        await self._mark_superseded(
+                            resolved, existing, datetime.now(UTC).isoformat(),
+                        )
                 logger.debug("Skipping duplicate memory store: %s", existing)
                 # NOT created by this call: the caller must not compensate it.
                 return (existing, False)
