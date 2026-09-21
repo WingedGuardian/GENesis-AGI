@@ -937,4 +937,8 @@ jobs:
         # was unwired and the fix for that added a 44th case. Re-counting last
         # caught it before the commit instead of in round 6. The habit is cheap;
         # the four prior instances each cost a review round.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23342
+        #
+        # UNION with this branch's raise (its own measurement): the
+        # disarm/arm/quarantine-recheck fixes added four tests to
+        # test_connection.py, so the floor is 23342 + 4 = 23346.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23346

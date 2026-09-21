@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Iterable
 from contextlib import asynccontextmanager, suppress
@@ -303,6 +304,78 @@ _JITTER_HIGH = 1.2
 _async_sleep = asyncio.sleep
 
 
+# Leading whitespace / `-- line` / `/* block */` comments before the first SQL
+# token. Used to find the statement's leading VERB for the transaction-control
+# refusal below — a denylist over the leading token only, deliberately NOT a SQL
+# parser: a miss (an unrecognised spelling) degrades to the pre-existing
+# behavior (statement forwarded), while a match fails LOUD before the statement
+# runs, so neither direction can silently corrupt a transaction.
+_LEADING_SQL_NOISE = re.compile(r"(?:\s+|--[^\n]*(?:\n|$)|/\*.*?\*/)*", re.S)
+
+# SQLite's transaction-control statement verbs. Inside an owned transaction()
+# block these fork the single-commit invariant exactly like calling
+# commit()/rollback() would (which _refuse_inside_txn already refuses) — an
+# early raw COMMIT makes later statements non-atomic, a raw ROLLBACK discards
+# the unit while the context manager still reports success, a raw BEGIN errors.
+# SAVEPOINT/RELEASE are included: the transaction() contract is "issue only
+# statement executes inside the block" — relaxing that for savepoints would be
+# a conscious, separate decision.
+_TXN_CONTROL_VERBS = frozenset({"begin", "commit", "end", "rollback", "savepoint", "release"})
+
+#: SQLite authorizer action codes for transaction control. These are what the
+#: guard actually enforces; `_TXN_CONTROL_VERBS` above only shapes the error
+#: MESSAGE on the method surface (`commit()`, `rollback()`), where there is no
+#: statement for SQLite to authorize.
+#:
+#: WHY AN AUTHORIZER AND NOT A PARSER. Reading the leading verb means deciding,
+#: in Python, what SQLite will treat as the first statement — and that is an
+#: open set. Each review round produced another spelling it got wrong: a BOM at
+#: byte zero, then `"; COMMIT"` (an empty statement, so the parser read no verb
+#: at all), then a BOM after whitespace or a comment, which `lstrip` cannot
+#: reach. MEASURED: the authorizer refuses every one of those, plus the C-level
+#: `Connection.commit()` that no SQL inspection can see, because it fires on the
+#: ACTION after SQLite itself has lexed the statement. There is no spelling left
+#: to enumerate. (Codex P1 x2, PR #1881.)
+#:
+#: SQLITE_SAVEPOINT is a SEPARATE code from SQLITE_TRANSACTION and is included
+#: deliberately: `_TXN_CONTROL_VERBS` covered savepoint/release, and MEASURED,
+#: denying only SQLITE_TRANSACTION leaves `SAVEPOINT s1` ALLOWED. Dropping that
+#: coverage while deleting the parser would have been a silent narrowing.
+_TXN_AUTHORIZER_DENIED_ACTIONS = frozenset(
+    {
+        sqlite3.SQLITE_TRANSACTION,  # BEGIN / COMMIT / END / ROLLBACK
+        sqlite3.SQLITE_SAVEPOINT,  # SAVEPOINT / RELEASE
+    }
+)
+
+
+def _deny_txn_control(action: int, *_args: Any) -> int:
+    """Authorizer callback: refuse transaction control, allow everything else.
+
+    Runs on aiosqlite's worker thread for every statement SQLite prepares, so it
+    must stay trivial — no I/O, no locks, no logging. A raise here surfaces as a
+    generic authorization failure and would lose the reason, which is why the
+    refusal is a return value rather than an exception.
+    """
+    return sqlite3.SQLITE_DENY if action in _TXN_AUTHORIZER_DENIED_ACTIONS else sqlite3.SQLITE_OK
+
+
+def _leading_sql_verb(sql: str) -> str:
+    """The statement's first keyword, lowercased (comments/whitespace skipped);
+    '' when none found.
+
+    A leading U+FEFF is stripped FIRST because Python's ``\\s`` does not match it
+    but SQLite skips it: without this, ``"\ufeffCOMMIT"`` reads as verbless here
+    and then executes for real (MEASURED). Reachable whenever SQL comes from a
+    file — ``open(encoding="utf-8")`` keeps a BOM; only ``utf-8-sig`` drops it.
+    """
+    m = _LEADING_SQL_NOISE.match(sql.lstrip("\ufeff"))
+    stripped = sql.lstrip("\ufeff")
+    rest = stripped[m.end() :] if m else stripped
+    verb = re.match(r"[A-Za-z_]+", rest)
+    return verb.group(0).lower() if verb else ""
+
+
 def _is_lock_error(exc: BaseException) -> bool:
     """True for SQLite lock errors: "database is locked" (SQLITE_BUSY) AND
     "database table is locked" (SQLITE_LOCKED), case-insensitive.
@@ -312,6 +385,67 @@ def _is_lock_error(exc: BaseException) -> bool:
     depend on it.
     """
     return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
+
+
+class _GuardedCursor:
+    """A cursor handed out from INSIDE an owned :meth:`transaction` block, with
+    the transaction-control surface refused on it exactly as it is on the
+    connection.
+
+    Guarding :meth:`SerializedConnection.cursor` alone does not close this hole
+    and it is a mistake to think it does: ``execute()`` returns an
+    ``aiosqlite.Cursor`` too, so a body can obtain the same class through the
+    ordinary query path and commit through it. MEASURED before this wrapper
+    existed: ``cur = await conn.execute("SELECT 1"); await cur.execute("COMMIT")``
+    ended the transaction, and so did ``async with conn.execute(...)`` and
+    ``cur.executescript(...)`` — three escapes past a guard whose own comment
+    claimed to be the only door.
+
+    Everything else forwards untouched. The async-iteration and context-manager
+    protocols are declared explicitly because Python looks those up on the TYPE,
+    so ``__getattr__`` never sees them.
+    """
+
+    __slots__ = ("_cur", "_owner")
+
+    def __init__(self, cur: aiosqlite.Cursor, owner: SerializedConnection) -> None:
+        object.__setattr__(self, "_cur", cur)
+        object.__setattr__(self, "_owner", owner)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(object.__getattribute__(self, "_cur"), name)
+
+    async def execute(self, sql: str, parameters: Iterable[Any] | None = None) -> Any:
+        self._owner._refuse_txn_control_sql(sql)
+        await self._cur.execute(sql, parameters)
+        # Return the GUARDED cursor, not ``self._cur``: aiosqlite's
+        # ``Cursor.execute`` returns the same cursor, so the chained form
+        # ``cur = await cur.execute(...)`` would otherwise rebind ``cur`` to the
+        # raw cursor and the next ``execute("COMMIT")`` would bypass the guard.
+        return self
+
+    async def executemany(self, sql: str, parameters: Iterable[Iterable[Any]]) -> Any:
+        self._owner._refuse_txn_control_sql(sql)
+        await self._cur.executemany(sql, parameters)
+        return self
+
+    async def executescript(self, sql: str) -> Any:
+        # Refused wholesale, like the connection method: a script carries an
+        # implicit COMMIT, so no per-verb check can make it safe here.
+        self._owner._refuse_inside_txn("cursor.executescript")
+
+    def __aiter__(self) -> Any:
+        return self._cur.__aiter__()
+
+    async def __anext__(self) -> Any:
+        return await self._cur.__anext__()
+
+    async def __aenter__(self) -> _GuardedCursor:
+        await self._cur.__aenter__()
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> Any:
+        return await self._cur.__aexit__(*exc_info)
 
 
 class SerializedConnection:
@@ -350,6 +484,8 @@ class SerializedConnection:
             "_reconnect_fn",
             "_consecutive_errors",
             "_max_errors",
+            "_txn_owner",
+            "_op_epoch",
             "_db_path",
         }
     )
@@ -368,6 +504,19 @@ class SerializedConnection:
         object.__setattr__(self, "_reconnect_fn", reconnect_fn)
         object.__setattr__(self, "_consecutive_errors", 0)
         object.__setattr__(self, "_max_errors", self._MAX_LOCK_ERRORS)
+        # The asyncio.Task holding an OPEN explicit transaction (via
+        # :meth:`transaction`), or None. Read on every DB op by _owns_txn(), so
+        # it MUST be initialized here and live in _OWN_ATTRS — otherwise the
+        # first op resolves it through __getattr__ against the wrapped
+        # connection and raises AttributeError before any transaction exists.
+        object.__setattr__(self, "_txn_owner", None)
+        # Monotonic count of DB operations that COMPLETED on this connection.
+        # :meth:`transaction`'s entry wait reads it to tell a CONTENDED
+        # connection (peers are committing; work is progressing; keep waiting)
+        # from a WEDGED one (a peer opened a write, died before commit, and
+        # nothing will ever close it). Without it the wait is progress-blind and
+        # a busy connection is misreported as a wedge.
+        object.__setattr__(self, "_op_epoch", 0)
         object.__setattr__(self, "_db_path", db_path)
 
     # -- Attribute passthrough (e.g. row_factory, in_transaction) ----------
@@ -390,7 +539,14 @@ class SerializedConnection:
         """Track lock errors and attempt reconnection after threshold."""
         count = self._consecutive_errors + 1
         object.__setattr__(self, "_consecutive_errors", count)
-        if count >= self._max_errors and self._reconnect_fn is not None:
+        # Never reconnect in the middle of an OPEN explicit transaction: swapping
+        # `_conn` here would silently discard the uncommitted transaction on the
+        # old connection and leave :meth:`transaction`'s COMMIT/ROLLBACK operating
+        # on a fresh, transaction-less connection. Integrity is preserved either
+        # way (the CAS + single commit means a discarded txn wrote nothing), so
+        # just count the episode and raise — transaction() then rolls back on the
+        # still-open connection and the caller retries the whole unit. (F-E)
+        if count >= self._max_errors and self._reconnect_fn is not None and not self._owns_txn():
             logger.warning(
                 "DB lock error %d/%d — attempting reconnection",
                 count,
@@ -453,6 +609,10 @@ class SerializedConnection:
                     assert_not_quarantined(self._db_path)
                 result = await fn()
                 self._reset_error_count()
+                # Progress signal for transaction()'s entry wait: every completed
+                # op (execute/commit/rollback all route here) bumps the epoch, so
+                # a peer that is still WORKING is never mistaken for a wedge.
+                object.__setattr__(self, "_op_epoch", self._op_epoch + 1)
                 return result
             except sqlite3.OperationalError as e:
                 if not _is_lock_error(e):
@@ -480,6 +640,80 @@ class SerializedConnection:
         msg = "unreachable: retry loop exits via return or raise"
         raise AssertionError(msg)
 
+    # -- Transaction ownership (multi-statement atomicity) ------------------
+
+    def _owns_txn(self) -> bool:
+        """True iff the CURRENT task holds this connection's open explicit
+        transaction (opened via :meth:`transaction`).
+
+        Short-circuits on the common no-transaction case (``_txn_owner is None``)
+        WITHOUT calling ``asyncio.current_task()``, so the hot per-call locking
+        path pays only one attribute load + identity test when nothing is inside
+        a transaction — behavior-preserving vs the original ``async with
+        self._lock``.
+        """
+        return self._txn_owner is not None and self._txn_owner is asyncio.current_task()
+
+    @asynccontextmanager
+    async def _maybe_lock(self) -> AsyncIterator[None]:
+        """Acquire ``self._lock`` — UNLESS the current task already holds it via
+        an open :meth:`transaction` on this connection.
+
+        The lock is non-reentrant, and :meth:`transaction` holds it across the
+        whole ``BEGIN IMMEDIATE`` … COMMIT; a statement issued from inside that
+        block (same task) must therefore run on the ALREADY-held lock rather than
+        deadlocking on a re-acquire. When no transaction is active this is exactly
+        ``async with self._lock``.
+        """
+        if self._owns_txn():
+            yield
+        else:
+            async with self._lock:
+                yield
+
+    def _guard_cursor(self, cur: Any) -> Any:
+        """Wrap a cursor in :class:`_GuardedCursor` when the caller is inside an
+        owned transaction, so the transaction-control surface is refused on
+        EVERY cursor this class hands out — not just the one from
+        :meth:`cursor`. Outside a transaction the cursor is returned untouched,
+        so nothing on the hot path changes shape."""
+        return _GuardedCursor(cur, self) if self._owns_txn() else cur
+
+    def _refuse_inside_txn(self, op: str) -> None:
+        """Refuse a transaction-level op (commit/rollback/close/executescript)
+        issued from INSIDE an owned :meth:`transaction` block. The context
+        manager owns the single COMMIT/ROLLBACK; a body that committed or closed
+        mid-block would fork the all-or-nothing invariant the transaction exists
+        to provide. Mirrors the migration runner's ``_MigrationConnectionProxy``.
+        """
+        if self._owns_txn():
+            raise RuntimeError(
+                f"{op}() is not allowed inside transaction() — the transaction "
+                "context manager owns the single commit/rollback; issue only "
+                "statement executes inside the block"
+            )
+
+    def _refuse_txn_control_sql(self, sql: str) -> None:
+        """Refuse raw transaction-control SQL (``execute("COMMIT")`` etc.) from
+        INSIDE an owned :meth:`transaction` block — the raw-SQL spelling of what
+        :meth:`_refuse_inside_txn` refuses on the method surface. Without this, a
+        body's ``execute("COMMIT")`` bypasses the method-level guard and a later
+        exception can no longer roll back what was committed early, silently
+        forking the all-or-nothing invariant. Outside a transaction the verbs
+        pass through unchanged. ENUMERATED over src/ and scripts/: of the twelve
+        sites issuing transaction-control SQL, exactly one family routes through
+        this class — the migration runner (``db/migrations/runner.py``, via
+        ``_MigrationConnectionProxy``). The rest hold raw handles
+        (``aiosqlite.connect``, ``get_raw_db``, stdlib ``sqlite3``) and cannot
+        reach this guard at all."""
+        if self._owns_txn() and _leading_sql_verb(sql) in _TXN_CONTROL_VERBS:
+            raise RuntimeError(
+                f"transaction-control SQL ({_leading_sql_verb(sql).upper()}) is not "
+                "allowed inside transaction() — the transaction context manager "
+                "owns the single commit/rollback; issue only statement executes "
+                "inside the block"
+            )
+
     # -- Operations that return Result (support both await and async with) --
 
     def execute(
@@ -487,9 +721,12 @@ class SerializedConnection:
         sql: str,
         parameters: Iterable[Any] | None = None,
     ) -> Result:
-        async def _locked() -> aiosqlite.Cursor:
-            async with self._lock:
-                return await self._retry_locked(lambda: self._conn.execute(sql, parameters))
+        async def _locked() -> Any:
+            self._refuse_txn_control_sql(sql)
+            async with self._maybe_lock():
+                return self._guard_cursor(
+                    await self._retry_locked(lambda: self._conn.execute(sql, parameters))
+                )
 
         return Result(_locked())
 
@@ -499,12 +736,15 @@ class SerializedConnection:
         parameters: Iterable[Iterable[Any]],
     ) -> Result:
         async def _locked() -> aiosqlite.Cursor:
+            self._refuse_txn_control_sql(sql)
             # Materialize BEFORE the retry loop: a generator argument would be
             # consumed by a failed first attempt, so the retry would silently
             # execute zero/partial rows and "succeed".
             params = list(parameters)
-            async with self._lock:
-                return await self._retry_locked(lambda: self._conn.executemany(sql, params))
+            async with self._maybe_lock():
+                return self._guard_cursor(
+                    await self._retry_locked(lambda: self._conn.executemany(sql, params))
+                )
 
         return Result(_locked())
 
@@ -514,7 +754,8 @@ class SerializedConnection:
         parameters: Iterable[Any] | None = None,
     ) -> Result:
         async def _locked() -> list[aiosqlite.Row]:
-            async with self._lock:
+            self._refuse_txn_control_sql(sql)
+            async with self._maybe_lock():
                 return await self._retry_locked(
                     lambda: self._conn.execute_fetchall(sql, parameters)
                 )
@@ -527,7 +768,8 @@ class SerializedConnection:
         parameters: Iterable[Any] | None = None,
     ) -> Result:
         async def _locked() -> tuple | None:
-            async with self._lock:
+            self._refuse_txn_control_sql(sql)
+            async with self._maybe_lock():
                 return await self._retry_locked(lambda: self._conn.execute_insert(sql, parameters))
 
         return Result(_locked())
@@ -537,6 +779,7 @@ class SerializedConnection:
         # partially apply before the lock error, so re-running it is not
         # idempotent. Keeps the pre-retry behavior: count + re-raise.
         async def _locked() -> aiosqlite.Cursor:
+            self._refuse_inside_txn("executescript")  # (F-B) — see _refuse_inside_txn
             async with self._lock:
                 if self._db_path is not None:
                     from genesis.db.integrity import assert_not_quarantined
@@ -556,10 +799,12 @@ class SerializedConnection:
     # -- Simple async operations -------------------------------------------
 
     async def commit(self) -> None:
+        self._refuse_inside_txn("commit")  # (F-B)
         async with self._lock:
             await self._retry_locked(lambda: self._conn.commit())
 
     async def rollback(self) -> None:
+        self._refuse_inside_txn("rollback")  # (F-B)
         # Retried like commit (idempotent in legacy isolation mode): a locked
         # ROLLBACK that never lands leaves in_transaction=True permanently —
         # the exact wedge this class exists to prevent. Previously this path
@@ -568,16 +813,354 @@ class SerializedConnection:
             await self._retry_locked(lambda: self._conn.rollback())
 
     async def close(self) -> None:
+        self._refuse_inside_txn("close")  # (F-B)
         async with self._lock:
             await self._conn.close()
 
-    async def cursor(self) -> aiosqlite.Cursor:
-        async with self._lock:
-            if self._db_path is not None:
-                from genesis.db.integrity import assert_not_quarantined
+    async def cursor(self) -> Any:
+        # Inside a transaction this returns a _GuardedCursor, not a raw one: a
+        # raw cursor can issue COMMIT with nothing here able to observe it.
+        # Guarding this method ALONE would be theatre — execute() hands out the
+        # same class — so the wrapper is applied at every cursor-returning site.
+        # Union with main #2165: also refuse a cursor onto a quarantined DB file.
+        if self._db_path is not None:
+            from genesis.db.integrity import assert_not_quarantined
 
+            assert_not_quarantined(self._db_path)
+        async with self._maybe_lock():
+            # Recheck AFTER the wait: the lock can queue behind a held
+            # transaction, and an integrity check may quarantine the database
+            # while we wait — a cursor onto it must not be handed out anyway.
+            if self._db_path is not None:
                 assert_not_quarantined(self._db_path)
-            return await self._conn.cursor()
+            return self._guard_cursor(await self._conn.cursor())
+
+    # -- Multi-statement atomic transaction --------------------------------
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[SerializedConnection]:
+        """Hold the connection lock across an atomic ``BEGIN IMMEDIATE`` … COMMIT.
+
+        The multi-statement counterpart to the per-call locking every other
+        method uses. Statements issued on this connection FROM THE SAME TASK
+        inside the ``async with`` block run on the already-held lock (``execute``
+        & friends detect ownership via :meth:`_maybe_lock` and skip re-acquiring),
+        so no other coroutine can interleave a statement, commit, or rollback into
+        this transaction. That is what makes a read-modify-write — a
+        compare-and-set UPDATE followed by a dependent INSERT, say — atomic
+        against the other coroutines that share Genesis's single connection. The
+        per-call lock alone releases between the two statements, so a peer can
+        commit the half-open transaction and leave the pair applied apart.
+
+        Semantics: COMMIT on clean exit, ROLLBACK on ANY exception (the body's own
+        ``ValueError`` etc. included), then re-raise. ``commit``/``rollback``/
+        ``close``/``executescript`` — and raw transaction-control SQL through
+        ``execute``/``executemany`` (``COMMIT``/``ROLLBACK``/``BEGIN``/…) — are
+        REFUSED inside the block (they would fork the single-commit invariant);
+        only statement execution is allowed.
+
+        Entry waits out a peer coroutine's open IMPLICIT transaction (jittered,
+        lock released between checks) before issuing ``BEGIN IMMEDIATE``, so a
+        transaction() starting between another coroutine's ``execute()`` and its
+        ``commit()`` no longer fails with "cannot start a transaction within a
+        transaction". The wait distinguishes the two reasons a transaction can
+        be open and raises a DIFFERENT error for each: a WEDGE (no DB op
+        completed across the stall budget — a peer died before commit) versus
+        CONTENTION (peers keep committing, but no idle moment appeared within
+        the connection's ``busy_timeout`` budget; retry the unit).
+
+        NOT re-entrant (a nested ``transaction()`` on the same task raises). A
+        CHILD task that issues a statement on this connection from inside the
+        block is a *different* task, so it takes the normal lock path and BLOCKS
+        on the held lock — do not fan out concurrent writes inside a transaction.
+        """
+        if self._owns_txn():
+            raise RuntimeError("transaction() is not re-entrant on the same connection")
+        # Wait out a peer coroutine's IMPLICIT transaction before BEGIN. Ordinary
+        # CRUD does execute();commit() as TWO lock acquisitions, so between them
+        # the connection sits inside an implicit transaction (legacy isolation
+        # mode) with the lock RELEASED — a BEGIN IMMEDIATE issued in that window
+        # raises "cannot start a transaction within a transaction", which
+        # _retry_locked does not retry (it retries lock errors only). Retrying
+        # under the held lock could never help anyway: the peer needs this lock
+        # to land its commit. So: acquire, check idle, and if a peer's implicit
+        # transaction is open RELEASE and back off (jittered, bounded) so the
+        # peer's commit can proceed. The idle check is race-free once it passes —
+        # no other statement can run on the connection while we hold the lock, so
+        # nothing can open a transaction between the check and BEGIN.
+        #
+        # The wait is BOUNDED (same schedule as _WRITE_RETRY_DELAYS, ~1.75s of
+        # backoff): the gap being waited out is a peer's execute→commit window,
+        # normally sub-millisecond. An implicit transaction still open after the
+        # full schedule means a peer errored between execute and commit and
+        # nothing will close it until some later commit/rollback — failing LOUD
+        # there beats silently blocking every transaction() caller on a wedge.
+        # The budget counts STALLED checks only — consecutive samples that saw a
+        # transaction open AND no completed op since the previous sample. A peer
+        # that is committing bumps _op_epoch, which RESETS the stall count: a
+        # merely busy connection must not be reported as wedged (measured: a
+        # progress-blind bound failed ~6% of transaction() entries under a
+        # saturated writer while nothing was actually wedged).
+        stall_budget = len(_WRITE_RETRY_DELAYS) + 1
+        # Contention still needs an outer bound, or a permanently-saturated
+        # connection could starve this waiter forever. It is NOT a new invented
+        # number: it is this install's already-configured "how long may a writer
+        # wait for the database" knob (PRAGMA busy_timeout, env-tunable per
+        # process — 5s server default, 15s in MCP children), so it scales with
+        # the same operator decision every other wait on this connection obeys.
+        contention_deadline = asyncio.get_running_loop().time() + db_busy_timeout_ms() / 1000
+        stalls = 0
+        last_epoch = self._op_epoch
+        attempt = 0
+        while True:
+            await self._lock.acquire()
+            if not self._conn.in_transaction:
+                break  # idle — proceed, still holding the lock
+            epoch = self._op_epoch
+            progressed = epoch != last_epoch
+            last_epoch = epoch
+            stalls = 0 if progressed else stalls + 1
+            self._lock.release()
+            if stalls >= stall_budget:
+                logger.warning(
+                    "transaction(): giving up — a peer's implicit transaction has"
+                    " been open across %d consecutive checks with NO completed DB"
+                    " op in between. Either a coroutine opened a write and died"
+                    " before commit/rollback, or a long explicit transaction"
+                    " (e.g. the migration runner's raw BEGIN IMMEDIATE) holds the"
+                    " connection. Regression signal: this firing in a QUIET period"
+                    " points at an abandoned write, not contention.",
+                    stalls,
+                )
+                raise sqlite3.OperationalError(
+                    "transaction(): the connection has been inside another "
+                    f"coroutine's transaction across {stalls} consecutive checks "
+                    "with no DB op completing — a peer opened a write and never "
+                    "committed/rolled back, or a long explicit transaction is "
+                    "holding the connection"
+                )
+            if asyncio.get_running_loop().time() >= contention_deadline:
+                logger.warning(
+                    "transaction(): giving up after waiting out %.1fs of peer"
+                    " write traffic (busy_timeout budget) — the connection kept"
+                    " making progress, so this is CONTENTION, not a wedge; the"
+                    " caller should retry the whole unit.",
+                    db_busy_timeout_ms() / 1000,
+                )
+                raise sqlite3.OperationalError(
+                    "transaction(): could not find an idle moment on the shared "
+                    f"connection within the {db_busy_timeout_ms()}ms busy_timeout "
+                    "budget — peers kept committing (contention, not a wedge); "
+                    "retry the unit"
+                )
+            delay = _WRITE_RETRY_DELAYS[
+                min(attempt, len(_WRITE_RETRY_DELAYS) - 1)
+            ] * random.uniform(_JITTER_LOW, _JITTER_HIGH)
+            attempt += 1
+            logger.debug(
+                "transaction(): peer transaction open (stalls=%d/%d, progressed=%s)"
+                " — retrying in %.0fms",
+                stalls,
+                stall_budget,
+                progressed,
+                delay * 1000,
+            )
+            await _async_sleep(delay)
+        try:
+            try:
+                # Explicit IMMEDIATE: takes the write lock up front (no lazy
+                # read→write upgrade deadlock across processes) and makes the
+                # boundary unambiguous rather than relying on legacy implicit-BEGIN
+                # timing. A locked BEGIN opened no transaction, so _retry_locked
+                # re-running it is safe. Matches the migration runner's idiom.
+                await self._retry_locked(lambda: self._conn.execute("BEGIN IMMEDIATE"))
+            except BaseException:
+                # A cancelled (or otherwise failed) BEGIN await can still have
+                # LANDED on the aiosqlite worker — the thread runs the queued
+                # call to completion whether or not the Future was cancelled.
+                # Resolve the real outcome before cleaning up, or a live
+                # transaction escapes ownership and wedges the connection.
+                if await self._txn_is_open():
+                    await self._rollback_then_quarantine()
+                raise
+            # Ownership is claimed only AFTER BEGIN lands: _handle_lock_error
+            # suppresses reconnection while a transaction is OPEN, and a failed
+            # BEGIN is not one — claiming earlier would strand the caller on an
+            # unhealthy connection that can never recover.
+            object.__setattr__(self, "_txn_owner", asyncio.current_task())
+            # ARM the authorizer only now — after BEGIN has landed and ownership
+            # is claimed. Arming earlier would deny our OWN `BEGIN IMMEDIATE`
+            # above (MEASURED: it does), and the retry path re-runs that BEGIN.
+            #
+            # Safe on a SHARED connection because the lock is held for the whole
+            # block: a non-owner awaits it in `_maybe_lock`, and the owner's own
+            # statements are exactly the ones this is here to guard.
+            #
+            # The arming call sits INSIDE the try whose except rolls back: a
+            # set_authorizer failure after BEGIN must not skip cleanup — the
+            # transaction is open and `_txn_owner` is already claimed, so an
+            # unhandled raise would strand ownership while the lock releases.
+            try:
+                await self._conn.set_authorizer(_deny_txn_control)
+                try:
+                    yield self
+                finally:
+                    # DISARM before ANY boundary operation. Commit, rollback and
+                    # the quarantine path all issue transaction control, so an
+                    # armed authorizer would deny the primitive's OWN cleanup —
+                    # turning a recoverable body error into a wedged connection.
+                    #
+                    # In a `finally` around the yield specifically, so the error
+                    # path disarms too. The guard is per-CONNECTION state on a
+                    # SHARED connection: leaving it armed does not fail this
+                    # caller, it fails every LATER one, which is a far worse
+                    # outcome than the bypass it prevents and is why
+                    # `test_the_guard_survives_a_failing_body` is written first.
+                    disarmed = await self._disarm_txn_authorizer()
+                # If disarming quarantined the connection, the REAL transaction
+                # died with the old handle — committing the fresh replacement
+                # would no-op while this block reports success, silently losing
+                # the body's writes. Surface that instead of committing.
+                if not disarmed:
+                    raise RuntimeError(
+                        "transaction(): the transaction guard could not be "
+                        "removed and the connection was quarantined — the "
+                        "transaction closed uncommitted with it"
+                    )
+                # COMMIT via the driver method, NOT execute("COMMIT"): under a WAL
+                # post-commit-autocheckpoint SQLITE_BUSY the commit frame is already
+                # durable and in_transaction is False, so _retry_locked's retry of
+                # .commit() no-ops (idempotent). execute("COMMIT") would instead
+                # raise "no transaction is active" and surface a SPURIOUS failure
+                # for an append that actually landed. (F-A)
+                try:
+                    await self._retry_locked(lambda: self._conn.commit())
+                except asyncio.CancelledError:
+                    # Same queued-op ambiguity as BEGIN: the commit may be
+                    # durable even though the await was cancelled. Roll back
+                    # only if the transaction is provably still open — a landed
+                    # commit must not be "rolled back" (it no-ops anyway) nor
+                    # reported as uncommitted.
+                    if await self._txn_is_open():
+                        await self._rollback_then_quarantine()
+                    raise
+            except BaseException:
+                await self._rollback_then_quarantine()
+                raise
+            finally:
+                # Clear ownership BEFORE the lock is released (the outer finally
+                # below releases it), so there is never a window where the lock
+                # is free but a stale owner would route ops lock-free.
+                object.__setattr__(self, "_txn_owner", None)
+        finally:
+            self._lock.release()
+
+    async def _disarm_txn_authorizer(self) -> None:
+        """Remove the transaction guard, and QUARANTINE if it will not come off.
+
+        Failing to disarm is strictly worse than never arming: the authorizer is
+        per-connection state on a SHARED connection, so a stuck guard does not
+        fail this caller — it silently denies every later caller's commit, on a
+        connection that looks healthy. That is the same "a possibly-broken
+        connection must never be handed back" judgement `_rollback_then_
+        quarantine` already makes, so it gets the same answer rather than a log
+        line nobody reads.
+
+        Returns False when the connection was quarantined: the caller must
+        then NOT commit, because the real transaction died with the old handle
+        and the replacement has nothing to commit.
+        """
+        try:
+            await self._conn.set_authorizer(None)
+        except Exception:
+            logger.error(
+                "transaction(): could not remove the transaction authorizer — "
+                "quarantining, because a connection that cannot commit must not "
+                "be returned to other callers",
+                exc_info=True,
+            )
+            await self._quarantine_connection()
+            return False
+        return True
+
+    async def _txn_is_open(self) -> bool:
+        """Authoritative open-transaction check after a boundary call's await
+        was cancelled or failed.
+
+        aiosqlite runs queued calls on a worker thread that completes them even
+        when the awaiting Future was cancelled, so a cancelled ``BEGIN`` await
+        does NOT mean no transaction opened. This issues a serialized no-op —
+        every previously queued op lands before it on the same thread — and
+        only then reads ``in_transaction``, making the read safe even if the
+        task is cancelled again while draining.
+        """
+        probe = asyncio.ensure_future(self._conn.execute("SELECT 1"))
+        while not probe.done():
+            try:
+                await asyncio.wait([probe])
+            except asyncio.CancelledError:
+                continue  # keep draining; the queued BEGIN/COMMIT must settle first
+        if not probe.cancelled() and (exc := probe.exception()) is not None:
+            logger.debug("transaction(): settle probe failed", exc_info=exc)
+        return self._conn.in_transaction
+
+    async def _rollback_then_quarantine(self) -> None:
+        """Best-effort ROLLBACK; if it fails, quarantine the connection.
+
+        A rollback that fails after the body already wrote leaves a possibly
+        OPEN transaction on the connection — a later unrelated write+commit
+        could then commit the supposedly-abandoned partial unit. Rather than
+        returning that connection to normal callers, close it and reconnect so
+        the partial work can never be committed. The original error is never
+        masked: callers raise their own exception after this returns.
+        """
+        try:
+            await self._retry_locked(lambda: self._conn.rollback())
+            return
+        except asyncio.CancelledError:
+            # The rollback may still have landed on the worker thread; only a
+            # provably-open transaction needs quarantine — and the
+            # CancelledError must keep propagating EITHER WAY (quarantining and
+            # then returning would swallow it, and the caller's bare `raise`
+            # would surface the wrong exception).
+            if await self._txn_is_open():
+                logger.error(
+                    "transaction(): connection quarantined — a possibly-open "
+                    "transaction must never be committed by a later caller; "
+                    "closing and reconnecting"
+                )
+                await self._quarantine_connection()
+            raise
+        except Exception:
+            logger.error("ROLLBACK after transaction() error failed", exc_info=True)
+        logger.error(
+            "transaction(): connection quarantined — a possibly-open transaction "
+            "must never be committed by a later caller; closing and reconnecting"
+        )
+        await self._quarantine_connection()
+
+    async def _quarantine_connection(self) -> None:
+        """Close the connection and replace it, so a suspect one is never reused.
+
+        Extracted rather than copied: two call sites now need it — a rollback
+        that could not be proven to have landed, and an authorizer that would
+        not come off. Both reach the same conclusion (this connection must not
+        be handed to another caller) and a second inline copy is how the two
+        would drift apart.
+
+        Best-effort throughout, and deliberately so: it runs while an error is
+        already propagating, and raising here would mask the original.
+        """
+        try:
+            await self._conn.close()
+        except Exception:
+            logger.debug("Close during quarantine failed", exc_info=True)
+        if self._reconnect_fn is not None:
+            try:
+                object.__setattr__(self, "_conn", await self._reconnect_fn())
+                object.__setattr__(self, "_consecutive_errors", 0)
+            except Exception:
+                logger.error("DB reconnect during quarantine failed", exc_info=True)
 
     # -- Async iteration support (used by some callers) --------------------
 
