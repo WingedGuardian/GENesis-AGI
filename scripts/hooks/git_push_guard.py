@@ -1370,30 +1370,64 @@ _INLINE_REVIEW_BOTS = {
     "chatgpt-codex-connector[bot]",
     "github-advanced-security[bot]",
 }
-#: Markers of a review body that is a TEMPLATE rather than a findings channel.
-#: ALL must be present, so a body merely quoting one phrase is not suppressed.
-#: Chosen by measurement over 21 live review bodies from 3 reviewers on 6 PRs:
-#: this pair suppressed 6/6 wrapper bodies and 0/15 findings-bearing ones.
-_WRAPPER_REVIEW_BODY_MARKERS = (
-    "Codex Review",
-    "automated review suggestions for this pull request",
+#: The template's distinctive sentence. A body that does not contain it is NOT
+#: this template and is never suppressed, however short it is — see the gate at
+#: the top of `_is_wrapper_review_body`, which exists because the residue test
+#: alone silently dropped brief real findings.
+_WRAPPER_REVIEW_BODY_SIGNATURE = "automated review suggestions for this pull request"
+#: Pieces of the known review TEMPLATE, removed one at a time to see whether
+#: anything a human would read is left. Order does not matter; each is deleted
+#: wherever it appears. The `<details>` block is matched non-greedily and its
+#: content is vendor chrome ("About Codex in GitHub"), not review output.
+_WRAPPER_REVIEW_BODY_PARTS = (
+    re.compile(r"<details>.*?</details>", re.S),
+    re.compile(r"^#+.*Codex Review.*$", re.M),
+    re.compile(r"Here are some automated review suggestions for this pull request\.?"),
+    re.compile(r"\*\*Reviewed commit:\*\*\s*`?[0-9a-f]{7,40}`?"),
 )
+#: Below this many characters of residue, what is left of a stripped template is
+#: punctuation and whitespace rather than content. MEASURED: the live template
+#: leaves 0 characters; the smallest real finding body in the same corpus is
+#: over 400. Any value in that gap behaves identically, so this is a threshold
+#: with a measured margin either side rather than a number chosen to fit.
+_WRAPPER_RESIDUE_MAX_CHARS = 24
 
 
 def _is_wrapper_review_body(body: str) -> bool:
     """True when a review BODY is a template carrying no findings of its own.
 
-    Used to keep the uncounted tail from annotating every PR. The alternative —
-    a list of logins whose bodies are wrappers — was measured WORSE on fail
-    direction, not on accuracy: when the template changes this predicate stops
-    matching and the body is surfaced (noise, visible), where a login list would
-    silently drop a body that had started carrying findings.
+    SUBTRACTIVE, not a marker denylist. An earlier revision asked "does this
+    body contain the template's two marker phrases?", which suppressed anything
+    that OPENED with the template and then appended real content — re-creating
+    the review-body blind spot for the one shape most likely to carry a finding
+    (Codex P2, and its own suggested remedy). This instead REMOVES the template
+    and asks what survives: a pure wrapper leaves nothing, a wrapper with a
+    summary bolted on leaves the summary, and the summary is what gets surfaced.
 
-    Substring tests rather than a regex, deliberately: this runs on a hook path,
-    the input is third-party text, and a super-linear scan there is a fail-open
-    because a killed hook does not block. Two `in` checks cannot backtrack.
+    Used to keep the uncounted tail from annotating every PR. A list of logins
+    whose bodies are wrappers was measured WORSE on fail direction, not on
+    accuracy: when the template changes this predicate stops matching and the
+    body is SURFACED (noise, visible, recoverable), where a login list silently
+    drops a body that had started carrying findings.
+
+    Bounded work: each pattern is anchored to a literal and the `<details>`
+    match is non-greedy, so this is linear in the body. That matters because it
+    runs on a hook path, where a scan an author can make slow is a fail-open —
+    a killed hook does not block.
     """
-    return all(marker in body for marker in _WRAPPER_REVIEW_BODY_MARKERS)
+    # GATE ON THE SIGNATURE FIRST. Without this the residue test alone suppresses
+    # any SHORT body — "first pass: found a race." reduces to 19 characters of
+    # content and would be silently dropped. Caught by its own test, and it is
+    # the same silent-drop class this bucket exists to close: a threshold that
+    # cannot tell "a template with nothing left" from "a brief real finding".
+    if _WRAPPER_REVIEW_BODY_SIGNATURE not in body:
+        return False
+    residue = body
+    for part in _WRAPPER_REVIEW_BODY_PARTS:
+        residue = part.sub("", residue)
+    # Strip markdown furniture the template leaves behind so residue measures
+    # CONTENT, not the punctuation between removed pieces.
+    return len(re.sub(r"[\s*_`>#|:\-]", "", residue)) <= _WRAPPER_RESIDUE_MAX_CHARS
 
 
 # A reply "engages" (silences) an inline P1 finding ONLY when authored by someone with
@@ -3080,7 +3114,13 @@ def _check_inline_review_findings(
     # So these are SURFACED and make the total a floor; they are never SCORED,
     # because guessing a severity from an unrecognised reviewer would be worse
     # than the blindness, and never BLOCK, because a human comment is not a gate.
-    unclassified_reviews: list[str] = []  # logins, deduped, order preserved
+    # ONE ENTRY PER REVIEW, not per reviewer. Deduping on login understated the
+    # input and mislabelled its own unit (Codex P2): re-reviews are routine after
+    # a push, and MEASURED on PR #2191 a single author posted FOUR distinct
+    # bodies — potentially four different findings — which a login-deduped list
+    # announced as "1 review". The count and the unit have to describe the same
+    # thing, which is the defect class this whole change exists to remove.
+    unclassified_reviews: list[str] = []  # one login per REVIEW, order preserved
     reviews, reviews_complete = _pr_review_bodies(pr_num, repo=repo)
     # An unreadable second channel is handled at the END, next to the
     # incomplete-read check, not by returning from here. Returning early would
@@ -3182,11 +3222,7 @@ def _check_inline_review_findings(
             # findings is a different capability and a different risk (see the
             # filed issue); awareness is the contract here.
             review_body = (review.get("body") or "").strip()
-            if (
-                review_body
-                and not _is_wrapper_review_body(review_body)
-                and review_login not in unclassified_reviews
-            ):
+            if review_body and not _is_wrapper_review_body(review_body):
                 unclassified_reviews.append(review_login)
             continue
         parsed, declared, declared_known, depth_drift = _cr_outside_diff_entries(
@@ -3320,19 +3356,26 @@ def _check_inline_review_findings(
         # body text: this NOTE's line 0 is not the one `check_pr_report` renders
         # raw, but the whole block is untrusted third-party content and a login
         # is the smallest thing that still makes the input findable.
+        # BOTH numbers, because they answer different questions and reporting
+        # either alone misleads: the REVIEW count is how many bodies went
+        # unread, the REVIEWER count is how many distinct sources they came
+        # from. A login-deduped total announced four bodies as one review.
+        distinct = sorted(set(unclassified_reviews))
         print(
-            f"NOTE: PR #{pr_num} — {len(unclassified_reviews)} review(s) delivered in "
-            f"a review BODY by an author this gate does not recognise. NOT scored "
-            f"and NOT blocking — go read them; a review that offers to help is "
-            f"never willfully ignored here, whoever wrote it:",
+            f"NOTE: PR #{pr_num} — {len(unclassified_reviews)} review(s) from "
+            f"{len(distinct)} reviewer(s), delivered in a review BODY this gate "
+            f"cannot parse. NOT scored and NOT blocking — go read them; a review "
+            f"that offers to help is never willfully ignored here, whoever wrote it:",
             file=sys.stderr,
         )
-        for who in unclassified_reviews[:5]:
-            print(f"  [unclassified reviewer: {who}]", file=sys.stderr)
-        if len(unclassified_reviews) > 5:
+        for who in distinct[:5]:
+            count = unclassified_reviews.count(who)
+            suffix = f" ×{count}" if count > 1 else ""
+            print(f"  [unclassified reviewer: {who}{suffix}]", file=sys.stderr)
+        if len(distinct) > 5:
             print(
-                f"  … and {len(unclassified_reviews) - 5} more (listing bounded to 5; "
-                f"the count above is the total)",
+                f"  … and {len(distinct) - 5} more reviewer(s) (listing bounded to 5; "
+                f"the counts above are the totals)",
                 file=sys.stderr,
             )
     if _scope_cache and _scope_cache[0] is None:

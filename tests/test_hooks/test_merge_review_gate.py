@@ -6638,22 +6638,107 @@ class TestUncountedFindingsReachTheRow:
             "an always-on signal also pins approx>=1, killing the exact count"
         )
 
-    def test_the_wrapper_test_requires_EVERY_marker(self, guard_module):
-        """ALL markers, not ANY — a mutation sweep caught this unpinned.
+    #: The live template, captured not invented — see the fixture note below.
+    _WRAPPER_BODY = (
+        "\n### 💡 Codex Review\n\nHere are some automated review suggestions for "
+        "this pull request.\n\n**Reviewed commit:** `6ab969b1dd`\n    \n\n"
+        "<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n"
+        "If Codex has suggestions, it will comment; otherwise it will react "
+        "with 👍.\n</details>\n"
+    )
 
-        The predicate suppresses a review body from the count, so a test that is
-        too loose SILENCES reviewers. One marker alone is satisfiable by a body
-        that merely QUOTES the template — a reviewer writing "this looks like
-        the Codex Review boilerplate" would have been suppressed under `any`,
-        which is a silent drop wearing the noise-control fix's clothes.
+    def test_a_wrapper_with_content_APPENDED_is_not_suppressed(self, guard_module):
+        """Codex P2 — a marker denylist silenced the shape most likely to matter.
+
+        The predicate used to ask "does this body contain the template's two
+        marker phrases?", which is TRUE of a body that opens with the template
+        and then appends a real finding. That re-created the review-body blind
+        spot for exactly the case worth catching, inside the noise-control fix.
+
+        It is SUBTRACTIVE now: remove the template, ask what survives. A pure
+        wrapper leaves nothing; a wrapper plus a summary leaves the summary.
         """
-        markers = guard_module._WRAPPER_REVIEW_BODY_MARKERS
-        assert len(markers) >= 2, "a single-marker predicate cannot be an ALL test"
-        assert guard_module._is_wrapper_review_body(" ".join(markers)) is True
-        for solo in markers:
-            assert guard_module._is_wrapper_review_body(f"prose mentioning {solo}") is False, (
-                f"one marker alone suppressed a body: {solo!r}"
+        assert guard_module._is_wrapper_review_body(self._WRAPPER_BODY) is True
+        with_finding = (
+            self._WRAPPER_BODY
+            + "\n\n**Summary:** this drops the lock before the write and "
+            "deadlocks under concurrency.\n"
+        )
+        assert guard_module._is_wrapper_review_body(with_finding) is False, (
+            "a template with a finding appended was suppressed — the exact blind "
+            "spot this bucket exists to close"
+        )
+
+    def test_a_reviewer_QUOTING_the_template_is_not_suppressed(self, guard_module):
+        """The other half, and the marker approach failed it too.
+
+        A human reporting "the Codex Review bot keeps saying 'automated review
+        suggestions for this pull request' but misses a real NPE" contains both
+        marker phrases and none of the template's structure. Suppressing that is
+        a silent drop wearing the noise-control fix's clothes.
+        """
+        quoted = (
+            "I think the Codex Review bot is broken — it keeps saying 'automated "
+            "review suggestions for this pull request' but there is a real NPE at "
+            "line 40 that it misses every single time."
+        )
+        assert guard_module._is_wrapper_review_body(quoted) is False, quoted
+
+    def test_a_SHORT_real_body_is_never_mistaken_for_a_template(self, guard_module):
+        """A defect in the fix above, caught by a sibling test rather than review.
+
+        The subtractive predicate strips the template and asks whether the
+        residue is trivial. On its own that ALSO suppresses any brief real body
+        — "first pass: found a race." reduces to 19 characters of content, under
+        the residue bound — so a reviewer who writes tersely was silently
+        dropped. That is the same silent drop this bucket exists to close,
+        reintroduced by its own noise control.
+
+        The residue test is now gated on the template's SIGNATURE being present,
+        so a body that is not this template is never measured against a
+        template's bound, however short it is.
+        """
+        for terse in (
+            "first pass: found a race.",
+            "LGTM",
+            "nit: typo",
+            "I found a race.",
+            "",
+        ):
+            assert guard_module._is_wrapper_review_body(terse) is False, (
+                f"a short body was suppressed as a template: {terse!r}"
             )
+
+    def test_the_bucket_counts_REVIEWS_not_reviewers(self, guard_module, monkeypatch):
+        """Codex P2, and it was LIVE rather than latent.
+
+        `unclassified_reviews` deduped on login while the NOTE reported its
+        length as a number of `review(s)`. MEASURED on PR #2191: one author
+        posted FOUR distinct bodies — potentially four different findings —
+        which the deduped list announced as "1 review", understating by 4x.
+
+        Re-reviews after a push are routine, so this is the common case, not an
+        edge one. The count and the unit must describe the same thing.
+        """
+        monkeypatch.setattr(
+            guard_module,
+            "_pr_review_bodies",
+            lambda *a, **k: (
+                [
+                    {"login": "a-bot[bot]", "body": "first pass: found a race.", "state": ""},
+                    {"login": "a-bot[bot]", "body": "second pass: still racy.", "state": ""},
+                    {"login": "a-bot[bot]", "body": "third pass: also a leak.", "state": ""},
+                    {"login": "someone-else", "body": "unrelated concern.", "state": ""},
+                ],
+                True,
+            ),
+        )
+        out: list[dict] = []
+        with _mock_inline(guard_module, []):
+            guard_module._check_inline_review_findings("5", uncounted_out=out)
+        assert out[0]["approx"]["unclassified_review_bodies"] == 4, (
+            f"four bodies were counted as fewer — the login dedup is back: {out[0]}"
+        )
 
     def test_a_title_leading_with_an_html_comment_renders_its_prose(self, guard_module):
         """The reviewer whose findings most need surfacing led with machine noise.
