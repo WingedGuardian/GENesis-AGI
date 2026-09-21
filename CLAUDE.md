@@ -97,8 +97,10 @@ Pick the tool by the question (full matrix + freshness model:
 **Serena** (Python LSP) for symbols/references/rename — **always live**, the
 default for "who calls X / what breaks if I change Z"; **codebase-memory-mcp**
 for architecture/graph; **GitNexus** for deep blast-radius/flows/coupling —
-**snapshot-based, so `gitnexus analyze` first** when freshness matters (it
-drifts after pulling merged PRs). Prefer these over manual reads for dependency
+**snapshot-based**. From the main checkout, refresh with
+`scripts/lib/code_intel_index.sh "$PWD" gitnexus fast` when freshness matters.
+Linked worktrees are deliberately not indexed; use Serena for live branch truth.
+GitNexus also drifts after pulling merged PRs. Prefer these over manual reads for dependency
 questions; none is a mandatory pre-edit gate.
 
 ## Skill Library
@@ -243,6 +245,37 @@ For plans, fixes, architecture decisions, or any non-trivial change:
   documented rationale for why it can't reach 90%)
 
 Applies to both CC sessions and Genesis autonomy decisions.
+
+## Instrument For The Answer, Not The Alarm
+
+*Trigger, mechanical:* you are about to build or deploy something whose job is
+to OBSERVE an event you cannot cheaply re-trigger — an intermittent failure, a
+race, a corruption, a scheduled job — **and whose next occurrence costs the
+USER an outage, a recovery, or lost data.** Routine reversible work, and
+anything you can redo yourself, is out of scope.
+
+The test is not "will this detect it?" It is: **"when this fires exactly once,
+will I have the answer — or only the news?"** If the honest answer is "I'll
+know it happened, then I'll investigate", it is not built yet.
+
+- **Capture IDENTITY at the moment, not just occurrence** — which pid, caller,
+  command, resolved AT the event; the actor may be gone a millisecond later. A
+  log that proves *when* and not *who* buys another occurrence.
+- **Deploy every independent layer you can afford** — independent meaning
+  *different failure modes*. The narrow exception to "no speculative changes":
+  you are buying observation, not committing a fix.
+- **"Not installed" and "permission denied" are starting points, not
+  verdicts** — ask whether a different uid, host, or namespace grants it,
+  *within authority you already hold*. Reaching for privilege or a host you
+  were not given is a question for the user, never a way around the limit.
+
+**The sentence to catch yourself in:** *"if this doesn't tell us, we'll add
+more next time"* — said out loud, the cost lands on the next failure, which
+someone else absorbs. Instance: an instrument for a recurring data-corruption
+investigation proved *when* each occurrence happened and never *what* caused
+it; two rounds were spent re-watching the same failure, each costing a
+recovery. Enumeration and control arms are not restated here —
+`genesis-development`, high-stakes-verification §9 and §10 own them.
 
 ## Memory System — Layer Model
 
@@ -612,6 +645,15 @@ behind the writer, and 7 were a guard since removed.
   with a single question — a Claude Code rendering bug rejects single-question
   calls. Always pass ≥2 questions; if only one is real, add a trivial/filler
   second question to satisfy the tool. Every time, no exceptions.
+- **A question you need answered gets ASKED, and carries what it takes to
+  answer it.** Prose questions in the body of a message get missed, so ask
+  through `AskUserQuestion` — and RE-ASK when one goes unanswered and still
+  blocks. A question you restate each turn and never force is a status line,
+  not a question. Carry the facts the decision turns on: state verified now
+  (not recalled from a plan or a ledger row — those go stale), what each option
+  costs, and the cost of deciding nothing. An option whose description doesn't
+  say what it costs is a label. Same obligation on any channel asking for a
+  decision — a dispatched session's report, a PR comment.
 - **Plan mode by default** for any task with 3+ steps or architectural
   decisions. If something goes sideways — STOP and re-plan. A plan-mode
   document under `~/.claude/plans/` that will outlive one session opens with

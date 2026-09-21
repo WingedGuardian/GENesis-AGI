@@ -95,14 +95,21 @@ def decide(name: str, is_corrupt: bool, episode: dict | None, now: datetime, cfg
 
 async def _incus_exec_stdin(
     container: str, cmd_str: str, stdin_data: bytes, timeout: float,
+    user: str = "ubuntu",
 ) -> tuple[int, str]:
-    """Run ``su - ubuntu -c <cmd_str>`` in the container, piping stdin_data.
+    """Run ``su - <user> -c <cmd_str>`` in the container, piping stdin_data.
+
+    ``user`` defaults to ``ubuntu`` so the two existing callers keep their exact
+    behaviour; ``GuardianConfig.container_user`` is a supported setting that
+    ``collector.py`` and ``health_signals.py`` already honour, and a caller that
+    resolves ``$HOME``-relative paths MUST pass it or it probes the wrong home on
+    any install configured with another user.
 
     Mirrors the heartbeat writer (check.py) — collector._incus_exec has no stdin
     support, so this is a local variant. Returns (rc, stdout)."""
     proc = await asyncio.create_subprocess_exec(
         "incus", "exec", container, "--",
-        "su", "-", "ubuntu", "-c", cmd_str,
+        "su", "-", user, "-c", cmd_str,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

@@ -26,6 +26,7 @@ is the one that goes stale.
 | Re-measure another agent's finding before acting on it | CLAUDE.md, "Verify agent output" |
 | Acceptance bar + measured rate as the default method | SKILL.md, On-Load Mindset |
 | **Choosing a command/value by reasoning about an external tool** — do not; §9 below | here |
+| **Instrument for the answer, not the alarm** — the trigger, and the one-question test for an instrument | CLAUDE.md, "Instrument For The Answer, Not The Alarm"; mechanics in §10 below |
 
 The rest of this file is what those do not cover.
 
@@ -231,3 +232,42 @@ contains the damage.
 The measurement cost about twenty minutes. The four guesses cost three review
 rounds, a merge-blocking finding each time, and a note that would have told someone
 to run a command that quietly did not work.
+
+## 10. Instrumenting an event you cannot re-trigger
+
+§9 is about choosing a command by measuring. This is its sibling: choosing an
+INSTRUMENT, when the thing you want to observe is intermittent and each
+occurrence costs the user a recovery. The trigger and the one-question test
+live in CLAUDE.md, "Instrument For The Answer, Not The Alarm"; enumeration
+(§9, "Enumerate the space") and control arms (§9, "Control the instrument")
+already bind here unchanged. What those do not cover:
+
+**Observation and attribution are different capabilities, and the cheap one
+looks sufficient.** A watcher that reports an event is easy; one that names the
+actor usually needs a different mechanism, often a more privileged one. Decide
+which you need BEFORE building, because discovering the gap costs one whole
+occurrence — and on a rare event that may be the only one you get for hours.
+Worked example: inotify reports that a file was deleted and structurally cannot
+say by whom; fanotify carries the causing pid but only for a listener holding
+`CAP_SYS_ADMIN` in the INITIAL user namespace, so inside an unprivileged
+container the field is present and silently zero. Same event, same kernel,
+different answer — and "permission denied" was a uid problem, not a capability
+the environment lacked.
+
+**A sampler cannot see an actor shorter than its interval.** Diffing process
+tables every N seconds misses anything that starts and exits between two
+samples, and the miss is invisible: the actor is in neither the appeared nor
+the vanished set, so the log reads clean. If the suspect class is short-lived,
+sample-based identification is the wrong instrument however fast you poll —
+take the event-driven path, or accept that you are measuring timing only.
+
+**State what each layer CANNOT see, in the artifact.** An instrument's blind
+spot is part of its output. Writing it down is what stops the next reader
+treating a clean log as evidence of absence — the same failure the vacuous-test
+rules guard against, one level up.
+
+**Beware instrumenting with a tool that is itself a participant.** A probe that
+opens the resource under investigation joins the population you are measuring.
+Prefer read-only surfaces (`/proc`, filesystem metadata) and say so in the
+docstring, or you will spend a round distinguishing your own footprints from
+the defect's.
