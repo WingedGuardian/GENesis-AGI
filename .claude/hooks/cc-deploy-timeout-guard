@@ -1,21 +1,63 @@
 #!/usr/bin/env bash
 # PreToolUse(Bash) ADVISORY — never blocks (always exit 0).
 #
-# Long deploys — scripts/update.sh, bootstrap.sh, host-setup.sh — routinely exceed
-# the Bash TOOL's 120s DEFAULT timeout (container align + guardian redeploy + host
-# update-node/update-cc, run sequentially). An inner `timeout N …` does NOT extend
-# the tool's own timeout, so a FOREGROUND run gets SIGKILLed at 120s (exit 143) and
-# update.sh's SIGTERM traps roll it back mid-deploy. The fix is to run these via
-# `run_in_background: true` (harness-tracked, no timeout ceiling). This hook nudges
-# toward that, only when such a deploy is run in the FOREGROUND.
+# Deploys (update.sh / bootstrap.sh / host-setup.sh) must be DETACHED from the CC
+# session. A foreground run cannot fit inside the Bash tool's 600000ms hard
+# ceiling, and `run_in_background` is bound to the SESSION's lifetime and has been
+# killed mid-run twice.
 #
-# Non-blocking by contract: EVERY path exits 0. Worst case is a spurious one-line
-# note (e.g. on `cat scripts/update.sh`); it can never stop a legitimate command.
-# See the genesis-development skill's Timeout Policy and CC memory
-# feedback-bash-tool-timeout-long-deploys.
+# The measurements, the incident dates and the history live in the
+# genesis-development skill's Timeout Policy and in CC memory
+# `deploy_detach_not_background` — deliberately NOT duplicated here. This text is
+# injected on every fire, and every factual claim in it is one more thing that can
+# be wrong or go stale: two review rounds found five such claims in this file, one
+# of which was already false on the day it first shipped. Keep the advisory to what
+# the reader must DO.
+#
+# POLARITY: ALLOWLIST. A command segment mentioning a deploy script is treated as
+# session-held UNLESS that same segment's FIRST executable token is `systemd-run`
+# carrying a `--unit` flag — the only form measured to leave the caller's session
+# and cgroup. Anything unrecognised — a new spelling, an abbreviated flag, a form
+# nobody anticipated — FIRES. The previous version was a denylist that
+# blacklisted `--scope`, and systemd's unambiguous-prefix matching (`--scop`,
+# `--sco`, `--sc`) walked straight past it.
+#
+# `setsid` was on this allowlist once and is not a detaching launcher: a
+# foreground `setsid bash scripts/update.sh` starts a new session but stays a
+# synchronous child of the Bash call, which still waits on it and still kills it
+# at the 600000ms ceiling — the exact termination this guard exists to prevent.
+# Substring matching is gone for the same reason: `SETSID_NOTE=setsid`, a
+# trailing `# systemd-run --unit x` comment, or `echo systemd-run | bash
+# update.sh` all satisfied `*systemd-run*`/`--unit` text without detaching
+# anything. The check below reads TOKENS — leading VAR=val assignments are
+# skipped, the first real word must be `systemd-run`, and `--unit`/`--unit=…`
+# must appear as a flag token. A launcher hiding inside a quoted string or a
+# non-leading position does not count; that errs toward firing, which is the
+# safe direction for an advisory.
+#
+# `--scope` is NOT a detaching form and is not on the allowlist: MEASURED, a
+# `--scope` child keeps the CALLER'S session id, because a scope is registered for
+# an already-forked process and systemd never calls setsid() for it. Only a
+# `--unit` service leaves the session.
+#
+# Segment-anchored so a detaching launcher in ONE part of a compound command does
+# not vouch for a deploy in another (`systemd-run --unit x /bin/true && bash
+# scripts/update.sh`). The split is a coarse one on && || ; and is NOT a shell
+# parser — but its errors are safe by construction: over-splitting yields smaller
+# segments, which are LESS likely to contain a launcher, which fires.
+#
+# Non-blocking by contract: EVERY path exits 0 — including under an inherited
+# SHELLOPTS=errexit with malformed stdin or with jq absent, both of which used to
+# abort this script before it reached its own guarded code.
+# Over-broad matching on read-only commands is tracked in issue #2088.
 
-IN=$(cat 2>/dev/null)
-CMD=$(printf '%s' "$IN" | jq -r '.tool_input.command // empty' 2>/dev/null)
+IN=$(cat 2>/dev/null) || IN=""
+[ -z "$IN" ] && exit 0
+
+# `|| CMD=""`: under an inherited errexit, a failing command substitution in an
+# assignment aborts the script. jq exits non-zero on malformed input, and is 127
+# when absent.
+CMD=$(printf '%s' "$IN" | jq -r '.tool_input.command // empty' 2>/dev/null) || CMD=""
 [ -z "$CMD" ] && exit 0
 
 # Only the long-deploy scripts.
@@ -24,14 +66,111 @@ case "$CMD" in
     *) exit 0 ;;
 esac
 
-# Already backgrounded (correct usage) → nothing to say.
-BG=$(printf '%s' "$IN" | jq -r '.tool_input.run_in_background // false' 2>/dev/null)
-[ "$BG" = "true" ] && exit 0
+# Split on every operator that starts an independent simple command — && || ; |
+# and bare & — then ask of each segment that mentions a deploy script: is THIS
+# segment detached? `|` and `&` must be in the set: `echo systemd-run | bash
+# update.sh` is one segment under an &&/;/||-only split, so the pipe stage's
+# launcher text would vouch for the deploy it precedes.
+_SEGMENTS=$(printf '%s' "$CMD" | sed 's/&&/\n/g; s/||/\n/g; s/&/\n/g; s/|/\n/g; s/;/\n/g') || _SEGMENTS="$CMD"
+
+# A long-option check that honours systemd's unambiguous-prefix matching:
+# `--sc`, `--sco`, `--scop` all mean --scope to systemd-run, so matching only
+# the full spelling lets `--sco` past the disqualifier (CodeRabbit, #2095).
+_longopt_is() {  # $1: flag token with any =value stripped; $2: canonical --long
+    case "$1" in --?*) : ;; *) return 1 ;; esac
+    case "$2" in "$1"*) return 0 ;; esac
+    return 1
+}
+
+_held=0
+_held_script=""
+while IFS= read -r _seg; do
+    case "$_seg" in
+        *update.sh*|*bootstrap.sh*|*host-setup.sh*) : ;;
+        *) continue ;;
+    esac
+    # ALLOWLIST, on TOKENS — not substrings, and only systemd-run's OWN options.
+    # Skip a leading run of VAR=val assignments; the first real word must be
+    # `systemd-run`. Then scan only the tokens BEFORE the `--` delimiter or the
+    # first non-flag operand (which begin the launched command): a `--unit` /
+    # `--unit=…` flag there is required, and a `--scope` / `--scope=…` flag
+    # disqualifies outright. `--unit` inside the child command or a redirect
+    # target does not count, a `#`-comment tail is stripped, and a launcher
+    # quoted inside `-c '…'` never reaches this walk — every miss fires.
+    _first=""
+    _has_unit=0
+    _has_scope=0
+    _rest="${_seg%%#*}"
+    for _tok in $_rest; do
+        if [ -z "$_first" ]; then
+            case "$_tok" in
+                *=*) continue ;;   # VAR=val assignment word
+            esac
+            _first="$_tok"
+            continue
+        fi
+        case "$_tok" in
+            --) break ;;
+            -*) : ;;
+            *) break ;;            # the command operand: stop scanning options
+        esac
+        _flag="${_tok%%=*}"
+        if _longopt_is "$_flag" --unit; then _has_unit=1
+        elif _longopt_is "$_flag" --scope; then _has_scope=1; fi
+    done
+    if [ "$_first" = "systemd-run" ] && [ "$_has_unit" -eq 1 ] && [ "$_has_scope" -eq 0 ]; then
+        continue
+    fi
+    _held=1
+    # Which deploy entry point is session-held — the prescription below must
+    # name the script in the FAILING segment, not the first deploy mention:
+    # `systemd-run … update.sh && bash host-setup.sh` puts the held script
+    # second (CodeRabbit, #2095). update.sh, bootstrap.sh and host-setup.sh
+    # are not interchangeable and host-setup takes host-specific arguments.
+    if [ -z "$_held_script" ]; then
+        case "$_seg" in
+            *bootstrap.sh*) _held_script=bootstrap.sh ;;
+            *host-setup.sh*) _held_script=host-setup.sh ;;
+            *) _held_script=update.sh ;;
+        esac
+    fi
+done <<EOF
+$_SEGMENTS
+EOF
+
+[ "$_held" -eq 0 ] && exit 0
 
 # Surface the nudge via PreToolUse structured stdout (additionalContext) — exit 0
 # + stderr is treated as "no objection" and is NOT shown to the model, which would
 # make this guard invisible in the exact path it protects.
-ADVISORY="ADVISORY: this looks like a long deploy (update.sh / bootstrap.sh / host-setup.sh) in the FOREGROUND. It aligns the container + redeploys the guardian + syncs the host (update-node up to 600s, update-cc up to 300s, sequential) and routinely exceeds the Bash tool's 120s DEFAULT timeout — an inner 'timeout N' does NOT extend it, and a SIGTERM at 120s makes update.sh roll back mid-deploy. Use run_in_background: true — it is harness-tracked, notifies on completion, and has no ceiling. Raising the 'timeout' param does NOT work here: the Bash tool's maximum is 600000ms (10 min), a larger value is not honoured, and these deploys routinely run longer — so there is no foreground timeout value that makes this safe."
+# `|| true`: `read -d ''` returns non-zero at EOF (no NUL found) even though it
+# populates the variable.
+read -r -d '' ADVISORY <<'ADV' || true
+ADVISORY: this is a long deploy (update.sh / bootstrap.sh / host-setup.sh) that has NOT been detached from this session. Neither holding it in the foreground nor run_in_background works here — the first cannot fit inside the Bash tool's 600000ms hard ceiling (and the SIGTERM that follows makes update.sh roll back a deploy that was going fine), and the second is bound to this session's lifetime and has been killed mid-run twice.
+
+Detach it instead:
+
+  systemd-run --user --collect --unit genesis-deploy-manual \
+    --working-directory=$HOME/genesis --setenv=PATH="$PATH" \
+    /bin/bash -c 'exec ./scripts/update.sh > ~/tmp/deploy-$(date +%Y%m%d-%H%M).log 2>&1'
+
+(Substitute the script that is actually held — bootstrap.sh and host-setup.sh are
+NOT interchangeable with update.sh, and host-setup.sh takes host-specific
+arguments the caller must keep.)
+
+Every part of that is load-bearing. --unit is what leaves the session ('systemd-run --user --scope' does NOT: a scope child keeps the caller's session id). --working-directory is required because systemd-run does not inherit this cwd. --setenv=PATH is required because a --user unit otherwise runs with systemd's default PATH, under which bootstrap takes different branches.
+
+Then VERIFY it took, because a failed launch is indistinguishable from a successful one: with a relative path and no --working-directory, bash exits instantly and --collect reaps the unit, leaving no trace. Run 'systemctl --user is-active genesis-deploy-manual' promptly — it must print 'active' (it also prints 'inactive' once the deploy has FINISHED). Then poll the log for the outcome. genesis-server going 'inactive' mid-run is EXPECTED, not a failure.
+
+Full rationale, measurements and incident history: the genesis-development skill's Timeout Policy.
+ADV
+
+# Point the prescription at the script that is actually held — the matched entry
+# point is not always update.sh, and the three deploy scripts are not
+# interchangeable. Only the `./scripts/…` path is rewritten, so the prose
+# mentions of update.sh elsewhere in the advisory are untouched.
+ADVISORY="${ADVISORY//.\/scripts\/update.sh/.\/scripts\/${_held_script:-update.sh}}"
+
 # jq builds valid JSON (escapes the message). If jq somehow fails, fall back to
 # stderr so the nudge is at least not lost, and still exit 0 (never block).
 jq -n --arg c "$ADVISORY" '{hookSpecificOutput:{hookEventName:"PreToolUse",additionalContext:$c}}' 2>/dev/null \
