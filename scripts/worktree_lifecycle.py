@@ -1645,16 +1645,23 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
         checkout_ref = commit
 
     # Does the ref we would check out still RESOLVE? A trash entry can outlive
-    # its commit (registration lock failed, or predates the locking scheme) —
-    # `cat-file -e` failing means BOTH `worktree add` attempts in the real path
-    # fail too, and recovery ends as a plain-directory move.
-    ref_resolves = bool(checkout_ref) and _run_git(
-        repo_root,
-        # `cat-file -e`, not `rev-parse --verify`: the latter echoes a
-        # well-formed sha back with rc 0 whether or not the object exists.
-        ["cat-file", "-e", f"{checkout_ref}^{{commit}}"],
-        timeout=10,
-    ) is not None
+    # its commit (registration lock failed, or predates the locking scheme). This
+    # is THREE states, not two: only a completed nonzero `cat-file` PROVES the
+    # object is gone — a timeout or spawn failure is unknown, and must not be
+    # previewed as the plain-directory fallback a real run may not take.
+    # `cat-file -e`, not `rev-parse --verify`: the latter echoes a well-formed
+    # sha back with rc 0 whether or not the object exists.
+    ref_state = "unknown"
+    if checkout_ref:
+        try:
+            probe = subprocess.run(
+                ["git", "cat-file", "-e", f"{checkout_ref}^{{commit}}"],
+                capture_output=True, cwd=str(repo_root), timeout=15,
+                env=_git_env(),
+            )
+            ref_state = "resolves" if probe.returncode == 0 else "missing"
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            ref_state = "unknown"
 
     # `git worktree add` recreates TRACKED files; the restore step then fills in
     # only what the checkout left missing (copy-only-missing). Count the files
@@ -1690,46 +1697,89 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
                     link_paths.add(p)
             tree = (tracked, link_paths)
 
-    def _blocked_by_link(c: str) -> bool:
+    link_target_cache: dict[str, str | None] = {}
+
+    def _link_escapes(link_path: str, seen: frozenset[str]) -> bool | None:
+        """Whether a tracked symlink resolves OUTSIDE the worktree. None =
+        cannot say confidently (unreadable target or a link cycle).
+
+        Resolves recursively: a target can sit lexically inside the tree while
+        passing through ANOTHER tracked link that escapes (`link -> safe`,
+        `safe -> ../../outside`). `_restore_from_dir` calls `realpath` on the
+        full destination parent, so it catches the chain; the preview must too.
+        """
+        if link_path in seen:
+            return None  # cycle — cannot resolve
+        if link_path not in link_target_cache:
+            try:
+                out = _run_git(
+                    repo_root, ["show", f"{checkout_ref}:{link_path}"], timeout=10
+                )
+            except (UnicodeDecodeError, ValueError):
+                out = None
+            lines = out.splitlines() if out is not None else []
+            link_target_cache[link_path] = lines[0].strip() if lines else None
+        target = link_target_cache[link_path]
+        if target is None or not target:
+            return None
+        if os.path.isabs(target):
+            return True
+        resolved = os.path.normpath(
+            os.path.join(os.path.dirname(link_path), target)
+        )
+        if resolved == ".." or resolved.startswith("../"):
+            return True
+        # The resolved path is lexically inside, but may itself traverse a
+        # tracked link — walk its ancestors.
+        parts = resolved.split("/")
+        for i in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:i])
+            if prefix in tree[1]:
+                return _link_escapes(prefix, seen | {link_path})
+        return False
+
+    def _blocked_by_link(c: str) -> bool | None:
         """A tracked SYMLINK ancestor whose target leaves the worktree makes a
         stored file unrestorable — `_restore_from_dir` refuses to write through
-        it (invariant 2). An in-tree link target restores normally, so only
-        absolute targets and `..` escapes block the count."""
+        it (invariant 2). An in-tree link target restores normally. None = an
+        ancestor's escape could not be determined."""
         for i in range(1, c.count("/") + 1):
             ancestor = c.rsplit("/", i)[0]
             if ancestor not in tree[1]:
                 continue
-            try:
-                target = _run_git(
-                    repo_root, ["show", f"{checkout_ref}:{ancestor}"], timeout=10
-                )
-            except (UnicodeDecodeError, ValueError):
-                target = None
-            if target is None:
-                continue  # unreadable — not evidence of an escape
-            resolved = os.path.normpath(
-                os.path.join(os.path.dirname(ancestor), target.strip())
-            )
-            if os.path.isabs(target.strip()) or resolved.split("/")[0] == "..":
-                return True
+            escapes = _link_escapes(ancestor, frozenset())
+            if escapes is not False:
+                return escapes
         return False
 
     _log(f"WOULD RECOVER {original_path} ({ref_note})")
-    if not ref_resolves:
+    if ref_state == "missing":
         # An unresolvable ref is more than an uncertain count: BOTH worktree-add
         # attempts in `_restore_from_dir` would fail, and recovery would end as
         # a plain-directory move. Preview that, not a checkout that can't happen.
         _log("  the recorded ref no longer resolves — a real run would fall "
              "back to a PLAIN DIRECTORY move (no usable worktree checkout)")
         _log(f"WOULD RESTORE up to {len(candidates)} file(s) from {stored}")
+    elif ref_state == "unknown":
+        _log("  could not verify whether the recorded ref still resolves")
+        _log(f"WOULD RESTORE up to {len(candidates)} file(s) from {stored}")
     elif tree is None:
         _log(f"WOULD RESTORE up to {len(candidates)} file(s) from {stored}")
     else:
-        restorable = sum(
-            1 for c in candidates
-            if c not in tree[0] and not _blocked_by_link(c)
-        )
-        _log(f"WOULD RESTORE {restorable} untracked file(s) from {stored}")
+        restorable = 0
+        uncertain = False
+        for c in candidates:
+            if c in tree[0]:
+                continue
+            blocked = _blocked_by_link(c)
+            if blocked is None:
+                uncertain = True
+            elif not blocked:
+                restorable += 1
+        if uncertain:
+            _log(f"WOULD RESTORE up to {len(candidates)} file(s) from {stored}")
+        else:
+            _log(f"WOULD RESTORE {restorable} untracked file(s) from {stored}")
     _log(consume_note)
     return True
 
