@@ -198,16 +198,7 @@ def surface_variants(
             and normalize_content(alias, aliases) == canonical
         ]
         positions.extend((m.start(), m.end(), canonical) for m in matches)
-    # Longest match wins at equal start positions: for nested canonicals
-    # ({"X": "Claude", "CC": "Claude Code"}) the "Claude" inside "Claude
-    # Code" must not swallow the longer slot.
     positions.sort(key=lambda p: (p[0], -p[1]))
-    slots_all: list[tuple[int, int, str]] = []
-    last_end = -1
-    for start, end, canonical in positions:
-        if start >= last_end:
-            slots_all.append((start, end, canonical))
-            last_end = end
 
     results: list[str] = []
     seen = {content}
@@ -228,49 +219,50 @@ def surface_variants(
             _emit(pattern.sub(alias, content))
 
     _CANDIDATE_BUDGET = 512
+    _SET_BUDGET = 64
 
     def _enumerate(slot_list: list[tuple[int, int, str]]) -> None:
-        """Product over one mutually-disjoint slot set (None = keep canonical)."""
-        slot_list = [(s, e, c) for (s, e, c) in slot_list if spellings[c]]
-        choice_lists = [[None, *spellings[c]] for (_, _, c) in slot_list]
+        """Product over one mutually-disjoint slot set; every slot takes an
+        alias (an unset slot is a subset that doesn't contain it)."""
+        choice_lists = [spellings[c] for (_, _, c) in slot_list]
         for picks in islice(product(*choice_lists), _CANDIDATE_BUDGET):
-            if all(p is None for p in picks):
-                continue
             out: list[str] = []
             cursor = 0
             for (start, end, _c), pick in zip(slot_list, picks, strict=True):
                 out.append(content[cursor:start])
-                out.append(pick if pick is not None else content[start:end])
+                out.append(pick)
                 cursor = end
             out.append(content[cursor:])
             _emit("".join(out))
             if len(results) >= limit:
                 return
 
-    _enumerate(slots_all)
+    # Overlapping canonicals ({"X": "Claude", "CC": "Claude Code"}, or
+    # {"WHOLE": "Alpha Beta Gamma", "A": "Alpha", "G": "Gamma"}) cannot be
+    # reduced to one kept set: a legacy row can substitute disjoint dropped
+    # spans together ("A Beta G") or a shorter span inside a longer one
+    # ("X Code"). Enumerate every mutually-disjoint subset of matching spans
+    # by include/exclude backtracking — bounded by _SET_BUDGET, correctness
+    # by _emit's normalize_content check.
+    span_slots = [p for p in positions if spellings.get(p[2])]
+    span_slots.sort(key=lambda p: (p[0], p[1]))
+    sets_enumerated = 0
 
-    # A span dropped to an overlap can still combine with every kept span it
-    # does not intersect: "New YC and F" needs the dropped "York City" slot
-    # plus the disjoint "Foo" slot. Re-enumerate per dropped span over the
-    # compatible set (spans in slots_all are already mutually disjoint).
-    kept_spans = {(s, e) for s, e, _ in slots_all}
-    for d_start, d_end, d_canonical in positions:
-        if (d_start, d_end) in kept_spans:
-            continue
-        if not spellings.get(d_canonical):
-            continue
-        dropped = (d_start, d_end, d_canonical)
-        compat = sorted(
-            [dropped]
-            + [
-                s
-                for s in slots_all
-                if not (s[0] < d_end and d_start < s[1])
-            ]
-        )
-        _enumerate(compat)
-        if len(results) >= limit:
-            break
+    def _walk(i: int, covered_end: int, chosen: list[tuple[int, int, str]]) -> None:
+        nonlocal sets_enumerated
+        if sets_enumerated >= _SET_BUDGET or len(results) >= limit:
+            return
+        if i == len(span_slots):
+            if chosen:
+                sets_enumerated += 1
+                _enumerate(chosen)
+            return
+        _walk(i + 1, covered_end, chosen)  # exclude span_slots[i]
+        start, end, canonical = span_slots[i]
+        if start >= covered_end:
+            _walk(i + 1, end, chosen + [(start, end, canonical)])
+
+    _walk(0, -1, [])
 
     return results
 

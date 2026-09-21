@@ -151,6 +151,13 @@ def test_surface_variants_combines_dropped_slot_with_disjoint_slots():
     assert "New YC and F" in variants
 
 
+def test_surface_variants_combines_disjoint_dropped_spans():
+    """Two spans dropped under one covering canonical still combine:
+    "A Beta G" needs the dropped "Alpha" and "Gamma" slots together."""
+    aliases = {"WHOLE": "Alpha Beta Gamma", "A": "Alpha", "G": "Gamma"}
+    assert "A Beta G" in surface_variants("Alpha Beta Gamma", aliases)
+
+
 def test_surface_variants_no_match_returns_empty():
     assert surface_variants("nothing aliased here", {"CC": "Claude Code"}) == []
 
