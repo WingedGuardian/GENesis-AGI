@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -71,7 +72,11 @@ def home(tmp_path: Path) -> Path:
 
 
 def _run_hook(
-    command: str, repo: Path, home: Path, payload_cwd: str | None = None
+    command: str,
+    repo: Path,
+    home: Path,
+    payload_cwd: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     body = {
         "hook_event_name": "PreToolUse",
@@ -83,6 +88,9 @@ def _run_hook(
         body["cwd"] = payload_cwd
     payload = json.dumps(body)
     env = {**os.environ, "HOME": str(home)}
+    env.setdefault("_TEST_REVIEW_BUDGET_PR", "none")
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         [sys.executable, str(_HOOK)],
         input=payload,
@@ -92,6 +100,29 @@ def _run_hook(
         text=True,
         timeout=30,
     )
+
+
+def test_in_flight_branch_probe_timeout_blocks_before_hook_kill(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text("#!/bin/sh\nexec sleep 30\n")
+    fake_git.chmod(0o755)
+
+    started = time.monotonic()
+    res = _run_hook(
+        'git commit -m "timed probe"',
+        repo,
+        home,
+        extra_env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+    elapsed = time.monotonic() - started
+
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "deadline expired during subprocess" in res.stderr
+    assert elapsed < 9.5
 
 
 def _mark(repo: Path, home: Path) -> subprocess.CompletedProcess:
@@ -1725,25 +1756,43 @@ def test_long_force_create_to_main_blocks(repo: Path, home: Path) -> None:
     assert "switches branches" in res.stderr
 
 
-def test_attached_short_branch_create_to_feature_allowed(repo: Path, home: Path) -> None:
-    # The attached form to a NON-main branch (`git switch -cfeature`) must stay allowed.
+@pytest.mark.parametrize(
+    "switch",
+    [
+        "git switch -- feature/other",
+        "git switch --detach HEAD",
+        "git switch",
+    ],
+)
+def test_every_switch_form_before_commit_requires_separate_command(
+    repo: Path, home: Path, switch: str
+) -> None:
+    _mark(repo, home)
+    res = _run_hook(f"cd {repo} && {switch} && git commit --amend --no-edit", repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "separate commands" in res.stderr.lower()
+
+
+def test_attached_short_branch_create_before_commit_blocks(repo: Path, home: Path) -> None:
+    # The review budget belongs to the branch the commit lands on. The hook sees
+    # only pre-command state, so even a literal feature target must be separate.
     _mark(repo, home)
     res = _run_hook(
         f"cd {repo} && git switch -cfeature/x && git commit --amend --no-edit", repo, home
     )
-    assert res.returncode == 0, res.stdout + res.stderr
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "separate commands" in res.stderr.lower()
 
 
-def test_create_branch_then_commit_still_allowed(repo: Path, home: Path) -> None:
-    # The flow the gate ITSELF recommends — create a NON-main branch and commit —
-    # must NOT be blocked by the branch-mutation guard.
+def test_create_branch_then_commit_requires_separate_commands(repo: Path, home: Path) -> None:
     _mark(repo, home)
     res = _run_hook(
         f"cd {repo} && git checkout -b feature/new && git commit --amend --no-edit",
         repo,
         home,
     )
-    assert res.returncode == 0, res.stdout + res.stderr
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "separate commands" in res.stderr.lower()
 
 
 def test_checkout_file_restore_then_commit_allowed(repo: Path, home: Path) -> None:
