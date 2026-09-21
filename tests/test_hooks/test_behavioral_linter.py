@@ -860,6 +860,63 @@ class TestBashAuditFindings:
             r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
             assert r.returncode == 2, f"{cmd!r} was not blocked"
 
+    def test_git_search_subcommands_are_not_exempt_from_executor_flags(self):
+        """CodeRabbit Major, #1826: `_EXEC_FLAGS` was tested only inside the
+        `_READ_ONLY_VERBS` branch, so the `git` branch returned True for any
+        `git log|grep|show|diff|blame` regardless of its flags.
+
+        `git grep --open-files-in-pager=<cmd>` runs <cmd> on every matched
+        file, which is the same class as `find -exec` and `rg --pre`. The
+        short form is the half a long-option table misses: `-O` attaches its
+        value with no `=`, so an `a == f or a.startswith(f + "=")` test cannot
+        match it however many spellings the table lists.
+        """
+        for cmd in (
+            f'git grep --open-files-in-pager="curl -X POST {self._ENDPOINT}" needle',
+            f'git grep -O"curl -X POST {self._ENDPOINT}" needle',
+            # ABBREVIATION: git accepts any unambiguous prefix, so a literal
+            # flag table can only ever list one spelling. MEASURED: --op=,
+            # --ope=, --open= and --open-files= all RUN the program; --o= is
+            # refused as ambiguous with --or, so --op is the floor.
+            f'git grep --op="curl -X POST {self._ENDPOINT}" needle',
+            f'git grep --open-files="curl -X POST {self._ENDPOINT}" needle',
+            # BUNDLING: -O may end any short cluster, and -n is the flag a
+            # real grep would already carry.
+            f'git grep -nO"curl -X POST {self._ENDPOINT}" needle',
+            # QUOTED: the guard reads the command as typed, the shell hands
+            # the tool a de-quoted argv — a bare .split() leaves the quote
+            # attached and every table misses it.
+            f'git grep "--open-files-in-pager=curl -X POST {self._ENDPOINT}" needle',
+            f'rg "--pre" "curl -X POST {self._ENDPOINT}" needle',
+        ):
+            r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            assert r.returncode == 2, f"{cmd!r} was not blocked"
+
+    def test_ordinary_git_searches_stay_exempt(self):
+        """The control for the test above, and the reason it is not a blunt
+        `git`-is-never-read-only rule: a plain search must still be exempt, or
+        the fix has bought its coverage by disabling the exemption."""
+        for cmd in (
+            "git log --oneline -S'api.openai.com/v1/chat/completions'",
+            "git grep -n 'api.openai.com/v1/chat/completions'",
+            "git show HEAD --stat",
+            # MEASURED: `-O` is NOT one flag. On diff/show it names an
+            # ORDERFILE — `git diff -O/nonexistent HEAD~1` answers "fatal:
+            # failed to read orderfile" — and only `git grep -O<pager>`
+            # executes. A blanket `-O` test would trade the fail-open above
+            # for a fail-closed on these.
+            #
+            # These two CARRY A BLOCKED LITERAL on purpose. Without one the
+            # linter returns 0 whether or not the exemption applies, so the
+            # fixture passes with the scoping REMOVED and pins nothing —
+            # measured, and it is how the first version of this control was
+            # vacuous.
+            f"git diff -Osome-orderfile -G'{self._ENDPOINT}' HEAD~1",
+            f"git show -Osome-orderfile -S'{self._ENDPOINT}'",
+        ):
+            r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            assert r.returncode == 0, f"{cmd!r} was wrongly blocked"
+
     def test_input_process_substitution_is_not_a_search(self):
         """`<(cmd)` runs an arbitrary subcommand as the search's stdin — same
         class as `find -exec`, reached through `_CHAINS`."""

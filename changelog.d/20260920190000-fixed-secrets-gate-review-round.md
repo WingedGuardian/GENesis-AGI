@@ -3,7 +3,18 @@
   `rg x <(curl <endpoint>)` no longer slips the read-only exemption — input
   process substitution, a bare `&` background operator, and executor flags
   (`rg --pre`, `--hostname-bin`, `--pager`) all break the search exemption
-  now. A quoted bare `secrets.env` that resolves in cwd no longer gates as
+  now, and that executor test is SHARED with the `git` branch, which had been
+  returning read-only for any `git log|grep|show|diff|blame` regardless of
+  its flags. Neither half of that flag has a fixed spelling, so the test is a
+  per-subcommand regex rather than a literal table: git accepts any
+  unambiguous prefix (`--op=<cmd>` runs), and `-O` bundles into any short
+  cluster (`-nO<cmd>` runs). The command is tokenized with `shlex` instead of
+  `.split()` because the guard reads it as typed while the shell hands the
+  tool a de-quoted argv — `rg "--pre" <cmd>` slipped every table on the quote
+  alone. `-O` is scoped per subcommand: on `grep` it is that pager flag, on
+  `diff`/`show` it names an ORDER FILE, so matching it everywhere would swap
+  one fail-open for a fail-closed. A quoted bare `secrets.env` that resolves
+  in cwd no longer gates as
   if it were an operand (`allow_bare` honoured by the stat and inode arms),
   a quoted mention is not a denial, and a heredoc feeding an interpreter is
   scanned instead of stripped — `python3 <<EOF … cat secrets.env` can no

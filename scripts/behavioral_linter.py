@@ -39,6 +39,7 @@ Emits SteerMessage for unified enforcement feedback.
 import json
 import os
 import re
+import shlex
 import sys
 from fnmatch import fnmatch
 from pathlib import Path
@@ -169,9 +170,49 @@ _CHAINS = re.compile(r"(&|\|\||[\n;|`>]|<<|<\(|\$\()")
 
 #: Flags that turn a search verb into an EXECUTOR. `rg --pre <cmd>` runs the
 #: preprocessor on every matched file and `rg --hostname-bin <cmd>` runs it for
-#: hyperlink hostnames; `--pager` (ag/ack) spawns the named program. A search
-#: carrying one is `find -exec` in a trench coat (Devin SEC finding, #1826).
-_EXEC_FLAGS = ("--pre", "--hostname-bin", "--pager")
+#: hyperlink hostnames; `--pager` (ag/ack) and `git grep --open-files-in-pager`
+#: spawn the named program. A search carrying one is `find -exec` in a trench
+#: coat (Devin SEC finding, #1826).
+#: The long forms need no per-verb scoping: a subcommand that does not define
+#: one refuses it outright (MEASURED: `git log --open-files-in-pager=` exits
+#: "fatal: unrecognized argument").
+_EXEC_FLAGS = ("--pre", "--hostname-bin", "--pager", "--open-files-in-pager")
+
+#: Per-git-subcommand executor spellings, as a REGEX rather than a literal
+#: tuple, because neither half of this flag has a fixed spelling.
+#: MEASURED against this install's git:
+#:   * ABBREVIATION — git's parse-options accepts any UNAMBIGUOUS prefix, so
+#:     `--op=<cmd>`, `--ope=<cmd>`, `--open=<cmd>` and `--open-files=<cmd>` all
+#:     RUN <cmd>. `--o=` is refused as ambiguous with `--or`, which is why the
+#:     floor is `--op`. A literal tuple can only ever list one of these.
+#:   * BUNDLING — `-O` may end any short cluster: `-nO<cmd>` and `-inO<cmd>`
+#:     both run. A `startswith("-O")` test sees only the bare form.
+#: SCOPED per subcommand because `-O` is not one flag: on `grep` it is
+#: --open-files-in-pager and executes, while on `diff`/`show` it names an
+#: ORDER FILE (`git diff -O/nonexistent HEAD~1` -> "fatal: failed to read
+#: orderfile"). Matching `-O` everywhere would trade this fail-open for a
+#: fail-closed on legitimate spellings — the same mistake in the other
+#: direction. MEASURED: `git blame -O<script>` does NOT execute it, and
+#: `git -c diff.external=<cmd> diff` already fails closed because `-c` is not
+#: in _GIT_SEARCH_SUBCOMMANDS.
+_GIT_EXEC_PATTERNS = {"grep": re.compile(r"^--op[a-z-]*(=|$)|^-[A-Za-z]*O")}
+
+#: The git subcommands admitted as searches at all.
+_GIT_SEARCH_SUBCOMMANDS = frozenset({"log", "grep", "show", "diff", "blame"})
+
+
+def _carries_exec_flag(args: list[str], pattern: re.Pattern[str] | None = None) -> bool:
+    """Whether any arg is an executor flag, in any spelling it can take.
+
+    Shared by BOTH branches of `_is_read_only_command`. It used to be inspected
+    only inside the `_READ_ONLY_VERBS` branch, so the `git` branch returned
+    read-only for any `git log|grep|show|diff|blame` regardless of its flags
+    (CodeRabbit Major, #1826) — the executor test existed and simply was not
+    reached on half the paths it was written for.
+    """
+    if any(a == f or a.startswith(f + "=") for a in args for f in _EXEC_FLAGS):
+        return True
+    return pattern is not None and any(pattern.match(a) for a in args)
 
 
 def _is_read_only_command(command: str) -> bool:
@@ -184,15 +225,32 @@ def _is_read_only_command(command: str) -> bool:
     """
     if _CHAINS.search(command):
         return False
-    parts = command.strip().split()
+    # shlex, NOT `.split()`: the guard reads the command as TYPED while the
+    # shell hands the tool a de-quoted argv, so a bare split leaves the quotes
+    # attached and every flag table misses them. MEASURED bypasses of the
+    # split form: `rg "--pre" <cmd>` (the original Devin finding, still open
+    # through this spelling), `git grep "-O<cmd>"`, and
+    # `git grep "--open-files-in-pager=<cmd>"` — all execute, all were allowed.
+    # shlex is what `scripts/hooks/shell_parse.py` itself tokenizes with, and
+    # `_CHAINS` above has already refused anything compound, so a simple
+    # command is all this has to handle. Unbalanced quoting cannot be
+    # tokenized and fails CLOSED rather than falling back to a split.
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
     if not parts:
         return False
     verb = os.path.basename(parts[0])
     if verb in _READ_ONLY_VERBS:
-        return not any(
-            a == f or a.startswith(f + "=") for a in parts[1:] for f in _EXEC_FLAGS
-        )
-    return verb == "git" and len(parts) > 1 and parts[1] in {"log", "grep", "show", "diff", "blame"}
+        return not _carries_exec_flag(parts[1:])
+    if verb != "git" or len(parts) < 2 or parts[1] not in _GIT_SEARCH_SUBCOMMANDS:
+        return False
+    # Same executor test as the branch above — the flags are scanned AFTER the
+    # subcommand, and the short-form set is chosen by it.
+    return not _carries_exec_flag(
+        parts[2:], _GIT_EXEC_PATTERNS.get(parts[1])
+    )
 
 
 def _escaped(content: str, rule_name: str, *, bash_mode: bool) -> bool:
