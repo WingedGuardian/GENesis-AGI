@@ -1179,6 +1179,19 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         echo "  systemd daemon reloaded (units changed)"
     fi
 
+    # A user manager stops at logout without lingering, taking every enabled
+    # timer with it — `Persistent=true` only replays the miss once the manager
+    # next starts, which for a daily watcher may be never. Mirror install.sh.
+    if command -v loginctl &>/dev/null; then
+        if ! loginctl show-user "$(whoami)" 2>/dev/null | grep -q "Linger=yes"; then
+            if loginctl enable-linger "$(whoami)" 2>/dev/null; then
+                echo "  + linger enabled for $(whoami)"
+            else
+                echo "  WARNING: could not enable linger (timers stop on logout)"
+            fi
+        fi
+    fi
+
     # Enable + start every rendered timer (idempotent), EXCEPT timers that are a
     # deliberate setup step. Without this a fresh install/repair leaves the
     # housekeeping timers (watchdog, disk-hygiene) rendered but dead. The backup

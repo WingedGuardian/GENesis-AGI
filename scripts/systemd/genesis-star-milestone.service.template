@@ -24,11 +24,11 @@ Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
 StandardOutput=journal
 StandardError=journal
 # Writes exactly two things: the observation (the database under the repo's data
-# dir) and its own state file under ~/.genesis. ReadWritePaths=%h covers both
-# without granting anything outside the home.
+# dir) and its own state file under ~/.genesis — so those are the only two paths
+# it may write. %h would also hand it shell profiles and SSH configuration.
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=%h
+ReadWritePaths=%h/.genesis __REPO_DIR__/data
 
 # No [Install] section, deliberately — driven only by its paired timer, matching
 # genesis-cc-settings-align.service.template. The bootstrap loop enables

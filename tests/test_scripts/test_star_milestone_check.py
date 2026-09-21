@@ -152,6 +152,43 @@ def test_an_unreadable_count_exits_nonzero_and_touches_nothing(wired, monkeypatc
     assert not wired["state"].exists()
 
 
+@pytest.mark.parametrize("bad", [True, -5, "200", None], ids=["bool", "negative", "string", "missing"])
+def test_a_count_that_is_not_a_plain_nonnegative_int_is_unread(wired, monkeypatch, bad):
+    """`bool` subclasses `int`: `isinstance(True, int)` is True, so a malformed
+    payload carrying `true` would pass an isinstance check as a count of 1 —
+    a green run for a count that was never read. Negatives compare below every
+    milestone the same way a zero would."""
+
+    # Drive _star_count's own guard rather than stubbing it away: urlopen hands
+    # back the malformed payload, and the real check is what must reject it.
+    import io
+    import urllib.request
+
+    class _FakeResp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda req, timeout=0: _FakeResp(json.dumps({"stargazers_count": bad}).encode()),
+    )
+    with pytest.raises(ValueError):
+        mod._star_count("owner/repo")
+
+
+def test_state_written_for_a_different_repo_does_not_suppress_this_one(wired, monkeypatch):
+    """Repo A's announced 500 is no reason repo B at 200 stays silent. The state
+    file records the slug it belongs to; a mismatch reads as no state."""
+    wired["state"].write_text(json.dumps({"slug": "alice/old", "highest_announced": 500}))
+    _at(monkeypatch, 201)
+    assert mod.main() == 0
+    assert wired["announced"] == [(200, 201)]
+    assert json.loads(wired["state"].read_text())["slug"] == "owner/repo"
+
+
 def test_an_unconfigured_install_is_a_clean_no_op(monkeypatch):
     """Bootstrap enables every shipped timer on EVERY clone. A fresh install has
     no github.user, and a daily failing unit there would be a defect we shipped,

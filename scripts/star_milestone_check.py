@@ -115,37 +115,30 @@ def _slug() -> str | None:
     if owner and repo:
         return f"{owner}/{repo}"
 
-    # FALL BACK TO THE REPO'S OWN REMOTE, because the config key is optional and
+    # FALL BACK TO THE REPO'S OWN REMOTES, because the config key is optional and
     # a watcher that hinges on an optional key is a watcher that silently does
     # nothing. MEASURED on the install this was built for: `github.user` was
     # unset (no `github:` section in genesis.yaml at all), so the very first live
     # run reported "nothing to watch" on a repo we had been pushing to all day.
     # Fifteen green unit tests did not catch that; running it once did.
     #
-    # `origin` is the repo this checkout came from, which is the repo whose stars
-    # anyone here would mean. Config still wins when both keys are set, for the
-    # install that deliberately watches something other than its own origin.
-    return _slug_from_origin()
+    # The remote to read is the one pointing at the PUBLIC repo — an install
+    # whose `origin` is a private fork keeps a second remote for it, and the
+    # fork's star count (or its 404) is not the milestone anyone parked work
+    # behind. `github_public_repo` selects it, the same rule the update
+    # collector's `_update_remote()` applies. Config still wins when both keys
+    # are set, for the install that deliberately watches something other than
+    # its own repo.
+    return _slug_from_remotes(env.github_public_repo())
 
 
-def _slug_from_origin() -> str | None:
-    """owner/repo parsed from `origin`, or None if it is absent or not GitHub.
+def _parse_github_slug(url: str) -> str | None:
+    """owner/repo parsed from one remote URL, or None if it is not GitHub.
 
     Handles both URL shapes git uses — https://github.com/owner/repo(.git) and
     git@github.com:owner/repo(.git) — and refuses anything else rather than
     guessing, since a non-GitHub remote has no stargazers to read.
     """
-    try:
-        out = subprocess.run(
-            ["git", "-C", str(Path(__file__).resolve().parent.parent),
-             "remote", "get-url", "origin"],
-            capture_output=True, text=True, timeout=15,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if out.returncode != 0:
-        return None
-    url = out.stdout.strip()
     for prefix in ("https://github.com/", "http://github.com/", "git@github.com:",
                    "ssh://git@github.com/"):
         if url.startswith(prefix):
@@ -160,6 +153,46 @@ def _slug_from_origin() -> str | None:
     return f"{parts[0]}/{parts[1]}"
 
 
+def _slug_from_remotes(public_repo: str = "") -> str | None:
+    """owner/repo for the public repo, resolved from this checkout's remotes.
+
+    Preference order: the remote whose fetch URL names *public_repo* (the
+    supported private-fork topology — `origin` is the fork, a second remote
+    carries the public repo), then `origin`, then any other GitHub remote.
+    None when no remote parses, which is the same clean no-op as an
+    unconfigured install.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parent.parent),
+             "remote", "-v"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    fetch_slugs: dict[str, str] = {}
+    for line in out.stdout.splitlines():
+        if "(fetch)" not in line:
+            continue
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        slug = _parse_github_slug(fields[1])
+        if slug:
+            fetch_slugs.setdefault(fields[0], slug)
+    if not fetch_slugs:
+        return None
+    if public_repo:
+        for slug in fetch_slugs.values():
+            if slug.rsplit("/", 1)[-1] == public_repo:
+                return slug
+    if "origin" in fetch_slugs:
+        return fetch_slugs["origin"]
+    return next(iter(fetch_slugs.values()))
+
+
 def _star_count(slug: str) -> int:
     # S310: scheme and host are the constants above; only the slug varies, and
     # it comes from this install's own config rather than from any request.
@@ -170,37 +203,49 @@ def _star_count(slug: str) -> int:
     with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:  # noqa: S310
         payload = json.load(resp)
     count = payload.get("stargazers_count")
-    if not isinstance(count, int):
+    # `type(...) is int`, not isinstance: bool subclasses int, so `true` in a
+    # malformed payload would otherwise pass as a count of 1 — a successful
+    # silent exit for a count that was never read. Negatives are the same
+    # shape of lie: they compare below every milestone.
+    if type(count) is not int or count < 0:
         # An absent or non-integer field is an UNREAD count, never a zero.
         # Zero would compare below every milestone and read as "no news".
         raise ValueError(f"stargazers_count missing or not an int: {count!r}")
     return count
 
 
-def _already_announced() -> int:
+def _already_announced(slug: str) -> int:
     try:
         data = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
-        value = data.get("highest_announced")
-        return int(value) if isinstance(value, int) else 0
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return 0
+    # State belongs to a repository. A file written for a different slug — or
+    # one written before slugs were recorded — must not suppress this repo's
+    # milestones: repo A's announced 500 is no reason repo B at 200 stays silent.
+    # The observation id and content_hash already key on slug, so announcing
+    # again here cannot double-post a milestone the database remembers.
+    if data.get("slug") != slug:
+        return 0
+    value = data.get("highest_announced")
+    return int(value) if isinstance(value, int) else 0
 
 
-def _remember(milestone: int, count: int) -> None:
-    _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _STATE_PATH.with_suffix(".json.tmp")
-    tmp.write_text(
+def _remember(slug: str, milestone: int, count: int) -> None:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from genesis.util.atomic import atomic_write_text  # noqa: PLC0415
+
+    atomic_write_text(
+        _STATE_PATH,
         json.dumps(
             {
+                "slug": slug,
                 "highest_announced": milestone,
                 "stars_at_announcement": count,
                 "announced_at": datetime.now(UTC).isoformat(),
             },
             indent=2,
         ),
-        encoding="utf-8",
     )
-    tmp.replace(_STATE_PATH)  # atomic; a torn state file reads as "announce again"
 
 
 async def _announce(slug: str, milestone: int, count: int) -> bool:
@@ -227,20 +272,32 @@ async def _announce(slug: str, milestone: int, count: int) -> bool:
     now = datetime.now(UTC).isoformat()
     async with aiosqlite.connect(str(DEFAULT_DB_PATH), timeout=10) as db:
         await db.execute("PRAGMA busy_timeout=5000")
-        created = await observations.create(
-            db,
-            id=hashlib.sha256(f"star-milestone|{slug}|{milestone}".encode()).hexdigest()[:32],
-            source="star_milestone_check",
-            type="repo_milestone_reached",
-            content=content,
-            priority="high",
-            created_at=now,
-            category="repo",
-            # Stable across runs, so a lost state file cannot produce a second
-            # announcement of the same milestone.
-            content_hash=hashlib.sha256(f"star-milestone|{slug}|{milestone}".encode()).hexdigest(),
-            skip_if_duplicate=True,
-        )
+        try:
+            created = await observations.create(
+                db,
+                id=hashlib.sha256(f"star-milestone|{slug}|{milestone}".encode()).hexdigest()[:32],
+                source="star_milestone_check",
+                type="repo_milestone_reached",
+                content=content,
+                priority="high",
+                created_at=now,
+                category="repo",
+                # Stable across runs, so a lost state file cannot produce a second
+                # announcement of the same milestone.
+                content_hash=hashlib.sha256(f"star-milestone|{slug}|{milestone}".encode()).hexdigest(),
+                skip_if_duplicate=True,
+            )
+        except aiosqlite.IntegrityError:
+            # The deterministic id already exists but the dedup clause let the
+            # INSERT through: the prior announcement was RESOLVED manually
+            # (dedup matches only resolved = 0 rows), and the primary key still
+            # rejects the retry. A resolved milestone stays announced —
+            # resurrecting it would re-fire a wake-up somebody dismissed.
+            logger.info(
+                "%s milestone %d was announced before and resolved; not re-announcing",
+                slug, milestone,
+            )
+            return False
     return created is not None
 
 
@@ -256,7 +313,7 @@ def main() -> int:
         return 1
 
     milestones = _milestones()
-    announced = _already_announced()
+    announced = _already_announced(slug)
     crossed = [m for m in milestones if m <= count and m > announced]
     if not crossed:
         logger.info(
@@ -274,7 +331,7 @@ def main() -> int:
         logger.error("could not write the milestone observation: %s", exc)
         return 1
 
-    _remember(top, count)
+    _remember(slug, top, count)
     logger.info(
         "%s crossed %d stars (now %d) — observation %s",
         slug,
