@@ -377,3 +377,37 @@ async def test_the_dedup_lookup_is_scoped_to_the_writes_subsystem(store):
         "scoping it to user-visible rows means every identical retry misses "
         "its prior row and mints another copy"
     )
+
+
+@pytest.mark.asyncio()
+async def test_an_alternate_alias_spelling_finds_the_legacy_row(store):
+    """A legacy row under a DIFFERENT alias of the same canonical still dedups.
+
+    The shipped seed maps both "CC" and "claude-code" to "Claude Code", so
+    checking only <normalized, this write's raw> misses a row stored under the
+    OTHER surface form — the reviewer-named case.
+    """
+    import genesis.memory.entity_resolution as er
+    import genesis.memory.store as store_mod
+
+    legacy = "CC owns the review gate"          # stored before / unnormalized
+    raw = "claude-code owns the review gate"    # this write's own spelling
+
+    queried: list[str] = []
+
+    async def by_form(_db, *, content, source_subsystem=None):
+        queried.append(content)
+        return "legacy-cc-id" if content == legacy else None
+
+    with (
+        patch.object(
+            er, "load_aliases",
+            lambda: {"CC": "Claude Code", "claude-code": "Claude Code"},
+        ),
+        patch.object(store_mod.memory_crud, "find_exact_duplicate", by_form),
+    ):
+        returned = await store.store(raw, "conversation")
+
+    assert returned == "legacy-cc-id", (
+        f"the legacy row's surface form was never queried (queried {queried!r})"
+    )

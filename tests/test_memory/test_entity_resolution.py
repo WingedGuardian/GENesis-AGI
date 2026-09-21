@@ -16,6 +16,7 @@ from genesis.memory.entity_resolution import (
     log_resolution,
     normalize_content,
     pick_duplicate_survivor,
+    surface_variants,
 )
 
 # --- normalize_content ---
@@ -44,6 +45,32 @@ def test_normalize_word_boundary():
 def test_normalize_no_aliases():
     result = normalize_content("hello world", {})
     assert result == "hello world"
+
+
+# --- surface_variants ---
+
+
+def test_surface_variants_recovers_each_alias_spelling():
+    """Both seeded spellings of "Claude Code" come back from canonical text."""
+    aliases = {"CC": "Claude Code", "claude-code": "Claude Code"}
+    variants = surface_variants("Claude Code owns the gate", aliases)
+    assert "CC owns the gate" in variants
+    assert "claude-code owns the gate" in variants
+    assert "Claude Code owns the gate" not in variants  # input is never a variant
+
+
+def test_surface_variants_combines_distinct_canonicals():
+    aliases = {"CC": "Claude Code", "LLM": "large language model"}
+    variants = surface_variants(
+        "Claude Code uses an large language model", aliases
+    )
+    assert "CC uses an large language model" in variants
+    assert "Claude Code uses an LLM" in variants
+    assert "CC uses an LLM" in variants
+
+
+def test_surface_variants_no_match_returns_empty():
+    assert surface_variants("nothing aliased here", {"CC": "Claude Code"}) == []
 
 
 def test_normalize_none_aliases():

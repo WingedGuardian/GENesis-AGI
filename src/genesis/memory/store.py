@@ -394,6 +394,23 @@ class MemoryStore:
                     self._db, content=raw_content,
                     source_subsystem=source_subsystem,
                 )
+            if not existing:
+                # A legacy row can also carry a DIFFERENT alias spelling than
+                # this write's raw form — the seed maps both "CC" and
+                # "claude-code" to "Claude Code", so a row stored as "CC ..."
+                # is invisible to a later "claude-code ..." write unless the
+                # alternate surface forms are queried too.
+                from genesis.memory.entity_resolution import surface_variants
+
+                for variant in surface_variants(content):
+                    if variant == raw_content:
+                        continue  # already queried above
+                    existing = await memory_crud.find_exact_duplicate(
+                        self._db, content=variant,
+                        source_subsystem=source_subsystem,
+                    )
+                    if existing:
+                        break
             if existing:
                 # A duplicate does NOT discharge the supersession. The caller
                 # asked for two things — store this, deprecate that — and only

@@ -136,6 +136,51 @@ def normalize_content(content: str, aliases: dict[str, str] | None = None) -> st
     return content
 
 
+def surface_variants(
+    content: str,
+    aliases: dict[str, str] | None = None,
+    *,
+    limit: int = 16,
+) -> list[str]:
+    """Return the raw spellings *content* could have been stored under.
+
+    The inverse of :func:`normalize_content`: for each alias whose canonical
+    form appears in *content* (same whole-word, case-insensitive matching),
+    produce the spelling with the alias substituted back in. A row written
+    before an alias existed — or while normalization was failing — holds the
+    raw surface form, and the shipped seed maps BOTH ``"CC"`` and
+    ``"claude-code"`` to ``"Claude Code"``, so the current write's own raw
+    spelling is not the only one a legacy row can carry.
+
+    Substitution is replace-all per alias and iterates over the frontier, so
+    several distinct canonicals in one string produce their combinations; the
+    result is capped at *limit* (and never includes *content* itself).
+    Best-effort like ``normalize_content``: returns ``[]`` on any failure.
+    """
+    if aliases is None:
+        aliases = load_aliases()
+    if not aliases:
+        return []
+
+    import re
+
+    variants: set[str] = {content}
+    frontier = [content]
+    for alias, canonical in aliases.items():
+        if alias == canonical:
+            continue
+        pattern = re.compile(r"\b" + re.escape(canonical) + r"\b", re.IGNORECASE)
+        for text in list(frontier):
+            replaced = pattern.sub(alias, text)
+            if replaced != text and replaced not in variants:
+                variants.add(replaced)
+                frontier.append(replaced)
+        if len(variants) - 1 >= limit:
+            break
+    variants.discard(content)
+    return sorted(variants)[:limit]
+
+
 # ── Dedup Candidate Discovery ────────────────────────────────────────────
 
 
