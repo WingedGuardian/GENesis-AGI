@@ -42,6 +42,17 @@
 # writing two different filenames have nothing to merge. That is the structural
 # fix and it is already in place; union was a stopgap layered on top of it.
 #
+# ONE RESIDUAL WINDOW, which no commit can close: a branch created while union
+# was in force still carries `merge=union` in its CHECKED-OUT .gitattributes,
+# and attributes resolve from the checkout — so that branch's FIRST catch-up
+# merge after this file lands still union-merges CHANGELOG.md and can still
+# resurrect release-cut deletions, at exit 0, one last time. Verified 2026-09-21
+# on a synthetic repo: a branch with the attribute merged a commit deleting
+# lines inside a hunk the branch edited and removing the attribute — the deleted
+# lines returned, exit 0, no conflict. The remedy is the same one the last
+# paragraph names: after the merge, diff CHANGELOG.md against the base's and
+# restore the removals. Every merge after that first one is safe.
+#
 # SO: a CHANGELOG.md collision now CONFLICTS, visibly, and is resolved by hand —
 # which for a branch carrying an inline entry means taking the base's file and
 # moving the entry into a fragment. A visible conflict is the correct outcome:
