@@ -165,16 +165,19 @@ _wrapper_on_signal() {
     fi
     exit "$rc"
 }
-# Trap armed AFTER the pid assignment: a signal landing before it gets the
-# pre-forwarding behaviour (wrapper dies, kernel releases the lock) rather than
-# a trap that fires with no child to name.
+# Traps armed BEFORE the child launch: a TERM landing between spawn and trap
+# install would take the default disposition — the wrapper dies, the kernel
+# releases the lock, and the child keeps validating while a deploy restarts the
+# server under it (Devin #1804). With the trap first, that same signal runs
+# _wrapper_on_signal: _cmd_pid is empty only if the child was never started, in
+# which case the handler exits having forwarded nothing.
 # NOTE: a wrapped command backgrounded from a non-job-control shell inherits
 # SIGINT as SIG_IGN (POSIX), so INT forwarding is inert for callers that spawn
 # us from scripts — the TERM path is the live one.
-"$@" {_DEPLOY_LOCK_FD}>&- &
-_cmd_pid=$!
 trap '_wrapper_on_signal TERM' TERM
 trap '_wrapper_on_signal INT' INT
+"$@" {_DEPLOY_LOCK_FD}>&- &
+_cmd_pid=$!
 wait "$_cmd_pid" || cmd_rc=$?
 trap - TERM INT
 if [ "$RECEIPT" -eq 1 ] && [ "$cmd_rc" -eq 0 ]; then
@@ -204,6 +207,19 @@ if [ "$RECEIPT" -eq 1 ] && [ "$cmd_rc" -eq 0 ]; then
         echo "       describe what was validated. Commit, stash, or restore first." >&2
         exit 1
     fi
-    append_deploy_receipt "validated" "$SHA" "validation"
+    # A `validated` row claims the SERVER ran $SHA — a clean tree at HEAD only
+    # proves the checkout, not the process: a pull that advanced HEAD then
+    # failed before restart leaves old code serving while the ledger would
+    # still record `validated` for the new SHA (Devin #1804). Require the
+    # ledger's newest deploy outcome for $SHA to be `deployed`. The command's
+    # own result is unaffected — it ran and passed; only the receipt claim is
+    # withheld, loudly, on stderr.
+    if deploy_receipt_serving_ok "$SHA"; then
+        append_deploy_receipt "validated" "$SHA" "validation"
+    else
+        echo "WARNING: no validated receipt written for $SHA — the deploy ledger has" >&2
+        echo "         no successful 'deployed' row for this SHA, so the serving process" >&2
+        echo "         may be running older code. Complete a successful deploy first." >&2
+    fi
 fi
 exit "$cmd_rc"

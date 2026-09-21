@@ -146,10 +146,14 @@ def test_wire_contract_pause_int_in_gateway_range(lib_text: str) -> None:
     EVERY value that can reach the wire is checked: the lib's `:=` default and each
     caller's literal override (deploy_code_only.sh uses a shorter window)."""
     pause = _extract_func(lib_text, "_guardian_pause")
-    # The owned form `pause <ttl> <token>` is tried first; the bare form is the
-    # fallback for gateways that predate the owner grammar.
+    # The atomic acquire `pause-if-absent <ttl> <token>` is tried first; the
+    # owned `pause <ttl> <token>` and bare `pause <ttl>` are the fallbacks for
+    # gateways that predate the conditional verbs / the owner grammar.
+    assert '"pause-if-absent $GUARDIAN_PAUSE_TTL $_GUARDIAN_TOKEN"' in pause, (
+        "acquire must use the atomic `pause-if-absent <ttl> <owner>` verb"
+    )
     assert '"pause $GUARDIAN_PAUSE_TTL $_GUARDIAN_TOKEN"' in pause, (
-        "wire verb must be `pause <ttl> <owner>`"
+        "the owned `pause <ttl> <owner>` fallback must remain"
     )
     assert '"pause $GUARDIAN_PAUSE_TTL"' in pause, (
         "the bare `pause <ttl>` fallback for pre-owner gateways must remain"
@@ -173,9 +177,22 @@ def test_syntax_ok(script: Path) -> None:
 
 
 # ── functional: drive the SHIPPED helpers with a stubbed, LOGGED ssh ──────────
-def _harness(lib_text: str, tmp_path: Path, *, ssh_rc: int, pre_paused: bool = False):
+def _harness(
+    lib_text: str,
+    tmp_path: Path,
+    *,
+    ssh_rc: int,
+    pre_paused: bool = False,
+    legacy: bool = False,
+    owner_conflict: bool = False,
+):
     """Fake host-config (yaml + venv-python + key) and a PATH ssh stub that LOGS its
-    verb and exits ssh_rc. Returns (run(body) -> stdout+stderr, ssh_log Path)."""
+    verb and exits ssh_rc. Returns (run(body) -> stdout+stderr, ssh_log Path).
+
+    ``legacy`` emulates a gateway that predates the conditional verbs: it replies
+    ``denied`` to ``pause-if-absent``/``pause-if-owner`` and only speaks the plain
+    ``paused`` + ``pause`` grammar. ``owner_conflict`` makes ``pause-if-owner``
+    refuse with "owned by another holder" (a live pause a different holder wrote)."""
     home = tmp_path / "home"
     (home / ".genesis").mkdir(parents=True)
     (home / ".genesis" / "guardian_remote.yaml").write_text("host_ip: 1.2.3.4\nhost_user: u\n")
@@ -197,12 +214,34 @@ def _harness(lib_text: str, tmp_path: Path, *, ssh_rc: int, pre_paused: bool = F
     # log the LAST arg (the verb) always; the `paused` query additionally returns
     # its JSON on stdout (the ownership check greps it), so pre_paused drives it.
     _paused_json = '{"paused": true}' if pre_paused else '{"paused": false}'
+    _cond_absent = (
+        'echo \'{"ok": false, "error": "denied"}\' >&2; exit 1\n'
+        if legacy
+        else (
+            'echo \'{"ok": false, "action": "pause-if-absent", "error": "already paused"}\' >&2; exit 1\n'
+            if pre_paused
+            else ""
+        )
+    )
+    if legacy:
+        _cond_owner = 'echo \'{{"ok": false, "error": "denied"}}\' >&2; exit 1\n'
+    elif owner_conflict:
+        _cond_owner = (
+            'echo \'{{"ok": false, "action": "pause-if-owner", '
+            '"error": "pause is owned by another holder"}}\' >&2; exit 1\n'
+        )
+    else:
+        _cond_owner = ""
     (stub / "ssh").write_text(
         "#!/bin/bash\n"
         'verb="${@: -1}"\n'
         f'echo "$verb" >> "{ssh_log}"\n'
         f"if [ \"$verb\" = paused ]; then echo '{_paused_json}'; fi\n"
-        f'case "$verb" in resume*) [ {ssh_rc} -eq 0 ] && echo \'{{"ok": true, "action": "resume"}}\' ;; esac\n'
+        'case "$verb" in\n'
+        f"  pause-if-absent*) {_cond_absent} ;;\n"
+        f"  pause-if-owner*) {_cond_owner} ;;\n"
+        f'  resume*) [ {ssh_rc} -eq 0 ] && echo \'{{"ok": true, "action": "resume"}}\' ;;\n'
+        "esac\n"
         f"exit {ssh_rc}\n"
     )
     for f in ("timeout", "ssh"):
@@ -242,7 +281,9 @@ def test_pause_success_sends_wire_and_sets_flag(lib_text: str, tmp_path: Path) -
     out = run('_guardian_pause\n[ "${_GUARDIAN_PAUSED:-}" = 1 ] && echo PAUSED_SET || true\n')
     assert "REACHED_END" in out and "PAUSED_SET" in out
     sent = ssh_log.read_text()
-    assert "pause 1800" in sent, "must send the `pause <ttl>` wire verb"
+    assert "pause-if-absent 1800 deploy-" in sent, (
+        "must send the atomic `pause-if-absent <ttl> <token>` acquire verb"
+    )
 
 
 def test_resume_fires_on_exit_when_the_caller_arms_the_trap(lib_text: str, tmp_path: Path) -> None:
@@ -303,8 +344,10 @@ def test_pause_skips_when_already_paused(lib_text: str, tmp_path: Path) -> None:
     assert "UNPAUSED" in out and "PAUSED_SET" not in out, "must not own a pre-existing pause"
     assert "already paused" in out
     sent = ssh_log.read_text() if ssh_log.exists() else ""
-    assert "paused" in sent, "must query the gateway pause state"
-    assert "pause 1800" not in sent, "must NOT send our own pause over a pre-existing one"
+    assert "pause-if-absent" in sent, (
+        "must ask atomically — the conditional verb, not a `paused` probe"
+    )
+    assert "\npause 1800" not in f"\n{sent}", "must NOT send our own pause over a pre-existing one"
 
 
 def test_pause_proceeds_when_not_already_paused(lib_text: str, tmp_path: Path) -> None:
@@ -316,7 +359,9 @@ def test_pause_proceeds_when_not_already_paused(lib_text: str, tmp_path: Path) -
     )
     assert "PAUSED_SET" in out
     sent = ssh_log.read_text()
-    assert "paused" in sent and "pause 1800" in sent, "must query THEN pause"
+    assert "pause-if-absent 1800" in sent, (
+        "acquire is a single atomic verb — no separate `paused` probe to race"
+    )
 
 
 def test_resume_best_effort_on_ssh_failure(lib_text: str, tmp_path: Path) -> None:
@@ -356,7 +401,9 @@ def test_lease_renewer_wired_and_bounded(lib_text: str) -> None:
     BEFORE the resume SSH (so it can't re-pause after we resume)."""
     renew = _extract_func(lib_text, "_guardian_renew_loop")
     assert "GUARDIAN_PAUSE_RENEW_MAX" in renew, "renewer must be bounded (no runaway)"
-    assert "pause $GUARDIAN_PAUSE_TTL" in renew, "renewer must re-issue the pause verb"
+    assert "pause-if-owner $GUARDIAN_PAUSE_TTL" in renew, (
+        "renewer must re-issue via the atomic `pause-if-owner` verb"
+    )
     pause = _extract_func(lib_text, "_guardian_pause")
     assert "_guardian_renew_loop >/dev/null 2>&1 &" in pause, (
         "pause starts the renewer (redirected bg)"
@@ -377,8 +424,57 @@ def test_lease_renewer_reissues_pause_then_stops(lib_text: str, tmp_path: Path) 
     # then _guardian_resume kills it.
     run("GUARDIAN_PAUSE_TTL=2\n_guardian_pause\nsleep 3\n_guardian_resume\n")
     sent = ssh_log.read_text() if ssh_log.exists() else ""
-    n = sent.count("pause 2")
-    assert n >= 2, f"renewer must re-issue pause at least once (saw {n} 'pause 2')"
+    n = sent.count("pause-if-owner 2")
+    assert n >= 1, f"renewer must re-issue the conditional pause (saw {n})"
+
+
+def test_acquire_is_atomic_single_verb(lib_text: str, tmp_path: Path) -> None:
+    """Devin #1804 regression: the old acquire was `paused` then `pause` — an
+    operator pause landing between the two got clobbered. The new acquire is ONE
+    ssh call (`pause-if-absent`); a bare `paused` probe before it must not exist."""
+    run, ssh_log = _harness(lib_text, tmp_path, ssh_rc=0)
+    run("_guardian_pause\n_guardian_resume\n")
+    sent = f"\n{ssh_log.read_text()}"
+    assert "\npaused\n" not in sent, "no separate `paused` probe on the acquire path"
+
+
+def test_legacy_gateway_falls_back_to_probe_then_pause(lib_text: str, tmp_path: Path) -> None:
+    """A gateway predating `pause-if-absent` replies denied; the client must fall
+    back to the legacy `paused` probe + `pause <ttl> <token>` (documented
+    non-atomic path) and still arm the pause."""
+    run, ssh_log = _harness(lib_text, tmp_path, ssh_rc=0, legacy=True)
+    out = run(
+        '_guardian_pause\n[ "${_GUARDIAN_PAUSED:-}" = 1 ] && echo PAUSED_SET || echo UNPAUSED\n'
+    )
+    assert "PAUSED_SET" in out
+    sent = ssh_log.read_text()
+    assert "pause-if-absent" in sent and "\npaused\n" in f"\n{sent}"
+    assert "pause 1800 deploy-" in sent
+
+
+def test_legacy_gateway_respects_a_preexisting_pause(lib_text: str, tmp_path: Path) -> None:
+    """Legacy fallback still refuses to clobber: denied pause-if-absent, `paused`
+    reports an operator pause → leave it intact, never send `pause`."""
+    run, ssh_log = _harness(lib_text, tmp_path, ssh_rc=0, legacy=True, pre_paused=True)
+    out = run(
+        '_guardian_pause\n[ "${_GUARDIAN_PAUSED:-}" = 1 ] && echo PAUSED_SET || echo UNPAUSED\n'
+    )
+    assert "UNPAUSED" in out and "already paused" in out
+    sent = ssh_log.read_text()
+    assert "pause 1800" not in sent
+
+
+def test_renewer_stops_when_another_holder_owns_the_pause(lib_text: str, tmp_path: Path) -> None:
+    """Devin #1804: a renewal must never overwrite a pause another holder wrote.
+    With `pause-if-owner` refusing 'owned by another holder', the renewer stops —
+    no unconditional `pause` is sent after the refusal."""
+    run, ssh_log = _harness(lib_text, tmp_path, ssh_rc=0, owner_conflict=True)
+    run("GUARDIAN_PAUSE_TTL=2\n_guardian_pause\nsleep 3\n_guardian_resume\n")
+    sent = ssh_log.read_text() if ssh_log.exists() else ""
+    assert "pause-if-owner 2" in sent, "renewer attempted the conditional renew"
+    assert "\npause 2 " not in f"\n{sent}" and "\npause 2\n" not in f"\n{sent}", (
+        "after 'owned by another holder' the renewer must not fall through to an unconditional pause"
+    )
 
 
 if sys.platform.startswith("win"):  # pragma: no cover

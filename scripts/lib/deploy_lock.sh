@@ -168,6 +168,41 @@ PY
     return 0
 }
 
+# deploy_receipt_serving_ok <sha>
+#   True when the ledger's newest DEPLOY-OUTCOME row for <sha> is `deployed` —
+#   post-restart and health-checked, so the serving process provably loaded
+#   that SHA. Tree identity alone cannot prove process identity: a pull that
+#   advanced HEAD to B then failed before restart leaves the OLD process
+#   serving while clean HEAD reads B (Devin #1804), so a `validated` receipt
+#   gated only on HEAD falsely marks undeployed code. deploy_failed,
+#   health_failed, deployed_not_started, and no deploy row at all all fail
+#   closed. Validation rows are skipped — they describe what was tested, not
+#   what is serving.
+deploy_receipt_serving_ok() {
+    local sha="$1"
+    [ -f "$GENESIS_DEPLOY_RECEIPTS" ] || return 1
+    RECEIPT_FILE="$GENESIS_DEPLOY_RECEIPTS" WANT_SHA="$sha" python3 - <<'PY'
+import json
+import os
+import sys
+
+latest = None
+with open(os.environ["RECEIPT_FILE"], encoding="utf-8") as f:
+    for line in f:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("sha") != os.environ["WANT_SHA"]:
+            continue
+        if row.get("status") in (
+            "deployed", "deploy_failed", "health_failed", "deployed_not_started",
+        ):
+            latest = row["status"]
+sys.exit(0 if latest == "deployed" else 1)
+PY
+}
+
 # prune_deploy_receipts
 #   Trim the receipts ledger to the newest _DEPLOY_RECEIPTS_KEEP lines. Lives
 #   HERE, beside the append it bounds, rather than inline in disk_hygiene.sh:

@@ -937,4 +937,12 @@ jobs:
         # was unwired and the fix for that added a 44th case. Re-counting last
         # caught it before the commit instead of in round 6. The habit is cheap;
         # the four prior instances each cost a review round.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23342
+        #
+        # 23342 -> 23350, the SIXTH move: the guardian-pause/gateway
+        # atomic-verbs round adds four cases in test_update_guardian_pause.py
+        # (atomic acquire, legacy fallback, legacy pre-existing-pause, owner-
+        # conflict renewer stop) and four in test_deploy_lock.py (three
+        # parametrized failed-outcome refusals + the no-deploy-row refusal).
+        # MEASURED by --collect-only on the two files at HEAD (67) and after
+        # the last edit (75) — delta counted, not grepped.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23350

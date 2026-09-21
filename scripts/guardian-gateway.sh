@@ -4,6 +4,10 @@
 # Restricts container->host SSH to exactly these operations:
 #   restart-timer  — restart the guardian timer
 #   pause          — pause guardian checks
+#   pause-if-absent <ttl> [owner] — atomic acquire: write only when no live
+#                     pause exists (check + write under the pause lock)
+#   pause-if-owner <ttl> <owner>  — atomic renew: write only when the pause is
+#                     absent or already owned by that token
 #   resume         — resume guardian checks
 #   status         — get current guardian state
 #   reset-state    — reset stuck state machine to healthy
@@ -109,12 +113,59 @@ _write_gateway_pause() {
     printf '{"ok": true, "action": "pause", "expires_at": "%s"}\n' "$expires_iso"
 }
 
+# Serialize paused.json read-modify-writes across concurrent ssh sessions. The
+# writes themselves are already atomic (tmp+mv above), but pause-if-absent and
+# the owner-matched resume are check-then-act pairs — without this lock a
+# pause could land between resume's owner read and its delete, or between
+# pause-if-absent's check and its write (Devin #1804).
+_pause_lock() {
+    mkdir -p "$STATE_DIR"
+    exec 9>"$STATE_DIR/.pause.lock"
+    flock -w 5 9 || {
+        echo '{"ok": false, "error": "pause lock contention"}' >&2
+        exit 1
+    }
+}
+
+# Same predicate the `paused` verb reports — live means present + literal true +
+# now < expires_at <= now + 3600 — for use under _pause_lock where the
+# check-then-act must be atomic.
+_gateway_pause_live() {
+    [ -f "$STATE_DIR/paused.json" ] || return 1
+    python3 -c "import json,datetime as dt,sys;d=json.load(open('$STATE_DIR/paused.json'));e=d.get('expires_at');now=dt.datetime.now(dt.timezone.utc);x=(dt.datetime.fromisoformat(e.replace('Z','+00:00')) if e else None);x=(x.replace(tzinfo=dt.timezone.utc) if (x and x.tzinfo is None) else x);sys.exit(0 if (d.get('paused') is True and x is not None and now<x<=now+dt.timedelta(seconds=3600)) else 1)" 2>/dev/null
+}
+
+# Conditional pause verbs are `pause` with an atomic precondition checked under
+# _pause_lock, so a concurrent pause can never be clobbered by the gap between
+# a separate `paused` query and the write (Devin #1804):
+#   pause-if-absent <ttl> [owner] — write only if NO live pause exists; fails
+#       "already paused" otherwise (deploy acquire).
+#   pause-if-owner  <ttl> <owner> — write only if absent or owned BY the given
+#       token; fails "owned by another holder" when a live pause carries a
+#       different owner (deploy renewal — extends its own pause without ever
+#       overwriting someone else's).
+# Both normalize to the `pause` arm here so the grammar has one implementation.
+_GW_IF_ABSENT=""
+_GW_IF_OWNER=""
+case "${SSH_ORIGINAL_COMMAND:-}" in
+    pause-if-absent\ *)
+        _GW_IF_ABSENT=1
+        SSH_ORIGINAL_COMMAND="pause ${SSH_ORIGINAL_COMMAND#pause-if-absent }"
+        ;;
+    pause-if-owner\ *)
+        _GW_IF_OWNER="${SSH_ORIGINAL_COMMAND#pause-if-owner }"
+        _GW_IF_OWNER="${_GW_IF_OWNER#* }"
+        SSH_ORIGINAL_COMMAND="pause ${SSH_ORIGINAL_COMMAND#pause-if-owner }"
+        ;;
+esac
+
 case "${SSH_ORIGINAL_COMMAND:-}" in
     restart-timer)
         systemctl --user restart genesis-guardian.timer
         echo '{"ok": true, "action": "restart-timer"}'
         ;;
     pause)
+        _pause_lock
         _write_gateway_pause 1800
         ;;
     pause\ *)
@@ -166,6 +217,28 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
             echo '{"ok": false, "action": "pause", "error": "ttl out of range (1-3600)"}' >&2
             exit 1
         fi
+        _pause_lock
+        if [ -n "$_GW_IF_ABSENT" ] && _gateway_pause_live; then
+            echo '{"ok": false, "action": "pause-if-absent", "error": "already paused"}' >&2
+            exit 1
+        fi
+        if [ -n "$_GW_IF_OWNER" ]; then
+            # A live pause owned by a DIFFERENT holder is not ours to extend —
+            # refuse rather than overwrite it. `pause-if-owner` requires an
+            # owner arg; a bare `<ttl>` form would normalize to owner=ttl.
+            case "$_GW_IF_OWNER" in
+                "$_PAUSE_OWNER") ;;
+                *)  echo '{"ok": false, "action": "pause-if-owner", "error": "owner argument required"}' >&2
+                    exit 1 ;;
+            esac
+            if _gateway_pause_live; then
+                _LIVE_OWNER=$(python3 -c "import json;print(json.load(open('$STATE_DIR/paused.json')).get('owner') or '')" 2>/dev/null || echo "")
+                if [ "$_LIVE_OWNER" != "$_GW_IF_OWNER" ]; then
+                    echo '{"ok": false, "action": "pause-if-owner", "error": "pause is owned by another holder"}' >&2
+                    exit 1
+                fi
+            fi
+        fi
         _write_gateway_pause "$_PAUSE_TTL" "$_PAUSE_OWNER"
         ;;
     resume|resume\ *)
@@ -186,6 +259,7 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
                 echo '{"ok": false, "action": "resume", "error": "owner too long (max 64 chars)"}' >&2
                 exit 1
             fi
+            _pause_lock
             if [ -f "$STATE_DIR/paused.json" ]; then
                 _FILE_OWNER=$(python3 -c "import json;print(json.load(open('$STATE_DIR/paused.json')).get('owner') or '')" 2>/dev/null || echo "")
                 if [ "$_FILE_OWNER" != "$_RESUME_OWNER" ]; then

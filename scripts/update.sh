@@ -63,7 +63,7 @@ GENESIS_ROOT="${GENESIS_UPDATE_ORIG_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 SCRIPT_DIR="$GENESIS_ROOT/scripts"
 VENV_DIR="$GENESIS_ROOT/.venv"
 STARTED_AT="$(date -Iseconds)"
-STATE_FILE="$HOME/.genesis/update_state.json"
+STATE_FILE="${GENESIS_HOME:-$HOME/.genesis}/update_state.json"
 
 # Shared deploy-station pieces (issue #1699). deploy_lock.sh supplies the lock
 # PATH constant + the deploy-receipt appender (this script keeps its own inline
@@ -82,7 +82,7 @@ source "$SCRIPT_DIR/lib/guardian_pause.sh"
 # Written at each phase boundary so crash recovery knows where we stopped.
 _write_state() {
     local phase="$1"
-    mkdir -p "$HOME/.genesis"
+    mkdir -p "$(dirname "$STATE_FILE")"
     cat > "$STATE_FILE" << SEOF
 {
     "phase": "$phase",

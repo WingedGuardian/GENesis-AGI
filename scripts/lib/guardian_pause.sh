@@ -55,36 +55,51 @@ _guardian_pause() {
     [ -n "$hip" ] && [ -f "$key" ] || return 0
     _GUARDIAN_HOST="${hus:-ubuntu}@${hip}"
     _GUARDIAN_KEY="$key"
-    # Don't clobber a pause we did not create: if the gateway already has an
-    # UNEXPIRED pause (an operator or another workflow set it), leave it intact —
-    # proceed WITHOUT pausing and WITHOUT marking paused, so the caller's EXIT
-    # never removes their pause (a pre-existing pause already covers our restart
-    # window). Against an OLD gateway with no `paused` verb the query
-    # errors/returns non-JSON → no match → we fall through and pause as before
-    # (backward-compatible). The pipe is in an `if` condition, so a failing ssh
-    # can't abort the caller.
-    if timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
-        "$_GUARDIAN_HOST" paused 2>/dev/null | grep -q '"paused": true'; then
+    # Don't clobber a pause we did not create — atomic acquire: `pause-if-absent`
+    # runs the live-pause check and the write under the gateway's pause lock,
+    # so an operator pause can never be clobbered by the gap between a
+    # separate `paused` query and our write
+    # (Devin #1804). Responses:
+    #   rc 0               -> we hold the pause; renewer/resume arm below.
+    #   "already paused"   -> a live pause that is not ours; leave it intact and
+    #                         do NOT arm resume (it already covers our window).
+    #   "denied" / other   -> old gateway without the verb or a transport
+    #                         failure: fall through to the legacy probe+pause,
+    #                         which is non-atomic but only reachable there.
+    _GUARDIAN_TOKEN="deploy-$$-$(date -u +%s)"
+    _gw_rc=0
+    # 2>&1: the gateway's "already paused"/"denied" replies are emitted on
+    # stderr — merge them into _gw_out so the response dispatch below sees them.
+    _gw_out="$(timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+        "$_GUARDIAN_HOST" "pause-if-absent $GUARDIAN_PAUSE_TTL $_GUARDIAN_TOKEN" 2>&1)" || _gw_rc=$?
+    if [ "$_gw_rc" -eq 0 ]; then
+        :
+    elif printf '%s' "$_gw_out" | grep -q 'already paused'; then
         echo "  Guardian already paused (operator/other) — leaving it intact; not arming our resume"
         return 0
-    fi
-    # Pause WITH an ownership token: the gateway records it in paused.json, the
-    # renewer stops extending a pause another holder overwrote, and
-    # `resume <token>` deletes only the pause this invocation created — an
-    # operator pause issued while we ran is preserved (Codex P2, #1804).
-    _GUARDIAN_TOKEN="deploy-$$-$(date -u +%s)"
-    # Only mark paused if the gateway ACCEPTED the verb. A gateway that
-    # predates the owner grammar rejects `pause <ttl> <token>` outright (its
-    # ttl check sees the token) — fall back to the bare form there and clear
-    # the token so the resume and renewer take the old unconditional path.
-    # A denied/unreachable pause also fails through to the same warning; the
-    # `if`/`elif` is set -e-safe, so neither can abort the caller.
-    if timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
-        "$_GUARDIAN_HOST" "pause $GUARDIAN_PAUSE_TTL $_GUARDIAN_TOKEN" >/dev/null 2>&1; then
-        :
-    elif timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
-        "$_GUARDIAN_HOST" "pause $GUARDIAN_PAUSE_TTL" >/dev/null 2>&1; then
-        _GUARDIAN_TOKEN=""
+    elif printf '%s' "$_gw_out" | grep -q '"denied"'; then
+        # Gateway predates pause-if-absent — legacy check-then-pause. The race
+        # this tolerates (an operator pause landing between `paused` and
+        # `pause` gets overwritten) exists only against an old gateway.
+        if timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+            "$_GUARDIAN_HOST" paused 2>/dev/null | grep -q '"paused": true'; then
+            echo "  Guardian already paused (operator/other) — leaving it intact; not arming our resume"
+            return 0
+        fi
+        # A gateway that predates the owner grammar rejects `pause <ttl>
+        # <token>` outright (its ttl check sees the token) — fall back to the
+        # bare form there and clear the token so the resume and renewer take
+        # the old unconditional path.
+        if timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+            "$_GUARDIAN_HOST" "pause $GUARDIAN_PAUSE_TTL $_GUARDIAN_TOKEN" >/dev/null 2>&1; then
+            :
+        elif timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+            "$_GUARDIAN_HOST" "pause $GUARDIAN_PAUSE_TTL" >/dev/null 2>&1; then
+            _GUARDIAN_TOKEN=""
+        else
+            echo "  WARNING: guardian pause not accepted (old gateway or host unreachable) — proceeding unpaused" >&2
+            return 0
+        fi
     else
         echo "  WARNING: guardian pause not accepted (old gateway or host unreachable) — proceeding unpaused" >&2
         return 0
@@ -165,12 +180,27 @@ _guardian_renew_loop() {
     while [ "$i" -lt "$GUARDIAN_PAUSE_RENEW_MAX" ]; do
         sleep "$((GUARDIAN_PAUSE_TTL / 2))"
         if [ -n "${_GUARDIAN_TOKEN:-}" ]; then
-            # Ownership check before extending: a pause file overwritten by
-            # another holder mid-deploy is not ours to refresh — renewing would
-            # re-stamp our token over their pause, exactly the clobber the
-            # token exists to prevent (Codex P2, #1804). An unreadable or
-            # missing reply also skips this round rather than risk a blind
-            # overwrite; the next iteration re-checks.
+            # Atomic renew: `pause-if-owner` writes ONLY if the pause is absent
+            # or already ours — a pause another holder wrote mid-deploy is never
+            # overwritten by a renewal, and "owned by another holder" stops this
+            # loop instead of racing them (Devin #1804). A gateway that predates
+            # the verb replies "denied" → the legacy probe+pause below (its
+            # probe-then-write race is reachable only there).
+            _pstate=$(timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+                "$_GUARDIAN_HOST" "pause-if-owner $GUARDIAN_PAUSE_TTL $_GUARDIAN_TOKEN" 2>&1 || true)
+            if printf '%s' "$_pstate" | grep -q '"ok": true'; then
+                i=$((i + 1)); continue
+            fi
+            if printf '%s' "$_pstate" | grep -q 'owned by another holder'; then
+                break
+            fi
+            if ! printf '%s' "$_pstate" | grep -q '"denied"'; then
+                # Transport failure / unexpected reply — skip this round rather
+                # than risk a blind overwrite; the next iteration retries.
+                i=$((i + 1)); continue
+            fi
+            # Legacy gateway: ownership check before extending — a pause file
+            # overwritten by another holder is not ours to refresh (Codex P2).
             _pstate=$(timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
                 "$_GUARDIAN_HOST" paused 2>/dev/null || true)
             [ -n "$_pstate" ] || { i=$((i + 1)); continue; }

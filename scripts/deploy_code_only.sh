@@ -55,7 +55,10 @@ fi
 # checkout this script lives in, which is the only production form.
 GENESIS_ROOT="${GENESIS_DEPLOY_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 VENV_DIR="$GENESIS_ROOT/.venv"
-STATE_FILE="$HOME/.genesis/update_state.json"
+# Honor GENESIS_HOME: env.update_in_progress() reads the state file from
+# genesis_home(), so a relocated runtime would write this marker where the
+# watchdog never looks and restart the server mid-deploy.
+STATE_FILE="${GENESIS_HOME:-$HOME/.genesis}/update_state.json"
 # NOTE: an earlier revision also wrote ~/.genesis/deploy_window.json. It was
 # removed rather than wired: nothing anywhere read it, and every field it carried
 # (active/started_at/pid) is already in STATE_FILE — which additionally carries
@@ -125,7 +128,7 @@ _write_state() {
     # Minimal update_state.json in the shape env.update_in_progress() reads:
     # counts while phase != "done", started_at recent, and $$ alive — so a
     # crashed wrapper self-heals with no TTL bookkeeping of ours.
-    mkdir -p "$HOME/.genesis"
+    mkdir -p "$(dirname "$STATE_FILE")"
     cat > "$STATE_FILE" << SEOF
 {
     "phase": "$1",

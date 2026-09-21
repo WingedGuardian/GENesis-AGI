@@ -521,16 +521,67 @@ class TestCodeOnlyWrapper:
 
 
 class TestRunUnderDeployLock:
+    @staticmethod
+    def _seed_deploy_row(env, sha: str, status: str) -> None:
+        p = Path(env["GENESIS_DEPLOY_RECEIPTS"])
+        p.write_text(
+            json.dumps(
+                {
+                    "ts": "2026-01-01T00:00:00+00:00",
+                    "status": status,
+                    "sha": sha,
+                    "path": "code-only",
+                    "by": "test",
+                }
+            )
+            + "\n"
+        )
+
     def test_shared_hold_records_validated_sha_on_success(self, station):
+        """A validated receipt requires the ledger's latest deploy outcome for
+        the SHA to be `deployed` — tree identity alone does not prove the
+        serving process loaded it (Devin #1804)."""
         env, sha = station["env"], station["sha"]
+        self._seed_deploy_row(env, sha, "deployed")
         r = subprocess.run(
             ["bash", str(_RUN_UNDER), "--receipt", "--wait", "5", "--", "true"],
             env=env,
         )
         assert r.returncode == 0
         rows = _receipts(env)
-        assert [row["status"] for row in rows] == ["validated"]
-        assert rows[0]["sha"] == sha
+        assert [row["status"] for row in rows] == ["deployed", "validated"]
+        assert rows[1]["sha"] == sha
+
+    @pytest.mark.parametrize("outcome", ["deploy_failed", "health_failed", "deployed_not_started"])
+    def test_no_validated_receipt_after_a_failed_deploy_outcome(self, station, outcome):
+        """Devin #1804: a pull that advanced HEAD then failed leaves the OLD
+        process serving — a `validated` row for that SHA is a false claim and
+        must be withheld (the wrapped command still exits 0)."""
+        env, sha = station["env"], station["sha"]
+        self._seed_deploy_row(env, sha, outcome)
+        r = subprocess.run(
+            ["bash", str(_RUN_UNDER), "--receipt", "--wait", "5", "--", "true"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 0, "the command ran fine — only the receipt claim is withheld"
+        assert "no validated receipt" in r.stderr
+        assert [row["status"] for row in _receipts(env)] == [outcome]
+
+    def test_no_validated_receipt_without_a_deploy_row(self, station):
+        """No deploy receipt for the SHA at all → the serving process is
+        unproven; the validated row is withheld, fail-closed."""
+        env = station["env"]
+        r = subprocess.run(
+            ["bash", str(_RUN_UNDER), "--receipt", "--wait", "5", "--", "true"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 0
+        assert "no validated receipt" in r.stderr
+        assert _receipts(env) == []
 
     def test_failure_propagates_and_writes_no_receipt(self, station):
         env = station["env"]
@@ -677,19 +728,26 @@ class TestRunUnderReceiptScope:
     def test_receipts_write_into_a_directory_that_does_not_exist_yet(self, station, tmp_path):
         """Append mode raises when the parent is missing and the appender only WARNS,
         so the row would vanish with a stderr line nobody reads — in the ledger that
-        is the whole point of the feature. A validation hold writes no state file, so
-        nothing else creates the directory for it."""
+        is the whole point of the feature. Exercised at the appender: a validation
+        hold can no longer reach it (its `validated` write is gated on a `deployed`
+        row, which presupposes the ledger already exists — Devin #1804)."""
         env = dict(station["env"])
         env["GENESIS_DEPLOY_RECEIPTS"] = str(tmp_path / "fresh" / "nested" / "receipts.jsonl")
         r = subprocess.run(
-            ["bash", str(_RUN_UNDER), "--receipt", "--wait", "5", "--", "true"],
+            [
+                "bash",
+                "-c",
+                f'source "{_LIB}"; append_deploy_receipt "deployed" "$1" "code-only"',
+                "-",
+                station["sha"],
+            ],
             env=env,
             capture_output=True,
             text=True,
         )
         assert r.returncode == 0, r.stderr
         rows = _receipts(env)
-        assert [row["status"] for row in rows] == ["validated"]
+        assert [row["status"] for row in rows] == ["deployed"]
 
     def test_receipt_refused_from_a_worktree_copy(self, station, tmp_path):
         """--receipt's SHA claim is about the SERVING tree (architect SF4): a
@@ -826,7 +884,7 @@ class TestGuardianComposition:
         )
         assert r.returncode == 1
         log = sshlog.read_text()
-        assert "pause 300" in log, "the wrapper's short TTL must reach the gateway"
+        assert "pause-if-absent 300" in log, "the wrapper's short TTL must reach the gateway"
         assert "pause 1800" not in log, "the lib default must not win over the override"
         assert "resume" in log.splitlines()[-1], (
             "resume must fire on the alert-and-hold exit (cleanup composition)"
