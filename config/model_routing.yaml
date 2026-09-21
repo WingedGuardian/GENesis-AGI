@@ -169,10 +169,13 @@ providers:
   # circuit breakers was a redundant footgun; consolidated to groq-free.
   gemini-free:
     type: google
-    # GA stable (was gemini-3-flash-preview; gemini-3.5-flash is Google's own
-    # recommended replacement for that preview — escape preview deprecation churn).
-    model: gemini-3.5-flash
-    profile: gemini-3.5-flash
+    # GA stable (was gemini-3-flash-preview; 3.5-flash replaced that preview to
+    # escape preview deprecation churn, and 3.8-flash is the current GA).
+    # Bumped 3.5 -> 3.8 on 2026-09-21: a live generateContent call returned 200
+    # on this install's key. That proves the model is CALLABLE here; it does not
+    # by itself prove free-tier eligibility, so re-check if quota behaviour changes.
+    model: gemini-3.8-flash
+    profile: gemini-3.8-flash
     free: true
     rpm_limit: 15
     # NO rpd_limit yet, deliberately: live 429s show "limit: 20" and Genesis
@@ -180,11 +183,26 @@ providers:
     # proven. A wrong shipped daily cap would deselect the provider on every
     # install. Measure (count successes per UTC day vs 20) before setting.
     open_duration_s: 120
-    # gemini-3.5-flash reasons by default (~70-90 thinking tokens even on trivial
+    # This family reasons by default (~70-90 thinking tokens even on trivial
     # prompts → empty content at tight max_tokens + free-tier TPM bloat). This is
     # the fast-flash lane (fact extraction, tagging, surplus brainstorm), so
     # suppress thinking. reasoning_effort=disable → Gemini thinkingBudget=0
-    # (verified live 2026-06-23: content correct, 0 reasoning tokens at mt=20).
+    # (verified live 2026-06-23 on 3.5-flash: content correct, 0 reasoning
+    # tokens at mt=20).
+    #
+    # RE-VERIFIED 2026-09-21 on 3.8-flash, because the suppression is a
+    # per-version behaviour and the bump would otherwise have carried the old
+    # model's verification forward unexamined. At maxOutputTokens=256 with
+    # thinkingBudget=0: content='ok', finishReason=STOP, thoughtsTokenCount
+    # absent — the suppression still holds.
+    # KNOWN FLOOR, measured in the same session: at maxOutputTokens=16 the same
+    # setting produced EMPTY content (finishReason=MAX_TOKENS, 12 thought
+    # tokens), where 3.5-flash had answered. 3.8-flash therefore needs more
+    # headroom than its predecessor before it will emit anything. No caller in
+    # this repo is near that edge — the routed callers use 150-2000, the one
+    # max_tokens=10 site is `eval/longmemeval/judge.py`, which its own docstring
+    # documents as deliberately independent of this routing table — but a new
+    # caller asking for a double-digit budget should know the floor is there.
     params:
       reasoning_effort: disable
   openrouter-free:
@@ -219,15 +237,15 @@ providers:
     open_duration_s: 120
   openrouter-sonnet:
     type: openrouter
-    model: anthropic/claude-sonnet-4.6
-    profile: claude-sonnet-4.6
+    model: anthropic/claude-sonnet-5
+    profile: claude-sonnet-5
     free: false
     rpm_limit: 20
     open_duration_s: 120
   openrouter-opus:
     type: openrouter
-    model: anthropic/claude-opus-4.6
-    profile: claude-opus-4.6
+    model: anthropic/claude-opus-5
+    profile: claude-opus-5
     free: false
     rpm_limit: 20
     open_duration_s: 120
@@ -277,17 +295,19 @@ providers:
     free: false
     rpm_limit: 20
     open_duration_s: 120
-  openrouter-deepseek-v4-flash:
+  openrouter-deepseek-flash:
     type: openrouter
-    model: deepseek/deepseek-v4-flash
-    profile: deepseek-v4-flash
+    model: deepseek/deepseek-v4.1-flash
+    profile: deepseek-v4.1-flash
     free: false
     rpm_limit: 20
     open_duration_s: 120
-  openrouter-gpt55:
+  # The frontier GPT lane: hard reasoning where correctness outweighs cost.
+  # Renamed from `openrouter-gpt55` (version-neutral) on 2026-09-21.
+  openrouter-gpt-max:
     type: openrouter
-    model: openai/gpt-5.5
-    profile: gpt-5.5
+    model: openai/gpt-6-astra
+    profile: gpt-6-astra
     free: false
     rpm_limit: 20
     open_duration_s: 120
@@ -309,35 +329,35 @@ providers:
     # Deprecated: use openrouter-deepseek-v4 or v4-flash instead
     enabled: false
     open_duration_s: 120
-  openai-gpt5:
+  openai-gpt:
     type: openai
-    model: gpt-5.4
-    profile: gpt-5.4
+    model: gpt-5.6-sol
+    profile: gpt-5.6-sol
     free: false
     open_duration_s: 120
   xai-grok:
     type: xai
-    model: grok-3-mini
-    profile: grok-3-mini
+    model: grok-4.6
+    profile: grok-4.6
     free: false
     open_duration_s: 120
   qwen-plus:
     type: qwen
-    model: qwen3.5-plus
-    profile: qwen-3.5-plus
+    model: qwen3.6-plus
+    profile: qwen-3.6-plus
     free: false
     open_duration_s: 120
-  glm51:
+  glm:
     type: zenmux
-    model: z-ai/glm-5.1
-    profile: glm-5.1
+    model: z-ai/glm-5.3
+    profile: glm-5.3
     base_url: https://zenmux.ai/api/v1
     free: false
     open_duration_s: 120
-  minimax-m25:
+  minimax:
     type: minimax
-    model: MiniMax-M2.7
-    profile: minimax-m2.7
+    model: MiniMax-M3
+    profile: minimax-m3
     base_url: https://api.minimaxi.com/v1
     free: false
     open_duration_s: 120
@@ -348,16 +368,19 @@ providers:
     free: false
     rpm_limit: 20
     open_duration_s: 120
-  gpt-5.4:
+  # The general GPT lane: most work, cost-held. Renamed from `gpt-5.4`
+  # (version-neutral) on 2026-09-21; it was also the only provider whose name
+  # carried no route prefix, so it read like a sibling of `openai-gpt*`.
+  openrouter-gpt:
     type: openrouter
-    model: openai/gpt-5.4
-    profile: gpt-5.4
+    model: openai/gpt-5.6-sol
+    profile: gpt-5.6-sol
     free: false
     open_duration_s: 120
-  kimi-k2.5:
+  kimi:
     type: openrouter
-    model: moonshotai/kimi-k2.6
-    profile: kimi-k2.6
+    model: moonshotai/kimi-k3
+    profile: kimi-k3
     free: false
     rpm_limit: 20
     open_duration_s: 120
@@ -426,13 +449,13 @@ call_sites:
     - nvidia-nim-deepseek
     - mistral-large-free
     - mistral-medium-free
-    - openrouter-deepseek-v4-flash
+    - openrouter-deepseek-flash
   # V4 placeholder: cognitive state IS actively maintained today, but via direct
   # DB writes (awareness/loop.py, cc/reflection_bridge*.py), NOT this call site.
   # This entry reserves a routing chain for the future LLM-summary regeneration feature.
   10_cognitive_state:
     chain:
-    - glm51
+    - glm
     - openrouter-sonnet
     default_paid: true
   11_user_model_synthesis:
@@ -478,7 +501,7 @@ call_sites:
     chain:
     - openrouter-deepseek-v4
     - nvidia-nim-deepseek
-    - openrouter-deepseek-v4-flash
+    - openrouter-deepseek-flash
     - openrouter-qwen36plus
     default_paid: true
     description: "Task executor Gate 2 — cross-vendor quality review of deliverables. Renamed from 17_fresh_eyes_review 2026-05-10 (disambiguates from outreach pre-send check at 23_outreach_review)."
@@ -490,7 +513,7 @@ call_sites:
     default_paid: true
   20_adversarial_counterargument:
     chain:
-    - openrouter-gpt55
+    - openrouter-gpt-max
     - nvidia-nim-deepseek
     - openrouter-deepseek-v4
     - openrouter-qwen36plus
@@ -516,7 +539,7 @@ call_sites:
   dream_cycle_synthesis:
     chain:
     - nvidia-nim-deepseek
-    - openrouter-deepseek-v4-flash
+    - openrouter-deepseek-flash
     - groq-free
     retry_profile: background
   # Adversarial challenge of synthesis output. Must stay model-independent from
@@ -553,7 +576,7 @@ call_sites:
     # Paid Kimi via OpenRouter as last-resort fallback — a non-DeepSeek, non-groq
     # family, so the challenge stays model-independent from synthesis across the
     # whole chain even when the free tier is down. Only billed during an outage.
-    - kimi-k2.5
+    - kimi
     retry_profile: background
   dream_cycle_entity_check:
     chain:
@@ -587,7 +610,7 @@ call_sites:
   dream_cycle_entity_challenge:
     chain:
     - nvidia-nim-deepseek
-    - openrouter-deepseek-v4-flash
+    - openrouter-deepseek-flash
     retry_profile: background
   # Entity-NODE merge-vs-distinct adjudication (entity_adjudication drainer).
   # Same free-SLM shape as dream_cycle_entity_check; hourly, small backlog.
@@ -607,7 +630,7 @@ call_sites:
   entity_adjudication_challenge:
     chain:
     - nvidia-nim-deepseek
-    - openrouter-deepseek-v4-flash
+    - openrouter-deepseek-flash
     retry_profile: background
   # One-shot supervised wing backfill (scripts/wing_backfill.py) — batch
   # classification of legacy general/uncategorized memories into wings.
@@ -616,12 +639,12 @@ call_sites:
     chain:
     - nvidia-nim-deepseek
     - groq-free
-    - openrouter-deepseek-v4-flash
+    - openrouter-deepseek-flash
     retry_profile: background
   27_pre_execution_assessment:
     chain:
-    - glm51
-    - openrouter-deepseek-v4-flash
+    - glm
+    - openrouter-deepseek-flash
     default_paid: true
     retry_profile: user_facing
     description: "Task executor — sanity-check proposed execution plans before committing resources"
@@ -629,8 +652,8 @@ call_sites:
   # (awareness/loop.py:perform_tick). Kept as historical; no live consumers.
   28_observation_sweep:
     chain:
-    - openrouter-deepseek-v4-flash
-    - glm51
+    - openrouter-deepseek-flash
+    - glm
     - groq-free
     - gemini-free
     default_paid: true
@@ -650,14 +673,14 @@ call_sites:
     retry_profile: background
   31_outcome_classification:
     chain:
-    - glm51
+    - glm
     - mistral-large-free
     - mistral-medium-free
     default_paid: true
     never_pays: false
   32_delta_assessment:
     chain:
-    - glm51
+    - glm
     - mistral-large-free
     - mistral-medium-free
     default_paid: true
@@ -681,7 +704,7 @@ call_sites:
   38_procedure_extraction:
     chain:
     - nvidia-nim-deepseek
-    - openrouter-deepseek-v4-flash
+    - openrouter-deepseek-flash
     - openrouter-deepseek-v4
     - groq-free
     - mistral-large-free
@@ -726,7 +749,7 @@ call_sites:
   43_task_retrospective:
     chain:
     - nvidia-nim-deepseek
-    - openrouter-deepseek-v4-flash
+    - openrouter-deepseek-flash
     - openrouter-deepseek-v4
     - mistral-large-free
     - mistral-medium-free
@@ -736,7 +759,7 @@ call_sites:
   44_task_premortem:
     chain:
     - nvidia-nim-deepseek
-    - openrouter-deepseek-v4-flash
+    - openrouter-deepseek-flash
     - openrouter-deepseek-v4
     - mistral-large-free
     - mistral-medium-free
@@ -787,7 +810,7 @@ call_sites:
     description: "Outreach pre-send cross-vendor review (free chain). Renamed from 23_fresh_eyes_review 2026-05-10 (disambiguates from executor Gate 2 at 17_executor_review)."
   36_code_auditor:
     chain:
-    - kimi-k2.5
+    - kimi
     - gemini-free
     - openrouter-mimo
     description: "Surplus code review \u2014 evaluate codebase for bugs and quality\
@@ -813,7 +836,7 @@ call_sites:
     - mistral-large-free
     - mistral-medium-free
     - openrouter-free
-    - openrouter-deepseek-v4-flash
+    - openrouter-deepseek-flash
     default_paid: true
     retry_profile: background
     description: "Knowledge pipeline — distill raw content into structured knowledge units"
@@ -837,9 +860,9 @@ call_sites:
     description: "Resume review Pass 2 — knowledge-augmented critique"
   contingency_foreground:
     chain:
-    - kimi-k2.5
+    - kimi
     - openrouter-qwen36plus
-    - gpt-5.4
+    - openrouter-gpt
     default_paid: true
     retry_profile: user_facing
     description: "CC contingency \u2014 foreground conversation via API when CC unavailable"
@@ -857,7 +880,7 @@ call_sites:
     chain:
     - openrouter-sonnet
     - openrouter-qwen36plus
-    - gpt-5.4
+    - openrouter-gpt
     default_paid: true
     retry_profile: background
     description: Autonomous executor non-tooling reasoning via API
@@ -913,7 +936,7 @@ call_sites:
     chain:
     - openrouter-deepseek-v4
     - nvidia-nim-deepseek
-    - openrouter-deepseek-v4-flash
+    - openrouter-deepseek-flash
     default_paid: true
     retry_profile: background
     dispatch: api
@@ -937,7 +960,7 @@ call_sites:
   desk_primary:
     chain:
     - openrouter-deepseek-v4
-    - glm51
+    - glm
     - openrouter-sonnet
     default_paid: true
     retry_profile: desk_interactive
@@ -952,7 +975,7 @@ call_sites:
   desk_fast:
     chain:
     - groq-free
-    - openrouter-deepseek-v4-flash
+    - openrouter-deepseek-flash
     - gemini-free
     default_paid: true
     retry_profile: desk_interactive
