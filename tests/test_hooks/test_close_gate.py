@@ -302,6 +302,46 @@ def test_below_terminal_close_asks_without_needing_a_commitment(repo, tmp_path):
     assert _verdict(r) == "ask", f"{_verdict(r)}: {r.stdout}{r.stderr}"
 
 
+def test_commitment_for_a_suffix_numbered_pr_does_not_count(repo, tmp_path):
+    """A commitment naming #915 must not satisfy a terminal close of #15 — the
+    digits appear as a SUFFIX, and only `\b` bounded the right side."""
+    d = tmp_path / "commitments"
+    d.mkdir()
+    (d / "15.txt").write_text(
+        "Rebuild commitment for PR #915: an earlier terminal close failed its "
+        "seven review rounds and is being rebuilt from the recorded failure "
+        "classes rather than re-patched on the same branch. "
+        "Follow-up: f1f2546dadb34e1ca62ab6395368fba7\n"
+    )
+    r = _run(
+        "gh pr close 15",
+        repo,
+        dispatched=None,
+        extra_env={
+            "_TEST_GH_CODEX_REVIEWS": _SEVEN_ROUNDS,
+            "_TEST_CLOSE_COMMITMENT_DIR": str(d),
+        },
+    )
+    assert _verdict(r) == "block", f"{_verdict(r)}: {r.stdout}{r.stderr}"
+
+
+def test_gh_api_placeholder_repo_still_runs_the_terminal_check(repo, tmp_path):
+    """`repos/{owner}/{repo}/pulls/N` resolves through gh's cwd repo — the literal
+    placeholders are not a repository, so the close must derive the real one
+    (like a bare close) rather than skip the commitment requirement."""
+    r = _run(
+        "gh api repos/{owner}/{repo}/pulls/1579 -X PATCH -f state=closed",
+        repo,
+        dispatched=None,
+        extra_env={
+            "_TEST_GH_CODEX_REVIEWS": _SEVEN_ROUNDS,
+            "_TEST_CLOSE_COMMITMENT_DIR": str(tmp_path / "commitments"),
+        },
+    )
+    assert _verdict(r) == "block", f"{_verdict(r)}: {r.stdout}{r.stderr}"
+    assert "rebuild" in (r.stderr or "").lower(), r.stderr
+
+
 # ── compound-collapse must include close ──────────────────────────────────
 
 

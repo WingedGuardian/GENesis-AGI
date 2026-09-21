@@ -4259,7 +4259,14 @@ def _gh_api_close_target(argv: list[str]) -> tuple[str | None, str | None]:
     for tok in argv:
         m = re.search(r"(?:^|/)repos/([^/\s]+/[^/\s]+)/(?:pulls|issues)/(\d+)(?:/|\b)", tok)
         if m:
-            return m.group(2), m.group(1)
+            _captured = m.group(1)
+            if "{" in _captured or "}" in _captured:
+                # gh resolves {owner}/{repo} placeholders from the cwd repo, so
+                # the literal capture is not a real target — hand back no repo
+                # and let the caller derive it from the close segment's cwd
+                # (failing closed when it cannot).
+                return m.group(2), None
+            return m.group(2), _captured
     # An explicit --repo/-R that cannot normalize to OWNER/REPO (a shell
     # variable like `--repo "$R"`) must not read as "no repo given": the
     # caller would then query the cwd repo's review history while gh closes
@@ -4321,7 +4328,7 @@ def _read_close_commitment(repo: str | None, pr: str) -> str | None:
         return None
     # Word-BOUNDED, not substring: a commitment naming #1579 must not satisfy a
     # close of #15 (the digits appear inside the longer number).
-    if not re.search(rf"#?{re.escape(pr)}\b", text):
+    if not re.search(rf"(?<!\d)#?{re.escape(pr)}\b", text):
         return None
     # ``Follow-up:`` must name an actual follow-up id, not just the word —
     # ``follow_up`` as bare prose satisfies nothing the gate can point at.

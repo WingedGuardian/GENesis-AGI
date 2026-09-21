@@ -231,12 +231,23 @@ def test_force_push_mirror_blocked_even_dispatched():
 
 
 def test_push_and_pr_create_compound_asks_once():
-    """push && gh pr create is ONE prompt — for the push. gh pr create is not a
-    code-publish (it opens a review request on already-pushed code), so it rides
-    on the push's approval instead of demanding its own (user direction)."""
-    res = _run("git push origin feat && gh pr create --title x --body y")
+    """push && gh pr create --head … is ONE prompt — for the push. An explicit
+    --head create cannot publish (it never pushes or forks), so it rides on
+    the push's approval instead of demanding its own."""
+    res = _run(f"git push origin feat && gh pr create --head {_HEAD} --title x --body y")
     assert res.returncode == 0, res.stderr
     assert _decision(res) == "ask"
+
+
+def test_push_and_publishing_pr_create_compound_blocked():
+    """push && gh pr create (no --head) cannot share the push's prompt unless
+    the push provably publishes the create's own branch — an implicit create
+    MAY push a branch the approval never covered, so the compound is refused
+    and each op must run as its own gated command."""
+    res = _run("git push origin feat && gh pr create --title x --body y")
+    assert res.returncode == 2
+    assert _decision(res) is None
+    assert "separate" in res.stderr
 
 
 def test_two_pushes_compound_blocked():
