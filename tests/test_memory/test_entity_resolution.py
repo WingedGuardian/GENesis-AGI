@@ -96,6 +96,32 @@ def test_surface_variants_follows_alias_chains_to_fixpoint():
     assert "bar item" in variants
 
 
+def test_surface_variants_respects_mapping_order_on_chains():
+    """Only spellings that forward-normalize to the input are variants.
+
+    With ``{"bar": "baz", "foo": "bar"}`` (baz-rule first), ``normalize("foo")
+    == "bar"`` — the foo spelling must NOT be offered for "baz item", or a
+    stored "foo item" row (which persists as "bar item") would suppress a
+    different write. For "bar item" it must be offered.
+    """
+    aliases = {"bar": "baz", "foo": "bar"}
+    assert "foo item" not in surface_variants("baz item", aliases)
+    assert "foo item" in surface_variants("bar item", aliases)
+
+
+def test_surface_variants_repeated_canonicals_keep_homogeneous_forms():
+    """Three occurrences x two aliases exceeds a naive budget; the all-alias
+    forms are emitted before mixed enumeration so they are never priced out.
+    """
+    aliases = {"CC": "Claude Code", "claude-code": "Claude Code"}
+    variants = surface_variants(
+        "Claude Code / Claude Code / Claude Code", aliases
+    )
+    assert "CC / CC / CC" in variants
+    assert "claude-code / claude-code / claude-code" in variants
+    assert "CC / Claude Code / claude-code" in variants
+
+
 def test_surface_variants_no_match_returns_empty():
     assert surface_variants("nothing aliased here", {"CC": "Claude Code"}) == []
 

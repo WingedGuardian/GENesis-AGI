@@ -152,21 +152,21 @@ def surface_variants(
     ``"claude-code"`` to ``"Claude Code"``, so the current write's own raw
     spelling is not the only one a legacy row can carry.
 
-    Traversal is a bounded breadth-first fixed point over SINGLE-occurrence
-    rewrites — three cases demand all three properties:
+    Each canonical occurrence is a SLOT, enumerated independently — a legacy
+    row can mix spellings (``"CC reviews claude-code"``). A slot's candidate
+    spellings are the aliases that forward-normalize to that canonical, which
+    is what makes chained mappings (``foo -> bar``, ``bar -> baz``) and
+    dictionary-order sensitivity come out right: ``normalize_content``
+    decides, so no spelling is offered that the write path could not itself
+    produce. Boundaries are ``(?<!\w)``/``(?!\w)`` lookarounds, not ``\b``, so
+    a canonical starting or ending with punctuation (``"C++"``) still matches.
 
-    * one occurrence at a time, because a legacy row can mix spellings
-      (``"CC reviews claude-code"`` is only reachable by rewriting the two
-      ``"Claude Code"`` occurrences independently);
-    * a fixed point over the whole mapping set, because an alias can chain
-      (``foo -> bar``, ``bar -> baz``): a rewrite can introduce a canonical
-      an already-visited mapping would rewrite;
-    * ``(?<!\w)``/``(?!\w)`` lookarounds instead of ``\b``, because a
-      canonical ending or starting with punctuation (``"C++"``) has no word
-      boundary on that side and would never match.
-
-    The result is capped at *limit* (and never includes *content* itself).
-    Best-effort like ``normalize_content``: returns ``[]`` on any failure.
+    Homogeneous forms (every slot carrying the same alias) are emitted FIRST,
+    before the mixed enumeration, so the common legacy shape cannot be priced
+    out of *limit* by intermediate combinations. Every candidate is verified
+    by re-running ``normalize_content`` on it — the enumeration is only ever
+    as precise as the inverse, and the check keeps it honest. Capped at
+    *limit*; best-effort like ``normalize_content`` — ``[]`` on any failure.
     """
     if aliases is None:
         aliases = load_aliases()
@@ -174,27 +174,73 @@ def surface_variants(
         return []
 
     import re
+    from itertools import islice, product
 
-    variants: set[str] = {content}
-    queue = [content]
-    while queue and len(variants) - 1 < limit:
-        text = queue.pop(0)
-        for alias, canonical in aliases.items():
-            if alias == canonical:
-                continue
-            pattern = re.compile(
-                r"(?<!\w)" + re.escape(canonical) + r"(?!\w)", re.IGNORECASE
-            )
-            for match in pattern.finditer(text):
-                replaced = text[: match.start()] + alias + text[match.end():]
-                if replaced in variants:
-                    continue
-                variants.add(replaced)
-                queue.append(replaced)
-                if len(variants) - 1 >= limit:
-                    break
-    variants.discard(content)
-    return sorted(variants)[:limit]
+    def _bounded(term: str) -> re.Pattern:
+        return re.compile(
+            r"(?<!\w)" + re.escape(term) + r"(?!\w)", re.IGNORECASE
+        )
+
+    # Positions and per-slot spellings for each canonical present in content.
+    spellings: dict[str, list[str]] = {}
+    positions: list[tuple[int, int, str]] = []
+    for canonical in dict.fromkeys(aliases.values()):
+        matches = list(_bounded(canonical).finditer(content))
+        if not matches:
+            continue
+        spellings[canonical] = [
+            alias
+            for alias in dict.fromkeys(aliases)
+            if alias != canonical
+            and normalize_content(alias, aliases) == canonical
+        ]
+        positions.extend((m.start(), m.end(), canonical) for m in matches)
+    positions.sort()
+    # Pathological overlapping canonicals (one nested in another): keep the
+    # first, non-overlapping set.
+    slots_all: list[tuple[int, int, str]] = []
+    last_end = -1
+    for start, end, canonical in positions:
+        if start >= last_end:
+            slots_all.append((start, end, canonical))
+            last_end = end
+
+    results: list[str] = []
+    seen = {content}
+
+    def _emit(text: str) -> None:
+        if len(results) >= limit or text in seen:
+            return
+        if normalize_content(text, aliases) != content:
+            return  # not a spelling this normalization could have produced
+        seen.add(text)
+        results.append(text)
+
+    for canonical, names in spellings.items():
+        if not names:
+            continue
+        pattern = _bounded(canonical)
+        for alias in names:
+            _emit(pattern.sub(alias, content))
+
+    slots = [(s, e, c) for (s, e, c) in slots_all if spellings[c]]
+    choice_lists = [[None, *spellings[c]] for (_, _, c) in slots]
+    _CANDIDATE_BUDGET = 512
+    for picks in islice(product(*choice_lists), _CANDIDATE_BUDGET):
+        if all(p is None for p in picks):
+            continue
+        out: list[str] = []
+        cursor = 0
+        for (start, end, _c), pick in zip(slots, picks, strict=True):
+            out.append(content[cursor:start])
+            out.append(pick if pick is not None else content[start:end])
+            cursor = end
+        out.append(content[cursor:])
+        _emit("".join(out))
+        if len(results) >= limit:
+            break
+
+    return results
 
 
 # ── Dedup Candidate Discovery ────────────────────────────────────────────
