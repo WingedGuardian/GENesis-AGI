@@ -246,6 +246,37 @@ For plans, fixes, architecture decisions, or any non-trivial change:
 
 Applies to both CC sessions and Genesis autonomy decisions.
 
+## Instrument For The Answer, Not The Alarm
+
+*Trigger, mechanical:* you are about to build or deploy something whose job is
+to OBSERVE an event you cannot cheaply re-trigger — an intermittent failure, a
+race, a corruption, a scheduled job — **and whose next occurrence costs the
+USER an outage, a recovery, or lost data.** Routine reversible work, and
+anything you can redo yourself, is out of scope.
+
+The test is not "will this detect it?" It is: **"when this fires exactly once,
+will I have the answer — or only the news?"** If the honest answer is "I'll
+know it happened, then I'll investigate", it is not built yet.
+
+- **Capture IDENTITY at the moment, not just occurrence** — which pid, caller,
+  command, resolved AT the event; the actor may be gone a millisecond later. A
+  log that proves *when* and not *who* buys another occurrence.
+- **Deploy every independent layer you can afford** — independent meaning
+  *different failure modes*. The narrow exception to "no speculative changes":
+  you are buying observation, not committing a fix.
+- **"Not installed" and "permission denied" are starting points, not
+  verdicts** — ask whether a different uid, host, or namespace grants it,
+  *within authority you already hold*. Reaching for privilege or a host you
+  were not given is a question for the user, never a way around the limit.
+
+**The sentence to catch yourself in:** *"if this doesn't tell us, we'll add
+more next time"* — said out loud, the cost lands on the next failure, which
+someone else absorbs. Instance: an instrument for a recurring data-corruption
+investigation proved *when* each occurrence happened and never *what* caused
+it; two rounds were spent re-watching the same failure, each costing a
+recovery. Enumeration and control arms are not restated here —
+`genesis-development`, high-stakes-verification §9 and §10 own them.
+
 ## Memory System — Layer Model
 
 **Two memory systems:** a **fact, decision, or plan** to store for later →
