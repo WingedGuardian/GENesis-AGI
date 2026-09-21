@@ -302,22 +302,240 @@ def test_the_group_word_reads_the_option_table_not_the_dashes(argv, group):
     assert _module()._gh_group(argv) == group
 
 
+def _fires(command: str) -> bool:
+    """Does the detector report a close for this single command?
+
+    Unit-level via `_module()`, the pattern this file already uses for
+    predicates whose behavioural signature through the CLI would be identical
+    across the cases being distinguished. Single commands only -- the compound
+    handling has its own cases in the smoke matrix.
+    """
+    import shlex
+
+    return _module()._closes_a_pr(shlex.split(command)) is not None
+
+
 @pytest.mark.parametrize(
-    ("token", "is_field"),
+    ("command", "fires"),
     [
-        ("state=closed", True),
-        ("-fstate=closed", True),
-        ("--field=state=closed", True),
-        ("mystate=closed", False),
-        ("repos/o/r/pulls/5?state=closed", False),  # a GET filter reads, not closes
-        ("title=fix: state=closed parsing", False),
+        # The forms the field may legitimately take. These pin the SAME
+        # property the deleted `_is_state_closed_field` unit test pinned --
+        # that only a real `state` field counts -- but through the detector
+        # rather than through a helper, so the assertion survives the next
+        # change of implementation rather than naming one.
+        pytest.param(
+            "gh api repos/o/r/pulls/5 -X PATCH " + _F + " state=closed",
+            True,
+            id="separated-field",
+        ),
+        pytest.param(
+            "gh api repos/o/r/pulls/5 -X PATCH " + _F + "state=closed",
+            True,
+            id="glued-short-field",
+        ),
+        pytest.param(
+            "gh api repos/o/r/pulls/5 -X PATCH --field=state=closed",
+            True,
+            id="attached-long-field",
+        ),
+        pytest.param(
+            "gh api repos/o/r/pulls/5 --method patch " + _F + " state=closed",
+            True,
+            id="method-name-is-case-insensitive",
+        ),
+        # A token that merely ENDS in the phrase is not the field. The old
+        # suffix test accepted any dashed token, so an output template read as
+        # a close while the request updated only a title.
+        pytest.param(
+            "gh api repos/o/r/pulls/5 -X PATCH " + _F + " title=x --template=state=closed",
+            False,
+            id="an-output-template-is-not-a-field",
+        ),
+        pytest.param(
+            "gh api repos/o/r/pulls/5 -X PATCH " + _F + " notstate=closed",
+            False,
+            id="a-field-whose-name-merely-ends-in-state",
+        ),
+        pytest.param(
+            "gh api repos/o/r/pulls/5 -X PATCH " + _F + " title='fix: state=closed parsing'",
+            False,
+            id="a-title-that-mentions-the-phrase",
+        ),
     ],
 )
-def test_the_state_field_is_judged_per_token(token, is_field):
-    """Joined-argv matching failed in BOTH directions here: `\b` missed the
-    glued flag, and widening it swallowed a PR title that mentions the phrase.
-    Only the token knows whether what precedes `state` is a flag or a word."""
-    assert _module()._is_state_closed_field(token) is is_field
+def test_only_a_real_state_field_counts(command, fires):
+    """Joined-argv matching failed in BOTH directions here: a word boundary
+    missed the glued flag, and widening it swallowed a PR title that mentions
+    the phrase. Only a parsed FIELD knows whether what precedes `state` is a
+    flag or a word, and only its KEY says whether the field is `state` at all.
+    """
+    assert _fires(command) is fires
+
+
+@pytest.mark.parametrize(
+    ("command", "fires"),
+    [
+        # MEASURED from `gh api --help` (gh 2.101.0): the method defaults to
+        # GET, and to POST as soon as any parameter is added -- never to
+        # PATCH. So an endpoint-plus-field command with no method states a
+        # request that closes nothing, and reading the verdict off the path
+        # and the field alone reported it as a close.
+        pytest.param(
+            "gh api repos/o/r/pulls/5 " + _F + " state=closed",
+            False,
+            id="no-method-is-a-POST-and-closes-nothing",
+        ),
+        pytest.param(
+            "gh api repos/o/r/pulls/5 -X GET " + _F + " state=closed",
+            False,
+            id="an-explicit-GET-reads",
+        ),
+        pytest.param(
+            "gh api repos/o/r/pulls/5 -X PATCH " + _F + " state=closed",
+            True,
+            id="an-explicit-PATCH-closes",
+        ),
+    ],
+)
+def test_the_request_method_decides_whether_anything_is_written(command, fires):
+    """A close is a WRITE, and gh will not make one unless it is asked to."""
+    assert _fires(command) is fires
+
+
+@pytest.mark.parametrize(
+    ("command", "fires"),
+    [
+        # `api` has to be the GROUP. Token membership also sees workflow
+        # names, alias bodies and ordinary operands.
+        pytest.param(
+            "gh workflow run api " + _F + " query='mutation { closePullRequest(x) }'",
+            False,
+            id="a-workflow-named-api",
+        ),
+        pytest.param(
+            "gh api graphql " + _F + " query='mutation { closePullRequest(x) }'",
+            True,
+            id="the-real-graphql-close",
+        ),
+        # The mutation must live in the `query` field. The joined-argv regex
+        # could begin inside one field's value and end inside another's, so a
+        # query that creates an issue, beside an unrelated field naming the
+        # mutation, reported a close.
+        pytest.param(
+            "gh api graphql "
+            + _F
+            + " query='mutation { createIssue(x) }' "
+            + _F
+            + " body=closePullRequest",
+            False,
+            id="the-mutation-name-in-a-neighbouring-field",
+        ),
+        pytest.param(
+            "gh api repos/o/r/issues/5/comments "
+            + _F
+            + " body='example: query=mutation { closePullRequest(x) }'",
+            False,
+            id="a-comment-quoting-a-sample-query",
+        ),
+        # An endpoint that appears only as field DATA is not the endpoint.
+        pytest.param(
+            "gh api graphql -X PATCH " + _F + " body=repos/o/r/pulls/5 " + _F + " state=closed",
+            False,
+            id="a-path-carried-as-prose",
+        ),
+    ],
+)
+def test_the_api_group_and_the_field_key_are_read_by_position(command, fires):
+    """Every one of these fired under joined-argv matching, and they are ONE
+    class: the detector was reading TEXT where it had STRUCTURE available."""
+    assert _fires(command) is fires
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param("gh pr close 1 --help", id="help-after-the-operand"),
+        pytest.param("gh pr close 1 -h", id="short-help"),
+        pytest.param(
+            "gh api repos/o/r/pulls/5 -X PATCH " + _F + " state=closed --help",
+            id="api-help",
+        ),
+    ],
+)
+def test_a_help_invocation_performs_nothing(command):
+    """MEASURED: `gh api repos/octocat/hello-world --help` prints help and
+    issues no request even with the endpoint already given, so a terminal help
+    flag means there is nothing to note. An advisory that fires on `--help` is
+    teaching its reader to ignore it."""
+    assert _fires(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(
+            "gh pr close 1 --comment '--help'",
+            id="a-closing-comment-whose-text-is-a-help-flag",
+        ),
+        pytest.param(
+            "gh api repos/o/r/pulls/5 -X PATCH " + _F + " state=closed " + _F + " body='--help'",
+            id="a-field-value-that-is-a-help-flag",
+        ),
+    ],
+)
+def test_help_INSIDE_a_value_does_not_silence_a_real_close(command):
+    """The guard-the-guard for the test above, and it caught a real defect in
+    the first version of that fix.
+
+    A bare `"--help" in argv` scan reads a VALUE as a flag, so it would go
+    silent on a command that really closes -- turning a false-positive fix
+    into a false NEGATIVE, which is the worse direction. The `--comment` case
+    is the one that bit: `gh pr close -c/--comment` takes a value (MEASURED
+    from its own help) and the shared spec knows only `-R`, so that flag had
+    to be named for the skip to happen."""
+    assert _fires(command) is True
+
+
+def test_a_compound_close_reports_HOW_MANY_not_how_many_mechanisms():
+    """Deduplicating by mechanism erased repetition.
+
+    Two closes spelled the same way collapse to one reason, and a lead that
+    took its number from the reason LIST then described a compound retirement
+    of two PRs as though it touched one -- understating the blast radius in
+    exactly the situation the rule exists for. Occurrences and distinct
+    mechanisms are now counted separately.
+    """
+    note = _note(_run("gh pr close 1 && gh pr close 2"))
+    assert "closes 2 pull requests" in note, note
+
+
+def test_one_close_still_reads_as_one():
+    """The guard-the-guard for the count: a change that made every note plural
+    would satisfy the test above perfectly."""
+    note = _note(_run("gh pr close 1"))
+    assert "closes a pull request," in note, note
+
+
+def test_the_issues_endpoint_does_not_assert_a_pull_request():
+    """`/issues/N` addresses ordinary issues AND pull requests, and the command
+    text says nowhere which this number is.
+
+    The standing rule being surfaced is about PRs, so asserting one here would
+    be the advisory inventing the fact that makes it relevant. Detection is
+    kept -- closing a PR through the issues path is documented and real -- and
+    the WORDING is what carries the uncertainty.
+    """
+    note = _note(_run("gh api repos/o/r/issues/5 -X PATCH " + _F + " state=closed"))
+    assert note, "the issues path should still be detected"
+    assert "pull request or issue" in note, note
+
+
+def test_the_pulls_endpoint_is_still_unambiguous():
+    """The other direction: the hedge must not leak onto the path that IS
+    unambiguous, or every note starts hedging and the distinction is lost."""
+    note = _note(_run("gh api repos/o/r/pulls/5 -X PATCH " + _F + " state=closed"))
+    assert "pull request or issue" not in note, note
+    assert "closes a pull request," in note, note
 
 
 def test_the_hook_is_actually_wired():
