@@ -766,9 +766,29 @@ behind the writer, and 7 were a guard since removed.
   either way? Ask. Filing itself needs no per-instance approval: a bug you found while
   reviewing a PR, that does not block that PR, is the ordinary case — file it and keep
   the PR moving (discriminator + bounds: genesis-development, "Keep the PR the PR").
-  One limit stays absolute: a **security** defect — an unpatched bypass, a
-  credential exposure, anything exploitable — is NEVER filed publicly before it
-  is fixed, no matter who owns it. Everything else — who may file, the command,
+  One limit stays absolute, and it turns on **who gains**: a security defect —
+  one whose disclosure hands someone a capability they do not already have — is
+  NEVER filed publicly before it is fixed, no matter who owns it. Credential
+  exposure, an auth or privilege bypass, anything reachable by a party with LESS
+  access than it grants.
+  **A fail-open in a local development guard is USUALLY not that** — apply the
+  test, never the label, because the bare word "bypass" is what misroutes it.
+  Those hooks run only where an install wires them, and whoever can trigger one
+  already has commit access to that checkout. For a guard on the REVIEW chain
+  the worst case is typically an under-reviewed change reaching a PR that still
+  waits on maintainer approval — the state of any PR authored without them; a
+  guard protecting something else (local data, backups, repo routing) has its
+  own worst case — name it, never inherit this one. **The exception that the
+  test catches and the label does not:** a guard whose job is to stop a SECRET
+  or PRIVATE DATA reaching a public surface is security-class however local it
+  is — a branch on a public repo is public the moment it is pushed, merged or
+  not, and this repo's own leak incident was install IPs and personal emails,
+  not keys. So name the
+  adversary and what they gain before withholding; if the answer is "us, and
+  nothing we already lacked", file it. And verify the CHAIN rather than the
+  wording — a deny message naming "secrets" describes what the FLAG does to
+  git's hook chain, not which of this install's controls stand in that path.
+  Everything else — who may file, the command,
   labels, dispatched sessions, the time-gated case — is in
   `.claude/docs/mcp-tools-guide.md` ("Where Deferred Work Goes"). Read it before
   filing your first.
