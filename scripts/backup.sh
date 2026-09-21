@@ -835,6 +835,25 @@ if [ -d "$_OVERRIDE_STORE" ]; then
     log "Hook audit stores: $_AUDIT_COUNT file(s), $_AUDIT_DROPPED pruned from mirror"
 fi
 
+# --- 6e. Close-commitment store ---
+# The push guard's rebuild commitments: before a terminal-round PR close may
+# even be ASKED, the session must write a named commitment to rebuild from the
+# recorded failure classes, and the approval dialog quotes it back. Small,
+# self-contained text records — plain copy like the stores above; the backups
+# repo is private. Copy-only, not mirrored: the live store is never pruned (a
+# commitment is a standing obligation, not a flush), so nothing needs deleting
+# here either.
+_CLOSE_COMMIT_STORE="$HOME/.genesis/close_commitments"
+if [ -d "$_CLOSE_COMMIT_STORE" ]; then
+    log "Backing up close commitments..."
+    mkdir -p close_commitments
+    _CC_COUNT=0
+    while IFS= read -r -d '' _f; do
+        cp "$_f" close_commitments/ && _CC_COUNT=$(( _CC_COUNT + 1 ))
+    done < <(find "$_CLOSE_COMMIT_STORE" -maxdepth 1 -type f -name '*.txt' -print0)
+    log "Close commitments: $_CC_COUNT file(s)"
+fi
+
 # --- 7. Secrets (encrypted with GPG symmetric) ---
 log "Backing up secrets (encrypted)..."
 mkdir -p secrets

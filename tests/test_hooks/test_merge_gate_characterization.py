@@ -490,7 +490,7 @@ _CASES: list[tuple[str, object, int, str]] = [
             "gh pr merge 1 --repo owner/repo --admin && gh pr merge 2 --repo owner/repo --admin",
         ),
         2,
-        "multiple publish/merge operations",
+        "multiple publish/merge/close operations",
     ),
     # ── review-body findings block (F2 — the 2nd scanner; ordered AFTER binding,
     #    BEFORE the inline scan — a reorder the extraction could make undetected) ──

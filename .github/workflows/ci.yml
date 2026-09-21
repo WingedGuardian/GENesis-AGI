@@ -937,4 +937,10 @@ jobs:
         # was unwired and the fix for that added a 44th case. Re-counting last
         # caught it before the commit instead of in round 6. The habit is cheap;
         # the four prior instances each cost a review round.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23342
+        # 23342 -> 23345, the SIXTH move: the close-gate round added two
+        # regression cases (placeholder-repo target, suffix-numbered
+        # commitment) and split the compound push+create case into its
+        # ride-along and publishing forms — three new collections total.
+        # 23345 -> 23346, the SEVENTH move: the `api`-as-argument regression
+        # case for _gh_api_closes_pr.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23346
