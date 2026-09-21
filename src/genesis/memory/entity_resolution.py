@@ -165,8 +165,11 @@ def surface_variants(
     before the mixed enumeration, so the common legacy shape cannot be priced
     out of *limit* by intermediate combinations. Every candidate is verified
     by re-running ``normalize_content`` on it — the enumeration is only ever
-    as precise as the inverse, and the check keeps it honest. Capped at
-    *limit*; best-effort like ``normalize_content`` — ``[]`` on any failure.
+    as precise as the inverse, and the check keeps it honest. The check
+    compares casefolded, because normalization preserves the casing it found:
+    a lowercase canonical in *content* must still accept the alias spellings.
+    Capped at *limit*; best-effort like ``normalize_content`` — ``[]`` on any
+    failure.
     """
     if aliases is None:
         aliases = load_aliases()
@@ -195,9 +198,10 @@ def surface_variants(
             and normalize_content(alias, aliases) == canonical
         ]
         positions.extend((m.start(), m.end(), canonical) for m in matches)
-    positions.sort()
-    # Pathological overlapping canonicals (one nested in another): keep the
-    # first, non-overlapping set.
+    # Longest match wins at equal start positions: for nested canonicals
+    # ({"X": "Claude", "CC": "Claude Code"}) the "Claude" inside "Claude
+    # Code" must not swallow the longer slot.
+    positions.sort(key=lambda p: (p[0], -p[1]))
     slots_all: list[tuple[int, int, str]] = []
     last_end = -1
     for start, end, canonical in positions:
@@ -211,7 +215,7 @@ def surface_variants(
     def _emit(text: str) -> None:
         if len(results) >= limit or text in seen:
             return
-        if normalize_content(text, aliases) != content:
+        if normalize_content(text, aliases).casefold() != content.casefold():
             return  # not a spelling this normalization could have produced
         seen.add(text)
         results.append(text)
@@ -239,6 +243,16 @@ def surface_variants(
         _emit("".join(out))
         if len(results) >= limit:
             break
+
+    # Slots dropped to an overlap still get their single-substitution forms:
+    # "X Code" inside a kept "Claude Code" span is a spelling a legacy row
+    # could carry even though it cannot slot-combine with the kept span.
+    kept_spans = {(s, e) for s, e, _ in slots_all}
+    for start, end, canonical in positions:
+        if (start, end) in kept_spans:
+            continue
+        for alias in spellings.get(canonical, []):
+            _emit(content[:start] + alias + content[end:])
 
     return results
 

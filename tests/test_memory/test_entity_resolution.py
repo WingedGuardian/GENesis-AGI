@@ -122,6 +122,27 @@ def test_surface_variants_repeated_canonicals_keep_homogeneous_forms():
     assert "CC / Claude Code / claude-code" in variants
 
 
+def test_surface_variants_accepts_canonical_case_differences():
+    """Matching is case-insensitive, so a lowercase canonical in content still
+    yields its alias spellings — normalization only differs in the canonical's
+    own casing, which the verification must tolerate."""
+    aliases = {"CC": "Claude Code"}
+    assert "CC owns the gate" in surface_variants(
+        "claude code owns the gate", aliases
+    )
+
+
+def test_surface_variants_prefers_longest_nested_canonical():
+    """With {"X": "Claude", "CC": "Claude Code"}, "Claude" inside "Claude
+    Code" must not swallow the longer slot: "CC and X" is reachable, and the
+    dropped shorter span still gets its own substitution ("X Code and Claude").
+    """
+    aliases = {"X": "Claude", "CC": "Claude Code"}
+    variants = surface_variants("Claude Code and Claude", aliases)
+    assert "CC and X" in variants
+    assert "X Code and Claude" in variants
+
+
 def test_surface_variants_no_match_returns_empty():
     assert surface_variants("nothing aliased here", {"CC": "Claude Code"}) == []
 
