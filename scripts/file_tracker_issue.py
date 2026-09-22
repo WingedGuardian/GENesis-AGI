@@ -61,6 +61,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -103,6 +104,56 @@ WRITE_PERMISSIONS = frozenset({"WRITE", "MAINTAIN", "ADMIN"})
 MAX_FORK_DEPTH = 10
 
 Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
+
+#: Compiled per home value. The home cannot change within a process run in
+#: practice, but caching is keyed by value rather than assumed-constant.
+_HOME_RE_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def _redact_home(text: str) -> str:
+    """Replace this install's home directory with ``~``.
+
+    Every refusal below goes to stderr — terminal scrollback, session
+    transcripts, CI logs — and the account name in a home path is exactly the
+    identifier the contribution sanitizer exists to keep out of a public
+    artefact. Issue #2152 fixed one such refusal by dropping the value
+    entirely. That works where the value is a path we CONSTRUCTED and can
+    reconstruct from a docstring; it does not work for a subprocess's stderr,
+    where the path is the diagnostic. Substituting keeps "which file" and loses
+    "whose account".
+
+    SCOPE, stated so nobody reads more into it: this redacts THIS install's
+    home directory and nothing else. It is not a general scrubber, it knows
+    nothing about third-party absolute paths a subprocess might print, and it
+    is not a substitute for the privacy scan that guards the issue BODY. It
+    closes the one class #2152 named, on the surfaces that still had it.
+
+    A home of ``/`` is left alone: substituting there would turn every absolute
+    path in the message into ``~``-prefixed nonsense, and an install whose home
+    is the filesystem root has no account name in it to protect.
+    """
+    try:
+        home = str(Path.home())
+    except (RuntimeError, OSError, KeyError):
+        # Path.home() resolves HOME or the passwd entry, and a stripped
+        # environment with no passwd entry raises. A refusal must never fail
+        # while trying to make itself safe.
+        return text
+    if not home or home == os.sep:
+        return text
+    # Anchored, not a bare str.replace. MEASURED: with a home of `/home/jay`,
+    # `cannot read /home/jayson/keys/id_rsa` became `cannot read ~son/keys/...`
+    # -- it half-destroys a DIFFERENT account's name and names a file that does
+    # not exist, which is worse than the leak in the one direction that costs a
+    # debugging round. A URL containing the same characters
+    # (`https://example.invalid/home/jay/docs`) was mangled the same way.
+    # Left boundary: not preceded by a word character or a slash, so
+    # `/var/home/jay/...` is left alone. Right boundary: the path must END
+    # there or continue with a separator, so `/home/jayson` does not match.
+    return _HOME_RE_CACHE.setdefault(
+        home, re.compile(rf"(?<![\w/]){re.escape(home)}(?=/|$|[\s'\"),:;])")
+    ).sub("~", text)
+
 
 class Refused(Exception):
     """A precondition failed. NOTHING was posted — this is a hard guarantee."""
@@ -180,16 +231,24 @@ def _repair_stream(stream) -> None:
 def _gh_json(run: Runner, argv: Sequence[str]) -> dict:
     proc = run(argv)
     if proc.returncode != 0:
-        raise Refused(f"`{' '.join(argv)}` failed: {proc.stderr.strip() or proc.returncode}")
+        raise Refused(
+            _redact_home(
+                f"`{' '.join(argv)}` failed: {proc.stderr.strip() or proc.returncode}"
+            )
+        )
     try:
         data = json.loads(proc.stdout or "{}")
     except json.JSONDecodeError as exc:
-        raise Refused(f"`{' '.join(argv)}` returned unparseable JSON: {exc}") from exc
+        raise Refused(
+            _redact_home(f"`{' '.join(argv)}` returned unparseable JSON: {exc}")
+        ) from exc
     if not isinstance(data, dict):
         # `gh` returning a list or null here would surface as an AttributeError
         # from the caller's .get(), which is not in any handler's except clause.
         raise Refused(
-            f"`{' '.join(argv)}` returned {type(data).__name__}, expected an object"
+            _redact_home(
+                f"`{' '.join(argv)}` returned {type(data).__name__}, expected an object"
+            )
         )
     return data
 
@@ -277,8 +336,10 @@ def find_duplicate(slug: str, title: str, run: Runner = _run) -> int | None:
     except subprocess.SubprocessError as exc:
         # TimeoutExpired is NOT an OSError and is caught by no handler upstream.
         raise Refused(
-            f"duplicate check on {slug} did not complete ({exc}). Refusing to file — "
-            "a lookup that never finished is not 'no duplicate'."
+            _redact_home(
+                f"duplicate check on {slug} did not complete ({exc}). Refusing to file — "
+                "a lookup that never finished is not 'no duplicate'."
+            )
         ) from exc
     # returncode is checked BEFORE stdout is parsed, deliberately: `gh api
     # --paginate` writes each page as it arrives and only then reports a later
@@ -287,8 +348,11 @@ def find_duplicate(slug: str, title: str, run: Runner = _run) -> int | None:
     # against. Do not reorder.
     if proc.returncode != 0:
         raise Refused(
-            f"duplicate check failed on {slug}: {proc.stderr.strip() or proc.returncode}. "
-            "Refusing to file — a failed lookup is not 'no duplicate'."
+            _redact_home(
+                f"duplicate check failed on {slug}: "
+                f"{proc.stderr.strip() or proc.returncode}. "
+                "Refusing to file — a failed lookup is not 'no duplicate'."
+            )
         )
     target = _normalize(title)
     for raw in (proc.stdout or "").splitlines():
@@ -299,8 +363,10 @@ def find_duplicate(slug: str, title: str, run: Runner = _run) -> int | None:
             issue = json.loads(line)
         except json.JSONDecodeError as exc:
             raise Refused(
-                f"duplicate check returned unparseable JSON: {exc}. Refusing — a partial "
-                "read cannot prove absence."
+                _redact_home(
+                    f"duplicate check returned unparseable JSON: {exc}. Refusing — a "
+                    "partial read cannot prove absence."
+                )
             ) from exc
         if _normalize(str(issue.get("title", ""))) == target:
             return int(issue["number"])
@@ -365,7 +431,7 @@ def tracker_lock(slug: str):
         except OSError:
             # Blocking silently for a peer's full paginated listing looks like a
             # hang. Say so, then wait.
-            print(f"waiting for the {slug} tracker lock…", file=sys.stderr)
+            print(_redact_home(f"waiting for the {slug} tracker lock…"), file=sys.stderr)
             fcntl.flock(handle, fcntl.LOCK_EX)
         try:
             yield
@@ -404,8 +470,10 @@ def _reconcile_uncertain_create(slug: str, title: str, cause: str, run: Runner) 
     if found is not None:
         return f"{slug}#{found} (reconciled: {cause}, but the issue EXISTS)"
     raise Refused(
-        f"{cause}. Reconciled against {slug}: no issue with this title exists, so "
-        "nothing was posted. Safe to retry."
+        _redact_home(
+            f"{cause}. Reconciled against {slug}: no issue with this title exists, "
+            "so nothing was posted. Safe to retry."
+        )
     )
 
 
@@ -457,9 +525,11 @@ def privacy_scan(title: str, body: str) -> list[str]:
         from genesis.contribution.sanitize import scan_prose
     except ImportError as exc:
         raise Refused(
-            f"cannot import the privacy scanner ({exc}). An issue is a public, "
-            "irreversible post with no CI backstop, so it is not filed unscanned. "
-            "Run from the repo with its venv: .venv/bin/python scripts/file_tracker_issue.py"
+            _redact_home(
+                f"cannot import the privacy scanner ({exc}). An issue is a public, "
+                "irreversible post with no CI backstop, so it is not filed unscanned. "
+                "Run from the repo with its venv: .venv/bin/python scripts/file_tracker_issue.py"
+            )
         ) from exc
 
     # Scanned SEPARATELY, one call per field, because the line number is the
@@ -636,7 +706,10 @@ def create_issue(
         # have committed the issue. Catch the whole SubprocessError family: none
         # of it is an OSError, so none of it is caught anywhere upstream.
         return _reconcile_uncertain_create(
-            slug, title, f"gh issue create on {slug} did not complete ({exc})", run
+            slug,
+            title,
+            _redact_home(f"gh issue create on {slug} did not complete ({exc})"),
+            run,
         )
     except KeyboardInterrupt:
         # SIGINT/SIGTERM after the request went out. KeyboardInterrupt is a
@@ -649,8 +722,10 @@ def create_issue(
         return _reconcile_uncertain_create(
             slug,
             title,
-            f"gh issue create on {slug} exited {proc.returncode} "
-            f"({proc.stderr.strip() or 'no stderr'})",
+            _redact_home(
+                f"gh issue create on {slug} exited {proc.returncode} "
+                f"({proc.stderr.strip() or 'no stderr'})"
+            ),
             run,
         )
     url = proc.stdout.strip()
@@ -676,9 +751,24 @@ def _report_posted(posted: str, why: str) -> int:
 
 
 def _warn(message: str) -> None:
-    """stderr write that cannot itself become the failure being reported."""
+    """The single stderr writer -- and therefore where redaction belongs.
+
+    REDACT AT THE EMITTER, NOT AT THE CONSTRUCTORS. The first version of this
+    change wrapped eight `Refused(...)` sites individually and put an AST guard
+    in front of them. An adversarial audit measured what that actually covered:
+    thirteen of eighteen leak shapes passed the guard, because "every way a
+    string can reach a Refused constructor" is an OPEN set -- `"x: " + str(exc)`,
+    `"%s" % proc.stderr`, `.format(...)`, a message built on a previous line, a
+    keyword argument, an aliased constructor. Meanwhile two live leaks reached
+    stderr without touching a `Refused` at all: the generic `ERROR: {exc}`
+    handler, and the `gh issue create` TIMEOUT cause.
+
+    The emitters are a CLOSED set of five, enumerable and checkable, and every
+    one of those leaks passes through them. `_redact_home` is idempotent, so a
+    message already redacted upstream is unharmed.
+    """
     with contextlib.suppress(OSError):
-        print(message, file=sys.stderr)
+        print(_redact_home(message), file=sys.stderr)
 
 
 def _sigterm_as_interrupt(signum, frame):  # noqa: ARG001 - signal handler signature
@@ -818,7 +908,12 @@ def _run_main(argv: Sequence[str] | None, run: Runner) -> int:
                 _warn(f"DUPLICATE: {slug}#{dup} already has this exact title. Nothing filed.")
                 return _finish(3)
             if args.dry_run:
-                print(f"DRY RUN ok — would file to {slug} (perm={perm}) with labels {labels}")
+                print(
+                    _redact_home(
+                        f"DRY RUN ok — would file to {slug} (perm={perm}) "
+                        f"with labels {labels}"
+                    )
+                )
                 return _finish(0)
             # Create FIRST, report second. If stdout is closed or full, the post
             # has already happened — letting the print's OSError fall through to
@@ -838,13 +933,16 @@ def _run_main(argv: Sequence[str] | None, run: Runner) -> int:
         # From here the issue EXISTS. Nothing below may report otherwise — see
         # the handlers, which all check `posted` first.
         try:
-            print(posted)
+            print(_redact_home(posted))
         except OSError:
             # The post is already durable; a reporting failure must not
             # reclassify it. The stderr fallback is itself guarded, because it
             # can fail for the same reason.
             with contextlib.suppress(OSError):
-                print(f"POSTED (could not write the URL to stdout): {posted}", file=sys.stderr)
+                print(
+                    _redact_home(f"POSTED (could not write the URL to stdout): {posted}"),
+                    file=sys.stderr,
+                )
         return _finish(0)
     except Indeterminate as exc:
         if posted:
