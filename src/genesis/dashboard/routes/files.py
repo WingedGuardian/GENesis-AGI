@@ -190,6 +190,45 @@ def _locked_by_this_process(resolved: Path) -> bool:
     return False
 
 
+#: Every SQLite database file begins with this, byte 0. Fixed by the file format
+#: and not by any naming convention, which is the point: it identifies a database
+#: no matter what it is called or who has it open.
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def _looks_like_sqlite(resolved: Path) -> bool:
+    """Does *resolved* begin with the SQLite file-format magic?
+
+    Content, not name and not ownership — the only one of the three that sees a
+    database belonging to a DIFFERENT process under an unrecognised name. The
+    managed Chromium profile is the measured case: ``Cookies``, ``History`` and
+    ``Web Data`` are extensionless and held by the browser, so neither the
+    identity scan nor the suffix list classifies them.
+
+    SAFE TO OPEN, and this is worth stating because opening database files is the
+    hazard this whole module exists to prevent. POSIX releases record locks per
+    PROCESS. This runs only after :func:`_locked_by_this_process` returned False,
+    so we hold no descriptor on it and our close therefore releases nothing; and
+    another process's locks are unaffected by what we open and close.
+
+    RESIDUAL RACE, stated rather than papered over: between that identity check
+    and this read, another thread in THIS process could open the file — Flask
+    serves with ``threaded=True``. The window is microseconds and the same window
+    already existed for the route's own read, which this check runs ahead of and
+    usually prevents. Closing it properly needs a registry of every database the
+    server opens, which is a larger change than this fix and is tracked
+    separately.
+
+    Reads 16 bytes. Any OSError means "cannot tell", which falls through to the
+    name check rather than granting access.
+    """
+    try:
+        with resolved.open("rb") as fh:
+            return fh.read(len(_SQLITE_MAGIC)) == _SQLITE_MAGIC
+    except OSError:
+        return False
+
+
 def _contains_live_database(directory: Path) -> bool:
     """Does *directory* hold a database, directly or in a subdirectory?
 
@@ -212,7 +251,11 @@ def _contains_live_database(directory: Path) -> bool:
                 continue
         except OSError:
             continue
-        if _is_sqlite_artifact(child.name) or _locked_by_this_process(child):
+        if (
+            _is_sqlite_artifact(child.name)
+            or _locked_by_this_process(child)
+            or _looks_like_sqlite(child)
+        ):
             return True
     return False
 
@@ -243,9 +286,24 @@ def _is_allowed(path: Path) -> bool:
     # Stats the path, so it runs only after containment above.
     if _locked_by_this_process(resolved):
         return False
-    # SECONDARY: name. Catches databases this process has not opened yet.
+    # SECONDARY: CONTENT. The decisive check for a database this process does
+    # not hold — which neither of the others can see. Review found the concrete
+    # case: the managed Chromium profile keeps `Cookies`, `History` and
+    # `Web Data`, all extensionless and held by the BROWSER, so the identity scan
+    # (genesis-server's descriptors only) and the suffix rule (no extension to
+    # match) both pass them straight through to a truncating write.
+    #
+    # Reading the header is safe precisely BECAUSE the identity check above
+    # already returned False: POSIX drops locks per PROCESS, so opening a file we
+    # hold no descriptor on releases nothing, and another process's locks are
+    # untouched by our close.
+    if _looks_like_sqlite(resolved):
+        return False
+    # TERTIARY: name. Still needed — the two checks above require the file to
+    # EXIST, and `create`/`rename` validate a destination that does not yet.
     # Checked on the RESOLVED name, so a SYMLINK cannot smuggle one through
-    # under an innocent-looking path (a hardlink can — that is the check above).
+    # under an innocent-looking path (a hardlink can — that is the identity
+    # check above).
     return not _is_sqlite_artifact(resolved.name)
 
 

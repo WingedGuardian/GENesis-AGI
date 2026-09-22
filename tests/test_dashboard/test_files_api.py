@@ -348,9 +348,15 @@ def test_a_held_database_is_refused_under_any_name(client, tmp_path):
     ``Cookies``. It is refused because we HOLD it, not because of what it is
     called.
     """
-    odd = tmp_path / "Cookies"
-    odd.write_bytes(b"SQLite format 3\x00")
+    # Deliberately NOT SQLite content and NOT a recognised name, so neither the
+    # content check nor the suffix rule can claim it — leaving the identity check
+    # as the only thing that can refuse it. An earlier version of this fixture
+    # used real SQLite bytes, which meant the content check answered first and
+    # the test stopped isolating what it names.
+    odd = tmp_path / "held-thing"
+    odd.write_text("not a database at all")
     assert not files_mod._is_sqlite_artifact(odd.name), "fixture no longer isolates identity"
+    assert not files_mod._looks_like_sqlite(odd), "fixture no longer isolates identity"
 
     fh = open(odd, "rb")  # noqa: SIM115 — holding it open IS the condition
     try:
@@ -358,7 +364,8 @@ def test_a_held_database_is_refused_under_any_name(client, tmp_path):
     finally:
         fh.close()
 
-    # And once nothing holds it, the name-only rule does not claim it.
+    # Control: once nothing holds it, nothing else claims it either — so the 403
+    # above was the identity check and not some other rule firing.
     assert client.get(f"/api/genesis/files/read?path={odd}").status_code == 200
 
 
@@ -409,6 +416,61 @@ def test_containment_is_checked_before_touching_the_filesystem(client, tmp_path,
     (tmp_path / "ordinary.txt").write_text("x")
     with pytest.raises(AssertionError, match="before containment"):
         client.get(f"/api/genesis/files/read?path={tmp_path / 'ordinary.txt'}")
+
+
+@pytest.mark.parametrize("name", ["Cookies", "History", "Web Data", "mydata"])
+@pytest.mark.parametrize("route,method", [
+    ("/api/genesis/files/read", "get"),
+    ("/api/genesis/files/download", "get"),
+    ("/api/genesis/files/delete", "delete"),
+    ("/api/genesis/files/write", "put"),
+])
+def test_extensionless_database_held_by_nobody_is_refused(client, tmp_path, name, route, method):
+    """The case neither name nor ownership can see: identified by CONTENT.
+
+    Review found the concrete production path — the managed Chromium profile
+    keeps `Cookies`, `History` and `Web Data`, all extensionless and held by the
+    BROWSER rather than by genesis-server. So the identity scan (our descriptors
+    only) and the suffix list (no extension) both passed them through to a
+    truncating write or an outright delete, while the browser was live.
+    """
+    db = tmp_path / name
+    db.write_bytes(b"SQLite format 3\x00" + b"\x00" * 4096)
+    before = db.stat().st_size
+    assert not files_mod._is_sqlite_artifact(db.name), "fixture no longer isolates content"
+
+    if method == "put":
+        resp = client.put(route, json={"path": str(db), "content": "x"})
+    else:
+        resp = getattr(client, method)(f"{route}?path={db}")
+
+    assert resp.status_code == 403, f"{route} reached an extensionless database"
+    assert db.exists(), f"{route} deleted it"
+    assert db.stat().st_size == before, f"{route} truncated it"
+
+
+def test_content_check_does_not_block_ordinary_extensionless_files(client, tmp_path):
+    """Control: identifying by content must not swallow README, LICENSE, etc."""
+    for name in ("README", "LICENSE", "Dockerfile"):
+        f = tmp_path / name
+        f.write_text("ordinary text")
+        resp = client.get(f"/api/genesis/files/read?path={f}")
+        assert resp.status_code == 200, f"{name} was refused"
+        assert resp.get_json()["content"] == "ordinary text"
+
+
+def test_renaming_a_directory_with_an_extensionless_database_is_refused(client, tmp_path):
+    """The rename guard must use the content check too, not just names."""
+    profile = tmp_path / "browser-profile"
+    profile.mkdir()
+    (profile / "Cookies").write_bytes(b"SQLite format 3\x00" + b"\x00" * 64)
+
+    resp = client.post(
+        "/api/genesis/files/rename",
+        json={"path": str(profile), "new_name": "browser-profile-old"},
+    )
+    assert resp.status_code == 403
+    assert profile.exists()
 
 
 def test_renaming_an_ordinary_directory_still_works(client, tmp_path):
