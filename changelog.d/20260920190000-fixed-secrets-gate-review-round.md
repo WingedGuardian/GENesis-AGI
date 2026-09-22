@@ -24,3 +24,12 @@
   be imported (was exit 1 = non-blocking allow), a failed critical-
   observation write is logged to stderr instead of swallowed, and the hook
   write path uses the canonical guarded `connect_sqlite_rw` factory.
+  Wiring `NotebookEdit` read every cell as executable, so a markdown cell
+  that merely documented a provider endpoint was hard-blocked by the same
+  rule that exempts `*.md` for that exact content — a notebook's path ends
+  in `.ipynb`, so the documentation globs could never see the cell. Only an
+  explicitly prose cell type is exempt; an absent or unrecognised one is
+  still read as code. Both guards' docstrings now state the measured scope
+  (3 of 11 access paths, issue #2230) — the correction had landed in one of
+  the two copies, leaving the public guard still telling readers the gap was
+  two known residuals.

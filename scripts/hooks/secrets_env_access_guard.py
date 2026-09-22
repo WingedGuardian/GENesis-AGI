@@ -22,9 +22,21 @@ the literal string ``secrets.env`` in a Bash command and was broken in seconds b
 ``cat ~/genesis/secrets.*``, ``cat s*.env`` and friends — and it never saw
 ``Read``/``Grep`` at all. Enumerating spellings is the hand-rolled-matcher tar
 pit; ``secrets_target.touches_secrets`` instead expands globs and compares
-inodes, so a spelling nobody imagined still resolves to the same file. Its two
-declared residuals (shell variables, and a copy being gated only at the copy)
-live in that module's docstring.
+inodes, so a spelling nobody imagined still resolves to the same file.
+
+**What it does NOT catch is larger than this docstring used to say.** It said
+the residuals were two (shell variables, and a copy gated only at the copy).
+They are not: MEASURED at this head, the gate holds on 3 of 11 real access
+paths, and ``grep -R API_KEY`` over the repo prints credential values
+ungated. So this hook closes the DIRECT spellings — a named path, a glob that
+expands to the file, a heredoc fed to a recognised interpreter — and is not
+the boundary. The measured table lives in ``secrets_target``'s docstring and
+is the acceptance bar of **issue #2230**, which moves enforcement to the
+filesystem and credential boundaries where one check answers every row.
+
+Read that table before trusting this hook. The sentence it replaces was the
+kind of completeness claim that is worse than silence: it told a reader the
+gap was bounded and named, when nobody had enumerated it.
 
 Fail-open on a malformed payload: this is a consent gate on a file access, not a
 destructive-action guard, and a crashed hook must not wedge every tool call.

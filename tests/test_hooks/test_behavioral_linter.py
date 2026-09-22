@@ -1221,3 +1221,69 @@ class TestNotebookCells:
             "a notebook under tests/ is excluded by the rule's own globs; if "
             "this blocks, notebook_path is not reaching the rule scoping"
         )
+
+    #: A notebook lives at a `.ipynb` path, so the rule's `*.md`/`*.rst`/`*.txt`
+    #: documentation globs can never match it however prose-like a cell is. The
+    #: cell TYPE is the only thing that distinguishes prose from code here.
+    _NB = "src/genesis/analysis.ipynb"
+    _PROSE = "Route through the endpoint https://api.openai.com/v1/chat/completions."
+    _CODE = 'requests.post("https://api.openai.com/v1/chat/completions")'
+
+    def _cell(self, cell_type, source):
+        payload = {"notebook_path": self._NB, "new_source": source}
+        if cell_type is not None:
+            payload["cell_type"] = cell_type
+        return _run_linter({"tool_name": "NotebookEdit", "tool_input": payload})
+
+    def test_a_markdown_cell_documenting_an_endpoint_is_not_executable_code(self):
+        """The fix's own motivating case, MEASURED as exit 2 before it.
+
+        Wiring `new_source` (the commit above) read every cell as code, so a
+        markdown cell that merely NAMES an endpoint was hard-blocked — by the
+        same rule that exempts `*.md`, `*.rst` and `*.txt` for exactly this
+        content. The exemption could not see it because the payload's path is
+        `.ipynb` (Codex P2, #1826). A false positive on a hard block is the
+        worse direction: the author's remedy is an escape sigil on prose.
+        """
+        assert self._cell("markdown", self._PROSE).returncode == 0
+        assert self._cell("raw", self._PROSE).returncode == 0
+
+    def test_a_code_cell_is_still_blocked(self):
+        """The control. An exemption that also frees code is worse than none."""
+        assert self._cell("code", self._CODE).returncode == 2
+
+    def test_an_unrecognised_or_missing_cell_type_is_treated_as_code(self):
+        """Allowlist polarity, and this is the whole reason for it.
+
+        A denylist of `{"code"}` would exempt every cell type Jupyter adds
+        next, and would exempt a payload that simply omits the field. Both are
+        silent holes in the gate NotebookEdit was wired for. The ambiguous case
+        fails CLOSED.
+        """
+        for cell_type in (None, "", "sql", "Code", 123, ["markdown"], {"t": "markdown"}):
+            assert self._cell(cell_type, self._CODE).returncode == 2, (
+                f"cell_type={cell_type!r} is not a recognised prose cell and must keep gating"
+            )
+
+    def test_the_prose_exemption_is_matched_case_insensitively(self):
+        assert self._cell("MarKdOwN", self._PROSE).returncode == 0
+
+    def test_a_stray_cell_type_cannot_exempt_a_Write(self):
+        """The bypass an author would reach for, and it is closed by ordering.
+
+        `content` is selected BEFORE the cell_type branch is consulted, so a
+        `Write` payload that smuggles in `cell_type: markdown` is still linted
+        as source. If this ever returns 0, the exemption has escaped the one
+        field it was scoped to.
+        """
+        r = _run_linter(
+            {
+                "tool_name": "Write",
+                "tool_input": {
+                    "file_path": "src/genesis/caller.py",
+                    "cell_type": "markdown",
+                    "content": self._CODE,
+                },
+            }
+        )
+        assert r.returncode == 2

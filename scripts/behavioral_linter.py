@@ -92,6 +92,22 @@ except Exception as _exc:  # noqa: BLE001 — no yaml means NO rules load: same 
 
 _RULES_DIR = Path(__file__).resolve().parent.parent / "config" / "behavioral_rules"
 
+#: Notebook cell types whose source is PROSE, not executable code.
+#:
+#: A markdown cell documenting `https://api.openai.com/v1/chat/completions` is
+#: the same artifact as that line in a `.md` file, which every content rule
+#: already exempts via `exempt_paths`. But the payload's path ends in `.ipynb`,
+#: so the glob cannot see the cell and the prose was hard-blocked by the
+#: exemption written to allow it — MEASURED exit 2 (Codex P2, #1826). That
+#: false positive was introduced BY the commit that wired NotebookEdit here.
+#:
+#: Polarity is ALLOWLIST, deliberately. An absent, unknown or non-string
+#: cell_type reads as CODE and keeps gating: wiring NotebookEdit exists to
+#: catch a provider call in a cell, so the ambiguous case must fail closed.
+#: A denylist of `{"code"}` would silently exempt every cell type Jupyter
+#: adds next, which is the inverse and worse error.
+_PROSE_CELL_TYPES = frozenset({"markdown", "raw"})
+
 
 def _load_rules() -> list[dict]:
     """Load all rule YAML files from the behavioral_rules directory."""
@@ -519,11 +535,9 @@ def main() -> int:
     # connected and checks nothing. A notebook cell is executable — a session
     # can add a cell carrying a direct provider request and run it later, and
     # neither tool call would contain a checked endpoint (Codex P1, #1826).
-    content = (
-        field(payload, "content")
-        or field(payload, "new_string")
-        or field(payload, "new_source")
-    )
+    content = field(payload, "content") or field(payload, "new_string")
+    if not content and field(payload, "cell_type").lower() not in _PROSE_CELL_TYPES:
+        content = field(payload, "new_source")
     bash_mode = False
     if not content:
         content = field(payload, "command")
