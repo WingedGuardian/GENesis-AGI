@@ -706,11 +706,42 @@ class TestCommandCarriersAreRefusedWithoutInspection:
 
         A refusal conditional on the tokenizer succeeding is a refusal the
         caller controls.
+
+        SCOPED TO A LAUNCHER MENTION — every command here names one. The
+        unscoped version of this refusal cost 77 of 83,201 recorded commands
+        against origin/main and ~91% of those were heredoc scripts the parser
+        merely could not read; requiring a launcher costs 53 and keeps every
+        measured attack spelling closed. Its other direction is pinned by
+        `test_an_unreadable_command_with_NO_launcher_is_left_as_main_has_it`.
         """
         q = chr(34)
         assert self._main(f"eval '{self.RM} -r -f /a/b'", tmp_path) == 2
         assert self._main(f"eval '{self.RM} -r -f /a/b' {q}", tmp_path) == 2
         assert self._main(f"bash -c '{self.RM} -r -f /a/b' {q}", tmp_path) == 2
+
+    def test_an_unreadable_command_with_NO_launcher_is_left_as_main_has_it(
+        self, tmp_path
+    ):
+        """The PRICE of scoping the blind refusal, pinned so it is not a surprise.
+
+        `rm -r -f /a/b "` is unreadable, names a removal, and names no
+        launcher. It is ALLOWED — MEASURED identical on origin/main, so this
+        change neither opens nor closes it, and the bidirectional corpus sweep
+        reports 0 of 83,201 commands going from refused to allowed.
+
+        Kept as an explicit test rather than left implicit, because a NARROWING
+        regresses in the direction nobody sweeps: the 153-cell axis sweep only
+        exercises CARRIED spellings and is structurally blind to this one.
+        """
+        q = chr(34)
+        assert self._main(f"{self.RM} -r -f /a/b {q}", tmp_path) == 0
+
+        # The discriminator: the SAME unreadable command, plus a launcher.
+        assert self._main(f"eval '{self.RM} -r -f /a/b' {q}", tmp_path) == 2
+
+        # And a glued `-rf` still blocks unreadable, via the legacy pattern —
+        # so the scoping did not delete the fallback it sits in front of.
+        assert self._main(f"{self.RM} -rf /a/b {q}", tmp_path) == 2
 
     @pytest.mark.parametrize(
         "payload,why",

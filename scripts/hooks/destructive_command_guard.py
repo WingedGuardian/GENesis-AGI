@@ -165,6 +165,13 @@ except Exception:  # noqa: BLE001 — degraded, never permissive
 # over-block a recoverable command and the deny text would be untrue.
 _UNMODELLABLE_CARRIERS = _COMMAND_CARRIERS - _NESTED_SHELLS
 
+# A carrier NAME anywhere in the raw text. Used ONLY to scope the blind branch
+# below, never to decide a command position — that question belongs to the
+# resolver, and a name cannot answer it (see `_COMMAND_OPENERS`).
+_CARRIER_WORDS = re.compile(
+    r"\b(" + "|".join(sorted(re.escape(c) for c in _COMMAND_CARRIERS)) + r")\b"
+)
+
 
 def _resolver_carrier_refusal(cmd: str) -> str | None:
     """Carrier verdict from the RESOLVER, or None if it has nothing to say.
@@ -178,17 +185,45 @@ def _resolver_carrier_refusal(cmd: str) -> str | None:
     try:
         segs, blind = _analyze_checked(cmd)
     except Exception:  # noqa: BLE001
+        # Same scoping as the blind branch below, for the same measured reason
+        # — and it must be the SAME, or the shipped predicate is not the one
+        # the 53/83,201 figure was measured on.
+        if not _CARRIER_WORDS.search(cmd):
+            return None
         return (
-            "this command cannot be analysed, and it names a removal — refused "
-            "conservatively rather than scanned with a weaker pattern."
+            "this command cannot be analysed, it names a launcher, and it names "
+            "a removal — refused conservatively rather than scanned with a "
+            "weaker pattern."
         )
     if blind is not None:
-        # REFUSE, do not degrade. The previous revision fell through to a
-        # glued-`-rf` regex here, so one trailing quote turned a BLOCK into an
-        # allow (MEASURED).
+        # AN UNREADABLE COMMAND THAT ALSO NAMES A LAUNCHER. Refuse, do not
+        # degrade: the previous revision fell through to a glued-`-rf` regex
+        # here, so one trailing quote turned a BLOCK into an allow (MEASURED —
+        # `eval 'rm -r -f /a/b' "` was ALLOWED while the same command without
+        # the quote BLOCKED). A refusal conditional on the tokenizer succeeding
+        # is a refusal the caller controls.
+        #
+        # SCOPED TO A CARRIER MENTION, and the scope is measured rather than
+        # assumed. Refusing EVERY unreadable command that names a removal cost
+        # 77 of 83,201 recorded commands against origin/main (0.093%), and ~91%
+        # of those were ordinary `python - <<'PY' … rm …` scripts — refused
+        # because the parser cannot read a HEREDOC BODY, which is the known
+        # over-read filed as a residual, not an ambiguity about a removal.
+        # Requiring a launcher name too costs 53 (0.064%) and keeps every
+        # measured attack spelling closed, because each of them names its
+        # launcher. The remaining 53 are mostly scripts that mention a `.sh`
+        # path or a shell by name; that is the price of a text test and it is
+        # why this scoping is the ONLY place one is used.
+        #
+        # A command with no launcher mention falls through to the ordinary
+        # scan, which is the behaviour on main — so this narrows what the
+        # change ADDS, and reopens nothing that was previously closed.
+        if not _CARRIER_WORDS.search(cmd):
+            return None
         return (
-            f"this command cannot be read ({blind.cause}), and it names a "
-            f"removal, so the guard cannot verify what would be deleted."
+            f"this command cannot be read ({blind.cause}), it names a launcher, "
+            f"and it names a removal — so the guard cannot verify what would be "
+            f"deleted. Re-issue it in a form the parser can read."
         )
     for seg in segs:
         if seg.exe in _UNMODELLABLE_CARRIERS:
