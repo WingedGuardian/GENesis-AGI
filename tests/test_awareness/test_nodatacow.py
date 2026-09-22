@@ -259,6 +259,7 @@ async def test_the_inprocess_spelling_would_have_dropped_it(_live_wal_holder):
     lock. If this ever stops dropping, the guarantee asserted above has become
     untestable on this platform and its passing is no longer evidence.
     """
+    import errno
     import fcntl
     import struct
 
@@ -267,9 +268,27 @@ async def test_the_inprocess_spelling_would_have_dropped_it(_live_wal_holder):
     if before == 0:
         pytest.skip("no POSIX lock observable on this platform — nothing to assert")
 
-    # The spelling shipped until 2026-09-21, verbatim in shape.
-    with open(db, "rb") as fh:
-        fcntl.ioctl(fh.fileno(), loop._FS_IOC_GETFLAGS, struct.pack("l", 0))
+    # The spelling shipped until 2026-09-21, in shape — now wrapped in a `try`.
+    #
+    # The ioctl is INCIDENTAL here: what drops the lock is the CLOSE, so the
+    # `with` block has already performed the thing under test by the time any
+    # ioctl error surfaces, and Python closes the handle on the exception path.
+    # MEASURED on both tmpfs and ext4: locks 1 -> 0 either way.
+    #
+    # So the assertion must not be gated on errno taxonomy. An earlier revision
+    # allowed only ENOTTY, on the stated grounds that "tmpfs/overlay/NFS answer
+    # ENOTTY" — MEASURED FALSE for tmpfs, where shmem implements fileattr_get
+    # and the ioctl SUCCEEDS (/dev/shm, kernel 6.8). Worse, a single-value
+    # allowlist turns any filesystem answering EOPNOTSUPP/ENOSYS/EINVAL into a
+    # hard RED, which is worse than the silent skip it replaced. Tolerate the
+    # whole unsupported class; anything else is re-raised rather than swallowed.
+    _UNSUPPORTED = {errno.ENOTTY, errno.EOPNOTSUPP, errno.ENOSYS, errno.EINVAL}
+    try:
+        with open(db, "rb") as fh:
+            fcntl.ioctl(fh.fileno(), loop._FS_IOC_GETFLAGS, struct.pack("l", 0))
+    except OSError as exc:
+        if exc.errno not in _UNSUPPORTED:
+            raise
 
     assert _locks_held_on(db) < before, (
         "the in-process open no longer drops the lock, so the fix above is not "
@@ -328,3 +347,123 @@ async def test_spawn_failure_reports_none_rather_than_raising(tmp_path, monkeypa
     monkeypatch.setattr(loop.sys, "executable", str(tmp_path / "no-such-interpreter"))
 
     assert await loop._nocow_flag(db) is None
+
+
+@pytest.mark.asyncio
+async def test_reaping_an_unkillable_child_does_not_hang_the_tick(monkeypatch):
+    """The reap is bounded, or the probe's own timeout is worthless.
+
+    SIGKILL cannot complete while a child sits in uninterruptible sleep — which
+    is the exact failure mode the probe timeout exists to bound. An unbounded
+    ``await proc.wait()`` in the reaper would therefore defeat that timeout and
+    hang the awareness tick forever: bounded probe, unbounded reaper.
+
+    Simulated with a child whose wait() never returns, so the assertion is about
+    the reaper's structure rather than about provoking real D-state.
+    """
+    import asyncio
+    import time
+
+    class _Unkillable:
+        def kill(self):
+            pass
+
+        async def wait(self):
+            # Deliberately FINITE, and much larger than the bound below. A truly
+            # unbounded sleep would make the un-fixed code HANG pytest rather
+            # than fail it, which cannot be mutation-verified — a test whose
+            # failure mode is "runs forever" tells you nothing on the day it
+            # regresses.
+            await asyncio.sleep(5)
+
+    monkeypatch.setattr(loop, "_NOCOW_REAP_TIMEOUT_S", 0.05)
+
+    start = time.monotonic()
+    await loop._kill_probe(_Unkillable())
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 2.0, (
+        f"_kill_probe blocked for {elapsed:.1f}s on a child that never exits — "
+        "the reap is unbounded and will hang the tick"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_probe_stays_cancelled_and_yields_no_verdict(monkeypatch):
+    """The invariant asserted at the PRODUCTION CALL SITE, not on the helper.
+
+    This is the second time in this PR that a guarantee was locked one layer
+    below where it has to hold, and a stored procedure from this same lineage
+    names it: the regression test must assert the invariant at the production
+    call site, because a test that exercises only the extracted helper stays
+    green when someone reintroduces the hazard next to it in the caller.
+
+    MEASURED against the whole package (447 tests), with `_kill_probe` left
+    perfect, these all SURVIVED before this test existed:
+      * an extra unbounded `await proc.wait()` beside the `_kill_probe` call
+      * deleting `_nocow_flag`'s `except asyncio.CancelledError` block entirely
+      * changing that block's `raise` to `return None` — the exact "shrug" the
+        docstring forbids
+      * widening `_kill_probe`'s `except TimeoutError` to `except BaseException`,
+        which swallows cancellation
+
+    So: cancel a REAL probe mid-flight, against a real subprocess, and require
+    that the cancellation survives as a cancellation.
+    """
+    import asyncio
+    from pathlib import Path
+
+    # A probe that will not finish on its own, so the cancel lands mid-flight.
+    monkeypatch.setattr(loop, "_NOCOW_PROBE_SRC", "import time; time.sleep(60)\n")
+
+    reaped = []
+    original_kill = loop._kill_probe
+
+    async def _spy(proc):
+        reaped.append(proc)
+        await original_kill(proc)
+
+    monkeypatch.setattr(loop, "_kill_probe", _spy)
+
+    task = asyncio.create_task(loop._nocow_flag(Path("/etc/hostname")))
+    await asyncio.sleep(0.3)  # let the child actually spawn
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled(), "cancellation was converted into a verdict"
+
+    # The propagation assertion above is NOT enough on its own, and finding that
+    # out cost a mutation round: deleting the whole `except CancelledError` block
+    # leaves cancellation propagating NATURALLY out of wait_for, so the task is
+    # still cancelled and the assertion still passes — while the child leaks.
+    # Killing the child is what that handler is FOR, so that is what to assert.
+    assert reaped, "cancellation propagated but the child was never reaped"
+
+
+@pytest.mark.asyncio
+async def test_the_timeout_path_is_bounded_at_the_call_site(monkeypatch):
+    """The timeout handler, not the helper — a separate path from cancellation.
+
+    MEASURED as a surviving mutant before this test existed: an extra unbounded
+    `await proc.wait()` placed NEXT TO the bounded `_kill_probe` call, inside
+    `_nocow_flag`'s timeout handler, kept the suite green. A perfect helper does
+    not make its caller correct.
+    """
+    import asyncio
+    import time
+    from pathlib import Path
+
+    monkeypatch.setattr(loop, "_NOCOW_PROBE_SRC", "import time; time.sleep(60)\n")
+    monkeypatch.setattr(loop, "_NOCOW_PROBE_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(loop, "_NOCOW_REAP_TIMEOUT_S", 0.2)
+
+    start = time.monotonic()
+    result = await asyncio.wait_for(loop._nocow_flag(Path("/etc/hostname")), timeout=20)
+    elapsed = time.monotonic() - start
+
+    assert result is None, "a timed-out probe must report None, not a verdict"
+    assert elapsed < 5.0, (
+        f"the timeout path took {elapsed:.1f}s against a 0.2s probe bound and a "
+        "0.2s reap bound — something on the call site waits unbounded"
+    )

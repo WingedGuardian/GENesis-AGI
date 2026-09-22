@@ -1697,13 +1697,58 @@ _NOCOW_PROBE_SRC = (
 #: and a stall delays every check after it.
 _NOCOW_PROBE_TIMEOUT_S = 3
 
+#: Separate, much SHORTER bound on reaping a child we have already SIGKILLed.
+#: Reusing the probe timeout here silently doubled the worst-case tick stall to
+#: 6s (measured at a scaled constant), and bought nothing for it: a killed child
+#: that has not been collected within a few hundred milliseconds is in
+#: uninterruptible sleep and will not exit in three seconds either. MEASURED: a
+#: killed child reaches GONE within 0.5s via asyncio's child watcher. So the only
+#: outcomes are "collected almost immediately" or "not collected at all", and a
+#: long bound merely delays the tick before reaching the same conclusion.
+_NOCOW_REAP_TIMEOUT_S = 0.5
+
 
 async def _kill_probe(proc) -> None:
-    """Reap a probe child we are abandoning. Never raises."""
+    """Reap a probe child we are abandoning. Never raises, never blocks forever.
+
+    The wait is BOUNDED, and that bound is the whole point. SIGKILL cannot
+    complete while the child sits in uninterruptible sleep — which is precisely
+    the failure mode :data:`_NOCOW_PROBE_TIMEOUT_S` exists to bound. An unbounded
+    ``await proc.wait()`` here would therefore defeat that timeout and hang the
+    awareness tick indefinitely: the probe would be bounded and its reaper would
+    not.
+
+    If the bounded wait expires the child is left UN-REAPED — not, as an earlier
+    revision of this docstring claimed, "left for the OS to reap". The OS cannot
+    reap a live parent's child; only a wait from this process does. MEASURED: a
+    killed child whose ``wait()`` is never awaited still reaches ``GONE`` within
+    0.5s, collected by asyncio's own ``PidfdChildWatcher`` independently of any
+    awaiter — and in the one case this bound exists for, a genuinely
+    uninterruptible child, nothing collects it at all and the pidfd registration
+    stays. So: the watcher will collect it if it ever leaves uninterruptible
+    sleep, and one leaked registration is strictly better than a stalled tick.
+    The decision was right; the reason given for it was false.
+
+    ``CancelledError`` derives from ``BaseException``, so neither handler below
+    catches it and it propagates by construction — correct, because this is
+    called from the cancellation path and must not convert a cancellation into a
+    shrug. VERIFIED rather than recalled: ``TimeoutError is asyncio.TimeoutError``
+    and its MRO is (TimeoutError, OSError, Exception, BaseException, object), so
+    ``except TimeoutError`` catches what ``wait_for`` raises while
+    ``CancelledError`` passes through both handlers untouched.
+    """
     with contextlib.suppress(ProcessLookupError):
         proc.kill()
-    with contextlib.suppress(Exception):
-        await proc.wait()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=_NOCOW_REAP_TIMEOUT_S)
+    except TimeoutError:
+        logger.debug(
+            "nodatacow probe child survived SIGKILL for %ss (uninterruptible?); "
+            "leaving it un-reaped rather than blocking the tick",
+            _NOCOW_REAP_TIMEOUT_S,
+        )
+    except Exception:
+        logger.debug("nodatacow probe reap failed", exc_info=True)
 
 
 async def _nocow_flag(db_path: Path) -> bool | None:
