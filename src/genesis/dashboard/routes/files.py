@@ -85,10 +85,151 @@ def _sanitize_relpath(relpath: str | None) -> list[str]:
     return segments
 
 
+#: SQLite databases and the sidecars a live connection keeps beside them.
+#:
+#: These must never be opened by a file route, and the reason is not privacy —
+#: it is that OPENING ONE CORRUPTS IT. POSIX releases every record lock a process
+#: holds on a file the moment that process closes ANY descriptor to it, not
+#: merely the descriptor that took the lock. SQLite's unix VFS defers its own
+#: closes to defend against this but cannot see a descriptor opened by other
+#: code in the same process — and these routes run inside genesis-server, which
+#: holds SQLite's locks on the live database.
+#:
+#: So a single read drops the server's lock. The next short-lived opener then
+#: takes an exclusive lock, concludes it is the last connection, checkpoints its
+#: partial view into the main file and unlinks the -wal/-shm, while the server
+#: keeps writing through descriptors whose directory entries are gone. MEASURED:
+#: an in-process open/close of a live ``-shm`` took its locks 2 -> 0, and the
+#: same mechanism malformed a production database in under two minutes.
+#:
+#: NOT AN AUTH QUESTION. An authenticated read performs the identical open and
+#: drops the identical locks — the owner browsing data/ in the dashboard's own
+#: Files tab would do it. Authentication changes who can trigger it, never what
+#: it does, so the block belongs on the FILE, not on the caller.
+#:
+#: TWO CHECKS, AND THE NAME-BASED ONE IS THE WEAKER. The hazard is not "this
+#: file is named like a database" — it is "this process already holds a
+#: descriptor on this inode", which is exactly the condition under which our
+#: close drops our locks. So :func:`_locked_by_this_process` is primary and
+#: matches on IDENTITY; the suffix list below is defence in depth for databases
+#: the process has not opened yet.
+#:
+#: The suffix list does NOT cover every SQLite database under any name, and
+#: saying so would be false. MEASURED spellings it misses: a database configured
+#: through ``GENESIS_DB_PATH`` with no extension at all (``genesis.env`` supports
+#: this); Chromium profile databases (``Cookies``, ``History``, ``Web Data`` —
+#: extensionless, and present on this install); a multi-database master journal
+#: (``genesis.db-mj7b3a91e0``); ``.db3``; ``-wal2``; ``genesis.db.pre-update``.
+#: The identity check is what actually covers those, because it never asks what
+#: the file is called.
+#:
+#: Accepted cost, stated: an archived database copy matching a suffix is blocked
+#: even though opening one cannot affect the live file's locks. These are binary
+#: files a text route would mangle anyway.
+#: Bound on the rename guard's directory walk. A rename is a rare, interactive
+#: operation, so the cost only ever lands on a human who asked for it; the bound
+#: exists so a pathological tree cannot stall a request thread, not to save time
+#: on the common case.
+_RENAME_SCAN_MAX_ENTRIES = 20_000
+
+_SQLITE_DB_SUFFIXES = (".db", ".db3", ".sqlite", ".sqlite3")
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-wal2", "-shm", "-journal")
+#: SQLite's multi-database master journal: ``<db>-mj<8 hex><8 hex>``.
+_MASTER_JOURNAL_RE = re.compile(r"-mj[0-9a-f]{4,}$", re.IGNORECASE)
+
+
+def _is_sqlite_artifact(name: str) -> bool:
+    """Is *name* a SQLite database, or a sidecar of one?
+
+    Name-based and therefore incomplete by construction — see the note above.
+    Kept as a second line behind :func:`_locked_by_this_process`.
+    """
+    lowered = name.lower()
+    lowered = _MASTER_JOURNAL_RE.sub("", lowered)
+    for sidecar in _SQLITE_SIDECAR_SUFFIXES:
+        if lowered.endswith(sidecar):
+            lowered = lowered[: -len(sidecar)]
+            break
+    return lowered.endswith(_SQLITE_DB_SUFFIXES)
+
+
+def _locked_by_this_process(resolved: Path) -> bool:
+    """Does THIS process already hold a descriptor on *resolved*'s inode?
+
+    Identity, not name. This is the check that actually matches the hazard: a
+    close only drops locks we hold, and we only hold locks on files we have
+    open. It therefore covers a database under any configured name, and a
+    HARDLINK alias — which ``Path.resolve()`` cannot see, because a hardlink is
+    not a symlink, it is a second name for the same inode. MEASURED before this
+    existed: a ``notes.txt`` hardlinked to the live database read 200,
+    downloaded 200, and was truncated 8192 -> 9 bytes by a write.
+
+    Cost MEASURED at ~0.18 ms over the server's open-fd set.
+
+    Fails OPEN (returns False) when ``/proc`` is unreadable or the path cannot
+    be stat'd — deliberately, because this is the FIRST of two checks and the
+    suffix rule still runs behind it. A hard failure here would take the file
+    browser down on any platform without ``/proc``.
+    """
+    try:
+        st = resolved.stat()
+    except OSError:
+        return False
+    target = (st.st_dev, st.st_ino)
+    try:
+        entries = os.listdir("/proc/self/fd")
+    except OSError:
+        return False
+    for entry in entries:
+        try:
+            fd_st = os.stat(f"/proc/self/fd/{entry}")
+        except OSError:
+            continue  # closed between listing and stat, or not stattable
+        if (fd_st.st_dev, fd_st.st_ino) == target:
+            return True
+    return False
+
+
+def _contains_live_database(directory: Path) -> bool:
+    """Does *directory* hold a database, directly or in a subdirectory?
+
+    Used by the rename guard: moving a directory relocates its contents without
+    ever opening them, so the leaf-name checks in :func:`_is_allowed` cannot see
+    it. Walks rather than globbing one level, because ``data/`` could be renamed
+    by way of its parent.
+
+    Bounded at ``_RENAME_SCAN_MAX_ENTRIES`` and fails CLOSED on the bound: a
+    directory too large to scan is refused rather than waved through, since the
+    only thing being refused is a rename the operator can perform another way.
+    """
+    seen = 0
+    for child in directory.rglob("*"):
+        seen += 1
+        if seen > _RENAME_SCAN_MAX_ENTRIES:
+            return True  # too big to clear — refuse rather than guess
+        try:
+            if not child.is_file():
+                continue
+        except OSError:
+            continue
+        if _is_sqlite_artifact(child.name) or _locked_by_this_process(child):
+            return True
+    return False
+
+
 def _is_allowed(path: Path) -> bool:
     """Check that *path* resolves inside an allowed root and isn't blocked."""
     resolved = path.resolve()
     if resolved.name.lower() in _BLOCKED_NAMES:
+        return False
+    # PRIMARY: identity. Covers any database this process has open, under any
+    # name, including through a hardlink alias that resolve() cannot detect.
+    if _locked_by_this_process(resolved):
+        return False
+    # SECONDARY: name. Catches databases this process has not opened yet.
+    # Checked on the RESOLVED name, so a SYMLINK cannot smuggle one through
+    # under an innocent-looking path (a hardlink can — that is the check above).
+    if _is_sqlite_artifact(resolved.name):
         return False
     # Block paths containing "secret" in any component (except dir names "secrets"/".secrets")
     for part in resolved.parts:
@@ -289,6 +430,15 @@ def file_rename():
         return jsonify({"error": "new_name must be a filename, not a path"}), 400
     if not source.exists():
         return jsonify({"error": "Source not found"}), 404
+
+    # `_is_allowed` inspects a LEAF name, so it cannot see that a directory
+    # contains the live database. Renaming that directory does not open the
+    # file — it is outside the "never open a database" rule — but the outcome is
+    # the same loss: the server keeps writing through descriptors whose
+    # directory entry has moved, and the next connection creates a fresh empty
+    # database at the original path. MEASURED reachable (200) before this guard.
+    if source.is_dir() and _contains_live_database(source):
+        return jsonify({"error": "Directory contains a live database"}), 403
 
     dest = source.parent / new_name
     if not _is_allowed(dest):

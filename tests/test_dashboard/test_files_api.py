@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from io import BytesIO
 from pathlib import Path
 
 import pytest
 from flask import Flask
 
+import genesis.dashboard.routes.files as files_mod
 from genesis.dashboard.api import blueprint
 
 
@@ -224,3 +226,206 @@ def test_upload_too_large(client, tmp_path):
         assert resp.status_code == 413
     finally:
         files_mod._MAX_UPLOAD_SIZE = original_limit
+
+
+# ── SQLite artifacts must be unreachable through every file route ──────────
+#
+# Not a privacy rule. These routes run inside genesis-server, which holds POSIX
+# locks on the live database, and POSIX releases ALL of a process's locks on a
+# file when that process closes ANY descriptor to it. So a single READ through
+# this API drops the server's lock and seeds the WAL split-brain that malformed
+# a production database in under two minutes. The -shm is 32 KB, comfortably
+# under _MAX_FILE_SIZE, so the size cap never stood in the way.
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "genesis.db",
+        "genesis.db-wal",
+        "genesis.db-shm",
+        "genesis.db-journal",
+        "queue.sqlite",
+        "index.sqlite3",
+        "GENESIS.DB",  # case-insensitive
+        "other.sqlite-shm",
+    ],
+)
+def test_sqlite_artifacts_are_refused_by_read(client, tmp_path, name):
+    (tmp_path / name).write_bytes(b"SQLite format 3\x00")
+    resp = client.get(f"/api/genesis/files/read?path={tmp_path / name}")
+    assert resp.status_code == 403, f"{name} was readable — this opens it in-process"
+
+
+def _db_file(tmp_path, name="genesis.db"):
+    db = tmp_path / name
+    db.write_bytes(b"SQLite format 3\x00" + b"\x00" * 4096)
+    return db
+
+
+@pytest.mark.parametrize("route,method", [
+    ("/api/genesis/files/read", "get"),
+    ("/api/genesis/files/download", "get"),
+    ("/api/genesis/files/delete", "delete"),
+    ("/api/genesis/files/write", "put"),
+])
+def test_every_path_route_refuses_a_database(client, tmp_path, route, method):
+    """Assert on the ROUTES, not just the helper — and cover the MUTATING ones.
+
+    An earlier revision of this test covered only read/download/delete. An
+    adversarial review then narrowed the block to
+    ``... and request.method in ("GET", "DELETE")``, kept the whole file GREEN at
+    34 passed, and truncated a database through ``PUT /files/write`` from 8192
+    bytes to 5. A refusal test that omits the routes which WRITE is not testing
+    the thing that loses data.
+    """
+    db = _db_file(tmp_path)
+    before = db.stat().st_size
+
+    if method == "put":
+        resp = client.put(route, json={"path": str(db), "content": "x"})
+    else:
+        resp = getattr(client, method)(f"{route}?path={db}")
+
+    assert resp.status_code == 403, f"{route} reached the database"
+    assert db.exists(), f"{route} deleted the database despite refusing"
+    # The size assertion is what makes the write case non-vacuous: a 403 alone
+    # would not catch a route that refuses AFTER writing.
+    assert db.stat().st_size == before, f"{route} MODIFIED the database"
+
+
+def test_create_and_rename_refuse_database_destinations(client, tmp_path):
+    """The two routes that CONSTRUCT a destination rather than receiving one."""
+    resp = client.post(
+        "/api/genesis/files/create",
+        json={"path": str(tmp_path / "new.db"), "content": "x"},
+    )
+    assert resp.status_code == 403
+    assert not (tmp_path / "new.db").exists()
+
+    plain = tmp_path / "plain.txt"
+    plain.write_text("x")
+    resp = client.post(
+        "/api/genesis/files/rename",
+        json={"path": str(plain), "new_name": "new.db"},
+    )
+    assert resp.status_code == 403
+    assert plain.exists(), "rename moved the file despite refusing"
+
+
+def test_hardlink_to_a_database_is_refused(client, tmp_path):
+    """resolve() cannot see a hardlink — only the identity check can.
+
+    A hardlink is not an alias, it is a second name for the same inode, so the
+    resolved NAME is innocent. MEASURED before the identity check existed: such
+    a file read 200, downloaded 200, and was truncated 8192 -> 9 by a write.
+    """
+    db = _db_file(tmp_path)
+    link = tmp_path / "notes.txt"
+    try:
+        os.link(db, link)
+    except OSError:
+        pytest.skip("hardlinks unsupported here")
+
+    fh = open(db, "rb")  # noqa: SIM115 — the point is to HOLD it open
+    try:
+        before = db.stat().st_size
+        assert client.get(f"/api/genesis/files/read?path={link}").status_code == 403
+        resp = client.put(
+            "/api/genesis/files/write", json={"path": str(link), "content": "x"}
+        )
+        assert resp.status_code == 403
+        assert db.stat().st_size == before, "the database was truncated via a hardlink"
+    finally:
+        fh.close()
+
+
+def test_a_held_database_is_refused_under_any_name(client, tmp_path):
+    """The identity check, isolated: no suffix, no recognisable name.
+
+    This is the case the suffix list provably misses — a database configured
+    through GENESIS_DB_PATH with no extension, or a Chromium profile DB named
+    ``Cookies``. It is refused because we HOLD it, not because of what it is
+    called.
+    """
+    odd = tmp_path / "Cookies"
+    odd.write_bytes(b"SQLite format 3\x00")
+    assert not files_mod._is_sqlite_artifact(odd.name), "fixture no longer isolates identity"
+
+    fh = open(odd, "rb")  # noqa: SIM115 — holding it open IS the condition
+    try:
+        assert client.get(f"/api/genesis/files/read?path={odd}").status_code == 403
+    finally:
+        fh.close()
+
+    # And once nothing holds it, the name-only rule does not claim it.
+    assert client.get(f"/api/genesis/files/read?path={odd}").status_code == 200
+
+
+def test_renaming_a_directory_containing_a_database_is_refused(client, tmp_path):
+    """Moving the parent relocates the database without ever opening it.
+
+    Outside the literal "never open a database" rule, same data loss: the server
+    keeps writing through descriptors whose directory entry moved, and the next
+    connection creates a fresh empty database at the original path. MEASURED
+    reachable (200) before the guard.
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _db_file(data_dir)
+
+    resp = client.post(
+        "/api/genesis/files/rename",
+        json={"path": str(data_dir), "new_name": "data-old"},
+    )
+    assert resp.status_code == 403
+    assert data_dir.exists(), "the data directory was moved"
+    assert not (tmp_path / "data-old").exists()
+
+
+def test_renaming_an_ordinary_directory_still_works(client, tmp_path):
+    """Control for the guard above — it must not freeze the file browser."""
+    plain_dir = tmp_path / "notes"
+    plain_dir.mkdir()
+    (plain_dir / "a.md").write_text("x")
+
+    resp = client.post(
+        "/api/genesis/files/rename",
+        json={"path": str(plain_dir), "new_name": "notes-old"},
+    )
+    assert resp.status_code == 200
+    assert (tmp_path / "notes-old").is_dir()
+
+
+def test_symlink_to_a_database_is_refused(client, tmp_path):
+    """The check runs on the RESOLVED name, so an innocent-looking link fails."""
+    real = tmp_path / "genesis.db"
+    real.write_bytes(b"SQLite format 3\x00")
+    link = tmp_path / "notes.txt"
+    link.symlink_to(real)
+
+    resp = client.get(f"/api/genesis/files/read?path={link}")
+    assert resp.status_code == 403
+
+
+def test_ordinary_files_beside_a_database_still_work(client, tmp_path):
+    """Control: the rule must block the database CLASS, not the directory.
+
+    Without this, a rule that refused everything would pass every assertion
+    above while breaking the file browser entirely.
+    """
+    (tmp_path / "genesis.db").write_bytes(b"SQLite format 3\x00")
+    notes = tmp_path / "notes.md"
+    notes.write_text("still readable")
+
+    resp = client.get(f"/api/genesis/files/read?path={notes}")
+    assert resp.status_code == 200
+    assert resp.get_json()["content"] == "still readable"
+
+
+@pytest.mark.parametrize("name", ["report.db.txt", "database.md", "sqlite-notes.txt"])
+def test_lookalike_names_are_not_over_blocked(client, tmp_path, name):
+    """Names that merely mention a database are ordinary files."""
+    (tmp_path / name).write_text("ok")
+    resp = client.get(f"/api/genesis/files/read?path={tmp_path / name}")
+    assert resp.status_code == 200
