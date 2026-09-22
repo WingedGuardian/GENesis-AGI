@@ -92,21 +92,30 @@ except Exception as _exc:  # noqa: BLE001 — no yaml means NO rules load: same 
 
 _RULES_DIR = Path(__file__).resolve().parent.parent / "config" / "behavioral_rules"
 
-#: Notebook cell types whose source is PROSE, not executable code.
+#: Notebook cell types whose source is PROSE, mapped to the documentation file
+#: each one IS. A markdown cell is a `.md`; a raw cell is a `.txt`.
 #:
 #: A markdown cell documenting `https://api.openai.com/v1/chat/completions` is
-#: the same artifact as that line in a `.md` file, which every content rule
-#: already exempts via `exempt_paths`. But the payload's path ends in `.ipynb`,
-#: so the glob cannot see the cell and the prose was hard-blocked by the
-#: exemption written to allow it — MEASURED exit 2 (Codex P2, #1826). That
-#: false positive was introduced BY the commit that wired NotebookEdit here.
+#: the same artifact as that line in a `.md` file, which the provider rule
+#: exempts by extension. But the payload's path ends in `.ipynb`, so the glob
+#: could not see the cell and the prose was hard-blocked by the exemption
+#: written to allow it — MEASURED exit 2 (Codex P2, #1826). That false positive
+#: was introduced BY the commit that wired NotebookEdit here.
+#:
+#: **The cell is scoped as documentation, not DISCARDED.** The first fix simply
+#: dropped a prose cell's source, which silently exempted it from every OTHER
+#: rule too — `no-prompt-injection` declares no exclusions at all, precisely
+#: because injected text in a document is the threat, so `ignore previous
+#: instructions` warned in `notes.md` and went unchecked in a markdown cell.
+#: MEASURED, and introduced by the fix one commit earlier (Devin, #1826). A
+#: content rule must still see the text; only a rule that EXCLUDES the matching
+#: documentation extension steps aside.
 #:
 #: Polarity is ALLOWLIST, deliberately. An absent, unknown or non-string
-#: cell_type reads as CODE and keeps gating: wiring NotebookEdit exists to
-#: catch a provider call in a cell, so the ambiguous case must fail closed.
-#: A denylist of `{"code"}` would silently exempt every cell type Jupyter
-#: adds next, which is the inverse and worse error.
-_PROSE_CELL_TYPES = frozenset({"markdown", "raw"})
+#: cell_type reads as CODE: wiring NotebookEdit exists to catch a provider call
+#: in a cell, so the ambiguous case must fail closed. A denylist of `{"code"}`
+#: would silently exempt every cell type Jupyter adds next.
+_PROSE_CELL_TYPES = {"markdown": ".md", "raw": ".txt"}
 
 
 def _load_rules() -> list[dict]:
@@ -142,8 +151,15 @@ def _glob_match(file_path: str, globs: list) -> bool:
     return any(fnmatch(name, g) or fnmatch(base, g) for g in globs)
 
 
-def _applies_to(rule: dict, file_path: str) -> bool:
+def _applies_to(rule: dict, file_path: str, *, prose_ext: str = "") -> bool:
     """Whether a rule applies to the given file path.
+
+    ``prose_ext`` names the documentation extension a NOTEBOOK PROSE CELL is
+    equivalent to (``.md`` for markdown, ``.txt`` for raw). When set, the
+    rule's ``excludes`` are additionally tested against the notebook path
+    rewritten with that extension — so a rule exempting docs steps aside for a
+    prose cell, while a rule with no such exemption still sees the text, and
+    directory-shaped excludes like ``tests/*`` keep matching either way.
 
     A rule may declare ``applies_to`` (allow-list) and/or ``excludes``
     (deny-list) as lists of globs:
@@ -156,8 +172,11 @@ def _applies_to(rule: dict, file_path: str) -> bool:
     active (fail toward checking).
     """
     excludes = rule.get("excludes")
-    if excludes and file_path and _glob_match(file_path, excludes):
-        return False
+    if excludes and file_path:
+        if _glob_match(file_path, excludes):
+            return False
+        if prose_ext and _glob_match(os.path.splitext(file_path)[0] + prose_ext, excludes):
+            return False
     globs = rule.get("applies_to")
     if not globs:
         return True
@@ -378,7 +397,12 @@ def _escaped(content: str, rule_name: str, *, bash_mode: bool) -> bool:
 
 
 def _check_content(
-    content: str, rules: list[dict], file_path: str = "", *, bash_mode: bool = False
+    content: str,
+    rules: list[dict],
+    file_path: str = "",
+    *,
+    bash_mode: bool = False,
+    prose_ext: str = "",
 ) -> list[tuple[dict, dict, str]]:
     """Check content against all rules.
 
@@ -390,7 +414,7 @@ def _check_content(
     for rule in rules:
         rule_name = rule.get("name", "unnamed")
 
-        if not _applies_to(rule, file_path):
+        if not _applies_to(rule, file_path, prose_ext=prose_ext):
             continue
 
         # Escape hatch: an explicit opt-out comment turns off the whole rule.
@@ -536,8 +560,11 @@ def main() -> int:
     # can add a cell carrying a direct provider request and run it later, and
     # neither tool call would contain a checked endpoint (Codex P1, #1826).
     content = field(payload, "content") or field(payload, "new_string")
-    if not content and field(payload, "cell_type").lower() not in _PROSE_CELL_TYPES:
+    prose_ext = ""
+    if not content:
         content = field(payload, "new_source")
+        if content:
+            prose_ext = _PROSE_CELL_TYPES.get(field(payload, "cell_type").lower(), "")
     bash_mode = False
     if not content:
         content = field(payload, "command")
@@ -572,7 +599,9 @@ def main() -> int:
     if not rules:
         return 0
 
-    violations = _check_content(content, rules, file_path, bash_mode=bash_mode)
+    violations = _check_content(
+        content, rules, file_path, bash_mode=bash_mode, prose_ext=prose_ext
+    )
     if not violations:
         return 0
 
