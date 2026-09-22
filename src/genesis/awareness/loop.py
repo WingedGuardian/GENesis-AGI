@@ -1647,6 +1647,15 @@ async def _resolve_follow_up_watchdog(db) -> None:
 _NOCOW_ALERT_COOLDOWN_S = 24 * 3600
 # None = "never alerted" (same monotonic-since-boot caveat as the WAL alert).
 _last_nocow_alert_at: float | None = None
+#: The one probe child we SIGKILLed and could not collect, if any. Holds the
+#: accumulation bounded at ONE — see :func:`_nocow_flag`'s "at most one
+#: survivor" clause. None means there is nothing outstanding.
+_stuck_nocow_probe = None
+#: When that survivor was recorded (``time.monotonic``). Only for the WARNING
+#: that says how long this monitor has been disabled — nothing branches on it,
+#: deliberately: a deadline that re-probed would re-open the very leak the
+#: survivor represents.
+_stuck_nocow_probe_since: float | None = None
 _FS_IOC_GETFLAGS = 0x80086601
 _FS_NOCOW_FL = 0x00800000
 
@@ -1729,6 +1738,14 @@ async def _kill_probe(proc) -> None:
     sleep, and one leaked registration is strictly better than a stalled tick.
     The decision was right; the reason given for it was false.
 
+    "ONE leaked registration" is only true because the CALLER makes it true.
+    Review pointed out that this function alone bounds nothing: the check runs
+    hourly, so a filesystem wedged for a week would leave ~168 un-reaped
+    children and as many watcher registrations, not one. :func:`_nocow_flag`
+    records the survivor in :data:`_stuck_nocow_probe` and declines to spawn
+    beside it, which is where the bound actually lives. Do not read this
+    docstring as a guarantee this function provides.
+
     ``CancelledError`` derives from ``BaseException``, so neither handler below
     catches it and it propagates by construction — correct, because this is
     called from the cancellation path and must not convert a cancellation into a
@@ -1795,11 +1812,61 @@ async def _nocow_flag(db_path: Path) -> bool | None:
 
     The cost of that fidelity is one short-lived process per hourly check.
 
+    AT MOST ONE SURVIVOR, EVER. A child wedged in uninterruptible sleep cannot
+    be collected — :func:`_kill_probe` gives up on it deliberately rather than
+    stall the tick. Left there, the hourly cadence would accumulate one such
+    child (and one asyncio child-watcher registration) per hour for as long as
+    the filesystem stayed wedged. So the survivor is recorded in
+    :data:`_stuck_nocow_probe` and no new probe is spawned while it is still
+    running; the check simply reports "could not tell", which is the same answer
+    the spawn would have produced. The latch clears itself the first time the
+    child's ``returncode`` is set — asyncio's watcher does that without an
+    awaiter — so recovery needs no timer and no cleanup path.
+
     Returns None — never raises — for EVERY failure mode: spawn failure, a
     timeout, a non-zero exit, unparseable output. The caller's own blanket
     ``except`` would swallow an exception anyway, so raising here would only
     make the failure harder to see, not safer.
     """
+    global _stuck_nocow_probe, _stuck_nocow_probe_since
+
+    if _stuck_nocow_probe is not None:
+        if _stuck_nocow_probe.returncode is None:
+            # A previous probe is STILL wedged. Spawning beside it is what turns
+            # one leaked child into one per hour, so decline instead — the answer
+            # would be "could not tell" either way, which is what we return.
+            #
+            # WARNING, not debug, and that is the point. While this holds, the
+            # nodatacow monitor is OFF: it reports "could not tell" every hour
+            # and raises nothing. The shipped log level is INFO, so a debug line
+            # here would make a disabled health check invisible — which is the
+            # failure this very function's spawn-failure comment warns about.
+            # It does not self-clear on a timer: a child that never leaves
+            # uninterruptible sleep keeps the monitor off until the server
+            # restarts, and saying so out loud is the remedy, because retrying
+            # into a wedged filesystem buys nothing and re-opens the leak.
+            held_for = (
+                time.monotonic() - _stuck_nocow_probe_since
+                if _stuck_nocow_probe_since is not None
+                else float("nan")
+            )
+            logger.warning(
+                "nodatacow check SKIPPED and will stay skipped: probe pid %s has "
+                "not exited after %.0fs (uninterruptible — a wedged filesystem?). "
+                "This monitor is disabled until that child exits or the server "
+                "restarts.",
+                getattr(_stuck_nocow_probe, "pid", "?"),
+                held_for,
+            )
+            return None
+        # It exited on its own. asyncio's child watcher sets ``returncode``
+        # without anyone awaiting — MEASURED on this install (Python 3.12.3,
+        # PidfdChildWatcher, returncode set ~10ms after SIGKILL with no awaiter)
+        # — so this clears itself on the next check with no extra machinery and
+        # no timer.
+        _stuck_nocow_probe = None
+        _stuck_nocow_probe_since = None
+
     try:
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -1824,7 +1891,20 @@ async def _nocow_flag(db_path: Path) -> bool | None:
             proc.communicate(), timeout=_NOCOW_PROBE_TIMEOUT_S
         )
     except TimeoutError:
+        # RECORD FIRST, clear on success — never the other way round. `_kill_probe`
+        # awaits, so it is a cancellation point: a tick cancelled during the reap
+        # would propagate CancelledError straight past a trailing assignment,
+        # leaving the child killed but UNTRACKED and the next check free to spawn
+        # beside it. That is precisely the accumulation this latch exists to stop,
+        # so the window must not exist. Review found this by executing it:
+        # `kills=1 latch=None -> LEAKED, UNTRACKED`.
+        _stuck_nocow_probe = proc
+        _stuck_nocow_probe_since = time.monotonic()
         await _kill_probe(proc)
+        if proc.returncode is not None:
+            # collected; nothing is outstanding
+            _stuck_nocow_probe = None
+            _stuck_nocow_probe_since = None
         logger.debug("nodatacow probe timed out after %ss", _NOCOW_PROBE_TIMEOUT_S)
         return None
     except asyncio.CancelledError:
@@ -1832,7 +1912,16 @@ async def _nocow_flag(db_path: Path) -> bool | None:
         # and had no await point, so this window is NEW: without the kill the
         # child outlives us. Reap it, then let cancellation propagate — never
         # convert it into a verdict.
+        #
+        # Same record-first ordering, and here it is not a corner: this handler
+        # runs BECAUSE something cancelled us, so a second cancellation arriving
+        # during the reap is the ordinary case rather than the exotic one.
+        _stuck_nocow_probe = proc
+        _stuck_nocow_probe_since = time.monotonic()
         await _kill_probe(proc)
+        if proc.returncode is not None:
+            _stuck_nocow_probe = None
+            _stuck_nocow_probe_since = None
         raise
 
     if proc.returncode != 0:

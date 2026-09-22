@@ -46,8 +46,12 @@ def _locks_held_on(path) -> int:
 @pytest.fixture(autouse=True)
 def _reset_cooldown():
     loop._last_nocow_alert_at = None
+    loop._stuck_nocow_probe = None
+    loop._stuck_nocow_probe_since = None
     yield
     loop._last_nocow_alert_at = None
+    loop._stuck_nocow_probe = None
+    loop._stuck_nocow_probe_since = None
 
 
 @pytest.fixture
@@ -467,3 +471,319 @@ async def test_the_timeout_path_is_bounded_at_the_call_site(monkeypatch):
         f"the timeout path took {elapsed:.1f}s against a 0.2s probe bound and a "
         "0.2s reap bound — something on the call site waits unbounded"
     )
+
+
+# ---------------------------------------------------------------------------
+# At most ONE un-reaped probe child, ever.
+#
+# Review finding (Devin, PR #2226): _kill_probe abandons a child that survives
+# SIGKILL — correct, because waiting on an uninterruptible child would defeat
+# the very timeout it serves. But abandoning is not bounding. The check runs
+# hourly, so a filesystem wedged for a week leaves ~168 un-reaped children and
+# as many asyncio child-watcher registrations. The bound has to live in the
+# CALLER, which is what these tests pin.
+# ---------------------------------------------------------------------------
+
+
+class _WedgedProc:
+    """A probe child that ignores SIGKILL until explicitly released.
+
+    Stands in for a child in uninterruptible sleep — the one state where
+    ``kill()`` is accepted and the process still does not exit. Nothing in the
+    test suite can produce a real D-state process (it needs a wedged
+    filesystem), so this models the contract the code depends on: ``kill()``
+    returns, and ``returncode`` stays None.
+    """
+
+    def __init__(self, pid: int = 424242) -> None:
+        import asyncio as _asyncio
+
+        self.pid = pid
+        self.returncode = None
+        self.kills = 0
+        self._released = _asyncio.Event()
+
+    def kill(self) -> None:
+        self.kills += 1
+
+    async def wait(self):
+        await self._released.wait()
+        return self.returncode
+
+    async def communicate(self):
+        await self._released.wait()
+        return b"", b""
+
+    def release(self, code: int = 0) -> None:
+        """The child finally exits. Mirrors asyncio's child watcher setting
+        ``returncode`` with nobody awaiting — which is what lets the latch clear
+        itself without a timer."""
+        self.returncode = code
+        self._released.set()
+
+
+class _KillableProc(_WedgedProc):
+    """A child that DOES die on SIGKILL — the ordinary timeout case.
+
+    This is the discriminating control. If the latch fired for every timeout
+    rather than only for children that survive the kill, a single slow probe
+    would disable the check until the next restart.
+    """
+
+    def kill(self) -> None:
+        self.kills += 1
+        self.release(-9)
+
+
+def _spawn_returning(monkeypatch, *procs):
+    """Patch the spawn seam; return a list that records each spawn."""
+    import asyncio as _asyncio
+
+    spawned: list = []
+    queue = list(procs)
+
+    async def _fake_exec(*_a, **_kw):
+        proc = queue.pop(0) if queue else _WedgedProc()
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(loop, "_NOCOW_PROBE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(loop, "_NOCOW_REAP_TIMEOUT_S", 0.02)
+    return spawned
+
+
+@pytest.mark.asyncio
+async def test_a_wedged_probe_is_not_spawned_beside(tmp_path, monkeypatch):
+    """THE ACCEPTANCE BAR. Hour two must not add a second stuck child."""
+    from pathlib import Path
+
+    wedged = _WedgedProc()
+    spawned = _spawn_returning(monkeypatch, wedged, _WedgedProc(pid=999999))
+
+    first = await loop._nocow_flag(Path(tmp_path / "genesis.db"))
+    assert first is None
+    assert len(spawned) == 1
+    assert wedged.kills == 1, "the first probe must still be SIGKILLed"
+    assert loop._stuck_nocow_probe is wedged, "the survivor must be recorded"
+
+    second = await loop._nocow_flag(Path(tmp_path / "genesis.db"))
+
+    assert second is None, "declining to probe reports 'could not tell'"
+    assert len(spawned) == 1, (
+        f"a second probe was spawned beside a child that never exited "
+        f"({len(spawned)} spawns) — this is the per-hour accumulation"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_latch_clears_once_the_stuck_child_exits(tmp_path, monkeypatch):
+    """Self-healing, with no timer and no cleanup path: the next call clears it."""
+    from pathlib import Path
+
+    wedged = _WedgedProc()
+    healthy = _KillableProc(pid=555)
+    spawned = _spawn_returning(monkeypatch, wedged, healthy)
+
+    await loop._nocow_flag(Path(tmp_path / "genesis.db"))
+    assert loop._stuck_nocow_probe is wedged
+
+    wedged.release(0)  # the filesystem un-wedges; the watcher sets returncode
+
+    await loop._nocow_flag(Path(tmp_path / "genesis.db"))
+
+    assert len(spawned) == 2, "probing must resume once the survivor is gone"
+    assert loop._stuck_nocow_probe is not wedged
+
+
+@pytest.mark.asyncio
+async def test_a_timeout_whose_child_died_does_not_latch(tmp_path, monkeypatch):
+    """THE CONTROL. A latch that fires on every timeout would be a worse bug
+    than the one being fixed: one slow probe would disable the check until the
+    process restarts. Only a child that survives SIGKILL may latch."""
+    from pathlib import Path
+
+    killable = _KillableProc()
+    spawned = _spawn_returning(monkeypatch, killable, _KillableProc(pid=2))
+
+    await loop._nocow_flag(Path(tmp_path / "genesis.db"))
+    assert killable.kills == 1
+    assert killable.returncode is not None, "fixture must model a collected child"
+    assert loop._stuck_nocow_probe is None, (
+        "a child that DIED on SIGKILL is not a survivor and must not latch"
+    )
+
+    await loop._nocow_flag(Path(tmp_path / "genesis.db"))
+    assert len(spawned) == 2, "an ordinary timeout must not suppress later checks"
+
+
+@pytest.mark.asyncio
+async def test_cancellation_also_records_a_surviving_child(tmp_path, monkeypatch):
+    """Shutdown takes the same abandon path, so it needs the same bound.
+
+    Without this, a cancelled tick would leak a survivor that nothing tracks —
+    and the next probe would spawn beside it.
+    """
+    import asyncio as _asyncio
+    from pathlib import Path
+
+    wedged = _WedgedProc()
+    _spawn_returning(monkeypatch, wedged)
+
+    task = _asyncio.ensure_future(loop._nocow_flag(Path(tmp_path / "genesis.db")))
+    await _asyncio.sleep(0)  # let it reach the await on communicate()
+    task.cancel()
+    with pytest.raises(_asyncio.CancelledError):
+        await task
+
+    assert wedged.kills == 1, "cancellation must still SIGKILL the child"
+    assert loop._stuck_nocow_probe is wedged, (
+        "a child abandoned by CANCELLATION accumulates exactly like one "
+        "abandoned by timeout"
+    )
+
+
+def _slow_kill_seam(monkeypatch):
+    """Replace `_kill_probe` with one that parks inside the reap.
+
+    `_kill_probe` awaits, which makes it a cancellation point — the whole
+    subject of these two tests. Parking there lets a cancellation be delivered
+    at exactly that await rather than hoping to hit a real 0.02s window.
+    """
+    import asyncio as _asyncio
+
+    reap_entered = _asyncio.Event()
+
+    async def _slow_kill(proc):
+        proc.kill()
+        reap_entered.set()
+        await _asyncio.sleep(3600)
+
+    monkeypatch.setattr(loop, "_kill_probe", _slow_kill)
+    return reap_entered
+
+
+@pytest.mark.asyncio
+async def test_timeout_path_records_before_the_cancellable_reap(
+    tmp_path, monkeypatch
+):
+    """Record BEFORE the cancellable await, not after — the TIMEOUT path.
+
+    An earlier revision assigned the latch after `_kill_probe`. Review
+    reproduced the consequence by execution: cancel the tick mid-reap and
+    CancelledError propagates past the assignment, leaving the child killed but
+    UNTRACKED, so the next hourly check spawns beside it. That is the exact
+    accumulation this feature exists to prevent, reachable through the
+    feature's own cleanup path.
+
+    NOTE FOR WHOEVER EDITS THIS: an earlier version of this test claimed to
+    cover the CANCELLATION path and did not — it reaches `_kill_probe` via the
+    timeout, so mutating the cancellation path left it green. Mutation caught
+    that; reading it did not. The two paths need the two tests below.
+    """
+    import asyncio as _asyncio
+    from pathlib import Path
+
+    wedged = _WedgedProc()
+    _spawn_returning(monkeypatch, wedged)
+    reap_entered = _slow_kill_seam(monkeypatch)
+
+    task = _asyncio.ensure_future(loop._nocow_flag(Path(tmp_path / "genesis.db")))
+    await _asyncio.wait_for(reap_entered.wait(), timeout=5)  # timeout fired
+    task.cancel()
+    with pytest.raises(_asyncio.CancelledError):
+        await task
+
+    assert loop._stuck_nocow_probe is wedged, (
+        "a cancellation inside the timeout path's reap left the killed child "
+        "untracked — the next check will spawn beside it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_path_records_before_the_cancellable_reap(
+    tmp_path, monkeypatch
+):
+    """Same ordering, on the CANCELLATION path — where it is the ordinary case.
+
+    This handler runs *because* something cancelled us, so a second
+    cancellation arriving while it reaps is not exotic: it is what a shutdown
+    that stops waiting looks like. Getting here needs the first cancel to land
+    on `communicate()` BEFORE the timeout fires, which is why this test cancels
+    immediately instead of waiting for the reap like the one above.
+    """
+    import asyncio as _asyncio
+    from pathlib import Path
+
+    wedged = _WedgedProc()
+    _spawn_returning(monkeypatch, wedged)
+    monkeypatch.setattr(loop, "_NOCOW_PROBE_TIMEOUT_S", 30)  # timeout must NOT win
+    reap_entered = _slow_kill_seam(monkeypatch)
+
+    task = _asyncio.ensure_future(loop._nocow_flag(Path(tmp_path / "genesis.db")))
+    await _asyncio.sleep(0)  # park on communicate()
+    task.cancel()  # -> CancelledError handler -> the reap
+    await _asyncio.wait_for(reap_entered.wait(), timeout=5)
+    task.cancel()  # second cancel, delivered INSIDE the reap
+    with pytest.raises(_asyncio.CancelledError):
+        await task
+
+    assert loop._stuck_nocow_probe is wedged, (
+        "a cancellation inside the cancel path's reap left the killed child "
+        "untracked"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_caller_stops_spawning_too(_db_file, monkeypatch):
+    """THE GUARANTEE AT THE CALL SITE, not one layer below it.
+
+    Every other test here drives `_nocow_flag` directly. That is the mistake
+    this file already records twice (see the docstrings above on asserting a
+    guarantee at the helper rather than at its caller) and which a BLOCKER on
+    the parent PR caught once — a mutant that moved the check into
+    `_check_db_nodatacow` kept eleven helper-level tests green while dropping
+    the real guarantee. `_check_db_nodatacow` is what the awareness tick calls,
+    so the bound has to hold THERE.
+    """
+    monkeypatch.setattr(loop, "_fs_type_for", lambda _p: "btrfs")
+    wedged = _WedgedProc()
+    spawned = _spawn_returning(monkeypatch, wedged, _WedgedProc(pid=777))
+    spy = AsyncMock()
+    monkeypatch.setattr(loop.observations, "create", spy)
+
+    await loop._check_db_nodatacow(object())  # hour one: probe wedges
+    await loop._check_db_nodatacow(object())  # hour two: must not spawn again
+
+    assert len(spawned) == 1, (
+        f"the production call site spawned {len(spawned)} probes across two "
+        "ticks while the first child was still alive"
+    )
+    spy.assert_not_called(), "an undeterminable flag must never raise an alert"
+
+
+@pytest.mark.asyncio
+async def test_a_held_latch_is_announced_at_warning_not_debug(
+    tmp_path, monkeypatch, caplog
+):
+    """A silently disabled health check is the failure mode, not a quiet success.
+
+    While the latch holds, this monitor reports "could not tell" every hour and
+    raises nothing. The shipped level is INFO, so a debug line would make that
+    invisible for as long as it lasts — which can be until the server restarts.
+    """
+    import logging
+    from pathlib import Path
+
+    wedged = _WedgedProc(pid=31337)
+    _spawn_returning(monkeypatch, wedged)
+
+    await loop._nocow_flag(Path(tmp_path / "genesis.db"))
+    assert loop._stuck_nocow_probe is wedged
+
+    with caplog.at_level(logging.WARNING, logger=loop.logger.name):
+        await loop._nocow_flag(Path(tmp_path / "genesis.db"))
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, "declining to probe must be visible at the shipped log level"
+    assert "31337" in warnings[0].getMessage(), "name the pid that is wedged"
