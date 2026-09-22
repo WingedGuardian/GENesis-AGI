@@ -251,14 +251,32 @@ def _looks_like_sqlite(resolved: Path) -> bool:
     server opens, which is a larger change than this fix and is tracked
     separately.
 
+    OPENED NON-BLOCKING, AND ONLY REGULAR FILES ARE READ. A plain
+    ``open(path, "rb")`` on a FIFO with no writer blocks forever, which would
+    hang a Flask worker — this check runs BEFORE the routes do their own
+    file-type checks, so it is the first thing a special file meets.
+    ``O_NONBLOCK`` makes that open return immediately and ``fstat`` on the
+    resulting descriptor decides whether there is anything worth reading;
+    anything that is not a regular file is not a database. ``O_NOFOLLOW`` is
+    belt-and-braces: *resolved* has already been through ``Path.resolve()`` so
+    its last component should not be a symlink, and this refuses rather than
+    follows if one appeared in between.
+
     Reads 16 bytes. Any OSError means "cannot tell", which falls through to the
     name check rather than granting access.
     """
     try:
-        with resolved.open("rb") as fh:
-            return fh.read(len(_SQLITE_MAGIC)) == _SQLITE_MAGIC
+        fd = os.open(resolved, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     except OSError:
         return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False  # FIFO, device, socket — not a database
+        return os.read(fd, len(_SQLITE_MAGIC)) == _SQLITE_MAGIC
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
 
 
 def _contains_live_database(directory: Path) -> bool:

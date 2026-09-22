@@ -408,6 +408,39 @@ def test_a_directory_named_like_a_database_is_still_usable(client, tmp_path):
         assert resp.status_code == 200, f"directory {name} was refused"
 
 
+def test_a_fifo_does_not_hang_the_content_check(client, tmp_path):
+    """A FIFO with no writer must not block the request worker.
+
+    The content check runs BEFORE the routes do their own file-type checks, so
+    it is the first thing a special file meets. A plain open("rb") on a
+    writer-less FIFO blocks forever and would hang a Flask worker — which is a
+    denial of service introduced by the check itself, not by the caller.
+
+    Asserted by TIME, not just by outcome: a correctness-only assertion would
+    pass by hanging until pytest was killed, which is the failure mode this
+    guards against.
+    """
+    import threading
+    import time
+
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+
+    result = {}
+
+    def _call():
+        start = time.monotonic()
+        result["status"] = client.get(f"/api/genesis/files/read?path={fifo}").status_code
+        result["elapsed"] = time.monotonic() - start
+
+    t = threading.Thread(target=_call, daemon=True)
+    t.start()
+    t.join(timeout=10)
+
+    assert not t.is_alive(), "the request blocked on a writer-less FIFO"
+    assert result["elapsed"] < 5.0, f"took {result['elapsed']:.1f}s on a FIFO"
+
+
 def test_an_unreadable_subtree_refuses_the_rename(client, tmp_path):
     """Fail CLOSED when the tree cannot be fully inspected.
 
