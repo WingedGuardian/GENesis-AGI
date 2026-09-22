@@ -763,3 +763,85 @@ def test_containment_is_checked_before_any_filesystem_call(tmp_path, monkeypatch
         "an out-of-root path reached a filesystem call — containment is no "
         f"longer checked first, which is the py/path-injection shape. Touched: {touched}"
     )
+
+
+def test_a_database_ABOVE_the_allowed_roots_does_not_deny_them_all(
+    client, tmp_path, monkeypatch
+):
+    """The CLASS, not the case.
+
+    Fixing "the database's parent IS an allowed root" left its sibling alive:
+    a parent that is an ANCESTOR of the roots. With `~/genesis.db` the area
+    becomes `~`, and `~/genesis`, `~/.genesis` and `~/.claude` are all beneath
+    it — so every file in all three roots is refused at once. Review (Devin)
+    found it immediately after the first fix landed, which is the signal that
+    the first fix answered an instance.
+
+    Directory-scoping now applies only where the parent lies STRICTLY INSIDE a
+    root, which covers both arrangements and any third one of the same shape.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(files_mod, "_ALLOWED_ROOTS", [root])
+    db = tmp_path / "genesis.db"  # ABOVE the root, not in it
+    db.write_bytes(b"SQLite format 3\x00")
+    monkeypatch.setattr("genesis.env.genesis_db_path", lambda: db)
+
+    ordinary = root / "README.md"
+    ordinary.write_text("an ordinary file in an allowed root")
+
+    _db, area = files_mod._configured_db_identity()
+    assert area is None, (
+        f"area={area} is an ancestor of the allowed root — every file beneath "
+        "it is refused, which is the whole root"
+    )
+    assert client.get(f"/api/genesis/files/read?path={ordinary}").status_code == 200, (
+        "a database ABOVE the allowed roots denied every file inside them"
+    )
+
+
+def test_the_rename_scan_bound_stops_before_materialising_the_directory(
+    tmp_path, monkeypatch
+):
+    """A bound checked after the allocation is not a bound.
+
+    `list(it)` materialised every entry before the counter could refuse, so a
+    hostile directory paid full enumeration and allocation cost first. Asserted
+    by counting what the walk actually PULLS from the iterator: it must stop
+    just past the limit, not consume the whole directory.
+    """
+    monkeypatch.setattr(files_mod, "_RENAME_SCAN_MAX_ENTRIES", 5)
+    big = tmp_path / "big"
+    big.mkdir()
+    for i in range(40):
+        (big / f"f{i:03d}.txt").write_text("x")
+
+    pulled = 0
+    real_scandir = files_mod.os.scandir
+
+    class _CountingScandir:
+        def __init__(self, path):
+            self._it = real_scandir(path)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return self._it.__exit__(*exc)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal pulled
+            entry = next(self._it)
+            pulled += 1
+            return entry
+
+    monkeypatch.setattr(files_mod.os, "scandir", lambda p: _CountingScandir(p))
+
+    assert files_mod._contains_live_database(big) is True  # refused on the bound
+    assert pulled <= 10, (
+        f"the walk pulled {pulled} of 40 entries against a bound of 5 — it is "
+        "materialising the directory before the bound can stop it"
+    )

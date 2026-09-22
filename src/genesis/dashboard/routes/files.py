@@ -191,12 +191,20 @@ def _configured_db_identity() -> tuple[Path | None, Path | None]:
     computed ONCE and handed to the rename walk rather than recomputed per
     child, where it cost ~5.3s at the 20,000-entry scan bound.
 
-    ONE CONFIG SHAPE IS HANDLED EXPLICITLY: **the database sits directly in an
-    allowed root** (``~/genesis/genesis.db`` rather than
-    ``~/genesis/data/genesis.db``). Its parent IS the root, so "everything
-    beside it" is everything — the file browser would refuse the whole tree,
-    uploads included. ``area`` is None there, and the database's sidecars are
-    covered by an ANCHORED name prefix instead.
+    DIRECTORY-SCOPING IS ONLY APPLIED WHERE IT IS MEANINGFUL: when the
+    database's parent lies STRICTLY INSIDE an allowed root. Anywhere else,
+    refusing "everything beside the database" refuses an entire allowed root:
+
+    * ``~/genesis/genesis.db`` — the parent IS a root, so everything beside it
+      is everything in that root.
+    * ``~/genesis.db`` — the parent is an ANCESTOR of all three roots, so it
+      denies all of them at once. Review (Devin) found this one after the first
+      was fixed, which is the tell: the first fix answered the INSTANCE
+      (``parent == root``) and left the class. The predicate below answers the
+      class, so a third arrangement of the same shape cannot appear.
+
+    Where scoping does not apply, ``area`` is None and the database's sidecars
+    are covered by an ANCHORED name prefix instead.
 
     A RELATIVE configured path is resolved, not refused, and that is deliberate.
     ``genesis.env.genesis_db_path`` returns the configured value unresolved, and
@@ -236,9 +244,11 @@ def _configured_db_identity() -> tuple[Path | None, Path | None]:
         return (None, None)
 
     parent = db_path.parent
-    area: Path | None = parent
-    if any(parent == root.resolve() for root in _ALLOWED_ROOTS):
-        area = None
+    strictly_inside_a_root = any(
+        parent != root.resolve() and parent.is_relative_to(root.resolve())
+        for root in _ALLOWED_ROOTS
+    )
+    area: Path | None = parent if strictly_inside_a_root else None
     return (db_path, area)
 
 
@@ -325,28 +335,34 @@ def _contains_live_database(directory: Path) -> bool:
     stack = [directory]
     while stack:
         current = stack.pop()
+        # Iterate the scandir handle DIRECTLY rather than materialising it with
+        # `list(it)` first. The bound below is what makes this safe on a hostile
+        # tree, and a bound checked after the allocation is not a bound: review
+        # (Devin) pointed out that a directory of a million entries built a
+        # million `DirEntry` objects before the counter reached 20,001 and
+        # refused. The OSError handler now wraps the ITERATION too, because
+        # scandir can raise part-way through, not only at open.
         try:
             with os.scandir(current) as it:
-                entries = list(it)
+                for entry in it:
+                    seen += 1
+                    if seen > _RENAME_SCAN_MAX_ENTRIES:
+                        return True  # too big to clear — refuse rather than guess
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        return True  # same reasoning: unknown means refused
+                    if _is_sqlite_artifact(entry.name) or _in_configured_database_area(
+                        Path(entry.path), identity
+                    ):
+                        return True
         except OSError:
             # Cannot inspect it, so cannot clear it. Refuse.
             return True
-        for entry in entries:
-            seen += 1
-            if seen > _RENAME_SCAN_MAX_ENTRIES:
-                return True  # too big to clear — refuse rather than guess
-            try:
-                if entry.is_dir(follow_symlinks=False):
-                    stack.append(Path(entry.path))
-                    continue
-                if not entry.is_file(follow_symlinks=False):
-                    continue
-            except OSError:
-                return True  # same reasoning: unknown means refused
-            if _is_sqlite_artifact(entry.name) or _in_configured_database_area(
-                Path(entry.path), identity
-            ):
-                return True
     return False
 
 
