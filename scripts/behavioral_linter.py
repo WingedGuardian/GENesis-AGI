@@ -203,7 +203,20 @@ _EXEC_FLAGS = ("--pre", "--hostname-bin", "--pager", "--open-files-in-pager")
 #: direction. MEASURED: `git blame -O<script>` does NOT execute it, and
 #: `git -c diff.external=<cmd> diff` already fails closed because `-c` is not
 #: in _GIT_SEARCH_SUBCOMMANDS.
-_GIT_EXEC_PATTERNS = {"grep": re.compile(r"^--op[a-z-]*(=|$)|^-[A-Za-z]*O")}
+#: The cluster is `[A-Za-z0-9]`, not `[A-Za-z]`. The first version modelled
+#: bundling for LETTERS, having measured `-nO` and `-inO` — and git grep's
+#: context options are DIGITS (`-1`..`-9`), which cluster the same way.
+#: MEASURED by marker file, in a scratch repo:
+#:     -O<script>     executed    matched by the old pattern
+#:     -nO<script>    executed    matched
+#:     -2O<script>    executed    NOT matched   <- bypass
+#:     -i2O<script>   executed    NOT matched   <- bypass
+#: That is the same bundling class one character wide, found by a reviewer
+#: after the commit that claimed to close it. Instance-patched here rather
+#: than redesigned because the mechanism itself is dispositioned in #2230;
+#: leaving a MEASURED direct spelling open while the docstring says direct
+#: spellings are closed would make that docstring wrong on the day it landed.
+_GIT_EXEC_PATTERNS = {"grep": re.compile(r"^--op[a-z-]*(=|$)|^-[A-Za-z0-9]*O")}
 
 #: The git subcommands admitted as searches at all.
 _GIT_SEARCH_SUBCOMMANDS = frozenset({"log", "grep", "show", "diff", "blame"})
@@ -217,7 +230,18 @@ def _carries_exec_flag(args: list[str], pattern: re.Pattern[str] | None = None) 
     read-only for any `git log|grep|show|diff|blame` regardless of its flags
     (CodeRabbit Major, #1826) — the executor test existed and simply was not
     reached on half the paths it was written for.
+
+    Scanning STOPS at the first bare `--`. Everything after it is a path
+    operand, and a repository may legitimately contain a file whose name looks
+    like a flag. MEASURED in a scratch repo with a tracked file named
+    `-Onotes`: `git grep needle -- -Onotes` searches it and executes NOTHING,
+    while `git grep -O<script> needle` executes. Without the boundary the
+    matcher sees `-Onotes`, revokes the exemption, and the endpoint rule hard-
+    blocks a real search — a false block on the audit sessions that most need
+    to grep for provider usage (Devin finding, #1826).
     """
+    if "--" in args:
+        args = args[: args.index("--")]
     if any(a == f or a.startswith(f + "=") for a in args for f in _EXEC_FLAGS):
         return True
     return pattern is not None and any(pattern.match(a) for a in args)

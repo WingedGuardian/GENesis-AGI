@@ -883,6 +883,14 @@ class TestBashAuditFindings:
             # BUNDLING: -O may end any short cluster, and -n is the flag a
             # real grep would already carry.
             f'git grep -nO"curl -X POST {self._ENDPOINT}" needle',
+            # ...and the cluster is not only LETTERS. git grep's context
+            # options are DIGITS, and the first version of this pattern wrote
+            # [A-Za-z]* having measured only -nO and -inO. MEASURED by marker
+            # file in a scratch repo: -2O<script> and -i2O<script> both
+            # EXECUTE, and neither matched. Found by a reviewer, one round
+            # after the commit that claimed to close bundling.
+            f'git grep -2O"curl -X POST {self._ENDPOINT}" needle',
+            f'git grep -i2O"curl -X POST {self._ENDPOINT}" needle',
             # QUOTED: the guard reads the command as typed, the shell hands
             # the tool a de-quoted argv — a bare .split() leaves the quote
             # attached and every table misses it.
@@ -913,6 +921,16 @@ class TestBashAuditFindings:
             # vacuous.
             f"git diff -Osome-orderfile -G'{self._ENDPOINT}' HEAD~1",
             f"git show -Osome-orderfile -S'{self._ENDPOINT}'",
+            # After a bare `--` every argument is a PATH, and a repository may
+            # legitimately hold a file whose name looks like a flag. MEASURED
+            # in a scratch repo with a tracked `-Onotes`: `git grep needle --
+            # -Onotes` searches it and executes NOTHING, while `git grep
+            # -O<script> needle` executes. Without the boundary the matcher
+            # sees the path, revokes the exemption, and hard-blocks a real
+            # search — landing on the audit sessions that most need to grep
+            # for provider usage (Devin finding, #1826).
+            f"git grep '{self._ENDPOINT}' -- -Onotes",
+            f"git grep '{self._ENDPOINT}' -- --pre-release-notes.md",
         ):
             r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
             assert r.returncode == 0, f"{cmd!r} was wrongly blocked"
