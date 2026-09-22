@@ -173,8 +173,18 @@ def _is_secret_path(raw: str, inodes: set[tuple[int, int]], *, allow_bare: bool 
         return False
     try:
         p = Path(os.path.expanduser(raw))
-        if p.name.endswith(".example"):
-            return False
+        # NOTE: there is deliberately no `.example` test here. An earlier
+        # version short-circuited on the UNRESOLVED name before the inode
+        # compare below, which made a filename outrank file identity: a symlink
+        # named `x.example` pointing AT the real secrets.env was allowed, while
+        # a hardlink to the same inode under any other name correctly gated
+        # (MEASURED both ways). It also contradicted the comment below claiming
+        # the inode arm is unconditional. The branch had no legitimate effect to
+        # trade for that: `_SECRET_BASENAMES` is ('secrets.env',), so the
+        # template is already rejected by the name checks further down — proven
+        # by mutation, the suite stays green with the branch deleted. If a
+        # template exemption is ever wanted again it must come AFTER the
+        # identity test and read `p.resolve().name`.
         st = p.resolve().stat()
         if (st.st_dev, st.st_ino) in inodes:
             # A real secrets file — but a bare NAME is still ambiguous when the
@@ -237,10 +247,28 @@ _SUSPICIOUS = re.compile(r"(\$\{?\w+|`|\$\()", re.IGNORECASE)
 #: ``dashboard/routes/secrets.py`` (a source file that is not the credentials
 #: file). Still included: ``f=secrets; cat $f.env``, the declared shell-variable
 #: residual this arm exists for.
-#: ``.example`` is excluded here for the same reason ``_is_secret_path`` excludes
-#: it: the template holds nothing. Without the lookahead, ANY command mentioning
-#: ``secrets.env.example`` alongside a ``$`` gated at the command level, even
-#: though the per-token check would have cleared it.
+#: ``.example`` is excluded here, and the reason is NOT the one an earlier
+#: version of this comment gave — it said "for the same reason
+#: ``_is_secret_path`` excludes it", and that function no longer excludes it at
+#: all, because doing so let a filename outrank an inode. The two are different
+#: mechanisms and only one was safe:
+#:
+#: * ``_is_secret_path`` answers IDENTITY. A name test there is unsound, since
+#:   any name can point at the real file.
+#: * this lookahead narrows a SUSPICION heuristic over tokens that could not be
+#:   resolved at all. There is no identity to defer to, so a name is the only
+#:   evidence available, and excluding the template only declines to gate on a
+#:   file that holds nothing. Without it, ANY command mentioning
+#:   ``secrets.env.example`` alongside a ``$`` gated at the command level even
+#:   though the per-token check would have cleared it.
+#:
+#: MEASURED when the identity-side branch was removed: every shape that reaches
+#: the REAL file still matches here — ``f=secrets; cat $f.env``,
+#: ``cat $HOME/secrets.env``, and ``cat secrets.env.example/../secrets.env``.
+#: One shape does NOT: ``g=secrets.env.example; cat ${g%.example}`` strips the
+#: suffix by parameter expansion and misses. That is an exotic instance of the
+#: shell-variable residual this arm already declares, not a new class — recorded
+#: on #2230 rather than chased with a wider pattern.
 _SECRETISH = re.compile(
     r"(?<![\w-])secrets?\.(?:env\b(?!\.example)|[*?\[])|(?<![\w-])secrets?(?![\w.-])",
     re.IGNORECASE,

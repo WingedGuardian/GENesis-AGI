@@ -379,6 +379,46 @@ class TestAuditFindings:
     def test_grep_glob_alone_is_gated(self, fake_home: Path) -> None:
         assert self._touches(paths=[str(fake_home / "genesis" / "secrets*")])
 
+    # ── a NAME must never outrank the INODE ─────────────────────────────────
+    def test_a_dot_example_name_pointing_at_the_real_file_is_gated(self, fake_home: Path) -> None:
+        """The P1 an external audit found: a filename decided file identity.
+
+        An earlier version tested ``p.name.endswith(".example")`` on the
+        UNRESOLVED token and returned False before the inode compare. MEASURED
+        at the time: a symlink named ``x.example`` pointing at the real
+        ``secrets.env`` was ALLOWED, while a hardlink to the same inode under
+        an ordinary name correctly gated — same file, opposite verdict, decided
+        by a name.
+
+        This is the identity property itself, so it is asserted against a link
+        the test creates rather than against a spelling: any future short-cut
+        placed in front of the inode compare fails here regardless of how it is
+        written.
+        """
+        real = fake_home / "genesis" / "secrets.env"
+        decoy = fake_home / "genesis" / "x.example"
+        decoy.symlink_to(real)
+        assert decoy.resolve() == real.resolve(), "fixture drift: the link is not the file"
+
+        assert self._touches(paths=[str(decoy)]), (
+            "a path named *.example that RESOLVES to the credentials file must "
+            "gate — the inode arm is unconditional and no name test may precede it"
+        )
+
+    def test_a_real_template_is_still_not_gated(self, fake_home: Path) -> None:
+        """The control, and the reason the removed branch was safe to remove.
+
+        Deleting the ``.example`` short-circuit cost nothing legitimate:
+        ``_SECRET_BASENAMES`` is ``('secrets.env',)``, so an actual template —
+        a separate file, not a link to the real one — is already rejected by
+        the name checks further down. If this ever fails, the deletion DID have
+        a cost and the trade must be re-argued.
+        """
+        template = fake_home / "genesis" / "secrets.env.example"
+        template.write_text("API_KEY=\n")
+        assert not self._touches(paths=[str(template)])
+        assert not self._touches(command="cat secrets.env.example")
+
     def test_grep_pattern_is_content_not_a_path(self, db: str) -> None:
         """External finding: `Grep {"pattern": "secrets.env"}` searches file
         CONTENT for the string — a mention, not an access. Only Glob uses
