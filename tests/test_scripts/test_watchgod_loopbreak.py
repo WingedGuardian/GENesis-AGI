@@ -18,9 +18,12 @@ starting the daemon.
 """
 
 import os
+import shutil
 import stat
 import subprocess
 from pathlib import Path
+
+import pytest
 
 _WATCHGOD = Path(__file__).resolve().parents[2] / "scripts" / "tmp_watchgod.sh"
 
@@ -491,6 +494,10 @@ def test_oom_stale_contained_line_cannot_account_for_a_new_kill(tmp_path):
         + f'printf \'%s\' "low 0\nhigh 0\nmax 0\noom 3\noom_kill 6\noom_group_kill 0\n" > "{oom}"; '
         + 'r2=$(check_oom_events "$r1"); echo "B2=$r2"'
     )
+    # Deliberately NOT overriding OOM_EVENTS_LOCAL_FILE here. This cell is one
+    # of the two that actually failed on CI, so it has to keep binding the
+    # lazy-derivation fix: pinning the path per-test fixes it a second time and
+    # removes it from the net that proves the general fix works.
     out = _run(home, bind, snippet, {"STUB_JOURNAL": _KILL_LINE})
     assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
     assert "B1=5" in out.stdout and "B2=6" in out.stdout, out.stdout
@@ -579,6 +586,38 @@ def test_oom_container_trigger_pages_despite_a_contained_record(tmp_path):
     calls = (home / ".genesis" / "alerts" / "calls.log").read_text()
     assert "emergency watchgod:oom" in calls, calls
     assert "container-level trigger" in calls, calls
+
+
+def test_the_local_counter_path_follows_a_reassigned_events_file(tmp_path):
+    """The local path must resolve when it is USED, not when the script is
+    sourced.
+
+    MEASURED, and this was a live CI failure rather than a hypothetical: bound
+    at source time, `OOM_EVENTS_LOCAL_FILE` still pointed at the real
+    /sys/fs/cgroup for every test that aims `OOM_EVENTS_FILE` at its fixture
+    INSIDE the snippet. Those tests then read the HOST's cgroup — the very
+    thing this file stubs journalctl to avoid. On a machine that has the file
+    they are green; on a runner that does not, the trigger reads unverifiable
+    and every suppression cell pages instead. Two cells failed on CI while
+    passing locally for exactly this reason.
+
+    The fixture below sets a LOCAL counter the host could not coincidentally
+    match, so a read of the wrong file cannot produce this answer.
+    """
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 5, local_oom=41)
+    out = _run(
+        home,
+        bind,
+        _PRELUDE + f'OOM_EVENTS_FILE="{oom}"; echo "LOC=$(_read_oom_local_trigger)"',
+        # deliberately NOT passing OOM_EVENTS_FILE in the env: the snippet
+        # reassigns it after sourcing, which is the shape that broke.
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert "LOC=41" in out.stdout, (
+        "the local counter must be read from the fixture beside the reassigned "
+        f"events file, not from the host cgroup: {out.stdout}"
+    )
 
 
 def test_oom_unverifiable_trigger_pages_even_when_contained(tmp_path):
@@ -757,6 +796,276 @@ def test_oom_unarmed_cursor_pages_and_reanchors(tmp_path):
     # re-anchored: the fallback query's --show-cursor landed in the cursor file
     cursor = home / ".genesis" / "logs" / ".oom_journal_cursor"
     assert cursor.exists() and cursor.read_text().startswith("s=stub")
+
+
+def test_oom_arm_refuses_to_report_armed_when_the_cursor_write_fails(tmp_path):
+    """An unwritable cursor path must not report itself as armed.
+
+    SCOPE, corrected after verify-RED, because the first version of this
+    docstring named a mechanism the cell does not detect: putting a DIRECTORY
+    at the cursor path fails the write AND the read-back, so this cell stays
+    green when the write's exit-status check alone is reverted. It binds the
+    OUTCOME — drain=1 — and nothing finer. The write check is isolated by
+    `…_a_failed_write_leaves_a_STALE_cursor`; the read-back by
+    `…_reads_back_empty`. Both are needed and neither subsumes the other.
+
+    A directory is used rather than a permission bit because it behaves the
+    same when the suite runs as root.
+    """
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 5)
+    (home / ".genesis" / "logs" / ".oom_journal_cursor").mkdir()
+    out = _run(
+        home,
+        bind,
+        _PRELUDE + 'b=$(_oom_arm_baseline); echo "B=$b"',
+        {"OOM_EVENTS_FILE": str(oom)},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert "B=5:0:0:0:1" in out.stdout, (
+        f"an unpersisted cursor must carry drain=1, not drain=0: {out.stdout}"
+    )
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes through a read-only file")
+def test_oom_drain_is_not_cleared_by_a_query_that_failed_to_reanchor(tmp_path):
+    """A SUCCESSFUL QUERY IS NOT AN ANCHORED CURSOR.
+
+    Found by adversarial audit and reproduced before fixing: `drain` was
+    cleared on `_oom_query_ok == 1`, but the re-anchor that a successful query
+    performs swallowed its own write failure — the very `|| true` this change
+    exists to remove, one function away. So drain was set correctly and thrown
+    away one tick later, and the kill after that was suppressed.
+
+    The sequence, with the cursor path unwritable throughout:
+
+      arm    → drain=1, nothing persisted
+      kill 1 → pages (drain did its job); its journal record is consumed
+      kill 2 → GENUINE, and wrote no record of its own (a non-main process
+               dying inside a surviving scope writes no unit-failure line —
+               exactly the case the cursor exists to catch). The fallback
+               window still offers kill 1's contained record, which accounts
+               for it, and the page is suppressed.
+
+    MEASURED before the fix: two kills, ONE page. Both must page.
+    """
+    home, _cc, bind = _sandbox(tmp_path)
+    # Unwritable for every writer, including the re-anchor inside the query.
+    (home / ".genesis" / "logs" / ".oom_journal_cursor").mkdir()
+    oom = _oom_file(tmp_path, 4)
+    out = _run(
+        home,
+        bind,
+        _PRELUDE
+        + f'OOM_EVENTS_FILE="{oom}"; '
+        + 's=$(_oom_arm_baseline); echo "ARM=[$s]"; '
+        + f"printf 'low 0\nhigh 0\nmax 0\noom 3\noom_kill 5\noom_group_kill 0\n' > \"{oom}\"; "
+        + 's=$(check_oom_events "$s"); echo "T1=[$s]"; '
+        + f"printf 'low 0\nhigh 0\nmax 0\noom 3\noom_kill 6\noom_group_kill 0\n' > \"{oom}\"; "
+        + 's=$(check_oom_events "$s"); echo "T2=[$s]"',
+        {"STUB_JOURNAL": _KILL_LINE},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert "ARM=[4:0:0:0:1]" in out.stdout, f"the arm must report drain=1: {out.stdout}"
+    assert "T1=[5:0:0:0:1]" in out.stdout, (
+        f"a query that could not re-anchor must NOT clear drain: {out.stdout}"
+    )
+    calls = (home / ".genesis" / "alerts" / "calls.log").read_text()
+    assert calls.count("emergency watchgod:oom") == 2, (
+        "both kills must page — the second is genuine and wrote no record of "
+        f"its own, so only a stale record could have explained it: {calls}"
+    )
+
+
+def test_a_failed_reanchor_does_not_leave_a_stale_cursor_behind(tmp_path):
+    """A stale cursor is indistinguishable from a fresh anchor to anything that
+    only checks the file exists — and that check is what clears drain.
+
+    So when the re-anchor cannot persist, the OLD value is removed rather than
+    left to be mistaken for the new one.
+    """
+    home, _cc, bind = _sandbox(tmp_path)
+    cursor = home / ".genesis" / "logs" / ".oom_journal_cursor"
+    cursor.write_text("s=stale;i=1")
+    cursor.chmod(0o444)
+    oom = _oom_file(tmp_path, 4)
+    try:
+        out = _run(
+            home,
+            bind,
+            _PRELUDE
+            + f'OOM_EVENTS_FILE="{oom}"; '
+            + f"printf 'low 0\nhigh 0\nmax 0\noom 3\noom_kill 5\noom_group_kill 0\n' > \"{oom}\"; "
+            + 'r=$(check_oom_events "4:0:0:0:1"); echo "R=[$r]"',
+            {"STUB_JOURNAL": _KILL_LINE},
+        )
+    finally:
+        if cursor.exists():
+            cursor.chmod(0o644)
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert "R=[5:0:0:0:1]" in out.stdout, (
+        f"drain must survive a re-anchor that could not persist: {out.stdout}"
+    )
+    assert not cursor.exists() or not cursor.read_text().startswith("s=stale"), (
+        "the stale cursor must not survive a failed re-anchor"
+    )
+
+
+def test_oom_arm_refuses_when_journalctl_is_not_installed(tmp_path):
+    """The one arming branch no mutation could reach.
+
+    Every other cell runs with journalctl on PATH, so `command -v journalctl ||
+    return 1` never fires and a mutation flipping it to `return 0` turns
+    nothing red — the branch is real but unconstructible from the default
+    harness. An install without systemd's journal is not hypothetical, and the
+    contract is "rc 0 only when the cursor is persisted", which such a host can
+    never satisfy.
+
+    PATH is rebuilt with only the externals the arm path needs, so journalctl
+    is genuinely absent rather than merely stubbed to fail — those are
+    different branches.
+    """
+    home, _cc, bind = _sandbox(tmp_path)
+    minimal = tmp_path / "nojournal"
+    minimal.mkdir()
+    for tool in ("bash", "awk", "dirname", "date", "cat", "sed", "tail", "mkdir", "rm"):
+        src = shutil.which(tool)
+        if src:
+            (minimal / tool).symlink_to(src)
+    assert not shutil.which("journalctl", path=str(minimal)), "journalctl must be absent"
+    oom = _oom_file(tmp_path, 5)
+    env = dict(os.environ, HOME=str(home), PATH=str(minimal), OOM_EVENTS_FILE=str(oom))
+    out = subprocess.run(
+        [
+            shutil.which("bash") or "/bin/bash",
+            "-c",
+            f"source '{_WATCHGOD}'\nb=$(_oom_arm_baseline); echo \"B=$b\"",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert "B=5:0:0:0:1" in out.stdout, (
+        f"no journalctl means no anchorable cursor, so drain=1: {out.stdout}"
+    )
+    cursor = home / ".genesis" / "logs" / ".oom_journal_cursor"
+    assert not cursor.exists(), "nothing should have been written"
+
+
+def test_oom_arm_refuses_when_a_failed_write_leaves_a_STALE_cursor(tmp_path):
+    """The case the read-back cannot see, and the reason the write's exit
+    status is checked on its own.
+
+    MEASURED while verify-RED'ing this fix: restoring the original `|| true` on
+    the write turned NOTHING red, because the other cell puts a DIRECTORY at
+    the cursor path — where the write fails AND the read-back fails, so the
+    read-back alone produces the right answer. That cell asserts the outcome
+    but isolates nothing.
+
+    Here a VALID cursor file already exists and the write fails. The read-back
+    then succeeds, returning the OLD position, and arming would report drain=0
+    while the cursor points somewhere before the baseline — which is precisely
+    the state in which a pre-baseline record can account for a post-baseline
+    kill and suppress a real page.
+    """
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 5)
+    cursor = home / ".genesis" / "logs" / ".oom_journal_cursor"
+    cursor.write_text("s=stale;i=1")
+    cursor.chmod(0o444)
+    try:
+        out = _run(
+            home,
+            bind,
+            _PRELUDE + 'b=$(_oom_arm_baseline); echo "B=$b"',
+            {"OOM_EVENTS_FILE": str(oom)},
+        )
+    finally:
+        cursor.chmod(0o644)
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert "B=5:0:0:0:1" in out.stdout, (
+        "a write that failed over a VALID stale cursor must carry drain=1 — "
+        f"the read-back cannot distinguish it from a fresh anchor: {out.stdout}"
+    )
+    assert cursor.read_text() == "s=stale;i=1", "the stale cursor is still what is on disk"
+
+
+def test_oom_arm_refuses_when_the_cursor_reads_back_empty(tmp_path):
+    """The write can report success and still leave nothing behind — a full
+    filesystem surfaces the failure on close, not on the write.
+
+    Exercised by stubbing `cat`, the same way this suite already stubs
+    journalctl: at the point it matters, an unreadable cursor and an absent one
+    are the same thing, so they must get the same answer.
+    """
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 5)
+    _make_exec(bind / "cat", "#!/usr/bin/env bash\nexit 0\n")  # succeeds, prints nothing
+    out = _run(
+        home,
+        bind,
+        _PRELUDE + 'b=$(_oom_arm_baseline); echo "B=$b"',
+        {"OOM_EVENTS_FILE": str(oom)},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert "B=5:0:0:0:1" in out.stdout, (
+        f"a cursor that does not read back must carry drain=1: {out.stdout}"
+    )
+
+
+def test_oom_late_arm_anchors_the_cursor_main_only_arms_once(tmp_path):
+    """Codex P1 (#1790): `main` arms ONCE. If `memory.events` is unreadable at
+    that moment the spec is empty — monitoring unavailable — and arming returns
+    before it ever reaches the journal, so the cursor is never anchored.
+
+    The baseline is then really established on the first tick where the counter
+    reads, and that path emitted drain=0 with an unanchored cursor. Two halves
+    are asserted, because either alone passes for the wrong reason: the cursor
+    file must now EXIST (the late arm ran), and the emitted spec must be a real
+    baseline rather than the empty one.
+    """
+    home, _cc, bind = _sandbox(tmp_path)
+    missing = tmp_path / "not-yet-there"
+    out = _run(
+        home,
+        bind,
+        _PRELUDE
+        + f'OOM_EVENTS_FILE="{missing}"; b=$(_oom_arm_baseline); echo "ARM=[$b]"; '
+        # the counter becomes readable only now, one tick later
+        + f'OOM_EVENTS_FILE="{_oom_file(tmp_path, 7)}"; '
+        + 'r=$(check_oom_events "$b"); echo "B=$r"',
+        {"OOM_EVENTS_FILE": str(missing)},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert "ARM=[]" in out.stdout, f"the startup arm must report unavailable: {out.stdout}"
+    assert "B=7:0:0:0:0" in out.stdout, f"the late arm must establish a baseline: {out.stdout}"
+    cursor = home / ".genesis" / "logs" / ".oom_journal_cursor"
+    assert cursor.exists(), "the late arm must anchor the journal cursor"
+    assert cursor.read_text().startswith("s=stub"), cursor.read_text()
+
+
+def test_oom_late_arm_carries_drain_when_it_cannot_anchor(tmp_path):
+    """The other half of the late arm. If the cursor still cannot be persisted
+    on that tick, the emitted spec must say so — otherwise the baseline reads
+    as trustworthy while the next query has nothing to anchor against."""
+    home, _cc, bind = _sandbox(tmp_path)
+    missing = tmp_path / "not-yet-there"
+    (home / ".genesis" / "logs" / ".oom_journal_cursor").mkdir()
+    out = _run(
+        home,
+        bind,
+        _PRELUDE
+        + f'OOM_EVENTS_FILE="{missing}"; b=$(_oom_arm_baseline); '
+        + f'OOM_EVENTS_FILE="{_oom_file(tmp_path, 7)}"; '
+        + 'r=$(check_oom_events "$b"); echo "B=$r"',
+        {"OOM_EVENTS_FILE": str(missing)},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert "B=7:0:0:0:1" in out.stdout, (
+        f"an unanchorable late arm must carry drain=1: {out.stdout}"
+    )
 
 
 def test_oom_startup_baseline_advances_cursor(tmp_path):
