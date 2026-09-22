@@ -252,18 +252,37 @@ def test_recorded_row_carries_ttl_and_origin(db: str) -> None:
     ``expires_at`` (from ``_compute_ttl``) nor a resolved ``origin_class``. Going
     through ``create_sync`` is what fixed that, so assert the columns rather than
     the call, or the next refactor can quietly go back to a raw write.
+
+    The first version of this test named ``expires_at`` in the sentence above
+    and then selected ``created_at``, which the raw insert DID set — so a
+    regression to that raw write would have passed it, leaving the retention
+    invariant it claims to cover untested (Codex P2, #1826). It selects the
+    column it is about now.
+
+    The horizon itself is deliberately not pinned to a day count: that is a
+    retention setting, and a test that fails when someone tunes it is churn
+    rather than protection. What must hold is that a TTL EXISTS and is in the
+    future, which is exactly what the raw write did not do.
     """
     _run("cat secrets.env", db, dispatched=True)
     row = (
         sqlite3.connect(db)
-        .execute("SELECT priority, origin_class, created_at FROM observations")
+        .execute("SELECT priority, origin_class, created_at, expires_at FROM observations")
         .fetchone()
     )
     assert row is not None, "the deny must record an observation"
-    priority, origin_class, created_at = row
+    priority, origin_class, created_at, expires_at = row
     assert priority == "critical"
     assert origin_class == "first_party"
     assert created_at
+    assert expires_at, (
+        "expires_at is unset — the row went in through a raw INSERT again, "
+        "which is the regression create_sync was adopted to prevent"
+    )
+    assert expires_at > created_at, (
+        f"expires_at {expires_at!r} must be after created_at {created_at!r}; "
+        "an expiry at or before creation is a row that is already stale"
+    )
 
 
 def test_malformed_payload_fails_open(db: str) -> None:
@@ -534,3 +553,86 @@ class TestAuditFindings:
         )
         assert proc.returncode == 0, proc.stderr
         assert "Traceback" not in proc.stderr
+
+    # ── R-1: the glob prefilter decided from the pattern's SPELLING ─────────
+    #
+    # `_glob_hits_secret` returned before expanding anything unless the raw
+    # token contained "secret" or ".env", so an ordinary way of typing a path
+    # reached the real file with no consent. MEASURED against this install's
+    # actual secrets.env, with a literal path gating as the control: all four
+    # spellings below returned False. `?ecrets.env` gated, but only because
+    # ".env" survives literally in it — the coincidence, not the rule.
+    #
+    # The narrowing is now the pattern's ROOT, which cannot be spelled around:
+    # everything before the first wildcard is literal and must survive into
+    # any match.
+    @pytest.mark.parametrize(
+        "pattern",
+        ["s*.e*", "secr??s.e??", "[s]ecrets.e[n]v", "*.*", "?ecrets.env", "secrets.*"],
+    )
+    def test_a_glob_that_expands_to_the_file_gates_whatever_its_spelling(
+        self, fake_home: Path, pattern: str
+    ) -> None:
+        assert self._touches(command=f"cat {fake_home}/genesis/{pattern}")
+
+    @pytest.mark.parametrize("pattern", ["*.md", "READ*", "doc?/*.txt"])
+    def test_a_glob_in_the_same_directory_that_cannot_match_stays_silent(
+        self, fake_home: Path, pattern: str
+    ) -> None:
+        """The other direction, and it is what stops the fix becoming noise.
+
+        These sit in the very directory the narrowing now walks, so they prove
+        the decision comes from EXPANSION rather than from proximity.
+        """
+        assert not self._touches(command=f"cat {fake_home}/genesis/{pattern}")
+
+    def test_a_glob_rooted_elsewhere_is_not_walked(self) -> None:
+        """The cost half, and the reason a prefilter exists at all.
+
+        A pattern rooted outside every directory holding a secrets file cannot
+        name one, so the narrowing answers it without expanding it.
+
+        What this asserts is the VERDICT, not the absence of a walk. It still
+        pins the narrowing, though by a route worth naming: with the narrowing
+        disabled the pattern reaches the walk, exceeds the wildcard-segment
+        ceiling, and GATES — MEASURED, this fails on that mutation. Its
+        neighbour `test_wide_glob_is_fast` catches the same mutation by timing;
+        this one states the reason rather than the symptom, so a future change
+        that keeps the speed while losing the narrowing is still caught.
+        """
+        assert not self._touches(command="ls /usr/*/*/*")
+
+    # ── R-2: the heredoc receiver was matched by pattern, not resolved ──────
+    #
+    # A heredoc body is data unless the heredoc feeds something that EXECUTES
+    # it. The first version anchored the interpreter at the command start or
+    # after an operator, so three ordinary spellings hid it and the credential
+    # read inside the body ran without consent. MEASURED against the real file.
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            "python3",
+            "FOO=1 python3",
+            "/usr/bin/python3",
+            "env FOO=1 python3",
+            "sudo python3",
+            "./venv/bin/python",
+        ],
+    )
+    def test_a_heredoc_feeding_an_interpreter_is_scanned_however_invoked(
+        self, fake_home: Path, prefix: str
+    ) -> None:
+        target = str(fake_home / "genesis" / "secrets.env")
+        body = f"open({target!r}).read()"
+        assert self._touches(command=f"{prefix} <<'PY'\n{body}\nPY")
+
+    def test_a_heredoc_feeding_a_data_receiver_is_still_data(self, fake_home: Path) -> None:
+        """The control, and the reason this is not simply "scan every heredoc".
+
+        A commit message discussing the file opens nothing. Losing this makes
+        the guard prompt on every commit that mentions credentials.
+        """
+        target = fake_home / "genesis" / "secrets.env"
+        assert not self._touches(
+            command=f"git commit -F - <<'EOF'\nrotate the keys in {target}\nEOF"
+        )

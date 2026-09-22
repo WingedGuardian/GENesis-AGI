@@ -54,6 +54,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import shell_parse  # noqa: E402
 from hook_input import brace_expand, strip_quoted  # noqa: E402
 
 #: Real secrets files. `secrets.env.example` is the shipped TEMPLATE and holds
@@ -190,15 +191,77 @@ _SECRETISH = re.compile(
 #: message discussing the file; nothing in it is opened. But `python3 <<'EOF'
 #: … cat secrets.env … EOF` EXECUTES the body — stripping it before the operand
 #: scan lets a nested credential read run without consent (Devin SEC finding,
-#: #1826). `_EXEC_HEREDOC` detects an interpreter/command-runner verb leading a
-#: `<<` introducer; when one is present the body is scanned like the rest of the
-#: command.
+#: #1826). Which receiver a heredoc feeds is therefore a question about the
+#: command's resolved EXECUTABLE, and that is `shell_parse`'s job rather than a
+#: pattern's: the first version anchored the interpreter at the command start or
+#: after an operator, and MEASURED against the real file, three ordinary
+#: spellings hid it and ran the credential read without consent —
+#: `FOO=1 python3 <<'PY'`, `/usr/bin/python3 <<'PY'` and `env FOO=1 python3
+#: <<'PY'`. An assignment prefix, an absolute path and `env` are not exotic;
+#: they are what the next spelling always looks like, which is why this is
+#: bound to the canonical parser instead of being widened again.
 _HEREDOC = re.compile(r"<<-?\s*'?\"?(\w+)'?\"?\n.*?^\s*\1\s*$", re.DOTALL | re.MULTILINE)
-_EXEC_HEREDOC = re.compile(
-    r"(?:^|[;&|]\s*)(?:sudo\s+|command\s+)?"
-    r"(?:python[0-9.]*|bash|zsh|dash|sh|node|nodejs|ruby|perl|php|lua|pwsh|powershell|"
-    r"ssh|docker\s+exec|kubectl\s+exec|podman\s+exec)\b[^|\n<>]*<<-?",
+
+#: Basenames that EXECUTE what they are fed. Matched against
+#: `Segment.exe`, which `shell_parse` has already stripped of env
+#: assignments, `env`, `sudo`/`command` wrappers and any directory part — so
+#: this set names receivers, never spellings of them. `python` is a prefix
+#: match for the versioned forms (`python3`, `python3.12`).
+_EXEC_RECEIVERS = frozenset(
+    {
+        "bash",
+        "zsh",
+        "dash",
+        "sh",
+        "ksh",
+        "fish",
+        "node",
+        "nodejs",
+        "ruby",
+        "perl",
+        "php",
+        "lua",
+        "pwsh",
+        "powershell",
+        "ssh",
+        "docker",
+        "kubectl",
+        "podman",
+    }
 )
+
+
+def _heredoc_feeds_an_executor(command: str) -> bool:
+    """Does any segment of this command EXECUTE what a heredoc gives it?
+
+    Fails CLOSED in every direction a credentials gate should: an unparseable
+    command, a blind spot `shell_parse` reports, or an unresolved verb all
+    return True, which keeps the heredoc body in the operand scan. The cost of
+    a wrong True is that a data heredoc's prose is scanned — which at worst
+    asks for consent the user can grant; the cost of a wrong False is a
+    credential read that never asked.
+
+    Deliberately broader than "the segment carrying the `<<`": `Segment.raw`
+    has the redirect excised, so the introducer cannot be attributed back to
+    its own segment. An interpreter anywhere in a command that also carries a
+    heredoc is enough to keep the body. That over-scans a pipeline pairing an
+    interpreter with an unrelated data heredoc, and over-scanning is the
+    direction this module chooses everywhere else.
+    """
+    try:
+        segments, blind = shell_parse.analyze_checked(command)
+    except Exception:  # noqa: BLE001 - any parse failure is an unknown receiver
+        return True
+    if blind is not None:
+        return True
+    for seg in segments:
+        if seg.verb_unresolved:
+            return True
+        exe = seg.exe
+        if exe in _EXEC_RECEIVERS or exe.startswith("python"):
+            return True
+    return False
+
 
 #: Ceilings on the glob walk below. A glob is expanded against the REAL
 #: filesystem, so a token like ``/*/*/*/*/*/*`` walks an unbounded subtree —
@@ -218,11 +281,64 @@ _GLOB_MAX_HITS = 500
 _GLOB_MAX_WILD_SEGMENTS = 2
 
 
+def _glob_may_reach_secrets(tok: str) -> bool:
+    """Could this pattern name a secrets file at all? Cheap, and not a spelling test.
+
+    The walk has to be narrowed — expanding every glob costs more than the hook
+    budget (see the constants above). What it must NOT be narrowed by is the
+    pattern's SPELLING, which is what the first version did: it walked only
+    tokens whose literal text contained ``secret`` or ``.env``, deciding from
+    characters the shell never sees.
+
+    MEASURED against the real secrets file on this install, with `cat <literal
+    path>` gating as the control: ``~/genesis/s*.e*``, ``~/genesis/secr??s.e??``,
+    ``~/genesis/[s]ecrets.e[n]v`` and ``~/genesis/*.*`` all expand to it and all
+    returned False — no consent asked. (``?ecrets.env`` gated, but only because
+    ``.env`` survives literally in it, which is the coincidence rather than the
+    rule.) Every one of those is an ordinary way to type a path.
+
+    What narrows soundly is where the pattern is ROOTED. Everything before the
+    first wildcard is literal and must survive into any match, so a pattern
+    whose fixed prefix lies outside every directory that holds a secrets file
+    cannot name one, whatever it is spelled like. That keeps ``ls /usr/*/*/*``
+    off the walk for a reason nobody can spell around.
+
+    Three ways to answer yes, and the last two are deliberate slack:
+
+    * the fixed prefix can reach a directory holding a candidate secrets file;
+    * the prefix is RELATIVE, so it is rooted at a shell cwd this hook does not
+      know — the same cwd it cannot know for any other token;
+    * the old name test still passes, which keeps a COPY named like the real
+      thing recognised wherever it lives (``_is_secret_path`` matches those by
+      basename, and no path test can predict where someone put one).
+
+    Cost, stated: a pattern anchored at the filesystem root (``/*/*/*``) reaches
+    everything, so it walks, and the wildcard-segment ceiling then GATES it.
+    That is a prompt on a command almost nobody runs, chosen over a fail-open on
+    one that is typed daily, and it matches what this module already does with
+    any pattern it cannot walk inside its budget.
+    """
+    expanded = os.path.expanduser(tok)
+    cut = next((i for i, ch in enumerate(expanded) if ch in "*?["), len(expanded))
+    fixed = expanded[:cut]
+    if not os.path.isabs(fixed):
+        return True
+    base = (os.path.dirname(fixed) if cut < len(expanded) else fixed).rstrip(os.sep)
+    for root in _candidate_roots():
+        try:
+            holder = os.path.dirname(str(root.expanduser()))
+        except (OSError, ValueError):
+            continue
+        if holder == base or holder.startswith(base + os.sep):
+            return True
+    return bool(re.search(r"secret|\.env", tok, re.IGNORECASE))
+
+
 def _glob_hits_secret(tok: str, inodes: set[tuple[int, int]]) -> bool:
     """Expand one glob token, bounded. True = it is (or may be) a secrets file."""
     # A pattern that cannot name a secrets file is not worth walking for at all.
-    # This is what keeps `ls /*/*/*/*` off the expensive path entirely.
-    if not re.search(r"secret|\.env", tok, re.IGNORECASE):
+    # This is what keeps `ls /usr/*/*/*` off the expensive path entirely.
+    if not _glob_may_reach_secrets(tok):
         return False
     wild = sum(1 for seg in tok.split(os.sep) if any(ch in seg for ch in "*?["))
     if wild > _GLOB_MAX_WILD_SEGMENTS:
@@ -274,7 +390,7 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
 
     # Heredoc bodies are data — unless the heredoc feeds an interpreter, in
     # which case the body IS the executed payload and must be scanned.
-    exec_heredoc = _EXEC_HEREDOC.search(command) is not None
+    exec_heredoc = _heredoc_feeds_an_executor(command)
     scan = command if exec_heredoc else _HEREDOC.sub(" ", command)
     # Quoted regions are DATA for the command-level arm too: a commit message
     # naming the file is not an operand. The declared shell-variable residual

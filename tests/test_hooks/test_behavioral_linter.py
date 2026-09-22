@@ -934,3 +934,264 @@ class TestBashAuditFindings:
         ):
             r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
             assert r.returncode == 2, f"{cmd!r} was not blocked"
+
+
+class TestQuotedOperatorsAreData:
+    """`_CHAINS` scanned the RAW command, so a QUOTED operator revoked the
+    read-only exemption and the endpoint rule hard-blocked a pure search.
+
+    MEASURED (Codex P2, #1826): searching for two endpoints in one alternation
+    came back not-read-only purely because of the `|` inside the quotes, and
+    the quoted `&`, `;` and `>` spellings did the same. A false block on a
+    search is how a guard gets routed around, which costs more than the rule
+    it enforces.
+
+    The replacement is a UNION of two detectors and BOTH halves are pinned
+    below, because each is blind exactly where the other sees. Drop the
+    operator scan and process substitution and redirects stop counting; drop
+    the parser and an ACTIVE command substitution inside double quotes stops
+    counting, because `strip_quoted` erases the span around it.
+    """
+
+    def test_a_quoted_operator_leaves_the_search_exempt(self):
+        for cmd in (
+            "rg 'api.openai.com/v1/chat|api.anthropic.com/v1/messages' src",
+            'rg "api.openai.com/v1/chat & more" src',
+            "rg 'api.openai.com/v1/chat;more' src",
+            "rg 'api.openai.com/v1/chat>more' src",
+            "rg 'api.openai.com/v1/chat `tick`' src",
+        ):
+            r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            assert r.returncode == 0, (
+                f"{cmd!r} is one search — a quoted operator is DATA. "
+                f"stdout={r.stdout} stderr={r.stderr}"
+            )
+
+    def test_a_real_operator_still_revokes_the_exemption(self):
+        for cmd in (
+            "rg needle src && curl https://api.openai.com/v1/chat/completions",
+            "grep needle src & curl https://api.openai.com/v1/chat/completions",
+            "rg needle <(curl https://api.openai.com/v1/chat/completions)",
+            "rg needle src; curl https://api.openai.com/v1/chat/completions",
+            # Command substitution is ACTIVE inside DOUBLE quotes: this really
+            # does run curl. It is the case `strip_quoted` alone would erase.
+            'rg "$(curl https://api.openai.com/v1/chat/completions)" src',
+            'rg "use `curl https://api.openai.com/v1/chat/completions`" src',
+        ):
+            r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            assert r.returncode == 2, f"{cmd!r} smuggled a provider call past the exemption"
+
+
+class TestProviderCoverageTracksTheInventory:
+    """The rule identifies a provider by hostname, from a hand-maintained list,
+    and the list was behind the inventory by three.
+
+    MEASURED by executing the linter, with an OpenAI call as the control:
+    `curl https://zenmux.ai/api/v1/chat/completions` and
+    `curl https://api.minimaxi.com/v1/...` both exited 0 while the control
+    exited 2 (Codex P1, #1826). Both are providers this repository SHIPS —
+    declared with `base_url`s in `config/model_routing.yaml`.
+
+    Adding three rows closed the gap and did not fix the shape: a list
+    maintained by hand is behind the inventory by construction, and the next
+    provider gets added exactly the way those three did. Deriving the rule from
+    the inventory is filed separately.
+
+    What this test does is make the drift LOUD. It reads the shipped provider
+    config and asserts the rule names every host in it, so the failure mode
+    changes from a credentialed endpoint nobody notices to a test that says
+    which provider is missing. That is not coverage — it is a tripwire on the
+    gap, which is the honest thing to have while the list is still a list.
+    """
+
+    _REPO = Path(_SCRIPT).resolve().parent.parent
+    _RULE = _REPO / "config" / "behavioral_rules" / "no_raw_provider_calls.yaml"
+    _ROUTING = _REPO / "config" / "model_routing.yaml"
+    _LINTER = _REPO / "scripts" / "behavioral_linter.py"
+
+    @classmethod
+    def _shipped_hosts(cls) -> set:
+        import re as _re
+
+        text = cls._ROUTING.read_text(encoding="utf-8")
+        return {
+            m.group(1) for m in _re.finditer(r"base_url:\s*[\"']?https?://([A-Za-z0-9.-]+)", text)
+        }
+
+    @staticmethod
+    def _unescaped(text: str) -> str:
+        """Both lists spell a host as a REGEX, so the metacharacters that
+        cannot occur in a hostname come out before a substring test can see it.
+
+        `\\` for the escaped dots, and `?` because a pattern uses one to cover
+        two spellings at once — `api\\.minimaxi?\\.com` is how MiniMax's two
+        hosts are named, and with the `?` left in, the literal
+        `api.minimaxi.com` is not a substring of it. This test caught exactly
+        that on its first run, against a list this session had just edited.
+
+        Stated for what it is: a NAME-PRESENCE check, not a would-it-fire
+        check. It answers "has someone thought about this provider here?",
+        which is the question a drifting list fails. Whether the pattern's PATH
+        is right is what the per-provider execution tests above cover.
+        """
+        return text.replace("\\", "").replace("?", "")
+
+    def test_every_shipped_provider_host_is_named_by_the_rule(self):
+        """Reads the PATTERNS, not the file.
+
+        The first version searched the whole rule file, and verify-RED caught
+        it immediately: deleting the Zenmux pattern left the test GREEN,
+        because `zenmux.ai` still appeared in the prose explaining why the
+        pattern was added. A tripwire satisfied by its own comment is the
+        vacuous shape this whole PR keeps finding elsewhere, so it is worth
+        recording that it was found here by mutation and not by reading.
+        """
+        import yaml as _yaml
+
+        hosts = self._shipped_hosts()
+        assert hosts, (
+            "no base_url host found in the shipped routing config — this "
+            "reconciliation is reading nothing, which would pass forever"
+        )
+        loaded = _yaml.safe_load(self._RULE.read_text(encoding="utf-8"))
+        patterns = [p.get("regex", "") for p in (loaded or {}).get("patterns", [])]
+        assert patterns, "no patterns parsed out of the rule — reading nothing again"
+        rule = self._unescaped(" ".join(patterns))
+        missing = sorted(h for h in hosts if h not in rule)
+        assert not missing, (
+            f"config/model_routing.yaml ships provider host(s) {missing} that "
+            "no pattern in no_raw_provider_calls.yaml names. A credentialed "
+            "endpoint the cost controls cannot see is exactly what this rule "
+            "exists to prevent — add the pattern, AND its twin in "
+            "behavioral_linter._DEGRADED_GATED."
+        )
+
+    def test_the_degraded_path_names_them_too(self):
+        """`_DEGRADED_GATED` is a SECOND copy of the same list.
+
+        Its own comment says it mirrors the rule file, and it had the same
+        three gaps. A provider present in one and missing from the other is
+        covered while the tree is healthy and uncovered exactly when it is
+        broken — the only moment that crude over-block exists for.
+        """
+        import re as _re
+
+        hosts = self._shipped_hosts()
+        linter = self._LINTER.read_text(encoding="utf-8")
+        region = linter.split("_DEGRADED_GATED", 1)[1].split("\n)", 1)[0]
+        # Comment lines OUT, for the reason the sibling test records: the
+        # comment inside this very expression names the providers it added, so
+        # searching the region whole lets the prose satisfy the check.
+        region = "\n".join(ln for ln in region.splitlines() if not ln.strip().startswith("#"))
+        block = self._unescaped(region)
+        assert _re.search(r"\bopenai\b", block), (
+            "the _DEGRADED_GATED slice came back empty or wrong, so this test "
+            "is reading the wrong region and would pass whatever the list said"
+        )
+        missing = sorted(h for h in hosts if h not in block)
+        assert not missing, (
+            f"_DEGRADED_GATED omits shipped provider host(s) {missing}; the two "
+            "copies of this list have drifted"
+        )
+
+
+class TestConfigPathExemption:
+    """The exemption written to allow provider endpoints in config BLOCKED the
+    spelling Write and Edit most naturally supply.
+
+    `fnmatch` gives `*/config/*.yaml` no match against a ROOT-RELATIVE
+    `config/model_routing.yaml`. MEASURED by running this hook on all three
+    forms: the root-relative one exited 2 while `./config/…` and the absolute
+    path exited 0 (Codex P2, #1826). The file already paired `tests/*` with
+    `*/tests/*` for the same reason, so the inconsistency was visible in the
+    exclusion list itself.
+
+    Both directions, because an exclusion is the easiest thing to widen too far.
+    """
+
+    _CONTENT = "base_url: https://api.openai.com/v1/chat/completions\n"
+
+    def test_every_spelling_of_the_shipped_config_is_exempt(self):
+        for path in (
+            "config/model_routing.yaml",
+            "./config/model_routing.yaml",
+            "/home/anyone/genesis/config/model_routing.yaml",
+        ):
+            r = _run_linter(
+                {"tool_name": "Write", "tool_input": {"file_path": path, "content": self._CONTENT}}
+            )
+            assert r.returncode == 0, (
+                f"{path!r} names the shipped provider config and must stay "
+                f"editable. stdout={r.stdout} stderr={r.stderr}"
+            )
+
+    def test_the_exemption_did_not_widen_past_config(self):
+        """The control. A carve-out that also exempts source is worse than none."""
+        for path in ("src/genesis/foo.py", "scripts/foo.py", "configuration/foo.py"):
+            r = _run_linter(
+                {"tool_name": "Write", "tool_input": {"file_path": path, "content": self._CONTENT}}
+            )
+            assert r.returncode == 2, f"{path!r} is not config and must still be blocked"
+
+
+class TestNotebookCells:
+    """A notebook cell is executable, and the rule reached neither its tool nor
+    its field.
+
+    `NotebookEdit` was absent from the hook's matcher, and the payload reader
+    knew only `content`/`new_string`/`command` — so wiring the tool alone would
+    have connected a hook that then found nothing and returned 0, which is the
+    shape of a guard that looks attached and checks nothing. A session could
+    add a cell carrying a direct provider request and run the notebook later,
+    with no checked endpoint in either tool call (Codex P1, #1826).
+    """
+
+    def test_a_notebook_cell_with_a_raw_provider_call_is_blocked(self):
+        r = _run_linter(
+            {
+                "tool_name": "NotebookEdit",
+                "tool_input": {
+                    "notebook_path": "/tmp/analysis.ipynb",
+                    "new_source": (
+                        "import requests\n"
+                        'requests.post("https://api.openai.com/v1/chat/completions")'
+                    ),
+                },
+            }
+        )
+        assert r.returncode == 2, "a provider call in a notebook cell was not blocked"
+        assert "no-raw-provider-calls" in (r.stdout + r.stderr)
+
+    def test_an_ordinary_notebook_cell_passes(self):
+        """The control. Without it the test above also passes for a linter that
+        blocks every notebook edit, which is a worse guard than none."""
+        r = _run_linter(
+            {
+                "tool_name": "NotebookEdit",
+                "tool_input": {
+                    "notebook_path": "/tmp/analysis.ipynb",
+                    "new_source": "import pandas as pd\ndf = pd.DataFrame()",
+                },
+            }
+        )
+        assert r.returncode == 0, r.stdout + r.stderr
+
+    def test_the_notebook_path_reaches_the_rule_scoping(self):
+        """`notebook_path`, not `file_path`, so the exclusion globs still apply.
+
+        Without it a notebook edit is scoped as a PATHLESS payload, which
+        silently changes which rules apply rather than failing visibly.
+        """
+        r = _run_linter(
+            {
+                "tool_name": "NotebookEdit",
+                "tool_input": {
+                    "notebook_path": "tests/scratch.ipynb",
+                    "new_source": 'requests.post("https://api.openai.com/v1/chat/completions")',
+                },
+            }
+        )
+        assert r.returncode == 0, (
+            "a notebook under tests/ is excluded by the rule's own globs; if "
+            "this blocks, notebook_path is not reaching the rule scoping"
+        )

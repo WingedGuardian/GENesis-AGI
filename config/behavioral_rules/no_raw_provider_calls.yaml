@@ -65,8 +65,16 @@ excludes:
   - "*/genesis/eval/longmemeval/*"
   - "*/genesis/recon/model_intelligence.py"
   - "*/genesis/cc/invoker.py"
-  # Config that legitimately declares provider base_urls.
+  # Config that legitimately declares provider base_urls. BOTH spellings, for
+  # the same reason `tests/*` is paired with `*/tests/*` four lines below:
+  # `fnmatch` gives `*/config/*.yaml` no match against a ROOT-RELATIVE
+  # `config/model_routing.yaml`, which is the spelling Write and Edit most
+  # naturally supply. MEASURED by running this hook on all three forms — the
+  # root-relative one exited 2 while `./config/…` and the absolute path both
+  # exited 0, so editing a legitimate provider endpoint in the shipped config
+  # was hard-blocked by the exemption written to allow it (Codex P2, #1826).
   - "*/config/*.yaml"
+  - "config/*.yaml"
   # Tests carry endpoint strings as FIXTURES and do not send them. Blocking an
   # edit here obstructs real work; committed source is separately covered by
   # CI (scripts/check_external_io.py), which is the layer that sees new endpoints.
@@ -96,6 +104,32 @@ patterns:
     context: "direct Groq completion call — must go through a routing call site"
   - regex: 'api\.deepinfra\.com(?::\d+)?/v\d+/(openai/)?(chat/)?(completions|embeddings)'
     context: "direct DeepInfra completion/embedding call — must go through a routing call site"
+  # Three providers this repository already SHIPS were absent from this list,
+  # MEASURED by executing the linter: `curl https://zenmux.ai/api/v1/chat/
+  # completions` and `curl https://api.minimaxi.com/v1/...` both exited 0 while
+  # the OpenAI control exited 2 (Codex P1, #1826). Zenmux and MiniMax are
+  # declared in config/model_routing.yaml and Dashscope embeddings are called
+  # from src/genesis/memory/embeddings.py, so each was a credentialed endpoint
+  # the cost controls could not see.
+  #
+  # Adding three rows does not fix the SHAPE — a hand-maintained denylist is
+  # behind the inventory by construction, and the next provider is added the
+  # same way these three were. Deriving coverage from the inventory is tracked
+  # as an issue; what keeps this list honest in the meantime is the test that
+  # reconciles it against the shipped provider config, which fails by NAME when
+  # the two drift instead of going quiet.
+  #
+  # Every entry carries its OWN context. The first draft of this block inserted
+  # these three BETWEEN the DeepInfra regex and its context line, which left
+  # DeepInfra with no message and gave Dashscope DeepInfra's — a mislabelled
+  # block, which is worse than a missing one because the reader trusts it. The
+  # suite stayed green, because nothing asserts a per-provider context string.
+  - regex: 'zenmux\.ai(?::\d+)?/api/v\d+/(chat/)?(completions|embeddings)'
+    context: "direct Zenmux completion/embedding call — must go through a routing call site"
+  - regex: 'api\.minimaxi?\.com(?::\d+)?/v\d+/\S*(chatcompletion|completions|embeddings)'
+    context: "direct MiniMax completion/embedding call — must go through a routing call site"
+  - regex: 'dashscope\.aliyuncs\.com(?::\d+)?/\S*/(chat/)?(completions|embeddings)'
+    context: "direct Dashscope completion/embedding call — must go through a routing call site"
   # Both Gemini and NVIDIA below require an API PATH, not a bare host. They were
   # host-only at first, which is the one shape that cannot distinguish CALLING an
   # endpoint from SEARCHING for one: `rg -n 'generativelanguage.googleapis.com'

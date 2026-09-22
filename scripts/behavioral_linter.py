@@ -48,7 +48,8 @@ from pathlib import Path
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
 try:
-    from hook_input import degraded_exit, field, read_payload  # noqa: E402
+    import shell_parse  # noqa: E402
+    from hook_input import degraded_exit, field, read_payload, strip_quoted  # noqa: E402
 except Exception:  # noqa: BLE001 — hook_input itself failed; nothing imports it back.
     if __name__ != "__main__":
         raise
@@ -73,6 +74,13 @@ _DEGRADED_GATED = (
     r"api\.(?:openai|anthropic|mistral|groq|deepinfra|x)\.com"
     r"|openrouter\.ai|generativelanguage\.googleapis\.com"
     r"|integrate\.api\.nvidia\.com"
+    # Zenmux, MiniMax and Dashscope, added with their rule-file counterparts.
+    # This set is a SECOND copy of that list by construction — the comment
+    # above says it mirrors it — so a provider present in one and missing from
+    # the other is covered while the tree is healthy and uncovered exactly when
+    # it is broken, which is the moment this over-block exists for. Found by
+    # checking this list after fixing the rule file, not by a reviewer.
+    r"|zenmux\.ai|api\.minimaxi?\.com|dashscope\.aliyuncs\.com"
 )
 
 try:
@@ -215,6 +223,46 @@ def _carries_exec_flag(args: list[str], pattern: re.Pattern[str] | None = None) 
     return pattern is not None and any(pattern.match(a) for a in args)
 
 
+def _is_compound(command: str) -> bool:
+    """Is this more than one command, or a command that writes?
+
+    A UNION of two detectors, because each is blind exactly where the other
+    sees, and using either alone regresses a case the other already covers.
+
+    `_CHAINS` over `strip_quoted(command)` — the operator scan, with quoted
+    spans removed first. Scanning the RAW text made a quoted operator revoke
+    the exemption, so `rg 'a.com/v1|b.com/v2' src` — a pure search — was
+    classified not-read-only and the endpoint rule hard-blocked it. MEASURED:
+    the quoted `|`, `&`, `;` and `>` spellings all did this (Codex P2, #1826).
+
+    `shell_parse` segment count — because `strip_quoted` removes a whole
+    double-quoted span, and a command substitution inside double quotes is
+    ACTIVE: `rg "use `curl <endpoint>`" src` really does run curl. Stripping
+    hides it; the parser resolves it into a second segment.
+
+    Neither half is sufficient. The parser does NOT split on `<(…)` or on a
+    redirect (MEASURED: both come back as one segment with no redirect
+    recorded), which are two of the cases `_CHAINS` was extended to catch —
+    a CodeRabbit Major on this same PR, among them. So the scan stays.
+
+    Fails CLOSED: an unparseable command or a blind spot the parser reports
+    means the shape is unknown, and an unknown shape is not a search.
+
+    MEASURED over 17 cases — 7 that must stay exempt (quoted `|`, `&`, `;`,
+    `>`, a single-quoted backtick, a plain search, a plain `git grep`) and 10
+    that must not (`&&`, bare `&`, pipe, process substitution, redirect,
+    heredoc, newline, `;`, and the two active substitutions inside double
+    quotes) — 17/17 correct.
+    """
+    if _CHAINS.search(strip_quoted(command)):
+        return True
+    try:
+        segments, blind = shell_parse.analyze_checked(command)
+    except Exception:  # noqa: BLE001 - an unknown shape is not a search
+        return True
+    return blind is not None or len(segments) > 1
+
+
 def _is_read_only_command(command: str) -> bool:
     """A single search/inspect invocation with nothing chained onto it.
 
@@ -223,7 +271,7 @@ def _is_read_only_command(command: str) -> bool:
     program. `git` is admitted only as `git log`/`git grep`/`git show`, never
     bare, because `git` also has subcommands that write.
     """
-    if _CHAINS.search(command):
+    if _is_compound(command):
         return False
     # shlex, NOT `.split()`: the guard reads the command as TYPED while the
     # shell hands the tool a de-quoted argv, so a bare split leaves the quotes
@@ -426,7 +474,17 @@ def main() -> int:
     # payload contract carries no tool_name at all, and a hook that went silent
     # under one of the two contracts is the exact failure hook_input exists to
     # prevent. tool_name is used only to label the message.
-    content = field(payload, "content") or field(payload, "new_string")
+    # `new_source` is NotebookEdit's content field. Wiring NotebookEdit to this
+    # hook without it would have been wiring with no effect: the read below
+    # would find nothing and return 0, which is the shape of a hook that looks
+    # connected and checks nothing. A notebook cell is executable — a session
+    # can add a cell carrying a direct provider request and run it later, and
+    # neither tool call would contain a checked endpoint (Codex P1, #1826).
+    content = (
+        field(payload, "content")
+        or field(payload, "new_string")
+        or field(payload, "new_source")
+    )
     bash_mode = False
     if not content:
         content = field(payload, "command")
@@ -437,7 +495,7 @@ def main() -> int:
     if not tool_name:
         tool_name = "Bash" if bash_mode else "Write"
 
-    file_path = field(payload, "file_path")
+    file_path = field(payload, "file_path") or field(payload, "notebook_path")
 
     # Never lint the rule-definition files themselves: they necessarily contain
     # the very patterns they match (the kill-all call literals, the hide-on-
