@@ -86,6 +86,10 @@ _ALWAYS_BLOCK = {".", "..", "/", "~", "*"}
 # A SUPERSET rather than a mirror, because this guard's hole is wider: it never
 # descends into `sh -c "…"` the way the resolver does, so the nested-shell names
 # belong here and not in the resolver's set.
+# Named separately because the resolver MODELS these — see
+# `_UNMODELLABLE_CARRIERS` below, which is the set minus these.
+_NESTED_SHELLS = frozenset({"bash", "sh", "dash", "zsh", "ksh", "ash"})
+
 _COMMAND_CARRIERS = frozenset(
     # shell_parse._REPARSE_CARRIERS — kept in step by the parity test named above.
     # `ssh` is absent there on purpose (it runs the command on another machine);
@@ -106,21 +110,95 @@ _COMMAND_CARRIERS = frozenset(
         "runcon",
         "sg",
     }
-    | {"bash", "sh", "dash", "zsh", "ksh", "ash"}  # shell_parse._NESTED
+    | _NESTED_SHELLS
 )
 
 # Command separators that start a new simple command within one Bash
 # string. Tokens matching these end an rm invocation's argument list.
-# Where bash can OPEN a command. `_SEPARATORS` alone is not that set: `time`,
-# `nice`, `{`, `(`, `then`, `do`, `else` and `!` all precede a command word, and
-# scoping the carrier check to separators let every one of them carry a removal
-# past it (MEASURED: five spellings allowed where the direct form blocked).
+# FALLBACK ONLY — a rough "where might a command start" guess, used when the
+# resolver could not be imported. It is NOT the primary mechanism and must not
+# become one again.
+#
+# ⚠ THIS SET IS WRONG IN BOTH DIRECTIONS AT ONCE, and an earlier revision of
+# this comment claimed otherwise. It asserted that "a keyword like `then`
+# cannot appear as a bare argument in the same way" a command name can. That is
+# MEASURED FALSE: `echo then bash rm`, `echo do sh rm -rf`, `echo else bash rm`
+# and `echo elif sh rm` were all REFUSED while main allowed them — the exact
+# regression the comment was written to explain the fix for. The claim is
+# withdrawn rather than rewritten, because the underlying idea was the error:
+#
+#   over-inclusive   a keyword in ARGUMENT position is not opening anything
+#   under-inclusive  `if`, `while`, `until`, `case …)`, `exec` and `coproc` all
+#                    open a command and are not here; nor are `$( )`, backticks,
+#                    leading assignments, or the `env`/`sudo`/`timeout` prefixes
+#
+# Both directions come from the same place: a NAME cannot tell you whether it
+# is the first word of a simple command, which is what `bash(1)` §"Simple
+# Commands" actually defines ("optional variable assignments … the first word
+# specifies the command"). Only a parse answers that, which is why
+# `_resolver_carrier_refusal` is primary and this is the degraded path.
+#
+# `"\n"` is dead here — `_rm_violations` folds newlines to " ; " before
+# tokenizing, so no token can equal it. Kept so the set reads as the same
+# vocabulary as `_SEPARATORS`, which carries the same dead member.
+#
 # Kept SEPARATE from `_SEPARATORS`, which means "where an rm operand list ends"
 # — the two sets answer different questions and merging them would silently
 # change operand parsing.
 _COMMAND_OPENERS = frozenset(
-    {"|", "||", "&&", ";", "&", "\n", "{", "(", "!", "then", "do", "else", "elif", "time", "nice"}
+    {"|", "||", "&&", ";", "&", "\n", "{", "(", "!", "then", "do", "else", "elif"}
 )
+
+# GUARDED, and the except-path is the previous behaviour rather than a weaker
+# one: if the resolver cannot be imported this guard falls back to its own token
+# scan, which is what shipped before. No new fail-open path — the objection that
+# an import adds one to a blocking guard assumes the except-path is permissive,
+# and here it is not. Same shape as `protected_paths_guard`'s guarded import.
+try:  # noqa: SIM105
+    from shell_parse import analyze_checked as _analyze_checked
+except Exception:  # noqa: BLE001 — degraded, never permissive
+    _analyze_checked = None
+
+# The launchers the RESOLVER refuses to model. The shells are deliberately NOT
+# here: the resolver recovers `sh -c "…"` into real segments (MEASURED:
+# `bash -c "rm -rf /etc"` -> exes=['bash','rm']), so refusing them blind would
+# over-block a recoverable command and the deny text would be untrue.
+_UNMODELLABLE_CARRIERS = _COMMAND_CARRIERS - _NESTED_SHELLS
+
+
+def _resolver_carrier_refusal(cmd: str) -> str | None:
+    """Carrier verdict from the RESOLVER, or None if it has nothing to say.
+
+    Returns a reason to refuse, or None to let the ordinary scan proceed.
+    Raises nothing: an unusable resolver is reported by the caller's own
+    fallback, never by an exception escaping into a blocking hook.
+    """
+    if _analyze_checked is None:
+        return None  # caller falls back to the token scan
+    try:
+        segs, blind = _analyze_checked(cmd)
+    except Exception:  # noqa: BLE001
+        return (
+            "this command cannot be analysed, and it names a removal — refused "
+            "conservatively rather than scanned with a weaker pattern."
+        )
+    if blind is not None:
+        # REFUSE, do not degrade. The previous revision fell through to a
+        # glued-`-rf` regex here, so one trailing quote turned a BLOCK into an
+        # allow (MEASURED).
+        return (
+            f"this command cannot be read ({blind.cause}), and it names a "
+            f"removal, so the guard cannot verify what would be deleted."
+        )
+    for seg in segs:
+        if seg.exe in _UNMODELLABLE_CARRIERS:
+            return (
+                f"'{seg.exe}' runs a command this resolver refuses to model, so "
+                f"the payload cannot be recovered and a removal inside it cannot "
+                f"be verified. Re-issue the command without the launcher."
+            )
+    return None
+
 
 _RM_WORD = re.compile(r"\brm\b|\brmdir\b")
 
@@ -421,7 +499,33 @@ def _check_target(target: str) -> str | None:
     return None
 
 
-def _rm_violations(cmd: str) -> list[str] | None:
+def _recovered_removals(cmd: str) -> list[str]:
+    """Command strings for removals the resolver recovered from a nested shell.
+
+    Returns re-quoted argv for each `rm`/`rmdir` segment the resolver found at
+    depth > 0 — i.e. inside `sh -c "…"` — so the ordinary operand rules can be
+    applied to it. Top-level segments are excluded because the token scan
+    already walks them; this adds only what the scan structurally cannot see.
+
+    Re-quoted with `shlex.quote`, so an operand containing spaces survives the
+    round trip instead of splitting into two shallow targets.
+    """
+    if _analyze_checked is None:
+        return []
+    try:
+        segs, blind = _analyze_checked(cmd)
+    except Exception:  # noqa: BLE001
+        return []
+    if blind is not None:
+        return []
+    out: list[str] = []
+    for seg in segs:
+        if getattr(seg, "depth", 0) > 0 and seg.exe in ("rm", "rmdir"):
+            out.append(" ".join(shlex.quote(a) for a in seg.argv))
+    return out
+
+
+def _rm_violations(cmd: str, *, refuse_carriers: bool = True) -> list[str] | None:
     """Reasons to block, or None when the command cannot be tokenized.
 
     There is no recursion into a carried command string and no depth bound. A
@@ -494,8 +598,18 @@ def _rm_violations(cmd: str) -> list[str] | None:
         # contained `rm` somewhere, because of main()'s prefilter — but a
         # refusal that depends on an unrelated prefilter to stay narrow is one
         # edit away from being wrong.)
+        # FALLBACK ONLY. When the resolver is available the caller passes
+        # refuse_carriers=False, because `_resolver_carrier_refusal` has
+        # already decided this with real parsing. This name-based test is
+        # kept for the degraded path and is known to be wrong in BOTH
+        # directions — `echo then bash rm` over-blocks, `if bash -c …`
+        # under-blocks — which is precisely why it is no longer primary.
         at_command_position = i == 0 or tokens[i - 1] in _COMMAND_OPENERS
-        if at_command_position and os.path.basename(core) in _COMMAND_CARRIERS:
+        if (
+            refuse_carriers
+            and at_command_position
+            and os.path.basename(core) in _COMMAND_CARRIERS
+        ):
             # A LAUNCHER THAT RUNS A COMMAND THIS GUARD CANNOT RECOVER.
             # REFUSE OUTRIGHT, deliberately WITHOUT inspecting what it carries.
             #
@@ -592,10 +706,36 @@ def main() -> int:
         if not cmd or not _RM_WORD.search(cmd):
             return 0
 
-        violations = _rm_violations(cmd)
+        # THE RESOLVER DECIDES CARRIERS, not a name list over flat tokens.
+        # A name-based position test is wrong in BOTH directions at once
+        # (`echo then bash rm` over-blocks; `if bash -c …` under-blocks), which
+        # is why it is no longer primary. This also REFUSES an unreadable
+        # command rather than degrading to a glued-`-rf` regex, closing a
+        # one-character bypass: `eval 'rm -r -f /a/b' "` used to be ALLOWED
+        # while the same command without the trailing quote BLOCKED.
+        carrier_reason = _resolver_carrier_refusal(cmd)
+        if carrier_reason:
+            print(f"BLOCKED: {carrier_reason}", file=sys.stderr)
+            return 2
+
+        resolved = _analyze_checked is not None
+        violations = _rm_violations(cmd, refuse_carriers=not resolved)
+
+        if resolved and violations is not None:
+            # The resolver RECOVERS a nested shell's payload, so scan what it
+            # recovered. Without this the quoted payload of `sh -c "rm -rf X"`
+            # is a single token the operand scan cannot see — the reason the
+            # previous revision refused shells outright and told the reader
+            # their payload "cannot be recovered", which was untrue.
+            for inner in _recovered_removals(cmd):
+                extra = _rm_violations(inner, refuse_carriers=False)
+                if extra:
+                    violations.extend(extra)
+
         if violations is None:
-            # Tokenizer failed — the legacy regex still catches the
-            # common spelling; beyond that we fail open by design.
+            # Unreachable while the resolver is available — it refuses an
+            # unreadable command above. Kept for the degraded path, where the
+            # legacy regex is still better than nothing.
             if not _RM_RF_PATTERN.search(cmd):
                 return 0
             violations = [

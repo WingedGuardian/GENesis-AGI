@@ -633,8 +633,14 @@ class TestLauncherCarriersAreRefusedWithoutInspection:
         ],
     )
     def test_a_carrier_NAMED_but_not_RUN_is_untouched(self, cmd, fake_home):
-        """The refusal keys on command POSITION, never on the word appearing."""
-        r = _run(cmd, fake_home)
+        """The refusal keys on command POSITION, never on the word appearing.
+
+        Each command carries a REAL `rm` so it gets past the `\\brm\\b`
+        prefilter at :262 and actually reaches the carrier loop. Without one the
+        guard returns at the prefilter and the test passes with the carrier
+        branch deleted — which is what an earlier version of it did.
+        """
+        r = _run(f"{cmd}; {self.RM} -f /tmp/scratch-xyz", fake_home)
         assert r.returncode == 0, f"over-blocked: {cmd!r} -> {r.stderr}"
 
     def test_ordinary_protected_path_behaviour_is_unchanged(self, fake_home):

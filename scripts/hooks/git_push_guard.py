@@ -266,18 +266,32 @@ except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degrad
 # NOT. A word boundary asks the one thing that was meant — that the flag is a whole
 # token — without naming the characters that may follow it. MEASURED cost of the
 # widening over 74,282 real commands: 15,945 -> 15,995, i.e. +50 (+0.07%).
-# `\bcommit\b` is here for the CARRIER arm, which consults this pattern to decide
-# whether a launcher is in this guard's scope at all. `git commit`'s short
-# hook-skip form is `-n`, and a pattern holding only `--no-verify` let
-# `eval git commit -n -m x` through while the direct spelling blocked via
-# `commit_skips_hooks` (MEASURED). A narrower `commit … -Xn` clause was measured
-# and REJECTED: it is length-bounded, so it missed
+_GATED_MENTION = re.compile(
+    r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b|\b(?:push|merge)\b"
+)
+
+# The CARRIER arm's own net. It is `_GATED_MENTION` plus `\bcommit\b`, and it is
+# SEPARATE on purpose — the two arms are different consumers with costs that
+# differ by more than an order of magnitude, and widening the shared pattern
+# charged the difference to a path that had no reason to pay it.
+#
+# Why `commit` is needed here: `git commit`'s short hook-skip form is `-n`, and a
+# pattern holding only `--no-verify` let `eval git commit -n -m x` through while
+# the direct spelling blocked via `commit_skips_hooks` (MEASURED). A narrower
+# `commit … -Xn` clause was measured and REJECTED — length-bounded, so it missed
 # `git commit --amend --no-edit --author="A B" --date=now -n`, and a case it did
 # match matched the word `commit` inside "commit message" rather than the
-# subcommand — passing for a reason unrelated to its intent. MEASURED cost of
-# the bare word over 83,201 recorded commands, counted on the carrier arm:
-# 13 -> 22 (+9, 0.0156% -> 0.0264%).
-_GATED_MENTION = re.compile(
+# subcommand, i.e. passed for a reason unrelated to its intent.
+#
+# Why it must NOT be in the shared pattern. MEASURED over 83,201 recorded
+# commands: on the carrier arm the word costs 13 -> 22 (+9). On the BLIND-SPOT
+# arm, which reads the same pattern, it costs 404 -> 687 (+283) — and those are
+# real: 12 of 12 sampled corpus commands go allow on origin/main and BLOCK on
+# the widened pattern through the actual guard. They are ordinary
+# `python - <<'PY'` heredocs whose BODY happens to mention commit. An earlier
+# revision published the +9 as this guard's rate, having counted one arm of a
+# two-arm change.
+_CARRIER_GATED_MENTION = re.compile(
     r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b|\b(?:push|merge|commit)\b"
 )
 
@@ -9459,7 +9473,7 @@ def _run_merge_and_push_gates() -> int:
         # guard, and the deny text told the reader to "run the git/gh command
         # directly" on a command containing no git.
         #
-        # MEASURED over the recorded corpus: 126 carrier hits unscoped, 18 once
+        # MEASURED over the recorded corpus: 126 carrier hits unscoped, 22 once
         # scoped — an 83% cut, with every attack spelling this change documents
         # still refused, because each contains the literal `git`.
         #
@@ -9469,8 +9483,31 @@ def _run_merge_and_push_gates() -> int:
         # the two guards now fail identically instead of taking opposite sides
         # of one question. Closing it properly needs the resolver to report a
         # carrier as a blind-spot cause, which is filed, not built here.
-        carried_gated_op = _mentions_gated_op(cmd) and any(
-            s.exe in _REPARSE_CARRIERS for s in segs
+        # PER SEGMENT, not per command. A carrier verdict is "a fact about a
+        # SPECIFIC segment" — this file says so where it explains why
+        # `hidden_gated_verb` must not be suppressed by a different segment
+        # parsing — and reading the whole command string made it a fact about
+        # the command. MEASURED cost of that: `eval "$(ssh-agent -s)" && git
+        # commit -m x` was REFUSED, where the `eval` carries nothing gated and
+        # the `git commit` is a separate, fully-parsed segment the ordinary
+        # commit gate already handles.
+        #
+        # `_mentions_gated_op` OR the carrier net: the former is this guard's
+        # own definition of its business and already includes `gh pr create` —
+        # the FOURTH gated operation, which a hand-built regex silently dropped
+        # (MEASURED: `eval gh pr create …` scored mentions_gated=True,
+        # carrier_net=False, and was ALLOWED). The carrier net adds only
+        # `commit`, which the shared pattern must not carry — see its
+        # definition.
+        #
+        # Every attack spelling keeps the gated word INSIDE the carrier's own
+        # segment, so none of them is affected: `eval git push`,
+        # `eval git commit -n -m x`, `eval "git pu""sh origin main"`,
+        # `su ubuntu -c 'git push'`, `eval gh pr create …`.
+        carried_gated_op = any(
+            s.exe in _REPARSE_CARRIERS
+            and (_mentions_gated_op(s.raw) or bool(_CARRIER_GATED_MENTION.search(s.raw)))
+            for s in segs
         )
         # The two predicates are NOT suppressed by the same thing, and collapsing
         # them into one `not (…parsed…)` guard was the defect.

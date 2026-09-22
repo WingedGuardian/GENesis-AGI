@@ -533,12 +533,12 @@ class TestCommandCarriersAreRefusedWithoutInspection:
     @pytest.mark.parametrize(
         "opener,cmd",
         [
-            ("time", 'time bash -c "{RM} -rf /a/b"'),
             ("brace", '{{ bash -c "{RM} -rf /a/b"; }}'),
             ("then", 'if true; then bash -c "{RM} -rf /a/b"; fi'),
-            ("nice", 'nice bash -c "{RM} -rf /a/b"'),
             ("do", 'for i in 1; do bash -c "{RM} -rf /a/b"; done'),
+            ("else", 'if false; then true; else bash -c "{RM} -rf /a/b"; fi'),
             ("subshell", '( bash -c "{RM} -rf /a/b" )'),
+            ("separator", 'true; bash -c "{RM} -rf /a/b"'),
         ],
     )
     def test_a_carrier_after_any_command_OPENER_is_refused(self, opener, cmd):
@@ -596,6 +596,167 @@ class TestCommandCarriersAreRefusedWithoutInspection:
         )
         got = res.returncode == 2
         assert got is blocked, f"{cmd!r}: expected blocked={blocked} ({why}), got {res.returncode}"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "echo time bash {RM}",
+            "echo nice sh {RM} -rf",
+            "echo 'run time bash to {RM} it'",
+        ],
+    )
+    def test_a_PREFIX_COMMAND_name_in_argument_position_is_not_an_opener(self, cmd):
+        """Control keywords may open a command; command NAMES may also be data.
+
+        An earlier revision listed `time` and `nice` as openers. This scanner
+        has no notion of being inside a simple command, so the bare name fired
+        wherever the WORD appeared: `echo time bash rm` was REFUSED while main
+        allows it. `then` and `do` cannot appear as bare arguments the same way,
+        which is why the set is control keywords only.
+
+        The prefix-command class is a PRE-EXISTING gap (main allows
+        `env sh -c "rm -rf /a/b"` and five siblings identically) and needs
+        simple-command tracking rather than a longer list.
+        """
+        assert not _blocks(cmd.format(RM=self.RM)), cmd
+
+    # ---- the RESOLVER path. `_blocks()` cannot reach it: it calls
+    # `_rm_violations` directly, so it bypasses main() and therefore the
+    # resolver pre-pass entirely. Every test above this line pins the FALLBACK.
+
+    @staticmethod
+    def _main(cmd: str, home) -> int:
+        import json
+        import os
+        import subprocess
+        import sys as _sys
+
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        script = (
+            Path(__file__).resolve().parents[2]
+            / "scripts"
+            / "hooks"
+            / "destructive_command_guard.py"
+        )
+        return subprocess.run(
+            [_sys.executable, str(script)],
+            input=json.dumps({"tool_input": {"command": cmd}, "tool_name": "Bash"}),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        ).returncode
+
+    @pytest.mark.parametrize(
+        "label,cmd",
+        [
+            ("after if", 'if sh -c "{RM} -rf /a/b"; then :; fi'),
+            ("after while", 'while sh -c "{RM} -rf /a/b"; do break; done'),
+            ("after until", 'until sh -c "{RM} -rf /a/b"; do break; done'),
+            ("after exec", 'exec sh -c "{RM} -rf /a/b"'),
+            ("substitution", "$(eval '{RM} -rf /a/b')"),
+            ("assignment prefix", 'FOO=1 sh -c "{RM} -rf /a/b"'),
+            ("env prefix", 'env sh -c "{RM} -rf /a/b"'),
+            ("sudo prefix", 'sudo sh -c "{RM} -rf /a/b"'),
+            ("timeout prefix", 'timeout 5 sh -c "{RM} -rf /a/b"'),
+        ],
+    )
+    def test_the_resolver_sees_command_positions_a_name_list_cannot(
+        self, label, cmd, tmp_path
+    ):
+        """Every one of these was ALLOWED while the direct spelling BLOCKED.
+
+        They are not a longer list of names — they are what a real parse gives
+        for free. A name-based position test was wrong in BOTH directions at
+        once: it under-blocked all of the above and over-blocked
+        `echo then bash rm`. That is why the resolver is primary now.
+        """
+        assert self._main(cmd.format(RM=self.RM), tmp_path) == 2, label
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "echo then bash {RM}",
+            "echo do sh {RM} -rf",
+            "echo else bash {RM}",
+            "echo elif sh {RM}",
+        ],
+    )
+    def test_a_control_keyword_in_ARGUMENT_position_is_not_a_command_opener(
+        self, cmd, tmp_path
+    ):
+        """The other direction of the same defect.
+
+        A revision that fixed the `time`/`nice` over-block left `then`/`do`/
+        `else`/`elif` doing exactly the same thing, and carried a comment
+        asserting they could not — MEASURED false: `echo then bash rm` was
+        REFUSED while main allowed it.
+        """
+        assert self._main(cmd.format(RM=self.RM), tmp_path) == 0, cmd
+
+    def test_an_unreadable_command_is_REFUSED_not_degraded(self, tmp_path):
+        """The one-character bypass of the mechanism this guard is named for.
+
+        A blind parse used to fall through to `_RM_RF_PATTERN`, which needs a
+        GLUED `-rf`. So one trailing quote flipped the verdict:
+
+            eval 'rm -r -f /a/b'        BLOCK
+            eval 'rm -r -f /a/b' "      allow      <- same command
+
+        A refusal conditional on the tokenizer succeeding is a refusal the
+        caller controls.
+        """
+        q = chr(34)
+        assert self._main(f"eval '{self.RM} -r -f /a/b'", tmp_path) == 2
+        assert self._main(f"eval '{self.RM} -r -f /a/b' {q}", tmp_path) == 2
+        assert self._main(f"bash -c '{self.RM} -r -f /a/b' {q}", tmp_path) == 2
+
+    @pytest.mark.parametrize(
+        "payload,why",
+        [
+            ("{RM} -rf /a/b", "shallow — blocked directly too"),
+            ("{RM} -rf node_modules", "depth 1 — blocked directly too"),
+            ("{RM} -rf ./deep/a/b/c", "deep enough — allowed directly too"),
+            ("echo hi", "no removal at all"),
+        ],
+    )
+    def test_a_shell_payload_gets_the_SAME_verdict_as_the_direct_spelling(
+        self, payload, why, tmp_path
+    ):
+        """Shells are RECOVERED, not refused blind — and that is the property.
+
+        `analyze_checked('bash -c "rm -rf /etc"')` returns exes=['bash','rm'],
+        so the payload is recoverable and the ordinary operand rules apply to
+        it. A previous revision refused all six shell names outright and told
+        the reader their payload "cannot be recovered", which was untrue and
+        cost ordinary commands like `bash -c 'rm -rf node_modules'`.
+
+        The contract is PARITY, not permissiveness: whatever the direct
+        spelling does, the carried spelling does.
+        """
+        direct = self._main(payload.format(RM=self.RM), tmp_path)
+        carried = self._main(f"bash -c '{payload.format(RM=self.RM)}'", tmp_path)
+        assert carried == direct, f"{why}: direct={direct} carried={carried}"
+
+    def test_an_UNMODELLABLE_carrier_is_still_refused(self, tmp_path):
+        """The shells move to recovery; the fourteen the resolver refuses to
+        model do not. `eval` has no grammar to model at all."""
+        assert self._main(f"eval '{self.RM} -rf /a/b'", tmp_path) == 2
+        assert self._main(f"su -c '{self.RM} -rf /a/b' root", tmp_path) == 2
+
+    def test_the_degraded_path_is_the_PREVIOUS_behaviour_not_a_weaker_one(self):
+        """If the resolver cannot be imported, the name-list scan still runs.
+
+        The guarded import's except-path must not be permissive — that is the
+        whole answer to "an import adds a failure path to a blocking guard".
+        """
+        assert _blocks(f"eval '{self.RM} -rf /a/b'"), (
+            "with carrier refusal ON (the degraded default) a carrier must block"
+        )
+        assert dg._analyze_checked is None or dg._UNMODELLABLE_CARRIERS, (
+            "the unmodellable set must be non-empty when the resolver is present"
+        )
 
     def test_the_depth_bound_is_gone(self):
         """No numeric bound remains, so no depth can be an attacker's budget."""

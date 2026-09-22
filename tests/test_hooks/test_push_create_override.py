@@ -898,6 +898,53 @@ class TestLauncherCarriedGatedOps:
             res = _run(cmd)
             assert res.returncode == 0, f"{cmd!r} is not this guard's business: {res.stderr[:120]}"
 
+    def test_the_carrier_net_is_SEPARATE_from_the_blind_spot_net(self):
+        """`commit` belongs to the carrier arm only, and this pins that.
+
+        `_GATED_MENTION` has two consumers: the carrier arm ("is this launcher
+        this guard's business?") and the blind-spot arm ("this command is
+        unreadable AND names a gated op"). Their costs differ by more than an
+        order of magnitude, and an earlier revision widened the SHARED pattern
+        with `commit` after costing only the carrier arm.
+
+        MEASURED on the arm that was not counted: of 1,643 corpus commands the
+        resolver calls blind, the widened pattern matched 283 more than the old
+        one — and 12 of 12 sampled went allow -> BLOCK through the REAL guard on
+        both arms. They were ordinary `python - <<'PY'` heredocs whose BODY
+        mentioned the word commit. The figure published for the change was +9.
+        """
+        import importlib.util
+        import sys as _sys
+
+        spec = importlib.util.spec_from_file_location(
+            "gpg_pattern_check",
+            Path(__file__).resolve().parents[2] / "scripts" / "hooks" / "git_push_guard.py",
+        )
+        mod = importlib.util.module_from_spec(spec)
+        _sys.modules["gpg_pattern_check"] = mod
+        spec.loader.exec_module(mod)
+
+        prose = "print('commit the change')"
+        assert not mod._GATED_MENTION.search(prose), (
+            "the SHARED pattern must not match a bare `commit` — the blind-spot "
+            "arm reads it, and 283 real commands pay for that widening"
+        )
+        assert mod._CARRIER_GATED_MENTION.search(prose), (
+            "the CARRIER pattern must match `commit`, which is what closes "
+            "`eval git commit -n`"
+        )
+        # Assembled from fragments, same reason as PUSH/NV above.
+        gated = [
+            "git " + self.PUSH,
+            "git " + "mer" + "ge x",
+            self.NV,
+            "--" + "for" + "ce",
+            "--" + "ad" + "min",
+        ]
+        for tok in gated:
+            assert mod._CARRIER_GATED_MENTION.search(tok), f"carrier net lost {tok!r}"
+            assert mod._GATED_MENTION.search(tok), f"shared net lost {tok!r}"
+
     def test_the_bare_spelling_is_not_turned_into_a_refusal(self):
         """The control: the carrier branch left the ordinary push path alone.
 
