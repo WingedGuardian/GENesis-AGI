@@ -1756,3 +1756,397 @@ async def test_a_sweep_that_MEASURED_NOTHING_cannot_publish_a_CLEAN_BOARD(
     # accounting that makes suppression auditable.
     terminal = record["stages"]["branches"]["terminal"]
     assert sum(v for k, v in terminal.items() if k != "refs_total") == terminal["refs_total"]
+
+
+# ── Mode transitions: lowering the lever must RETIRE what it stops maintaining ─
+#
+# The worker only ever sees its CURRENT mode, so on its own it cannot tell a
+# settled `observe` from an `alert` -> `observe` drop. Both missing transitions
+# were stale-by-construction:
+#
+#   * `alert` -> `observe` left the standing findings alert exactly as it was —
+#     the guard that maintains it simply skips when the mode is not `alert` — so
+#     a quieter lever went on presenting obsolete findings until the 3-day TTL.
+#   * `alert`/`observe` -> `off` returned BEFORE opening a connection, so nothing
+#     could be retired even in principle, and the run record kept the PREVIOUS
+#     mode, so `zero_drop_status` answered "is this thing on?" with the answer
+#     from before it was switched off.
+#
+# These pin the transitions end to end, through the real worker and the real DB.
+
+
+async def _resolution_notes(db_path, source):
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    try:
+        cur = await conn.execute(
+            "SELECT resolution_notes FROM observations WHERE source = ? AND resolved = 1",
+            (source,),
+        )
+        return [r["resolution_notes"] for r in await cur.fetchall()]
+    finally:
+        await conn.close()
+
+
+async def _resolved_count(db_path, source):
+    conn = await aiosqlite.connect(db_path)
+    try:
+        cur = await conn.execute(
+            "SELECT COUNT(*) FROM observations WHERE source = ? AND resolved = 1",
+            (source,),
+        )
+        return (await cur.fetchone())[0]
+    finally:
+        await conn.close()
+
+
+async def test_lowering_alert_to_observe_retires_the_standing_findings_alert(
+    env, db_path, monkeypatch
+):
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    await _run(db_path)
+    assert len(await _open_observations(db_path, w.ALERT_SOURCE)) == 1
+
+    monkeypatch.setattr(w, "effective_mode", lambda: "observe")
+    out = await _run(db_path)
+    assert out["status"] in ("ok", "degraded")
+
+    assert await _open_observations(db_path, w.ALERT_SOURCE) == [], "the alert must retire"
+    # ...and the finding is STILL stranded, so the retirement is a LEVER CHANGE,
+    # not a clean board pretending the work landed.
+    assert len(await _rows(db_path)) == 1
+
+    assert json.loads(w.last_run_path().read_text())["mode"] == "observe"
+    notes = await _resolution_notes(db_path, w.ALERT_SOURCE)
+    assert len(notes) == 1
+    assert "alert -> observe" in notes[0], notes[0]
+    assert "board is clean" not in notes[0], "a lever change is NOT a clean board"
+
+
+async def test_lowering_the_mode_is_not_swallowed_by_the_debounce(env, db_path, monkeypatch):
+    """The transition is not a routine sweep: it has to happen ON the drop, not
+    whenever the hourly interval next elapses. The debounce would otherwise hide
+    it, because the previous run is usually seconds old when the lever moves."""
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    await _run(db_path)
+    monkeypatch.setattr(w, "effective_mode", lambda: "observe")
+
+    out = await w.run_zero_drop_worker(
+        trigger="session_start", force=False, db_path=db_path, repo_path="/repo"
+    )
+    assert out["status"] != "debounced"
+    assert await _open_observations(db_path, w.ALERT_SOURCE) == []
+
+
+async def test_lowering_to_off_retires_both_alerts_and_records_the_mode(env, db_path, monkeypatch):
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    await _run(db_path)  # a finding lands, and the findings alert stands
+    env["prs"] = {"error": "gh boom"}  # ...then a leg goes blind
+    await _run(db_path)
+    assert len(await _open_observations(db_path, w.ALERT_SOURCE)) == 1
+    assert len(await _open_observations(db_path, w.BLIND_SOURCE)) == 1
+
+    monkeypatch.setattr(w, "effective_mode", lambda: "off")
+    out = await _run(db_path)
+
+    assert out["status"] == "ok"
+    assert await _open_observations(db_path, w.ALERT_SOURCE) == []
+    assert await _open_observations(db_path, w.BLIND_SOURCE) == []
+
+    record = json.loads(w.last_run_path().read_text())
+    assert record["mode"] == "off", "the status surface must stop reporting the old mode"
+    assert "off" in record["coverage"]
+    # SCOPE is stated (an omission renders as a positive "nothing frozen"), but
+    # nothing was MEASURED, so no measurement key may appear — a zero here would
+    # read as a sweep that looked and found a clean board.
+    assert record["frozen_classes"] == list(w.ALL_CLASSES)
+    for key in ("stages", "counts_by_status", "open_findings"):
+        assert key not in record, f"an off run must not publish {key}"
+
+
+async def test_the_off_transition_actually_opens_a_connection(env, db_path, monkeypatch):
+    """The `off` path used to return before `get_raw_db`, so it could not retire
+    anything even in principle. Pin that it reaches the database now."""
+    import contextlib
+
+    import genesis.db.connection as conn_mod
+
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    await _run(db_path)
+
+    calls = {"n": 0}
+    real = conn_mod.get_raw_db
+
+    @contextlib.asynccontextmanager
+    async def _spy(path):
+        calls["n"] += 1
+        async with real(path) as db:
+            yield db
+
+    monkeypatch.setattr(conn_mod, "get_raw_db", _spy)
+    monkeypatch.setattr(w, "effective_mode", lambda: "off")
+    await _run(db_path)
+    assert calls["n"] == 1, "the off transition must open a connection to retire"
+
+
+async def test_steady_state_off_does_not_touch_the_database_or_rewrite_the_record(
+    env, db_path, monkeypatch
+):
+    import contextlib
+
+    import genesis.db.connection as conn_mod
+
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    await _run(db_path)
+    monkeypatch.setattr(w, "effective_mode", lambda: "off")
+    await _run(db_path)  # the transition run writes the `off` record
+    stamped = json.loads(w.last_run_path().read_text())
+    assert stamped["mode"] == "off"
+
+    calls = {"n": 0}
+    real = conn_mod.get_raw_db
+
+    @contextlib.asynccontextmanager
+    async def _spy(path):
+        calls["n"] += 1
+        async with real(path) as db:
+            yield db
+
+    monkeypatch.setattr(conn_mod, "get_raw_db", _spy)
+    out = await _run(db_path)
+
+    assert out["status"] == "skipped_off"
+    assert calls["n"] == 0, "a settled `off` must not open a connection"
+    assert json.loads(w.last_run_path().read_text()) == stamped, "nor rewrite the record"
+
+
+async def test_raising_the_mode_back_does_not_double_resolve_or_re_mint(env, db_path, monkeypatch):
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    await _run(db_path)
+    assert len(await _open_observations(db_path, w.ALERT_SOURCE)) == 1
+
+    monkeypatch.setattr(w, "effective_mode", lambda: "observe")
+    await _run(db_path)
+    assert await _open_observations(db_path, w.ALERT_SOURCE) == []
+    retired = await _resolved_count(db_path, w.ALERT_SOURCE)
+    assert retired == 1
+
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    await _run(db_path)
+
+    # Exactly one live alert again — no duplicate minted...
+    assert len(await _open_observations(db_path, w.ALERT_SOURCE)) == 1
+    # ...and the earlier retirement was not resolved a second time.
+    assert await _resolved_count(db_path, w.ALERT_SOURCE) == retired
+    assert json.loads(w.last_run_path().read_text())["mode"] == "alert"
+
+
+async def test_raising_from_off_to_observe_records_the_new_mode(env, db_path, monkeypatch):
+    monkeypatch.setattr(w, "effective_mode", lambda: "observe")
+    await _run(db_path)
+    monkeypatch.setattr(w, "effective_mode", lambda: "off")
+    await _run(db_path)
+    assert json.loads(w.last_run_path().read_text())["mode"] == "off"
+
+    monkeypatch.setattr(w, "effective_mode", lambda: "observe")
+    out = await w.run_zero_drop_worker(
+        trigger="session_start", force=False, db_path=db_path, repo_path="/repo"
+    )
+    assert out["status"] != "debounced", "raising the mode must take effect immediately"
+    record = json.loads(w.last_run_path().read_text())
+    assert record["mode"] == "observe"
+    assert "stages" in record, "a running mode sweeps and measures again"
+
+
+async def test_a_failed_retirement_retries_on_a_SHORT_floor_not_the_full_interval(
+    env, db_path, monkeypatch
+):
+    """A retirement that fails must not strand the row for a whole interval.
+
+    The `observe` path ADVANCES the mode — this run swept and measured under
+    `observe`, so the record names the mode that actually ran — which means the
+    drop is not re-detected on the next trigger. The failure is carried in
+    `degraded` instead, and the next trigger retries it on the SHORT floor a
+    failed sweep gets rather than unconditionally: the retry re-runs the whole
+    sweep, so a persistently failing resolve must not replay it on every
+    session boundary.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from genesis.db.crud import observations as obs
+
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    await _run(db_path)
+    assert len(await _open_observations(db_path, w.ALERT_SOURCE)) == 1
+
+    real = obs.resolve_by_source_and_type
+
+    async def _boom(db, **kw):
+        if kw.get("source") == w.ALERT_SOURCE:
+            raise RuntimeError("resolve exploded")
+        return await real(db, **kw)
+
+    monkeypatch.setattr(obs, "resolve_by_source_and_type", _boom)
+    monkeypatch.setattr(w, "effective_mode", lambda: "observe")
+    out = await _run(db_path)
+
+    assert out["degraded"]["alert"] == "resolve_failed"
+    assert len(await _open_observations(db_path, w.ALERT_SOURCE)) == 1, "still standing"
+    record = json.loads(w.last_run_path().read_text())
+    assert record["mode"] == "alert", "a failed transition must retain its prior mode"
+    assert record["pending_mode"] == "observe"
+    assert record["degraded"]["alert"] == "resolve_failed"
+
+    # Within the floor a non-forced trigger waits — the retry is BOUNDED.
+    out = await w.run_zero_drop_worker(
+        trigger="session_start", force=False, db_path=db_path, repo_path="/repo"
+    )
+    assert out["status"] == "debounced"
+
+    # Past the floor it RETRIES rather than waiting out the full interval.
+    record = json.loads(w.last_run_path().read_text())
+    record["computed_at"] = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+    w.last_run_path().write_text(json.dumps(record))
+    monkeypatch.setattr(obs, "resolve_by_source_and_type", real)
+
+    out = await w.run_zero_drop_worker(
+        trigger="session_start", force=False, db_path=db_path, repo_path="/repo"
+    )
+    assert out["status"] != "debounced", "a pending retire must retry, not wait the interval"
+    assert await _open_observations(db_path, w.ALERT_SOURCE) == []
+    record = json.loads(w.last_run_path().read_text())
+    assert "alert" not in (record["degraded"] or {})
+    assert "pending_mode" not in record
+
+
+async def test_reverting_pending_mode_runs_immediately_and_clears_pending_state(
+    env, db_path, monkeypatch
+):
+    from genesis.db.crud import observations as obs
+
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    await _run(db_path)
+    real = obs.resolve_by_source_and_type
+
+    async def _boom(db, **kw):
+        if kw.get("source") == w.ALERT_SOURCE:
+            raise RuntimeError("resolve exploded")
+        return await real(db, **kw)
+
+    monkeypatch.setattr(obs, "resolve_by_source_and_type", _boom)
+    monkeypatch.setattr(w, "effective_mode", lambda: "observe")
+    out = await _run(db_path)
+    assert out["degraded"]["alert"] == "resolve_failed"
+    assert json.loads(w.last_run_path().read_text())["pending_mode"] == "observe"
+
+    monkeypatch.setattr(obs, "resolve_by_source_and_type", real)
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    out = await w.run_zero_drop_worker(
+        trigger="session_start", force=False, db_path=db_path, repo_path="/repo"
+    )
+
+    assert out["status"] != "debounced", "reverting a pending transition must run now"
+    record = json.loads(w.last_run_path().read_text())
+    assert record["mode"] == "alert"
+    assert "pending_mode" not in record
+
+
+async def test_off_transition_keeps_prior_mode_and_retries_failed_retirement(
+    env, db_path, monkeypatch
+):
+    from genesis.db.crud import observations as obs
+
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    await _run(db_path)
+    assert len(await _open_observations(db_path, w.ALERT_SOURCE)) == 1
+    real = obs.resolve_by_source_and_type
+
+    async def _boom(db, **kw):
+        if kw.get("source") == w.ALERT_SOURCE:
+            raise RuntimeError("resolve exploded")
+        return await real(db, **kw)
+
+    monkeypatch.setattr(obs, "resolve_by_source_and_type", _boom)
+    monkeypatch.setattr(w, "effective_mode", lambda: "off")
+    out = await _run(db_path)
+    assert out["status"] == "degraded"
+    assert len(await _open_observations(db_path, w.ALERT_SOURCE)) == 1
+    assert json.loads(w.last_run_path().read_text())["mode"] == "alert"
+
+    monkeypatch.setattr(obs, "resolve_by_source_and_type", real)
+    out = await w.run_zero_drop_worker(
+        trigger="session_start", force=False, db_path=db_path, repo_path="/repo"
+    )
+    assert out["status"] == "ok"
+    assert await _open_observations(db_path, w.ALERT_SOURCE) == []
+    assert json.loads(w.last_run_path().read_text())["mode"] == "off"
+
+
+async def test_off_transition_record_write_failure_keeps_prior_mode_and_retries(
+    env, db_path, monkeypatch
+):
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    await _run(db_path)
+    previous = json.loads(w.last_run_path().read_text())
+    real_write = w._atomic_write_json
+
+    def _fail_transition_record(path, data):
+        if path == w.last_run_path():
+            raise OSError("state disk temporarily unavailable")
+        return real_write(path, data)
+
+    monkeypatch.setattr(w, "_atomic_write_json", _fail_transition_record)
+    monkeypatch.setattr(w, "effective_mode", lambda: "off")
+    out = await _run(db_path)
+
+    assert out["status"] == "degraded"
+    assert json.loads(w.last_run_path().read_text()) == previous
+
+    monkeypatch.setattr(w, "_atomic_write_json", real_write)
+    out = await w.run_zero_drop_worker(
+        trigger="session_start", force=False, db_path=db_path, repo_path="/repo"
+    )
+    assert out["status"] == "ok"
+    assert json.loads(w.last_run_path().read_text())["mode"] == "off"
+
+
+async def test_reverting_failed_off_to_alert_retires_alerts_immediately(env, db_path, monkeypatch):
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    await _run(db_path)
+    assert len(await _open_observations(db_path, w.ALERT_SOURCE)) == 1
+
+    monkeypatch.setattr(w, "effective_mode", lambda: "off")
+    await _run(db_path)
+    assert await _open_observations(db_path, w.ALERT_SOURCE) == []
+    assert json.loads(w.last_run_path().read_text())["mode"] == "off"
+
+    real_write = w._atomic_write_json
+    failed = False
+
+    def _fail_once(path, data):
+        nonlocal failed
+        if path == w.last_run_path() and not failed:
+            failed = True
+            raise OSError("state disk temporarily unavailable")
+        return real_write(path, data)
+
+    monkeypatch.setattr(w, "_atomic_write_json", _fail_once)
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    with pytest.raises(OSError, match="state disk temporarily unavailable"):
+        await _run(db_path)
+
+    record = json.loads(w.last_run_path().read_text())
+    assert record["mode"] == "off"
+    assert record["pending_mode"] == "alert"
+    assert len(await _open_observations(db_path, w.ALERT_SOURCE)) == 1
+
+    monkeypatch.setattr(w, "effective_mode", lambda: "off")
+    out = await w.run_zero_drop_worker(
+        trigger="session_start", force=False, db_path=db_path, repo_path="/repo"
+    )
+
+    assert out["status"] == "ok"
+    assert await _open_observations(db_path, w.ALERT_SOURCE) == []
+    record = json.loads(w.last_run_path().read_text())
+    assert record["mode"] == "off"
+    assert "pending_mode" not in record

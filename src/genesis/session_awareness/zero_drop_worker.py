@@ -71,6 +71,7 @@ from genesis.session_awareness.zero_drop import (
     neutralise as _neutralise,
 )
 from genesis.session_awareness.zero_drop_config import (
+    MODES,
     alert_priority,
     effective_mode,
     knob_int,
@@ -105,6 +106,77 @@ FAILED_RETRY_FLOOR_MINUTES = 5
 
 BRANCH_CLASSES = (CLASS_UNPUSHED, CLASS_PUSHED_NO_PR)
 ALL_CLASSES = (*BRANCH_CLASSES, CLASS_DIRTY)
+
+# Mode ranking for TRANSITION detection. The worker only ever sees its CURRENT
+# mode, so "did the lever come down?" can only be answered against the mode the
+# PREVIOUS run recorded — and that record is untrusted input, so an absent or
+# unrecognised mode must read as "no transition known" rather than raise.
+_MODE_LEVEL = {mode: level for level, mode in enumerate(MODES)}
+
+
+def _mode_level(mode: object) -> int | None:
+    """Rank a mode, or ``None`` for anything that is not a known mode."""
+    return _MODE_LEVEL.get(mode) if isinstance(mode, str) else None
+
+
+def _mode_dropped(prior_mode: object, mode: str) -> bool:
+    """Did the effective mode FALL relative to the previous run's mode?
+
+    Only a genuine DOWNWARD step counts. A rise (or an unchanged mode) is not a
+    transition this module acts on, which is what keeps raising the lever from
+    re-running the retirement the drop already performed.
+    """
+    before, after = _mode_level(prior_mode), _mode_level(mode)
+    return before is not None and after is not None and after < before
+
+
+def _mode_changed(prior_mode: object, mode: str) -> bool:
+    """Whether the recorded and effective modes differ in either direction."""
+    before, after = _mode_level(prior_mode), _mode_level(mode)
+    return before is not None and after is not None and before != after
+
+
+def _mode_change_note(prior_mode: object, mode: str) -> str:
+    """The resolution note for an alert retired by a MODE CHANGE.
+
+    It has to name the lever change rather than read like the board came clean.
+    Those are different claims and an operator closing the loop on a retired
+    alert must be able to tell which one happened: "2 findings, then the mode
+    was lowered" is not the same statement as "the work landed".
+    """
+    if isinstance(prior_mode, str) and prior_mode and prior_mode != mode:
+        return (
+            f"zero-drop detector mode changed {prior_mode} -> {mode}: the standing "
+            "alert was retired because the detector no longer maintains it under "
+            "this mode — a lever change, NOT a clean board"
+        )
+    return (
+        "the zero-drop detector is not maintaining a findings alert under "
+        f"mode={mode} — a lever change, NOT a clean board"
+    )
+
+
+def _retire_pending(prior: dict, mode: str) -> bool:
+    """Did a previous run record a mode transition that still needs retrying?
+
+    `observe` maintains no findings alert, so every observe sweep retires any
+    that stands; when that resolve FAILS the row stays up and the run records
+    ``degraded["alert"] = "resolve_failed"``. The next trigger must retry rather
+    than let the row sit until the 3-day TTL — but the retry re-runs the whole
+    sweep, so it is retried on the same SHORT floor a failed sweep gets instead
+    of unconditionally: a persistently failing resolve must not replay a
+    network-touching ~14-20s sweep on every session boundary, which is exactly
+    why ``FAILED_RETRY_FLOOR_MINUTES`` exists. The prior mode stays in the run
+    record until retirement succeeds. That keeps the transition detectable;
+    the degraded status bounds retries to the same short floor as other failed
+    sweeps.
+    """
+    if prior.get("pending_mode") == mode:
+        return True
+    if mode != "observe":
+        return False
+    return (prior.get("degraded") or {}).get("alert") == "resolve_failed"
+
 
 # Display bound for one rendered identity. MEASURED on this install 2026-09-05:
 # 211 local branches, longest name 45 chars (p95 36); longest worktree path 114,
@@ -987,8 +1059,11 @@ async def _run(*, trigger: str, force: bool, db_path: Path | str, repo_path: str
     if trigger == "session_start" and os.environ.get("GENESIS_ZERO_DROP_DISABLED") == "1":
         return {"status": "skipped_disabled"}
     mode = effective_mode()
-    if mode == "off":
-        return {"status": "skipped_off"}
+    # `off` is NOT an early return any more. Lowering the lever to `off` must
+    # still retire the standing alerts and record the mode, and both need the
+    # lock and a connection — which `_run_locked` is where they are held. A
+    # steady-state `off` run (nothing to retire) still short-circuits inside
+    # `_run_locked` without ever touching the database.
 
     root = _zero_drop_root()
     root.mkdir(parents=True, exist_ok=True)
@@ -1021,13 +1096,24 @@ async def _run(*, trigger: str, force: bool, db_path: Path | str, repo_path: str
             # obvious home is `run_zero_drop_worker`'s handler, but the lock is
             # released before the exception reaches it, so a concurrent sweep's
             # good record could be clobbered by this failure record.
-            _write_failure_record(trigger=trigger, mode=mode, exc=exc)
+            prior = read_last_run()
+            prior_mode = prior.get("mode")
+            transition_failed = _mode_changed(prior_mode, mode)
+            failure_mode = prior_mode if transition_failed else mode
+            _write_failure_record(
+                trigger=trigger,
+                mode=failure_mode,
+                pending_mode=mode if transition_failed else None,
+                exc=exc,
+            )
             raise
     finally:
         lock_fh.close()
 
 
-def _write_failure_record(*, trigger: str, mode: str, exc: BaseException) -> None:
+def _write_failure_record(
+    *, trigger: str, mode: str, exc: BaseException, pending_mode: str | None = None
+) -> None:
     """Replace the run record with one that says the sweep FAILED.
 
     Deliberately minimal on the MEASUREMENT keys: no ``stages``, no
@@ -1054,22 +1140,137 @@ def _write_failure_record(*, trigger: str, mode: str, exc: BaseException) -> Non
     the caller is about to return.
     """
     try:
-        _atomic_write_json(
-            last_run_path(),
-            {
-                "version": 1,
-                "computed_at": datetime.now(UTC).isoformat(),
-                "trigger": trigger,
-                "mode": mode,
-                "status": "failed",
-                "degraded": {"sweep_failed": f"{type(exc).__name__}: {exc}"[:300]},
-                "coverage": f"FROZEN: {','.join(ALL_CLASSES)}",
-                "frozen_classes": list(ALL_CLASSES),
-                "notes": ["record replaced by a FAILED sweep — nothing was measured"],
-            },
-        )
+        record = {
+            "version": 1,
+            "computed_at": datetime.now(UTC).isoformat(),
+            "trigger": trigger,
+            "mode": mode,
+            "status": "failed",
+            "degraded": {"sweep_failed": f"{type(exc).__name__}: {exc}"[:300]},
+            "coverage": f"FROZEN: {','.join(ALL_CLASSES)}",
+            "frozen_classes": list(ALL_CLASSES),
+            "notes": ["record replaced by a FAILED sweep — nothing was measured"],
+        }
+        if pending_mode is not None:
+            record["pending_mode"] = pending_mode
+        _atomic_write_json(last_run_path(), record)
     except Exception:
         logger.warning("zero_drop could not record its own failure", exc_info=True)
+
+
+async def _retire_alert_source(db, *, source: str, note: str) -> str:
+    """Resolve any standing alert of *source*, idempotently.
+
+    Returns ``"resolved"`` (rows were standing and are now closed),
+    ``"unchanged"`` (there was nothing to close — the steady state), or
+    ``"resolve_failed"``. The zero-row case is not an error: it is what an
+    ordinary run looks like once the mode change has already been applied.
+    """
+    from genesis.db.crud import observations
+
+    try:
+        resolved = await observations.resolve_by_source_and_type(
+            db,
+            source=source,
+            type=ALERT_TYPE,
+            resolved_at=_now(),
+            resolution_notes=note,
+        )
+    except Exception:
+        logger.warning("zero_drop alert retire failed for %s", source, exc_info=True)
+        return "resolve_failed"
+    return "resolved" if resolved else "unchanged"
+
+
+async def _run_off_transition(
+    *, trigger: str, db_path: Path | str, repo_path: str, prior_mode: object
+) -> dict:
+    """The transition INTO ``off``: retire the standing alerts, record the mode.
+
+    `off` is the one mode with no sweep behind it, so this is the whole of what
+    a run in that mode does: open a connection, retire BOTH the findings alert
+    and the blindness alert (the detector is about to stop maintaining either),
+    and stamp a run record whose ``mode`` is ``off`` so ``zero_drop_status``
+    stops reporting the mode from before the lever was lowered.
+
+    The record is deliberately MINIMAL on the MEASUREMENT keys — nothing was
+    swept, and publishing ``stages``/``counts_by_status``/``open_findings``
+    would read as a run that looked and found nothing, the confident stale zero
+    this subsystem exists to prevent. ``coverage``/``frozen_classes`` are SCOPE
+    claims rather than measurements, and an omission there is NOT neutral: the
+    status tool renders ``frozen_classes`` absent as ``[]``, a positive claim
+    that nothing is unfrozen at the exact moment nothing can be swept. Every
+    class is unswept, so every class is named.
+
+    A resolve that FAILS does not advance the recorded mode. Leaving the prior
+    mode in place is what lets the next trigger re-detect the drop and retry the
+    resolves; writing ``mode: off`` here would make the transition look complete
+    and strand the still-open alerts until their TTL — the precise failure this
+    method exists to fix.
+
+    Never raises: a raise would reach `_run`'s handler, which stamps a failure
+    record whose ``mode`` is ``off`` — the same poison, arrived at one level up.
+    """
+    from genesis.db.connection import get_raw_db
+
+    started = time.monotonic()
+    now_iso = _now()
+    note = _mode_change_note(prior_mode, "off")
+    degraded: dict[str, str] = {}
+    findings_state = "unchanged"
+    blind_state = "unchanged"
+    try:
+        async with get_raw_db(str(db_path)) as db:
+            findings_state = await _retire_alert_source(db, source=ALERT_SOURCE, note=note)
+            blind_state = await _retire_alert_source(db, source=BLIND_SOURCE, note=note)
+    except Exception as exc:  # noqa: BLE001 — the transition or nothing
+        logger.warning("zero_drop off-transition could not reach the database", exc_info=True)
+        degraded["off_transition"] = f"{type(exc).__name__}: {exc}"[:200]
+
+    if findings_state == "resolve_failed":
+        degraded["alert"] = findings_state
+    if blind_state == "resolve_failed":
+        degraded["blind_alert"] = blind_state
+
+    if degraded:
+        logger.warning(
+            "zero_drop off-transition incomplete (%s); keeping the prior mode so it retries",
+            ", ".join(sorted(degraded)),
+        )
+        return {"status": "degraded", "mode": "off", "degraded": degraded}
+
+    record = {
+        "version": 1,
+        "run_id": uuid.uuid4().hex,
+        "computed_at": now_iso,
+        "trigger": trigger,
+        "mode": "off",
+        "status": "ok",
+        "duration_s": round(time.monotonic() - started, 2),
+        "repo_path": repo_path,
+        "notes": [f"mode changed {prior_mode} -> off: detector disabled; standing alerts retired"],
+        "degraded": {},
+        "applied": {},
+        "coverage": "not swept (mode off)",
+        "frozen_classes": list(ALL_CLASSES),
+        "alert": findings_state,
+        "blind_alert": blind_state,
+    }
+    try:
+        _atomic_write_json(last_run_path(), record)
+    except Exception as exc:  # noqa: BLE001 — preserve the prior transition key
+        logger.warning("zero_drop off-transition could not record completion", exc_info=True)
+        return {
+            "status": "degraded",
+            "mode": "off",
+            "degraded": {"off_transition_record": f"{type(exc).__name__}: {exc}"[:200]},
+        }
+    return {
+        "status": "ok",
+        "mode": "off",
+        "alert": findings_state,
+        "blind_alert": blind_state,
+    }
 
 
 async def _run_locked(
@@ -1077,6 +1278,26 @@ async def _run_locked(
 ) -> dict:
     cfg = load_config()
     prior = read_last_run()
+    prior_mode = prior.get("mode")
+    # A MODE TRANSITION is not a routine sweep, and the debounce must not
+    # swallow it: lowering `alert` -> `observe` has to retire the standing
+    # findings alert NOW rather than whenever the interval next elapses.
+    dropped = _mode_dropped(prior_mode, mode)
+    pending_mode = prior.get("pending_mode")
+    pending_reverted = isinstance(pending_mode, str) and pending_mode != mode
+    changed = _mode_changed(prior_mode, mode) or pending_reverted
+    if mode == "off":
+        if not dropped and not pending_reverted:
+            # Steady-state off: nothing to retire, and no reason to rewrite a
+            # record the previous transition already stamped `off`.
+            return {"status": "skipped_off"}
+        off_prior_mode = pending_mode if pending_reverted else prior_mode
+        return await _run_off_transition(
+            trigger=trigger,
+            db_path=db_path,
+            repo_path=repo_path,
+            prior_mode=off_prior_mode,
+        )
     # A FAILED prior debounces on a SHORT floor rather than the full interval.
     #
     # Two mistakes are available here and the first draft made the second. A
@@ -1094,12 +1315,17 @@ async def _run_locked(
     # So the floor is derived from that cost rather than picked: at 5 minutes a
     # persistently failing detector spends under 7% of wall-clock sweeping,
     # while a transient fault still recovers in minutes instead of an hour.
+    # A pending findings-alert retirement retries on the same floor, for the
+    # same reason: the retry re-runs the whole sweep.
+    retry_pending = prior.get("status") == "failed" or _retire_pending(prior, mode)
     debounce_minutes = (
-        FAILED_RETRY_FLOOR_MINUTES
-        if prior.get("status") == "failed"
-        else knob_int(cfg, "min_interval_minutes")
+        FAILED_RETRY_FLOOR_MINUTES if retry_pending else knob_int(cfg, "min_interval_minutes")
     )
-    if not force and _within_minutes(prior.get("computed_at"), debounce_minutes):
+    if (
+        not force
+        and not (changed and not retry_pending)
+        and _within_minutes(prior.get("computed_at"), debounce_minutes)
+    ):
         return {"status": "debounced"}
 
     run_id = uuid.uuid4().hex
@@ -1365,6 +1591,23 @@ async def _run_locked(
             )
             if alert_state in ("alert_failed", "resolve_failed"):
                 degraded["alert"] = alert_state
+        elif mode == "observe":
+            # `observe` maintains NO findings alert, so any row still standing
+            # from a higher mode is obsolete the moment the lever comes down.
+            # Retiring it here — on every observe run, idempotently — is what
+            # stops the board from going on presenting findings the detector has
+            # stopped maintaining until the 3-day TTL happened to re-mint them.
+            # The zero-row case is the steady state and costs one UPDATE.
+            alert_state = await _retire_alert_source(
+                db, source=ALERT_SOURCE, note=_mode_change_note(prior_mode, mode)
+            )
+            if alert_state == "resolve_failed":
+                # Recorded in `degraded`, which is ALSO the retry key: the next
+                # trigger re-detects it via `_retire_pending` and retries on the
+                # short floor instead of waiting out the interval. The mode is
+                # still advanced to `observe` — this run swept and measured
+                # under it, and the record's job is to name the mode that ran.
+                degraded["alert"] = alert_state
         # Blindness is reported in EVERY running mode: the lever governs egress
         # about findings, and a broken instrument is not a finding.
         blind_state = await _maintain_blind_alert(db, degraded=degraded, frozen=frozen)
@@ -1392,7 +1635,7 @@ async def _run_locked(
         "run_id": run_id,
         "computed_at": now_iso,
         "trigger": trigger,
-        "mode": mode,
+        "mode": prior_mode if dropped and alert_state == "resolve_failed" else mode,
         "status": status,
         "duration_s": duration_s,
         "base_ref": base_ref,
@@ -1413,6 +1656,8 @@ async def _run_locked(
         "alert": alert_state,
         "blind_alert": blind_state,
     }
+    if dropped and alert_state == "resolve_failed":
+        record["pending_mode"] = mode
     _atomic_write_json(last_run_path(), record)
     return {
         "status": status,
