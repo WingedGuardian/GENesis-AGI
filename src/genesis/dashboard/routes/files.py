@@ -153,7 +153,9 @@ def _is_sqlite_artifact(name: str) -> bool:
     return lowered.endswith(_SQLITE_DB_SUFFIXES)
 
 
-def _locked_by_this_process(resolved: Path) -> bool:
+def _locked_by_this_process(
+    resolved: Path, identities: frozenset[tuple[int, int]] | None = None
+) -> bool:
     """Does THIS process already hold a descriptor on *resolved*'s inode?
 
     Identity, not name. This is the check that actually matches the hazard: a
@@ -166,28 +168,58 @@ def _locked_by_this_process(resolved: Path) -> bool:
 
     Cost MEASURED at ~0.18 ms over the server's open-fd set.
 
+    ONLY DATABASE-LIKE DESCRIPTORS COUNT. An earlier revision matched ANY open
+    inode, which made every file the server happens to hold permanently
+    unreachable — review named the concrete regression: normal bootstrap installs
+    a ``RotatingFileHandler`` on ``~/genesis/logs/genesis.log``, so reading the
+    current log returned 403 on every route. Holding a descriptor is only
+    dangerous when the descriptor is a DATABASE's, so the candidate set is
+    filtered by what each descriptor points AT before any inode is compared.
+    That keeps the hardlink case, because the server opened the database under
+    its real name and it is that name we read back from ``/proc``.
+
     Fails OPEN (returns False) when ``/proc`` is unreadable or the path cannot
-    be stat'd — deliberately, because this is the FIRST of two checks and the
-    suffix rule still runs behind it. A hard failure here would take the file
-    browser down on any platform without ``/proc``.
+    be stat'd — deliberately, because two further checks run behind it. A hard
+    failure here would take the file browser down on any platform without
+    ``/proc``.
     """
     try:
         st = resolved.stat()
     except OSError:
         return False
-    target = (st.st_dev, st.st_ino)
+    held = _held_database_identities() if identities is None else identities
+    return (st.st_dev, st.st_ino) in held
+
+
+def _held_database_identities() -> frozenset[tuple[int, int]]:
+    """``(st_dev, st_ino)`` of every DATABASE-like file this process holds open.
+
+    Computed once and reusable: :func:`_contains_live_database` calls the check
+    per child, and re-enumerating ``/proc/self/fd`` for each one made a directory
+    walk O(entries x descriptors) — measured by review at roughly six seconds for
+    5,000 files against 300 descriptors, on a threaded Flask request.
+    """
+    out: set[tuple[int, int]] = set()
     try:
         entries = os.listdir("/proc/self/fd")
     except OSError:
-        return False
+        return frozenset()
     for entry in entries:
+        fd_path = f"/proc/self/fd/{entry}"
         try:
-            fd_st = os.stat(f"/proc/self/fd/{entry}")
+            target = os.readlink(fd_path)
         except OSError:
-            continue  # closed between listing and stat, or not stattable
-        if (fd_st.st_dev, fd_st.st_ino) == target:
-            return True
-    return False
+            continue  # closed between listing and reading, or not a link
+        # " (deleted)" is kept deliberately: an unlinked database is exactly the
+        # orphan case this module exists for, and its name still identifies it.
+        if not _is_sqlite_artifact(Path(target.removesuffix(" (deleted)")).name):
+            continue
+        try:
+            fd_st = os.stat(fd_path)
+        except OSError:
+            continue
+        out.add((fd_st.st_dev, fd_st.st_ino))
+    return frozenset(out)
 
 
 #: Every SQLite database file begins with this, byte 0. Fixed by the file format
@@ -240,23 +272,49 @@ def _contains_live_database(directory: Path) -> bool:
     Bounded at ``_RENAME_SCAN_MAX_ENTRIES`` and fails CLOSED on the bound: a
     directory too large to scan is refused rather than waved through, since the
     only thing being refused is a rename the operator can perform another way.
+
+    Uses ``os.scandir`` rather than ``Path.rglob``. That is not a style choice:
+    ``rglob`` SILENTLY OMITS directories it cannot descend into, so this function
+    could return False having never looked at part of the tree while its
+    docstring claimed to fail closed. Review named the case — if the server holds
+    ``tree/private/live.db`` and ``private`` loses search permission, renaming
+    ``tree`` was permitted and relocated a live database. An unreadable subtree
+    now refuses, which is what "fails closed" has to mean.
+
+    The held-descriptor set is snapshotted ONCE. Re-deriving it per child made
+    this O(entries x descriptors) — measured at ~6s for 5,000 files against 300
+    descriptors, on a request thread.
     """
+    held = _held_database_identities()
     seen = 0
-    for child in directory.rglob("*"):
-        seen += 1
-        if seen > _RENAME_SCAN_MAX_ENTRIES:
-            return True  # too big to clear — refuse rather than guess
+    stack = [directory]
+    while stack:
+        current = stack.pop()
         try:
-            if not child.is_file():
-                continue
+            with os.scandir(current) as it:
+                entries = list(it)
         except OSError:
-            continue
-        if (
-            _is_sqlite_artifact(child.name)
-            or _locked_by_this_process(child)
-            or _looks_like_sqlite(child)
-        ):
+            # Cannot inspect it, so cannot clear it. Refuse.
             return True
+        for entry in entries:
+            seen += 1
+            if seen > _RENAME_SCAN_MAX_ENTRIES:
+                return True  # too big to clear — refuse rather than guess
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(Path(entry.path))
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+            except OSError:
+                return True  # same reasoning: unknown means refused
+            child = Path(entry.path)
+            if (
+                _is_sqlite_artifact(entry.name)
+                or _locked_by_this_process(child, held)
+                or _looks_like_sqlite(child)
+            ):
+                return True
     return False
 
 
@@ -304,6 +362,21 @@ def _is_allowed(path: Path) -> bool:
     # Checked on the RESOLVED name, so a SYMLINK cannot smuggle one through
     # under an innocent-looking path (a hardlink can — that is the identity
     # check above).
+    #
+    # DIRECTORIES ARE EXEMPT from the name rule. A directory cannot be opened as
+    # a database, so it cannot trigger the lock loss this guards, and blocking it
+    # only made an existing directory named `project.db` or `fixtures.sqlite`
+    # unlistable and unrenameable. A directory that CONTAINS a database is a
+    # separate question, answered by the recursive guard in `file_rename`.
+    #
+    # Stated limit: a not-yet-existing path cannot be told apart from a file
+    # here, so creating a NEW directory with a database-shaped name is still
+    # refused. Narrow, and the caller can rename into it afterwards.
+    try:
+        if resolved.is_dir():
+            return True
+    except OSError:
+        pass
     return not _is_sqlite_artifact(resolved.name)
 
 

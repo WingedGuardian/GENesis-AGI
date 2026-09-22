@@ -348,25 +348,90 @@ def test_a_held_database_is_refused_under_any_name(client, tmp_path):
     ``Cookies``. It is refused because we HOLD it, not because of what it is
     called.
     """
-    # Deliberately NOT SQLite content and NOT a recognised name, so neither the
-    # content check nor the suffix rule can claim it — leaving the identity check
-    # as the only thing that can refuse it. An earlier version of this fixture
-    # used real SQLite bytes, which meant the content check answered first and
-    # the test stopped isolating what it names.
-    odd = tmp_path / "held-thing"
-    odd.write_text("not a database at all")
-    assert not files_mod._is_sqlite_artifact(odd.name), "fixture no longer isolates identity"
-    assert not files_mod._looks_like_sqlite(odd), "fixture no longer isolates identity"
-
-    fh = open(odd, "rb")  # noqa: SIM115 — holding it open IS the condition
+    # The case ONLY identity can catch, now that identity is scoped to
+    # database-shaped descriptors: a hardlink, under an innocent name, to an
+    # EMPTY database we hold open. Empty because SQLite creates a zero-byte file
+    # before its first write — so the content check sees no magic, the leaf name
+    # is innocent, and `Path.resolve()` cannot detect a hardlink. What remains is
+    # that we hold a descriptor whose own path IS database-shaped.
+    db = tmp_path / "genesis.db"
+    db.touch()  # zero bytes: a real, freshly created database
+    link = tmp_path / "held-thing"
     try:
-        assert client.get(f"/api/genesis/files/read?path={odd}").status_code == 403
+        os.link(db, link)
+    except OSError:
+        pytest.skip("hardlinks unsupported here")
+
+    assert not files_mod._is_sqlite_artifact(link.name), "fixture no longer isolates identity"
+    assert not files_mod._looks_like_sqlite(link), "fixture no longer isolates identity"
+
+    fh = open(db, "rb")  # noqa: SIM115 — holding it open IS the condition
+    try:
+        assert client.get(f"/api/genesis/files/read?path={link}").status_code == 403
     finally:
         fh.close()
 
     # Control: once nothing holds it, nothing else claims it either — so the 403
     # above was the identity check and not some other rule firing.
-    assert client.get(f"/api/genesis/files/read?path={odd}").status_code == 200
+    assert client.get(f"/api/genesis/files/read?path={link}").status_code == 200
+
+
+def test_an_ordinary_held_file_is_still_readable(client, tmp_path):
+    """Holding a descriptor is not by itself grounds to refuse.
+
+    Review named the regression this prevents: normal bootstrap installs a
+    RotatingFileHandler on ~/genesis/logs/genesis.log, so an identity check that
+    matched ANY open inode made the current log return 403 on every route —
+    read, download, write, delete and rename. Closing a descriptor is only
+    dangerous when the process holds SQLite locks on that inode, so only
+    database-shaped descriptors are candidates.
+    """
+    log = tmp_path / "genesis.log"
+    log.write_text("a log line")
+
+    fh = open(log, "a")  # noqa: SIM115 — the open handler IS the condition
+    try:
+        resp = client.get(f"/api/genesis/files/read?path={log}")
+        assert resp.status_code == 200, "an open log file was refused"
+        assert resp.get_json()["content"] == "a log line"
+    finally:
+        fh.close()
+
+
+def test_a_directory_named_like_a_database_is_still_usable(client, tmp_path):
+    """A directory cannot be opened as a database, so the name rule must not claim it."""
+    for name in ("project.db", "fixtures.sqlite"):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "note.txt").write_text("x")
+        resp = client.get(f"/api/genesis/files?path={d}")
+        assert resp.status_code == 200, f"directory {name} was refused"
+
+
+def test_an_unreadable_subtree_refuses_the_rename(client, tmp_path):
+    """Fail CLOSED when the tree cannot be fully inspected.
+
+    Path.rglob silently omits directories it cannot descend into, so the guard
+    could return False having never seen part of the tree while claiming to fail
+    closed. Review named the case: a live database under a subdirectory that
+    later loses search permission.
+    """
+    tree = tmp_path / "tree"
+    private = tree / "private"
+    private.mkdir(parents=True)
+    (private / "live.db").write_bytes(b"SQLite format 3\x00")
+    private.chmod(0o000)
+    try:
+        resp = client.post(
+            "/api/genesis/files/rename",
+            json={"path": str(tree), "new_name": "tree-old"},
+        )
+        if os.geteuid() == 0:
+            pytest.skip("running as root — permission bits do not restrict the walk")
+        assert resp.status_code == 403, "an uninspectable subtree was waved through"
+        assert tree.exists()
+    finally:
+        private.chmod(0o755)
 
 
 def test_renaming_a_directory_containing_a_database_is_refused(client, tmp_path):
