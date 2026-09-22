@@ -547,95 +547,96 @@ def test_the_blinding_prefix_really_blinds(fake_home):
     )
 
 
-class TestLauncherCarriedRemovals:
-    """A launcher the resolver refuses to model hid its removal from this guard.
+class TestLauncherCarriersAreRefusedWithoutInspection:
+    """A launcher that runs a command this resolver cannot recover is REFUSED,
+    deliberately without inspecting what it carries.
 
-    `eval rm -rf $HOME/genesis/data` resolves to `exe == "eval"`, so the segment
-    fell out of the `exe not in ("rm","rmdir")` test and was ALLOWED — measured
-    on the deployed parser, where the bare spelling blocks.
+    The refusal is payload-BLIND on purpose, and that is the whole design. An
+    earlier revision inspected the payload; three independent reviewers and a
+    153-cell sweep produced 19 distinct spellings that walked past it, and the
+    reason is not a short table:
 
-    The fallback is the same shape as the two unresolvable-operand fallbacks
-    already in this module: check the SEGMENT'S raw text, refuse if a protected
-    path is named. The controls below are what keep it honest — a carried
-    removal of an UNPROTECTED path must still run, or the guard has simply
-    banned the launcher.
+      * an ARGV payload (`eval rm -rf X`) never presents `rm`, its flags and its
+        operand inside one token, so a per-token parse sees no removal;
+      * NESTING defeats a single pass — recovering the inner string yields
+        another carrier;
+      * bash CONCATENATES adjacent quoted fragments, so a payload can hold no
+        matchable word at all;
+      * several carriers ATTACH the command to an option, so the inner exe
+        parses as `--command=rm`.
 
-    The dangerous literals are assembled from fragments, as
-    `test_guard_ansic_fail_closed.py` does: these strings are fixture DATA, and
-    a test file containing them verbatim trips the very guard under test when
-    anything reads the file through a shell.
+    The middle two are properties of the shell. Any test applied to the payload
+    can be spelled around; a refusal keyed on the carrier cannot, because it
+    reads no payload.
     """
 
     RM = "r" + "m"
-    RF = "-r" + "f"
-    PROT = "/genesis/data"
-    SAFE = "/tmp/scratch-xyz"
+    CARRIERS = [
+        "eval", "su", "runuser", "setpriv", "chroot", "flock", "watch",
+        "script", "systemd-run", "unshare", "nsenter", "pkexec", "runcon", "sg",
+    ]
 
+    @pytest.mark.parametrize("carrier", CARRIERS)
+    def test_every_named_carrier_is_refused(self, carrier, fake_home):
+        """Membership is uniform: no carrier in the set is a weaker spelling."""
+        r = _run(f"{carrier} {self.RM} -rf {H}/genesis/data", fake_home)
+        assert r.returncode == 2, f"{carrier} was not refused: {r.stdout} {r.stderr}"
+
+    # Each of these DEFEATED the previous, payload-inspecting design. They are
+    # regression pins, not illustrations: every one was measured allow-vs-block
+    # against the direct spelling before this change.
     @pytest.mark.parametrize(
-        "carrier",
+        "label,payload",
         [
-            "eval {rm} {rf} {target}",
-            'eval "{rm} {rf} {target}"',
-            "su ubuntu -c '{rm} {rf} {target}'",
-            "runuser -u ubuntu -c '{rm} {rf} {target}'",
-            "setpriv --reuid 1000 {rm} {rf} {target}",
-            "chroot /mnt {rm} {rf} {target}",
+            ("argv ancestor",       "eval {RM} -rf {H}/genesis"),
+            ("argv glob",           "eval {RM} -rf {H}/genesis/*"),
+            ("argv no-force",       "eval {RM} -r {H}/genesis"),
+            ("nested x2 quoted",    "eval 'eval '\"'\"'{RM} -rf {H}/genesis'\"'\"''"),
+            ("nested x4 argv",      "eval eval eval eval {RM} -rf {H}/genesis"),
+            ("attached --command",  "su --command='{RM} -rf {H}/genesis' root"),
+            ("attached -c glued",   "script -c'{RM} -rf {H}/genesis' /tmp/o"),
+            ("quoted exact",        "eval '{RM} -rf {H}/genesis/data'"),
+            ("split fragments",     "eval '{RM} -rf {H}/gen''esis'"),
         ],
     )
-    def test_a_protected_path_behind_a_carrier_blocks(self, carrier, fake_home):
-        cmd = carrier.format(rm=self.RM, rf=self.RF, target=H + self.PROT)
-        res = _run(cmd, fake_home)
-        assert res.returncode == 2, (
-            f"{cmd!r}: the launcher runs this and the protected directory goes "
-            f"with it — stderr={res.stderr.strip()[:200]!r}"
-        )
+    def test_the_spellings_that_defeated_inspection_are_refused(
+        self, label, payload, fake_home
+    ):
+        cmd = payload.format(RM=self.RM, H=H)
+        r = _run(cmd, fake_home)
+        assert r.returncode == 2, f"{label} not refused: {cmd!r}"
 
-    @pytest.mark.parametrize(
-        "carrier",
-        [
-            "eval {rm} {rf} {target}",
-            'eval "{rm} {rf} {target}"',
-            "su ubuntu -c '{rm} {rf} {target}'",
-        ],
-    )
-    def test_a_carrier_without_a_protected_path_still_runs(self, carrier, fake_home):
-        cmd = carrier.format(rm=self.RM, rf=self.RF, target=H + self.SAFE)
-        assert _run(cmd, fake_home).returncode == 0, (
-            f"{cmd!r}: nothing protected is named, so refusing this would ban "
-            "the launcher rather than protect anything"
-        )
+    def test_the_refusal_does_not_depend_on_the_payload(self, fake_home):
+        """PINS THE OVER-BLOCK AS INTENDED, and its bound.
 
-    def test_the_bare_spelling_is_unaffected(self, fake_home):
-        # The control that proves the carrier branch did not displace the
-        # ordinary resolved path.
-        blocked = f"{self.RM} {self.RF} {H}{self.PROT}"
-        allowed = f"{self.RM} {self.RF} {H}{self.SAFE}"
-        assert _run(blocked, fake_home).returncode == 2
-        assert _run(allowed, fake_home).returncode == 0
+        A carried removal naming NOTHING protected is still refused: the moment
+        the verdict depends on what the payload says, every spelling above comes
+        back, because the payload is the attacker's to spell.
 
-    def test_a_mention_of_a_protected_path_without_a_removal_is_allowed(self, fake_home):
-        # The carrier branch checks the segment's RAW TEXT, so this is the shape
-        # most at risk of over-blocking: a carrier, a protected path, no removal.
-        assert _run(f"eval ls -la {H}{self.PROT}", fake_home).returncode == 0, (
-            "listing a protected directory through a launcher is not destructive"
-        )
-
-    @pytest.mark.parametrize("shape", ["ancestor", "glob"])
-    def test_the_carried_spelling_keeps_ancestor_and_glob_reasoning(self, shape, fake_home):
-        """A substring floor alone loses exactly the most destructive shapes.
-
-        This module says so at its own `_legacy_substring_block` comment: a
-        protected path is not a SUBSTRING of a command naming its PARENT, so an
-        ancestor removal and a glob both slip a substring test. An earlier
-        revision of the carrier branch used that floor alone, and both of these
-        were ALLOWED behind a launcher while the bare spelling blocked. The
-        branch now re-runs the precise operand scan over the carried string, so
-        the two spellings agree.
+        The bound is the module's own `\\brm\\b` prefilter at :262 — a command
+        that mentions no removal returns before this branch, so `eval echo hi`
+        is untouched. That is what keeps the refusal narrow, and it is asserted
+        here so a later edit to the prefilter cannot widen this silently.
         """
-        target = H + "/genesis" + ("/*" if shape == "glob" else "")
-        bare = f"{self.RM} {self.RF} {target}"
-        carried = f'eval "{bare}"'
-        assert _run(bare, fake_home).returncode == 2, "precondition: the bare spelling blocks"
-        assert _run(carried, fake_home).returncode == 2, (
-            f"{carried!r}: carrying an {shape} removal must not clear the guard"
-        )
+        assert _run(f"eval {self.RM} -rf /tmp/scratch-xyz", fake_home).returncode == 2
+        assert _run("eval echo hi", fake_home).returncode == 0
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "which eval",
+            "grep -rn eval src/",
+            "rsync --exclude=su a b",
+            "echo 'eval is a shell builtin'",
+            "man chroot",
+            "ls -la /usr/bin/script",
+        ],
+    )
+    def test_a_carrier_NAMED_but_not_RUN_is_untouched(self, cmd, fake_home):
+        """The refusal keys on command POSITION, never on the word appearing."""
+        r = _run(cmd, fake_home)
+        assert r.returncode == 0, f"over-blocked: {cmd!r} -> {r.stderr}"
+
+    def test_ordinary_protected_path_behaviour_is_unchanged(self, fake_home):
+        assert _run(f"{self.RM} -rf {H}/genesis/data", fake_home).returncode == 2
+        assert _run(f"{self.RM} -rf {H}/scratch/x", fake_home).returncode == 0

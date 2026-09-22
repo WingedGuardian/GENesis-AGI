@@ -861,13 +861,72 @@ class TestLauncherCarriedGatedOps:
         """
         assert _run(f"git status --short && eval git {self.PUSH}").returncode == 2
 
-    def test_the_bare_spelling_still_asks_rather_than_blocking(self):
-        # The control that proves the carrier branch did not change the ordinary
-        # push path into a refusal.
+    # `-n` assembled from fragments for the same reason as PUSH/NV above.
+    SHORT_NV = "-" + "n"
+
+    def test_a_carried_commit_with_the_SHORT_hook_skip_is_refused(self):
+        """`git commit -n` is `--no-verify`'s supported short form.
+
+        The mention pattern that scopes this guard's carrier arm held only
+        `--no-verify`, so `eval git commit -n -m x` was ALLOWED while the direct
+        spelling BLOCKED through `commit_skips_hooks` (MEASURED, and found
+        independently by three reviewers). The scope now carries `commit`
+        itself: a carried commit of ANY spelling is this guard's business,
+        because it cannot read the payload to find out which.
+        """
+        assert _run(f"eval git commit {self.SHORT_NV} -m x").returncode == 2
+        assert _run(f"eval 'git commit {self.SHORT_NV} -m x'").returncode == 2
+        # The long form, and a nesting, for the same reason.
+        assert _run(f"eval git commit {self.NV} -m x").returncode == 2
+        assert _run(f"eval eval git commit {self.SHORT_NV} -m x").returncode == 2
+
+    def test_the_carrier_arm_is_scoped_to_THIS_guards_subject(self):
+        """The carrier arms the deny; the guard's own subject matter scopes it.
+
+        An unscoped version banned the launcher rather than gating the
+        operation — `eval ls -la`, `unshare -r whoami` and
+        `systemd-run --user --scope -- /bin/true` were all refused by a PUSH
+        guard, and the deny text told the reader to run "the git/gh command"
+        on a command containing no git. MEASURED over the recorded corpus:
+        126 carrier hits unscoped, 22 once scoped.
+
+        The sibling guard draws the same line with its own `\\brm\\b` prefilter.
+        A text test is unsound for FINDING an operation — fragments concatenate
+        — but sound for deciding whether a command is this guard's business.
+        """
+        for cmd in ("eval ls -la", "unshare -r whoami", "flock -n /tmp/x.lock echo hi"):
+            res = _run(cmd)
+            assert res.returncode == 0, f"{cmd!r} is not this guard's business: {res.stderr[:120]}"
+
+    def test_the_bare_spelling_is_not_turned_into_a_refusal(self):
+        """The control: the carrier branch left the ordinary push path alone.
+
+        It asserts the push reaches its NORMAL approval machinery, not WHICH
+        branch of that machinery — because the latter depends on whether the
+        current branch is already on the remote, which is state this test does
+        not control and cannot sensibly fix.
+
+        MEASURED, identical command and tree, only the cwd differing: from a
+        published PR branch the allowlist answers `allow` ("re-push … already on
+        the remote"); from an unpublished branch it answers `ask`. Asserting
+        `== "ask"` therefore went RED exactly when run on a live PR branch — the
+        only state a PR is ever in — which makes it a control that fails when it
+        is needed and passes when it is not.
+        """
         res = _run(f"git {self.PUSH}")
-        assert _decision(res) == "ask", (
-            f"the bare spelling must keep its approval dialog: {res.stdout[:160]!r}"
+        assert res.returncode == 0, (
+            f"the bare spelling must not be refused: {res.stdout[:160]!r}"
         )
+        assert _decision(res) in ("ask", "allow"), (
+            f"the bare spelling must reach the ordinary approval path, not the "
+            f"carrier deny: {res.stdout[:160]!r}"
+        )
+        # No substring check on the reason: the carrier deny is an exit 2, so
+        # `returncode == 0` above already proves that branch was not taken. An
+        # earlier version asserted "launcher" not in the output and failed
+        # because the BRANCH is named `fix/launcher-carriers` and the allowlist
+        # quotes the branch name back — a control coupled to the branch it runs
+        # on is the same defect this test was just fixed for.
 
     @pytest.mark.parametrize(
         "cmd",

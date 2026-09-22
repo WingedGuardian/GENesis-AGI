@@ -192,17 +192,29 @@ _RUN_CARRIERS = frozenset({"uv", "poetry", "hatch", "pdm", "pipenv", "rye"})
 #:
 #: MEMBERSHIP IS ENUMERATED, NOT CHOSEN — an earlier revision listed five names
 #: and read as a survey of the class. Probing the launcher vocabulary against
-#: the real parser found ten more that self-resolve identically.
+#: the real parser found nine more that self-resolve identically, so the set is
+#: FOURTEEN. A consumer refuses on the carrier itself and never reads what it
+#: carries, so membership decides a refusal outright; the count is stated here
+#: because a comment naming a different number than the set below is how an
+#: omission stops looking like one.
 #:
-#: ⚠ `ssh` IS DELIBERATELY ABSENT, and it is the one a reviewer will ask about
-#: because it is the highest-traffic member. It does not belong here: `ssh host
-#: "…"` runs the command on ANOTHER MACHINE, so checking it against THIS box's
-#: protected paths is a category error, and the gated-operation net would fire
-#: on ordinary cross-machine work. MEASURED over 81,877 recorded commands: the
-#: ten names below would newly refuse ZERO, while `ssh` alone would newly refuse
-#: 214 — every sampled one a file copy or a remote probe that publishes and
-#: deletes nothing locally. Gating a remote command needs its own design; it is
-#: tracked separately rather than solved by appending a name to this set.
+#: COST IS NOT ZERO, and an earlier revision of this comment said it was. That
+#: figure was measured against a version that refused only when the PAYLOAD
+#: named something protected. MEASURED over 83,201 recorded commands against
+#: what actually ships, per consumer, because their prefilters differ and no
+#: rate transfers between them: protected_paths 17 (0.020%), destructive 99
+#: (0.119%), git_push 22 (0.026%). Every one is recoverable by re-issuing the
+#: command without the launcher.
+#:
+#: ⚠ `ssh` IS DELIBERATELY ABSENT, and it is the one a reviewer will ask about.
+#: It does not belong here: `ssh host "…"` runs the command on ANOTHER MACHINE,
+#: so checking it against THIS box's protected paths is a category error.
+#: MEASURED over 81,877 recorded commands, `ssh` alone would newly refuse 214 —
+#: every sampled one a file copy or a remote probe that publishes and deletes
+#: nothing locally, i.e. an order of magnitude above the whole set's cost, for
+#: commands whose effects are not on this machine at all. Gating a remote
+#: command needs its own design; it is tracked separately rather than solved by
+#: appending a name to this set.
 _REPARSE_CARRIERS = frozenset(
     {
         "eval",
@@ -210,7 +222,7 @@ _REPARSE_CARRIERS = frozenset(
         "runuser",
         "setpriv",
         "chroot",
-        # Self-resolving on the deployed parser, same class, zero measured cost.
+        # Self-resolving on the deployed parser, same class as the five above.
         "flock",
         "watch",
         "script",

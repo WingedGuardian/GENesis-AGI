@@ -493,127 +493,149 @@ class TestNestedQuotingContexts:
         )
 
 
-class TestCommandCarriersCarryTheirPayload:
-    """A launcher handed a QUOTED command string hid the `rm` inside it.
+class TestCommandCarriersAreRefusedWithoutInspection:
+    """A launcher that runs a command this guard cannot recover is REFUSED.
 
-    This guard scans every token, so the UNQUOTED spelling already blocked —
-    `eval rm -rf /a/b` leaves `rm` standing as its own token. The quoted one did
-    not: `eval "rm -rf /a/b"` is a SINGLE shlex token whose basename is `b`, so
-    the `basename(core) != "rm"` test skipped it and the command was ALLOWED.
-
-    The controls are the load-bearing half. `echo "rm -rf /a/b"` must stay
-    allowed — the string is identical, and only the CARRIER distinguishes a
-    command from prose. Without that pair, a recursion that fired on any token
-    containing `rm` would pass the block cases while blocking every mention.
+    The previous revision recursed into the carried string, bounded by
+    `_MAX_CARRIER_DEPTH`. Both halves were wrong: the bound SKIPPED the branch
+    on reaching the limit instead of refusing, so four nested `eval` layers
+    reached an unblocked `rm -rf` (MEASURED, on `rm -rf ~` — a home-directory
+    wipe allowed by both guards); and the recursion could not see an argv
+    payload, an option-attached payload, or one split across quoted fragments.
     """
 
-    @pytest.mark.parametrize(
-        "cmd",
-        [
-            'eval "rm -rf /a/b"',
-            "eval 'rm -rf /a/b'",
-            'su ubuntu -c "rm -rf /a/b"',
-            'runuser -u ubuntu -c "rm -rf /a/b"',
-            'sh -c "rm -rf /a/b"',
-            'bash -c "rm -rf /a/b"',
-            'dash -c "rm -rf /a/b"',
-        ],
-    )
-    def test_a_carried_removal_still_blocks(self, cmd):
-        assert _blocks(cmd), (
-            f"{cmd!r}: the launcher runs this and the shell removes the path, so "
-            "hiding it behind a quoted string must not clear the guard"
-        )
+    RM = "r" + "m"
+    CARRIERS = [
+        "eval", "su", "runuser", "setpriv", "chroot", "flock", "watch",
+        "script", "systemd-run", "unshare", "nsenter", "pkexec", "runcon", "sg",
+        "bash", "sh", "dash", "zsh", "ksh", "ash",
+    ]
 
-    def test_the_unquoted_spelling_was_already_caught(self):
-        # Pinned so a future refactor cannot trade the old coverage for the new.
-        assert _blocks("eval rm -rf /a/b")
+    @pytest.mark.parametrize("carrier", CARRIERS)
+    def test_every_carrier_is_refused(self, carrier):
+        assert _blocks(f"{carrier} '{self.RM} -rf /a/b'"), carrier
 
     @pytest.mark.parametrize(
-        "cmd",
+        "label,cmd",
         [
-            'echo "rm -rf /a/b"',
-            'printf "%s" "rm -rf /a/b"',
-            'grep -q "rm -rf" script.sh',
+            ("argv",              "eval {RM} -rf /a/b"),
+            ("nested x4",         "eval eval eval eval {RM} -rf /a/b"),
+            ("nested x5",         "eval eval eval eval eval {RM} -rf /a/b"),
+            ("attached --command", "su --command='{RM} -rf /a/b' root"),
+            ("attached -c glued",  "script -c'{RM} -rf /a/b' /tmp/o"),
+            ("quote-split verb",   "eval '{RM}'\"''\"' -rf /a/b'"),
+            ("unparseable payload", 'eval "{RM} -rf / #\\""'),
         ],
     )
-    def test_a_mention_without_a_carrier_is_not_a_command(self, cmd):
-        assert not _blocks(cmd), (
-            f"{cmd!r}: no launcher runs this string, so it is prose — blocking "
-            "it would make every command that NAMES a removal unrunnable"
-        )
+    def test_the_spellings_that_defeated_recursion_are_refused(self, label, cmd):
+        assert _blocks(cmd.format(RM=self.RM)), label
 
     @pytest.mark.parametrize(
-        "cmd",
+        "opener,cmd",
         [
-            'eval "rm -rf /home/u/proj/sub/deep"',
-            'sh -c "rm -rf /home/u/proj/sub/deep"',
+            ("time", 'time bash -c "{RM} -rf /a/b"'),
+            ("brace", '{{ bash -c "{RM} -rf /a/b"; }}'),
+            ("then", 'if true; then bash -c "{RM} -rf /a/b"; fi'),
+            ("nice", 'nice bash -c "{RM} -rf /a/b"'),
+            ("do", 'for i in 1; do bash -c "{RM} -rf /a/b"; done'),
+            ("subshell", '( bash -c "{RM} -rf /a/b" )'),
         ],
     )
-    def test_a_carried_removal_of_a_deep_path_is_still_allowed(self, cmd):
-        assert not _blocks(cmd), (
-            f"{cmd!r}: recursion must reuse the DEPTH rule, not block on the "
-            "carrier alone — otherwise every carried rm becomes unrunnable"
-        )
+    def test_a_carrier_after_any_command_OPENER_is_refused(self, opener, cmd):
+        """Command position is not just "after a separator".
 
-    def test_two_levels_of_carrier_still_block(self):
-        # An earlier revision bounded the recursion at ONE level and pinned this
-        # case as allowed, calling it "the limit". It is not a limit, it is a
-        # bypass: the direct spelling blocks, and nesting two carriers is not a
-        # reason to permit the same removal.
-        assert _blocks("""eval "sh -c \\"rm -rf /a/b\\"" """)
-
-    def test_an_unparseable_carried_string_blocks_conservatively(self):
-        """The sentinel `_rm_violations` returns for "shlex could not tokenize".
-
-        `main()` treats that None as a conservative BLOCK. An earlier revision
-        of the recursion tested `if inner:`, which cannot tell None from `[]`,
-        so an unreadable carried string was silently downgraded to "no
-        violation" — a fail-open on the guard in front of a root removal, while
-        the direct spelling blocked. Measured: bash really runs this one.
+        Scoping the carrier check to `_SEPARATORS` (`| || && ; & \\n`) fixed an
+        argument-position over-block and opened these five in the same edit:
+        each was MEASURED allow while the direct `rm -rf /a/b` blocked. `time`,
+        `nice`, `{`, `(`, `then` and `do` all precede a command word, and the
+        `rm` scan one branch down already knows this — its comment is why it
+        deliberately walks every token instead.
         """
-        unparseable = 'rm -rf / #"'
-        # The direct spelling blocks at MAIN() level, not here: `_rm_violations`
-        # returns the None sentinel and `main()` converts it. Asserting
-        # `_blocks(...)` on it would fail for that reason alone — which is what
-        # the first draft of this test did, and the precondition caught it.
-        assert dg._rm_violations(unparseable) is None, (
-            "precondition: the direct spelling must produce the cannot-parse sentinel"
+        assert _blocks(cmd.format(RM=self.RM)), opener
+
+    @pytest.mark.parametrize(
+        "cmd,blocked,why",
+        [
+            ("eval echo performance", False, "`perform` is not an rm invocation"),
+            ("eval echo 'the form of it'", False, "`form` is not an rm invocation"),
+            ("eval echo storm", False, "`storm` is not an rm invocation"),
+            ("eval {RM} -rf /a/b", True, "a real removal still reaches the guard"),
+            ("eval /bin/{RM} -rf /a/b", True, "a path-qualified rm still matches"),
+            ("true; eval {RM} -rf /a/b", True, "`;rm` satisfies a leading boundary"),
+        ],
+    )
+    def test_the_entry_prefilter_is_a_WORD_not_a_substring(self, cmd, blocked, why, tmp_path):
+        """Run the guard as a SUBPROCESS, so main()'s prefilter is exercised.
+
+        `_blocks` calls `_rm_violations` directly and therefore cannot see the
+        prefilter at all — which is why a mutation reverting it to a substring
+        test SURVIVED the whole suite. A substring test also matches `perform`,
+        `form` and `storm`; harmless while a false match cost only a scan that
+        found nothing, and an over-block once a carrier in command position is
+        refused on sight. MEASURED over 83,201 recorded commands: 170 -> 99.
+        """
+        import json
+        import os
+        import subprocess
+        import sys as _sys
+
+        env = dict(os.environ)
+        env["HOME"] = str(tmp_path)
+        script = Path(__file__).resolve().parents[2] / "scripts" / "hooks" / (
+            "destructive_command_guard.py"
         )
-        # The inner `"` MUST be escaped or this builds a different command than
-        # the one under test — `eval "rm -rf / #""` rather than `eval "rm -rf /
-        # #\""`. The first draft interpolated it raw and failed for that reason,
-        # which is the fixture-shape trap rather than a finding about the guard.
-        carried = 'eval "' + unparseable.replace('"', '\\"') + '"'
-        assert carried == 'eval "rm -rf / #\\""', f"fixture built {carried!r}"
-        assert _blocks(carried), (
-            "carrying it must not turn the conservative refusal into an allow — "
-            "the recursion has to propagate the sentinel, not treat it as empty"
+        res = subprocess.run(
+            [_sys.executable, str(script)],
+            input=json.dumps(
+                {"tool_input": {"command": cmd.format(RM=self.RM)}, "tool_name": "Bash"}
+            ),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
         )
+        got = res.returncode == 2
+        assert got is blocked, f"{cmd!r}: expected blocked={blocked} ({why}), got {res.returncode}"
+
+    def test_the_depth_bound_is_gone(self):
+        """No numeric bound remains, so no depth can be an attacker's budget."""
+        assert not hasattr(dg, "_MAX_CARRIER_DEPTH")
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "which eval",
+            "grep -rn eval src/",
+            "echo 'eval is a builtin'",
+            "ls /bin/sh",
+            "ls -la /usr/bin/script",
+            "cp /bin/sh /tmp/x",
+            "find / -name sg -delete",
+        ],
+    )
+    def test_a_carrier_NAMED_but_not_RUN_is_untouched(self, cmd):
+        """A carrier name in ARGUMENT position launches nothing.
+
+        Every one of these was refused before the command-position scope was
+        added — `ls /bin/sh` resolves basename `sh`, which is in the set.
+        """
+        assert not _blocks(cmd), cmd
 
     def test_the_carrier_set_covers_every_launcher_the_resolver_names(self):
-        """Parity with `shell_parse._REPARSE_CARRIERS`, in the SUPERSET direction.
-
-        This module is stdlib-only by declaration and deliberately does not
-        import the resolver, so the set is a local copy. That copy is only as
-        good as this lock: adding a launcher to the resolver must fail here
-        until it is added here too. A SUPERSET rather than equality because this
-        guard's hole is wider — it never descends into `sh -c "…"`, so the
-        nested-shell names belong here and not in the resolver's set.
-        """
+        """Superset parity: this module keeps a LOCAL copy because it is
+        stdlib-only by declaration and must not import the resolver. The copy is
+        locked here, so a launcher added to the resolver fails this test until
+        it is added there too."""
         import importlib.util
 
-        path = Path(__file__).resolve().parents[2] / "scripts" / "hooks" / "shell_parse.py"
-        spec = importlib.util.spec_from_file_location("_sp_parity", path)
-        sp = importlib.util.module_from_spec(spec)
-        sys.modules["_sp_parity"] = sp
-        spec.loader.exec_module(sp)
-        try:
-            missing = set(sp._REPARSE_CARRIERS) - set(dg._COMMAND_CARRIERS)
-            assert not missing, (
-                f"shell_parse._REPARSE_CARRIERS names {sorted(missing)}, which this "
-                "guard would not descend into. Add them to _COMMAND_CARRIERS."
-            )
-            assert set(sp._NESTED) <= set(dg._COMMAND_CARRIERS)
-        finally:
-            sys.modules.pop("_sp_parity", None)
+        spec = importlib.util.spec_from_file_location(
+            "sp_parity",
+            Path(__file__).resolve().parents[2] / "scripts" / "hooks" / "shell_parse.py",
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["sp_parity"] = mod
+        spec.loader.exec_module(mod)
+        missing = (set(mod._REPARSE_CARRIERS) | set(mod._NESTED)) - set(
+            dg._COMMAND_CARRIERS
+        )
+        assert not missing, f"resolver names launchers this guard does not: {missing}"

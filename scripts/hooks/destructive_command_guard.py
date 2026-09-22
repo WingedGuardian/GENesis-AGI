@@ -86,15 +86,6 @@ _ALWAYS_BLOCK = {".", "..", "/", "~", "*"}
 # A SUPERSET rather than a mirror, because this guard's hole is wider: it never
 # descends into `sh -c "…"` the way the resolver does, so the nested-shell names
 # belong here and not in the resolver's set.
-# How many nested carriers to descend through. Termination does NOT depend on
-# this: recursion only fires when a carrier is followed by another token, and
-# every shlex token of a multi-token string is strictly shorter than its input,
-# so the argument decreases monotonically. The bound is a cheap backstop against
-# an exotic tokenizer case, not the reason the recursion halts — which is why it
-# is 3 rather than 1. At 1, `eval "sh -c \"rm -rf /a/b\""` was ALLOWED while the
-# direct spelling blocked, and a test pinned that as correct.
-_MAX_CARRIER_DEPTH = 3
-
 _COMMAND_CARRIERS = frozenset(
     # shell_parse._REPARSE_CARRIERS — kept in step by the parity test named above.
     # `ssh` is absent there on purpose (it runs the command on another machine);
@@ -120,6 +111,19 @@ _COMMAND_CARRIERS = frozenset(
 
 # Command separators that start a new simple command within one Bash
 # string. Tokens matching these end an rm invocation's argument list.
+# Where bash can OPEN a command. `_SEPARATORS` alone is not that set: `time`,
+# `nice`, `{`, `(`, `then`, `do`, `else` and `!` all precede a command word, and
+# scoping the carrier check to separators let every one of them carry a removal
+# past it (MEASURED: five spellings allowed where the direct form blocked).
+# Kept SEPARATE from `_SEPARATORS`, which means "where an rm operand list ends"
+# — the two sets answer different questions and merging them would silently
+# change operand parsing.
+_COMMAND_OPENERS = frozenset(
+    {"|", "||", "&&", ";", "&", "\n", "{", "(", "!", "then", "do", "else", "elif", "time", "nice"}
+)
+
+_RM_WORD = re.compile(r"\brm\b|\brmdir\b")
+
 _SEPARATORS = {"|", "||", "&&", ";", "&", "\n"}
 
 # A redirection-shaped rm-operand token to SKIP: one that starts with a
@@ -417,14 +421,15 @@ def _check_target(target: str) -> str | None:
     return None
 
 
-def _rm_violations(cmd: str, depth: int = 0) -> list[str] | None:
+def _rm_violations(cmd: str) -> list[str] | None:
     """Reasons to block, or None when the command cannot be tokenized.
 
-    ``depth`` bounds the one level of recursion into a command string carried by
-    a launcher (see ``_COMMAND_CARRIERS``); callers outside this module never
-    pass it. Recursion is safe without a re-entrancy flag because this function
-    reads no mutable module state — every module-level name it touches is a
-    compiled regex or a frozenset constant.
+    There is no recursion into a carried command string and no depth bound. A
+    launcher in command position (see ``_COMMAND_CARRIERS``) is refused on
+    sight, without the payload being read: a payload spelled as argv, attached
+    to an option, split across adjacent quoted fragments, or nested inside
+    another launcher defeats any inspection, and the first three are properties
+    of the shell rather than gaps in a table.
     """
     # Line-continuations and bare newlines must be handled BEFORE shlex, which
     # drops a bare newline as whitespace (so a following command would fold into
@@ -480,41 +485,43 @@ def _rm_violations(cmd: str, depth: int = 0) -> list[str] | None:
         # — it keeps a dangerous target shallow (`/)` → depth 1), which
         # _check_target blocks.
         core = tokens[i][1:] if tokens[i].startswith("(") else tokens[i]
-        if os.path.basename(core) in _COMMAND_CARRIERS and depth < _MAX_CARRIER_DEPTH:
-            # A LAUNCHER CARRYING A QUOTED COMMAND STRING. This guard scans every
-            # token, so the UNQUOTED spelling (`eval rm -rf /a/b`) is already
-            # caught — `rm` stands alone as a token. The QUOTED one is not:
-            # `eval "rm -rf /a/b"` is a SINGLE token whose basename is `b`, so
-            # the test below skips it and the command was ALLOWED (measured).
+        # COMMAND POSITION ONLY. This scanner walks every token, so a bare
+        # membership test also matched a carrier name appearing as an ARGUMENT:
+        # `ls /bin/sh` (basename `sh`) and `which eval` were both refused. A
+        # carrier can only launch something when it is the command being run, so
+        # the refusal is scoped to the first token or one directly after a
+        # separator. (The caught cases were reachable only when the command also
+        # contained `rm` somewhere, because of main()'s prefilter — but a
+        # refusal that depends on an unrelated prefilter to stay narrow is one
+        # edit away from being wrong.)
+        at_command_position = i == 0 or tokens[i - 1] in _COMMAND_OPENERS
+        if at_command_position and os.path.basename(core) in _COMMAND_CARRIERS:
+            # A LAUNCHER THAT RUNS A COMMAND THIS GUARD CANNOT RECOVER.
+            # REFUSE OUTRIGHT, deliberately WITHOUT inspecting what it carries.
             #
-            # Re-run this same function over the carried string rather than
-            # inventing a second matcher, so the flag accumulation, `--`
-            # handling, brace expansion and depth rules all apply to the inner
-            # command exactly as they do to an outer one. `depth < 1` bounds it
-            # at one level: enough for `eval "…"`, and it cannot recurse away.
-            # Safe without a re-entrancy flag because this function is PURE —
-            # one call site, no mutable module state, no `global` (verified).
-            for tok in tokens[i + 1 :]:
-                if tok in _SEPARATORS:
-                    break
-                if "rm" not in tok:
-                    continue
-                inner = _rm_violations(tok, depth=depth + 1)
-                if inner is None:
-                    # None means "shlex could not tokenize", NOT "nothing found".
-                    # `main()` treats that sentinel as a conservative BLOCK, and
-                    # dropping it here inverted this module's fail direction for
-                    # the carried spelling: `eval "rm -rf / #\""` is a command
-                    # bash RUNS, and it was allowed while the direct spelling
-                    # blocked. Mirror `main()` exactly — same sentinel, same
-                    # pattern test, same verdict.
-                    if _RM_RF_PATTERN.search(tok):
-                        violations.append(
-                            "recursive+force rm inside a carried command string "
-                            "this guard cannot parse — blocked conservatively."
-                        )
-                elif inner:
-                    violations.extend(inner)
+            # An earlier revision recursed into the carried string, bounded by
+            # `_MAX_CARRIER_DEPTH`. Both halves were wrong. The bound SKIPPED the
+            # branch on reaching the limit instead of refusing, so it relocated
+            # the bypass rather than closing it — four nested `eval` layers
+            # reached an unblocked `rm -rf` (MEASURED). And the recursion itself
+            # could not see a payload spelled as ARGV, nor one attached to an
+            # option (`su --command='rm -rf /a/b'` parses its exe as
+            # `--command=rm`), nor one split across adjacent quoted fragments,
+            # which bash concatenates before any of this runs.
+            #
+            # Those are properties of the SHELL. A test applied to the payload
+            # can always be spelled around; a refusal keyed on the CARRIER cannot,
+            # because it reads no payload. MEASURED over 83,201 recorded
+            # commands, refusing on carrier presence in THIS guard costs 99
+            # (0.119%) — not the figure the sibling module records, whose
+            # carrier set excludes the shells and whose prefilter differs. Each
+            # guard's rate is its own; a number measured for one of them says
+            # nothing about another.
+            violations.append(
+                f"'{os.path.basename(core)}' runs a command this guard cannot "
+                f"recover, so it cannot verify the command is not a destructive "
+                f"removal. Re-issue it without the launcher."
+            )
             i += 1
             continue
         if os.path.basename(core) != "rm":
@@ -575,7 +582,14 @@ def main() -> int:
         cmd = field(read_payload(), "command")
         if discarded_write is not None:
             discarded_write.remember(cmd)
-        if not cmd or "rm" not in cmd:
+        # WORD boundary, not a substring. A substring test also matched
+        # `perform`, `form`, `storm` and `confirm`, which cannot be an `rm`
+        # invocation — harmless while a false match only cost a scan that found
+        # nothing, but the carrier refusal above turns a false match into a
+        # REFUSAL. MEASURED over 83,201 recorded commands: 170 -> 99 refused,
+        # and every real spelling still matches (`/bin/rm`, `;rm`, `&&rm`,
+        # `rm-cache` all satisfy a leading boundary).
+        if not cmd or not _RM_WORD.search(cmd):
             return 0
 
         violations = _rm_violations(cmd)

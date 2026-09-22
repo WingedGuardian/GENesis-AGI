@@ -266,8 +266,19 @@ except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degrad
 # NOT. A word boundary asks the one thing that was meant — that the flag is a whole
 # token — without naming the characters that may follow it. MEASURED cost of the
 # widening over 74,282 real commands: 15,945 -> 15,995, i.e. +50 (+0.07%).
+# `\bcommit\b` is here for the CARRIER arm, which consults this pattern to decide
+# whether a launcher is in this guard's scope at all. `git commit`'s short
+# hook-skip form is `-n`, and a pattern holding only `--no-verify` let
+# `eval git commit -n -m x` through while the direct spelling blocked via
+# `commit_skips_hooks` (MEASURED). A narrower `commit … -Xn` clause was measured
+# and REJECTED: it is length-bounded, so it missed
+# `git commit --amend --no-edit --author="A B" --date=now -n`, and a case it did
+# match matched the word `commit` inside "commit message" rather than the
+# subcommand — passing for a reason unrelated to its intent. MEASURED cost of
+# the bare word over 83,201 recorded commands, counted on the carrier arm:
+# 13 -> 22 (+9, 0.0156% -> 0.0264%).
 _GATED_MENTION = re.compile(
-    r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b|\b(?:push|merge)\b"
+    r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b|\b(?:push|merge|commit)\b"
 )
 
 # `gh pr create` is the FOURTH gated operation (it can push or fork the branch —
@@ -9432,8 +9443,34 @@ def _run_merge_and_push_gates() -> int:
         # refusing) and so it arms the SAME deferred deny, but it must sit
         # OUTSIDE the `blind is not None` conjunct below — that is the whole
         # defect: these segments are not blind, they are opaque.
-        carried_gated_op = any(
-            s.exe in _REPARSE_CARRIERS and _mentions_gated_op(s.raw) for s in segs
+        # The carrier is what arms this, but the guard's own SUBJECT MATTER is
+        # what scopes it — the same shape `protected_paths_guard` uses at :262,
+        # where `\brm\b` gates its carrier arm.
+        #
+        # The distinction matters and an earlier revision of this line got it
+        # backwards. A text test is unsound for FINDING the operation: bash
+        # concatenates adjacent quoted fragments, so `eval "git pu""sh origin
+        # main"` runs `git push` while carrying no `push` token (MEASURED). It
+        # is sound for SCOPING a guard to the thing it gates, because a command
+        # that mentions no publish at all is not this guard's business however
+        # it is spelled. Dropping the scope made the branch ban the launcher
+        # rather than gate the operation: `eval ls -la`, `unshare -r whoami` and
+        # `systemd-run --user --scope -- /bin/true` were all refused by a PUSH
+        # guard, and the deny text told the reader to "run the git/gh command
+        # directly" on a command containing no git.
+        #
+        # MEASURED over the recorded corpus: 126 carrier hits unscoped, 18 once
+        # scoped — an 83% cut, with every attack spelling this change documents
+        # still refused, because each contains the literal `git`.
+        #
+        # STATED RESIDUAL: `eval "gi""t push"` escapes this bound, since the
+        # bound is itself text. That is the SAME exposure already accepted one
+        # file over, where a split `r""m` escapes the `\brm\b` prefilter — so
+        # the two guards now fail identically instead of taking opposite sides
+        # of one question. Closing it properly needs the resolver to report a
+        # carrier as a blind-spot cause, which is filed, not built here.
+        carried_gated_op = _mentions_gated_op(cmd) and any(
+            s.exe in _REPARSE_CARRIERS for s in segs
         )
         # The two predicates are NOT suppressed by the same thing, and collapsing
         # them into one `not (…parsed…)` guard was the defect.
@@ -9485,9 +9522,11 @@ def _run_merge_and_push_gates() -> int:
             # visible, or keep the launcher and run the gated command as its own
             # tool call where the ordinary gates see it.
             blind_spot_deny = (
-                "BLOCKED: this command runs a gated operation through a launcher "
-                "the guard cannot resolve, so it cannot verify what would "
-                "actually run.\n"
+                "BLOCKED: this command names a gated operation and runs a "
+                "launcher whose payload this guard cannot recover, so it "
+                "cannot verify what would actually run. The payload is not "
+                "inspected on purpose: adjacent quoted fragments concatenate, "
+                "so a carried command can be spelled past any inspection.\n"
                 "To proceed: run the git/gh command directly, without the "
                 "launcher, so the ordinary push and merge gates can see it — or "
                 "keep the launcher for the work that needs it and issue the "

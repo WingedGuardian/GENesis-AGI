@@ -379,52 +379,48 @@ def main() -> int:
     cwd = payload.get("cwd") if isinstance(payload, dict) else None
     for seg in segs:
         if seg.exe in _REPARSE_CARRIERS:
-            # A LAUNCHER THE RESOLVER REFUSES TO MODEL, so this segment's argv
-            # is the launcher's, not the command's — `eval rm -rf <protected>`
-            # resolves to `exe == "eval"` and falls out of the `rm` test below,
-            # which is why it was ALLOWED (measured on the deployed parser).
-            # TWO CHECKS, and the order matters. First re-run the PRECISE
-            # operand scan over the carried string, because the substring floor
-            # below is at its weakest exactly where the command is most
-            # destructive — this module says so itself at :296-304: a protected
-            # path is not a substring of a command naming its PARENT, so
-            # `eval "rm -rf ~/genesis"` (an ANCESTOR) and `~/genesis/*` (a GLOB)
-            # both slip a substring test while the bare spelling blocks on both.
-            # Re-using `_operand_blocks` rather than widening the substring test
-            # keeps ancestor, glob and protected-file reasoning identical
-            # between the carried and direct spellings.
-            for tok in seg.argv[1:]:
-                if not _RM_PATTERN.search(tok):
-                    continue
-                try:
-                    # `analyze_checked`, never bare `analyze`: the bare form is
-                    # BOUNDED (a depth limit and a length cap) and reports
-                    # neither, so a consumer cannot tell "found nothing" from
-                    # "stopped looking" — the exact class this branch exists to
-                    # close, one layer in. A blind inner parse means the precise
-                    # scan below covered nothing, and the substring floor after
-                    # the loop is the honest response rather than a silent pass.
-                    inner_segs, inner_blind = analyze_checked(tok)
-                    if inner_blind is not None:
-                        inner_segs = []
-                except Exception:  # noqa: BLE001 — an unreadable inner string
-                    inner_segs = []  # falls through to the substring floor
-                for inner in inner_segs:
-                    if inner.exe not in ("rm", "rmdir"):
-                        continue
-                    for raw_operand in _rm_operands(inner.argv):
-                        for operand in brace_expand(raw_operand):
-                            reason = _operand_blocks(operand, cwd, dirs, files)
-                            if reason:
-                                return _block(reason)
-            # Then the substring floor, which still carries the UNQUOTED
-            # spelling and anything the inner parse could not resolve.
-            reason = _legacy_substring_block(
-                seg.raw, dirs, "whose command is carried by a launcher this parser cannot resolve"
+            # A LAUNCHER THAT RUNS A COMMAND THIS RESOLVER CANNOT RECOVER.
+            # REFUSE OUTRIGHT, deliberately WITHOUT looking at the payload.
+            #
+            # An earlier revision of this branch did look: it re-ran the precise
+            # operand scan over each carried token, then fell back to a substring
+            # floor. Three independent reviewers and a 153-cell sweep took it
+            # apart, and the measurements say the SHAPE cannot work rather than
+            # that the table was short:
+            #
+            #   * a payload passed as ARGV (`eval rm -rf X`) never presents `rm`,
+            #     its flags and its operand inside ONE token, so a per-token
+            #     parse sees no removal at all;
+            #   * NESTING defeats a single pass, because recovering the inner
+            #     string just yields another carrier;
+            #   * bash CONCATENATES adjacent quoted fragments, so a payload can
+            #     contain no matchable word at all — `"git pu""sh"` runs
+            #     `git push` while the text holds no `push`;
+            #   * several carriers ATTACH their command to an option
+            #     (`su --command='rm -rf X'`), so the inner exe parses as
+            #     `--command=rm`.
+            #
+            # The middle two are properties of the SHELL, not gaps in a list, so
+            # no amount of further matching closes them: any test applied to the
+            # payload can be spelled around. Refusing on the CARRIER cannot be,
+            # because it never reads the payload.
+            #
+            # MEASURED over 83,201 recorded commands: this guard refuses 17
+            # of them (0.020%), every one recoverable by re-issuing the command
+            # without the launcher. The rate is low because the `\brm\b`
+            # prefilter at :262 returns before this branch for any command that
+            # mentions no removal — that prefilter is what bounds the refusal,
+            # and it is asserted by a test for exactly that reason. Sibling
+            # guards measure their own rates against their own sets; this figure
+            # is not transferable to them.
+            return _block(
+                f"'{seg.exe}' runs a command this guard cannot recover, so it "
+                f"cannot verify whether that command deletes a protected path. "
+                f"Refused without inspecting the payload: a carried command can "
+                f"be spelled so that no inspection would see it.\n"
+                f"To proceed: run the command directly, without '{seg.exe}', so "
+                f"the ordinary protected-path checks can see its operands."
             )
-            if reason:
-                return _block(reason)
-            continue
         if seg.exe not in ("rm", "rmdir"):
             continue
         seg_unresolved = False
