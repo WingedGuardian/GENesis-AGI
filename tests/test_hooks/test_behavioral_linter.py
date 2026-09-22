@@ -931,6 +931,14 @@ class TestBashAuditFindings:
             # for provider usage (Devin finding, #1826).
             f"git grep '{self._ENDPOINT}' -- -Onotes",
             f"git grep '{self._ENDPOINT}' -- --pre-release-notes.md",
+            # `-e` and `-f` take the REST of the token as their argument, so an
+            # `O` after one is inside a pattern, not an option. MEASURED:
+            # `git grep -e2O<endpoint>` searches and executes nothing, while
+            # the widened digit class matched it and blocked the search — a
+            # false block introduced one commit earlier by widening without
+            # modelling which short options consume their remainder.
+            f"git grep -e2O{self._ENDPOINT}",
+            f"git grep -f2O{self._ENDPOINT}",
         ):
             r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
             assert r.returncode == 0, f"{cmd!r} was wrongly blocked"

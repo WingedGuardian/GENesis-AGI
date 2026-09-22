@@ -216,7 +216,22 @@ _EXEC_FLAGS = ("--pre", "--hostname-bin", "--pager", "--open-files-in-pager")
 #: than redesigned because the mechanism itself is dispositioned in #2230;
 #: leaving a MEASURED direct spelling open while the docstring says direct
 #: spellings are closed would make that docstring wrong on the day it landed.
-_GIT_EXEC_PATTERNS = {"grep": re.compile(r"^--op[a-z-]*(=|$)|^-[A-Za-z0-9]*O")}
+#: ...and the cluster STOPS at `-e` or `-f`. Both take the rest of the token
+#: as their argument — `-e<pattern>`, `-f<file>` — so an `O` after one of them
+#: is inside a pattern, not an option. MEASURED: `git grep
+#: -e2O<endpoint>` searches and executes nothing (rc=0, no marker), while the
+#: widened class matched it and hard-blocked a legitimate endpoint search.
+#: That is the exact cost the read-only exemption exists to avoid, and I
+#: introduced it one commit earlier by widening the class without modelling
+#: which short options consume their remainder. `-E`/`-F` take no argument and
+#: stay in the cluster.
+#:
+#: This is the FOURTH spelling of this one flag to need handling — bare,
+#: abbreviated, bundled-with-letters, bundled-with-digits, and now
+#: not-after-an-argument-taking-option. Each was correct and each arrived after
+#: the commit that claimed to close the class. That record is the argument in
+#: #2230, not a reason to expect the fifth to be different.
+_GIT_EXEC_PATTERNS = {"grep": re.compile(r"^--op[a-z-]*(=|$)|^-(?:(?![ef])[A-Za-z0-9])*O")}
 
 #: The git subcommands admitted as searches at all.
 _GIT_SEARCH_SUBCOMMANDS = frozenset({"log", "grep", "show", "diff", "blame"})
