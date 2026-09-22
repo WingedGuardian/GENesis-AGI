@@ -545,3 +545,97 @@ def test_the_blinding_prefix_really_blinds(fake_home):
         "the prefix no longer produces a NON-BOUNDS blind spot, so the "
         f"fall-through tests above exercise the ordinary path: {blind}"
     )
+
+
+class TestLauncherCarriedRemovals:
+    """A launcher the resolver refuses to model hid its removal from this guard.
+
+    `eval rm -rf $HOME/genesis/data` resolves to `exe == "eval"`, so the segment
+    fell out of the `exe not in ("rm","rmdir")` test and was ALLOWED — measured
+    on the deployed parser, where the bare spelling blocks.
+
+    The fallback is the same shape as the two unresolvable-operand fallbacks
+    already in this module: check the SEGMENT'S raw text, refuse if a protected
+    path is named. The controls below are what keep it honest — a carried
+    removal of an UNPROTECTED path must still run, or the guard has simply
+    banned the launcher.
+
+    The dangerous literals are assembled from fragments, as
+    `test_guard_ansic_fail_closed.py` does: these strings are fixture DATA, and
+    a test file containing them verbatim trips the very guard under test when
+    anything reads the file through a shell.
+    """
+
+    RM = "r" + "m"
+    RF = "-r" + "f"
+    PROT = "/genesis/data"
+    SAFE = "/tmp/scratch-xyz"
+
+    @pytest.mark.parametrize(
+        "carrier",
+        [
+            "eval {rm} {rf} {target}",
+            'eval "{rm} {rf} {target}"',
+            "su ubuntu -c '{rm} {rf} {target}'",
+            "runuser -u ubuntu -c '{rm} {rf} {target}'",
+            "setpriv --reuid 1000 {rm} {rf} {target}",
+            "chroot /mnt {rm} {rf} {target}",
+        ],
+    )
+    def test_a_protected_path_behind_a_carrier_blocks(self, carrier, fake_home):
+        cmd = carrier.format(rm=self.RM, rf=self.RF, target=H + self.PROT)
+        res = _run(cmd, fake_home)
+        assert res.returncode == 2, (
+            f"{cmd!r}: the launcher runs this and the protected directory goes "
+            f"with it — stderr={res.stderr.strip()[:200]!r}"
+        )
+
+    @pytest.mark.parametrize(
+        "carrier",
+        [
+            "eval {rm} {rf} {target}",
+            'eval "{rm} {rf} {target}"',
+            "su ubuntu -c '{rm} {rf} {target}'",
+        ],
+    )
+    def test_a_carrier_without_a_protected_path_still_runs(self, carrier, fake_home):
+        cmd = carrier.format(rm=self.RM, rf=self.RF, target=H + self.SAFE)
+        assert _run(cmd, fake_home).returncode == 0, (
+            f"{cmd!r}: nothing protected is named, so refusing this would ban "
+            "the launcher rather than protect anything"
+        )
+
+    def test_the_bare_spelling_is_unaffected(self, fake_home):
+        # The control that proves the carrier branch did not displace the
+        # ordinary resolved path.
+        blocked = f"{self.RM} {self.RF} {H}{self.PROT}"
+        allowed = f"{self.RM} {self.RF} {H}{self.SAFE}"
+        assert _run(blocked, fake_home).returncode == 2
+        assert _run(allowed, fake_home).returncode == 0
+
+    def test_a_mention_of_a_protected_path_without_a_removal_is_allowed(self, fake_home):
+        # The carrier branch checks the segment's RAW TEXT, so this is the shape
+        # most at risk of over-blocking: a carrier, a protected path, no removal.
+        assert _run(f"eval ls -la {H}{self.PROT}", fake_home).returncode == 0, (
+            "listing a protected directory through a launcher is not destructive"
+        )
+
+    @pytest.mark.parametrize("shape", ["ancestor", "glob"])
+    def test_the_carried_spelling_keeps_ancestor_and_glob_reasoning(self, shape, fake_home):
+        """A substring floor alone loses exactly the most destructive shapes.
+
+        This module says so at its own `_legacy_substring_block` comment: a
+        protected path is not a SUBSTRING of a command naming its PARENT, so an
+        ancestor removal and a glob both slip a substring test. An earlier
+        revision of the carrier branch used that floor alone, and both of these
+        were ALLOWED behind a launcher while the bare spelling blocked. The
+        branch now re-runs the precise operand scan over the carried string, so
+        the two spellings agree.
+        """
+        target = H + "/genesis" + ("/*" if shape == "glob" else "")
+        bare = f"{self.RM} {self.RF} {target}"
+        carried = f'eval "{bare}"'
+        assert _run(bare, fake_home).returncode == 2, "precondition: the bare spelling blocks"
+        assert _run(carried, fake_home).returncode == 2, (
+            f"{carried!r}: carrying an {shape} removal must not clear the guard"
+        )

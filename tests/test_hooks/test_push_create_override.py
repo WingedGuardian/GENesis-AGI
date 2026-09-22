@@ -805,3 +805,89 @@ def test_integration_record_stays_under_isolated_home(published_feat, tmp_path):
         "record did not land under the isolated GENESIS_HOME — the guard subprocess "
         "no longer inherits GENESIS_HOME? (real-~/.genesis leak risk)"
     )
+class TestLauncherCarriedGatedOps:
+    """A gated operation behind a launcher the resolver refuses to model.
+
+    `eval git push` parses CLEANLY — `blind` is None — and resolves to
+    `exe == "eval"`, so every push/merge/create predicate sees nothing AND the
+    raw-text net is unreachable, because that net is gated on `blind is not
+    None`. Measured on the deployed guard: a silent ALLOW, where the bare
+    spelling asks.
+
+    It arms the same deferred deny as `hidden_gated_verb` — the file's own
+    comment puts "an unreadable program naming a publish" in that class — so the
+    verdict is a BLOCK in both session kinds rather than an ask. Stricter than
+    the bare spelling on purpose: the guard cannot verify what would run, and
+    the remedy (drop the launcher, or issue the gated command as its own call)
+    costs one line.
+    """
+
+    # Assembled from fragments: a test file containing these verbatim trips the
+    # guards under test whenever anything reads it through a shell.
+    PUSH = "pu" + "sh"
+    NV = "--no-" + "ver" + "ify"
+
+    @pytest.mark.parametrize(
+        "carrier",
+        [
+            "eval git {op}",
+            'eval "git {op}"',
+            "su ubuntu -c 'git {op}'",
+            "runuser -u ubuntu -c 'git {op}'",
+            "setpriv --reuid 1000 git {op}",
+        ],
+    )
+    def test_a_carried_publish_is_refused(self, carrier):
+        cmd = carrier.format(op=self.PUSH)
+        res = _run(cmd)
+        assert res.returncode == 2, (
+            f"{cmd!r}: the launcher runs this and the branch is published, but "
+            f"no gate saw it — stdout={res.stdout[:160]!r}"
+        )
+
+    def test_a_carried_publish_is_refused_when_dispatched_too(self):
+        # No human is present to approve, so the refusal must not soften.
+        assert _run(f"eval git {self.PUSH}", dispatched=True).returncode == 2
+
+    def test_a_carried_hook_skip_is_refused(self):
+        assert _run(f"eval git commit {self.NV} -m x").returncode == 2
+
+    def test_a_parsed_sibling_segment_does_not_suppress_it(self):
+        """The suppression trap this guard already documents for `hidden_gated_verb`.
+
+        A carrier is a fact about ONE segment, so another segment parsing
+        cleanly says nothing about it. Suppressing on that basis would let an
+        unresolved publish ride a visible one.
+        """
+        assert _run(f"git status --short && eval git {self.PUSH}").returncode == 2
+
+    def test_the_bare_spelling_still_asks_rather_than_blocking(self):
+        # The control that proves the carrier branch did not change the ordinary
+        # push path into a refusal.
+        res = _run(f"git {self.PUSH}")
+        assert _decision(res) == "ask", (
+            f"the bare spelling must keep its approval dialog: {res.stdout[:160]!r}"
+        )
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "git status --short",
+            "eval ls -la",
+            'eval "PAY=$X"',
+        ],
+    )
+    def test_a_carrier_without_a_gated_operation_is_untouched(self, cmd):
+        res = _run(cmd)
+        assert res.returncode == 0 and _decision(res) != "deny", (
+            f"{cmd!r}: naming no gated operation, this must not be refused — "
+            "otherwise the branch bans the launcher rather than gating the op"
+        )
+
+    def test_prose_naming_a_gated_operation_is_not_a_carried_command(self):
+        # The over-block shape most at risk: the words are present, but `echo`
+        # is not a carrier, so nothing here publishes anything.
+        res = _run(f'echo "eval git {self.PUSH} is the shape that was allowed"')
+        assert res.returncode == 0, (
+            f"a sentence about a publish is not a publish: {res.stderr[:160]!r}"
+        )

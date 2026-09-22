@@ -168,6 +168,60 @@ _WRAPPERS = set(_WRAPPER_SPEC)
 # A front-end invoked with any other subcommand (`uv pip install …`) is therefore
 # left resolving to the front-end itself, exactly as before.
 _RUN_CARRIERS = frozenset({"uv", "poetry", "hatch", "pdm", "pipenv", "rye"})
+#: Launchers that RUN another command and whose grammar this resolver refuses to
+#: model. They are deliberately NOT `_WRAPPER_SPEC` entries: the walk already
+#: stops at an unknown wrapper and leaves the segment on the launcher, so this
+#: set does not change parsing at all. It NAMES that state for consumers.
+#:
+#: WHY NOT A TABLE. `runuser --help` documents TWO grammars selected by flag —
+#: `-u user [--] command` (argv) and the su-compatible `-c 'string'` (a string
+#: the shell re-parses) — so one arity entry cannot be right for both, and being
+#: wrong on the `-c` form is FAIL-OPEN. `eval` has no grammar to table at all: it
+#: re-parses whatever string it is handed. The `sudo -S` note in `_WRAPPER_SPEC`
+#: refuses the same treadmill for the same reason, and a wrong arity CONSUMES THE
+#: COMMAND WORD — a bypass reached by trying to be more precise.
+#:
+#: ⚠ NAMING A CARRIER CLOSES NOTHING BY ITSELF. An un-stripped segment is simply
+#: a hidden command (see `_strip_wrappers`, where `recoverable` is true for
+#: `uvx` alone). The hole closes only where a CONSUMER keys a conservative
+#: fallback on this set — `full_suite_guard._CARRIER_EXES` and
+#: `worktree_cwd_guard._CARRIER_NAMES` are the two shipped precedents.
+#:
+#: MEASURED on the deployed parser, with controls: every name below reports only
+#: the launcher, while `sudo`, `command` and a bare `rm` resolve correctly.
+#:
+#: MEMBERSHIP IS ENUMERATED, NOT CHOSEN — an earlier revision listed five names
+#: and read as a survey of the class. Probing the launcher vocabulary against
+#: the real parser found ten more that self-resolve identically.
+#:
+#: ⚠ `ssh` IS DELIBERATELY ABSENT, and it is the one a reviewer will ask about
+#: because it is the highest-traffic member. It does not belong here: `ssh host
+#: "…"` runs the command on ANOTHER MACHINE, so checking it against THIS box's
+#: protected paths is a category error, and the gated-operation net would fire
+#: on ordinary cross-machine work. MEASURED over 81,877 recorded commands: the
+#: ten names below would newly refuse ZERO, while `ssh` alone would newly refuse
+#: 214 — every sampled one a file copy or a remote probe that publishes and
+#: deletes nothing locally. Gating a remote command needs its own design; it is
+#: tracked separately rather than solved by appending a name to this set.
+_REPARSE_CARRIERS = frozenset(
+    {
+        "eval",
+        "su",
+        "runuser",
+        "setpriv",
+        "chroot",
+        # Self-resolving on the deployed parser, same class, zero measured cost.
+        "flock",
+        "watch",
+        "script",
+        "systemd-run",
+        "unshare",
+        "nsenter",
+        "pkexec",
+        "runcon",
+        "sg",
+    }
+)
 # Value-consuming flags accepted BEFORE the wrapped command, on either the
 # front-end or its `run` subcommand.
 #

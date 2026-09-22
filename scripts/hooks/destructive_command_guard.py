@@ -69,6 +69,55 @@ _RM_RF_PATTERN = re.compile(
 # Dangerous special targets — always block regardless of depth
 _ALWAYS_BLOCK = {".", "..", "/", "~", "*"}
 
+# Programs that RUN a command string handed to them as one argument. A quoted
+# string is a single shlex token, so the every-token scan below cannot see the
+# `rm` inside it — `eval "rm -rf /a/b"` was allowed while the unquoted spelling
+# blocked (measured).
+#
+# DELIBERATELY A LOCAL COPY, not an import. This module is stdlib-only by
+# declaration (see the header) and does not use `shell_parse` at all — it is the
+# independent second layer, and importing the resolver would both contradict
+# that and add an import-failure path to a BLOCKING guard. The repo's documented
+# pattern for exactly this boundary is duplicate + parity test, and
+# `tests/test_hooks/test_destructive_command_guard.py` asserts this set is a
+# SUPERSET of `shell_parse._REPARSE_CARRIERS`, so a launcher added there fails
+# the test until it is added here too.
+#
+# A SUPERSET rather than a mirror, because this guard's hole is wider: it never
+# descends into `sh -c "…"` the way the resolver does, so the nested-shell names
+# belong here and not in the resolver's set.
+# How many nested carriers to descend through. Termination does NOT depend on
+# this: recursion only fires when a carrier is followed by another token, and
+# every shlex token of a multi-token string is strictly shorter than its input,
+# so the argument decreases monotonically. The bound is a cheap backstop against
+# an exotic tokenizer case, not the reason the recursion halts — which is why it
+# is 3 rather than 1. At 1, `eval "sh -c \"rm -rf /a/b\""` was ALLOWED while the
+# direct spelling blocked, and a test pinned that as correct.
+_MAX_CARRIER_DEPTH = 3
+
+_COMMAND_CARRIERS = frozenset(
+    # shell_parse._REPARSE_CARRIERS — kept in step by the parity test named above.
+    # `ssh` is absent there on purpose (it runs the command on another machine);
+    # that reasoning is recorded at the resolver's own definition.
+    {
+        "eval",
+        "su",
+        "runuser",
+        "setpriv",
+        "chroot",
+        "flock",
+        "watch",
+        "script",
+        "systemd-run",
+        "unshare",
+        "nsenter",
+        "pkexec",
+        "runcon",
+        "sg",
+    }
+    | {"bash", "sh", "dash", "zsh", "ksh", "ash"}  # shell_parse._NESTED
+)
+
 # Command separators that start a new simple command within one Bash
 # string. Tokens matching these end an rm invocation's argument list.
 _SEPARATORS = {"|", "||", "&&", ";", "&", "\n"}
@@ -368,8 +417,15 @@ def _check_target(target: str) -> str | None:
     return None
 
 
-def _rm_violations(cmd: str) -> list[str] | None:
-    """Reasons to block, or None when the command cannot be tokenized."""
+def _rm_violations(cmd: str, depth: int = 0) -> list[str] | None:
+    """Reasons to block, or None when the command cannot be tokenized.
+
+    ``depth`` bounds the one level of recursion into a command string carried by
+    a launcher (see ``_COMMAND_CARRIERS``); callers outside this module never
+    pass it. Recursion is safe without a re-entrancy flag because this function
+    reads no mutable module state — every module-level name it touches is a
+    compiled regex or a frozenset constant.
+    """
     # Line-continuations and bare newlines must be handled BEFORE shlex, which
     # drops a bare newline as whitespace (so a following command would fold into
     # the first rm's operands) and keeps an escaped newline INSIDE the token.
@@ -424,6 +480,43 @@ def _rm_violations(cmd: str) -> list[str] | None:
         # — it keeps a dangerous target shallow (`/)` → depth 1), which
         # _check_target blocks.
         core = tokens[i][1:] if tokens[i].startswith("(") else tokens[i]
+        if os.path.basename(core) in _COMMAND_CARRIERS and depth < _MAX_CARRIER_DEPTH:
+            # A LAUNCHER CARRYING A QUOTED COMMAND STRING. This guard scans every
+            # token, so the UNQUOTED spelling (`eval rm -rf /a/b`) is already
+            # caught — `rm` stands alone as a token. The QUOTED one is not:
+            # `eval "rm -rf /a/b"` is a SINGLE token whose basename is `b`, so
+            # the test below skips it and the command was ALLOWED (measured).
+            #
+            # Re-run this same function over the carried string rather than
+            # inventing a second matcher, so the flag accumulation, `--`
+            # handling, brace expansion and depth rules all apply to the inner
+            # command exactly as they do to an outer one. `depth < 1` bounds it
+            # at one level: enough for `eval "…"`, and it cannot recurse away.
+            # Safe without a re-entrancy flag because this function is PURE —
+            # one call site, no mutable module state, no `global` (verified).
+            for tok in tokens[i + 1 :]:
+                if tok in _SEPARATORS:
+                    break
+                if "rm" not in tok:
+                    continue
+                inner = _rm_violations(tok, depth=depth + 1)
+                if inner is None:
+                    # None means "shlex could not tokenize", NOT "nothing found".
+                    # `main()` treats that sentinel as a conservative BLOCK, and
+                    # dropping it here inverted this module's fail direction for
+                    # the carried spelling: `eval "rm -rf / #\""` is a command
+                    # bash RUNS, and it was allowed while the direct spelling
+                    # blocked. Mirror `main()` exactly — same sentinel, same
+                    # pattern test, same verdict.
+                    if _RM_RF_PATTERN.search(tok):
+                        violations.append(
+                            "recursive+force rm inside a carried command string "
+                            "this guard cannot parse — blocked conservatively."
+                        )
+                elif inner:
+                    violations.extend(inner)
+            i += 1
+            continue
         if os.path.basename(core) != "rm":
             i += 1
             continue

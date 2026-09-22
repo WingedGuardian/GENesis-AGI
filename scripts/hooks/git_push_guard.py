@@ -216,6 +216,7 @@ _DEGRADED_GATED = (
 try:
     from shell_parse import (  # noqa: E402
         _KNOWN_SIGILS,
+        _REPARSE_CARRIERS,
         analyze,
         analyze_checked,
         commit_skips_hooks,
@@ -9422,6 +9423,18 @@ def _run_merge_and_push_gates() -> int:
         # honest split: an unreadable program naming a publish is worth
         # refusing, an unreadable program naming nothing is a Tuesday.
         hidden_gated_verb = any(s.verb_unresolved and s.exe in _GATED_EXES for s in segs)
+        # A LAUNCHER THE RESOLVER REFUSES TO MODEL, carrying a gated operation.
+        # `eval git push --no-verify` parses CLEANLY — `blind` is None — and
+        # resolves to `exe == "eval"`, so every predicate above sees no push and
+        # the raw-text net below never runs. MEASURED on the deployed guard:
+        # silent allow, where the bare spelling asks. Same class as
+        # `hidden_gated_verb` (an unreadable program naming a publish is worth
+        # refusing) and so it arms the SAME deferred deny, but it must sit
+        # OUTSIDE the `blind is not None` conjunct below — that is the whole
+        # defect: these segments are not blind, they are opaque.
+        carried_gated_op = any(
+            s.exe in _REPARSE_CARRIERS and _mentions_gated_op(s.raw) for s in segs
+        )
         # The two predicates are NOT suppressed by the same thing, and collapsing
         # them into one `not (…parsed…)` guard was the defect.
         #
@@ -9459,6 +9472,27 @@ def _run_merge_and_push_gates() -> int:
             if blind.bounds_induced:
                 print(blind_spot_deny, file=sys.stderr)
                 return 2
+
+        if carried_gated_op and blind_spot_deny is None:
+            # Its OWN message: the blind one interpolates `blind.cause`/`.hint`,
+            # and there is no `blind` here — these segments parse cleanly. The
+            # blind branch keeps precedence when both fire, because its
+            # diagnosis is the sharper one.
+            #
+            # The remedy is deliberately NOT "rephrase until the guard stops
+            # matching" — that would be a bypass instruction. Both routes it
+            # offers submit to the gate: drop the launcher so the operation is
+            # visible, or keep the launcher and run the gated command as its own
+            # tool call where the ordinary gates see it.
+            blind_spot_deny = (
+                "BLOCKED: this command runs a gated operation through a launcher "
+                "the guard cannot resolve, so it cannot verify what would "
+                "actually run.\n"
+                "To proceed: run the git/gh command directly, without the "
+                "launcher, so the ordinary push and merge gates can see it — or "
+                "keep the launcher for the work that needs it and issue the "
+                "gated command as its own Bash call."
+            )
 
         # Each git push / gh pr merge is a SEPARATE gated action. A single Bash
         # command carrying more than one would collapse into ONE ask/gate

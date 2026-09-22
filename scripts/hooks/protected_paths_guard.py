@@ -92,7 +92,7 @@ except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must b
 _DEGRADED_GATED = r"\brm\b|\brmdir\b"
 
 try:
-    from shell_parse import analyze_checked  # noqa: E402
+    from shell_parse import _REPARSE_CARRIERS, analyze_checked  # noqa: E402
 except Exception as _exc:  # noqa: BLE001 — see degraded_exit: exit 1 is a FAIL-OPEN.
     if __name__ != "__main__":
         # A test importing a deliberately broken tree must see the real error, not a
@@ -378,6 +378,53 @@ def main() -> int:
 
     cwd = payload.get("cwd") if isinstance(payload, dict) else None
     for seg in segs:
+        if seg.exe in _REPARSE_CARRIERS:
+            # A LAUNCHER THE RESOLVER REFUSES TO MODEL, so this segment's argv
+            # is the launcher's, not the command's — `eval rm -rf <protected>`
+            # resolves to `exe == "eval"` and falls out of the `rm` test below,
+            # which is why it was ALLOWED (measured on the deployed parser).
+            # TWO CHECKS, and the order matters. First re-run the PRECISE
+            # operand scan over the carried string, because the substring floor
+            # below is at its weakest exactly where the command is most
+            # destructive — this module says so itself at :296-304: a protected
+            # path is not a substring of a command naming its PARENT, so
+            # `eval "rm -rf ~/genesis"` (an ANCESTOR) and `~/genesis/*` (a GLOB)
+            # both slip a substring test while the bare spelling blocks on both.
+            # Re-using `_operand_blocks` rather than widening the substring test
+            # keeps ancestor, glob and protected-file reasoning identical
+            # between the carried and direct spellings.
+            for tok in seg.argv[1:]:
+                if not _RM_PATTERN.search(tok):
+                    continue
+                try:
+                    # `analyze_checked`, never bare `analyze`: the bare form is
+                    # BOUNDED (a depth limit and a length cap) and reports
+                    # neither, so a consumer cannot tell "found nothing" from
+                    # "stopped looking" — the exact class this branch exists to
+                    # close, one layer in. A blind inner parse means the precise
+                    # scan below covered nothing, and the substring floor after
+                    # the loop is the honest response rather than a silent pass.
+                    inner_segs, inner_blind = analyze_checked(tok)
+                    if inner_blind is not None:
+                        inner_segs = []
+                except Exception:  # noqa: BLE001 — an unreadable inner string
+                    inner_segs = []  # falls through to the substring floor
+                for inner in inner_segs:
+                    if inner.exe not in ("rm", "rmdir"):
+                        continue
+                    for raw_operand in _rm_operands(inner.argv):
+                        for operand in brace_expand(raw_operand):
+                            reason = _operand_blocks(operand, cwd, dirs, files)
+                            if reason:
+                                return _block(reason)
+            # Then the substring floor, which still carries the UNQUOTED
+            # spelling and anything the inner parse could not resolve.
+            reason = _legacy_substring_block(
+                seg.raw, dirs, "whose command is carried by a launcher this parser cannot resolve"
+            )
+            if reason:
+                return _block(reason)
+            continue
         if seg.exe not in ("rm", "rmdir"):
             continue
         seg_unresolved = False
