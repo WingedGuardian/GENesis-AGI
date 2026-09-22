@@ -22,13 +22,27 @@ def app(tmp_path):
 
     # Patch allowed roots AND the uploads dir to use tmp_path, so upload tests
     # never touch the real ~/.genesis/uploads.
-    import genesis.dashboard.routes.files as files_mod
 
     original_roots = files_mod._ALLOWED_ROOTS
     original_upload = files_mod._UPLOAD_DIR
     files_mod._ALLOWED_ROOTS = [tmp_path]
     files_mod._UPLOAD_DIR = tmp_path / "uploads"
+
+    # Move the isolated database OUT of the allowed root.
+    #
+    # conftest's autouse `_isolate_genesis_db_path` points genesis_db_path() at
+    # `tmp_path / "isolated-genesis.db"`, and this fixture makes `tmp_path` the
+    # allowed root — so without this, the allowed root IS the database's
+    # directory and every file in it is correctly refused, failing tests that
+    # have nothing to do with databases. Park it in a sibling directory so the
+    # two concerns stop overlapping; tests that want the database-area rule
+    # exercised point at `db_area` explicitly.
+    mp = pytest.MonkeyPatch()
+    mp.setattr("genesis.env.genesis_db_path", lambda: tmp_path.parent / "db_area" / "genesis.db")
+
     yield app
+
+    mp.undo()
     files_mod._ALLOWED_ROOTS = original_roots
     files_mod._UPLOAD_DIR = original_upload
 
@@ -100,7 +114,6 @@ def test_download_binary_file(client, tmp_path):
 
 def test_download_too_large(client, tmp_path):
     """Files exceeding the upload size limit return 413."""
-    import genesis.dashboard.routes.files as files_mod
 
     original_limit = files_mod._MAX_UPLOAD_SIZE
     files_mod._MAX_UPLOAD_SIZE = 100  # 100 bytes for testing
@@ -217,7 +230,6 @@ def test_upload_blocked_subdir_creates_no_orphan_dir(client, tmp_path):
 
 def test_upload_too_large(client, tmp_path):
     """A file exceeding the upload size limit returns 413."""
-    import genesis.dashboard.routes.files as files_mod
 
     original_limit = files_mod._MAX_UPLOAD_SIZE
     files_mod._MAX_UPLOAD_SIZE = 100
@@ -313,69 +325,6 @@ def test_create_and_rename_refuse_database_destinations(client, tmp_path):
     assert plain.exists(), "rename moved the file despite refusing"
 
 
-def test_hardlink_to_a_database_is_refused(client, tmp_path):
-    """resolve() cannot see a hardlink — only the identity check can.
-
-    A hardlink is not an alias, it is a second name for the same inode, so the
-    resolved NAME is innocent. MEASURED before the identity check existed: such
-    a file read 200, downloaded 200, and was truncated 8192 -> 9 by a write.
-    """
-    db = _db_file(tmp_path)
-    link = tmp_path / "notes.txt"
-    try:
-        os.link(db, link)
-    except OSError:
-        pytest.skip("hardlinks unsupported here")
-
-    fh = open(db, "rb")  # noqa: SIM115 — the point is to HOLD it open
-    try:
-        before = db.stat().st_size
-        assert client.get(f"/api/genesis/files/read?path={link}").status_code == 403
-        resp = client.put(
-            "/api/genesis/files/write", json={"path": str(link), "content": "x"}
-        )
-        assert resp.status_code == 403
-        assert db.stat().st_size == before, "the database was truncated via a hardlink"
-    finally:
-        fh.close()
-
-
-def test_a_held_database_is_refused_under_any_name(client, tmp_path):
-    """The identity check, isolated: no suffix, no recognisable name.
-
-    This is the case the suffix list provably misses — a database configured
-    through GENESIS_DB_PATH with no extension, or a Chromium profile DB named
-    ``Cookies``. It is refused because we HOLD it, not because of what it is
-    called.
-    """
-    # The case ONLY identity can catch, now that identity is scoped to
-    # database-shaped descriptors: a hardlink, under an innocent name, to an
-    # EMPTY database we hold open. Empty because SQLite creates a zero-byte file
-    # before its first write — so the content check sees no magic, the leaf name
-    # is innocent, and `Path.resolve()` cannot detect a hardlink. What remains is
-    # that we hold a descriptor whose own path IS database-shaped.
-    db = tmp_path / "genesis.db"
-    db.touch()  # zero bytes: a real, freshly created database
-    link = tmp_path / "held-thing"
-    try:
-        os.link(db, link)
-    except OSError:
-        pytest.skip("hardlinks unsupported here")
-
-    assert not files_mod._is_sqlite_artifact(link.name), "fixture no longer isolates identity"
-    assert not files_mod._looks_like_sqlite(link), "fixture no longer isolates identity"
-
-    fh = open(db, "rb")  # noqa: SIM115 — holding it open IS the condition
-    try:
-        assert client.get(f"/api/genesis/files/read?path={link}").status_code == 403
-    finally:
-        fh.close()
-
-    # Control: once nothing holds it, nothing else claims it either — so the 403
-    # above was the identity check and not some other rule firing.
-    assert client.get(f"/api/genesis/files/read?path={link}").status_code == 200
-
-
 def test_an_ordinary_held_file_is_still_readable(client, tmp_path):
     """Holding a descriptor is not by itself grounds to refuse.
 
@@ -406,39 +355,6 @@ def test_a_directory_named_like_a_database_is_still_usable(client, tmp_path):
         (d / "note.txt").write_text("x")
         resp = client.get(f"/api/genesis/files?path={d}")
         assert resp.status_code == 200, f"directory {name} was refused"
-
-
-def test_a_fifo_does_not_hang_the_content_check(client, tmp_path):
-    """A FIFO with no writer must not block the request worker.
-
-    The content check runs BEFORE the routes do their own file-type checks, so
-    it is the first thing a special file meets. A plain open("rb") on a
-    writer-less FIFO blocks forever and would hang a Flask worker — which is a
-    denial of service introduced by the check itself, not by the caller.
-
-    Asserted by TIME, not just by outcome: a correctness-only assertion would
-    pass by hanging until pytest was killed, which is the failure mode this
-    guards against.
-    """
-    import threading
-    import time
-
-    fifo = tmp_path / "pipe"
-    os.mkfifo(fifo)
-
-    result = {}
-
-    def _call():
-        start = time.monotonic()
-        result["status"] = client.get(f"/api/genesis/files/read?path={fifo}").status_code
-        result["elapsed"] = time.monotonic() - start
-
-    t = threading.Thread(target=_call, daemon=True)
-    t.start()
-    t.join(timeout=10)
-
-    assert not t.is_alive(), "the request blocked on a writer-less FIFO"
-    assert result["elapsed"] < 5.0, f"took {result['elapsed']:.1f}s on a FIFO"
 
 
 def test_an_unreadable_subtree_refuses_the_rename(client, tmp_path):
@@ -488,89 +404,6 @@ def test_renaming_a_directory_containing_a_database_is_refused(client, tmp_path)
     assert not (tmp_path / "data-old").exists()
 
 
-def test_containment_is_checked_before_touching_the_filesystem(client, tmp_path, monkeypatch):
-    """An out-of-root path must be refused WITHOUT stat'ing or walking it.
-
-    Ordering cannot change the verdict — every check returns False on a match —
-    so a plain "is it refused?" test would pass either way and prove nothing.
-    Instead, make the filesystem-touching check EXPLODE if it is reached: if the
-    request still returns 403, containment ran first.
-
-    This is what CodeQL's py/path-injection flagged (3 high alerts): the identity
-    check stats a caller-supplied path, so it must not run on one that has not
-    been proven to lie inside an allowed root.
-    """
-
-    def _must_not_run(_resolved):
-        raise AssertionError("filesystem touched before containment was checked")
-
-    monkeypatch.setattr(files_mod, "_locked_by_this_process", _must_not_run)
-
-    resp = client.get("/api/genesis/files/read?path=/etc/passwd")
-    assert resp.status_code == 403
-
-    # Control: INSIDE an allowed root, the identity check must still be reached —
-    # otherwise the assertion above would pass simply because nothing calls it.
-    (tmp_path / "ordinary.txt").write_text("x")
-    with pytest.raises(AssertionError, match="before containment"):
-        client.get(f"/api/genesis/files/read?path={tmp_path / 'ordinary.txt'}")
-
-
-@pytest.mark.parametrize("name", ["Cookies", "History", "Web Data", "mydata"])
-@pytest.mark.parametrize("route,method", [
-    ("/api/genesis/files/read", "get"),
-    ("/api/genesis/files/download", "get"),
-    ("/api/genesis/files/delete", "delete"),
-    ("/api/genesis/files/write", "put"),
-])
-def test_extensionless_database_held_by_nobody_is_refused(client, tmp_path, name, route, method):
-    """The case neither name nor ownership can see: identified by CONTENT.
-
-    Review found the concrete production path — the managed Chromium profile
-    keeps `Cookies`, `History` and `Web Data`, all extensionless and held by the
-    BROWSER rather than by genesis-server. So the identity scan (our descriptors
-    only) and the suffix list (no extension) both passed them through to a
-    truncating write or an outright delete, while the browser was live.
-    """
-    db = tmp_path / name
-    db.write_bytes(b"SQLite format 3\x00" + b"\x00" * 4096)
-    before = db.stat().st_size
-    assert not files_mod._is_sqlite_artifact(db.name), "fixture no longer isolates content"
-
-    if method == "put":
-        resp = client.put(route, json={"path": str(db), "content": "x"})
-    else:
-        resp = getattr(client, method)(f"{route}?path={db}")
-
-    assert resp.status_code == 403, f"{route} reached an extensionless database"
-    assert db.exists(), f"{route} deleted it"
-    assert db.stat().st_size == before, f"{route} truncated it"
-
-
-def test_content_check_does_not_block_ordinary_extensionless_files(client, tmp_path):
-    """Control: identifying by content must not swallow README, LICENSE, etc."""
-    for name in ("README", "LICENSE", "Dockerfile"):
-        f = tmp_path / name
-        f.write_text("ordinary text")
-        resp = client.get(f"/api/genesis/files/read?path={f}")
-        assert resp.status_code == 200, f"{name} was refused"
-        assert resp.get_json()["content"] == "ordinary text"
-
-
-def test_renaming_a_directory_with_an_extensionless_database_is_refused(client, tmp_path):
-    """The rename guard must use the content check too, not just names."""
-    profile = tmp_path / "browser-profile"
-    profile.mkdir()
-    (profile / "Cookies").write_bytes(b"SQLite format 3\x00" + b"\x00" * 64)
-
-    resp = client.post(
-        "/api/genesis/files/rename",
-        json={"path": str(profile), "new_name": "browser-profile-old"},
-    )
-    assert resp.status_code == 403
-    assert profile.exists()
-
-
 def test_renaming_an_ordinary_directory_still_works(client, tmp_path):
     """Control for the guard above — it must not freeze the file browser."""
     plain_dir = tmp_path / "notes"
@@ -617,3 +450,76 @@ def test_lookalike_names_are_not_over_blocked(client, tmp_path, name):
     (tmp_path / name).write_text("ok")
     resp = client.get(f"/api/genesis/files/read?path={tmp_path / name}")
     assert resp.status_code == 200
+
+
+# ── The configured database area ──────────────────────────────────────────
+#
+# The one AUTHORITATIVE rule: the path comes from config rather than from a
+# guess about names, so it covers the database under ANY spelling — including
+# the extensionless form genesis.env supports — and every sidecar beside it.
+
+
+@pytest.fixture()
+def db_area(tmp_path, monkeypatch):
+    """Point the configured database INSIDE the allowed root, and return it."""
+    area = tmp_path / "data"
+    area.mkdir()
+    db = area / "configured-db-no-extension"  # deliberately unrecognisable by name
+    db.write_bytes(b"SQLite format 3\x00")
+    monkeypatch.setattr("genesis.env.genesis_db_path", lambda: db)
+    return db
+
+
+@pytest.mark.parametrize("route,method", [
+    ("/api/genesis/files/read", "get"),
+    ("/api/genesis/files/download", "get"),
+    ("/api/genesis/files/delete", "delete"),
+    ("/api/genesis/files/write", "put"),
+])
+def test_the_configured_database_is_refused_under_any_name(client, db_area, route, method):
+    """Named so the suffix rule cannot possibly match — config is what catches it."""
+    assert not files_mod._is_sqlite_artifact(db_area.name), "fixture no longer isolates config"
+    before = db_area.stat().st_size
+
+    if method == "put":
+        resp = client.put(route, json={"path": str(db_area), "content": "x"})
+    else:
+        resp = getattr(client, method)(f"{route}?path={db_area}")
+
+    assert resp.status_code == 403, f"{route} reached the configured database"
+    assert db_area.exists() and db_area.stat().st_size == before
+
+
+@pytest.mark.parametrize("sidecar", ["-wal", "-shm", "-journal", "-mj7b3a91e0"])
+def test_sidecars_of_the_configured_database_are_refused(client, db_area, sidecar):
+    """Sidecars inherit the base name, so a suffix rule cannot see them either.
+
+    This is the case review raised twice: a WAL sidecar does not begin with the
+    SQLite magic and its base name carries no recognised suffix. Being BESIDE
+    the configured database is what catches it.
+    """
+    side = db_area.parent / (db_area.name + sidecar)
+    side.write_bytes(b"\x37\x7f\x06\x82" + b"\x00" * 64)  # a WAL header, not magic
+
+    resp = client.get(f"/api/genesis/files/read?path={side}")
+    assert resp.status_code == 403, f"{sidecar} was reachable"
+
+
+def test_renaming_the_database_directory_is_refused(client, db_area):
+    """Moving the parent relocates the database without ever opening it."""
+    resp = client.post(
+        "/api/genesis/files/rename",
+        json={"path": str(db_area.parent), "new_name": "data-old"},
+    )
+    assert resp.status_code == 403
+    assert db_area.parent.exists()
+
+
+def test_files_outside_the_database_area_are_unaffected(client, db_area, tmp_path):
+    """Control: the rule is scoped to that directory, not to the whole root."""
+    notes = tmp_path / "notes.md"
+    notes.write_text("still readable")
+
+    resp = client.get(f"/api/genesis/files/read?path={notes}")
+    assert resp.status_code == 200
+    assert resp.get_json()["content"] == "still readable"

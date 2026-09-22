@@ -107,25 +107,36 @@ def _sanitize_relpath(relpath: str | None) -> list[str]:
 #: Files tab would do it. Authentication changes who can trigger it, never what
 #: it does, so the block belongs on the FILE, not on the caller.
 #:
-#: TWO CHECKS, AND THE NAME-BASED ONE IS THE WEAKER. The hazard is not "this
-#: file is named like a database" — it is "this process already holds a
-#: descriptor on this inode", which is exactly the condition under which our
-#: close drops our locks. So :func:`_locked_by_this_process` is primary and
-#: matches on IDENTITY; the suffix list below is defence in depth for databases
-#: the process has not opened yet.
+#: NOTHING HERE OPENS OR STATS THE CALLER'S PATH, and that constraint is the
+#: design rather than an implementation detail. It was learned the expensive way.
+#: Earlier revisions added an identity check (comparing inodes against
+#: ``/proc/self/fd``) and a content probe (reading the SQLite magic). The content
+#: probe OPENED the live database inside the server — the exact operation this
+#: guard exists to prevent — and was reachable whenever the identity check failed
+#: open, which it does when ``/proc`` is unreadable and when the configured
+#: database has no extension. Review REPRODUCED the consequence: a second process
+#: acquired the previously-blocked write lock immediately after that probe
+#: closed. A guard whose fallback performs the harm is worse than a guard with a
+#: known gap, so both layers were removed rather than patched again.
 #:
-#: The suffix list does NOT cover every SQLite database under any name, and
-#: saying so would be false. MEASURED spellings it misses: a database configured
-#: through ``GENESIS_DB_PATH`` with no extension at all (``genesis.env`` supports
-#: this); Chromium profile databases (``Cookies``, ``History``, ``Web Data`` —
-#: extensionless, and present on this install); a multi-database master journal
-#: (``genesis.db-mj7b3a91e0``); ``.db3``; ``-wal2``; ``genesis.db.pre-update``.
-#: The identity check is what actually covers those, because it never asks what
-#: the file is called.
+#: What remains cannot misfire, because it never touches the file:
+#:   1. the CONFIGURED database path and everything beside it — read from config
+#:      rather than guessed, so it covers the main database under any name
+#:      including no extension at all, plus every sidecar;
+#:   2. a name-suffix rule, for databases living elsewhere.
+#:
+#: STATED GAP, because pretending otherwise is what produced the removed code: a
+#: database OUTSIDE the data directory under a name the suffix rule does not
+#: recognise is NOT covered — the managed Chromium profile's ``Cookies``,
+#: ``History`` and ``Web Data`` are the measured example. Closing that needs a
+#: registry of the databases the server actually opens, which two independent
+#: reviewers converged on and which is tracked separately. It is deliberately NOT
+#: approximated here with a third heuristic.
 #:
 #: Accepted cost, stated: an archived database copy matching a suffix is blocked
 #: even though opening one cannot affect the live file's locks. These are binary
 #: files a text route would mangle anyway.
+
 #: Bound on the rename guard's directory walk. A rename is a rare, interactive
 #: operation, so the cost only ever lands on a human who asked for it; the bound
 #: exists so a pathological tree cannot stall a request thread, not to save time
@@ -142,7 +153,8 @@ def _is_sqlite_artifact(name: str) -> bool:
     """Is *name* a SQLite database, or a sidecar of one?
 
     Name-based and therefore incomplete by construction — see the note above.
-    Kept as a second line behind :func:`_locked_by_this_process`.
+    Covers databases outside the configured data directory; the authoritative
+    check for the configured one is :func:`_in_configured_database_area`.
     """
     lowered = name.lower()
     lowered = _MASTER_JOURNAL_RE.sub("", lowered)
@@ -153,130 +165,31 @@ def _is_sqlite_artifact(name: str) -> bool:
     return lowered.endswith(_SQLITE_DB_SUFFIXES)
 
 
-def _locked_by_this_process(
-    resolved: Path, identities: frozenset[tuple[int, int]] | None = None
-) -> bool:
-    """Does THIS process already hold a descriptor on *resolved*'s inode?
+def _in_configured_database_area(resolved: Path) -> bool:
+    """Is *resolved* the configured database, or anything beside it?
 
-    Identity, not name. This is the check that actually matches the hazard: a
-    close only drops locks we hold, and we only hold locks on files we have
-    open. It therefore covers a database under any configured name, and a
-    HARDLINK alias — which ``Path.resolve()`` cannot see, because a hardlink is
-    not a symlink, it is a second name for the same inode. MEASURED before this
-    existed: a ``notes.txt`` hardlinked to the live database read 200,
-    downloaded 200, and was truncated 8192 -> 9 bytes by a write.
+    The one AUTHORITATIVE check here: the path comes from config, not from a
+    guess about names, so it covers the main database under any spelling —
+    including the extensionless form ``genesis.env`` explicitly supports — and
+    every sidecar it keeps in the same directory, present or future.
 
-    Cost MEASURED at ~0.18 ms over the server's open-fd set.
+    Directory-scoped on purpose. A database keeps company: ``-wal``, ``-shm``,
+    ``-journal``, master journals, pre-restore copies. Enumerating those by name
+    is the approach that kept coming up short, and the data directory holds
+    nothing a file browser needs to open anyway.
 
-    ONLY DATABASE-LIKE DESCRIPTORS COUNT. An earlier revision matched ANY open
-    inode, which made every file the server happens to hold permanently
-    unreachable — review named the concrete regression: normal bootstrap installs
-    a ``RotatingFileHandler`` on ``~/genesis/logs/genesis.log``, so reading the
-    current log returned 403 on every route. Holding a descriptor is only
-    dangerous when the descriptor is a DATABASE's, so the candidate set is
-    filtered by what each descriptor points AT before any inode is compared.
-    That keeps the hardlink case, because the server opened the database under
-    its real name and it is that name we read back from ``/proc``.
-
-    Fails OPEN (returns False) when ``/proc`` is unreadable or the path cannot
-    be stat'd — deliberately, because two further checks run behind it. A hard
-    failure here would take the file browser down on any platform without
-    ``/proc``.
+    Reads config but touches no filesystem: ``is_relative_to`` is pure path
+    arithmetic. Fails OPEN if the path cannot be resolved, which is safe because
+    the name rule still runs behind it — and unlike the removed probes, failing
+    open here does nothing dangerous, it merely declines to add a reason.
     """
     try:
-        st = resolved.stat()
-    except OSError:
+        from genesis.env import genesis_db_path
+
+        db_path = genesis_db_path().resolve()
+    except Exception:  # config unreadable — fall through to the name rule
         return False
-    held = _held_database_identities() if identities is None else identities
-    return (st.st_dev, st.st_ino) in held
-
-
-def _held_database_identities() -> frozenset[tuple[int, int]]:
-    """``(st_dev, st_ino)`` of every DATABASE-like file this process holds open.
-
-    Computed once and reusable: :func:`_contains_live_database` calls the check
-    per child, and re-enumerating ``/proc/self/fd`` for each one made a directory
-    walk O(entries x descriptors) — measured by review at roughly six seconds for
-    5,000 files against 300 descriptors, on a threaded Flask request.
-    """
-    out: set[tuple[int, int]] = set()
-    try:
-        entries = os.listdir("/proc/self/fd")
-    except OSError:
-        return frozenset()
-    for entry in entries:
-        fd_path = f"/proc/self/fd/{entry}"
-        try:
-            target = os.readlink(fd_path)
-        except OSError:
-            continue  # closed between listing and reading, or not a link
-        # " (deleted)" is kept deliberately: an unlinked database is exactly the
-        # orphan case this module exists for, and its name still identifies it.
-        if not _is_sqlite_artifact(Path(target.removesuffix(" (deleted)")).name):
-            continue
-        try:
-            fd_st = os.stat(fd_path)
-        except OSError:
-            continue
-        out.add((fd_st.st_dev, fd_st.st_ino))
-    return frozenset(out)
-
-
-#: Every SQLite database file begins with this, byte 0. Fixed by the file format
-#: and not by any naming convention, which is the point: it identifies a database
-#: no matter what it is called or who has it open.
-_SQLITE_MAGIC = b"SQLite format 3\x00"
-
-
-def _looks_like_sqlite(resolved: Path) -> bool:
-    """Does *resolved* begin with the SQLite file-format magic?
-
-    Content, not name and not ownership — the only one of the three that sees a
-    database belonging to a DIFFERENT process under an unrecognised name. The
-    managed Chromium profile is the measured case: ``Cookies``, ``History`` and
-    ``Web Data`` are extensionless and held by the browser, so neither the
-    identity scan nor the suffix list classifies them.
-
-    SAFE TO OPEN, and this is worth stating because opening database files is the
-    hazard this whole module exists to prevent. POSIX releases record locks per
-    PROCESS. This runs only after :func:`_locked_by_this_process` returned False,
-    so we hold no descriptor on it and our close therefore releases nothing; and
-    another process's locks are unaffected by what we open and close.
-
-    RESIDUAL RACE, stated rather than papered over: between that identity check
-    and this read, another thread in THIS process could open the file — Flask
-    serves with ``threaded=True``. The window is microseconds and the same window
-    already existed for the route's own read, which this check runs ahead of and
-    usually prevents. Closing it properly needs a registry of every database the
-    server opens, which is a larger change than this fix and is tracked
-    separately.
-
-    OPENED NON-BLOCKING, AND ONLY REGULAR FILES ARE READ. A plain
-    ``open(path, "rb")`` on a FIFO with no writer blocks forever, which would
-    hang a Flask worker — this check runs BEFORE the routes do their own
-    file-type checks, so it is the first thing a special file meets.
-    ``O_NONBLOCK`` makes that open return immediately and ``fstat`` on the
-    resulting descriptor decides whether there is anything worth reading;
-    anything that is not a regular file is not a database. ``O_NOFOLLOW`` is
-    belt-and-braces: *resolved* has already been through ``Path.resolve()`` so
-    its last component should not be a symlink, and this refuses rather than
-    follows if one appeared in between.
-
-    Reads 16 bytes. Any OSError means "cannot tell", which falls through to the
-    name check rather than granting access.
-    """
-    try:
-        fd = os.open(resolved, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-    except OSError:
-        return False
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return False  # FIFO, device, socket — not a database
-        return os.read(fd, len(_SQLITE_MAGIC)) == _SQLITE_MAGIC
-    except OSError:
-        return False
-    finally:
-        os.close(fd)
+    return resolved == db_path or resolved.is_relative_to(db_path.parent)
 
 
 def _contains_live_database(directory: Path) -> bool:
@@ -299,11 +212,13 @@ def _contains_live_database(directory: Path) -> bool:
     ``tree`` was permitted and relocated a live database. An unreadable subtree
     now refuses, which is what "fails closed" has to mean.
 
-    The held-descriptor set is snapshotted ONCE. Re-deriving it per child made
-    this O(entries x descriptors) — measured at ~6s for 5,000 files against 300
-    descriptors, on a request thread.
+    Classifies children by NAME only, and deliberately does not open or stat
+    them. An earlier revision consulted ``/proc/self/fd`` per child — O(entries x
+    descriptors), measured at ~6s for 5,000 files against 300 descriptors on a
+    request thread — and then read each one's header, which meant a rename
+    request could itself drop the server's locks. Walking a directory is not a
+    reason to touch every file in it.
     """
-    held = _held_database_identities()
     seen = 0
     stack = [directory]
     while stack:
@@ -326,11 +241,8 @@ def _contains_live_database(directory: Path) -> bool:
                     continue
             except OSError:
                 return True  # same reasoning: unknown means refused
-            child = Path(entry.path)
-            if (
-                _is_sqlite_artifact(entry.name)
-                or _locked_by_this_process(child, held)
-                or _looks_like_sqlite(child)
+            if _is_sqlite_artifact(entry.name) or _in_configured_database_area(
+                Path(entry.path)
             ):
                 return True
     return False
@@ -357,29 +269,16 @@ def _is_allowed(path: Path) -> bool:
     for part in resolved.parts:
         if "secret" in part.lower() and part.lower() not in ("secrets", ".secrets"):
             return False
-    # PRIMARY: identity. Covers any database this process has open, under any
-    # name, including through a hardlink alias that resolve() cannot detect.
-    # Stats the path, so it runs only after containment above.
-    if _locked_by_this_process(resolved):
+    # PRIMARY: the configured database and everything beside it. Authoritative
+    # rather than heuristic — the path comes from config, so it covers the main
+    # database under any name (including none) and every sidecar. Pure path
+    # arithmetic; touches nothing.
+    if _in_configured_database_area(resolved):
         return False
-    # SECONDARY: CONTENT. The decisive check for a database this process does
-    # not hold — which neither of the others can see. Review found the concrete
-    # case: the managed Chromium profile keeps `Cookies`, `History` and
-    # `Web Data`, all extensionless and held by the BROWSER, so the identity scan
-    # (genesis-server's descriptors only) and the suffix rule (no extension to
-    # match) both pass them straight through to a truncating write.
-    #
-    # Reading the header is safe precisely BECAUSE the identity check above
-    # already returned False: POSIX drops locks per PROCESS, so opening a file we
-    # hold no descriptor on releases nothing, and another process's locks are
-    # untouched by our close.
-    if _looks_like_sqlite(resolved):
-        return False
-    # TERTIARY: name. Still needed — the two checks above require the file to
-    # EXIST, and `create`/`rename` validate a destination that does not yet.
-    # Checked on the RESOLVED name, so a SYMLINK cannot smuggle one through
-    # under an innocent-looking path (a hardlink can — that is the identity
-    # check above).
+    # SECONDARY: name, for databases living elsewhere. Checked on the RESOLVED
+    # name, so a SYMLINK cannot smuggle one through under an innocent-looking
+    # path. A HARDLINK still can — see the stated gap in the module note; that
+    # needs the registry, not another guess.
     #
     # DIRECTORIES ARE EXEMPT from the name rule. A directory cannot be opened as
     # a database, so it cannot trigger the lock loss this guards, and blocking it
