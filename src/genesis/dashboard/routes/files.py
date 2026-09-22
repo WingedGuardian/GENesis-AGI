@@ -218,24 +218,35 @@ def _contains_live_database(directory: Path) -> bool:
 
 
 def _is_allowed(path: Path) -> bool:
-    """Check that *path* resolves inside an allowed root and isn't blocked."""
+    """Check that *path* resolves inside an allowed root and isn't blocked.
+
+    CONTAINMENT IS CHECKED FIRST, and that ordering is load-bearing rather than
+    stylistic: every later check returns False on a match, so reordering cannot
+    change the verdict — but it does change what this function TOUCHES. The
+    identity check below stats the path, and the rename guard walks it. Doing
+    either to a path that has not been proven to lie inside an allowed root is
+    filesystem work on unvalidated input, which is what CodeQL's py/path-injection
+    flagged here (3 high-severity alerts, all of them fair). Reject out-of-root
+    paths before touching the filesystem at all.
+    """
     resolved = path.resolve()
+    if not any(resolved.is_relative_to(root.resolve()) for root in _ALLOWED_ROOTS):
+        return False
     if resolved.name.lower() in _BLOCKED_NAMES:
-        return False
-    # PRIMARY: identity. Covers any database this process has open, under any
-    # name, including through a hardlink alias that resolve() cannot detect.
-    if _locked_by_this_process(resolved):
-        return False
-    # SECONDARY: name. Catches databases this process has not opened yet.
-    # Checked on the RESOLVED name, so a SYMLINK cannot smuggle one through
-    # under an innocent-looking path (a hardlink can — that is the check above).
-    if _is_sqlite_artifact(resolved.name):
         return False
     # Block paths containing "secret" in any component (except dir names "secrets"/".secrets")
     for part in resolved.parts:
         if "secret" in part.lower() and part.lower() not in ("secrets", ".secrets"):
             return False
-    return any(resolved.is_relative_to(root.resolve()) for root in _ALLOWED_ROOTS)
+    # PRIMARY: identity. Covers any database this process has open, under any
+    # name, including through a hardlink alias that resolve() cannot detect.
+    # Stats the path, so it runs only after containment above.
+    if _locked_by_this_process(resolved):
+        return False
+    # SECONDARY: name. Catches databases this process has not opened yet.
+    # Checked on the RESOLVED name, so a SYMLINK cannot smuggle one through
+    # under an innocent-looking path (a hardlink can — that is the check above).
+    return not _is_sqlite_artifact(resolved.name)
 
 
 def _sanitize_path(raw: str | None) -> tuple[Path | None, tuple | None]:

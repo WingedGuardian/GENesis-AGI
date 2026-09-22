@@ -383,6 +383,34 @@ def test_renaming_a_directory_containing_a_database_is_refused(client, tmp_path)
     assert not (tmp_path / "data-old").exists()
 
 
+def test_containment_is_checked_before_touching_the_filesystem(client, tmp_path, monkeypatch):
+    """An out-of-root path must be refused WITHOUT stat'ing or walking it.
+
+    Ordering cannot change the verdict — every check returns False on a match —
+    so a plain "is it refused?" test would pass either way and prove nothing.
+    Instead, make the filesystem-touching check EXPLODE if it is reached: if the
+    request still returns 403, containment ran first.
+
+    This is what CodeQL's py/path-injection flagged (3 high alerts): the identity
+    check stats a caller-supplied path, so it must not run on one that has not
+    been proven to lie inside an allowed root.
+    """
+
+    def _must_not_run(_resolved):
+        raise AssertionError("filesystem touched before containment was checked")
+
+    monkeypatch.setattr(files_mod, "_locked_by_this_process", _must_not_run)
+
+    resp = client.get("/api/genesis/files/read?path=/etc/passwd")
+    assert resp.status_code == 403
+
+    # Control: INSIDE an allowed root, the identity check must still be reached —
+    # otherwise the assertion above would pass simply because nothing calls it.
+    (tmp_path / "ordinary.txt").write_text("x")
+    with pytest.raises(AssertionError, match="before containment"):
+        client.get(f"/api/genesis/files/read?path={tmp_path / 'ordinary.txt'}")
+
+
 def test_renaming_an_ordinary_directory_still_works(client, tmp_path):
     """Control for the guard above — it must not freeze the file browser."""
     plain_dir = tmp_path / "notes"
