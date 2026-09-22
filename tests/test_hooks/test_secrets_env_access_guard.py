@@ -554,6 +554,49 @@ class TestAuditFindings:
         assert proc.returncode == 0, proc.stderr
         assert "Traceback" not in proc.stderr
 
+    # ── R-0: the guard read an override name nothing sets ──────────────────
+    def test_a_relocated_secrets_file_is_gated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`SECRETS_PATH` is the override the rest of the system uses.
+
+        The guard read `GENESIS_SECRETS_PATH`, which MEASURED appears exactly
+        once repo-wide — on that line. So an install that relocates its
+        credentials had no gate at all, and silently: a guard that finds no
+        candidate root allows (Codex P1, #1826).
+
+        A custom BASENAME is deliberate here. `_SECRET_BASENAMES` would rescue
+        a relocated `secrets.env` by name alone, so a test using that name
+        passes whether or not the override is read — the vacuous version of
+        this test.
+        """
+        relocated = tmp_path / "vault" / "credentials.prod"
+        relocated.parent.mkdir(parents=True)
+        relocated.write_text("API_KEY=x\n")
+        monkeypatch.setenv("SECRETS_PATH", str(relocated))
+        assert self._touches(command=f"cat {relocated}")
+
+    def test_the_guard_reads_the_same_override_the_runtime_does(self) -> None:
+        """The two resolvers are a REPLICA — a hook is stdlib-only and cannot
+        import `genesis.env` — so the only defence is that they are checked
+        against each other rather than maintained in parallel from memory."""
+        import re as _re
+
+        env_src = (Path(__file__).resolve().parents[2] / "src" / "genesis" / "env.py").read_text(
+            encoding="utf-8"
+        )
+        body = env_src.split("def secrets_path(", 1)[1].split("\ndef ", 1)[0]
+        names = set(_re.findall(r"os\.environ\.get\(\s*[\"'](\w+)[\"']", body))
+        assert names, "could not read secrets_path()'s override — this test is checking nothing"
+
+        guard = (_HOOKS / "secrets_target.py").read_text(encoding="utf-8")
+        missing = sorted(n for n in names if f'"{n}"' not in guard)
+        assert not missing, (
+            f"genesis.env.secrets_path() honours {missing}, which "
+            "secrets_target.py does not read. An override the runtime obeys "
+            "and the guard ignores is a credentials file outside the gate."
+        )
+
     # ── R-1: the glob prefilter decided from the pattern's SPELLING ─────────
     #
     # `_glob_hits_secret` returned before expanding anything unless the raw

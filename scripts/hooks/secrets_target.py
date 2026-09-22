@@ -1,4 +1,4 @@
-"""Does this tool call TOUCH the secrets file? Answered by resolved path, not by string.
+r"""Does this tool call TOUCH the secrets file? Answered by resolved path, not by string.
 
 The first version of this gate matched the literal ``secrets.env`` in a Bash
 command. An adversarial review broke it in seconds with shapes nobody would call
@@ -12,7 +12,43 @@ secrets file" but **"does anything in this call resolve to the secrets file"** �
 expand the globs, follow the symlinks, compare by ``st_ino``. A spelling the
 author never imagined still resolves to the same inode.
 
-Two honest residuals, declared rather than hidden:
+WHAT THIS DOES NOT CATCH — read this before trusting it.
+
+An earlier version of this docstring said "two honest residuals, declared
+rather than hidden". That was the wrong claim: the residuals are not two, and
+they were not declared because nobody had enumerated them. MEASURED at this
+head against a real credentials file, with a literal path and a glob as
+positive controls and two benign commands as negative controls:
+
+    gated       cat <literal path>
+    gated       cat ~/genesis/s*.e*
+    NOT gated   grep -R API_KEY ~/genesis        <- prints the values
+    NOT gated   cp -R ~/genesis /tmp/x
+    NOT gated   tar -cf /tmp/x.tar ~/genesis
+    NOT gated   cat ~/alias/s*.e*                <- symlinked directory
+    NOT gated   cat ~/genesis/secrets\.env
+    NOT gated   cat ~/genesis/sec"rets".env
+    NOT gated   cat ~/genesis/'secrets'.env
+    NOT gated   awk -f - <<'AWK' … system("cat …")
+    silent      ls ~/genesis · cat README.md     <- correct
+
+**Three of eleven.** Every row is a different way a path or a receiver reaches
+the file, drawn from a different vocabulary — word splitting, quote
+concatenation, backslash escapes, symlink resolution, recursive tool semantics,
+the open set of programs that execute stdin. Predicting all of them from
+command text is the thing this module was written to avoid doing with strings,
+and it is still doing it one layer up.
+
+So the honest statement of what this is: a gate that closes the DIRECT
+spellings — a named path, a glob that expands to the file, a heredoc fed to a
+recognised interpreter — and does not close indirect access. It is strictly
+better than the string matcher it replaced, and it is not the boundary. The
+replacement enforces at the filesystem and credential boundaries instead, where
+one check answers every row above at once; that is **issue #2230**, and it
+carries this table as its acceptance bar.
+
+Two residuals that a boundary rebuild does NOT remove, kept from the earlier
+version because they remain true:
 
 * **Shell variables are not expanded.** ``f=secrets; cat $f.env`` cannot be
   resolved without executing the shell, and this module never executes anything.
@@ -63,12 +99,37 @@ from hook_input import brace_expand, strip_quoted  # noqa: E402
 _SECRET_BASENAMES = ("secrets.env",)
 
 
+#: The override the rest of the system actually uses. `SECRETS_PATH` is what
+#: `scripts/install.sh` documents and consumes (`:18`, `:128`), what
+#: `genesis.env.secrets_path()` reads at `:181`, and what six test modules call
+#: "the sanctioned SECRETS_PATH env override".
+#:
+#: This guard read `GENESIS_SECRETS_PATH`, a name NOTHING in the tree sets —
+#: MEASURED, one occurrence repo-wide, and it was this line. So on any install
+#: that relocates its credentials, the file was outside the gate entirely and
+#: the failure was silent, because a guard that finds no candidate root simply
+#: allows (Codex P1, #1826).
+#:
+#: Both names are read, the canonical one first: the invented spelling stays
+#: accepted because an install that already exported it would otherwise lose
+#: the gate at the moment this fix landed, which is the wrong direction for a
+#: credentials guard to move even briefly.
+#:
+#: Stdlib-only by contract — a hook cannot import `genesis.env` — so this
+#: MIRRORS `secrets_path()` rather than calling it. That is a replica, and the
+#: honest mitigation is that it is now a replica of something real instead of
+#: a name of its own; `test_the_guard_reads_the_same_override_the_runtime_does`
+#: fails if the two ever disagree.
+_SECRETS_PATH_ENV = ("SECRETS_PATH", "GENESIS_SECRETS_PATH")
+
+
 def _candidate_roots() -> list[Path]:
     """Where a real secrets.env plausibly lives on this install."""
     roots = []
-    explicit = os.environ.get("GENESIS_SECRETS_PATH")
-    if explicit:
-        roots.append(Path(explicit).expanduser())
+    for name in _SECRETS_PATH_ENV:
+        explicit = os.environ.get(name)
+        if explicit:
+            roots.append(Path(explicit).expanduser())
     roots.append(Path.home() / "genesis" / "secrets.env")
     repo = os.environ.get("CLAUDE_PROJECT_DIR")
     if repo:
