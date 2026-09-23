@@ -206,9 +206,11 @@ _falkordb_arch() {
 # The GitHub release ships NO checksum or signature assets (0 of 15, verified
 # 2026-09-06), so without this the download is trusted on TLS alone. The x64
 # digest below was computed from the exact artifact that was load-tested on the
-# reference install. An operator who overrides FALKORDB_VERSION gets a loud
-# warning instead of a silent unverified install: pinning a digest we have not
-# actually run would be worse than admitting we have none.
+# reference install. An operator who overrides FALKORDB_VERSION to a pair with
+# no pinned digest is REFUSED, not warned — the module is loaded as native
+# code, so installing bytes we cannot authenticate is an integrity gap, not a
+# supported escape hatch. Pinning a digest we have not actually run is the
+# answer for a real upgrade, not an unverified install.
 _falkordb_expected_sha() {
     case "$1/$2" in
         4.20.4/x64) printf '81ea6b989dc2fd4c9ad905e246018b220b02f0e40c406255f9da4768c1684555' ;;  # pragma: allowlist secret  (public release checksum, not a secret)
@@ -226,10 +228,32 @@ falkordb_module_install() {
         return 0
     fi
 
+    # Fail closed before any download: a version/arch pair we have not pinned
+    # a digest for cannot be verified, and the module runs as native code.
+    expected="$(_falkordb_expected_sha "$FALKORDB_VERSION" "$arch")"
+    if [ -z "$expected" ]; then
+        echo "  Skipped: no pinned checksum for FalkorDB $FALKORDB_VERSION/$arch —"
+        echo "           refusing to install a module the repository has not verified."
+        echo "           To adopt a newer build, pin its digest in _falkordb_expected_sha."
+        return 0
+    fi
+
     dest="$FALKORDB_DEPS_DIR/$FALKORDB_VERSION"
     target="$dest/falkordb.so"
     if [ -f "$target" ]; then
-        echo "  OK: FalkorDB module $FALKORDB_VERSION already present."
+        # The file is the sentinel for "installed", but redis refuses a module
+        # without the execute bit — verify the bit rather than trusting it.
+        if [ -x "$target" ]; then
+            echo "  OK: FalkorDB module $FALKORDB_VERSION already present."
+            return 0
+        fi
+        if chmod +x "$target" 2>/dev/null; then
+            echo "  OK: FalkorDB module $FALKORDB_VERSION already present (restored +x)."
+            return 0
+        fi
+        rm -f "$target" 2>/dev/null || true
+        echo "  WARNING: $target exists without the execute bit and could not be"
+        echo "           repaired — removed so the next run reinstalls cleanly."
         return 0
     fi
 
@@ -256,31 +280,23 @@ falkordb_module_install() {
         return 0
     fi
 
-    expected="$(_falkordb_expected_sha "$FALKORDB_VERSION" "$arch")"
-    if [ -z "$expected" ]; then
-        echo "  WARNING: no pinned checksum for FalkorDB $FALKORDB_VERSION/$arch —"
-        echo "           installing UNVERIFIED (the upstream release ships no checksums)."
-    else
-        actual=""
-        if command -v sha256sum >/dev/null 2>&1; then
-            # `|| true`: under pipefail the pipeline's status would reach the
-            # caller; 2>/dev/null hides the message, not the status.
-            actual="$(sha256sum "$target.partial" 2>/dev/null | awk '{print $1}' || true)"
-        fi
-        if [ -z "$actual" ]; then
-            # We HAVE a pin and cannot check it — refuse. That is different from
-            # the unpinned case above, which is a deliberate operator override.
-            rm -f "$target.partial" 2>/dev/null || true
-            echo "  WARNING: cannot verify the FalkorDB module (sha256sum unavailable)"
-            echo "           and a digest is pinned for this version — refusing to install."
-            return 0
-        elif [ "$actual" != "$expected" ]; then
-            rm -f "$target.partial" 2>/dev/null || true
-            echo "  WARNING: FalkorDB module checksum MISMATCH — refusing to install."
-            echo "           expected $expected"
-            echo "           actual   $actual"
-            return 0
-        fi
+    actual=""
+    if command -v sha256sum >/dev/null 2>&1; then
+        # `|| true`: under pipefail the pipeline's status would reach the
+        # caller; 2>/dev/null hides the message, not the status.
+        actual="$(sha256sum "$target.partial" 2>/dev/null | awk '{print $1}' || true)"
+    fi
+    if [ -z "$actual" ]; then
+        rm -f "$target.partial" 2>/dev/null || true
+        echo "  WARNING: cannot verify the FalkorDB module (sha256sum unavailable)"
+        echo "           and a digest is pinned for this version — refusing to install."
+        return 0
+    elif [ "$actual" != "$expected" ]; then
+        rm -f "$target.partial" 2>/dev/null || true
+        echo "  WARNING: FalkorDB module checksum MISMATCH — refusing to install."
+        echo "           expected $expected"
+        echo "           actual   $actual"
+        return 0
     fi
 
     mv "$target.partial" "$target" 2>/dev/null || {

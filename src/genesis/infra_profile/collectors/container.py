@@ -126,10 +126,17 @@ async def _run_cmd(
         return None
     proc = None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+        # The spawn await gets the same bound as communicate(): a child whose
+        # exec never reports back (a wedged loader, a hung interpreter) must
+        # degrade the probe, not freeze the refresh — the SPAWN is inside the
+        # try precisely so its failure routes through the same error paths.
+        proc = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            ),
+            timeout=timeout,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except TimeoutError:

@@ -310,13 +310,17 @@ def test_the_module_half_needs_no_consent(tmp_path):
     """
     env = _stage(tmp_path)
     del env["GENESIS_FALKORDB_PROVISION"]
-    env["FALKORDB_VERSION"] = "9.9.9"
-    (tmp_path / "release" / "v9.9.9").mkdir()
-    (tmp_path / "release" / "v9.9.9" / "falkordb-x64.so").write_bytes(b"x")
+    artifact = tmp_path / "release" / "v4.20.4" / "falkordb-x64.so"
+    real_sha = subprocess.run(
+        ["sha256sum", str(artifact)], capture_output=True, text=True, check=True
+    ).stdout.split()[0]
 
-    result = _run("falkordb_module_install", env)
+    result = _run(
+        f'_falkordb_expected_sha() {{ printf "{real_sha}"; }}; falkordb_module_install',
+        env,
+    )
     assert result.returncode == 0, result.stderr
-    assert (Path(env["FALKORDB_DEPS_DIR"]) / "9.9.9" / "falkordb.so").is_file()
+    assert (Path(env["FALKORDB_DEPS_DIR"]) / "4.20.4" / "falkordb.so").is_file()
 
 
 def test_kill_switch_stops_everything_including_the_module(tmp_path):
@@ -360,8 +364,7 @@ def test_a_non_dpkg_redis_still_blocks_provisioning(tmp_path):
 def test_a_pinned_version_refuses_to_install_when_it_cannot_be_verified(tmp_path):
     """Having a pin and no way to check it must fail CLOSED.
 
-    Different from the unpinned case, which is a deliberate operator override:
-    here we know what the bytes should be and cannot confirm it.
+    Here we know what the bytes should be and cannot confirm it — refuse.
     """
     env = _stage(tmp_path)
     no_sha = Path(env["PATH"].split(":")[0]) / "sha256sum"
@@ -506,7 +509,8 @@ def test_matching_checksum_installs_with_the_execute_bit(tmp_path):
     assert installed.stat().st_mode & 0o111, "module installed without +x"
 
 
-def test_unpinned_version_warns_loudly_rather_than_silently_trusting(tmp_path):
+def test_unpinned_version_is_refused_without_downloading(tmp_path):
+    """No pinned digest means no install — the module runs as native code."""
     env = _stage(tmp_path)
     env["FALKORDB_VERSION"] = "9.9.9"
     (tmp_path / "release" / "v9.9.9").mkdir()
@@ -515,17 +519,49 @@ def test_unpinned_version_warns_loudly_rather_than_silently_trusting(tmp_path):
     result = _run("falkordb_module_install", env)
     assert result.returncode == 0, result.stderr
     assert "no pinned checksum" in result.stdout
-    assert "UNVERIFIED" in result.stdout
+    assert "refus" in result.stdout
+    dest = Path(env["FALKORDB_DEPS_DIR"]) / "9.9.9"
+    assert not (dest / "falkordb.so").exists(), "installed an unverified module"
+    assert not (dest / "falkordb.so.partial").exists(), "downloaded before refusing"
+
+
+def test_an_already_present_module_repairs_a_missing_execute_bit(tmp_path):
+    """`-f target` is the installed sentinel, but redis refuses it without +x.
+
+    A leftover file with 0644 must be repaired, not reported as present — and
+    a failed repair removes it so the next run reinstalls instead of trusting
+    the sentinel forever.
+    """
+    env = _stage(tmp_path)
+    artifact = tmp_path / "release" / "v4.20.4" / "falkordb-x64.so"
+    real_sha = subprocess.run(
+        ["sha256sum", str(artifact)], capture_output=True, text=True, check=True
+    ).stdout.split()[0]
+
+    target = Path(env["FALKORDB_DEPS_DIR"]) / "4.20.4" / "falkordb.so"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"x")
+    target.chmod(0o644)
+
+    result = _run(
+        f'_falkordb_expected_sha() {{ printf "{real_sha}"; }}; falkordb_module_install',
+        env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "restored +x" in result.stdout
+    assert target.stat().st_mode & 0o111, "module left unexecutable"
 
 
 def test_second_run_is_idempotent(tmp_path):
     env = _stage(tmp_path)
-    env["FALKORDB_VERSION"] = "9.9.9"
-    (tmp_path / "release" / "v9.9.9").mkdir()
-    (tmp_path / "release" / "v9.9.9" / "falkordb-x64.so").write_bytes(b"x")
+    artifact = tmp_path / "release" / "v4.20.4" / "falkordb-x64.so"
+    real_sha = subprocess.run(
+        ["sha256sum", str(artifact)], capture_output=True, text=True, check=True
+    ).stdout.split()[0]
 
-    assert _run("falkordb_module_install", env).returncode == 0
-    second = _run("falkordb_module_install", env)
+    cmd = f'_falkordb_expected_sha() {{ printf "{real_sha}"; }}; falkordb_module_install'
+    assert _run(cmd, env).returncode == 0
+    second = _run(cmd, env)
     assert second.returncode == 0
     assert "already present" in second.stdout
 

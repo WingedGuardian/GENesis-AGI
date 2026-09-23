@@ -39,7 +39,12 @@ async def reap(proc: asyncio.subprocess.Process | None) -> None:
     with contextlib.suppress(ProcessLookupError):
         proc.kill()
     try:
-        await proc.wait()
+        # Bounded, not bare `await proc.wait()`: a reaper that waits forever is
+        # an unbounded await INSIDE the timeout handler, which turns a hung
+        # child into a hung refresh. Once the kill has fired, the child
+        # watcher reaps independently anyway — this wait is hygiene, not
+        # correctness, so 5s is generous rather than tight.
+        await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=5.0)
     except Exception:  # noqa: BLE001 - reaping is best-effort, never fatal
         # Deliberately not raised: the kill above already fired, and the child
         # watcher reaps independently. Logged so a persistent failure is

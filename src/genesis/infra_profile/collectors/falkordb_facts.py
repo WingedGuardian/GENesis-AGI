@@ -90,11 +90,16 @@ async def _unit_states() -> tuple[str | None, str | None]:
     if shutil.which("systemctl") is None:
         return (None, None)
 
-    proc = await asyncio.create_subprocess_exec(
-        "systemctl", "--user", "show", _UNIT,
-        "-p", "ActiveState", "-p", "UnitFileState", "--value",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+    proc = await asyncio.wait_for(
+        asyncio.create_subprocess_exec(
+            "systemctl", "--user", "show", _UNIT,
+            "-p", "ActiveState", "-p", "UnitFileState", "--value",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        ),
+        # Same bound as communicate() below: an unbounded spawn await freezes
+        # the collector if exec never reports back.
+        timeout=_CMD_TIMEOUT,
     )
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_CMD_TIMEOUT)
