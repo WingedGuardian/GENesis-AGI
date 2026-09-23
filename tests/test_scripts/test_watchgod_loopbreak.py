@@ -877,6 +877,40 @@ def test_oom_drain_is_not_cleared_by_a_query_that_failed_to_reanchor(tmp_path):
     )
 
 
+def test_drain_is_SET_when_a_query_cannot_save_its_cursor(tmp_path):
+    """The inverse of the cell below, and it is reachable from the ORDINARY state.
+
+    `drain` means "the cursor is not anchored". The first fix made a verified
+    anchor the only thing that could CLEAR it — but nothing ever SET it, so from
+    a healthy `drain=0` a re-anchor that cannot persist deleted the cursor and
+    left the flag at 0. The next query then falls back to the relative window
+    and re-reads the record the previous tick already counted.
+
+    MEASURED before this fix, starting from `4:0:0:0:0` with the cursor path
+    unwritable: a contained kill, then a real kill that wrote no record of its
+    own — TWO kills, ZERO pages. The existing drain cells all start from
+    `drain=1`, so none of them could see it.
+    """
+    home, _cc, bind = _sandbox(tmp_path)
+    (home / ".genesis" / "logs" / ".oom_journal_cursor").mkdir()
+    oom = _oom_file(tmp_path, 4)
+    out = _run(
+        home,
+        bind,
+        _PRELUDE
+        + f'OOM_EVENTS_FILE="{oom}"; '
+        + f"printf 'low 0\nhigh 0\nmax 0\noom 3\noom_kill 5\noom_group_kill 0\n' > \"{oom}\"; "
+        + 'r=$(check_oom_events "4:0:0:0:0"); echo "R=[$r]"',
+        {"STUB_JOURNAL": _KILL_LINE},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert "R=[5:0:0:0:1]" in out.stdout, (
+        "a query that could not save its cursor must SET drain, not leave it at "
+        f"whatever it was: {out.stdout}"
+    )
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes through a read-only file")
 def test_a_failed_reanchor_does_not_leave_a_stale_cursor_behind(tmp_path):
     """A stale cursor is indistinguishable from a fresh anchor to anything that
     only checks the file exists — and that check is what clears drain.
@@ -954,6 +988,7 @@ def test_oom_arm_refuses_when_journalctl_is_not_installed(tmp_path):
     assert not cursor.exists(), "nothing should have been written"
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes through a read-only file")
 def test_oom_arm_refuses_when_a_failed_write_leaves_a_STALE_cursor(tmp_path):
     """The case the read-back cannot see, and the reason the write's exit
     status is checked on its own.

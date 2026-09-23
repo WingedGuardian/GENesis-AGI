@@ -764,8 +764,20 @@ check_oom_events() {
         # accounted for by the first kill's record, still inside the fallback
         # window, and suppressed. Two kills, one page. Clear drain only when the
         # cursor is verifiably on disk.
-        if (( _oom_query_ok == 1 )) && _oom_cursor_is_anchored; then
+        # BOTH DIRECTIONS. `drain` means "the cursor is not anchored", so the
+        # cursor decides it -- clearing it on success while never SETTING it left
+        # the inverse open, and the inverse is reachable from the ordinary
+        # drain=0 state: a re-anchor that cannot persist deletes the cursor
+        # (:549) and leaves drain=0 behind, so the next query falls back to the
+        # relative window and re-reads the record this tick just counted.
+        # MEASURED from `4:0:0:0:0` with the cursor path unwritable: a contained
+        # kill, then a real kill that wrote no record of its own -- TWO kills,
+        # ZERO pages. Setting drain from the cursor closes it in one place
+        # rather than at each site that can fail to write.
+        if _oom_cursor_is_anchored; then
             prev_drain=0
+        else
+            prev_drain=1
         fi
         # Bound the OOM log (retention discipline — matches cc_exit/log rotation);
         # keep the most recent ~1000 lines so a thrashing container can't leak it.
