@@ -86,13 +86,6 @@ from shell_parse import (  # noqa: E402
 #: resolves on the basename and would match it.
 _GH_WORD = re.compile(r"(?<![\w-])gh(?![\w-])")
 
-#: `gh api`'s option grammar now lives in `shell_parse._GH_FLAG_TABLE`, the
-#: per-(group, subcommand) model shared by every consumer — a second copy here
-#: was the third recurrence of the same argv-walk defect (#2209). Row
-#: semantics unchanged: `-f` takes a value under `api` and none under
-#: `pr create`, which is exactly why the table is per-row.
-_API_VALUE_FLAGS = _GH_FLAG_TABLE[("api", "")][0]
-
 #: The two spellings that carry a `key=value` request parameter.
 _API_FIELD_FLAGS = frozenset({"-f", "--raw-field", "-F", "--field"})
 
@@ -108,6 +101,14 @@ _HELP_FLAGS = frozenset({"--help", "-h"})
 #: "create"` -- gh having eaten `pr` as the value of `-f`. So a parser that
 #: does not step over these mislocates the group exactly where gh does not.
 _VALUE_FLAGS = _GH_ALL_VALUE_FLAGS
+
+#: `gh api`'s OWN row of the shared table. The union above is right while the
+#: command path is unresolved — that is gh's own behaviour — but it is WRONG
+#: after `api` resolves: `-i` carries a value under `pr checks` yet is the
+#: valueless `--include` under `api`, so a union-only scan reads
+#: `gh api … -i -X PATCH` as `-i` consuming `-X` and hides the PATCH (Devin
+#: Review on #2256). `GhInvocation.path_end` marks the switch point.
+_API_VALUE_FLAGS = _GH_FLAG_TABLE[("api", "")][0]
 
 #: The mutation, tested against the VALUE of the `query` field rather than
 #: against rejoined argv. The previous form searched the whole command and so
@@ -134,7 +135,7 @@ _GRAPHQL_CLOSE = re.compile(r"\bmutation\b.*?closePullRequest", re.IGNORECASE | 
 _REST_PATH = re.compile(r"(?:https?://[^/]+/)?/?repos/[^/\s]+/[^/\s]+/(?P<kind>pulls|issues)/\d+/?")
 
 
-def _split_api_option(tok: str) -> tuple[str, str | None]:
+def _split_api_option(tok: str, value_flags: frozenset[str]) -> tuple[str, str | None]:
     """`-fstate=closed` -> ('-f', 'state=closed'); `--field=x=1` -> ('--field', 'x=1').
 
     Only a flag KNOWN to take a value absorbs a glued remainder. Without that
@@ -146,7 +147,7 @@ def _split_api_option(tok: str) -> tuple[str, str | None]:
     if tok.startswith("--"):
         name, sep, val = tok.partition("=")
         return name, (val if sep else None)
-    if len(tok) > 2 and tok[:2] in _VALUE_FLAGS:
+    if len(tok) > 2 and tok[:2] in value_flags:
         # `-X=PATCH` as well as `-XPATCH`: the separator is optional in the
         # shorthand form, and keeping the `=` in the value made the method
         # compare as "=PATCH" and never match.
@@ -160,22 +161,28 @@ def _gh_group(argv: list[str]) -> str | None:
     return inv.group if inv else None
 
 
-def _has_terminal_help(argv: list[str], value_flags: frozenset[str]) -> bool:
+def _has_terminal_help(argv: list[str], inv) -> bool:
     """Is a help flag present as a FLAG rather than as some option's value?
 
     A plain `tok in argv` scan would read a field whose CONTENT is `--help` as
     help and go silent on a real close. Skipping each value-flag's argument is
-    what keeps a field's content from deciding whether the command runs.
+    what keeps a field's content from deciding whether the command runs — and
+    the flag set doing that skipping switches at `inv.path_end` (union before
+    the path resolves, the resolved row after), or `api -i --help` reads
+    `--help` as `-i`'s value and a help-only command looks like a close.
     """
+    row = _GH_FLAG_TABLE.get((inv.group, inv.subcommand or ""), (frozenset(), frozenset()))
+    post_path_flags = row[0] if inv.path_end else _VALUE_FLAGS
     skip_next = False
-    for tok in argv[1:]:
+    for i, tok in enumerate(argv[1:], start=1):
         if skip_next:
             skip_next = False
             continue
-        name, value = _split_api_option(tok)
+        vf = _VALUE_FLAGS if i < inv.path_end else post_path_flags
+        name, value = _split_api_option(tok, vf)
         if name in _HELP_FLAGS:
             return True
-        if value is None and name in value_flags:
+        if value is None and name in vf:
             skip_next = True
     return False
 
@@ -215,8 +222,9 @@ def _parse_api(argv: list[str]) -> _ApiCall | None:
             positional_only = True
             i += 1
             continue
-        name, value = _split_api_option(tok)
-        if value is None and name in _VALUE_FLAGS:
+        vf = _VALUE_FLAGS if i < inv.path_end else _API_VALUE_FLAGS
+        name, value = _split_api_option(tok, vf)
+        if value is None and name in vf:
             i += 1
             value = argv[i] if i < len(argv) else None
         if value is not None:
@@ -246,7 +254,8 @@ def _closes_a_pr(argv: list[str]) -> str | None:
     """Why this argv appears to close a PR, or None. Text-visible forms only."""
     if not argv or os.path.basename(argv[0]) != "gh":
         return None
-    if _has_terminal_help(argv, _GH_ALL_VALUE_FLAGS):
+    inv = gh_command(argv)
+    if inv is not None and _has_terminal_help(argv, inv):
         return None
     # The group/subcommand comes from `shell_parse.gh_command`, the shared
     # resolver every consumer now uses (#2209) — a hand-rolled walk here was
@@ -255,7 +264,6 @@ def _closes_a_pr(argv: list[str]) -> str | None:
     # close 1` and silenced a real close. Requiring the group position keeps
     # the measured negatives (`gh run list` naming a workflow, `gh label
     # create`, `gh alias set` carrying the words as operands) unreachable.
-    inv = gh_command(argv)
     if inv is not None and inv.group == "pr" and inv.subcommand == "close":
         return "`gh pr close`"
     call = _parse_api(argv)

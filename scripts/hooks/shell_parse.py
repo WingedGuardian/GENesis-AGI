@@ -3148,7 +3148,6 @@ _GH_ALL_BOOL_FLAGS = frozenset().union(*(b for _, b in _GH_FLAG_TABLE.values()))
 #: Groups that CONTAIN subcommands (the second bare word is a verb) versus
 #: leaf commands like ``api``, whose next bare word is an operand.
 _GH_GROUPS = frozenset({g for g, s in _GH_FLAG_TABLE if s})
-_GH_LEAF_COMMANDS = frozenset({g for g, s in _GH_FLAG_TABLE if not s})
 
 #: Root-level flags gh accepts before any command.
 _GH_ROOT_FLAGS = frozenset({"--help", "--version", "-h", "-v"})
@@ -3174,12 +3173,16 @@ def _gh_option(tok: str, value_flags: frozenset[str]) -> tuple[str, str | None]:
 
 class GhInvocation(NamedTuple):
     """A gh argv resolved to its command path, operands, and the dashed tokens
-    no modeled flag row could classify."""
+    no modeled flag row could classify. ``path_end`` is the argv index just
+    past the last command-path token: the boundary where a caller switches
+    from the union flag table to the resolved row's own.
+    """
 
     group: str
     subcommand: str | None
     positionals: tuple[str, ...]
     unmodelled: tuple[str, ...]
+    path_end: int
 
 
 def gh_command(argv: list[str]) -> GhInvocation | None:
@@ -3197,6 +3200,16 @@ def gh_command(argv: list[str]) -> GhInvocation | None:
     fail-open advisory the opposite. gh's own parser is closed-world, so an
     unmodelled flag most likely means the command exits 1 — but that is gh's
     claim, and a flag added by a newer release would make it wrong.
+
+    ``path_end`` lets a caller that scans argv for option VALUES (fields,
+    methods) apply the same two-phase grammar this walk does — the union
+    before the path, the resolved row after — rather than one flat set for
+    the whole argv. The flat set is wrong post-path: ``-i`` takes a value
+    under ``pr checks`` but none under ``api``, so a union-only scan reads
+    ``gh api … -i -X PATCH`` as ``-i`` consuming ``-X`` (the ``-i`` name is
+    in the union), hiding the PATCH. If the path never resolved (``path_end``
+    is 0), the union applies to the whole argv — matching gh, which eats the
+    "group" word as a flag value in exactly that case.
     """
     if not argv or _basename(argv[0]) != "gh":
         return None
@@ -3206,6 +3219,7 @@ def gh_command(argv: list[str]) -> GhInvocation | None:
     value_flags = _GH_ALL_VALUE_FLAGS
     bool_flags = _GH_ALL_BOOL_FLAGS | _GH_ROOT_FLAGS
     capacity = 1  # until the group word says otherwise
+    path_end = 0  # argv index just past the last command-path token
     i = 1
     while i < len(argv):
         tok = argv[i]
@@ -3228,6 +3242,7 @@ def gh_command(argv: list[str]) -> GhInvocation | None:
             if len(path) == 1 and path[0] in _GH_GROUPS:
                 capacity = 2
             if len(path) == capacity:
+                path_end = i + 1
                 row = _GH_FLAG_TABLE.get((path[0], path[1] if capacity == 2 else ""))
                 if row is not None:
                     value_flags, bool_flags = row[0], row[1] | _GH_ROOT_FLAGS
@@ -3236,7 +3251,13 @@ def gh_command(argv: list[str]) -> GhInvocation | None:
         i += 1
     if not path:
         return None
-    return GhInvocation(path[0], path[1] if len(path) > 1 else None, tuple(positionals), tuple(unmodelled))
+    return GhInvocation(
+        path[0],
+        path[1] if len(path) > 1 else None,
+        tuple(positionals),
+        tuple(unmodelled),
+        path_end,
+    )
 
 
 def gh_pr_subcommand(argv: list[str]) -> str | None:
