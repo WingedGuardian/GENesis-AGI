@@ -288,11 +288,13 @@ def test_a_failed_disable_reports_the_daemon_it_left_running(tmp_path):
     result = _run("falkordb_redis_install", env)
 
     assert result.returncode == 0, result.stderr
-    assert "disable --now' failed" in result.stdout
-    assert "still enabled on :6379" in result.stdout
+    assert "could not be" in result.stdout
+    assert "still enabled on" in result.stdout
     assert "system unit disabled" not in result.stdout, "claimed the posture anyway"
-    # And no 'completed provisioning' marker — a later run must retry the
-    # stand-down, not print 'already provisioned' over a live system daemon.
+    # The INSTALL marker IS written (the package is ours) but the completion
+    # marker is not — that split is what lets a later run retry exactly the
+    # unfinished stand-down instead of replaying 'already provisioned'.
+    assert Path(env["FALKORDB_INSTALL_MARKER"]).exists()
     assert not Path(env["FALKORDB_PROVISION_MARKER"]).exists()
 
 
@@ -307,6 +309,27 @@ def test_a_unit_still_enabled_after_disable_leaves_no_marker(tmp_path):
     assert not Path(env["FALKORDB_PROVISION_MARKER"]).exists()
 
 
+def test_an_incomplete_provisioning_retries_only_the_stand_down(tmp_path):
+    """We installed the package but the stand-down failed: the next run must
+    finish OUR step, not read our redis as the operator's and stop.
+
+    Without the install/completion marker split, a redis that is ours lands in
+    the same 'leave it alone' branch as one that is theirs — and the daemon we
+    created stays enabled on :6379 forever.
+    """
+    env = _stage(tmp_path)
+    env["DPKG_QUERY_STATUS"] = "installed"  # package on the box already
+    Path(env["FALKORDB_INSTALL_MARKER"]).write_text("2026-09-06T00:00:00Z\n")
+    # No FALKORDB_PROVISION_MARKER: this run must retry, not declare victory.
+
+    result = _run("falkordb_redis_install", env)
+    assert result.returncode == 0, result.stderr
+    assert "completed pending stand-down" in result.stdout
+    assert "your call" not in result.stdout, "read our own redis as the operator's"
+    assert "apt-get install" not in _apt_log(env), "re-installed instead of retrying"
+    assert Path(env["FALKORDB_PROVISION_MARKER"]).exists()
+
+
 def test_a_unit_still_enabled_after_disable_reports_it(tmp_path):
     """The disable can succeed while the unit stays enabled — verify, don't trust."""
     env = _stage(tmp_path)
@@ -316,6 +339,20 @@ def test_a_unit_still_enabled_after_disable_reports_it(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "still enabled" in result.stdout
     assert "system unit disabled" not in result.stdout, "claimed the posture anyway"
+
+
+def test_an_incomplete_retry_that_still_fails_keeps_retrying(tmp_path):
+    """A retry that fails must not write the completion marker either — the
+    NEXT retry must still know the stand-down is outstanding."""
+    env = _stage(tmp_path)
+    env["DPKG_QUERY_STATUS"] = "installed"
+    Path(env["FALKORDB_INSTALL_MARKER"]).write_text("2026-09-06T00:00:00Z\n")
+    env["SYSTEMCTL_RC"] = "1"
+
+    result = _run("falkordb_redis_install", env)
+    assert result.returncode == 0, result.stderr
+    assert "enabled on :6379" in result.stdout
+    assert not Path(env["FALKORDB_PROVISION_MARKER"]).exists()
 
 
 def test_an_unpinned_architecture_changes_nothing_on_the_system(tmp_path):

@@ -112,6 +112,7 @@ def _stage(tmp_path: Path) -> dict:
         # would depend on whether the machine running the suite has redis
         # installed — which it does, on any box that has run this provisioning.
         "FALKORDB_REDIS_BINARIES": "falkordb-test-absent-binary",
+        "FALKORDB_INSTALL_MARKER": str(tmp_path / "installed.marker"),
         "FALKORDB_PROVISION_MARKER": str(tmp_path / "provisioned.marker"),
         # The system half is opt-in; tests that exercise it must say so, the
         # same way an operator has to. The consent tests below override this.

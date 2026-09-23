@@ -119,11 +119,17 @@ _falkordb_opted_in() {
         END { exit(found ? 0 : 1) }
     ' "$FALKORDB_LOCAL_CONFIG" 2>/dev/null
 }
-# Provenance marker. NOT the apt list file: SETUP.md tells operators with a
-# pre-existing redis to create exactly that path by hand, and upstream's own
-# install docs produce it too — so branching on it would have Genesis claim
-# credit for a system change it explicitly declined to make. This file is
-# written only by us, only after our own successful install.
+# Provenance markers — two, because "we installed the package" and "we
+# finished standing its system unit down" are different facts. The INSTALL
+# marker is written right after apt-get install succeeds; the PROVISION marker
+# only after the stand-down verifies. A run killed between the two leaves a
+# redis that is ours-and-unfinished rather than mistaken for an operator's —
+# and the next run retries exactly the unfinished step.
+# Neither is the apt list file: SETUP.md tells operators with a pre-existing
+# redis to create exactly that path by hand, and upstream's own install docs
+# produce it too — so branching on it would have Genesis claim credit for a
+# system change it explicitly declined to make.
+FALKORDB_INSTALL_MARKER="${FALKORDB_INSTALL_MARKER:-$FALKORDB_DEPS_DIR/.redis-installed-by-genesis}"
 FALKORDB_PROVISION_MARKER="${FALKORDB_PROVISION_MARKER:-$FALKORDB_DEPS_DIR/.redis-provisioned-by-genesis}"
 # Binaries that mean "someone else's redis is already here". A seam because
 # `command -v` searches the real PATH, which a stubbed test environment cannot
@@ -355,6 +361,19 @@ falkordb_redis_install() {
         # that trains people to ignore output.
         if [ -f "$FALKORDB_PROVISION_MARKER" ]; then
             echo "  OK: redis-server already provisioned."
+        elif [ -f "$FALKORDB_INSTALL_MARKER" ]; then
+            # Ours, but unfinished: a previous run installed the package and
+            # failed (or never reached) the stand-down. Retry JUST that step —
+            # the operator-decision message below is for a redis that is not
+            # ours, and printing it here would abandon our own daemon on :6379.
+            if _falkordb_stand_down_system_redis; then
+                date -u +%Y-%m-%dT%H:%M:%SZ > "$FALKORDB_PROVISION_MARKER" 2>/dev/null || true
+                echo "  OK: redis-server provisioned (completed pending stand-down)."
+            else
+                echo "  WARNING: redis-server is ours, but its system unit is still"
+                echo "           enabled on :6379. Stand it down by hand:"
+                echo "           sudo systemctl disable --now redis-server"
+            fi
         else
             echo "  Skipped: redis-server is already installed — leaving it, and the apt repo, alone."
             echo "           FalkorDB needs >= $FALKORDB_MIN_REDIS. Adding the upstream repo would"
@@ -494,39 +513,44 @@ falkordb_redis_install() {
         return 0
     fi
 
+    # Record WE installed the package BEFORE attempting the stand-down: the
+    # install marker is what lets a later run distinguish our incomplete
+    # provisioning from an operator-owned redis, and retry only the stand-down.
+    mkdir -p "$(dirname "$FALKORDB_INSTALL_MARKER")" 2>/dev/null || true
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$FALKORDB_INSTALL_MARKER" 2>/dev/null || true
+
     # The deb enables a SYSTEM redis on 6379. Genesis does not want it: our unit
     # is a per-user instance with --port 0 that speaks only over a unix socket.
-    #
-    # Reached only when _falkordb_redis_present said no, so this stands down a
-    # unit THIS run created. Record that, both so a re-run can tell our work
-    # from an operator's and so the disable is never replayed against a redis
-    # someone installed afterwards.
-    # Standing the package's system unit down is part of provisioning, not
-    # cosmetic: if it fails, a second redis keeps running on :6379 across
-    # reboots, so failure must never read as the socket-only posture.
+    # Standing that unit down is part of provisioning, not cosmetic: if it
+    # fails, a second redis keeps running on :6379 across reboots, so failure
+    # must never read as the socket-only posture.
+    if _falkordb_stand_down_system_redis; then
+        # The completion marker records a FINISHED provisioning — including the
+        # verified stand-down. Written only here so a failed disable is retried
+        # on the next run rather than replayed as 'already provisioned'.
+        date -u +%Y-%m-%dT%H:%M:%SZ > "$FALKORDB_PROVISION_MARKER" 2>/dev/null || true
+        echo "  Installed: redis-server (system unit disabled — Genesis uses a socket-only user unit)"
+    else
+        echo "  WARNING: redis-server installed, but its system unit could not be"
+        echo "           stood down — the package's system redis is still enabled on"
+        echo "           :6379. Stand it down by hand:"
+        echo "           sudo systemctl disable --now redis-server"
+    fi
+    return 0
+}
+
+# _falkordb_stand_down_system_redis — disable AND verify the package's system
+# unit, in one step both call sites share: the fresh-install path and the
+# retry path for an incomplete earlier provisioning. rc 0 only when the unit
+# is disabled for real; every failure is the caller's to report.
+_falkordb_stand_down_system_redis() {
+    local rc
     rc=0
     sudo systemctl disable --now redis-server >/dev/null 2>&1 || rc=$?
-    if [ "$rc" -ne 0 ]; then
-        echo "  WARNING: redis-server installed, but 'systemctl disable --now' failed (rc=$rc):"
-        echo "           the package's system redis is still enabled on :6379. Stand it"
-        echo "           down by hand: sudo systemctl disable --now redis-server"
-        return 0
-    fi
+    [ "$rc" -eq 0 ] || return 1
     rc=0
     sudo systemctl is-enabled --quiet redis-server >/dev/null 2>&1 || rc=$?
-    if [ "$rc" -eq 0 ]; then
-        echo "  WARNING: redis-server installed, but its system unit is still enabled"
-        echo "           after disable — stand it down by hand:"
-        echo "           sudo systemctl disable --now redis-server"
-        return 0
-    fi
-    # The marker records a COMPLETED provisioning — including the stand-down.
-    # Written only after both checks pass so a failed disable is retried on the
-    # next run rather than replayed as 'already provisioned' forever.
-    mkdir -p "$(dirname "$FALKORDB_PROVISION_MARKER")" 2>/dev/null || true
-    date -u +%Y-%m-%dT%H:%M:%SZ > "$FALKORDB_PROVISION_MARKER" 2>/dev/null || true
-    echo "  Installed: redis-server (system unit disabled — Genesis uses a socket-only user unit)"
-    return 0
+    [ "$rc" -ne 0 ]
 }
 
 # falkordb_provision — the single entry point bootstrap calls.
