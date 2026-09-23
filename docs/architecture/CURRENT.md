@@ -1115,7 +1115,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: d0627c854 2026-09-11
+verified: a81851746 2026-09-16
 ```
 
 - **channels/**: adapter framework. Telegram (`bridge.py` =
@@ -1158,8 +1158,11 @@ verified: d0627c854 2026-09-11
   live runtime (stale-but-functional).
 - **hosting/**: the OUTER layer that calls the runtime. `standalone.py` is the
   default (`python -m genesis serve`; also hosts the OpenClaw
-  `/v1/chat/completions` endpoint, and registers the desk brain at
-  `/v1/desk/chat/completions` — `dashboard/routes/desk_api.py`, an
+  `/v1/chat/completions` endpoint, the bearer-gated agent-to-agent
+  connector at `/v1/agent/*` (published through a path-scoped tailnet
+  listener rather than by opening the dashboard port -- that port also
+  carries the OpenClaw route, which has no auth of its own), and the desk
+  brain at `/v1/desk/chat/completions` — `dashboard/routes/desk_api.py`, an
   OpenAI-compatible surface that routes each turn through `ModelRouter` on two
   lanes rather than spawning a CC subprocess, so a desktop client holds no model
   credential. Bearer-authed with `GENESIS_MCP_HTTP_TOKEN`; text-only, and an

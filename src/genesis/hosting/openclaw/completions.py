@@ -43,6 +43,7 @@ import uuid
 from flask import Blueprint, Response, current_app, jsonify, request
 
 from genesis.cc.types import ChannelType
+from genesis.hosting.openai_messages import extract_last_user_message
 from genesis.dashboard.auth import check_bearer_token
 
 logger = logging.getLogger("genesis.hosting.openclaw")
@@ -79,7 +80,12 @@ def chat_completions():
 
     conversation_loop = current_app.config.get("OPENCLAW_CONVERSATION_LOOP")
     event_loop = current_app.config.get("GENESIS_EVENT_LOOP")
-    if conversation_loop is None or event_loop is None:
+    # is_running() matters, not just existence: with a configured-but-stopped
+    # loop (shutdown being the ordinary case) run_coroutine_threadsafe raises
+    # RuntimeError, so the caller gets a 500 while the coroutine it just
+    # created is never awaited. The 503 below is the response that case wants.
+    if (conversation_loop is None or event_loop is None
+            or not getattr(event_loop, "is_running", lambda: True)()):
         # Fallback: ConversationLoop not initialized (e.g., DB unavailable)
         return jsonify({"error": "ConversationLoop not available", "type": "error"}), 503
 
@@ -208,24 +214,7 @@ def _stream_response(conversation_loop, event_loop, user_message, session_key, c
     yield "data: [DONE]\n\n"
 
 
-def _extract_last_user_message(messages: list) -> str | None:
-    """Extract the text of the most recent user message.
-
-    Handles both string content and OpenAI multimodal content arrays
-    (``[{"type": "text", "text": "..."}]``).  Returns None if no valid
-    user message is found.
-    """
-    for m in reversed(messages):
-        if not isinstance(m, dict) or m.get("role") != "user":
-            continue
-        content = m.get("content")
-        if isinstance(content, str) and content.strip():
-            return content
-        if isinstance(content, list):
-            # Multimodal: extract first text block
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text = block.get("text", "")
-                    if text.strip():
-                        return text
-    return None
+# Moved to genesis.hosting.openai_messages so the agent connector shares ONE
+# parser with this endpoint instead of carrying a second copy. Re-exported
+# under the original private name to keep existing callers and tests working.
+_extract_last_user_message = extract_last_user_message

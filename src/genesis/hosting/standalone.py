@@ -464,7 +464,10 @@ class StandaloneAdapter:
             )
 
             self._app.config["OPENCLAW_CONVERSATION_LOOP"] = conversation_loop
-            logger.info("OpenClaw ConversationLoop initialized")
+            # Vendor-neutral alias: the same loop, under a name that does not
+            # imply an OpenClaw-only consumer. The agent connector reads this.
+            self._app.config["GENESIS_CONVERSATION_LOOP"] = conversation_loop
+            logger.info("ConversationLoop initialized (OpenClaw + agent connector)")
         except Exception:
             logger.exception("Failed to initialize OpenClaw ConversationLoop")
 
@@ -767,6 +770,25 @@ class StandaloneAdapter:
                 )
         except Exception:
             logger.exception("Failed to register voice API blueprint")
+
+        # Agent-to-agent connector blueprint
+        try:
+            from genesis.dashboard.routes.agent_api import agent_api_bp
+
+            if "agent_api" not in app.blueprints:
+                app.register_blueprint(agent_api_bp)
+                logger.info("Agent connector blueprint registered")
+            from genesis.dashboard.routes._bearer import token_is_configured
+
+            if not token_is_configured("GENESIS_AGENT_API_TOKEN"):
+                logger.warning(
+                    "agent connector disabled: GENESIS_AGENT_API_TOKEN not "
+                    "configured (unset, blank, or under 16 chars) - all "
+                    "/v1/agent/* routes answer 503 (fail-closed; set a strong "
+                    "token in secrets.env to enable it)"
+                )
+        except Exception:
+            logger.exception("Failed to register agent connector blueprint")
 
         # Desk brain API — a desktop assistant's router-backed brain.
         try:

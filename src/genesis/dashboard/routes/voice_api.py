@@ -25,7 +25,7 @@ from flask import Blueprint, current_app, jsonify, request
 
 from genesis.channels.voice.graduation import validate_envelope
 from genesis.channels.voice.transcript_writer import validate_conversation
-from genesis.dashboard.auth import check_bearer_token
+from genesis.dashboard.routes._bearer import require_bearer
 
 logger = logging.getLogger("genesis.dashboard.voice_api")
 
@@ -36,13 +36,50 @@ _FUTURE_TIMEOUT_SECONDS = 8.0
 
 
 def _check_voice_token() -> tuple[str, int] | None:
-    """Validate Bearer token. Returns (error message, http status) or None if OK.
+    """Validate Bearer token. Returns (error message, http status) or OK (None).
 
-    Thin wrapper over the shared ``/v1/*`` bearer check so every machine-caller
-    surface enforces one implementation; the wrapper is kept because this
-    module's six routes call it by name.
+    Fail-closed: when ``GENESIS_MCP_HTTP_TOKEN`` is not configured, every
+    ``/v1/voice/*`` route answers 503 — a write surface (``/v1/voice/graduate``)
+    shares this token model, so open-by-default is not acceptable even on a
+    trusted network. Set the token in ``secrets.env`` to enable the voice API
+    (the standalone host logs a boot-time warning when it is missing).
+
+    Delegates to the shared ``require_bearer``. This function previously
+    carried its own copy of the check, and that copy had three defects the
+    shared one fixes: it compared ``str`` (so a non-ASCII Authorization header
+    raised ``TypeError`` inside ``hmac.compare_digest`` and returned 500 with a
+    traceback to an UNAUTHENTICATED caller, since Werkzeug decodes headers as
+    latin-1); it accepted a whitespace-only or one-character token as
+    configured while the boot log reported the surface enabled; and it matched
+    the scheme case-sensitively, refusing a client that is conformant with
+    RFC 7235 section 2.1. The wire-visible messages are unchanged.
+    Fail-closed: when ``GENESIS_MCP_HTTP_TOKEN`` is not set, every
+    ``/v1/voice/*`` route answers 503 — a write surface (``/v1/voice/graduate``)
+    shares this token model, so open-by-default is not acceptable even on a
+    trusted network. Set the token in ``secrets.env`` to enable the voice API
+    (the standalone host logs a boot-time warning when it is missing).
     """
-    return check_bearer_token("voice API")
+    # min_chars=1 deliberately. The shared helper defaults to a 16-character
+    # floor, which is right for a NEW surface -- but this one is live, and
+    # MEASURED: applying that floor here turns a shorter existing token into
+    # "not configured" and 503s the whole voice API. Raising the floor on an
+    # integration someone already configured is a breaking policy change and
+    # wants its own decision, not a ride-along with a bug fix. Empty and
+    # whitespace-only are still refused.
+    return require_bearer("GENESIS_MCP_HTTP_TOKEN", "voice API", min_chars=1)
+    token = os.environ.get("GENESIS_MCP_HTTP_TOKEN", "")
+    if not token:
+        return ("voice API disabled: GENESIS_MCP_HTTP_TOKEN not configured", 503)
+
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return ("Missing or invalid Authorization header", 401)
+
+    request_token = auth_header[7:]
+    if not hmac.compare_digest(request_token, token):
+        return ("Invalid bearer token", 401)
+
+    return None
 
 
 @voice_api_bp.route("/v1/voice/chat/completions", methods=["POST"])
