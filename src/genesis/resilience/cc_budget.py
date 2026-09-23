@@ -53,12 +53,27 @@ class CCBudgetTracker:
         entries, not CC invocations — they must not consume the budget or
         trigger throttling.
         """
+        # The cutoff is built in PYTHON, so both sides of the comparison below
+        # are ISO-8601 with a 'T' and the lexical compare is correct. This is
+        # the counterexample to the julianday() conversions elsewhere in this
+        # subsystem: those were wrong because their cutoff came from SQLite's
+        # datetime(), which renders a SPACE where the stored value has 'T'.
+        # Either generate both sides here or push both through julianday() —
+        # never mix the two.
         cutoff = (self._clock() - timedelta(hours=1)).isoformat()
         cursor = await self._db.execute(
             """SELECT COUNT(*) FROM cc_sessions
                WHERE started_at > ?
                  AND status IN ('active', 'completed', 'expired', 'checkpointed', 'failed')
-                 AND source_tag != 'voice'""",
+                 -- COALESCE for CONSISTENCY with the four sibling predicates
+                 -- in db/crud/cc_sessions.py, not to fix a live defect: the
+                 -- column is `TEXT NOT NULL DEFAULT 'foreground'`
+                 -- (db/schema/_tables.py), so a NULL is impossible here and
+                 -- MEASURED 0 of 5,023 live rows carry one. `NULL != 'voice'`
+                 -- would evaluate to NULL rather than true, so if the
+                 -- constraint were ever relaxed this predicate would silently
+                 -- drop those rows from the budget.
+                 AND COALESCE(source_tag, '') != 'voice'""",
             (cutoff,),
         )
         row = await cursor.fetchone()

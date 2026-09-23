@@ -207,6 +207,9 @@ class TestModelSource:
         monkeypatch.setattr(mod, "read_payload", lambda: {"session_id": sid, "model": "opus-x"})
         monkeypatch.setattr(mod, "_claude_ancestor", lambda _pid: (200, ["claude"]))
         monkeypatch.setattr(mod.os, "getppid", lambda: 300)
+        # The roster var outranks the payload by design, so a real one in the
+        # ambient environment would make this cell assert the wrong winner.
+        monkeypatch.delenv("GENESIS_ROSTER_MODEL", raising=False)
 
         db_file = tmp_path / "genesis.db"
         conn = await aiosqlite.connect(db_file)
@@ -226,3 +229,102 @@ class TestModelSource:
             "SELECT model FROM cc_sessions WHERE id = ?", (sid,)
         ).fetchone()
         assert row and row[0] == "opus-x"
+
+    @pytest.mark.asyncio
+    async def test_roster_model_outranks_the_payload(self, tmp_path, monkeypatch):
+        """A ROUTED peer session must record the roster model, not CC's.
+
+        `scripts/gmodel` launches a peer window with GENESIS_ROSTER_MODEL set
+        precisely because CC's self-reported model says "Claude" for a peer —
+        `session_heartbeat.cached_model` gives that var precedence for the same
+        reason. Reading the payload FIRST (as an earlier revision did) silently
+        inverted that, so `cc_sessions.model` recorded Claude while
+        `session_heartbeats.model` recorded the peer: two tables disagreeing
+        about one session."""
+        import genesis.env
+        from genesis.db.schema import create_all_tables
+
+        mod = _load()
+        sid = "s-roster-model"
+        monkeypatch.setattr(
+            mod, "read_payload", lambda: {"session_id": sid, "model": "claude-opus-5"}
+        )
+        monkeypatch.setattr(mod, "_claude_ancestor", lambda _pid: (200, ["claude"]))
+        monkeypatch.setattr(mod.os, "getppid", lambda: 300)
+        monkeypatch.setenv("GENESIS_ROSTER_MODEL", "glm-5.3")
+
+        db_file = tmp_path / "genesis.db"
+        conn = await aiosqlite.connect(db_file)
+        await create_all_tables(conn)
+        await conn.commit()
+        await conn.close()
+        monkeypatch.setattr(genesis.env, "genesis_db_path", lambda: db_file)
+
+        mod.main()
+
+        row = sqlite3.connect(db_file).execute(
+            "SELECT model FROM cc_sessions WHERE id = ?", (sid,)
+        ).fetchone()
+        assert row and row[0] == "glm-5.3", (
+            "the routed identity must outrank CC's self-report"
+        )
+
+    @pytest.mark.asyncio
+    async def test_payload_still_wins_when_no_roster_var(self, tmp_path, monkeypatch):
+        """Negative control: without the roster var the payload must still win,
+        or the fix above would have simply broken the ordinary path."""
+        import genesis.env
+        from genesis.db.schema import create_all_tables
+
+        mod = _load()
+        sid = "s-no-roster"
+        monkeypatch.setattr(
+            mod, "read_payload", lambda: {"session_id": sid, "model": "opus-x"}
+        )
+        monkeypatch.setattr(mod, "_claude_ancestor", lambda _pid: (200, ["claude"]))
+        monkeypatch.setattr(mod.os, "getppid", lambda: 300)
+        monkeypatch.delenv("GENESIS_ROSTER_MODEL", raising=False)
+
+        db_file = tmp_path / "genesis.db"
+        conn = await aiosqlite.connect(db_file)
+        await create_all_tables(conn)
+        await conn.commit()
+        await conn.close()
+        monkeypatch.setattr(genesis.env, "genesis_db_path", lambda: db_file)
+
+        import session_heartbeat
+
+        monkeypatch.setattr(session_heartbeat, "cached_model", lambda _sid: "cache-loses")
+        mod.main()
+
+        row = sqlite3.connect(db_file).execute(
+            "SELECT model FROM cc_sessions WHERE id = ?", (sid,)
+        ).fetchone()
+        assert row and row[0] == "opus-x"
+
+
+class TestHeadlessDetection:
+    """`--print=<value>` is a real CC spelling, and an exact-token membership
+    test misses it — registering a duplicate terminal row racing the managed
+    one, which is the outcome this module exists to prevent."""
+
+    def test_joined_print_form_is_headless(self):
+        mod = _load()
+        assert mod._is_headless(["claude", "--print=hello world"]) is True
+
+    def test_separated_forms_are_headless(self):
+        mod = _load()
+        assert mod._is_headless(["claude", "--print", "hi"]) is True
+        assert mod._is_headless(["claude", "-p", "hi"]) is True
+
+    def test_interactive_is_not_headless(self):
+        mod = _load()
+        assert mod._is_headless(["claude"]) is False
+        assert mod._is_headless(["claude", "--permission-mode", "plan"]) is False
+
+    def test_short_flag_is_matched_exactly_not_by_prefix(self):
+        """A prefix test on `-p` would swallow every other short flag starting
+        with p, so the short form stays an exact match."""
+        mod = _load()
+        assert mod._is_headless(["claude", "-print-nothing"]) is False
+        assert mod._is_headless(["claude", "--printer"]) is False

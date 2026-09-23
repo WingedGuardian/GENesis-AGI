@@ -362,6 +362,7 @@ async def checkpoint_dark(
     *,
     checkpointed_at: str,
     expected_last_activity: str | None | object = _ACTIVITY_UNSET,
+    heartbeat_fresh_after: str | None = None,
 ) -> bool:
     """Relabel a dark (abandoned) foreground row ``active`` → ``checkpointed``.
 
@@ -379,20 +380,43 @@ async def checkpoint_dark(
     catch that race. Passing the candidate row's observed
     ``last_activity_at`` makes the write conditional on the liveness stamp
     being unchanged — a revived row is left active for the next pass.
+
+    ``heartbeat_fresh_after`` closes the REMAINING race, which neither guard
+    above can reach. The reaper snapshots the alive-proof set
+    (``_fresh_heartbeat_ids``) once per pass and then processes rows one at a
+    time; a heartbeat committed after that snapshot leaves BOTH guards
+    satisfied, because ``session_observer_hook`` writes ``session_heartbeats``
+    ONLY — it never touches ``cc_sessions.last_activity_at`` — and the
+    proactive hook writes the two in separate transactions. The window is
+    sub-millisecond for the first row and seconds-to-minutes for the tail of a
+    full ``max_per_tick`` pass, against a 10-minute staleness threshold, and
+    the cost of losing it is an alert telling the user nothing is running on a
+    session that IS running. Passing the cutoff re-checks freshness INSIDE
+    this statement, so the read and the write are one atomic operation rather
+    than two with a pass between them.
     """
-    if expected_last_activity is _ACTIVITY_UNSET:
-        cursor = await db.execute(
-            "UPDATE cc_sessions SET status = 'checkpointed', checkpointed_at = ? "
-            "WHERE id = ? AND status = 'active'",
-            (checkpointed_at, id),
+    clauses = ["id = ?", "status = 'active'"]
+    params: list[object] = [checkpointed_at, id]
+    if expected_last_activity is not _ACTIVITY_UNSET:
+        clauses.append("COALESCE(last_activity_at, '') = COALESCE(?, '')")
+        params.append(expected_last_activity)
+    if heartbeat_fresh_after is not None:
+        # Correlated on cc_session_id, which is what the heartbeat plane keys
+        # on. A row with a NULL cc_session_id matches nothing here and so is
+        # NOT protected — that is pre-existing (the reaper's own filter keys
+        # on the same column) and is left alone deliberately rather than
+        # silently changed under a race fix.
+        clauses.append(
+            "NOT EXISTS (SELECT 1 FROM session_heartbeats h "
+            "WHERE h.cc_session_id = cc_sessions.cc_session_id "
+            "AND h.updated_at > ?)"
         )
-    else:
-        cursor = await db.execute(
-            "UPDATE cc_sessions SET status = 'checkpointed', checkpointed_at = ? "
-            "WHERE id = ? AND status = 'active' "
-            "AND COALESCE(last_activity_at, '') = COALESCE(?, '')",
-            (checkpointed_at, id, expected_last_activity),
-        )
+        params.append(heartbeat_fresh_after)
+    cursor = await db.execute(
+        "UPDATE cc_sessions SET status = 'checkpointed', checkpointed_at = ? "
+        "WHERE " + " AND ".join(clauses),
+        tuple(params),
+    )
     await db.commit()
     return cursor.rowcount > 0
 
@@ -857,10 +881,25 @@ async def get_status_counts(
     *,
     hours: int = 24,
 ) -> dict[str, int]:
-    """Count sessions by status within the given time window."""
+    """Count sessions by status within the given time window.
+
+    Compares through ``julianday()`` on BOTH operands, for the reason the
+    snapshot reader documents: ``started_at`` is ISO-8601 text with a ``T``
+    while ``datetime('now', …)`` renders with a SPACE, and ``T`` (0x54) sorts
+    after ``' '`` (0x20) — so a lexical compare admits every row sharing the
+    cutoff's calendar date regardless of its time.
+
+    The size of the error is therefore TIME-OF-DAY dependent, not a constant:
+    it is zero just after midnight UTC and grows through the day as more rows
+    fall inside the over-admitted date. MEASURED on the live table on
+    2026-09-23, three times across ~90 minutes, the lexical form returned 45
+    where this one returned 41, then 36, then 33 — same defect, three
+    different numbers, which is why the mechanism is stated here and the
+    figure is not.
+    """
     cursor = await db.execute(
         "SELECT status, COUNT(*) FROM cc_sessions "
-        "WHERE started_at >= datetime('now', ? || ' hours') "
+        "WHERE julianday(started_at) >= julianday('now', ? || ' hours') "
         "GROUP BY status",
         (f"-{hours}",),
     )
@@ -874,10 +913,15 @@ async def get_recent_topics(
     session_type: str = "foreground",
     limit: int = 15,
 ) -> list[str]:
-    """Get recent non-empty session topics."""
+    """Get recent non-empty session topics.
+
+    ``julianday()`` on both operands — same reason as ``get_status_counts``
+    above: a lexical ISO-vs-``datetime('now')`` compare widens the window to
+    the whole cutoff calendar date.
+    """
     cursor = await db.execute(
         "SELECT topic FROM cc_sessions "
-        "WHERE started_at >= datetime('now', ? || ' hours') "
+        "WHERE julianday(started_at) >= julianday('now', ? || ' hours') "
         "AND session_type = ? "
         "AND topic != '' AND topic IS NOT NULL "
         "ORDER BY started_at DESC LIMIT ?",

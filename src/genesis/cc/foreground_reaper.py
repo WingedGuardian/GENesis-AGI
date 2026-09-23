@@ -329,12 +329,23 @@ def _pid_dead(pid: int, row: dict) -> bool:
     return started > anchor
 
 
-async def _fresh_heartbeat_ids(db: Any, *, now: datetime) -> set[str]:
-    """cc_session_ids with a heartbeat inside the freshness window — the
-    ALIVE-proof set. Injectable ``now`` (no wall clock) so tests and the
-    reaper share one cutoff; the window is the heartbeats table's own
-    staleness convention."""
-    cutoff = (now - session_heartbeats._STALE_THRESHOLD).isoformat()
+def _heartbeat_cutoff(now: datetime) -> str:
+    """The freshness boundary for alive-proof, as an ISO string.
+
+    ONE definition, used by both the pass-level snapshot and the per-row
+    write guard inside ``checkpoint_dark``. They must not each derive their
+    own: two cutoffs computed at different moments disagree by exactly the
+    window the write guard exists to close.
+
+    The window is the heartbeats table's own staleness convention rather than
+    a number chosen here."""
+    return (now - session_heartbeats._STALE_THRESHOLD).isoformat()
+
+
+async def _fresh_heartbeat_ids(db: Any, *, cutoff: str) -> set[str]:
+    """cc_session_ids with a heartbeat newer than ``cutoff`` — the ALIVE-proof
+    set. Takes the cutoff rather than computing one from ``now`` so the caller
+    can hand the SAME string to the per-row write guard."""
     cur = await db.execute(
         "SELECT cc_session_id FROM session_heartbeats WHERE updated_at > ?",
         (cutoff,),
@@ -350,6 +361,7 @@ async def _process_row(
     now: datetime,
     cutoff: datetime,
     age_cutoff: datetime | None = None,
+    heartbeat_cutoff: str | None = None,
     mode: str,
     result: dict,
 ) -> None:
@@ -359,15 +371,22 @@ async def _process_row(
     ``age_cutoff`` is the unanswered-turn age guard for THIS row's eligibility
     evidence: rows admitted on PID-proven death use the dead-process cutoff
     (a dead process cannot be a mid-flight turn), while timestamp-only rows
-    keep the full idle cutoff. Defaults to ``cutoff``."""
+    keep the full idle cutoff. Defaults to ``cutoff``.
+
+    ``heartbeat_cutoff`` is the SAME freshness cutoff the pass-level alive-proof
+    filter used, re-applied inside the checkpoint write. The pass-level filter
+    is a snapshot taken once; this row may be processed seconds or minutes
+    later, and a heartbeat landing in between is invisible to that snapshot."""
     won = await cc_sessions.checkpoint_dark(
         db,
         row["id"],
         checkpointed_at=now.isoformat(),
         expected_last_activity=row.get("last_activity_at"),
+        heartbeat_fresh_after=heartbeat_cutoff,
     )
     if not won:
-        # A concurrent turn revived the row between the query and this write.
+        # A concurrent turn revived the row, or a heartbeat arrived after the
+        # pass-level snapshot, between the query and this write.
         return
     result["reaped"] += 1
 
@@ -474,7 +493,32 @@ async def reap_dark_foreground(
         for row in fast_rows:
             if row["id"] in seen:
                 continue  # already in the 24h set; process once
-            if _pid_dead(row["pid"], row):
+            # ISOLATED PER ROW, like the processing loop below — because this
+            # loop sits OUTSIDE that loop's try, so a raise here aborts the
+            # WHOLE pass: not just the fast path, but the already-fetched
+            # 24h-idle rows, the alive-proof read, and every checkpoint.
+            #
+            # `_pid_dead`'s own /proc handling is COMPLETE — it catches
+            # (OSError, UnicodeError) and fails open — so this is not about an
+            # unreadable /proc entry, and an earlier draft of this comment
+            # claimed otherwise. What can still escape is a MALFORMED ROW:
+            # `row["pid"]` raises KeyError if the column is missing, and the
+            # `started > anchor` compare raises TypeError if a timestamp is
+            # not a string. Neither should be possible from the CRUD query,
+            # which is exactly why neither would be noticed — the cost of
+            # being wrong is a silently dead reaper, and the cost of the guard
+            # is three lines.
+            try:
+                is_dead = _pid_dead(row["pid"], row)
+            except Exception:
+                logger.warning(
+                    "foreground reaper: liveness check failed for %s — "
+                    "treating as ALIVE (absence of evidence is not death)",
+                    str(row.get("id", "?"))[:8],
+                    exc_info=True,
+                )
+                continue
+            if is_dead:
                 dead_ids.add(row["id"])
                 rows.append(row)
 
@@ -483,7 +527,13 @@ async def reap_dark_foreground(
     # not be checkpointed under an active user, and a "dead pid" verdict on a
     # heartbeating row means OUR pid evidence is stale, not the session.
     # Heartbeat ABSENCE proves nothing (idle-at-prompt sessions don't beat).
-    fresh = await _fresh_heartbeat_ids(db, now=now)
+    # ONE cutoff for both the pass-level filter and the per-row write guard.
+    # Derived once and threaded through so the snapshot below and the
+    # `NOT EXISTS` inside `checkpoint_dark` can never disagree about what
+    # "fresh" means — two independently-computed cutoffs would reintroduce
+    # the race this closes.
+    heartbeat_cutoff = _heartbeat_cutoff(now)
+    fresh = await _fresh_heartbeat_ids(db, cutoff=heartbeat_cutoff)
     if fresh:
         rows = [r for r in rows if r.get("cc_session_id") not in fresh]
 
@@ -506,6 +556,7 @@ async def reap_dark_foreground(
                 now=now,
                 cutoff=cutoff,
                 age_cutoff=dead_cutoff if row["id"] in dead_ids else cutoff,
+                heartbeat_cutoff=heartbeat_cutoff,
                 mode=mode,
                 result=result,
             )

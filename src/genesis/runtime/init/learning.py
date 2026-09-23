@@ -19,6 +19,44 @@ if TYPE_CHECKING:
 logger = logging.getLogger("genesis.runtime")
 
 
+#: Upper bound on the dead-pid sweep's poll interval, in minutes. CLAUDE.md:
+#: an ``IntervalTrigger`` counts from scheduler start and RESETS on restart, so
+#: anything longer than an hour may never fire on a box that restarts often.
+_DEAD_PID_MAX_INTERVAL_MIN = 60
+
+
+def _build_dead_pid_trigger(configured_minutes: int):
+    """The ``session_reaper_dead_pid`` poll trigger for a configured value.
+
+    ``dead_process_minutes`` answers *"how long before a dead process counts as
+    dead"*. It is NOT *"how often we look"*, and fusing the two is what makes
+    this cadence a hazard: ``knob_int`` enforces only ``> 0``, so an overlay —
+    or ``settings_update``, which accepts any positive int — can drive the poll
+    interval anywhere.
+
+    So the interval is CAPPED rather than converted. Polling more often than
+    the eligibility age is harmless (a ``dead_only`` pass is the cheap
+    candidate query plus a ``/proc`` check; an early pass simply finds
+    nothing), which makes the cap free, and it keeps this trigger inside the
+    1-hour rule BY CONSTRUCTION at every config value.
+
+    Deliberately NOT a ``CronTrigger`` above the cap, which an earlier revision
+    of this fix used: it built ``hour="*/{N}"`` from the config value, and
+    ``hour`` has range 0-23, so **N > 23 raised ValueError**. ``init()`` wraps
+    its body in one broad ``except Exception``, so that raise would have been
+    swallowed along with the remaining ``add_job`` calls and
+    ``scheduler.start()`` — killing the entire learning scheduler over a config
+    value that was harmless before the "fix". A guard against a bad overlay
+    must not be the thing a bad overlay detonates. Returning one trigger type
+    for every input is what makes that unrepeatable.
+    """
+    from apscheduler.triggers.interval import IntervalTrigger
+
+    return IntervalTrigger(
+        minutes=min(configured_minutes, _DEAD_PID_MAX_INTERVAL_MIN)
+    )
+
+
 def _wire_drip_retention_jobs(scheduler, rt) -> None:
     """Register restart-safe 90d retention jobs for the genesis.db drip tables.
 
@@ -1290,18 +1328,24 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _reap_dead_foreground,
-            IntervalTrigger(
-                minutes=knob_int(load_config(), "dead_process_minutes"),
-            ),
+            _build_dead_pid_trigger(knob_int(load_config(), "dead_process_minutes")),
             id="session_reaper_dead_pid",
             max_instances=1,
             misfire_grace_time=3600,
         )
-        # The boot-time sweep kick for this job lives at the END of
+        # `session_reaper`'s boot-time sweep kick lives at the END of
         # GenesisRuntime.bootstrap() (not here) — session end-hooks (e.g. the
         # ego's dispatch-outcome tracker) register during LATER init steps,
         # and a sweep fired from learning init would expire orphaned rows
         # before those hooks exist.
+        #
+        # It kicks `get_job("session_reaper")` SPECIFICALLY, not this job —
+        # this comment sat directly under `session_reaper_dead_pid`'s add_job
+        # and read as though it covered it. `session_reaper_dead_pid` has no
+        # boot kick of its own and needs none: `session_reaper`'s handler
+        # calls `reap_dark_foreground(rt)` with `dead_only=False`, which runs
+        # the dead-pid fast path too. What a restart costs is this job's
+        # dedicated cadence, not the capability.
 
         async def _refresh_capability_map() -> None:
             if rt._db is None:

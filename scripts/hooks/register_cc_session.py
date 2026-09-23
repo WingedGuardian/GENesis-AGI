@@ -69,6 +69,20 @@ def _claude_ancestor(start_pid: int) -> tuple[int, list[str]] | None:
     return None
 
 
+def _is_headless(argv: list[str]) -> bool:
+    """True when this `claude` invocation is a headless (-p/--print) run.
+
+    Matched by PREFIX for the long form, not by exact token: CC accepts
+    ``--print=<value>`` as well as ``--print <value>``, and an exact-membership
+    test misses the joined spelling entirely — which registers a duplicate
+    terminal row racing the managed one, the outcome this module's docstring
+    says it exists to prevent. The short form stays exact: ``-p`` takes its
+    value as a separate token, and a prefix test on ``-p`` would swallow every
+    other short flag beginning with p.
+    """
+    return any(tok in ("-p", "--print") or tok.startswith("--print=") for tok in argv)
+
+
 def main() -> None:
     payload = read_payload()
     sid = session_id(payload, default="")
@@ -79,7 +93,7 @@ def main() -> None:
     if found is None:
         return
     pid, argv = found
-    if "-p" in argv or "--print" in argv:
+    if _is_headless(argv):
         return  # headless invocation — not a terminal session
 
     try:
@@ -91,13 +105,27 @@ def main() -> None:
     except Exception:
         return
 
-    # Prefer the model THIS hook's own payload carries: SessionStart hooks run
-    # in parallel with no ordering guarantee, so the cache genesis_session_
-    # context writes may not exist yet — a cache-only read permanently stores
-    # 'unknown'. The cache remains the --resume fallback (payload model can be
-    # absent on some hook events).
-    model = str(payload.get("model") or "") or None
+    # Model resolution, in STRICT precedence order. The order is the whole
+    # point: an earlier revision read the payload first, which silently
+    # inverted the roster rule below and made this table disagree with
+    # session_heartbeats about the same session.
+    #
+    # 1. The ROUTED identity, which outranks everything. scripts/gmodel
+    #    launches a peer window with GENESIS_ROSTER_MODEL in its environment
+    #    precisely because CC's self-reported model says "Claude" for a peer.
+    #    session_heartbeat.cached_model gives that var the same precedence
+    #    (and says why), so reading the payload ahead of it records Claude in
+    #    cc_sessions while session_heartbeats records the peer.
+    model = os.environ.get("GENESIS_ROSTER_MODEL", "").strip() or None
     if model is None:
+        # 2. This hook's OWN payload. SessionStart hooks run in parallel with
+        #    no ordering guarantee, so the cache genesis_session_context
+        #    writes may not exist yet — a cache-only read at this point
+        #    permanently stores 'unknown'.
+        model = str(payload.get("model") or "") or None
+    if model is None:
+        # 3. The cache, which is the resume/clear fallback: CC OMITS `model`
+        #    on those events, so the payload cannot answer there.
         try:
             from session_heartbeat import cached_model
 

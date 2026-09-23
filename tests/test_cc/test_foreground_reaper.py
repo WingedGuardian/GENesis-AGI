@@ -483,3 +483,143 @@ class TestPidDead:
             fr, "read_proc_start_iso", lambda pid: "2026-07-21T23:00:00+00:00"
         )
         assert fr._pid_dead(4242, self._row()) is False
+# --- round-5 fixes: the pass-abort shape, dead_only, and the heartbeat race ----
+#
+# Every cell below pins a defect that survived four review rounds because
+# nothing exercised it. `dead_only=True` in particular had ZERO coverage: it is
+# the ONLY way the scheduled `session_reaper_dead_pid` job calls this function,
+# so the production call signature was untested end to end.
+
+
+async def test_liveness_check_raise_does_not_abort_the_pass(db, monkeypatch):
+    """A raise from the liveness check must not silence the whole reaper.
+
+    `_pid_dead` is called while BUILDING the candidate list, outside the
+    per-row try, so before the fix a raise there propagated out of
+    `reap_dark_foreground` entirely — losing not just the fast-path row but
+    the already-fetched 24h-idle rows, the alive-proof read and every
+    checkpoint.
+
+    NOT an unreadable /proc entry: `_pid_dead` catches (OSError, UnicodeError)
+    itself and fails open, so that case never reached here. The reachable
+    shapes are malformed-row ones — a missing `pid` key, a non-string
+    timestamp in the recycle compare — so this raises a generic exception to
+    pin the CALL SITE's isolation rather than any one cause.
+
+    The 24h row below is the evidence: it is unrelated to the raising row and
+    must still be reaped."""
+    await _seed(db, last_activity=OLD)  # ordinary 24h-idle row
+    await _seed_terminal(db)  # fast-path candidate whose check will raise
+    _patch_tail(monkeypatch, [])
+
+    def _boom(pid, row):
+        raise RuntimeError("liveness check blew up")
+
+    monkeypatch.setattr(fr, "_pid_dead", _boom)
+    res = await fr.reap_dark_foreground(_rt(db), now=NOW, idle_hours=24, mode="observe")
+
+    assert res["reaped"] == 1, "the unrelated 24h row must still be reaped"
+    assert (await cc_sessions.get_by_id(db, "s1"))["status"] == "checkpointed"
+    # The raising candidate is treated as ALIVE — absence of evidence is not
+    # death evidence.
+    assert (await cc_sessions.get_by_id(db, "term-1"))["status"] == "active"
+
+
+async def test_dead_only_skips_the_24h_scan(db, monkeypatch):
+    """`dead_only=True` is the scheduled job's ONLY call shape, and it must not
+    touch timestamp-only rows — that is what makes the 30-minute cadence cheap
+    enough to run 48x a day."""
+    await _seed(db, last_activity=OLD)  # 24h-idle, NOT pid-dead
+    _patch_tail(monkeypatch, [])
+    monkeypatch.setattr(fr, "_pid_dead", lambda pid, row: True)
+    res = await fr.reap_dark_foreground(
+        _rt(db), now=NOW, idle_hours=24, mode="observe", dead_only=True
+    )
+    assert res["reaped"] == 0
+    assert (await cc_sessions.get_by_id(db, "s1"))["status"] == "active"
+
+
+async def test_dead_only_still_reaps_a_dead_pid(db, monkeypatch):
+    """The positive control for the cell above: `dead_only` must not be inert."""
+    await _seed_terminal(db)
+    _patch_tail(monkeypatch, [])
+    monkeypatch.setattr(fr, "_pid_dead", lambda pid, row: True)
+    res = await fr.reap_dark_foreground(
+        _rt(db), now=NOW, idle_hours=24, mode="observe", dead_only=True
+    )
+    assert res["reaped"] == 1
+    assert (await cc_sessions.get_by_id(db, "term-1"))["status"] == "checkpointed"
+
+
+async def test_heartbeat_arriving_after_the_snapshot_blocks_the_write(db, monkeypatch):
+    """The TOCTOU both reviewers reported, from the write side.
+
+    The pass-level alive-proof filter is a SNAPSHOT. This commits a fresh
+    heartbeat AFTER that snapshot and before the row's checkpoint write —
+    exactly the interleaving the filter cannot see, and the one that produces
+    a Telegram alert saying "nothing is still running on it" about a live
+    session. The `NOT EXISTS` inside `checkpoint_dark` is what catches it."""
+    await _seed_terminal(db)
+    _patch_tail(monkeypatch, [])
+    monkeypatch.setattr(fr, "_pid_dead", lambda pid, row: True)
+
+    real_ids = fr._fresh_heartbeat_ids
+
+    async def _snapshot_then_beat(db_, *, cutoff):
+        got = await real_ids(db_, cutoff=cutoff)
+        # The heartbeat lands here: after the read, before any write.
+        await _hb(db_, "term-1", FRESH_HB)
+        return got
+
+    monkeypatch.setattr(fr, "_fresh_heartbeat_ids", _snapshot_then_beat)
+    rt = _rt(db)  # ONE runtime: _rt() builds a fresh mock per call, so
+    # asserting on a second _rt(db) would inspect a mock nothing ever used.
+    res = await fr.reap_dark_foreground(rt, now=NOW, idle_hours=24, mode="notify")
+
+    assert (await cc_sessions.get_by_id(db, "term-1"))["status"] == "active"
+    assert res["reaped"] == 0
+    # And no alert was sent about a session that is running.
+    assert rt._outreach_pipeline.submit_urgent.await_count == 0
+
+
+async def test_stale_heartbeat_does_not_block_the_write(db, monkeypatch):
+    """Negative control for the cell above — without it, a `NOT EXISTS` that
+    matched ANY heartbeat row would pass the positive test while breaking
+    reaping entirely."""
+    await _seed_terminal(db)
+    await _hb(db, "term-1", OLD)  # 60h old — well outside the freshness window
+    _patch_tail(monkeypatch, [])
+    monkeypatch.setattr(fr, "_pid_dead", lambda pid, row: True)
+    res = await fr.reap_dark_foreground(_rt(db), now=NOW, idle_hours=24, mode="observe")
+    assert res["reaped"] == 1
+    assert (await cc_sessions.get_by_id(db, "term-1"))["status"] == "checkpointed"
+
+
+async def test_one_cutoff_feeds_both_the_filter_and_the_write_guard(db, monkeypatch):
+    """The filter and the write guard must not each derive their own cutoff:
+    two values computed at different moments disagree by exactly the window the
+    guard closes."""
+    seen: list[str] = []
+    real_ids = fr._fresh_heartbeat_ids
+
+    async def _record(db_, *, cutoff):
+        seen.append(cutoff)
+        return await real_ids(db_, cutoff=cutoff)
+
+    monkeypatch.setattr(fr, "_fresh_heartbeat_ids", _record)
+    real_ckpt = cc_sessions.checkpoint_dark
+
+    async def _record_ckpt(db_, id_, **kw):
+        seen.append(kw.get("heartbeat_fresh_after"))
+        return await real_ckpt(db_, id_, **kw)
+
+    monkeypatch.setattr(cc_sessions, "checkpoint_dark", _record_ckpt)
+    await _seed_terminal(db)
+    _patch_tail(monkeypatch, [])
+    monkeypatch.setattr(fr, "_pid_dead", lambda pid, row: True)
+    await fr.reap_dark_foreground(_rt(db), now=NOW, idle_hours=24, mode="observe")
+
+    assert len(seen) == 2, f"expected filter + write guard, got {seen}"
+    assert seen[0] is not None and seen[1] is not None
+    assert seen[0] == seen[1]
+    assert seen[0] == fr._heartbeat_cutoff(NOW)
