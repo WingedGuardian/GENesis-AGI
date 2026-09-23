@@ -418,6 +418,9 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-disk-hygiene.timer genesis-disk-hygiene.service \
                     genesis-cc-tmp-align.timer genesis-cc-tmp-align.service \
                     genesis-cc-settings-align.timer genesis-cc-settings-align.service \
+                    genesis-graph-project.timer genesis-graph-project.service \
+                    genesis-code-intel.timer genesis-code-intel.service \
+                    genesis-backup.timer genesis-backup.service \
                     genesis-server.service genesis-bridge.service \
                     qdrant.service; do
             safe_disable_service "$unit"
@@ -436,11 +439,14 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
         if [ "$DRY_RUN" = true ]; then
             echo "    [DRY RUN] Would clear persistent timer state for:" \
                  "genesis-cc-settings-align, genesis-cc-align, genesis-disk-hygiene," \
-                 "genesis-watchdog, genesis-cc-tmp-align"
+                 "genesis-watchdog, genesis-graph-project, genesis-code-intel," \
+                 "genesis-backup, genesis-cc-tmp-align"
         else
             systemctl --user clean --what=state \
                 genesis-cc-settings-align.timer genesis-cc-align.timer \
                 genesis-disk-hygiene.timer genesis-watchdog.timer \
+                genesis-graph-project.timer genesis-code-intel.timer \
+                genesis-backup.timer \
                 genesis-cc-tmp-align.timer 2>/dev/null || true
         fi
 

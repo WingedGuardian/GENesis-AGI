@@ -228,6 +228,22 @@ def _project_lock(graph_key: str) -> asyncio.Lock:
     return _PROJECT_LOCKS.setdefault(graph_key, asyncio.Lock())
 
 
+class ProjectionInProgress(GraphUnavailableError):
+    """Another projector process holds the cross-process publication lock.
+
+    NOT an engine failure, and told apart by TYPE rather than by message for
+    exactly the reason `_LeaseLost` below gives. The caller that matters is the
+    scheduled projector: an hourly tick colliding with a manual run (which this
+    module's own docstring recommends running) previously fell through to the
+    generic branch and printed "the engine is not reachable over its socket —
+    check genesis-falkordb", naming a service that was working perfectly.
+
+    Public, unlike its siblings, because `graphstore_project.main()` imports it
+    to decide an EXIT CODE: a collision is a benign no-op, not a failure, since
+    the run that holds the lock is projecting the same data.
+    """
+
+
 class _LeaseLost(GraphUnavailableError):
     """The publication lease was gone at swap time — NOT an engine failure.
 
@@ -716,17 +732,24 @@ class FalkorGraphStore:
         because a stale projection is indistinguishable from a current one from
         the engine's side.
 
-        The bound on that window is the projector's cadence, and the projector is
-        F3's first slice: a scheduled full re-projection, decided at HOURLY. At
-        the measured 1,610 links/day that is at most ~70 links stale (a burst can
-        exceed it — dream cycles write in batches), and a restart self-heals
-        within the hour. It is a bounded window, not invalidation-on-write; the
-        DB-side change signal that would give write-level freshness is filed and
-        unbuilt (issue #1641), and is F3's second slice.
+        The bound on that window is the projector's cadence, and that cadence now
+        EXISTS: F3 slice 1 shipped `genesis-graph-project.timer`, a scheduled full
+        re-projection at HOURLY. At the measured 1,610 links/day that is at most
+        ~70 links stale (a burst can exceed it — dream cycles write in batches,
+        and one MEASURED week ranged from 4,075 links in a day to 5), and a
+        restart self-heals within the hour. It is a bounded window, not
+        invalidation-on-write; the DB-side change signal that would give
+        write-level freshness is filed and unbuilt (issue #1641), and is F3's
+        second slice.
 
-        None of it is reachable today: the lever defaults to `networkx`
-        (`config/graphstore.yaml`), so nothing reads this projection. The window
-        is what the cutover has to accept, or close first.
+        What that changes for the cutover: the window used to be open-ended, so
+        moving reads onto this store landed on a projection as stale as whenever
+        someone last ran the projector by hand. It is now one hour by default,
+        which is a cost to accept knowingly rather than an unknown. The lever
+        still defaults to `networkx` (`config/graphstore.yaml`), and the timer
+        deliberately does NOT gate on `mode` — the projection is kept current
+        whenever the engine exists, so flipping the lever lands on a current
+        graph instead of creating the staleness at the moment of the flip.
         """
         return None
 
@@ -735,9 +758,10 @@ class FalkorGraphStore:
     async def project(self, db: aiosqlite.Connection) -> dict[str, int]:
         """Rebuild the whole projection from ``memory_links``. Explicit, not scheduled.
 
-        F3 owns automating this (debounced on the dirty signal, with a
-        generation watermark). It lives here now because a store nothing ever
-        populates cannot be verified against anything.
+        Automated since F3 slice 1: `genesis-graph-project.timer` calls the
+        `graphstore_project` entrypoint hourly. The debounce-on-dirty-signal
+        refinement belongs to slice 2 (issue #1641) and is not built, so this is
+        a scheduled FULL re-projection rather than an incremental one.
 
         BUILD-THEN-SWAP, and the alternative is why. Projecting in place means
         `DETACH DELETE` followed by ~12.8s of batched writes, during which a
@@ -777,7 +801,7 @@ class FalkorGraphStore:
         async with _project_lock(self._graph_key):
             token = await self._acquire_publish_lock()
             if token is None:
-                raise GraphUnavailableError(
+                raise ProjectionInProgress(
                     f"another projection of {self._graph_key!r} is already in progress "
                     "— not starting a second one, because the two would race to "
                     "publish and the SLOWER build wins, which can walk the live "

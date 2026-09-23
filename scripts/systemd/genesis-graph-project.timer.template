@@ -1,0 +1,23 @@
+[Unit]
+Description=Genesis Graph Projection — hourly schedule
+
+[Timer]
+# HOURLY is the staleness bound the store's own contract names. At the MEASURED
+# live write rate the projection drifts by a few hundred to a few thousand links
+# a day, so an hour bounds the window to a small fraction of that — but the rate
+# is BURSTY rather than smooth (measured across one week: 4,075 links one day,
+# 5 the next, 849 another), so a burst inside the hour can still exceed the
+# nominal bound. That is a bounded window, not invalidation-on-write, and it is
+# the accepted cost until the DB-side change signal (issue #1641) lands.
+OnCalendar=hourly
+# A box that was asleep or off at the top of the hour still projects on wake,
+# rather than waiting for the next one with a projection that is already stale.
+Persistent=true
+AccuracySec=1min
+# De-correlate from the other timers: a projection is the heaviest hourly job
+# here, and landing it on the same second as the watchdog and the hygiene sweep
+# is avoidable contention.
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
