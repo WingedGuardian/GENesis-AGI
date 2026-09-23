@@ -831,3 +831,138 @@ class TestCommandCarriersAreRefusedWithoutInspection:
             dg._COMMAND_CARRIERS
         )
         assert not missing, f"resolver names launchers this guard does not: {missing}"
+
+
+class TestCarriedRmdirIsNotThisGuardsBusiness:
+    """`rmdir` removes an EMPTY directory and has no recursive-force form.
+
+    The carrier pre-pass refuses without reading the payload, so it inherited
+    whatever `_RM_WORD` admitted — and `_RM_WORD` names both verbs because the
+    ORDINARY operand scan wants both. MEASURED before the split:
+
+        rmdir /tmp/empty-dir            exit 0
+        eval 'rmdir /tmp/empty-dir'     exit 2      <- same command, carried
+
+    That asymmetry is the thing the carrier design exists to remove, not to
+    create. Protected-path coverage for `rmdir` is untouched — it lives in
+    `protected_paths_guard`, whose own prefilter still names both verbs.
+    """
+
+    RM = "r" + "m"
+
+    @staticmethod
+    def _main(cmd: str, home) -> int:
+        import json
+        import os
+        import subprocess
+        import sys as _sys
+
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        script = (
+            Path(__file__).resolve().parents[2]
+            / "scripts"
+            / "hooks"
+            / "destructive_command_guard.py"
+        )
+        return subprocess.run(
+            [_sys.executable, str(script)],
+            input=json.dumps({"tool_input": {"command": cmd}, "tool_name": "Bash"}),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        ).returncode
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "eval '{RM}dir /tmp/empty-dir'",
+            "su ubuntu -c '{RM}dir /tmp/empty-dir'",
+            "eval {RM}dir /tmp/empty-dir",
+        ],
+    )
+    def test_a_carried_rmdir_is_not_refused(self, cmd, tmp_path):
+        """PARITY with the direct spelling, which this guard also allows."""
+        direct = self._main(f"{self.RM}dir /tmp/empty-dir", tmp_path)
+        assert direct == 0, "precondition: the direct spelling must allow"
+        assert self._main(cmd.format(RM=self.RM), tmp_path) == 0, cmd
+
+    def test_a_carried_rm_is_still_refused(self, tmp_path):
+        """The control. Narrowing the carrier prefilter must not reach `rm`."""
+        assert self._main(f"eval '{self.RM} -rf /a/b'", tmp_path) == 2
+
+    def test_rmdir_beside_an_rm_still_refuses(self, tmp_path):
+        """A command naming BOTH verbs still satisfies the narrowed prefilter."""
+        assert (
+            self._main(f"eval '{self.RM}dir /tmp/x; {self.RM} -rf /a/b'", tmp_path) == 2
+        )
+
+
+class TestACarrierRefusalSaysTheWholeCommandWentToo:
+    """A refusal on step 3 discards steps 1 and 2, and must say so.
+
+    Claude Code throws away the ENTIRE Bash call when a PreToolUse hook exits 2.
+    Every other exit-2 path in this guard prints the discarded-steps note; the
+    carrier pre-pass was added without it, so a caller reading a message about a
+    launcher had no reason to suspect an earlier write never happened.
+
+    ⚠ THE EXISTING AST LOCK CANNOT CATCH THIS, which is why the test is
+    behavioural. `test_every_configured_python_bash_blocker_emits_the_note`
+    asserts the FILE calls `warn()` somewhere — and it does, at the violations
+    branch — so a new exit-2 path that skips the call passes it unchanged. A
+    grep proves a call exists; only running the guard proves this path reaches
+    it.
+    """
+
+    RM = "r" + "m"
+    MARKER = "the ENTIRE command was discarded"
+
+    @staticmethod
+    def _run(cmd: str, home):
+        import json
+        import os
+        import subprocess
+        import sys as _sys
+
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        script = (
+            Path(__file__).resolve().parents[2]
+            / "scripts"
+            / "hooks"
+            / "destructive_command_guard.py"
+        )
+        return subprocess.run(
+            [_sys.executable, str(script)],
+            input=json.dumps({"tool_input": {"command": cmd}, "tool_name": "Bash"}),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+
+    def test_a_multi_step_carrier_refusal_prints_the_note(self, tmp_path):
+        cmd = f"echo one > /tmp/step1.txt && eval '{self.RM} -rf /a/b'"
+        res = self._run(cmd, tmp_path)
+        assert res.returncode == 2, "precondition: the carrier branch must refuse"
+        assert self.MARKER in res.stderr, (
+            "a carrier refusal discarded an earlier write silently:\n" + res.stderr
+        )
+
+    def test_an_unreadable_carrier_refusal_prints_the_note(self, tmp_path):
+        """The blind branch is a second exit-2 path through the same call site."""
+        q = chr(34)
+        cmd = f"echo one > /tmp/step1.txt && eval '{self.RM} -r -f /a/b' {q}"
+        res = self._run(cmd, tmp_path)
+        assert res.returncode == 2, "precondition: the blind branch must refuse"
+        assert self.MARKER in res.stderr, res.stderr
+
+    def test_a_SINGLE_step_carrier_refusal_does_not_print_it(self, tmp_path):
+        """The negative control. A one-step command discarded nothing else, and
+        a note that fires on every refusal teaches the reader to skip it."""
+        res = self._run(f"eval '{self.RM} -rf /a/b'", tmp_path)
+        assert res.returncode == 2
+        assert self.MARKER not in res.stderr, (
+            "the note fired on a single-step command:\n" + res.stderr
+        )

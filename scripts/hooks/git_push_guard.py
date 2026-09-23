@@ -208,9 +208,22 @@ except Exception:  # noqa: BLE001 — see above: a load failure exits 1 = non-bl
 # separator starved it. Both copies carried it, so both were corrected — fixing the
 # degraded one alone would have left the LIVE net starved while the comment claimed
 # the class was closed.
+# `commit` IS here, and it is the one word whose membership differs by consumer.
+# MEASURED: paired with a `shell_parse` that predates `_REPARSE_CARRIERS`, the
+# import above fails and this matcher becomes the ONLY enforcement — and without
+# `commit` BOTH `eval git commit -n -m x` AND the direct `git commit -n -m x`
+# exited 0, i.e. the hook-skip gate vanished entirely in that pairing. This PR
+# adds `_REPARSE_CARRIERS` to that import, so it is this change that makes the
+# pairing reachable; the gap is therefore this change's to close.
+#
+# It does NOT follow that `_GATED_MENTION` should carry it — that one is read by
+# the LIVE blind-spot arm, where the same word cost +283 refusals on ordinary
+# heredocs (see its own note). This matcher only ever runs against a BROKEN hook
+# tree, where the file's stated direction is deliberate over-breadth and the
+# remedy printed to the caller is "repair the tree".
 _DEGRADED_GATED = (
     r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b"
-    r"|\b(?:push|merge)\b|\bgh\b|\bsqlite3\b"
+    r"|\b(?:push|merge|commit)\b|\bgh\b|\bsqlite3\b"
 )
 
 try:

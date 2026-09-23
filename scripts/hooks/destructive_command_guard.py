@@ -15,8 +15,15 @@ the 2026-07-10 P1 triage empirically confirmed the old single-token
 regex missed the `-r -f`, `--recursive --force`, `-Rf`, and `-- /`
 spellings, and folded multiple operands into one pseudo-path.
 
-Stdlib-only. Unparseable commands fall back to the legacy regex match
-(fail-open beyond that — this guard must not block legitimate work).
+Stdlib-only in its own logic; it imports the shared resolver behind a GUARDED
+import whose failure path is this module's own token scan, so a broken sibling
+degrades it to the previous behaviour rather than disabling it.
+
+An unparseable command that also names a LAUNCHER is REFUSED — this used to say
+"fail-open beyond that", and that sentence described the defect: a blind parse
+fell through to a glued-`-rf` regex, so one trailing quote turned a BLOCK into
+an allow. An unparseable command naming no launcher still falls back to the
+legacy regex match, which is where the fail-open now stops.
 """
 
 from __future__ import annotations
@@ -74,11 +81,19 @@ _ALWAYS_BLOCK = {".", "..", "/", "~", "*"}
 # `rm` inside it — `eval "rm -rf /a/b"` was allowed while the unquoted spelling
 # blocked (measured).
 #
-# DELIBERATELY A LOCAL COPY, not an import. This module is stdlib-only by
-# declaration (see the header) and does not use `shell_parse` at all — it is the
-# independent second layer, and importing the resolver would both contradict
-# that and add an import-failure path to a BLOCKING guard. The repo's documented
-# pattern for exactly this boundary is duplicate + parity test, and
+# DELIBERATELY A LOCAL COPY, not an import — and the reason is NOT the one this
+# comment used to give. It said this module "does not use `shell_parse` at all",
+# which a later commit on this very branch made false: `_resolver_carrier_refusal`
+# imports `analyze_checked` at :158. Issue #2232 quotes the retired sentence as
+# the reason this set "cannot become an import", so it is corrected there too.
+#
+# THE SURVIVING REASON: the set must OUTLIVE the guarded import. The import is
+# wrapped precisely because an import failure in a blocking guard exits 1, which
+# Claude Code reads as NON-blocking — so when it fails, this module still has to
+# know what a carrier is. A set that arrived through the same import would vanish
+# exactly when it is needed. `protected_paths_guard` documents the same shape for
+# its own degraded constant. The repo's documented pattern for this boundary is
+# duplicate + parity test, and
 # `tests/test_hooks/test_destructive_command_guard.py` asserts this set is a
 # SUPERSET of `shell_parse._REPARSE_CARRIERS`, so a launcher added there fails
 # the test until it is added here too.
@@ -236,6 +251,19 @@ def _resolver_carrier_refusal(cmd: str) -> str | None:
 
 
 _RM_WORD = re.compile(r"\brm\b|\brmdir\b")
+
+# The CARRIER pre-pass's own prefilter, and it deliberately EXCLUDES `rmdir`.
+# `rmdir` removes an EMPTY directory and has no recursive-force combination at
+# all, so a carried `rmdir` is not in this guard's subject matter — refusing it
+# protects nothing here while costing a respell. MEASURED before the split:
+# `eval 'rmdir /tmp/empty-dir'` exited 2 while the direct spelling exited 0,
+# which is the asymmetry the carrier design is supposed to remove rather than
+# create. Protected-path coverage for `rmdir` is unaffected: it lives in
+# `protected_paths_guard`, whose own prefilter still names both verbs.
+#
+# `_RM_WORD` keeps BOTH verbs, because the ordinary operand scan below is what
+# the wider prefilter exists for.
+_RM_CARRIER_WORD = re.compile(r"\brm\b")
 
 _SEPARATORS = {"|", "||", "&&", ";", "&", "\n"}
 
@@ -733,11 +761,19 @@ def main() -> int:
             discarded_write.remember(cmd)
         # WORD boundary, not a substring. A substring test also matched
         # `perform`, `form`, `storm` and `confirm`, which cannot be an `rm`
-        # invocation — harmless while a false match only cost a scan that found
-        # nothing, but the carrier refusal above turns a false match into a
-        # REFUSAL. MEASURED over 83,201 recorded commands: 170 -> 99 refused,
-        # and every real spelling still matches (`/bin/rm`, `;rm`, `&&rm`,
-        # `rm-cache` all satisfy a leading boundary).
+        # invocation. MEASURED over 83,201 recorded commands when this gate fed
+        # the carrier refusal directly: 170 -> 99 refused; every real spelling
+        # still matches (`/bin/rm`, `;rm`, `&&rm`, `rm-cache` all satisfy a
+        # leading boundary).
+        #
+        # ⚠ THE BOUNDARY HERE IS NO LONGER WHAT PREVENTS THAT OVER-BLOCK, and
+        # saying so is the point of this note: the carrier pre-pass below reads
+        # `_RM_CARRIER_WORD`, so a false match admitted HERE now reaches only
+        # the ordinary operand scan, which finds no `rm` command and allows. A
+        # mutation widening THIS constant to a substring was measured to
+        # SURVIVE the whole suite for exactly that reason — behaviourally null,
+        # not an untested mechanism. The property moved; the constant that
+        # carries it is `_RM_CARRIER_WORD`, and that one is mutation-pinned.
         if not cmd or not _RM_WORD.search(cmd):
             return 0
 
@@ -748,9 +784,24 @@ def main() -> int:
         # command rather than degrading to a glued-`-rf` regex, closing a
         # one-character bypass: `eval 'rm -r -f /a/b' "` used to be ALLOWED
         # while the same command without the trailing quote BLOCKED.
-        carrier_reason = _resolver_carrier_refusal(cmd)
+        # `_RM_CARRIER_WORD`, not `_RM_WORD`: a carried `rmdir` is outside this
+        # guard's subject matter and refusing it only created an asymmetry with
+        # its own direct spelling. See the constant.
+        carrier_reason = (
+            _resolver_carrier_refusal(cmd)
+            if _RM_CARRIER_WORD.search(cmd)
+            else None
+        )
         if carrier_reason:
             print(f"BLOCKED: {carrier_reason}", file=sys.stderr)
+            # Claude Code discards the WHOLE Bash call when a PreToolUse hook
+            # exits 2, so a refusal on step 3 also silently throws away steps 1
+            # and 2. Every other exit-2 path in this file says so; this one was
+            # added without it, which is the same defect one branch over — a
+            # caller reading a message about a launcher has no reason to suspect
+            # an earlier write did not happen.
+            if discarded_write is not None:
+                discarded_write.warn()
             return 2
 
         resolved = _analyze_checked is not None

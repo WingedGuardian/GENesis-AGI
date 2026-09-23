@@ -1480,3 +1480,65 @@ def test_the_advisory_allowlist_has_no_stale_entries():
         f"{stale} are in _ADVISORY_BY_DESIGN but no longer fire on Bash. Remove them — "
         f"an exemption for a hook nobody runs is debt, not safety."
     )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git commit -n -m x",
+        "eval git commit -n -m x",
+        "su ubuntu -c 'git commit -n -m x'",
+    ],
+)
+def test_the_degraded_matcher_sees_commit_not_only_push(tmp_path, command):
+    """A hook-skipping commit must not walk through a DEGRADED push guard.
+
+    MEASURED against a tree whose `shell_parse` cannot satisfy the guard's
+    import: with `commit` absent from `_DEGRADED_GATED`, BOTH the carried form
+    and the plain `git commit -n -m x` exited 0 — the no-verify gate vanished
+    entirely, while `git push` in the same tree exited 2.
+
+    The pairing is reachable because this change ADDED `_REPARSE_CARRIERS` to
+    that import, so an install carrying the new guard beside an older parser
+    degrades where it previously did not.
+
+    `-n` matters: it is `commit`'s SHORT hook-skip form, so a matcher holding
+    only `--no-verify` never sees it.
+    """
+    root = _tree(tmp_path, poisoned=True)
+    res = _run(root, "hooks/git_push_guard.py", command, tmp_path / "home_commit")
+    assert res.returncode == 2, (
+        f"degraded git_push_guard returned {res.returncode} for {command!r}; "
+        "non-2 lets Claude Code run a commit that skips the hooks"
+    )
+
+
+def test_the_degraded_matcher_covers_every_verb_the_carrier_arm_gates():
+    """Parity, asserted rather than remembered.
+
+    The live carrier arm and the degraded matcher are separate patterns on
+    purpose — `_GATED_MENTION` must NOT carry `commit`, because the live
+    blind-spot arm reads it and the word costs +283 refusals there. But the
+    DEGRADED matcher has no such consumer, and a verb gated on the live path
+    while invisible on the degraded one is exactly how this defect arrived.
+
+    Verb set only: the flag alternatives are already pinned, both directions,
+    by `test_a_flag_mention_is_not_starved_by_the_separator_after_it`.
+    """
+    import importlib
+    import re as _re
+
+    sys.path.insert(0, str(_HOOKS))
+    guard = importlib.import_module("git_push_guard")
+    carrier_verbs = set(
+        _re.findall(r"[a-z]+", _re.search(
+            r"\\b\(\?:([a-z|]+)\)\\b", guard._CARRIER_GATED_MENTION.pattern
+        ).group(1))
+    )
+    assert carrier_verbs, "could not extract the carrier arm's verb set — fix the test"
+    degraded = guard._DEGRADED_GATED
+    missing = sorted(v for v in carrier_verbs if not _re.search(rf"\b{v}\b", degraded))
+    assert not missing, (
+        f"{missing} are gated on the carrier arm but invisible to the degraded "
+        "matcher; a broken hook tree would let them through"
+    )

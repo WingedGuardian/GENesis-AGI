@@ -202,9 +202,20 @@ _RUN_CARRIERS = frozenset({"uv", "poetry", "hatch", "pdm", "pipenv", "rye"})
 #: figure was measured against a version that refused only when the PAYLOAD
 #: named something protected. MEASURED over 83,201 recorded commands against
 #: what actually ships, per consumer, because their prefilters differ and no
-#: rate transfers between them: protected_paths 17 (0.020%), destructive 99
-#: (0.119%), git_push 22 (0.026%). Every one is recoverable by re-issuing the
-#: command without the launcher.
+#: rate transfers between them: protected_paths 21 (0.025%), destructive 53
+#: (0.064%), git_push 0 (0.000%). Every one is recoverable by re-issuing the
+#: command without the launcher, and NONE of the three relaxes anything — the
+#: same sweep reports 0 commands going from refused to allowed.
+#:
+#: ⚠ THESE REPLACE 17/99/22, WHICH WERE WRONG IN TWO DIFFERENT WAYS. The 99 and
+#: the 22 were measured against mechanisms that no longer ship (a name-list
+#: command-position test; a carrier scope read over the whole command rather
+#: than the carrier's own segment). The 17 was a METHOD error, and the more
+#: useful one to record: it came from importing the guard's predicate and
+#: calling it directly, which passes no `cwd` — the real guard reads one. Run
+#: end-to-end through the guard as a subprocess, with each corpus row's own
+#: cwd, the figure is 21. Quote the end-to-end number; a reproduction of a
+#: guard measures the reproduction until the guard itself is run.
 #:
 #: ⚠ `ssh` IS DELIBERATELY ABSENT, and it is the one a reviewer will ask about.
 #: It does not belong here: `ssh host "…"` runs the command on ANOTHER MACHINE,
