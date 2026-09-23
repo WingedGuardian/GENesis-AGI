@@ -31,6 +31,7 @@ from __future__ import annotations
 import pytest
 from flask import Flask
 
+import genesis.dashboard.auth as auth_mod
 import genesis.dashboard.routes.files as files_mod
 from genesis.dashboard._blueprint import blueprint
 
@@ -276,3 +277,57 @@ def test_ordinary_names_survive_the_widened_vocabulary(tmp_path, monkeypatch, na
     target = root / name
     target.write_text("ordinary")
     assert files_mod._is_allowed(target) is True, f"{name} was wrongly refused"
+
+
+@pytest.mark.parametrize("name", [".env.local", ".env.production", ".env.development"])
+def test_dotenv_variants_are_refused(tmp_path, monkeypatch, name):
+    """A credential extension is not always the LAST one.
+
+    The dotenv convention puts the environment AFTER the extension, so an
+    `endswith('.env')` test sees `.local` and passes the file straight through —
+    and `_BLOCKED_NAMES` carries only bare `.env`. These are the spellings a
+    project is most likely to actually have.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(files_mod, "_ALLOWED_ROOTS", [root])
+    target = root / name
+    target.write_text("API_KEY=x")
+    assert files_mod._is_allowed(target) is False, f"{name} is readable through the file browser"
+
+
+def test_internal_bearer_reaches_the_file_routes(app, monkeypatch, tmp_path):
+    """The two gates on one request must agree about who is trusted.
+
+    ``check_api_mutation_auth`` accepts the internal bearer explicitly and
+    origin-independently, because a browser attacker cannot read a 0600 file to
+    forge it. A sibling gate that consults only the session cookie would refuse
+    the very caller the mutation gate just blessed — so a trusted machine caller
+    would pass one gate and be 403'd by the next, on the same request.
+    """
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "pw")
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "notes.md").write_text("hello")
+    monkeypatch.setattr(files_mod, "_ALLOWED_ROOTS", [root])
+
+    token = auth_mod.get_or_create_internal_api_token()
+    resp = app.test_client().get(
+        f"/api/genesis/files/read?path={root / 'notes.md'}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, "a trusted machine caller lost file access"
+
+
+def test_a_wrong_bearer_is_still_refused(app, monkeypatch):
+    """Guard-the-guard: accepting the header is not accepting any header.
+
+    Without this, `has_internal_bearer` could return True on the mere PRESENCE
+    of an Authorization header and every assertion above would still pass.
+    """
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "pw")
+    resp = app.test_client().get(
+        "/api/genesis/files?path=.", headers={"Authorization": "Bearer not-the-token"}
+    )
+    body = resp.get_json(silent=True) or {}
+    assert resp.status_code == 403 and body.get("error") == "authentication required"

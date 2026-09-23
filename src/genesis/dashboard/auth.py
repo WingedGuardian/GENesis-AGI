@@ -164,6 +164,26 @@ def is_authenticated() -> bool:
     return session.get("authenticated") is True
 
 
+def has_internal_bearer() -> bool:
+    """Is this request carrying the valid internal API bearer token?
+
+    Extracted rather than re-implemented at each gate: ``check_api_mutation_auth``
+    performs the same check inline, and two gates disagreeing about who counts as
+    a trusted machine caller is precisely the defect this exists to prevent — a
+    caller the mutation gate blesses being refused by a sibling gate on the same
+    request.
+
+    CSRF-immune by construction, which is why the mutation gate checks it FIRST
+    and origin-independently: an attacker in a browser cannot read a 0600 file to
+    forge the header. Never true when no token can be produced.
+    """
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Bearer "):
+        return False
+    expected = get_or_create_internal_api_token()
+    return bool(expected) and hmac.compare_digest(header[7:], expected)
+
+
 def check_password(input_password: str) -> bool:
     """Constant-time password comparison."""
     pw = get_dashboard_password()

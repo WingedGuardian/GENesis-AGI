@@ -15,7 +15,7 @@ from pathlib import Path
 from flask import jsonify, request, send_file
 
 from genesis.dashboard._blueprint import blueprint
-from genesis.dashboard.auth import is_authenticated
+from genesis.dashboard.auth import has_internal_bearer, is_authenticated
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +118,12 @@ def _is_credential_component(part: str) -> bool:
     if name in _CREDENTIAL_NAMES:
         return True
     if name.endswith(_CREDENTIAL_SUFFIXES):
+        return True
+    # A credential extension is not always the LAST one. The dotenv convention
+    # puts the environment after it — `.env.local`, `.env.production` — so an
+    # endswith test sees `.local` and passes the file through. Checking every
+    # dot-segment boundary catches those without widening the vocabulary.
+    if any(f".{segment}" in _CREDENTIAL_SUFFIXES for segment in name.split(".") if segment):
         return True
     for segment in name.lstrip(".").split("."):
         if segment and re.split(r"[_\-]+", segment)[-1] in _CREDENTIAL_STEMS:
@@ -483,9 +489,9 @@ def _auth_or_403():
     predates this gate, and nothing in this module can close it — the operator
     has declined to supply the thing a gate would check.
     """
-    if not is_authenticated():
-        return jsonify({"error": "authentication required"}), 403
-    return None
+    if is_authenticated() or has_internal_bearer():
+        return None
+    return jsonify({"error": "authentication required"}), 403
 
 
 def _is_allowed(path: Path) -> bool:
