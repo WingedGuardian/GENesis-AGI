@@ -78,6 +78,7 @@ class ChannelType(StrEnum):
     WHATSAPP = "whatsapp"
     WEB = "web"
     VOICE = "voice"
+    AGENT = "agent"
 
 
 def origin_delivery_supported(channel: ChannelType | str | None) -> bool:
@@ -88,7 +89,7 @@ def origin_delivery_supported(channel: ChannelType | str | None) -> bool:
     that resolver returns a real ``(chat_id, thread_id)`` target ONLY for Telegram
     origins (a Telegram voice message arrives on the ``telegram`` channel — the
     ``VOICE`` channel is the separate S2S surface, which has no addressable thread).
-    Every other channel (WEB/OpenClaw, WhatsApp, VOICE, terminal) falls back to the
+    Every other channel (WEB/OpenClaw, WhatsApp, VOICE, AGENT, terminal) falls back to the
     default owner surface. The channel research-reroute nudge is gated on this so it
     never promises "I'll report back to this conversation" on a channel where the
     delivery model would silently redirect the result to the owner surface instead.
@@ -103,7 +104,7 @@ def is_owner_attended_channel(channel: ChannelType | str | None) -> bool:
     """Whether a conversation on *channel* is owner-authenticated at the message
     boundary — the single owner-ATTENDED channel set (terminal, Telegram).
 
-    Every gateway channel (web/OpenClaw, WhatsApp, voice) is NOT owner-
+    Every gateway channel (web/OpenClaw, WhatsApp, voice, agent) is NOT owner-
     authenticated when a message arrives, and an unknown/None channel is treated
     as not-attended (fail-closed). This is the one predicate for owner-vs-gateway
     trust at the conversation boundary; both :func:`task_detected_origin` (what
@@ -120,7 +121,7 @@ def session_origin_for_channel(channel: ChannelType | str | None) -> str | None:
     Owner-attended (terminal/Telegram) → ``None``: the invoker leaves
     ``GENESIS_SESSION_ORIGIN`` unset and the memory/observation chokepoints
     coalesce server/foreground writes to first_party (unchanged behaviour).
-    Every gateway channel (web/OpenClaw, WhatsApp, voice) → ``external_untrusted``
+    Every gateway channel (web/OpenClaw, WhatsApp, voice, agent) → ``external_untrusted``
     so the session's OWN memory/``observation_write`` calls are stamped untrusted —
     without this a gateway session runs with no origin env and its writes coalesce
     to first_party (mcp/memory/observations.py), which the read-side origin gate
@@ -140,7 +141,7 @@ def observation_origin_for_channel(channel: ChannelType | str | None) -> str:
     writes ABOUT a session on *channel*).
 
     Owner-attended (terminal/Telegram) → ``first_party``; every other channel
-    (web/OpenClaw, WhatsApp, voice, inbox, or unknown) → ``external_untrusted``
+    (web/OpenClaw, WhatsApp, voice, agent, inbox, or unknown) → ``external_untrusted``
     (fail-closed). Note the polarity difference from
     :func:`session_origin_for_channel`, which returns ``None`` for owner-attended:
     an OBSERVATION with NULL origin is EXCLUDED from surfacing (the read side
@@ -158,7 +159,7 @@ def task_detected_origin(channel: ChannelType | str | None) -> str:
 
     Owner-ATTENDED channels (terminal, Telegram) stamp ``owner`` — a task the
     owner typed legitimately carries dispatch authority. Every gateway channel
-    (web/OpenClaw, WhatsApp, voice) is NOT owner-authenticated at the message
+    (web/OpenClaw, WhatsApp, voice, agent) is NOT owner-authenticated at the message
     boundary, so its detected tasks are ``external_untrusted``: still visible,
     but never auto-dispatch-authorized (the autonomy dispatcher's origin gate
     bars them). Fail-closed: an unknown/None channel → external_untrusted.

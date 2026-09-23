@@ -33,6 +33,24 @@ ALERT_DIR="$HOME/.genesis/alerts"
 # point it at a fixture file. OOM_LOG lives beside the watchgod log (NOT in
 # cc-tmp) so it survives cleanup.
 OOM_EVENTS_FILE="${OOM_EVENTS_FILE:-/sys/fs/cgroup/memory.events}"
+# The trigger discriminator (Codex P1, #1790): a unit's `oom_kill` count records
+# WHICH process died, not WHOSE limit fired — when the container (or any
+# ancestor) hits its limit, the kernel can pick a high-RSS victim inside a
+# contained child scope, and the journal then names that child. Only the cgroup
+# whose OWN limit was hit records a LOCAL `oom` event, so the container root's
+# memory.events.local `oom` counter distinguishes container pressure from a
+# contained cap doing its job. Readable since kernel 4.19 wherever
+# memory.events is; unreadable here means the trigger cannot be verified and
+# the kill PAGES (attribution never silences on missing evidence).
+# Deliberately NOT resolved here. An explicit override wins, but the DEFAULT is
+# derived from OOM_EVENTS_FILE at the moment it is read (see
+# _read_oom_local_trigger), because resolving it at source time freezes it
+# against whatever OOM_EVENTS_FILE happened to be then — and anything that
+# reassigns OOM_EVENTS_FILE afterwards leaves this pointing at the real
+# /sys/fs/cgroup while believing otherwise. That is silent, and it is
+# environment-dependent: it reads correct on a host that has the file and
+# inverts every suppression decision on one that does not.
+OOM_EVENTS_LOCAL_FILE="${OOM_EVENTS_LOCAL_FILE:-}"
 OOM_LOG="$(dirname "$LOG_FILE")/oom_events.log"
 
 # Durable alert queue (F.3) — emergency-tier events page Telegram via the
@@ -50,6 +68,14 @@ fi
 CC_TMP_DIR="$HOME/.genesis/cc-tmp"
 CC_TMP_BUDGET_MB=500
 SACRED_GROUND_MB=150
+# Units whose OOM kill is CONTAINMENT WORKING, not a container emergency: they
+# run inside their own MemoryMax scope on purpose (issue #1775 — 11 emergency
+# pages for the code-intel indexer dying at its own 2G cap, attributed to "the
+# container" and blamed on CC sessions, while `free` showed 17.8 GB available).
+# Space-separated unit-name prefixes; override in watchgod.conf or the env.
+# cbm-mcp- = the codebase-memory MCP wrapper (.claude/mcp/run-codebase-memory),
+# capped and NAMED for exactly this classification (issue #1792).
+OOM_CONTAINED_UNIT_PREFIXES="${OOM_CONTAINED_UNIT_PREFIXES:-code-intel- cbm-mcp-}"
 
 # ── Load config ──────────────────────────────────────────────
 load_config() {
@@ -448,13 +474,196 @@ _read_oom_kill() {
     awk '/^oom_kill /{print $2; found=1} END{exit !found}' "$OOM_EVENTS_FILE" 2>/dev/null
 }
 
+_read_oom_local_trigger() {
+    # Echo the container root's LOCAL `oom` count (limit invocations charged to
+    # this cgroup itself, descendants excluded); non-zero return if unavailable.
+    local _local_file="${OOM_EVENTS_LOCAL_FILE:-$(dirname "$OOM_EVENTS_FILE")/memory.events.local}"
+    [[ -r "$_local_file" ]] || return 1
+    awk '/^oom /{print $2; found=1} END{exit !found}' "$_local_file" 2>/dev/null
+}
+
+# Attribution reads the systemd journal because the killer cgroup is usually a
+# TRANSIENT scope, deleted with its job — every surviving cgroup shows the kill
+# only as an inherited aggregate (measured: local=0 at every level) — while the
+# journal names the unit and outlives the scope. The query window is a CURSOR:
+# each successful read advances a durable epoch marker, and the next read asks
+# only for lines SINCE it. That is what keeps attribution honest during a
+# thrashing contained job: without it, a contained kill's line from the
+# PREVIOUS increment still inside a fixed lookback could account for a NEW
+# kill that left no line of its own (a non-main process dying inside a
+# surviving scope writes no unit-failure line) and silence a page. A missing
+# cursor (first run) falls back to a short lookback computed from the LIVE
+# poll interval; a failed query does not advance the cursor. Every failure
+# direction lands on the unattributed PAGE, never on silence.
+_OOM_CURSOR_FILE="$(dirname "$LOG_FILE")/.oom_journal_cursor"
+
+_oom_killed_units() {
+    # Echo unit names the user journal says were oom-killed since the cursor,
+    # one per line.
+    # rc!=0 = journal UNAVAILABLE (no journalctl, or the query failed) — the
+    # caller degrades to the unattributed page. rc=0 with empty output =
+    # journal readable, no oom-kill record (also unattributed).
+    command -v journalctl >/dev/null 2>&1 || return 1
+    # Computed per call, not at load time: load_config re-sources watchgod.conf
+    # every tick and may change POLL_INTERVAL — a frozen window shorter than
+    # one poll gap would miss every contained kill and re-open the false pages.
+    local _fallback_s=$(( POLL_INTERVAL * 2 + 60 ))
+    local _cursor out rc=0
+    _cursor=$(cat "$_OOM_CURSOR_FILE" 2>/dev/null) || _cursor=""
+    # A REAL journal cursor, not a timestamp. `--since` is a TIMESTAMP filter and
+    # is INCLUSIVE at its boundary, so an entry landing exactly on the stored
+    # second is re-read on the next tick; `--after-cursor` is a POSITION filter
+    # and starts strictly AFTER the named entry, so every record is seen exactly
+    # once. That distinction is load-bearing now that the caller reconciles
+    # RECORD COUNT against kill deltas: a double-counted boundary entry would
+    # inflate the count. `--show-cursor` appends a trailing `-- cursor: s=…`
+    # line, stripped below.
+    #
+    # NOTE (adversarial audit, #1790): journalctl REFUSES to combine
+    # --after-cursor with --since/--cursor ("Please specify only one of" —
+    # verified on systemd 255), and these records' timestamps are PID 1's
+    # EMISSION time, not the kernel kill time — so a time window can neither
+    # compose with the position filter nor bound a late record anyway. The
+    # late/pre-baseline record problem is therefore closed by the caller's
+    # DEFICIT reconciliation (see check_oom_events), not here.
+    if [[ "$_cursor" == s=* ]]; then
+        out=$(journalctl --user --after-cursor "$_cursor" --no-pager --show-cursor -o cat 2>/dev/null) || rc=$?
+    else
+        # First run, or a cursor file written by an older version (epoch digits):
+        # fall back to the time window. Never trust a malformed value as a cursor.
+        out=$(journalctl --user --since "-${_fallback_s} seconds" --no-pager --show-cursor -o cat 2>/dev/null) || rc=$?
+    fi
+    [[ $rc -ne 0 ]] && return 1
+    # Advance the cursor only on a SUCCESSFUL read (this function runs in a
+    # command substitution, but file writes escape the subshell). If the read
+    # returned no cursor line (an empty journal window), KEEP the old cursor
+    # rather than clearing it — clearing would re-read the whole window next
+    # tick and double-count.
+    local _newcur
+    _newcur=$(printf '%s\n' "$out" | sed -n 's/^-- cursor: //p' | tail -1)
+    # Through the single verified writer, like every other advance. On failure
+    # the OLD cursor is removed rather than left behind: a stale value is
+    # indistinguishable from a fresh anchor to anything that merely checks the
+    # file exists, and `drain` is cleared on exactly that check.
+    if [[ -n "$_newcur" ]]; then
+        _oom_persist_cursor "$_newcur" || rm -f "$_OOM_CURSOR_FILE" 2>/dev/null || true
+    fi
+    # `-o cat` renders systemd's line as `<unit>: Failed with result 'oom-kill'.`
+    # A unit name can legally contain ':' (template instances); cut would then
+    # truncate it, and a truncated name cannot match a contained prefix — so a
+    # pathological name mis-classifies toward PAGING, the safe direction.
+    # NOT `sort -u`: the caller compares this list's RECORD COUNT against the
+    # kill delta, and de-duplicating collapses two kills of the same unit name
+    # into one line — which would under-count and suppress a page for a kill
+    # nothing accounted for. Cardinality is the point; the display string
+    # de-duplicates separately. (The `-- cursor:` line carries no oom-kill
+    # phrase, so grep drops it here.)
+    printf '%s
+' "$out"         | { grep -F ": Failed with result 'oom-kill'" || true; }         | cut -d: -f1
+}
+
+_oom_units_all_contained() {
+    # $1 = newline-separated non-empty unit list. rc 0 = EVERY unit matches a
+    # contained prefix; any unmatched unit → rc 1 (one uncontained kill pages).
+    local u p ok
+    while IFS= read -r u; do
+        [[ -z "$u" ]] && continue
+        ok=0
+        for p in $OOM_CONTAINED_UNIT_PREFIXES; do
+            [[ "$u" == "$p"* ]] && { ok=1; break; }
+        done
+        [[ $ok -eq 1 ]] || return 1
+    done <<<"$1"
+    return 0
+}
+
 check_oom_events() {
-    # $1 = previous baseline count. Echoes the (possibly-updated) baseline so the
-    # caller can carry it to the next tick. On an increment: durable snapshot +
-    # one dedup'd page. Never touches stdout except the final baseline echo.
-    local prev="$1" cur
-    cur=$(_read_oom_kill) || { printf '%s' "$prev"; return 0; }
-    [[ -z "$cur" ]] && { printf '%s' "$prev"; return 0; }
+    # $1 = the carried baseline spec
+    #   counter:local_oom:deficit:deficit_ts:drain
+    # (a bare counter from an older caller is accepted: local unverified,
+    # deficit 0). Echoes the refreshed spec for the next tick. Never touches
+    # stdout except the final spec echo.
+    #
+    # The spec carries FIVE facts because suppression needs all of them
+    # (#1790 review round):
+    #   counter     — the oom_kill aggregate (was there a kill?)
+    #   local_oom   — the container root's LOCAL oom count (WHOSE limit fired:
+    #                 the journal names the victim unit, and a container-limit
+    #                 kill can victimise a contained child scope)
+    #   deficit     — kills we already paged for whose journal records have not
+    #                 been seen yet. systemd's record of a unit failure can be
+    #                 emitted AFTER the poll that observed the counter
+    #                 increment, and the record's timestamp is PID 1's EMISSION
+    #                 time (measured on the live journal, #1790 audit) — so NO
+    #                 time window can exclude a late record from the next
+    #                 kill's batch. The only sound correlation is
+    #                 reconciliation: records returned by a query first retire
+    #                 the owed deficit, and only the REST may account for the
+    #                 current delta. A late record can therefore never cover a
+    #                 kill it does not belong to (Codex P1 / Devin, #1790).
+    #   deficit_ts  — when the deficit last GREW. A kill that never writes a
+    #                 record (a non-main process dying inside a surviving
+    #                 scope) leaves a deficit nothing can retire; it expires
+    #                 after 20 poll intervals so contained kills are not
+    #                 spuriously paged forever. Residue, accepted: a journald
+    #                 outage LONGER than the TTL, ending with a query whose
+    #                 backlogged records exactly equal deficit+n, can
+    #                 mis-attribute once. systemd's emission lag is
+    #                 milliseconds in every measurement we have; the TTL is
+    #                 generous against it.
+    #   drain       — set when arming could not advance the journal cursor
+    #                 (journalctl absent/failing at startup): the FIRST
+    #                 resolution must page and re-anchor, because the fallback
+    #                 window would return pre-baseline records that could
+    #                 otherwise "account" for a post-startup kill.
+    local prev_spec="$1" prev prev_local prev_deficit prev_deficit_ts prev_drain
+    prev="${prev_spec%%:*}"
+    local _r1="" _r2="" _r3="" _r4=""
+    [[ "$prev_spec" == *:* ]] && _r1="${prev_spec#*:}"
+    prev_local="${_r1%%:*}"
+    [[ "$_r1" == *:* ]] && _r2="${_r1#*:}"
+    prev_deficit="${_r2%%:*}"
+    [[ "$_r2" == *:* ]] && _r3="${_r2#*:}"
+    prev_deficit_ts="${_r3%%:*}"
+    [[ "$_r3" == *:* ]] && _r4="${_r3#*:}"
+    prev_drain="${_r4%%:*}"
+    # Numeric hygiene: a malformed element degrades to "unknown", never to a
+    # bash arithmetic error under set -e (audit NOTE, #1790).
+    [[ "$prev" =~ ^[0-9]+$ ]] || prev=""
+    [[ "$prev_local" =~ ^[0-9]+$ ]] || prev_local=""
+    [[ "$prev_deficit" =~ ^[0-9]+$ ]] || prev_deficit=0
+    [[ "$prev_deficit_ts" =~ ^[0-9]+$ ]] || prev_deficit_ts=0
+    [[ "$prev_drain" == "1" ]] || prev_drain=0
+    local cur loc_oom now_epoch
+    cur=$(_read_oom_kill) || { printf '%s' "$prev_spec"; return 0; }
+    [[ "$cur" =~ ^[0-9]+$ ]] || { printf '%s' "$prev_spec"; return 0; }
+    loc_oom=$(_read_oom_local_trigger) || loc_oom=""
+    [[ "$loc_oom" =~ ^[0-9]+$ ]] || loc_oom=""
+    now_epoch=$(date +%s)
+    # Expire an unretireable deficit (see the spec comment above). Computed
+    # PER CALL, like _oom_killed_units' fallback window: load_config re-sources
+    # watchgod.conf every tick and may change POLL_INTERVAL.
+    local _deficit_ttl=$(( POLL_INTERVAL * 20 ))
+    if (( prev_deficit > 0 && prev_deficit_ts > 0 )) \
+        && (( now_epoch - prev_deficit_ts > _deficit_ttl )); then
+        prev_deficit=0
+    fi
+    # LATE ARM (Codex P1, #1790). `main` calls `_oom_arm_baseline` exactly once,
+    # at startup. If `memory.events` was unreadable at that moment the spec came
+    # back empty -- "monitoring unavailable" -- and the journal cursor was never
+    # anchored, because arming returns before it gets that far. The baseline is
+    # then actually established HERE, on the first tick where the counter reads,
+    # and emitting drain=0 from that path would hand the next kill's query a
+    # fallback time window in which a PRE-BASELINE record can explain it away.
+    # A malformed spec lands here too, and for the same reason: we do not know
+    # what the cursor points at, so we re-anchor or refuse to trust it.
+    if [[ -z "$prev" ]]; then
+        _oom_arm_cursor || prev_drain=1
+        # `main` already told the operator monitoring was off. It is not, from
+        # here on, and a log that never retracts a scary line is how someone
+        # concludes the monitor is dead while it is running.
+        log INFO "OOM event capture armed late (baseline oom_kill=${cur}${prev_drain:+, drain=${prev_drain}})"
+    fi
     if [[ -n "$prev" ]] && (( cur > prev )); then
         local n=$(( cur - prev )) stamp
         stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -465,13 +674,116 @@ check_oom_events() {
             echo
         } >> "$OOM_LOG" 2>/dev/null || true
         log WARN "cgroup OOM kill detected (oom_kill ${prev} -> ${cur}); snapshot → ${OOM_LOG}"
-        # Emergency tier (pages): an OOM kill is a discrete serious event — the
-        # usual reason a CC session vanishes with no crash message — not routine
-        # tier pressure, so unlike ORANGE it warrants a proactive page (per the
-        # 2026-08-19 decision). Deduped per distinct oom_kill total.
-        queue_alert emergency "watchgod:oom" "cgroup OOM kill(s) detected" \
-            "${n} process(es) OOM-killed in the container cgroup (oom_kill ${prev}->${cur}). A CC session vanishing with no crash message is often this. Snapshot: ${OOM_LOG}" \
-            "watchgod:oom:${cur}"
+        # ATTRIBUTE before paging (issue #1775): the root counter aggregates
+        # oom_kill from every descendant cgroup, so a by-design kill inside a
+        # resource-capped child scope reads identically to genuine container
+        # pressure. Ask the journal which unit died; when EVERY killed unit is
+        # a known contained scope, the cap did its job — record it (snapshot +
+        # WARN log stay either way) and do not page. Anything else — a
+        # non-contained unit, no record, or no journal — pages exactly as
+        # before: attribution can only ever DOWNGRADE a known-contained kill,
+        # never silence an unknown one.
+        #
+        # TRIGGER CHECK FIRST (Codex P1, #1790): the journal names the VICTIM,
+        # not the cgroup whose limit fired. When the container root's LOCAL
+        # oom counter moved, the container's own limit triggered the kill —
+        # the victim can still be a contained child, so journal attribution
+        # must never suppress this. LIMIT OF THE MECHANISM, stated honestly:
+        # an ancestor ABOVE the container root (the host/VM slice) firing and
+        # victimising a contained child is indistinguishable from a contained
+        # kill at this layer and can still be suppressed — no container-side
+        # signal names that trigger. Unreadable local counter = unverifiable
+        # trigger = the same fail direction (page).
+        local _container_trigger=0
+        if [[ -n "$loc_oom" && -n "$prev_local" ]] && (( loc_oom > prev_local )); then
+            _container_trigger=1
+        fi
+        local _oom_units="" _oom_who="unattributed" _oom_n=0 _oom_query_ok=0
+        if _oom_units=$(_oom_killed_units); then
+            _oom_query_ok=1
+            if [[ -n "$_oom_units" ]]; then
+                _oom_who=$(printf '%s\n' "$_oom_units" | sort -u | paste -sd, -)
+                _oom_n=$(printf '%s\n' "$_oom_units" | grep -c . || true)
+            fi
+        else
+            _oom_units=""
+        fi
+        # RECONCILE (see the spec comment): the obligations are the owed
+        # deficit PLUS this tick's delta; the records returned retire them.
+        # Suppress only when records FULLY account for every obligation and
+        # every named unit is contained. Anything else pages, and the
+        # unaccounted remainder carries forward as the new deficit — which is
+        # why a LATE record (returned by a later query) can never cover a kill
+        # it does not belong to: by then its own kill is already an
+        # obligation. EVERY observed kill must be accounted for, not merely
+        # SOME of them (the partially attributed batch was the original
+        # fail-open here).
+        local _obligations=$(( prev_deficit + n )) _new_deficit
+        _new_deficit=$(( _obligations - _oom_n ))
+        (( _new_deficit < 0 )) && _new_deficit=0
+        if (( prev_drain == 0 && _container_trigger == 0 )) \
+            && [[ -n "$loc_oom" && -n "$prev_local" && -n "$_oom_units" ]] \
+            && (( _oom_n == _obligations )) \
+            && _oom_units_all_contained "$_oom_units"; then
+            log WARN "OOM kill contained in [${_oom_who}] — its own resource cap fired, not container pressure; not paging (snapshot kept)"
+        else
+            # Emergency tier (pages): an OOM kill is a discrete serious event —
+            # the usual reason a CC session vanishing with no crash message —
+            # not routine tier pressure, so unlike ORANGE it warrants a
+            # proactive page (per the 2026-08-19 decision). Deduped per
+            # distinct oom_kill total.
+            local _why="killed unit(s): ${_oom_who}"
+            if (( prev_drain == 1 )); then
+                _why="journal cursor could not be armed at startup; killed unit(s): ${_oom_who}"
+            elif [[ "$_container_trigger" -eq 1 ]]; then
+                _why="container-level trigger (memory.events.local oom ${prev_local} -> ${loc_oom}); killed unit(s): ${_oom_who}"
+            elif [[ -z "$loc_oom" || -z "$prev_local" ]]; then
+                _why="trigger unverifiable (memory.events.local unreadable); killed unit(s): ${_oom_who}"
+            fi
+            queue_alert emergency "watchgod:oom" "cgroup OOM kill(s) detected" \
+                "${n} process(es) OOM-killed in the container cgroup (oom_kill ${prev}->${cur}; ${_why}). A CC session vanishing with no crash message is often this. Snapshot: ${OOM_LOG}" \
+                "watchgod:oom:${cur}"
+        fi
+        # The deficit clock only restarts when the deficit GROWS; retirements
+        # keep the original timestamp so a shrinking deficit cannot live
+        # forever by halves.
+        if (( _new_deficit > prev_deficit )); then
+            prev_deficit_ts=$now_epoch
+        fi
+        prev_deficit=$_new_deficit
+        # drain clears ONLY on a successful query: the flag means "the cursor
+        # was never anchored", and a FAILED resolution neither re-anchors it
+        # nor returns records — clearing on failure would let the next tick's
+        # fallback window offer pre-baseline records as attribution (audit
+        # BLOCKER, #1790 round 2).
+        # A SUCCESSFUL QUERY IS NOT AN ANCHORED CURSOR, and conflating them
+        # gave back exactly what drain was added to prevent. MEASURED with the
+        # cursor path unwritable: the arm correctly set drain=1, the next kill
+        # paged and cleared drain, its re-anchor silently failed, and the kill
+        # after that -- a genuine one whose own record was never written -- was
+        # accounted for by the first kill's record, still inside the fallback
+        # window, and suppressed. Two kills, one page. Clear drain only when the
+        # cursor is verifiably on disk.
+        # BOTH DIRECTIONS. `drain` means "the cursor is not anchored", so the
+        # cursor decides it -- clearing it on success while never SETTING it left
+        # the inverse open, and the inverse is reachable from the ordinary
+        # drain=0 state: a re-anchor that cannot persist deletes the cursor
+        # (:549) and leaves drain=0 behind, so the next query falls back to the
+        # relative window and re-reads the record this tick just counted.
+        # MEASURED from `4:0:0:0:0` with the cursor path unwritable: a contained
+        # kill, then a real kill that wrote no record of its own -- TWO kills,
+        # ZERO pages. Setting drain from the cursor closes it in one place
+        # rather than at each site that can fail to write.
+        # Clearing needs BOTH: the query succeeded AND the cursor on disk is
+        # anchored. The anchored check alone is syntax -- a stale file from a
+        # dead epoch passes it -- and on a failed query nothing re-anchored, so
+        # clearing there trusts a position nobody verified. Setting needs only
+        # the anchor to be missing.
+        if ! _oom_cursor_is_anchored; then
+            prev_drain=1
+        elif (( _oom_query_ok == 1 )); then
+            prev_drain=0
+        fi
         # Bound the OOM log (retention discipline — matches cc_exit/log rotation);
         # keep the most recent ~1000 lines so a thrashing container can't leak it.
         local oom_lines
@@ -480,7 +792,101 @@ check_oom_events() {
             tail -n 1000 "$OOM_LOG" > "${OOM_LOG}.tmp" 2>/dev/null && mv "${OOM_LOG}.tmp" "$OOM_LOG" 2>/dev/null || true
         fi
     fi
-    printf '%s' "$cur"
+    # A transient unreadable local counter must not DISARM future trigger
+    # verification: carry the last known local baseline forward (the tick
+    # itself still pages — the current value is unknown — and a jump observed
+    # once the file is readable again correctly reads as a container trigger).
+    printf '%s' "${cur}:${loc_oom:-$prev_local}:${prev_deficit}:${prev_deficit_ts}:${prev_drain}"
+}
+
+_oom_persist_cursor() {
+    # $1 = a cursor value (with or without the leading `s=`). rc 0 ONLY when the
+    # cursor file now verifiably holds it.
+    #
+    # THE SINGLE WRITER. Every path that advances the cursor goes through here,
+    # because a cursor that was not persisted is the one state the whole
+    # suppression mechanism cannot survive: queries fall back to a TIME WINDOW,
+    # where a record written before the baseline can account for a kill that
+    # happened after it.
+    #
+    # The write's exit status is not enough on its own -- a full filesystem
+    # reports the failure on close, leaving an empty or truncated file behind --
+    # so the value is read BACK and compared. At the point this matters an
+    # unreadable cursor and an absent one are the same thing, and they get the
+    # same answer.
+    local _want="s=${1#s=}" _back=""
+    [[ "$_want" != "s=" ]] || return 1
+    # The write's own status is checked, and then the value is read back and
+    # compared to what we MEANT to write. The comparison subsumes the status
+    # check -- MEASURED: reverting this `|| return 1` to `|| true` turns no test
+    # red, because a failed write leaves either nothing (read-back fails) or the
+    # OLD value (read-back mismatches). It is kept as the cheap early exit and
+    # because a future refactor that weakened the read-back to a bare `s=*`
+    # prefix test would make it load-bearing again.
+    printf '%s' "$_want" > "$_OOM_CURSOR_FILE" 2>/dev/null || return 1
+    _back=$(cat "$_OOM_CURSOR_FILE" 2>/dev/null) || return 1
+    [[ "$_back" == "$_want" ]] || return 1
+    return 0
+}
+
+_oom_cursor_is_anchored() {
+    # rc 0 when a usable cursor is on disk. This is the fact `drain` denies, so
+    # nothing may clear drain without it.
+    local _back=""
+    _back=$(cat "$_OOM_CURSOR_FILE" 2>/dev/null) || return 1
+    [[ "$_back" == s=* ]] || return 1
+    return 0
+}
+
+_oom_arm_cursor() {
+    # Advance the journal cursor to the current tail and PERSIST it.
+    #
+    # rc 0 ONLY when the cursor file now holds that position. rc 1 for every
+    # other outcome -- journalctl absent, the query failing, the write failing,
+    # or a write that reported success and left nothing readable behind. The
+    # caller must carry drain=1 on rc 1, because an unarmed cursor is not a
+    # cosmetic gap: the next query falls back to a TIME WINDOW, where a record
+    # written BEFORE the baseline can account for a kill that happened after it
+    # and suppress a real page.
+    #
+    # `-n 0 --show-cursor` prints the tail cursor with no entries, so this
+    # advances the position without consuming anything.
+    command -v journalctl >/dev/null 2>&1 || return 1
+    local _tail_cursor=""
+    _tail_cursor=$(journalctl --user -n 0 --show-cursor --no-pager -o cat 2>/dev/null \
+        | sed -n 's/^-- cursor: //p' | tail -1) || _tail_cursor=""
+    [[ -n "$_tail_cursor" ]] || return 1
+    _oom_persist_cursor "$_tail_cursor"
+}
+
+_oom_arm_baseline() {
+    # Echo the initial OOM baseline spec
+    # ("counter:local_oom:deficit:deficit_ts:drain"; empty = monitoring
+    # unavailable) and advance the journal cursor to the current tail (Codex
+    # P1, #1790): records of kills that predate the baseline — written before
+    # this (re)start, or left behind the cursor by a kill that landed in the
+    # gap — must never account for a post-startup kill. `-n 0 --show-cursor`
+    # prints the tail cursor with no entries, so this advances the position
+    # without consuming anything. When the cursor cannot be armed (journalctl
+    # absent or failing), the spec carries drain=1: the first resolution then
+    # pages and re-anchors rather than trusting the fallback window's
+    # pre-baseline records.
+    local base="" loc="" drain=0
+    base=$(_read_oom_kill) || base=""
+    [[ -z "$base" ]] && { printf '%s' ""; return 0; }
+    loc=$(_read_oom_local_trigger) || loc=""
+    if ! _oom_arm_cursor; then
+        drain=1
+        # A cursor file from a PREVIOUS daemon epoch must not survive a failed
+        # arm. It passes the anchored check on syntax, but its POSITION predates
+        # this baseline -- a query from it returns pre-baseline records, and one
+        # of those can account for a post-baseline kill. MEASURED: with a stale
+        # file surviving, drain=0 and an expired deficit, one real line-less
+        # kill produced ZERO pages. Absent file -> queries use the bounded
+        # fallback window and drain=1 covers the first resolution.
+        rm -f "$_OOM_CURSOR_FILE" 2>/dev/null || true
+    fi
+    printf '%s' "${base}:${loc}:0:0:${drain}"
 }
 
 # ── Main loop ────────────────────────────────────────────────
@@ -491,11 +897,11 @@ main() {
     # Baseline the OOM counter at startup so we only page on NEW kills (never the
     # cumulative-since-boot history). Empty baseline = monitoring unavailable.
     local oom_baseline
-    oom_baseline=$(_read_oom_kill) || oom_baseline=""
+    oom_baseline=$(_oom_arm_baseline)
     if [[ -z "$oom_baseline" ]]; then
         log INFO "OOM event capture unavailable (no readable ${OOM_EVENTS_FILE}) — OOM monitoring off"
     else
-        log INFO "OOM event capture armed (baseline oom_kill=${oom_baseline})"
+        log INFO "OOM event capture armed (baseline oom_kill=${oom_baseline%%:*})"
     fi
 
     while true; do
