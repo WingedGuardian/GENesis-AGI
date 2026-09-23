@@ -72,9 +72,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import read_payload, tool_input  # noqa: E402
 from hook_output import print_json_bounded  # noqa: E402
 from shell_parse import (  # noqa: E402
-    _VERB_DISPATCHERS,
-    _option_name,
+    _GH_ALL_VALUE_FLAGS,
+    _GH_FLAG_TABLE,
     analyze_checked,
+    gh_command,
 )
 
 #: Cheap prefilter, same reasoning as `capped_read_advisory._GH_WORD`: this runs
@@ -85,81 +86,28 @@ from shell_parse import (  # noqa: E402
 #: resolves on the basename and would match it.
 _GH_WORD = re.compile(r"(?<![\w-])gh(?![\w-])")
 
-#: `gh api`'s option grammar, MEASURED from `gh api --help` (gh 2.101.0,
-#: consulted 2026-09-20) rather than recalled, per the house rule that a claim
-#: about an external tool's flags is a lookup and not a memory.
-#:
-#: It is scoped to the `api` GROUP and deliberately NOT merged into
-#: `shell_parse`'s shared `gh` spec. That is a different thing from the second
-#: copy the doctrine forbids: gh's option grammar is PER-SUBCOMMAND, and the
-#: same short flag means different things under different groups. MEASURED:
-#: `gh api -f` is `--raw-field` and TAKES a value, while `gh pr create -f` is
-#: `--fill` and takes none. Adding `-f` to the shared `value_flags` would
-#: therefore mis-parse `gh pr create -f` for every consumer of that spec, the
-#: fail-closed merge gate included. The shared spec models what is common to
-#: all of gh (`-R/--repo`); this models one group that it does not.
-_API_VALUE_FLAGS = frozenset(
-    {
-        "--cache",
-        "-F",
-        "--field",
-        "-H",
-        "--header",
-        "--hostname",
-        "--input",
-        "-q",
-        "--jq",
-        "-X",
-        "--method",
-        "-p",
-        "--preview",
-        "-f",
-        "--raw-field",
-        "-t",
-        "--template",
-    }
-)
+#: `gh api`'s option grammar now lives in `shell_parse._GH_FLAG_TABLE`, the
+#: per-(group, subcommand) model shared by every consumer — a second copy here
+#: was the third recurrence of the same argv-walk defect (#2209). Row
+#: semantics unchanged: `-f` takes a value under `api` and none under
+#: `pr create`, which is exactly why the table is per-row.
+_API_VALUE_FLAGS = _GH_FLAG_TABLE[("api", "")][0]
 
 #: The two spellings that carry a `key=value` request parameter.
 _API_FIELD_FLAGS = frozenset({"-f", "--raw-field", "-F", "--field"})
-
-#: Value-taking flags for the `pr close` group, MEASURED from
-#: `gh pr close --help` (gh 2.101.0): `-c/--comment` takes a string and
-#: `-R/--repo` a repo. The shared spec knows only `-R`, and without `-c`
-#: here a closing COMMENT whose text is a help flag would read as a help
-#: invocation and silence a real close -- a false NEGATIVE introduced by a
-#: false-positive fix, which is the worse of the two directions.
-#: `-R/--repo` is deliberately NOT restated here. Duplicating it made the
-#: local table answer first, so the shared spec's hardened glued and attached
-#: spellings were never consulted and the reuse this file claims in two
-#: docstrings was behaviourally DEAD -- MEASURED: deleting both `_option_name`
-#: branches left the suite 89/89 green, and an exhaustive differential over
-#: 406,875 argv shapes found 0 disagreements. With the duplicate gone the
-#: shared spec is the only reader of the repo flag, the reuse is live, and
-#: deleting it correctly turns the suite red.
-_PR_CLOSE_VALUE_FLAGS = frozenset({"-c", "--comment"})
 
 #: MEASURED: `gh api repos/octocat/hello-world --help` prints help and issues no
 #: request, so a terminal help flag ANYWHERE means the command performs nothing.
 _HELP_FLAGS = frozenset({"--help", "-h"})
 
 #: Every value-taking flag this hook must step over, from ANY of the groups
-#: it reads. Unioned rather than applied per-position, because MEASURED
-#: against the real CLI that is what gh itself does: it accepts a
-#: subcommand-local value flag BEFORE the group and consumes the next token as
-#: its value. `gh -X PATCH api --help` and `gh -c note pr close --help` both
+#: it reads — the union across all modeled rows, because MEASURED against the
+#: real CLI that is what gh itself applies while the command path is still
+#: unresolved: `gh -X PATCH api --help` and `gh -c note pr close --help` both
 #: resolve, and `gh -f pr create --help` FAILS with `unknown command
 #: "create"` -- gh having eaten `pr` as the value of `-f`. So a parser that
-#: does not step over these mislocates the group exactly where gh does not,
-#: and the union is the conservative reading of gh's own behaviour rather
-#: than a guess about it.
-#:
-#: This is still a per-subcommand model, not a widening of `shell_parse`'s
-#: shared spec: the same short flag means different things under different
-#: groups (`gh api -f` takes a value; `gh pr create -f` is `--fill` and takes
-#: none), so merging these into the shared table would mis-parse the latter
-#: for the fail-closed merge gate. Recurring class, filed separately.
-_VALUE_FLAGS = _API_VALUE_FLAGS | _PR_CLOSE_VALUE_FLAGS
+#: does not step over these mislocates the group exactly where gh does not.
+_VALUE_FLAGS = _GH_ALL_VALUE_FLAGS
 
 #: The mutation, tested against the VALUE of the `query` field rather than
 #: against rejoined argv. The previous form searched the whole command and so
@@ -206,85 +154,10 @@ def _split_api_option(tok: str) -> tuple[str, str | None]:
     return tok, None
 
 
-def _gh_group_at(argv: list[str]) -> tuple[int, str] | None:
-    """(index, GROUP word) for a gh argv, or None.
-
-    The option table is read off `shell_parse`'s own dispatcher spec rather than
-    restated, which is the instruction `gh_pr_subcommand` leaves in its body:
-    *"a second copy of one CLI option grammar is the shape that produced the
-    defect this change is about."* That defect was a separated `--repo o/r`
-    whose VALUE got read as the subcommand.
-
-    I reproduced it here, one level up, on the first attempt: a hand-rolled
-    "first token not starting with `-`" returned `owner/repo` for
-    `gh --repo owner/repo pr close 1` and silenced a real close. The test caught
-    it. Reading the spec is what makes that unrepresentable rather than
-    remembered.
-    """
-    spec = _VERB_DISPATCHERS.get("gh")
-    if spec is None:  # pragma: no cover - the spec is module-level and static
-        return None
-    skip_next = False
-    for i, tok in enumerate(argv[1:], start=1):
-        if skip_next:
-            skip_next = False
-            continue
-        # The shared spec FIRST, because it carries the hardened handling of
-        # the repo flag's glued and attached spellings -- the form that
-        # produced the original bypass. The union then covers the
-        # subcommand-local flags gh also accepts here, which the shared spec
-        # deliberately does not model.
-        name, attached = _option_name(tok, spec)
-        if not attached and name in spec.value_flags:
-            skip_next = True
-            continue
-        local, local_value = _split_api_option(tok)
-        if local_value is None and local in _VALUE_FLAGS:
-            skip_next = True
-            continue
-        if not tok.startswith("-"):
-            return i, tok
-    return None
-
-
 def _gh_group(argv: list[str]) -> str | None:
     """The gh GROUP word (`pr`, `run`, `label`, …) for a gh argv, or None."""
-    hit = _gh_group_at(argv)
-    return hit[1] if hit else None
-
-
-def _positional_after(argv: list[str], start: int) -> str | None:
-    """The next POSITIONAL word after index `start`, stepping over flag values.
-
-    `gh_pr_subcommand` is not used for this any more, and the reason is a
-    MEASURED miss rather than a preference: its shared grammar consumes only
-    the repo flag, so `gh pr -c note close 1` read `note` as the subcommand
-    and a real close went unreported. `-c/--comment` is `gh pr close`'s own
-    flag, which the shared spec does not model and should not -- the same
-    per-subcommand split documented on `_VALUE_FLAGS`.
-
-    This is that spec EXTENDED, not replaced: the hardened repo-flag handling
-    still runs first, through `_option_name`, so the separated-value bypass it
-    was written for cannot come back through this door.
-    """
-    spec = _VERB_DISPATCHERS.get("gh")
-    skip_next = False
-    for tok in argv[start + 1 :]:
-        if skip_next:
-            skip_next = False
-            continue
-        if spec is not None:
-            name, attached = _option_name(tok, spec)
-            if not attached and name in spec.value_flags:
-                skip_next = True
-                continue
-        local, local_value = _split_api_option(tok)
-        if local_value is None and local in _VALUE_FLAGS:
-            skip_next = True
-            continue
-        if not tok.startswith("-"):
-            return tok
-    return None
+    inv = gh_command(argv)
+    return inv.group if inv else None
 
 
 def _has_terminal_help(argv: list[str], value_flags: frozenset[str]) -> bool:
@@ -320,29 +193,22 @@ def _parse_api(argv: list[str]) -> _ApiCall | None:
     `gh workflow run api …` invocation runs a WORKFLOW named `api`, and the old
     membership test (`"api" in argv[1:]`) claimed it closed a PR.
     """
-    hit = _gh_group_at(argv)
-    if hit is None or hit[1] != "api":
+    inv = gh_command(argv)
+    if inv is None or inv.group != "api":
         return None
-    group_i = hit[0]
-    endpoint: str | None = None
+    # The endpoint is the first POSITIONAL after the command path, resolved by
+    # the shared walk rather than a local one. The OPTION scan below still
+    # covers all of argv, because gh accepts api-local flags on BOTH sides of
+    # the group -- MEASURED: `gh -X PATCH api ...` resolves. Only the ENDPOINT
+    # is positional; the options belong to the invocation wherever they sit.
+    endpoint = inv.positionals[0] if inv.positionals else None
     fields: list[tuple[str, str]] = []
     method: str | None = None
     positional_only = False
-    # The scan starts at argv[1], NOT after the group, because gh accepts
-    # api-local flags on BOTH sides of it -- MEASURED: `gh -X PATCH api ...`
-    # resolves. Starting after the group located `api` correctly and then
-    # never saw the method, so a real close read as a no-method request and
-    # went unreported. Only the ENDPOINT is positional-after-the-group; the
-    # options belong to the invocation wherever they sit.
     i = 1
     while i < len(argv):
         tok = argv[i]
-        if i == group_i:
-            i += 1
-            continue
         if positional_only or not tok.startswith("-") or tok == "-":
-            if endpoint is None and i > group_i:
-                endpoint = tok
             i += 1
             continue
         if tok == "--":
@@ -380,27 +246,17 @@ def _closes_a_pr(argv: list[str]) -> str | None:
     """Why this argv appears to close a PR, or None. Text-visible forms only."""
     if not argv or os.path.basename(argv[0]) != "gh":
         return None
-    spec = _VERB_DISPATCHERS.get("gh")
-    shared_flags = spec.value_flags if spec is not None else frozenset()
-    known_values = frozenset(_API_VALUE_FLAGS | _PR_CLOSE_VALUE_FLAGS | set(shared_flags))
-    if _has_terminal_help(argv, known_values):
+    if _has_terminal_help(argv, _GH_ALL_VALUE_FLAGS):
         return None
-    # `gh_pr_subcommand` is REUSED rather than re-derived: it already survived a
-    # real bypass (a separated repo flag whose VALUE was read as the subcommand,
-    # skipping every downstream gate), and a second copy of that grammar is how
-    # the two drift apart.
-    #
-    # But it is reused with an ADDED narrowing, because the cost model inverts
-    # here. It scans for a `pr` token ANYWHERE in argv, which is the safe
-    # direction for the fail-closed merge gate it was written for -- over-
-    # matching there costs a prompt. Over-matching HERE is the failure this hook
-    # names as fatal to itself. MEASURED false positives: a `gh run list`
-    # naming a workflow, a `gh label create`, and a `gh alias set` whose
-    # operands happened to contain those words. An advisory additionally
-    # requires the group to be the first positional, which is the only shape
-    # that is really a `pr` subcommand.
-    hit = _gh_group_at(argv)
-    if hit is not None and hit[1] == "pr" and _positional_after(argv, hit[0]) == "close":
+    # The group/subcommand comes from `shell_parse.gh_command`, the shared
+    # resolver every consumer now uses (#2209) — a hand-rolled walk here was
+    # the second recurrence of the same defect: a `first token not starting
+    # with -` locator returned `owner/repo` for `gh --repo owner/repo pr
+    # close 1` and silenced a real close. Requiring the group position keeps
+    # the measured negatives (`gh run list` naming a workflow, `gh label
+    # create`, `gh alias set` carrying the words as operands) unreachable.
+    inv = gh_command(argv)
+    if inv is not None and inv.group == "pr" and inv.subcommand == "close":
         return "`gh pr close`"
     call = _parse_api(argv)
     if call is None or call.endpoint is None:

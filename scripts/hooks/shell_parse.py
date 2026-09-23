@@ -3055,6 +3055,190 @@ def git_subcommand(argv: list[str]) -> str | None:
     return None if i is None else argv[i]
 
 
+#: Per-(group, subcommand) flag model for gh, MEASURED by parsing
+#: ``gh help <group> <sub>`` on gh 2.78.0 — a flag takes a value iff its help
+#: line carries a placeholder (``string``, ``int``, ``[HOST/]OWNER/REPO``, …).
+#: Each row is ``(value_flags, valueless_flags)``.
+#:
+#: The per-subcommand split is load-bearing, not a preference: the same short
+#: flag means different things under different commands — MEASURED, ``gh api
+#: -f`` is ``--raw-field`` (a value) while ``gh pr create -f`` is ``--fill``
+#: (none). A single flat table is not a correct model of this CLI, which is
+#: why three argv walks each re-derived it wrong (#2209). The drift test in
+#: ``tests/test_hooks/test_gh_flag_table.py`` re-reads ``gh help`` and fails
+#: when a release moves an arity, so the table is checked rather than trusted.
+_GH_FLAG_TABLE: dict[tuple[str, str], tuple[frozenset[str], frozenset[str]]] = {
+    ("api", ""): (frozenset({'--cache', '--field', '--header', '--hostname', '--input', '--jq', '--method', '--preview', '--raw-field', '--template', '-F', '-H', '-X', '-f', '-p', '-q', '-t'}),
+        frozenset({'--help', '--include', '--paginate', '--silent', '--slurp', '--verbose', '-i'})),
+    ("cache", "list"): (frozenset({'--jq', '--json', '--key', '--limit', '--order', '--ref', '--repo', '--sort', '--template', '-L', '-O', '-R', '-S', '-k', '-q', '-r', '-t'}),
+        frozenset({'--help'})),
+    ("gist", "list"): (frozenset({'--filter', '--limit', '-L'}),
+        frozenset({'--help', '--include-content', '--public', '--secret'})),
+    ("issue", "close"): (frozenset({'--comment', '--reason', '--repo', '-R', '-c', '-r'}),
+        frozenset({'--help'})),
+    ("issue", "comment"): (frozenset({'--body', '--body-file', '--repo', '-F', '-R', '-b'}),
+        frozenset({'--create-if-none', '--delete-last', '--edit-last', '--editor', '--help', '--web', '--yes', '-e', '-w'})),
+    ("issue", "create"): (frozenset({'--assignee', '--body', '--body-file', '--label', '--milestone', '--project', '--recover', '--repo', '--template', '--title', '-F', '-R', '-T', '-a', '-b', '-l', '-m', '-p', '-t'}),
+        frozenset({'--editor', '--help', '--web', '-e', '-w'})),
+    ("issue", "edit"): (frozenset({'--add-assignee', '--add-label', '--add-project', '--body', '--body-file', '--milestone', '--remove-assignee', '--remove-label', '--remove-project', '--repo', '--title', '-F', '-R', '-b', '-m', '-t'}),
+        frozenset({'--help', '--remove-milestone'})),
+    ("issue", "list"): (frozenset({'--app', '--assignee', '--author', '--jq', '--json', '--label', '--limit', '--mention', '--milestone', '--repo', '--search', '--state', '--template', '-A', '-L', '-R', '-S', '-a', '-l', '-m', '-q', '-s', '-t'}),
+        frozenset({'--help', '--web', '-w'})),
+    ("issue", "view"): (frozenset({'--jq', '--json', '--repo', '--template', '-R', '-q', '-t'}),
+        frozenset({'--comments', '--help', '--web', '-c', '-w'})),
+    ("label", "list"): (frozenset({'--jq', '--json', '--limit', '--order', '--repo', '--search', '--sort', '--template', '-L', '-R', '-S', '-q', '-t'}),
+        frozenset({'--help', '--web', '-w'})),
+    ("pr", "checks"): (frozenset({'--interval', '--jq', '--json', '--repo', '--template', '-R', '-i', '-q', '-t'}),
+        frozenset({'--fail-fast', '--help', '--required', '--watch', '--web', '-w'})),
+    ("pr", "close"): (frozenset({'--comment', '--repo', '-R', '-c'}),
+        frozenset({'--delete-branch', '--help', '-d'})),
+    ("pr", "comment"): (frozenset({'--body', '--body-file', '--repo', '-F', '-R', '-b'}),
+        frozenset({'--create-if-none', '--delete-last', '--edit-last', '--editor', '--help', '--web', '--yes', '-e', '-w'})),
+    ("pr", "create"): (frozenset({'--assignee', '--base', '--body', '--body-file', '--head', '--label', '--milestone', '--project', '--recover', '--repo', '--reviewer', '--template', '--title', '-B', '-F', '-H', '-R', '-T', '-a', '-b', '-l', '-m', '-p', '-r', '-t'}),
+        frozenset({'--draft', '--dry-run', '--editor', '--fill', '--fill-first', '--fill-verbose', '--help', '--no-maintainer-edit', '--web', '-d', '-e', '-f', '-w'})),
+    ("pr", "diff"): (frozenset({'--color', '--repo', '-R'}),
+        frozenset({'--help', '--name-only', '--patch', '--web', '-w'})),
+    ("pr", "edit"): (frozenset({'--add-assignee', '--add-label', '--add-project', '--add-reviewer', '--base', '--body', '--body-file', '--milestone', '--remove-assignee', '--remove-label', '--remove-project', '--remove-reviewer', '--repo', '--title', '-B', '-F', '-R', '-b', '-m', '-t'}),
+        frozenset({'--help', '--remove-milestone'})),
+    ("pr", "list"): (frozenset({'--app', '--assignee', '--author', '--base', '--head', '--jq', '--json', '--label', '--limit', '--repo', '--search', '--state', '--template', '-A', '-B', '-H', '-L', '-R', '-S', '-a', '-l', '-q', '-s', '-t'}),
+        frozenset({'--draft', '--help', '--web', '-d', '-w'})),
+    ("pr", "merge"): (frozenset({'--author-email', '--body', '--body-file', '--match-head-commit', '--repo', '--subject', '-A', '-F', '-R', '-b', '-t'}),
+        frozenset({'--admin', '--auto', '--delete-branch', '--disable-auto', '--help', '--merge', '--rebase', '--squash', '-d', '-m', '-r', '-s'})),
+    ("pr", "ready"): (frozenset({'--repo', '-R'}),
+        frozenset({'--help', '--undo'})),
+    ("pr", "view"): (frozenset({'--jq', '--json', '--repo', '--template', '-R', '-q', '-t'}),
+        frozenset({'--comments', '--help', '--web', '-c', '-w'})),
+    ("release", "list"): (frozenset({'--jq', '--json', '--limit', '--order', '--repo', '--template', '-L', '-O', '-R', '-q', '-t'}),
+        frozenset({'--exclude-drafts', '--exclude-pre-releases', '--help'})),
+    ("repo", "list"): (frozenset({'--jq', '--json', '--language', '--limit', '--template', '--topic', '--visibility', '-L', '-l', '-q', '-t'}),
+        frozenset({'--archived', '--fork', '--help', '--no-archived', '--source'})),
+    ("repo", "view"): (frozenset({'--branch', '--jq', '--json', '--template', '-b', '-q', '-t'}),
+        frozenset({'--help', '--web', '-w'})),
+    ("run", "list"): (frozenset({'--branch', '--commit', '--created', '--event', '--jq', '--json', '--limit', '--repo', '--status', '--template', '--user', '--workflow', '-L', '-R', '-b', '-c', '-e', '-q', '-s', '-t', '-u', '-w'}),
+        frozenset({'--all', '--help', '-a'})),
+    ("run", "view"): (frozenset({'--attempt', '--job', '--jq', '--json', '--repo', '--template', '-R', '-a', '-j', '-q', '-t'}),
+        frozenset({'--exit-status', '--help', '--log', '--log-failed', '--verbose', '--web', '-v', '-w'})),
+    ("search", "code"): (frozenset({'--extension', '--filename', '--jq', '--json', '--language', '--limit', '--match', '--owner', '--repo', '--size', '--template', '-L', '-R', '-q', '-t'}),
+        frozenset({'--help', '--web', '-w'})),
+    ("search", "commits"): (frozenset({'--author', '--author-date', '--author-email', '--author-name', '--committer', '--committer-date', '--committer-email', '--committer-name', '--hash', '--jq', '--json', '--limit', '--order', '--owner', '--parent', '--repo', '--sort', '--template', '--tree', '--visibility', '-L', '-R', '-q', '-t'}),
+        frozenset({'--help', '--merge', '--web', '-w'})),
+    ("search", "issues"): (frozenset({'--app', '--assignee', '--author', '--closed', '--commenter', '--comments', '--created', '--interactions', '--involves', '--jq', '--json', '--label', '--language', '--limit', '--match', '--mentions', '--milestone', '--order', '--owner', '--project', '--reactions', '--repo', '--sort', '--state', '--team-mentions', '--template', '--updated', '--visibility', '-L', '-R', '-q', '-t'}),
+        frozenset({'--archived', '--help', '--include-prs', '--locked', '--no-assignee', '--no-label', '--no-milestone', '--no-project', '--web', '-w'})),
+    ("search", "prs"): (frozenset({'--app', '--assignee', '--author', '--base', '--checks', '--closed', '--commenter', '--comments', '--created', '--head', '--interactions', '--involves', '--jq', '--json', '--label', '--language', '--limit', '--match', '--mentions', '--merged-at', '--milestone', '--order', '--owner', '--project', '--reactions', '--repo', '--review', '--review-requested', '--reviewed-by', '--sort', '--state', '--team-mentions', '--template', '--updated', '--visibility', '-B', '-H', '-L', '-R', '-q', '-t'}),
+        frozenset({'--archived', '--draft', '--help', '--locked', '--merged', '--no-assignee', '--no-label', '--no-milestone', '--no-project', '--web', '-w'})),
+    ("search", "repos"): (frozenset({'--created', '--followers', '--forks', '--good-first-issues', '--help-wanted-issues', '--include-forks', '--jq', '--json', '--language', '--license', '--limit', '--match', '--number-topics', '--order', '--owner', '--size', '--sort', '--stars', '--template', '--topic', '--updated', '--visibility', '-L', '-q', '-t'}),
+        frozenset({'--archived', '--help', '--web', '-w'})),
+    ("workflow", "list"): (frozenset({'--jq', '--json', '--limit', '--repo', '--template', '-L', '-R', '-q', '-t'}),
+        frozenset({'--all', '--help', '-a'})),
+}
+
+#: The UNION across every modeled row, used while the command path is still
+#: unresolved — which is exactly where gh itself applies it. MEASURED against
+#: the real CLI: ``gh -X PATCH api --help`` resolves to ``gh api`` and
+#: ``gh -c note pr close --help`` resolves to ``gh pr close``, so a
+#: subcommand-local value flag consumes its argument BEFORE the group; and
+#: ``gh -f pr create --help`` FAILS with ``unknown command "create"`` because
+#: ``-f`` — a value flag under ``api`` — ate ``pr``. Union semantics before the
+#: path resolves is therefore not an approximation of gh's behaviour, it IS
+#: the behaviour. After the path resolves the walk switches to that row's own
+#: table, where ``-f`` under ``gh pr create`` is correctly valueless.
+_GH_ALL_VALUE_FLAGS = frozenset().union(*(v for v, _ in _GH_FLAG_TABLE.values()))
+_GH_ALL_BOOL_FLAGS = frozenset().union(*(b for _, b in _GH_FLAG_TABLE.values()))
+
+#: Groups that CONTAIN subcommands (the second bare word is a verb) versus
+#: leaf commands like ``api``, whose next bare word is an operand.
+_GH_GROUPS = frozenset({g for g, s in _GH_FLAG_TABLE if s})
+_GH_LEAF_COMMANDS = frozenset({g for g, s in _GH_FLAG_TABLE if not s})
+
+#: Root-level flags gh accepts before any command.
+_GH_ROOT_FLAGS = frozenset({"--help", "--version", "-h", "-v"})
+
+
+def _gh_option(tok: str, value_flags: frozenset[str]) -> tuple[str, str | None]:
+    """Split a gh option token into (name, glued-value-or-None).
+
+    Three spellings of one option answer the same: ``--repo o/r``,
+    ``--repo=o/r``, ``-Ro/r``. The glued short form is recognised only when the
+    short is a KNOWN value flag in the active set — a boolean short bundled
+    with others must not absorb the remainder as a value.
+    """
+    if tok.startswith("--"):
+        name, sep, val = tok.partition("=")
+        return name, (val if sep else None)
+    if tok.startswith("-") and len(tok) > 2:
+        head = tok[:2]
+        if head in value_flags:
+            return head, tok[2:].lstrip("=") or None
+    return tok, None
+
+
+class GhInvocation(NamedTuple):
+    """A gh argv resolved to its command path, operands, and the dashed tokens
+    no modeled flag row could classify."""
+
+    group: str
+    subcommand: str | None
+    positionals: tuple[str, ...]
+    unmodelled: tuple[str, ...]
+
+
+def gh_command(argv: list[str]) -> GhInvocation | None:
+    """Resolve a ``gh`` argv to its (group, subcommand, positionals), or None.
+
+    The single argv walk every consumer uses — the fix for the same defect
+    arriving three times in three different argv walkers (#2209). Before the
+    command path resolves it applies the union of all modeled value flags,
+    matching gh's own traversal (see :data:`_GH_ALL_VALUE_FLAGS`); after it
+    resolves it applies that row's own table.
+
+    ``unmodelled`` reports rather than decides: a dashed token in no modeled
+    row is returned to the CALLER, because the right fail direction differs —
+    a fail-closed gate wants to assume it takes a value (conservative), a
+    fail-open advisory the opposite. gh's own parser is closed-world, so an
+    unmodelled flag most likely means the command exits 1 — but that is gh's
+    claim, and a flag added by a newer release would make it wrong.
+    """
+    if not argv or _basename(argv[0]) != "gh":
+        return None
+    path: list[str] = []
+    positionals: list[str] = []
+    unmodelled: list[str] = []
+    value_flags = _GH_ALL_VALUE_FLAGS
+    bool_flags = _GH_ALL_BOOL_FLAGS | _GH_ROOT_FLAGS
+    capacity = 1  # until the group word says otherwise
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            positionals.extend(argv[i + 1 :])
+            break
+        if tok.startswith("-") and tok != "-":
+            name, glued = _gh_option(tok, value_flags)
+            if name in value_flags:
+                i += 1 if glued is not None else 2
+                continue
+            if name in bool_flags or tok in bool_flags:
+                i += 1
+                continue
+            unmodelled.append(tok)
+            i += 1
+            continue
+        if len(path) < capacity:
+            path.append(tok)
+            if len(path) == 1 and path[0] in _GH_GROUPS:
+                capacity = 2
+            if len(path) == capacity:
+                row = _GH_FLAG_TABLE.get((path[0], path[1] if capacity == 2 else ""))
+                if row is not None:
+                    value_flags, bool_flags = row[0], row[1] | _GH_ROOT_FLAGS
+        else:
+            positionals.append(tok)
+        i += 1
+    if not path:
+        return None
+    return GhInvocation(path[0], path[1] if len(path) > 1 else None, tuple(positionals), tuple(unmodelled))
+
+
 def gh_pr_subcommand(argv: list[str]) -> str | None:
     """For a ``gh`` argv, the subcommand after ``pr`` (create/merge/…), else None.
 
@@ -3065,32 +3249,42 @@ def gh_pr_subcommand(argv: list[str]) -> str | None:
     downstream gate (merge/create/comment) silently skips that segment: the
     separated ``-R o/r`` form let ``gh pr -R o/r merge N --admin`` bypass ALL
     fail-closed merge gates (found 2026-08-13 via the escalation-gate review).
-    Glued (``-Ro/r``) and ``--repo=o/r`` forms are single ``-``-prefixed tokens
-    and were already skipped.
+
+    The flag grammar is the union table, not the two-flag spec this walk
+    previously shared: that spec consumed only ``-R/--repo``, so a
+    subcommand-local value flag between the group and its verb put its own
+    VALUE in the verb slot — ``gh pr -c note close 1`` read ``note`` as the
+    subcommand (a real close reported as no close), and ``gh -X PATCH api``
+    put ``PATCH`` in the group slot. Unknown dashed tokens are NOT consumed —
+    in this fail-closed direction a skipped word is the dangerous miss, not
+    a false match.
     """
     if not argv or _basename(argv[0]) != "gh":
         return None
-    spec = _VERB_DISPATCHERS["gh"]
-    for i, t in enumerate(argv[1:], 1):
+    i = 1
+    while i < len(argv):
+        t = argv[i]
+        name, glued = _gh_option(t, _GH_ALL_VALUE_FLAGS)
+        if name in _GH_ALL_VALUE_FLAGS:
+            i += 1 if glued is not None else 2
+            continue
+        if t.startswith("-") and t != "-":
+            i += 1
+            continue
         if t == "pr":
-            skip_next = False
-            for u in argv[i + 1 :]:
-                if skip_next:
-                    skip_next = False
+            j = i + 1
+            while j < len(argv):
+                u = argv[j]
+                uname, uglued = _gh_option(u, _GH_ALL_VALUE_FLAGS)
+                if uname in _GH_ALL_VALUE_FLAGS:
+                    j += 1 if uglued is not None else 2
                     continue
-                # Read the option table off the shared spec rather than a local
-                # set literal. No argv makes the two disagree today (checked the
-                # separated, attached and glued spellings, and both orderings of
-                # the group word), so this is drift insurance rather than a fix.
-                # But a second copy of one CLI option grammar is the shape that
-                # produced the defect this change is about, twenty lines above.
-                name, attached = _option_name(u, spec)
-                if not attached and name in spec.value_flags:
-                    skip_next = True
+                if u.startswith("-") and u != "-":
+                    j += 1
                     continue
-                if not u.startswith("-"):
-                    return u
+                return u
             return None
+        i += 1
     return None
 
 
