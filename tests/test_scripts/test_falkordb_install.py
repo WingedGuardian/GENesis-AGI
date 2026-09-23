@@ -47,11 +47,12 @@ echo "apt-get $*" >> "$APT_LOG"
 exit "${APT_RC:-0}"
 """
 # apt-cache policy <pkg> — reports a configurable Candidate version. The lib
-# only consults it after a failed `apt-get update`, to refuse installing a
-# redis below the module's hard floor.
+# verifies it against the module's 8.0.0 floor immediately before EVERY
+# install, so the default is what the upstream repo actually serves today;
+# below-floor tests override APT_CANDIDATE.
 _APT_CACHE_STUB = """#!/bin/bash
 if [ "$1" = "policy" ]; then
-    printf ' %s:\\n  Installed: (none)\\n  Candidate: %s\\n' "$2" "${APT_CANDIDATE:-(none)}"
+    printf ' %s:\\n  Installed: (none)\\n  Candidate: %s\\n' "$2" "${APT_CANDIDATE:-2:8.0.4-1rl1~noble}"
 fi
 exit 0
 """
@@ -418,6 +419,27 @@ def test_a_failed_apt_update_refuses_a_below_floor_candidate(tmp_path):
     assert "below" in result.stdout and "floor" in result.stdout
     assert "apt-get update" in _apt_log(env)
     assert "apt-get install" not in _apt_log(env), "installed an unusable redis"
+
+
+def test_a_later_run_with_a_stale_index_still_refuses_the_install(tmp_path):
+    """The candidate gate must hold on the SECOND run, not only the first.
+
+    A run that leaves `redis.list` behind when its update fails makes the
+    next bootstrap skip the whole repo block — update included — and go
+    straight to `apt-get install` with the same unusable index. The check
+    therefore lives immediately before the install, unconditionally.
+    """
+    env = _stage(tmp_path)
+    Path(env["FALKORDB_APT_LIST"]).write_text(
+        "deb [signed-by=x] https://packages.redis.io/deb noble main\n"
+    )
+    env["APT_CANDIDATE"] = "6:7.0.15-1"  # stale index: only the distro's 7.x
+    result = _run("falkordb_redis_install", env)
+
+    assert result.returncode == 0, result.stderr
+    assert "apt-get update" not in _apt_log(env), "re-ran update on existing list"
+    assert "apt-get install" not in _apt_log(env), "installed a below-floor redis"
+    assert "below" in result.stdout and "floor" in result.stdout
 
 
 def test_unknown_codename_skips_before_touching_apt(tmp_path):

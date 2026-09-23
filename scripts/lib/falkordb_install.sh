@@ -404,27 +404,28 @@ falkordb_redis_install() {
         echo "  Added: redis apt repo ($codename)"
         rc=0
         sudo apt-get update -qq >/dev/null 2>&1 || rc=$?
-        if [ "$rc" -ne 0 ]; then
-            echo "  WARNING: apt-get update failed (rc=$rc)."
-            # With a stale index, apt can only offer the distro's 7.x — which
-            # the module refuses to load on. Installing it anyway would put a
-            # database daemon on the box that cannot run the engine it was
-            # installed for, so confirm the candidate meets the floor first.
-            local candidate major
-            candidate="$(apt-cache policy redis-server 2>/dev/null \
-                | awk '/Candidate:/ {print $2}')"
-            major="${candidate#*:}"   # strip any epoch
-            major="${major%%.*}"
-            case "$major" in
-                ''|*[!0-9]*|[0-7])
-                    echo "  Skipped: apt would install redis-server '${candidate:-unknown}', below the"
-                    echo "           $FALKORDB_MIN_REDIS floor the module enforces. Re-run after"
-                    echo "           `sudo apt-get update` succeeds."
-                    return 0
-                    ;;
-            esac
-        fi
+        [ "$rc" -eq 0 ] || echo "  WARNING: apt-get update failed (rc=$rc)."
     fi
+
+    # The candidate is verified immediately before EVERY install, not just when
+    # this run added the repo: a failed `apt-get update` above — or a re-run
+    # where the list file already exists and no update ran at all — leaves a
+    # stale index whose only offer is the distro's 7.x, which the module
+    # refuses to load on. Installing it anyway would put a database daemon on
+    # the box that cannot run the engine it was installed for.
+    local candidate major
+    candidate="$(apt-cache policy redis-server 2>/dev/null \
+        | awk '/Candidate:/ {print $2}')"
+    major="${candidate#*:}"   # strip any epoch
+    major="${major%%.*}"
+    case "$major" in
+        ''|*[!0-9]*|[0-7])
+            echo "  Skipped: apt would install redis-server '${candidate:-unknown}', below the"
+            echo "           $FALKORDB_MIN_REDIS floor the module enforces. Re-run after"
+            echo "           'sudo apt-get update' succeeds."
+            return 0
+            ;;
+    esac
 
     rc=0
     sudo apt-get install -y -qq redis-server >/dev/null 2>&1 || rc=$?
