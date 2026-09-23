@@ -671,6 +671,14 @@ _NOT_WIRED = {
     # wrapped, because there the failed module is the one that would read the payload
     # and there is no matcher to choose — no token, no trade, no exemption.
     "background_pipe_guard.py": "only token is `|` at 70.30% — would wedge the repair",
+    # adopt_first_gate's documented contract is FAIL-OPEN — its own docstring:
+    # "a crash here must not wedge planning or editing. Nothing in this file is
+    # a safety boundary." A poisoned tree making it exit 1 and vanish costs a
+    # missed advisory or an unenforced plan verdict; wiring a local refuse would
+    # instead block EVERY Write/Edit/ExitPlanMode until repair — the worse
+    # direction for a gate whose whole measured design property is that it must
+    # never become the thing that wedges the work.
+    "adopt_first_gate.py": "fail-open by contract — refusing would wedge every edit and plan exit",
 }
 
 
@@ -791,6 +799,77 @@ def test_new_guard_with_old_hook_input_fails_closed(tmp_path, guard, rel, comman
         "non-2 lets Claude Code run the command"
     )
     assert "shared hook_input is incompatible" in res.stderr
+
+
+@pytest.mark.parametrize(
+    ("rel", "message"),
+    [
+        ("hooks/git_push_guard.py", "native approval helper is incompatible"),
+        ("review_enforcement_commit.py", "native approval helper is incompatible"),
+    ],
+)
+def test_new_guard_with_old_tree_missing_native_approval_fails_closed(tmp_path, rel, message):
+    root = _tree(tmp_path, poisoned=False)
+    (root / "scripts" / "hooks" / "native_approval.py").unlink()
+    res = _run(root, rel, "git status", tmp_path / f"home_{Path(rel).stem}")
+    assert res.returncode == 2
+    assert message in res.stderr
+
+
+def test_commit_guard_with_old_tree_missing_deadline_helper_fails_closed(tmp_path):
+    root = _tree(tmp_path, poisoned=False)
+    (root / "scripts" / "review_deadline.py").unlink()
+    res = _run(
+        root,
+        "review_enforcement_commit.py",
+        "git status",
+        tmp_path / "home_missing_deadline",
+    )
+    assert res.returncode == 2
+    assert "deadline helper is incompatible" in res.stderr
+
+
+def test_review_state_keeps_its_safe_timeout_fallback_on_old_tree(tmp_path):
+    root = _tree(tmp_path, poisoned=False)
+    (root / "scripts" / "review_deadline.py").unlink()
+    res = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                f"sys.path.insert(0, {str(root / 'scripts')!r}); "
+                "import review_state; "
+                "print(review_state._deadline_timeout(0.0, 8.0))"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert res.returncode != 0
+    assert "aggregate review-gate deadline expired" in res.stderr
+
+
+def test_review_scope_keeps_advisory_fallback_without_deadline_helper(tmp_path):
+    root = _tree(tmp_path, poisoned=False)
+    (root / "scripts" / "review_deadline.py").unlink()
+    res = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                f"sys.path.insert(0, {str(root / 'scripts')!r}); "
+                "import review_scope; print('ok')"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.strip() == "ok"
 
 
 def test_check_pr_with_old_hook_input_surfaces_the_import_error(tmp_path):
@@ -1188,6 +1267,7 @@ _ADVISORY_BY_DESIGN = {
     "hooks/capped_read_advisory.py": "ADVISORY ONLY.",
     "hooks/credential_surface_hook.py": "Exit 0 always — advisory, never blocks.",
     "hooks/pipe_status_guard.py": "ADVISORY, never blocking:",
+    "hooks/pr_close_advisory.py": "Say so; never block it.",
     "hooks/pre_push_privacy_review.py": "NON-BLOCKING.",
     "hooks/tmux_kill_server_guard.py": "which is exactly why this is ADVISORY, never a block",
     "procedure_advisor.py": "surfaces relevant procedures as advisory context.",

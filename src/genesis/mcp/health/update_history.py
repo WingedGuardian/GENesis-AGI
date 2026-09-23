@@ -57,6 +57,27 @@ async def _impl_update_history_recent(limit: int = _DEFAULT_LIMIT) -> dict:
             **base_meta,
         }
 
+    # Admission fence — same reasoning as the job-health tool: an MCP child
+    # process opening read-WRITE can checkpoint a stale `-wal` into a
+    # quarantined database on close. Reported, not silently empty: "no deploy
+    # history" and "cannot read deploy history" are different answers, and
+    # during a recovery the difference matters.
+    from genesis.db.admission import database_is_fenced
+
+    if database_is_fenced(_DB_PATH):
+        return {
+            "count": 0,
+            "success_rate": None,
+            "entries": [],
+            "note": (
+                f"Genesis database at {_DB_PATH} was refused by the admission "
+                "check — it is quarantined, or its admission state could not be "
+                "established (the check fails closed). Deploy history is "
+                "unavailable until that clears."
+            ),
+            **base_meta,
+        }
+
     try:
         async with aiosqlite.connect(str(_DB_PATH)) as db:
             await db.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")

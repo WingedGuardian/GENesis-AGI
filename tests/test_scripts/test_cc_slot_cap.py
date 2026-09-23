@@ -98,9 +98,14 @@ def _setup(tmp_path, *, action, exists, session_names, rc, attached=""):
     """
     home = tmp_path / "home"
     fakebin = tmp_path / "fakebin"
-    venvbin = home / "genesis" / ".venv" / "bin"
-    for d in (fakebin, venvbin, home / "genesis" / "scripts"):
+    checkout = tmp_path / "checkout"
+    scriptsbin = checkout / "scripts"
+    venvbin = checkout / ".venv" / "bin"
+    for d in (fakebin, scriptsbin, venvbin):
         d.mkdir(parents=True, exist_ok=True)
+    script_path = scriptsbin / "cc-slot.sh"
+    script_path.write_bytes(_CC_SLOT.read_bytes())
+    script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     spawn_marker = tmp_path / "spawned"
     kill_file = tmp_path / "killed"
     names = "".join(f"{n}\n" for n in session_names)
@@ -167,19 +172,19 @@ exit 0
         "FAKE_NAMES": names,
         "FAKE_ATTACHED": attached,
     }
-    return env, spawn_marker, kill_file
+    return env, spawn_marker, kill_file, script_path
 
 
 def _run(
     tmp_path, *, action, exists=False, session_names=(), rc=0, mode="genesis-3-4", extra_env=None
 ):
-    env, spawn_marker, kill_file = _setup(
+    env, spawn_marker, kill_file, script_path = _setup(
         tmp_path, action=action, exists=exists, session_names=session_names, rc=rc
     )
     if extra_env:
         env.update(extra_env)
     proc = subprocess.run(
-        ["bash", str(_CC_SLOT), mode], env=env, capture_output=True, text=True, timeout=30
+        ["bash", str(script_path), mode], env=env, capture_output=True, text=True, timeout=30
     )
     killed = kill_file.read_text() if kill_file.exists() else ""
     return proc, spawn_marker.exists(), killed
@@ -201,7 +206,7 @@ def _run_pty(
     """Run cc-slot.sh under a pty so the interactive reclaim `read </dev/tty` works."""
     import pty
 
-    env, spawn_marker, kill_file = _setup(
+    env, spawn_marker, kill_file, script_path = _setup(
         tmp_path,
         action=action,
         exists=exists,
@@ -216,7 +221,7 @@ def _run_pty(
     pid, fd = pty.fork()
     if pid == 0:  # child: becomes the pty session leader
         try:
-            os.execve("/bin/bash", ["bash", str(_CC_SLOT), mode], env)  # noqa: S606 — pty child, fixed argv
+            os.execve("/bin/bash", ["bash", str(script_path), mode], env)  # noqa: S606 — pty child, fixed argv
         except Exception:  # noqa: BLE001
             os._exit(127)
     os.write(fd, feed)

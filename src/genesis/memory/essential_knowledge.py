@@ -19,7 +19,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from genesis.db.crud.observations import SAFE_ORIGIN_SQL
+from genesis.db.crud.observations import SAFE_ORIGIN_SQL, SAFE_SURFACING_ORIGINS
 
 logger = logging.getLogger(__name__)
 
@@ -195,16 +195,97 @@ async def _active_session_pivots(db: aiosqlite.Connection) -> list[str]:
         return []
 
 
+def _safe_origin_values() -> tuple[str, ...]:
+    """Origin classes that may reach L1.
+
+    This is ``SAFE_SURFACING_ORIGINS`` — the SAME set this module already reads
+    as ``SAFE_ORIGIN_SQL`` forty lines above, in its tuple form. Its defining
+    comment names "essential_knowledge L1" as its purpose and scopes the SQL
+    form to "the two essential_knowledge readers that build SQL directly"; this
+    is the third such reader, so it belongs to that constant rather than to a
+    new one.
+
+    Deliberately NOT ``provenance._SAFE_ORIGINS``, which is equal today and is
+    not the same policy: its own comment says it mirrors ``immunity.is_blockable``,
+    so the two would diverge the first time blockability and surfacing stopped
+    agreeing — and nothing would fail when they did. The crud-side literals also
+    exist specifically to avoid a crud->memory layering cycle, which a private
+    import back into memory reintroduces.
+    """
+    return SAFE_SURFACING_ORIGINS
+
+
+def _owner_attended_channel_values() -> tuple[str, ...]:
+    """Channel values that count as owner-attended, DERIVED from the predicate.
+
+    Never hardcode this set here. L1 Essential Knowledge is injected into every
+    session, so a topic that reaches it is content every future session reads as
+    Genesis's own.
+
+    The drift a literal would cause is fail-CLOSED, not fail-open, and saying it
+    the other way round overstates the case: an allowlist cannot admit a channel
+    nobody listed, so a stale literal could never let a gateway channel slip in.
+    What it WOULD do is quietly stop admitting a channel that later became
+    owner-attended, costing L1 its context with nothing failing to say so.
+    """
+    from genesis.cc.types import ChannelType, is_owner_attended_channel
+
+    return tuple(c.value for c in ChannelType if is_owner_attended_channel(c))
+
+
 async def _recent_session_topics(db: aiosqlite.Connection, days: int = 7) -> list[str]:
-    """Get recent foreground session topics."""
+    """Get recent foreground session topics, owner-attended channels only.
+
+    A NULL channel passes, and NOT because such rows are historical:
+    ``register_from_filesystem`` inserts without the column on every extraction
+    pass, so unstamped rows are written continuously and are the bulk of what
+    this query draws on. See the clause itself for the measurement. Everything
+    that IS stamped must be on the owner-attended list -- a gateway channel
+    carries content an outside party chose, and this query feeds every session.
+    """
+    allowed = _owner_attended_channel_values()
+    safe_origins = _safe_origin_values()
+    origin_ph = ", ".join("?" for _ in safe_origins)
+    # Only "?" characters, one per enum member -- no caller input reaches the
+    # SQL text, and the channel VALUES below are still bound parameters.
+    placeholders = ", ".join("?" for _ in allowed)
+    # S608 is a false positive: the only interpolation is `placeholders`, which
+    # is a run of "?" characters sized by the enum. Every VALUE is bound.
+    sql = (  # noqa: S608
+        "SELECT topic FROM cc_sessions "  # noqa: S608
+        "WHERE source_tag = 'foreground' "
+        "AND topic IS NOT NULL AND topic != '' "
+        f"AND (channel IS NULL OR channel IN ({placeholders})) "
+        # Belt and braces on the NULL branch, and an ALLOWLIST for the same
+        # reason the channel clause is one. The first draft of this listed the
+        # origins to EXCLUDE, five lines under a docstring saying never to
+        # hardcode such a set -- so an origin class nobody had thought of
+        # reached L1 by default, and one of the two names in it
+        # ('external') was not even a real origin class. The safe set already
+        # exists as SAFE_SURFACING_ORIGINS; use it.
+        #
+        # NULL passes here, and the reason is NOT that such rows are legacy.
+        # MEASURED on a live install: register_from_filesystem
+        # (db/crud/cc_sessions.py) inserts without either column on every
+        # extraction pass, and accounts for 32 of the 34 currently-eligible
+        # rows over seven days (1451 of 1498 all-time). Excluding NULL would
+        # therefore empty L1 of almost everything, which is why this clause is
+        # admit-NULL even though the sibling reader above, over the
+        # OBSERVATIONS table, excludes it and calls that fail-closed. Different
+        # tables: migration 0085 backfilled origin_class there, not here.
+        #
+        # So this narrows the surface, it does not close it: a transcript
+        # auto-registered from the filesystem carries neither field and is
+        # indistinguishable from a CLI session at this query. Closing it
+        # belongs to the registration path -- stamping the columns at insert --
+        # not to another predicate here.
+        f"AND (origin_class IS NULL OR origin_class IN ({origin_ph})) "
+        "AND started_at > datetime('now', ?) "
+        "ORDER BY started_at DESC LIMIT 10"
+    )
     try:
         cursor = await db.execute(
-            "SELECT topic FROM cc_sessions "
-            "WHERE source_tag = 'foreground' "
-            "AND topic IS NOT NULL AND topic != '' "
-            "AND started_at > datetime('now', ?) "
-            "ORDER BY started_at DESC LIMIT 10",
-            (f"-{days} days",),
+            sql, (*allowed, *safe_origins, f"-{days} days"),
         )
         rows = await cursor.fetchall()
         return [row[0][:200] for row in rows if row[0]]

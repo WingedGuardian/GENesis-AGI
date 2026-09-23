@@ -66,8 +66,19 @@ def _fake_tools(bindir: Path, log: Path, *, sleep: float = 0) -> None:
             + version_guard
             + f'echo "{name} ARGS:$*" >> "{log}"\n'
             f'echo "{name} ULIMIT_V:$(ulimit -v)" >> "{log}"\n'
+            f'echo "{name} OOM_ADJ:$(</proc/self/oom_score_adj)" >> "{log}"\n'
             + (f"sleep {sleep}\n" if sleep else ""),
         )
+
+
+def _inherited_oom_adj() -> str:
+    """This process's own oom_score_adj — what a child INHERITS absent a write.
+
+    Asserting a literal "0" is wrong: it is true on a developer box and NOT on a
+    GitHub runner (measured: a runner starts at 500). The invariant is "the value
+    did not CHANGE", not "the value is zero".
+    """
+    return Path("/proc/self/oom_score_adj").read_text().strip()
 
 
 def _fake_systemd_run(bindir: Path, log: Path, *, probe_ok: bool = True) -> None:
@@ -77,6 +88,7 @@ def _fake_systemd_run(bindir: Path, log: Path, *, probe_ok: bool = True) -> None
         body = (
             "#!/usr/bin/env bash\n"
             f'echo "$*" >> "{log}"\n'
+            f'echo "SYSTEMD_RUN_OOM_ADJ:$(cat /proc/self/oom_score_adj)" >> "{log}"\n'
             'while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done\n'
             "shift\n"
             'exec "$@"\n'
@@ -1001,7 +1013,7 @@ def test_a_small_install_refuses_the_rebuild_rather_than_capping_it_uselessly(tm
     session. The pressure watchdog does not cover this; it samples load and I/O
     wait, neither of which moves early enough on an OOM path.
 
-    MEASURED working set for a full rebuild: 4,874,166,272 bytes (4.65 GiB), so
+    MEASURED working set for a full rebuild: 4,874,166,272 bytes (4.54 GiB), so
     below that a cap cannot bite and the job is refused instead.
     """
     for gib in (4, 5, 6):
@@ -1053,7 +1065,7 @@ def test_sub_mib_headroom_keeps_full_byte_precision(tmp_path):
 
 def test_a_configured_cap_below_the_working_set_is_refused(tmp_path):
     """An operator override (or the legacy shared CODE_INTEL_INDEX_MEMORY_MAX=2G)
-    below the measured 4.65 GiB working set cannot bite: on a large host the
+    below the measured 4.54 GiB working set cannot bite: on a large host the
     rebuild would still run and be killed by its own cgroup. Refuse instead."""
     for want in ("2G", "4G", "4096M"):
         cap, why = _headroom_decision(tmp_path, 32, want=want)
@@ -1072,3 +1084,362 @@ def test_fractional_and_malformed_caps(tmp_path):
         cap, why = _headroom_decision(tmp_path, 32, want=bad)
         assert why, f"malformed cap {bad!r} was allowed to run"
         assert "not a parseable" in why, why
+# ── 3b. OOM kill-order preference ─────────────────────────────────────────
+# The disposable batch indexer gets the kernel's maximum OOM preference inside
+# its applicable OOM domain. The supervisor, probe and watchdog retain their
+# inherited score so they can still stop, thaw and reap the heavy child.
+
+
+def test_oom_score_adj_reaches_the_indexer(tmp_path):
+    """The INDEXER must inherit the raised value, not merely the script.
+
+    `-p OOMScoreAdjust=` is invalid on `systemd-run --scope` (a scope does not
+    exec, so Exec properties do not apply), so the mechanism is a self-write
+    plus inheritance. What has to hold is that the tool actually sees it.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog, probe_ok=True)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
+    assert res.returncode == 0, res.stderr
+    assert "OOM_ADJ:1000" in log.read_text()
+    # And NOT passed as a scope property, which systemd would reject outright.
+    assert "OOMScoreAdjust" not in slog.read_text()
+
+
+def test_oom_score_adj_1000_override_reaches_the_indexer(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "1000"},
+    )
+    assert res.returncode == 0, res.stderr
+    assert "OOM_ADJ:1000" in log.read_text()
+
+
+def test_oom_score_adj_non_numeric_refuses_index(tmp_path):
+    """A malformed override cannot weaken the batch-victim contract."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "not-a-number"},
+    )
+    assert res.returncode != 0
+    assert "requires 1000" in res.stderr
+    assert not log.exists() or "codebase-memory-mcp ARGS:" not in log.read_text()
+
+
+def test_oom_score_adj_negative_is_refused_not_attempted(tmp_path):
+    """A negative value is unachievable from a user manager anyway (measured:
+    -1 and -500 both land on the manager's own value), so the guard rejects it
+    at the lever rather than writing and failing.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "-500"},
+    )
+    assert res.returncode != 0
+    assert "requires 1000" in res.stderr
+    assert not log.exists() or "codebase-memory-mcp ARGS:" not in log.read_text()
+
+
+def test_oom_score_adj_keeps_a_higher_inherited_value(tmp_path):
+    """An inherited maximum remains maximum in the disposable child."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    # Change only subprocess state. Mutating the pytest parent would contaminate
+    # later tests if restoration failed or the test process were interrupted.
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        preexec_fn=lambda: Path("/proc/self/oom_score_adj").write_text("1000\n"),
+    )
+    assert res.returncode == 0, res.stderr
+    assert "OOM_ADJ:1000" in log.read_text(), (
+        "the inherited maximum did not reach the disposable child"
+    )
+    assert "requires 1000" not in res.stderr
+
+
+def test_explicit_override_cannot_lower_child_preference(tmp_path):
+    """An explicit lever cannot opt a heavy batch job out of the safety policy."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "321"},
+        preexec_fn=lambda: Path("/proc/self/oom_score_adj").write_text("800\n"),
+    )
+    assert res.returncode != 0
+    assert "requires 1000" in res.stderr
+    assert not log.exists() or "codebase-memory-mcp ARGS:" not in log.read_text()
+
+
+def test_oom_score_adj_oversized_value_is_rejected_not_wrapped(tmp_path):
+    """All-digit is not in-range. $((10#$v)) WRAPS past bash's signed 64-bit
+    range, so this value evaluates to 0, would sail through a `> 1000` check, and
+    would be written and logged as accepted — a silent downgrade to the least
+    preferred setting, from an input that looks like an obvious typo.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "18446744073709551616"},
+    )
+    assert res.returncode != 0
+    assert "requires 1000" in res.stderr
+    assert not log.exists() or "codebase-memory-mcp ARGS:" not in log.read_text()
+
+
+def test_success_log_does_not_quote_other_units_oom_scores(tmp_path):
+    """The log line must not name scores this script does not own.
+
+    It used to read "the server at 100" while the shipped unit template declared
+    -500 — a number that existed nowhere, presenting a kill ordering that was not
+    real. An operational log that invents its own facts is worse than a terse one,
+    because OOM diagnosis is exactly when someone trusts it.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
+    assert res.returncode == 0, res.stderr
+    assert "OOM_ADJ:1000" in log.read_text()
+    for claim in ("the server at 100", "at 500", "at 0)"):
+        assert claim not in res.stdout, f"log still asserts a foreign score: {claim!r}"
+
+
+def test_oom_score_adj_is_above_the_cc_subprocess_rung(tmp_path):
+    """500 would TIE with CC subprocesses, which invoker.py already sets to 500.
+
+    At equal adj the kernel falls back to memory charge, so a large session could
+    be chosen over the indexer — defeating the ordering this feature exists for.
+    """
+    invoker = (_REPO_ROOT / "src/genesis/cc/invoker.py").read_text()
+    assert "def set_oom_score_adj(pid: int, score: int = 500)" in invoker, (
+        "invoker's CC-subprocess rung moved; the index adj must stay strictly above it"
+    )
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
+    assert res.returncode == 0, res.stderr
+    logged = log.read_text()
+    adj = int(re.search(r"OOM_ADJ:(\d+)", logged).group(1))
+    assert adj > 500, f"index adj {adj} does not outrank CC subprocesses at 500"
+
+
+def test_oom_adjustment_is_child_only_in_systemd_scope_path(tmp_path):
+    """The disposable tool is maximally preferred; its supervisor is not."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog, probe_ok=True)
+    repo = _make_repo(tmp_path)
+
+    res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
+
+    assert res.returncode == 0, res.stderr
+    assert "OOM_ADJ:1000" in log.read_text()
+    # The fake is called once for the capability probe and once for the real
+    # workload.  Inspect the workload record specifically: checking the
+    # combined log would let the probe's inherited score mask a regression
+    # that changed only the execution-time systemd-run process.
+    systemd_lines = slog.read_text().splitlines()
+    assert len(systemd_lines) == 4, systemd_lines
+    assert "--description" in systemd_lines[-2]
+    assert systemd_lines[-1] == f"SYSTEMD_RUN_OOM_ADJ:{_inherited_oom_adj()}"
+
+
+def test_oom_adjustment_reaches_child_in_fallback_path(tmp_path):
+    minbin = _minimal_path(tmp_path)
+    log = tmp_path / "tools.log"
+    _fake_tools(minbin, log)
+    repo = _make_repo(tmp_path)
+
+    res = _run_entry(tmp_path, repo, "cbm", path=str(minbin))
+
+    assert res.returncode == 0, res.stderr
+    assert "OOM_ADJ:1000" in log.read_text()
+
+
+def test_fallback_watchdog_kills_the_whole_indexer_process_group(tmp_path):
+    """The no-systemd wall cap must not leave an indexer descendant orphaned."""
+    import time
+
+    minbin = _minimal_path(tmp_path, "date", "ps", "tr", "sleep")
+    child_pid_log = tmp_path / "child.pid"
+    _write_exec(
+        minbin / "codebase-memory-mcp",
+        "#!/usr/bin/env bash\n"
+        "/bin/sleep 60 &\n"
+        f'echo "$!" > "{child_pid_log}"\n'
+        "wait\n",
+    )
+    repo = _make_repo(tmp_path)
+
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        "fast",
+        path=str(minbin),
+        env_extra={
+            "CODE_INTEL_WATCHDOG_WALL_FAST": "2",
+            "CODE_INTEL_WATCHDOG_INTERVAL": "1",
+            "CODE_INTEL_WATCHDOG_WARMUP_S": "0",
+            "CODE_INTEL_FAKE_LOADAVG": "0",
+        },
+    )
+
+    assert res.returncode != 0, "a killed index must report failure"
+    assert "wall cap" in res.stdout
+    child_pid = int(child_pid_log.read_text())
+    deadline = time.monotonic() + 3
+    while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not Path(f"/proc/{child_pid}").exists(), (
+        f"fallback watchdog left indexer descendant {child_pid} alive"
+    )
+
+
+def test_lower_oom_adjustment_override_refuses_workload(tmp_path):
+    """An operator override may not weaken the batch-victim safety contract."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "321"},
+    )
+
+    assert res.returncode != 0
+    assert "requires 1000" in (res.stdout + res.stderr)
+    assert not log.exists() or "codebase-memory-mcp ARGS:" not in log.read_text()
+
+
+def test_oom_adjustment_write_failure_refuses_workload(tmp_path):
+    """If the child cannot prove its score, it must not start the heavy job."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_TEST_FORCE_OOM_ADJ_FAILURE": "1"},
+    )
+
+    assert res.returncode != 0
+    assert "cannot establish oom_score_adj=1000" in (res.stdout + res.stderr)
+    assert not log.exists() or "codebase-memory-mcp ARGS:" not in log.read_text()
+
+
+def test_oom_child_launcher_preserves_argument_boundaries(tmp_path):
+    log = tmp_path / "args.log"
+    marker = tmp_path / "must-not-exist"
+    tool = tmp_path / "tool with spaces"
+    _write_exec(
+        tool,
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$#" > "{log}"\n'
+        f'printf "<%s>\\n" "$@" >> "{log}"\n',
+    )
+    args = ["space value", f"$(touch {marker})", "semi;colon", "*"]
+
+    res = subprocess.run(
+        ["bash", str(_ENTRYPOINT), "--exec-indexer-with-oom-adj", str(tool), *args],
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert res.returncode == 0, res.stderr
+    assert log.read_text().splitlines() == ["4", *(f"<{arg}>" for arg in args)]
+    assert not marker.exists(), "a metacharacter argument was evaluated by a shell"
+
+
+def test_oom_child_launcher_propagates_exit_status(tmp_path):
+    tool = tmp_path / "fails"
+    _write_exec(tool, "#!/usr/bin/env bash\nexit 23\n")
+
+    res = subprocess.run(
+        ["bash", str(_ENTRYPOINT), "--exec-indexer-with-oom-adj", str(tool)],
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert res.returncode == 23
+
+
+def test_relative_entrypoint_survives_indexer_working_directory_change(tmp_path):
+    """The child wrapper path must remain valid after the GitNexus ``cd``."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    env = {
+        "PATH": f"{fakebin}:{_SYSTEM_PATH}",
+        "HOME": str(tmp_path),
+        "GENESIS_HOME": str(tmp_path / ".genesis"),
+        "CODE_INTEL_WATCHDOG_INTERVAL": "0.05",
+        "CODE_INTEL_WATCHDOG_WARMUP_INTERVAL": "0.05",
+        "CODE_INTEL_FAKE_LOADAVG": "0",
+        "CODE_INTEL_MEM_CEILING_BYTES": str(64 * 1024**3),
+        "CODE_INTEL_MEM_CURRENT_BYTES": str(512 * 1024**2),
+    }
+    relative = _ENTRYPOINT.relative_to(_REPO_ROOT)
+
+    res = subprocess.run(
+        ["bash", str(relative), str(repo), "gitnexus"],
+        cwd=_REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+
+    assert res.returncode == 0, res.stderr
+    assert "OOM_ADJ:1000" in log.read_text()
+
+
+def test_noop_worktree_skip_does_not_validate_child_oom_override(tmp_path):
+    """No child means no adjustment and no child-policy failure."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path, worktree=True)
+
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "321"},
+    )
+
+    assert res.returncode == 0, res.stderr
+    assert "worktree" in res.stdout
+    assert not log.exists()

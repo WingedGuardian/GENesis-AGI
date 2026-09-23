@@ -430,7 +430,14 @@ verified: cff02d745 2026-09-23
   is the trap: `cc_sessions` (+ a `/proc` walk, `observability/cc_slots.
   enumerate_cc_slots`) is what the DASHBOARD renders; `session_heartbeats` is
   what SESSIONS tell each other. They share no source and neither substitutes
-  for the other. `session_heartbeats` has exactly ONE reader in the tree —
+  for the other. The trap in READING the slot rows: `rss_mb` is the slot's
+  WHOLE PROCESS TREE (the `claude` process plus its Serena LSP and MCP-server
+  children — most of a session's real cost), while `proc_rss_mb` is the root
+  process alone. It used to report only the root, which understated a slot
+  roughly threefold and kept the slot-memory thresholds from ever firing; the
+  measurements and the threshold basis live in the constants' own comment in
+  `observability/cc_slots.py`, not here. `session_heartbeats` has exactly ONE
+  reader in the tree —
   `scripts/proactive_memory_hook.py`, which prints a `[Concurrent | …]` tag into
   each peer session's context on UserPromptSubmit — so it is an AGENT-ONLY
   channel with no human surface. Written by that same hook and refreshed
@@ -967,7 +974,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: d0627c854 2026-09-11
+verified: 640c4f2e3 2026-09-18
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -976,8 +983,15 @@ verified: d0627c854 2026-09-11
   only that method may tombstone). The conversational path
   (`knowledge_ingest_source` MCP) requires explicit user confirmation —
   contrast the intake bypass in entry 4.
-- **inbox/**: file-drop monitor with approval-gated dispatch; phase order
-  recover pending → resume approval → detect → create → dispatch;
+- **inbox/**: file-drop monitor with approval-gated dispatch. Before any DB,
+  approval, response, or baseline mutation, it composes and validates one
+  deterministic system prompt from `INBOX_EVALUATE.md`, the complete
+  `evaluate` skill, the complete `user_evaluate` skill, and an explicit
+  precedence footer. A missing, unreadable, or empty component fails the scan
+  closed without caching a partial prompt; a successful composite is reused
+  byte-for-byte by the approval route, CC invocation, and prompt-version hash.
+  The phase order is prompt preflight → recover pending → resume approval →
+  detect → create → dispatch;
   `approval_key_stable=True` (ONE
   site-level approval key). The refresh path folds parked files into the
   batch so approvals fire once (#914). A pending approval is HELD until the
@@ -2526,6 +2540,46 @@ verified: f24c15e9 2026-09-05
   (shipped config default, not the live earned level). The persistent Overview
   **Readiness panel** that renders the tier rail + these enrichment chips (config-
   framed, refreshed on return to Overview) is **PR-B2b** — shipped.
+- **db/ ADMISSION (one seam, quarantine only — read the residual):** every
+  open-time connect in `db/connection.py` — `connect_sqlite_rw`, the guarded
+  aiosqlite connector, `get_db` (+ its reconnect), `get_raw_db`,
+  `open_ro_connection` — calls `db/admission.assert_admitted`, which delegates
+  to **quarantine** (`db/integrity.py`, inode-bound, so a verified replacement
+  clears it naturally). Script-side raw openers — CC hooks, stdlib-only and
+  unable to import `genesis` — consult the same predicate through the
+  `scripts/hooks/db_admission_check.py` shim, whose single policy is "any
+  failure to establish state reads as FENCED". That shim is a COLOCATED
+  helper: `sync-hooks.sh` installs it beside `emit_bugfix_audit.py`, because
+  the git hook runs the installed copy out of `$GIT_COMMON_DIR/hooks` where a
+  sibling import is the only one that resolves.
+  Two AST-locked boundaries rather than conventional ones:
+  `test_db/test_connection_admission_lock.py` pins the open-time connect set
+  (a NEW factory fails until classified — it exists because a hand enumeration
+  already missed `get_raw_db`), and
+  `test_scripts/test_scripts_opener_admission.py` roots at `scripts/`, which
+  the older RW inventory test does not reach.
+  **THE PERIMETER IS NOT CLOSED, and a recovery procedure must not assume it
+  is.** Both gates check that a fence call is PRESENT, not that it runs before
+  the connect or resolves to the real predicate — demonstrated, not supposed:
+  a reviewer's script with a stubbed fence placed after the write passed the
+  scripts gate. Behaviour replays are the compensating control and cover the
+  WRITER scripts only. Separately, ~12 read-only openers under `src/genesis/`
+  bypass both gates entirely: the RW-mode ones were fenced individually (both
+  MCP health tools, `guardian/watchdog`, the dashboard update route) because a
+  read-write open can checkpoint a stale `-wal` into the main file on close,
+  but the RO set is tracked in issue #2180, not covered. The older
+  `test_rw_connection_inventory.py` cannot catch them — it skips any call whose
+  source text contains `mode=ro`, so a NEW read-only opener in `src/` fails no
+  test at all.
+  A **maintenance fence** (an operator holding the path during replacement)
+  was built here and deliberately REMOVED before shipping: its reader and
+  writer derived keys independently and could disagree, and the perimeter it
+  claimed did not exist. It returns with its write side (`restore.sh`), a
+  computed opener enumeration, and shared key derivation. Also still open:
+  `SerializedConnection`'s PER-CALL re-asserts, and the fact that quarantine
+  is declared only at startup — a live server meeting `SQLITE_CORRUPT` does
+  not trip it (the 2026-09-18 log-storm class). Both land with the runtime
+  corruption trip.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Two
   schema paths coexist: base DDL (`schema/_tables.py`, 117 CREATE TABLE, a count

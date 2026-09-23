@@ -92,7 +92,7 @@ def _monitor(db, inbox_dir, invoker, sm, tmp_path, *, items_per_eval=3):
     return InboxMonitor(
         db=db, invoker=invoker, session_manager=sm, config=cfg,
         writer=ResponseWriter(watch_path=inbox_dir, timezone="UTC"),
-        clock=_FakeClock(), prompt_dir=tmp_path,
+        clock=_FakeClock(),
     )
 
 
@@ -194,7 +194,7 @@ async def test_retry_is_cooldown_exempt(
     mon = InboxMonitor(
         db=db, invoker=mock_invoker, session_manager=mock_session_manager,
         config=cfg, writer=ResponseWriter(watch_path=inbox_dir, timezone="UTC"),
-        clock=_FakeClock(), prompt_dir=tmp_path,
+        clock=_FakeClock(),
     )
     fp = inbox_dir / "Genesis.md"
     fp.write_text(_urls(6))

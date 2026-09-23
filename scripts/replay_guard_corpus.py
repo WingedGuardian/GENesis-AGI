@@ -105,6 +105,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import tokenize
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
@@ -276,6 +277,17 @@ def load_corpus(*, rebuild: bool = False) -> list[tuple[str, str]]:
         else:
             return [(c, w) for c, w in rows]
     print("building corpus from transcripts (streaming)…", file=sys.stderr)
+    # Stamped BEFORE the walk, and written onto the cache after the replace
+    # below, because the cache's mtime is read as PROVENANCE by
+    # `_cache_provenance` and `os.replace` would set it to the WRITE — the
+    # walk's END. A transcript appended at minute 3 of a twenty-minute walk then
+    # carries an mtime EARLIER than the cache and reads as "unchanged", over a
+    # corpus that provably does not contain it. MEASURED: a file appended 2s
+    # into a walk reported `0 of 1 transcript files have changed since`, which
+    # is the strongest currency claim available, from a cache known to be short.
+    # Stamping the START errs the other way — anything touched during the build
+    # is reported as drift — and over-reporting drift is the honest direction.
+    walk_started = time.time()
     cmds = _extract_commands()
     _CACHE.parent.mkdir(parents=True, exist_ok=True)
     # Create it 0600 BEFORE writing, not after: the corpus is verbatim command
@@ -309,6 +321,18 @@ def load_corpus(*, rebuild: bool = False) -> list[tuple[str, str]]:
         with os.fdopen(fd, "w") as f:
             for pair in cmds:
                 f.write(json.dumps(pair) + "\n")
+            f.flush()
+            # Stamp the still-open fd, BEFORE the replace. `os.replace`
+            # preserves the source inode's mtime, so the provenance stamp
+            # travels atomically with the content it describes. Doing it as a
+            # second `os.utime(_CACHE, …)` after the replace is a separate
+            # operation on a named path, and two concurrent rebuilds can
+            # interleave replace/utime so that one run's corpus ends up wearing
+            # the other's later start time — under-reporting drift, the one
+            # direction the comment above rules out. Concurrent rebuilds are not
+            # hypothetical here; the mkstemp comment below records a real
+            # collision.
+            os.utime(f.fileno(), (walk_started, walk_started))
         os.replace(tmp, _CACHE)
     except BaseException:
         # Leave no orphan behind, but do NOT sweep sibling temps: a delete loop
@@ -319,6 +343,10 @@ def load_corpus(*, rebuild: bool = False) -> list[tuple[str, str]]:
     # Report the mode the file ACTUALLY carries. A hard-coded "(mode 0600)" is
     # how the bug above stayed invisible: the line claimed a mode nothing had
     # verified, on a file that demonstrably holds secrets.
+    # (The walk-start stamp is applied to the temp fd above, before the replace,
+    # so there is no second operation here to fail or to race. Side effect,
+    # stated: an earlier mtime means the disk-hygiene retention prune reaches
+    # this file sooner by the build's duration — minutes against a 45-day window.)
     mode = stat.S_IMODE(_CACHE.stat().st_mode)
     print(
         f"cached {len(cmds)} unique commands -> {_CACHE} (mode {mode:04o})",
@@ -337,6 +365,150 @@ def _harden(path: Path) -> None:
         # NOT silent. Swallowing this means reading and replaying from a
         # world-readable file full of real commands while saying nothing.
         print(f"WARNING: could not tighten {path} ({exc})", file=sys.stderr)
+
+
+def _cache_provenance() -> str | None:
+    """How old the cache is, and how far the transcript tree has moved since it.
+
+    Returned rather than printed, and printed BESIDE the corpus size rather than
+    logged at load time, for the reason the caveat line already gives: the number
+    is what gets pasted into a PR body, so anything qualifying it has to travel
+    alongside it. A stderr note does not survive a copy-paste of stdout.
+
+    THIS DOES NOT REBUILD, and the asymmetry with `load_corpus`'s other branches
+    is deliberate. Those rebuild because the cache cannot be READ — corrupt, v1,
+    wrong row shape — so there is nothing to return. A stale cache reads fine and
+    is simply SHORTER than the tree; the measurement it supports is valid for the
+    rows it holds. The defect being fixed here is the SILENCE, not the staleness.
+
+    Nor is there a staleness THRESHOLD. A strict one (any transcript newer than
+    the cache) fires on literally every run, because the newest transcript is
+    always the caller's own session and is seconds old — MEASURED, the whole tree
+    was 12,025 files and the newest had been touched 0.1s earlier. A tolerant one
+    would need a bound in days or files that nothing here can justify, and this
+    file's own rule is not to publish a limit it cannot name the budget for.
+
+    Costs one os.walk + stat sweep over the transcript tree: MEASURED 0.32-0.51s across
+    12,025 files, against a replay that runs for minutes and a rebuild that walks
+    the same tree reading every byte of it.
+    """
+    try:
+        built = _CACHE.stat().st_mtime
+    except FileNotFoundError:
+        # No cache at all. Say nothing rather than invent a date — and note the
+        # docstring's "just built from scratch" reading is NOT reachable from
+        # main(), which calls this after load_corpus() has always left a cache
+        # behind. By then an absent cache means the disk-hygiene prune won a
+        # race, which is a real event and not a fresh build.
+        return None
+    except OSError as exc:
+        # It EXISTED at the stat and could not be read. Distinguished from the
+        # absent case above because the remedies differ and, more importantly,
+        # because returning None here would delete the qualifier entirely — the
+        # same silence this whole function exists to remove, one level up.
+        # `exc.strerror`, never `{exc}`: an OSError's str() embeds the absolute
+        # filename, and THIS line is printed to stdout specifically so it travels
+        # with the number into a PR body. The repo's own rule is that no
+        # /home/<user> path reaches a public surface, so the one message most
+        # likely to be pasted must not carry one. The stderr warnings elsewhere
+        # in this file do print the path, deliberately: stderr is the operator's
+        # channel, not the published one.
+        return (
+            f"cache present but unreadable ({exc.strerror or type(exc).__name__}), "
+            "so its age and drift are unknown"
+        )
+
+    try:
+        # UTC, not localtime, and NOT %Z. This string is printed to stdout for
+        # the express purpose of being pasted into a PR body, so it is a PUBLIC
+        # surface — and %Z renders the operator's timezone abbreviation while
+        # localtime renders the hour they were at the machine. That is the
+        # INDIRECT personal context the repo's privacy rule names directly
+        # (region, schedule), leaking from the branch that runs every time
+        # rather than from an error path. The rest of this repo's %Z call sites
+        # render to the OWNER's own Telegram or dashboard, where local time is
+        # the entire point; this one does not. UTC keeps every property the line
+        # needs — an absolute, comparable build instant — and discloses neither.
+        stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(built))
+    except (OSError, OverflowError, ValueError) as exc:
+        # `localtime` raises on a timestamp outside the platform's range. Left
+        # uncaught it would abort a run that has already paid for a full corpus
+        # load — minutes of work discarded to render one advisory line.
+        # Same reasoning as the branch above — stdout, so no filename.
+        detail = getattr(exc, "strerror", None) or type(exc).__name__
+        return f"cache mtime {built!r} cannot be rendered ({detail}), so its age is unknown"
+
+    if built > time.time():
+        # A future mtime means the clock moved — an NTP step back, a restore
+        # from a host that was ahead. It must be REPORTED, never absorbed:
+        # clamping the age to zero and comparing every transcript against a
+        # future instant yields "0 minutes ago" and "0 of N changed", which is
+        # the strongest currency claim available produced by a broken input.
+        # No slack constant: on one filesystem a future mtime is not jitter.
+        return (
+            f"cache mtime is {stamp}, in the FUTURE — the clock moved, so age and drift are unknown"
+        )
+
+    age_s = time.time() - built
+    if age_s < 3600:
+        age = f"{age_s / 60:.0f} minutes ago"
+    elif age_s < 86400:
+        age = f"{age_s / 3600:.1f} hours ago"
+    else:
+        age = f"{age_s / 86400:.1f} days ago"
+
+    total = newer = unreadable_files = 0
+    unreadable_dirs = 0
+
+    def _unreadable_dir(_exc: OSError) -> None:
+        nonlocal unreadable_dirs
+        unreadable_dirs += 1
+
+    # os.walk with an explicit `onerror`, NOT Path.rglob. MEASURED on CPython
+    # 3.12: `Path.walk` swallows a scandir failure whenever `on_error` is None
+    # and `rglob` exposes no hook at all, so one unreadable subdirectory yields
+    # a SHORT file list and raises nothing — the denominator silently shrinks
+    # and the line then reports a confident count of a tree it only partly saw.
+    # That is the truncated-read failure this file refuses everywhere else.
+    for root, _dirs, files in os.walk(_TRANSCRIPTS, onerror=_unreadable_dir, followlinks=False):
+        for name in files:
+            if not name.endswith(".jsonl"):
+                continue
+            total += 1
+            try:
+                if os.stat(os.path.join(root, name)).st_mtime > built:
+                    newer += 1
+            except OSError:
+                # Rotated between the walk and the stat. COUNTED, not skipped:
+                # a silent skip can only make the drift read LOW, and low reads
+                # as "the cache is current" — the one conclusion the evidence
+                # does not support.
+                unreadable_files += 1
+
+    if not total:
+        if unreadable_dirs:
+            return f"cache built {stamp} ({age}); the transcript tree could not be read, so drift is unknown"
+        return f"cache built {stamp} ({age}); no transcripts found, so drift is unknown"
+
+    blind = ""
+    if unreadable_dirs or unreadable_files:
+        missed = []
+        if unreadable_dirs:
+            missed.append(
+                f"{unreadable_dirs} unreadable director{'y' if unreadable_dirs == 1 else 'ies'}"
+            )
+        if unreadable_files:
+            missed.append(
+                f"{unreadable_files} unreadable file{'' if unreadable_files == 1 else 's'}"
+            )
+        blind = (
+            f" — {' and '.join(missed)} skipped, so BOTH counts are floors "
+            "and the real ratio may be higher or lower"
+        )
+    return (
+        f"cache built {stamp} ({age}); "
+        f"{newer} of {total} transcript files have changed since{blind}"
+    )
 
 
 # ── guard invocation ─────────────────────────────────────────────────────────
@@ -976,7 +1148,20 @@ GUARDS: dict[str, Guard] = {
             "replay pays a process spawn per matching row on top of the guard's "
             "own work. `rm` and `mv` occur as the SUBCOMMAND names in the "
             "`*git*rm*|*git*mv*` case glob and in comments about what the guard "
-            "matches; neither is invoked.",
+            "matches; neither is invoked. AND IT IS NOT WIRED BY THIS REPO, which "
+            "the table above obscures by listing it beside five guards that are. "
+            "`bash_safety_hook.sh` does not appear in this repo's "
+            "`.claude/settings.json`, and MEASURED across every ref it never has: "
+            "`git log --all -S'bash_safety_hook.sh' -- .claude/settings.json` "
+            "returns nothing, no install script provisions it, and the CHANGELOG "
+            "records the absence as the reason a mergeable check was moved out of "
+            "this script and into git_push_guard.py (#290). Where it runs at all it "
+            "is registered by hand in a USER-level settings file outside this repo. "
+            "Two consequences the other five do not carry: on a fresh clone this "
+            "guard is not wired, so a rate measured for it here would be the rate "
+            "of a hook nothing runs; and its REGISTRATION — the wall clock the "
+            "shared parser's cost bounds are calibrated against — is install-"
+            "specific and cannot be established from inside this repo at all.",
             cites=(
                 Cite(
                     "scripts/bash_safety_hook.sh",
@@ -1689,7 +1874,12 @@ def main() -> int:
         # corpus build still worked. Advertising an operation no code path can
         # perform is the failure this file exists to stop doing.
         rows = load_corpus(rebuild=True)
-        print(f"corpus rebuilt: {len(rows)} rows -> {_CACHE}")
+        # stderr, matching its sibling below: the absolute cache path embeds the
+        # operator's home directory, and stdout is the surface this tool's output
+        # gets pasted from. Pre-existing, fixed here because it is the same
+        # invariant the new provenance line asserts, in the same file — leaving
+        # it would ship a contradiction of this change's own rule.
+        print(f"corpus rebuilt: {len(rows)} rows -> {_CACHE}", file=sys.stderr)
         return 0
     if not args.guard and not args.all:
         ap.error("pass --guard <name>, --all, --list, or --rebuild")
@@ -1728,6 +1918,7 @@ def main() -> int:
         return 2
 
     corpus = load_corpus(rebuild=args.rebuild)
+    available = len(corpus)
     if args.limit is not None:
         corpus = corpus[: args.limit]
     if not corpus:
@@ -1746,7 +1937,27 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
-    print(f"corpus: {len(corpus)} unique real commands\n")
+    if len(corpus) == available:
+        print(f"corpus: {available} unique real commands")
+    else:
+        # The denominator, ALWAYS, when a limit truncated the read. `--limit 500`
+        # used to print "corpus: 500 unique real commands" against 149,385
+        # available — a subset wearing the grammar of a full sweep, and the line
+        # directly above a rate that gets pasted into PR bodies. This file already
+        # refuses an empty corpus on exactly that reasoning; a truncated one is
+        # the same failure with a number in it, which is the harder one to catch
+        # because it looks like a measurement.
+        print(
+            f"corpus: {len(corpus)} of {available} unique real commands "
+            f"(--limit {args.limit}) — a SUBSET, not this install's rate, and "
+            f"the first {len(corpus)} in SORT ORDER rather than a sample: "
+            f"_extract_commands returns sorted(seen), so a limited run is "
+            f"biased toward whatever sorts lowest, not a random slice"
+        )
+    provenance = _cache_provenance()
+    if provenance:
+        print(f"    {provenance}")
+    print()
 
     if any(GUARDS[n].spawns_process for n in names):
         # Announced, not silent. The recorded rows carry no session flag, so the

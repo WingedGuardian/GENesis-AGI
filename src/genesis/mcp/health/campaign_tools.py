@@ -16,11 +16,10 @@ import json
 import logging
 import uuid
 from datetime import UTC, datetime
-from pathlib import Path
 
 import aiosqlite
 
-from genesis.env import db_busy_timeout_ms
+from genesis.env import db_busy_timeout_ms, genesis_db_path
 from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
@@ -30,7 +29,7 @@ _runner = None
 _db = None
 
 # DB path for fallback connections (matches task_tools.py pattern)
-_DB_PATH = Path.home() / "genesis" / "data" / "genesis.db"
+_DB_PATH = genesis_db_path()
 
 
 def init_campaign_tools(*, runner, db) -> None:
@@ -51,7 +50,9 @@ def init_campaign_tools(*, runner, db) -> None:
 
 async def _get_db() -> aiosqlite.Connection:
     """Open a direct DB connection for MCP fallback reads/writes."""
-    db = await aiosqlite.connect(str(_DB_PATH))
+    from genesis.db.connection import connect_aiosqlite_rw
+
+    db = await connect_aiosqlite_rw(_DB_PATH)
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")
