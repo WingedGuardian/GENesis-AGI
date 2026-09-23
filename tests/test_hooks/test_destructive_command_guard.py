@@ -1015,3 +1015,89 @@ class TestUnresolvedVariableIsItsOwnVerdict:
         # The acceptance bar's other direction: routine cleanup under a deep
         # scratch directory must not start failing.
         assert not _blocks("rm -rf /srv/app/data/build")
+
+
+class TestAResolverThatRAISESKeepsTheFallbackRefusalOn:
+    """"The import worked" is not "the resolver answered for THIS command".
+
+    An earlier spelling set the fallback's carrier refusal from
+    `_analyze_checked is not None` — a fact about the IMPORT. The two differ on
+    exactly one path, the resolver raising, and on that path the earlier
+    spelling turned the token-level carrier refusal OFF: it disabled the last
+    thing left to catch a carrier precisely when the first thing had failed.
+
+    These call `main()` in-process, because the distinction lives in a branch
+    that a subprocess cannot reach without breaking the resolver on disk.
+    """
+
+    RM = "r" + "m"
+
+    @staticmethod
+    def _main_with(monkeypatch, cmd: str, resolver) -> int:
+        import io
+        import json
+
+        monkeypatch.setattr(dg, "_analyze_checked", resolver, raising=False)
+        monkeypatch.setattr(
+            "sys.stdin",
+            io.StringIO(json.dumps({"tool_input": {"command": cmd}, "tool_name": "Bash"})),
+        )
+        return dg.main()
+
+    # A carrier the RAW-TEXT scope test cannot see, because shell quoting splits
+    # the name — `\bsh\b` and `\beval\b` both miss these, while shlex resolves
+    # them to `bash` and `eval`. That combination is the only place the flag
+    # changes anything, so a test using a plainly-spelled `eval` proves nothing:
+    # the text test refuses it one branch earlier. MEASURED — such a test passed
+    # against a mutant that reverted this fix.
+    INVISIBLE = [
+        ('ba' + chr(39) + 's' + chr(39) + 'h -c', "quote-split bash"),
+        ('e' + chr(34) + 'v' + chr(34) + 'al', "quote-split eval"),
+        ('ev' + chr(34) + chr(34) + 'al', "empty-string-split eval"),
+    ]
+
+    @pytest.mark.parametrize("carrier,why", INVISIBLE)
+    def test_a_raising_resolver_still_refuses_a_carrier(
+        self, carrier, why, monkeypatch
+    ):
+        def boom(_cmd):
+            raise RuntimeError("resolver exploded")
+
+        cmd = f"{carrier} '{self.RM} -rf /a/b'"
+        assert self._main_with(monkeypatch, cmd, boom) == 2, (
+            f"{why}: a raising resolver disabled the fallback carrier refusal — "
+            "the one path where nothing else is left to catch a carrier"
+        )
+
+    @pytest.mark.parametrize("carrier,why", INVISIBLE)
+    def test_the_raw_text_scope_really_is_blind_to_these(self, carrier, why):
+        """Guard-the-guard: if `_CARRIER_WORDS` saw these, the tests above would
+        pass through the text branch and pin nothing."""
+        cmd = f"{carrier} '{self.RM} -rf /a/b'"
+        assert not dg._CARRIER_WORDS.search(cmd), (
+            f"{why}: fixture lost its property — the text scope now matches, so "
+            "the raise-path test no longer reaches the flag it claims to pin"
+        )
+
+    def test_a_raising_resolver_does_not_refuse_a_plain_safe_command(
+        self, monkeypatch
+    ):
+        """The negative control. Failing closed is not failing on everything."""
+
+        def boom(_cmd):
+            raise RuntimeError("resolver exploded")
+
+        cmd = f"{self.RM} -rf ./deep/a/b/c/d"
+        assert self._main_with(monkeypatch, cmd, boom) == 0
+
+    def test_a_working_resolver_leaves_the_fallback_refusal_OFF(self, monkeypatch):
+        """The other side: with a live resolver the fallback must NOT double up,
+        or `bash -c 'rm -rf ./deep/a/b/c/d'` is refused though it is recoverable
+        and its direct spelling allows."""
+        cmd = f"bash -c '{self.RM} -rf ./deep/a/b/c/d'"
+        assert self._main_with(monkeypatch, cmd, dg._analyze_checked) == 0
+
+    def test_a_MISSING_resolver_also_keeps_the_refusal_on(self, monkeypatch):
+        """The degraded import path reports unanalysed for the same reason."""
+        cmd = f"eval '{self.RM} -rf /a/b'"
+        assert self._main_with(monkeypatch, cmd, None) == 2
