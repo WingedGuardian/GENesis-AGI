@@ -60,18 +60,41 @@ def _measured_flags(group: str, sub: str) -> tuple[frozenset[str], frozenset[str
 
 
 def test_flag_table_matches_gh_help():
-    """Every modeled row equals what the installed gh's own help declares."""
+    """Every modeled row agrees with what the installed gh's own help declares.
+
+    Three rules, by danger:
+
+    - **Arity conflict fails.** A flag present in both the table and the help
+      but modelled with the wrong arity is the defect this file exists to
+      catch — a moved arity silently changes what the resolver consumes.
+    - **A help-only VALUE flag fails.** A new value-taking flag the table does
+      not model would be skipped without consuming its argument, and the
+      argument lands in the positionals — a wrong parse, not just an
+      `unmodelled` report.
+    - **Bool-only and table-only drift is tolerated.** gh versions differ
+      across environments (the table was measured on 2.78.0; runners ship
+      newer): a flag the local gh lacks (table-only) and a new valueless flag
+      (help-only bool, which lands in `unmodelled` — reported, fail-safe) do
+      not change any modelled flag's arity, so they are recorded in the
+      failure message only when they accompany a real conflict.
+    """
     for (group, sub), expected in sp._GH_FLAG_TABLE.items():
         value, boolean = _measured_flags(group, sub)
-        assert value == expected[0], (
-            f"gh help {group} {sub}: value-flag set drifted\n"
-            f"  table only: {sorted(expected[0] - value)}\n"
-            f"  help  only: {sorted(value - expected[0])}"
+        t_value, t_bool = expected
+        conflicts = (
+            sorted((t_value - value) & boolean)
+            + sorted((t_bool - boolean) & value)
         )
-        assert boolean == expected[1], (
-            f"gh help {group} {sub}: valueless-flag set drifted\n"
-            f"  table only: {sorted(expected[1] - boolean)}\n"
-            f"  help  only: {sorted(boolean - expected[1])}"
+        assert not conflicts, (
+            f"gh help {group} {sub}: arity moved on {conflicts}\n"
+            f"  table-only (older gh?): {sorted((t_value | t_bool) - (value | boolean))}\n"
+            f"  help-only bool (newer gh?): {sorted(boolean - t_bool)}"
+        )
+        new_value_flags = sorted(value - t_value)
+        assert not new_value_flags, (
+            f"gh help {group} {sub}: unmodelled value-taking flag(s) "
+            f"{new_value_flags} — add them to the table; a skipped value flag "
+            "leaves its argument in the positionals"
         )
 
 

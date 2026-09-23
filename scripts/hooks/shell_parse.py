@@ -3069,7 +3069,7 @@ def git_subcommand(argv: list[str]) -> str | None:
 #: when a release moves an arity, so the table is checked rather than trusted.
 _GH_FLAG_TABLE: dict[tuple[str, str], tuple[frozenset[str], frozenset[str]]] = {
     ("api", ""): (frozenset({'--cache', '--field', '--header', '--hostname', '--input', '--jq', '--method', '--preview', '--raw-field', '--template', '-F', '-H', '-X', '-f', '-p', '-q', '-t'}),
-        frozenset({'--help', '--include', '--paginate', '--silent', '--slurp', '--verbose', '-i'})),
+        frozenset({'--allow-escape-sequences', '--help', '--include', '--paginate', '--silent', '--slurp', '--verbose', '-i'})),
     ("cache", "list"): (frozenset({'--jq', '--json', '--key', '--limit', '--order', '--ref', '--repo', '--sort', '--template', '-L', '-O', '-R', '-S', '-k', '-q', '-r', '-t'}),
         frozenset({'--help'})),
     ("gist", "list"): (frozenset({'--filter', '--limit', '-L'}),
