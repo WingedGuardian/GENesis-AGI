@@ -109,6 +109,29 @@ isolation is still load-bearing for you — it is:
   health probes and dashboard polling keep working. Anything readable through
   the API is readable by anyone who can reach the port.
 - It is **inert when no dashboard password is set**, which is the default.
+
+  A narrow exception to that last point. A few routes decide not *whether* to
+  answer but *how much* to include, and those read `has_verified_credential()`
+  instead — which, unlike `is_authenticated()`, is never true when no password
+  is configured, because nothing can be proved without a credential to present.
+  Today that covers the provider-key **values** (`/api/genesis/secrets`) and
+  the backup target, filesystem paths and NAS username
+  (`/api/genesis/backup/config`). Those are withheld from an unauthenticated
+  caller on every install, including a passwordless one. The routes still
+  answer and the response shape is unchanged; only the sensitive values are
+  absent.
+
+  **This is not the whole class, and it should not be read as one.** Two
+  `reveal` endpoints — `/api/genesis/references/<id>/reveal` (stored plaintext
+  credentials) and `/api/genesis/attention/<id>/reveal-text` (captured
+  transcript text) — are gated on `is_authenticated()`, so on a passwordless
+  install they still return their contents to any caller who can reach the
+  port. They are knowingly left as they are for now: an endpoint whose entire
+  product is the secret has no redacted middle state, so credential-gating it
+  returns 403 where an unauthenticated operator currently gets 200 — a
+  narrowing of access, which is a product decision rather than a bug fix.
+  Until that decision is taken, treat those two as covered by the network
+  isolation above and by nothing else.
 - It exempts everything under the `/api/genesis/auth/` prefix — a prefix match,
   not a fixed list, so any route added there in future is exempt by default.
   Today that prefix holds login, logout and an auth-status probe. None of them
@@ -142,8 +165,10 @@ gateway in front of them.
 - Treat the built-in web terminal and the noVNC console as **unauthenticated
   administrative access**: anyone who can reach those ports can drive Genesis.
   For the dashboard API, assume the same for reads and for any install with no
-  dashboard password set. Network isolation remains the primary control; the
-  mutation gate above is a second layer, not a replacement for it.
+  dashboard password set — with the credential-gated field values noted above
+  as the one carve-out, which is a narrow one and does not change the posture.
+  Network isolation remains the primary control; the mutation gate above is a
+  second layer, not a replacement for it.
 
 Security audits should verify this network restriction (firewall / overlay)
 rather than re-flagging the `0.0.0.0` bind, which is intentional for the

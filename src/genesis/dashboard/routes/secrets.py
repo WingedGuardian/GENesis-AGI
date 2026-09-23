@@ -17,7 +17,7 @@ from pathlib import Path
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import blueprint
-from genesis.dashboard.auth import is_authenticated
+from genesis.dashboard.auth import has_verified_credential
 from genesis.env import repo_root, secrets_path
 
 logger = logging.getLogger(__name__)
@@ -245,11 +245,18 @@ def _update_secrets_file(updates: dict[str, str]) -> None:
 def secrets_list():
     """Return grouped key registry with status and current values.
 
-    Values are only included for authenticated sessions. Unauthenticated
-    callers (monitoring tools, Guardian probes) see status but not values.
+    Values are included only for a caller that PROVED it is the operator.
+    Everyone else — monitoring tools, Guardian probes, anything on the network
+    — sees each key's status but never its value.
+
+    ``has_verified_credential`` rather than ``is_authenticated``: the latter
+    returns True when no password is configured, which on a passwordless
+    install served every plaintext key to any unauthenticated caller. A box
+    with no credential set cannot have proved anything, so it gets status only
+    until a password exists.
     """
     groups: dict[str, list[dict]] = {}
-    include_values = is_authenticated()
+    include_values = has_verified_credential()
 
     for kdef in _KEY_REGISTRY:
         entry = {
@@ -268,7 +275,23 @@ def secrets_list():
         groups.setdefault(kdef.group, []).append(entry)
 
     result = [{"name": name, "keys": keys} for name, keys in groups.items()]
-    return jsonify({"groups": result})
+    return jsonify(
+        {
+            "groups": result,
+            # The editor MUST distinguish "not set" from "set but withheld". An
+            # unreadable value is not an empty one, and the UI seeds its edit
+            # buffer from ``value`` precisely so that saving without typing means
+            # "no change" rather than "clear this". With every value blank and no
+            # signal, that seed degrades to "" for the whole registry and the
+            # clear path re-opens for the optional overrides.
+            #
+            # Redaction stays BROAD on purpose — it is not split by
+            # ``is_sensitive``, because that flag is a name-pattern heuristic and
+            # misses real bearer credentials (a webhook URL is not matched by it).
+            # Withholding a few harmless values is the cheaper error.
+            "values_withheld": not include_values,
+        }
+    )
 
 
 @blueprint.route("/api/genesis/secrets", methods=["PUT"])

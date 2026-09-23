@@ -422,7 +422,7 @@ def test_get_config_strips_creds_and_gates_nas(client):
                 "interval": "6h",
             },
         ),
-        patch(f"{_BK}.is_authenticated", return_value=False),
+        patch(f"{_BK}.has_verified_credential", return_value=False),
     ):
         resp = client.get("/api/genesis/backup/config")
     data = resp.get_json()
@@ -453,7 +453,7 @@ def test_get_config_returns_nas_when_authenticated(client):
                 "interval": None,
             },
         ),
-        patch(f"{_BK}.is_authenticated", return_value=True),
+        patch(f"{_BK}.has_verified_credential", return_value=True),
     ):
         resp = client.get("/api/genesis/backup/config")
     data = resp.get_json()
@@ -485,7 +485,7 @@ def _status_env(tmp_path, status: dict, authed=True):
                 "interval": "6h",
             },
         ),
-        patch(f"{_BK}.is_authenticated", return_value=authed),
+        patch(f"{_BK}.has_verified_credential", return_value=authed),
     )
 
 
@@ -685,9 +685,11 @@ def test_get_config_backend_backward_compat(client):
                 "interval": "6h",
             },
         ),
-        patch(f"{_BK}.is_authenticated", return_value=True),
     ):
         resp = client.get("/api/genesis/backup/config")
+    # No auth patch: this asserts on ``tier2_backend``, which is returned
+    # unconditionally. Patching a predicate the assertion does not depend on
+    # reads as though the result were auth-conditioned, and it is not.
     assert resp.get_json()["tier2_backend"] == "smb"
 
 

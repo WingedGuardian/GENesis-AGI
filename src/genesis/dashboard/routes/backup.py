@@ -29,7 +29,7 @@ from pathlib import Path
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import blueprint
-from genesis.dashboard.auth import is_authenticated
+from genesis.dashboard.auth import has_verified_credential, is_authenticated
 from genesis.util.systemd import systemctl_env
 
 logger = logging.getLogger(__name__)
@@ -315,7 +315,10 @@ def _destinations(status: dict | None, repo: str | None) -> dict:
         "snapshot_id": status.get("snapshot_id"),
         "snapshot_count": status.get("snapshot_count"),
     }
-    if is_authenticated():
+    # Disclosure, not admission — a caller that has not PROVED it is the
+    # operator never sees the target. ``is_authenticated`` would return True on
+    # a passwordless install and hand the NAS URL or local path to anyone.
+    if has_verified_credential():
         if backend == "smb":
             tier2["target"] = _strip_url_creds(_key_value("GENESIS_BACKUP_NAS")) or None
         elif backend == "local":
@@ -631,9 +634,11 @@ def backup_config_get():
     """Current backup configuration for the dashboard form.
 
     Non-sensitive fields are always returned (with the repo URL credential-
-    stripped). The NAS share/user are infra detail returned only to
-    authenticated callers; passphrase/NAS password are NEVER returned — only
-    a boolean indicating whether they are set.
+    stripped). The local path, NAS share and NAS user are infra detail returned
+    only to a caller that has PROVED it is the operator — ``has_verified_credential``,
+    not ``is_authenticated``, so a passwordless install withholds them rather than
+    disclosing them. Passphrase and NAS password are NEVER returned — only a
+    boolean indicating whether they are set.
     """
     from genesis.dashboard.routes.secrets import _key_value
 
@@ -647,8 +652,10 @@ def backup_config_get():
         "passphrase_set": bool(_key_value("GENESIS_BACKUP_PASSPHRASE")),
         "nas_pass_set": bool(_key_value("GENESIS_BACKUP_NAS_PASS")),
     }
-    # Filesystem paths/shares are infra detail — only for authenticated callers.
-    if is_authenticated():
+    # Filesystem paths/shares and the NAS username are infra detail — only for a
+    # caller that has PROVED it is the operator. Not ``is_authenticated``: that
+    # opens up when no password is set, which disclosed these to the network.
+    if has_verified_credential():
         result["local_path"] = _key_value("GENESIS_BACKUP_LOCAL_PATH")
         result["nas"] = _key_value("GENESIS_BACKUP_NAS")
         result["nas_user"] = _key_value("GENESIS_BACKUP_NAS_USER")

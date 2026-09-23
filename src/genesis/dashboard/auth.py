@@ -9,6 +9,7 @@ hmac.compare_digest (constant-time, no timing attacks).
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
 import os
@@ -158,10 +159,67 @@ def check_bearer_token(surface: str) -> tuple[str, int] | None:
 
 
 def is_authenticated() -> bool:
-    """Check if current request has a valid session."""
+    """Check if current request has a valid session.
+
+    Returns ``True`` when no password is configured — "auth disabled". That is
+    correct for a GATE (``if not is_authenticated(): 401``): an install that
+    chose not to set a password is not refused its own dashboard.
+
+    It is WRONG for a disclosure decision. See ``has_verified_credential``.
+    """
     if not get_dashboard_password():
         return True  # Auth disabled
     return session.get("authenticated") is True
+
+
+def has_verified_credential() -> bool:
+    """Did this request PROVE who it is? Never true without a password set.
+
+    The distinction from ``is_authenticated`` is the whole point, and the two
+    are not interchangeable:
+
+    * ``is_authenticated`` answers *"may this request proceed?"* and opens up
+      when no password is configured, so an unconfigured install keeps working.
+    * ``has_verified_credential`` answers *"has this caller demonstrated it is
+      the operator?"* — and with no password configured, nothing can, because
+      there is no credential to present.
+
+    Use this for any decision that REVEALS something rather than admitting
+    someone. Gating disclosure on ``is_authenticated`` inverts it: the flag
+    that chooses redact-vs-reveal flips to REVEAL on exactly the installs that
+    have no credential, so a passwordless box serves its secrets to whoever can
+    reach it. That was live on three sites — the provider-key values and two
+    backup-config routes — and is what this predicate exists to prevent.
+
+    Deliberately session-only: it does NOT accept the internal bearer token.
+    Both current callers are the dashboard's own browser front-end, so no
+    machine caller needs it, and a process holding that 0600 token can already
+    read the same values straight out of the environment — accepting it here
+    would widen the surface while buying nothing.
+    """
+    pw = get_dashboard_password()
+    if not pw:
+        return False
+    if session.get("authenticated") is not True:
+        return False
+    # Bind the session to the credential it was issued against, so rotating the
+    # password after a suspected compromise actually evicts the old cookie from
+    # the disclosure path. A session minted before this existed carries no
+    # fingerprint and is refused here — it must log in again to see values.
+    # Deliberately NOT applied to ``is_authenticated``: evicting gates would
+    # narrow access, which this change promises not to do.
+    return hmac.compare_digest(
+        str(session.get("pw_fingerprint", "")), _password_fingerprint(pw)
+    )
+
+
+def _password_fingerprint(password: str) -> str:
+    """A non-reversible tag identifying WHICH password a session was issued for.
+
+    Truncated to 16 hex characters: this is an equality tag, never a credential
+    check, and the full digest is not stored in a cookie the client can read.
+    """
+    return hashlib.sha256(password.encode()).hexdigest()[:16]
 
 
 def check_password(input_password: str) -> bool:
@@ -382,9 +440,22 @@ def auth_login():
     if not password:
         return jsonify({"error": "Password required"}), 400
 
+    # Mint NOTHING when there is no credential to check against. ``check_password``
+    # returns True in that state ("auth disabled"), so without this guard any POST
+    # to this route received a permanent 30-day session on a passwordless install —
+    # and that cookie outlived the configuration change, so an operator who later
+    # set a password inherited a session an attacker had already harvested. That
+    # defeats the exact remediation this file recommends, which is why the check
+    # is here and not only at the disclosure sites.
+    pw = get_dashboard_password()
+    if not pw:
+        logger.info("Dashboard login attempted from %s while auth is disabled", ip)
+        return jsonify({"status": "auth_disabled"})
+
     if check_password(password):
         session.permanent = True
         session["authenticated"] = True
+        session["pw_fingerprint"] = _password_fingerprint(pw)
         logger.info("Dashboard login successful from %s", ip)
         return jsonify({"status": "ok"})
 
