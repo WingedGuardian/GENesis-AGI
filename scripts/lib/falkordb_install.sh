@@ -365,6 +365,7 @@ falkordb_redis_install() {
             # for a redis that is not ours, and printing it here would abandon
             # our own daemon on :6379.
             if _falkordb_stand_down_system_redis; then
+                mkdir -p "$(dirname "$FALKORDB_PROVISION_MARKER")" 2>/dev/null || true
                 date -u +%Y-%m-%dT%H:%M:%SZ > "$FALKORDB_PROVISION_MARKER" 2>/dev/null || true
                 echo "  OK: redis-server provisioned (completed pending stand-down)."
             else
@@ -534,7 +535,11 @@ falkordb_redis_install() {
     if _falkordb_stand_down_system_redis; then
         # The completion marker records a FINISHED provisioning — including the
         # verified stand-down. Written only here so a failed disable is retried
-        # on the next run rather than replayed as 'already provisioned'.
+        # on the next run rather than replayed as 'already provisioned'. The
+        # parent is created first: on a fresh install nothing else has made
+        # FALKORDB_DEPS_DIR yet, and a dropped write reads as 'incomplete'
+        # forever — the NEXT bootstrap would stand down the unit again.
+        mkdir -p "$(dirname "$FALKORDB_PROVISION_MARKER")" 2>/dev/null || true
         date -u +%Y-%m-%dT%H:%M:%SZ > "$FALKORDB_PROVISION_MARKER" 2>/dev/null || true
         echo "  Installed: redis-server (system unit disabled — Genesis uses a socket-only user unit)"
     else
