@@ -57,9 +57,25 @@ LOCK_DIR="$GENESIS_HOME/locks"
 _log() { printf 'graph-project: %s\n' "$1"; }
 
 if [ ! -x "$VENV_PY" ]; then
-    # An install whose venv is missing or half-built. Not this timer's problem
-    # to report every hour — bootstrap is where that surfaces.
-    _log "no venv interpreter at $VENV_PY — nothing to do"
+    # SPLIT BY WHETHER THIS INSTALL HAS AN ENGINE, rather than exiting 0 for
+    # both. Without an interpreter the runner cannot ask Python whether the
+    # install is armed, so it asks the filesystem the one question that
+    # matters: is there an engine socket?
+    #
+    # No socket -> no engine was ever provisioned, so a missing venv is a
+    # broken install that bootstrap surfaces, and an hourly red unit would add
+    # noise rather than information. Exit 0.
+    #
+    # Socket present -> this install HAS an engine whose projection is supposed
+    # to be refreshed, and it silently is not. An earlier version exited 0 here
+    # too, which meant the timer reported SUCCESS hourly, forever, while nothing
+    # was projected — the same fail-open the exit codes below exist to prevent,
+    # one layer earlier. That case is EX_TEMPFAIL.
+    if [ -S "$GENESIS_HOME/falkordb/falkordb.sock" ]; then
+        _log "engine socket present but no venv interpreter at $VENV_PY — cannot project"
+        exit 75
+    fi
+    _log "no venv interpreter at $VENV_PY and no engine socket — nothing to do"
     exit 0
 fi
 

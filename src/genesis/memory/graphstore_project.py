@@ -33,7 +33,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import importlib.util
+import signal
 import time
 from pathlib import Path
 from urllib.parse import quote
@@ -202,6 +204,34 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+
+    # SIGTERM must unwind, or the projector leaks a full copy of the graph.
+    #
+    # MEASURED with a control arm: under Python's DEFAULT SIGTERM handling the
+    # process dies without running `except BaseException` OR `finally`, while
+    # SIGINT runs both. The store deletes its staging graph only from an
+    # `except BaseException`, so a `TimeoutStartSec` expiry — which systemd
+    # delivers as SIGTERM — abandons a full projection under a pid-keyed name
+    # that the next tick, being a different process, will never reuse.
+    #
+    # Routing SIGTERM onto KeyboardInterrupt puts it on the SAME path Ctrl+C
+    # already takes, which is the path measured to clean up correctly, rather
+    # than inventing a second shutdown route that would need its own proof.
+    # `asyncio.run` already unwinds KeyboardInterrupt.
+    #
+    # This is the handler half only. It cannot cover SIGKILL, an OOM kill or a
+    # power loss — no handler can — so the store ALSO sweeps orphaned staging
+    # graphs whose pid is gone at the start of every build. That backstop is
+    # what actually closes the class; this just makes the common case immediate
+    # instead of waiting an hour.
+    def _unwind_on_terminate(signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt(f"terminated by signal {signum}")
+
+    with contextlib.suppress(ValueError, OSError):
+        # ValueError when not on the main thread — the projector always is, but
+        # refusing to run because a signal could not be installed would trade a
+        # cleanup guarantee for no projection at all.
+        signal.signal(signal.SIGTERM, _unwind_on_terminate)
 
     if args.if_armed:
         ok, reason = armed()

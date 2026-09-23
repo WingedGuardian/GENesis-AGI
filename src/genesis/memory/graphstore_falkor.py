@@ -219,6 +219,28 @@ def _connect_in_daemon_thread(fn: Any, **kwargs: Any) -> asyncio.Future[Any]:
     return fut
 
 
+def _pid_alive(pid: int) -> bool:
+    """Is this pid a live process? Conservative: unknown counts as ALIVE.
+
+    The caller deletes what this says is dead, so the two error directions are
+    not symmetric. A false DEAD destroys a projection another process is
+    actively building; a false ALIVE leaves an orphan for the next sweep. Every
+    ambiguous case therefore answers True.
+    """
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists, owned by someone else. Not ours to reap either way.
+        return True
+    except OSError:
+        return True
+    return True
+
+
 def _project_lock(graph_key: str) -> asyncio.Lock:
     """The lock guarding projections of ``graph_key``.
 
@@ -812,6 +834,65 @@ class FalkorGraphStore:
             finally:
                 await self._release_publish_lock(token)
 
+    async def _sweep_orphan_staging(self) -> int:
+        """Delete staging graphs whose BUILDING PROCESS no longer exists.
+
+        WHY THIS IS NEEDED NOW, and it is a consequence of F3 rather than a
+        pre-existing hole. The staging key carries the pid, and the comment on
+        that choice reasons that an abandoned staging graph "has its orphan
+        reclaimed by this same process's NEXT run". That is true for an
+        IN-PROCESS scheduled projector, which is what was anticipated. F3
+        slice 1 ships a process-per-tick timer instead, so there IS no next run
+        in the same process: every tick has a new pid, and the previous tick's
+        orphan would never be reclaimed by anyone.
+
+        The trigger is the timeout the timer adds. MEASURED: Python's default
+        SIGTERM handling unwinds nothing — `except BaseException` and `finally`
+        both fail to run, where SIGINT runs both — so `TimeoutStartSec` firing
+        leaves a FULL copy of the projection behind, and each retry keys on a
+        different pid. Against a 1gb engine cap that accumulates.
+
+        A signal handler covers the timeout case, and this covers what no
+        handler can: SIGKILL, an OOM kill, a power loss. Those are precisely
+        when a duplicate graph is most likely to already be straining memory,
+        so the backstop matters more than the handler does.
+
+        Conservative by construction: it deletes only keys matching this graph's
+        own staging pattern whose pid suffix parses AND is provably gone. Its
+        own pid is skipped (the caller deletes that directly, and an in-flight
+        build must never be swept out from under itself). A recycled pid reads
+        as ALIVE and the orphan simply waits for a later sweep — the harmless
+        direction.
+        """
+        pattern = f"{self._graph_key}_staging_*"
+        cursor: int = 0
+        removed = 0
+        mine = os.getpid()
+        while True:
+            cursor, keys = await self._key_op(
+                "scan", cursor, match=pattern, count=100, timeout=_PROJECT_TIMEOUT_S
+            )
+            for raw in keys or ():
+                key = raw.decode() if isinstance(raw, bytes) else str(raw)
+                suffix = key.rsplit("_", 1)[-1]
+                if not suffix.isdigit():
+                    # Not a key this module minted. Leave it alone rather than
+                    # guessing at something another writer owns.
+                    continue
+                pid = int(suffix)
+                if pid == mine or _pid_alive(pid):
+                    continue
+                await self._key_op("delete", key, timeout=_PROJECT_TIMEOUT_S)
+                removed += 1
+                logger.warning(
+                    "graphstore: reclaimed orphan staging graph %s (pid %d is gone)",
+                    key,
+                    pid,
+                )
+            if not cursor:
+                break
+        return removed
+
     async def _project_locked(
         self, db: aiosqlite.Connection, token: str | None
     ) -> dict[str, int]:
@@ -892,6 +973,16 @@ class FalkorGraphStore:
         # hourly projector is an hour later rather than never.
         staging = f"{self._graph_key}_staging_{os.getpid()}"
         await self._key_op("delete", staging, timeout=_PROJECT_TIMEOUT_S)
+        # And every OTHER process's abandoned staging graph. The self-delete
+        # above only reclaims this pid's own orphan, which is sufficient for an
+        # in-process projector and useless for the process-per-tick timer F3
+        # actually ships — there, each tick has a new pid and nothing would ever
+        # reclaim the last one. Failures are logged and swallowed: a sweep that
+        # cannot run is not a reason to refuse to project.
+        try:
+            await self._sweep_orphan_staging()
+        except Exception:
+            logger.warning("graphstore: orphan staging sweep failed", exc_info=True)
 
         # CLEANUP COVERS THE WHOLE BUILD, not just the swap. An earlier version
         # wrapped only the rename, so a failure or timeout in index creation or

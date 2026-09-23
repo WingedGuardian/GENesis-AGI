@@ -17,6 +17,8 @@ attempted, rather than an `except` clause after one.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from genesis.memory import graphstore_project as gp
@@ -338,3 +340,88 @@ def test_config_is_readable_treats_an_absent_file_as_fine(tmp_path, monkeypatch)
 
     monkeypatch.setattr(gc, "_base_path", lambda: tmp_path / "nope.yaml")
     assert gc.config_is_readable() is True
+
+
+# -- the staging-graph leak, and why a handler alone is not the fix ------------
+
+
+def test_sigterm_is_routed_onto_the_cleanup_path(monkeypatch, tmp_path, capsys):
+    """MEASURED: Python's DEFAULT SIGTERM handling runs neither `except
+    BaseException` nor `finally`, while SIGINT runs both.
+
+    The store deletes its staging graph only from an `except BaseException`, so
+    a `TimeoutStartSec` expiry — delivered as SIGTERM — abandoned a full copy of
+    the projection under a pid-keyed name no later tick would reuse. Routing
+    SIGTERM onto KeyboardInterrupt puts it on the same path Ctrl+C already takes,
+    which is the one measured to clean up correctly.
+
+    Asserts the handler is INSTALLED and RAISES, rather than that a signal was
+    delivered — delivery timing in a test process is its own flake.
+    """
+    import signal as _signal
+
+    monkeypatch.setattr(gp, "falkordb_socket_path", lambda: tmp_path / "absent.sock")
+    monkeypatch.setattr("sys.argv", ["graphstore_project", "--if-armed"])
+    gp.main()
+
+    handler = _signal.getsignal(_signal.SIGTERM)
+    assert handler not in (_signal.SIG_DFL, _signal.SIG_IGN), (
+        "SIGTERM is still on the default disposition, which unwinds nothing — "
+        "a timed-out projection would abandon its staging graph"
+    )
+    with pytest.raises(KeyboardInterrupt):
+        handler(_signal.SIGTERM, None)
+
+
+def test_pid_alive_answers_alive_for_anything_ambiguous():
+    """The two error directions are NOT symmetric, so this is asserted.
+
+    A false DEAD destroys a projection another process is actively building; a
+    false ALIVE leaves an orphan for the next sweep. Every uncertain case must
+    therefore answer True.
+    """
+    from genesis.memory.graphstore_falkor import _pid_alive
+
+    assert _pid_alive(os.getpid()) is True
+    assert _pid_alive(0) is True, "pid 0 is not a reapable process"
+    assert _pid_alive(-1) is True, "a negative pid is a process GROUP, never ours to reap"
+    # A pid that cannot exist on Linux (default pid_max is 4194304).
+    assert _pid_alive(2**31 - 1) is False
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_reaps_dead_pids_and_spares_everything_else(monkeypatch):
+    """The backstop that covers what no signal handler can — SIGKILL, an OOM
+    kill, a power loss.
+
+    Engine-free: `_key_op` is stubbed, so this pins the SELECTION LOGIC, which
+    is where the danger is. Deleting a live build's staging graph would corrupt
+    a concurrent projection.
+    """
+    from genesis.memory.graphstore_falkor import FalkorGraphStore
+
+    store = FalkorGraphStore(graph_key="swept")
+    mine = os.getpid()
+    keys = [
+        f"swept_staging_{2**31 - 1}".encode(),  # dead -> reap
+        f"swept_staging_{mine}".encode(),  # OURS -> never
+        b"swept_staging_notanumber",  # not ours to guess at
+        f"swept_staging_{os.getppid()}".encode(),  # alive -> spare
+    ]
+    deleted: list[str] = []
+
+    async def _fake_key_op(op, *args, timeout=None, **kwargs):
+        if op == "scan":
+            return 0, keys
+        if op == "delete":
+            deleted.append(args[0])
+            return 1
+        raise AssertionError(f"unexpected op {op}")
+
+    monkeypatch.setattr(store, "_key_op", _fake_key_op)
+    removed = await store._sweep_orphan_staging()
+
+    assert removed == 1
+    assert deleted == [f"swept_staging_{2**31 - 1}"], (
+        f"swept the wrong set: {deleted} — a live or unparseable key was reaped"
+    )
