@@ -131,6 +131,26 @@ _COMMAND_CARRIERS = frozenset(
     | _NESTED_SHELLS
 )
 
+#: Carriers this set deliberately LACKS — test_carrier_sets fails when a union
+#: member is absent without a recorded reason (#2232). Mirrors
+#: `shell_parse._REPARSE_CARRIER_EXCLUDES` minus the names already covered here
+#: via _NESTED_SHELLS.
+_COMMAND_CARRIER_EXCLUDES: dict[str, str] = {
+    **{name: "a `run`-gated package front-end — `uv run rm -rf …` leaves the "
+        "segment on `uv` and the rm never reaches this guard's scan; gating "
+        "front-ends is _RUN_CARRIERS' job, not a free re-parse"
+        for name in ("uv", "uvx", "poetry", "hatch", "pdm", "pipenv", "rye")},
+    "ssh": "runs the command on ANOTHER machine — remote gating is its own "
+    "design, tracked separately (#2231)",
+    "docker": "runs the command inside a container — same remote-class "
+    "reasoning as ssh",
+    "find": "carries visible argv (`find -exec rm …`) — the payload is "
+    "already a bare token this guard's scan sees",
+    "parallel": "carries visible argv — same reasoning as find",
+    "xargs": "a `_WRAPPER_SPEC` entry — the resolver strips through it, so "
+    "its payload is a visible segment, not an opaque string",
+}
+
 # Command separators that start a new simple command within one Bash
 # string. Tokens matching these end an rm invocation's argument list.
 # FALLBACK ONLY — a rough "where might a command start" guess, used when the
@@ -542,7 +562,36 @@ def _check_target(target: str) -> str | None:
     clean = target.strip("'\"")
     if clean in _ALWAYS_BLOCK:
         return f"rm -rf on '{clean}' is not allowed."
+    # An unresolved expansion is its own verdict, not a path component.
+    # The hook sees command TEXT, so a surviving '$' — shell-local variable,
+    # command substitution, or an env var set in another segment — means the
+    # real path and its real depth are unknowable here. The old code counted
+    # it as ONE literal component, which made the depth floor POSITIONAL:
+    # `rm -rf "$SP/head2"` refused at depth 2 while `rm -rf "$SP/a/b/c/d"`
+    # passed, same cause, opposite verdict — and `$EMPTY/a/b/c/d` is
+    # `/a/b/c/d` when EMPTY is "". (#2233)
+    #
+    # expandvars is deliberately NOT used: it would guess. Quote and escape
+    # syntax is already stripped by the time an operand reaches this
+    # function, so `'$T'` (literal) and `"$T"` (expands) are the same token
+    # — expanding reads a path the shell never receives; and an UNQUOTED
+    # `$T` is field-split by bash into multiple operands, so one token's
+    # value `/home /tmp/a/b/c` is really `rm -rf /home …` borrowing the
+    # second path's depth. Refuse every '$' uniformly, and SAY it is the
+    # variable, not the count, that is the cause — a message that reports
+    # only a depth invites the reader to conclude the counter is wrong and
+    # reach for the literal spelling for the wrong reason.
     expanded = os.path.normpath(os.path.expanduser(clean))
+    if "$" in expanded:
+        return (
+            f"rm -rf on '{clean}' contains an unresolved shell variable, "
+            f"so its real depth is unknown — refusing."
+        )
+    if "`" in expanded:
+        return (
+            f"rm -rf on '{clean}' contains an unresolved command substitution, "
+            f"so its real depth is unknown — refusing."
+        )
     parts = [p for p in expanded.split("/") if p]
     # A surviving '..' means the path traverses upward from a base the
     # hook cannot know (its cwd need not match the Bash invocation's).

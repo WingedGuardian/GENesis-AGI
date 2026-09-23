@@ -168,6 +168,21 @@ _WRAPPERS = set(_WRAPPER_SPEC)
 # A front-end invoked with any other subcommand (`uv pip install …`) is therefore
 # left resolving to the front-end itself, exactly as before.
 _RUN_CARRIERS = frozenset({"uv", "poetry", "hatch", "pdm", "pipenv", "rye"})
+#: Carriers this set deliberately LACKS — test_carrier_sets fails when a union
+#: member is absent without a recorded reason (#2232).
+_RUN_CARRIER_EXCLUDES: dict[str, str] = {
+    "uvx": "no `run` subcommand to gate on — uvx execs the tool directly; an "
+    "unstripped uvx segment is handled by the recoverable branch in "
+    "_strip_wrappers, not the run gate",
+    **{name: "not a package-manager `run` front-end — gating it on a `run` "
+        "literal here would swallow the first bare word of every subcommand"
+        for name in (
+            "eval", "su", "runuser", "setpriv", "chroot", "flock", "watch",
+            "script", "systemd-run", "unshare", "nsenter", "pkexec", "runcon",
+            "sg", "ssh", "find", "parallel", "docker", "xargs",
+            "bash", "sh", "dash", "zsh", "ksh", "ash",
+        )},
+}
 #: Launchers that RUN another command and whose grammar this resolver refuses to
 #: model. They are deliberately NOT `_WRAPPER_SPEC` entries: the walk already
 #: stops at an unknown wrapper and leaves the segment on the launcher, so this
@@ -240,6 +255,37 @@ _RUN_CARRIERS = frozenset({"uv", "poetry", "hatch", "pdm", "pipenv", "rye"})
 #: commands whose effects are not on this machine at all. Gating a remote
 #: command needs its own design; it is tracked separately rather than solved by
 #: appending a name to this set.
+#: Carriers this set deliberately LACKS — test_carrier_sets fails when a union
+#: member is absent without a recorded reason (#2232). The `ssh` reasoning is
+#: the long comment above; the rest:
+#:
+#: - package front-ends gate on a `run` literal (_RUN_CARRIERS), not free
+#:   re-parse — modelling them here would consume the first bare word of
+#:   every subcommand, the bypass `_RUN_CARRIERS` exists to avoid;
+#: - `find`/`parallel`/`xargs` carry visible argv, not an opaque string —
+#:   `xargs` is a `_WRAPPER_SPEC` entry the resolver strips through, and a
+#:   `find -exec` payload is already a bare `rm` token the walk sees;
+#: - `docker` is the same remote-class reasoning as `ssh`: the command runs
+#:   inside a container, not on this box's filesystem;
+#: - the nested shells are `_NESTED_SHELLS`, modelled by the resolver's own
+#:   recursion rather than named as carriers.
+_REPARSE_CARRIER_EXCLUDES: dict[str, str] = {
+    **{name: "a `run`-gated package front-end, not a free re-parse — see "
+        "_RUN_CARRIERS"
+        for name in ("uv", "uvx", "poetry", "hatch", "pdm", "pipenv", "rye")},
+    "ssh": "runs the command on ANOTHER machine — remote gating is its own "
+    "design, tracked separately (#2231); see the comment above",
+    "docker": "runs the command inside a container — same remote-class "
+    "reasoning as ssh",
+    "find": "carries visible argv (`find -exec rm …`) — the payload is "
+    "already a bare token the walk sees, not an opaque string",
+    "parallel": "carries visible argv — same reasoning as find",
+    "xargs": "a `_WRAPPER_SPEC` entry — the resolver already strips through "
+    "it, so it never reaches the carrier state",
+    **{name: "a nested shell — modelled by the resolver's own recursion "
+        "(_NESTED_SHELLS), not a carrier to refuse on"
+        for name in ("bash", "sh", "dash", "zsh", "ksh", "ash")},
+}
 _REPARSE_CARRIERS = frozenset(
     {
         "eval",
