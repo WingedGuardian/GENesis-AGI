@@ -436,7 +436,8 @@ verified: d0627c854 2026-09-11
   process alone. It used to report only the root, which understated a slot
   roughly threefold and kept the slot-memory thresholds from ever firing; the
   measurements and the threshold basis live in the constants' own comment in
-  `observability/cc_slots.py`, not here. `session_heartbeats` has exactly ONE reader in the tree —
+  `observability/cc_slots.py`, not here. `session_heartbeats` has exactly ONE
+  reader in the tree —
   `scripts/proactive_memory_hook.py`, which prints a `[Concurrent | …]` tag into
   each peer session's context on UserPromptSubmit — so it is an AGENT-ONLY
   channel with no human surface. Written by that same hook and refreshed

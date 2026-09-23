@@ -2003,10 +2003,12 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
         # Comparing the threshold against the root process alone — which is what
         # this did before — meant the alert could not fire in the regime it
         # exists for: the root stays ~0.8 GB while the tree balloons.
-        rss = slot.get("rss_mb", 0.0)
-        # `or rss`, not a .get default: the dashboard detail path emits the key
-        # with value None, and a present-None would survive a default and then
-        # TypeError inside the try — swallowing the alert at DEBUG.
+        # `or`, not a .get default, on BOTH keys: a present-None survives a
+        # default, and `rss` is compared outside the inner try, where a None
+        # raises out of a function whose contract is "never raises into the
+        # tick". Defensive — no production caller passes rows today (the one
+        # call site enumerates live slots).
+        rss = slot.get("rss_mb") or 0.0
         proc_rss = slot.get("proc_rss_mb") or rss
         if rss < SLOT_RSS_WARN_MB:
             continue

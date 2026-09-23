@@ -95,6 +95,25 @@ async def test_held_is_terminal_unlinks(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ignored_is_terminal_unlinks(tmp_path, monkeypatch):
+    """IGNORED is the pipeline's own "permanent, stop retrying" status.
+
+    Its comments say so twice — it returns IGNORED instead of FAILED precisely
+    because "the drain treats FAILED as transient and retries it" — and
+    `outreach_recovery` discards IGNORED as a permanent non-delivery. Until now
+    this drain retried it anyway. On an install whose blocker channel has no
+    registered adapter, every queued alert resolves IGNORED forever: an ERROR
+    log per entry per tick until the queue's 14-day prune silently discarded
+    the alerts with no record that they were never delivered.
+    """
+    root = tmp_path / "queue"
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
+    _enqueue(root, dedupe_key="backup:k2")
+    await alert_drain._make_drainer(_RT(pipeline=_FakePipeline(OutreachStatus.IGNORED)))()
+    assert q.list_queued(root) == []
+
+
+@pytest.mark.asyncio
 async def test_failed_keeps_for_retry(tmp_path, monkeypatch):
     root = tmp_path / "queue"
     monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)

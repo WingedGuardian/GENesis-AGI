@@ -1,4 +1,4 @@
-- **A delivery hiccup can no longer page the same alert twice.** When sending
+- **A failed or retried delivery can no longer page the same alert twice.** When sending
   an alert to Telegram failed transiently, two independent recovery mechanisms
   both took ownership of the retry: the durable alert queue kept its copy for
   the next pass, and the delivery pipeline separately queued its own retry.

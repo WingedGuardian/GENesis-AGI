@@ -89,7 +89,7 @@ def _make_drainer(rt):
         #    approving them delivers the same alert once per hold. Terminal here
         #    matches `resilience/outreach_recovery.py:170`, which already treats
         #    HELD as terminal — and whose comment claims it "mirrors
-        #    alert_drain". It did not; this makes the claim true.
+        #    alert_drain". It did not; HELD and IGNORED here now match recovery's terminal set.
         # FAILED/PENDING → keep + retry next tick, and because the request above
         # carries `defer_retry=False`, a FAILED send leaves THIS queue as the
         # delivery's ONLY retrier. Before that flag existed the pipeline also
@@ -97,10 +97,20 @@ def _make_drainer(rt):
         # delivery: recovery delivered at 08:31:57 and the kept entry resent at
         # 08:35:42 — one OOM alert, two pages (issue #1781, MEASURED from the
         # journal + outreach rows).
+        # IGNORED is terminal too. The pipeline chose that status SPECIFICALLY
+        # to stop retry loops (its own comment: "the drain treats
+        # DELIVERED/ENGAGED/HELD/IGNORED as terminal and FAILED as transient"),
+        # and outreach_recovery already discards it as a permanent
+        # non-delivery. Honouring it here matters on an install whose blocker
+        # channel has no registered adapter: every queued alert resolves
+        # IGNORED forever, which without this line meant an ERROR log per
+        # entry per tick until the queue's 14-day prune silently discarded the
+        # alerts with no record that they were never delivered.
         return result.status in (
             OutreachStatus.DELIVERED,
             OutreachStatus.REJECTED,
             OutreachStatus.HELD,
+            OutreachStatus.IGNORED,
         )
 
     async def _drainer() -> None:
