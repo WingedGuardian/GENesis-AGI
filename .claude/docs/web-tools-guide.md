@@ -47,7 +47,7 @@ libraries on GitHub, use these INSTEAD of generic web search:
 | **`recon_github_search`** | Genesis research sessions | Find public GitHub.com repositories, or issues through literal text plus structured repository/state/label filters, using an unauthenticated fixed endpoint |
 | **`recon_github_read`** | Genesis research sessions | Inspect public GitHub.com repository metadata, bounded trees, or UTF-8 source files up to Genesis's 8 MiB file limit |
 | **`gh search repos/code`** | Foreground with Bash | Direct CLI fallback |
-| **grep.app** | Both | `web_fetch("https://grep.app/search?q=QUERY")` — semantic code search, better than GitHub native |
+| **grep.app** | Both | `searchGitHub` via the Grep MCP server (`https://mcp.grep.app`, no API key) — LITERAL/regex code search over ~1M public repos |
 | **`gh api search/repositories?q=QUERY`** | Foreground with Bash | Structured CLI fallback |
 | **Exa** with GitHub filter | Both | `web_search(query, backend="exa")` with `include_domains: ["github.com"]` |
 
@@ -55,7 +55,10 @@ libraries on GitHub, use these INSTEAD of generic web search:
 "how do other projects handle X," or "what open-source tools exist for Y."
 Generic web search returns blog posts ABOUT GitHub projects; these tools
 search GitHub directly. grep.app is especially valuable for finding
-implementation patterns across repos. GitHub's code-search API requires
+implementation patterns across repos — but query it with actual code
+(`useState(`, `max_review_iterations`, `(?s)try {.*await`), never with keywords
+or a question. It greps; it does not embed. For conceptual discovery where you
+cannot name the code, use Exa instead. GitHub's code-search API requires
 credentials, so the public-only recon tool discovers candidate repositories and
 then inspects their trees/files; foreground sessions can use authenticated CLI
 search when operator-private visibility is appropriate.
