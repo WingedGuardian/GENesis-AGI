@@ -968,6 +968,58 @@ class TestACarrierRefusalSaysTheWholeCommandWentToo:
         )
 
 
+class TestUnresolvedVariableIsItsOwnVerdict:
+    """#2233: an unexpanded shell variable counted as ONE path component made
+    the depth floor positional — ``$SP/head2`` refused at depth 2 while
+    ``$SP/a/b/c/d`` passed, same cause, opposite verdict. The verdict must be
+    uniform over the cause, not over how many literals follow the variable.
+    """
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            '"$SP/head2"',  # was refused at depth 2 — for the wrong reason
+            '"$SP/a/b/c/d"',  # was ALLOWED: the positional hole
+            '"$EMPTY/a/b/c/d"',  # empty var → /a/b/c/d
+            '"${SP}/x/y/z/w"',  # ${…} spelling of the same cause
+            '"$(pwd)/a/b/c"',  # command substitution — equally unresolvable
+            '"`printf / x/y/z/w`"',  # backtick substitution: no '$', same hole
+            # — the static text has four components but bash evaluates the
+            # substitution to '/', so the depth floor never saw the real path
+            "'$SP/a/b/c/d'",  # SINGLE-QUOTED: literal to bash, still refused —
+            # quote syntax is stripped before the operand is seen, so the
+            # guard cannot know the literal is safe; refusing is the honest
+            # verdict, and every '$' reaching here is refused for the same
+            # reason an unquoted one is.
+        ],
+    )
+    def test_every_unresolved_spelling_is_refused(self, target):
+        assert _blocks(f"rm -rf {target}"), (
+            f"{target}: an unresolved expansion must not depth-pass on its "
+            "literal tail"
+        )
+
+    def test_the_reason_names_the_cause(self):
+        reasons = dg._rm_violations('rm -rf "$SP/head2"')
+        assert any("unresolved shell variable" in r for r in reasons), reasons
+
+    def test_env_expansion_is_not_guessed(self, monkeypatch):
+        # expandvars is deliberately NOT applied: the hook's environment is
+        # not the shell's, quote context is already stripped, and an unquoted
+        # expansion is field-split by bash into operands this function cannot
+        # see. Every surviving '$' is refused, resolvable or not — including
+        # an env value that would smuggle a shallow path inside a deep one.
+        monkeypatch.setenv("DG_TEST_DEEP", "/srv/app/data/build")
+        assert _blocks('rm -rf "$DG_TEST_DEEP"')
+        monkeypatch.setenv("DG_TEST_SPLIT", "/home /tmp/a/b/c/d")
+        assert _blocks('rm -rf $DG_TEST_SPLIT')
+
+    def test_the_fully_literal_deep_path_is_still_allowed(self):
+        # The acceptance bar's other direction: routine cleanup under a deep
+        # scratch directory must not start failing.
+        assert not _blocks("rm -rf /srv/app/data/build")
+
+
 class TestAResolverThatRAISESKeepsTheFallbackRefusalOn:
     """"The import worked" is not "the resolver answered for THIS command".
 
