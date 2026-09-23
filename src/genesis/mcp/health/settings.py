@@ -294,7 +294,12 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
             "reaps abandoned foreground sessions to 'checkpointed' and tells the "
             "origin user their request was interrupted (crisp unanswered-user "
             "signal only); observe reaps + records without notifying; off does "
-            "nothing. Read live each reaper pass — takes effect next pass, no restart."
+            "nothing. Read live each reaper pass — takes effect next pass, no "
+            "restart. ONE exception: `dead_process_minutes` is read live for "
+            "candidate ELIGIBILITY but also bounds the dead-pid sweep's poll "
+            "interval, which is fixed when the job is registered — so the "
+            "eligibility half changes on the next pass and the cadence half "
+            "needs a server restart."
         ),
         config_filename="cc_foreground_reaper.yaml",
         readonly=False,
