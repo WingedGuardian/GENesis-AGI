@@ -3074,7 +3074,7 @@ _GH_FLAG_TABLE: dict[tuple[str, str], tuple[frozenset[str], frozenset[str]]] = {
         frozenset({'--help'})),
     ("gist", "list"): (frozenset({'--filter', '--limit', '-L'}),
         frozenset({'--help', '--include-content', '--public', '--secret'})),
-    ("issue", "close"): (frozenset({'--comment', '--reason', '--repo', '-R', '-c', '-r'}),
+    ("issue", "close"): (frozenset({'--comment', '--duplicate-of', '--reason', '--repo', '-R', '-c', '-r'}),
         frozenset({'--help'})),
     ("issue", "comment"): (frozenset({'--attach', '--body', '--body-file', '--repo', '-F', '-R', '-b'}),
         frozenset({'--create-if-none', '--delete-last', '--edit-last', '--editor', '--help', '--web', '--yes', '-e', '-w'})),
