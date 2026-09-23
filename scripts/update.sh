@@ -334,6 +334,49 @@ _guardian_redeploy_reason() {
     return 0
 }
 
+# Resident daemons whose ExecStart is a repo script, as unit:script[,script…]
+# pairs — EVERY startup-loaded file, not just ExecStart: tmp_watchgod sources
+# lib/alert_queue.sh once at start, so a lib-only pull would otherwise leave
+# the daemon paging with old code while reading as fresh. Timer-fired
+# oneshots re-exec their script every tick and are immune; genesis-server
+# and genesis-bridge have their own restart handling. A unit listed here is
+# restarted by _sync_deploy_targets when it is RUNNING code older than any
+# of its listed files (verified instance: tmp_watchgod ran a 7-week-old copy
+# for two weeks after its OOM-capture feature merged, leaving the one
+# instrument built to explain silent session deaths inert). The rendered
+# unit template is listed too: a template-only change is met with
+# daemon-reload by bootstrap (scripts/bootstrap.sh renders + reloads, never
+# restarts), so the running daemon would keep its old directives until an
+# unrelated bounce.
+# DELIBERATELY EXCLUDED: genesis-code-intel-freeze — an operator-armed
+# kill switch whose whole guarantee is continuously HOLDING the index
+# locks; an auto-bounce would release them mid-freeze. Its code freshness
+# is the operator's re-arm. Keep in LOCKSTEP with deploy_health's
+# RESIDENT_UNIT_SCRIPTS (test-enforced).
+RESIDENT_UNIT_SCRIPTS="genesis-tmp-watchgod.service:scripts/tmp_watchgod.sh,scripts/lib/alert_queue.sh,scripts/systemd/genesis-tmp-watchgod.service.template"
+
+_unit_restart_reason() {
+    # Pure verdict: facts in → reason out (mirrors _guardian_redeploy_reason,
+    # so tests exercise the decision with no systemd). $1 = unit active (1/0),
+    # $2 = unit ExecMainStart epoch ('' unreadable), $3 = script mtime epoch
+    # ('' unreadable), $4 = unit name. Fail direction: anything unreadable or
+    # non-numeric → NO restart. mtime, not commit time, on purpose: mtime is
+    # stamped at checkout — when the code arrived on THIS install — where a
+    # commit timestamp is authored upstream and misses a daemon started
+    # between the commit and the pull. A spurious touch costs one harmless
+    # bounce; the opposite miss is the two-week inert-detector case above.
+    local active="$1" start_epoch="$2" script_epoch="$3" unit="$4"
+    # Not running → nothing stale to heal (starting a stopped unit is
+    # bootstrap's enablement decision, not the drift heal's).
+    [ "$active" = "1" ] || return 0
+    case "$start_epoch" in '' | *[!0-9]*) return 0 ;; esac
+    case "$script_epoch" in '' | *[!0-9]*) return 0 ;; esac
+    if [ "$start_epoch" -lt "$script_epoch" ]; then
+        echo "$unit started before its script last changed — restarting onto current code"
+    fi
+    return 0
+}
+
 # ── Deploy-target sync: guardian redeploy + host Node/CC + container CC ──
 # Extracted into a function so it runs on BOTH paths: the normal post-update
 # path AND the "Already up to date" path. Drift healing (pin alignment on the
@@ -628,6 +671,126 @@ _sync_deploy_targets() {
         echo "  WARNING: $_cc_env missing — skipping container CC sync"
         HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_env_missing"
     fi
+
+    # ── Restart resident repo-script daemons running pre-pull code ──────
+    # Runs on BOTH paths that reach this function (post-merge AND the
+    # "Already up to date" no-op), because the stale-daemon case survives
+    # no-op runs by definition. set -e is live at both call sites (the ERR
+    # trap is already disarmed at both) — every step is guarded so a probe
+    # failure cannot abort the tail of a run.
+    # BEGIN unit-restart-check (extracted by tests/test_scripts/test_update_unit_restart.py)
+    for _pair in $RESIDENT_UNIT_SCRIPTS; do
+        _ru_unit="${_pair%%:*}"
+        _ru_script="${_pair#*:}"
+        _ru_active=0
+        if systemctl --user is-active --quiet "$_ru_unit" 2>/dev/null; then
+            _ru_active=1
+        fi
+        # TZ=UTC on BOTH the render and the parse: systemctl formats
+        # timestamp properties client-side in the caller's zone, and GNU
+        # date resolves ambiguous zone ABBREVIATIONS (CST, IST …) to its
+        # own guess — measured 50400s off for a UTC+8 install, reading a
+        # stale daemon as fresh for up to 14h. An unambiguous UTC render
+        # parses identically everywhere (and sidesteps DST fold hours).
+        _ru_start_ts=""
+        _ru_start_ts=$(TZ=UTC systemctl --user show "$_ru_unit" -p ExecMainStartTimestamp --value 2>/dev/null) || _ru_start_ts=""
+        _ru_start_epoch=""
+        if [ -n "$_ru_start_ts" ] && [ "$_ru_start_ts" != "n/a" ]; then
+            _ru_start_epoch=$(TZ=UTC date -d "$_ru_start_ts" +%s 2>/dev/null) || _ru_start_epoch=""
+        fi
+        # Newest change across ALL the unit's startup-loaded files. One
+        # unreadable or future-dated file voids the WHOLE unit's verdict —
+        # deciding on the remaining paths would let a missing ExecStart
+        # read as unchanged while a newer library forced a restart on
+        # incomplete facts (fail direction: unreadable → no restart).
+        _ru_now=$(date +%s 2>/dev/null) || _ru_now=""
+        _ru_script_epoch=""
+        _ru_unreadable=0
+        for _ru_one in ${_ru_script//,/ }; do
+            _ru_e=""
+            _ru_e=$(stat -c %Y "$GENESIS_ROOT/$_ru_one" 2>/dev/null) || _ru_e=""
+            case "$_ru_e" in '' | *[!0-9]*) _ru_unreadable=1; break ;; esac
+            if [ -n "$_ru_now" ] && [ "$_ru_e" -gt "$_ru_now" ]; then
+                # Future-dated mtime (clock rollback, restored snapshot):
+                # arrival time untrustworthy → unit unjudgeable.
+                _ru_unreadable=1; break
+            fi
+            if [ -z "$_ru_script_epoch" ] || [ "$_ru_e" -gt "$_ru_script_epoch" ]; then
+                _ru_script_epoch="$_ru_e"
+            fi
+        done
+        [ "$_ru_unreadable" = "1" ] && _ru_script_epoch=""
+        _ru_reason=""
+        _ru_reason=$(_unit_restart_reason "$_ru_active" "$_ru_start_epoch" "$_ru_script_epoch" "$_ru_unit") || _ru_reason=""
+        if [ -n "$_ru_reason" ]; then
+            echo "  $_ru_reason"
+            # A newer unit TEMPLATE is not healed by the restart alone:
+            # try-restart loads the INSTALLED unit, which only bootstrap
+            # renders — and on the no-op path bootstrap never ran, so the
+            # daemon would bounce onto the OLD directives while its fresh
+            # start time masks the drift (render + daemon-reload first, same
+            # substitutions bootstrap uses — a render failure is degraded,
+            # not a masked restart).
+            if [ -f "$GENESIS_ROOT/scripts/lib/render_systemd_template.sh" ]; then
+                # shellcheck source=lib/render_systemd_template.sh
+                . "$GENESIS_ROOT/scripts/lib/render_systemd_template.sh"
+                for _ru_one in ${_ru_script//,/ }; do
+                    case "$_ru_one" in
+                        *.template)
+                            _ru_target="$HOME/.config/systemd/user/$(basename "$_ru_one" .template)"
+                            _ru_rendered=""
+                            _ru_rendered=$(render_systemd_template "$GENESIS_ROOT/$_ru_one" 2>/dev/null) || _ru_rendered=""
+                            if [ -z "$_ru_rendered" ]; then
+                                HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}unit_render_${_ru_unit%%.service}"
+                            elif [ "$_ru_rendered" != "$(cat "$_ru_target" 2>/dev/null)" ]; then
+                                if mkdir -p "$(dirname "$_ru_target")" \
+                                    && printf '%s\n' "$_ru_rendered" > "$_ru_target"; then
+                                    systemctl --user daemon-reload 2>/dev/null || true
+                                else
+                                    HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}unit_render_${_ru_unit%%.service}"
+                                fi
+                            fi
+                            ;;
+                    esac
+                done
+            fi
+            # try-restart, not restart: closes the is-active→act race so an
+            # operator-stopped unit STAYS stopped — starting it is
+            # bootstrap's enablement decision, the same invariant the
+            # inactive-skip above encodes.
+            if ! systemctl --user try-restart "$_ru_unit" 2>/dev/null; then
+                echo "  WARNING: restart of $_ru_unit failed"
+                # Deploy-target alignment failure — accumulate like every
+                # other miss in this function, so update_history records a
+                # degraded deployment instead of a clean one.
+                HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}unit_restart_${_ru_unit%%.service}"
+            else
+                # LIVENESS, not the exit code: genesis-tmp-watchgod is
+                # Type=exec + Restart=always(10s), so a script that execs
+                # and dies parks the unit in activating(auto-restart)
+                # while `try-restart` exits 0 — install.sh:1327 already
+                # keys on is-active for exactly this reason (a healthy
+                # unit reads `active` immediately; the short settle only
+                # covers the exec→die window, overridable for tests).
+                sleep "${_RU_SETTLE_S:-3}" 2>/dev/null || true
+                if ! systemctl --user is-active --quiet "$_ru_unit" 2>/dev/null; then
+                    # try-restart also exits 0 doing NOTHING on a unit an
+                    # operator stopped in the is-active→act race — flagging
+                    # unit_restart_* there records an intentional stop as a
+                    # failed deploy. Only a restart that produced a NEW main
+                    # invocation is this heal's to judge: ExecMainStartTimestamp
+                    # changes on a real start, stays put on a no-op.
+                    _ru_post_ts=""
+                    _ru_post_ts=$(TZ=UTC systemctl --user show "$_ru_unit" -p ExecMainStartTimestamp --value 2>/dev/null) || _ru_post_ts=""
+                    if [ -z "$_ru_post_ts" ] || [ "$_ru_post_ts" != "$_ru_start_ts" ]; then
+                        echo "  WARNING: $_ru_unit is not active after restart — still running old code or crash-looping"
+                        HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}unit_restart_${_ru_unit%%.service}"
+                    fi
+                fi
+            fi
+        fi
+    done
+    # END unit-restart-check
     echo ""
 }
 

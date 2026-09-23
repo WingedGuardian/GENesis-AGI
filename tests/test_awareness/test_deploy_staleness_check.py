@@ -50,15 +50,18 @@ def _snap(
     age_days=None,
     behind=None,
     missing_units=None,
+    stale_units=None,
     tier2=None,
     host_status="ok",
+    status=None,
 ):
     return {
-        "status": "attention" if findings else "healthy",
+        "status": status or ("attention" if findings else "healthy"),
         "findings": findings,
         "last_update": {"age_days": age_days, "new_commit": "abc", "completed_at": "x"},
         "git": {"head": "abc", "commits_behind_upstream": behind, "fetch_age_hours": 1.0},
         "missing_units": missing_units or [],
+        "stale_units": stale_units or [],
         "tier2_pending": tier2 or [],
         "host_gateway": {"status": host_status},
     }
@@ -77,6 +80,23 @@ async def _rows(db, resolved=0):
         f"FROM observations WHERE source='{SOURCE}' AND resolved={resolved}"
     )
     return list(await cur.fetchall())
+
+
+async def test_stale_units_finding_names_the_daemon(db, monkeypatch):
+    """A resident daemon running pre-update code raises an alert whose prose
+    names the unit — the inert-detector shape, surfaced instead of silent."""
+    _patch_snapshot(
+        monkeypatch,
+        _snap(
+            ["stale_units:genesis-tmp-watchgod.service"],
+            stale_units=["genesis-tmp-watchgod.service"],
+        ),
+    )
+    await loop._check_deploy_staleness(db)
+    rows = await _rows(db)
+    assert len(rows) == 1
+    assert "genesis-tmp-watchgod.service" in rows[0]["content"]
+    assert "pre-update code" in rows[0]["content"]
 
 
 async def test_no_findings_is_quiet(db, monkeypatch):
@@ -246,6 +266,22 @@ async def test_partial_recovery_retires_missing_unit_anchors(db, monkeypatch):
     rows = await _rows(db)
     assert len(rows) == 1
     assert rows[0]["priority"] == "high"
+
+
+async def test_unknown_snapshot_does_not_resolve_alert(db, monkeypatch):
+    """A collector that could not answer (unit probe failed, startup file
+    unreadable, baseline lost) must leave a live alert alone — resolving it
+    would convert an outage into a false all-clear (external finding)."""
+    _patch_snapshot(monkeypatch, _snap(["tier2_pending:2"], tier2=["a", "b"]))
+    await loop._check_deploy_staleness(db)
+    assert len(await _rows(db)) == 1
+    # Now the snapshot cannot judge (stale_units collector returned None):
+    # empty findings AND status unknown — the alert must stay active.
+    unknown = _snap([], status="unknown")
+    unknown["stale_units"] = None
+    _patch_snapshot(monkeypatch, unknown)
+    await loop._check_deploy_staleness(db)
+    assert len(await _rows(db)) == 1
 
 
 async def test_snapshot_error_is_quiet(db, monkeypatch):

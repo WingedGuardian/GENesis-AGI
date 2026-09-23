@@ -1234,7 +1234,13 @@ async def _check_deploy_staleness(db) -> None:
             return
         findings = snap.get("findings") or []
         if not findings:
-            await _resolve_deploy_staleness(db)
+            # Only a CONFIRMED-clean snapshot recovers alerts. "unknown"
+            # means a collector could not answer (unit probe failed, a
+            # startup file was unreadable, the update baseline is lost) —
+            # resolving a live alert on missing evidence converts an outage
+            # into a false all-clear.
+            if snap.get("status") == "healthy":
+                await _resolve_deploy_staleness(db)
             return
 
         # Alert identity keys on the finding CLASSES, not the raw keys —
@@ -1322,6 +1328,11 @@ async def _check_deploy_staleness(db) -> None:
             )
         if missing_units:
             detail.append("missing systemd units: " + ", ".join(missing_units))
+        stale_units = snap.get("stale_units") or []
+        if stale_units:
+            detail.append(
+                "resident daemons running pre-update code: " + ", ".join(stale_units)
+            )
         if tier2:
             detail.append(f"{len(tier2)} update.sh-only file(s) changed since the last update")
         if host.get("status") in ("drift", "unknown_commit"):
