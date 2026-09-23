@@ -177,3 +177,28 @@ def test_the_entrypoints_exit_code_is_propagated_unaltered(tmp_path):
     assert res.returncode == 3, (
         f"the entrypoint's exit code must reach systemd unaltered, got {res.returncode}"
     )
+
+
+def test_it_survives_an_unset_home(tmp_path, fake_repo):
+    """`set -u` + `$HOME` aborts with "unbound variable" in a stripped
+    environment, and a systemd unit is exactly where that happens.
+
+    A repo-wide contract test asserts the guard PATTERN is present
+    (test_home_guard_coverage.py); this asserts the guard WORKS, which is a
+    different claim — a pattern can be present and still not resolve.
+    """
+    env = {
+        k: v for k, v in os.environ.items() if k != "HOME"
+    }
+    env["GENESIS_HOME"] = str(tmp_path / "genesis")
+    env["GENESIS_REPO_DIR"] = str(fake_repo)
+    assert "HOME" not in env
+
+    res = subprocess.run(
+        ["bash", str(RUNNER)], env=env, capture_output=True, text=True, timeout=120, check=False
+    )
+    assert "unbound variable" not in res.stderr, res.stderr
+    # It reached the stub interpreter, which is proof it got past every $HOME
+    # dereference rather than merely not crashing early.
+    assert "stub: projected" in res.stdout, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    assert res.returncode == 0

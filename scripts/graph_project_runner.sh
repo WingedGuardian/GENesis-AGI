@@ -29,6 +29,26 @@
 
 set -uo pipefail
 
+# Resolve HOME before the first dereference below. Under `set -u` a stripped
+# environment aborts at the first `$HOME` expansion with "HOME: unbound
+# variable", and a systemd unit is exactly the context where that can happen.
+# Falls back to the passwd entry for the current uid — the same source
+# Path.home() uses — and fails closed if even that is unresolvable.
+# Enforced repo-wide by tests/test_scripts/test_home_guard_coverage.py; see CC
+# memory sandbox_shell_no_home.
+#
+# 75, not the house snippet's 1, for consistency with this file's own exit
+# contract: an unresolvable HOME is a tick that could not run, which is what 75
+# means here.
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || {
+        printf 'graph-project: HOME is unset and could not be resolved from passwd\n' >&2
+        exit 75
+    }
+    export HOME
+fi
+
 GENESIS_HOME="${GENESIS_HOME:-$HOME/.genesis}"
 REPO_DIR="${GENESIS_REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 VENV_PY="$REPO_DIR/.venv/bin/python"
