@@ -298,7 +298,12 @@ def test_render_block_refuses_a_non_repo_relative_path(tmp_path):
                     "name": "leaky",
                     "description": "d",
                     "tier": 2,
-                    "path": "/home/someone/.genesis/skill-library/leaky",
+                    # Absolute but deliberately NOT home-shaped. A realistic
+                    # /home/<user>/... fixture matches the leak detector's
+                    # generic pattern class and trips the pre-push privacy
+                    # scan on every push, training readers to wave it through.
+                    # What this test needs is only that the path is absolute.
+                    "path": "/absolute/outside-any-repo/leaky",
                     "marker": "SKILL.md",
                 }
             ],
