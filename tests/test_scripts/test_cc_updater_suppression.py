@@ -2020,10 +2020,25 @@ class TestConsumersReadTheChannel:
         someone runs --dry-run to avoid.
         """
         src = (_REPO_ROOT / "scripts" / "uninstall.sh").read_text()
-        idx = src.index("systemctl --user clean --what=state")
-        window = src[max(0, idx - 500):idx]
-        assert 'DRY_RUN" = true' in window, (
-            "the timer-state clean is not inside a DRY_RUN guard"
+        # EVERY site, not `src.index(...)`. uninstall.sh has two cleanup paths —
+        # direct-container and host-driven — and checking only the first
+        # occurrence left the second entirely unverified. That is the same
+        # first-occurrence blind spot that let a timer be added to one path and
+        # not the other; a guard test must not share the defect's granularity.
+        needle = "systemctl --user clean --what=state"
+        sites = [i for i in range(len(src)) if src.startswith(needle, i)]
+        assert len(sites) >= 2, (
+            f"expected a clean site in BOTH uninstall paths, found {len(sites)} "
+            "— either a path lost its cleanup or this scan is wrong"
+        )
+        unguarded = [
+            src[:i].count("\n") + 1
+            for i in sites
+            if 'DRY_RUN" = true' not in src[max(0, i - 500):i]
+        ]
+        assert not unguarded, (
+            "the timer-state clean is not inside a DRY_RUN guard at "
+            f"line(s) {unguarded}"
         )
         assert "Would clear persistent timer state" in src, (
             "--dry-run must still SAY what it would have done, like its neighbours"

@@ -108,6 +108,13 @@ safe_remove() {
     local path="$1"
     local label="${2:-$1}"
     if [ -e "$path" ] || [ -L "$path" ]; then
+        # Word splitting on $GENESIS_PERSISTENT_TIMERS is DELIBERATE in both
+        # branches below: the inventory is a space-separated unit list, not one
+        # argument. Explained here rather than beside the command because a
+        # neighbouring test asserts the DRY_RUN guard sits within 500 characters
+        # of the clean call, and a comment block wedged between them pushed it
+        # out of range — the guard was still there, the window just could not
+        # see it.
         if [ "$DRY_RUN" = true ]; then
             echo "    [DRY RUN] Would remove: $label"
         else
@@ -460,8 +467,6 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
             # than no preview, since previewing is the whole point of the flag.
             echo "    [DRY RUN] Would clear persistent timer state for: $GENESIS_PERSISTENT_TIMERS"
         else
-            # Deliberate word splitting: the inventory is a space-separated
-            # unit list, not one argument.
             # shellcheck disable=SC2086
             systemctl --user clean --what=state $GENESIS_PERSISTENT_TIMERS 2>/dev/null || true
         fi
