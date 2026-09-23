@@ -609,75 +609,39 @@ async def follow_up_create(
 ) -> dict:
     """Create a follow-up in the accountability ledger.
 
-    FIRST — is this the right home? Genesis-repo work (code, tests, docs, infra —
-    anything that would live in the public repo, even when hit locally) belongs on
-    the PUBLIC TRACKER as a GitHub issue, not here — but ONLY from an install that
-    owns the tracker, and only with the user's explicit approval each time (a public
-    post is irreversible). A security defect is never filed publicly before it is
-    fixed. Where those do not hold, it stays HERE until a maintainer carries it over.
-
-    This ledger is otherwise for USER-OWNED work (a deliverable, an errand, something
-    asked for and unfinished) and operational state purely LOCAL to this box.
-    Something you are consciously NOT pursuing is `deferred_cold` (tabled) — never an
-    issue, because we don't want it picked up.
-
-    A DISPATCHED session records here rather than filing publicly — but the row is
-    FORCED onto the COLD `tabled` lane by sacred-board authorization, whatever
-    work_state you pass, and tabled rows are excluded from every default listing.
-    Say in `reason` that it is repo work awaiting a foreground session, and expect
-    to need `follow_up_list(include_tabled=True)` to find it again.
-
-    Mechanics: `.claude/docs/mcp-tools-guide.md`, "Where Deferred Work Goes".
-
-    Declare the item's WORK_STATE — the tool DERIVES the lane from it, so priority
-    never decides the lane. Two lists:
-    - HOT (follow_up): work you INTEND to do near-term. May be blocked on time, an
-      event, or just manpower — but NEVER hard-blocked / not-an-easy-fix / vague.
-    - COLD (tabled): things you are CONSCIOUSLY NOT doing near-term (further off,
-      harder, vaguer — maybe someday). Kept off the actionable queue.
+    RIGHT HOME? Genesis-repo work → a GitHub ISSUE, not here — but NOT from a
+    dispatched session, and never an unfixed security defect: those stay here.
+    Consciously not pursuing → deferred_cold (tabled), never an issue. This
+    ledger is for USER-OWNED work and state LOCAL to this box. Full routing:
+    CLAUDE.md "Where deferred work goes". Dispatched rows are FORCED to the COLD
+    `tabled` lane (hidden by default; list with include_tabled=True) — say in
+    `reason` that it awaits a foreground session.
 
     Args:
-        content: What needs to happen (actionable description).
-        reason: Why this follow-up exists (context for future sessions/ego).
-        work_state: The item's actual state — this DERIVES the lane. Pick honestly;
-            it is an intent/tractability axis, NOT priority (a low-priority item you
-            still intend to do is 'ready', not 'deferred_cold'):
-            - "ready": actionable now, just needs doing → HOT (follow_up).
-            - "blocked_on_trigger": intended, waiting on a specific time/event/
-              precondition → HOT (follow_up). REQUIRES revisit_condition. Not valid
-              with strategy="surplus_task" (that dispatches immediately, ignoring the
-              trigger) — use scheduled_task (time) or user_input_needed/ego_judgment (event).
-            - "deferred_cold": consciously not pursuing near-term (vague/hard/
-              someday) → COLD (tabled).
-        strategy: How to EXECUTE it if/when acted on (orthogonal to work_state):
-            - user_input_needed: park for a future interactive CC session (coding,
-              plan execution, Genesis dev, file edits). Surfaces in morning report.
-            - surplus_task: enqueue to the free-model surplus system — pure analysis/
-              summarization only, never code/file edits or interactive work.
-            - scheduled_task: like surplus_task but time-triggered (the time-based
-              form of blocked_on_trigger); requires scheduled_at. Free model only.
-            - ego_judgment: hand to ego to evaluate next cycle (a good default for
-              deferred_cold items, which have no near-term execution route).
-        revisit_condition: The trigger to revisit — REQUIRED when
-            work_state="blocked_on_trigger" (name the time/event/precondition).
-            Optional but encouraged for deferred_cold (what would revive it).
-        scheduled_at: ISO datetime (required when strategy is scheduled_task).
+        content: What needs to happen.
+        reason: Why it exists.
+        work_state: DERIVES the lane; an intent axis, NOT priority:
+            - "ready": actionable now → HOT (follow_up).
+            - "blocked_on_trigger": waiting on a time/event/precondition → HOT.
+              REQUIRES revisit_condition. Invalid with strategy="surplus_task"
+              (dispatches at once, ignoring the trigger).
+            - "deferred_cold": consciously not pursuing near-term → COLD (tabled).
+        strategy: How to execute (orthogonal to work_state):
+            - user_input_needed: park for an interactive CC session.
+            - surplus_task: free-model surplus queue; analysis only, never edits.
+            - scheduled_task: surplus_task on a timer; requires scheduled_at.
+            - ego_judgment: ego evaluates it next cycle.
+        revisit_condition: REQUIRED when work_state="blocked_on_trigger"; for
+            deferred_cold, what would revive it.
+        scheduled_at: ISO datetime; required for strategy="scheduled_task".
         priority: low | medium | high | critical. Does NOT affect the lane.
-        pinned: If true, ego can see but cannot auto-resolve; only the user closes it.
-        domain: "internal" (operational Genesis work that stays LOCAL — repo work
-            belongs on the public tracker, not here) or "user_world" (the user's
-            life/career/content). Leave empty to let Genesis classify (internal-only);
-            note the classifier keyword-matches repo-ish terms, so an empty domain on
-            a misrouted repo item will still look correctly filed.
-        source_session: which session this work originated from — pass your own
-            session id. A FOREGROUND session reads it from the per-turn
-            ``[Clock: … | Session: xxxxxxxx]`` tag (the 8-char prefix resolves to
-            the full id); a DISPATCHED session reads it from the ``## This
-            Session`` block at session start, which is where its full id is
-            given (that session never receives the per-turn tag). Recorded as
-            provenance; repo-pulse uses it to attribute completions. A prefix
-            that does not resolve uniquely is stored as NULL, never truncated.
-            Leave empty only when the origin genuinely is not a CC session.
+        pinned: If true, automation never auto-resolves it.
+        domain: "internal" (LOCAL operational work) or "user_world" (the user's
+            life/career/content). Empty = auto (internal or NULL, never
+            user_world).
+        source_session: your session id — the per-turn Session tag prefix
+            (foreground) or the "## This Session" block (dispatched). An
+            unresolvable prefix is stored NULL. Empty only if not from CC.
     """
     return await _impl_follow_up_create(
         content,
