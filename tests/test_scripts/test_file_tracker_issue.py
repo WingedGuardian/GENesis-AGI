@@ -1716,6 +1716,25 @@ def test_the_redactor_does_not_eat_a_different_account_or_a_url():
     assert fti._redact_home(f"open {real} failed") == "open ~ failed"
 
 
+def test_the_redactor_handles_a_path_ending_a_sentence():
+    """`gh` writes diagnostics as sentences.
+
+    The first anchored version required a separator or end-of-string after the
+    home, so `failed to read <home>.` kept the period out of the boundary and
+    the account name went into the refusal unredacted. Terminal punctuation
+    ends a token too — but only when whitespace or the end follows it, or
+    `<home>.config` (a different directory) would be rewritten.
+    """
+    real = str(Path.home())
+    for text in (f"failed to read {real}.", f"see {real}. Next", f"under {real}!", f"q {real}?"):
+        out = fti._redact_home(text)
+        assert real not in out, f"a path ending a sentence leaked: {out}"
+        assert "~" in out, out
+    # The control that stops the boundary from being widened into a bug.
+    for text in (f"dir {real}.config/x", f"sib {real}son/keys"):
+        assert fti._redact_home(text) == text, f"a different directory was rewritten: {text}"
+
+
 def test_the_emitter_guard_rejects_a_call_that_is_not_the_redactor():
     """The guard admits a wrapped emitter by the wrapper's NAME. A cell that
     only ever wraps with `_redact_home` cannot tell that from admitting any

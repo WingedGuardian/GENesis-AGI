@@ -150,8 +150,15 @@ def _redact_home(text: str) -> str:
     # Left boundary: not preceded by a word character or a slash, so
     # `/var/home/jay/...` is left alone. Right boundary: the path must END
     # there or continue with a separator, so `/home/jayson` does not match.
+    #
+    # Terminal punctuation counts as an ending ONLY when it ends the token.
+    # `gh` writes diagnostics as sentences -- `failed to read <home>.` -- and
+    # without this the period rejected the boundary and the account name went
+    # straight into the refusal. Requiring whitespace-or-end after the `.!?`
+    # keeps `<home>.config/x` unmatched, which is a DIFFERENT directory and
+    # must not be rewritten.
     return _HOME_RE_CACHE.setdefault(
-        home, re.compile(rf"(?<![\w/]){re.escape(home)}(?=/|$|[\s'\"),:;])")
+        home, re.compile(rf"(?<![\w/]){re.escape(home)}(?=/|$|[\s'\"),:;]|[.!?](?:\s|$))")
     ).sub("~", text)
 
 
