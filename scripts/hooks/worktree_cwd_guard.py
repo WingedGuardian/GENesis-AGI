@@ -164,6 +164,34 @@ _OPERATION = "remove"
 _CARRIER_NAMES = frozenset(
     {"eval", "ssh", "find", "parallel", "watch", "script", "su", "docker", "flock", "xargs"}
 )
+
+#: Carriers this set deliberately LACKS — test_carrier_sets fails when a union
+#: member is absent without a recorded reason (#2232).
+_NOT_A_TEXT_CARRIER = (
+    "not a carrier for a raw-text match — `uv run pytest` resolves to `uv` "
+    "with a payload the segment walk already sees, and a bare `uv` mention "
+    "is not itself dangerous"
+)
+_CARRIER_EXCLUDES: dict[str, str] = {
+    **{name: _NOT_A_TEXT_CARRIER for name in (
+        # package-manager `run` front-ends — subcommand-gated, not bare-name
+        "uv", "uvx", "poetry", "hatch", "pdm", "pipenv", "rye",
+        # nested shells — visible argv, the carried command is not a hidden
+        # string the way `eval`/`-c` payloads are
+        "bash", "sh", "dash", "zsh", "ksh", "ash",
+    )},
+    # re-parse launchers beyond the five this set keeps — narrower scope than
+    # _REPARSE_CARRIERS: only the spellings seen in worktree-adjacent corpora
+    "runuser": "not seen carrying worktree-touching commands; _REPARSE_CARRIERS guards cover it",
+    "setpriv": "not seen carrying worktree-touching commands; _REPARSE_CARRIERS guards cover it",
+    "chroot": "not seen carrying worktree-touching commands; _REPARSE_CARRIERS guards cover it",
+    "systemd-run": "not seen carrying worktree-touching commands; _REPARSE_CARRIERS guards cover it",
+    "unshare": "not seen carrying worktree-touching commands; _REPARSE_CARRIERS guards cover it",
+    "nsenter": "not seen carrying worktree-touching commands; _REPARSE_CARRIERS guards cover it",
+    "pkexec": "not seen carrying worktree-touching commands; _REPARSE_CARRIERS guards cover it",
+    "runcon": "not seen carrying worktree-touching commands; _REPARSE_CARRIERS guards cover it",
+    "sg": "not seen carrying worktree-touching commands; _REPARSE_CARRIERS guards cover it",
+}
 # The raw-text half. It stays because it is the only thing that sees a shell
 # FUNCTION DEFINITION, which has no executable to resolve.
 _COMMAND_CARRIER = re.compile(
