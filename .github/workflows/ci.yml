@@ -964,4 +964,22 @@ jobs:
         # contributes its delta against main, never its total — and the count
         # is only final once the last test-adding edit is in, which on this
         # branch was two rounds after the line was first written.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23419
+        #
+        # UNION with this branch's new test file: the blocked-task-resume
+        # work adds tests/test_autonomy/test_blocked_task_resume.py, which
+        # does not exist on main at all, so its delta is its FULL collected
+        # count, not the increment of the last edit that touched it.
+        # MEASURED on this branch, collected last:
+        #   pytest tests/test_autonomy/test_blocked_task_resume.py --collect-only -q
+        #   -> 19 tests collected
+        # so the floor is 23419 + 19 = 23438. The ceiling does not move:
+        # the file adds no skips.
+        #
+        # The previous resolution of this same conflict said '+2' and set
+        # 23344. That is the SEVENTH instance of the trap, from the third
+        # direction: the 2 was the delta of the claim-sweep edit against an
+        # EARLIER STATE OF THIS BRANCH, not against main. A floor that is
+        # too low still passes CI -- it just stops catching the 17 tests it
+        # was supposed to notice going missing, which is why nothing failed
+        # and nobody looked.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23438
