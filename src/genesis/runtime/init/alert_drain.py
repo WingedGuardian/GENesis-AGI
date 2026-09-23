@@ -128,7 +128,13 @@ def _make_drainer(rt):
         # recovery` already chose loud: it calls `mark_discarded` with a
         # reason for this same status. The alert queue has no such call, so
         # the log is where the disposition gets recorded.
-        if terminal and result.status in (OutreachStatus.REJECTED, OutreachStatus.IGNORED):
+        # IGNORED only, NOT REJECTED. Every REJECTED cause is a deliberate
+        # decision rather than a lost page: dedup rejects because the alert
+        # ALREADY DELIVERED (is_duplicate matches delivered history only), and
+        # governance DENY / fresh-eyes reject because policy said no. Warning
+        # on those sends an operator hunting a page that either arrived or was
+        # never meant to.
+        if terminal and result.status == OutreachStatus.IGNORED:
             logger.warning(
                 "alert-queue entry discarded UNDELIVERED (%s): source=%s dedupe_key=%s%s — "
                 "the alert is gone; if this is a channel misconfiguration, fix it and the "

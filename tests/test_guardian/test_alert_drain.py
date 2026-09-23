@@ -139,11 +139,19 @@ async def test_a_terminal_non_delivery_is_recorded_not_silent(tmp_path, monkeypa
     )
     # A DELIVERED entry is unlinked just as silently as before — the new line
     # must fire on non-delivery only, or it becomes noise that gets tuned out.
-    caplog.clear()
-    _enqueue(root, dedupe_key="backup:k4")
-    with caplog.at_level("WARNING"):
-        await alert_drain._make_drainer(_RT(pipeline=_FakePipeline(OutreachStatus.DELIVERED)))()
-    assert not any("discarded UNDELIVERED" in r.message for r in caplog.records)
+    # DELIVERED unlinks as silently as before, and so does REJECTED: every
+    # REJECTED cause is a DECISION, not a lost page — dedup rejects because the
+    # alert already delivered, governance DENY because policy said no. Warning
+    # on those sends an operator hunting a page that arrived (review, at head).
+    for silent in (OutreachStatus.DELIVERED, OutreachStatus.REJECTED):
+        caplog.clear()
+        _enqueue(root, dedupe_key=f"backup:{silent.value}")
+        with caplog.at_level("WARNING"):
+            await alert_drain._make_drainer(_RT(pipeline=_FakePipeline(silent)))()
+        assert not any("discarded UNDELIVERED" in r.message for r in caplog.records), (
+            f"{silent.value} is a decision, not a lost page: "
+            f"{[r.message for r in caplog.records]}"
+        )
 
 
 @pytest.mark.asyncio
