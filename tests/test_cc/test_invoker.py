@@ -4348,6 +4348,43 @@ async def test_refuses_to_launch_when_the_gh_seal_cannot_be_prepared(
         await _verify(invoker, CCInvocation(prompt="hi", bash_allowlist=("gh",)))
 
 
+# --- The seal answers, rather than raising, when it moves under us ----------
+
+
+def test_a_seal_that_moves_under_the_check_reports_no_rather_than_raising(tmp_path):
+    """A concurrent rewrite must not turn into a refused launch.
+
+    The first `_seal_matches` call runs OUTSIDE the rewrite lock, so a writer
+    unlinking a stale file between the listing and the read is expected rather
+    than exceptional. If that escaped, it would reach the caller's fallback and
+    refuse a launch that should have succeeded — the whole point of queueing
+    behind the lock is to handle it, and that path is only reached by answering
+    False.
+
+    Fail-closed is preserved and asserted: the answer is never True. This is
+    "cannot confirm", which is not the same as "does not match", and both are
+    correctly handled by going on to take the lock.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    target = tmp_path / "seal"
+    target.mkdir()
+    (target / "config.yml").write_text("x", encoding="utf-8")
+    (target / "config.yml").chmod(0o400)
+    target.chmod(0o500)
+
+    real_iterdir = Path.iterdir
+
+    def vanishing(self):
+        for entry in real_iterdir(self):
+            entry.chmod(0o600)
+            entry.unlink()  # the concurrent writer, mid-rewrite
+            yield entry
+
+    with patch.object(Path, "iterdir", vanishing):
+        assert inv_mod._seal_matches(target, {"config.yml": "x"}) is False
+
+
 # --- The confinement is checked where the env is BUILT ----------------------
 
 

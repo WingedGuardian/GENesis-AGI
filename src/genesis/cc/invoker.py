@@ -378,16 +378,29 @@ def _seal_matches(target: Path, desired: dict[str, str]) -> bool:
     not a seal — a rewrite interrupted between its chmod-writable and its
     chmod-back leaves the right bytes at the wrong permissions, and a
     content-only check would call that good.
+
+    ANSWERS "NO" RATHER THAN RAISING when the directory moves under it. The
+    first caller runs this OUTSIDE the rewrite lock, so a concurrent writer
+    unlinking a stale file between the listing and the read is expected, not
+    exceptional. Letting that escape would reach the caller's fallback and
+    REFUSE a launch that should have succeeded — the queue-behind-the-lock path
+    exists precisely to handle it, and it is only reached by returning False.
+    Fail-closed is preserved: an unconfirmable seal is never reported as
+    matching.
     """
-    if not target.is_dir() or target.stat().st_mode & 0o777 != 0o500:
+    try:
+        if not target.is_dir() or target.stat().st_mode & 0o777 != 0o500:
+            return False
+        present = {p.name: p for p in target.iterdir() if p.is_file()}
+        if set(present) != set(desired):
+            return False
+        return all(
+            path.stat().st_mode & 0o777 == 0o400
+            and path.read_text(encoding="utf-8") == desired[name]
+            for name, path in present.items()
+        )
+    except (OSError, UnicodeError):
         return False
-    present = {p.name: p for p in target.iterdir() if p.is_file()}
-    if set(present) != set(desired):
-        return False
-    return all(
-        path.stat().st_mode & 0o777 == 0o400 and path.read_text(encoding="utf-8") == desired[name]
-        for name, path in present.items()
-    )
 
 
 def _gh_hardening() -> dict[str, str] | None:
