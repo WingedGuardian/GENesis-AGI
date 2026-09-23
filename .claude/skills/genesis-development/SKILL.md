@@ -313,6 +313,16 @@ returned 0 in-server and **three** features shipped green but inert since
 July; the module's docstring claim "same-uid reads succeed" was a shell-tested
 falsehood. The fix routed around the ptrace-gated read entirely.)
 
+**And when the work is done, audit the CLAIMS as well as the outcome.**
+Everything above distrusts a VERIFICATION; the companion failure is the
+SENTENCES you wrote about the work — a number in a commit message, a docstring's
+assertion, an in-thread reply saying a finding is fixed. A green suite says
+nothing about any of them, and permanent record has no tone of voice, so the
+next session reads a confident sentence as a measured one. Those surfaces are
+ENUMERABLE, which makes the check mechanical rather than a mood.
+`references/high-stakes-verification.md` §11 carries the canonical surface list
+and the walk; do not keep a second copy of that list here.
+
 ### Acceptance Bar + Measured Rate — the primary methodology
 
 **Use this as often as it applies. It is the default way to build anything here,
@@ -4031,6 +4041,7 @@ references on every trigger.
 | Writing or revising a multi-session plan document | `references/plan-docs.md` |
 | Pre-release review, bug hunt, guard/gate change — verification method | `references/high-stakes-verification.md` |
 | Choosing a command/value/procedure by reasoning about an external tool | same, section 9 |
+| Auditing the CLAIMS a session wrote (wrap-up, or before any permanent record) | same, section 11 |
 | Which code tool to use (CBM vs Serena vs GitNexus vs Grep) | `.claude/docs/code-intelligence.md` |
 
 **Freshness rule:** On first read of `codebase-map.md` in a session,

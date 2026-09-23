@@ -750,7 +750,12 @@ behind the writer, and 7 were a guard since removed.
   2026-09-04: finished, tested code sat unpushed on a local branch for 1.5
   days because it was recorded only in a plan file nothing reads back.)
 - **Session wrap-up**: structured handoff — what changed, what's pending,
-  what was learned. If it's not committed, it doesn't exist.
+  what was learned. If it's not committed, it doesn't exist. **If the session
+  wrote numbers, dates or status assertions into permanent record, audit those
+  CLAIMS too** — re-derive them rather than re-reading them; a green suite
+  checks none of them, and a confident sentence in permanent record is read as
+  a measured one. The canonical surface list and the walk live in the
+  genesis-development skill, `references/high-stakes-verification.md` §11.
 - **Where deferred work goes.** Bias = FIX NOW; defer only if the work is (1) blocked
   on an unmet precondition (incl. an unmade design decision), (2) gated on time/data,
   or (3) big enough to derail the session — or the user directs it.
