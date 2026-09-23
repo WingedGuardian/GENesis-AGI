@@ -177,7 +177,15 @@ def test_collect_skills_tier1_wins_on_duplicate(tmp_path):
 # render_block + update_agents_md — markers, idempotency, preservation
 # --------------------------------------------------------------------------- #
 def test_render_block_wrapped_in_markers_with_content(tmp_path):
-    skills = [{"name": "taste", "description": "design dials", "tier": 1}]
+    skills = [
+        {
+            "name": "taste",
+            "description": "design dials",
+            "tier": 1,
+            "path": ".claude/skills/taste",
+            "marker": "SKILL.md",
+        }
+    ]
     tools = [{"name": "browser_click", "description": "Click.", "server": "genesis-health"}]
 
     block = _exp.render_block(skills, tools)
@@ -185,6 +193,182 @@ def test_render_block_wrapped_in_markers_with_content(tmp_path):
     assert block.startswith(_exp.START_MARKER)
     assert block.rstrip().endswith(_exp.END_MARKER)
     assert "taste" in block and "browser_click" in block
+
+
+def test_render_block_emits_the_real_path_not_a_name_guess(tmp_path):
+    """A nested skill's path must survive into the bullet verbatim.
+
+    `gitnexus-cli` lives at `.claude/skills/gitnexus/gitnexus-cli/`, NOT at
+    `.claude/skills/gitnexus-cli/`. An external client that derived the path
+    from the name would miss 6 of this repo's Tier 1 skills, which is the
+    defect this rendering exists to remove.
+    """
+    skills = [
+        {
+            "name": "gitnexus-cli",
+            "description": "CLI wrapper",
+            "tier": 1,
+            "path": ".claude/skills/gitnexus/gitnexus-cli",
+            "marker": "SKILL.md",
+        }
+    ]
+
+    block = _exp.render_block(skills, [])
+    bullets = [ln for ln in block.splitlines() if ln.startswith("- **")]
+
+    assert "`.claude/skills/gitnexus/gitnexus-cli/SKILL.md`" in "\n".join(bullets)
+    # Scoped to the BULLETS on purpose: asserting only that the real path is
+    # present would pass even if a name-derived one were emitted alongside it.
+    # The header prose quotes the wrong path deliberately, as the counter-
+    # example, so a whole-block assertion here fails against correct output.
+    assert not any(".claude/skills/gitnexus-cli/" in ln for ln in bullets)
+
+
+def test_render_block_emits_tier2_path_under_src(tmp_path):
+    """Tier 2 skills live under src/genesis/skills and must say so.
+
+    The bullet list is flat and unannotated, so without the path a reader
+    cannot tell a Tier 2 entry from a Tier 1 one.
+    """
+    skills = [
+        {
+            "name": "browser-automation",
+            "description": "drive a browser",
+            "tier": 2,
+            "path": "src/genesis/skills/browser-automation",
+            "marker": "SKILL.md",
+        }
+    ]
+
+    block = _exp.render_block(skills, [])
+
+    assert "`src/genesis/skills/browser-automation/SKILL.md`" in block
+
+
+def test_every_emitted_skill_path_resolves_in_this_repo():
+    """The bullets must be TRUE of this repo, not merely well-formed.
+
+    Every other test here feeds render_block a fixture dict and checks the
+    dict comes back out — which proves the renderer is faithful and proves
+    nothing about whether the value is real. This one walks the actual tiers
+    and opens every file the block would publish, so a marker that is not
+    SKILL.md, a container laid out differently, or a scanner change all fail
+    HERE rather than shipping a path that 404s for an external client.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    skills = _exp.collect_skills(repo_root)
+
+    assert skills, "no skills collected — the scan itself is broken"
+    missing = [
+        f"{s['name']} -> {s['path']}/{s.get('marker')}"
+        for s in skills
+        if not (repo_root / s["path"] / (s.get("marker") or "SKILL.md")).is_file()
+    ]
+    assert not missing, f"emitted skill paths that do not resolve: {missing}"
+
+
+def test_nested_container_skill_is_reachable_by_its_emitted_path():
+    """Pins the header prose's own worked example against the filesystem.
+
+    The header tells readers `gitnexus-cli` lives under a container. If that
+    layout ever changes, the prose becomes a lie that nothing else detects —
+    the class-level test above would still pass, because it checks whatever
+    the scanner currently reports rather than this specific claim.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    skills = {s["name"]: s for s in _exp.collect_skills(repo_root)}
+
+    cli = skills.get("gitnexus-cli")
+    assert cli is not None, "gitnexus-cli missing — the header example is stale"
+    assert cli["path"] == ".claude/skills/gitnexus/gitnexus-cli"
+    assert (repo_root / cli["path"] / cli["marker"]).is_file()
+
+
+def test_render_block_refuses_a_non_repo_relative_path(tmp_path):
+    """An absolute path would publish a home directory into a public file.
+
+    Reachable, not hypothetical: _scan_tier falls back to str(entry) for any
+    skill outside repo_root, which is how the ~/.genesis/skill-library tier
+    resolves. Nothing but an omitted call keeps that tier out of this render.
+    """
+    with pytest.raises(ValueError, match="non-repo-relative"):
+        _exp.render_block(
+            [
+                {
+                    "name": "leaky",
+                    "description": "d",
+                    "tier": 2,
+                    "path": "/home/someone/.genesis/skill-library/leaky",
+                    "marker": "SKILL.md",
+                }
+            ],
+            [],
+        )
+
+
+def test_render_block_emits_a_non_default_marker(tmp_path):
+    """A skill defined by README.md must not be advertised as SKILL.md.
+
+    The scanner accepts three markers; hardcoding one at render time would
+    re-introduce a name-based guess and emit a path that does not resolve.
+    """
+    block = _exp.render_block(
+        [
+            {
+                "name": "readme-defined",
+                "description": "d",
+                "tier": 2,
+                "path": "src/genesis/skills/readme-defined",
+                "marker": "README.md",
+            }
+        ],
+        [],
+    )
+
+    assert "`src/genesis/skills/readme-defined/README.md`" in block
+    assert "readme-defined/SKILL.md" not in block
+
+
+def test_marker_less_directory_is_refused_not_guessed(tmp_path):
+    """A directory with no instruction file must stop the export.
+
+    REPRODUCED before the fix: `_scan_tier` emits a name-only entry for a
+    top-level directory carrying no marker, `_resolve_marker` substituted
+    "SKILL.md", and the bullet shipped `<dir>/SKILL.md` pointing at nothing —
+    round 1's defect relocated one layer down. Drives the REAL scan → collect →
+    render chain, because the bug lived in how those three compose.
+    """
+    (tmp_path / ".claude" / "skills" / "orphan-dir").mkdir(parents=True)
+
+    skills = _exp.collect_skills(tmp_path)
+
+    assert skills, "fixture did not produce an entry — the scan changed shape"
+    assert skills[0]["marker"] == "", "a missing marker must resolve EMPTY, not a guess"
+    with pytest.raises(ValueError, match="no instruction file"):
+        _exp.render_block(skills, [])
+
+
+def test_marker_set_is_the_scanner_s_own(tmp_path):
+    """Import, never restate.
+
+    A second hand-written copy is how a future fourth spelling gets handled in
+    the scanner and silently missed here — which would publish a path no
+    external client can open.
+    """
+    import generate_skill_catalog as _gsc_direct
+
+    assert _exp._gsc.SKILL_MARKERS is _gsc_direct.SKILL_MARKERS
+
+
+def test_render_block_refuses_a_skill_with_no_path(tmp_path):
+    """Fail loud, never emit a pathless bullet.
+
+    A bullet without a path silently returns the reader to guessing from the
+    name — the exact inference this block removes — so a missing path is a
+    generator bug to surface, not a field to degrade around.
+    """
+    with pytest.raises(ValueError, match="has no path"):
+        _exp.render_block([{"name": "orphan", "description": "d", "tier": 1}], [])
 
 
 def test_update_appends_block_when_markers_absent(tmp_path):

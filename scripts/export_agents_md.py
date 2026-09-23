@@ -169,6 +169,21 @@ def _frontmatter_description(skill_dir: Path) -> str | None:
     return None
 
 
+def _resolve_marker(skill_dir: Path) -> str:
+    """Name of the instruction file inside ``skill_dir``, or "" if there is none.
+
+    Returns EMPTY rather than guessing. `_scan_tier` emits a name-only entry
+    for a top-level directory carrying no marker at all, and naming a file that
+    does not exist is the same defect this whole block removes — an external
+    client follows the path and finds nothing. `render_block` refuses an empty
+    marker, so such a skill stops the export instead of publishing a dead link.
+    """
+    for name in _gsc.SKILL_MARKERS:
+        if (skill_dir / name).is_file():
+            return name
+    return ""
+
+
 def collect_skills(repo_root: Path) -> list[dict]:
     """Skills from the repo-tracked tiers only.
 
@@ -190,6 +205,13 @@ def collect_skills(repo_root: Path) -> list[dict]:
         full = _frontmatter_description(repo_root / s["path"])
         if full:
             s["description"] = full
+        # Resolve the REAL instruction file rather than assuming SKILL.md.
+        # The scanner accepts three markers (_SKILL_MARKERS), so appending a
+        # fixed name at render time would be the same name-based inference
+        # this block exists to remove, one layer down — and it would emit a
+        # path that does not resolve for a skill defined by skill.md or
+        # README.md. None exists in-repo today; nothing stops one tomorrow.
+        s["marker"] = _resolve_marker(repo_root / s["path"])
     return skills
 
 
@@ -209,11 +231,56 @@ def render_block(skills: list[dict], tools: list[dict]) -> str:
         "",
         "### Skills",
         "",
+        "Each entry gives the skill's real directory; its instructions are the "
+        "`SKILL.md` inside. Read the path, never infer one from the name — the "
+        "name is not the directory. Some skills nest inside a container "
+        "(`gitnexus-cli` lives under `.claude/skills/gitnexus/`, not "
+        "`.claude/skills/gitnexus-cli/`), and skills live under two roots.",
+        "",
     ]
     if skills:
         for s in sorted(skills, key=lambda x: x["name"]):
             desc = (s.get("description") or "").strip()
-            lines.append(f"- **{s['name']}** — {desc}" if desc else f"- **{s['name']}**")
+            # The path is the point of this list — a bullet without one sends
+            # the reader back to guessing from the name, the exact inference
+            # this block removes. Fail loudly rather than emit one.
+            #
+            # ABSOLUTE is the shape that can actually occur and the one that
+            # matters most: generate_skill_catalog._scan_tier falls back to
+            # str(entry) when a skill is not under repo_root, which is live for
+            # the ~/.genesis/skill-library tier. That tier is kept out of a
+            # shipped AGENTS.md only by collect_skills not scanning it — a
+            # comment and an omitted call, not a check. An absolute path here
+            # would publish a home directory, i.e. a username, into a public
+            # file. Refuse it structurally so the privacy property does not
+            # depend on nobody ever adding that tier back.
+            path = (s.get("path") or "").strip()
+            if not path:
+                raise ValueError(
+                    f"skill {s['name']!r} has no path; refusing to emit a bullet "
+                    "that would invite a name-based guess"
+                )
+            if Path(path).is_absolute() or ".." in Path(path).parts:
+                raise ValueError(
+                    f"skill {s['name']!r} has a non-repo-relative path {path!r}; "
+                    "refusing to publish it (an absolute path leaks a home "
+                    "directory into a public file)"
+                )
+            # An unresolved marker means the directory carries no instruction
+            # file at all (_scan_tier still emits a name-only entry for one at
+            # the top level). Naming a file that does not exist is the same
+            # dead-link defect as guessing the directory, so refuse rather than
+            # substitute a default — REPRODUCED: a marker-less dir previously
+            # shipped `<dir>/SKILL.md` pointing at nothing.
+            marker = (s.get("marker") or "").strip()
+            if not marker:
+                raise ValueError(
+                    f"skill {s['name']!r} at {path!r} has no instruction file "
+                    f"({', '.join(_gsc.SKILL_MARKERS)}); refusing to publish a "
+                    "bullet whose path an external client cannot open"
+                )
+            head = f"- **{s['name']}** (`{path}/{marker}`)"
+            lines.append(f"{head} — {desc}" if desc else head)
     else:
         lines.append("_none_")
     lines += ["", "### MCP Tools", ""]

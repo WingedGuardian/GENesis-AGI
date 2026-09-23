@@ -69,13 +69,21 @@ CATALOG_PATH = Path.home() / ".genesis" / "skill_catalog.json"
 _MAX_FRONTMATTER_CHARS = 65_536
 
 
+# The instruction-file names a skill directory may use, in precedence order.
+# Module-level so consumers can IMPORT it instead of restating it: a second
+# hand-written copy is how a future fourth spelling gets handled in one place
+# and silently missed in the other (export_agents_md.py publishes these names
+# into AGENTS.md, where a wrong one is a path an external client cannot open).
+SKILL_MARKERS = ("SKILL.md", "skill.md", "README.md")
+
+
 def _extract_skill_info(skill_dir: Path) -> dict | None:
     """Extract name and description from a skill directory.
 
     Looks for SKILL.md with YAML frontmatter, or any .md file with a
     name/description pattern.
     """
-    for md_name in ("SKILL.md", "skill.md", "README.md"):
+    for md_name in SKILL_MARKERS:
         md_file = skill_dir / md_name
         if md_file.exists():
             try:
