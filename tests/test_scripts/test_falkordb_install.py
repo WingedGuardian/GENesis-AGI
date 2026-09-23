@@ -442,6 +442,25 @@ def test_a_later_run_with_a_stale_index_still_refuses_the_install(tmp_path):
     assert "below" in result.stdout and "floor" in result.stdout
 
 
+def test_a_failed_apt_cache_probe_skips_without_aborting_bootstrap(tmp_path):
+    """The probe runs unconditionally now, so its failure must degrade, not abort.
+
+    A bare `candidate="$(apt-cache ... )"` assignment carries the pipeline's
+    status into a caller running `set -euo pipefail` — a transient cache error
+    would kill the entire bootstrap over an optional provisioning step.
+    """
+    env = _stage(tmp_path)
+    # apt-cache exits nonzero: unreadable cache.
+    apt_cache = Path(env["PATH"].split(":")[0]) / "apt-cache"
+    apt_cache.write_text("#!/bin/bash\nexit 100\n")
+    apt_cache.chmod(0o755)
+
+    result = _run("falkordb_redis_install", env)  # _run sets -euo pipefail
+    assert result.returncode == 0, result.stderr
+    assert "could not ask apt" in result.stdout
+    assert "apt-get install" not in _apt_log(env)
+
+
 def test_unknown_codename_skips_before_touching_apt(tmp_path):
     env = _stage(tmp_path)
     Path(env["FALKORDB_OS_RELEASE"]).write_text("ID=weird\n")  # no VERSION_CODENAME

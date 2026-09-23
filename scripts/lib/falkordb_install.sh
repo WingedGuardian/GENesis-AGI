@@ -414,8 +414,17 @@ falkordb_redis_install() {
     # refuses to load on. Installing it anyway would put a database daemon on
     # the box that cannot run the engine it was installed for.
     local candidate major
+    rc=0
+    # `|| rc=$?`: a bare assignment carries the pipeline's status, and this lib
+    # is sourced under `set -euo pipefail` — an apt-cache failure would abort
+    # the whole bootstrap instead of declining an optional provisioning step.
     candidate="$(apt-cache policy redis-server 2>/dev/null \
-        | awk '/Candidate:/ {print $2}')"
+        | awk '/Candidate:/ {print $2}')" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "  Skipped: could not ask apt which redis-server it would install (rc=$rc)."
+        echo "           The graph engine needs >= $FALKORDB_MIN_REDIS; unverifiable means not installed."
+        return 0
+    fi
     major="${candidate#*:}"   # strip any epoch
     major="${major%%.*}"
     case "$major" in
