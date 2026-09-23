@@ -353,6 +353,57 @@ async def _fresh_heartbeat_ids(db: Any, *, cutoff: str) -> set[str]:
     return {r[0] for r in await cur.fetchall()}
 
 
+async def _revived_since_checkpoint(db: Any, row: dict, *, heartbeat_cutoff: str | None) -> bool:
+    """True when this row shows signs of life AFTER its checkpoint write.
+
+    Read immediately before an interruption alert is sent, because that alert
+    asserts something about the PRESENT ("nothing is still running on it") on
+    the strength of a fact established earlier in the same function.
+
+    Two independent signals, either sufficient — they come from different
+    writers and neither implies the other:
+
+    * ``status != 'checkpointed'`` — the prompt path calls
+      ``touch_terminal_session_row_sync``, which sets ``status = 'active'``
+      and clears the terminal stamp.
+    * a heartbeat newer than ``heartbeat_cutoff`` — ``session_observer_hook``
+      writes ``session_heartbeats`` ONLY, so a session busy inside one long
+      tool call beats without ever touching ``cc_sessions``.
+
+    Fails toward SENDING: on a read error, or with no cutoff to compare
+    against, this returns False and the alert goes out. A missed alert is the
+    failure this whole subsystem exists to prevent, and a spurious one is
+    recoverable by reading it — the asymmetry runs the other way from the
+    checkpoint guard, deliberately, because the costs are not symmetric here.
+    """
+    try:
+        cur = await db.execute(
+            "SELECT status, cc_session_id FROM cc_sessions WHERE id = ?",
+            (row["id"],),
+        )
+        fresh = await cur.fetchone()
+        if fresh is None:
+            return False
+        if fresh["status"] != "checkpointed":
+            return True
+        cc_sid = fresh["cc_session_id"]
+        if not cc_sid or not heartbeat_cutoff:
+            return False
+        cur = await db.execute(
+            "SELECT 1 FROM session_heartbeats WHERE cc_session_id = ? AND updated_at > ?",
+            (cc_sid, heartbeat_cutoff),
+        )
+        return await cur.fetchone() is not None
+    except Exception:
+        logger.warning(
+            "foreground reaper: revival re-check failed for %s — sending the "
+            "alert (a missed interruption is the worse failure)",
+            str(row.get("id", "?"))[:8],
+            exc_info=True,
+        )
+        return False
+
+
 async def _process_row(
     rt: Any,
     db: Any,
@@ -412,6 +463,28 @@ async def _process_row(
         and not await _covered_by_other_subsystem(db, row["id"])
     )
     notified = False
+    if notify_eligible and await _revived_since_checkpoint(
+        db, row, heartbeat_cutoff=heartbeat_cutoff
+    ):
+        # Winning `checkpoint_dark` proved the row was dark AT THAT STATEMENT.
+        # Between then and here sit a transcript read (up to _TAIL_MAX_BYTES),
+        # two awaited queries in `_covered_by_other_subsystem`, and an awaited
+        # outreach submission — so a prompt arriving in that gap writes its
+        # heartbeat, reopens the row, and the alert still goes out telling the
+        # user nothing is running on a turn that just started.
+        #
+        # The checkpoint guard cannot cover this: it RESERVES nothing, it only
+        # proves a fact about the instant it ran. This is the same class that
+        # guard closes, one step further along, and it is the last one before
+        # the message leaves — so the check belongs immediately before the
+        # send, not earlier.
+        logger.info(
+            "foreground reaper: %s revived after checkpoint — suppressing the "
+            "interruption alert (the session is live again)",
+            str(row.get("id", "?"))[:8],
+        )
+        notify_eligible = False
+        result["revived"] = result.get("revived", 0) + 1
     if notify_eligible:
         notified = await _notify_origin(rt, row)  # never raises; False on failure
         if notified:

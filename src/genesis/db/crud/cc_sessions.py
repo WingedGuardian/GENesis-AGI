@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
-from urllib.parse import quote
+from pathlib import Path
 
 import aiosqlite
 
@@ -184,14 +184,28 @@ def register_terminal_session_sync(
     """
     import sqlite3
 
+    from genesis.db.connection import connect_sqlite_rw
+    from genesis.db.integrity import DatabaseIntegrityError
+
     now = datetime.now(UTC).isoformat()
     try:
-        # mode=rw: open read-write WITHOUT creating — a missing file raises
-        # OperationalError (swallowed below) instead of leaving a stray empty
-        # DB behind, which would fool the caller's exists() pre-bootstrap guard.
-        with sqlite3.connect(
-            f"file:{quote(str(db_path), safe='/')}?mode=rw", uri=True, timeout=1.0
-        ) as conn:
+        # NEVER CREATE, and never write a QUARANTINED database. Two separate
+        # obligations, and they need two mechanisms:
+        #
+        #  - never create: an explicit exists() check. The `?mode=rw` URI this
+        #    replaces did it more tightly (no TOCTOU), but a URI cannot go
+        #    through the canonical factory below — `connect_sqlite_rw` calls
+        #    `Path(...).resolve()` on its argument, which mangles `file:...?`
+        #    into a bogus relative path. The residual window is between this
+        #    check and the open, and its worst case is the stray empty file the
+        #    URI form prevented; the caller's own pre-bootstrap guard still
+        #    stands in front of it.
+        #  - never write a quarantined DB: `connect_sqlite_rw` asserts
+        #    admission at open time. The URI form bypassed that entirely, which
+        #    is a hook writing to a database already judged corrupt.
+        if not Path(db_path).exists():
+            return
+        with connect_sqlite_rw(db_path, timeout=1.0) as conn:
             cur = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cc_sessions'"
             )
@@ -217,7 +231,11 @@ def register_terminal_session_sync(
                 (now, pid, model, cc_session_id),
             )
             conn.commit()
-    except sqlite3.Error:
+    except (sqlite3.Error, DatabaseIntegrityError):
+        # DatabaseIntegrityError is the QUARANTINE refusal from the factory's
+        # admission check. It is not a sqlite3.Error, so without naming it here
+        # a quarantined database would raise out of a SessionStart hook or a
+        # prompt-time write — the one thing these helpers promise never to do.
         return
 
 
@@ -240,12 +258,16 @@ def touch_terminal_session_row_sync(db_path: str, cc_session_id: str) -> None:
     """
     import sqlite3
 
+    from genesis.db.connection import connect_sqlite_rw
+    from genesis.db.integrity import DatabaseIntegrityError
+
     now = datetime.now(UTC).isoformat()
     try:
-        # mode=rw for the same reason as the registration write above.
-        with sqlite3.connect(
-            f"file:{quote(str(db_path), safe='/')}?mode=rw", uri=True, timeout=1.0
-        ) as conn:
+        # Same two obligations as the registration write above, same split:
+        # exists() for never-create, the canonical factory for admission.
+        if not Path(db_path).exists():
+            return
+        with connect_sqlite_rw(db_path, timeout=1.0) as conn:
             conn.execute(
                 "UPDATE cc_sessions SET last_activity_at = ?, status = 'active', "
                 "completed_at = NULL "
@@ -255,7 +277,11 @@ def touch_terminal_session_row_sync(db_path: str, cc_session_id: str) -> None:
                 (now, cc_session_id),
             )
             conn.commit()
-    except sqlite3.Error:
+    except (sqlite3.Error, DatabaseIntegrityError):
+        # DatabaseIntegrityError is the QUARANTINE refusal from the factory's
+        # admission check. It is not a sqlite3.Error, so without naming it here
+        # a quarantined database would raise out of a SessionStart hook or a
+        # prompt-time write — the one thing these helpers promise never to do.
         return
 
 

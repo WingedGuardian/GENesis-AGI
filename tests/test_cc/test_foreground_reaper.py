@@ -270,7 +270,18 @@ FRESH_HB = "2026-07-22T11:55:00+00:00"  # 5 min before NOW → fresh
 IDLE_40M = "2026-07-22T11:20:00+00:00"  # 40 min before NOW
 
 
-async def _seed_terminal(db, *, sid="term-1", last_activity=IDLE_40M, pid=4242):
+async def _seed_terminal(
+    db, *, sid="term-1", last_activity=IDLE_40M, pid=4242, addressable=True
+):
+    """A terminal-registered row: pid known, ``id == cc_session_id``.
+
+    ``addressable`` sets channel/chat_id. It defaults TRUE because
+    ``_notify_origin`` resolves its target from those columns and returns False
+    without them — so a fixture lacking them makes every
+    ``submit_urgent.await_count == 0`` assertion pass VACUOUSLY, whatever the
+    code under test does. That is not hypothetical: it is how three cells in
+    this file were green before the negative control caught it.
+    """
     await cc_sessions.register_from_filesystem(
         db, id=sid, cc_session_id=sid, started_at=last_activity, status="active",
     )
@@ -278,6 +289,12 @@ async def _seed_terminal(db, *, sid="term-1", last_activity=IDLE_40M, pid=4242):
         "UPDATE cc_sessions SET last_activity_at = ? WHERE id = ?",
         (last_activity, sid),
     )
+    if addressable:
+        await db.execute(
+            "UPDATE cc_sessions SET channel = 'telegram', chat_id = '12345', "
+            "user_id = 'tg-999' WHERE id = ?",
+            (sid,),
+        )
     await db.commit()
     await cc_sessions.set_pid(db, sid, pid=pid)
 
@@ -623,3 +640,120 @@ async def test_one_cutoff_feeds_both_the_filter_and_the_write_guard(db, monkeypa
     assert seen[0] is not None and seen[1] is not None
     assert seen[0] == seen[1]
     assert seen[0] == fr._heartbeat_cutoff(NOW)
+# --- round 6: the notify window, after the checkpoint has already committed ---
+#
+# `checkpoint_dark` winning proves the row was dark AT THAT STATEMENT. Between
+# it and the send sit a transcript read, two awaited queries and an awaited
+# outreach submission — so the guard that closes the checkpoint race does not
+# reach this one. These cells pin the LAST check before the message leaves.
+
+
+async def test_revival_after_checkpoint_suppresses_the_alert(db, monkeypatch):
+    """A prompt arriving after the checkpoint commits must not still be told
+    its work was interrupted."""
+    await _seed_terminal(db)
+    _patch_tail(monkeypatch, [_user("do the thing", OLD)])  # notify-eligible
+    monkeypatch.setattr(fr, "_pid_dead", lambda pid, row: True)
+
+    real_ckpt = cc_sessions.checkpoint_dark
+
+    async def _ckpt_then_revive(db_, id_, **kw):
+        won = await real_ckpt(db_, id_, **kw)
+        # The prompt lands HERE: after the checkpoint, before the notify.
+        await _hb(db_, "term-1", FRESH_HB)
+        await db_.execute("UPDATE cc_sessions SET status = 'active' WHERE id = ?", (id_,))
+        await db_.commit()
+        return won
+
+    monkeypatch.setattr(cc_sessions, "checkpoint_dark", _ckpt_then_revive)
+    rt = _rt(db)
+    res = await fr.reap_dark_foreground(rt, now=NOW, idle_hours=24, mode="notify")
+
+    assert rt._outreach_pipeline.submit_urgent.await_count == 0, (
+        "a revived session was told nothing was running on it"
+    )
+    assert res["notified"] == 0
+    assert res.get("revived") == 1
+
+
+async def test_a_genuinely_dark_row_is_still_notified(db, monkeypatch):
+    """Negative control. Without it, a re-check that returned True
+    unconditionally would pass the cell above while disabling notification
+    entirely — which is the failure this subsystem exists to prevent."""
+    await _seed_terminal(db)
+    _patch_tail(monkeypatch, [_user("do the thing", OLD)])
+    monkeypatch.setattr(fr, "_pid_dead", lambda pid, row: True)
+    rt = _rt(db)
+    res = await fr.reap_dark_foreground(rt, now=NOW, idle_hours=24, mode="notify")
+
+    assert rt._outreach_pipeline.submit_urgent.await_count == 1
+    assert res["notified"] == 1
+    assert res.get("revived", 0) == 0
+
+
+async def test_revival_recheck_fails_toward_sending():
+    """The asymmetry is deliberate and runs the OPPOSITE way to the checkpoint
+    guard: a MISSED interruption alert is the failure this subsystem exists to
+    prevent, so an unreadable re-check must not swallow the alert.
+
+    Driven against the helper directly with a raising stand-in rather than by
+    monkeypatching the real connection: `db` is a SerializedConnection, and
+    wrapping its `execute` while re-entering it from inside the wrapper
+    deadlocks the serializer — an earlier version of this cell hung the whole
+    suite rather than failing."""
+
+    class _RaisingDb:
+        async def execute(self, *a, **k):
+            raise RuntimeError("re-check query exploded")
+
+    revived = await fr._revived_since_checkpoint(
+        _RaisingDb(), {"id": "term-1"}, heartbeat_cutoff=FRESH_HB
+    )
+    assert revived is False, "an unreadable re-check must not suppress the alert"
+
+
+async def test_revival_recheck_with_no_cutoff_fails_toward_sending():
+    """Same direction for the other degraded input: no cutoff to compare
+    against means no evidence of revival, which must not become evidence OF
+    it."""
+
+    class _Row(dict):
+        pass
+
+    class _Db:
+        async def execute(self, sql, params=None):
+            class _Cur:
+                async def fetchone(_self):
+                    return {"status": "checkpointed", "cc_session_id": "cc-1"}
+
+            return _Cur()
+
+    revived = await fr._revived_since_checkpoint(
+        _Db(), {"id": "term-1"}, heartbeat_cutoff=None
+    )
+    assert revived is False
+
+
+async def test_heartbeat_only_revival_is_caught(db, monkeypatch):
+    """`session_observer_hook` writes session_heartbeats ONLY — it never
+    touches cc_sessions — so a session busy inside one long tool call revives
+    without its status changing. Status alone cannot see that."""
+    await _seed_terminal(db)
+    _patch_tail(monkeypatch, [_user("do the thing", OLD)])
+    monkeypatch.setattr(fr, "_pid_dead", lambda pid, row: True)
+
+    real_ckpt = cc_sessions.checkpoint_dark
+
+    async def _ckpt_then_beat_only(db_, id_, **kw):
+        won = await real_ckpt(db_, id_, **kw)
+        await _hb(db_, "term-1", FRESH_HB)  # heartbeat ONLY; status untouched
+        return won
+
+    monkeypatch.setattr(cc_sessions, "checkpoint_dark", _ckpt_then_beat_only)
+    rt = _rt(db)
+    res = await fr.reap_dark_foreground(rt, now=NOW, idle_hours=24, mode="notify")
+
+    row = await cc_sessions.get_by_id(db, "term-1")
+    assert row["status"] == "checkpointed", "status really did stay unchanged"
+    assert rt._outreach_pipeline.submit_urgent.await_count == 0
+    assert res.get("revived") == 1
