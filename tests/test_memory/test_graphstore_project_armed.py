@@ -36,6 +36,37 @@ def socket(tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _restore_sigterm():
+    """Restore the SIGTERM disposition after EVERY test in this module.
+
+    `main()` installs a process-global SIGTERM handler that raises
+    KeyboardInterrupt — correct for a CLI entrypoint, and catastrophic to leak
+    out of a test. `signal.signal` is per-PROCESS, so it outlives the test, and
+    `fork` COPIES it into every child: a multiprocessing worker then inherits a
+    SIGTERM that raises instead of exiting, so `Pool.terminate()` cannot kill it
+    and the pool hangs forever.
+
+    MEASURED, because this already happened rather than being a precaution: two
+    tests in tests/test_scripts/test_session_heartbeat_throttle.py — a file this
+    branch never touched — hung for the full 3600s pytest-timeout, and the
+    traceback named `_unwind_on_terminate` inside
+    `multiprocessing/connection.py:_recv`. The whole CI run went from 34 minutes
+    to 2h25.
+
+    AUTOUSE and module-wide rather than a try/finally in the one obvious test:
+    every `_run()` helper below calls `main()`, so the leak had several sources
+    and fixing only the visible one would leave the class open.
+    """
+    import signal as _signal
+
+    saved = _signal.getsignal(_signal.SIGTERM)
+    try:
+        yield
+    finally:
+        _signal.signal(_signal.SIGTERM, saved)
+
+
+@pytest.fixture(autouse=True)
 def _enabled(monkeypatch):
     """Default the config to enabled, so each test varies ONE condition."""
     monkeypatch.setattr(gp, "load_config", lambda: {"enabled": True, "mode": "networkx"})
