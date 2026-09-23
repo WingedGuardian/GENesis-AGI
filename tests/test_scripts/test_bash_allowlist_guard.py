@@ -156,20 +156,41 @@ def test_guard_refuses_a_bare_ampersand(cmd):
         "gh pr list",
         "gh api repos/o/r --jq .state",
         "gh pr comment 1 --body hello",
-        "gh pr create --title 'a (b) c'",
-        "gh search prs 'is:open (draft)'",
+        "gh --version",
     ],
 )
 def test_the_operator_set_did_not_over_block_ordinary_gh_usage(cmd):
-    """The cost side of the operator fix, measured rather than assumed.
+    """The cost side of the operator set: paren-free gh usage still works.
 
-    `&` was added because it reaches a second binary. `(` and `)` were
-    deliberately NOT added: against real bash they reach nothing in any
-    position the other entries leave open, so listing them would refuse
-    parentheses in ordinary arguments — a jq filter, a search query, a PR
-    title — while closing nothing. These are the shapes that would break.
+    Widening a guard is cheap to do and expensive to discover, so the shapes
+    that must KEEP working are asserted beside the shapes that must not.
     """
     assert _run(GUARD, _payload(cmd), allowlist="gh").returncode == 0
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "gh pr create --title 'a (b) c'",
+        "gh search prs 'is:open (draft)'",
+        "gh api x (y)",
+    ],
+)
+def test_parentheses_are_refused_and_this_costs_ordinary_arguments(cmd):
+    """`(` and `)` are refused by OWNER DECISION, as defence in depth.
+
+    The measurement does not support them on its own: against real bash, with
+    an allowlisted first token, a subshell is unreachable in every position the
+    other entries leave open — `(cmd)` straight after a command word is a
+    syntax error, and getting to one needs a separator that is already blocked.
+
+    So this test pins a COST rather than a protection, deliberately. Every case
+    here is an ordinary, harmless gh invocation that an allowlisted session can
+    no longer issue: a PR title, a search query, a positional argument. If that
+    cost is ever judged too high, this test is the list of what comes back, and
+    the enumeration in bash_allowlist_lib.sh is the argument for removing them.
+    """
+    assert _run(GUARD, _payload(cmd), allowlist="gh").returncode == 2
 
 
 @pytest.mark.parametrize(
@@ -509,3 +530,32 @@ def test_both_entry_points_use_the_shared_predicate():
         assert marker not in caller.read_text(encoding="utf-8"), (
             f"{caller.name} carries its own copy of the allowlist test — the predicate has forked"
         )
+
+
+# --- The chokepoint's fail-closed leg is scoped to the Bash tool ------------
+
+
+@pytest.mark.parametrize(
+    ("tool", "payload_extra", "want", "why"),
+    [
+        ("BashOutput", {"bash_id": "abc"}, 0, "carries no command and is not this gate's business"),
+        ("KillShell", {"shell_id": "abc"}, 0, "same"),
+        ("Bash", {}, 2, "a Bash call with no readable command must still fail closed"),
+    ],
+)
+def test_chokepoint_fail_closed_leg_is_scoped_to_the_bash_tool(tool, payload_extra, want, why):
+    """A matcher is a REGEX, so a bare "Bash" also matches "BashOutput".
+
+    MEASURED: a hook registered as `^Bash$` fires on a Bash call, so the
+    unanchored spelling — which is how this hook is wired where it is wired at
+    all — matches sibling tools too. Those carry no `.tool_input.command`, and
+    without this scoping the new fail-closed leg would refuse every one of them
+    in an allowlisted session, reporting a missing command the tool never had.
+
+    The injected guard avoids this by anchoring its own matcher; the chokepoint
+    cannot, because its registration lives in an install's user-level settings
+    and is not ours to change. So it gates on the tool name instead.
+    """
+    payload = json.dumps({"tool_name": tool, "tool_input": payload_extra})
+    proc = _run(CHOKEPOINT, payload, allowlist="gh")
+    assert proc.returncode == want, f"{tool}: {why} (stderr: {proc.stderr[:120]})"

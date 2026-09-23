@@ -378,7 +378,7 @@ def test_build_args_refuses_when_env_overrides_would_blank_the_allowlist(
         )
 
 
-def test_build_args_refuses_when_the_guard_was_rewritten_out_of_the_settings(
+async def test_build_args_refuses_when_the_guard_was_rewritten_out_of_the_settings(
     invoker, monkeypatch, tmp_path
 ):
     """The shared settings path is one file, and older code rewrites it.
@@ -392,7 +392,7 @@ def test_build_args_refuses_when_the_guard_was_rewritten_out_of_the_settings(
     settings = _settings_registering(tmp_path, "some-other-hook.py")
     monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: settings)
     with pytest.raises(RuntimeError, match="does not register"):
-        invoker._build_args(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+        await _verify(invoker, CCInvocation(prompt="hi", bash_allowlist=("gh",)))
 
 
 def _arm(monkeypatch, tmp_path, argv):
@@ -413,7 +413,20 @@ def _arm(monkeypatch, tmp_path, argv):
     return settings
 
 
-def test_build_args_refuses_a_hook_registered_by_someone_else(invoker, monkeypatch, tmp_path):
+async def _verify(invoker, inv):
+    """Drive the checks a real spawn path drives, in the same order.
+
+    `_build_args` keeps only the cheap checks; the settings read, the seal and
+    the two subprocess probes moved behind `verify_allowlist_enforceable` so
+    they do not run on the event loop. Both spawn paths call them back to back,
+    so the tests do too — asserting on `_build_args` alone would now assert on
+    half the gate.
+    """
+    invoker._build_args(inv)
+    await invoker.verify_allowlist_enforceable(inv)
+
+
+async def test_build_args_refuses_a_hook_registered_by_someone_else(invoker, monkeypatch, tmp_path):
     """The settings file is outside the repo and any same-uid process can write
     it — including a confined session that can drop a file somewhere.
 
@@ -429,10 +442,12 @@ def test_build_args_refuses_a_hook_registered_by_someone_else(invoker, monkeypat
     settings = _settings_registering(tmp_path, f"bash {planted} {inv_mod._ALLOWLIST_GUARD_SCRIPT}")
     monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: settings)
     with pytest.raises(RuntimeError, match="does not register"):
-        invoker._build_args(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+        await _verify(invoker, CCInvocation(prompt="hi", bash_allowlist=("gh",)))
 
 
-def test_build_args_refuses_a_registered_hook_that_does_not_refuse(invoker, monkeypatch, tmp_path):
+async def test_build_args_refuses_a_registered_hook_that_does_not_refuse(
+    invoker, monkeypatch, tmp_path
+):
     """Registered is not the same as BINDING, and that gap is a real defect.
 
     The launcher resolves hooks against the MAIN worktree while the registrar
@@ -446,10 +461,10 @@ def test_build_args_refuses_a_registered_hook_that_does_not_refuse(invoker, monk
     permit_all.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     _arm(monkeypatch, tmp_path, ["bash", str(permit_all)])
     with pytest.raises(RuntimeError, match="instead of refusing it"):
-        invoker._build_args(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+        await _verify(invoker, CCInvocation(prompt="hi", bash_allowlist=("gh",)))
 
 
-def test_build_args_refuses_a_registered_hook_that_refuses_everything(
+async def test_build_args_refuses_a_registered_hook_that_refuses_everything(
     invoker, monkeypatch, tmp_path
 ):
     """The other direction, and it is not redundant.
@@ -463,10 +478,10 @@ def test_build_args_refuses_a_registered_hook_that_refuses_everything(
     refuse_all.write_text("#!/usr/bin/env bash\nexit 2\n", encoding="utf-8")
     _arm(monkeypatch, tmp_path, ["bash", str(refuse_all)])
     with pytest.raises(RuntimeError, match="could do nothing at all"):
-        invoker._build_args(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+        await _verify(invoker, CCInvocation(prompt="hi", bash_allowlist=("gh",)))
 
 
-def test_build_args_probes_in_the_childs_environment_not_the_parents(
+async def test_build_args_probes_in_the_childs_environment_not_the_parents(
     invoker, monkeypatch, tmp_path
 ):
     """env_overrides wins in _build_env, so a probe under os.environ would test
@@ -487,12 +502,13 @@ def test_build_args_probes_in_the_childs_environment_not_the_parents(
     )
     _arm(monkeypatch, tmp_path, ["bash", str(reporter)])
     with pytest.raises(RuntimeError):
-        invoker._build_args(
+        await _verify(
+            invoker,
             CCInvocation(
                 prompt="hi",
                 bash_allowlist=("gh",),
                 env_overrides={"GENESIS_PROBE_MARKER": "from-child-env"},
-            )
+            ),
         )
     assert (tmp_path / "seen.txt").read_text() == "from-child-env", (
         "the probe ran in the parent environment, so it cannot see what the "
@@ -500,7 +516,7 @@ def test_build_args_probes_in_the_childs_environment_not_the_parents(
     )
 
 
-def test_build_args_launches_an_allowlisted_profile_when_the_guard_binds(
+async def test_build_args_launches_an_allowlisted_profile_when_the_guard_binds(
     invoker, monkeypatch, tmp_path
 ):
     """The permitting path, against the REAL guard. A check that only refuses
@@ -508,7 +524,9 @@ def test_build_args_launches_an_allowlisted_profile_when_the_guard_binds(
     path that did not exist, so it asserted a launch that was never enforceable.
     """
     settings = _arm(monkeypatch, tmp_path, ["bash", str(_REAL_GUARD)])
-    args = invoker._build_args(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+    inv = CCInvocation(prompt="hi", bash_allowlist=("gh",))
+    args = invoker._build_args(inv)
+    await invoker.verify_allowlist_enforceable(inv)
     assert args[args.index("--settings") + 1] == settings
 
 
@@ -4247,3 +4265,186 @@ def test_build_env_does_not_harden_gh_for_an_unrelated_allowlist(invoker, monkey
     env = invoker._build_env(CCInvocation(prompt="hi", bash_allowlist=("git",)))
     assert env["GENESIS_BASH_ALLOWLIST"] == "git"
     assert not env["GH_CONFIG_DIR"].endswith("sealed")
+
+
+# --- The verification must stay wired to every spawn path -------------------
+
+
+def test_every_spawn_path_awaits_the_allowlist_verification():
+    """Structural lock on the async split.
+
+    `_build_args` keeps only the cheap checks now; the settings read, the seal
+    and the two subprocess probes moved behind `verify_allowlist_enforceable`
+    so they do not stall the event loop. That split is only safe while EVERY
+    path that calls `_build_args` also awaits the verification — a path that
+    skipped it would launch a profile whose confinement was never demonstrated,
+    which is the defect this whole change exists to remove.
+
+    Asserted by AST over the module rather than by reading, so a spawn path
+    added later fails here instead of launching unverified. Allowlist polarity:
+    the test enumerates the callers and requires the await in each, so a NEW
+    caller is a failure by construction rather than an omission nobody sees.
+    """
+    import ast
+    import inspect
+
+    from genesis.cc import invoker as inv_mod
+
+    tree = ast.parse(inspect.getsource(inv_mod))
+    callers: dict[str, bool] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef):
+            continue
+        body = ast.dump(node)
+        if "attr='_build_args'" not in body:
+            continue
+        callers[node.name] = "attr='verify_allowlist_enforceable'" in body
+
+    assert callers, "no caller of _build_args found — the AST probe is inert"
+    missing = sorted(name for name, ok in callers.items() if not ok)
+    assert not missing, (
+        f"these call _build_args without awaiting verify_allowlist_enforceable: "
+        f"{missing}. An allowlisted profile launched from there would never "
+        f"have its confinement demonstrated."
+    )
+
+
+# --- Fail closed when a binary's own hardening is not in force --------------
+
+
+async def test_refuses_to_launch_when_the_gh_seal_cannot_be_prepared(
+    invoker, monkeypatch, tmp_path
+):
+    """A seal that could not be built is a REFUSAL, not a degraded mode.
+
+    Without it the session falls back to the operator's own writable config —
+    exactly where `gh alias set --shell` installs an escape, and where any
+    alias the operator already has is already waiting. Pinning the pager alone
+    would close one route of three and read as hardening.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    _arm(monkeypatch, tmp_path, ["bash", str(_REAL_GUARD)])
+    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda: None)
+    with pytest.raises(RuntimeError, match="could not be prepared"):
+        await _verify(invoker, CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+
+
+@pytest.mark.parametrize("key", ["GH_CONFIG_DIR", "GH_PAGER"])
+async def test_refuses_when_env_overrides_would_strip_the_gh_hardening(
+    invoker, monkeypatch, tmp_path, key
+):
+    """env_overrides is applied LAST in _build_env and wins over everything.
+
+    Defending `GENESIS_BASH_ALLOWLIST` by name was the narrow version of this:
+    the same mechanism can replace the confinement of the allowlisted binary
+    after every other check has passed, and the guard cannot see it — a command
+    whose first token is `gh` is genuinely allowlisted.
+    """
+    _arm(monkeypatch, tmp_path, ["bash", str(_REAL_GUARD)])
+    with pytest.raises(RuntimeError, match="not in the environment"):
+        await _verify(
+            invoker,
+            CCInvocation(
+                prompt="hi",
+                bash_allowlist=("gh",),
+                env_overrides={key: "/tmp/attacker-writable"},
+            ),
+        )
+
+
+def test_a_seal_with_the_right_bytes_at_the_wrong_modes_is_not_a_seal(monkeypatch, tmp_path):
+    """The modes ARE the mechanism, so the match test compares them too.
+
+    A rewrite interrupted between its chmod-writable and its chmod-back leaves
+    correct content at writable permissions. A content-only check would call
+    that good and skip the repair, leaving a session pointed at a config it can
+    write — which is the escape, restored quietly.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    sealed = Path(_seal(monkeypatch, tmp_path))
+    assert inv_mod._seal_matches(
+        sealed,
+        {
+            "config.yml": (sealed / "config.yml").read_text(),
+            "hosts.yml": (sealed / "hosts.yml").read_text(),
+        },
+    )
+
+    desired = {
+        "config.yml": (sealed / "config.yml").read_text(),
+        "hosts.yml": (sealed / "hosts.yml").read_text(),
+    }
+
+    # DIRECTORY mode alone, files left at 0400. Asserted separately because the
+    # file-mode check below would otherwise catch a combined case and the
+    # directory check could be deleted without any test noticing — a writable
+    # directory lets gh CREATE config.yml even when the existing files are
+    # read-only, so this is the half that matters most.
+    sealed.chmod(0o700)
+    assert not inv_mod._seal_matches(sealed, desired), (
+        "a writable seal DIRECTORY compared equal; gh could add a config file"
+    )
+    sealed.chmod(0o500)
+    assert inv_mod._seal_matches(sealed, desired), "restoring the mode did not restore the match"
+
+    sealed.chmod(0o700)
+    (sealed / "config.yml").chmod(0o600)
+    assert not inv_mod._seal_matches(
+        sealed,
+        {
+            "config.yml": (sealed / "config.yml").read_text(),
+            "hosts.yml": (sealed / "hosts.yml").read_text(),
+        },
+    ), "a writable seal compared equal — the repair would be skipped"
+
+
+def test_seal_rewrites_are_serialised_against_a_concurrent_writer(monkeypatch, tmp_path):
+    """The rewrite is not atomic, so it must not interleave.
+
+    It chmods the directory writable, unlinks, writes, then chmods back. Two
+    dispatches arriving together — first run, or just after the operator's
+    token changes — would otherwise collide, and the loser gets a
+    PermissionError mid-write, returns None, and the caller refuses a launch
+    that should have succeeded.
+
+    Tested by holding the lock and asserting the rewrite BLOCKS rather than by
+    asserting a lock file exists: the file existing says a lock was opened, not
+    that anything waits on it.
+    """
+    import fcntl
+    import threading
+
+    import genesis.cc.invoker as inv_mod
+
+    source = tmp_path / "src-gh"
+    source.mkdir()
+    (source / "hosts.yml").write_text("github.com:\n  oauth_token: x\n", encoding="utf-8")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(source))
+    target = tmp_path / "sealed"
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", target)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = target.parent / f"{target.name}.lock"
+    done = threading.Event()
+
+    with open(lock_path, "w", encoding="utf-8") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        worker = threading.Thread(target=lambda: (inv_mod._sealed_gh_config_dir(), done.set()))
+        worker.start()
+        blocked = not done.wait(timeout=1.5)
+        assert blocked, (
+            "the rewrite completed while another writer held the lock — two "
+            "concurrent dispatches can interleave mid-rewrite"
+        )
+    # Lock released: it should now finish on its own.
+    assert done.wait(timeout=10), "the rewrite never completed after the lock was freed"
+    worker.join(timeout=5)
+    assert inv_mod._seal_matches(
+        target,
+        {
+            "config.yml": inv_mod._SEALED_GH_CONFIG_YML,
+            "hosts.yml": "github.com:\n  oauth_token: x\n",
+        },
+    )

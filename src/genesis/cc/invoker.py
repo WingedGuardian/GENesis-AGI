@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -318,22 +319,35 @@ def _sealed_gh_config_dir() -> str | None:
     bounds one binary's self-reconfiguration. Both limits are documented in
     ``.claude/docs/background-sessions.md``.
     """
-    source = Path(os.environ.get("GH_CONFIG_DIR") or (Path.home() / ".config" / "gh"))
-    hosts = source / "hosts.yml"
-    desired = {
-        "config.yml": _SEALED_GH_CONFIG_YML,
-        # Absent when gh was never authenticated. Seal anyway: an unauthenticated
-        # session is no reason to leave the alias route open.
-        **({"hosts.yml": hosts.read_text(encoding="utf-8")} if hosts.is_file() else {}),
-    }
     target = _SEALED_GH_CONFIG_DIR
     try:
-        current = {
-            p.name: p.read_text(encoding="utf-8")
-            for p in (target.iterdir() if target.is_dir() else ())
-            if p.is_file()
+        source = Path(os.environ.get("GH_CONFIG_DIR") or (Path.home() / ".config" / "gh"))
+        hosts = source / "hosts.yml"
+        desired = {
+            "config.yml": _SEALED_GH_CONFIG_YML,
+            # Absent when gh was never authenticated. Seal anyway: an
+            # unauthenticated session is no reason to leave the alias route
+            # open. Read INSIDE the try — an unreadable or non-UTF-8 hosts.yml
+            # would otherwise raise straight out of _build_env, past the
+            # fallback this function documents.
+            **({"hosts.yml": hosts.read_text(encoding="utf-8")} if hosts.is_file() else {}),
         }
-        if current != desired:
+        if _seal_matches(target, desired):
+            return str(target)
+        # REWRITES ARE SERIALISED. The seal is one shared directory, and the
+        # rewrite is not atomic — it chmods the directory writable, unlinks,
+        # writes, then chmods back. Two dispatches arriving together (first run,
+        # or just after the operator's token changes) would otherwise interleave,
+        # and the loser gets PermissionError mid-write, returns None, and the
+        # caller refuses a launch that should have succeeded.
+        target.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = target.parent / f"{target.name}.lock"
+        with open(lock_path, "w", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            # Re-check under the lock: the writer we queued behind may have
+            # already produced exactly what we want.
+            if _seal_matches(target, desired):
+                return str(target)
             target.mkdir(parents=True, exist_ok=True)
             target.chmod(0o700)
             for stale in target.iterdir():
@@ -347,25 +361,51 @@ def _sealed_gh_config_dir() -> str | None:
                 path.chmod(0o400)
             target.chmod(0o500)
         return str(target)
-    except OSError:
+    except (OSError, UnicodeError):
         logger.warning("Could not prepare the sealed gh config at %s", target, exc_info=True)
         return None
 
 
-def _gh_hardening() -> dict[str, str]:
-    """Environment that keeps an allowlisted ``gh`` from spawning a shell."""
+def _seal_matches(target: Path, desired: dict[str, str]) -> bool:
+    """Is the sealed directory already exactly ``desired``?
+
+    Compares CONTENT and MODES both, because a seal whose files are writable is
+    not a seal — a rewrite interrupted between its chmod-writable and its
+    chmod-back leaves the right bytes at the wrong permissions, and a
+    content-only check would call that good.
+    """
+    if not target.is_dir() or target.stat().st_mode & 0o777 != 0o500:
+        return False
+    present = {p.name: p for p in target.iterdir() if p.is_file()}
+    if set(present) != set(desired):
+        return False
+    return all(
+        path.stat().st_mode & 0o777 == 0o400 and path.read_text(encoding="utf-8") == desired[name]
+        for name, path in present.items()
+    )
+
+
+def _gh_hardening() -> dict[str, str] | None:
+    """Environment that keeps an allowlisted ``gh`` from spawning a shell.
+
+    Returns ``None`` when the seal could not be prepared. That is a REFUSAL
+    signal, not a degraded mode: without the sealed directory the session falls
+    back to the operator's own writable config, which is precisely where
+    ``gh alias set --shell`` installs an escape — and where any alias the
+    operator already has is waiting. Pinning the pager alone would close one
+    route of three and read as hardening.
+    """
     sealed = _sealed_gh_config_dir()
-    # GH_PAGER belts the pager route independently of the config file, so it
-    # holds even if the sealed directory could not be prepared.
-    hardened = {"GH_PAGER": "cat", "PAGER": "cat"}
-    if sealed:
-        hardened["GH_CONFIG_DIR"] = sealed
-    return hardened
+    if sealed is None:
+        return None
+    return {"GH_CONFIG_DIR": sealed, "GH_PAGER": "cat", "PAGER": "cat"}
 
 
 #: Per-allowlisted-binary environment hardening. Keyed by the binary as it
-#: appears in a profile's ``bash_allowlist``.
-_BINARY_HARDENING: dict[str, Callable[[], dict[str, str]]] = {"gh": _gh_hardening}
+#: appears in a profile's ``bash_allowlist``. A callable returning ``None``
+#: means "this binary cannot be confined right now", and the invoker refuses to
+#: launch rather than launching it unconfined.
+_BINARY_HARDENING: dict[str, Callable[[], dict[str, str] | None]] = {"gh": _gh_hardening}
 
 
 def _allowlist_guard_argv() -> list[str] | None:
@@ -777,6 +817,42 @@ class CCInvoker:
                 f"restriction would not be applied. Drop safe_mode=True, or "
                 f"drop the bash_allowlist and confine the profile another way."
             )
+
+    async def verify_allowlist_enforceable(self, inv: CCInvocation) -> None:
+        """The EXPENSIVE half of the allowlist check, kept off the event loop.
+
+        ``_build_args`` stays synchronous — the tests call it directly, and the
+        cheap checks there answer from fields of the invocation alone. What
+        cannot stay there is this: a settings read, a seal write, and two
+        subprocess probes with a 30s ceiling each. ``_build_args`` is called
+        from inside coroutines, so running those inline would stall the whole
+        server loop — channels, other sessions, cancellations — for up to a
+        minute on a hanging guard.
+
+        ``_get_scope_args`` in this module was made async for exactly this
+        reason and says so; this follows it rather than inventing a second
+        shape.
+
+        MUST be awaited by every spawn path before the child is started. Both
+        of them do, immediately after ``_build_args``, and a test asserts it —
+        a path that skipped this would launch a profile whose confinement was
+        never demonstrated, which is the defect this whole change exists to
+        remove.
+        """
+        if not inv.bash_allowlist:
+            return
+        await asyncio.to_thread(self._verify_allowlist_enforceable_blocking, inv)
+
+    def _verify_allowlist_enforceable_blocking(self, inv: CCInvocation) -> None:
+        """Body of :meth:`verify_allowlist_enforceable`; runs in a worker thread."""
+        allowlist = ",".join(inv.bash_allowlist)
+        span_settings = cc_span_settings_path()
+        if span_settings is None:
+            raise RuntimeError(
+                f"Refusing to launch: this invocation restricts Bash to "
+                f"[{allowlist}], but the settings file that registers the "
+                f"enforcing hook could not be written."
+            )
         # The settings file is ONE shared path, so a concurrently-running
         # Genesis process on OLDER code recomputes the span-only payload, sees
         # this content as stale, and rewrites it — after we wrote it. Re-read
@@ -796,7 +872,53 @@ class CCInvoker:
         # the session actually gets. Defending one variable by name was the
         # narrower version of this; building the same env makes the check
         # faithful by construction.
-        self._verify_allowlist_guard_binds(registered, inv.bash_allowlist, self._build_env(inv))
+        child_env = self._build_env(inv)
+        self._refuse_unhardened_binary(inv, child_env)
+        self._verify_allowlist_guard_binds(registered, inv.bash_allowlist, child_env)
+
+    @staticmethod
+    def _refuse_unhardened_binary(inv: CCInvocation, child_env: dict[str, str]) -> None:
+        """Refuse when an allowlisted binary's own hardening is not in force.
+
+        Two ways that happens, and neither is visible to the guard — the guard
+        sees a command whose first token is allowlisted and says yes, correctly.
+        The confinement those commands rely on lives in the ENVIRONMENT:
+
+        * the hardening could not be prepared at all (its callable returns
+          ``None``), so the session would fall back to the operator's own
+          writable configuration; and
+        * ``env_overrides`` is applied LAST in ``_build_env`` and wins over
+          everything, so it can replace the hardening after it was applied.
+
+        Checked by COMPARING the child's actual environment against a freshly
+        computed hardening rather than by listing variables to defend — the
+        same shape as the guard-binding check, and for the same reason: an
+        enumeration of names goes stale the moment a hardening grows a key.
+        """
+        for binary in inv.bash_allowlist:
+            hardening = _BINARY_HARDENING.get(binary)
+            if hardening is None:
+                continue
+            required = hardening()
+            if required is None:
+                raise RuntimeError(
+                    f"Refusing to launch: this invocation allows {binary!r}, "
+                    f"which can be reconfigured to run commands, and its "
+                    f"confinement could not be prepared. Launching would give "
+                    f"the session {binary!r} against a writable configuration, "
+                    f"which is an escape from the allowlist rather than a "
+                    f"weaker form of it."
+                )
+            wrong = sorted(k for k, v in required.items() if child_env.get(k) != v)
+            if wrong:
+                raise RuntimeError(
+                    f"Refusing to launch: this invocation allows {binary!r}, "
+                    f"but its confinement is not in the environment the session "
+                    f"would receive — {', '.join(wrong)} "
+                    f"{'differs' if len(wrong) == 1 else 'differ'} from the "
+                    f"hardened value. env_overrides is applied last and wins; "
+                    f"drop the override or drop the allowlist."
+                )
 
     @staticmethod
     def _verify_allowlist_guard_binds(
@@ -1124,7 +1246,10 @@ class CCInvoker:
             # unrestricted shell while every token is still the allowed one.
             # Each entry that needs it gets its hardening applied here.
             for binary in inv.bash_allowlist:
-                env.update(_BINARY_HARDENING.get(binary, lambda: {})())
+                hardening = _BINARY_HARDENING.get(binary)
+                applied = hardening() if hardening else None
+                if applied:
+                    env.update(applied)
         else:
             env.pop("GENESIS_BASH_ALLOWLIST", None)
         # Per-invocation overrides win over EVERYTHING above (inherited environ,
@@ -1413,6 +1538,8 @@ class CCInvoker:
 
     async def _run_inner(self, invocation: CCInvocation) -> CCOutput:
         args = self._build_args(invocation)
+        # Off the event loop: settings read, seal write, two probes.
+        await self.verify_allowlist_enforceable(invocation)
         env = self._build_env(invocation)
         env = await self._apply_login_fallback(env, invocation)
         start = time.monotonic()
@@ -1603,6 +1730,8 @@ class CCInvoker:
     ) -> CCOutput:
         """Run CC with stream-json output, calling on_event for each line."""
         args = self._build_args(invocation)
+        # Off the event loop: settings read, seal write, two probes.
+        await self.verify_allowlist_enforceable(invocation)
         # Override output format to stream-json (requires --verbose with -p).
         # Target the --output-format value by its flag, not a bare args.index("json")
         # scan — other args (e.g. --settings .../cc-span-settings.json) can contain

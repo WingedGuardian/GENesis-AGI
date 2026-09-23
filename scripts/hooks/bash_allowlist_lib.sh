@@ -68,20 +68,25 @@ genesis_bash_allowlist_verdict() {
     #   &   &(no space)   reach a second binary  -> ADDED here
     #   ;   &&   ||   |   `…`   $(…)   >   <     reach one, already listed
     #   ;;   ;&   ;;&                            parse only inside `case`, and
-    #                                            every spelling contains `;`
-    #   (   )                                    do not reach one in any
-    #                                            position the entries above
-    #                                            leave open — `(cmd)` after an
-    #                                            allowlisted token is a syntax
-    #                                            error, and reaching it needs a
+    #                                            every spelling contains `;`,
+    #                                            so they are already covered
+    #   (   )                                    reach nothing in any position
+    #                                            the entries above leave open —
+    #                                            `(cmd)` after an allowlisted
+    #                                            token is a syntax error, and
+    #                                            reaching a subshell needs a
     #                                            separator already blocked
     #
-    # So `(`/`)` are deliberately NOT listed: they would refuse quoted
-    # parentheses in ordinary arguments (a `--jq` filter, a search query) while
-    # closing nothing measurable. Over-blocking is the right side to err on
-    # where it buys something; here it buys nothing.
+    # `(` and `)` are listed ANYWAY, by owner decision, as defence in depth
+    # against a construction the enumeration above did not model. Recording the
+    # trade rather than the conclusion: the measurement says they close nothing
+    # reachable today, and they DO cost — a parenthesis in an ordinary argument
+    # (a `--jq` filter, a search query, a PR title) is now refused in an
+    # allowlisted session. That cost is real and is pinned by tests, so the next
+    # reader can price it rather than rediscover it. The operator can still pass
+    # such an argument; it has to come from a tool that is not Bash.
     case "$cmd" in
-        *';'*|*'&'*|*'|'*|*'`'*|*'$('*|*'>'*|*'<'*)
+        *';'*|*'&'*|*'|'*|*'`'*|*'$('*|*'>'*|*'<'*|*'('*|*')'*)
             echo "BLOCKED: this session's Bash may not chain, pipe, substitute, or redirect (allowlist: $allow)." >&2
             return 2;;
     esac

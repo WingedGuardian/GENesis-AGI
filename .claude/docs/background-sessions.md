@@ -108,8 +108,15 @@ profile grants a scoped shell by appearing in `_PROFILE_BASH_ALLOWLIST`
 (`src/genesis/cc/direct_session.py`); without an entry there, a Bash-granting
 profile's shell is governed only by the global destructive-op blocks. The
 allowlist matches the command's **first token** and blocks embedded newlines
-plus chaining/piping/substitution/redirection (`; & && || | ` ` $() > <`) —
-note `&` on its own, which backgrounds the first command and runs the next.
+plus chaining/piping/substitution/redirection — `; & && || |` backtick `$() > <`
+and also `( )`. Two of those are worth knowing about: `&` on its own backgrounds
+the first command and RUNS THE NEXT one, so it is not covered by `&&`; and the
+parentheses are defence in depth rather than a measured escape — against real
+bash a subshell is unreachable in every position the other entries leave open,
+so the cost they carry is real (a parenthesis in a `--jq` filter, a search
+query or a PR title is refused) while the protection is speculative. If that
+trade ever wants revisiting, the enumeration is in
+`scripts/hooks/bash_allowlist_lib.sh` and the cost is pinned by tests.
 
 **What first-token allowlisting cannot do on its own**, stated because the one
 built-in case is also the one exposed to external content: it bounds WHICH
