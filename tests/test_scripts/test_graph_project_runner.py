@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -122,17 +123,34 @@ def test_a_held_lock_is_a_clean_no_op(tmp_path, fake_repo):
 
     The work is being done. Going red here would make a collision with the
     manual run the docs recommend look like a failure.
+
+    WAITS for the holder to actually take the lock before running the child.
+    An earlier version started the holder and immediately invoked the runner,
+    which races: if the holder had not yet acquired, the runner took the lock,
+    ran to completion and the test passed for entirely the wrong reason. A
+    reviewer caught it. Confirming acquisition is cheap; a flaky test that
+    passes wrongly is not.
     """
     home = tmp_path / "genesis"
     (home / "locks").mkdir(parents=True)
     lock = home / "locks" / "graph-project-runner.lock"
     lock.touch()
 
-    # Hold it for the duration of the child's attempt.
-    with subprocess.Popen(
-        ["flock", "-x", str(lock), "sleep", "10"],
-    ) as holder:
+    with subprocess.Popen(["flock", "-x", str(lock), "sleep", "30"]) as holder:
         try:
+            # Poll until a non-blocking attempt FAILS, which is positive proof
+            # the holder owns it — not a sleep, which would only make the race
+            # rarer.
+            deadline = time.monotonic() + 30
+            while True:
+                probe = subprocess.run(
+                    ["flock", "-n", str(lock), "true"], capture_output=True, check=False
+                )
+                if probe.returncode != 0:
+                    break
+                assert time.monotonic() < deadline, "holder never acquired the lock"
+                time.sleep(0.05)
+
             res = _run(home=home, repo=fake_repo, timeout=60)
         finally:
             holder.terminate()
@@ -140,6 +158,9 @@ def test_a_held_lock_is_a_clean_no_op(tmp_path, fake_repo):
 
     assert res.returncode == 0, f"a held lock must be 0, got {res.returncode}"
     assert "already in progress" in res.stdout
+    assert "stub: projected" not in res.stdout, (
+        "the runner must not have projected while the lock was held"
+    )
 
 
 def test_a_missing_venv_is_a_clean_no_op(tmp_path):

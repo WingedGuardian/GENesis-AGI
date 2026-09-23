@@ -39,36 +39,14 @@ from pathlib import Path
 from urllib.parse import quote
 
 from genesis.env import falkordb_socket_path, genesis_db_path
-from genesis.memory.graphstore import GraphUnavailableError
-from genesis.memory.graphstore_config import load_config
+from genesis.memory.graphstore import DatabaseUnreachable, GraphUnavailableError
+from genesis.memory.graphstore_config import config_is_readable, load_config
 from genesis.memory.graphstore_falkor import GRAPH_KEY, FalkorGraphStore, ProjectionInProgress
 
 #: Client module the store imports. Named here rather than imported so the
 #: armed check costs nothing on an install that never provisioned the engine —
 #: importing it to find out whether it imports is the thing being avoided.
 _CLIENT_MODULE = "falkordb"
-
-
-class _DatabaseUnreachable(GraphUnavailableError):
-    """The memory DATABASE could not be opened or read.
-
-    A SUBCLASS rather than a substring match on the message, because `main()`
-    has to tell three failures apart to print the right remediation, and keying
-    that on message wording means rewording a message silently sends the reader
-    to the wrong service. MEASURED before this existed: a database that could
-    not be opened printed "the engine is not reachable over its socket — check
-    genesis-falkordb", which is a different subsystem from the one that failed.
-    That matters more now than it did, because the hourly timer prints this
-    into the journal unattended, where a wrong instruction is all the reader
-    gets.
-
-    Still a ``GraphUnavailableError``, so every existing caller that catches
-    that catches this unchanged.
-
-    The client-vs-engine split below it is still a substring match on
-    "not importable", raised in ``graphstore_falkor``. Left alone deliberately:
-    moving it is that module's change, not this one's.
-    """
 
 
 def armed(socket_path: Path | None = None) -> tuple[bool, str]:
@@ -113,6 +91,15 @@ def armed(socket_path: Path | None = None) -> tuple[bool, str]:
     config ``enabled`` key above is the lever that stops the projector, and it
     is the one that survives into a unit.
     """
+    # A config we cannot READ is not consent. `load_config()` absorbs a parse
+    # failure and returns DEFAULTS, and DEFAULTS["enabled"] is True — so
+    # without this check a corrupted overlay is indistinguishable from an
+    # operator enabling the backend, and the projector would read a typo as
+    # permission. Checked FIRST, before the value itself, because the value is
+    # meaningless when its source did not parse.
+    if not config_is_readable():
+        return False, "graphstore config did not parse — declining to act on defaults"
+
     try:
         # `is not True`, NOT falsiness — the same reading `graphstore_config`'s
         # `effective_mode()` uses, and for the same reason it spells out: the
@@ -127,9 +114,12 @@ def armed(socket_path: Path | None = None) -> tuple[bool, str]:
         # a second reading of a value another module already defines.
         if load_config().get("enabled", True) is not True:
             return False, "graphstore is not enabled in config (enabled is not exactly true)"
-    except Exception as exc:  # noqa: BLE001 - unreadable config is not armed
-        # load_config() degrades to defaults internally, so reaching here means
-        # something worse than a bad value. Not armed, and say which.
+    except Exception as exc:  # noqa: BLE001 - anything unexpected is not armed
+        # NOT the unreadable-config case — `config_is_readable()` above owns
+        # that, because `load_config()` never raises for a parse failure. This
+        # catches something worse and unforeseen (an unreadable directory, a
+        # permission error on the stat). Kept, and no longer claiming to handle
+        # a case it cannot reach.
         return False, f"graphstore config could not be read: {type(exc).__name__}"
 
     sock = socket_path if socket_path is not None else falkordb_socket_path()
@@ -174,15 +164,19 @@ async def build(graph_key: str = GRAPH_KEY) -> dict[str, int]:
             f"file:{quote(str(db_path), safe='/')}?mode=ro", uri=True
         )
     except Exception as exc:
-        raise _DatabaseUnreachable(
+        raise DatabaseUnreachable(
             f"the memory database at {db_path} cannot be opened: {exc}"
         ) from exc
     try:
         return await store.project(db)
     except GraphUnavailableError:
+        # Includes DatabaseUnreachable raised INSIDE the store while reading
+        # SQLite to build the projection — re-raised with its type intact,
+        # which is the whole point of the type being shared rather than
+        # private to this module.
         raise
     except Exception as exc:
-        raise _DatabaseUnreachable(
+        raise DatabaseUnreachable(
             f"the memory database at {db_path} cannot be read: {exc}"
         ) from exc
     finally:
@@ -234,7 +228,7 @@ def main() -> int:
             print(f"skipping: {exc}")
             return 0
         print(f"cannot project: {exc}")
-        if isinstance(exc, _DatabaseUnreachable):
+        if isinstance(exc, DatabaseUnreachable):
             # Checked FIRST and by TYPE. Before this branch existed a database
             # failure fell through to the engine message below and told the
             # reader to check a service that was running perfectly.

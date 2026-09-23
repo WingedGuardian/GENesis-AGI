@@ -29,7 +29,11 @@
   it exits immediately with one line and no error, rather than failing hourly
   forever. Setting `enabled: false` in `config/graphstore.yaml` stops it too.
 
-  Still outstanding, and worth knowing if you are relying on this: an hour is a
-  *bound*, not freshness-on-write. A burst inside the hour can still leave the
-  projection meaningfully behind. Write-level freshness needs a database-side
-  change signal, which is tracked separately and is not part of this change.
+  Two caveats, both worth knowing if you are relying on this. An hour is a
+  *bound*, not freshness-on-write: a burst of writes inside the hour can still
+  leave the projection meaningfully behind, and write-level freshness needs a
+  database-side change signal that is tracked separately. And the bound is a
+  little over an hour rather than exactly one — the schedule adds up to three
+  minutes of deliberate jitter so this job does not collide with the other
+  timers, and the published snapshot is further behind by however long the
+  rebuild takes.

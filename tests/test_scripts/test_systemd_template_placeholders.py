@@ -232,33 +232,79 @@ def _persistent_timers() -> list[Path]:
     ]
 
 
-def test_every_persistent_timer_is_cleaned_up_by_uninstall():
-    """`Persistent=true` leaves a stamp under ~/.local/share/systemd/timers/
-    that removing the unit file does NOT remove.
+def test_every_clean_site_uses_the_shared_timer_inventory():
+    """PER SITE, not a whole-file count — that distinction is the bug.
 
-    systemd.timer(5) says to run `systemctl clean --what=state` BEFORE
-    uninstalling such a unit; uninstall.sh does exactly that, for a list of
-    timers written out by hand. A new Persistent timer that is not added to
-    that list leaves a stale "last run" behind, and a reinstall can then
-    immediately replay a run it should not — for the projector, a full
-    re-projection during bootstrap.
+    `uninstall.sh` has TWO cleanup paths: direct-container and host-driven.
+    Each used to carry its own hardcoded `clean --what=state` list, and they
+    drifted: a timer was added to one and not the other, which the file's own
+    comment had already named as an asymmetry once before it happened again.
 
-    Generalised from `test_cc_tmp_align_template.py`, which enforces the same
-    rule for a single named timer and so could not see the next one.
+    An earlier version of this test counted timer names across the WHOLE file
+    and so passed while one path was entirely uncovered — it proved a name
+    appeared *somewhere*, which is not the property that matters. A reviewer
+    caught exactly that. The fix is a single shared inventory variable; this
+    asserts every site uses it, so a new timer added to the inventory reaches
+    both paths and no site can hardcode its way back out.
     """
     uninstall = (REPO / "scripts" / "uninstall.sh").read_text(encoding="utf-8")
-    missing: list[str] = []
-    for timer in _persistent_timers():
-        name = timer.name.removesuffix(".template")
-        # Twice: once to stop/disable, once in the `clean --what=state` list.
-        if uninstall.count(name) < 2:
-            missing.append(f"{name} (appears {uninstall.count(name)}x, need >=2)")
-
-    assert not missing, (
-        "scripts/uninstall.sh must both disable AND clear persistent state for "
-        "every Persistent=true timer; these are under-covered:\n  "
-        + "\n  ".join(missing)
+    # Comments stripped first. Without this the scan matches PROSE mentioning
+    # the command — including this repo's own explanatory comments and the one
+    # in uninstall.sh that describes this very rule — and reports them as
+    # hardcoded sites. The sibling `_substituted_tokens` above had the
+    # identical defect; the lesson did not transfer on its own.
+    code = "\n".join(
+        line for line in uninstall.splitlines() if not _COMMENT_LINE.match(line)
     )
+    sites = re.findall(r"clean --what=state([^\n]*)", code)
+    # Denominator: both cleanup paths must be present, or this is vacuous.
+    assert len(sites) >= 2, (
+        f"expected at least 2 `clean --what=state` sites (direct-container and "
+        f"host-driven), found {len(sites)} — the scan is probably broken"
+    )
+    hardcoded = [site.strip() for site in sites if "$GENESIS_PERSISTENT_TIMERS" not in site]
+    assert not hardcoded, (
+        "every `clean --what=state` site must use $GENESIS_PERSISTENT_TIMERS so "
+        "the two uninstall paths cannot drift; these hardcode their own list:\n  "
+        + "\n  ".join(hardcoded)
+    )
+
+
+def test_the_shared_inventory_lists_every_persistent_timer():
+    """The inventory is only worth using if it is COMPLETE.
+
+    Derived from the templates rather than copied, so adding a
+    `Persistent=true` timer without adding it here fails.
+    """
+    uninstall = (REPO / "scripts" / "uninstall.sh").read_text(encoding="utf-8")
+    match = re.search(
+        r'GENESIS_PERSISTENT_TIMERS="(.*?)"', uninstall, re.S
+    )
+    assert match, "GENESIS_PERSISTENT_TIMERS is not defined in scripts/uninstall.sh"
+    listed = set(match.group(1).split())
+
+    expected = {p.name.removesuffix(".template") for p in _persistent_timers()}
+    missing = expected - listed
+    assert not missing, (
+        "these Persistent=true timers are not in GENESIS_PERSISTENT_TIMERS, so "
+        f"their schedule stamps survive an uninstall: {sorted(missing)}"
+    )
+
+
+# NOT CHECKED HERE, deliberately: whether each persistent timer is also
+# DISABLED. An earlier draft asserted "the name appears at least twice in
+# uninstall.sh" as a proxy for disable-plus-clean. It was wrong twice over — the
+# shared inventory collapses each name to ONE occurrence, so the count stopped
+# meaning anything the moment the duplication it measured was removed; and
+# `genesis-cc-align.timer` is host-only by contract with no container leg, so it
+# is CORRECTLY absent from container-side disable lists and the rule would have
+# cried wolf on a file that was right.
+#
+# A real check would have to parse the disable invocations, which are not
+# uniform (a `for` loop, inline `systemctl --user disable`, and a
+# `container_exec` heredoc), and would need to know which units are host-only.
+# That is worth doing; it is not worth faking with a count. Left as a stated
+# gap rather than a green test that proves nothing.
 
 
 def test_there_is_at_least_one_persistent_timer_to_check():

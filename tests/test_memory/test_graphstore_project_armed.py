@@ -20,7 +20,7 @@ from __future__ import annotations
 import pytest
 
 from genesis.memory import graphstore_project as gp
-from genesis.memory.graphstore import GraphUnavailableError
+from genesis.memory.graphstore import DatabaseUnreachable, GraphUnavailableError
 from genesis.memory.graphstore_falkor import ProjectionInProgress
 
 
@@ -199,7 +199,7 @@ def test_a_database_failure_does_not_blame_the_graph_engine(monkeypatch, socket,
     monkeypatch.setattr(gp, "falkordb_socket_path", lambda: socket)
 
     async def _db_fails(*_a, **_k):
-        raise gp._DatabaseUnreachable("the memory database at /x/y.db cannot be opened")
+        raise DatabaseUnreachable("the memory database at /x/y.db cannot be opened")
 
     monkeypatch.setattr(gp, "build", _db_fails)
 
@@ -229,7 +229,7 @@ def test_an_engine_failure_still_blames_the_engine(monkeypatch, socket, capsys):
 def test_the_database_error_is_still_a_graph_unavailable_error():
     """Subclassing is the compatibility promise: every existing caller catches
     GraphUnavailableError, and none of them should have to learn a new type."""
-    assert issubclass(gp._DatabaseUnreachable, GraphUnavailableError)
+    assert issubclass(DatabaseUnreachable, GraphUnavailableError)
 
 
 def test_a_collision_with_another_projector_is_a_no_op_not_a_failure(monkeypatch, socket, capsys):
@@ -254,3 +254,87 @@ def test_a_collision_with_another_projector_is_a_no_op_not_a_failure(monkeypatch
     assert "skipping" in out
     assert "genesis-falkordb" not in out
     assert "cannot project" not in out
+
+
+def test_a_db_read_failure_inside_the_store_also_routes_to_the_database(
+    monkeypatch, socket, capsys
+):
+    """The path the first fix MISSED, and the reason the type is shared.
+
+    `FalkorGraphStore._project_locked` converts every SQLite read failure into
+    the graph error hierarchy itself, so it never reached `build()`'s generic
+    `except Exception` where the private type used to be applied — the
+    `except GraphUnavailableError: raise` above it won first. Only the
+    database-OPEN path was covered, which a reviewer caught.
+
+    Now the store raises the shared `DatabaseUnreachable` directly, so the type
+    survives the re-raise and the remediation is right for both.
+    """
+    monkeypatch.setattr(gp, "falkordb_socket_path", lambda: socket)
+
+    async def _store_read_fails(*_a, **_k):
+        raise DatabaseUnreachable(
+            "the memory database cannot be read — the projection cannot be built: no such table"
+        )
+
+    monkeypatch.setattr(gp, "build", _store_read_fails)
+
+    assert _run(monkeypatch, ["--if-armed"]) == 1
+    out = capsys.readouterr().out
+    assert "memory database could not be read" in out
+    assert "genesis-falkordb" not in out
+
+
+def test_the_store_raises_the_shared_type_for_a_db_read_failure():
+    """Binds the PRODUCER, not just this module's handling of it.
+
+    Asserting only that `main()` routes the type correctly would pass even if
+    the store went back to raising the generic error — which is precisely the
+    defect that shipped. This pins the raise site itself.
+    """
+    import inspect
+
+    from genesis.memory import graphstore_falkor
+
+    src = inspect.getsource(graphstore_falkor.FalkorGraphStore._project_locked)
+    assert "raise DatabaseUnreachable(" in src, (
+        "_project_locked must raise the shared DatabaseUnreachable for SQLite "
+        "read failures; raising the generic GraphUnavailableError sends "
+        "operators to the graph engine for a database problem"
+    )
+
+
+# -- a config we cannot read is not consent ------------------------------------
+
+
+def test_an_unparseable_config_is_not_armed(monkeypatch, socket):
+    """`load_config()` absorbs a parse failure and returns DEFAULTS, and
+    DEFAULTS["enabled"] is True — so without a validity check a corrupted
+    overlay is indistinguishable from an operator enabling the backend.
+
+    The realistic path: someone edits the overlay to write `enabled: false`,
+    fat-fingers the YAML, and the projector reads the typo as permission.
+    """
+    monkeypatch.setattr(gp, "config_is_readable", lambda: False)
+    ok, reason = gp.armed(socket)
+    assert ok is False
+    assert "did not parse" in reason
+
+
+def test_config_is_readable_rejects_broken_yaml(tmp_path, monkeypatch):
+    """Binds the accessor itself, not just this module's use of it."""
+    from genesis.memory import graphstore_config as gc
+
+    bad = tmp_path / "graphstore.yaml"
+    bad.write_text("enabled: [unclosed\n", encoding="utf-8")
+    monkeypatch.setattr(gc, "_base_path", lambda: bad)
+    assert gc.config_is_readable() is False
+
+
+def test_config_is_readable_treats_an_absent_file_as_fine(tmp_path, monkeypatch):
+    """ABSENT is not CORRUPT, and conflating them would make 'no config' mean
+    'do nothing' — a different and wrong reading for a fresh install."""
+    from genesis.memory import graphstore_config as gc
+
+    monkeypatch.setattr(gc, "_base_path", lambda: tmp_path / "nope.yaml")
+    assert gc.config_is_readable() is True

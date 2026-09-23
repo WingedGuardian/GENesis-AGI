@@ -54,7 +54,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from genesis.env import falkordb_socket_path
-from genesis.memory.graphstore import GraphNode, GraphUnavailableError
+from genesis.memory.graphstore import DatabaseUnreachable, GraphNode, GraphUnavailableError
 
 if TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Awaitable, Callable
@@ -861,7 +861,13 @@ class FalkorGraphStore:
             # escaping as a raw aiosqlite error past a facade that catches only
             # GraphUnavailableError — and this store must not reintroduce it on
             # its own projection path.
-            raise GraphUnavailableError(
+            # DatabaseUnreachable, not the generic error: this is the DATABASE
+            # failing, and the caller routes remediation on the type. Raising
+            # the parent here sent operators to `systemctl status
+            # genesis-falkordb` for a database problem, because the CLI's own
+            # database branch sits behind an `except GraphUnavailableError:
+            # raise` that this raise satisfied first.
+            raise DatabaseUnreachable(
                 f"the memory database cannot be read — the projection cannot "
                 f"be built: {exc}"
             ) from exc
