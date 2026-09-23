@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -260,10 +261,134 @@ async def _get_scope_args() -> list[str]:
         return _SCOPE_ARGS or []
 
 
-# A minimal, runtime-generated CC settings file that registers ONLY the span
-# PostToolUse hook. Lives outside the repo so it is install-local and never
-# committed; regenerated idempotently (see cc_span_settings_path).
+# A minimal, runtime-generated CC settings file that registers the hooks a
+# dispatched session cannot otherwise receive. Lives outside the repo so it is
+# install-local and never committed; regenerated idempotently (see
+# cc_span_settings_path).
 _CC_SPAN_SETTINGS_PATH = Path.home() / ".genesis" / "cc-span-settings.json"
+
+# The hook that enforces GENESIS_BASH_ALLOWLIST, named once so the registration
+# and the pre-launch checks that verify it cannot drift apart.
+_ALLOWLIST_GUARD_SCRIPT = "hooks/bash_allowlist_guard.sh"
+
+
+# A sealed `gh` configuration for allowlisted sessions. Shared rather than
+# per-dispatch because its content is derived from the operator's own gh config
+# and is identical for every dispatch, so one idempotently-maintained directory
+# has no cleanup surface and no concurrent-writer problem.
+_SEALED_GH_CONFIG_DIR = Path.home() / ".genesis" / "gh-sealed"
+
+# gh reads `config.yml` for aliases, pager and editor. Synthesised rather than
+# copied: the session needs a file to exist (gh writes one on migration
+# otherwise, which a read-only directory would turn into a hard failure), and
+# the values we want are exactly "no aliases, no shell-spawning pager".
+_SEALED_GH_CONFIG_YML = 'version: "1"\npager: cat\naliases: {}\n'
+
+
+def _sealed_gh_config_dir() -> str | None:
+    """A read-only ``GH_CONFIG_DIR`` that keeps ``gh`` from spawning a shell.
+
+    THE PROBLEM. ``gh`` can be told to run arbitrary commands through its own
+    configuration — a shell alias, a pager, an editor, an extension. Every one
+    of those is reached with ``gh`` as the first token, so a first-token
+    allowlist permits the command that installs the escape AND the command that
+    triggers it. VERIFIED executing: two permitted ``gh`` invocations were
+    enough to run an arbitrary program. That matters most on the one profile
+    that has an allowlist, which is also the one that reads external pull
+    request threads, i.e. attacker-authored text.
+
+    THE FIX. Point the session at a directory gh cannot write: an unwritable
+    ``config.yml`` means ``gh alias set`` and ``gh config set`` fail, and the
+    synthesised contents pin the pager to ``cat`` so the pager route is closed
+    even before that. MEASURED: auth still resolves, ordinary ``gh`` commands
+    including live API calls still work, and both write paths return non-zero.
+
+    ``hosts.yml`` IS copied, because it is where the credential lives and gh
+    has no other way to find it. The copy is 0400 inside a 0500 directory owned
+    by this user — the same reachability as the original, which is 0600 in the
+    user's own home — so this moves a secret, it does not widen who can read
+    one. Say that plainly rather than leaving it implied.
+
+    Returns the directory, or ``None`` when it cannot be prepared — the caller
+    then leaves ``GH_CONFIG_DIR`` alone rather than pointing a session at a
+    half-built config.
+
+    NOT a complete confinement of ``gh``. Subcommands that write files to
+    caller-chosen paths remain available. The allowlist bounds the binary; this
+    bounds one binary's self-reconfiguration. Both limits are documented in
+    ``.claude/docs/background-sessions.md``.
+    """
+    source = Path(os.environ.get("GH_CONFIG_DIR") or (Path.home() / ".config" / "gh"))
+    hosts = source / "hosts.yml"
+    desired = {
+        "config.yml": _SEALED_GH_CONFIG_YML,
+        # Absent when gh was never authenticated. Seal anyway: an unauthenticated
+        # session is no reason to leave the alias route open.
+        **({"hosts.yml": hosts.read_text(encoding="utf-8")} if hosts.is_file() else {}),
+    }
+    target = _SEALED_GH_CONFIG_DIR
+    try:
+        current = {
+            p.name: p.read_text(encoding="utf-8")
+            for p in (target.iterdir() if target.is_dir() else ())
+            if p.is_file()
+        }
+        if current != desired:
+            target.mkdir(parents=True, exist_ok=True)
+            target.chmod(0o700)
+            for stale in target.iterdir():
+                if stale.is_file() and stale.name not in desired:
+                    stale.unlink()
+            for name, body in desired.items():
+                path = target / name
+                path.touch(mode=0o600, exist_ok=True)
+                path.chmod(0o600)
+                path.write_text(body, encoding="utf-8")
+                path.chmod(0o400)
+            target.chmod(0o500)
+        return str(target)
+    except OSError:
+        logger.warning("Could not prepare the sealed gh config at %s", target, exc_info=True)
+        return None
+
+
+def _gh_hardening() -> dict[str, str]:
+    """Environment that keeps an allowlisted ``gh`` from spawning a shell."""
+    sealed = _sealed_gh_config_dir()
+    # GH_PAGER belts the pager route independently of the config file, so it
+    # holds even if the sealed directory could not be prepared.
+    hardened = {"GH_PAGER": "cat", "PAGER": "cat"}
+    if sealed:
+        hardened["GH_CONFIG_DIR"] = sealed
+    return hardened
+
+
+#: Per-allowlisted-binary environment hardening. Keyed by the binary as it
+#: appears in a profile's ``bash_allowlist``.
+_BINARY_HARDENING: dict[str, Callable[[], dict[str, str]]] = {"gh": _gh_hardening}
+
+
+def _allowlist_guard_argv() -> list[str] | None:
+    """The argv that runs the allowlist guard, computed LOCALLY.
+
+    Single source of truth for two callers that must not disagree: the settings
+    writer, which registers this command for Claude Code to run, and the
+    pre-launch binding check, which runs it here to confirm it refuses.
+
+    The binding check deliberately does NOT execute the command it parses out
+    of the settings file. That file lives outside the repo and is writable by
+    any same-uid process, so executing its contents would run an attacker-
+    chosen argv inside the parent — which inherits the server's full
+    environment, credentials included. The parsed value is COMPARED to this,
+    and this is what runs.
+    """
+    from genesis import env
+
+    genesis_hook = env.repo_root() / ".claude" / "hooks" / "genesis-hook"
+    if not genesis_hook.exists():
+        return None
+    return [str(genesis_hook), _ALLOWLIST_GUARD_SCRIPT]
+
 
 # Keep an owned background-wait ceiling strictly below the hard timeout_s SIGKILL
 # so the CLI ends bg-wait + flushes a partial result (and prints its "terminating"
@@ -365,22 +490,46 @@ async def _emit_bg_truncation_event(cc_session_id: str) -> None:
 
 
 def cc_span_settings_path() -> str | None:
-    """Generate (idempotently) a minimal CC settings file that registers ONLY
-    the span PostToolUse hook, and return its absolute path — or ``None`` if the
+    """Generate (idempotently) the minimal CC settings file injected into every
+    dispatched session, and return its absolute path — or ``None`` if the
     launcher is unavailable.
+
+    (The name is historical: the span hook was this file's first tenant. It now
+    carries the small set of hooks a dispatch cannot otherwise receive.)
 
     Why this exists: dispatched CC sessions run with a working directory outside
     any git repo (``~/.genesis/background-sessions``), and Claude Code discovers
     project ``.claude/settings.json`` via git-root detection — so the repo-level
     hook registration never loads there and ``cc_span_hook`` never fires. Passing
-    this file via ``--settings`` injects JUST that hook; CC merges it with the
-    user's settings, leaving every other hook untouched. The hook itself no-ops
-    unless ``GENESIS_TRACE_ID`` is set, so attaching it to every dispatch is safe
-    (and is why this is the *single* registration — the repo-level one was
-    removed to avoid a double-fire when a dispatch runs in a worktree cwd, which
-    *does* load repo settings).
+    this file via ``--settings`` injects JUST these hooks; CC merges them with
+    the user's settings, leaving every other hook untouched.
 
-    The hook command uses an ABSOLUTE path to the ``genesis-hook`` launcher,
+    Two hooks, and BOTH are registered UNCONDITIONALLY because both are
+    documented no-ops unless an environment variable is set — which is what lets
+    this stay a single fixed path written idempotently, with no per-invocation
+    content for two concurrent dispatches to race over:
+
+    * ``cc_span_hook`` (PostToolUse) no-ops unless ``GENESIS_TRACE_ID`` is set.
+      This is the *single* registration — the repo-level one was removed to
+      avoid a double-fire when a dispatch runs in a worktree cwd, which *does*
+      load repo settings.
+    * ``bash_allowlist_guard`` (PreToolUse/Bash) no-ops unless
+      ``GENESIS_BASH_ALLOWLIST`` is set, returning before it reads stdin. It is
+      what actually enforces a scoped profile's Bash restriction; without it the
+      restriction is declared by ``_build_env`` and read by nobody. See
+      ``scripts/hooks/bash_allowlist_lib.sh`` for the predicate and the reason
+      an install may safely have both this and the user-level chokepoint wired.
+      The no-op is cheap but not free: MEASURED ~30ms per Bash call on a live
+      install, spent in the launcher rather than the guard, and paid by EVERY
+      dispatched session rather than only scoped ones.
+
+    MEASURED 2026-09-23 on CC 2.1.246, from a dispatch-shaped invocation (cwd
+    outside any repo, ``--dangerously-skip-permissions``): a PreToolUse Bash
+    hook supplied via ``--settings`` fires, and its exit 2 refuses the call —
+    the command demonstrably does not run. Controls: the same invocation without
+    ``--settings`` ran the command and left no hook marker.
+
+    The hook commands use an ABSOLUTE path to the ``genesis-hook`` launcher,
     which self-locates the install root from its own filesystem position — NOT
     ``${CLAUDE_PROJECT_DIR}``, which CC leaves unset in dispatched sessions.
     Written atomically and only when stale, so it tracks the install root across
@@ -391,10 +540,53 @@ def cc_span_settings_path() -> str | None:
     genesis_hook = env.repo_root() / ".claude" / "hooks" / "genesis-hook"
     if not genesis_hook.exists():
         return None
+    guard_argv = _allowlist_guard_argv()
+    if guard_argv is None:  # pragma: no cover - same existence test as above
+        return None
 
     desired = json.dumps(
         {
             "hooks": {
+                "PreToolUse": [
+                    {
+                        # ANCHORED, and measured rather than assumed: a matcher
+                        # is a REGEX (probed on CC 2.1.246 — a hook registered
+                        # as "^Bash$" fires on a Bash call), so a bare "Bash"
+                        # also matches "BashOutput". That tool carries no
+                        # .tool_input.command, so under an allowlist it would
+                        # hit this guard's fail-closed leg and be refused with a
+                        # message about a command it never had. The ~15 hooks in
+                        # .claude/settings.json using a bare "Bash" do not show
+                        # this because they all fail OPEN on an unreadable
+                        # payload.
+                        "matcher": "^Bash$",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                # Built from the same helper the pre-launch
+                                # binding check uses, so the command that is
+                                # registered and the command that is verified
+                                # cannot drift. shlex.join quotes it: an install
+                                # root containing a space would otherwise
+                                # produce a command CC's shell cannot resolve —
+                                # exit 127, which is non-blocking, i.e. a
+                                # permit.
+                                "command": shlex.join(guard_argv),
+                                # Generous by ~300x against the guard's real cost
+                                # (an env test, one jq, one awk — well under a
+                                # tenth of a second), because the failure
+                                # direction is asymmetric: a PreToolUse hook that
+                                # exceeds its declared timeout is killed and the
+                                # call PROCEEDS, so a tight bound on a
+                                # containment hook converts it into a silent
+                                # permit. Bounded rather than omitted so a hook
+                                # that somehow hangs cannot stall the session
+                                # indefinitely.
+                                "timeout": 30,
+                            },
+                        ],
+                    },
+                ],
                 "PostToolUse": [
                     {
                         "matcher": ".*",
@@ -519,6 +711,211 @@ class CCInvoker:
         except Exception:
             logger.warning("CC empty-output callback failed", exc_info=True)
 
+    def _refuse_unenforceable_allowlist(self, inv: CCInvocation, span_settings: str | None) -> None:
+        """Refuse to launch a Bash-restricted profile whose restriction will not
+        be enforced.
+
+        ``_build_env`` exports ``GENESIS_BASH_ALLOWLIST`` for a scoped profile,
+        but the export is only a DECLARATION — a hook has to read it. If the
+        hook is not going to run, the profile launches with unrestricted Bash
+        while every declaration in the codebase says it is confined, which is
+        strictly worse than having no allowlist at all: the safety argument in
+        ``autonomy/audit.py`` rests on it.
+
+        Checked here rather than by parsing the user's settings — that would be
+        the wrong instrument, since it would also have to find a USER-level
+        registration, which an install may legitimately have, and refusing there
+        would strand a correctly-protected box. What the invoker can answer
+        exactly is whether IT armed the hook, and whether the hook BINDS.
+
+        Called from ``_build_args``, which is the chokepoint both spawn paths
+        share (``run`` and ``run_streaming``), so one check covers both.
+        """
+        if not inv.bash_allowlist:
+            return
+
+        allowlist = ",".join(inv.bash_allowlist)
+        if span_settings is None:
+            raise RuntimeError(
+                f"Refusing to launch: this invocation restricts Bash to "
+                f"[{allowlist}], but the settings file that registers the "
+                f"enforcing hook could not be written, so the restriction "
+                f"would not be applied. Check that "
+                f".claude/hooks/genesis-hook exists and that ~/.genesis is "
+                f"writable."
+            )
+        # ORDER MATTERS, and not only for speed. The checks below are grouped
+        # cheapest-and-most-specific first: the three that read only fields of
+        # this invocation, then the file read, then the subprocess probes. A
+        # caller that trips one of the cheap conditions gets the message about
+        # THAT condition rather than a generic one from a later check it would
+        # also have failed — which is what stops a test asserting "it refuses"
+        # from passing for the wrong reason.
+        #
+        # env_overrides is applied LAST in _build_env and wins over everything,
+        # so it can blank the variable the guard reads after every other check
+        # has passed. Nothing does this today; this keeps it that way.
+        override = (inv.env_overrides or {}).get("GENESIS_BASH_ALLOWLIST")
+        if override is not None and override != allowlist:
+            raise RuntimeError(
+                f"Refusing to launch: this invocation restricts Bash to "
+                f"[{allowlist}], but env_overrides sets "
+                f"GENESIS_BASH_ALLOWLIST={override!r}, and env_overrides wins — "
+                f"the guard would read that instead. Set one or the other."
+            )
+        if inv.bare:
+            raise RuntimeError(
+                f"Refusing to launch: this invocation restricts Bash to "
+                f"[{allowlist}], but --bare skips hooks entirely, so the "
+                f"restriction would not be applied. Drop bare=True, or drop "
+                f"the bash_allowlist and confine the profile another way."
+            )
+        if inv.safe_mode:
+            raise RuntimeError(
+                f"Refusing to launch: this invocation restricts Bash to "
+                f"[{allowlist}], but --safe-mode disables all hooks, so the "
+                f"restriction would not be applied. Drop safe_mode=True, or "
+                f"drop the bash_allowlist and confine the profile another way."
+            )
+        # The settings file is ONE shared path, so a concurrently-running
+        # Genesis process on OLDER code recomputes the span-only payload, sees
+        # this content as stale, and rewrites it — after we wrote it. Re-read
+        # immediately before launch rather than trusting the write.
+        try:
+            registered = Path(span_settings).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(
+                f"Refusing to launch: this invocation restricts Bash to "
+                f"[{allowlist}], but the settings file could not be re-read to "
+                f"confirm the enforcing hook is registered ({exc.strerror})."
+            ) from exc
+        # The child's REAL environment, not this process's. env_overrides is
+        # applied last and wins, so a probe run under os.environ would test a
+        # different PATH (where `jq`/`awk` resolve from) and a different
+        # GENESIS_HOOK_DEV_LOCAL (which root the guard is loaded from) than
+        # the session actually gets. Defending one variable by name was the
+        # narrower version of this; building the same env makes the check
+        # faithful by construction.
+        self._verify_allowlist_guard_binds(registered, inv.bash_allowlist, self._build_env(inv))
+
+    @staticmethod
+    def _verify_allowlist_guard_binds(
+        registered: str, bash_allowlist: tuple[str, ...], child_env: dict[str, str]
+    ) -> None:
+        """Prove the registered guard REFUSES and PERMITS — by running it.
+
+        Every check above establishes that the guard is REGISTERED. None of them
+        establishes that it BINDS, and the gap between those is where this
+        failed once already: the launcher resolves a hook against the MAIN
+        worktree, while the registrar checks the INVOKING tree, so a guard
+        present to the registrar can be absent to the launcher. The launcher
+        then exits non-blocking and every command runs.
+
+        Rather than re-implement the launcher's root resolution here — which
+        would be a second copy of shell logic, free to drift from the first —
+        run the guard and read the verdicts. BOTH directions: a refusal alone
+        would also be produced by a launcher refusing everything because it
+        cannot find the guard at all, which is a contained session but not a
+        working one.
+
+        WHAT RUNS IS THE LOCALLY-COMPUTED ARGV, never the string parsed out of
+        the settings file. That file sits outside the repo and is writable by
+        any same-uid process, and this subprocess runs in the PARENT, which
+        carries the server's whole environment — every API key in secrets.env
+        among it. Executing a value read from a mutable file there would hand
+        an attacker who can win one write a credential-bearing shell. So the
+        registered command is parsed only to be COMPARED, and a mismatch is a
+        refusal rather than a thing to run.
+
+        The comparison is also why the entry is matched by CONTENT rather than
+        taken from index 0: a second PreToolUse hook registered ahead of this
+        one would otherwise be executed and its exit code read as the allowlist
+        verdict.
+
+        Costs two short subprocesses, paid only by an invocation that declares
+        an allowlist. Those are rare, and the alternative is launching a profile
+        whose confinement has never been demonstrated.
+        """
+        expected = _allowlist_guard_argv()
+        if expected is None:
+            raise RuntimeError(
+                "Refusing to launch: the genesis-hook launcher is not present, "
+                "so the Bash allowlist cannot be enforced."
+            )
+        try:
+            commands = [
+                hook.get("command", "")
+                for block in json.loads(registered)["hooks"].get("PreToolUse", [])
+                for hook in block.get("hooks", [])
+            ]
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise RuntimeError(
+                f"Refusing to launch: the registered Bash-allowlist hook could "
+                f"not be read out of the settings file to verify it ({exc})."
+            ) from exc
+        # Matched by CONTENT, which covers both ways this can be wrong with one
+        # test: the file was rewritten by another Genesis process on older code
+        # (so the guard is simply absent), or it was modified to name something
+        # else. Selecting by index would additionally have run a second hook
+        # registered ahead of this one and read ITS exit code as the verdict.
+        if not any(shlex.split(command) == expected for command in commands):
+            raise RuntimeError(
+                "Refusing to launch: the settings file does not register the "
+                "Bash-allowlist hook this process computed — it has been "
+                "rewritten since, most likely by another Genesis process "
+                "running older code. Refusing rather than running what it now "
+                "names."
+            )
+        argv = expected
+
+        allowlist = ",".join(bash_allowlist)
+        env = {**child_env, "GENESIS_BASH_ALLOWLIST": allowlist}
+
+        def _probe(cmd: str) -> int:
+            payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            try:
+                return subprocess.run(
+                    argv,
+                    input=payload,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    # Matches the timeout the hook is registered with, so a
+                    # guard slow enough to fail there fails here too rather
+                    # than passing this check and being killed in the session.
+                    timeout=30,
+                ).returncode
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise RuntimeError(
+                    f"Refusing to launch: this invocation restricts Bash to "
+                    f"[{allowlist}], but the enforcing hook could not be run to "
+                    f"verify it ({exc})."
+                ) from exc
+
+        # A token that cannot be on any allowlist, so a working guard refuses it.
+        refused = _probe("__genesis_allowlist_verification_probe__")
+        if refused != 2:
+            raise RuntimeError(
+                f"Refusing to launch: this invocation restricts Bash to "
+                f"[{allowlist}], but the registered hook returned {refused} for "
+                f"a command outside that list instead of refusing it, so the "
+                f"restriction is not in force. Check that "
+                f"scripts/hooks/bash_allowlist_guard.sh is present in the hook "
+                f"root the launcher resolves (the MAIN worktree, which can lag "
+                f"the tree this process is running from)."
+            )
+
+        permitted = _probe(bash_allowlist[0])
+        if permitted != 0:
+            raise RuntimeError(
+                f"Refusing to launch: this invocation restricts Bash to "
+                f"[{allowlist}], and the registered hook refuses even "
+                f"{bash_allowlist[0]!r} (returned {permitted}), so the session "
+                f"could do nothing at all. This usually means the guard is "
+                f"missing from the launcher's hook root and the launcher is "
+                f"refusing on its behalf."
+            )
+
     def _build_args(self, inv: CCInvocation) -> list[str]:
         args = [self._claude_path, "-p"]
         # Roster routing: when model_id_override is set, model selection comes
@@ -567,14 +964,15 @@ class CCInvoker:
         # servers cleanly (probe-verified) — the secure-by-default posture.
         if inv.strict_mcp_config and not inv.bare:
             args.append("--strict-mcp-config")
-        # Register the span-capture PostToolUse hook for this dispatched session.
-        # Dispatched sessions run with a cwd outside any git repo, so CC never
-        # loads the repo's .claude/settings.json; --settings injects just this
-        # hook (CC merges it with the user's settings). No-op unless a trace is
-        # active (GENESIS_TRACE_ID). See cc_span_settings_path.
+        # Register the dispatch hooks (span capture, Bash allowlist enforcement)
+        # for this session. Dispatched sessions run with a cwd outside any git
+        # repo, so CC never loads the repo's .claude/settings.json; --settings
+        # injects just these hooks and CC merges them with the user's settings.
+        # Both no-op unless their env var is set. See cc_span_settings_path.
         span_settings = cc_span_settings_path()
         if span_settings:
             args += ["--settings", span_settings]
+        self._refuse_unenforceable_allowlist(inv, span_settings)
         if inv.skip_permissions:
             args.append("--dangerously-skip-permissions")
         if inv.allowed_tools:
@@ -720,6 +1118,13 @@ class CCInvoker:
         # must not leak from the parent, so pop when the field is empty).
         if inv and inv.bash_allowlist:
             env["GENESIS_BASH_ALLOWLIST"] = ",".join(inv.bash_allowlist)
+            # PER-BINARY HARDENING. A first-token allowlist bounds WHICH binary
+            # runs; it cannot bound what that binary can be told to do, and an
+            # allowlisted binary with a shell escape hands the session an
+            # unrestricted shell while every token is still the allowed one.
+            # Each entry that needs it gets its hardening applied here.
+            for binary in inv.bash_allowlist:
+                env.update(_BINARY_HARDENING.get(binary, lambda: {})())
         else:
             env.pop("GENESIS_BASH_ALLOWLIST", None)
         # Per-invocation overrides win over EVERYTHING above (inherited environ,
@@ -1542,8 +1947,7 @@ class CCInvoker:
             await asyncio.sleep(_ESCALATION_GRACE_S)
         if proc.returncode is None or process_group_alive(proc):
             logger.warning(
-                "CC streaming group survived graceful stop/kill "
-                "(PID %s, rc=%s) — group-killing",
+                "CC streaming group survived graceful stop/kill (PID %s, rc=%s) — group-killing",
                 proc.pid,
                 proc.returncode,
             )
@@ -1745,8 +2149,7 @@ class CCInvoker:
             if oversized_dropped and not output.text.strip():
                 raise _unreplayable_after_drop(
                     oversized_dropped,
-                    "the result carried no text — the answer was almost "
-                    "certainly one of them",
+                    "the result carried no text — the answer was almost certainly one of them",
                 )
 
             # Success — notify recovery if previously errored
@@ -1794,8 +2197,7 @@ class CCInvoker:
         if oversized_dropped and result_data is None and not (bg_truncated and partial_text):
             raise _unreplayable_after_drop(
                 oversized_dropped,
-                "NO result event arrived — the result line was almost "
-                "certainly one of them",
+                "NO result event arrived — the result line was almost certainly one of them",
             )
 
         # No result event — treat collected text as response (success path)

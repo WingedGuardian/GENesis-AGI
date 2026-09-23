@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import signal
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -201,6 +202,339 @@ def test_cc_span_settings_path_rewrites_when_stale(monkeypatch, tmp_path):
     assert data["hooks"]["PostToolUse"][0]["matcher"] == ".*"
 
 
+# --- Bash-allowlist enforcement for dispatched sessions ---------------------
+
+
+def test_cc_span_settings_registers_the_bash_allowlist_guard(monkeypatch, tmp_path):
+    """The injected file carries the PreToolUse hook that enforces the allowlist.
+
+    ``_build_env`` exports GENESIS_BASH_ALLOWLIST for a scoped profile, but that
+    is only a declaration — this hook is the reader. It is registered
+    unconditionally because it no-ops without the env var, which is what keeps
+    the file a single fixed path with no per-invocation content.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    fake_repo, hook = _fake_genesis_hook_repo(tmp_path)
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(fake_repo))
+    out = tmp_path / "settings.json"
+    monkeypatch.setattr(inv_mod, "_CC_SPAN_SETTINGS_PATH", out)
+
+    inv_mod.cc_span_settings_path()
+    data = json.loads(out.read_text())
+
+    entry = data["hooks"]["PreToolUse"][0]
+    # Anchored on purpose. MEASURED on CC 2.1.246: a matcher is a REGEX (a hook
+    # registered as "^Bash$" fires on a Bash call), so a bare "Bash" also
+    # matches "BashOutput", which carries no .tool_input.command and would be
+    # refused by the guard's fail-closed leg with a misleading reason.
+    assert entry["matcher"] == "^Bash$"
+    cmd = entry["hooks"][0]["command"]
+    assert cmd == f"{hook} hooks/bash_allowlist_guard.sh"
+    # Absolute launcher path — CC leaves ${CLAUDE_PROJECT_DIR} unset in a dispatch.
+    assert cmd.startswith("/")
+    assert "${CLAUDE_PROJECT_DIR}" not in cmd
+    # The span hook must survive alongside it, not be displaced by it.
+    assert data["hooks"]["PostToolUse"][0]["matcher"] == ".*"
+
+
+def test_registered_guard_command_survives_a_space_in_the_install_root(monkeypatch, tmp_path):
+    """An install root containing a space must still produce a runnable command.
+
+    Unquoted, the shell CC runs the hook with would split the path and fail to
+    resolve it — exit 127, which is a NON-BLOCKING error, so the tool call
+    proceeds. That is the same fail-open shape this whole change exists to
+    remove, reached by a filesystem layout rather than a missing file.
+
+    Asserted by round-tripping through shlex, which is how the pre-launch
+    binding check parses it back.
+    """
+    import shlex
+
+    import genesis.cc.invoker as inv_mod
+
+    spaced = tmp_path / "install root with spaces"
+    hook = spaced / "repo" / ".claude" / "hooks" / "genesis-hook"
+    hook.parent.mkdir(parents=True)
+    hook.write_text("#!/bin/bash\n")
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(spaced / "repo"))
+    out = tmp_path / "settings.json"
+    monkeypatch.setattr(inv_mod, "_CC_SPAN_SETTINGS_PATH", out)
+
+    inv_mod.cc_span_settings_path()
+    command = json.loads(out.read_text())["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    argv = shlex.split(command)
+    assert argv == [str(hook), inv_mod._ALLOWLIST_GUARD_SCRIPT], (
+        f"the launcher path did not survive quoting: {argv}"
+    )
+
+
+def test_bash_allowlist_guard_timeout_is_generous(monkeypatch, tmp_path):
+    """A tight timeout on a containment hook converts it into a silent permit.
+
+    A PreToolUse hook that exceeds its declared timeout is killed and the call
+    PROCEEDS, so the bound has to sit far above the guard's real cost rather
+    than close to it. Bounded rather than omitted so a hang cannot stall the
+    session forever.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    fake_repo, _ = _fake_genesis_hook_repo(tmp_path)
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(fake_repo))
+    out = tmp_path / "settings.json"
+    monkeypatch.setattr(inv_mod, "_CC_SPAN_SETTINGS_PATH", out)
+
+    inv_mod.cc_span_settings_path()
+    data = json.loads(out.read_text())
+    timeout = data["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"]
+    assert timeout >= 10, "too tight — a slow guard would be killed, i.e. permit"
+
+
+def test_build_args_refuses_an_allowlist_it_cannot_enforce(invoker, monkeypatch):
+    """No settings file → the enforcing hook is not registered → do not launch.
+
+    Launching anyway gives the profile unrestricted Bash while every
+    declaration in the codebase says it is confined to its allowlist, which is
+    worse than having declared no allowlist at all.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: None)
+    with pytest.raises(RuntimeError, match="Refusing to launch"):
+        invoker._build_args(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+
+
+_REPO = Path(__file__).resolve().parents[2]
+_REAL_GUARD = _REPO / "scripts" / "hooks" / "bash_allowlist_guard.sh"
+
+
+def _settings_registering(tmp_path, command: str) -> str:
+    """Write a settings file whose PreToolUse Bash hook runs ``command``.
+
+    The pre-launch checks read and EXECUTE whatever the settings file
+    registers, so a test supplies the command directly rather than going
+    through the launcher — the launcher's own resolution is covered by
+    ``tests/test_scripts/test_bash_allowlist_guard.py``.
+    """
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [{"type": "command", "command": command, "timeout": 30}],
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [("bare", "--bare skips hooks"), ("safe_mode", "--safe-mode disables all hooks")],
+)
+def test_build_args_refuses_an_allowlist_under_a_hook_disabling_flag(
+    invoker, monkeypatch, tmp_path, flag, expected
+):
+    """--bare skips hooks; --safe-mode disables all customizations.
+
+    Either one silently un-enforces the allowlist even though the settings file
+    was written correctly, so the settings check alone would not catch it.
+    Nothing sets these alongside an allowlist today — this keeps it that way.
+
+    The settings file here is REAL and enforcing, and the assertion names the
+    specific reason: otherwise these would pass on any later check's refusal
+    too, which is how a test starts passing for the wrong reason.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    settings = _settings_registering(tmp_path, f"bash {_REAL_GUARD}")
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: settings)
+    with pytest.raises(RuntimeError, match=expected):
+        invoker._build_args(CCInvocation(prompt="hi", bash_allowlist=("gh",), **{flag: True}))
+
+
+def test_build_args_refuses_when_env_overrides_would_blank_the_allowlist(
+    invoker, monkeypatch, tmp_path
+):
+    """env_overrides is applied last in _build_env and wins over everything."""
+    import genesis.cc.invoker as inv_mod
+
+    settings = _settings_registering(tmp_path, f"bash {_REAL_GUARD}")
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: settings)
+    with pytest.raises(RuntimeError, match="env_overrides sets"):
+        invoker._build_args(
+            CCInvocation(
+                prompt="hi",
+                bash_allowlist=("gh",),
+                env_overrides={"GENESIS_BASH_ALLOWLIST": ""},
+            )
+        )
+
+
+def test_build_args_refuses_when_the_guard_was_rewritten_out_of_the_settings(
+    invoker, monkeypatch, tmp_path
+):
+    """The shared settings path is one file, and older code rewrites it.
+
+    A concurrently-running Genesis process on pre-merge code recomputes the
+    span-only payload, sees this content as stale, and replaces it — after we
+    wrote it. Re-reading at launch is what catches that.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    settings = _settings_registering(tmp_path, "some-other-hook.py")
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: settings)
+    with pytest.raises(RuntimeError, match="does not register"):
+        invoker._build_args(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+
+
+def _arm(monkeypatch, tmp_path, argv):
+    """Register ``argv`` as the guard AND make the invoker expect exactly it.
+
+    The binding check refuses to execute anything other than the argv it
+    computes locally, so a test that wants the PROBE arms exercised has to move
+    both ends together. Patching only the settings file exercises the
+    tamper check instead — which is a different test, below.
+    """
+    import shlex
+
+    import genesis.cc.invoker as inv_mod
+
+    settings = _settings_registering(tmp_path, shlex.join(argv))
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: settings)
+    monkeypatch.setattr(inv_mod, "_allowlist_guard_argv", lambda: list(argv))
+    return settings
+
+
+def test_build_args_refuses_a_hook_registered_by_someone_else(invoker, monkeypatch, tmp_path):
+    """The settings file is outside the repo and any same-uid process can write
+    it — including a confined session that can drop a file somewhere.
+
+    The probe runs in the PARENT, which carries the server's whole environment,
+    so executing a command read out of that file would hand whoever won one
+    write a credential-bearing shell. The registered command is therefore
+    COMPARED against the locally-computed argv and a mismatch is a refusal.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    planted = tmp_path / "planted.sh"
+    planted.write_text("#!/usr/bin/env bash\nexit 2\n", encoding="utf-8")
+    settings = _settings_registering(tmp_path, f"bash {planted} {inv_mod._ALLOWLIST_GUARD_SCRIPT}")
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: settings)
+    with pytest.raises(RuntimeError, match="does not register"):
+        invoker._build_args(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+
+
+def test_build_args_refuses_a_registered_hook_that_does_not_refuse(invoker, monkeypatch, tmp_path):
+    """Registered is not the same as BINDING, and that gap is a real defect.
+
+    The launcher resolves hooks against the MAIN worktree while the registrar
+    checks the invoking tree, so a guard the registrar can see may be absent to
+    the launcher — which then exits non-blocking and every command runs. The
+    only thing that distinguishes those cases is running the hook.
+
+    Here the guard is present and permits everything.
+    """
+    permit_all = tmp_path / "permit_all.sh"
+    permit_all.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    _arm(monkeypatch, tmp_path, ["bash", str(permit_all)])
+    with pytest.raises(RuntimeError, match="instead of refusing it"):
+        invoker._build_args(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+
+
+def test_build_args_refuses_a_registered_hook_that_refuses_everything(
+    invoker, monkeypatch, tmp_path
+):
+    """The other direction, and it is not redundant.
+
+    A hook that refuses EVERYTHING also refuses the probe, so a one-directional
+    check would call it enforcing. That state is exactly what the launcher
+    produces when the guard is missing: contained, but unable to run even its
+    own allowlisted binary.
+    """
+    refuse_all = tmp_path / "refuse_all.sh"
+    refuse_all.write_text("#!/usr/bin/env bash\nexit 2\n", encoding="utf-8")
+    _arm(monkeypatch, tmp_path, ["bash", str(refuse_all)])
+    with pytest.raises(RuntimeError, match="could do nothing at all"):
+        invoker._build_args(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+
+
+def test_build_args_probes_in_the_childs_environment_not_the_parents(
+    invoker, monkeypatch, tmp_path
+):
+    """env_overrides wins in _build_env, so a probe under os.environ would test
+    a different PATH than the session gets — and PATH is where the guard
+    resolves jq and awk from. Defending one variable by name was the narrow
+    version of this; building the same env is the structural one.
+
+    The stand-in guard reports what it sees, so the assertion is about the
+    environment reaching it rather than about a verdict.
+    """
+    reporter = tmp_path / "reporter.sh"
+    reporter.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s" "$GENESIS_PROBE_MARKER" > {tmp_path}/seen.txt\n'
+        '[ "$1" = "__genesis_allowlist_verification_probe__" ] && exit 2\n'
+        "cat >/dev/null; exit 2\n",
+        encoding="utf-8",
+    )
+    _arm(monkeypatch, tmp_path, ["bash", str(reporter)])
+    with pytest.raises(RuntimeError):
+        invoker._build_args(
+            CCInvocation(
+                prompt="hi",
+                bash_allowlist=("gh",),
+                env_overrides={"GENESIS_PROBE_MARKER": "from-child-env"},
+            )
+        )
+    assert (tmp_path / "seen.txt").read_text() == "from-child-env", (
+        "the probe ran in the parent environment, so it cannot see what the "
+        "session's own PATH or dev-local override would do to the guard"
+    )
+
+
+def test_build_args_launches_an_allowlisted_profile_when_the_guard_binds(
+    invoker, monkeypatch, tmp_path
+):
+    """The permitting path, against the REAL guard. A check that only refuses
+    proves nothing — and the earliest version of this test pointed at a settings
+    path that did not exist, so it asserted a launch that was never enforceable.
+    """
+    settings = _arm(monkeypatch, tmp_path, ["bash", str(_REAL_GUARD)])
+    args = invoker._build_args(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+    assert args[args.index("--settings") + 1] == settings
+
+
+@pytest.mark.parametrize("flag", ["bare", "safe_mode"])
+def test_build_args_allows_hook_disabling_flags_without_an_allowlist(invoker, monkeypatch, flag):
+    """No collateral refusal.
+
+    --bare and --safe-mode are legitimate for the eval-bench arms, which
+    declare no allowlist. The refusal is about the COMBINATION, so a profile
+    using either alone must still launch — and must not pay the probes.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: "/tmp/s.json")
+    invoker._build_args(CCInvocation(prompt="hi", **{flag: True}))
+
+
+def test_build_args_allows_a_missing_settings_file_without_an_allowlist(invoker, monkeypatch):
+    """An unwritable settings file is not itself fatal — only unenforceability is."""
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: None)
+    args = invoker._build_args(CCInvocation(prompt="hi"))
+    assert "--settings" not in args
+
+
 def test_build_env_strips_claudecode(invoker):
     with patch.dict(
         "os.environ",
@@ -334,9 +668,7 @@ def test_probe_sets_the_same_properties_as_the_real_invocation(monkeypatch):
     # here instead of at dispatch time.
     assert probe_argv[:-1] == out
     for prop in inv_mod._SCOPE_PROPERTIES:
-        assert ["-p", prop] == probe_argv[
-            probe_argv.index(prop) - 1 : probe_argv.index(prop) + 1
-        ]
+        assert ["-p", prop] == probe_argv[probe_argv.index(prop) - 1 : probe_argv.index(prop) + 1]
         assert prop in out
 
 
@@ -383,9 +715,7 @@ def _stub_probe(monkeypatch, results):
                 f"probe called {len(calls)}x but only {len(seq)} result(s) were "
                 "stubbed — the caller is probing more often than expected"
             )
-        return real_subprocess.CompletedProcess(
-            args[0], seq[len(calls) - 1], b"", b"bus error"
-        )
+        return real_subprocess.CompletedProcess(args[0], seq[len(calls) - 1], b"", b"bus error")
 
     monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
     monkeypatch.setattr(inv_mod.subprocess, "run", _probe)
@@ -898,12 +1228,10 @@ def _make_async_stdout(data: bytes, *, raise_on: tuple[int, ...] = ()):
             if self._i >= len(self._lines):
                 return b""
             idx = self._i
-            self._i += 1                      # consumed BEFORE raising
+            self._i += 1  # consumed BEFORE raising
             self.reads.append(idx)
             if idx in raise_on:
-                raise ValueError(
-                    "Separator is not found, and chunk exceed the limit"
-                )
+                raise ValueError("Separator is not found, and chunk exceed the limit")
             return self._lines[idx]
 
         def __aiter__(self):
@@ -990,6 +1318,7 @@ async def test_run_streaming_timeout_returns_partial(invoker, monkeypatch):
     data = _make_stream_lines(*events)
 
     mock_proc = AsyncMock()
+
     # Simulate: stdout yields lines then hangs → timeout fires. Must expose
     # readline() (the reader no longer uses the async-iterator protocol), and
     # must hang at the AWAIT rather than end the stream — an EOF would exit
@@ -1128,9 +1457,15 @@ async def test_run_streaming_records_tools_in_first_seen_order_without_repeats(i
 
     def _result(text):
         return {
-            "type": "result", "subtype": "success", "is_error": False, "result": text,
-            "session_id": "s9", "total_cost_usd": 0.0, "duration_ms": 1,
-            "usage": {"input_tokens": 1, "output_tokens": 1}, "modelUsage": {},
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": text,
+            "session_id": "s9",
+            "total_cost_usd": 0.0,
+            "duration_ms": 1,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "modelUsage": {},
         }
 
     async def _run(events):
@@ -1410,6 +1745,7 @@ def test_register_prunes_dead_entries():
 async def test_run_registers_under_session_key_and_clears(invoker, monkeypatch):
     """End-to-end: run() registers the proc under invocation.session_key while
     executing, and unregisters it in finally (cc-loop-01)."""
+
     def _killpg_gone(*a):
         raise ProcessLookupError  # vacant group — never live-fire a real probe
 
@@ -1451,6 +1787,7 @@ async def test_run_registers_under_session_key_and_clears(invoker, monkeypatch):
 @pytest.mark.asyncio
 async def test_run_streaming_registers_under_session_key_and_clears(invoker, monkeypatch):
     """run_streaming registers under session_key during streaming and clears in finally."""
+
     def _killpg_gone(*a):
         raise ProcessLookupError  # vacant group — never live-fire a real probe
 
@@ -2269,6 +2606,7 @@ def _bg_result_events():
 async def test_run_streaming_sets_bg_truncated_on_ceiling_marker(monkeypatch):
     """The 'Background tasks still running...' stderr marker sets bg_truncated,
     and the partial result is still delivered (not dropped)."""
+
     def _killpg_gone(*a):
         raise ProcessLookupError  # vacant group — never live-fire a real probe
 
@@ -2323,6 +2661,7 @@ async def test_run_streaming_no_bg_truncated_without_marker(monkeypatch):
 async def test_run_streaming_bg_truncated_on_no_result_branch(monkeypatch):
     """Whole-tree kill before a result line flushes: the no-result branch must
     still mark bg_truncated (review Finding 2)."""
+
     def _killpg_gone(*a):
         raise ProcessLookupError  # vacant group — never live-fire a real probe
 
@@ -2610,7 +2949,8 @@ async def test_streaming_terminate_ignored_escalates_to_group_kill(invoker, monk
 
 @pytest.mark.asyncio
 async def test_streaming_escalates_when_leader_exits_but_group_survives(
-    invoker, monkeypatch,
+    invoker,
+    monkeypatch,
 ):
     """Codex P2 (PR #1417): after terminate(), the LEADER can exit (returncode
     set, e.g. -15) while an MCP/helper child survives in the group. Escalation
@@ -2702,6 +3042,7 @@ def _no_host_syscalls(monkeypatch):
     told to prefer killing an unrelated process. Stub it rather than gamble on
     the pid being vacant.
     """
+
     def _gone(*a):
         raise ProcessLookupError  # vacant group — never live-fire a real probe
 
@@ -2727,7 +3068,7 @@ async def test_over_limit_line_is_dropped_and_the_session_survives(invoker):
     assert output.text == "survived"
     assert output.session_id == "s1"
     assert not output.is_error
-    assert 1 in proc.stdout.reads, proc.stdout.reads   # the fault was reached
+    assert 1 in proc.stdout.reads, proc.stdout.reads  # the fault was reached
 
 
 @pytest.mark.asyncio
@@ -2775,15 +3116,13 @@ async def test_dropping_the_result_line_raises_instead_of_faking_success(invoker
         {"type": "system", "subtype": "init", "session_id": "s1"},
         _result_event("never seen"),
     )
-    proc = _streaming_proc(data, raise_on=(1,))   # the RESULT line is dropped
+    proc = _streaming_proc(data, raise_on=(1,))  # the RESULT line is dropped
 
     with (
         patch("asyncio.create_subprocess_exec", return_value=proc),
         pytest.raises(CCStreamTruncatedError, match="NO result event"),
     ):
-        await asyncio.wait_for(
-            invoker.run_streaming(CCInvocation(prompt="x")), timeout=10
-        )
+        await asyncio.wait_for(invoker.run_streaming(CCInvocation(prompt="x")), timeout=10)
 
     assert issubclass(CCStreamTruncatedError, CCProcessError), (
         "handlers catching CCProcessError must keep catching this"
@@ -2818,7 +3157,7 @@ async def test_dropped_line_with_empty_result_does_not_feed_the_cap_detector(inv
         {"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}},
         _result_event(""),
     )
-    proc = _streaming_proc(data, raise_on=(1,))   # drop the assistant line
+    proc = _streaming_proc(data, raise_on=(1,))  # drop the assistant line
     fired = []
 
     async def _spy(*a, **k):
@@ -2832,7 +3171,7 @@ async def test_dropped_line_with_empty_result_does_not_feed_the_cap_detector(inv
     ):
         await invoker.run_streaming(CCInvocation(prompt="x", expect_output=True))
 
-    assert 1 in proc.stdout.reads, proc.stdout.reads   # the fault was reached
+    assert 1 in proc.stdout.reads, proc.stdout.reads  # the fault was reached
     assert not fired, "a dropped-line run forged the silent-cap signature"
 
 
@@ -2861,9 +3200,7 @@ async def test_bg_truncation_explains_a_missing_result_better_than_a_drop_does(
     )
     # index 1 = the oversized tool-result trace; no result event ever arrives.
     proc = _streaming_proc(data, raise_on=(1,))
-    proc.stderr = _make_mock_stderr(
-        b"Background tasks still running after 600s; terminating.\n"
-    )
+    proc.stderr = _make_mock_stderr(b"Background tasks still running after 600s; terminating.\n")
     proc.pid = 424201  # explicit + distinct; never a mock default
 
     with patch("asyncio.create_subprocess_exec", return_value=proc):
@@ -2881,9 +3218,7 @@ async def test_bg_truncation_explains_a_missing_result_better_than_a_drop_does(
 
 
 @pytest.mark.asyncio
-async def test_an_empty_result_without_a_drop_is_still_the_cap_signature(
-    invoker, monkeypatch
-):
+async def test_an_empty_result_without_a_drop_is_still_the_cap_signature(invoker, monkeypatch):
     """CLAUSE COVER for `oversized_dropped` in the result guard.
 
     Empty output with NO drop is the unexplained-empty shape the silent-cap
@@ -2935,9 +3270,7 @@ async def test_no_result_and_no_drop_returns_the_collected_text(invoker, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_a_drop_with_surviving_text_still_raises_without_bg_truncation(
-    invoker, monkeypatch
-):
+async def test_a_drop_with_surviving_text_still_raises_without_bg_truncation(invoker, monkeypatch):
     """CLAUSE COVER for the `bg_truncated` conjunct of the exemption.
 
     Surviving partial text is NOT on its own a reason to forgive a missing
@@ -2977,9 +3310,7 @@ async def test_bg_truncation_with_nothing_collected_still_raises(invoker, monkey
         {"type": "assistant", "message": {"content": [{"type": "text", "text": "the answer"}]}},
     )
     proc = _streaming_proc(data, raise_on=(1,))  # the only text line is dropped
-    proc.stderr = _make_mock_stderr(
-        b"Background tasks still running after 600s; terminating.\n"
-    )
+    proc.stderr = _make_mock_stderr(b"Background tasks still running after 600s; terminating.\n")
     proc.pid = 424205  # explicit + distinct; never a mock default
 
     with (
@@ -3072,9 +3403,7 @@ def _error_result_event(text: str) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_a_drop_before_an_error_result_is_not_a_retryable_error(
-    invoker, monkeypatch
-):
+async def test_a_drop_before_an_error_result_is_not_a_retryable_error(invoker, monkeypatch):
     """The RETRYABLE branches run before the drop guard, so they had to learn it.
 
     The first round's fix only covered the shapes that fall THROUGH to the guard.
@@ -3095,9 +3424,14 @@ async def test_a_drop_before_an_error_result_is_not_a_retryable_error(
     _no_host_syscalls(monkeypatch)
     data = _make_stream_lines(
         {"type": "system", "subtype": "init", "session_id": "s1"},
-        {"type": "assistant", "message": {"content": [
-            {"type": "text", "text": "oversized tool result"},
-        ]}},
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "oversized tool result"},
+                ]
+            },
+        },
         _error_result_event("You've hit your usage limit"),
     )
     proc = _streaming_proc(data, raise_on=(1,))
@@ -3152,9 +3486,7 @@ async def test_an_error_result_without_a_drop_still_raises_the_classified_error(
 
 
 @pytest.mark.asyncio
-async def test_a_drop_before_an_empty_rate_limited_result_is_not_retryable(
-    invoker, monkeypatch
-):
+async def test_a_drop_before_an_empty_rate_limited_result_is_not_retryable(invoker, monkeypatch):
     """The second retryable branch, and the more expensive one.
 
     A rate-limit error is what sends the turn to roster failover, so replaying
@@ -3166,9 +3498,14 @@ async def test_a_drop_before_an_empty_rate_limited_result_is_not_retryable(
     _no_host_syscalls(monkeypatch)
     data = _make_stream_lines(
         {"type": "system", "subtype": "init", "session_id": "s1"},
-        {"type": "assistant", "message": {"content": [
-            {"type": "text", "text": "oversized tool result"},
-        ]}},
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "oversized tool result"},
+                ]
+            },
+        },
         {"type": "rate_limit_event", "info": {}},
         _result_event(""),
     )
@@ -3186,9 +3523,7 @@ async def test_a_drop_before_an_empty_rate_limited_result_is_not_retryable(
 
 
 @pytest.mark.asyncio
-async def test_an_empty_rate_limited_result_without_a_drop_still_rate_limits(
-    invoker, monkeypatch
-):
+async def test_an_empty_rate_limited_result_without_a_drop_still_rate_limits(invoker, monkeypatch):
     """CLAUSE COVER for `oversized_dropped` at the rate-limit branch.
 
     Without a drop, an empty rate-limited result is exactly what failover is
@@ -3213,9 +3548,7 @@ async def test_an_empty_rate_limited_result_without_a_drop_still_rate_limits(
 
 
 @pytest.mark.asyncio
-async def test_a_drop_does_not_discard_a_rate_limited_answer_that_survived(
-    invoker, monkeypatch
-):
+async def test_a_drop_does_not_discard_a_rate_limited_answer_that_survived(invoker, monkeypatch):
     """The BOUND on the two fixes above, and the reason they are placed where
     they are rather than hoisted above the whole result block.
 
@@ -3227,9 +3560,14 @@ async def test_a_drop_does_not_discard_a_rate_limited_answer_that_survived(
     _no_host_syscalls(monkeypatch)
     data = _make_stream_lines(
         {"type": "system", "subtype": "init", "session_id": "s1"},
-        {"type": "assistant", "message": {"content": [
-            {"type": "text", "text": "oversized tool result"},
-        ]}},
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "oversized tool result"},
+                ]
+            },
+        },
         {"type": "rate_limit_event", "info": {}},
         _result_event("the answer survived"),
     )
@@ -3244,9 +3582,7 @@ async def test_a_drop_does_not_discard_a_rate_limited_answer_that_survived(
 
 
 @pytest.mark.asyncio
-async def test_a_surviving_answer_still_reports_the_lines_it_lost(
-    invoker, monkeypatch
-):
+async def test_a_surviving_answer_still_reports_the_lines_it_lost(invoker, monkeypatch):
     """The drop has to be visible OUTSIDE `run_streaming`.
 
     This is the return path that matters most, because it is the one that looks
@@ -3264,9 +3600,14 @@ async def test_a_surviving_answer_still_reports_the_lines_it_lost(
     _no_host_syscalls(monkeypatch)
     data = _make_stream_lines(
         {"type": "system", "subtype": "init", "session_id": "s1"},
-        {"type": "assistant", "message": {"content": [
-            {"type": "text", "text": "oversized tool result"},
-        ]}},
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "oversized tool result"},
+                ]
+            },
+        },
         _result_event("the answer survived"),
     )
     proc = _streaming_proc(data, raise_on=(1,))
@@ -3277,9 +3618,7 @@ async def test_a_surviving_answer_still_reports_the_lines_it_lost(
 
     assert 1 in proc.stdout.reads, proc.stdout.reads  # the drop really happened
     assert output.text == "the answer survived"
-    assert output.stream_lines_dropped == 1, (
-        "a run that lost a line reported itself as a clean one"
-    )
+    assert output.stream_lines_dropped == 1, "a run that lost a line reported itself as a clean one"
 
 
 @pytest.mark.asyncio
@@ -3321,7 +3660,11 @@ class _TailAfterOverrunStdout:
     """
 
     def __init__(self, tail: bytes, rest: bytes):
-        self._steps: list = [ValueError("Separator is not found"), tail, *rest.splitlines(keepends=True)]
+        self._steps: list = [
+            ValueError("Separator is not found"),
+            tail,
+            *rest.splitlines(keepends=True),
+        ]
         self._i = 0
         self.reads: list[int] = []
 
@@ -3375,9 +3718,7 @@ async def test_the_tail_of_a_dropped_line_never_reaches_the_log_verbatim(
 
 
 @pytest.mark.asyncio
-async def test_a_clean_stream_still_logs_a_non_json_line_verbatim(
-    invoker, monkeypatch, caplog
-):
+async def test_a_clean_stream_still_logs_a_non_json_line_verbatim(invoker, monkeypatch, caplog):
     """CLAUSE COVER for `oversized_dropped` at the non-JSON log.
 
     With nothing dropped, a non-JSON line is a CLI protocol fault and its text
@@ -3395,9 +3736,9 @@ async def test_a_clean_stream_still_logs_a_non_json_line_verbatim(
         output = await invoker.run_streaming(CCInvocation(prompt="x"))
 
     assert output.text == "ok"
-    assert any(
-        "this-is-not-json-at-all" in r.getMessage() for r in caplog.records
-    ), "a protocol fault on a clean stream lost its only diagnostic"
+    assert any("this-is-not-json-at-all" in r.getMessage() for r in caplog.records), (
+        "a protocol fault on a clean stream lost its only diagnostic"
+    )
 
 
 @pytest.mark.asyncio
@@ -3439,18 +3780,33 @@ async def test_a_multi_block_assistant_line_warns_exactly_once(invoker, caplog):
     fixed on the peer-availability read path.
     """
     events = [
-        {"type": "assistant", "message": {"content": [
-            {"type": "thinking", "thinking": "hmm"},
-            {"type": "tool_use", "name": "Read", "input": {}},
-        ]}},
-        {"type": "assistant", "message": {"content": [
-            {"type": "text", "text": "hi"},
-            {"type": "tool_use", "name": "Bash", "input": {}},
-        ]}},
         {
-            "type": "result", "subtype": "success", "is_error": False,
-            "result": "done", "session_id": "s9", "total_cost_usd": 0.01,
-            "duration_ms": 100, "usage": {"input_tokens": 1, "output_tokens": 1},
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "thinking", "thinking": "hmm"},
+                    {"type": "tool_use", "name": "Read", "input": {}},
+                ]
+            },
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "tool_use", "name": "Bash", "input": {}},
+                ]
+            },
+        },
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "done",
+            "session_id": "s9",
+            "total_cost_usd": 0.01,
+            "duration_ms": 100,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
             "modelUsage": {},
         },
     ]
@@ -3482,14 +3838,24 @@ async def test_the_canary_does_not_fire_on_an_unrecognized_block(invoker, caplog
     devalue every real firing.
     """
     events = [
-        {"type": "assistant", "message": {"content": [
-            {"type": "redacted_thinking", "data": "x"},
-            {"type": "text", "text": "hi"},
-        ]}},
         {
-            "type": "result", "subtype": "success", "is_error": False,
-            "result": "done", "session_id": "s10", "total_cost_usd": 0.01,
-            "duration_ms": 100, "usage": {"input_tokens": 1, "output_tokens": 1},
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "redacted_thinking", "data": "x"},
+                    {"type": "text", "text": "hi"},
+                ]
+            },
+        },
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "done",
+            "session_id": "s10",
+            "total_cost_usd": 0.01,
+            "duration_ms": 100,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
             "modelUsage": {},
         },
     ]
@@ -3532,9 +3898,14 @@ async def test_a_drop_then_a_timeout_is_still_unreplayable(invoker, monkeypatch)
     _no_host_syscalls(monkeypatch)
     data = _make_stream_lines(
         {"type": "system", "subtype": "init", "session_id": "s1"},
-        {"type": "assistant", "message": {"content": [
-            {"type": "text", "text": "oversized tool result"},
-        ]}},
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "oversized tool result"},
+                ]
+            },
+        },
     )
 
     class _DropThenHang:
@@ -3623,9 +3994,7 @@ def _proc_with_one_huge_line(data: bytes, *, overruns: int, at: int):
                 # advanced: nothing has been consumed to a newline yet.
                 self._left -= 1
                 self.raises += 1
-                raise ValueError(
-                    "Separator is not found, and chunk exceed the limit"
-                )
+                raise ValueError("Separator is not found, and chunk exceed the limit")
             idx = self._i
             self._i += 1
             self.reads.append(idx)
@@ -3774,3 +4143,107 @@ async def test_a_clean_stream_still_reports_an_empty_inventory(invoker):
     assert output.tools_used == (), (
         f"a clean tool-free stream lost its runtime report ({output.tools_used!r})"
     )
+
+
+# --- Per-binary hardening: gh cannot be told to spawn a shell ---------------
+
+
+def _seal(monkeypatch, tmp_path, *, hosts: str | None = "github.com:\n  oauth_token: x\n"):
+    """Point the sealer at a synthetic source and target, and run it."""
+    import genesis.cc.invoker as inv_mod
+
+    source = tmp_path / "src-gh"
+    source.mkdir()
+    if hosts is not None:
+        (source / "hosts.yml").write_text(hosts, encoding="utf-8")
+    (source / "config.yml").write_text("aliases:\n  x: !whoami\n", encoding="utf-8")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(source))
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", tmp_path / "sealed")
+    return inv_mod._sealed_gh_config_dir()
+
+
+def test_sealed_gh_config_is_unwritable_by_the_session(monkeypatch, tmp_path):
+    """gh writes its aliases, pager and editor into config.yml.
+
+    Each of those runs a command of the caller's choosing, reached with `gh` as
+    every token — so a first-token allowlist permits both the command that
+    installs the escape and the command that triggers it. Making the file
+    unwritable is what closes it; the modes ARE the mechanism, so assert them.
+    """
+    sealed = Path(_seal(monkeypatch, tmp_path))
+    assert sealed.stat().st_mode & 0o777 == 0o500, "session could create new files here"
+    for name in ("config.yml", "hosts.yml"):
+        mode = (sealed / name).stat().st_mode & 0o777
+        assert mode == 0o400, f"{name} is writable ({oct(mode)}) — gh could rewrite it"
+
+
+def test_sealed_gh_config_carries_no_aliases_and_a_shell_free_pager(monkeypatch, tmp_path):
+    """config.yml is SYNTHESISED, not copied.
+
+    Copying would carry the operator's own aliases into the confined session,
+    which is the escape arriving by inheritance rather than by being installed.
+    The fixture's source config deliberately contains a shell alias.
+    """
+    sealed = Path(_seal(monkeypatch, tmp_path))
+    body = (sealed / "config.yml").read_text()
+    assert "aliases: {}" in body
+    assert "pager: cat" in body
+    assert "whoami" not in body, "the operator's own aliases leaked into the seal"
+
+
+def test_sealed_gh_config_copies_the_credential_at_owner_only_mode(monkeypatch, tmp_path):
+    """hosts.yml has to be copied — it is the only place gh finds the token.
+
+    The copy must be no more reachable than the original, so pin the mode: this
+    moves a secret, and the test is what stops it widening later.
+    """
+    sealed = Path(_seal(monkeypatch, tmp_path))
+    assert (sealed / "hosts.yml").read_text().startswith("github.com:")
+    assert (sealed / "hosts.yml").stat().st_mode & 0o777 == 0o400
+
+
+def test_sealed_gh_config_seals_even_when_gh_was_never_authenticated(monkeypatch, tmp_path):
+    """No credential is not a reason to leave the alias route open."""
+    sealed = Path(_seal(monkeypatch, tmp_path, hosts=None))
+    assert not (Path(sealed) / "hosts.yml").exists()
+    assert (Path(sealed) / "config.yml").stat().st_mode & 0o777 == 0o400
+
+
+def test_sealed_gh_config_is_idempotent_and_self_healing(monkeypatch, tmp_path):
+    """Re-runs must not churn, and a tampered seal must be repaired."""
+    import genesis.cc.invoker as inv_mod
+
+    sealed = Path(_seal(monkeypatch, tmp_path))
+    assert inv_mod._sealed_gh_config_dir() == str(sealed)
+
+    sealed.chmod(0o700)
+    (sealed / "config.yml").chmod(0o600)
+    (sealed / "config.yml").write_text("aliases:\n  evil: !whoami\n", encoding="utf-8")
+    repaired = Path(inv_mod._sealed_gh_config_dir())
+    assert "evil" not in (repaired / "config.yml").read_text()
+    assert (repaired / "config.yml").stat().st_mode & 0o777 == 0o400
+
+
+def test_build_env_hardens_gh_only_for_an_allowlisted_session(invoker, monkeypatch, tmp_path):
+    """The hardening rides the allowlist, not the binary being present.
+
+    An ordinary dispatch must keep the operator's own gh config — repointing
+    GH_CONFIG_DIR for every session would change unrelated behaviour.
+    """
+    _seal(monkeypatch, tmp_path)
+
+    scoped = invoker._build_env(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+    assert scoped["GH_CONFIG_DIR"].endswith("sealed")
+    assert scoped["GH_PAGER"] == "cat"
+
+    unscoped = invoker._build_env(CCInvocation(prompt="hi"))
+    assert unscoped.get("GH_CONFIG_DIR") != scoped["GH_CONFIG_DIR"]
+    assert "GH_PAGER" not in unscoped or unscoped["GH_PAGER"] != "cat"
+
+
+def test_build_env_does_not_harden_gh_for_an_unrelated_allowlist(invoker, monkeypatch, tmp_path):
+    """A profile allowlisting something else gets no gh hardening."""
+    _seal(monkeypatch, tmp_path)
+    env = invoker._build_env(CCInvocation(prompt="hi", bash_allowlist=("git",)))
+    assert env["GENESIS_BASH_ALLOWLIST"] == "git"
+    assert not env["GH_CONFIG_DIR"].endswith("sealed")

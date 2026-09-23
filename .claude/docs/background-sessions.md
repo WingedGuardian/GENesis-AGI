@@ -86,16 +86,55 @@ keep the full user-scoped toolset. As defense-in-depth, `_UNIVERSAL_DISALLOW` al
 denies the user-scoped servers by name (`_USER_SCOPED_MCP_WILDCARDS`).
 
 **`steward` is the one built-in Bash-enabled profile** — its Bash is restricted
-to the `gh` CLI only, enforced by `scripts/bash_safety_hook.sh` via the
-`GENESIS_BASH_ALLOWLIST` env var set from `CCInvocation.bash_allowlist`. It
-still blocks Edit/Write/browser. Built for the upstream-PR stewardship
+to the `gh` CLI only, enforced by `scripts/hooks/bash_allowlist_guard.sh`, which
+the invoker registers in the `--settings` file it injects into every dispatched
+session, reading the `GENESIS_BASH_ALLOWLIST` env var set from
+`CCInvocation.bash_allowlist`. That injected registration is the one that
+matters: a dispatched session's working directory is outside any git repo, so
+Claude Code's git-root settings discovery never loads the repo's
+`.claude/settings.json`, and this repo wires the hook there in no ref anyway.
+An install may ALSO wire the global chokepoint `scripts/bash_safety_hook.sh` in
+its user-level settings; both share one predicate
+(`scripts/hooks/bash_allowlist_lib.sh`), so the second copy reaches the same
+verdict rather than a different one. The invoker refuses to launch a profile
+whose allowlist it cannot arm, including when `bare` or `safe_mode` would
+disable hooks, and verifies the registered guard actually refuses and permits
+before launching.
+
+It still blocks Edit/Write/browser. Built for the upstream-PR stewardship
 campaign: it reads/comments/reopens/closes Genesis's own PRs to external repos
 and escalates code-change requests rather than editing or pushing itself. A
 profile grants a scoped shell by appearing in `_PROFILE_BASH_ALLOWLIST`
 (`src/genesis/cc/direct_session.py`); without an entry there, a Bash-granting
 profile's shell is governed only by the global destructive-op blocks. The
-allowlist matches the command's **first token** and blocks all
-chaining/piping/substitution/redirection (`; && | $() ` ` > <`).
+allowlist matches the command's **first token** and blocks embedded newlines
+plus chaining/piping/substitution/redirection (`; & && || | ` ` $() > <`) —
+note `&` on its own, which backgrounds the first command and runs the next.
+
+**What first-token allowlisting cannot do on its own**, stated because the one
+built-in case is also the one exposed to external content: it bounds WHICH
+binary runs, never what that binary can be told to do. An allowlisted binary
+that can be configured to run commands hands the session a shell while every
+token is still the allowed one — the same limit the overlay-profile note below
+records for interpreters.
+
+`gh` is such a binary (aliases, pager, editor, extensions), so it gets
+**per-binary hardening** alongside the allowlist: an allowlisted session runs
+with `GH_CONFIG_DIR` pointed at a read-only configuration Genesis maintains,
+carrying no aliases and a pager that is not a shell. `gh alias set` and
+`gh config set` then fail, so the routes that reconfigure `gh` into a shell are
+closed rather than merely documented. The credential file is copied into that
+directory because it is the only place `gh` looks for it; the copy is
+owner-only, inside an owner-only directory, so it is no more reachable than the
+original. Hardening is keyed by binary in `_BINARY_HARDENING`
+(`src/genesis/cc/invoker.py`) — a new allowlisted binary that can spawn a shell
+needs an entry there, and the allowlist alone should not be read as confining
+it.
+
+Still NOT confined, and worth knowing before granting a scoped shell:
+subcommands that write files to caller-chosen paths remain available (`gh run
+download`, `gh release download`), so "Write/Edit stay blocked" describes the
+TOOLS, not everything that can put bytes on disk.
 
 ### Install-local profiles (overlay)
 

@@ -36,33 +36,64 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # needs the verbatim payload to re-feed the Python guards.
 RAW=$(cat)
 CMD=$(printf '%s' "$RAW" | jq -r '.tool_input.command // empty' 2>/dev/null)
-[ -z "$CMD" ] && exit 0
 
-# Bash allowlist gate — scoped background profiles (e.g. "steward") export
-# GENESIS_BASH_ALLOWLIST (comma-separated command binaries, e.g. "gh"). When set,
-# the command's first token must be one of them, and no chaining/piping/
-# substitution/redirection is permitted (those could escape the allowlist).
-# Unset → no effect (every other session behaves exactly as before).
-if [ -n "$GENESIS_BASH_ALLOWLIST" ]; then
-    # Reject embedded newlines first — a `case` glob does not reliably match
-    # $'\n', so use a line count (printf adds no trailing newline, so any count
-    # > 0 means an embedded newline → a second command on its own line).
-    if [ "$(printf '%s' "$CMD" | wc -l)" -gt 0 ]; then
-        echo "BLOCKED: multi-line commands are not permitted in an allowlisted session ($GENESIS_BASH_ALLOWLIST)." >&2
+# An unreadable payload is normally nothing to act on, so exiting 0 is right —
+# EXCEPT when this session declares an allowlist. There, "I could not read the
+# command" is not the same as "the command is fine": no jq on PATH, a payload
+# shape this hook does not know, or an empty command would all silently drop
+# the restriction, which is the one failure a containment gate must not have.
+# Refuse instead. The refusal is scoped to sessions that declared an allowlist
+# — dispatched ones — so it cannot strand an interactive session, which never
+# sets the variable and so never reaches this branch.
+#
+# Gated on the TOOL, not only on the payload, because a matcher is a REGEX: an
+# install that wires this hook as "Bash" (which is how it is wired where it is
+# wired at all) also matches "BashOutput", and that tool carries no
+# .tool_input.command. Without this test the refusal above would fire on every
+# BashOutput call in an allowlisted session and report a missing command the
+# tool never had. A tool name we CAN read and which is not Bash is simply not
+# this gate's business; one we cannot read falls through to the refusal, which
+# is the fail-closed direction.
+_TOOL=$(printf '%s' "$RAW" | jq -r '.tool_name // empty' 2>/dev/null)
+if [ -n "$_TOOL" ] && [ "$_TOOL" != "Bash" ]; then
+    exit 0
+fi
+if [ -z "$CMD" ]; then
+    if [ -n "${GENESIS_BASH_ALLOWLIST:-}" ]; then
+        echo "BLOCKED: this session restricts Bash to [$GENESIS_BASH_ALLOWLIST], and no" >&2
+        echo "command could be read from the hook payload (is jq on PATH?), so it" >&2
+        echo "cannot be cleared." >&2
         exit 2
     fi
-    case "$CMD" in
-        *';'*|*'&&'*|*'||'*|*'|'*|*'`'*|*'$('*|*'>'*|*'<'*)
-            echo "BLOCKED: this session's Bash may not chain, pipe, substitute, or redirect (allowlist: $GENESIS_BASH_ALLOWLIST)." >&2
-            exit 2;;
-    esac
-    _first=$(printf '%s' "$CMD" | awk '{print $1}')
-    case ",$GENESIS_BASH_ALLOWLIST," in
-        *",$_first,"*) : ;;  # first token is allowlisted — fall through to the standard checks
-        *)
-            echo "BLOCKED: this session may only run [$GENESIS_BASH_ALLOWLIST] commands; got '$_first'." >&2
-            exit 2;;
-    esac
+    exit 0
+fi
+
+# Bash allowlist gate — scoped background profiles (e.g. "steward") export
+# GENESIS_BASH_ALLOWLIST. The predicate itself lives in hooks/bash_allowlist_lib.sh
+# so that this global chokepoint and the hook injected into dispatched sessions
+# (hooks/bash_allowlist_guard.sh) share ONE implementation and cannot drift;
+# an install with both wired reaches the same verdict twice, which is
+# idempotent rather than a conflict. Unset → no effect (every other session
+# behaves exactly as before).
+_ALLOWLIST_LIB="$SCRIPT_DIR/hooks/bash_allowlist_lib.sh"
+if [ -n "${GENESIS_BASH_ALLOWLIST:-}" ]; then
+    if [ ! -r "$_ALLOWLIST_LIB" ]; then
+        echo "BLOCKED: this session restricts Bash to [$GENESIS_BASH_ALLOWLIST], but the" >&2
+        echo "allowlist predicate ($_ALLOWLIST_LIB) is unreadable, so the" >&2
+        echo "restriction cannot be applied." >&2
+        exit 2
+    fi
+    # shellcheck source=scripts/hooks/bash_allowlist_lib.sh
+    . "$_ALLOWLIST_LIB"
+    _rc=0
+    genesis_bash_allowlist_verdict "$CMD" || _rc=$?
+    # A refusal is terminal; a pass falls through to the standard checks below,
+    # which still apply to an allowlisted binary (defense in depth). Written as
+    # an `if` rather than `[ … ] && exit` so the no-refusal path does not leave
+    # a false exit status behind for the next statement to inherit.
+    if [ "$_rc" -ne 0 ]; then
+        exit "$_rc"
+    fi
 fi
 
 # Is the CURRENT cwd inside a genesis checkout — i.e. one whose project-level
