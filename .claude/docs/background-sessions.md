@@ -125,18 +125,39 @@ that can be configured to run commands hands the session a shell while every
 token is still the allowed one — the same limit the overlay-profile note below
 records for interpreters.
 
-`gh` is such a binary (aliases, pager, editor, extensions), so it gets
-**per-binary hardening** alongside the allowlist: an allowlisted session runs
-with `GH_CONFIG_DIR` pointed at a read-only configuration Genesis maintains,
-carrying no aliases and a pager that is not a shell. `gh alias set` and
-`gh config set` then fail, so the routes that reconfigure `gh` into a shell are
-closed rather than merely documented. The credential file is copied into that
-directory because it is the only place `gh` looks for it; the copy is
-owner-only, inside an owner-only directory, so it is no more reachable than the
-original. Hardening is keyed by binary in `_BINARY_HARDENING`
-(`src/genesis/cc/invoker.py`) — a new allowlisted binary that can spawn a shell
-needs an entry there, and the allowlist alone should not be read as confining
-it.
+`gh` is such a binary, so it gets **per-binary hardening** alongside the
+allowlist. It will run a program of its own accord through an alias, the pager,
+the editor, the browser, or an extension — the set `gh help environment`
+documents — and every one of them is reached with `gh` as the first token, so
+the allowlist permits both the command that installs an escape and the command
+that fires it. An allowlisted session therefore runs with all of them pinned:
+`GH_CONFIG_DIR` at a read-only configuration Genesis maintains that carries no
+aliases and a pager that is not a shell, the editor and browser variables at an
+inert command, and `XDG_DATA_HOME` at that same read-only directory.
+
+**`XDG_DATA_HOME` is the one that is easy to get wrong**, so it is called out
+rather than left to the reader: extensions do NOT live under `GH_CONFIG_DIR`.
+MEASURED — an extension planted under the config directory was not found, while
+one under the data directory ran. Sealing the config directory alone therefore
+leaves `gh extension install` followed by `gh extension exec` as arbitrary
+execution with both first tokens allowed. Pinning the data directory at the
+same read-only seal closes both halves: the install cannot create the directory
+it needs, and the exec finds nothing.
+
+`GH_PATH` is deliberately NOT pinned. It tells `gh` where its own binary is for
+extension callbacks, and it was measured inert: with a planted value an
+ordinary read still ran the real `gh`, and with extensions unreachable it
+redirects nothing.
+
+The credential file is copied into the sealed directory because it is the only
+place `gh` looks for it; the copy is owner-only, inside an owner-only
+directory, so it is no more reachable than the original. Hardening is keyed by
+binary in `_BINARY_HARDENING` (`src/genesis/cc/invoker.py`) and applied in
+`_build_env`, which REFUSES to return an environment whose hardening it could
+not prepare or that a later override stripped — the environment that was
+checked is the environment that launches, because there is only one that both
+spawn paths build. A new allowlisted binary that can spawn a shell needs an
+entry there, and the allowlist alone should not be read as confining it.
 
 Still NOT confined, and worth knowing before granting a scoped shell:
 subcommands that write files to caller-chosen paths remain available (`gh run

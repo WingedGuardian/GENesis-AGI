@@ -310,9 +310,14 @@ def _sealed_gh_config_dir() -> str | None:
     user's own home — so this moves a secret, it does not widen who can read
     one. Say that plainly rather than leaving it implied.
 
-    Returns the directory, or ``None`` when it cannot be prepared — the caller
-    then leaves ``GH_CONFIG_DIR`` alone rather than pointing a session at a
-    half-built config.
+    Returns the directory, or ``None`` when it cannot be prepared. The caller
+    REFUSES TO LAUNCH on that; it is not a degraded mode, because the fallback
+    is the operator's own writable config.
+
+    THIS DIRECTORY DOES NOT COVER EXTENSIONS. MEASURED: they resolve from the
+    data dir, not from here, so sealing the config dir alone leaves
+    ``gh extension`` wide open. ``_gh_hardening`` closes that by pointing
+    ``XDG_DATA_HOME`` at this same directory; the measurement lives there.
 
     NOT a complete confinement of ``gh``. Subcommands that write files to
     caller-chosen paths remain available. The allowlist bounds the binary; this
@@ -388,17 +393,82 @@ def _seal_matches(target: Path, desired: dict[str, str]) -> bool:
 def _gh_hardening() -> dict[str, str] | None:
     """Environment that keeps an allowlisted ``gh`` from spawning a shell.
 
+    ``gh`` runs a program of its own accord in a set its own documentation
+    closes: an alias, the pager, the editor, the browser — and an extension,
+    which is a program outright. Every one is reached with ``gh`` as the first
+    token, so a first-token allowlist permits both the command that installs an
+    escape and the command that fires it. This set is enumerated from
+    ``gh help environment``, not from whatever a reviewer thought of next,
+    which is the difference between closing the question and adding another
+    round to a denylist.
+
+    THE EXTENSION ROUTE IS NOT CLOSED BY THE CONFIG SEAL, and that is the trap
+    worth stating loudly. MEASURED: extensions resolve from
+    ``$XDG_DATA_HOME/gh/extensions``, NOT from ``GH_CONFIG_DIR``. An extension
+    planted under the config dir was not found; one planted under the data dir
+    RAN. So an install followed by an exec was arbitrary execution with every
+    first token allowed. Pointing ``XDG_DATA_HOME`` at the same read-only seal
+    closes both halves: the install cannot create ``<seal>/gh``, and the exec
+    finds nothing. MEASURED alongside it, so the cure is known not to be worse
+    than the disease: auth, live API calls and pull-request reads all still
+    work under that pin.
+
+    Editor and browser are pinned to ``true``. gh runs them through a shell, so
+    a bare name suffices. Neither is reachable from inside a guarded session —
+    the guard refuses a command whose first token is an environment assignment
+    — but gh executes them from INHERITED environment, so they are pinned
+    rather than argued about.
+
+    MEASURED inert, and therefore deliberately NOT pinned: ``GH_PATH``. It
+    tells gh where its own binary is, for extension callbacks. With a planted
+    value an ordinary read still ran the real gh, and with extensions
+    unreachable it redirects nothing. Pinning it would be a speculative change.
+
     Returns ``None`` when the seal could not be prepared. That is a REFUSAL
     signal, not a degraded mode: without the sealed directory the session falls
-    back to the operator's own writable config, which is precisely where
-    ``gh alias set --shell`` installs an escape — and where any alias the
-    operator already has is waiting. Pinning the pager alone would close one
-    route of three and read as hardening.
+    back to the operator's own writable config, which is precisely where an
+    alias escape is installed — and where any alias the operator already has is
+    waiting. Pinning the pager alone would close one route of five and read as
+    hardening.
     """
     sealed = _sealed_gh_config_dir()
     if sealed is None:
         return None
-    return {"GH_CONFIG_DIR": sealed, "GH_PAGER": "cat", "PAGER": "cat"}
+    return {
+        "GH_CONFIG_DIR": sealed,
+        # Extensions live under the DATA dir, not the config dir. Same seal.
+        "XDG_DATA_HOME": sealed,
+        "GH_PAGER": "cat",
+        "PAGER": "cat",
+        "GH_EDITOR": "true",
+        "GIT_EDITOR": "true",
+        "VISUAL": "true",
+        "EDITOR": "true",
+        "GH_BROWSER": "true",
+        "BROWSER": "true",
+    }
+
+
+def _unconfinable_binary_message(binary: str) -> str:
+    """Refusal text for a binary whose hardening could not be prepared."""
+    return (
+        f"Refusing to launch: this invocation allows {binary!r}, which can be "
+        f"reconfigured to run commands, and its confinement could not be "
+        f"prepared. Launching would give the session {binary!r} against a "
+        f"writable configuration, which is an escape from the allowlist rather "
+        f"than a weaker form of it."
+    )
+
+
+def _unhardened_env_message(binary: str, wrong: list[str]) -> str:
+    """Refusal text for hardening that is absent from the env being launched."""
+    return (
+        f"Refusing to launch: this invocation allows {binary!r}, but its "
+        f"confinement is not in the environment the session would receive — "
+        f"{', '.join(wrong)} {'differs' if len(wrong) == 1 else 'differ'} from "
+        f"the hardened value. env_overrides is applied last and wins; drop the "
+        f"override or drop the allowlist."
+    )
 
 
 #: Per-allowlisted-binary environment hardening. Keyed by the binary as it
@@ -872,53 +942,13 @@ class CCInvoker:
         # the session actually gets. Defending one variable by name was the
         # narrower version of this; building the same env makes the check
         # faithful by construction.
+        # _build_env is the chokepoint for the hardening itself: it refuses
+        # there, on the env it returns, so the environment that was checked IS
+        # the environment that gets launched. Checking a second copy here would
+        # re-open the gap it closes — both spawn paths rebuild the env after
+        # this runs, and only a check inside the builder covers that rebuild.
         child_env = self._build_env(inv)
-        self._refuse_unhardened_binary(inv, child_env)
         self._verify_allowlist_guard_binds(registered, inv.bash_allowlist, child_env)
-
-    @staticmethod
-    def _refuse_unhardened_binary(inv: CCInvocation, child_env: dict[str, str]) -> None:
-        """Refuse when an allowlisted binary's own hardening is not in force.
-
-        Two ways that happens, and neither is visible to the guard — the guard
-        sees a command whose first token is allowlisted and says yes, correctly.
-        The confinement those commands rely on lives in the ENVIRONMENT:
-
-        * the hardening could not be prepared at all (its callable returns
-          ``None``), so the session would fall back to the operator's own
-          writable configuration; and
-        * ``env_overrides`` is applied LAST in ``_build_env`` and wins over
-          everything, so it can replace the hardening after it was applied.
-
-        Checked by COMPARING the child's actual environment against a freshly
-        computed hardening rather than by listing variables to defend — the
-        same shape as the guard-binding check, and for the same reason: an
-        enumeration of names goes stale the moment a hardening grows a key.
-        """
-        for binary in inv.bash_allowlist:
-            hardening = _BINARY_HARDENING.get(binary)
-            if hardening is None:
-                continue
-            required = hardening()
-            if required is None:
-                raise RuntimeError(
-                    f"Refusing to launch: this invocation allows {binary!r}, "
-                    f"which can be reconfigured to run commands, and its "
-                    f"confinement could not be prepared. Launching would give "
-                    f"the session {binary!r} against a writable configuration, "
-                    f"which is an escape from the allowlist rather than a "
-                    f"weaker form of it."
-                )
-            wrong = sorted(k for k, v in required.items() if child_env.get(k) != v)
-            if wrong:
-                raise RuntimeError(
-                    f"Refusing to launch: this invocation allows {binary!r}, "
-                    f"but its confinement is not in the environment the session "
-                    f"would receive — {', '.join(wrong)} "
-                    f"{'differs' if len(wrong) == 1 else 'differ'} from the "
-                    f"hardened value. env_overrides is applied last and wins; "
-                    f"drop the override or drop the allowlist."
-                )
 
     @staticmethod
     def _verify_allowlist_guard_binds(
@@ -1238,6 +1268,7 @@ class CCInvoker:
         # (e.g. "steward" → gh only). scripts/bash_safety_hook.sh reads this and
         # blocks any non-allowlisted command. Absent → no restriction (the var
         # must not leak from the parent, so pop when the field is empty).
+        required_hardening: dict[str, dict[str, str]] = {}
         if inv and inv.bash_allowlist:
             env["GENESIS_BASH_ALLOWLIST"] = ",".join(inv.bash_allowlist)
             # PER-BINARY HARDENING. A first-token allowlist bounds WHICH binary
@@ -1247,9 +1278,17 @@ class CCInvoker:
             # Each entry that needs it gets its hardening applied here.
             for binary in inv.bash_allowlist:
                 hardening = _BINARY_HARDENING.get(binary)
-                applied = hardening() if hardening else None
-                if applied:
-                    env.update(applied)
+                if hardening is None:
+                    continue
+                applied = hardening()
+                if applied is None:
+                    # FAIL CLOSED. Skipping the update would launch the session
+                    # against the operator's writable configuration — the very
+                    # escape this hardening exists to remove, and an outcome
+                    # strictly worse than not launching at all.
+                    raise RuntimeError(_unconfinable_binary_message(binary))
+                required_hardening[binary] = applied
+                env.update(applied)
         else:
             env.pop("GENESIS_BASH_ALLOWLIST", None)
         # Per-invocation overrides win over EVERYTHING above (inherited environ,
@@ -1263,6 +1302,17 @@ class CCInvoker:
             # silently desync). An explicit TMPDIR override still wins.
             if "CLAUDE_CODE_TMPDIR" in inv.env_overrides and "TMPDIR" not in inv.env_overrides:
                 env["TMPDIR"] = env["CLAUDE_CODE_TMPDIR"]
+        # LAST WORD, deliberately after env_overrides. Overrides are applied
+        # last and win over everything, so they can replace a confinement that
+        # was correctly applied above. Re-read the env being returned rather
+        # than trusting that the update stuck: this function is the only thing
+        # every launch path shares, so a check here is a check on what actually
+        # runs. Comparing against the freshly computed hardening, not a list of
+        # variable names, keeps it honest when a hardening grows a key.
+        for binary, required in required_hardening.items():
+            wrong = sorted(k for k, v in required.items() if env.get(k) != v)
+            if wrong:
+                raise RuntimeError(_unhardened_env_message(binary, wrong))
         return env
 
     def _register_proc(self, key: str, proc: asyncio.subprocess.Process) -> None:

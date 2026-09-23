@@ -4338,7 +4338,7 @@ async def test_refuses_to_launch_when_the_gh_seal_cannot_be_prepared(
     Without it the session falls back to the operator's own writable config —
     exactly where `gh alias set --shell` installs an escape, and where any
     alias the operator already has is already waiting. Pinning the pager alone
-    would close one route of three and read as hardening.
+    would close one route of five and read as hardening.
     """
     import genesis.cc.invoker as inv_mod
 
@@ -4346,6 +4346,134 @@ async def test_refuses_to_launch_when_the_gh_seal_cannot_be_prepared(
     monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda: None)
     with pytest.raises(RuntimeError, match="could not be prepared"):
         await _verify(invoker, CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+
+
+# --- The confinement is checked where the env is BUILT ----------------------
+
+
+def test_build_env_itself_refuses_when_a_binary_cannot_be_confined(invoker, monkeypatch):
+    """The refusal lives in the builder, not only in the pre-launch verifier.
+
+    This is the binding that matters, and the reason it is not merely a second
+    copy of the verifier's test: BOTH spawn paths call `_build_env` AGAIN after
+    `verify_allowlist_enforceable` has passed, and launch what that second call
+    returns. A check that lives only in the verifier therefore inspects an
+    environment that is then thrown away. Refusing inside the builder makes the
+    environment that was checked the environment that runs, by construction
+    rather than by the two staying in step.
+
+    Drives `_build_env` DIRECTLY for that reason — going through the verifier
+    would pass even with the builder failing open, which is the state this
+    replaces.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda: None)
+    with pytest.raises(RuntimeError, match="could not be prepared"):
+        invoker._build_env(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+
+
+def test_build_env_refuses_when_an_override_strips_the_confinement(invoker):
+    """`env_overrides` is applied last and wins — including over hardening.
+
+    Asserted at the builder for the same reason as above: the override is
+    applied on every build, so the check has to be on every build too.
+    """
+    with pytest.raises(RuntimeError, match="not in the environment"):
+        invoker._build_env(
+            CCInvocation(
+                prompt="hi",
+                bash_allowlist=("gh",),
+                env_overrides={"XDG_DATA_HOME": "/tmp/attacker-writable"},
+            )
+        )
+
+
+def test_an_unallowlisted_invocation_is_untouched_by_any_of_this(invoker):
+    """No allowlist, no hardening, no refusal — the collateral-damage arm.
+
+    Without it a refusal that fired on every dispatch would look exactly like
+    a working confinement.
+    """
+    env = invoker._build_env(CCInvocation(prompt="hi"))
+    assert "GENESIS_BASH_ALLOWLIST" not in env
+    assert "XDG_DATA_HOME" not in env
+
+
+# --- Every route gh documents for running a program of its own accord -------
+
+
+def test_the_gh_confinement_pins_the_extension_data_dir(monkeypatch):
+    """Extensions are NOT under the config dir, which is the whole trap.
+
+    MEASURED: `gh` resolves extensions from `$XDG_DATA_HOME/gh/extensions`, so
+    a sealed `GH_CONFIG_DIR` leaves `gh extension install` followed by
+    `gh extension exec` as arbitrary execution with `gh` as both first tokens.
+    An extension planted under the config dir was not found; one under the data
+    dir ran. Pinning the data dir at the same read-only seal closes both halves
+    — the install cannot create the directory, and the exec finds nothing.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda: "/seal")
+    hardened = inv_mod._gh_hardening()
+    assert hardened is not None
+    assert hardened["XDG_DATA_HOME"] == "/seal", (
+        "the extension route is open: extensions resolve from the DATA dir, "
+        "not from GH_CONFIG_DIR, so sealing the config dir alone does nothing "
+        "about `gh extension`."
+    )
+
+
+def test_the_gh_confinement_pins_every_documented_program_route(monkeypatch):
+    """Enumerated from `gh help environment`, not from review findings.
+
+    Each of these names a program gh will run, or a directory gh will run a
+    program out of. They are asserted as a SET so that dropping one fails here
+    rather than in the next review round — the routes arrived one review at a
+    time, which is the signature of a denylist, and the fix for that is to bind
+    the whole documented set at once.
+
+    `GH_PATH` is deliberately absent, and that absence is asserted below rather
+    than left ambiguous: it was MEASURED inert — with a planted value an
+    ordinary read still ran the real gh, and with extensions already unreachable
+    it redirects nothing.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda: "/seal")
+    hardened = inv_mod._gh_hardening()
+    assert hardened is not None
+    assert hardened == {
+        "GH_CONFIG_DIR": "/seal",
+        "XDG_DATA_HOME": "/seal",
+        "GH_PAGER": "cat",
+        "PAGER": "cat",
+        "GH_EDITOR": "true",
+        "GIT_EDITOR": "true",
+        "VISUAL": "true",
+        "EDITOR": "true",
+        "GH_BROWSER": "true",
+        "BROWSER": "true",
+    }
+    assert "GH_PATH" not in hardened
+
+
+def test_the_confinement_reaches_the_env_a_dispatch_would_receive(invoker, monkeypatch):
+    """End of the chain: the pins are in the dict the spawn paths launch.
+
+    The unit above proves `_gh_hardening` returns them. This proves they
+    survive everything `_build_env` does afterwards, which is where a later
+    edit would quietly drop them.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda: "/seal")
+    env = invoker._build_env(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+    assert env["XDG_DATA_HOME"] == "/seal"
+    assert env["GH_CONFIG_DIR"] == "/seal"
+    assert env["BROWSER"] == "true"
+    assert env["EDITOR"] == "true"
 
 
 @pytest.mark.parametrize("key", ["GH_CONFIG_DIR", "GH_PAGER"])
