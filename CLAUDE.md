@@ -139,6 +139,19 @@ Genesis to research, summarize, write content, or do non-Genesis tasks).
 
 ## Design Principles
 
+- **Adopt before you build** — Default order is ADOPT > ADAPT > build. "Build"
+  needs a specific stated reason, and *"nothing adoptable exists"* is a claim
+  that requires a LOGGED SEARCH, not an impression. Compare **user-visible
+  capability**, never architectural depth: "ours is more sophisticated" is a
+  reason to UPGRADE, never a reason to build — and the `evaluate` skill's
+  Overlap Comparison table exists precisely to replace the sentence "we already
+  have this". Genesis's own job is the **brain**: cognition, memory, judgment.
+  Tools that touch the outside world get adopted and wrapped in glue, and the
+  safety and due diligence go INTO that glue rather than into reimplementing the
+  component. State time-to-capability for every option — hours-to-adopt versus
+  weeks-to-build is a first-class factor beside cost and quality. Run
+  `/evaluate` when any candidate tool surfaces; the disposition is the user's
+  call, not one to preempt.
 - **Flexibility > lock-in** — Adapter patterns, generic interfaces, pluggable
   components. Every external dependency should be swappable.
 - **LLM-first solutions** — Code handles structure (timeouts, validation, event
@@ -661,6 +674,13 @@ behind the writer, and 7 were a guard since removed.
   trackers it executes) — format and rationale in the genesis-development
   skill, `references/plan-docs.md`. Task-executor plans (`/task`,
   `TASK_INTAKE.md`) keep their own section contract and are out of scope.
+  **A plan that
+  proposes new source files carries an `## Adopt / Adapt / Build` verdict** —
+  the `evaluate` skill's vocabulary (`ADOPT | WATCH | IGNORE | ADAPT`), naming
+  what was searched, what was found, and hours-to-capability for each option.
+  One line is enough when building is right (`BUILD — cognitive core, no
+  external substitute, searched: <terms>`); the point is that the question gets
+  asked BEFORE the effort, which is the only moment it is cheap to answer.
 - **Use subagents** to keep main context clean. One concern per subagent.
   **A MANDATED subagent is already the request** — when a gate's block message
   tells you to dispatch one, dispatch it; don't stop to ask. Ask only for
@@ -766,9 +786,29 @@ behind the writer, and 7 were a guard since removed.
   either way? Ask. Filing itself needs no per-instance approval: a bug you found while
   reviewing a PR, that does not block that PR, is the ordinary case — file it and keep
   the PR moving (discriminator + bounds: genesis-development, "Keep the PR the PR").
-  One limit stays absolute: a **security** defect — an unpatched bypass, a
-  credential exposure, anything exploitable — is NEVER filed publicly before it
-  is fixed, no matter who owns it. Everything else — who may file, the command,
+  One limit stays absolute, and it turns on **who gains**: a security defect —
+  one whose disclosure hands someone a capability they do not already have — is
+  NEVER filed publicly before it is fixed, no matter who owns it. Credential
+  exposure, an auth or privilege bypass, anything reachable by a party with LESS
+  access than it grants.
+  **A fail-open in a local development guard is USUALLY not that** — apply the
+  test, never the label, because the bare word "bypass" is what misroutes it.
+  Those hooks run only where an install wires them, and whoever can trigger one
+  already has commit access to that checkout. For a guard on the REVIEW chain
+  the worst case is typically an under-reviewed change reaching a PR that still
+  waits on maintainer approval — the state of any PR authored without them; a
+  guard protecting something else (local data, backups, repo routing) has its
+  own worst case — name it, never inherit this one. **The exception that the
+  test catches and the label does not:** a guard whose job is to stop a SECRET
+  or PRIVATE DATA reaching a public surface is security-class however local it
+  is — a branch on a public repo is public the moment it is pushed, merged or
+  not, and this repo's own leak incident was install IPs and personal emails,
+  not keys. So name the
+  adversary and what they gain before withholding; if the answer is "us, and
+  nothing we already lacked", file it. And verify the CHAIN rather than the
+  wording — a deny message naming "secrets" describes what the FLAG does to
+  git's hook chain, not which of this install's controls stand in that path.
+  Everything else — who may file, the command,
   labels, dispatched sessions, the time-gated case — is in
   `.claude/docs/mcp-tools-guide.md` ("Where Deferred Work Goes"). Read it before
   filing your first.
