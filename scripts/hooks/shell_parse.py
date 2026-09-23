@@ -179,8 +179,8 @@ _RUN_CARRIER_EXCLUDES: dict[str, str] = {
         for name in (
             "eval", "su", "runuser", "setpriv", "chroot", "flock", "watch",
             "script", "systemd-run", "unshare", "nsenter", "pkexec", "runcon",
-            "sg", "ssh", "find", "parallel", "docker", "xargs",
-            "bash", "sh", "dash", "zsh", "ksh", "ash",
+            "sg", "source", ".", "builtin", "ssh", "find", "parallel", "docker",
+            "xargs", "bash", "sh", "dash", "zsh", "ksh", "ash",
         )},
 }
 #: Launchers that RUN another command and whose grammar this resolver refuses to

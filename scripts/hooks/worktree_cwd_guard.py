@@ -191,6 +191,9 @@ _CARRIER_EXCLUDES: dict[str, str] = {
     "pkexec": "not seen carrying worktree-touching commands; _REPARSE_CARRIERS guards cover it",
     "runcon": "not seen carrying worktree-touching commands; _REPARSE_CARRIERS guards cover it",
     "sg": "not seen carrying worktree-touching commands; _REPARSE_CARRIERS guards cover it",
+    "source": "not seen carrying worktree-touching commands; _REPARSE_CARRIERS guards cover it",
+    ".": "not seen carrying worktree-touching commands; _REPARSE_CARRIERS guards cover it",
+    "builtin": "not seen carrying worktree-touching commands; _REPARSE_CARRIERS guards cover it",
 }
 # The raw-text half. It stays because it is the only thing that sees a shell
 # FUNCTION DEFINITION, which has no executable to resolve.

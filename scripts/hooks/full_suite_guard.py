@@ -192,6 +192,7 @@ _CARRIER_EXCLUDES: dict[str, str] = {
         # re-parse launchers — shell_parse._REPARSE_CARRIERS
         "eval", "su", "runuser", "setpriv", "chroot", "flock", "watch",
         "script", "systemd-run", "unshare", "nsenter", "pkexec", "runcon", "sg",
+        "source", ".", "builtin",
         # remote / argv-visible carriers — worktree_cwd_guard._CARRIER_NAMES
         "ssh", "find", "parallel", "docker", "xargs",
         # nested shells — destructive_command_guard._NESTED_SHELLS
