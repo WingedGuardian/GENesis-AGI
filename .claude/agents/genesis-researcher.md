@@ -22,7 +22,7 @@ When searching for repos, libraries, or implementation patterns on GitHub:
 
 - **`gh search repos "query" --limit 10`** — Find repos by topic/description. Via Bash.
 - **`gh search code "query" --limit 10`** — Search code across all public repos. Via Bash.
-- **`searchGitHub`** (Grep MCP, `https://mcp.grep.app`, no API key) — LITERAL/regex code search over ~1M public repos. Query with real code (`useState(`, `def handle_`, `(?s)try {.*await`), never keywords or a question; it greps, it does not embed. Filters: `language`, `repo`, `path`, `useRegexp`, `matchCase`.
+- **`searchGitHub`** (Grep MCP, `https://mcp.grep.app`, no API key) — LITERAL/regex code search over ~1M public repos. Query with real code (`useState(`, `def handle_`, `(?s)try {.*await`), never keywords or a question; it greps, it does not embed. Filter by `language`, `repo`, `path`; modify with `useRegexp`, `matchCase`, `matchWholeWords`. **Foreground sessions only** — a background research session gets health/memory/recon and nothing else, so fall back to `gh search code` and `recon_github_search` there rather than assuming this tool exists.
 - **`gh api search/repositories?q=QUERY`** — Structured JSON results. Via Bash.
 
 **When to use:** Any time the prompt asks to "search GitHub," "find repos," "look for libraries," or "how do other projects handle X." These are FAR more targeted than web search for code discovery.
