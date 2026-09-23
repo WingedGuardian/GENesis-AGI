@@ -188,15 +188,28 @@ _CARRIER_WORDS = re.compile(
 )
 
 
-def _resolver_carrier_refusal(cmd: str) -> str | None:
-    """Carrier verdict from the RESOLVER, or None if it has nothing to say.
+def _resolver_carrier_refusal(cmd: str) -> tuple[str | None, bool]:
+    """Carrier verdict from the RESOLVER, and whether it ANSWERED at all.
 
-    Returns a reason to refuse, or None to let the ordinary scan proceed.
-    Raises nothing: an unusable resolver is reported by the caller's own
-    fallback, never by an exception escaping into a blocking hook.
+    Returns ``(reason, analysed)``. ``reason`` is a string to refuse with, or
+    None to let the ordinary scan proceed. ``analysed`` is False only when the
+    resolver could not be consulted — the import failed, or the call raised —
+    and the caller must then keep its own token-level carrier refusal ON,
+    because "the import succeeded" is not the same claim as "the resolver
+    produced an answer for THIS command". Conflating them disabled the fallback
+    refusal on exactly the path where nothing else was left to catch a carrier.
+
+    ⚠ BLIND IS NOT "UNANALYSED". A blind result is the resolver ANSWERING that
+    it cannot read the command, and that answer is already handled below and
+    deliberately scoped to a carrier mention — treating it as unanalysed would
+    switch the fallback refusal back on for every unreadable command and undo
+    that scoping (MEASURED: 53 refusals over the recorded corpus becomes 77).
+
+    Raises nothing: an unusable resolver is reported through the flag, never by
+    an exception escaping into a blocking hook.
     """
     if _analyze_checked is None:
-        return None  # caller falls back to the token scan
+        return None, False  # caller falls back to the token scan, refusal ON
     try:
         segs, blind = _analyze_checked(cmd)
     except Exception:  # noqa: BLE001
@@ -204,12 +217,12 @@ def _resolver_carrier_refusal(cmd: str) -> str | None:
         # — and it must be the SAME, or the shipped predicate is not the one
         # the 53/83,201 figure was measured on.
         if not _CARRIER_WORDS.search(cmd):
-            return None
+            return None, False
         return (
             "this command cannot be analysed, it names a launcher, and it names "
             "a removal — refused conservatively rather than scanned with a "
             "weaker pattern."
-        )
+        ), False
     if blind is not None:
         # AN UNREADABLE COMMAND THAT ALSO NAMES A LAUNCHER. Refuse, do not
         # degrade: the previous revision fell through to a glued-`-rf` regex
@@ -234,20 +247,20 @@ def _resolver_carrier_refusal(cmd: str) -> str | None:
         # scan, which is the behaviour on main — so this narrows what the
         # change ADDS, and reopens nothing that was previously closed.
         if not _CARRIER_WORDS.search(cmd):
-            return None
+            return None, True
         return (
             f"this command cannot be read ({blind.cause}), it names a launcher, "
             f"and it names a removal — so the guard cannot verify what would be "
             f"deleted. Re-issue it in a form the parser can read."
-        )
+        ), True
     for seg in segs:
         if seg.exe in _UNMODELLABLE_CARRIERS:
             return (
                 f"'{seg.exe}' runs a command this resolver refuses to model, so "
                 f"the payload cannot be recovered and a removal inside it cannot "
                 f"be verified. Re-issue the command without the launcher."
-            )
-    return None
+            ), True
+    return None, True
 
 
 _RM_WORD = re.compile(r"\brm\b|\brmdir\b")
@@ -787,10 +800,19 @@ def main() -> int:
         # `_RM_CARRIER_WORD`, not `_RM_WORD`: a carried `rmdir` is outside this
         # guard's subject matter and refusing it only created an asymmetry with
         # its own direct spelling. See the constant.
-        carrier_reason = (
+        #
+        # `analysed` is NOT `_analyze_checked is not None`. That earlier
+        # spelling asked whether the IMPORT worked; this asks whether the
+        # resolver produced an answer for THIS command. They differ on one
+        # path — the resolver raising — and on that path the earlier spelling
+        # turned the fallback's own carrier refusal OFF, i.e. disabled the last
+        # thing left to catch a carrier precisely when the first thing had just
+        # failed. A prefiltered-out command counts as analysed: it is one the
+        # carrier pre-pass has no business with, not one nothing could read.
+        carrier_reason, analysed = (
             _resolver_carrier_refusal(cmd)
             if _RM_CARRIER_WORD.search(cmd)
-            else None
+            else (None, True)
         )
         if carrier_reason:
             print(f"BLOCKED: {carrier_reason}", file=sys.stderr)
@@ -804,10 +826,9 @@ def main() -> int:
                 discarded_write.warn()
             return 2
 
-        resolved = _analyze_checked is not None
-        violations = _rm_violations(cmd, refuse_carriers=not resolved)
+        violations = _rm_violations(cmd, refuse_carriers=not analysed)
 
-        if resolved and violations is not None:
+        if analysed and violations is not None:
             # The resolver RECOVERS a nested shell's payload, so scan what it
             # recovered. Without this the quoted payload of `sh -c "rm -rf X"`
             # is a single token the operand scan cannot see — the reason the
