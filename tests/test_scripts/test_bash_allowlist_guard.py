@@ -28,6 +28,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -375,19 +376,27 @@ def test_launcher_runs_a_shell_hook_under_bash(tmp_path: Path):
     Routing the guard through the launcher (rather than wiring its absolute
     path) is what gives it the same HOOK_ROOT anti-drift resolution as the
     other hooks, so this dispatch has to work.
+
+    On a SYNTHETIC root rather than this checkout: a test that writes a probe
+    into the repository's own scripts/hooks/ mutates the tree it is testing,
+    which races any concurrent run on a shared box and leaves debris if the
+    process dies between write and unlink.
     """
-    probe = _REPO_ROOT / "scripts" / "hooks" / "_launcher_probe_tmp.sh"
-    probe.write_text("#!/usr/bin/env bash\necho SHELL_HOOK_RAN\n", encoding="utf-8")
-    try:
-        proc = subprocess.run(
-            [str(LAUNCHER), "hooks/_launcher_probe_tmp.sh"],
-            capture_output=True,
-            text=True,
-            cwd=str(_REPO_ROOT),
-            env={**os.environ, "GENESIS_HOOK_DEV_LOCAL": "1"},
-        )
-    finally:
-        probe.unlink(missing_ok=True)
+    root = tmp_path / "root"
+    (root / ".claude" / "hooks").mkdir(parents=True)
+    (root / "scripts" / "hooks").mkdir(parents=True)
+    shutil.copy2(LAUNCHER, root / ".claude" / "hooks" / "genesis-hook")
+    (root / "scripts" / "hooks" / "probe.sh").write_text(
+        "#!/usr/bin/env bash\necho SHELL_HOOK_RAN\n", encoding="utf-8"
+    )
+
+    proc = subprocess.run(
+        [str(root / ".claude" / "hooks" / "genesis-hook"), "hooks/probe.sh"],
+        capture_output=True,
+        text=True,
+        cwd=str(root),
+        env={**os.environ, "GENESIS_HOOK_DEV_LOCAL": "1"},
+    )
     assert proc.returncode == 0, proc.stderr
     assert "SHELL_HOOK_RAN" in proc.stdout
 
@@ -484,19 +493,31 @@ def test_launcher_still_runs_a_python_hook_under_python(tmp_path: Path):
 
     Without this, a `case` that sent everything to bash would pass the test
     above while breaking all ~55 wired hooks.
+
+    Built on a SYNTHETIC root carrying its own `.venv/bin/python`, rather than
+    on this checkout. The launcher resolves the interpreter from a `.venv` at
+    one of its roots and exits non-zero when it finds none — which is true of a
+    CI runner that installs dependencies some other way. MEASURED: against the
+    real checkout this failed on CI with `genesis-hook: GENESIS_HOOK_DEV_LOCAL=1`
+    and rc=1, i.e. the test was asserting a property of the developer's machine.
     """
-    probe = _REPO_ROOT / "scripts" / "hooks" / "_launcher_probe_tmp.py"
-    probe.write_text("import sys\nprint('PY_HOOK_RAN', sys.version_info[0])\n", encoding="utf-8")
-    try:
-        proc = subprocess.run(
-            [str(LAUNCHER), "hooks/_launcher_probe_tmp.py"],
-            capture_output=True,
-            text=True,
-            cwd=str(_REPO_ROOT),
-            env={**os.environ, "GENESIS_HOOK_DEV_LOCAL": "1"},
-        )
-    finally:
-        probe.unlink(missing_ok=True)
+    root = tmp_path / "root"
+    (root / ".claude" / "hooks").mkdir(parents=True)
+    (root / "scripts" / "hooks").mkdir(parents=True)
+    (root / ".venv" / "bin").mkdir(parents=True)
+    shutil.copy2(LAUNCHER, root / ".claude" / "hooks" / "genesis-hook")
+    (root / ".venv" / "bin" / "python").symlink_to(sys.executable)
+    (root / "scripts" / "hooks" / "probe.py").write_text(
+        "import sys\nprint('PY_HOOK_RAN', sys.version_info[0])\n", encoding="utf-8"
+    )
+
+    proc = subprocess.run(
+        [str(root / ".claude" / "hooks" / "genesis-hook"), "hooks/probe.py"],
+        capture_output=True,
+        text=True,
+        cwd=str(root),
+        env={**os.environ, "GENESIS_HOOK_DEV_LOCAL": "1"},
+    )
     assert proc.returncode == 0, proc.stderr
     assert "PY_HOOK_RAN 3" in proc.stdout
 
