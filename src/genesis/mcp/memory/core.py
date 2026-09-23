@@ -101,7 +101,7 @@ async def memory_recall(
             co-occurrence.
         mode: "auto" (default) = standard + drift fallback; "standard" =
             hybrid only; "drift" = 3-phase drift retrieval directly, which
-            ignores wing/room filters.
+            ignores wing/room filters (an invalid wing is still refused).
         time_range: Date range as "YYYY-MM-DD/YYYY-MM-DD"; boosts temporally
             matching memories. Temporal language in the query is also
             detected automatically.
