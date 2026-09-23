@@ -163,8 +163,10 @@ cc_ensure_updater_suppressed() {
 _cc_ensure_updater_suppressed_inner() {
     local settings_file="${1:-$HOME/.claude/settings.json}"
     shift || true
-    # Any remaining args are KEY=VALUE **set-if-absent** defaults applied in the
-    # SAME atomic write (install.sh passes the subagent-nesting default). Two
+    # Any remaining args are **set-if-absent** defaults applied in the SAME atomic
+    # write: `KEY=VALUE` for the env block (install.sh passes the subagent-nesting
+    # default), or `top:KEY=<json>` for a TOP-LEVEL key with a JSON-typed value
+    # (e.g. `top:syncClaudeAiSkills=false`); the python block documents both. Two
     # policies, one read-modify-write: the suppression keys are ENFORCED to an
     # exact value, the defaults are only filled in when the key is missing, so a
     # deliberate operator override survives. They are merged here rather than
@@ -408,11 +410,53 @@ except (ValueError, OSError):
 # permanently and silently. Follow the link and rewrite the real target.
 path = os.path.realpath(sys.argv[1])
 REQUIRED = {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}
-# argv[2:] are KEY=VALUE defaults applied ONLY when the key is absent, so a
-# deliberate operator override is preserved. Malformed entries are ignored rather
-# than failing the suppression this function primarily exists to guarantee.
+# argv[2:] are set-if-absent defaults, applied ONLY when the key is absent, so a
+# deliberate operator override is preserved. Two shapes:
+#   KEY=VALUE        -> env block, string value (the original form)
+#   top:KEY=<json>   -> TOP-LEVEL key, JSON-typed value — CC's own settings such
+#                       as syncClaudeAiSkills are top-level booleans, which the
+#                       env form cannot express (it would write the STRING "false"
+#                       inside env, where CC never reads it).
+# Malformed entries are ignored rather than failing the suppression this function
+# primarily exists to guarantee — but a refused top-level default is NAMED on
+# stderr, since its caller asked for a specific setting and would otherwise
+# believe it landed. `top:env=` is refused: it would replace the block the
+# suppression keys live in.
+#
+# STRICT JSON, not Python-JSON: Python's json accepts NaN / Infinity and writes
+# them back out, which CC's parser rejects — so a lenient value would publish a
+# settings.json CC cannot read (losing the suppression keys) while the Python
+# re-read below verified it as correct. The encode check in the loop
+# (allow_nan=False) is the ONE place that refuses them. RecursionError is caught
+# with ValueError: a deeply nested value must be refused, not abort the
+# suppression.
 DEFAULTS = {}
+TOP_DEFAULTS = {}
 for _arg in sys.argv[2:]:
+    if _arg.startswith("top:"):
+        _k, _sep, _raw = _arg[len("top:"):].partition("=")
+        _shown = _arg if len(_arg) <= 120 else _arg[:120] + "…"
+        # Exact, un-normalised key: `top: env=` must not slip past the refusal
+        # as a different-looking key, and CC never reads a padded name anyway.
+        if not _k or _k != _k.strip() or not _sep or _k == "env" or _k in REQUIRED:
+            print("top-level default %r ignored (need top:KEY=<json>; KEY unpadded, "
+                  "not env, not a suppression key)" % _shown, file=sys.stderr)
+            continue
+        try:
+            _val = json.loads(_raw)
+            # Prove it can be WRITTEN too, with the write's own encoder settings.
+            # MEASURED: the C scanner parses 5,000 levels of nesting happily, and
+            # compact json.dumps (C encoder) encodes it — but the write uses
+            # indent=2, which takes the recursive pure-Python encoder and
+            # overflows, failing the suppression. So the check must mirror the
+            # write exactly, including the one level of nesting under the file's
+            # top-level object.
+            json.dumps({_k: _val}, indent=2, allow_nan=False)
+            TOP_DEFAULTS[_k] = _val
+        except (ValueError, RecursionError):
+            print("top-level default %r ignored (value is not strict JSON)" % _shown,
+                  file=sys.stderr)
+        continue
     if "=" in _arg:
         _k, _v = _arg.split("=", 1)
         if _k:
@@ -492,13 +536,18 @@ for _attempt in range(ATTEMPTS):
 
     repaired = [k for k, v in REQUIRED.items() if env.get(k) != v]
     missing_defaults = [k for k in DEFAULTS if k not in env]
-    if not repaired and not missing_defaults:
+    # `not in`, never a falsy test: an operator's explicit `false`/`null` IS a
+    # value, and set-if-absent must not treat it as absence.
+    missing_top = [k for k in TOP_DEFAULTS if k not in data]
+    if not repaired and not missing_defaults and not missing_top:
         sys.exit(0)          # already correct — no write, nothing to report
 
     for k in repaired:
         env[k] = REQUIRED[k]
     for k in missing_defaults:
         env[k] = DEFAULTS[k]
+    for k in missing_top:
+        data[k] = TOP_DEFAULTS[k]
 
     # The RESOLVED target's directory may not exist: a dangling symlink into a
     # dotfiles tree (settings.json -> ../dotfiles/claude/settings.json) resolves
@@ -643,6 +692,7 @@ for _attempt in range(ATTEMPTS):
         # otherwise pass, and the caller would print "applied" for a key that
         # is not there.
         still += [k for k in missing_defaults if k not in final_env]
+        still += [k for k in missing_top if k not in final]
     except (OSError, ValueError):
         still = list(REQUIRED)
     if still:
@@ -655,7 +705,7 @@ for _attempt in range(ATTEMPTS):
     # suppression repairs made a defaults-only write produce rc 0 with EMPTY
     # stdout — byte-identical to "file already correct, nothing written" — so
     # the caller reported `ok` (untouched) for a run that modified the file.
-    print(" ".join(sorted(repaired + missing_defaults)))
+    print(" ".join(sorted(repaired + missing_defaults + missing_top)))
     sys.exit(0)
 
 _exhausted("settings.json kept changing under us (%d attempts) — left untouched rather "
@@ -702,8 +752,10 @@ PYEOF
         # written at most once — but the MESSAGE must not cry "suppression was
         # MISSING" over a defaults-only write.
         CC_SUPPRESSION_STATE=repaired
-        case "$out" in
-            *DISABLE_*)
+        # The two EXACT names, space-delimited — a glob on `DISABLE_` would also
+        # fire for any default whose name merely contains it.
+        case " $out " in
+            *" DISABLE_AUTOUPDATER "*|*" DISABLE_UPDATES "*)
                 echo "  ! CC auto-updater suppression was MISSING in $settings_file — restored: $out" >&2
                 ;;
             *)

@@ -560,6 +560,149 @@ class TestSetIfAbsentDefaults:
         assert set(env) == {"DISABLE_AUTOUPDATER", "DISABLE_UPDATES"}, env
 
 
+class TestTopLevelDefaults:
+    """``top:KEY=<json>`` is a set-if-absent default for a TOP-LEVEL settings key
+    (a sibling of ``env``), with a JSON-typed value — CC's own settings such as
+    ``syncClaudeAiSkills`` are booleans at the top level, which the env-block-only
+    ``KEY=VALUE`` form cannot express. Same single write, same verification."""
+
+    _CALL = 'cc_ensure_updater_suppressed "" {args} || true; echo "STATE=$CC_SUPPRESSION_STATE"'
+
+    def _call(self, tmp_path: Path, *args: str):
+        quoted = " ".join(f"'{a}'" for a in args)
+        return _run(tmp_path, self._CALL.format(args=quoted))
+
+    def test_a_top_level_boolean_default_lands_as_a_json_boolean(self, tmp_path: Path) -> None:
+        r = self._call(tmp_path, "top:syncClaudeAiSkills=false")
+        assert "STATE=repaired" in r.stdout, r.stderr
+        data = json.loads(_settings(tmp_path).read_text())
+        assert data["syncClaudeAiSkills"] is False, data
+        assert "syncClaudeAiSkills" not in data["env"], "top-level, not the env block"
+        assert data["env"]["DISABLE_UPDATES"] == "1"
+
+    def test_env_and_top_level_defaults_share_one_write(self, tmp_path: Path) -> None:
+        self._call(
+            tmp_path,
+            "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2",
+            "top:syncClaudeAiSkills=false",
+            "top:syncClaudeAiPlugins=false",
+        )
+        data = json.loads(_settings(tmp_path).read_text())
+        assert data["env"]["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] == "2"
+        assert data["syncClaudeAiSkills"] is False
+        assert data["syncClaudeAiPlugins"] is False
+
+    def test_an_operator_value_survives(self, tmp_path: Path) -> None:
+        s = _settings(tmp_path)
+        s.parent.mkdir(parents=True, exist_ok=True)
+        s.write_text(
+            json.dumps(
+                {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"},
+                 "syncClaudeAiSkills": True}
+            )
+        )
+        r = self._call(tmp_path, "top:syncClaudeAiSkills=false")
+        assert "STATE=ok" in r.stdout, "nothing absent, so nothing written"
+        assert json.loads(s.read_text())["syncClaudeAiSkills"] is True
+
+    def test_a_present_but_null_value_counts_as_present(self, tmp_path: Path) -> None:
+        """Set-if-ABSENT: an explicit null is an operator choice, not absence."""
+        s = _settings(tmp_path)
+        s.parent.mkdir(parents=True, exist_ok=True)
+        s.write_text(json.dumps(
+            {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}, "statusLine": None}
+        ))
+        r = self._call(tmp_path, 'top:statusLine={"type":"command","command":"x"}')
+        data = json.loads(s.read_text())
+        assert data["statusLine"] is None
+        # Distinguishing: nothing was written at all (not "written somewhere else").
+        assert "STATE=ok" in r.stdout, r.stderr
+        assert not any(k.startswith("top:") for k in data["env"]), data
+
+    def test_a_json_object_value_round_trips(self, tmp_path: Path) -> None:
+        self._call(tmp_path, 'top:statusLine={"type":"command","command":"x"}')
+        assert json.loads(_settings(tmp_path).read_text())["statusLine"] == {
+            "type": "command", "command": "x"}
+
+    def test_a_defaults_only_write_reports_the_key_it_wrote(self, tmp_path: Path) -> None:
+        s = _settings(tmp_path)
+        s.parent.mkdir(parents=True, exist_ok=True)
+        s.write_text(json.dumps({"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}}))
+        r = self._call(tmp_path, "top:syncClaudeAiPlugins=false")
+        assert "STATE=repaired" in r.stdout
+        assert json.loads(s.read_text())["syncClaudeAiPlugins"] is False
+        assert "syncClaudeAiPlugins" in r.stderr, "the write must be reported, not silent"
+        assert "MISSING" not in r.stderr, "a defaults-only write is not a suppression repair"
+
+    @pytest.mark.parametrize(
+        "arg",
+        [
+            "top:env={}",  # would replace the env block the suppression lives in
+            "top:syncClaudeAiSkills=nope",  # not JSON
+            "top:=false",  # no key
+            "top:syncClaudeAiSkills",  # no value at all
+            "top:x=NaN",  # Python-JSON only; CC's parser rejects the written file
+            "top:x=-Infinity",
+            "top:x=" + "[" * 5000 + "]" * 5000,  # RecursionError, not ValueError
+            "top: env={}",  # padded key must not slip past the env refusal
+            'top:DISABLE_UPDATES="0"',  # a suppression name at top level
+        ],
+    )
+    def test_malformed_or_forbidden_entries_are_refused_and_suppression_still_lands(
+        self, tmp_path: Path, arg: str
+    ) -> None:
+        r = self._call(tmp_path, arg)
+        data = json.loads(_settings(tmp_path).read_text())
+        assert data["env"]["DISABLE_AUTOUPDATER"] == "1", "the primary guarantee holds"
+        assert set(data) == {"env"}, f"{arg!r} must write nothing top-level: {data}"
+        assert set(data["env"]) == {"DISABLE_AUTOUPDATER", "DISABLE_UPDATES"}, data
+        assert "ignored" in r.stderr, "a refused default is named, never dropped silently"
+
+    def test_a_default_whose_name_contains_disable_is_not_a_suppression_repair(
+        self, tmp_path: Path
+    ) -> None:
+        s = _settings(tmp_path)
+        s.parent.mkdir(parents=True, exist_ok=True)
+        s.write_text(json.dumps({"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}}))
+        r = self._call(tmp_path, "top:DISABLE_FOO=true")
+        assert json.loads(s.read_text())["DISABLE_FOO"] is True
+        assert "MISSING" not in r.stderr, r.stderr
+
+    def test_a_top_level_default_eaten_by_a_clobber_is_not_reported_applied(
+        self, tmp_path: Path
+    ) -> None:
+        """Behavioural: a writer that removes the default immediately after our
+        rename (while sparing the env keys) must turn the run into `contended`,
+        never `repaired` — the caller must not print 'applied' for a key that is
+        not there. Staged deterministically by wrapping os.replace in the
+        reconciler's own interpreter via sitecustomize."""
+        shim = tmp_path / "shim"
+        shim.mkdir()
+        (shim / "sitecustomize.py").write_text(
+            "import os, json\n"
+            "_real = os.replace\n"
+            "def _clobber(src, dst, *a, **k):\n"
+            "    _real(src, dst, *a, **k)\n"
+            "    if str(dst).endswith('settings.json'):\n"
+            "        d = json.load(open(dst)); d.pop('syncClaudeAiSkills', None)\n"
+            "        json.dump(d, open(dst, 'w'))\n"
+            "os.replace = _clobber\n"
+        )
+        bindir = _minimal_bin(tmp_path)
+        (tmp_path / "home").mkdir(exist_ok=True)
+        r = subprocess.run(
+            ["bash", "-c", f'set -u; source "{_LIB}"; '
+             + self._CALL.format(args="'top:syncClaudeAiSkills=false'")],
+            capture_output=True, text=True, timeout=60,
+            env={"HOME": str(tmp_path / "home"), "PATH": str(bindir),
+                 "CC_VERSION": "9.9.9", "PYTHONPATH": str(shim)},
+        )
+        # Guard-the-guard: the shim really ran (the key is gone from disk).
+        assert "syncClaudeAiSkills" not in json.loads(_settings(tmp_path).read_text())
+        assert "STATE=contended" in r.stdout, (r.stdout, r.stderr)
+        assert "syncClaudeAiSkills" in r.stderr
+
+
 class TestLostUpdate:
     """The write is a read-modify-write on a file OTHER processes rewrite (CC
     persists settings on a /config change or a permission grant). os.replace is
