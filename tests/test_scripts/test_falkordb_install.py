@@ -180,6 +180,30 @@ def test_a_later_false_overrides_an_earlier_true(tmp_path):
         Path(env["FALKORDB_APT_LIST"]).unlink(missing_ok=True)
 
 
+def test_a_repeated_graph_engine_block_restarts_consent(tmp_path):
+    """Duplicate TOP-LEVEL mappings are legal YAML; PyYAML keeps the LAST.
+
+    An earlier block's `provision: true` must not survive into a file whose
+    effective `graph_engine` mapping never consented — the gate must disagree
+    with a withdrawn decision, not with itself.
+    """
+    env = _stage(tmp_path)
+    del env["GENESIS_FALKORDB_PROVISION"]
+    for body, consents in (
+        # Earlier block consents; the LAST mapping (what PyYAML loads) does not.
+        ("graph_engine:\n  provision: true\ngraph_engine:\n  backend: x\n", False),
+        # Earlier block silent; the effective mapping consents.
+        ("graph_engine:\n  backend: x\ngraph_engine:\n  provision: true\n", True),
+    ):
+        Path(env["FALKORDB_LOCAL_CONFIG"]).write_text(body)
+        result = _run("falkordb_redis_install", env)
+        assert result.returncode == 0, result.stderr
+        assert Path(env["FALKORDB_APT_LIST"]).exists() == consents, (
+            f"last-block-wins not honoured: {body!r}"
+        )
+        Path(env["FALKORDB_APT_LIST"]).unlink(missing_ok=True)
+
+
 def test_kill_switch_stops_everything_including_the_module(tmp_path):
     env = _stage(tmp_path)
     env["GENESIS_FALKORDB_PROVISION_DISABLED"] = "1"
@@ -248,6 +272,8 @@ def test_fresh_box_adds_repo_installs_and_stands_down_system_redis(tmp_path):
     # reporting disabled (stub rc 1) is what lets this line print.
     assert "systemctl is-enabled" in log
     assert "system unit disabled" in result.stdout
+    # The marker is written only AFTER the verified stand-down.
+    assert Path(env["FALKORDB_PROVISION_MARKER"]).exists()
 
 
 def test_a_failed_disable_reports_the_daemon_it_left_running(tmp_path):
@@ -265,6 +291,20 @@ def test_a_failed_disable_reports_the_daemon_it_left_running(tmp_path):
     assert "disable --now' failed" in result.stdout
     assert "still enabled on :6379" in result.stdout
     assert "system unit disabled" not in result.stdout, "claimed the posture anyway"
+    # And no 'completed provisioning' marker — a later run must retry the
+    # stand-down, not print 'already provisioned' over a live system daemon.
+    assert not Path(env["FALKORDB_PROVISION_MARKER"]).exists()
+
+
+def test_a_unit_still_enabled_after_disable_leaves_no_marker(tmp_path):
+    """The verify-failure path must leave the marker unwritten too."""
+    env = _stage(tmp_path)
+    env["SYSTEMCTL_IS_ENABLED_RC"] = "0"
+    result = _run("falkordb_redis_install", env)
+
+    assert result.returncode == 0, result.stderr
+    assert "still enabled" in result.stdout
+    assert not Path(env["FALKORDB_PROVISION_MARKER"]).exists()
 
 
 def test_a_unit_still_enabled_after_disable_reports_it(tmp_path):
@@ -276,6 +316,54 @@ def test_a_unit_still_enabled_after_disable_reports_it(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "still enabled" in result.stdout
     assert "system unit disabled" not in result.stdout, "claimed the posture anyway"
+
+
+def test_an_unpinned_architecture_changes_nothing_on_the_system(tmp_path):
+    """No pinned digest for this arch means the module can never verify —
+    so provisioning must stop BEFORE apt, not after redis is already on.
+
+    On arm64v8 the module install would deterministically refuse; without the
+    preflight an opted-in ARM box gained a third-party apt repo and a redis
+    daemon for an engine that could never load.
+    """
+    env = _stage(tmp_path)
+    uname = Path(env["PATH"].split(":")[0]) / "uname"
+    uname.write_text("#!/bin/bash\nprintf 'aarch64\\n'\n")
+    uname.chmod(0o755)
+
+    result = _run("falkordb_provision", env)
+    assert result.returncode == 0, result.stderr
+    assert "no pinned checksum" in result.stdout
+    assert not Path(env["FALKORDB_APT_LIST"]).exists(), "repo added before preflight"
+    assert "apt-get" not in _apt_log(env), "apt ran on an unsupportable arch"
+
+
+def test_a_derivative_maps_to_its_ubuntu_base_suite(tmp_path):
+    """Mint's VERSION_CODENAME is 'wilma' — no such redis suite. UBUNTU_CODENAME
+    is the base it actually tracks, so the source must be written for that."""
+    env = _stage(tmp_path)
+    Path(env["FALKORDB_OS_RELEASE"]).write_text(
+        "ID=linuxmint\nVERSION_CODENAME=wilma\nUBUNTU_CODENAME=noble\n"
+    )
+    result = _run("falkordb_redis_install", env)
+
+    assert result.returncode == 0, result.stderr
+    assert "noble main" in Path(env["FALKORDB_APT_LIST"]).read_text(), (
+        "wrote a suite the repo does not serve"
+    )
+
+
+def test_an_unserved_distro_writes_no_apt_source(tmp_path):
+    """Neither UBUNTU_CODENAME nor a served ID — any suite would be a guess."""
+    env = _stage(tmp_path)
+    Path(env["FALKORDB_OS_RELEASE"]).write_text(
+        "ID=arch\nVERSION_CODENAME=rolling\n"
+    )
+    result = _run("falkordb_redis_install", env)
+
+    assert result.returncode == 0, result.stderr
+    assert "no published redis apt suite" in result.stdout
+    assert not Path(env["FALKORDB_APT_LIST"]).exists()
 
 
 def test_a_failed_apt_update_refuses_a_below_floor_candidate(tmp_path):
@@ -292,6 +380,9 @@ def test_a_failed_apt_update_refuses_a_below_floor_candidate(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert "update failed" in result.stdout
+    # A source that cannot update must not be LEFT: apt consults every list on
+    # every operation, so a broken suite would fail unrelated apt runs too.
+    assert not Path(env["FALKORDB_APT_LIST"]).exists(), "broken source left enabled"
     assert "below" in result.stdout and "floor" in result.stdout
     assert "apt-get update" in _apt_log(env)
     assert "apt-get install" not in _apt_log(env), "installed an unusable redis"
@@ -339,9 +430,9 @@ def test_a_failed_apt_cache_probe_skips_without_aborting_bootstrap(tmp_path):
 
 def test_unknown_codename_skips_before_touching_apt(tmp_path):
     env = _stage(tmp_path)
-    Path(env["FALKORDB_OS_RELEASE"]).write_text("ID=weird\n")  # no VERSION_CODENAME
+    Path(env["FALKORDB_OS_RELEASE"]).write_text("ID=weird\n")  # no codenames at all
     result = _run("falkordb_redis_install", env)
 
     assert result.returncode == 0, result.stderr
-    assert "VERSION_CODENAME" in result.stdout
+    assert "no published redis apt suite" in result.stdout
     assert not Path(env["FALKORDB_APT_LIST"]).exists()

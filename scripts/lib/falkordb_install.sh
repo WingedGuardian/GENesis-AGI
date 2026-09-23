@@ -85,7 +85,10 @@ _falkordb_opted_in() {
     [ -r "$FALKORDB_LOCAL_CONFIG" ] || return 1
     awk '
         function indent_of(line) { match(line, /^[ \t]*/); return RLENGTH }
-        /^graph_engine[[:space:]]*:/ { in_block = 1; child_indent = -1; next }
+        # A REPEATED top-level mapping restarts consent too: PyYAML keeps the
+        # LAST duplicate `graph_engine:` block, so a true from an earlier block
+        # must not survive into a file whose effective mapping says otherwise.
+        /^graph_engine[[:space:]]*:/ { in_block = 1; child_indent = -1; found = 0; next }
         # Any other column-0 key closes the block; graph_engine is top-level,
         # so the parent indent is always 0 and needs no tracking.
         /^[^[:space:]#]/ { in_block = 0 }
@@ -367,18 +370,42 @@ falkordb_redis_install() {
         return 0
     fi
 
+    # Which suite does packages.redis.io serve for THIS box? Two cases:
+    #   - UBUNTU_CODENAME (set by Ubuntu derivatives like Mint): the operator's
+    #     own VERSION_CODENAME is their release name — Mint's 'wilma' has no
+    #     redis suite — but the derivative declares the Ubuntu base it tracks,
+    #     which does. Always prefer it.
+    #   - otherwise require ID itself to be a distro the repo publishes suites
+    #     for (ubuntu, debian). Any other codename would write an apt source
+    #     that fails update forever — worse than declining to provision.
     codename=""
+    os_id=""
     if [ -r "$FALKORDB_OS_RELEASE" ]; then
         # Guarded: a bare assignment carries the substitution's status, and an
         # os-release that fails to source would abort bootstrap under set -e —
         # against this lib's never-abort contract.
         rc=0
         # shellcheck disable=SC1090
-        codename="$(. "$FALKORDB_OS_RELEASE" && printf '%s' "${VERSION_CODENAME:-}")" || rc=$?
+        codename="$(. "$FALKORDB_OS_RELEASE" && printf '%s' "${UBUNTU_CODENAME:-}")" || rc=$?
         [ "$rc" -eq 0 ] || codename=""
+        if [ -z "$codename" ]; then
+            rc=0
+            # shellcheck disable=SC1090
+            os_id="$(. "$FALKORDB_OS_RELEASE" && printf '%s' "${ID:-}")" || rc=$?
+            case "$os_id" in
+                ubuntu|debian)
+                    rc=0
+                    # shellcheck disable=SC1090
+                    codename="$(. "$FALKORDB_OS_RELEASE" && printf '%s' "${VERSION_CODENAME:-}")" || rc=$?
+                    [ "$rc" -eq 0 ] || codename=""
+                    ;;
+            esac
+        fi
     fi
     if [ -z "$codename" ]; then
-        echo "  Skipped: could not read VERSION_CODENAME from $FALKORDB_OS_RELEASE — cannot pick an apt suite."
+        echo "  Skipped: no published redis apt suite for this system (${os_id:-unknown};"
+        echo "           the repo serves ubuntu/debian and derivatives that declare"
+        echo "           UBUNTU_CODENAME). Cannot pick an apt suite to provision."
         return 0
     fi
 
@@ -420,7 +447,15 @@ falkordb_redis_install() {
         echo "  Added: redis apt repo ($codename)"
         rc=0
         sudo apt-get update -qq >/dev/null 2>&1 || rc=$?
-        [ "$rc" -eq 0 ] || echo "  WARNING: apt-get update failed (rc=$rc)."
+        if [ "$rc" -ne 0 ]; then
+            # A source that cannot update is worse than no source: apt consults
+            # every list on EVERY operation, so a broken suite we leave behind
+            # fails the operator's unrelated apt runs too. Remove only what
+            # this run created — both were written above, unconditionally.
+            sudo rm -f "$FALKORDB_APT_LIST" "$FALKORDB_APT_KEYRING" 2>/dev/null || true
+            echo "  WARNING: apt-get update failed (rc=$rc) — removed the redis apt"
+            echo "           source this run added so it cannot break later apt runs."
+        fi
     fi
 
     # The candidate is verified immediately before EVERY install, not just when
@@ -466,8 +501,6 @@ falkordb_redis_install() {
     # unit THIS run created. Record that, both so a re-run can tell our work
     # from an operator's and so the disable is never replayed against a redis
     # someone installed afterwards.
-    mkdir -p "$(dirname "$FALKORDB_PROVISION_MARKER")" 2>/dev/null || true
-    date -u +%Y-%m-%dT%H:%M:%SZ > "$FALKORDB_PROVISION_MARKER" 2>/dev/null || true
     # Standing the package's system unit down is part of provisioning, not
     # cosmetic: if it fails, a second redis keeps running on :6379 across
     # reboots, so failure must never read as the socket-only posture.
@@ -487,17 +520,43 @@ falkordb_redis_install() {
         echo "           sudo systemctl disable --now redis-server"
         return 0
     fi
+    # The marker records a COMPLETED provisioning — including the stand-down.
+    # Written only after both checks pass so a failed disable is retried on the
+    # next run rather than replayed as 'already provisioned' forever.
+    mkdir -p "$(dirname "$FALKORDB_PROVISION_MARKER")" 2>/dev/null || true
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$FALKORDB_PROVISION_MARKER" 2>/dev/null || true
     echo "  Installed: redis-server (system unit disabled — Genesis uses a socket-only user unit)"
     return 0
 }
 
 # falkordb_provision — the single entry point bootstrap calls.
 falkordb_provision() {
+    local arch
     if [ "$FALKORDB_PROVISION_DISABLED" = "1" ]; then
         echo "  Skipped: GENESIS_FALKORDB_PROVISION_DISABLED=1."
         return 0
     fi
     mkdir -p "$FALKORDB_DATA_DIR" 2>/dev/null || true
+    # Preflight before touching the system: the module half refuses any
+    # version/arch pair with no pinned digest, so a box that can never install
+    # the module (an architecture we ship no asset for, or an unpinned pair
+    # like 4.20.4/arm64v8 while only x64 is pinned) has no business gaining an
+    # apt repo and a database first. Installing redis on such a box is a
+    # system change for an engine that can never load. A module already on
+    # disk was verified when it landed, so it counts as supportable.
+    arch="$(_falkordb_arch)"
+    if [ -z "$arch" ]; then
+        echo "  Skipped: no FalkorDB module ships for $(uname -m 2>/dev/null || echo 'this architecture') —"
+        echo "           nothing provisioned."
+        return 0
+    fi
+    if [ -z "$(_falkordb_expected_sha "$FALKORDB_VERSION" "$arch")" ] \
+        && [ ! -f "$FALKORDB_DEPS_DIR/$FALKORDB_VERSION/falkordb.so" ]; then
+        echo "  Skipped: no pinned checksum for FalkorDB $FALKORDB_VERSION/$arch —"
+        echo "           the module cannot be verified, so no system changes were made."
+        echo "           To adopt this build, pin its digest in _falkordb_expected_sha."
+        return 0
+    fi
     falkordb_redis_install
     falkordb_module_install
     return 0
