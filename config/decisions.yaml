@@ -1,0 +1,139 @@
+# Decision question registry — every bounded-choice decision Genesis makes.
+#
+# INCLUSION TEST, and it is structural rather than a value judgment: is the
+# answer drawn from a declarable finite set? If yes it belongs here — including
+# decisions currently made by a hardcoded constant standing in for a judgment.
+#
+# DECLARED IS NOT WIRED. A spec here records what a site asks and what it does
+# with the answer. Nothing below is load-bearing yet; each site is promoted
+# individually, in shadow, on measured evidence that it beats its incumbent.
+# Register liberally, promote individually.
+#
+# The question WORDING is the asset, not scaffolding around it. MEASURED
+# 2026-09-23: a hand-written question scored AUC 0.900 on a real Genesis task
+# where the vendor's own pre-tuned preset scored 0.560 on the same model and
+# the same cases.
+#
+# `consumes` decides what a site needs and therefore how it degrades:
+#   argmax   — top label only.   Needs accuracy. Works uncalibrated.
+#   ordering — relative order.   Needs ranking.  Works uncalibrated.
+#   threshold— absolute p.       REQUIRES calibration; a threshold is mandatory.
+#
+# A local `decisions.local.yaml` overlay (gitignored) is deep-merged on top.
+
+decisions:
+
+  # --- memory ------------------------------------------------------------
+  memory_relationship:
+    type: choice
+    instructions: "How does Note B relate to Note A?"
+    options:
+      duplicate: "B restates A with no new information"
+      contradicts: "B asserts something incompatible with A"
+      succeeded_by: "B updates or replaces A"
+      distinct: "unrelated, or independently true"
+    consumes: argmax
+    latency_budget_ms: 2000
+    fallback:
+      typed: argmax_advisory
+      legacy: existing_llm_path
+    outcome_source: ledger_predictions
+    owner: memory.relationship_classifier
+
+  # --- egress ------------------------------------------------------------
+  # MEASURED 2026-09-23, english checkpoint, zero-shot, no fine-tuning:
+  # AUC 0.900 separating inferential-PII from clean technical prose, on a
+  # class the incumbent nine-regex scanner scores at chance (0.500).
+  #
+  # `ordering`, NOT `threshold`, deliberately. The natural consumption here is
+  # pass/review/block, but no calibrated threshold exists: the 0.081 cut that
+  # looked good was fitted on self-authored, unrealistically short cases.
+  # Promote to `threshold` only once a calibration fitted on a corpus this
+  # project did not author says what the number should be.
+  egress_personal_context:
+    type: noul
+    instructions: >-
+      Does this text reveal details of the author's personal life — household
+      members, family, languages spoken at home, daily schedule, habits,
+      health, or physical location?
+    consumes: ordering
+    latency_budget_ms: 4000
+    fallback:
+      typed: rank_for_human_review
+      legacy: regex_scan_only
+    outcome_source: egress_review_outcomes
+    owner: security.output_scanner
+
+  # Complementary to the regexes, NOT a replacement. MEASURED: this caught an
+  # email address scan_outbound missed; scan_outbound caught a /home/<user>/
+  # path this missed. Union covered 4/4. Both arms stay.
+  egress_direct_identifier:
+    type: noul
+    instructions: >-
+      Does this text contain a direct identifier: an IP address, a real
+      person's name, an email address, a file path containing a username, or a
+      credential or API key?
+    consumes: ordering
+    latency_budget_ms: 4000
+    fallback:
+      typed: rank_for_human_review
+      legacy: regex_scan_only
+    outcome_source: egress_review_outcomes
+    owner: security.output_scanner
+
+  # --- triage ------------------------------------------------------------
+  # Promotes a hardcoded constant to a judgment. The incumbent is
+  # `token_count < 100` in learning/triage/prefilter.py — a threshold nobody
+  # believes is correct, sitting there because asking cost two seconds and a
+  # model call.
+  triage_depth:
+    type: choice
+    instructions: "How much analysis does this interaction warrant?"
+    options:
+      skip: "no durable signal; nothing to extract or act on"
+      micro: "one fact or preference worth storing, nothing more"
+      standard: "ordinary extraction and classification"
+      deep: "decisions, commitments or corrections that need full reasoning"
+    consumes: argmax
+    latency_budget_ms: 1500
+    fallback:
+      typed: argmax_advisory
+      legacy: token_count_heuristic
+    outcome_source: calibration_cells
+    owner: learning.triage.prefilter
+
+  # --- routing -----------------------------------------------------------
+  model_route_difficulty:
+    type: score
+    instructions: "How hard is this request for a language model?"
+    criteria:
+      - "trivial — lookup, formatting, or a one-line transformation"
+      - "moderate — ordinary reasoning within one domain"
+      - "hard — multi-step reasoning, or judgment with real consequences"
+    consumes: ordering
+    latency_budget_ms: 800
+    fallback:
+      typed: rank_advisory
+      legacy: static_chain_selection
+    outcome_source: calibration_cells
+    owner: routing.router
+
+  # --- skills ------------------------------------------------------------
+  # 69 SKILL.md files on this install, well past the soft cap. Declared here
+  # mainly to pin the constraint: at default token budgets a 77-option choice
+  # measured 0.425 against 0.870 for a model without the limit, because each
+  # label got ~3-4 tokens. Options are resolved at call time from the skill
+  # index; the strategy is what makes the question answerable at all.
+  skill_selection:
+    type: choice
+    instructions: "Which skill best fits the task described?"
+    options:
+      __dynamic__: "resolved at call time from the skill index"
+      __none__: "no skill applies; proceed without one"
+    consumes: argmax
+    cardinality_strategy: shortlist
+    latency_budget_ms: 1200
+    fallback:
+      typed: argmax_advisory
+      legacy: skill_injection_hook
+    owner: skills.injection
