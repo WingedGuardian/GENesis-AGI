@@ -696,51 +696,31 @@ class TestCommandCarriersAreRefusedWithoutInspection:
         assert self._main(cmd.format(RM=self.RM), tmp_path) == 0, cmd
 
     def test_an_unreadable_command_is_REFUSED_not_degraded(self, tmp_path):
-        """The one-character bypass of the mechanism this guard is named for.
+        """A blind parse used to fall through to `_RM_RF_PATTERN`, which needs
+        a GLUED `-rf`, so a split-flag spelling walked past it. A refusal
+        conditional on the tokenizer succeeding is a refusal the caller
+        controls, so an unreadable command naming a removal now refuses
+        UNCONDITIONALLY.
 
-        A blind parse used to fall through to `_RM_RF_PATTERN`, which needs a
-        GLUED `-rf`. So one trailing quote flipped the verdict:
-
-            eval 'rm -r -f /a/b'        BLOCK
-            eval 'rm -r -f /a/b' "      allow      <- same command
-
-        A refusal conditional on the tokenizer succeeding is a refusal the
-        caller controls.
-
-        SCOPED TO A LAUNCHER MENTION — every command here names one. The
-        unscoped version of this refusal cost 77 of 83,201 recorded commands
-        against origin/main and ~91% of those were heredoc scripts the parser
-        merely could not read; requiring a launcher costs 53 and keeps every
-        measured attack spelling closed. Its other direction is pinned by
-        `test_an_unreadable_command_with_NO_launcher_is_left_as_main_has_it`.
+        ⚠ AN EARLIER REVISION SCOPED THIS TO COMMANDS THAT ALSO NAMED A
+        LAUNCHER, to save a few dozen refusals over the recorded corpus. That
+        scope was DELETED — it is unsound in principle, not in detail: on this
+        path the parser has already failed, so the only thing left to
+        recognise a launcher is a text test over the raw string, and text
+        tests are respellable. Two consecutive review rounds each found the
+        next spelling. Refusing on unreadability alone names nothing and so
+        cannot be respelled.
         """
         q = chr(34)
         assert self._main(f"eval '{self.RM} -r -f /a/b'", tmp_path) == 2
         assert self._main(f"eval '{self.RM} -r -f /a/b' {q}", tmp_path) == 2
         assert self._main(f"bash -c '{self.RM} -r -f /a/b' {q}", tmp_path) == 2
-
-    def test_an_unreadable_command_with_NO_launcher_is_left_as_main_has_it(
-        self, tmp_path
-    ):
-        """The PRICE of scoping the blind refusal, pinned so it is not a surprise.
-
-        `rm -r -f /a/b "` is unreadable, names a removal, and names no
-        launcher. It is ALLOWED — MEASURED identical on origin/main, so this
-        change neither opens nor closes it, and the bidirectional corpus sweep
-        reports 0 of 83,201 commands going from refused to allowed.
-
-        Kept as an explicit test rather than left implicit, because a NARROWING
-        regresses in the direction nobody sweeps: the 153-cell axis sweep only
-        exercises CARRIED spellings and is structurally blind to this one.
-        """
-        q = chr(34)
-        assert self._main(f"{self.RM} -r -f /a/b {q}", tmp_path) == 0
-
-        # The discriminator: the SAME unreadable command, plus a launcher.
-        assert self._main(f"eval '{self.RM} -r -f /a/b' {q}", tmp_path) == 2
+        # No launcher named at all — still refuses, because the rule no longer
+        # asks. This is the case the deleted scope used to allow.
+        assert self._main(f"{self.RM} -r -f /a/b {q}", tmp_path) == 2
 
         # And a glued `-rf` still blocks unreadable, via the legacy pattern —
-        # so the scoping did not delete the fallback it sits in front of.
+        # unchanged by this deletion.
         assert self._main(f"{self.RM} -rf /a/b {q}", tmp_path) == 2
 
     @pytest.mark.parametrize(
@@ -995,51 +975,37 @@ class TestAResolverThatRAISESKeepsTheFallbackRefusalOn:
         )
         return dg.main()
 
-    # A carrier the RAW-TEXT scope test cannot see, because shell quoting splits
-    # the name — `\bsh\b` and `\beval\b` both miss these, while shlex resolves
-    # them to `bash` and `eval`. That combination is the only place the flag
-    # changes anything, so a test using a plainly-spelled `eval` proves nothing:
-    # the text test refuses it one branch earlier. MEASURED — such a test passed
-    # against a mutant that reverted this fix.
-    INVISIBLE = [
-        ('ba' + chr(39) + 's' + chr(39) + 'h -c', "quote-split bash"),
-        ('e' + chr(34) + 'v' + chr(34) + 'al', "quote-split eval"),
-        ('ev' + chr(34) + chr(34) + 'al', "empty-string-split eval"),
-    ]
-
-    @pytest.mark.parametrize("carrier,why", INVISIBLE)
-    def test_a_raising_resolver_still_refuses_a_carrier(
-        self, carrier, why, monkeypatch
-    ):
+    # ⚠ THIS CLASS ONCE PARAMETRIZED OVER CARRIER SPELLINGS THE RAW-TEXT SCOPE
+    # TEST COULD NOT SEE. That scope is now DELETED (see `_resolver_carrier_
+    # refusal`'s raise branch): a raising resolver refuses ANY command naming a
+    # removal, no carrier required. So a plain, unscoped payload is sufficient
+    # and there is no longer a scope predicate to guard-the-guard against.
+    def test_a_raising_resolver_still_refuses_a_removal(self, monkeypatch):
         def boom(_cmd):
             raise RuntimeError("resolver exploded")
 
-        cmd = f"{carrier} '{self.RM} -rf /a/b'"
+        cmd = f"{self.RM} -rf /a/b"
         assert self._main_with(monkeypatch, cmd, boom) == 2, (
-            f"{why}: a raising resolver disabled the fallback carrier refusal — "
-            "the one path where nothing else is left to catch a carrier"
-        )
-
-    @pytest.mark.parametrize("carrier,why", INVISIBLE)
-    def test_the_raw_text_scope_really_is_blind_to_these(self, carrier, why):
-        """Guard-the-guard: if `_CARRIER_WORDS` saw these, the tests above would
-        pass through the text branch and pin nothing."""
-        cmd = f"{carrier} '{self.RM} -rf /a/b'"
-        assert not dg._CARRIER_WORDS.search(cmd), (
-            f"{why}: fixture lost its property — the text scope now matches, so "
-            "the raise-path test no longer reaches the flag it claims to pin"
+            "a raising resolver must not disable the fallback refusal — the "
+            "one path where nothing else is left to catch a removal"
         )
 
     def test_a_raising_resolver_does_not_refuse_a_plain_safe_command(
         self, monkeypatch
     ):
-        """The negative control. Failing closed is not failing on everything."""
+        """The negative control. Failing closed is not failing on everything.
+
+        A command that names no removal never reaches the resolver at all — the
+        `\\brm\\b` prefilter returns first — so a raising resolver cannot refuse
+        it. (A command that DOES name a removal now refuses when the resolver
+        raises, whatever its depth: the raise branch is unconditional, because
+        a guard that cannot analyse a removal cannot verify it.)
+        """
 
         def boom(_cmd):
             raise RuntimeError("resolver exploded")
 
-        cmd = f"{self.RM} -rf ./deep/a/b/c/d"
-        assert self._main_with(monkeypatch, cmd, boom) == 0
+        assert self._main_with(monkeypatch, "ls -la /srv/app", boom) == 0
 
     def test_a_working_resolver_leaves_the_fallback_refusal_OFF(self, monkeypatch):
         """The other side: with a live resolver the fallback must NOT double up,

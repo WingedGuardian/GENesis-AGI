@@ -19,11 +19,11 @@ Stdlib-only in its own logic; it imports the shared resolver behind a GUARDED
 import whose failure path is this module's own token scan, so a broken sibling
 degrades it to the previous behaviour rather than disabling it.
 
-An unparseable command that also names a LAUNCHER is REFUSED — this used to say
+An unparseable command that names a removal is REFUSED. This used to say
 "fail-open beyond that", and that sentence described the defect: a blind parse
-fell through to a glued-`-rf` regex, so one trailing quote turned a BLOCK into
-an allow. An unparseable command naming no launcher still falls back to the
-legacy regex match, which is where the fail-open now stops.
+fell through to a glued-`-rf` regex, which a split-flag spelling walks past.
+The legacy regex now runs only on the degraded path, when the resolver itself
+could not be imported.
 """
 
 from __future__ import annotations
@@ -83,8 +83,8 @@ _ALWAYS_BLOCK = {".", "..", "/", "~", "*"}
 #
 # DELIBERATELY A LOCAL COPY, not an import — and the reason is NOT the one this
 # comment used to give. It said this module "does not use `shell_parse` at all",
-# which a later commit on this very branch made false: `_resolver_carrier_refusal`
-# imports `analyze_checked` at :158. Issue #2232 quotes the retired sentence as
+# which a later change made false: this module imports `analyze_checked` in a
+# guarded block below. Issue #2232 quotes the retired sentence as
 # the reason this set "cannot become an import", so it is corrected there too.
 #
 # THE SURVIVING REASON: the set must OUTLIVE the guarded import. The import is
@@ -124,6 +124,9 @@ _COMMAND_CARRIERS = frozenset(
         "pkexec",
         "runcon",
         "sg",
+        "source",
+        ".",
+        "builtin",
     }
     | _NESTED_SHELLS
 )
@@ -180,14 +183,6 @@ except Exception:  # noqa: BLE001 — degraded, never permissive
 # over-block a recoverable command and the deny text would be untrue.
 _UNMODELLABLE_CARRIERS = _COMMAND_CARRIERS - _NESTED_SHELLS
 
-# A carrier NAME anywhere in the raw text. Used ONLY to scope the blind branch
-# below, never to decide a command position — that question belongs to the
-# resolver, and a name cannot answer it (see `_COMMAND_OPENERS`).
-_CARRIER_WORDS = re.compile(
-    r"\b(" + "|".join(sorted(re.escape(c) for c in _COMMAND_CARRIERS)) + r")\b"
-)
-
-
 def _resolver_carrier_refusal(cmd: str) -> tuple[str | None, bool]:
     """Carrier verdict from the RESOLVER, and whether it ANSWERED at all.
 
@@ -200,10 +195,8 @@ def _resolver_carrier_refusal(cmd: str) -> tuple[str | None, bool]:
     refusal on exactly the path where nothing else was left to catch a carrier.
 
     ⚠ BLIND IS NOT "UNANALYSED". A blind result is the resolver ANSWERING that
-    it cannot read the command, and that answer is already handled below and
-    deliberately scoped to a carrier mention — treating it as unanalysed would
-    switch the fallback refusal back on for every unreadable command and undo
-    that scoping (MEASURED: 53 refusals over the recorded corpus becomes 77).
+    it cannot read the command, and that answer is handled below by refusing.
+    Only an import failure or a raise means nobody answered at all.
 
     Raises nothing: an unusable resolver is reported through the flag, never by
     an exception escaping into a blocking hook.
@@ -213,45 +206,35 @@ def _resolver_carrier_refusal(cmd: str) -> tuple[str | None, bool]:
     try:
         segs, blind = _analyze_checked(cmd)
     except Exception:  # noqa: BLE001
-        # Same scoping as the blind branch below, for the same measured reason
-        # — and it must be the SAME, or the shipped predicate is not the one
-        # the 53/83,201 figure was measured on.
-        if not _CARRIER_WORDS.search(cmd):
-            return None, False
         return (
-            "this command cannot be analysed, it names a launcher, and it names "
-            "a removal — refused conservatively rather than scanned with a "
-            "weaker pattern."
+            "this command cannot be analysed and it names a removal — refused "
+            "conservatively rather than scanned with a weaker pattern."
         ), False
     if blind is not None:
-        # AN UNREADABLE COMMAND THAT ALSO NAMES A LAUNCHER. Refuse, do not
-        # degrade: the previous revision fell through to a glued-`-rf` regex
-        # here, so one trailing quote turned a BLOCK into an allow (MEASURED —
-        # `eval 'rm -r -f /a/b' "` was ALLOWED while the same command without
-        # the quote BLOCKED). A refusal conditional on the tokenizer succeeding
-        # is a refusal the caller controls.
+        # AN UNREADABLE COMMAND THAT NAMES A REMOVAL. Refuse; do not degrade to
+        # the glued-`-rf` regex, which a split-flag spelling walks past.
         #
-        # SCOPED TO A CARRIER MENTION, and the scope is measured rather than
-        # assumed. Refusing EVERY unreadable command that names a removal cost
-        # 77 of 83,201 recorded commands against origin/main (0.093%), and ~91%
-        # of those were ordinary `python - <<'PY' … rm …` scripts — refused
-        # because the parser cannot read a HEREDOC BODY, which is the known
-        # over-read filed as a residual, not an ambiguity about a removal.
-        # Requiring a launcher name too costs 53 (0.064%) and keeps every
-        # measured attack spelling closed, because each of them names its
-        # launcher. The remaining 53 are mostly scripts that mention a `.sh`
-        # path or a shell by name; that is the price of a text test and it is
-        # why this scoping is the ONLY place one is used.
+        # ⚠ NO CARRIER SCOPE, DELIBERATELY, AND AN EARLIER REVISION HAD ONE. It
+        # refused only when the raw text ALSO named a launcher, to save a few
+        # dozen refusals over the recorded corpus. That is unsound in principle,
+        # not in detail: on this path the parser has already FAILED, so the only
+        # thing left to recognise a launcher is a text test over the raw string
+        # — and bash resolves the command word only after quote removal and six
+        # kinds of expansion (bash(1), EXPANSION), so any name test can be
+        # respelled. Two consecutive review rounds each found the next spelling.
+        # No resolver change can help here either: the resolver is what failed.
         #
-        # A command with no launcher mention falls through to the ordinary
-        # scan, which is the behaviour on main — so this narrows what the
-        # change ADDS, and reopens nothing that was previously closed.
-        if not _CARRIER_WORDS.search(cmd):
-            return None, True
+        # So this refuses on unreadability itself, which names nothing and so
+        # cannot be respelled — the same rule `protected_paths_guard` already
+        # applies to an unreadable removal. MEASURED cost: 77 newly refused of
+        # 83,201 recorded commands against origin/main, versus 53 with the
+        # deleted scope. Most of the difference is `python - <<'PY' … rm …`
+        # scripts the parser cannot read a heredoc body of; #1748 fixes that
+        # at the source and would take most of it back.
         return (
-            f"this command cannot be read ({blind.cause}), it names a launcher, "
-            f"and it names a removal — so the guard cannot verify what would be "
-            f"deleted. Re-issue it in a form the parser can read."
+            f"this command cannot be read ({blind.cause}) and it names a "
+            f"removal, so the guard cannot verify what would be deleted. "
+            f"Re-issue it in a form the parser can read."
         ), True
     for seg in segs:
         if seg.exe in _UNMODELLABLE_CARRIERS:

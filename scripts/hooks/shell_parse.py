@@ -190,32 +190,46 @@ _RUN_CARRIERS = frozenset({"uv", "poetry", "hatch", "pdm", "pipenv", "rye"})
 #: MEASURED on the deployed parser, with controls: every name below reports only
 #: the launcher, while `sudo`, `command` and a bare `rm` resolve correctly.
 #:
-#: MEMBERSHIP IS ENUMERATED, NOT CHOSEN — an earlier revision listed five names
-#: and read as a survey of the class. Probing the launcher vocabulary against
-#: the real parser found nine more that self-resolve identically, so the set is
-#: FOURTEEN. A consumer refuses on the carrier itself and never reads what it
-#: carries, so membership decides a refusal outright; the count is stated here
-#: because a comment naming a different number than the set below is how an
-#: omission stops looking like one.
+#: MEMBERSHIP IS A FLOOR, NOT A SURVEY OF THE CLASS — an earlier revision of
+#: this comment claimed it was enumerated. A consumer refuses on the carrier
+#: itself and never reads what it carries, so membership decides a refusal
+#: outright, and the true class is "any command that re-parses or dispatches a
+#: string it was handed" — open-ended, since it also includes `xargs`, `awk`,
+#: any language's `-c`/`eval` flag, and a shell FUNCTION defined earlier in the
+#: same command. What is enumerated is the subset that SELF-RESOLVES on THIS
+#: parser (`seg.exe` literally equals the launcher name); `source`, `.` and
+#: `builtin` joined the set on that same test. The count is stated here because
+#: a comment naming a different number than the set below is how an omission
+#: stops looking like one — SEVENTEEN as of this revision.
 #:
-#: COST IS NOT ZERO, and an earlier revision of this comment said it was. That
-#: figure was measured against a version that refused only when the PAYLOAD
-#: named something protected. MEASURED over 83,201 recorded commands against
-#: what actually ships, per consumer, because their prefilters differ and no
-#: rate transfers between them: protected_paths 21 (0.025%), destructive 53
-#: (0.064%), git_push 0 (0.000%). Every one is recoverable by re-issuing the
-#: command without the launcher, and NONE of the three relaxes anything — the
-#: same sweep reports 0 commands going from refused to allowed.
+#: COST IS NOT ZERO, and an earlier revision of this comment said it was. Each
+#: consumer's rate is its own, because their prefilters differ and no rate
+#: transfers between them.
 #:
-#: ⚠ THESE REPLACE 17/99/22, WHICH WERE WRONG IN TWO DIFFERENT WAYS. The 99 and
-#: the 22 were measured against mechanisms that no longer ship (a name-list
-#: command-position test; a carrier scope read over the whole command rather
-#: than the carrier's own segment). The 17 was a METHOD error, and the more
-#: useful one to record: it came from importing the guard's predicate and
-#: calling it directly, which passes no `cwd` — the real guard reads one. Run
-#: end-to-end through the guard as a subprocess, with each corpus row's own
-#: cwd, the figure is 21. Quote the end-to-end number; a reproduction of a
-#: guard measures the reproduction until the guard itself is run.
+#: protected_paths: MEASURED end-to-end (real guard as a subprocess, each corpus
+#: row's own cwd) over 83,201 recorded commands — 19 refusals (0.023%), 0
+#: relaxed, every one recoverable by re-issuing without the launcher. This is
+#: AFTER per-segment scoping and the addition of source/./builtin; the figure is
+#: also recorded at the branch that produces it, in protected_paths_guard.py.
+#:
+#: ⚠ destructive and git_push: PENDING RE-MEASUREMENT. The figures once written
+#: here (53 and 0) predate two changes that both move them — deleting the blind
+#: carrier-name scope in destructive_command_guard (an unreadable removal now
+#: refuses unconditionally, which only raises the count) and adding
+#: source/./builtin to the shared set that git_push also imports. The combined
+#: three-guard corpus sweep did not finish inside an hour; each guard needs its
+#: own bounded run. Do not quote a number here until that run exists — an earlier
+#: 17/99/22 was wrong precisely because a figure outlived the mechanism it was
+#: measured against.
+#:
+#: ⚠ THE 17/99/22 THAT ONCE STOOD HERE WERE WRONG IN TWO WAYS. The 99 and the 22
+#: were measured against mechanisms that no longer ship (a name-list
+#: command-position test; a carrier scope read over the whole command rather than
+#: the carrier's own segment). The 17 was a METHOD error: it came from importing
+#: the guard's predicate and calling it directly, which passes no `cwd` — the
+#: real guard reads one — and end-to-end the figure was 21, since narrowed to 19
+#: by per-segment scoping. Quote the end-to-end number; a reproduction of a guard
+#: measures the reproduction until the guard itself is run.
 #:
 #: ⚠ `ssh` IS DELIBERATELY ABSENT, and it is the one a reviewer will ask about.
 #: It does not belong here: `ssh host "…"` runs the command on ANOTHER MACHINE,
@@ -243,6 +257,14 @@ _REPARSE_CARRIERS = frozenset(
         "pkexec",
         "runcon",
         "sg",
+        # Re-parse the current shell's own input rather than spawning a child,
+        # so they carry the exact same hole: a string handed to them is run
+        # with none of the surrounding command's scrutiny. `builtin` prefixes
+        # any builtin (including `eval`) and bypasses a function override of
+        # the same name, which is a distinct reason to catch it here.
+        "source",
+        ".",
+        "builtin",
     }
 )
 # Value-consuming flags accepted BEFORE the wrapped command, on either the

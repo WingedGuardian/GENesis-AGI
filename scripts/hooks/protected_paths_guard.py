@@ -378,7 +378,19 @@ def main() -> int:
 
     cwd = payload.get("cwd") if isinstance(payload, dict) else None
     for seg in segs:
-        if seg.exe in _REPARSE_CARRIERS:
+        # PER-SEGMENT, not per-command: refuse only when the CARRIER'S OWN
+        # segment mentions rm/rmdir, mirroring the fix `git_push_guard` already
+        # ships for the identical defect. An earlier revision read the whole
+        # command, so a carrier in one segment combined with an UNRELATED
+        # segment's own `rm` mention to refuse a command the carrier never
+        # touched. MEASURED over the 1,585 recorded commands that reach this
+        # branch's prefilter: the per-command scope refused 277 of them; the
+        # per-segment scope refuses 1 — the other 276 were a carrier segment
+        # carrying nothing destructive, refused only because a LATER, unrelated
+        # segment mentioned rm. `_RM_PATTERN` is the same prefilter used at the
+        # module's fast path; `seg.raw` is the carrier's own segment text, not
+        # the whole command.
+        if seg.exe in _REPARSE_CARRIERS and _RM_PATTERN.search(seg.raw):
             # A LAUNCHER THAT RUNS A COMMAND THIS RESOLVER CANNOT RECOVER.
             # REFUSE OUTRIGHT, deliberately WITHOUT looking at the payload.
             #
@@ -405,14 +417,20 @@ def main() -> int:
             # payload can be spelled around. Refusing on the CARRIER cannot be,
             # because it never reads the payload.
             #
-            # MEASURED over 83,201 recorded commands: this guard refuses 17
-            # of them (0.020%), every one recoverable by re-issuing the command
-            # without the launcher. The rate is low because the `\brm\b`
+            # MEASURED end-to-end through this guard as a subprocess, each
+            # corpus row's own cwd, 83,201 recorded commands: 19 refusals
+            # (0.023%), every one recoverable by re-issuing the command without
+            # the launcher. This is AFTER per-segment scoping and the addition
+            # of `source`/`.`/`builtin` — both changed the figure and roughly
+            # cancelled: scoping removed 276 false refusals the per-command
+            # form produced (a carrier segment refused because an UNRELATED
+            # segment mentioned rm), while the three added launchers cost a
+            # few more true ones. The rate stays low because the `\brm\b`
             # prefilter at :262 returns before this branch for any command that
             # mentions no removal — that prefilter is what bounds the refusal,
             # and it is asserted by a test for exactly that reason. Sibling
-            # guards measure their own rates against their own sets; this figure
-            # is not transferable to them.
+            # guards measure their own rates against their own sets; this
+            # figure is not transferable to them.
             return _block(
                 f"'{seg.exe}' runs a command this guard cannot recover, so it "
                 f"cannot verify whether that command deletes a protected path. "
