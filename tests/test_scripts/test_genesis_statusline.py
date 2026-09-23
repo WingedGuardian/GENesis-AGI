@@ -179,6 +179,66 @@ def test_non_utf8_chained_output_keeps_its_rows_with_replacement(sl, monkeypatch
     assert out.splitlines()[1] == "� ok"
 
 
+def _pid_gone(pid: int, within: float = 5.0) -> bool:
+    import time
+
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_a_hung_chained_command_is_killed_with_its_children(sl, tmp_path, monkeypatch, capsys):
+    """Past the cap the chained command's WHOLE group dies — including a
+    grandchild the shell spawned, which killing the shell alone would orphan."""
+    import time
+
+    monkeypatch.setattr(sl, "_CHAINED_TIMEOUT_S", 0.5)
+    kid = tmp_path / "kid.pid"
+    cmd = f"sleep 30 & echo $! > {kid}; wait"
+    t0 = time.monotonic()
+    rc, out = _run(sl, monkeypatch, capsys, {"cwd": "/x"}, ["--then", cmd])
+    assert time.monotonic() - t0 < 10, "the cap did not bound the wait"
+    assert rc == 0
+    assert out.splitlines() == ["feat/x · ledger:— · streak:2/3 · PR:—"]
+    pid = int(kid.read_text())  # guard-the-guard: the grandchild really existed
+    assert _pid_gone(pid), f"grandchild {pid} survived the timeout"
+
+
+def test_sigterm_to_the_script_takes_the_chained_group_with_it(tmp_path):
+    """Claude Code cancels an in-flight status-line command by signalling it; the
+    chained command lives in its own group, so the script must forward the kill."""
+    import signal
+    import time
+
+    kid = tmp_path / "kid.pid"
+    proc = subprocess.Popen(
+        [sys.executable, str(_SCRIPT), "--then", f"sleep 30 & echo $! > {kid}; wait"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(tmp_path),
+            "GENESIS_DB_PATH": str(tmp_path / "absent.db"),
+        },
+    )
+    proc.stdin.write(b'{"cwd": "/"}')
+    proc.stdin.close()
+    deadline = time.monotonic() + 30
+    while not kid.exists() or not kid.read_text().strip():
+        assert time.monotonic() < deadline, "chained command never started"
+        time.sleep(0.05)
+    pid = int(kid.read_text())
+    proc.send_signal(signal.SIGTERM)
+    proc.wait(timeout=10)
+    assert _pid_gone(pid), f"grandchild {pid} survived SIGTERM to the script"
+
+
 def _git_repo(path: Path, branch: str) -> Path:
     path.mkdir()
     subprocess.run(["git", "init", "-q", "-b", branch, str(path)], check=True)

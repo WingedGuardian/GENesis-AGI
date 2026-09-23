@@ -139,15 +139,57 @@ def render(data: dict) -> str:
     return _SEP.join((branch, ledger, streak, _pr_field(data)))
 
 
+#: Cap on the chained command. Failure mode it bounds: Claude Code cancels an
+#: in-flight status-line command only when the NEXT update arrives, and "slow
+#: scripts block the status line from updating until they complete" (CC
+#: statusline docs) — so a chained command that hangs in an idle session leaves
+#: the line stale indefinitely. MEASURED: the chained Node status line this was
+#: built beside runs in ~120ms, so 5s is >40x its normal cost and is reached only
+#: by a command that is actually stuck. Owner-chosen value (2026-09-23).
+_CHAINED_TIMEOUT_S = 5.0
+
+
+def _kill_group(proc) -> None:
+    """SIGKILL the chained command's whole process group (the shell AND what it
+    spawned). Guarded: a pgid <= 1 would signal init or every process we own."""
+    import os
+    import signal
+
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        return
+    if pgid > 1:
+        with contextlib.suppress(OSError):
+            os.killpg(pgid, signal.SIGKILL)
+
+
 def _start_chained(cmd: str, raw: str):
-    """Start the chained command now so its latency overlaps our render."""
+    """Start the chained command now so its latency overlaps our render.
+
+    It gets its OWN process group so a timeout can kill everything it spawned,
+    not just the shell. That also takes it out of OUR group, which Claude Code
+    signals to cancel us — so a SIGTERM handler forwards the kill. Residual: a
+    SIGKILL of this script cannot be caught, and would orphan a chained command
+    that is itself hung.
+    """
+    import signal
+
     proc = subprocess.Popen(  # noqa: S602 — operator-configured command, same trust as statusLine itself
         cmd,
         shell=True,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
+        start_new_session=True,
     )
+
+    def _on_term(_signum, _frame):
+        _kill_group(proc)
+        sys.exit(0)
+
+    with contextlib.suppress(ValueError, OSError):
+        signal.signal(signal.SIGTERM, _on_term)
     return proc, raw.encode("utf-8", "surrogateescape")
 
 
@@ -155,13 +197,18 @@ def _finish_chained(started) -> str:
     """The chained command's stdout, or "" when it failed. Never raises.
 
     Bytes in, bytes out, decoded with replacement: a chained command emitting
-    non-UTF-8 must cost its own rows, never blank ours. No timeout of our own —
-    Claude Code cancels an in-flight status-line command when the next update
-    arrives, which is the only bound a display command needs.
+    non-UTF-8 must cost its own rows, never blank ours. Past
+    ``_CHAINED_TIMEOUT_S`` its process group is killed and reaped, and it
+    contributes nothing.
     """
     try:
         proc, payload = started
-        out, _ = proc.communicate(payload)
+        try:
+            out, _ = proc.communicate(payload, timeout=_CHAINED_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            _kill_group(proc)
+            proc.communicate()  # reap; the pipes close with the group
+            return ""
         if proc.returncode != 0 or not out:
             return ""
         text = out.decode("utf-8", "replace")
