@@ -1735,6 +1735,30 @@ def test_the_redactor_handles_a_path_ending_a_sentence():
         assert fti._redact_home(text) == text, f"a different directory was rewritten: {text}"
 
 
+def test_the_boundary_tradeoff_is_asymmetric_on_purpose():
+    """Almost every byte is legal in a POSIX path, so nothing in the text can
+    prove where one ends. Erring one way MANGLES a valid diagnostic; erring the
+    other LEAKS the account name. Leaking is worse, so ambiguity resolves toward
+    redaction — and both halves of that choice are pinned here, because a later
+    reader will otherwise "fix" one side and silently break the other.
+
+    MEASURED: an earlier boundary treated `:`, `;`, `,`, `'`, `"` and `)` as
+    always-terminating, and rewrote six of twelve near-miss shapes — `<home>:2`
+    became `~:2`, naming a path that does not exist.
+    """
+    real = str(Path.home())
+    # Punctuation that occurs INSIDE real directory names terminates only when
+    # whitespace or the end follows it.
+    for text in (f"read {real}:2 failed", f"read {real};x failed", f"read {real},v failed"):
+        assert fti._redact_home(text) == text, f"a real sibling was rewritten: {text}"
+    # Quote and paren always terminate — ACCEPTED as the lossy side, because
+    # diagnostics quote paths and requiring whitespace after the quote would
+    # miss that and leak.
+    for text in (f"open '{real}': denied", f'q "{real}" x', f"see ({real})"):
+        out = fti._redact_home(text)
+        assert real not in out, f"a quoted path leaked: {out}"
+
+
 def test_the_emitter_guard_rejects_a_call_that_is_not_the_redactor():
     """The guard admits a wrapped emitter by the wrapper's NAME. A cell that
     only ever wraps with `_redact_home` cannot tell that from admitting any

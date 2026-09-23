@@ -151,14 +151,29 @@ def _redact_home(text: str) -> str:
     # `/var/home/jay/...` is left alone. Right boundary: the path must END
     # there or continue with a separator, so `/home/jayson` does not match.
     #
-    # Terminal punctuation counts as an ending ONLY when it ends the token.
-    # `gh` writes diagnostics as sentences -- `failed to read <home>.` -- and
-    # without this the period rejected the boundary and the account name went
-    # straight into the refusal. Requiring whitespace-or-end after the `.!?`
-    # keeps `<home>.config/x` unmatched, which is a DIFFERENT directory and
-    # must not be rewritten.
+    # THE RIGHT BOUNDARY IS A TRADEOFF, and it is deliberately asymmetric.
+    # Almost every byte is legal in a POSIX path, so nothing in the text can
+    # prove where a path ends. Erring one way MANGLES a valid diagnostic (it
+    # names a `~` path that does not exist); erring the other LEAKS the account
+    # name. Leaking is worse, so ambiguity resolves toward redaction.
+    #
+    #   `/` `\s` end-of-string  -- always a boundary.
+    #   `.!?,:;`                -- a boundary only when whitespace or the end
+    #                              follows, because all of them occur inside
+    #                              real directory names. MEASURED: without that
+    #                              qualifier `<home>:2`, `<home>;x` and
+    #                              `<home>,v` were rewritten, and `<home>.config`
+    #                              lost its first component.
+    #   `'` `\"` `)`             -- always a boundary, ACCEPTED as the lossy
+    #                              side. Diagnostics quote paths (`open
+    #                              '<home>': denied`), and requiring whitespace
+    #                              after the quote would miss that and leak. The
+    #                              cost is that a directory literally named
+    #                              `jay's` would be rewritten; that is a
+    #                              misleading message, not a disclosure.
     return _HOME_RE_CACHE.setdefault(
-        home, re.compile(rf"(?<![\w/]){re.escape(home)}(?=/|$|[\s'\"),:;]|[.!?](?:\s|$))")
+        home, re.compile(rf"(?<![\w/]){re.escape(home)}"
+        rf"(?=/|$|\s|['\")]|[.!?,:;](?:\s|$))")
     ).sub("~", text)
 
 
