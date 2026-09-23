@@ -114,6 +114,39 @@ async def test_ignored_is_terminal_unlinks(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_terminal_non_delivery_is_recorded_not_silent(tmp_path, monkeypatch, caplog):
+    """Unlinking on IGNORED is the honest cost of stopping the retry loop, and
+    review objected to it: a missing adapter now DROPS the alert where a config
+    fix could previously still recover it.
+
+    The mechanism is real, but the old behaviour did not preserve the alert
+    either — it retried forever and the queue's 14-day prune deleted it anyway.
+    So the choice is a silent loss in 14 days versus a loud one now, and
+    `outreach_recovery` already chose loud for this same status (it calls
+    `mark_discarded` with a reason). The alert queue has no such call, so the
+    log is where the disposition is recorded — and `queue.drain` unlinks on
+    True while saying nothing, so without this a discarded alert and a
+    delivered one leave the identical trace: none.
+    """
+    root = tmp_path / "queue"
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
+    _enqueue(root, dedupe_key="backup:k3")
+    with caplog.at_level("WARNING"):
+        await alert_drain._make_drainer(_RT(pipeline=_FakePipeline(OutreachStatus.IGNORED)))()
+    assert q.list_queued(root) == []
+    assert any("discarded UNDELIVERED" in r.message for r in caplog.records), (
+        f"the drop must be recorded, not silent: {[r.message for r in caplog.records]}"
+    )
+    # A DELIVERED entry is unlinked just as silently as before — the new line
+    # must fire on non-delivery only, or it becomes noise that gets tuned out.
+    caplog.clear()
+    _enqueue(root, dedupe_key="backup:k4")
+    with caplog.at_level("WARNING"):
+        await alert_drain._make_drainer(_RT(pipeline=_FakePipeline(OutreachStatus.DELIVERED)))()
+    assert not any("discarded UNDELIVERED" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_failed_keeps_for_retry(tmp_path, monkeypatch):
     root = tmp_path / "queue"
     monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)

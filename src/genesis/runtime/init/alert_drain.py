@@ -106,12 +106,39 @@ def _make_drainer(rt):
         # IGNORED forever, which without this line meant an ERROR log per
         # entry per tick until the queue's 14-day prune silently discarded the
         # alerts with no record that they were never delivered.
-        return result.status in (
+        terminal = result.status in (
             OutreachStatus.DELIVERED,
             OutreachStatus.REJECTED,
             OutreachStatus.HELD,
             OutreachStatus.IGNORED,
         )
+        # A TERMINAL NON-DELIVERY IS NOT A SUCCESS, and until now the drain
+        # could not tell the operator apart from one: `queue.drain` unlinks on
+        # True and says nothing, so a discarded alert and a delivered one left
+        # the same trace — none.
+        #
+        # This is the honest cost of treating IGNORED as terminal. Review
+        # objected that a missing adapter now DROPS the alert where before a
+        # configuration fix could still recover it, and the mechanism is real.
+        # The old behaviour did not preserve it either, though: it retried
+        # forever, logged an ERROR per entry per tick, and the queue's 14-day
+        # prune deleted it anyway — recovery only if someone noticed the flood
+        # inside the window. So the choice is not loss-versus-recovery, it is
+        # a silent loss in 14 days versus a loud one now, and `outreach_
+        # recovery` already chose loud: it calls `mark_discarded` with a
+        # reason for this same status. The alert queue has no such call, so
+        # the log is where the disposition gets recorded.
+        if terminal and result.status in (OutreachStatus.REJECTED, OutreachStatus.IGNORED):
+            logger.warning(
+                "alert-queue entry discarded UNDELIVERED (%s): source=%s dedupe_key=%s%s — "
+                "the alert is gone; if this is a channel misconfiguration, fix it and the "
+                "NEXT alert will deliver, but this one will not be retried",
+                result.status.value,
+                source,
+                identity,
+                f" error={result.error}" if result.error else "",
+            )
+        return terminal
 
     async def _drainer() -> None:
         # Resolve at drain time (call-time) via the GENESIS_HOME-aware resolver,
