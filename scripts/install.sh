@@ -989,6 +989,16 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
         CC_BIN_DIR="$CC_BIN_DIR:$_cc_prefix/bin"
     fi
 
+    # genesis-falkordb.service.template carries two placeholders beyond the
+    # shared five: __FALKORDB_VERSION__ and __REDIS_SERVER__. The resolver and
+    # the version pin live in the same lib bootstrap provisions from — sourced
+    # here for the render only; provisioning stays in bootstrap.sh. With the
+    # lib absent the literals below still produce a parseable (if inert) unit.
+    if [[ -f "$SCRIPT_DIR/lib/falkordb_install.sh" ]]; then
+        # shellcheck source=lib/falkordb_install.sh
+        source "$SCRIPT_DIR/lib/falkordb_install.sh"
+    fi
+
     for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
         [ -f "$template" ] || continue
         svc_name=$(basename "$template" .template)
@@ -1028,11 +1038,15 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
             _repo_esc=$(_sed_repl_esc "$REPO_DIR")
             _ccbin_esc=$(_sed_repl_esc "$CC_BIN_DIR")
             _az_root_esc=$(_sed_repl_esc "${AZ_ROOT:-$HOME/agent-zero}")
+            _falkordb_ver_esc=$(_sed_repl_esc "${FALKORDB_VERSION:-4.20.4}")
+            _redis_bin_esc=$(_sed_repl_esc "$(_falkordb_redis_server_bin 2>/dev/null || echo /usr/bin/redis-server)")
             sed -e "s|__HOME__|$_home_esc|g" \
                 -e "s|__VENV__|$_venv_esc|g" \
                 -e "s|__REPO_DIR__|$_repo_esc|g" \
                 -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \
                 -e "s|__AZ_ROOT__|$_az_root_esc|g" \
+                -e "s|__FALKORDB_VERSION__|$_falkordb_ver_esc|g" \
+                -e "s|__REDIS_SERVER__|$_redis_bin_esc|g" \
                 "$template" > "$target"
             echo "    + $svc_name generated"
             SERVICES_GENERATED=1
