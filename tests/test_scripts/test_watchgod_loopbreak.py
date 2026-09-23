@@ -877,6 +877,40 @@ def test_oom_drain_is_not_cleared_by_a_query_that_failed_to_reanchor(tmp_path):
     )
 
 
+def test_a_failed_query_cannot_clear_drain_even_with_a_cursor_on_disk(tmp_path):
+    """The anchored check is SYNTAX — it proves a file parses, not that its
+    position is trustworthy. On a failed query nothing re-anchored, so clearing
+    drain there trusts a position nobody verified this epoch.
+
+    Found by review at this head, confirmed by construction before fixing: a
+    stale cursor surviving a failed arm passed the syntax check, cleared drain
+    on a tick whose query FAILED, and — once the deficit TTL lapsed — a query
+    from that stale position returned a pre-baseline contained record that
+    accounted for a real line-less kill. One kill, zero pages.
+
+    Two halves close it: a failed arm now deletes a stale cursor (the cell
+    above), and this one — clearing drain requires the query to have SUCCEEDED,
+    because only a successful query re-anchors the file to a position minted
+    this epoch.
+    """
+    home, _cc, bind = _sandbox(tmp_path)
+    (home / ".genesis" / "logs" / ".oom_journal_cursor").write_text("s=genuine;i=5")
+    oom = _oom_file(tmp_path, 4)
+    out = _run(
+        home,
+        bind,
+        _PRELUDE
+        + f'OOM_EVENTS_FILE="{oom}"; '
+        + f"printf 'low 0\nhigh 0\nmax 0\noom 3\noom_kill 5\noom_group_kill 0\n' > \"{oom}\"; "
+        + 'r=$(check_oom_events "4:0:0:0:1"); echo "R=[$r]"',
+        {"STUB_JOURNAL_RC": "1"},  # the query fails; the cursor file still parses
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert "R=[5:0:1:" in out.stdout and out.stdout.rstrip().endswith(":1]"), (
+        f"a failed query must not clear drain, whatever is on disk: {out.stdout}"
+    )
+
+
 def test_drain_is_SET_when_a_query_cannot_save_its_cursor(tmp_path):
     """The inverse of the cell below, and it is reachable from the ORDINARY state.
 
@@ -1018,13 +1052,21 @@ def test_oom_arm_refuses_when_a_failed_write_leaves_a_STALE_cursor(tmp_path):
             {"OOM_EVENTS_FILE": str(oom)},
         )
     finally:
-        cursor.chmod(0o644)
+        if cursor.exists():
+            cursor.chmod(0o644)
     assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
     assert "B=5:0:0:0:1" in out.stdout, (
         "a write that failed over a VALID stale cursor must carry drain=1 — "
         f"the read-back cannot distinguish it from a fresh anchor: {out.stdout}"
     )
-    assert cursor.read_text() == "s=stale;i=1", "the stale cursor is still what is on disk"
+    # The stale file must be GONE, not preserved. It passes the anchored check
+    # on syntax while its POSITION predates the baseline, so leaving it behind
+    # is what let a pre-baseline record account for a post-baseline kill once
+    # drain was cleared and the deficit TTL had lapsed (found by review at this
+    # head, confirmed by construction: one real line-less kill, zero pages).
+    # The rm succeeds despite the 0444 mode because deletion is a DIRECTORY
+    # permission, which is also why this cell needs no root guard for this half.
+    assert not cursor.exists(), "a failed arm must remove a stale cursor, not keep it"
 
 
 def test_oom_arm_refuses_when_the_cursor_reads_back_empty(tmp_path):

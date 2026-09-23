@@ -774,10 +774,15 @@ check_oom_events() {
         # kill, then a real kill that wrote no record of its own -- TWO kills,
         # ZERO pages. Setting drain from the cursor closes it in one place
         # rather than at each site that can fail to write.
-        if _oom_cursor_is_anchored; then
-            prev_drain=0
-        else
+        # Clearing needs BOTH: the query succeeded AND the cursor on disk is
+        # anchored. The anchored check alone is syntax -- a stale file from a
+        # dead epoch passes it -- and on a failed query nothing re-anchored, so
+        # clearing there trusts a position nobody verified. Setting needs only
+        # the anchor to be missing.
+        if ! _oom_cursor_is_anchored; then
             prev_drain=1
+        elif (( _oom_query_ok == 1 )); then
+            prev_drain=0
         fi
         # Bound the OOM log (retention discipline — matches cc_exit/log rotation);
         # keep the most recent ~1000 lines so a thrashing container can't leak it.
@@ -870,7 +875,17 @@ _oom_arm_baseline() {
     base=$(_read_oom_kill) || base=""
     [[ -z "$base" ]] && { printf '%s' ""; return 0; }
     loc=$(_read_oom_local_trigger) || loc=""
-    _oom_arm_cursor || drain=1
+    if ! _oom_arm_cursor; then
+        drain=1
+        # A cursor file from a PREVIOUS daemon epoch must not survive a failed
+        # arm. It passes the anchored check on syntax, but its POSITION predates
+        # this baseline -- a query from it returns pre-baseline records, and one
+        # of those can account for a post-baseline kill. MEASURED: with a stale
+        # file surviving, drain=0 and an expired deficit, one real line-less
+        # kill produced ZERO pages. Absent file -> queries use the bounded
+        # fallback window and drain=1 covers the first resolution.
+        rm -f "$_OOM_CURSOR_FILE" 2>/dev/null || true
+    fi
     printf '%s' "${base}:${loc}:0:0:${drain}"
 }
 
