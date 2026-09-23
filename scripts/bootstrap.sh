@@ -1149,16 +1149,28 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         svc_name=$(basename "$template" .template)
 
         target="$SYSTEMD_USER_DIR/$svc_name"
+        # Escape every replacement for the `s|...|...|` grammar (`\`, `&`, `|`)
+        # the same way install.sh's renderer does: a `&` in $HOME or a `|` in an
+        # overridden FALKORDB_VERSION would corrupt the expression or make sed
+        # fail outright, and a failing render aborts bootstrap — the UPDATE
+        # path — under set -e.
+        _sed_repl_esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+        _home_esc=$(_sed_repl_esc "$HOME")
+        _venv_esc=$(_sed_repl_esc "$GENESIS_ROOT/.venv")
+        _repo_esc=$(_sed_repl_esc "$GENESIS_ROOT")
+        _ccbin_esc=$(_sed_repl_esc "$CC_BIN_DIR")
         # FALKORDB_VERSION is set by lib/falkordb_install.sh, sourced just above (the
         # source of truth for the pin); the literal fallback keeps the render
         # working when that lib is absent, in which case the unit is inert
         # anyway because no module was installed.
-        rendered=$(sed -e "s|__HOME__|$HOME|g" \
-                       -e "s|__VENV__|$GENESIS_ROOT/.venv|g" \
-                       -e "s|__REPO_DIR__|$GENESIS_ROOT|g" \
-                       -e "s|__CC_BIN_DIR__|$CC_BIN_DIR|g" \
-                       -e "s|__FALKORDB_VERSION__|${FALKORDB_VERSION:-4.20.4}|g" \
-                       -e "s|__REDIS_SERVER__|$(_falkordb_redis_server_bin 2>/dev/null || echo /usr/bin/redis-server)|g" \
+        _falkordb_ver_esc=$(_sed_repl_esc "${FALKORDB_VERSION:-4.20.4}")
+        _redis_bin_esc=$(_sed_repl_esc "$(_falkordb_redis_server_bin 2>/dev/null || echo /usr/bin/redis-server)")
+        rendered=$(sed -e "s|__HOME__|$_home_esc|g" \
+                       -e "s|__VENV__|$_venv_esc|g" \
+                       -e "s|__REPO_DIR__|$_repo_esc|g" \
+                       -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \
+                       -e "s|__FALKORDB_VERSION__|$_falkordb_ver_esc|g" \
+                       -e "s|__REDIS_SERVER__|$_redis_bin_esc|g" \
                        "$template")
         if [[ -f "$target" ]]; then
             current=$(cat "$target")

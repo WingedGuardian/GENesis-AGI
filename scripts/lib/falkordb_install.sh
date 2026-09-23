@@ -468,7 +468,25 @@ falkordb_redis_install() {
     # someone installed afterwards.
     mkdir -p "$(dirname "$FALKORDB_PROVISION_MARKER")" 2>/dev/null || true
     date -u +%Y-%m-%dT%H:%M:%SZ > "$FALKORDB_PROVISION_MARKER" 2>/dev/null || true
-    sudo systemctl disable --now redis-server >/dev/null 2>&1 || true
+    # Standing the package's system unit down is part of provisioning, not
+    # cosmetic: if it fails, a second redis keeps running on :6379 across
+    # reboots, so failure must never read as the socket-only posture.
+    rc=0
+    sudo systemctl disable --now redis-server >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "  WARNING: redis-server installed, but 'systemctl disable --now' failed (rc=$rc):"
+        echo "           the package's system redis is still enabled on :6379. Stand it"
+        echo "           down by hand: sudo systemctl disable --now redis-server"
+        return 0
+    fi
+    rc=0
+    sudo systemctl is-enabled --quiet redis-server >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        echo "  WARNING: redis-server installed, but its system unit is still enabled"
+        echo "           after disable — stand it down by hand:"
+        echo "           sudo systemctl disable --now redis-server"
+        return 0
+    fi
     echo "  Installed: redis-server (system unit disabled — Genesis uses a socket-only user unit)"
     return 0
 }
