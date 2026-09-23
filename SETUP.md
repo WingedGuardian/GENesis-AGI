@@ -66,9 +66,69 @@ Install via Claude Code's plugin manager.
   docker run -d --name qdrant -p 6333:6333 qdrant/qdrant
   ```
 - **Ollama**: Local embeddings. Set `OLLAMA_URL` in secrets.env.
+- **FalkorDB graph engine**: see below. Provisioned by `bootstrap.sh`, left
+  disabled — nothing reads it yet.
 
 Genesis degrades gracefully without these — it falls back to FTS5 text search
 and cloud embeddings.
+
+### Graph engine (FalkorDB)
+
+**Opt-in.** It is a Redis module needing `redis-server` 8.0.0 or newer, and
+Ubuntu/Debian stable ship 7.x — so provisioning it means adding Redis's
+official upstream apt repo to your machine. Genesis will not do that to you
+uninvited, and since `update.sh` re-runs `bootstrap.sh` on every update, "once"
+would have meant "on every install that pulls". Ask for it:
+
+```bash
+GENESIS_FALKORDB_PROVISION=1 ./scripts/bootstrap.sh
+```
+
+or persistently, in `~/.genesis/config/genesis.yaml`:
+
+```yaml
+graph_engine:
+  provision: true
+```
+
+`GENESIS_FALKORDB_PROVISION_DISABLED=1` disables the whole thing, module
+included. The engine module itself is fetched either way — it is one file under
+`~/.genesis/deps` and changes nothing about your system.
+
+The service listens on **no TCP port**; readers reach it over a unix socket in
+`~/.genesis/falkordb`.
+
+The unit is written but **not enabled**. Nothing in Genesis reads the engine
+yet, so leaving it off costs you nothing. To arm it:
+
+```bash
+systemctl --user enable --now genesis-falkordb
+systemctl --user status genesis-falkordb
+```
+
+**If you already run redis-server, bootstrap leaves it — and the apt repo —
+completely alone**, because adding that repo would upgrade your Redis on your
+next unrelated `apt upgrade`. Genesis will not make that decision for you. If
+you want the engine on such a box, do it yourself:
+
+```bash
+curl -fsSL https://packages.redis.io/gpg | sudo gpg --yes --dearmor \
+    -o /etc/apt/keyrings/redis-archive-keyring.gpg
+echo "deb [signed-by=/etc/apt/keyrings/redis-archive-keyring.gpg]" \
+    "https://packages.redis.io/deb $(. /etc/os-release && echo "$VERSION_CODENAME") main" \
+    | sudo tee /etc/apt/sources.list.d/redis.list
+sudo apt-get update && sudo apt-get install --only-upgrade redis-server
+```
+
+Then re-run `bootstrap.sh` to fetch the engine module.
+
+Note Redis 8 is tri-licensed (RSALv2 / SSPLv1 / AGPLv3) rather than the plain
+BSD of the 7.x in your distro. Running it unmodified places no obligation on
+your own code, but you are the one installing it.
+
+Uninstall removes Genesis's own files. The `redis-server` package and the apt
+repo are deliberately left in place — other software on your machine may use
+them.
 
 ## Post-Install Configuration
 
