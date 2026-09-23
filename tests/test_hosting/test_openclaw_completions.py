@@ -317,6 +317,66 @@ def test_adapter_is_idempotent():
     adapter.register_blueprints(app)
     completions_rules = [r for r in app.url_map.iter_rules() if "/v1/chat/completions" in r.rule]
     assert len(completions_rules) == 1
+class TestSharedParserMultipartBehaviour:
+    """The parser moved to genesis.hosting.openai_messages and is now shared.
+
+    That move CHANGED this endpoint's behaviour: it used to return at the first
+    text block, and now joins every block in order. The change is right -- in
+    the common [text, image, text] shape the trailing block is the instruction
+    that follows the attachment -- but every pre-existing parser test here uses
+    a SINGLE block, so nothing pinned the new behaviour on this side of the
+    shared helper. These do.
+    """
+
+    def test_all_text_blocks_are_joined_in_order(self):
+        from genesis.hosting.openclaw.completions import _extract_last_user_message
+
+        out = _extract_last_user_message(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "look at this"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}},
+                        {"type": "text", "text": "what is wrong with it"},
+                    ],
+                },
+            ]
+        )
+        assert out is not None
+        assert out.index("look at this") < out.index("what is wrong with it")
+
+    def test_control_a_single_block_is_unchanged(self):
+        """The pre-existing shape must behave exactly as before the move."""
+        from genesis.hosting.openclaw.completions import _extract_last_user_message
+
+        out = _extract_last_user_message(
+            [
+                {"role": "user", "content": [{"type": "text", "text": "just one"}]},
+            ]
+        )
+        assert out == "just one"
+
+    def test_control_plain_string_content_is_unchanged(self):
+        from genesis.hosting.openclaw.completions import _extract_last_user_message
+
+        out = _extract_last_user_message([{"role": "user", "content": "plain"}])
+        assert out == "plain"
+
+    def test_non_text_only_content_yields_nothing(self):
+        from genesis.hosting.openclaw.completions import _extract_last_user_message
+
+        out = _extract_last_user_message(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "x"}},
+                    ],
+                },
+            ]
+        )
+        assert out is None
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -426,3 +486,131 @@ def test_whitespace_only_configured_token_is_treated_as_unset(anon_client, mock_
         )
     assert resp.status_code == 503
     assert "GENESIS_MCP_HTTP_TOKEN" in resp.get_json()["error"]
+
+
+# --- readiness: is_running(), not existence ---------------------------------
+#
+# These exist because a mutation run deleted the readiness check entirely and
+# the suite stayed GREEN. The `app` fixture supplies MagicMock() as the event
+# loop, and a MagicMock auto-creates is_running() returning a truthy mock, so
+# every other test in this file satisfies the predicate by accident whatever it
+# says. Each test below therefore installs a REAL asyncio loop.
+#
+# The body is asserted, not just the status: three different conditions answer
+# 503 on this route, so the status alone cannot say which one fired — the same
+# reasoning test_unconfigured_token_fails_closed_not_open records above.
+
+
+def test_stopped_event_loop_returns_503(client, mock_rt):
+    """Configured-but-stopped is NOT ready.
+
+    This is the expensive state, not an obvious error: run_coroutine_threadsafe
+    accepts a stopped-but-open loop and returns a PENDING future, so without
+    this check the request blocks on future.result(timeout=300) for five
+    minutes holding one of three concurrency slots.
+    """
+    import asyncio
+
+    loop = asyncio.new_event_loop()  # created, never run
+    try:
+        client.application.config["GENESIS_EVENT_LOOP"] = loop
+        with patch("genesis.runtime.GenesisRuntime") as MockRT:
+            MockRT.instance.return_value = mock_rt
+            resp = client.post(
+                "/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "hello"}]},
+            )
+        assert resp.status_code == 503
+        assert "event loop not running" in resp.get_data(as_text=True)
+        assert not resp.is_streamed  # refused before the SSE generator
+    finally:
+        loop.close()
+
+
+def test_closed_event_loop_returns_503(client, mock_rt):
+    """Closed is the state that raises — and raises too late to set a status.
+
+    run_coroutine_threadsafe raises RuntimeError here, but inside the streaming
+    generator, after Flask has committed 200. Without this check the caller
+    gets 200 plus a generic apology, which is why the fix is a pre-flight
+    refusal rather than an exception handler.
+    """
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+    loop.close()
+    client.application.config["GENESIS_EVENT_LOOP"] = loop
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = mock_rt
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hello"}]},
+        )
+    assert resp.status_code == 503
+    assert "event loop not running" in resp.get_data(as_text=True)
+
+
+def test_an_object_that_is_not_a_loop_is_not_waved_through(client, mock_rt):
+    """No is_running attribute must NOT default to ready.
+
+    An earlier version used getattr(loop, "is_running", lambda: True), which
+    fails OPEN on exactly the object this gate exists to catch: every real loop
+    and every MagicMock has the attribute, so the default could only ever fire
+    for something that is not a loop. Pinned so it cannot come back.
+    """
+    class NotALoop:
+        pass
+
+    client.application.config["GENESIS_EVENT_LOOP"] = NotALoop()
+    # Measure what the SERVER does, not what the test harness does. With
+    # TESTING=True Flask re-raises, so asserting on the exception would pin a
+    # harness property while the comment reasoned about production. Turning
+    # propagation off gives the real answer: 500, logged with a traceback.
+    #
+    # And 500 is CORRECT here, not a bug being pinned as a feature. 503 says
+    # "retry later", but an object that is not a loop in this config slot is a
+    # permanent wiring error, so 503 would tell every client to hammer
+    # something no retry can fix. What must never happen is the request
+    # proceeding as if the loop were ready -- which is exactly what the
+    # getattr default did, silently.
+    client.application.config["PROPAGATE_EXCEPTIONS"] = False
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = mock_rt
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hello"}]},
+        )
+    assert resp.status_code == 500, "an object with no is_running was treated as ready"
+
+
+def test_missing_conversation_loop_names_itself_not_the_event_loop(client, mock_rt):
+    """Negative control for the split: the two 503s must stay distinguishable."""
+    client.application.config.pop("OPENCLAW_CONVERSATION_LOOP", None)
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = mock_rt
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hello"}]},
+        )
+    assert resp.status_code == 503
+    assert "ConversationLoop not available" in resp.get_data(as_text=True)
+
+
+def test_multimodal_text_blocks_join_with_a_blank_line():
+    """The SEPARATOR is part of the contract, not an implementation detail.
+
+    A mutation changing "\\n\\n" to "" left the suite green: the existing test
+    only asserted that both blocks appear. Concatenating without a separator
+    runs the last word of one block into the first of the next, which changes
+    the prompt the model receives.
+    """
+    from genesis.hosting.openai_messages import extract_last_user_message
+
+    out = extract_last_user_message(
+        [{"role": "user", "content": [
+            {"type": "text", "text": "first"},
+            {"type": "image_url", "image_url": {"url": "http://example.invalid/x.png"}},
+            {"type": "text", "text": "second"},
+        ]}]
+    )
+    assert out == "first\n\nsecond"

@@ -44,6 +44,7 @@ from flask import Blueprint, Response, current_app, jsonify, request
 
 from genesis.cc.types import ChannelType
 from genesis.dashboard.auth import check_bearer_token
+from genesis.hosting.openai_messages import extract_last_user_message
 
 logger = logging.getLogger("genesis.hosting.openclaw")
 
@@ -78,10 +79,32 @@ def chat_completions():
         return jsonify({"error": "Genesis not ready", "type": "error"}), 503
 
     conversation_loop = current_app.config.get("OPENCLAW_CONVERSATION_LOOP")
-    event_loop = current_app.config.get("GENESIS_EVENT_LOOP")
-    if conversation_loop is None or event_loop is None:
+    if conversation_loop is None:
         # Fallback: ConversationLoop not initialized (e.g., DB unavailable)
         return jsonify({"error": "ConversationLoop not available", "type": "error"}), 503
+
+    event_loop = current_app.config.get("GENESIS_EVENT_LOOP")
+    # READINESS, not existence -- and the two bad states fail differently, so
+    # neither is the "500" it is tempting to assume. MEASURED through the real
+    # route rather than reasoned about:
+    #   stopped, not closed -> run_coroutine_threadsafe returns a PENDING
+    #     future, so `future.result(timeout=300)` below blocks for the FULL
+    #     five minutes while holding one of only _MAX_CONCURRENT (3) slots.
+    #     Three such requests starve the endpoint for everyone else.
+    #   closed              -> run_coroutine_threadsafe raises RuntimeError,
+    #     but inside _stream_response, whose own `except Exception` runs after
+    #     Flask has already committed 200. The caller gets 200 and a generic
+    #     apology, never an error status.
+    # Both also leave the just-created coroutine un-awaited. is_running() is
+    # False for BOTH states, which is why it is the check.
+    #
+    # No getattr fallback: defaulting a missing is_running to True is a
+    # fail-OPEN on the one attribute this gate exists to read. Every asyncio
+    # loop has it, and so does a MagicMock, so the default could only ever
+    # fire for an object that is not a loop -- exactly the case that must not
+    # be waved through.
+    if event_loop is None or not event_loop.is_running():
+        return jsonify({"error": "event loop not running", "type": "error"}), 503
 
     data = request.get_json(force=True, silent=True) or {}
     messages = data.get("messages", [])
@@ -208,24 +231,8 @@ def _stream_response(conversation_loop, event_loop, user_message, session_key, c
     yield "data: [DONE]\n\n"
 
 
-def _extract_last_user_message(messages: list) -> str | None:
-    """Extract the text of the most recent user message.
-
-    Handles both string content and OpenAI multimodal content arrays
-    (``[{"type": "text", "text": "..."}]``).  Returns None if no valid
-    user message is found.
-    """
-    for m in reversed(messages):
-        if not isinstance(m, dict) or m.get("role") != "user":
-            continue
-        content = m.get("content")
-        if isinstance(content, str) and content.strip():
-            return content
-        if isinstance(content, list):
-            # Multimodal: extract first text block
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text = block.get("text", "")
-                    if text.strip():
-                        return text
-    return None
+# Moved to genesis.hosting.openai_messages so that any future surface accepting
+# the OpenAI request shape reads it through the same parser rather than copying
+# this one. Re-exported under the original private name so existing callers and
+# tests keep working.
+_extract_last_user_message = extract_last_user_message
