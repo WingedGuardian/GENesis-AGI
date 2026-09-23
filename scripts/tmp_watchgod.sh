@@ -140,6 +140,227 @@ fs_total_mb() {
     echo "${result:-0}"
 }
 
+glob_escape() {
+    # Escape the four characters find(1)'s -path GLOB treats specially, so an
+    # exclusion built from a real directory name matches that name literally.
+    # MEASURED 2026-09-23: without this, a directory named `sp[a]re` is NOT
+    # excluded by -not -path ".../sp[a]re/*" and is reaped anyway — a silent
+    # fail-OPEN in the exact direction this guard exists to prevent.
+    printf '%s' "$1" | sed 's/[][*?\\]/\\&/g'
+}
+
+live_open_paths() {
+    # Every filesystem path a live process currently holds OPEN, one per line.
+    #
+    # This is the signal the reap needs, and mtime is not: a directory being
+    # written RIGHT NOW is indistinguishable by mtime from a cache written a
+    # second ago and already closed, so a recency threshold either destroys
+    # in-flight work or refuses to reclaim fresh junk.
+    #
+    # It is a STRICTLY BETTER signal, not a complete one. A writer that opens,
+    # writes and closes each file in turn — a shell loop calling curl per file,
+    # an extractor that closes each member, a write-then-rename — holds no
+    # descriptor at the instant of the sweep and is reaped exactly as before.
+    # Do not read this as a biconditional.
+    #
+    # NEWLINE-delimited, and that is a CONSTRAINT rather than a choice. A path
+    # containing a newline splits into two records, neither of which matches —
+    # a silent fail-OPEN. The obvious fix is NUL delimiting, and it is not
+    # available here: MEASURED 2026-09-23, bash command substitution STRIPS NUL
+    # bytes outright (it warns "ignored null byte in input"), so a NUL-delimited
+    # snapshot arrives in the variable as one concatenated blob with no
+    # separators at all — strictly worse. awk itself handles RS="\0" fine; the
+    # shell variable is the limit. Accepted: every directory name this sweep
+    # meets in practice comes from mktemp, pip, or a CC session UUID.
+    #
+    # Same-uid processes only: another uid's /proc/<pid>/fd is EACCES and is
+    # skipped. cc-tmp is mode 700, so its writers are normally this user's own
+    # processes — "normally" because a root process writing there would be
+    # invisible here, which is one of the states the caller's self-test exists
+    # to notice.
+    #
+    # One find for the whole sweep rather than one per candidate directory.
+    # MEASURED 2026-09-23 on a live install: ~2,000 descriptors across ~170
+    # processes in a single pass (47-118ms), and identical counts inside a
+    # transient systemd --user unit (the service's own context) as in an
+    # interactive shell — this unit sets no ProtectProc/ProcSubset.
+    find /proc/[0-9]*/fd -maxdepth 1 -type l -printf '%l\n' 2>/dev/null || true
+}
+
+dir_has_live_writer() {
+    # 0 when the snapshot ($2) holds an open path under directory $1. Used for
+    # the depth-1 REAP decision, where the unit is the whole directory: reaping
+    # only the quiet part of a tree being written leaves its writer a
+    # partially-deleted directory.
+    #
+    # The needle goes through the environment rather than `awk -v`, which
+    # expands backslash escapes in the value — MEASURED: a directory named
+    # `ta\tb` silently fails to match under -v, and fail-OPEN follows.
+    # Prefix-matched on "$1/" so a sibling sharing a name prefix
+    # (pip-unpack-a beside pip-unpack-abc) cannot match the wrong directory.
+    local dir="$1" snapshot="$2"
+    [[ -n "$snapshot" ]] || return 1
+    # No early exit on match, deliberately: awk quitting mid-stream leaves
+    # printf writing into a closed pipe, and under pipefail the pipeline then
+    # returns 141 (SIGPIPE) — which the caller reads as "no live writer", so a
+    # FOUND writer produced a reap. MEASURED 2026-09-23 at snapshots >~379KB
+    # (mawk's read buffer; implementation-dependent). Draining the whole
+    # stream costs ~60ms at 800KB and makes the status always awk's own.
+    #
+    # The " (deleted)" skip: an unlinked inode's directory reclaims nothing
+    # and would be spared forever. A real filename ending in that literal
+    # string is indistinguishable (/proc does not escape) and would hide its
+    # writer — accepted: cc-tmp is mode 700 and same-uid, so an actor who can
+    # craft that name can already delete the tree directly.
+    printf '%s\n' "$snapshot" | _wg_needle="$dir/" awk '
+        / \(deleted\)$/ { next }
+        index($0, ENVIRON["_wg_needle"]) == 1 { found = 1 }
+        END { exit !found }
+    '
+}
+
+live_writer_units() {
+    # For each live open file under $2, the WORK UNIT its writer owns —
+    # "U <dir>" lines — plus the unit's ancestor NODES up to (never including)
+    # the root — "A <dir>" lines. Deduplicated.
+    #
+    # The unit question is where both review rounds' fixes conflicted, each
+    # correct about its own measured case: excluding the file's DEEPEST
+    # directory misses quiet siblings one level up (a pip unpack with a writer
+    # in a subdir lost already-downloaded files beside that subdir), while
+    # excluding the whole ANCESTOR CHAIN as subtrees turns one live session
+    # under claude-<uid>/ into a verdict about all of it (MEASURED live: 7
+    # project trees, 93 session dirs, 1 with live fds — a disabled reaper).
+    #
+    # Resolution — the unit is what the writer plausibly OWNS:
+    #   * an ordinary depth-1 dir (pip-unpack-*, tmpXXXX, tsx-*): the whole
+    #     depth-1 tree. mktemp-style dirs are single-owner by construction.
+    #   * under the claude-<uid>/ container: the SESSION tree
+    #     (claude-<uid>/<project>/<session>), the same 2-level layout
+    #     newest_session above already encodes. Siblings stay reclaimable.
+    #   * a loose file at the ROOT: no unit at all. CC points TMPDIR here, so
+    #     root-level held temp files are routine (227 measured live) — deriving
+    #     the root itself as a unit excluded EVERYTHING from every sweep.
+    #
+    # Unit subtrees are excluded whole ("U": node + contents); ancestors are
+    # excluded as NODES only ("A": the directory itself survives rm -rf /
+    # -delete, its OTHER children remain sweepable).
+    local snapshot="$1" root="$2"
+    [[ -n "$snapshot" ]] || return 0
+    printf '%s\n' "$snapshot" | _wg_root="$root/" awk '
+        / \(deleted\)$/ { next }
+        index($0, ENVIRON["_wg_root"]) != 1 { next }
+        {
+            rootlen = length(ENVIRON["_wg_root"])
+            rel = substr($0, rootlen + 1)
+            if (rel !~ /\//) {
+                # A loose file at the ROOT gets no directory unit (the C3
+                # floor: deriving the root dir excluded EVERYTHING) — but the
+                # FILE itself is still in-flight work, so protect exactly that
+                # one path, node-only. Bounded: one entry per held root file.
+                if (!(("F" rel) in seen)) { seen["F" rel] = 1; print "F " $0 }
+                next
+            }
+            d = rel
+            sub(/\/[^\/]*$/, "", d)       # dirname, root-relative
+            n = split(d, comp, "/")
+            # The container test is anchored to the NUMERIC-uid form on
+            # purpose: a bare /^claude-/ also matched claude-skills — the
+            # CACHE this same file deletes by name at two tiers — and
+            # reclassified it as a container, narrowing its unit to depth 2
+            # and re-creating for a neighbouring name the exact quiet-sibling
+            # loss the unit model exists to prevent (round-3 finding,
+            # MEASURED).
+            if (comp[1] ~ /^claude-[0-9]+$/) {
+                if (n < 2) {
+                    # A loose file directly under the container would derive
+                    # the container ITSELF as a unit — the C3 disabled-reaper
+                    # one level down (round-3 finding, MEASURED: one held
+                    # lockfile stopped every sibling tree being reclaimed).
+                    # Same remedy as the root floor: protect exactly the file.
+                    if (!(("F" rel) in seen)) { seen["F" rel] = 1; print "F " $0 }
+                    next
+                }
+                depth = (n < 3 ? n : 3)   # session tree, or shallower dirname
+            } else {
+                depth = 1                 # ordinary temp: depth-1 owns it
+            }
+            unit = comp[1]
+            for (i = 2; i <= depth; i++) unit = unit "/" comp[i]
+            if (!(("U" unit) in seen)) {
+                seen["U" unit] = 1
+                print "U " ENVIRON["_wg_root"] unit
+            }
+            anc = ""
+            for (i = 1; i < depth; i++) {
+                anc = (i == 1 ? comp[1] : anc "/" comp[i])
+                if (!(("A" anc) in seen)) {
+                    seen["A" anc] = 1
+                    print "A " ENVIRON["_wg_root"] anc
+                }
+            }
+        }
+    '
+}
+
+zone_a_live_exclusions() {
+    # Populate the array named by $1 with find(1) predicates protecting every
+    # live writer's WORK UNIT (see live_writer_units): "U" units as node +
+    # subtree, "A" ancestors as node only.
+    #
+    # ONE builder, consumed by EVERY Zone A deletion site. The alternative —
+    # each site matching in its own way — is what let a directory be spared by
+    # the reap loop, logged as spared, and then deleted by the cache sweep
+    # twenty lines later.
+    local -n _wg_out="$1"
+    local snapshot="$2" root="$3"
+    _wg_out=()
+    local line tag d esc count=0
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        tag="${line:0:1}"
+        d="${line:2}"
+        # N4: an absurdly large exclusion set would push find's argv past
+        # ARG_MAX, and `2>/dev/null || true` would swallow the failure — the
+        # sweep silently never runs, indistinguishable from "nothing to
+        # reclaim". Cap it LOUDLY; ~500 units is far beyond any real state
+        # (baseline: ~2,000 descriptors system-wide, 0 under cc-tmp).
+        if (( ++count > 512 )); then
+            log WARN "Zone A — live-writer exclusion set exceeded 512 entries; truncating (further live writers are NOT protected this sweep)"
+            break
+        fi
+        esc="$(glob_escape "$d")"
+        # "U" unit subtree: node + contents. "A" ancestor and "F" root-level
+        # held file: node only — an "F" exclusion is a single exact path, so
+        # it can never widen into the everything-match the C3 floor prevents.
+        _wg_out+=(-not -path "$esc")
+        if [[ "$tag" == "U" ]]; then
+            _wg_out+=(-not -path "$esc/*")
+        fi
+    done < <(live_writer_units "$snapshot" "$root")
+}
+
+cc_tmp_capacity_mb() {
+    # The cc-tmp volume's TRUE capacity in MB: min(what statfs reports, the
+    # configured cap). Two backends, verified live 2026-09-23 on two installs:
+    # on an LVM pool the volume is a real 2GiB block device and statfs tells
+    # the truth (min picks it); on a btrfs pool the volume is a subvolume
+    # whose 2GiB quota lives in a qgroup statfs CANNOT see — df reports the
+    # whole shared pool (349GB measured), so the configured number is the only
+    # true one (min picks it). A statfs failure (0) falls back to the config.
+    local fs_total conf
+    fs_total="$(fs_total_mb "$CC_TMP_DIR")"
+    conf="${CC_TMP_CAPACITY_MB:-2048}"
+    # A hand-edited conf value like "2G" would kill the daemon at the
+    # arithmetic below under set -e; degrade to the default instead.
+    [[ "$conf" =~ ^[0-9]+$ ]] || conf=2048
+    if (( fs_total > 0 && fs_total < conf )); then
+        echo "$fs_total"
+    else
+        echo "$conf"
+    fi
+}
+
 reap_dir_sparing_sockets() {
     # Object-level deletion that NEVER removes unix sockets. CC binds one
     # socket per live session under cc-tmp (cross-session messaging); they are
@@ -185,26 +406,49 @@ EOF
 #   Red    : > 90% OR fs free < sacred — nuclear cleanup + emergency alert
 
 clean_cc_yellow() {
+    # Same in-flight exclusions the tiers above use. YELLOW fires at 50% of
+    # budget — more often than either — and deletes *.tmp older than 60min: a
+    # long download's still-open .tmp is in-flight work by RED's own standard.
+    # Snapshot cost ~50-100ms per poll, measured.
+    local -a _yellow_excl=()
+    zone_a_live_exclusions _yellow_excl "$(live_open_paths)" "$CC_TMP_DIR"
     log INFO "Zone A YELLOW — cleaning stale session dirs and temp files"
 
     # Clean session dirs with mtime > 7 days
     find "$CC_TMP_DIR" -mindepth 2 -maxdepth 2 -type d -path "*/claude-*/???*" \
-        -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+        -mtime +7 ${_yellow_excl[@]+"${_yellow_excl[@]}"} \
+        -exec rm -rf {} + 2>/dev/null || true
 
     # Clean old temp files (*.tmp, *.env, *.yaml) > 1 hour old
     find "$CC_TMP_DIR" -type f \( -name "*.tmp" -o -name "*.env" -o -name "*.yaml" \) \
-        -mmin +60 -delete 2>/dev/null || true
+        -mmin +60 ${_yellow_excl[@]+"${_yellow_excl[@]}"} \
+        -delete 2>/dev/null || true
 }
 
 clean_cc_orange() {
     clean_cc_yellow
     log WARN "Zone A ORANGE — deleting caches, then re-measuring before any session kill"
 
+    # Same in-flight exclusions RED uses, for the same two names. ORANGE fires
+    # at 75% of budget — MORE often than RED — so guarding only RED would leave
+    # the incident class open on the tier that actually runs. A tsx-* directory
+    # is written into while its process runs; "rebuilt automatically" is true
+    # of a cache nobody is mid-write on, and says nothing about one that is.
+    #
+    # No probe self-test here, unlike RED: this tier deletes two named caches
+    # rather than reaping arbitrary directories, so a blind guard costs a
+    # rebuildable cache rather than a writer's work, and the scan runs on a
+    # far more frequent tier. RED carries the diagnostic.
+    local -a live_excl=()
+    zone_a_live_exclusions live_excl "$(live_open_paths)" "$CC_TMP_DIR"
+
     # Delete claude-skills cache (~35MB, CC re-clones on demand)
-    find "$CC_TMP_DIR" -type d -name "claude-skills" -exec rm -rf {} + 2>/dev/null || true
+    find "$CC_TMP_DIR" -type d -name "claude-skills" \
+        ${live_excl[@]+"${live_excl[@]}"} -exec rm -rf {} + 2>/dev/null || true
 
     # Delete tsx cache (~1.2MB, rebuilt automatically)
-    find "$CC_TMP_DIR" -type d -name "tsx-*" -exec rm -rf {} + 2>/dev/null || true
+    find "$CC_TMP_DIR" -type d -name "tsx-*" \
+        ${live_excl[@]+"${live_excl[@]}"} -exec rm -rf {} + 2>/dev/null || true
 
     mkdir -p "$ALERT_DIR"
     touch "$ALERT_DIR/tmp_warning"
@@ -277,25 +521,125 @@ clean_cc_red() {
     newest_session=$(find "$CC_TMP_DIR" -mindepth 2 -maxdepth 2 -type d -path "*/claude-*" \
         -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}') || true
 
-    # Reap every depth-1 dir except the newest session's ancestor —
-    # object-level and socket-sparing (see reap_dir_sparing_sockets); loose
-    # depth-1 files are the separate sweep below. `|| true` matches the
-    # file's find idiom: a transient find error must not abort the daemon
-    # mid-RED under set -euo pipefail.
-    find "$CC_TMP_DIR" -mindepth 1 -maxdepth 1 -type d | while IFS= read -r dir; do
-        # Skip if this contains the active session
+    # ── In-flight guard ──────────────────────────────────────
+    # Degrades OPEN AND LOUD. Reaping without the guard is today's behaviour
+    # and risks one writer's work; refusing to reap would spare everything and
+    # let cc-tmp fill, and a full cc-tmp is what kills CC sessions — the
+    # outcome this whole service exists to prevent. Open is the lesser harm.
+    # Silent is not an option in either direction.
+    #
+    # The check is a POSITIVE SELF-TEST, not an emptiness test. An empty
+    # snapshot is only the TOTAL failure; a partial /proc read, a writer owned
+    # by another uid, or a CC_TMP_DIR spelling the kernel does not use all
+    # yield a NON-empty snapshot with a structurally blind guard. Holding a
+    # descriptor open on a probe inside CC_TMP_DIR and requiring the snapshot
+    # to show it exercises every one of those at once — including the root
+    # spelling, which is the case no amount of reading would have caught.
+    # ── THE OXYGEN FLOOR — the invariant this whole tier exists for ──
+    # When true headroom falls under sacred ground, cc-tmp is about to hit its
+    # real ceiling, and a full cc-tmp is what kills CC sessions. At that point
+    # NOTHING is spared: the in-flight guard is not consulted, no descriptor
+    # and no guard defect can block reclamation. Keyed on cc_tmp_capacity_mb
+    # (not statfs) because on a btrfs backend df cannot see the volume quota —
+    # the deployed sacred-ground check read 190GB free while the real ceiling
+    # was 2GiB away, so it could never have fired before ENOSPC.
+    local capacity used_now headroom
+    capacity="$(cc_tmp_capacity_mb)"
+    used_now="$(dir_usage_mb "$CC_TMP_DIR")"
+    headroom=$(( capacity - used_now ))
+
+    local live_paths="" probe="" probe_snapshot=""
+    local probe_fd   # assigned by `exec {probe_fd}>` below, never by hand
+    if (( headroom < SACRED_GROUND_MB )); then
+        log WARN "Zone A RED — OXYGEN FLOOR: headroom ${headroom}MB < sacred ${SACRED_GROUND_MB}MB (capacity ${capacity}MB, used ${used_now}MB). In-flight guard BYPASSED — reclaiming everything."
+    else
+        probe="$(mktemp "$CC_TMP_DIR/.wg-probe.XXXXXX" 2>/dev/null)" || probe=""
+        if [[ -n "$probe" ]]; then
+            # Guarded: a failing `exec {fd}>` EXITS a non-interactive shell
+            # under set -e even mid-function (MEASURED 2026-09-23) — an
+            # unguarded probe open would take the daemon down at the exact
+            # tier where fd pressure makes open() likeliest to fail. On
+            # failure, degrade to the same no-probe path mktemp failure takes.
+            if exec {probe_fd}>"$probe" 2>/dev/null; then
+                probe_snapshot="$(live_open_paths)"
+                exec {probe_fd}>&-
+            fi
+            rm -f "$probe"
+        fi
+    fi
+    # Taken AFTER the probe is closed and unlinked: a snapshot still naming
+    # the probe would derive a unit from it and shrink the sweep for nothing.
+    # On the oxygen-floor path live_paths stays empty on purpose: an empty
+    # snapshot yields no exclusions and no spared directories anywhere below.
+    if (( headroom >= SACRED_GROUND_MB )); then
+        live_paths="$(live_open_paths)"
+        # Positive self-test, not an emptiness test: a partial /proc read,
+        # another uid's writer, or a CC_TMP_DIR spelling the kernel does not
+        # use all yield a NON-empty snapshot with a structurally blind guard.
+        # The probe is a root-level loose file, so dir_has_live_writer (a
+        # prefix test, no unit derivation) is the right checker for it.
+        # Exact-path match, not a prefix test: dir_has_live_writer answers
+        # "is ANYTHING open under cc-tmp", which any other session's
+        # descriptor satisfies (6 measured live at review time) — masking a
+        # partial /proc read, the failure mode this self-test names first
+        # (round-3 finding, MEASURED: the old form passed with the probe
+        # wholly invisible).
+        if [[ -z "$probe" ]] || ! printf '%s\n' "$probe_snapshot" | grep -qxF -- "$probe"; then
+            log WARN "Zone A RED — in-flight guard UNAVAILABLE (self-test failed: this process's own open probe under $CC_TMP_DIR is not visible in the /proc snapshot); reaping without it, an active writer's directory may be deleted"
+        fi
+    fi
+
+    # One exclusion set, built once, consumed by every deletion below.
+    local -a live_excl=()
+    zone_a_live_exclusions live_excl "$live_paths" "$CC_TMP_DIR"
+
+    # Reap every depth-1 dir except the newest session's ancestor and any
+    # directory a live process is writing into — object-level and
+    # socket-sparing (see reap_dir_sparing_sockets); loose files are the
+    # separate sweep below. `|| true` matches the file's find idiom: a
+    # transient find error must not abort the daemon mid-RED under
+    # set -euo pipefail.
+    local dir
+    while IFS= read -r dir; do
+        # Skip if this contains the active session. Deliberately NOT added to
+        # any exclusion list: this spares for a DIFFERENT reason than the
+        # live-writer branch, and the loose sweep below already carries its own
+        # deliberately narrower -not -path "$newest_session/*". Promoting this
+        # to the depth-1 parent would exclude every sibling project tree under
+        # claude-<uid>/ from the sweep (MEASURED: 7 trees, 1 of them live).
         if [[ -n "$newest_session" && "$newest_session" == "$dir/"* ]]; then
             continue
         fi
+        # The REAP unit is the whole directory: reaping only the quiet part of
+        # a tree being written leaves its writer a partially-deleted directory,
+        # which breaks it just as surely as removing the whole thing.
+        if dir_has_live_writer "$dir" "$live_paths"; then
+            log INFO "Zone A RED — sparing $dir (a live process is writing into it)"
+            continue
+        fi
         reap_dir_sparing_sockets "$dir"
-    done || true
+    done < <(find "$CC_TMP_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null) || true
 
-    # Delete all reclaimable files except those modified in last 60s
+    # Delete all reclaimable loose files except those modified in the last 60s.
+    # This sweep has no -maxdepth, so it walks the WHOLE tree — including the
+    # directories spared above. Without the exclusions it would delete the
+    # quiet files inside a directory the reap loop deliberately kept, which is
+    # the same partial-deletion failure by another route.
     find "$CC_TMP_DIR" -type f -not -newermt '60 seconds ago' \
-        -not -path "$newest_session/*" -delete 2>/dev/null || true
+        -not -path "$newest_session/*" ${live_excl[@]+"${live_excl[@]}"} \
+        -delete 2>/dev/null || true
 
-    # Delete caches unconditionally
+    # Delete caches — except where a live process is writing, and except
+    # inside the active session's own tree: a tsx-*/claude-skills dir INSIDE
+    # the newest session is that session's in-flight tooling state, and the
+    # descriptor guard alone cannot vouch for it (its writer may be between
+    # opens). Reclaim of DEAD caches is pinned by its own test arm. Without
+    # the live exclusions this sweep deleted a directory the reap loop had
+    # just spared AND logged as spared, which is worse than not sparing it:
+    # the operator is told a directory survived that did not.
     find "$CC_TMP_DIR" -type d \( -name "claude-skills" -o -name "tsx-*" \) \
+        ${live_excl[@]+"${live_excl[@]}"} \
+        -not -path "$newest_session/*" \
         -exec rm -rf {} + 2>/dev/null || true
 
     # Report the surviving control plane — counted AFTER every sweep above,

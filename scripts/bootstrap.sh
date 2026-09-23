@@ -879,8 +879,19 @@ cat > "$HOME/.genesis/config/watchgod.conf" <<WEOF
 CC_TMP_DIR=$CC_TMP_DIR
 CC_TMP_BUDGET_MB=500
 SACRED_GROUND_MB=150
+# True capacity of the cc-tmp volume in MB. On a btrfs storage backend df
+# CANNOT see the volume's cap (statfs reports the shared pool; the quota
+# lives in a qgroup), so the watchgod computes true headroom from THIS
+# number: headroom = min(fs_total, capacity) - used. Derived from the same
+# variable the volume-creation lib uses (scripts/lib/cc_tmp_volume.sh,
+# CCTMPVOL_SIZE_GIB, default 2GiB) rather than hardcoded — an install that
+# overrides the volume size at host-setup must export the same override when
+# this runs, or edit watchgod.conf; a silent mismatch in the LARGER direction
+# would fire the oxygen floor early and permanently bypass the in-flight
+# guard (round-3 finding).
+CC_TMP_CAPACITY_MB=$(( ${CCTMPVOL_SIZE_GIB:-2} * 1024 ))
 WEOF
-echo "  CC temp: ${CC_TMP_DIR} (budget: 500MB, sacred: 150MB)"
+echo "  CC temp: ${CC_TMP_DIR} (budget: 500MB, sacred: 150MB, capacity: 2048MB)"
 
 echo "  ~/.genesis/ initialized"
 echo
