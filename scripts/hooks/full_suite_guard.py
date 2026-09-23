@@ -179,6 +179,26 @@ def _targets_specific_test(args: list[str]) -> bool:
 #: one of these, the segment is UNRESOLVED — which is not the same as clean.
 _CARRIER_EXES = frozenset({"uv", "uvx", "poetry", "hatch", "pdm", "pipenv", "rye"})
 
+#: Carriers this set deliberately LACKS, with the reason each is elsewhere's
+#: problem — test_carrier_sets fails when a union member is absent without a
+#: recorded reason (#2232), so an omission can no longer pose as a decision.
+_NOT_A_RUN_FRONTEND = (
+    "not a package-manager `run` front-end — this set gates the literal "
+    "`run` subcommand only"
+)
+_CARRIER_EXCLUDES: dict[str, str] = {
+    name: _NOT_A_RUN_FRONTEND
+    for name in (
+        # re-parse launchers — shell_parse._REPARSE_CARRIERS
+        "eval", "su", "runuser", "setpriv", "chroot", "flock", "watch",
+        "script", "systemd-run", "unshare", "nsenter", "pkexec", "runcon", "sg",
+        # remote / argv-visible carriers — worktree_cwd_guard._CARRIER_NAMES
+        "ssh", "find", "parallel", "docker", "xargs",
+        # nested shells — destructive_command_guard._NESTED_SHELLS
+        "bash", "sh", "dash", "zsh", "ksh", "ash",
+    )
+}
+
 
 def _carried_pytest_args(seg: Segment) -> list[str] | None:
     """Args after a carried pytest executable inside an UNRESOLVED carrier, else None.

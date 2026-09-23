@@ -92,7 +92,7 @@ except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must b
 _DEGRADED_GATED = r"\brm\b|\brmdir\b"
 
 try:
-    from shell_parse import analyze_checked  # noqa: E402
+    from shell_parse import _REPARSE_CARRIERS, analyze_checked  # noqa: E402
 except Exception as _exc:  # noqa: BLE001 — see degraded_exit: exit 1 is a FAIL-OPEN.
     if __name__ != "__main__":
         # A test importing a deliberately broken tree must see the real error, not a
@@ -378,6 +378,67 @@ def main() -> int:
 
     cwd = payload.get("cwd") if isinstance(payload, dict) else None
     for seg in segs:
+        # PER-SEGMENT, not per-command: refuse only when the CARRIER'S OWN
+        # segment mentions rm/rmdir, mirroring the fix `git_push_guard` already
+        # ships for the identical defect. An earlier revision read the whole
+        # command, so a carrier in one segment combined with an UNRELATED
+        # segment's own `rm` mention to refuse a command the carrier never
+        # touched. MEASURED over the 1,585 recorded commands that reach this
+        # branch's prefilter: the per-command scope refused 277 of them; the
+        # per-segment scope refuses 1 — the other 276 were a carrier segment
+        # carrying nothing destructive, refused only because a LATER, unrelated
+        # segment mentioned rm. `_RM_PATTERN` is the same prefilter used at the
+        # module's fast path; `seg.raw` is the carrier's own segment text, not
+        # the whole command.
+        if seg.exe in _REPARSE_CARRIERS and _RM_PATTERN.search(seg.raw):
+            # A LAUNCHER THAT RUNS A COMMAND THIS RESOLVER CANNOT RECOVER.
+            # REFUSE OUTRIGHT, deliberately WITHOUT looking at the payload.
+            #
+            # An earlier revision of this branch did look: it re-ran the precise
+            # operand scan over each carried token, then fell back to a substring
+            # floor. Three independent reviewers and a 153-cell sweep took it
+            # apart, and the measurements say the SHAPE cannot work rather than
+            # that the table was short:
+            #
+            #   * a payload passed as ARGV (`eval rm -rf X`) never presents `rm`,
+            #     its flags and its operand inside ONE token, so a per-token
+            #     parse sees no removal at all;
+            #   * NESTING defeats a single pass, because recovering the inner
+            #     string just yields another carrier;
+            #   * bash CONCATENATES adjacent quoted fragments, so a payload can
+            #     contain no matchable word at all — `"git pu""sh"` runs
+            #     `git push` while the text holds no `push`;
+            #   * several carriers ATTACH their command to an option
+            #     (`su --command='rm -rf X'`), so the inner exe parses as
+            #     `--command=rm`.
+            #
+            # The middle two are properties of the SHELL, not gaps in a list, so
+            # no amount of further matching closes them: any test applied to the
+            # payload can be spelled around. Refusing on the CARRIER cannot be,
+            # because it never reads the payload.
+            #
+            # MEASURED end-to-end through this guard as a subprocess, each
+            # corpus row's own cwd, 83,201 recorded commands: 19 refusals
+            # (0.023%), every one recoverable by re-issuing the command without
+            # the launcher. This is AFTER per-segment scoping and the addition
+            # of `source`/`.`/`builtin` — both changed the figure and roughly
+            # cancelled: scoping removed 276 false refusals the per-command
+            # form produced (a carrier segment refused because an UNRELATED
+            # segment mentioned rm), while the three added launchers cost a
+            # few more true ones. The rate stays low because the `\brm\b`
+            # prefilter at :262 returns before this branch for any command that
+            # mentions no removal — that prefilter is what bounds the refusal,
+            # and it is asserted by a test for exactly that reason. Sibling
+            # guards measure their own rates against their own sets; this
+            # figure is not transferable to them.
+            return _block(
+                f"'{seg.exe}' runs a command this guard cannot recover, so it "
+                f"cannot verify whether that command deletes a protected path. "
+                f"Refused without inspecting the payload: a carried command can "
+                f"be spelled so that no inspection would see it.\n"
+                f"To proceed: run the command directly, without '{seg.exe}', so "
+                f"the ordinary protected-path checks can see its operands."
+            )
         if seg.exe not in ("rm", "rmdir"):
             continue
         seg_unresolved = False

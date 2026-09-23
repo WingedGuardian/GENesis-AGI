@@ -96,6 +96,12 @@ _WRAPPER_SPEC = {
     "setsid": (set(), 0),
     "time": ({"-o", "--output", "-f", "--format"}, 0),
     "command": (set(), 0),
+    # `builtin` runs its argument as a shell builtin, so `builtin eval '…'` and
+    # `builtin source f` reach the eval/source builtins WITH their inline-string
+    # /file payloads. Strip it transparently (like `command`) so the wrapped
+    # carrier is revealed and the carrier arm catches it — rather than listing
+    # `builtin` itself as a carrier, which would over-block `builtin cd`.
+    "builtin": (set(), 0),
     "exec": ({"-a"}, 0),
     # `-e/--eof` and `-i/--replace` are NOT here, and their absence is the point.
     # xargs gives them OPTIONAL values (`--eof[=END]`, `--replace[=R]`), so as a
@@ -168,6 +174,172 @@ _WRAPPERS = set(_WRAPPER_SPEC)
 # A front-end invoked with any other subcommand (`uv pip install …`) is therefore
 # left resolving to the front-end itself, exactly as before.
 _RUN_CARRIERS = frozenset({"uv", "poetry", "hatch", "pdm", "pipenv", "rye"})
+#: Carriers this set deliberately LACKS — test_carrier_sets fails when a union
+#: member is absent without a recorded reason (#2232).
+_RUN_CARRIER_EXCLUDES: dict[str, str] = {
+    "uvx": "no `run` subcommand to gate on — uvx execs the tool directly; an "
+    "unstripped uvx segment is handled by the recoverable branch in "
+    "_strip_wrappers, not the run gate",
+    **{name: "not a package-manager `run` front-end — gating it on a `run` "
+        "literal here would swallow the first bare word of every subcommand"
+        for name in (
+            "eval", "su", "runuser", "setpriv", "chroot", "flock", "watch",
+            "script", "systemd-run", "unshare", "nsenter", "pkexec", "runcon",
+            "sg", "ssh", "find", "parallel", "docker",
+            "xargs", "bash", "sh", "dash", "zsh", "ksh", "ash",
+        )},
+}
+#: Launchers that RUN another command and whose grammar this resolver refuses to
+#: model. They are deliberately NOT `_WRAPPER_SPEC` entries: the walk already
+#: stops at an unknown wrapper and leaves the segment on the launcher, so this
+#: set does not change parsing at all. It NAMES that state for consumers.
+#:
+#: WHY NOT A TABLE. `runuser --help` documents TWO grammars selected by flag —
+#: `-u user [--] command` (argv) and the su-compatible `-c 'string'` (a string
+#: the shell re-parses) — so one arity entry cannot be right for both, and being
+#: wrong on the `-c` form is FAIL-OPEN. `eval` has no grammar to table at all: it
+#: re-parses whatever string it is handed. The `sudo -S` note in `_WRAPPER_SPEC`
+#: refuses the same treadmill for the same reason, and a wrong arity CONSUMES THE
+#: COMMAND WORD — a bypass reached by trying to be more precise.
+#:
+#: ⚠ NAMING A CARRIER CLOSES NOTHING BY ITSELF. An un-stripped segment is simply
+#: a hidden command (see `_strip_wrappers`, where `recoverable` is true for
+#: `uvx` alone). The hole closes only where a CONSUMER keys a conservative
+#: fallback on this set — `full_suite_guard._CARRIER_EXES` and
+#: `worktree_cwd_guard._CARRIER_NAMES` are the two shipped precedents.
+#:
+#: MEASURED on the deployed parser, with controls: every name below reports only
+#: the launcher, while `sudo`, `command` and a bare `rm` resolve correctly.
+#:
+#: MEMBERSHIP IS A FLOOR, NOT A SURVEY OF THE CLASS — an earlier revision of
+#: this comment claimed it was enumerated. A consumer refuses on the carrier
+#: itself and never reads what it carries, so membership decides a refusal
+#: outright, and the true class is "any command that re-parses or dispatches a
+#: string it was handed" — open-ended, since it also includes `xargs`, `awk`,
+#: any language's `-c`/`eval` flag, and a shell FUNCTION defined earlier in the
+#: same command. What is enumerated is the subset that SELF-RESOLVES on THIS
+#: parser (`seg.exe` literally equals the launcher name). The count is stated
+#: here because a comment naming a different number than the set below is how an
+#: omission stops looking like one — FOURTEEN as of this revision. (`source`,
+#: `.` and `builtin` were briefly members and were removed: they run a FILE or a
+#: builtin, not an inline string, so a removal cannot hide in the command text.
+#: See the note beside the set.)
+#:
+#: COST IS NOT ZERO, and an earlier revision of this comment said it was. Each
+#: consumer's rate is its own, because their prefilters differ and no rate
+#: transfers between them.
+#:
+#: protected_paths: MEASURED end-to-end (real guard as a subprocess, each corpus
+#: row's own cwd) over 83,201 recorded commands — 19 refusals (0.023%), 0
+#: relaxed, every one recoverable by re-issuing without the launcher. This is
+#: AFTER per-segment scoping; dropping the file-runners source/./builtin from the
+#: carrier set leaves it unchanged — source contributes 0 to its per-segment arm
+#: (MEASURED, 3 firings with and without). Also recorded at the branch that
+#: produces it, in protected_paths_guard.py.
+#:
+#: destructive: MEASURED end-to-end (real guard as a subprocess) against
+#: origin/main — 78 refusals of 83,201 recorded commands (0.094%), 0 relaxed. Of
+#: the 78, ~53 are the unreadable-blind branch (heredoc BODIES the parser cannot
+#: read, #1748) and ~25 are genuine hidden carriers (literal, variable-indirected
+#: or opaque-payload). An intermediate revision reached 297 here, 219 of them
+#: `source ~/.venv/bin/activate && rm …` (venv activation, which CLAUDE.md
+#: mandates) — per-segment scoping the resolved carrier arm and dropping the
+#: file-runner carriers eliminated all 219; the opaque-payload re-close (so a
+#: variable-indirected removal in a carrier cannot walk past the literal check)
+#: added ~8 conservative refusals back.
+#:
+#: git_push: 0 of 83,201 (0.000%). Its carrier arm is per-segment and its
+#: baseline (origin/main) has no carrier arm at all; the arm fires on no recorded
+#: command, so a carried gated op converges with the existing raw-text net.
+#:
+#: Each guard needs its OWN bounded run — the combined three-guard subprocess
+#: sweep did not finish inside an hour. Quote the end-to-end number; an earlier
+#: 17/99/22 was wrong precisely because a figure outlived the mechanism it was
+#: measured against.
+#:
+#: ⚠ THE 17/99/22 THAT ONCE STOOD HERE WERE WRONG IN TWO WAYS. The 99 and the 22
+#: were measured against mechanisms that no longer ship (a name-list
+#: command-position test; a carrier scope read over the whole command rather than
+#: the carrier's own segment). The 17 was a METHOD error: it came from importing
+#: the guard's predicate and calling it directly, which passes no `cwd` — the
+#: real guard reads one — and end-to-end the figure was 21, since narrowed to 19
+#: by per-segment scoping. Quote the end-to-end number; a reproduction of a guard
+#: measures the reproduction until the guard itself is run.
+#:
+#: ⚠ `ssh` IS DELIBERATELY ABSENT, and it is the one a reviewer will ask about.
+#: It does not belong here: `ssh host "…"` runs the command on ANOTHER MACHINE,
+#: so checking it against THIS box's protected paths is a category error.
+#: MEASURED over 81,877 recorded commands, `ssh` alone would newly refuse 214 —
+#: every sampled one a file copy or a remote probe that publishes and deletes
+#: nothing locally, i.e. an order of magnitude above the whole set's cost, for
+#: commands whose effects are not on this machine at all. Gating a remote
+#: command needs its own design; it is tracked separately rather than solved by
+#: appending a name to this set.
+#: Carriers this set deliberately LACKS — test_carrier_sets fails when a union
+#: member is absent without a recorded reason (#2232). The `ssh` reasoning is
+#: the long comment above; the rest:
+#:
+#: - package front-ends gate on a `run` literal (_RUN_CARRIERS), not free
+#:   re-parse — modelling them here would consume the first bare word of
+#:   every subcommand, the bypass `_RUN_CARRIERS` exists to avoid;
+#: - `find`/`parallel`/`xargs` carry visible argv, not an opaque string —
+#:   `xargs` is a `_WRAPPER_SPEC` entry the resolver strips through, and a
+#:   `find -exec` payload is already a bare `rm` token the walk sees;
+#: - `docker` is the same remote-class reasoning as `ssh`: the command runs
+#:   inside a container, not on this box's filesystem;
+#: - the nested shells are `_NESTED_SHELLS`, modelled by the resolver's own
+#:   recursion rather than named as carriers.
+_REPARSE_CARRIER_EXCLUDES: dict[str, str] = {
+    **{name: "a `run`-gated package front-end, not a free re-parse — see "
+        "_RUN_CARRIERS"
+        for name in ("uv", "uvx", "poetry", "hatch", "pdm", "pipenv", "rye")},
+    "ssh": "runs the command on ANOTHER machine — remote gating is its own "
+    "design, tracked separately (#2231); see the comment above",
+    "docker": "runs the command inside a container — same remote-class "
+    "reasoning as ssh",
+    "find": "carries visible argv (`find -exec rm …`) — the payload is "
+    "already a bare token the walk sees, not an opaque string",
+    "parallel": "carries visible argv — same reasoning as find",
+    "xargs": "a `_WRAPPER_SPEC` entry — the resolver already strips through "
+    "it, so it never reaches the carrier state",
+    **{name: "a nested shell — modelled by the resolver's own recursion "
+        "(_NESTED_SHELLS), not a carrier to refuse on"
+        for name in ("bash", "sh", "dash", "zsh", "ksh", "ash")},
+}
+_REPARSE_CARRIERS = frozenset(
+    {
+        "eval",
+        "su",
+        "runuser",
+        "setpriv",
+        "chroot",
+        # Self-resolving on the deployed parser, same class as the five above.
+        "flock",
+        "watch",
+        "script",
+        "systemd-run",
+        "unshare",
+        "nsenter",
+        "pkexec",
+        "runcon",
+        "sg",
+    }
+)
+# `source`/`.` are NOT carriers, though an earlier revision of this branch added
+# them: they run the contents of a FILE, not an inline command STRING, so a
+# removal cannot be HIDDEN in the command text the way `eval "rm …"` or
+# `sh -c "rm …"` hides it. The visible `rm` in `source x && rm …` is a separate,
+# resolvable segment the ordinary scan already grades, and every consumer of this
+# set scopes PER SEGMENT, so the `source` segment never triggers a refusal.
+# Treating them as opaque carriers refused every `source ~/.venv/bin/activate &&
+# rm …` — MEASURED 219 of 83,201 recorded commands, almost all venv activation,
+# which CLAUDE.md itself mandates. Same threat model as `ssh`/`bash script.sh`.
+#
+# `builtin` is NOT dropped the same way, and an earlier version of this note was
+# wrong to lump it in: `eval` and `source` ARE shell builtins, so
+# `builtin eval 'rm …'` DOES reach an inline string. It is handled as a
+# TRANSPARENT PREFIX in `_WRAPPER_SPEC` (like `command`) — the resolver strips it
+# and the revealed `eval` (caught) or `source`/`.` (file-runner) is classified.
 # Value-consuming flags accepted BEFORE the wrapped command, on either the
 # front-end or its `run` subcommand.
 #
