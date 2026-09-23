@@ -983,6 +983,11 @@ class TestUnresolvedVariableIsItsOwnVerdict:
             '"$EMPTY/a/b/c/d"',  # empty var → /a/b/c/d
             '"${SP}/x/y/z/w"',  # ${…} spelling of the same cause
             '"$(pwd)/a/b/c"',  # command substitution — equally unresolvable
+            "'$SP/a/b/c/d'",  # SINGLE-QUOTED: literal to bash, still refused —
+            # quote syntax is stripped before the operand is seen, so the
+            # guard cannot know the literal is safe; refusing is the honest
+            # verdict, and every '$' reaching here is refused for the same
+            # reason an unquoted one is.
         ],
     )
     def test_every_unresolved_spelling_is_refused(self, target):
@@ -995,13 +1000,16 @@ class TestUnresolvedVariableIsItsOwnVerdict:
         reasons = dg._rm_violations('rm -rf "$SP/head2"')
         assert any("unresolved shell variable" in r for r in reasons), reasons
 
-    def test_a_resolvable_env_var_is_not_unresolved(self, monkeypatch):
-        # expandvars answers what the hook's own environment knows: a deep
-        # literal expansion passes, a shallow one still depth-blocks.
+    def test_env_expansion_is_not_guessed(self, monkeypatch):
+        # expandvars is deliberately NOT applied: the hook's environment is
+        # not the shell's, quote context is already stripped, and an unquoted
+        # expansion is field-split by bash into operands this function cannot
+        # see. Every surviving '$' is refused, resolvable or not — including
+        # an env value that would smuggle a shallow path inside a deep one.
         monkeypatch.setenv("DG_TEST_DEEP", "/srv/app/data/build")
-        assert not _blocks('rm -rf "$DG_TEST_DEEP"')
-        monkeypatch.setenv("DG_TEST_SHALLOW", "/a")
-        assert _blocks('rm -rf "$DG_TEST_SHALLOW"')
+        assert _blocks('rm -rf "$DG_TEST_DEEP"')
+        monkeypatch.setenv("DG_TEST_SPLIT", "/home /tmp/a/b/c/d")
+        assert _blocks('rm -rf $DG_TEST_SPLIT')
 
     def test_the_fully_literal_deep_path_is_still_allowed(self):
         # The acceptance bar's other direction: routine cleanup under a deep

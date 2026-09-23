@@ -547,18 +547,25 @@ def _check_target(target: str) -> str | None:
     if clean in _ALWAYS_BLOCK:
         return f"rm -rf on '{clean}' is not allowed."
     # An unresolved expansion is its own verdict, not a path component.
-    # expandvars substitutes every variable the hook's environment can see;
-    # a surviving '$' is a shell-local (or command substitution, or a $(...)
-    # whose value lives in another segment) — the real path and its real
-    # depth are unknowable here. The old code counted it as ONE literal
-    # component, which made the depth floor POSITIONAL: `rm -rf "$SP/head2"`
-    # refused at depth 2 while `rm -rf "$SP/a/b/c/d"` passed, same cause,
-    # opposite verdict — and `$EMPTY/a/b/c/d` is `/a/b/c/d` if EMPTY is "".
-    # Refuse every unresolved form uniformly, and SAY it is the variable,
-    # not the count, that is the cause — a message that reports only a
-    # depth invites the reader to conclude the counter is wrong and reach
-    # for the literal spelling for the wrong reason. (#2233)
-    expanded = os.path.normpath(os.path.expandvars(os.path.expanduser(clean)))
+    # The hook sees command TEXT, so a surviving '$' — shell-local variable,
+    # command substitution, or an env var set in another segment — means the
+    # real path and its real depth are unknowable here. The old code counted
+    # it as ONE literal component, which made the depth floor POSITIONAL:
+    # `rm -rf "$SP/head2"` refused at depth 2 while `rm -rf "$SP/a/b/c/d"`
+    # passed, same cause, opposite verdict — and `$EMPTY/a/b/c/d` is
+    # `/a/b/c/d` when EMPTY is "". (#2233)
+    #
+    # expandvars is deliberately NOT used: it would guess. Quote and escape
+    # syntax is already stripped by the time an operand reaches this
+    # function, so `'$T'` (literal) and `"$T"` (expands) are the same token
+    # — expanding reads a path the shell never receives; and an UNQUOTED
+    # `$T` is field-split by bash into multiple operands, so one token's
+    # value `/home /tmp/a/b/c` is really `rm -rf /home …` borrowing the
+    # second path's depth. Refuse every '$' uniformly, and SAY it is the
+    # variable, not the count, that is the cause — a message that reports
+    # only a depth invites the reader to conclude the counter is wrong and
+    # reach for the literal spelling for the wrong reason.
+    expanded = os.path.normpath(os.path.expanduser(clean))
     if "$" in expanded:
         return (
             f"rm -rf on '{clean}' contains an unresolved shell variable, "
