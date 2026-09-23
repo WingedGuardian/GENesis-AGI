@@ -121,17 +121,14 @@ isolation is still load-bearing for you — it is:
   answer and the response shape is unchanged; only the sensitive values are
   absent.
 
-  **This is not the whole class, and it should not be read as one.** Two
-  `reveal` endpoints — `/api/genesis/references/<id>/reveal` (stored plaintext
-  credentials) and `/api/genesis/attention/<id>/reveal-text` (captured
-  transcript text) — are gated on `is_authenticated()`, so on a passwordless
-  install they still return their contents to any caller who can reach the
-  port. They are knowingly left as they are for now: an endpoint whose entire
-  product is the secret has no redacted middle state, so credential-gating it
-  returns 403 where an unauthenticated operator currently gets 200 — a
-  narrowing of access, which is a product decision rather than a bug fix.
-  Until that decision is taken, treat those two as covered by the network
-  isolation above and by nothing else.
+  **This is not the whole class, and it should not be read as one.** The
+  carve-out reaches routes that have a redacted middle state — a response that
+  is still useful with the sensitive field absent. Routes whose entire product
+  IS the stored value have no such state, so credential-gating one removes the
+  function rather than narrowing the response; those remain on
+  `is_authenticated()` pending a product decision, and on a passwordless
+  install they are covered by the network isolation above and by nothing else.
+  Assume the default posture for them, not the carve-out.
 - It exempts everything under the `/api/genesis/auth/` prefix — a prefix match,
   not a fixed list, so any route added there in future is exempt by default.
   Today that prefix holds login, logout and an auth-status probe. None of them

@@ -18,7 +18,7 @@ from collections import defaultdict
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from flask import jsonify, redirect, request, session
+from flask import current_app, has_app_context, jsonify, redirect, request, session
 
 from genesis.dashboard._blueprint import blueprint
 
@@ -214,12 +214,28 @@ def has_verified_credential() -> bool:
 
 
 def _password_fingerprint(password: str) -> str:
-    """A non-reversible tag identifying WHICH password a session was issued for.
+    """A KEYED tag identifying WHICH password a session was issued for.
 
-    Truncated to 16 hex characters: this is an equality tag, never a credential
-    check, and the full digest is not stored in a cookie the client can read.
+    Keyed rather than bare, and that is the whole point of it. A Flask session
+    cookie is SIGNED but not ENCRYPTED, so everything inside it is readable by
+    anyone holding the cookie. A plain digest of the password would therefore
+    hand that holder an offline dictionary attack against a password an
+    operator very likely chose by hand — and truncation buys nothing against
+    it, because an attacker testing candidate passwords truncates their own
+    digests exactly the same way. Truncation costs collision resistance, which
+    is not the property under attack. Keying with a secret the client never
+    sees removes the attack rather than shortening it.
+
+    The key is the one Flask signed the cookie with, so a fingerprint cannot
+    outlive the cookie carrying it: rotating the secret invalidates the
+    signature and the tag together, and no session is left half-valid.
     """
-    return hashlib.sha256(password.encode()).hexdigest()[:16]
+    key = current_app.secret_key if has_app_context() else None
+    if not key:
+        key = get_or_create_secret_key()
+    if isinstance(key, str):
+        key = key.encode()
+    return hmac.new(key, password.encode(), hashlib.sha256).hexdigest()[:16]
 
 
 def check_password(input_password: str) -> bool:

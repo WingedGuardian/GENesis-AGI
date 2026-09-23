@@ -23,12 +23,15 @@ behaviour as correct.
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 from flask import Flask
 
 # Importing for the side effect of registering routes on the shared blueprint.
 import genesis.dashboard.routes.backup  # noqa: F401
 import genesis.dashboard.routes.secrets  # noqa: F401
+from genesis.dashboard import auth
 from genesis.dashboard._blueprint import blueprint
 
 _FAKE_KEY = "fc-fake-not-a-real-credential-0123456789"
@@ -209,3 +212,38 @@ def test_gates_are_untouched_when_no_password_is_set(app):
     # A gated MUTATION route stays reachable on a passwordless install.
     resp = app.test_client().post("/api/genesis/recon/watchlist", json={"repo": "owner/name"})
     assert resp.status_code != 401, "a passwordless install must not start refusing gated mutations"
+
+
+def test_password_fingerprint_is_keyed_not_a_bare_digest():
+    """The session tag must not be an offline dictionary attack in a cookie.
+
+    A Flask session cookie is SIGNED but not ENCRYPTED, so everything in it is
+    readable by whoever holds the cookie. A bare digest of the dashboard
+    password would therefore hand that holder a candidate-testing oracle
+    against a password an operator very likely chose by hand — and truncating
+    it changes nothing, because an attacker truncates their own digests the
+    same way. Truncation costs collision resistance, which is not the property
+    under attack here.
+
+    Asserted as three separate properties because only the conjunction is the
+    security claim: not the bare digest, key-dependent, and stable under one
+    key. Drop the third and a "fix" that returns fresh randomness would pass
+    the first two while logging every operator out on each request.
+    """
+    pw = "correct-horse-battery-staple"
+    bare = hashlib.sha256(pw.encode()).hexdigest()[:16]
+
+    app_a = Flask(__name__)
+    app_a.secret_key = "secret-A"
+    app_b = Flask(__name__)
+    app_b.secret_key = "secret-B"
+
+    with app_a.app_context():
+        under_a = auth._password_fingerprint(pw)
+        under_a_again = auth._password_fingerprint(pw)
+    with app_b.app_context():
+        under_b = auth._password_fingerprint(pw)
+
+    assert under_a != bare, "the fingerprint is an unkeyed digest of the password"
+    assert under_a != under_b, "the fingerprint does not depend on the signing key"
+    assert under_a == under_a_again, "the fingerprint is unstable within one key"
