@@ -4291,14 +4291,32 @@ def test_every_spawn_path_awaits_the_allowlist_verification():
     from genesis.cc import invoker as inv_mod
 
     tree = ast.parse(inspect.getsource(inv_mod))
+
+    def _awaits_verification(fn: ast.AST) -> bool:
+        """An ast.Await node, not merely a MENTION of the name.
+
+        The first version of this checked for the attribute in the dump, which
+        a bare `self.verify_allowlist_enforceable(inv)` satisfies — the
+        coroutine is then created and never run, so the verification silently
+        does not happen and the launch proceeds unverified. MEASURED: deleting
+        only the `await` keyword left that version GREEN. The sweep missed it
+        too, because it deleted the whole statement rather than the keyword.
+        """
+        return any(
+            isinstance(node, ast.Await)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == "verify_allowlist_enforceable"
+            for node in ast.walk(fn)
+        )
+
     callers: dict[str, bool] = {}
     for node in ast.walk(tree):
         if not isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef):
             continue
-        body = ast.dump(node)
-        if "attr='_build_args'" not in body:
+        if "attr='_build_args'" not in ast.dump(node):
             continue
-        callers[node.name] = "attr='verify_allowlist_enforceable'" in body
+        callers[node.name] = _awaits_verification(node)
 
     assert callers, "no caller of _build_args found — the AST probe is inert"
     missing = sorted(name for name, ok in callers.items() if not ok)
