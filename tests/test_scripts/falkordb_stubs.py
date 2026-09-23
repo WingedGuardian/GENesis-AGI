@@ -31,16 +31,28 @@ _DPKG_STUB = """#!/bin/bash
 if [ "$1" = "-s" ]; then exit "${DPKG_S_RC:-1}"; fi
 exit 0
 """
-# dpkg-query -W -f='${db:Status-Status}' redis-server — prints the status word.
-# The lib asks for this rather than `dpkg -s` because `dpkg -s` also exits 0 for
-# a removed-but-not-purged package ("deinstall ok config-files"), which would
-# make a box with NO redis look like a box that has one.
+# dpkg-query -W -f=<format> redis-server — answers the two formats the lib
+# uses: '${db:Status-Status}' for the presence check (rc 0 ONLY when the
+# status word is "installed", so a removed-but-not-purged package does not
+# count) and '${Version}' for the ownership fingerprint. An absent package
+# answers 1 to both, like real dpkg.
 _DPKG_QUERY_STUB = """#!/bin/bash
-printf '%s' "${DPKG_QUERY_STATUS-}"
-[ -n "${DPKG_QUERY_STATUS-}" ]
+# Present means: declared installed via DPKG_QUERY_STATUS, or our apt stub
+# actually installed it (it writes the dpkg info file on install).
+if [ "${DPKG_QUERY_STATUS-}" != "installed" ] && \\
+   [ ! -f "$FALKORDB_DPKG_INFO/redis-server.list" ]; then exit 1; fi
+case "$*" in
+    *Status-Status*) printf 'installed' ;;
+    *Version*) printf '%s' "${DPKG_QUERY_VERSION:-2:8.0.4-1rl1~noble}" ;;
+esac
+exit 0
 """
 _APT_STUB = """#!/bin/bash
 echo "apt-get $*" >> "$APT_LOG"
+if [ "$1" = "install" ] && [ "${APT_RC:-0}" = "0" ]; then
+    mkdir -p "$FALKORDB_DPKG_INFO"
+    printf 'pkg-files\n' > "$FALKORDB_DPKG_INFO/redis-server.list"
+fi
 exit "${APT_RC:-0}"
 """
 # apt-cache policy <pkg> — reports a configurable Candidate version. The lib
@@ -112,8 +124,8 @@ def _stage(tmp_path: Path) -> dict:
         # would depend on whether the machine running the suite has redis
         # installed — which it does, on any box that has run this provisioning.
         "FALKORDB_REDIS_BINARIES": "falkordb-test-absent-binary",
-        "FALKORDB_INSTALL_MARKER": str(tmp_path / "installed.marker"),
         "FALKORDB_PROVISION_MARKER": str(tmp_path / "provisioned.marker"),
+        "FALKORDB_DPKG_INFO": str(tmp_path / "dpkg-info"),
         # The system half is opt-in; tests that exercise it must say so, the
         # same way an operator has to. The consent tests below override this.
         "GENESIS_FALKORDB_PROVISION": "1",

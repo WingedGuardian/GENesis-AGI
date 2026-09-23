@@ -11,13 +11,11 @@
 # ships is rendered by bootstrap's template loop and left DISABLED; a later
 # slice adds the client and the config that can select it.
 #
-# Route chosen 2026-09-06 after measuring the alternatives: the standalone
-# release module + a distro-managed Redis, NOT the `falkordblite` pip package.
-# The pip route resolves its dependencies through a relative path into the
-# Python package tree and ships VENDORED libssl/libcrypto that would never
-# receive system security updates. The released module links the SYSTEM
-# OpenSSL (verified by ldd on the shipped .so), so patching redis/openssl is
-# ordinary apt work.
+# Route chosen 2026-09-06: the release module + a distro-managed Redis, NOT
+# `falkordblite` pip — that package resolves deps through the Python package
+# tree and ships vendored libssl/libcrypto that never gets security updates.
+# The released module links the SYSTEM OpenSSL (ldd-verified), so patching
+# redis/openssl is ordinary apt work.
 #
 # MEASURED on the reference install 2026-09-06, module v4.20.4:
 #   - the module REFUSES to load on redis-server 7.0.15 ("FalkorDB requires
@@ -47,39 +45,24 @@ FALKORDB_REPO_URL="${FALKORDB_REPO_URL:-https://packages.redis.io/deb}"
 FALKORDB_RELEASE_BASE="${FALKORDB_RELEASE_BASE:-https://github.com/FalkorDB/FalkorDB/releases/download}"
 FALKORDB_OS_RELEASE="${FALKORDB_OS_RELEASE:-/etc/os-release}"
 
-# CONSENT, as distinct from capability.
-#
-# Every other gate in this file asks "can we?" — sudo, apt, arch, codename.
-# This one asks "may we?", and it is a different question. The package half
-# adds a THIRD-PARTY APT REPO and installs a database daemon on someone's
-# machine. update.sh re-runs bootstrap.sh on every update, so without this an
-# operator who merely pulled Genesis would silently acquire a new apt trust
-# anchor for a feature that is inert until a later release wires a consumer.
-#
-# So the system half is OPT-IN: set GENESIS_FALKORDB_PROVISION=1 (or
-# graph_engine.provision: true in the local config) to allow it. The MODULE
-# half stays automatic — it writes one file under ~/.genesis/deps and changes
-# nothing about the system, so it costs an unwilling operator disk space and
-# nothing else, and it means arming the engine later is a one-command step.
-#
-# GENESIS_FALKORDB_PROVISION_DISABLED=1 turns the whole thing off, module
-# included, matching the kill-switch convention the other subsystems use.
+# CONSENT, as distinct from capability. The system half adds a THIRD-PARTY
+# APT REPO and installs a daemon, and update.sh re-runs bootstrap.sh on every
+# update — so it is OPT-IN: GENESIS_FALKORDB_PROVISION=1, or
+# graph_engine.provision: true in the local config. The MODULE half stays
+# automatic — one file under ~/.genesis/deps, nothing about the system.
+# GENESIS_FALKORDB_PROVISION_DISABLED=1 turns the whole thing off, matching
+# the kill-switch convention the other subsystems use.
 FALKORDB_PROVISION_OPT_IN="${GENESIS_FALKORDB_PROVISION:-}"
 FALKORDB_PROVISION_DISABLED="${GENESIS_FALKORDB_PROVISION_DISABLED:-}"
 FALKORDB_LOCAL_CONFIG="${FALKORDB_LOCAL_CONFIG:-$HOME/.genesis/config/genesis.yaml}"
 
-# _falkordb_opted_in — env first, then `provision: true` as a DIRECT child of a
-# TOP-LEVEL `graph_engine:` in the local config. Deliberately a narrow grep
-# rather than a YAML parse: this is a shell fragment with no parser available,
-# and the fail direction is correct — anything it cannot read plainly reads as
-# "no" (flow style, `graph_engine: {provision: true}`, is one such case).
-#
-# The KEY PATH is exact on purpose. This gate authorises adding a third-party
-# apt repo and installing a system package, so it must read consent only where
-# consent was written: `graph_engine:` must start at column 0, and `provision:`
-# must sit at the indentation of the block's first child. Accepting any nested
-# `provision: true` would let an unrelated sub-block — say a per-backend
-# setting — stand in for a system change the operator never agreed to.
+# _falkordb_opted_in — env first, then `provision: true` as a DIRECT child of
+# a TOP-LEVEL `graph_engine:` in the local config. Deliberately a narrow grep
+# rather than a YAML parse (no parser in a shell fragment), and the fail
+# direction is right: anything it cannot read plainly reads as "no". The KEY
+# PATH is exact on purpose — `graph_engine:` at column 0, `provision:` at the
+# first child's indent — because this gate authorises a system change and a
+# nested `provision:` for something else must never stand in for it.
 _falkordb_opted_in() {
     [ "$FALKORDB_PROVISION_OPT_IN" = "1" ] && return 0
     [ -r "$FALKORDB_LOCAL_CONFIG" ] || return 1
@@ -119,18 +102,32 @@ _falkordb_opted_in() {
         END { exit(found ? 0 : 1) }
     ' "$FALKORDB_LOCAL_CONFIG" 2>/dev/null
 }
-# Provenance markers — two, because "we installed the package" and "we
-# finished standing its system unit down" are different facts. The INSTALL
-# marker is written right after apt-get install succeeds; the PROVISION marker
-# only after the stand-down verifies. A run killed between the two leaves a
-# redis that is ours-and-unfinished rather than mistaken for an operator's —
-# and the next run retries exactly the unfinished step.
-# Neither is the apt list file: SETUP.md tells operators with a pre-existing
-# redis to create exactly that path by hand, and upstream's own install docs
-# produce it too — so branching on it would have Genesis claim credit for a
-# system change it explicitly declined to make.
-FALKORDB_INSTALL_MARKER="${FALKORDB_INSTALL_MARKER:-$FALKORDB_DEPS_DIR/.redis-installed-by-genesis}"
+# Provenance, in two pieces. The COMPLETION marker says the stand-down
+# verified; the INSTALL claim is a stamp line appended to the apt list file
+# we ourselves write — "<version>:<info-file mtime>", a fingerprint of that
+# package instance (see _falkordb_redis_pkg_stamp). A run killed between
+# install and stand-down retries exactly the unfinished step next time; an
+# operator's purge or replacement changes the fingerprint, so the claim
+# self-invalidates and the retry can never stand down a redis that is not
+# the one we put there. The stamp lives in the apt list, NOT in a HOME
+# marker: the claim must survive the directory that holds it being
+# unwritable — losing it strands an installed daemon we can never retry.
 FALKORDB_PROVISION_MARKER="${FALKORDB_PROVISION_MARKER:-$FALKORDB_DEPS_DIR/.redis-provisioned-by-genesis}"
+FALKORDB_DPKG_INFO="${FALKORDB_DPKG_INFO:-/var/lib/dpkg/info}"
+
+# _falkordb_redis_pkg_stamp — "<version>:<mtime of its dpkg info file>" for
+# the INSTALLED redis-server. dpkg rewrites the info file on every install,
+# so a purge+reinstall yields a different stamp. Empty when the identity
+# cannot be pinned down; callers decline rather than trust a stale claim.
+_falkordb_redis_pkg_stamp() {
+    local ver mtime
+    command -v dpkg-query >/dev/null 2>&1 || return 1
+    ver="$(dpkg-query -W -f='${Version}' redis-server 2>/dev/null || true)"
+    [ -n "$ver" ] || return 1
+    mtime="$(stat -c %Y "$FALKORDB_DPKG_INFO/redis-server.list" 2>/dev/null || true)"
+    [ -n "$mtime" ] || return 1
+    printf '%s:%s' "$ver" "$mtime"
+}
 # Binaries that mean "someone else's redis is already here". A seam because
 # `command -v` searches the real PATH, which a stubbed test environment cannot
 # hide — without this the suite would pass or fail depending on whether the
@@ -142,21 +139,13 @@ FALKORDB_REDIS_BINARIES="${FALKORDB_REDIS_BINARIES:-redis-server valkey-server}"
 FALKORDB_MIN_REDIS="8.0.0"
 
 # _falkordb_redis_server_bin — the ABSOLUTE path the unit's ExecStart needs.
-#
-# systemd requires an absolute ExecStart and does no PATH lookup, so the path
-# has to be resolved at render time rather than assumed. It was hardcoded to
-# /usr/bin/redis-server, which is right on Debian/Ubuntu and wrong anywhere the
-# binary lands in /usr/local/bin (a source build, Homebrew on a dev box, some
-# RPM layouts) — there the unit would fail to start with a bare 203/EXEC and
-# nothing pointing at the cause.
-#
-# Falls back to the historical literal when nothing is on PATH. A wrong-but-
-# absolute path is better than an empty ExecStart, which would not parse at all.
-# (An earlier version of this comment claimed "no module was installed either,
-# so the unit is inert". That was FALSE: falkordb_module_install is NOT gated on
-# consent, so the module is present even where redis is not. The unit is inert
-# on such a box because nothing enables it and nothing pulls it in — genesis-
-# server orders after it with After= and deliberately does not Wants= it.)
+# systemd does no PATH lookup, so resolve at render time: /usr/bin/redis-server
+# is right on Debian/Ubuntu and wrong under /usr/local (source builds,
+# Homebrew, some RPM layouts), where the unit dies with a bare 203/EXEC.
+# Falls back to the historical literal when nothing is on PATH — a wrong but
+# absolute path is better than an empty ExecStart, which would not parse.
+# (The unit is inert where redis is absent because nothing enables or pulls
+# it in — genesis-server orders After= it and deliberately does not Wants=.)
 _falkordb_redis_server_bin() {
     local binary path
     for binary in $FALKORDB_REDIS_BINARIES; do
@@ -176,15 +165,10 @@ _falkordb_redis_server_bin() {
 }
 
 # _falkordb_redis_present — is there a redis on this box we must not disturb?
-#
-# `dpkg -s` is the obvious check and it is WRONG: it exits 0 for a
-# removed-but-not-purged package (status "deinstall ok config-files"), so a box
-# where someone ran `apt remove redis-server` would be treated as having redis
-# and never provisioned. Ask for the status field instead.
-#
-# The dpkg answer is also not the whole answer: a source-built redis under
-# /usr/local, or valkey, is invisible to dpkg. Those still mean "someone else's
-# database is on this machine", so the binary check backs it up.
+# `dpkg -s` is the obvious check and WRONG: it exits 0 for a removed-but-not-
+# purged package ("deinstall ok config-files"); ask for the status field.
+# The binary check backs it up because a source-built redis or valkey is
+# invisible to dpkg — still "someone else's database on this machine".
 _falkordb_redis_present() {
     local status
     if command -v dpkg-query >/dev/null 2>&1; then
@@ -339,7 +323,7 @@ falkordb_module_install() {
 # next unrelated `apt upgrade`, which is a worse thing to do to someone's
 # machine than declining to provision.
 falkordb_redis_install() {
-    local codename rc keytmp
+    local codename rc keytmp stamp
     if ! _falkordb_opted_in; then
         echo "  Skipped: graph-engine server not provisioned (opt-in)."
         echo "           It adds the upstream redis apt repo and installs redis-server >= $FALKORDB_MIN_REDIS."
@@ -353,19 +337,33 @@ falkordb_redis_install() {
     fi
 
     if _falkordb_redis_present; then
-        # Distinguish "we provisioned this on an earlier run" from "the operator
-        # already had redis". Our apt list file is the marker: we write it, and
-        # only on a box that had no redis. Without this split, every re-run on a
-        # box we provisioned would print an operator-decision message about a
-        # decision that was already made — misleading, and the kind of message
-        # that trains people to ignore output.
+        # Distinguish "we provisioned this on an earlier run", "we started but
+        # never finished", and "the operator already had redis". Without this
+        # split, every re-run on a box we provisioned would print an
+        # operator-decision message about a decision that was already made —
+        # misleading, and the kind of message that trains people to ignore
+        # output.
         if [ -f "$FALKORDB_PROVISION_MARKER" ]; then
             echo "  OK: redis-server already provisioned."
-        elif [ -f "$FALKORDB_INSTALL_MARKER" ]; then
-            # Ours, but unfinished: a previous run installed the package and
-            # failed (or never reached) the stand-down. Retry JUST that step —
-            # the operator-decision message below is for a redis that is not
-            # ours, and printing it here would abandon our own daemon on :6379.
+            return 0
+        fi
+        stamp=""
+        if [ -f "$FALKORDB_APT_LIST" ]; then
+            stamp="$(_falkordb_redis_pkg_stamp || true)"
+            # Ours only if the apt list we wrote carries a stamp line matching
+            # THIS package's fingerprint (grep -xF: literal whole-line match).
+            # An operator-authored list has no stamp; a stale stamp names a
+            # package that is no longer installed. Both read as "not ours".
+            if [ -z "$stamp" ] || \
+               ! grep -qxF "# genesis-install-stamp: $stamp" "$FALKORDB_APT_LIST" 2>/dev/null; then
+                stamp=""
+            fi
+        fi
+        if [ -n "$stamp" ]; then
+            # Ours, unfinished, and the fingerprint still matches THIS package:
+            # retry JUST the stand-down. The operator-decision message below is
+            # for a redis that is not ours, and printing it here would abandon
+            # our own daemon on :6379.
             if _falkordb_stand_down_system_redis; then
                 date -u +%Y-%m-%dT%H:%M:%SZ > "$FALKORDB_PROVISION_MARKER" 2>/dev/null || true
                 echo "  OK: redis-server provisioned (completed pending stand-down)."
@@ -513,11 +511,20 @@ falkordb_redis_install() {
         return 0
     fi
 
-    # Record WE installed the package BEFORE attempting the stand-down: the
-    # install marker is what lets a later run distinguish our incomplete
-    # provisioning from an operator-owned redis, and retry only the stand-down.
-    mkdir -p "$(dirname "$FALKORDB_INSTALL_MARKER")" 2>/dev/null || true
-    date -u +%Y-%m-%dT%H:%M:%SZ > "$FALKORDB_INSTALL_MARKER" 2>/dev/null || true
+    # Record WE installed THIS package BEFORE attempting the stand-down: a
+    # stamp comment appended to the apt list, not a marker under HOME — the
+    # list is system-side and written with the same sudo the install needed,
+    # so provenance cannot silently die on an unwritable home directory. No
+    # fingerprint, no claim: an unfingerprintable install must not leave
+    # ownership state a later run could misread.
+    stamp="$(_falkordb_redis_pkg_stamp || true)"
+    if [ -n "$stamp" ]; then
+        printf '# genesis-install-stamp: %s\n' "$stamp" \
+            | sudo tee -a "$FALKORDB_APT_LIST" >/dev/null 2>&1 || {
+            echo "  WARNING: could not record provisioning provenance — if the"
+            echo "           stand-down below fails, no later run can retry it."
+        }
+    fi
 
     # The deb enables a SYSTEM redis on 6379. Genesis does not want it: our unit
     # is a per-user instance with --port 0 that speaks only over a unix socket.

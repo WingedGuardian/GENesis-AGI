@@ -8,6 +8,7 @@ wiring live in test_falkordb_module.py.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from tests.test_scripts.falkordb_stubs import REPO_ROOT, _apt_log, _run, _stage
@@ -259,10 +260,12 @@ def test_fresh_box_adds_repo_installs_and_stands_down_system_redis(tmp_path):
     result = _run("falkordb_redis_install", env)
 
     assert result.returncode == 0, result.stderr
-    assert Path(env["FALKORDB_APT_LIST"]).read_text().strip() == (
+    apt_list = Path(env["FALKORDB_APT_LIST"]).read_text()
+    assert apt_list.startswith(
         f"deb [signed-by={env['FALKORDB_APT_KEYRING']}] "
         "https://packages.redis.io/deb noble main"
     )
+    assert "# genesis-install-stamp: 2:8.0.4-1rl1~noble:" in apt_list
     log = _apt_log(env)
     assert "apt-get update" in log
     assert "apt-get install" in log
@@ -291,10 +294,11 @@ def test_a_failed_disable_reports_the_daemon_it_left_running(tmp_path):
     assert "could not be" in result.stdout
     assert "still enabled on" in result.stdout
     assert "system unit disabled" not in result.stdout, "claimed the posture anyway"
-    # The INSTALL marker IS written (the package is ours) but the completion
-    # marker is not — that split is what lets a later run retry exactly the
-    # unfinished stand-down instead of replaying 'already provisioned'.
-    assert Path(env["FALKORDB_INSTALL_MARKER"]).exists()
+    # The install stamp IS recorded in the apt list (the package is ours)
+    # but the completion marker is not — that split is what lets a later run
+    # retry exactly the unfinished stand-down instead of replaying
+    # 'already provisioned'.
+    assert "# genesis-install-stamp: " in Path(env["FALKORDB_APT_LIST"]).read_text()
     assert not Path(env["FALKORDB_PROVISION_MARKER"]).exists()
 
 
@@ -309,6 +313,21 @@ def test_a_unit_still_enabled_after_disable_leaves_no_marker(tmp_path):
     assert not Path(env["FALKORDB_PROVISION_MARKER"]).exists()
 
 
+def _mark_ours(env: dict) -> Path:
+    """Record our install the way the lib does: the CURRENT package's
+    fingerprint (version + mtime of its dpkg info file) as a stamp comment
+    inside the apt list, so a retry sees the claim as live, not stale."""
+    info = Path(env["FALKORDB_DPKG_INFO"]) / "redis-server.list"
+    info.parent.mkdir(parents=True, exist_ok=True)
+    info.write_text("pkg-files\n")
+    stamp = f"2:8.0.4-1rl1~noble:{int(info.stat().st_mtime)}"
+    Path(env["FALKORDB_APT_LIST"]).write_text(
+        "deb [signed-by=x] https://packages.redis.io/deb noble main\n"
+        f"# genesis-install-stamp: {stamp}\n"
+    )
+    return info
+
+
 def test_an_incomplete_provisioning_retries_only_the_stand_down(tmp_path):
     """We installed the package but the stand-down failed: the next run must
     finish OUR step, not read our redis as the operator's and stop.
@@ -319,7 +338,7 @@ def test_an_incomplete_provisioning_retries_only_the_stand_down(tmp_path):
     """
     env = _stage(tmp_path)
     env["DPKG_QUERY_STATUS"] = "installed"  # package on the box already
-    Path(env["FALKORDB_INSTALL_MARKER"]).write_text("2026-09-06T00:00:00Z\n")
+    _mark_ours(env)
     # No FALKORDB_PROVISION_MARKER: this run must retry, not declare victory.
 
     result = _run("falkordb_redis_install", env)
@@ -346,13 +365,52 @@ def test_an_incomplete_retry_that_still_fails_keeps_retrying(tmp_path):
     NEXT retry must still know the stand-down is outstanding."""
     env = _stage(tmp_path)
     env["DPKG_QUERY_STATUS"] = "installed"
-    Path(env["FALKORDB_INSTALL_MARKER"]).write_text("2026-09-06T00:00:00Z\n")
+    _mark_ours(env)
     env["SYSTEMCTL_RC"] = "1"
 
     result = _run("falkordb_redis_install", env)
     assert result.returncode == 0, result.stderr
     assert "enabled on :6379" in result.stdout
     assert not Path(env["FALKORDB_PROVISION_MARKER"]).exists()
+
+
+def test_a_stale_install_marker_never_disables_a_replacement_redis(tmp_path):
+    """The operator purges our package and installs their own: the fingerprint
+    in the install marker no longer matches the package on the box, so the
+    retry must NOT stand it down — and the stale claim is discarded.
+    """
+    env = _stage(tmp_path)
+    env["DPKG_QUERY_STATUS"] = "installed"
+    info = _mark_ours(env)
+    # The replacement package: dpkg rewrites its info file, changing the
+    # fingerprint. Force a different second so the stamp provably differs.
+    info.write_text("pkg-files\n")
+    new_mtime = int(info.stat().st_mtime) + 4000
+    os.utime(info, (new_mtime, new_mtime))
+
+    result = _run("falkordb_redis_install", env)
+    assert result.returncode == 0, result.stderr
+    assert "your call" in result.stdout, "claimed a redis that is not ours"
+    assert "systemctl disable" not in _apt_log(env), "disabled an operator's service"
+    assert not Path(env["FALKORDB_PROVISION_MARKER"]).exists()
+
+
+def test_an_unstampable_install_warns_instead_of_silent_orphaning(tmp_path):
+    """If the stamp cannot be appended to the apt list, the run must SAY that
+    # provenance is missing — a failed stand-down would otherwise silently
+    # become an unretryable operator-owned redis."""
+    env = _stage(tmp_path)
+    tee = Path(env["PATH"].split(":")[0]) / "tee"
+    tee.write_text(
+        "#!/bin/bash\n"
+        'if [ "$1" = "-a" ]; then exit 1; fi\n'
+        'exec /usr/bin/tee "$@"\n'
+    )
+    tee.chmod(0o755)
+
+    result = _run("falkordb_redis_install", env)
+    assert result.returncode == 0, result.stderr
+    assert "could not record provisioning provenance" in result.stdout
 
 
 def test_an_unpinned_architecture_changes_nothing_on_the_system(tmp_path):
