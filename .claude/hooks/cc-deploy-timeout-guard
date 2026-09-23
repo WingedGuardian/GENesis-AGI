@@ -82,6 +82,26 @@ _longopt_is() {  # $1: flag token with any =value stripped; $2: canonical --long
     return 1
 }
 
+# And the SEPARATE-value side of the same grammar: `--setenv PATH` carries its
+# argument in the NEXT token, not glued. Stopping the option scan at that
+# value — the `*)` operand case — hid every later flag, so
+# `systemd-run --setenv PATH --unit x …` read as undetached and advised
+# detachment at a command already detached (#2219). `man systemd-run`
+# documents which options take values; a flag NOT listed keeps its next token
+# in the scan, so an unknown value still ends the walk and fails closed.
+_value_opt() {  # $1: flag token, =value already stripped
+    case "$1" in
+        -E|-p|-t) return 0 ;;
+    esac
+    for _v in --unit --description --slice --uid --gid --nice --setenv \
+        --working-directory --service-type --property \
+        --on-active --on-boot --on-startup --on-unit-active \
+        --on-unit-inactive --on-calendar --on-timezone-change; do
+        _longopt_is "$1" "$_v" && return 0
+    done
+    return 1
+}
+
 _held=0
 _held_script=""
 while IFS= read -r _seg; do
@@ -100,13 +120,36 @@ while IFS= read -r _seg; do
     _first=""
     _has_unit=0
     _has_scope=0
+    _open_quote=""
     _rest="${_seg%%#*}"
+    _skip_value=0
     for _tok in $_rest; do
         if [ -z "$_first" ]; then
             case "$_tok" in
                 *=*) continue ;;   # VAR=val assignment word
             esac
             _first="$_tok"
+            continue
+        fi
+        if [ "$_skip_value" -eq 1 ]; then
+            _skip_value=0
+            # A separate value may itself be multi-word and quoted:
+            # `--description 'nightly deploy'` arrives already word-split as
+            # two tokens, so an unclosed leading quote holds the skip open
+            # until its closing quote — otherwise the second word lands in
+            # the operand slot and hides every later flag again.
+            case "$_tok" in
+                \'*\') : ;;
+                \'*) _open_quote="'" ;;
+                \"*\") : ;;
+                \"*) _open_quote='"' ;;
+            esac
+            continue                # a value flag's separate argument
+        fi
+        if [ -n "$_open_quote" ]; then
+            case "$_tok" in
+                *"$_open_quote"*) _open_quote="" ;;
+            esac
             continue
         fi
         case "$_tok" in
@@ -116,7 +159,8 @@ while IFS= read -r _seg; do
         esac
         _flag="${_tok%%=*}"
         if _longopt_is "$_flag" --unit; then _has_unit=1
-        elif _longopt_is "$_flag" --scope; then _has_scope=1; fi
+        elif _longopt_is "$_flag" --scope; then _has_scope=1
+        elif [ "$_flag" = "$_tok" ] && _value_opt "$_flag"; then _skip_value=1; fi
     done
     if [ "$_first" = "systemd-run" ] && [ "$_has_unit" -eq 1 ] && [ "$_has_scope" -eq 0 ]; then
         continue

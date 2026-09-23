@@ -382,6 +382,38 @@ class TestDeployGuardFiresOnTheDangerousInput:
         )
         assert self._run(detached, background=False).strip() == ""
 
+    def test_silent_when_a_value_flag_carries_a_separate_argument(self):
+        """`--setenv PATH` puts the flag's argument in the NEXT token — a
+        non-flag word, which the walk read as the command operand and stopped.
+        Everything after the value was invisible, so the prescribed command's
+        OWN separated spelling (`--setenv PATH` vs `--setenv=PATH`) read as
+        undetached and the guard advised detachment at a detached command
+        (#2219)."""
+        for detached in (
+            "systemd-run --user --collect --setenv PATH "
+            "--unit genesis-deploy-manual --working-directory $HOME/genesis "
+            "/bin/bash -c 'exec ./scripts/update.sh > ~/tmp/d.log 2>&1'",
+            "systemd-run --user --unit genesis-deploy-manual -E PATH "
+            "--working-directory $HOME/genesis /bin/bash scripts/update.sh",
+            "systemd-run --description 'nightly deploy' --user "
+            "--unit genesis-deploy-manual bash scripts/update.sh",
+        ):
+            assert self._run(detached, background=False).strip() == "", (
+                f"guard fired on `{detached}` — a value flag's separate "
+                "argument ended the option walk and hid the --unit flag"
+            )
+
+    def test_an_unknown_flag_value_still_fails_closed(self):
+        """A flag the walk does not model keeps its argument IN the scan: the
+        token stops the walk as the operand, so an unmodelled spellings never
+        exempts a command — silence only through recognised forms."""
+        cmd = "systemd-run --unmodelled thing --unit x bash scripts/update.sh"
+        out = self._run(cmd, False)
+        assert out.strip(), (
+            "guard went silent on an unmodelled flag spelling — unrecognised "
+            "input must fire, not slip through"
+        )
+
     def test_prescription_names_the_FAILING_segment(self):
         """_held_script used to latch onto the first segment MENTIONING a deploy
         script — including one that passed the detachment check — so
