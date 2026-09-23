@@ -86,16 +86,27 @@ PYEOF
             _warn_local_scope_shadow "$name" "$intended"
             return 0
         fi
-        # Gate the remove on the entry EXISTING, not on a non-empty command.
-        # An entry of the OTHER transport has no "command", so `registered` is
-        # empty and this used to skip the remove — then `claude mcp add`
-        # refuses the duplicate name (MEASURED rc=1) with its cause swallowed
-        # by 2>/dev/null, warning on every run forever and never healing. That
-        # hole was unreachable while every entry was stdio; registering an HTTP
-        # server makes it reachable, so it is fixed here rather than left.
-        if [ -n "$(_mcp_entry_exists "$name")" ]; then
-            echo "  $name: registered entry differs (transport or command)${registered:+ (stored: $registered)} — re-registering"
+        # Two different situations, and only one of them is ours to heal.
+        #
+        # A non-empty `registered` means a COMMAND entry that does not match:
+        # Genesis writes command entries under these names, so this is drift it
+        # plausibly created, and re-registering is the long-standing behaviour
+        # this helper exists for (see the header docblock).
+        #
+        # An EMPTY `registered` with an entry present means the stored entry has
+        # no command at all — a different transport, which Genesis has never
+        # written here. That is the operator's, so preserve it and say so
+        # rather than removing it. Without this split, adding HTTP support
+        # turned a helper that heals Genesis's own drift into one that deletes
+        # configuration it did not create.
+        if [ -n "$registered" ]; then
+            echo "  $name: registered command drifted ($registered) — re-registering"
             claude mcp remove "$name" -s "$scope" 2>/dev/null || true
+        elif [ -n "$(_mcp_entry_exists "$name")" ]; then
+            echo "  WARNING: $name already exists at $scope scope with a different transport."
+            echo "    Genesis has NOT modified it — it did not create that entry."
+            echo "    To adopt the Genesis-managed server: claude mcp remove $name -s $scope   (then re-run)"
+            return 0
         fi
     else
         if claude mcp list 2>/dev/null | grep -q "^$name:"; then
@@ -159,12 +170,26 @@ PYEOF
             _warn_local_scope_shadow "$name" "$url"
             return 0
         fi
-        # Existence, not identity — see the matching note in _register_mcp. A
-        # STDIO entry under this name has no "url", so gating on `$registered`
-        # would skip the remove and leave `claude mcp add` failing forever.
+        # PRESERVE, never overwrite. This is the first release to manage a
+        # server under this name, so an existing entry that does not match
+        # cannot be stale state Genesis created — it is the operator's, and
+        # there is no ownership marker that could tell us otherwise. Removing
+        # it would silently destroy their configuration (command, url, args,
+        # env), which is exactly what _warn_local_scope_shadow's doctrine
+        # forbids a few lines below.
+        #
+        # This also resolves the failure mode the existence check was added
+        # for: `claude mcp add` refuses a duplicate name (rc=1) with its cause
+        # swallowed, warning forever and never explaining. Skipping with an
+        # actionable conflict message is strictly better than both overwriting
+        # and looping. Once Genesis has registered it, the value matches and
+        # this branch never runs again.
         if [ -n "$(_mcp_entry_exists "$name")" ]; then
-            echo "  $name: registered entry differs (transport or url)${registered:+ (stored: $registered)} — re-registering"
-            claude mcp remove "$name" -s "$scope" 2>/dev/null || true
+            echo "  WARNING: $name is already registered at $scope scope${registered:+ (stored: $registered)} and does NOT match the intended URL."
+            echo "    Genesis has NOT modified it — an entry under this name was not created by Genesis."
+            echo "    To adopt the Genesis-managed server: claude mcp remove $name -s $scope   (then re-run)"
+            echo "    To keep yours and stop Genesis registering it: set GENESIS_GREP_MCP_URL= (empty)"
+            return 0
         fi
     else
         if claude mcp list 2>/dev/null | grep -q "^$name:"; then

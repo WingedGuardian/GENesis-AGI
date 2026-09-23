@@ -628,3 +628,122 @@ def test_register_project_scope_existing_is_noop(tmp_path):
     assert res.returncode == 0
     assert "already registered" in res.stdout
     assert "mcp add" not in clog.read_text()
+
+
+# -- _register_mcp_http (sources the REAL shared lib) ----------------------
+# The HTTP path shares no code with the stdio one above: different add flags,
+# a different stored key ("url", never "command"), and no argv to compare. It
+# was verified by hand against a live config during development and left no
+# regression behind, which an external reviewer flagged. These cover it.
+
+
+def _run_register_http(tmp_path: Path, args: list[str], claude_json: dict | None,
+                       env_extra: dict | None = None,
+                       ) -> tuple[subprocess.CompletedProcess, Path]:
+    import json
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir(exist_ok=True)
+    clog = tmp_path / "claude.log"
+    _write_exec(
+        fakebin / "claude",
+        "#!/usr/bin/env bash\n"
+        f'echo "$*" >> "{clog}"\n'
+        "exit 0\n",
+    )
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    if claude_json is not None:
+        (home / ".claude.json").write_text(json.dumps(claude_json), encoding="utf-8")
+    harness = tmp_path / "harness_http.sh"
+    quoted = " ".join(f"'{a}'" for a in args)
+    harness.write_text(
+        f'#!/usr/bin/env bash\n. "{_REGISTER_LIB}"\n_register_mcp_http {quoted}\n',
+        encoding="utf-8",
+    )
+    env = {"PATH": f"{fakebin}:{_SYSTEM_PATH}", "HOME": str(home)}
+    env.update(env_extra or {})
+    res = subprocess.run(
+        ["bash", str(harness)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    return res, clog
+
+
+def test_http_fresh_adds_with_transport_flag(tmp_path):
+    """Argument ORDER and the --transport flag are the contract with the CLI."""
+    res, clog = _run_register_http(
+        tmp_path, ["grep", "user", "https://mcp.grep.app"], {"mcpServers": {}})
+    assert res.returncode == 0
+    assert "mcp add --transport http grep -s user https://mcp.grep.app" in clog.read_text()
+
+
+def test_http_matching_url_is_noop(tmp_path):
+    """Idempotence: the same URL must not churn the registration."""
+    res, clog = _run_register_http(
+        tmp_path, ["grep", "user", "https://mcp.grep.app"],
+        {"mcpServers": {"grep": {"type": "http", "url": "https://mcp.grep.app"}}})
+    assert res.returncode == 0
+    assert "already registered" in res.stdout
+    assert "mcp add" not in (clog.read_text() if clog.exists() else "")
+
+
+def test_http_preserves_an_entry_it_did_not_create(tmp_path):
+    """NEVER overwrite a name Genesis has not established.
+
+    This is the first release managing a server called `grep`, so a mismatched
+    entry cannot be Genesis drift — it is the operator's, and removing it would
+    destroy their command/url/args/env. Flagged by an external reviewer after
+    an earlier revision removed it.
+    """
+    res, clog = _run_register_http(
+        tmp_path, ["grep", "user", "https://mcp.grep.app"],
+        {"mcpServers": {"grep": {"type": "stdio", "command": "/opt/their-own-grep"}}})
+    assert res.returncode == 0
+    log = clog.read_text() if clog.exists() else ""
+    assert "mcp remove" not in log, "must not delete an entry Genesis did not create"
+    assert "mcp add" not in log, "must not register over the operator's entry"
+    assert "WARNING" in res.stdout
+    assert "has NOT modified it" in res.stdout
+
+
+def test_http_empty_url_declines_and_says_entry_is_still_live(tmp_path):
+    """Declining must not read as 'absent' when the server is still registered."""
+    res, clog = _run_register_http(
+        tmp_path, ["grep", "user", ""],
+        {"mcpServers": {"grep": {"type": "http", "url": "https://mcp.grep.app"}}})
+    assert res.returncode == 0
+    assert "remains ACTIVE" in res.stdout
+    assert "mcp add" not in (clog.read_text() if clog.exists() else "")
+
+
+def test_http_empty_url_with_no_entry_is_a_plain_skip(tmp_path):
+    res, clog = _run_register_http(tmp_path, ["grep", "user", ""], {"mcpServers": {}})
+    assert res.returncode == 0
+    assert "registration declined" in res.stdout
+    assert "remains ACTIVE" not in res.stdout
+
+
+def test_http_url_default_is_declinable_by_empty_env(tmp_path):
+    """`${VAR-default}` not `:=` — an explicitly empty value must survive.
+
+    The colon form treats empty as unset and would re-assign the public
+    endpoint, defeating the one spelling an operator reaches for to opt out.
+    """
+    harness = tmp_path / "probe.sh"
+    harness.write_text(
+        f'#!/usr/bin/env bash\n. "{_REGISTER_LIB}"\necho "URL=[${{GENESIS_GREP_MCP_URL}}]"\n',
+        encoding="utf-8",
+    )
+    res = subprocess.run(
+        ["bash", str(harness)],
+        env={"PATH": _SYSTEM_PATH, "HOME": str(tmp_path), "GENESIS_GREP_MCP_URL": ""},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert "URL=[]" in res.stdout
+
+    res_default = subprocess.run(
+        ["bash", str(harness)],
+        env={"PATH": _SYSTEM_PATH, "HOME": str(tmp_path)},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert "URL=[https://mcp.grep.app]" in res_default.stdout
