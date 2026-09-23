@@ -275,6 +275,7 @@ async def search_fts(
     query: str,
     *,
     project: str | None = None,
+    exclude_project: str | None = None,
     domain: str | None = None,
     limit: int = 10,
 ) -> list[dict]:
@@ -299,6 +300,14 @@ async def search_fts(
     if project:
         sql += " AND f.project_type = ?"
         params.append(project)
+    if exclude_project:
+        # NULL-SAFE, and that is not a detail: in SQL `project_type != 'x'` is
+        # NULL — therefore NOT TRUE — for a row whose project_type is NULL, so
+        # the bare comparison silently drops every untyped row from the result.
+        # The exclusion must remove one partition, not every row that failed to
+        # declare one.
+        sql += " AND (f.project_type IS NULL OR f.project_type != ?)"
+        params.append(exclude_project)
     if domain:
         sql += " AND f.domain = ?"
         params.append(domain)
@@ -324,10 +333,23 @@ async def stats(
     db: aiosqlite.Connection,
     *,
     project: str | None = None,
+    exclude_project: str | None = None,
 ) -> dict:
-    """Aggregate stats for knowledge units."""
-    where = "WHERE project_type = ?" if project else ""
-    params: tuple = (project,) if project else ()
+    """Aggregate stats for knowledge units.
+
+    ``exclude_project`` is NULL-safe on purpose: a bare ``project_type != ?``
+    is NULL, and so not TRUE, for a row that declares no project_type, which
+    would drop every untyped row from the totals.
+    """
+    if project:
+        where = "WHERE project_type = ?"
+        params: tuple = (project,)
+    elif exclude_project:
+        where = "WHERE (project_type IS NULL OR project_type != ?)"
+        params = (exclude_project,)
+    else:
+        where = ""
+        params = ()
 
     rows = await db.execute_fetchall(
         f"SELECT COUNT(*), MIN(ingested_at), MAX(ingested_at) FROM knowledge_units {where}",
