@@ -983,6 +983,9 @@ class TestUnresolvedVariableIsItsOwnVerdict:
             '"$EMPTY/a/b/c/d"',  # empty var → /a/b/c/d
             '"${SP}/x/y/z/w"',  # ${…} spelling of the same cause
             '"$(pwd)/a/b/c"',  # command substitution — equally unresolvable
+            '"`printf / x/y/z/w`"',  # backtick substitution: no '$', same hole
+            # — the static text has four components but bash evaluates the
+            # substitution to '/', so the depth floor never saw the real path
             "'$SP/a/b/c/d'",  # SINGLE-QUOTED: literal to bash, still refused —
             # quote syntax is stripped before the operand is seen, so the
             # guard cannot know the literal is safe; refusing is the honest

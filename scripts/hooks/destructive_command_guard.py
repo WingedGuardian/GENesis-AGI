@@ -584,6 +584,11 @@ def _check_target(target: str) -> str | None:
             f"rm -rf on '{clean}' contains an unresolved shell variable, "
             f"so its real depth is unknown — refusing."
         )
+    if "`" in expanded:
+        return (
+            f"rm -rf on '{clean}' contains an unresolved command substitution, "
+            f"so its real depth is unknown — refusing."
+        )
     parts = [p for p in expanded.split("/") if p]
     # A surviving '..' means the path traverses upward from a base the
     # hook cannot know (its cwd need not match the Bash invocation's).
