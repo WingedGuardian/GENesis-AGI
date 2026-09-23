@@ -158,6 +158,21 @@ class TestGhCommand:
         inv = sp.gh_command(["gh", "--repo=o/r", "pr", "view", "1"])
         assert inv.group == "pr" and inv.subcommand == "view"
 
+    def test_equals_only_short_suffix_is_attached_not_next(self):
+        # pflag: `-b=` is an attached EMPTY value, not a request for the
+        # next argument — consuming `create` as the value loses the verb.
+        inv = sp.gh_command(["gh", "pr", "-b=", "create", "-t", "T"])
+        assert inv.subcommand == "create"
+        assert sp.gh_pr_subcommand(["gh", "pr", "-b=", "merge", "5"]) == "merge"
+
+    def test_attach_value_flag_does_not_eat_the_verb(self):
+        # `--attach` (newer gh) takes a value; unmodelled it would leave
+        # `image.png` in the verb slot.
+        assert (
+            sp.gh_pr_subcommand(["gh", "pr", "--attach", "image.png", "merge", "5"])
+            == "merge"
+        )
+
     def test_not_gh(self):
         assert sp.gh_command(["git", "push"]) is None
         assert sp.gh_command(["gh"]) is None

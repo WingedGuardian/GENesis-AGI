@@ -3076,11 +3076,11 @@ _GH_FLAG_TABLE: dict[tuple[str, str], tuple[frozenset[str], frozenset[str]]] = {
         frozenset({'--help', '--include-content', '--public', '--secret'})),
     ("issue", "close"): (frozenset({'--comment', '--reason', '--repo', '-R', '-c', '-r'}),
         frozenset({'--help'})),
-    ("issue", "comment"): (frozenset({'--body', '--body-file', '--repo', '-F', '-R', '-b'}),
+    ("issue", "comment"): (frozenset({'--attach', '--body', '--body-file', '--repo', '-F', '-R', '-b'}),
         frozenset({'--create-if-none', '--delete-last', '--edit-last', '--editor', '--help', '--web', '--yes', '-e', '-w'})),
-    ("issue", "create"): (frozenset({'--assignee', '--body', '--body-file', '--label', '--milestone', '--project', '--recover', '--repo', '--template', '--title', '-F', '-R', '-T', '-a', '-b', '-l', '-m', '-p', '-t'}),
+    ("issue", "create"): (frozenset({'--assignee', '--attach', '--body', '--body-file', '--label', '--milestone', '--project', '--recover', '--repo', '--template', '--title', '-F', '-R', '-T', '-a', '-b', '-l', '-m', '-p', '-t'}),
         frozenset({'--editor', '--help', '--web', '-e', '-w'})),
-    ("issue", "edit"): (frozenset({'--add-assignee', '--add-label', '--add-project', '--body', '--body-file', '--milestone', '--remove-assignee', '--remove-label', '--remove-project', '--repo', '--title', '-F', '-R', '-b', '-m', '-t'}),
+    ("issue", "edit"): (frozenset({'--add-assignee', '--add-label', '--add-project', '--attach', '--body', '--body-file', '--milestone', '--remove-assignee', '--remove-label', '--remove-project', '--repo', '--title', '-F', '-R', '-b', '-m', '-t'}),
         frozenset({'--help', '--remove-milestone'})),
     ("issue", "list"): (frozenset({'--app', '--assignee', '--author', '--jq', '--json', '--label', '--limit', '--mention', '--milestone', '--repo', '--search', '--state', '--template', '-A', '-L', '-R', '-S', '-a', '-l', '-m', '-q', '-s', '-t'}),
         frozenset({'--help', '--web', '-w'})),
@@ -3092,13 +3092,13 @@ _GH_FLAG_TABLE: dict[tuple[str, str], tuple[frozenset[str], frozenset[str]]] = {
         frozenset({'--fail-fast', '--help', '--required', '--watch', '--web', '-w'})),
     ("pr", "close"): (frozenset({'--comment', '--repo', '-R', '-c'}),
         frozenset({'--delete-branch', '--help', '-d'})),
-    ("pr", "comment"): (frozenset({'--body', '--body-file', '--repo', '-F', '-R', '-b'}),
+    ("pr", "comment"): (frozenset({'--attach', '--body', '--body-file', '--repo', '-F', '-R', '-b'}),
         frozenset({'--create-if-none', '--delete-last', '--edit-last', '--editor', '--help', '--web', '--yes', '-e', '-w'})),
-    ("pr", "create"): (frozenset({'--assignee', '--base', '--body', '--body-file', '--head', '--label', '--milestone', '--project', '--recover', '--repo', '--reviewer', '--template', '--title', '-B', '-F', '-H', '-R', '-T', '-a', '-b', '-l', '-m', '-p', '-r', '-t'}),
+    ("pr", "create"): (frozenset({'--assignee', '--attach', '--base', '--body', '--body-file', '--head', '--label', '--milestone', '--project', '--recover', '--repo', '--reviewer', '--template', '--title', '-B', '-F', '-H', '-R', '-T', '-a', '-b', '-l', '-m', '-p', '-r', '-t'}),
         frozenset({'--draft', '--dry-run', '--editor', '--fill', '--fill-first', '--fill-verbose', '--help', '--no-maintainer-edit', '--web', '-d', '-e', '-f', '-w'})),
     ("pr", "diff"): (frozenset({'--color', '--repo', '-R'}),
         frozenset({'--help', '--name-only', '--patch', '--web', '-w'})),
-    ("pr", "edit"): (frozenset({'--add-assignee', '--add-label', '--add-project', '--add-reviewer', '--base', '--body', '--body-file', '--milestone', '--remove-assignee', '--remove-label', '--remove-project', '--remove-reviewer', '--repo', '--title', '-B', '-F', '-R', '-b', '-m', '-t'}),
+    ("pr", "edit"): (frozenset({'--add-assignee', '--add-label', '--add-project', '--add-reviewer', '--attach', '--base', '--body', '--body-file', '--milestone', '--remove-assignee', '--remove-label', '--remove-project', '--remove-reviewer', '--repo', '--title', '-B', '-F', '-R', '-b', '-m', '-t'}),
         frozenset({'--help', '--remove-milestone'})),
     ("pr", "list"): (frozenset({'--app', '--assignee', '--author', '--base', '--head', '--jq', '--json', '--label', '--limit', '--repo', '--search', '--state', '--template', '-A', '-B', '-H', '-L', '-R', '-S', '-a', '-l', '-q', '-s', '-t'}),
         frozenset({'--draft', '--help', '--web', '-d', '-w'})),
@@ -3167,7 +3167,13 @@ def _gh_option(tok: str, value_flags: frozenset[str]) -> tuple[str, str | None]:
     if tok.startswith("-") and len(tok) > 2:
         head = tok[:2]
         if head in value_flags:
-            return head, tok[2:].lstrip("=") or None
+            rest = tok[2:]
+            if rest.startswith("="):
+                # ``-b=`` is pflag's attached EMPTY value — stripping the '='
+                # to "" and reporting None would consume the NEXT token as
+                # the value, hiding a verb like `create` behind it.
+                return head, rest[1:]
+            return head, rest or None
     return tok, None
 
 
