@@ -128,26 +128,6 @@ _COMMAND_CARRIERS = frozenset(
     | _NESTED_SHELLS
 )
 
-#: Carriers this set deliberately LACKS — test_carrier_sets fails when a union
-#: member is absent without a recorded reason (#2232). Mirrors
-#: `shell_parse._REPARSE_CARRIER_EXCLUDES` minus the names already covered here
-#: via _NESTED_SHELLS.
-_COMMAND_CARRIER_EXCLUDES: dict[str, str] = {
-    **{name: "a `run`-gated package front-end — `uv run rm -rf …` leaves the "
-        "segment on `uv` and the rm never reaches this guard's scan; gating "
-        "front-ends is _RUN_CARRIERS' job, not a free re-parse"
-        for name in ("uv", "uvx", "poetry", "hatch", "pdm", "pipenv", "rye")},
-    "ssh": "runs the command on ANOTHER machine — remote gating is its own "
-    "design, tracked separately (#2231)",
-    "docker": "runs the command inside a container — same remote-class "
-    "reasoning as ssh",
-    "find": "carries visible argv (`find -exec rm …`) — the payload is "
-    "already a bare token this guard's scan sees",
-    "parallel": "carries visible argv — same reasoning as find",
-    "xargs": "a `_WRAPPER_SPEC` entry — the resolver strips through it, so "
-    "its payload is a visible segment, not an opaque string",
-}
-
 # Command separators that start a new simple command within one Bash
 # string. Tokens matching these end an rm invocation's argument list.
 # FALLBACK ONLY — a rough "where might a command start" guess, used when the
@@ -602,6 +582,11 @@ def _check_target(target: str) -> str | None:
     if "$" in expanded:
         return (
             f"rm -rf on '{clean}' contains an unresolved shell variable, "
+            f"so its real depth is unknown — refusing."
+        )
+    if "`" in expanded:
+        return (
+            f"rm -rf on '{clean}' contains an unresolved command substitution, "
             f"so its real depth is unknown — refusing."
         )
     parts = [p for p in expanded.split("/") if p]
