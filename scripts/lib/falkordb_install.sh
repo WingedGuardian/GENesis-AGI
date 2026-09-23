@@ -96,7 +96,12 @@ _falkordb_opted_in() {
         in_block {
             ci = indent_of($0)
             if (child_indent < 0) child_indent = ci
+            # Match the provision KEY first, then judge its value: a duplicate
+            # key is legal YAML and PyYAML keeps the LAST one, so `true` then
+            # `false` is a withdrawal, not consent. found is overwritten on
+            # every provision line, never OR-accumulated.
             if (ci == child_indent &&
+                $0 ~ /^[[:space:]]*provision[[:space:]]*:/) {
                 # A trailing comment is still consent -- an operator who
                 # annotates their own config has not withdrawn it. The
                 # SPACE before `#` is required, not decoration. YAML only
@@ -105,7 +110,8 @@ _falkordb_opted_in() {
                 # the whole file unparseable to PyYAML (measured), so matching
                 # space-only leaves that case an under-read rather than
                 # granting consent off a config Genesis itself cannot load.
-                $0 ~ /^[[:space:]]*provision[[:space:]]*:[[:space:]]*(true|yes|on)( +#.*)?[[:space:]]*$/) found = 1
+                found = ($0 ~ /^[[:space:]]*provision[[:space:]]*:[[:space:]]*(true|yes|on)( +#.*)?[[:space:]]*$/)
+            }
         }
         END { exit(found ? 0 : 1) }
     ' "$FALKORDB_LOCAL_CONFIG" 2>/dev/null
@@ -283,7 +289,15 @@ falkordb_module_install() {
         return 0
     }
     # Redis refuses a module without the execute bit; the release asset is 644.
-    chmod +x "$target" 2>/dev/null || true
+    # A chmod failure is NOT survivable: reporting success would leave a file
+    # the `-f "$target"` check above treats as installed, so every later run
+    # would skip the repair and redis would refuse it at load time forever.
+    # Remove it so the next run downloads and tries again.
+    if ! chmod +x "$target" 2>/dev/null; then
+        rm -f "$target" 2>/dev/null || true
+        echo "  WARNING: could not set the execute bit on $target — FalkorDB module NOT installed."
+        return 0
+    fi
     echo "  Installed: FalkorDB module $FALKORDB_VERSION ($arch)"
     return 0
 }
@@ -390,7 +404,26 @@ falkordb_redis_install() {
         echo "  Added: redis apt repo ($codename)"
         rc=0
         sudo apt-get update -qq >/dev/null 2>&1 || rc=$?
-        [ "$rc" -eq 0 ] || echo "  WARNING: apt-get update failed (rc=$rc) — the install below may not find redis 8.x."
+        if [ "$rc" -ne 0 ]; then
+            echo "  WARNING: apt-get update failed (rc=$rc)."
+            # With a stale index, apt can only offer the distro's 7.x — which
+            # the module refuses to load on. Installing it anyway would put a
+            # database daemon on the box that cannot run the engine it was
+            # installed for, so confirm the candidate meets the floor first.
+            local candidate major
+            candidate="$(apt-cache policy redis-server 2>/dev/null \
+                | awk '/Candidate:/ {print $2}')"
+            major="${candidate#*:}"   # strip any epoch
+            major="${major%%.*}"
+            case "$major" in
+                ''|*[!0-9]*|[0-7])
+                    echo "  Skipped: apt would install redis-server '${candidate:-unknown}', below the"
+                    echo "           $FALKORDB_MIN_REDIS floor the module enforces. Re-run after"
+                    echo "           `sudo apt-get update` succeeds."
+                    return 0
+                    ;;
+            esac
+        fi
     fi
 
     rc=0

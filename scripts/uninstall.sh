@@ -312,7 +312,7 @@ fi
 
 if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
     echo "    Genesis (container-side):"
-    echo "      - Systemd units: genesis-server, genesis-bridge, genesis-watchdog, qdrant"
+    echo "      - Systemd units: genesis-server, genesis-bridge, genesis-watchdog, genesis-falkordb, qdrant"
     echo "      - Repository: ~/genesis/"
     echo "      - Runtime state: ~/.genesis/"
     echo "      - Database: ~/data/"
@@ -517,11 +517,13 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                 systemctl --user stop genesis-watchdog.timer genesis-watchdog.service 2>/dev/null || true;
                 systemctl --user stop genesis-cc-tmp-align.timer genesis-cc-tmp-align.service 2>/dev/null || true;
                 systemctl --user stop genesis-cc-settings-align.timer genesis-cc-settings-align.service 2>/dev/null || true;
-                systemctl --user stop genesis-server.service genesis-bridge.service qdrant.service 2>/dev/null || true;
+                systemctl --user stop genesis-server.service genesis-bridge.service \
+                    genesis-falkordb.service qdrant.service 2>/dev/null || true;
                 systemctl --user disable genesis-server.service genesis-bridge.service \
                     genesis-watchdog.timer genesis-watchdog.service \
                     genesis-cc-tmp-align.timer genesis-cc-tmp-align.service \
-                    genesis-cc-settings-align.timer genesis-cc-settings-align.service qdrant.service 2>/dev/null || true
+                    genesis-cc-settings-align.timer genesis-cc-settings-align.service \
+                    genesis-falkordb.service qdrant.service 2>/dev/null || true
             "
             ok "Stopped Genesis services"
 

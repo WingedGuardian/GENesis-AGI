@@ -46,6 +46,15 @@ _APT_STUB = """#!/bin/bash
 echo "apt-get $*" >> "$APT_LOG"
 exit "${APT_RC:-0}"
 """
+# apt-cache policy <pkg> — reports a configurable Candidate version. The lib
+# only consults it after a failed `apt-get update`, to refuse installing a
+# redis below the module's hard floor.
+_APT_CACHE_STUB = """#!/bin/bash
+if [ "$1" = "policy" ]; then
+    printf ' %s:\\n  Installed: (none)\\n  Candidate: %s\\n' "$2" "${APT_CANDIDATE:-(none)}"
+fi
+exit 0
+"""
 _GPG_STUB = """#!/bin/bash
 echo "gpg $*" >> "$APT_LOG"
 # --dearmor -o <path> <infile>: create the keyring so the caller's checks pass.
@@ -71,6 +80,7 @@ def _stage(tmp_path: Path) -> dict:
         ("dpkg", _DPKG_STUB),
         ("dpkg-query", _DPKG_QUERY_STUB),
         ("apt-get", _APT_STUB),
+        ("apt-cache", _APT_CACHE_STUB),
         ("gpg", _GPG_STUB),
         ("systemctl", _SYSTEMCTL_STUB),
     ):
@@ -269,6 +279,28 @@ def test_consent_still_reads_when_it_is_not_the_first_key(tmp_path):
     assert Path(env["FALKORDB_APT_LIST"]).exists(), result.stdout
 
 
+def test_a_later_false_overrides_an_earlier_true(tmp_path):
+    """Duplicate keys are legal YAML and PyYAML keeps the LAST one.
+
+    `provision: true` followed by `provision: false` is a withdrawal, not
+    consent — a matcher that OR-accumulates (any true anywhere grants) would
+    add an apt repo to a box whose operator changed their mind.
+    """
+    env = _stage(tmp_path)
+    del env["GENESIS_FALKORDB_PROVISION"]
+    for body, consents in (
+        ("graph_engine:\n  provision: true\n  provision: false\n", False),
+        ("graph_engine:\n  provision: false\n  provision: true\n", True),
+    ):
+        Path(env["FALKORDB_LOCAL_CONFIG"]).write_text(body)
+        result = _run("falkordb_redis_install", env)
+        assert result.returncode == 0, result.stderr
+        assert Path(env["FALKORDB_APT_LIST"]).exists() == consents, (
+            f"last-key-wins not honoured: {body!r}"
+        )
+        Path(env["FALKORDB_APT_LIST"]).unlink(missing_ok=True)
+
+
 def test_the_module_half_needs_no_consent(tmp_path):
     """It writes one file under ~/.genesis and changes nothing about the system.
 
@@ -369,6 +401,25 @@ def test_fresh_box_adds_repo_installs_and_stands_down_system_redis(tmp_path):
     assert "systemctl disable --now redis-server" in log
 
 
+def test_a_failed_apt_update_refuses_a_below_floor_candidate(tmp_path):
+    """A stale index can only offer the distro's 7.x, which the module refuses.
+
+    Installing it anyway would put a database daemon on the box that cannot
+    run the engine it was installed for — so a failed `apt-get update` gates
+    the install on a verified candidate >= the floor.
+    """
+    env = _stage(tmp_path)
+    env["APT_RC"] = "1"           # every apt-get call fails
+    env["APT_CANDIDATE"] = "6:7.0.15-1"  # what a stale index offers on noble
+    result = _run("falkordb_redis_install", env)
+
+    assert result.returncode == 0, result.stderr
+    assert "update failed" in result.stdout
+    assert "below" in result.stdout and "floor" in result.stdout
+    assert "apt-get update" in _apt_log(env)
+    assert "apt-get install" not in _apt_log(env), "installed an unusable redis"
+
+
 def test_unknown_codename_skips_before_touching_apt(tmp_path):
     env = _stage(tmp_path)
     Path(env["FALKORDB_OS_RELEASE"]).write_text("ID=weird\n")  # no VERSION_CODENAME
@@ -436,6 +487,49 @@ def test_second_run_is_idempotent(tmp_path):
     second = _run("falkordb_module_install", env)
     assert second.returncode == 0
     assert "already present" in second.stdout
+
+
+def test_chmod_failure_reports_not_installed_and_retries(tmp_path):
+    """A chmod failure must not leave a file the `-f target` check calls done.
+
+    Redis refuses a module without +x, so a file left behind after a failed
+    chmod would make every later run report "already present" while the
+    engine could never load it. Remove it so the next run repairs.
+    """
+    env = _stage(tmp_path)
+    chmod_stub = Path(env["PATH"].split(":")[0]) / "chmod"
+    # The stub must really chmod on the success path — it shadows /usr/bin/chmod
+    # for the whole run, so a no-op success would leave the file unexecutable.
+    chmod_stub.write_text(
+        '#!/bin/bash\n'
+        'if [ "${CHMOD_RC:-0}" != "0" ]; then exit "$CHMOD_RC"; fi\n'
+        'exec /usr/bin/chmod "$@"\n'
+    )
+    chmod_stub.chmod(0o755)
+
+    artifact = tmp_path / "release" / "v4.20.4" / "falkordb-x64.so"
+    real_sha = subprocess.run(
+        ["sha256sum", str(artifact)], capture_output=True, text=True, check=True
+    ).stdout.split()[0]
+
+    env["CHMOD_RC"] = "1"
+    first = _run(
+        f'_falkordb_expected_sha() {{ printf "{real_sha}"; }}; falkordb_module_install',
+        env,
+    )
+    assert first.returncode == 0, first.stderr
+    assert "NOT installed" in first.stdout
+    target = Path(env["FALKORDB_DEPS_DIR"]) / "4.20.4" / "falkordb.so"
+    assert not target.exists(), "broken install left behind for later runs to 'find'"
+
+    env["CHMOD_RC"] = "0"
+    second = _run(
+        f'_falkordb_expected_sha() {{ printf "{real_sha}"; }}; falkordb_module_install',
+        env,
+    )
+    assert second.returncode == 0, second.stderr
+    assert target.is_file(), second.stdout
+    assert target.stat().st_mode & 0o111
 
 
 def test_download_failure_leaves_no_half_file(tmp_path):
