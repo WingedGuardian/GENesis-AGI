@@ -966,3 +966,44 @@ class TestACarrierRefusalSaysTheWholeCommandWentToo:
         assert self.MARKER not in res.stderr, (
             "the note fired on a single-step command:\n" + res.stderr
         )
+
+
+class TestUnresolvedVariableIsItsOwnVerdict:
+    """#2233: an unexpanded shell variable counted as ONE path component made
+    the depth floor positional — ``$SP/head2`` refused at depth 2 while
+    ``$SP/a/b/c/d`` passed, same cause, opposite verdict. The verdict must be
+    uniform over the cause, not over how many literals follow the variable.
+    """
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            '"$SP/head2"',  # was refused at depth 2 — for the wrong reason
+            '"$SP/a/b/c/d"',  # was ALLOWED: the positional hole
+            '"$EMPTY/a/b/c/d"',  # empty var → /a/b/c/d
+            '"${SP}/x/y/z/w"',  # ${…} spelling of the same cause
+            '"$(pwd)/a/b/c"',  # command substitution — equally unresolvable
+        ],
+    )
+    def test_every_unresolved_spelling_is_refused(self, target):
+        assert _blocks(f"rm -rf {target}"), (
+            f"{target}: an unresolved expansion must not depth-pass on its "
+            "literal tail"
+        )
+
+    def test_the_reason_names_the_cause(self):
+        reasons = dg._rm_violations('rm -rf "$SP/head2"')
+        assert any("unresolved shell variable" in r for r in reasons), reasons
+
+    def test_a_resolvable_env_var_is_not_unresolved(self, monkeypatch):
+        # expandvars answers what the hook's own environment knows: a deep
+        # literal expansion passes, a shallow one still depth-blocks.
+        monkeypatch.setenv("DG_TEST_DEEP", "/srv/app/data/build")
+        assert not _blocks('rm -rf "$DG_TEST_DEEP"')
+        monkeypatch.setenv("DG_TEST_SHALLOW", "/a")
+        assert _blocks('rm -rf "$DG_TEST_SHALLOW"')
+
+    def test_the_fully_literal_deep_path_is_still_allowed(self):
+        # The acceptance bar's other direction: routine cleanup under a deep
+        # scratch directory must not start failing.
+        assert not _blocks("rm -rf /srv/app/data/build")

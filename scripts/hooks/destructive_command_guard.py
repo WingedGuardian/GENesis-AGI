@@ -546,7 +546,24 @@ def _check_target(target: str) -> str | None:
     clean = target.strip("'\"")
     if clean in _ALWAYS_BLOCK:
         return f"rm -rf on '{clean}' is not allowed."
-    expanded = os.path.normpath(os.path.expanduser(clean))
+    # An unresolved expansion is its own verdict, not a path component.
+    # expandvars substitutes every variable the hook's environment can see;
+    # a surviving '$' is a shell-local (or command substitution, or a $(...)
+    # whose value lives in another segment) — the real path and its real
+    # depth are unknowable here. The old code counted it as ONE literal
+    # component, which made the depth floor POSITIONAL: `rm -rf "$SP/head2"`
+    # refused at depth 2 while `rm -rf "$SP/a/b/c/d"` passed, same cause,
+    # opposite verdict — and `$EMPTY/a/b/c/d` is `/a/b/c/d` if EMPTY is "".
+    # Refuse every unresolved form uniformly, and SAY it is the variable,
+    # not the count, that is the cause — a message that reports only a
+    # depth invites the reader to conclude the counter is wrong and reach
+    # for the literal spelling for the wrong reason. (#2233)
+    expanded = os.path.normpath(os.path.expandvars(os.path.expanduser(clean)))
+    if "$" in expanded:
+        return (
+            f"rm -rf on '{clean}' contains an unresolved shell variable, "
+            f"so its real depth is unknown — refusing."
+        )
     parts = [p for p in expanded.split("/") if p]
     # A surviving '..' means the path traverses upward from a base the
     # hook cannot know (its cwd need not match the Bash invocation's).
