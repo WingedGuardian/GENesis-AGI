@@ -124,9 +124,14 @@ _COMMAND_CARRIERS = frozenset(
         "pkexec",
         "runcon",
         "sg",
-        "source",
-        ".",
-        "builtin",
+        # `source`/`.` are NOT carriers — they run a FILE, not an inline command
+        # STRING, so a removal cannot hide in the command text (see the note at
+        # shell_parse._REPARSE_CARRIERS, which this set mirrors). Refusing on
+        # their presence over-blocked `source ~/.venv/bin/activate && rm …`,
+        # MEASURED 219/83,201 recorded commands. `builtin` is not a carrier
+        # either, but is NOT merely dropped: it is a transparent prefix in
+        # shell_parse._WRAPPER_SPEC, so `builtin eval 'rm …'` resolves through to
+        # `eval` and IS caught.
     }
     | _NESTED_SHELLS
 )
@@ -246,18 +251,35 @@ def _resolver_carrier_refusal(cmd: str) -> tuple[str | None, bool]:
         #
         # So this refuses on unreadability itself, which names nothing and so
         # cannot be respelled — the same rule `protected_paths_guard` already
-        # applies to an unreadable removal. MEASURED cost: 77 newly refused of
-        # 83,201 recorded commands against origin/main, versus 53 with the
-        # deleted scope. Most of the difference is `python - <<'PY' … rm …`
-        # scripts the parser cannot read a heredoc body of; #1748 fixes that
-        # at the source and would take most of it back.
+        # applies to an unreadable removal. MEASURED end-to-end (real guard as a
+        # subprocess, each corpus row's own cwd) against origin/main: the WHOLE
+        # guard newly refuses 78 of 83,201 recorded commands (0.094%), 0 relaxed
+        # — of which ~53 are this blind branch, almost all `python - <<'PY' … rm
+        # …` scripts whose heredoc BODY the parser cannot read (#1748 fixes that
+        # at the source and would take most of it back), and ~25 are genuine
+        # hidden carriers (literal, variable-indirected, or opaque-payload). (An
+        # earlier 77-vs-53 figure was the blind branch alone at an intermediate
+        # revision; per-segment scoping and dropping the file-runner carriers cut
+        # the carrier arm's over-block from 297.)
         return (
             f"this command cannot be read ({blind.cause}) and it names a "
             f"removal, so the guard cannot verify what would be deleted. "
             f"Re-issue it in a form the parser can read."
         ), True
     for seg in segs:
-        if seg.exe in _UNMODELLABLE_CARRIERS:
+        # PER SEGMENT, like `protected_paths_guard` and `git_push_guard`: refuse
+        # only when the CARRIER'S OWN segment names the removal, not when a
+        # removal appears in a DIFFERENT, resolvable segment. `eval 'rm -rf x'`
+        # keeps the rm inside the eval segment's raw and still refuses; a benign
+        # `eval 'echo hi' && rm -f /tmp/x` leaves the rm in its own segment,
+        # which the ordinary operand scan grades (allowing a safe target,
+        # refusing a dangerous one). Without this scope the arm refused any
+        # rm-bearing command that merely CONTAINED a carrier anywhere — MEASURED
+        # as a large over-block of ordinary multi-step work.
+        if seg.exe in _UNMODELLABLE_CARRIERS and (
+            _RM_CARRIER_WORD.search(seg.raw)
+            or _OPAQUE_CARRIER_PAYLOAD.search(seg.raw)
+        ):
             return (
                 f"'{seg.exe}' runs a command this resolver refuses to model, so "
                 f"the payload cannot be recovered and a removal inside it cannot "
@@ -280,6 +302,19 @@ _RM_WORD = re.compile(r"\brm\b|\brmdir\b")
 # `_RM_WORD` keeps BOTH verbs, because the ordinary operand scan below is what
 # the wider prefilter exists for.
 _RM_CARRIER_WORD = re.compile(r"\brm\b")
+
+# A carrier segment whose payload carries an UNRESOLVED EXPANSION — `$(…)`,
+# `${…}`, `$VAR`, `$1`/`$@`/…, or a backtick — is opaque: the resolver cannot see
+# what it expands to, and a removal can be hidden there with NO literal `rm` in
+# the segment text. `x='rm -rf /a/b'; eval "$x"` executes the removal while the
+# eval segment's raw names no `rm`, so keying the per-segment refusal on literal
+# `rm` alone (as a first cut did) let shell indirection walk straight past it.
+# The refusal therefore fires on an opaque payload too. This does NOT reach the
+# benign relaxations: `source ~/.venv/bin/activate && rm …` has no unmodellable
+# carrier at all (`source` is dropped), and `eval 'echo hi' && rm …` has a
+# LITERAL, non-opaque eval payload. Like the whole arm, it only runs once the
+# command already names `rm` (the `_RM_CARRIER_WORD` prefilter in main()).
+_OPAQUE_CARRIER_PAYLOAD = re.compile(r"\$[\w({@*?#!-]|`")
 
 _SEPARATORS = {"|", "||", "&&", ";", "&", "\n"}
 
@@ -826,9 +861,15 @@ def main() -> int:
         # A name-based position test is wrong in BOTH directions at once
         # (`echo then bash rm` over-blocks; `if bash -c …` under-blocks), which
         # is why it is no longer primary. This also REFUSES an unreadable
-        # command rather than degrading to a glued-`-rf` regex, closing a
-        # one-character bypass: `eval 'rm -r -f /a/b' "` used to be ALLOWED
-        # while the same command without the trailing quote BLOCKED.
+        # command rather than degrading to `_RM_RF_PATTERN`, which matches only a
+        # GLUED `-rf` token — so an unreadable command carrying an unglued
+        # `rm -r -f` walked past it. A substitution nested past the parser's
+        # depth bound (`echo $(echo $(…rm -r -f /a/b…))`) or a command over the
+        # length cap is valid bash, goes blind, and used to be ALLOWED; it now
+        # refuses. (An earlier note cited `eval 'rm -r -f /a/b' "` as the bypass;
+        # that spelling is a bash SYNTAX ERROR, rc 2 under `bash -n` and `bash -c`,
+        # and never executes — the real inducers are the ones bash DOES run that
+        # the resolver rejects. See `_resolver_carrier_refusal`.)
         # `_RM_CARRIER_WORD`, not `_RM_WORD`: a carried `rmdir` is outside this
         # guard's subject matter and refusing it only created an asymmetry with
         # its own direct spelling. See the constant.

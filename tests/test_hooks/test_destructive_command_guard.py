@@ -813,6 +813,110 @@ class TestCommandCarriersAreRefusedWithoutInspection:
         assert not missing, f"resolver names launchers this guard does not: {missing}"
 
 
+class TestCarrierScopeIsPerSegmentAndFileRunnersAreNotCarriers:
+    """A carrier in one segment must not refuse a removal in a DIFFERENT,
+    resolvable segment, and `source`/`.`/`builtin` are not carriers at all.
+
+    Before per-segment scoping the resolved-carrier arm refused any rm-bearing
+    command that merely CONTAINED a carrier anywhere — MEASURED 297 newly-refused
+    over 83,201 recorded commands, 219 of them `source ~/.venv/bin/activate &&
+    rm …` (venv activation, which CLAUDE.md mandates for all Python work). After
+    the fix: 70 newly-refused, zero of those 219. Verify-RED: every ALLOW case
+    below refuses against the pre-change guard.
+    """
+
+    RM = "r" + "m"
+
+    @staticmethod
+    def _main(cmd: str, home) -> int:
+        import json
+        import os
+        import subprocess
+        import sys as _sys
+
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        script = (
+            Path(__file__).resolve().parents[2]
+            / "scripts"
+            / "hooks"
+            / "destructive_command_guard.py"
+        )
+        return subprocess.run(
+            [_sys.executable, str(script)],
+            input=json.dumps({"tool_input": {"command": cmd}, "tool_name": "Bash"}),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        ).returncode
+
+    @pytest.mark.parametrize(
+        "label,cmd",
+        [
+            ("carrier + separate benign rm", "eval 'echo hi' && {RM} -f /tmp/x"),
+            ("su -c + separate benign rm", "su ubuntu -c 'echo hi' && {RM} -f /tmp/x"),
+            ("source venv-activate + benign rm", "source ~/.venv/bin/activate && {RM} -f /tmp/x"),
+            ("dot-source + benign rm", ". ~/.venv/bin/activate; {RM} -f /tmp/x"),
+        ],
+    )
+    def test_a_carrier_beside_a_benign_removal_is_not_refused(self, label, cmd, tmp_path):
+        """PER-SEGMENT: the carrier's own segment names no removal, and the rm
+        segment resolves to a benign target the ordinary scan allows."""
+        assert self._main(cmd.format(RM=self.RM), tmp_path) == 0, label
+
+    def test_a_carrier_beside_a_DANGEROUS_removal_still_refuses(self, tmp_path):
+        """The control that keeps per-segment honest: a DANGEROUS rm in a
+        separate segment is still graded by the operand scan and refused."""
+        assert self._main(f"eval 'echo hi' && {self.RM} -rf /a/b", tmp_path) == 2
+
+    def test_a_carrier_HIDING_a_removal_in_its_own_segment_still_refuses(self, tmp_path):
+        """Why per-segment is safe: the carrier's OWN segment raw carries the
+        rm, so the scope still fires where the payload is genuinely hidden."""
+        assert self._main(f"eval '{self.RM} -rf /a/b'", tmp_path) == 2
+
+    def test_source_dot_builtin_are_not_carriers(self):
+        """They run a FILE or a builtin, not an inline command string, so a
+        removal cannot hide in the command text. A re-addition fails here."""
+        import importlib.util
+
+        for name in ("source", ".", "builtin"):
+            assert name not in dg._COMMAND_CARRIERS, name
+            assert name not in dg._UNMODELLABLE_CARRIERS, name
+        spec = importlib.util.spec_from_file_location(
+            "sp_notcarrier",
+            Path(__file__).resolve().parents[2] / "scripts" / "hooks" / "shell_parse.py",
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["sp_notcarrier"] = mod
+        spec.loader.exec_module(mod)
+        for name in ("source", ".", "builtin"):
+            assert name not in mod._REPARSE_CARRIERS, name
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "x='{RM} -rf /a/b'; eval \"$x\"",
+            "x='{RM} -rf /a/b'; su ubuntu -c \"$x\"",
+            "cmd=$(printf '{RM} -rf /a/b'); eval \"$cmd\"",
+        ],
+    )
+    def test_a_variable_indirected_removal_in_a_carrier_still_refuses(self, cmd, tmp_path):
+        """Per-segment cannot key on LITERAL `rm` alone: `eval \"$x\"` names no
+        `rm` in the carrier segment's raw, yet executes the removal `$x` holds.
+        The arm refuses an OPAQUE carrier payload (unresolved expansion) too."""
+        assert self._main(cmd.format(RM=self.RM), tmp_path) == 2, cmd
+
+    def test_builtin_reveals_its_wrapped_carrier(self, tmp_path):
+        """`builtin` is a transparent prefix (like `command`): the resolver
+        strips it, so `builtin eval 'rm …'` reaches the eval carrier and refuses,
+        while `builtin cd` (no removal) is untouched. `builtin eval '…'` DOES
+        take an inline string — dropping it outright would reopen the hole."""
+        assert self._main(f"builtin eval '{self.RM} -rf /a/b'", tmp_path) == 2
+        assert self._main(f"builtin {self.RM} -rf /a/b", tmp_path) == 2
+        assert self._main("builtin cd /x", tmp_path) == 0
+
+
 class TestCarriedRmdirIsNotThisGuardsBusiness:
     """`rmdir` removes an EMPTY directory and has no recursive-force form.
 

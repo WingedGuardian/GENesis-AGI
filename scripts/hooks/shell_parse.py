@@ -96,6 +96,12 @@ _WRAPPER_SPEC = {
     "setsid": (set(), 0),
     "time": ({"-o", "--output", "-f", "--format"}, 0),
     "command": (set(), 0),
+    # `builtin` runs its argument as a shell builtin, so `builtin eval '…'` and
+    # `builtin source f` reach the eval/source builtins WITH their inline-string
+    # /file payloads. Strip it transparently (like `command`) so the wrapped
+    # carrier is revealed and the carrier arm catches it — rather than listing
+    # `builtin` itself as a carrier, which would over-block `builtin cd`.
+    "builtin": (set(), 0),
     "exec": ({"-a"}, 0),
     # `-e/--eof` and `-i/--replace` are NOT here, and their absence is the point.
     # xargs gives them OPTIONAL values (`--eof[=END]`, `--replace[=R]`), so as a
@@ -179,7 +185,7 @@ _RUN_CARRIER_EXCLUDES: dict[str, str] = {
         for name in (
             "eval", "su", "runuser", "setpriv", "chroot", "flock", "watch",
             "script", "systemd-run", "unshare", "nsenter", "pkexec", "runcon",
-            "sg", "source", ".", "builtin", "ssh", "find", "parallel", "docker",
+            "sg", "ssh", "find", "parallel", "docker",
             "xargs", "bash", "sh", "dash", "zsh", "ksh", "ash",
         )},
 }
@@ -212,10 +218,12 @@ _RUN_CARRIER_EXCLUDES: dict[str, str] = {
 #: string it was handed" — open-ended, since it also includes `xargs`, `awk`,
 #: any language's `-c`/`eval` flag, and a shell FUNCTION defined earlier in the
 #: same command. What is enumerated is the subset that SELF-RESOLVES on THIS
-#: parser (`seg.exe` literally equals the launcher name); `source`, `.` and
-#: `builtin` joined the set on that same test. The count is stated here because
-#: a comment naming a different number than the set below is how an omission
-#: stops looking like one — SEVENTEEN as of this revision.
+#: parser (`seg.exe` literally equals the launcher name). The count is stated
+#: here because a comment naming a different number than the set below is how an
+#: omission stops looking like one — FOURTEEN as of this revision. (`source`,
+#: `.` and `builtin` were briefly members and were removed: they run a FILE or a
+#: builtin, not an inline string, so a removal cannot hide in the command text.
+#: See the note beside the set.)
 #:
 #: COST IS NOT ZERO, and an earlier revision of this comment said it was. Each
 #: consumer's rate is its own, because their prefilters differ and no rate
@@ -224,16 +232,28 @@ _RUN_CARRIER_EXCLUDES: dict[str, str] = {
 #: protected_paths: MEASURED end-to-end (real guard as a subprocess, each corpus
 #: row's own cwd) over 83,201 recorded commands — 19 refusals (0.023%), 0
 #: relaxed, every one recoverable by re-issuing without the launcher. This is
-#: AFTER per-segment scoping and the addition of source/./builtin; the figure is
-#: also recorded at the branch that produces it, in protected_paths_guard.py.
+#: AFTER per-segment scoping; dropping the file-runners source/./builtin from the
+#: carrier set leaves it unchanged — source contributes 0 to its per-segment arm
+#: (MEASURED, 3 firings with and without). Also recorded at the branch that
+#: produces it, in protected_paths_guard.py.
 #:
-#: ⚠ destructive and git_push: PENDING RE-MEASUREMENT. The figures once written
-#: here (53 and 0) predate two changes that both move them — deleting the blind
-#: carrier-name scope in destructive_command_guard (an unreadable removal now
-#: refuses unconditionally, which only raises the count) and adding
-#: source/./builtin to the shared set that git_push also imports. The combined
-#: three-guard corpus sweep did not finish inside an hour; each guard needs its
-#: own bounded run. Do not quote a number here until that run exists — an earlier
+#: destructive: MEASURED end-to-end (real guard as a subprocess) against
+#: origin/main — 78 refusals of 83,201 recorded commands (0.094%), 0 relaxed. Of
+#: the 78, ~53 are the unreadable-blind branch (heredoc BODIES the parser cannot
+#: read, #1748) and ~25 are genuine hidden carriers (literal, variable-indirected
+#: or opaque-payload). An intermediate revision reached 297 here, 219 of them
+#: `source ~/.venv/bin/activate && rm …` (venv activation, which CLAUDE.md
+#: mandates) — per-segment scoping the resolved carrier arm and dropping the
+#: file-runner carriers eliminated all 219; the opaque-payload re-close (so a
+#: variable-indirected removal in a carrier cannot walk past the literal check)
+#: added ~8 conservative refusals back.
+#:
+#: git_push: 0 of 83,201 (0.000%). Its carrier arm is per-segment and its
+#: baseline (origin/main) has no carrier arm at all; the arm fires on no recorded
+#: command, so a carried gated op converges with the existing raw-text net.
+#:
+#: Each guard needs its OWN bounded run — the combined three-guard subprocess
+#: sweep did not finish inside an hour. Quote the end-to-end number; an earlier
 #: 17/99/22 was wrong precisely because a figure outlived the mechanism it was
 #: measured against.
 #:
@@ -303,16 +323,23 @@ _REPARSE_CARRIERS = frozenset(
         "pkexec",
         "runcon",
         "sg",
-        # Re-parse the current shell's own input rather than spawning a child,
-        # so they carry the exact same hole: a string handed to them is run
-        # with none of the surrounding command's scrutiny. `builtin` prefixes
-        # any builtin (including `eval`) and bypasses a function override of
-        # the same name, which is a distinct reason to catch it here.
-        "source",
-        ".",
-        "builtin",
     }
 )
+# `source`/`.` are NOT carriers, though an earlier revision of this branch added
+# them: they run the contents of a FILE, not an inline command STRING, so a
+# removal cannot be HIDDEN in the command text the way `eval "rm …"` or
+# `sh -c "rm …"` hides it. The visible `rm` in `source x && rm …` is a separate,
+# resolvable segment the ordinary scan already grades, and every consumer of this
+# set scopes PER SEGMENT, so the `source` segment never triggers a refusal.
+# Treating them as opaque carriers refused every `source ~/.venv/bin/activate &&
+# rm …` — MEASURED 219 of 83,201 recorded commands, almost all venv activation,
+# which CLAUDE.md itself mandates. Same threat model as `ssh`/`bash script.sh`.
+#
+# `builtin` is NOT dropped the same way, and an earlier version of this note was
+# wrong to lump it in: `eval` and `source` ARE shell builtins, so
+# `builtin eval 'rm …'` DOES reach an inline string. It is handled as a
+# TRANSPARENT PREFIX in `_WRAPPER_SPEC` (like `command`) — the resolver strips it
+# and the revealed `eval` (caught) or `source`/`.` (file-runner) is classified.
 # Value-consuming flags accepted BEFORE the wrapped command, on either the
 # front-end or its `run` subcommand.
 #
