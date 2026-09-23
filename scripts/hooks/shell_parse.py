@@ -3277,14 +3277,19 @@ def gh_pr_subcommand(argv: list[str]) -> str | None:
     separated ``-R o/r`` form let ``gh pr -R o/r merge N --admin`` bypass ALL
     fail-closed merge gates (found 2026-08-13 via the escalation-gate review).
 
-    The flag grammar is the union table, not the two-flag spec this walk
-    previously shared: that spec consumed only ``-R/--repo``, so a
-    subcommand-local value flag between the group and its verb put its own
-    VALUE in the verb slot — ``gh pr -c note close 1`` read ``note`` as the
-    subcommand (a real close reported as no close), and ``gh -X PATCH api``
-    put ``PATCH`` in the group slot. Unknown dashed tokens are NOT consumed —
-    in this fail-closed direction a skipped word is the dangerous miss, not
-    a false match.
+    The walk uses the union flag table in BOTH positions — deliberately
+    broader than real gh, which resolves a command path and then applies
+    only that row's flags (measured 2026-09: union semantics hold before
+    the command path; between group and verb a colliding flag is rejected,
+    it does not consume the next word). The old spec consumed only
+    ``-R/--repo``, so a subcommand-local value flag between the group and
+    its verb put its own VALUE in the verb slot — ``gh pr -c note close 1``
+    read ``note`` as the subcommand (a real close reported as no close), and
+    ``gh -X PATCH api`` put ``PATCH`` in the group slot. Over-consumption
+    here is the safe direction — real gh errors on ``gh pr -c note close 1``,
+    reading it as a close can only over-match the fail-closed gate. Unknown
+    dashed tokens are NOT consumed — in this fail-closed direction a skipped
+    word is the dangerous miss, not a false match.
     """
     if not argv or _basename(argv[0]) != "gh":
         return None
