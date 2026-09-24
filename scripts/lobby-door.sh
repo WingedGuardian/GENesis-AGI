@@ -57,13 +57,65 @@ set -uo pipefail
 # ATTACHING to it, which is what made it destructible; this one CREATES it if
 # absent and then never touches it again.
 #
-# Idempotent and silent, MEASURED against a session holding live work under a
-# stale chooser: three runs left pane_pid, pane_mode and pane_current_command
-# byte-identical and printed nothing. (`new-session -d -A` would do the same job
-# but prints "open terminal failed: not a terminal" every time, so the
-# has-session form is used instead.)
+# Idempotent, MEASURED against a session holding live work under a stale
+# chooser: three runs left pane_pid, pane_mode and pane_current_command
+# byte-identical. (`new-session -d -A` would do the same job but prints "open
+# terminal failed: not a terminal" every time, so an existence test is used.)
+#
+# ⚠ This comment also used to say SILENT, and that was the load-bearing
+# falsehood. The probe printed nothing HERE — its stderr was redirected — while
+# tmux announced the miss to every OTHER attached client. "Prints nothing" was
+# checked from the wrong end, and the claim then read as settled for anyone who
+# came looking. Silence on your own stderr is not silence on the server.
+# WHY NOT `has-session`, WHICH IS THE OBVIOUS SPELLING
+# ----------------------------------------------------
+# Because on tmux, "no such session" is an ERROR, and a tmux error is a
+# SERVER-SIDE MESSAGE shown on every attached client's status line in
+# `message-style` — which is `bg=yellow` here, against a green `status-style`.
+# The `2>/dev/null` silences this PROCESS's stderr; it does not stop the server
+# telling the other clients.
+#
+# MEASURED on tmux 3.4 with a client attached:
+#   has-session -t "=lobby-555555" 2>/dev/null   -> +1 "can't find session"
+#   list-sessions -F … | grep -qxF "lobby-555555" -> +0
+# Same verdict, no message. With NO client attached neither emits, so a test
+# for this MUST attach one or it proves nothing.
+#
+# This matters because the picker-name probe below runs on the SUCCESS path:
+# the name is free every time, so "can't find session" fired on every single
+# fleet connection, painting the operator's status line yellow. `display-time`
+# is 750ms, so a warm connect finished painting after it expired and a cold one
+# did not — which is exactly the intermittency that made this so hard to pin.
+#
+# Evidence it was really this: the operator's own `show-messages` log showed
+#   has-session -t =lobby-1161923 / message: can't find session: lobby-1161923
+#   / new-session / choose-tree / switch-client -Z -t =cc-5:
+# — the chooser opening under the message, and the keypress meant to dismiss
+# the message being eaten by choose-tree as "select the highlighted entry".
+_session_exists() {
+    # -F (fixed string) because a session name is free text, -x so `lobby` can
+    # never match `lobby-123`. `list-sessions` failing (no server yet, first
+    # boot) yields no output, grep fails, and the caller reads "absent" — which
+    # is the correct answer in that state.
+    # `grep -xF … >/dev/null`, NOT `grep -qxF`. This file runs under
+    # `set -uo pipefail` (line 52), and -q exits on the first match — which can
+    # SIGPIPE tmux mid-write and make the PIPELINE fail while the session
+    # plainly exists. A false "absent" here is worse than the bug this function
+    # was written for: the door would then create on a taken name, tmux would
+    # answer `duplicate session`, and the login would die outright (MEASURED:
+    # exit 1, no client attached).
+    #
+    # Honest about the evidence: I could NOT reproduce that failure — 0/40
+    # false negatives with 301 sessions and the target sorted first, because
+    # ~3.6KB of names fits the ~64KB pipe buffer, so tmux completes its write
+    # before grep exits. It would take thousands of sessions to reach. The
+    # change is kept because it costs nothing and the failure mode if that
+    # bound is ever wrong is a dead login, not a cosmetic glitch.
+    tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -xF "$1" >/dev/null
+}
+
 WORKSPACE="lobby"
-tmux has-session -t "=${WORKSPACE}" 2>/dev/null \
+_session_exists "$WORKSPACE" \
     || tmux new-session -d -s "$WORKSPACE" 2>/dev/null
 
 # The PICKER is per-connection, so two live windows can never meet: one pid
@@ -80,7 +132,7 @@ tmux has-session -t "=${WORKSPACE}" 2>/dev/null \
 # lost work.
 SESSION="lobby-$$"
 _n=0
-while tmux has-session -t "=${SESSION}" 2>/dev/null; do
+while _session_exists "$SESSION"; do
     _n=$((_n + 1))
     SESSION="lobby-$$-${_n}"
     # A bound, not a fallback: 20 taken names means something is wrong that
