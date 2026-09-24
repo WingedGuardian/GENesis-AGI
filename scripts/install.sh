@@ -1106,10 +1106,12 @@ if command -v claude &>/dev/null; then
     fi
     command -v serena &>/dev/null && \
         _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$REPO_DIR"
-    # Grep (grep.app) — literal/regex code search over ~1M public GitHub repos.
+    # grep-app (grep.app) — literal/regex code search over ~1M public GitHub
+    # repos. Registered under a Genesis-owned name, not the generic `grep`, so
+    # an operator's own grep server is never touched.
     # No API key and no local binary, so nothing to gate on `command -v`: it is
     # a remote endpoint. User scope so worktree sessions get it too.
-    _register_mcp_http "grep" "user" "$GENESIS_GREP_MCP_URL"
+    _register_mcp_http "grep-app" "user" "$GENESIS_GREP_MCP_URL"
 fi
 
 # Queue initial code intelligence indexing — write an index-request marker for

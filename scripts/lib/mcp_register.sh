@@ -170,25 +170,29 @@ PYEOF
             _warn_local_scope_shadow "$name" "$url"
             return 0
         fi
-        # PRESERVE, never overwrite. This is the first release to manage a
-        # server under this name, so an existing entry that does not match
-        # cannot be stale state Genesis created — it is the operator's, and
-        # there is no ownership marker that could tell us otherwise. Removing
-        # it would silently destroy their configuration (command, url, args,
-        # env), which is exactly what _warn_local_scope_shadow's doctrine
-        # forbids a few lines below.
+        # Ownership is decided by the NAME, which is why Genesis registers
+        # `grep-app` rather than the generic `grep` that grep.app's own docs
+        # use. Two earlier revisions tried to infer ownership from the stored
+        # value and produced one defect each, in opposite directions: removing
+        # a mismatch destroyed an operator's own server, and preserving every
+        # mismatch made GENESIS_GREP_MCP_URL inert on any box Genesis had
+        # already set up. No predicate over an ambiguous name can be right
+        # both ways, so the ambiguity is removed instead of adjudicated.
         #
-        # This also resolves the failure mode the existence check was added
-        # for: `claude mcp add` refuses a duplicate name (rc=1) with its cause
-        # swallowed, warning forever and never explaining. Skipping with an
-        # actionable conflict message is strictly better than both overwriting
-        # and looping. Once Genesis has registered it, the value matches and
-        # this branch never runs again.
-        if [ -n "$(_mcp_entry_exists "$name")" ]; then
-            echo "  WARNING: $name is already registered at $scope scope${registered:+ (stored: $registered)} and does NOT match the intended URL."
-            echo "    Genesis has NOT modified it — an entry under this name was not created by Genesis."
+        # A URL mismatch under a Genesis-owned name is therefore OUR entry with
+        # a changed endpoint — heal it, which is what makes the override work
+        # on an existing install.
+        if [ -n "$registered" ]; then
+            echo "  $name: endpoint changed (stored: $registered) — re-registering"
+            claude mcp remove "$name" -s "$scope" 2>/dev/null || true
+        elif [ -n "$(_mcp_entry_exists "$name")" ]; then
+            # An entry with no "url" is a different TRANSPORT, which Genesis
+            # never writes here. Even under a name we own, that is something
+            # we did not create — preserve it and say so rather than deleting
+            # configuration whose origin we cannot account for.
+            echo "  WARNING: $name already exists at $scope scope with a different transport."
+            echo "    Genesis has NOT modified it — it did not create that entry."
             echo "    To adopt the Genesis-managed server: claude mcp remove $name -s $scope   (then re-run)"
-            echo "    To keep yours and stop Genesis registering it: set GENESIS_GREP_MCP_URL= (empty)"
             return 0
         fi
     else

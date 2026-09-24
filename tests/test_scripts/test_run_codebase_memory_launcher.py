@@ -672,32 +672,32 @@ def _run_register_http(tmp_path: Path, args: list[str], claude_json: dict | None
 def test_http_fresh_adds_with_transport_flag(tmp_path):
     """Argument ORDER and the --transport flag are the contract with the CLI."""
     res, clog = _run_register_http(
-        tmp_path, ["grep", "user", "https://mcp.grep.app"], {"mcpServers": {}})
+        tmp_path, ["grep-app", "user", "https://mcp.grep.app"], {"mcpServers": {}})
     assert res.returncode == 0
-    assert "mcp add --transport http grep -s user https://mcp.grep.app" in clog.read_text()
+    assert "mcp add --transport http grep-app -s user https://mcp.grep.app" in clog.read_text()
 
 
 def test_http_matching_url_is_noop(tmp_path):
     """Idempotence: the same URL must not churn the registration."""
     res, clog = _run_register_http(
-        tmp_path, ["grep", "user", "https://mcp.grep.app"],
-        {"mcpServers": {"grep": {"type": "http", "url": "https://mcp.grep.app"}}})
+        tmp_path, ["grep-app", "user", "https://mcp.grep.app"],
+        {"mcpServers": {"grep-app": {"type": "http", "url": "https://mcp.grep.app"}}})
     assert res.returncode == 0
     assert "already registered" in res.stdout
     assert "mcp add" not in (clog.read_text() if clog.exists() else "")
 
 
-def test_http_preserves_an_entry_it_did_not_create(tmp_path):
-    """NEVER overwrite a name Genesis has not established.
+def test_http_preserves_an_entry_of_another_transport(tmp_path):
+    """Never delete configuration Genesis cannot account for.
 
-    This is the first release managing a server called `grep`, so a mismatched
-    entry cannot be Genesis drift — it is the operator's, and removing it would
-    destroy their command/url/args/env. Flagged by an external reviewer after
-    an earlier revision removed it.
+    Genesis writes only http entries under this name, so a stdio entry is one
+    it did not create even though it owns the name. Removing it would destroy
+    the operator's command/args/env. Flagged by an external reviewer after an
+    earlier revision removed it.
     """
     res, clog = _run_register_http(
-        tmp_path, ["grep", "user", "https://mcp.grep.app"],
-        {"mcpServers": {"grep": {"type": "stdio", "command": "/opt/their-own-grep"}}})
+        tmp_path, ["grep-app", "user", "https://mcp.grep.app"],
+        {"mcpServers": {"grep-app": {"type": "stdio", "command": "/opt/their-own"}}})
     assert res.returncode == 0
     log = clog.read_text() if clog.exists() else ""
     assert "mcp remove" not in log, "must not delete an entry Genesis did not create"
@@ -709,15 +709,15 @@ def test_http_preserves_an_entry_it_did_not_create(tmp_path):
 def test_http_empty_url_declines_and_says_entry_is_still_live(tmp_path):
     """Declining must not read as 'absent' when the server is still registered."""
     res, clog = _run_register_http(
-        tmp_path, ["grep", "user", ""],
-        {"mcpServers": {"grep": {"type": "http", "url": "https://mcp.grep.app"}}})
+        tmp_path, ["grep-app", "user", ""],
+        {"mcpServers": {"grep-app": {"type": "http", "url": "https://mcp.grep.app"}}})
     assert res.returncode == 0
     assert "remains ACTIVE" in res.stdout
     assert "mcp add" not in (clog.read_text() if clog.exists() else "")
 
 
 def test_http_empty_url_with_no_entry_is_a_plain_skip(tmp_path):
-    res, clog = _run_register_http(tmp_path, ["grep", "user", ""], {"mcpServers": {}})
+    res, clog = _run_register_http(tmp_path, ["grep-app", "user", ""], {"mcpServers": {}})
     assert res.returncode == 0
     assert "registration declined" in res.stdout
     assert "remains ACTIVE" not in res.stdout
@@ -747,3 +747,41 @@ def test_http_url_default_is_declinable_by_empty_env(tmp_path):
         capture_output=True, text=True, timeout=30,
     )
     assert "URL=[https://mcp.grep.app]" in res_default.stdout
+
+
+def test_http_endpoint_override_heals_an_existing_registration(tmp_path):
+    """The override must work on a box Genesis has ALREADY set up.
+
+    An external reviewer measured this inert: the first bootstrap registered
+    the public endpoint, and a later run with GENESIS_GREP_MCP_URL pointing at
+    an internal one warned and left queries on the public URL. That is the
+    reason the server is registered under a Genesis-owned name — a URL
+    mismatch there is our own entry with a changed endpoint, so it is safe to
+    heal, which is precisely what an ambiguous name made impossible.
+    """
+    res, clog = _run_register_http(
+        tmp_path, ["grep-app", "user", "https://mcp.internal.example"],
+        {"mcpServers": {"grep-app": {"type": "http", "url": "https://mcp.grep.app"}}})
+
+    assert res.returncode == 0
+    log = clog.read_text() if clog.exists() else ""
+    assert "mcp remove grep-app" in log, "the stale endpoint must be removed"
+    assert "mcp add --transport http grep-app -s user https://mcp.internal.example" in log
+    assert "endpoint changed" in res.stdout
+
+
+def test_http_does_not_touch_a_plain_grep_entry(tmp_path):
+    """An operator's own `grep` server is not ours and must be left alone.
+
+    grep.app's own install command registers `grep`. Genesis deliberately does
+    not claim that name, so a box carrying both ends up with the operator's
+    `grep` untouched and Genesis's `grep-app` alongside it.
+    """
+    res, clog = _run_register_http(
+        tmp_path, ["grep-app", "user", "https://mcp.grep.app"],
+        {"mcpServers": {"grep": {"type": "http", "url": "https://their-own.example"}}})
+
+    assert res.returncode == 0
+    log = clog.read_text() if clog.exists() else ""
+    assert "mcp remove" not in log, "must never touch the operator's `grep`"
+    assert "mcp add --transport http grep-app" in log, "ours still registers"

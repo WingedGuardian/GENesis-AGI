@@ -792,12 +792,15 @@ if command -v serena &>/dev/null; then
     # caller's cwd — else bootstrap run from elsewhere writes to the wrong repo. B5.
     ( cd "$GENESIS_ROOT" && _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$GENESIS_ROOT" )
 fi
-# Grep (grep.app) — literal/regex code search over ~1M public GitHub repos.
+# grep-app (grep.app) — literal/regex code search over ~1M public GitHub repos.
+# Registered as `grep-app`, NOT the `grep` that grep.app's own docs use: a name
+# Genesis owns is one whose entries it can safely heal, and it leaves an
+# operator's own `grep` server alone.
 # No API key and no local binary: it is a REMOTE server, so there is nothing to
 # gate on `command -v`. User scope so it reaches worktree sessions too, which is
 # where most work here happens; project scope would cover only the main tree.
 # Registering does not start anything and costs nothing when unused.
-_register_mcp_http "grep" "user" "$GENESIS_GREP_MCP_URL"
+_register_mcp_http "grep-app" "user" "$GENESIS_GREP_MCP_URL"
 echo
 
 # --- Code Intelligence Indexing ---
