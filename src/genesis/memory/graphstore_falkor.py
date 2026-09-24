@@ -54,7 +54,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from genesis.env import falkordb_socket_path
-from genesis.memory.graphstore import GraphNode, GraphUnavailableError
+from genesis.memory.graphstore import DatabaseUnreachable, GraphNode, GraphUnavailableError
 
 if TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Awaitable, Callable
@@ -219,6 +219,28 @@ def _connect_in_daemon_thread(fn: Any, **kwargs: Any) -> asyncio.Future[Any]:
     return fut
 
 
+def _pid_alive(pid: int) -> bool:
+    """Is this pid a live process? Conservative: unknown counts as ALIVE.
+
+    The caller deletes what this says is dead, so the two error directions are
+    not symmetric. A false DEAD destroys a projection another process is
+    actively building; a false ALIVE leaves an orphan for the next sweep. Every
+    ambiguous case therefore answers True.
+    """
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists, owned by someone else. Not ours to reap either way.
+        return True
+    except OSError:
+        return True
+    return True
+
+
 def _project_lock(graph_key: str) -> asyncio.Lock:
     """The lock guarding projections of ``graph_key``.
 
@@ -226,6 +248,22 @@ def _project_lock(graph_key: str) -> asyncio.Lock:
     single-threaded event loop two coroutines cannot both create one.
     """
     return _PROJECT_LOCKS.setdefault(graph_key, asyncio.Lock())
+
+
+class ProjectionInProgress(GraphUnavailableError):
+    """Another projector process holds the cross-process publication lock.
+
+    NOT an engine failure, and told apart by TYPE rather than by message for
+    exactly the reason `_LeaseLost` below gives. The caller that matters is the
+    scheduled projector: an hourly tick colliding with a manual run (which this
+    module's own docstring recommends running) previously fell through to the
+    generic branch and printed "the engine is not reachable over its socket —
+    check genesis-falkordb", naming a service that was working perfectly.
+
+    Public, unlike its siblings, because `graphstore_project.main()` imports it
+    to decide an EXIT CODE: a collision is a benign no-op, not a failure, since
+    the run that holds the lock is projecting the same data.
+    """
 
 
 class _LeaseLost(GraphUnavailableError):
@@ -716,17 +754,24 @@ class FalkorGraphStore:
         because a stale projection is indistinguishable from a current one from
         the engine's side.
 
-        The bound on that window is the projector's cadence, and the projector is
-        F3's first slice: a scheduled full re-projection, decided at HOURLY. At
-        the measured 1,610 links/day that is at most ~70 links stale (a burst can
-        exceed it — dream cycles write in batches), and a restart self-heals
-        within the hour. It is a bounded window, not invalidation-on-write; the
-        DB-side change signal that would give write-level freshness is filed and
-        unbuilt (issue #1641), and is F3's second slice.
+        The bound on that window is the projector's cadence, and that cadence now
+        EXISTS: F3 slice 1 shipped `genesis-graph-project.timer`, a scheduled full
+        re-projection at HOURLY. At the measured 1,610 links/day that is at most
+        ~70 links stale (a burst can exceed it — dream cycles write in batches,
+        and one MEASURED week ranged from 4,075 links in a day to 5), and a
+        restart self-heals within the hour. It is a bounded window, not
+        invalidation-on-write; the DB-side change signal that would give
+        write-level freshness is filed and unbuilt (issue #1641), and is F3's
+        second slice.
 
-        None of it is reachable today: the lever defaults to `networkx`
-        (`config/graphstore.yaml`), so nothing reads this projection. The window
-        is what the cutover has to accept, or close first.
+        What that changes for the cutover: the window used to be open-ended, so
+        moving reads onto this store landed on a projection as stale as whenever
+        someone last ran the projector by hand. It is now one hour by default,
+        which is a cost to accept knowingly rather than an unknown. The lever
+        still defaults to `networkx` (`config/graphstore.yaml`), and the timer
+        deliberately does NOT gate on `mode` — the projection is kept current
+        whenever the engine exists, so flipping the lever lands on a current
+        graph instead of creating the staleness at the moment of the flip.
         """
         return None
 
@@ -735,9 +780,10 @@ class FalkorGraphStore:
     async def project(self, db: aiosqlite.Connection) -> dict[str, int]:
         """Rebuild the whole projection from ``memory_links``. Explicit, not scheduled.
 
-        F3 owns automating this (debounced on the dirty signal, with a
-        generation watermark). It lives here now because a store nothing ever
-        populates cannot be verified against anything.
+        Automated since F3 slice 1: `genesis-graph-project.timer` calls the
+        `graphstore_project` entrypoint hourly. The debounce-on-dirty-signal
+        refinement belongs to slice 2 (issue #1641) and is not built, so this is
+        a scheduled FULL re-projection rather than an incremental one.
 
         BUILD-THEN-SWAP, and the alternative is why. Projecting in place means
         `DETACH DELETE` followed by ~12.8s of batched writes, during which a
@@ -777,7 +823,7 @@ class FalkorGraphStore:
         async with _project_lock(self._graph_key):
             token = await self._acquire_publish_lock()
             if token is None:
-                raise GraphUnavailableError(
+                raise ProjectionInProgress(
                     f"another projection of {self._graph_key!r} is already in progress "
                     "— not starting a second one, because the two would race to "
                     "publish and the SLOWER build wins, which can walk the live "
@@ -787,6 +833,87 @@ class FalkorGraphStore:
                 return await self._project_locked(db, token)
             finally:
                 await self._release_publish_lock(token)
+
+    async def _sweep_orphan_staging(self) -> int:
+        """Delete staging graphs whose BUILDING PROCESS no longer exists.
+
+        WHY THIS IS NEEDED NOW, and it is a consequence of F3 rather than a
+        pre-existing hole. The staging key carries the pid, and the comment on
+        that choice reasons that an abandoned staging graph "has its orphan
+        reclaimed by this same process's NEXT run". That is true for an
+        IN-PROCESS scheduled projector, which is what was anticipated. F3
+        slice 1 ships a process-per-tick timer instead, so there IS no next run
+        in the same process: every tick has a new pid, and the previous tick's
+        orphan would never be reclaimed by anyone.
+
+        The trigger is the timeout the timer adds. MEASURED: Python's default
+        SIGTERM handling unwinds nothing — `except BaseException` and `finally`
+        both fail to run, where SIGINT runs both — so `TimeoutStartSec` firing
+        leaves a FULL copy of the projection behind, and each retry keys on a
+        different pid. Against a 1gb engine cap that accumulates.
+
+        A signal handler covers the timeout case, and this covers what no
+        handler can: SIGKILL, an OOM kill, a power loss. Those are precisely
+        when a duplicate graph is most likely to already be straining memory,
+        so the backstop matters more than the handler does.
+
+        PID NAMESPACES, asked about in review and worth answering here because
+        the pid check is NOT what makes this safe. The sweep runs from
+        ``_project_locked``, i.e. AFTER ``_acquire_publish_lock`` succeeded — so
+        while it runs, this process holds the cross-process publication lease
+        and no other projector can be between acquire and release. That property
+        is namespace-independent: it holds however the other process sees pids,
+        because it is enforced by the engine rather than by the OS.
+
+        The one gap in that argument is benign, and is stated rather than
+        glossed: a projector whose build outlasted the 300s lease TTL has
+        already LOST its claim, so we could acquire while it is still building
+        and reap its staging graph. Its publish was going to fail anyway — the
+        lease is gone — so nothing publishable is destroyed.
+
+        The pid check is therefore a second condition, not the first: it stops
+        this process reaping a key it might itself still want, and it keeps the
+        sweep inert on keys minted by something that is demonstrably alive.
+        Cross-namespace reachability would additionally require the engine's
+        unix socket to be visible in another namespace; it is created under
+        ``genesis_home()`` and the engine runs with ``--port 0``, so there is no
+        TCP path and the socket does not leave this filesystem by default.
+
+        Conservative by construction: it deletes only keys matching this graph's
+        own staging pattern whose pid suffix parses AND is provably gone. Its
+        own pid is skipped (the caller deletes that directly, and an in-flight
+        build must never be swept out from under itself). A recycled pid reads
+        as ALIVE and the orphan simply waits for a later sweep — the harmless
+        direction.
+        """
+        pattern = f"{self._graph_key}_staging_*"
+        cursor: int = 0
+        removed = 0
+        mine = os.getpid()
+        while True:
+            cursor, keys = await self._key_op(
+                "scan", cursor, match=pattern, count=100, timeout=_PROJECT_TIMEOUT_S
+            )
+            for raw in keys or ():
+                key = raw.decode() if isinstance(raw, bytes) else str(raw)
+                suffix = key.rsplit("_", 1)[-1]
+                if not suffix.isdigit():
+                    # Not a key this module minted. Leave it alone rather than
+                    # guessing at something another writer owns.
+                    continue
+                pid = int(suffix)
+                if pid == mine or _pid_alive(pid):
+                    continue
+                await self._key_op("delete", key, timeout=_PROJECT_TIMEOUT_S)
+                removed += 1
+                logger.warning(
+                    "graphstore: reclaimed orphan staging graph %s (pid %d is gone)",
+                    key,
+                    pid,
+                )
+            if not cursor:
+                break
+        return removed
 
     async def _project_locked(
         self, db: aiosqlite.Connection, token: str | None
@@ -837,7 +964,13 @@ class FalkorGraphStore:
             # escaping as a raw aiosqlite error past a facade that catches only
             # GraphUnavailableError — and this store must not reintroduce it on
             # its own projection path.
-            raise GraphUnavailableError(
+            # DatabaseUnreachable, not the generic error: this is the DATABASE
+            # failing, and the caller routes remediation on the type. Raising
+            # the parent here sent operators to `systemctl status
+            # genesis-falkordb` for a database problem, because the CLI's own
+            # database branch sits behind an `except GraphUnavailableError:
+            # raise` that this raise satisfied first.
+            raise DatabaseUnreachable(
                 f"the memory database cannot be read — the projection cannot "
                 f"be built: {exc}"
             ) from exc
@@ -862,6 +995,16 @@ class FalkorGraphStore:
         # hourly projector is an hour later rather than never.
         staging = f"{self._graph_key}_staging_{os.getpid()}"
         await self._key_op("delete", staging, timeout=_PROJECT_TIMEOUT_S)
+        # And every OTHER process's abandoned staging graph. The self-delete
+        # above only reclaims this pid's own orphan, which is sufficient for an
+        # in-process projector and useless for the process-per-tick timer F3
+        # actually ships — there, each tick has a new pid and nothing would ever
+        # reclaim the last one. Failures are logged and swallowed: a sweep that
+        # cannot run is not a reason to refuse to project.
+        try:
+            await self._sweep_orphan_staging()
+        except Exception:
+            logger.warning("graphstore: orphan staging sweep failed", exc_info=True)
 
         # CLEANUP COVERS THE WHOLE BUILD, not just the swap. An earlier version
         # wrapped only the rename, so a failure or timeout in index creation or
