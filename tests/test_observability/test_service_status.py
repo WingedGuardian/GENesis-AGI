@@ -234,3 +234,76 @@ class TestDetectGenesisService:
             side_effect=self._side_effect(server_installed=False, relay_active=False),
         ):
             assert _detect_genesis_service() == ("genesis-server.service", "Server")
+
+
+class TestCollectCcTmpUsageControlPlane:
+    """The control-plane counts must survive the read from the watchgod state file.
+
+    The state JSON is the only channel between the daemon that can SEE a severed
+    CC messaging socket and anything that can show it to a human, so a field that
+    the reader drops is a detector that reports to nobody.
+
+    The `unknown` cases matter as much as the populated one: a state file written
+    before this field existed, or written by a daemon whose probe could not run,
+    must never read as a healthy plane. "Could not measure" and "measured, and it
+    is fine" cannot share a value.
+    """
+
+    @staticmethod
+    def _read(tmp_path, payload: dict) -> dict:
+        state = tmp_path / "watchgod_state.json"
+        state.write_text(json.dumps(payload))
+        with patch(
+            "genesis.observability.service_status._TMP_WATCHGOD_STATE", state
+        ):
+            from genesis.observability.service_status import collect_cc_tmp_usage
+
+            return collect_cc_tmp_usage()
+
+    _BASE = {
+        "cc_tmp": {"tier": "green", "used_mb": 128, "budget_mb": 500},
+        "system_tmp": {"tier": "green", "used_pct": 0},
+        "poll_at": "2026-09-07T21:36:04Z",
+    }
+
+    def test_counts_are_passed_through(self, tmp_path):
+        result = self._read(
+            tmp_path,
+            {
+                **self._BASE,
+                "control_plane": {
+                    "status": "ok",
+                    "severed_sockets": 4,
+                    "stale_sockets": 1,
+                    "listeners": 5,
+                },
+            },
+        )
+        assert result["control_plane"] == {
+            "status": "ok",
+            "severed_sockets": 4,
+            "stale_sockets": 1,
+            "listeners": 5,
+        }
+        assert result["cc_tier"] == "green", "the existing fields must be untouched"
+
+    def test_missing_field_reads_as_unknown_not_healthy(self, tmp_path):
+        """A state file from a daemon that predates the detector."""
+        result = self._read(tmp_path, self._BASE)
+        assert result["control_plane"]["status"] == "unknown"
+
+    def test_daemon_reported_unknown_is_preserved(self, tmp_path):
+        """The daemon could not run its probe; that is not zero severed sockets."""
+        result = self._read(
+            tmp_path,
+            {
+                **self._BASE,
+                "control_plane": {
+                    "status": "unknown",
+                    "severed_sockets": 0,
+                    "stale_sockets": 0,
+                    "listeners": 0,
+                },
+            },
+        )
+        assert result["control_plane"]["status"] == "unknown"
