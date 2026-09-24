@@ -256,3 +256,55 @@ def test_run_mcp_suppresses_before_handing_off_to_run():
         "_run_mcp did not suppress the docket worker before calling run() — "
         "every MCP server will spin at ~4% of a CPU core while idle"
     )
+
+
+@pytest.mark.asyncio
+async def test_task_lookups_error_rather_than_returning_data(caplog):
+    """The one reachable protocol delta, pinned as a CONSCIOUS contract.
+
+    Raised on review (Devin, PR #2316): with docket suppressed, the three
+    ``tasks/*`` LOOKUP handlers return INTERNAL_ERROR ("Background tasks require
+    Docket") where they previously returned INVALID_PARAMS ("Task <id> not found").
+
+    Accepted rather than fixed, and this test is what makes that a decision instead
+    of an accident:
+
+    * No task can ever EXIST to be looked up. `server.py:705-721` raises
+      METHOD_NOT_FOUND for a `task_config.mode == "forbidden"` tool before docket is
+      consulted, and all 143 Genesis tools are forbidden (see the premise test
+      above). So every lookup is for an id that cannot exist, in both arms.
+    * Both arms ERROR. Neither returns data, and neither reports a task as missing
+      when it is present. The difference is which error code an impossible lookup
+      carries.
+    * The capability advertisement is NOT ours to change:
+      `low_level.py:187` sets `capabilities.tasks = get_task_capabilities()`
+      unconditionally, so fastmcp over-advertises relative to 143 forbidden tools
+      with or without this fix. Suppressing the advertisement would mean a SECOND
+      private-API intervention — more surface than the one being justified.
+
+    If a future change makes tasks reachable, `test_no_real_genesis_tool_opts_into_
+    background_tasks` fails first and names the server that did it.
+    """
+    module = _server_module()
+    mcp = _tool_server("tasks")
+    module._suppress_docket_worker(mcp)
+
+    async with Client(mcp) as client:
+        # list_tasks stays functional — measured identical in both arms. It returns
+        # a dict ({"tasks": [...], "nextCursor": ...}), so read the key rather than
+        # iterating the mapping, which yields the KEY NAMES and would pass/fail for
+        # entirely the wrong reason.
+        listed = await client.list_tasks()
+        assert listed["tasks"] == [], "a task existed on a server where none can be created"
+
+        for label, coro in (
+            ("get_task_status", client.get_task_status("missing-123")),
+            ("get_task_result", client.get_task_result("missing-123")),
+            ("cancel_task", client.cancel_task("missing-123")),
+        ):
+            with pytest.raises(Exception) as excinfo:  # noqa: B017 — see assert below
+                await coro
+            # The CONTRACT is "an impossible lookup errors", not the specific code:
+            # pinning the code would make this test fail on an upstream error-code
+            # change that harms nobody, which is how a test becomes noise.
+            assert excinfo.value is not None, f"{label} returned data for an impossible task id"
