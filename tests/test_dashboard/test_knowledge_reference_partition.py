@@ -187,6 +187,7 @@ from flask import Flask  # noqa: E402
 # blueprint — without it the test client 404s on every path below, which
 # would read as a passing guard.
 import genesis.dashboard.routes.knowledge  # noqa: E402,F401
+import genesis.dashboard.routes.knowledge_upload  # noqa: E402,F401
 from genesis.dashboard._blueprint import blueprint  # noqa: E402
 
 
@@ -347,3 +348,79 @@ async def test_stats_composes_both_filters_rather_than_dropping_one(db):
     # Guard-the-guard: a WHERE that matched nothing regardless would pass the above.
     only_project = await knowledge_crud.stats(db, project=REFERENCE_PROJECT)
     assert only_project["total"] == 1, "the project filter alone stopped working"
+
+
+# ── The partition has exactly one writer ─────────────────────────────
+
+
+def test_upload_refuses_the_reference_partition(client):
+    """A document upload must not be able to land in the reference store.
+
+    Excluding the partition from the knowledge browser closed the last door on
+    a row that should never have been there: `parse_reference_body` fails
+    CLOSED on a body it did not write and never falls back to the raw text, so
+    the References browser renders such a row blank, and the knowledge browser
+    now excludes it outright. The document would be reachable through neither —
+    data loss wearing the shape of a successful upload.
+
+    The fix is at the boundary rather than in either browser: the partition has
+    one writer, and it is not this route.
+    """
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = _rt()
+        resp = client.post(
+            "/api/genesis/knowledge/ingest",
+            json={"upload_id": "u-1", "project_type": REFERENCE_PROJECT, "domain": "auto"},
+        )
+
+    assert resp.status_code == 400
+    assert REFERENCE_PROJECT in (resp.get_json() or {}).get("error", "")
+
+
+def test_upload_still_accepts_an_ordinary_project_type(client):
+    """Guard-the-guard: refusing every upload would satisfy the test above.
+
+    Proven by REACHING THE NEXT STEP rather than by inspecting an error string:
+    the partition guard sits immediately before the status transition, so the
+    transition being attempted is exactly what "validation let it through"
+    means. Asserting on the absence of an error message would also pass if the
+    route fell over for some unrelated reason.
+    """
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch(
+            "genesis.db.crud.knowledge_uploads.atomic_transition",
+            new_callable=AsyncMock, return_value=False,
+        ) as mock_transition,
+        # The route consults `get` on the did-not-transition branch; stubbed so
+        # this test exercises the GUARD rather than the ingest machinery below it.
+        patch(
+            "genesis.db.crud.knowledge_uploads.get",
+            new_callable=AsyncMock, return_value=None,
+        ),
+    ):
+        MockRT.instance.return_value = _rt()
+        client.post(
+            "/api/genesis/knowledge/ingest",
+            json={"upload_id": "u-1", "project_type": "genesis", "domain": "auto"},
+        )
+
+    mock_transition.assert_awaited()
+    assert mock_transition.await_args.kwargs.get("project_type") == "genesis"
+
+
+@pytest.mark.asyncio
+async def test_taxonomy_does_not_offer_the_reserved_partition(db):
+    """The UI must not autocomplete a value the API refuses.
+
+    `taxonomy` reads DISTINCT project_type straight from `knowledge_units`,
+    which contains the reference rows — so the upload form was actively
+    offering the one value that orphaned the document.
+    """
+    from genesis.db.crud import knowledge_uploads
+
+    tax = await knowledge_uploads.taxonomy(db)
+    assert REFERENCE_PROJECT not in tax["project_types"], (
+        "autocomplete still offers the reserved partition"
+    )
+    assert "genesis" in tax["project_types"], "ordinary project types stopped being offered"
