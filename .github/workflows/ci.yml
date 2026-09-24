@@ -749,6 +749,15 @@ jobs:
           # NEITHER the -rf list nor the FAILURES block, so -rf alone leaves
           # the collection-time breakages -- the ones hardest to read off a
           # truncated log -- named nowhere.
+          # Falsifier for a claim this workflow's dormancy guard rests on:
+          # the fleet-door behavioural test needs a TERM to attach a tmux
+          # client, and is believed to have skipped on CI because runners set
+          # none. That was INFERRED, never measured -- the per-step `env:`
+          # echo above is what the step DECLARES, not the process
+          # environment (PATH and HOME are absent from it too). One line
+          # settles it in the log instead of leaving the next reader to
+          # re-derive it.
+          echo "TERM=[${TERM-UNSET}]"
           pytest -rfE --durations=25 \
             --ignore-glob='**/test_*az*.py' \
             --ignore-glob='**/test_*shim*.py' \
@@ -964,4 +973,47 @@ jobs:
         # contributes its delta against main, never its total — and the count
         # is only final once the last test-adding edit is in, which on this
         # branch was two rounds after the line was first written.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23419
+        #
+        # UNION with this branch's new test file: the blocked-task-resume
+        # work adds tests/test_autonomy/test_blocked_task_resume.py, which
+        # does not exist on main at all, so its delta is its FULL collected
+        # count, not the increment of the last edit that touched it.
+        # MEASURED on this branch, collected last:
+        #   pytest tests/test_autonomy/test_blocked_task_resume.py --collect-only -q
+        #   -> 19 tests collected
+        # so the floor is 23419 + 19 = 23438. The ceiling does not move:
+        # the file adds no skips.
+        #
+        # The previous resolution of this same conflict said '+2' and set
+        # 23344. That is the SEVENTH instance of the trap, from the third
+        # direction: the 2 was the delta of the claim-sweep edit against an
+        # EARLIER STATE OF THIS BRANCH, not against main. A floor that is
+        # too low still passes CI -- it just stops catching the 17 tests it
+        # was supposed to notice going missing, which is why nothing failed
+        # and nobody looked.
+        #
+        # UNION with this branch: the fleet-door probe fix adds
+        # tests/test_scripts/test_lobby_door_silent_probe.py, which does not
+        # exist on main, so its delta is its FULL collected count -- not the
+        # increment of the last edit that touched it.
+        #   pytest tests/test_scripts/test_lobby_door_silent_probe.py \
+        #     --collect-only -q  -> 2 tests collected
+        # so the floor is 23438 + 2 = 23440. The other test file this branch
+        # touches repairs an assertion inside an existing test: 20 test
+        # functions on main, 20 here, no delta.
+        #
+        # The CEILING does not move, and the reason is worth recording because
+        # the first attempt at this line moved it to 103 on a wrong diagnosis.
+        # That run did show 103 skips, and the extra one WAS this file -- but
+        # not from its @skipif, which had evaluated false because the runner
+        # has both tmux and script(1). The behavioural test ran, failed to
+        # attach a client for want of a TERM the runner does not set, and
+        # skipped at runtime through its own vacuity guard. Raising the
+        # ceiling would have recorded that dormancy as intended and left the
+        # only test that exercises the fix BEHAVIOURALLY never executing on
+        # CI (the static companion still binds it, and does run there). The
+        # test now sets TERM itself, so it SHOULD run and the count SHOULD
+        # stay at 102 -- a prediction, not a measurement: the run that would
+        # confirm it has not happened. If it is 103 again, read the skip
+        # message, which now carries the attach failure's own words.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23440

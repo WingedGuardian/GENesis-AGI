@@ -208,14 +208,28 @@ except Exception:  # noqa: BLE001 — see above: a load failure exits 1 = non-bl
 # separator starved it. Both copies carried it, so both were corrected — fixing the
 # degraded one alone would have left the LIVE net starved while the comment claimed
 # the class was closed.
+# `commit` IS here, and it is the one word whose membership differs by consumer.
+# MEASURED: paired with a `shell_parse` that predates `_REPARSE_CARRIERS`, the
+# import above fails and this matcher becomes the ONLY enforcement — and without
+# `commit` BOTH `eval git commit -n -m x` AND the direct `git commit -n -m x`
+# exited 0, i.e. the hook-skip gate vanished entirely in that pairing. This PR
+# adds `_REPARSE_CARRIERS` to that import, so it is this change that makes the
+# pairing reachable; the gap is therefore this change's to close.
+#
+# It does NOT follow that `_GATED_MENTION` should carry it — that one is read by
+# the LIVE blind-spot arm, where the same word cost +283 refusals on ordinary
+# heredocs (see its own note). This matcher only ever runs against a BROKEN hook
+# tree, where the file's stated direction is deliberate over-breadth and the
+# remedy printed to the caller is "repair the tree".
 _DEGRADED_GATED = (
     r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b"
-    r"|\b(?:push|merge)\b|\bgh\b|\bsqlite3\b"
+    r"|\b(?:push|merge|commit)\b|\bgh\b|\bsqlite3\b"
 )
 
 try:
     from shell_parse import (  # noqa: E402
         _KNOWN_SIGILS,
+        _REPARSE_CARRIERS,
         analyze,
         analyze_checked,
         commit_skips_hooks,
@@ -267,6 +281,31 @@ except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degrad
 # widening over 74,282 real commands: 15,945 -> 15,995, i.e. +50 (+0.07%).
 _GATED_MENTION = re.compile(
     r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b|\b(?:push|merge)\b"
+)
+
+# The CARRIER arm's own net. It is `_GATED_MENTION` plus `\bcommit\b`, and it is
+# SEPARATE on purpose — the two arms are different consumers with costs that
+# differ by more than an order of magnitude, and widening the shared pattern
+# charged the difference to a path that had no reason to pay it.
+#
+# Why `commit` is needed here: `git commit`'s short hook-skip form is `-n`, and a
+# pattern holding only `--no-verify` let `eval git commit -n -m x` through while
+# the direct spelling blocked via `commit_skips_hooks` (MEASURED). A narrower
+# `commit … -Xn` clause was measured and REJECTED — length-bounded, so it missed
+# `git commit --amend --no-edit --author="A B" --date=now -n`, and a case it did
+# match matched the word `commit` inside "commit message" rather than the
+# subcommand, i.e. passed for a reason unrelated to its intent.
+#
+# Why it must NOT be in the shared pattern. MEASURED over 83,201 recorded
+# commands: on the carrier arm the word costs 13 -> 22 (+9). On the BLIND-SPOT
+# arm, which reads the same pattern, it costs 404 -> 687 (+283) — and those are
+# real: 12 of 12 sampled corpus commands go allow on origin/main and BLOCK on
+# the widened pattern through the actual guard. They are ordinary
+# `python - <<'PY'` heredocs whose BODY happens to mention commit. An earlier
+# revision published the +9 as this guard's rate, having counted one arm of a
+# two-arm change.
+_CARRIER_GATED_MENTION = re.compile(
+    r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b|\b(?:push|merge|commit)\b"
 )
 
 # `gh pr create` is the FOURTH gated operation (it can push or fork the branch —
@@ -9422,6 +9461,67 @@ def _run_merge_and_push_gates() -> int:
         # honest split: an unreadable program naming a publish is worth
         # refusing, an unreadable program naming nothing is a Tuesday.
         hidden_gated_verb = any(s.verb_unresolved and s.exe in _GATED_EXES for s in segs)
+        # A LAUNCHER THE RESOLVER REFUSES TO MODEL, carrying a gated operation.
+        # `eval git push --no-verify` parses CLEANLY — `blind` is None — and
+        # resolves to `exe == "eval"`, so every predicate above sees no push and
+        # the raw-text net below never runs. MEASURED on the deployed guard:
+        # silent allow, where the bare spelling asks. Same class as
+        # `hidden_gated_verb` (an unreadable program naming a publish is worth
+        # refusing) and so it arms the SAME deferred deny, but it must sit
+        # OUTSIDE the `blind is not None` conjunct below — that is the whole
+        # defect: these segments are not blind, they are opaque.
+        # The carrier is what arms this, but the guard's own SUBJECT MATTER is
+        # what scopes it — the same shape `protected_paths_guard` uses at :262,
+        # where `\brm\b` gates its carrier arm.
+        #
+        # The distinction matters and an earlier revision of this line got it
+        # backwards. A text test is unsound for FINDING the operation: bash
+        # concatenates adjacent quoted fragments, so `eval "git pu""sh origin
+        # main"` runs `git push` while carrying no `push` token (MEASURED). It
+        # is sound for SCOPING a guard to the thing it gates, because a command
+        # that mentions no publish at all is not this guard's business however
+        # it is spelled. Dropping the scope made the branch ban the launcher
+        # rather than gate the operation: `eval ls -la`, `unshare -r whoami` and
+        # `systemd-run --user --scope -- /bin/true` were all refused by a PUSH
+        # guard, and the deny text told the reader to "run the git/gh command
+        # directly" on a command containing no git.
+        #
+        # MEASURED over the recorded corpus: 126 carrier hits unscoped, 22 once
+        # scoped — an 83% cut, with every attack spelling this change documents
+        # still refused, because each contains the literal `git`.
+        #
+        # STATED RESIDUAL: `eval "gi""t push"` escapes this bound, since the
+        # bound is itself text. That is the SAME exposure already accepted one
+        # file over, where a split `r""m` escapes the `\brm\b` prefilter — so
+        # the two guards now fail identically instead of taking opposite sides
+        # of one question. Closing it properly needs the resolver to report a
+        # carrier as a blind-spot cause, which is filed, not built here.
+        # PER SEGMENT, not per command. A carrier verdict is "a fact about a
+        # SPECIFIC segment" — this file says so where it explains why
+        # `hidden_gated_verb` must not be suppressed by a different segment
+        # parsing — and reading the whole command string made it a fact about
+        # the command. MEASURED cost of that: `eval "$(ssh-agent -s)" && git
+        # commit -m x` was REFUSED, where the `eval` carries nothing gated and
+        # the `git commit` is a separate, fully-parsed segment the ordinary
+        # commit gate already handles.
+        #
+        # `_mentions_gated_op` OR the carrier net: the former is this guard's
+        # own definition of its business and already includes `gh pr create` —
+        # the FOURTH gated operation, which a hand-built regex silently dropped
+        # (MEASURED: `eval gh pr create …` scored mentions_gated=True,
+        # carrier_net=False, and was ALLOWED). The carrier net adds only
+        # `commit`, which the shared pattern must not carry — see its
+        # definition.
+        #
+        # Every attack spelling keeps the gated word INSIDE the carrier's own
+        # segment, so none of them is affected: `eval git push`,
+        # `eval git commit -n -m x`, `eval "git pu""sh origin main"`,
+        # `su ubuntu -c 'git push'`, `eval gh pr create …`.
+        carried_gated_op = any(
+            s.exe in _REPARSE_CARRIERS
+            and (_mentions_gated_op(s.raw) or bool(_CARRIER_GATED_MENTION.search(s.raw)))
+            for s in segs
+        )
         # The two predicates are NOT suppressed by the same thing, and collapsing
         # them into one `not (…parsed…)` guard was the defect.
         #
@@ -9459,6 +9559,29 @@ def _run_merge_and_push_gates() -> int:
             if blind.bounds_induced:
                 print(blind_spot_deny, file=sys.stderr)
                 return 2
+
+        if carried_gated_op and blind_spot_deny is None:
+            # Its OWN message: the blind one interpolates `blind.cause`/`.hint`,
+            # and there is no `blind` here — these segments parse cleanly. The
+            # blind branch keeps precedence when both fire, because its
+            # diagnosis is the sharper one.
+            #
+            # The remedy is deliberately NOT "rephrase until the guard stops
+            # matching" — that would be a bypass instruction. Both routes it
+            # offers submit to the gate: drop the launcher so the operation is
+            # visible, or keep the launcher and run the gated command as its own
+            # tool call where the ordinary gates see it.
+            blind_spot_deny = (
+                "BLOCKED: this command names a gated operation and runs a "
+                "launcher whose payload this guard cannot recover, so it "
+                "cannot verify what would actually run. The payload is not "
+                "inspected on purpose: adjacent quoted fragments concatenate, "
+                "so a carried command can be spelled past any inspection.\n"
+                "To proceed: run the git/gh command directly, without the "
+                "launcher, so the ordinary push and merge gates can see it — or "
+                "keep the launcher for the work that needs it and issue the "
+                "gated command as its own Bash call."
+            )
 
         # Each git push / gh pr merge is a SEPARATE gated action. A single Bash
         # command carrying more than one would collapse into ONE ask/gate

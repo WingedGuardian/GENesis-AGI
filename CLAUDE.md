@@ -66,6 +66,11 @@ gateway, so the host recovery brain never lags a pin bump between updates; see
 `genesis-cc-settings-align.timer` (daily CONTAINER-side re-assert of CC's
 auto-updater suppression in `~/.claude/settings.json`, because the align path
 only helps a box that actually runs an align; see `scripts/cc_settings_align.sh`),
+`genesis-graph-project.timer` (hourly rebuild of the memory-graph projection
+that the FalkorDB store reads — the staleness BOUND, since that store's
+`invalidate()` is a no-op and nothing else refreshes it; a clean no-op on
+installs with no graph engine, so it is enabled everywhere; see
+`scripts/graph_project_runner.sh`),
 `genesis-code-intel.timer` (idle-gated code-intel
 index-request consumer; see `scripts/code_intel_runner.sh`) with
 `genesis-code-intel-freeze.service` as its on-demand kill-switch (rendered but
@@ -658,6 +663,9 @@ behind the writer, and 7 were a guard since removed.
   with a single question — a Claude Code rendering bug rejects single-question
   calls. Always pass ≥2 questions; if only one is real, add a trivial/filler
   second question to satisfy the tool. Every time, no exceptions.
+- **Diagnosis before fixes.** Always pause to tell the user the diagnosis
+  before rushing to fixes — unless they tell you not to, or the matter is
+  time-urgent.
 - **A question you need answered gets ASKED, and carries what it takes to
   answer it.** Prose questions in the body of a message get missed, so ask
   through `AskUserQuestion` — and RE-ASK when one goes unanswered and still
