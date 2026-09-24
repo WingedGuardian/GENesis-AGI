@@ -130,8 +130,11 @@ jobs:
 
       - name: Run installer (non-interactive, strict)
         env:
+          GENESIS_DEPLOY_BRANCH: ci-fresh-install
           GENESIS_INSTALL_STRICT: "1"
-        run: ./scripts/install.sh --non-interactive
+        run: |
+          git switch -c ci-fresh-install
+          ./scripts/install.sh --non-interactive
 
       - name: Verify install outcome
         run: |

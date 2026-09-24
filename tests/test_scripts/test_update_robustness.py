@@ -86,7 +86,7 @@ def test_conflict_json_is_valid_under_hostile_input(text: str) -> None:
 
 # ── #3 — bounded network calls ─────────────────────────────────────────────
 def test_git_fetch_is_timeout_bounded(text: str) -> None:
-    assert 'timeout 120 git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main' in text
+    assert 'timeout 120 git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" "$DEPLOY_BRANCH"' in text
 
 
 def test_health_curls_have_max_time(text: str) -> None:

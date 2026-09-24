@@ -42,16 +42,16 @@ def test_nohup_fallback_closes_lock_fd(text: str) -> None:
     assert "{_UPDATE_LOCK_FD}>&-" in block, "nohup fallback must close the lock FD for the child"
 
 
-def test_flock_after_worktree_refusal_before_backup(text: str) -> None:
-    """Placement: after the worktree refusal (so worktree runs never take the
+def test_flock_after_checkout_refusal_before_backup(text: str) -> None:
+    """Placement: after the checkout refusal (so invalid runs never take the
     lock) and before the rollback tag / pre-update backup (so the whole mutating
     run is protected) — and thus before the ERR/signal traps arm."""
-    worktree = text.find("update.sh must not run from a worktree")
+    checkout = text.find('genesis_assert_deploy_checkout "$GENESIS_ROOT" "$DEPLOY_BRANCH"')
     lock = text.find('exec {_UPDATE_LOCK_FD}>"$UPDATE_LOCK_FILE"')
     rollback_tag = text.find('ROLLBACK_TAG="pre-update-')
     trap_arm = text.find("trap _on_err ERR")
-    assert -1 < worktree < lock < rollback_tag, (
-        "flock must sit after worktree refusal, before the rollback tag"
+    assert -1 < checkout < lock < rollback_tag, (
+        "flock must sit after checkout refusal, before the rollback tag"
     )
     assert lock < trap_arm, (
         "flock must acquire before the ERR trap arms (contention exit is server-safe)"

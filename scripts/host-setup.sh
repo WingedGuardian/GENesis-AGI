@@ -55,6 +55,7 @@ DISK="30GB"
 CPUS="8"
 REPO_URL=""
 BRANCH="main"
+_BRANCH_EXPLICIT=0
 NON_INTERACTIVE=0
 INCUS_POOL_DIR=""  # auto-detected: set to /home/incus-data on split-disk VMs
 # Shell-quote each arg (printf %q) so the group-activation re-exec below
@@ -76,7 +77,7 @@ while [ $# -gt 0 ]; do
         --disk)           [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; DISK="$2"; _DISK_EXPLICIT=1; shift ;;
         --cpus)           [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; CPUS="$2"; _CPUS_EXPLICIT=1; shift ;;
         --repo)           [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; REPO_URL="$2"; shift ;;
-        --branch)         [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; BRANCH="$2"; shift ;;
+        --branch)         [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; BRANCH="$2"; _BRANCH_EXPLICIT=1; shift ;;
         --non-interactive) NON_INTERACTIVE=1 ;;
         -h|--help)
             sed -n '2,/^$/{ s/^# \?//; p }' "$0"
@@ -86,6 +87,44 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+_GENESIS_ROOT="$(cd "$_SCRIPT_DIR/.." && pwd)"
+# shellcheck source=lib/deploy_checkout.sh
+. "$_SCRIPT_DIR/lib/deploy_checkout.sh"
+if [ "$_BRANCH_EXPLICIT" = "1" ]; then
+    _DEPLOY_BRANCH="$(
+        GENESIS_DEPLOY_BRANCH="$BRANCH" genesis_resolve_deploy_branch "$_GENESIS_ROOT"
+    )"
+else
+    _DEPLOY_BRANCH="$(genesis_resolve_deploy_branch "$_GENESIS_ROOT")"
+    _PENDING_FILE="$(genesis_deploy_pending_file)"
+    if _PENDING_BRANCH="$(genesis_read_deploy_branch_file "$_PENDING_FILE" 2>/dev/null)"; then
+        _PENDING_RESOLVED="$(
+            GENESIS_DEPLOY_BRANCH="$_PENDING_BRANCH" \
+                genesis_resolve_deploy_branch "$_GENESIS_ROOT"
+        )"
+        if ! git -C "$_GENESIS_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            _DEPLOY_BRANCH="$_PENDING_RESOLVED"
+            _BRANCH_EXPLICIT=1
+        else
+            _CURRENT_BRANCH="$(git -C "$_GENESIS_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+            if [ "$_CURRENT_BRANCH" = "$_PENDING_RESOLVED" ]; then
+                _DEPLOY_BRANCH="$_PENDING_RESOLVED"
+                _BRANCH_EXPLICIT=1
+            elif [ "$_CURRENT_BRANCH" = "$_DEPLOY_BRANCH" ]; then
+                rm -f "$_PENDING_FILE"
+            fi
+        fi
+    fi
+fi
+if [ "$_BRANCH_EXPLICIT" = "1" ]; then
+    genesis_write_deploy_pending "$_DEPLOY_BRANCH"
+fi
+if git -C "$_GENESIS_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    genesis_assert_deploy_checkout "$_GENESIS_ROOT" "$_DEPLOY_BRANCH"
+fi
+BRANCH="$_DEPLOY_BRANCH"
 
 # Auto-detect repo URL from current remote if not specified
 if [ -z "$REPO_URL" ]; then
@@ -1021,6 +1060,8 @@ if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -
     incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
         --env "HOME=/home/ubuntu" \
         --env "XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID" \
+        --env "GENESIS_DEPLOY_BRANCH=$BRANCH" \
+        --env "GENESIS_PERSIST_DEPLOY_BRANCH=1" \
         --env "GENESIS_TIMEZONE=$_final_tz" \
         $_incus_tty --cwd /home/ubuntu/genesis -- \
         bash scripts/install.sh $_install_flags || {
@@ -1030,12 +1071,17 @@ if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -
         echo "  Connect to the container to debug:"
         echo "    incus exec $CONTAINER_NAME --user $UBUNTU_UID --env HOME=/home/ubuntu --env XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID --cwd /home/ubuntu/genesis -t -- bash -l"
     }
+    if [ "$_install_ok" = "1" ] && [ "$_BRANCH_EXPLICIT" = "1" ]; then
+        genesis_ensure_deploy_config "$_DEPLOY_BRANCH" 1
+        rm -f "$(genesis_deploy_pending_file)"
+    fi
 else
     echo ""
     echo "  ERROR: Genesis repo not found in container."
     echo "  Push the code manually, then run install.sh:"
     echo "    incus file push -r . ${CONTAINER_NAME}/home/ubuntu/genesis/"
     echo "    incus exec $CONTAINER_NAME --user $UBUNTU_UID --env HOME=/home/ubuntu --env XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID -t --cwd /home/ubuntu/genesis -- bash scripts/install.sh"
+    echo "    (re-running install.sh requires --env GENESIS_DEPLOY_BRANCH=$BRANCH --env GENESIS_PERSIST_DEPLOY_BRANCH=1)"
 fi
 
 # ── Container smoke test ──────────────────────────────────────
@@ -1177,7 +1223,6 @@ echo ""
 
 # Run install_guardian.sh from the LOCAL checkout (this repo).
 # install_guardian.sh copies code from its parent dir into ~/.local/share/genesis-guardian.
-_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 _guardian_script="$_SCRIPT_DIR/install_guardian.sh"
 if [ -f "$_guardian_script" ]; then
     _guardian_flags="--container-name $CONTAINER_NAME"

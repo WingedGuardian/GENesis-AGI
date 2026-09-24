@@ -80,6 +80,15 @@ if [ -z "${HOME:-}" ]; then
     [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
     export HOME
 fi
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=lib/deploy_checkout.sh
+. "$SCRIPT_DIR/lib/deploy_checkout.sh"
+DEPLOY_BRANCH="$(genesis_resolve_deploy_branch "$REPO_DIR")"
+genesis_assert_deploy_checkout "$REPO_DIR" "$DEPLOY_BRANCH"
+genesis_ensure_deploy_config "$DEPLOY_BRANCH"
+
 if ! grep -q "^HOME=" /etc/environment 2>/dev/null; then
     # /etc/environment is root-owned. Persist HOME best-effort: write directly
     # if it is writable (root installs), else via passwordless sudo. If neither
@@ -122,8 +131,6 @@ if [ -z "${TMPDIR:-}" ]; then
 fi
 
 # ── Path setup ───────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_PATH="${VENV_PATH:-$REPO_DIR/.venv}"
 SECRETS_FILE="${SECRETS_PATH:-$REPO_DIR/secrets.env}"
 SETUP_WARNINGS=0

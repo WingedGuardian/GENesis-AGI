@@ -64,6 +64,15 @@ SCRIPT_DIR="$GENESIS_ROOT/scripts"
 VENV_DIR="$GENESIS_ROOT/.venv"
 STARTED_AT="$(date -Iseconds)"
 STATE_FILE="$HOME/.genesis/update_state.json"
+CONFLICT_FILE="$HOME/.genesis/update_conflicts.json"
+
+# Refuse an undeployable checkout before clearing breadcrumbs, taking the update
+# lock, backing up data, or touching services.
+# shellcheck source=lib/deploy_checkout.sh
+. "$SCRIPT_DIR/lib/deploy_checkout.sh"
+DEPLOY_BRANCH="$(genesis_resolve_deploy_branch "$GENESIS_ROOT")"
+genesis_assert_deploy_checkout "$GENESIS_ROOT" "$DEPLOY_BRANCH"
+genesis_ensure_deploy_config "$DEPLOY_BRANCH"
 
 # Guardian pause across the deploy's server restart (PR-2). We pause the host
 # Guardian's gateway before the stop and resume on EXIT, so a deploy doesn't trip
@@ -98,12 +107,24 @@ _write_state() {
     "rollback_tag": "${ROLLBACK_TAG:-}",
     "old_tag": "${OLD_TAG:-}",
     "old_commit": "${OLD_COMMIT:-}",
+    "deploy_branch": "${DEPLOY_BRANCH:-}",
+    "deploy_head": "${DEPLOY_HEAD:-}",
     "started_at": "$STARTED_AT",
     "pid": $$,
     "services_stopped": [$(printf '"%s",' "${WERE_RUNNING[@]:-}" | sed 's/,$//')],
     "timestamp": "$(date -Iseconds)"
 }
 SEOF
+}
+
+_read_json_field() {
+    local file="$1"
+    local field="$2"
+    [ -f "$file" ] || return 1
+    GH_STATE_FILE="$file" GH_FIELD="$field" \
+        "$VENV_DIR/bin/python" -c \
+        "import json, os; print(json.load(open(os.environ['GH_STATE_FILE'])).get(os.environ['GH_FIELD'],''))" \
+        2>/dev/null
 }
 
 # Clear this run's deploy state files. The state file is ours (we wrote it) so
@@ -183,16 +204,6 @@ if [ -e "$HOME/.genesis/cc_suppression_outcome" ]; then
          "a suppression outcome reported later in this deploy may predate it"
 fi
 
-# Refuse to run from a worktree — pip install -e in bootstrap.sh would
-# redirect system-wide imports and cause I/O death spiral.
-if [[ "$GENESIS_ROOT" == *"/.claude/worktrees/"* ]] || \
-   [[ "$GENESIS_ROOT" == *"/.worktrees/"* ]]; then
-    echo "ERROR: update.sh must not run from a worktree."
-    echo "       GENESIS_ROOT=$GENESIS_ROOT"
-    echo "       Run from the main checkout instead."
-    exit 1
-fi
-
 # ── Mutual exclusion: only one update.sh at a time ────────
 # CLI runs, the dashboard direct path, and the orchestrator all reach this
 # script; without a shared lock two could overlap (both stop the server, both
@@ -233,7 +244,7 @@ UPDATE_REMOTE="$(_detect_update_remote)"
 echo "  Update remote: $UPDATE_REMOTE"
 
 # ── Current state ─────────────────────────────────────────
-ORIGINAL_BRANCH=$(git -C "$GENESIS_ROOT" symbolic-ref --short HEAD 2>/dev/null || echo "main")
+ORIGINAL_BRANCH=$(git -C "$GENESIS_ROOT" symbolic-ref --short HEAD)
 OLD_TAG=$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "untagged")
 OLD_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
 NEW_TAG="$OLD_TAG"
@@ -683,15 +694,22 @@ fi
 
 # ── Rollback tag ─────────────────────────────────────────
 ROLLBACK_TAG="pre-update-$(date +%Y%m%d-%H%M%S)"
-if [[ "$POST_MERGE" == "true" ]] && [ -f "$STATE_FILE" ]; then
-    # In post-merge mode, reuse the rollback tag from the initial update.sh run
-    # so rollback goes to pre-merge code, not the merged code.
-    _saved_rt=$(
-        GH_STATE_FILE="$STATE_FILE" \
-        "$VENV_DIR/bin/python" -c \
-        "import json, os; print(json.load(open(os.environ['GH_STATE_FILE'])).get('rollback_tag',''))" \
-        2>/dev/null
-    ) || _saved_rt=""
+if [[ "$POST_MERGE" == "true" ]]; then
+    # In post-merge mode, recover the original target and rollback tag from
+    # durable state. update_state is preferred; update_conflicts survives the
+    # dashboard's stopped-update state cleanup during long resolutions.
+    _saved_rt="$(_read_json_field "$STATE_FILE" rollback_tag || true)"
+    _saved_old_tag="$(_read_json_field "$STATE_FILE" old_tag || true)"
+    _saved_old_commit="$(_read_json_field "$STATE_FILE" old_commit || true)"
+    _saved_deploy_branch="$(_read_json_field "$STATE_FILE" deploy_branch || true)"
+    _saved_deploy_head="$(_read_json_field "$STATE_FILE" deploy_head || true)"
+    if [ -f "$CONFLICT_FILE" ]; then
+        [ -n "$_saved_rt" ] || _saved_rt="$(_read_json_field "$CONFLICT_FILE" rollback_tag || true)"
+        [ -n "$_saved_old_tag" ] || _saved_old_tag="$(_read_json_field "$CONFLICT_FILE" old_tag || true)"
+        [ -n "$_saved_old_commit" ] || _saved_old_commit="$(_read_json_field "$CONFLICT_FILE" old_commit || true)"
+        [ -n "$_saved_deploy_branch" ] || _saved_deploy_branch="$(_read_json_field "$CONFLICT_FILE" deploy_branch || true)"
+        [ -n "$_saved_deploy_head" ] || _saved_deploy_head="$(_read_json_field "$CONFLICT_FILE" deploy_head || true)"
+    fi
     if [ -n "$_saved_rt" ] && git -C "$GENESIS_ROOT" rev-parse "$_saved_rt" >/dev/null 2>&1; then
         ROLLBACK_TAG="$_saved_rt"
         echo "  Post-merge mode: reusing rollback tag $ROLLBACK_TAG"
@@ -699,22 +717,11 @@ if [[ "$POST_MERGE" == "true" ]] && [ -f "$STATE_FILE" ]; then
         git -C "$GENESIS_ROOT" tag "$ROLLBACK_TAG"
         echo "  Post-merge mode: created fallback rollback tag $ROLLBACK_TAG"
     fi
-    # Recover OLD_TAG/OLD_COMMIT from state file for correct update_history.
-    _saved_old_tag=$(
-        GH_STATE_FILE="$STATE_FILE" \
-        "$VENV_DIR/bin/python" -c \
-        "import json, os; print(json.load(open(os.environ['GH_STATE_FILE'])).get('old_tag',''))" \
-        2>/dev/null
-    ) || true
-    [ -n "${_saved_old_tag:-}" ] && OLD_TAG="$_saved_old_tag"
-    _saved_old_commit=$(
-        GH_STATE_FILE="$STATE_FILE" \
-        "$VENV_DIR/bin/python" -c \
-        "import json, os; print(json.load(open(os.environ['GH_STATE_FILE'])).get('old_commit',''))" \
-        2>/dev/null
-    ) || true
-    [ -n "${_saved_old_commit:-}" ] && OLD_COMMIT="$_saved_old_commit"
+    [ -n "$_saved_old_tag" ] && OLD_TAG="$_saved_old_tag"
+    [ -n "$_saved_old_commit" ] && OLD_COMMIT="$_saved_old_commit"
 else
+    _saved_deploy_branch=""
+    _saved_deploy_head=""
     git -C "$GENESIS_ROOT" tag "$ROLLBACK_TAG"
     echo "  Rollback tag: $ROLLBACK_TAG"
 fi
@@ -736,10 +743,26 @@ echo ""
 # up and exits with the server untouched.
 if [[ "$POST_MERGE" == "false" ]]; then
     echo "--- Fetching latest ---"
-    if ! timeout 120 git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main; then
+    if ! timeout 120 git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" "$DEPLOY_BRANCH"; then
         echo "  Fetch failed (network/timeout?) — server NOT stopped, nothing changed."
         git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
         _clear_deploy_state
+        exit 1
+    fi
+    DEPLOY_HEAD=$(git -C "$GENESIS_ROOT" rev-parse FETCH_HEAD)
+else
+    if [ -n "$_saved_deploy_branch" ] && [ "$_saved_deploy_branch" != "$DEPLOY_BRANCH" ]; then
+        echo "ERROR: saved update targeted deploy branch '$_saved_deploy_branch', not '$DEPLOY_BRANCH'." >&2
+        exit 1
+    fi
+    if [ -z "$_saved_deploy_head" ] \
+        || ! git -C "$GENESIS_ROOT" rev-parse --verify "$_saved_deploy_head^{commit}" >/dev/null 2>&1; then
+        echo "ERROR: post-merge update requires the fetched deploy head saved by the initial run." >&2
+        exit 1
+    fi
+    DEPLOY_HEAD="$_saved_deploy_head"
+    if ! git -C "$GENESIS_ROOT" merge-base --is-ancestor "$DEPLOY_HEAD" HEAD; then
+        echo "ERROR: post-merge HEAD does not contain the fetched deploy head $DEPLOY_HEAD." >&2
         exit 1
     fi
 fi
@@ -1129,6 +1152,17 @@ PYEOF
     return 0
 }
 
+# BEGIN success-degraded-subsystems (extracted by tests/test_scripts/test_update_deploy_safety.py)
+_success_degraded_subsystems() {
+    local degraded="$1"
+    local server_not_restarted="$2"
+    if [ "$server_not_restarted" = "true" ]; then
+        degraded="${degraded:+$degraded,}genesis-server-not-restarted"
+    fi
+    printf '%s\n' "$degraded"
+}
+# END success-degraded-subsystems
+
 # ── Rollback helper function ─────────────────────────────
 _do_rollback() {
     local reason="$1"
@@ -1375,21 +1409,34 @@ if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$USER_MD" &>/dev/null \
 fi
 # END user-md-premerge
 
+# BEGIN ephemeral-premerge-backup (extracted by tests/test_scripts/test_update_deploy_safety.py)
+EPHEMERAL_BACKUP_ROOT="$HOME/.genesis/premerge-backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
 for _eph in AGENTS.md config/procedure_triggers.yaml; do
     if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$_eph" &>/dev/null \
        && ! git -C "$GENESIS_ROOT" diff --quiet HEAD -- "$_eph" 2>/dev/null; then
+        _eph_backup="$EPHEMERAL_BACKUP_ROOT/$_eph"
+        mkdir -p "$_eph_backup"
+        chmod 700 "$EPHEMERAL_BACKUP_ROOT" "$_eph_backup"
+        git -C "$GENESIS_ROOT" diff --binary HEAD -- "$_eph" \
+            > "$_eph_backup/worktree.patch"
+        git -C "$GENESIS_ROOT" diff --binary --cached HEAD -- "$_eph" \
+            > "$_eph_backup/index.patch"
+        if [ -e "$GENESIS_ROOT/$_eph" ]; then
+            cp "$GENESIS_ROOT/$_eph" "$_eph_backup/current"
+        fi
         # `checkout HEAD --` (not `checkout --`) restores BOTH index and worktree
         # from HEAD, so a staged edit is cleared too — `checkout --` alone would
         # leave a staged change and the merge would still abort.
         git -C "$GENESIS_ROOT" checkout HEAD -- "$_eph" 2>/dev/null \
-            && echo "  (discarded local edits to ephemeral $_eph before merge)"
+            && echo "  (backed up $_eph to $_eph_backup; cleared local edits before merge)"
     fi
 done
+# END ephemeral-premerge-backup
 
-echo "--- Merging $UPDATE_REMOTE/main ---"
+echo "--- Merging $UPDATE_REMOTE/$DEPLOY_BRANCH ---"
 MERGE_OUTPUT=""
 MERGE_RC=0
-MERGE_OUTPUT=$(git -C "$GENESIS_ROOT" merge "$UPDATE_REMOTE/main" --no-edit 2>&1) || MERGE_RC=$?
+MERGE_OUTPUT=$(git -C "$GENESIS_ROOT" merge "$DEPLOY_HEAD" --no-edit 2>&1) || MERGE_RC=$?
 
 if [[ $MERGE_RC -ne 0 ]]; then
     # Check if this is a merge conflict (unmerged paths) vs other error
@@ -1407,9 +1454,11 @@ if [[ $MERGE_RC -ne 0 ]]; then
         # whole conflict context. Filenames with quotes broke the array the same
         # way. Guarded with `if !` (ERR-trap-exempt): a failure to write this
         # advisory supervisor context must NOT trip the armed rollback trap.
-        _uc_target_tag="$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$UPDATE_REMOTE/main" 2>/dev/null || echo 'untagged')"
-        _uc_target_commit="$(git -C "$GENESIS_ROOT" rev-parse --short "$UPDATE_REMOTE/main" 2>/dev/null || echo 'unknown')"
+        _uc_target_tag="$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$DEPLOY_HEAD" 2>/dev/null || echo 'untagged')"
+        _uc_target_commit="$(git -C "$GENESIS_ROOT" rev-parse "$DEPLOY_HEAD" 2>/dev/null || echo 'unknown')"
         if ! UC_OLD_TAG="$OLD_TAG" UC_OLD_COMMIT="$OLD_COMMIT" \
+             UC_ROLLBACK_TAG="$ROLLBACK_TAG" \
+             UC_DEPLOY_BRANCH="$DEPLOY_BRANCH" UC_DEPLOY_HEAD="$DEPLOY_HEAD" \
              UC_TARGET_TAG="$_uc_target_tag" UC_TARGET_COMMIT="$_uc_target_commit" \
              UC_FILES="$CONFLICTED_FILES" UC_MERGE_OUTPUT="$MERGE_OUTPUT" \
              "$VENV_DIR/bin/python" - > "$HOME/.genesis/update_conflicts.json.tmp" <<'PYEOF'
@@ -1422,8 +1471,11 @@ merge = "\n".join(os.environ.get("UC_MERGE_OUTPUT", "").splitlines()[:20])
 data = {
     "old_tag": os.environ.get("UC_OLD_TAG", ""),
     "old_commit": os.environ.get("UC_OLD_COMMIT", ""),
+    "rollback_tag": os.environ.get("UC_ROLLBACK_TAG", ""),
     "target_tag": os.environ.get("UC_TARGET_TAG", ""),
     "target_commit": os.environ.get("UC_TARGET_COMMIT", ""),
+    "deploy_branch": os.environ.get("UC_DEPLOY_BRANCH", ""),
+    "deploy_head": os.environ.get("UC_DEPLOY_HEAD", ""),
     "conflicted_files": files,
     "merge_output": merge,
     "timestamp": datetime.now(UTC).isoformat(),
@@ -1433,7 +1485,7 @@ PYEOF
         then
             echo "  WARNING: could not write structured conflict context (advisory)"
             rm -f "$HOME/.genesis/update_conflicts.json.tmp" || true
-        elif mv "$HOME/.genesis/update_conflicts.json.tmp" "$HOME/.genesis/update_conflicts.json"; then
+        elif mv "$HOME/.genesis/update_conflicts.json.tmp" "$CONFLICT_FILE"; then
             echo ""
             echo "  Conflict context written to ~/.genesis/update_conflicts.json"
         else
@@ -1474,6 +1526,12 @@ PYEOF
         _do_rollback "git merge failed: $(echo "$MERGE_OUTPUT" | head -3 | tr '\n' ' ')"
         exit 1
     fi
+fi
+
+if ! git -C "$GENESIS_ROOT" merge-base --is-ancestor "$DEPLOY_HEAD" HEAD; then
+    trap - ERR INT TERM
+    _do_rollback "merge completed without activating fetched deploy head $DEPLOY_HEAD"
+    exit 1
 fi
 
 NEW_TAG=$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "untagged")
@@ -1577,14 +1635,20 @@ elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
     # we must not erase it. This path also exits before the success-path
     # recording, so it doubles as the place to persist any host-side degradation
     # the drift healing just found.
+    _nd_server_not_restarted=false
+    [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]] \
+        || _nd_server_not_restarted=true
+    _nd_base_degraded="${HOST_CC_DEGRADED:-$PRE_UPDATE_DEGRADED}"
+    _nd_degraded="$(_success_degraded_subsystems \
+        "${HOST_CC_DEGRADED:-}" "$_nd_server_not_restarted")"
     if [ -f "$HOME/.genesis/last_update_failure.json" ] \
         && [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
         rm -f "$HOME/.genesis/last_update_failure.json"
-        _record_update_history "success" "" "$HOST_CC_DEGRADED"
+        _record_update_history "success" "" "$_nd_degraded"
         echo "  Cleared stale update-failure marker (server healthy, code current)."
-    elif [ -n "$HOST_CC_DEGRADED" ] || [ -n "$PRE_UPDATE_DEGRADED" ]; then
-        echo "  NOTE: recording degraded subsystem: ${HOST_CC_DEGRADED:-$PRE_UPDATE_DEGRADED}"
-        _record_update_history "success" "" "$HOST_CC_DEGRADED"
+    elif [ -n "$_nd_base_degraded" ] || [ "$_nd_server_not_restarted" = "true" ]; then
+        echo "  NOTE: recording degraded subsystem: $_nd_degraded"
+        _record_update_history "success" "" "$_nd_degraded"
     fi
     echo ""
     echo "  Nothing to do."
@@ -2281,10 +2345,10 @@ fi
 # If the server was operator-stopped (empty WERE_RUNNING, no recovery artifact),
 # it was intentionally NOT restarted or health-verified — record that in the
 # degraded column so this isn't a bare "success" that hides a down server.
-_p6_degraded="$HOST_CC_DEGRADED"
+_p6_degraded="$(_success_degraded_subsystems \
+    "$HOST_CC_DEGRADED" "${_OPERATOR_STOP:-false}")"
 if [ "${_OPERATOR_STOP:-false}" = "true" ]; then
     echo "  NOTE: server was not running at update start (operator-stopped) — not restarted."
-    _p6_degraded="${_p6_degraded:+$_p6_degraded,}genesis-server-not-restarted"
 fi
 # Subsystems that failed to initialise (or an unreadable/stale manifest). Advisory
 # by design — see the health-verification block — but it must reach the record,
@@ -2298,7 +2362,7 @@ _write_state "done"
 
 # Clean up state files — successful update, nothing to recover
 rm -f "$STATE_FILE"
-rm -f "$HOME/.genesis/update_conflicts.json"
+rm -f "$CONFLICT_FILE"
 rm -f "$HOME/.genesis/last_update_summary.txt"
 # Clean up PID file
 _clear_deploy_state

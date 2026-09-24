@@ -26,6 +26,11 @@ if [[ -z "${HOME:-}" ]]; then
     export HOME
 fi
 
+# shellcheck source=lib/deploy_checkout.sh
+. "$SCRIPT_DIR/lib/deploy_checkout.sh"
+DEPLOY_BRANCH="$(genesis_resolve_deploy_branch "$GENESIS_ROOT")"
+genesis_assert_deploy_checkout "$GENESIS_ROOT" "$DEPLOY_BRANCH"
+
 echo "=== Genesis Bootstrap ==="
 echo "Genesis root: $GENESIS_ROOT"
 echo
@@ -36,6 +41,7 @@ echo
 # shellcheck source=lib/live_system_guard.sh
 . "$SCRIPT_DIR/lib/live_system_guard.sh"
 bootstrap_refuse_if_server_live "$@" || exit 3
+genesis_ensure_deploy_config "$DEPLOY_BRANCH"
 
 # ── Crash recovery: check for interrupted update ─────────
 UPDATE_STATE="$HOME/.genesis/update_state.json"
