@@ -2295,3 +2295,87 @@ def test_the_inlined_isolation_default_tracks_the_real_constant():
         f"_GENESIS_MEM_MAX_DIGITS={declared.group(1)} but inlined fallbacks are "
         f"{sorted(inlined)} — the isolated-extraction copies have drifted"
     )
+
+
+# -- A refusal must reach only the legs whose arithmetic the value feeds -----
+#
+# An earlier revision of the magnitude bound put every constant into ONE shared
+# refusal string consumed by both legs, so a malformed CBM-only value refused
+# GitNexus and a malformed GitNexus-only value refused CBM. In each case a leg
+# with a valid cap and real headroom was skipped because of a variable it never
+# reads. Cross-contamination is invisible in the logs -- the skipped leg reports
+# a refusal naming the OTHER leg's variable, which reads like a config error.
+_LEG_ISOLATION_CASES = [
+    pytest.param(
+        "gitnexus", {"CODE_INTEL_CBM_MIN_BYTES": "1" + "0" * 30}, id="cbm-value-spares-gitnexus"
+    ),
+    pytest.param(
+        "cbm",
+        {"CODE_INTEL_GITNEXUS_MIN_BYTES": "1" + "0" * 30},
+        id="gitnexus-value-spares-cbm",
+    ),
+    pytest.param(
+        "gitnexus",
+        {"CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES": "18446744070735888385"},
+        id="cbm-charge-spares-gitnexus",
+    ),
+]
+
+
+@pytest.mark.parametrize("leg,env_extra", _LEG_ISOLATION_CASES)
+def test_a_bad_value_refuses_only_the_leg_that_reads_it(tmp_path, leg, env_extra):
+    """One leg's malformed constant must not refuse the other leg."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+
+    res = _run_entry(
+        tmp_path, repo, leg, path=f"{fakebin}:{_SYSTEM_PATH}", env_extra=env_extra
+    )
+
+    assert f"SKIP {leg}" not in res.stdout, (
+        f"{leg} was refused by a value only the other leg reads "
+        f"({sorted(env_extra)})\n{res.stdout}\n{res.stderr}"
+    )
+
+
+@pytest.mark.parametrize(
+    "leg,env_extra",
+    [
+        pytest.param("cbm", {"CODE_INTEL_CBM_MIN_BYTES": "1" + "0" * 30}, id="cbm-own-value"),
+        pytest.param(
+            "gitnexus",
+            {"CODE_INTEL_GITNEXUS_MIN_BYTES": "1" + "0" * 30},
+            id="gitnexus-own-value",
+        ),
+        pytest.param(
+            "cbm",
+            {"CODE_INTEL_SIBLING_RESERVE_BYTES": "1" + "0" * 30},
+            id="shared-value-hits-cbm",
+        ),
+        pytest.param(
+            "gitnexus",
+            {"CODE_INTEL_SIBLING_RESERVE_BYTES": "1" + "0" * 30},
+            id="shared-value-hits-gitnexus",
+        ),
+    ],
+)
+def test_a_bad_value_still_refuses_the_leg_that_does_read_it(tmp_path, leg, env_extra):
+    """The paired positive control for the isolation test above.
+
+    Without these, every assertion up there could pass because nothing refuses
+    anything at all -- an absence-assertion group proves nothing until its
+    presence-direction sibling is shown to fire.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+
+    res = _run_entry(
+        tmp_path, repo, leg, path=f"{fakebin}:{_SYSTEM_PATH}", env_extra=env_extra
+    )
+
+    assert f"SKIP {leg}" in res.stdout, (
+        f"{leg} was NOT refused by a value it reads ({sorted(env_extra)})"
+        f"\n{res.stdout}\n{res.stderr}"
+    )

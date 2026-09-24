@@ -643,25 +643,46 @@ if ! _genesis_uint_bounded "$CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES"; then
 fi
 CODE_INTEL_CBM_MIN_BYTES="${CODE_INTEL_CBM_MIN_BYTES:-$(( 2836 * 1024 * 1024 + CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES ))}"
 
+# THREE refusal scopes, not one. A refusal must reach exactly the legs whose
+# arithmetic the bad value feeds. An earlier revision of this change put every
+# constant in the shared string, which meant a malformed CBM-only constant
+# refused GitNexus (and vice versa) — a leg with a valid cap and real headroom
+# was skipped because of a variable it never reads.
+#
+# SHARED holds only what BOTH legs consume: the ceiling override, live usage,
+# and the sibling reserve.
+_genesis_bad_uint() {  # name -> refusal message, or nothing
+    printf '%s is not a nonnegative integer below 10^%s' "$1" "$_GENESIS_MEM_MAX_DIGITS"
+}
+
 GENESIS_MEM_ENV_REFUSE=""
-if [ -n "$_GENESIS_CHARGE_REFUSE" ]; then
-    GENESIS_MEM_ENV_REFUSE="$_GENESIS_CHARGE_REFUSE"
-# F4: the ceiling override belongs in the SHARED chain. Refusing it only on the
-# cbm leg left the gitnexus leg unable to tell "refused" from "no ceiling
-# discoverable" — both are an empty string there — so it skipped admission
-# entirely. A new refusal path that fails open on one of two legs.
-elif [ -n "${CODE_INTEL_MEM_CEILING_BYTES:-}" ] \
+if [ -n "${CODE_INTEL_MEM_CEILING_BYTES:-}" ] \
     && ! _genesis_uint_bounded "$CODE_INTEL_MEM_CEILING_BYTES"; then
-    GENESIS_MEM_ENV_REFUSE="CODE_INTEL_MEM_CEILING_BYTES is not a nonnegative integer below 10^$_GENESIS_MEM_MAX_DIGITS"
+    # The ceiling override belongs in the SHARED chain: refusing it only on the
+    # cbm leg left the gitnexus leg unable to tell "refused" from "no ceiling
+    # discoverable" — both are an empty string there — so it skipped admission
+    # entirely, a refusal path failing open on one of two legs.
+    GENESIS_MEM_ENV_REFUSE="$(_genesis_bad_uint CODE_INTEL_MEM_CEILING_BYTES)"
 elif [ -n "${CODE_INTEL_MEM_CURRENT_BYTES:-}" ] \
     && ! _genesis_uint_bounded "$CODE_INTEL_MEM_CURRENT_BYTES"; then
-    GENESIS_MEM_ENV_REFUSE="CODE_INTEL_MEM_CURRENT_BYTES is not a nonnegative integer below 10^$_GENESIS_MEM_MAX_DIGITS"
+    GENESIS_MEM_ENV_REFUSE="$(_genesis_bad_uint CODE_INTEL_MEM_CURRENT_BYTES)"
 elif ! _genesis_uint_bounded "$CODE_INTEL_SIBLING_RESERVE_BYTES"; then
-    GENESIS_MEM_ENV_REFUSE="CODE_INTEL_SIBLING_RESERVE_BYTES is not a nonnegative integer below 10^$_GENESIS_MEM_MAX_DIGITS"
+    GENESIS_MEM_ENV_REFUSE="$(_genesis_bad_uint CODE_INTEL_SIBLING_RESERVE_BYTES)"
+fi
+
+# CBM-only. The workload charge is an operand of the minimum-bytes sum above,
+# so its refusal was captured before that sum was computed.
+GENESIS_CBM_ENV_REFUSE=""
+if [ -n "$_GENESIS_CHARGE_REFUSE" ]; then
+    GENESIS_CBM_ENV_REFUSE="$_GENESIS_CHARGE_REFUSE"
 elif ! _genesis_uint_bounded "$CODE_INTEL_CBM_MIN_BYTES"; then
-    GENESIS_MEM_ENV_REFUSE="CODE_INTEL_CBM_MIN_BYTES is not a nonnegative integer below 10^$_GENESIS_MEM_MAX_DIGITS"
-elif ! _genesis_uint_bounded "$CODE_INTEL_GITNEXUS_MIN_BYTES"; then
-    GENESIS_MEM_ENV_REFUSE="CODE_INTEL_GITNEXUS_MIN_BYTES is not a nonnegative integer below 10^$_GENESIS_MEM_MAX_DIGITS"
+    GENESIS_CBM_ENV_REFUSE="$(_genesis_bad_uint CODE_INTEL_CBM_MIN_BYTES)"
+fi
+
+# GitNexus-only.
+GENESIS_GITNEXUS_ENV_REFUSE=""
+if ! _genesis_uint_bounded "$CODE_INTEL_GITNEXUS_MIN_BYTES"; then
+    GENESIS_GITNEXUS_ENV_REFUSE="$(_genesis_bad_uint CODE_INTEL_GITNEXUS_MIN_BYTES)"
 fi
 _GENESIS_CGROUP_FINITE_DIRS=()
 _GENESIS_CGROUP_FINITE_LIMITS=()
@@ -671,6 +692,8 @@ _genesis_want_b="$(_genesis_mem_bytes "$GITNEXUS_MEM_MAX")"
 GITNEXUS_MEM_REFUSE=""
 if [ -n "$GENESIS_MEM_ENV_REFUSE" ]; then
     GITNEXUS_MEM_REFUSE="$GENESIS_MEM_ENV_REFUSE"
+elif [ -n "$GENESIS_GITNEXUS_ENV_REFUSE" ]; then
+    GITNEXUS_MEM_REFUSE="$GENESIS_GITNEXUS_ENV_REFUSE"
 elif [ -z "$_genesis_want_b" ]; then
     # Fail closed: an unparseable cap must not reach MemoryMax, and skipping the
     # admission check silently would run the job unbounded.
@@ -986,6 +1009,8 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
         _cbm_want_b="$(_genesis_mem_bytes "$CBM_MEM_MAX")"
         if [ -n "$GENESIS_MEM_ENV_REFUSE" ]; then
             CBM_MEM_REFUSE="$GENESIS_MEM_ENV_REFUSE"
+        elif [ -n "$GENESIS_CBM_ENV_REFUSE" ]; then
+            CBM_MEM_REFUSE="$GENESIS_CBM_ENV_REFUSE"
         elif [ -z "$_cbm_want_b" ]; then
             CBM_MEM_REFUSE="CODE_INTEL_CBM_MEMORY_MAX='${CBM_MEM_MAX}' is not a parseable memory value"
         elif [ "$_cbm_want_b" -lt "$CODE_INTEL_CBM_MIN_BYTES" ]; then
