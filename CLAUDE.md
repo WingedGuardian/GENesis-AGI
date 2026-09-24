@@ -219,7 +219,8 @@ Applies to every assertion — in conversation, and doubly in anything written t
   hedged out loud — "I think", "unverified, but"), or **ASSUMED** (say so). An unmarked
   claim wears verified grammar and WILL be read as MEASURED/READ.
 - **Permanent-record discipline.** Never write an INFERRED claim into permanent record
-  (memory stores, follow-ups, specs, ledgers, evaluations, comments) in the grammar of a
+  (the surfaces are enumerated in the `genesis-development` skill,
+  `references/high-stakes-verification.md` §11) in the grammar of a
   fact — permanent record has no tone of voice; the next session builds on confident
   sentences. Status claims written to disk carry provenance + date ("per <artifact>, <date>").
 - **A surprising observation is a question, not an answer.** The pull to explain an anomaly

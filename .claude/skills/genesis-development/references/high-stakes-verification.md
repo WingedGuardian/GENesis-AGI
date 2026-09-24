@@ -297,15 +297,20 @@ rather than carrying their own copies:
 | Genesis memories stored this session | permanent, system-wide, recalled as fact |
 | changelog fragments | becomes a user-facing entry verbatim |
 | issue bodies | a public record the next reader treats as measured |
+| specs and evaluations | read later as a decision's basis, long after the basis moved |
+| plan documents | line numbers, PR heads and counts go quietly false as the tree moves |
 
 Then put each sentence on trial. Four steps, each carrying the instance that
 bought it — all from the single session that adopted this pass, which is the
 argument for it:
 
 1. **Re-compute every number written in prose, and name its denominator.**
-   Counting `except` handlers whose body is only `pass`, over the 1,291 files
-   under `src/genesis/`: a two-line `grep` said **212**, an AST walk said
-   **274**. The grep matched one spelling and missed **62 of 274 (22.6%)**.
+   MEASURED 2026-09-22, counting `except` handlers whose body is only `pass`
+   over the 1,291 **Python** files under `src/genesis/`: a two-line `grep` said
+   **212**, an AST walk said **274** — a gap of **62 (22.6% of 274)** that the
+   grep's single spelling never reached. Stated as the difference of totals,
+   which is what was measured: whether the grep's hits were a strict subset was
+   not checked, and a set-difference claim would need that.
 2. **Re-measure anything taken before the tree moved.** Counting a different
    thing — handlers with no `raise` and no logging call, same tree — a peer
    session fast-forwarded the checkout mid-analysis and the count moved
@@ -317,13 +322,18 @@ argument for it:
 4. **When a file and a tool disagree, RE-DERIVE — one of them is scoped to a
    different question.** An allowlist comment and a classifier docstring
    disagreed about whether skill-file findings score; calling the predicate
-   settled it in seconds, and the comment-reading was the wrong one. That
-   episode and its generalisation are already written up in SKILL.md's Pre-Merge
-   Gate section under `_is_doc_path` — read it there.
+   settled it in seconds, and the comment-reading was the wrong one. The
+   generalisation is already written up in SKILL.md's Pre-Merge Gate section
+   under `_is_doc_path` — read it there.
 
-Denominators for negatives, and re-reading an evidence sentence against the
-artifact it describes, are covered by the table at the top of this file; they
-belong to this walk but are not restated here.
+Denominators for negatives are covered by the table at the top of this file and
+are not restated here. One step belongs to this walk and is carried by no row,
+so it is stated rather than pointed at:
+
+5. **Re-read every evidence sentence against the artifact it names** — open the
+   PR, the file, the row. An evidence string is a claim like any other, and it
+   is the one written with the least attention, because by then the work feels
+   finished.
 
 Two outcomes of this pass feel like failure and are not. A claim that SHRINKS
 under audit is the method working (§8). And where one of §7's four causes fires,
