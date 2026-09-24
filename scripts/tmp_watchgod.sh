@@ -383,16 +383,8 @@ cc_tmp_capacity_mb() {
 }
 
 cc_tmp_headroom_mb() {
-    # TRUE headroom in MB — how much more cc-tmp can grow before the write that
-    # kills Claude Code. Two independent ceilings bind it, and the real one is
-    # whichever is lower:
-    #   capacity - used   the volume's own cap (config on btrfs, statfs on LVM)
-    #   fs_free           what the filesystem will actually hand out. Lower than
-    #                     capacity-used whenever reserved blocks, filesystem
-    #                     metadata, or deleted-but-still-open files hold space
-    #                     the directory usage total cannot see.
-    # Taking the MINIMUM means a new blindness in either measure can only make
-    # the floor fire EARLIER, never later.
+    # Headroom in MB — how much more cc-tmp can grow before it hits its own
+    # configured ceiling. ONE term, deliberately: capacity - used.
     #
     # fs_free is DELIBERATELY NOT folded in, and this is the third position on
     # that question — the first two were wrong and both are recorded here so
