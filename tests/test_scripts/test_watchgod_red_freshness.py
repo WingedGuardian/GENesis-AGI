@@ -852,50 +852,50 @@ def test_check_cc_tmp_reaches_red_on_true_headroom_under_budget(tmp_path):
     )
 
 
-def test_headroom_is_capped_by_filesystem_free_space(tmp_path):
-    """Capacity minus usage can exceed what the filesystem will actually hand
-    out — reserved blocks, metadata, and deleted-but-still-open files hold
-    space the directory total cannot see. Taking the minimum means a blindness
-    in either measure can only make the floor fire EARLIER, never later.
+def test_headroom_ignores_filesystem_free_space_entirely(tmp_path):
+    """The oxygen floor is a statement about CC-TMP'S OWN ceiling, and filesystem
+    free space is not that on any backend this install supports.
+
+    This arm exists because the cap was added, then gated, then removed, and the
+    test is what stops a fourth attempt. A reviewer asked for the cap (capacity
+    minus usage can overstate what is writable). An audit then showed it makes a
+    full HOST disk fire the total-bypass floor inside a near-empty cc-tmp, every
+    poll, freeing nothing. The obvious gate — only count it when cc-tmp is its
+    own mount — was tried and does NOT work: MEASURED 2026-09-24, the isolated
+    btrfs subvolume is genuinely its own mount point AND reports the same device
+    and the same free space as the root filesystem, so the gate passes and the
+    shared number comes straight back in.
+
+    What remains of the original concern is handled where it can be handled
+    honestly: cc_tmp_capacity_mb already takes min(fs_total, configured), so a
+    backend whose statfs tells the truth already yields the device's real size.
     """
     home, cctmp, bind = _sandbox(tmp_path)
     common = (
         "CC_TMP_CAPACITY_MB=2048; fs_total_mb() { echo 0; }; "
         "dir_usage_mb() { echo 100; }; fs_free_mb() { echo 40; }; cc_tmp_headroom_mb"
     )
-    # NB: the body contains a literal `%m` (stat's mount-point format), so this
-    # is built by replace() rather than %-formatting or .format().
+    # NB: the stub body contains a literal `%m` (stat's mount-point format), so
+    # it is built by replace() rather than %-formatting.
     stat_stub = (
         "#!/usr/bin/env bash\n"
         'if [ "$1" = "-c" ] && [ "$2" = "%m" ]; then echo "@MOUNT@"; exit 0; fi\n'
         'exec /usr/bin/stat "$@"\n'
     )
 
-    # ARM 1 — cc-tmp IS its own mount, so fs_free measures that volume and
-    # belongs in the minimum. `stat` is stubbed on PATH, the harness's existing
-    # idiom (same as tmux), to report cc-tmp as its own mount point.
-    _make_exec(bind / "stat", stat_stub.replace("@MOUNT@", "$3"))
-    proc = _run(home, bind, common)
-    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    assert proc.stdout.strip() == "40", (
-        "on a dedicated volume, headroom reported 1948MB of room on a "
-        f"filesystem with 40MB free: {proc.stdout!r}"
-    )
-
-    # ARM 2 — cc-tmp is NOT its own mount (volume creation was unsupported or
-    # failed, or this is a bare-metal install), so fs_free measures the SHARED
-    # filesystem and must be ignored. Folding it in would let "the host disk is
-    # full" trigger the total-bypass floor inside a near-empty cc-tmp, on every
-    # 30s poll, destroying in-flight writes while freeing nothing that moves
-    # the host disk. This arm is what keeps that from coming back.
-    _make_exec(bind / "stat", stat_stub.replace("@MOUNT@", "/"))
-    proc = _run(home, bind, common)
-    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    assert proc.stdout.strip() == "1948", (
-        "a full SHARED filesystem was folded into cc-tmp's headroom — the "
-        "oxygen floor would fire and bypass every guard over a disk that "
-        f"reclaiming cc-tmp cannot free: {proc.stdout!r}"
-    )
+    # BOTH mount answers must give the SAME headroom. Pinning both directions is
+    # the point: a future re-introduction would almost certainly arrive as an
+    # own-mount gate, and that is exactly the variant a single arm would miss.
+    for mount_answer, label in (("$3", "cc-tmp is its own mount"),
+                                ("/", "cc-tmp is on the shared filesystem")):
+        _make_exec(bind / "stat", stat_stub.replace("@MOUNT@", mount_answer))
+        proc = _run(home, bind, common)
+        assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+        assert proc.stdout.strip() == "1948", (
+            f"with {label}, a filesystem reporting 40MB free changed cc-tmp's "
+            "headroom — the oxygen floor would fire and bypass every guard over "
+            f"a disk that reclaiming cc-tmp cannot free: {proc.stdout!r}"
+        )
 
 
 _CAP_BLOCK_START = '_cc_cap_gib="${CCTMPVOL_SIZE_GIB:-2}"'

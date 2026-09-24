@@ -394,37 +394,41 @@ cc_tmp_headroom_mb() {
     # Taking the MINIMUM means a new blindness in either measure can only make
     # the floor fire EARLIER, never later.
     #
-    # …but fs_free counts ONLY when cc-tmp is its own mount point. That
-    # condition is the whole difference between two opposite meanings of the
-    # same number: on a dedicated volume it measures cc-tmp's own filesystem
-    # and belongs in the minimum; on an install where volume creation did not
-    # happen (an unsupported pool, a failed create or attach, a bare-metal
-    # bootstrap) cc-tmp is a plain directory on the SHARED filesystem, and
-    # folding that in makes "the host disk is full" indistinguishable from
-    # "cc-tmp is full". The floor's response — spare nothing, delete
-    # everything — is right for the second and is destructive AND futile for
-    # the first: it would wipe every in-flight write in a near-empty cc-tmp,
-    # on every 30s poll, without freeing anything that moves the host disk.
-    # `stat -c %m` is the discriminator (MEASURED with both oracle arms: the
-    # dedicated subvolume answers with its own path, a plain directory answers
-    # with its parent filesystem). A statfs-level host emergency keeps its own
-    # separate RED trigger in check_cc_tmp; it just does not license the
+    # fs_free is DELIBERATELY NOT folded in, and this is the third position on
+    # that question — the first two were wrong and both are recorded here so
+    # the cap does not get re-added a fourth time.
+    #
+    # The floor is a statement about CC-TMP'S OWN ceiling. fs_free answers a
+    # different question — how full is the filesystem cc-tmp happens to sit on
+    # — and on every backend this install supports that filesystem is SHARED:
+    #   * plain directory (unsupported pool, failed create/attach, bare metal)
+    #     -> the host root filesystem;
+    #   * btrfs subvolume (the isolated case) -> the whole pool. MEASURED
+    #     2026-09-24: cc-tmp and / report the SAME device and the SAME 200641MB
+    #     avail, while cc-tmp is genuinely its own mount point. So an
+    #     is-it-its-own-mount test — the obvious discriminator, and the one
+    #     tried second — passes on btrfs and lets the shared number straight
+    #     back in.
+    # Folding it in therefore makes "the host disk is full" indistinguishable
+    # from "cc-tmp is full", and the floor's response (spare nothing, delete
+    # everything) is correct for the second while being destructive AND futile
+    # for the first: it would wipe every in-flight write inside a near-empty
+    # cc-tmp, on every poll, without freeing a byte that moves the host disk.
+    #
+    # The concern that motivated the cap — that capacity minus usage can
+    # overstate what is actually writable — is already answered where it can be
+    # answered honestly: cc_tmp_capacity_mb takes min(fs_total, configured), so
+    # on a backend whose statfs tells the truth the capacity is already the
+    # device's real size. And a genuine host-level disk emergency keeps its own
+    # independent RED trigger in check_cc_tmp; it simply does not license the
     # bypass.
     #
     # $1 is the already-measured usage, because du of cc-tmp is not free and
     # check_cc_tmp has measured it one line earlier; a direct call measures it.
-    local used="${1:-}" capacity headroom fs_free mnt
+    local used="${1:-}" capacity
     [[ "$used" =~ ^[0-9]+$ ]] || used="$(dir_usage_mb "$CC_TMP_DIR")"
     capacity="$(cc_tmp_capacity_mb)"
-    headroom=$(( capacity - used ))
-    mnt="$(stat -c %m "$CC_TMP_DIR" 2>/dev/null)" || mnt=""
-    if [[ "$mnt" == "$CC_TMP_DIR" ]]; then
-        fs_free="$(fs_free_mb "$CC_TMP_DIR")"
-        if [[ "$fs_free" =~ ^[0-9]+$ ]] && (( fs_free < headroom )); then
-            headroom=$fs_free
-        fi
-    fi
-    echo "$headroom"
+    echo "$(( capacity - used ))"
 }
 
 reap_dir_sparing_sockets() {
@@ -621,16 +625,14 @@ clean_cc_red() {
     local probe_fd   # assigned by `exec {probe_fd}>` below, never by hand
     if (( headroom < SACRED_GROUND_MB )); then
         floor=1
-        # Log the COMPONENTS, not just the minimum. headroom is a min() of two
-        # independent ceilings, so the number alone cannot tell an operator
-        # WHICH one bound it — and those have different remedies (reclaim
-        # cc-tmp vs free the volume's filesystem). The extra du costs one call
-        # on a path that fires only in an emergency.
-        local _cap _used _free
+        # Log the COMPONENTS, not just the result. An operator seeing only the
+        # difference cannot tell a capacity that is wrong in the config from a
+        # cc-tmp that is genuinely full, and those have opposite remedies. The
+        # extra du costs one call on a path that fires only in an emergency.
+        local _cap _used
         _cap="$(cc_tmp_capacity_mb)"
         _used="$(dir_usage_mb "$CC_TMP_DIR")"
-        _free="$(fs_free_mb "$CC_TMP_DIR")"
-        log WARN "Zone A RED — OXYGEN FLOOR: true headroom ${headroom}MB < sacred ${SACRED_GROUND_MB}MB (capacity ${_cap}MB - used ${_used}MB; fs_free ${_free}MB, counted only when cc-tmp is its own mount). EVERY discretionary exclusion is bypassed — the in-flight guard, the 60-second freshness window, and the active session's own tree. Unix sockets are the ONLY thing that survives, anywhere in the tree (0 bytes: deleting them reclaims nothing and severs the control plane)."
+        log WARN "Zone A RED — OXYGEN FLOOR: true headroom ${headroom}MB < sacred ${SACRED_GROUND_MB}MB (capacity ${_cap}MB - used ${_used}MB; filesystem free space is deliberately NOT part of this — it measures a SHARED pool on every supported backend). EVERY discretionary exclusion is bypassed — the in-flight guard, the 60-second freshness window, and the active session's own tree. Unix sockets are the ONLY thing that survives, anywhere in the tree (0 bytes: deleting them reclaims nothing and severs the control plane)."
     else
         probe="$(mktemp "$CC_TMP_DIR/.wg-probe.XXXXXX" 2>/dev/null)" || probe=""
         if [[ -n "$probe" ]]; then

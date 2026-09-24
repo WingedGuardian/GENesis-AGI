@@ -8,11 +8,12 @@
   the "disk nearly full" emergency check was reading the shared pool's free
   space instead of the cc-tmp volume's true 2 GiB cap and so could never fire;
   it now computes headroom against the configured capacity
-  (`CC_TMP_CAPACITY_MB` in watchgod.conf, default 2048) — capped by real
-  filesystem free space only where the temp directory has its own volume,
-  since on installs where it shares the system disk a full disk would
-  otherwise have triggered the emergency inside an almost-empty temp directory
-  and destroyed in-flight work without freeing anything. Below 150 MB of true
+  (`CC_TMP_CAPACITY_MB` in watchgod.conf, default 2048), deliberately without
+  reference to how full the underlying disk is: that disk is shared on every
+  supported setup, so counting it would have let a full system disk trigger the
+  emergency inside an almost-empty temp directory and destroy in-flight work
+  without freeing anything. A genuinely full disk keeps its own separate
+  trigger. Below 150 MB of true
   headroom every protection is bypassed and everything reclaimable is
   reclaimed — including files written seconds ago and the active session's own
   temp tree, with unix sockets the one exception because deleting them frees
