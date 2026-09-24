@@ -170,3 +170,181 @@ async def test_exclusion_is_opt_in_so_references_py_is_unaffected(db):
     assert [r["unit_id"] for r in rows] == ["ref-1"], (
         "the reference store lost access to its own partition"
     )
+
+
+# ── Route-level guards ───────────────────────────────────────────────
+#
+# The CRUD tests above prove the SQL excludes the partition. They say nothing
+# about whether the ROUTES apply it — a regression in `recent`, `detail` or
+# `delete` passes every test above. These cover the route layer for all FIVE
+# routes rather than the three a reviewer named, because the population is the
+# module's routes, not the subset that was flagged.
+
+from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
+
+from flask import Flask  # noqa: E402
+
+# Imported for the SIDE EFFECT of registering the routes on the shared
+# blueprint — without it the test client 404s on every path below, which
+# would read as a passing guard.
+import genesis.dashboard.routes.knowledge  # noqa: E402,F401
+from genesis.dashboard._blueprint import blueprint  # noqa: E402
+
+
+@pytest.fixture()
+def client():
+    app = Flask(__name__)
+    app.register_blueprint(blueprint)
+    app.config["TESTING"] = True
+    return app.test_client()
+
+
+def _rt(db=None):
+    rt = MagicMock()
+    rt.is_bootstrapped = True
+    rt.db = db if db is not None else MagicMock()
+    return rt
+
+
+def _reference_row():
+    return {"id": "ref-1", "project_type": REFERENCE_PROJECT, "body": f"Value: {_SENTINEL}"}
+
+
+def test_route_recent_excludes_the_partition_in_its_sql(client):
+    """`recent` builds its SQL inline, so the guard lives in the route itself."""
+    cursor = MagicMock()
+    cursor.fetchall = AsyncMock(return_value=[])
+    cursor.fetchone = AsyncMock(return_value=(0,))
+    cursor.description = [("id",)]
+    db = MagicMock()
+    db.execute = AsyncMock(return_value=cursor)
+
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = _rt(db)
+        assert client.get("/api/genesis/knowledge/recent").status_code == 200
+
+    # BOTH statements — the page and the total — must be scoped, or paging
+    # walks off the end of a list shorter than the total it was handed.
+    assert db.execute.await_count == 2, "expected a page query and a total query"
+    for call in db.execute.await_args_list:
+        sql, params = call.args[0], call.args[1]
+        assert "project_type IS NULL OR project_type != ?" in sql, f"unscoped SQL: {sql}"
+        assert REFERENCE_PROJECT in params, f"exclusion value not bound: {params}"
+
+
+def test_route_detail_refuses_a_reference_row(client):
+    """404, and the body must not carry the value even in an error path."""
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch(
+            "genesis.db.crud.knowledge.get",
+            new_callable=AsyncMock, return_value=_reference_row(),
+        ),
+    ):
+        MockRT.instance.return_value = _rt()
+        resp = client.get("/api/genesis/knowledge/ref-1")
+
+    assert resp.status_code == 404
+    leaked = resp.get_data(as_text=True).count(_SENTINEL)
+    assert leaked == 0, "the refused response carried the reference value"
+
+
+def test_route_detail_still_serves_ordinary_knowledge(client):
+    """Guard-the-guard: a 404 for everything would satisfy the test above."""
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch(
+            "genesis.db.crud.knowledge.get",
+            new_callable=AsyncMock,
+            return_value={"id": "kb-1", "project_type": "genesis", "body": "ordinary"},
+        ),
+    ):
+        MockRT.instance.return_value = _rt()
+        resp = client.get("/api/genesis/knowledge/kb-1")
+
+    assert resp.status_code == 200
+
+
+def test_route_delete_refuses_a_reference_row_and_does_not_delete(client):
+    """The destructive half.
+
+    Asserting the 404 alone is not enough: the route reads the row BEFORE
+    deleting, so a guard placed after the delete would still answer 404 having
+    already destroyed a stored credential. The load-bearing assertion is that
+    `delete` was never awaited.
+    """
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch(
+            "genesis.db.crud.knowledge.get",
+            new_callable=AsyncMock, return_value=_reference_row(),
+        ),
+        patch("genesis.db.crud.knowledge.delete", new_callable=AsyncMock) as mock_delete,
+    ):
+        MockRT.instance.return_value = _rt()
+        resp = client.delete("/api/genesis/knowledge/ref-1")
+
+    assert resp.status_code == 404
+    mock_delete.assert_not_awaited()
+
+
+def test_route_search_refuses_an_explicit_reference_project(client):
+    """`?project=reference` was the shortest path to the whole store."""
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = _rt()
+        resp = client.get(f"/api/genesis/knowledge/search?q=Value&project={REFERENCE_PROJECT}")
+
+    assert resp.status_code == 400
+    assert "references" in (resp.get_json() or {}).get("use", "")
+
+
+def test_route_search_passes_the_exclusion_to_the_query(client):
+    """An ordinary search must still carry the exclusion down to the SQL."""
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch(
+            "genesis.db.crud.knowledge.search_fts",
+            new_callable=AsyncMock, return_value=[],
+        ) as mock_search,
+    ):
+        MockRT.instance.return_value = _rt()
+        assert client.get("/api/genesis/knowledge/search?q=anything").status_code == 200
+
+    assert mock_search.await_args.kwargs.get("exclude_project") == REFERENCE_PROJECT
+
+
+def test_route_stats_passes_the_exclusion_to_the_query(client):
+    """The count must describe the set browsing can actually reach."""
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch(
+            "genesis.db.crud.knowledge.stats",
+            new_callable=AsyncMock,
+            return_value={"total": 0, "by_domain": {}, "by_tier": {}},
+        ) as mock_stats,
+    ):
+        MockRT.instance.return_value = _rt()
+        assert client.get("/api/genesis/knowledge/stats").status_code == 200
+
+    assert mock_stats.await_args.kwargs.get("exclude_project") == REFERENCE_PROJECT
+
+
+@pytest.mark.asyncio
+async def test_stats_composes_both_filters_rather_than_dropping_one(db):
+    """`project` and `exclude_project` must AND, matching `search_fts`.
+
+    An `elif` here silently ignores the exclusion whenever both are supplied,
+    so the two sibling helpers would disagree about what the same pair of
+    arguments means. No caller passes both today — the inconsistency is the
+    defect, because the next caller will not know which one it got.
+    """
+    both = await knowledge_crud.stats(
+        db, project=REFERENCE_PROJECT, exclude_project=REFERENCE_PROJECT
+    )
+    assert both["total"] == 0, (
+        "the exclusion was dropped when a project filter was also supplied"
+    )
+
+    # Guard-the-guard: a WHERE that matched nothing regardless would pass the above.
+    only_project = await knowledge_crud.stats(db, project=REFERENCE_PROJECT)
+    assert only_project["total"] == 1, "the project filter alone stopped working"

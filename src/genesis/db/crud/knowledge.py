@@ -341,15 +341,21 @@ async def stats(
     is NULL, and so not TRUE, for a row that declares no project_type, which
     would drop every untyped row from the totals.
     """
+    # COMPOSED, not exclusive. An `elif` here would silently drop the
+    # exclusion whenever both filters are supplied, so `stats` would disagree
+    # with `search_fts` — which ANDs them — about what the same pair of
+    # arguments means. No caller passes both today; the inconsistency is the
+    # defect, because the next one will not know which function it got.
+    clauses: list[str] = []
+    values: list[str] = []
     if project:
-        where = "WHERE project_type = ?"
-        params: tuple = (project,)
-    elif exclude_project:
-        where = "WHERE (project_type IS NULL OR project_type != ?)"
-        params = (exclude_project,)
-    else:
-        where = ""
-        params = ()
+        clauses.append("project_type = ?")
+        values.append(project)
+    if exclude_project:
+        clauses.append("(project_type IS NULL OR project_type != ?)")
+        values.append(exclude_project)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    params: tuple = tuple(values)
 
     rows = await db.execute_fetchall(
         f"SELECT COUNT(*), MIN(ingested_at), MAX(ingested_at) FROM knowledge_units {where}",
