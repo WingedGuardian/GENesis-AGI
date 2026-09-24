@@ -1387,11 +1387,14 @@ _CR_BLOCKING_WEIGHT = 1.0
 # surfaced, never scored, so a severe bug Devin raised could not stop a merge.
 # MEASURED 2026-09-24 over every Devin comment on the 33 open non-draft PRs:
 # 166 comments, each opening with `<!-- devin-review-comment {json} -->` and
-# then exactly one of the five markers below. The MEANINGS are the vendor's own
-# (docs.devin.ai, "Devin Review", read 2026-09-24): red = a severe bug or a
-# critical security finding; orange = a non-severe bug or a security warning;
-# gray = informational. The owner kept the orange security warning at the same
-# weight as any orange finding rather than lifting it to the floor.
+# then exactly one of the five markers below. Red is Devin's severe tier (a
+# severe bug, or a critical security finding on the red square), yellow its
+# non-severe tier (a bug, or a security warning on the yellow square), and the
+# magnifier is informational. The strongest evidence for that reading is the
+# comments themselves: on a later count of 253 open-queue comments the marker
+# agreed with the metadata `kind` every time (red/yellow = bug, the squares =
+# security, magnifier = analysis). The owner kept the yellow security warning at
+# the same weight as any yellow finding rather than lifting it to the floor.
 #
 # A CLOSED set, and deliberately so: a marker this table has not seen is
 # surfaced as format drift and never scored. Guessing a severity from an
@@ -3014,6 +3017,12 @@ def _check_inline_review_findings(
         and (c.get("body") or "").lstrip().split("\n", 1)[0].startswith(_BOT_SELF_RESOLVED_LEAD)
     }
     devin_cleared: set[str] = set()
+    # Groups a MAINTAINER answered. A group cleared only by Devin's own reply is
+    # surfaced below rather than dropped: Devin's reviewer and its builder post
+    # under ONE login (MEASURED: the same account posts "Fixed in <sha>" replies
+    # on a devin/* branch), so a self-withdrawal is reply TEXT, not an identity.
+    # It still clears (owner ruling), but never silently (owner, 2026-09-24).
+    devin_maint_cleared: set[str] = set()
     devin_copies: dict[str, list[dict]] = {}
     for c in raw:
         if c.get("reply_to") or (c.get("login") or "") not in _DEVIN_LOGINS:
@@ -3026,11 +3035,14 @@ def _check_inline_review_findings(
         devin_copies.setdefault(fid, []).append(c)
         if c.get("id") in replied_to or c.get("id") in self_withdrawn:
             devin_cleared.add(fid)
+        if c.get("id") in replied_to:
+            devin_maint_cleared.add(fid)
     devin_seen: set[str] = set()
     devin_block: list[str] = []  # severe bug / critical security — the floor, 1.0 each
     devin_minor: list[str] = []  # non-severe bug / security warning — 0.5 each
     devin_analysis: list[str] = []  # informational — surfaced, never scored
     devin_unknown: list[str] = []  # unrecognised shape — surfaced as drift, never scored
+    devin_self_withdrawn: list[str] = []  # cleared by Devin's own reply only — surfaced
     devin_doc_skipped: list[str] = []  # scoring Devin findings on a doc path
     devin_off_diff: list[tuple[str, str]] = []  # scoring Devin findings outside the diff
     p1: list[str] = []
@@ -3179,7 +3191,20 @@ def _check_inline_review_findings(
                         drift_title += " (a copy of a finding classified by its readable copy)"
                     devin_unknown.append(drift_title)
             if fid in devin_cleared:
-                continue  # answered: maintainer reply, or Devin withdrew it
+                # Answered: a maintainer reply, or Devin withdrew it. The second
+                # is listed, from the parser alone (no file-list read).
+                if fid not in devin_maint_cleared:
+                    devin_self_withdrawn.append(
+                        next(
+                            (
+                                _inline_title(cp.get("body") or "")
+                                for cp in copies
+                                if _devin_finding(cp.get("body") or "")[1] is not None
+                            ),
+                            _inline_title(copies[0].get("body") or ""),
+                        )
+                    )
+                continue
             judged = [(cp, *_devin_disposition(cp)) for cp in copies]
             # The group SCORES on its strongest copy that is eligible to score.
             # Only when no copy is eligible is it reported, once, through its
@@ -3199,10 +3224,12 @@ def _check_inline_review_findings(
             dv_path = best.get("path")
             # A stronger copy that could not score is not dropped silently: the
             # reader sees that Devin marked the same finding more severely on an
-            # anchor outside this PR's scope. Surfaced on the title only, so no
-            # count changes.
+            # anchor this gate did not score (off-diff, or an excluded doc path).
+            # Surfaced on the title only, so no count changes.
             if eligible and _DEVIN_SEVERITY_RANK[readable[0][2]] > _DEVIN_SEVERITY_RANK[sev]:
-                title += " (another copy was marked more severe outside this PR's scope)"
+                title += (
+                    " (another copy was marked more severe on an anchor this gate did not score)"
+                )
             if disp == "analysis":
                 devin_analysis.append(title)
             elif disp == "off_diff":
@@ -3746,6 +3773,16 @@ def _check_inline_review_findings(
         )
         for title in devin_analysis[:5]:
             print(f"  [Devin analysis] {title}", file=sys.stderr)
+    if devin_self_withdrawn:
+        print(
+            f"NOTE: PR #{pr_num} — {len(devin_self_withdrawn)} Devin finding(s) "
+            f"cleared by Devin's own '✅ Resolved' reply, with no maintainer reply. "
+            f"Devin's reviewer and builder share one login, so check the fix "
+            f"really landed before relying on it:",
+            file=sys.stderr,
+        )
+        for title in devin_self_withdrawn[:5]:
+            print(f"  [Devin self-withdrawn] {title}", file=sys.stderr)
     if devin_unknown:
         print(
             f"NOTE: PR #{pr_num} — {len(devin_unknown)} Devin comment(s) whose "
@@ -4265,9 +4302,10 @@ def _pr_base_sha(pr_num: str, repo: str | None = None) -> str | None:
 
 def _pr_review_records(pr_num: str, repo: str | None = None) -> list[dict] | None:
     """EVERY review record ``{login, commit_id, state}`` on the PR, oldest-first, or
-    None on any API/parse error. The single fetch behind both the Codex reader below
-    and the substitute-review lookup, so the two can never disagree about what
-    GitHub returned. Same seam as before: ``_TEST_GH_CODEX_REVIEWS`` (one JSON object
+    None on any API/parse error. The one implementation behind both the Codex reader
+    below and the substitute-review lookup, so they parse GitHub's answer the same
+    way. It is NOT one fetch: the substitute path calls it again after the Codex
+    check, which costs a second read on that path only. Same seam as before: ``_TEST_GH_CODEX_REVIEWS`` (one JSON object
     per line, ``{login, commit_id[, state]}``; missing ``state`` = active)."""
     raw = os.environ.get("_TEST_GH_CODEX_REVIEWS")
     if raw is None:

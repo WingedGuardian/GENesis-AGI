@@ -1705,10 +1705,10 @@ def test_stale_review_override_wins_over_substitute(monkeypatch, capsys):
 def test_the_sigil_is_inert_when_codex_reviewed_the_head(monkeypatch, capsys):
     rows = "\n".join([_reviews_jsonl(HEAD), _devin_at()])
     rc = _run(monkeypatch, _merge_cmd(trailer="# substitute-review"), reviews=rows)
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()  # ONE read: a second one returns empty streams
     assert rc == 0
-    assert not _asked(out), "the owner was asked about a substitute Codex made unnecessary"
-    assert "stands in for Codex" not in capsys.readouterr().err
+    assert not _asked(captured.out), "the owner was asked about a substitute Codex made unnecessary"
+    assert "stands in for Codex" not in captured.err, "a stand-in was used though Codex is current"
 
 
 def test_a_substitute_never_waives_a_later_hard_block(monkeypatch, capsys):
@@ -1722,6 +1722,10 @@ def test_a_substitute_never_waives_a_later_hard_block(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert rc == 2
     assert not _asked(captured.out)
+    # Both halves, or a broken stand-in would pass this too (the freshness gate
+    # also returns 2): the stand-in ENGAGED, and the P1 is what blocked.
+    assert "stands in for Codex" in captured.err, captured.err
+    assert "inline review gate did not pass" in captured.err, captured.err
 
 
 def test_a_substitute_merge_stays_bound_to_the_substitute_head(monkeypatch, capsys):

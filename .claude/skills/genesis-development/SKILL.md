@@ -3775,9 +3775,10 @@ The review-findings gate specifically:
    depends on what it costs to be wrong (`_INLINE_SCORE_BLOCK_THRESHOLDS`).
 
    **Devin scores like Codex (owner ruling, 2026-09-24).** Its comments open
-   with `<!-- devin-review-comment {json} -->` and a marker whose meaning is the
-   vendor's own (red = severe bug / critical security, orange = non-severe bug /
-   security warning, gray 🔍 = informational, surfaced and never scored). A
+   with `<!-- devin-review-comment {json} -->` and a marker: red is Devin's severe
+   tier (bug / critical security), yellow its non-severe tier (bug / security
+   warning), and 🔍 is informational, surfaced and never scored. The marker agrees
+   with the metadata `kind` on every comment measured. A
    marker outside that closed set is FORMAT DRIFT: surfaced, never scored. A
    finding Devin posted twice counts once (dedup on its metadata `id`). It is
    parsed only for the `devin-ai-integration[bot]` Bot account, and its branch
@@ -3789,7 +3790,10 @@ The review-findings gate specifically:
    a DEVIN finding only, Devin itself replying in that finding's thread with a
    first line starting `✅ **Resolved**` (Devin may withdraw its own finding; no
    bot can clear another's, free prose such as "Fixed in …" clears nothing, and
-   Codex and CodeRabbit findings still need a maintainer reply). A thread
+   Codex and CodeRabbit findings still need a maintainer reply). Devin's reviewer
+   and its builder post under ONE login, so a self-withdrawal is reply text, not
+   an identity: it still clears, but the gate always LISTS it as
+   `[Devin self-withdrawn]` so you can check the fix landed. A thread
    resolved in the GitHub UI does NOT clear a finding; reply instead. A finding
    Devin posted more than once counts once: each copy's diff and documentation
    scope is judged on its OWN anchor, the finding scores on its strongest copy

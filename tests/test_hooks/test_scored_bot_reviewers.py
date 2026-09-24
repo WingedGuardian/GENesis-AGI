@@ -15,8 +15,9 @@ satisfies the Codex freshness check.
 Why the comment shape below is trusted: MEASURED 2026-09-24 over every Devin
 comment on the 33 open non-draft PRs — 166 comments, every one opening with
 `<!-- devin-review-comment {json} -->` and then one of five markers, and the
-marker meanings READ from Devin's own documentation (red = severe bug / critical
-security, orange = non-severe bug / security warning, gray = informational).
+marker agreeing with the metadata `kind` on every one (red and yellow are bugs,
+the red and yellow squares security, the magnifier analysis). Red is Devin's
+severe tier and yellow its non-severe tier.
 """
 
 from __future__ import annotations
@@ -39,7 +40,10 @@ CODERABBIT = "coderabbitai[bot]"
 
 @pytest.fixture(autouse=True)
 def _hermetic_pr_files(monkeypatch):
-    """In-diff set pinned to src/benign.py (a STANDARD-lane path: threshold 2.0)."""
+    """In-diff set pinned to src/benign.py (a STANDARD-lane path: threshold 2.0),
+    and the doc-path mode pinned to the shipped `skip`, so no test reads this
+    install's own config."""
+    monkeypatch.setenv("_TEST_DOC_FINDINGS_MODE", "skip")
     monkeypatch.setenv(
         "_TEST_GH_PR_FILES", '{"filename": "src/benign.py", "previous_filename": null}'
     )
@@ -303,6 +307,27 @@ class TestDevinDedupAndClearing:
         block, msg = _scan(guard, comments)
         assert block
 
+    def test_a_self_withdrawn_finding_is_surfaced_not_silent(self, guard, capsys):
+        """Devin's reviewer and builder post under ONE login, so a self-withdrawal
+        clears (owner ruling) but is always shown, never silent (owner, 2026-09-24)."""
+        comments = [
+            _c(1, _devin_body("🔴", "Severe, withdrawn by Devin")),
+            _c(2, "✅ **Resolved**: done", reply_to=1),
+        ]
+        block, msg = _scan(guard, comments)
+        assert not block, msg
+        err = capsys.readouterr().err
+        assert "[Devin self-withdrawn]" in err and "Severe, withdrawn by Devin" in err, err
+
+    def test_a_maintainer_cleared_finding_is_not_listed_as_self_withdrawn(self, guard, capsys):
+        comments = [
+            _c(1, _devin_body("🔴", "Answered by a maintainer")),
+            _c(2, "✅ **Resolved**: done", reply_to=1),
+            _c(9, "Agreed.", login="owner", utype="User", reply_to=1, assoc="OWNER"),
+        ]
+        _scan(guard, comments)
+        assert "[Devin self-withdrawn]" not in capsys.readouterr().err
+
     def test_resolved_marker_must_lead_the_reply(self, guard):
         comments = [
             _c(1, _devin_body("🔴", "Marker buried")),
@@ -336,6 +361,29 @@ class TestDevinScopeAndWaivers:
         )
         assert not block, msg
         assert "Prose nit" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        ("marker", "blocks"),
+        [("🔴", True), ("🟡", False)],
+    )
+    def test_p1_only_doc_mode_scores_devin_like_codex(
+        self, guard, monkeypatch, capsys, marker, blocks
+    ):
+        """Under `p1_only` a doc-path floor finding scores and a 0.5 one is skipped,
+        the same split the Codex branches apply to a P1 and a P2."""
+        monkeypatch.setenv("_TEST_DOC_FINDINGS_MODE", "p1_only")
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES", '{"filename": "docs/guide.md", "previous_filename": null}'
+        )
+        block, msg = _scan(
+            guard,
+            [_c(1, _devin_body(marker, "Doc finding", path="docs/guide.md"), path="docs/guide.md")],
+        )
+        assert block is blocks, msg
+        # Assert HOW it was handled, not only the verdict: a scored 0.5 would not
+        # block a doc-only change either, so the verdict alone cannot tell.
+        skipped = "[doc Devin]" in capsys.readouterr().err
+        assert skipped is (not blocks), "doc-path handling does not match p1_only"
 
     def test_review_override_waives_devin_findings_like_every_other(self, guard):
         block, _ = _scan(guard, [_c(1, _devin_body("🔴", "Waived"))], force=True)
@@ -528,7 +576,7 @@ class TestDuplicateCopiesUseTheStrongest:
             _c(2, _devin_body("🟡", "Yellow here", fid=fid)),
         ]
         _scan(guard, comments)
-        assert "marked more severe outside this PR" in capsys.readouterr().err
+        assert "on an anchor this gate did not score" in capsys.readouterr().err
 
     def test_every_unreadable_copy_counts_toward_drift(self, guard):
         fid = "BUG_pr-review-job-aaa_0016"
