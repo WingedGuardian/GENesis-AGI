@@ -38,6 +38,24 @@ MODE="default"          # default | genesis-only | guardian-only | full
 DRY_RUN=false
 INTERACTIVE=true
 CONTAINER_NAME="genesis"
+
+# ONE inventory of Persistent= timers, because there are TWO cleanup paths and
+# they have drifted apart before. A `Persistent=true` timer keeps a stamp under
+# ~/.local/share/systemd/timers/ that removing the unit file does NOT delete;
+# systemd.timer(5) says to clear it BEFORE the unit goes away, or a reinstall
+# inherits a stale "last run" and can immediately replay a run it should skip.
+#
+# Kept as a variable rather than repeated, because repeating it is exactly how
+# this broke: the direct-container branch gained a timer and the host-driven
+# branch did not, and this file's own comment already named that asymmetry once.
+# A fourth hardcoded list would have been the third instance.
+#
+# tests/test_scripts/test_systemd_template_placeholders.py derives the expected
+# set from the templates themselves and asserts EVERY `clean --what=state` site
+# uses this variable, so a new Persistent timer cannot be half-added.
+GENESIS_PERSISTENT_TIMERS="genesis-cc-settings-align.timer genesis-cc-align.timer \
+genesis-disk-hygiene.timer genesis-watchdog.timer genesis-graph-project.timer \
+genesis-code-intel.timer genesis-backup.timer genesis-cc-tmp-align.timer"
 CONTAINER_USER="ubuntu"
 IN_CONTAINER=false
 
@@ -90,6 +108,13 @@ safe_remove() {
     local path="$1"
     local label="${2:-$1}"
     if [ -e "$path" ] || [ -L "$path" ]; then
+        # Word splitting on $GENESIS_PERSISTENT_TIMERS is DELIBERATE in both
+        # branches below: the inventory is a space-separated unit list, not one
+        # argument. Explained here rather than beside the command because a
+        # neighbouring test asserts the DRY_RUN guard sits within 500 characters
+        # of the clean call, and a comment block wedged between them pushed it
+        # out of range — the guard was still there, the window just could not
+        # see it.
         if [ "$DRY_RUN" = true ]; then
             echo "    [DRY RUN] Would remove: $label"
         else
@@ -418,6 +443,9 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-disk-hygiene.timer genesis-disk-hygiene.service \
                     genesis-cc-tmp-align.timer genesis-cc-tmp-align.service \
                     genesis-cc-settings-align.timer genesis-cc-settings-align.service \
+                    genesis-graph-project.timer genesis-graph-project.service \
+                    genesis-code-intel.timer genesis-code-intel.service \
+                    genesis-backup.timer genesis-backup.service \
                     genesis-server.service genesis-bridge.service \
                     qdrant.service; do
             safe_disable_service "$unit"
@@ -434,14 +462,13 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
         # timer state changes whether a later reinstall replays a missed run,
         # which is exactly the outcome someone runs --dry-run to avoid.
         if [ "$DRY_RUN" = true ]; then
-            echo "    [DRY RUN] Would clear persistent timer state for:" \
-                 "genesis-cc-settings-align, genesis-cc-align, genesis-disk-hygiene," \
-                 "genesis-watchdog, genesis-cc-tmp-align"
+            # Reads the inventory rather than restating it: a --dry-run that
+            # names a DIFFERENT set from the one the real path clears is worse
+            # than no preview, since previewing is the whole point of the flag.
+            echo "    [DRY RUN] Would clear persistent timer state for: $GENESIS_PERSISTENT_TIMERS"
         else
-            systemctl --user clean --what=state \
-                genesis-cc-settings-align.timer genesis-cc-align.timer \
-                genesis-disk-hygiene.timer genesis-watchdog.timer \
-                genesis-cc-tmp-align.timer 2>/dev/null || true
+            # shellcheck disable=SC2086
+            systemctl --user clean --what=state $GENESIS_PERSISTENT_TIMERS 2>/dev/null || true
         fi
 
         # Wait for genesis-server port to close
@@ -508,10 +535,16 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                 systemctl --user stop genesis-watchdog.timer genesis-watchdog.service 2>/dev/null || true;
                 systemctl --user stop genesis-cc-tmp-align.timer genesis-cc-tmp-align.service 2>/dev/null || true;
                 systemctl --user stop genesis-cc-settings-align.timer genesis-cc-settings-align.service 2>/dev/null || true;
+                systemctl --user stop genesis-graph-project.timer genesis-graph-project.service 2>/dev/null || true;
+                systemctl --user stop genesis-code-intel.timer genesis-code-intel.service 2>/dev/null || true;
+                systemctl --user stop genesis-backup.timer genesis-backup.service 2>/dev/null || true;
                 systemctl --user stop genesis-server.service genesis-bridge.service qdrant.service 2>/dev/null || true;
                 systemctl --user disable genesis-server.service genesis-bridge.service \
                     genesis-watchdog.timer genesis-watchdog.service \
                     genesis-cc-tmp-align.timer genesis-cc-tmp-align.service \
+                    genesis-graph-project.timer genesis-graph-project.service \
+                    genesis-code-intel.timer genesis-code-intel.service \
+                    genesis-backup.timer genesis-backup.service \
                     genesis-cc-settings-align.timer genesis-cc-settings-align.service qdrant.service 2>/dev/null || true
             "
             ok "Stopped Genesis services"
@@ -530,10 +563,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                 echo "    [DRY RUN] Would clear persistent timer state inside the container"
             else
                 container_exec "
-                    systemctl --user clean --what=state \
-                        genesis-cc-settings-align.timer genesis-cc-align.timer \
-                        genesis-disk-hygiene.timer genesis-watchdog.timer \
-                        genesis-cc-tmp-align.timer 2>/dev/null || true
+                    systemctl --user clean --what=state $GENESIS_PERSISTENT_TIMERS 2>/dev/null || true
                 "
             fi
 

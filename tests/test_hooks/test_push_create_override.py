@@ -805,3 +805,195 @@ def test_integration_record_stays_under_isolated_home(published_feat, tmp_path):
         "record did not land under the isolated GENESIS_HOME — the guard subprocess "
         "no longer inherits GENESIS_HOME? (real-~/.genesis leak risk)"
     )
+class TestLauncherCarriedGatedOps:
+    """A gated operation behind a launcher the resolver refuses to model.
+
+    `eval git push` parses CLEANLY — `blind` is None — and resolves to
+    `exe == "eval"`, so every push/merge/create predicate sees nothing AND the
+    raw-text net is unreachable, because that net is gated on `blind is not
+    None`. Measured on the deployed guard: a silent ALLOW, where the bare
+    spelling asks.
+
+    It arms the same deferred deny as `hidden_gated_verb` — the file's own
+    comment puts "an unreadable program naming a publish" in that class — so the
+    verdict is a BLOCK in both session kinds rather than an ask. Stricter than
+    the bare spelling on purpose: the guard cannot verify what would run, and
+    the remedy (drop the launcher, or issue the gated command as its own call)
+    costs one line.
+    """
+
+    # Assembled from fragments: a test file containing these verbatim trips the
+    # guards under test whenever anything reads it through a shell.
+    PUSH = "pu" + "sh"
+    NV = "--no-" + "ver" + "ify"
+
+    @pytest.mark.parametrize(
+        "carrier",
+        [
+            "eval git {op}",
+            'eval "git {op}"',
+            "su ubuntu -c 'git {op}'",
+            "runuser -u ubuntu -c 'git {op}'",
+            "setpriv --reuid 1000 git {op}",
+        ],
+    )
+    def test_a_carried_publish_is_refused(self, carrier):
+        cmd = carrier.format(op=self.PUSH)
+        res = _run(cmd)
+        assert res.returncode == 2, (
+            f"{cmd!r}: the launcher runs this and the branch is published, but "
+            f"no gate saw it — stdout={res.stdout[:160]!r}"
+        )
+
+    def test_a_carried_publish_is_refused_when_dispatched_too(self):
+        # No human is present to approve, so the refusal must not soften.
+        assert _run(f"eval git {self.PUSH}", dispatched=True).returncode == 2
+
+    def test_a_carried_hook_skip_is_refused(self):
+        assert _run(f"eval git commit {self.NV} -m x").returncode == 2
+
+    def test_a_parsed_sibling_segment_does_not_suppress_it(self):
+        """The suppression trap this guard already documents for `hidden_gated_verb`.
+
+        A carrier is a fact about ONE segment, so another segment parsing
+        cleanly says nothing about it. Suppressing on that basis would let an
+        unresolved publish ride a visible one.
+        """
+        assert _run(f"git status --short && eval git {self.PUSH}").returncode == 2
+
+    # `-n` assembled from fragments for the same reason as PUSH/NV above.
+    SHORT_NV = "-" + "n"
+
+    def test_a_carried_commit_with_the_SHORT_hook_skip_is_refused(self):
+        """`git commit -n` is `--no-verify`'s supported short form.
+
+        The mention pattern that scopes this guard's carrier arm held only
+        `--no-verify`, so `eval git commit -n -m x` was ALLOWED while the direct
+        spelling BLOCKED through `commit_skips_hooks` (MEASURED, and found
+        independently by three reviewers). The scope now carries `commit`
+        itself: a carried commit of ANY spelling is this guard's business,
+        because it cannot read the payload to find out which.
+        """
+        assert _run(f"eval git commit {self.SHORT_NV} -m x").returncode == 2
+        assert _run(f"eval 'git commit {self.SHORT_NV} -m x'").returncode == 2
+        # The long form, and a nesting, for the same reason.
+        assert _run(f"eval git commit {self.NV} -m x").returncode == 2
+        assert _run(f"eval eval git commit {self.SHORT_NV} -m x").returncode == 2
+
+    def test_the_carrier_arm_is_scoped_to_THIS_guards_subject(self):
+        """The carrier arms the deny; the guard's own subject matter scopes it.
+
+        An unscoped version banned the launcher rather than gating the
+        operation — `eval ls -la`, `unshare -r whoami` and
+        `systemd-run --user --scope -- /bin/true` were all refused by a PUSH
+        guard, and the deny text told the reader to run "the git/gh command"
+        on a command containing no git. MEASURED over the recorded corpus:
+        126 carrier hits unscoped, 22 once scoped.
+
+        The sibling guard draws the same line with its own `\\brm\\b` prefilter.
+        A text test is unsound for FINDING an operation — fragments concatenate
+        — but sound for deciding whether a command is this guard's business.
+        """
+        for cmd in ("eval ls -la", "unshare -r whoami", "flock -n /tmp/x.lock echo hi"):
+            res = _run(cmd)
+            assert res.returncode == 0, f"{cmd!r} is not this guard's business: {res.stderr[:120]}"
+
+    def test_the_carrier_net_is_SEPARATE_from_the_blind_spot_net(self):
+        """`commit` belongs to the carrier arm only, and this pins that.
+
+        `_GATED_MENTION` has two consumers: the carrier arm ("is this launcher
+        this guard's business?") and the blind-spot arm ("this command is
+        unreadable AND names a gated op"). Their costs differ by more than an
+        order of magnitude, and an earlier revision widened the SHARED pattern
+        with `commit` after costing only the carrier arm.
+
+        MEASURED on the arm that was not counted: of 1,643 corpus commands the
+        resolver calls blind, the widened pattern matched 283 more than the old
+        one — and 12 of 12 sampled went allow -> BLOCK through the REAL guard on
+        both arms. They were ordinary `python - <<'PY'` heredocs whose BODY
+        mentioned the word commit. The figure published for the change was +9.
+        """
+        import importlib.util
+        import sys as _sys
+
+        spec = importlib.util.spec_from_file_location(
+            "gpg_pattern_check",
+            Path(__file__).resolve().parents[2] / "scripts" / "hooks" / "git_push_guard.py",
+        )
+        mod = importlib.util.module_from_spec(spec)
+        _sys.modules["gpg_pattern_check"] = mod
+        spec.loader.exec_module(mod)
+
+        prose = "print('commit the change')"
+        assert not mod._GATED_MENTION.search(prose), (
+            "the SHARED pattern must not match a bare `commit` — the blind-spot "
+            "arm reads it, and 283 real commands pay for that widening"
+        )
+        assert mod._CARRIER_GATED_MENTION.search(prose), (
+            "the CARRIER pattern must match `commit`, which is what closes "
+            "`eval git commit -n`"
+        )
+        # Assembled from fragments, same reason as PUSH/NV above.
+        gated = [
+            "git " + self.PUSH,
+            "git " + "mer" + "ge x",
+            self.NV,
+            "--" + "for" + "ce",
+            "--" + "ad" + "min",
+        ]
+        for tok in gated:
+            assert mod._CARRIER_GATED_MENTION.search(tok), f"carrier net lost {tok!r}"
+            assert mod._GATED_MENTION.search(tok), f"shared net lost {tok!r}"
+
+    def test_the_bare_spelling_is_not_turned_into_a_refusal(self):
+        """The control: the carrier branch left the ordinary push path alone.
+
+        It asserts the push reaches its NORMAL approval machinery, not WHICH
+        branch of that machinery — because the latter depends on whether the
+        current branch is already on the remote, which is state this test does
+        not control and cannot sensibly fix.
+
+        MEASURED, identical command and tree, only the cwd differing: from a
+        published PR branch the allowlist answers `allow` ("re-push … already on
+        the remote"); from an unpublished branch it answers `ask`. Asserting
+        `== "ask"` therefore went RED exactly when run on a live PR branch — the
+        only state a PR is ever in — which makes it a control that fails when it
+        is needed and passes when it is not.
+        """
+        res = _run(f"git {self.PUSH}")
+        assert res.returncode == 0, (
+            f"the bare spelling must not be refused: {res.stdout[:160]!r}"
+        )
+        assert _decision(res) in ("ask", "allow"), (
+            f"the bare spelling must reach the ordinary approval path, not the "
+            f"carrier deny: {res.stdout[:160]!r}"
+        )
+        # No substring check on the reason: the carrier deny is an exit 2, so
+        # `returncode == 0` above already proves that branch was not taken. An
+        # earlier version asserted "launcher" not in the output and failed
+        # because the BRANCH is named `fix/launcher-carriers` and the allowlist
+        # quotes the branch name back — a control coupled to the branch it runs
+        # on is the same defect this test was just fixed for.
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "git status --short",
+            "eval ls -la",
+            'eval "PAY=$X"',
+        ],
+    )
+    def test_a_carrier_without_a_gated_operation_is_untouched(self, cmd):
+        res = _run(cmd)
+        assert res.returncode == 0 and _decision(res) != "deny", (
+            f"{cmd!r}: naming no gated operation, this must not be refused — "
+            "otherwise the branch bans the launcher rather than gating the op"
+        )
+
+    def test_prose_naming_a_gated_operation_is_not_a_carried_command(self):
+        # The over-block shape most at risk: the words are present, but `echo`
+        # is not a carrier, so nothing here publishes anything.
+        res = _run(f'echo "eval git {self.PUSH} is the shape that was allowed"')
+        assert res.returncode == 0, (
+            f"a sentence about a publish is not a publish: {res.stderr[:160]!r}"
+        )

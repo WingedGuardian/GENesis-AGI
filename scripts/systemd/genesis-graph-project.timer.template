@@ -1,0 +1,36 @@
+[Unit]
+Description=Genesis Graph Projection — hourly schedule
+
+[Timer]
+# HOURLY nominally; a little OVER an hour in truth, and the difference is
+# stated rather than rounded away.
+#
+# Why hourly at all: at the MEASURED live write rate the projection drifts by a
+# few hundred to a few thousand links a day, so an hour keeps the window to a
+# small fraction of the graph. The rate is BURSTY rather than smooth (one
+# measured week: 4,075 links one day, 5 the next, 849 another), so a burst
+# inside the window can still exceed it. This is a bounded window, not
+# invalidation-on-write; that needs the DB-side change signal in issue #1641.
+#
+# Why NOT exactly an hour: OnCalendar defines nominal EVENTS, not a maximum
+# interval between executions. Each event can take its own RandomizedDelaySec
+# (up to 2min, below) plus AccuracySec coalescing (up to 1min), so two
+# consecutive starts can be ~63 minutes apart — and the PUBLISHED projection is
+# older still by the rebuild duration (MEASURED 16-21s). Anything downstream
+# quoting "one hour" as a guarantee is quoting the nominal figure, not this one.
+#
+# Randomization kept but reduced from 300s: decorrelating from the other timers
+# is worth a couple of minutes of slack, and 300s bought no more decorrelation
+# than 120s while widening the bound by another three minutes.
+OnCalendar=hourly
+# A box that was asleep or off at the top of the hour still projects on wake,
+# rather than waiting for the next one with a projection that is already stale.
+Persistent=true
+AccuracySec=1min
+# De-correlate from the other timers: a projection is the heaviest hourly job
+# here, and landing it on the same second as the watchdog and the hygiene sweep
+# is avoidable contention.
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

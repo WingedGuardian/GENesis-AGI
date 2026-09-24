@@ -1151,10 +1151,32 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         svc_name=$(basename "$template" .template)
 
         target="$SYSTEMD_USER_DIR/$svc_name"
+        # Every token any template uses must appear here, and `sed` will NOT
+        # tell you when one is missing — an unknown `__TOKEN__` passes through
+        # verbatim into a unit that then installs and enables reporting success.
+        # __AZ_ROOT__ is the instance that proves it: install.sh gained the
+        # expression, this loop never did, and agent-zero.service rendered here
+        # with a literal `WorkingDirectory=__AZ_ROOT__` (MEASURED on a live
+        # install) while the venv path one line below it came out correct.
+        # Default matches install.sh and scripts/vendor_assets.sh.
+        # Parity with install.sh is pinned by
+        # tests/test_scripts/test_systemd_template_placeholders.py.
+        #
+        # ESCAPED, unlike the four above it, and the asymmetry is deliberate:
+        # AZ_ROOT is the only one an OPERATOR supplies (an env var), while the
+        # others are computed here. MEASURED what unescaped does — `&` is sed's
+        # whole-match backreference, so AZ_ROOT=/tmp/R&D renders
+        # `WorkingDirectory=/tmp/R__AZ_ROOT__D`, putting the literal token BACK
+        # into the unit this line exists to fix; and a `|` makes sed exit 1,
+        # which under this script's `set -euo pipefail` aborts the whole render
+        # loop with units half-written. install.sh escapes all five via
+        # _sed_repl_esc; this matches it rather than widening the gap.
+        _az_root_esc=$(printf '%s' "${AZ_ROOT:-$HOME/agent-zero}" | sed -e 's/[\\&|]/\\&/g')
         rendered=$(sed -e "s|__HOME__|$HOME|g" \
                        -e "s|__VENV__|$GENESIS_ROOT/.venv|g" \
                        -e "s|__REPO_DIR__|$GENESIS_ROOT|g" \
                        -e "s|__CC_BIN_DIR__|$CC_BIN_DIR|g" \
+                       -e "s|__AZ_ROOT__|$_az_root_esc|g" \
                        "$template")
         if [[ -f "$target" ]]; then
             current=$(cat "$target")
