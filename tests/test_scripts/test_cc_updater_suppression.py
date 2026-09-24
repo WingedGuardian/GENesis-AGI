@@ -668,39 +668,64 @@ class TestTopLevelDefaults:
         assert json.loads(s.read_text())["DISABLE_FOO"] is True
         assert "MISSING" not in r.stderr, r.stderr
 
-    def test_a_top_level_default_eaten_by_a_clobber_is_not_reported_applied(
-        self, tmp_path: Path
-    ) -> None:
-        """Behavioural: a writer that removes the default immediately after our
-        rename (while sparing the env keys) must turn the run into `contended`,
-        never `repaired` — the caller must not print 'applied' for a key that is
-        not there. Staged deterministically by wrapping os.replace in the
-        reconciler's own interpreter via sitecustomize."""
+    def _run_with_clobber(self, tmp_path: Path, clobber: str, arg: str):
+        """Run the reconciler with os.replace wrapped (via sitecustomize, in the
+        reconciler's own interpreter) so *clobber* — python acting on dict `d`
+        — rewrites the file immediately after our rename."""
         shim = tmp_path / "shim"
-        shim.mkdir()
+        shim.mkdir(exist_ok=True)
         (shim / "sitecustomize.py").write_text(
             "import os, json\n"
             "_real = os.replace\n"
             "def _clobber(src, dst, *a, **k):\n"
             "    _real(src, dst, *a, **k)\n"
             "    if str(dst).endswith('settings.json'):\n"
-            "        d = json.load(open(dst)); d.pop('syncClaudeAiSkills', None)\n"
+            f"        d = json.load(open(dst)); {clobber}\n"
             "        json.dump(d, open(dst, 'w'))\n"
             "os.replace = _clobber\n"
         )
         bindir = _minimal_bin(tmp_path)
         (tmp_path / "home").mkdir(exist_ok=True)
-        r = subprocess.run(
-            ["bash", "-c", f'set -u; source "{_LIB}"; '
-             + self._CALL.format(args="'top:syncClaudeAiSkills=false'")],
+        return subprocess.run(
+            ["bash", "-c", f'set -u; source "{_LIB}"; ' + self._CALL.format(args=f"'{arg}'")],
             capture_output=True, text=True, timeout=60,
             env={"HOME": str(tmp_path / "home"), "PATH": str(bindir),
                  "CC_VERSION": "9.9.9", "PYTHONPATH": str(shim)},
         )
+
+    def test_a_top_level_default_eaten_by_a_clobber_is_not_reported_applied(
+        self, tmp_path: Path
+    ) -> None:
+        """Behavioural: a writer that removes the default right after our rename
+        (sparing the env keys) must make the run `contended`, never `repaired`."""
+        r = self._run_with_clobber(
+            tmp_path, "d.pop('syncClaudeAiSkills', None)", "top:syncClaudeAiSkills=false")
         # Guard-the-guard: the shim really ran (the key is gone from disk).
         assert "syncClaudeAiSkills" not in json.loads(_settings(tmp_path).read_text())
         assert "STATE=contended" in r.stdout, (r.stdout, r.stderr)
         assert "syncClaudeAiSkills" in r.stderr
+
+    def test_a_top_level_default_whose_VALUE_was_changed_is_not_reported_applied(
+        self, tmp_path: Path
+    ) -> None:
+        """The key survives but holds a different value — a presence check would
+        call that `repaired` and the caller would print `false` as applied."""
+        r = self._run_with_clobber(
+            tmp_path, "d['syncClaudeAiSkills'] = True", "top:syncClaudeAiSkills=false")
+        assert json.loads(_settings(tmp_path).read_text())["syncClaudeAiSkills"] is True
+        assert "STATE=contended" in r.stdout, (r.stdout, r.stderr)
+
+    def test_an_env_default_whose_VALUE_was_changed_is_not_reported_applied(
+        self, tmp_path: Path
+    ) -> None:
+        """Same class for the env form, fixed together (it had the same
+        presence-only check)."""
+        r = self._run_with_clobber(
+            tmp_path, "d['env']['CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH'] = '9'",
+            "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2")
+        assert json.loads(_settings(tmp_path).read_text())["env"][
+            "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] == "9"
+        assert "STATE=contended" in r.stdout, (r.stdout, r.stderr)
 
 
 class TestLostUpdate:
@@ -1895,17 +1920,19 @@ class TestVerifiedByConstruction:
         so no behavioural test can observe the entry value -- but a future
         branch that forgets is exactly the audience. Reverting the entry to
         `ok` re-opens all nine holes at once.
-        (b) the reconciler verifying WRITTEN DEFAULTS in its post-write
-        re-read: forcing a clobber that eats only the default between
-        os.replace and the re-read is a race this harness cannot stage
-        deterministically. A pin is weaker than behaviour and is labelled so.
+        (b) the post-write verification of WRITTEN DEFAULTS used to be pinned
+        here too, on the belief that a clobber between os.replace and the
+        re-read could not be staged deterministically. It can: a sitecustomize
+        shim wraps os.replace in the reconciler's own interpreter. So (b) is now
+        BEHAVIOURAL — TestTopLevelDefaults::
+        test_an_env_default_whose_VALUE_was_changed_is_not_reported_applied and
+        its top-level siblings — and the weaker source pin is gone.
         """
         src = _LIB.read_text()
         assert "CC_SUPPRESSION_STATE=unverified" in src, (
             "the entry state must be pessimistic -- `ok` as a default is how "
             "nine paths reported success without verifying"
         )
-        assert "still += [k for k in missing_defaults if k not in final_env]" in src
 
 
 class TestAlignVerifiesNotAssumes:

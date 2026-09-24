@@ -691,8 +691,17 @@ for _attempt in range(ATTEMPTS):
         # clobber that ate the default but spared the suppression keys would
         # otherwise pass, and the caller would print "applied" for a key that
         # is not there.
-        still += [k for k in missing_defaults if k not in final_env]
-        still += [k for k in missing_top if k not in final]
+        # The VALUE, not just the key: a writer that replaced what we wrote
+        # (`false` -> `true`) leaves the key present, and a presence check would
+        # report the requested value as applied. Canonical JSON for top-level
+        # values, so JSON false never compares equal to 0 inside a nested value.
+        still += [k for k in missing_defaults if final_env.get(k) != DEFAULTS[k]]
+
+        def _canon(v):
+            return json.dumps(v, sort_keys=True, allow_nan=False)
+
+        still += [k for k in missing_top
+                  if k not in final or _canon(final[k]) != _canon(TOP_DEFAULTS[k])]
     except (OSError, ValueError):
         still = list(REQUIRED)
     if still:
