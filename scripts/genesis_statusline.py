@@ -151,17 +151,33 @@ _CHAINED_TIMEOUT_S = 5.0
 
 def _kill_group(proc) -> None:
     """SIGKILL the chained command's whole process group (the shell AND what it
-    spawned). Guarded: a pgid <= 1 would signal init or every process we own."""
+    spawned).
+
+    The group id IS ``proc.pid`` — ``start_new_session`` makes the shell its
+    group leader — so no lookup. Two guards, both load-bearing:
+    - ``returncode is None``: once the shell has been REAPED its pid (and so its
+      group id) may be reused by an unrelated process; killing it then would hit
+      a stranger's group. An exited-but-unreaped shell still pins the id
+      (MEASURED: getpgid on the zombie returns its own pid), so this is the
+      exact line between safe and unsafe.
+    - ``pgid > 1``: killpg(1) signals every process this user owns.
+    """
     import os
     import signal
 
-    try:
-        pgid = os.getpgid(proc.pid)
-    except OSError:
-        return
-    if pgid > 1:
+    pgid = proc.pid
+    if proc.returncode is None and pgid > 1:
         with contextlib.suppress(OSError):
             os.killpg(pgid, signal.SIGKILL)
+
+
+def _disarm_sigterm() -> None:
+    """Restore the default SIGTERM once the chained command is finished, so a
+    late cancel cannot reach a group id that has since been released."""
+    import signal
+
+    with contextlib.suppress(ValueError, OSError):
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
 
 def _start_chained(cmd: str, raw: str):
@@ -226,6 +242,8 @@ def _finish_chained(started) -> str:
         return text if text.endswith("\n") else text + "\n"
     except Exception:  # noqa: BLE001 — see docstring
         return ""
+    finally:
+        _disarm_sigterm()
 
 
 def main(argv: list[str] | None = None) -> int:

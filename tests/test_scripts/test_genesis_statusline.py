@@ -222,6 +222,42 @@ def test_a_descendant_that_escaped_the_group_cannot_hold_the_cap_open(sl, monkey
     assert rc == 0 and out.startswith("feat/x · ")
 
 
+def test_a_reaped_chained_command_is_never_group_killed(sl):
+    """Once reaped, the chained shell's pid — and so its group id — may belong to
+    someone else. _kill_group must refuse, so a late call cannot hit a stranger's
+    group. The 'stranger' is a real live group we own, with an explicit pid."""
+    from types import SimpleNamespace
+
+    stranger = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        assert stranger.pid > 1
+        reaped = SimpleNamespace(pid=stranger.pid, returncode=0)
+        sl._kill_group(reaped)
+        # Not poll(): a SIGKILL is delivered asynchronously, so an immediate
+        # poll() reads None even when the kill happened (measured: that made
+        # this assertion vacuous). Require it to SURVIVE a bounded wait instead.
+        with pytest.raises(subprocess.TimeoutExpired):
+            stranger.wait(timeout=0.5)
+        live = SimpleNamespace(pid=stranger.pid, returncode=None)
+        sl._kill_group(live)  # control arm: an unreaped proc IS killed
+        assert stranger.wait(timeout=5) is not None
+    finally:
+        if stranger.poll() is None:
+            stranger.kill()
+            stranger.wait()
+
+
+def test_sigterm_handler_is_disarmed_once_the_chained_command_is_done(sl, monkeypatch, capsys):
+    import signal
+
+    before = signal.getsignal(signal.SIGTERM)
+    try:
+        _run(sl, monkeypatch, capsys, {"cwd": "/x"}, ["--then", "true"])
+        assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+    finally:
+        signal.signal(signal.SIGTERM, before)
+
+
 def test_sigterm_to_the_script_takes_the_chained_group_with_it(tmp_path):
     """Claude Code cancels an in-flight status-line command by signalling it; the
     chained command lives in its own group, so the script must forward the kill."""
