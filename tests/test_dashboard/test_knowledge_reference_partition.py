@@ -2,8 +2,7 @@
 
 Both stores live in ``knowledge_units``. The reference store is the
 ``project_type='reference'`` partition, and a reference row carries its stored
-value in ``body`` — 51 of the 101 rows on the install where this was found were
-``reference.credentials``, 21 were ``reference.network``.
+value in ``body`` — credentials, network facts and account details among them.
 
 ``references.py`` renders that partition behind value-free summaries, kind
 masking and an explicit reveal step, and it already scopes itself to it:
