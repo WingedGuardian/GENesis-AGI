@@ -6,13 +6,13 @@ Opening the fleet intermittently showed a yellow bar across the bottom of the
 window, a preview of some unrelated session, and pressing Enter dropped the
 operator into that session instead of the fleet picker.
 
-The yellow was never a pane mode. On this server ``status-style`` is
-``bg=green`` and ``message-style`` is ``bg=yellow``, so a yellow bottom line is
-a tmux MESSAGE. The door probed for a free picker-session name with
-``has-session``, and on tmux "no such session" is an ERROR — which is a
-server-side message painted on every attached client's status line. The
-``2>/dev/null`` in the door silenced the door's OWN stderr and did nothing
-about that.
+The yellow was never a pane mode. On the install where this was diagnosed
+``status-style`` is ``bg=green`` and ``message-style`` is ``bg=yellow``, so a
+yellow bottom line is a tmux MESSAGE. The door probed for a free
+picker-session name with ``has-session``, and on tmux "no such session" is an
+ERROR — which is a server-side message painted on every attached client's
+status line. The ``2>/dev/null`` in the door silenced the door's OWN stderr
+and did nothing about that.
 
 The probe runs on the SUCCESS path (the picker name is free every time), so the
 message fired on every single connection. ``display-time`` is 750ms, so a warm
@@ -83,18 +83,49 @@ def test_the_door_adds_no_tmux_message_to_an_attached_client(tmp_path):
     env.pop("TMUX", None)
     env["TMUX_TMPDIR"] = "/tmp"
     env["PATH"] = f"{shim_dir}:{env['PATH']}"
+    # script(1) gives tmux a pty, but tmux still needs terminfo to attach.
+    # Without this the attach fails, the guard below skips, and the test goes
+    # DORMANT on CI while still reading as a clean run -- which is what the
+    # first CI run did.
+    #
+    # MEASURED locally: unsetting TERM alone reproduces that run's skip at
+    # that line, and with TERM set the test passes even with TERM unset in
+    # the environment. INFERRED, not measured: that an unset TERM is what
+    # actually fired on the runner. A job step echoes TERM now so the next
+    # run settles it; GitHub's per-step `env:` block cannot, because it
+    # echoes what the step DECLARES, not the process environment.
+    #
+    # Set unconditionally rather than defaulted: TERM=dumb fails to attach
+    # exactly like an unset one, so a setdefault would still skip wherever a
+    # wrapper exports it. It also pins the pty to one shape instead of
+    # inheriting whatever terminal a developer happens to run under. The bug
+    # under test is a SERVER-side tmux message recorded against an attached
+    # client, so it is terminal-independent -- the pty only has to be good
+    # enough for list-clients to be non-empty.
+    env["TERM"] = "xterm-256color"
 
     client = None
+    client_fh = None
     try:
         for n in (1, 2, 3):
             _tmux(sock, "new-session", "-d", "-s", f"cc-{n}", "sleep", "120")
         time.sleep(0.5)
 
+        # Keep what the client says. Both streams went to /dev/null once, and
+        # the first CI run then failed to attach with nothing to say why --
+        # the skip below was all anyone got, which is how a wrong cause gets
+        # written down. STDOUT is the load-bearing one and stderr alone is not
+        # enough: script(1) hands tmux a pty, so tmux's "open terminal failed"
+        # is written INTO that pty and arrives on script's stdout. MEASURED by
+        # mutating TERM to an unknown terminfo name: capturing stderr only
+        # reported "(no stderr)" while the real reason existed on stdout.
+        client_log = tmp_path / "client.log"
+        client_fh = client_log.open("wb")
         client = subprocess.Popen(
             ["script", "-qec", f"tmux -L {sock} attach -t cc-1", "/dev/null"],
             env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=client_fh,
+            stderr=subprocess.STDOUT,
         )
         time.sleep(2)
 
@@ -102,7 +133,22 @@ def test_the_door_adds_no_tmux_message_to_an_attached_client(tmp_path):
         # because tmux keeps these messages per client.
         clients = _tmux(sock, "list-clients").stdout.strip()
         if not clients:
-            pytest.skip(f"could not attach a client on this runner: {clients!r}")
+            # Reap first. The PARENT never writes to this handle -- it hands
+            # the fd to the child, so flushing it here would flush an empty
+            # buffer and guarantee nothing. The child's stdout is a regular
+            # file and therefore fully buffered in ITS libc, so what puts the
+            # bytes on disk is the child exiting. It has in the failure this
+            # targets (tmux gives up at once), but a HUNG client would
+            # otherwise read back as "(said nothing)" -- the exact silence
+            # this capture exists to end.
+            try:
+                client.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                client.kill()
+                client.wait(timeout=5)
+            client_fh.close()
+            why = client_log.read_text(errors="replace").strip() or "(said nothing)"
+            pytest.skip(f"could not attach a client on this runner: {why}")
 
         before = _miss_count(sock)
         # The door ENDS in `exec tmux … choose-tree`, which is interactive and
@@ -136,7 +182,11 @@ def test_the_door_adds_no_tmux_message_to_an_attached_client(tmp_path):
         )
     finally:
         if client is not None:
+            # No-op if the skip path already reaped it: send_signal() polls and
+            # returns once returncode is set.
             client.kill()
+        if client_fh is not None:
+            client_fh.close()
         _tmux(sock, "kill-server")
 
 
