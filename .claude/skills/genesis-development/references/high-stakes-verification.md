@@ -300,9 +300,10 @@ rather than carrying their own copies:
 | specs and evaluations | read later as a decision's basis, long after the basis moved |
 | plan documents | line numbers, PR heads and counts go quietly false as the tree moves |
 
-Then put each sentence on trial. Four steps, each carrying the instance that
-bought it — all from the single session that adopted this pass, which is the
-argument for it:
+Then put each sentence on trial. Five steps, each carrying the instance that
+bought it. The first four come from the single session that adopted this pass,
+which is the argument for it; the fifth arrived later and is marked where it
+sits:
 
 1. **Re-compute every number written in prose, and name its denominator.**
    MEASURED 2026-09-22, counting `except` handlers whose body is only `pass`
@@ -327,13 +328,16 @@ argument for it:
    under `_is_doc_path` — read it there.
 
 Denominators for negatives are covered by the table at the top of this file and
-are not restated here. One step belongs to this walk and is carried by no row,
-so it is stated rather than pointed at:
+are not restated here. The fifth step is not, and is stated rather than pointed
+at — which is itself its instance:
 
 5. **Re-read every evidence sentence against the artifact it names** — open the
    PR, the file, the row. An evidence string is a claim like any other, and it
    is the one written with the least attention, because by then the work feels
-   finished.
+   finished. The instance is this section: its first draft declared this step
+   "covered by the table at the top of this file", and it was in no row. A
+   pointer to an obligation that does not exist reads exactly like the
+   obligation being met, which is the failure this whole pass is about.
 
 Two outcomes of this pass feel like failure and are not. A claim that SHRINKS
 under audit is the method working (§8). And where one of §7's four causes fires,
