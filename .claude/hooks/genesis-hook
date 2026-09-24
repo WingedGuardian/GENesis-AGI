@@ -110,25 +110,72 @@ fi
 # and its interpreter/site-packages come from the SAME tree. A worktree rarely
 # has its own .venv (worktrees never pip-install), so fall back to the other
 # known roots rather than fail.
-PYTHON=""
-for _root in "$HOOK_ROOT" "$MAIN_ROOT" "$GENESIS_ROOT"; do
-    if [[ -n "$_root" && -x "$_root/.venv/bin/python" ]]; then
-        PYTHON="$_root/.venv/bin/python"
-        break
-    fi
-done
-if [[ -z "$PYTHON" ]]; then
-    echo "ERROR: Genesis venv not found (looked in HOOK_ROOT/MAIN_ROOT/GENESIS_ROOT/.venv/bin/python)" >&2
-    echo "Run: cd $GENESIS_ROOT && python -m venv .venv && pip install -e ." >&2
-    exit 1
-fi
-
-SCRIPT_NAME="${1:?Usage: genesis-hook <script_name.py> [args...]}"
+SCRIPT_NAME="${1:?Usage: genesis-hook <script_name.py|script_name.sh> [args...]}"
 SCRIPT_PATH="$HOOK_ROOT/scripts/$SCRIPT_NAME"
+
+# Choose the interpreter by the script's language. Every hook wired today is
+# Python; a `.sh` hook runs under bash rather than being handed to the
+# interpreter, which would fail on its shebang line.
+#
+# Resolved into a variable rather than exec'd per branch ON PURPOSE. The git
+# scrub below has to sit on exactly ONE exec line, so a later refactor cannot
+# drop it from one branch while the other still carries it —
+# tests/test_hooks/test_git_env_scrub.py locks that shape, and it caught this
+# file's first attempt at the change.
+# A hook this launcher CANNOT RUN has cleared nothing, and exit 1 is
+# non-blocking to Claude Code — so in a session that declares a Bash allowlist,
+# every "cannot run" branch below would be a PERMIT. That is the exact silent
+# downgrade the allowlist guard exists to remove, one layer up.
+#
+# MEASURED: with the guard absent from the resolved HOOK_ROOT (a lagging main
+# worktree, a rollout, a --separate-git-dir clone that trips the MAIN_ROOT
+# fallback), `genesis-hook hooks/bash_allowlist_guard.sh` exited 1 and the
+# command proceeded.
+#
+# So: refuse (exit 2) when an allowlist is in force, and keep the ordinary
+# non-blocking exit 1 otherwise. Scoped to allowlisted sessions on purpose —
+# they are dispatched, never the repair path, so fail-closed here cannot
+# strand an interactive session trying to fix the tree.
+_cannot_run() {
+    if [[ -n "${GENESIS_BASH_ALLOWLIST:-}" ]]; then
+        echo "BLOCKED: this session restricts Bash to [$GENESIS_BASH_ALLOWLIST]," >&2
+        echo "and the hook above could not be run, so nothing has been cleared." >&2
+        exit 2
+    fi
+    exit 1
+}
+
+RUNNER=()
+if [[ "$SCRIPT_NAME" == *.sh ]]; then
+    RUNNER=(bash)
+else
+    # Find the Python venv, co-located with the hook tree (HOOK_ROOT) so the
+    # script and its interpreter/site-packages come from the SAME tree. A
+    # worktree rarely has its own .venv (worktrees never pip-install), so fall
+    # back to the other known roots rather than fail.
+    #
+    # Resolved only for a Python hook: a shell hook needs no interpreter, and
+    # exiting 1 here for one would fail OPEN — Claude Code treats a non-2 exit
+    # as a non-blocking error, so the tool call proceeds. That is the wrong
+    # direction for a shell hook that exists to REFUSE things.
+    PYTHON=""
+    for _root in "$HOOK_ROOT" "$MAIN_ROOT" "$GENESIS_ROOT"; do
+        if [[ -n "$_root" && -x "$_root/.venv/bin/python" ]]; then
+            PYTHON="$_root/.venv/bin/python"
+            break
+        fi
+    done
+    if [[ -z "$PYTHON" ]]; then
+        echo "ERROR: Genesis venv not found (looked in HOOK_ROOT/MAIN_ROOT/GENESIS_ROOT/.venv/bin/python)" >&2
+        echo "Run: cd $GENESIS_ROOT && python -m venv .venv && pip install -e ." >&2
+        _cannot_run
+    fi
+    RUNNER=("$PYTHON")
+fi
 
 if [[ ! -f "$SCRIPT_PATH" ]]; then
     echo "ERROR: Hook script not found: $SCRIPT_PATH" >&2
-    exit 1
+    _cannot_run
 fi
 
 shift
@@ -150,4 +197,10 @@ shift
 # hook invoked directly from a shell rather than through this launcher. Both
 # layers are deliberate: this one is the only thing that helps a hook that does
 # NOT scrub, and that is every hook other than those two.
-exec env "${_GIT_ENV_SCRUB[@]}" "$PYTHON" "$SCRIPT_PATH" "$@"
+# The point of routing a shell hook through this launcher at all — rather than
+# wiring its absolute path directly — is that it then inherits the SAME
+# guarantees as the other ~55: HOOK_ROOT resolution to the MAIN worktree, so the
+# hook cannot drift per branch (measured 2026-08: 60 of 70 worktrees ran a stale
+# guard), and the git-location scrub. A security hook resolved by a second,
+# parallel path is exactly the divergence those two properties exist to prevent.
+exec env "${_GIT_ENV_SCRUB[@]}" "${RUNNER[@]}" "$SCRIPT_PATH" "$@"
