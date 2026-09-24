@@ -46,7 +46,11 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DOOR = REPO_ROOT / "scripts" / "lobby-door.sh"
 
-pytestmark = pytest.mark.skipif(
+# Scoped to the BEHAVIOURAL test, not the module. A module-level `pytestmark`
+# applies to every test in the file, so it also skipped the static companion —
+# which needs neither tmux nor script(1), and whose entire purpose is to hold
+# the line on a runner that lacks them. The guard was disabling the guard.
+_needs_tmux = pytest.mark.skipif(
     shutil.which("tmux") is None or shutil.which("script") is None,
     reason="needs tmux and script(1) to attach a real client",
 )
@@ -66,6 +70,7 @@ def _miss_count(sock: str) -> int:
     return out.count("can't find session")
 
 
+@_needs_tmux
 def test_the_door_adds_no_tmux_message_to_an_attached_client(tmp_path):
     sock = f"lobbyprobe{os.getpid()}"
     shim_dir = tmp_path / "shim"

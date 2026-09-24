@@ -97,7 +97,21 @@ _session_exists() {
     # never match `lobby-123`. `list-sessions` failing (no server yet, first
     # boot) yields no output, grep fails, and the caller reads "absent" — which
     # is the correct answer in that state.
-    tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -qxF "$1"
+    # `grep -xF … >/dev/null`, NOT `grep -qxF`. This file runs under
+    # `set -uo pipefail` (line 52), and -q exits on the first match — which can
+    # SIGPIPE tmux mid-write and make the PIPELINE fail while the session
+    # plainly exists. A false "absent" here is worse than the bug this function
+    # was written for: the door would then create on a taken name, tmux would
+    # answer `duplicate session`, and the login would die outright (MEASURED:
+    # exit 1, no client attached).
+    #
+    # Honest about the evidence: I could NOT reproduce that failure — 0/40
+    # false negatives with 301 sessions and the target sorted first, because
+    # ~3.6KB of names fits the ~64KB pipe buffer, so tmux completes its write
+    # before grep exits. It would take thousands of sessions to reach. The
+    # change is kept because it costs nothing and the failure mode if that
+    # bound is ever wrong is a dead login, not a cosmetic glitch.
+    tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -xF "$1" >/dev/null
 }
 
 WORKSPACE="lobby"
