@@ -115,8 +115,8 @@ isolation is still load-bearing for you — it is:
   instead — which, unlike `is_authenticated()`, is never true when no password
   is configured, because nothing can be proved without a credential to present.
   Today that covers the provider-key **values** (`/api/genesis/secrets`) and
-  the backup target, filesystem paths and NAS username
-  (`/api/genesis/backup/config`). Those are withheld from an unauthenticated
+  the backup target (`/api/genesis/backup/status`) and the filesystem paths
+  and NAS username (`/api/genesis/backup/config`). Those are withheld from an unauthenticated
   caller on every install, including a passwordless one. The routes still
   answer and the response shape is unchanged; only the sensitive values are
   absent.

@@ -218,24 +218,45 @@ def _password_fingerprint(password: str) -> str:
 
     Keyed rather than bare, and that is the whole point of it. A Flask session
     cookie is SIGNED but not ENCRYPTED, so everything inside it is readable by
-    anyone holding the cookie. A plain digest of the password would therefore
-    hand that holder an offline dictionary attack against a password an
-    operator very likely chose by hand — and truncation buys nothing against
-    it, because an attacker testing candidate passwords truncates their own
-    digests exactly the same way. Truncation costs collision resistance, which
-    is not the property under attack. Keying with a secret the client never
-    sees removes the attack rather than shortening it.
+    anyone holding the cookie. A plain digest of the password would hand that
+    holder an offline dictionary attack against a password an operator very
+    likely chose by hand — and truncation buys nothing against it, because an
+    attacker testing candidates truncates their own digests the same way.
+    Truncation costs collision resistance, which is not the property under
+    attack. Keying with a secret the client never sees removes the attack.
+
+    NOT a slow KDF, deliberately, and the reasoning is worth keeping because
+    the obvious upgrade does not survive it. A KDF would only help against an
+    attacker who already holds the Flask secret — and such an attacker does not
+    need to crack anything: they forge ``authenticated: True`` directly, which
+    is what the terminal WebSocket gates on. The extra cost would buy defence
+    against someone who already has a shell, while forcing either a
+    per-request delay or a cache that RETAINS a rotated-away plaintext
+    password. Both are worse than the thing they defend.
 
     The key is the one Flask signed the cookie with, so a fingerprint cannot
     outlive the cookie carrying it: rotating the secret invalidates the
     signature and the tag together, and no session is left half-valid.
+
+    Encoded as BYTES with ``surrogateescape`` throughout — the same discipline
+    ``check_bearer_token`` uses. That covers every password the environment can
+    actually deliver: Python decodes ``os.environ`` with ``surrogateescape``, so
+    a value containing bytes that are not valid UTF-8 arrives as U+DC80..U+DCFF
+    and re-encodes to the original bytes. VERIFIED, not assumed — a plain
+    ``.encode()`` raises on exactly those.
+
+    Stated limit: a LONE high surrogate (U+D800..U+DBFF) still raises, because
+    ``surrogateescape`` only reverses the escapes it creates. That range is not
+    producible by the environment decode and would have to be assigned to
+    ``os.environ`` in-process, so it is named here rather than defended against.
     """
     key = current_app.secret_key if has_app_context() else None
     if not key:
         key = get_or_create_secret_key()
     if isinstance(key, str):
-        key = key.encode()
-    return hmac.new(key, password.encode(), hashlib.sha256).hexdigest()[:16]
+        key = key.encode("utf-8", "surrogateescape")
+    message = password.encode("utf-8", "surrogateescape")
+    return hmac.new(key, message, hashlib.sha256).hexdigest()[:16]
 
 
 def check_password(input_password: str) -> bool:
@@ -583,11 +604,19 @@ _LOGIN_HTML = """<!DOCTYPE html>
           credentials: 'same-origin',
           body: JSON.stringify({password: pw}),
         });
-        if (resp.ok) {
+        const body = await resp.json().catch(() => ({}));
+        if (resp.ok && body.status === 'auth_disabled') {
+          // 200, but NOTHING was minted: there is no password to check
+          // against. Redirecting here told the operator they were logged in
+          // while the session that gates the protected views did not exist,
+          // so values stayed hidden with no explanation.
+          err.textContent = 'No dashboard password is configured, so there is '
+            + 'nothing to log in to. Set one in Secrets to enable the '
+            + 'protected views.';
+        } else if (resp.ok) {
           window.location.href = '/genesis';
         } else {
-          const d = await resp.json().catch(() => ({}));
-          err.textContent = d.error || 'Login failed';
+          err.textContent = body.error || 'Login failed';
           document.getElementById('pw').select();
         }
       } catch (ex) {

@@ -2491,7 +2491,19 @@
               this.secretsGroups = body.groups;
               // Without this the editor cannot tell "not set" from "set but not
               // readable by you" — the whole reason the server sends it.
+              const wasWithheld = this.secretsWithheld;
               this.secretsWithheld = !!body.values_withheld;
+              // A SEED taken under the old disclosure state is stale the moment
+              // that state flips. Open a field while values are withheld, log
+              // in elsewhere, let a refresh land, then Save without typing: the
+              // untouched-and-withheld refusal no longer applies, and the empty
+              // seed reaches the clear path for an override the operator never
+              // saw. Drop the seeds so an open field must be re-opened.
+              if (wasWithheld !== this.secretsWithheld) {
+                this.secretsSeeded = {};
+                this.secretsEditing = {};
+                this.secretsValues = {};
+              }
             }
           } catch (e) { console.warn("Secrets fetch failed:", e); }
         },

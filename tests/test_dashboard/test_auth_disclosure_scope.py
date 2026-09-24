@@ -247,3 +247,35 @@ def test_password_fingerprint_is_keyed_not_a_bare_digest():
     assert under_a != bare, "the fingerprint is an unkeyed digest of the password"
     assert under_a != under_b, "the fingerprint does not depend on the signing key"
     assert under_a == under_a_again, "the fingerprint is unstable within one key"
+
+
+def test_fingerprint_handles_a_password_the_environment_can_deliver():
+    """A password containing bytes that are not valid UTF-8 must not raise.
+
+    Python decodes ``os.environ`` with ``surrogateescape``, so a password set
+    as raw bytes arrives as U+DC80..U+DCFF. A plain ``.encode()`` raises on
+    exactly those, which would turn the disclosure predicate into a 500 for an
+    operator whose password happens to contain one — a fail-closed crash where
+    a comparison belongs.
+
+    The lone-high-surrogate range (U+D800..U+DBFF) is deliberately NOT covered:
+    ``surrogateescape`` only reverses its own escapes, and that range cannot
+    come from the environment decode. Asserted here so the bound is explicit
+    rather than discovered later.
+    """
+    app = Flask(__name__)
+    app.secret_key = "test-secret-key"
+
+    # Exactly what os.environ yields for a value containing 0xFF 0xFE.
+    from_env = b"pw-\xff\xfe".decode("utf-8", "surrogateescape")
+    assert from_env.encode("utf-8", "surrogateescape") == b"pw-\xff\xfe"
+
+    with app.app_context():
+        tag = auth._password_fingerprint(from_env)
+        assert len(tag) == 16
+        # Distinct from an ordinary password under the same key — the escape
+        # must not collapse to a shared value.
+        assert tag != auth._password_fingerprint("pw-")
+
+    with app.app_context(), pytest.raises(UnicodeEncodeError):
+        auth._password_fingerprint("\ud800")
