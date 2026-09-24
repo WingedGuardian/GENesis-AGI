@@ -723,6 +723,36 @@ profiles:
     last_reviewed: "2026-03-26"
     review_source: manual
 
+  qwen2.5-3b:
+    display_name: "Qwen 2.5 3B"
+    provider: ollama
+    api_id: "qwen2.5:3b"
+    intelligence_tier: C
+    reasoning: C
+    instruction_following: B
+    anti_sycophancy: C
+    context_window: 32768
+    cost_tier: free
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    latency: low
+    strengths:
+      - local inference (zero network latency)
+      - zero cost
+      - simple classification and tagging
+    weaknesses:
+      - complex reasoning
+      - factuality (high hallucination rate)
+      - nuanced analysis
+    best_for: [triage, tagging]
+    avoid_for: [deep_reflection, strategic_reflection, foreground_conversation, code_work]
+    free_tier:
+      available: true
+      provider: local
+      limits: "unlimited (local inference)"
+    last_reviewed: "2026-03-26"
+    review_source: manual
+
   llama-3.3-70b:
     display_name: "Llama 3.3 70B"
     provider: meta
@@ -1285,12 +1315,12 @@ profiles:
     anti_sycophancy: C
     context_window: 1048576
     cost_tier: cheap
-    # MEASURED 2026-09-21 from Google's own pricing page (ai.google.dev/gemini-api/docs/pricing).
-    # These are the PAID-tier list rates in effect through 2026-12-31; Google
-    # states they double on 2027-01-01 ($1.50 / $7.50), so this entry carries a
-    # shelf life rather than a constant.
-    cost_per_mtok_in: 0.75
-    cost_per_mtok_out: 3.75
+    # CARRIED from the gemini-3.5-flash entry, NOT re-measured — Google's direct
+    # listing does not expose per-token price the way OpenRouter does, and this
+    # provider is reached on the Google API, not through OpenRouter. Same caveat
+    # applies to cost_tier and latency on this entry.
+    cost_per_mtok_in: 0.50
+    cost_per_mtok_out: 3.00
     latency: low
     strengths:
       - speed (instant first token)

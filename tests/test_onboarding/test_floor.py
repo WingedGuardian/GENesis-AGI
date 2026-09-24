@@ -202,15 +202,7 @@ def test_config_derivation_only_chain_referenced_cloud_types():
     assert "ollama" not in types and "lmstudio" not in types
     # Declared+enabled but referenced by NO chain → excluded:
     assert "qwen" not in types and "openai" not in types
-    assert "xai" not in types
-    # `minimax` IS chain-referenced as of 2026-09-21 — it became a paid
-    # last-resort rung on the chains that had no paid fallback at all — so the
-    # derivation now correctly reports it. That is the intended answer, and it
-    # is NOT the same case as `qwen` above: minimax is a genuine LLM provider
-    # with its own LLM key (API_KEY_MINIMAX), whereas API_KEY_QWEN drives the
-    # DashScope EMBEDDING backend. Drawing exactly that line is this test's job,
-    # which is why qwen-plus was dropped from those tails rather than chained.
-    assert "minimax" in types
+    assert "xai" not in types and "minimax" not in types
     # Disabled providers are absent from cfg.providers entirely:
     assert "deepseek" not in types and "github" not in types
 

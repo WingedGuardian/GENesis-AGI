@@ -528,14 +528,10 @@ async def test_budget_seed_data(db):
     cursor = await db.execute("SELECT id, budget_type, limit_usd FROM budgets ORDER BY limit_usd")
     rows = await cursor.fetchall()
     assert len(rows) == 3
-    # Raised 2026-09-21 from 2.00/30.00 alongside the routing change that added
-    # a paid last-resort rung to 19 previously-spend-less chains — see the note
-    # on BUDGET_SEED. SEED ONLY: `_migrations` inserts these with INSERT OR
-    # IGNORE, so an existing install keeps whatever its operator set.
     assert rows[0]["id"] == "budget_daily"
-    assert rows[0]["limit_usd"] == 5.00
+    assert rows[0]["limit_usd"] == 2.00
     assert rows[2]["id"] == "budget_monthly"
-    assert rows[2]["limit_usd"] == 50.00
+    assert rows[2]["limit_usd"] == 30.00
 
 
 async def test_budget_seed_idempotent(db):

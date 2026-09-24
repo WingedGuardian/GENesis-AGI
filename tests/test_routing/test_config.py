@@ -135,10 +135,7 @@ def test_load_full_yaml(monkeypatch):
     # 404-for-account on NIM); nvidia-nim-deepseek repointed v4-pro → v4-flash-0731.
     # 2026-09-05: 25 -> 26 with mistral-medium-free — the in-family rung
     # directly below Large (presumptive free tier; see model_routing.yaml).
-    # 2026-09-21: 26 → 25 after removing the unused ollama-3b chat rung. It was
-    # wired into no chain, so this changes no routing. Ollama remains a supported
-    # provider TYPE and ollama-embedding still ships — only that rung is gone.
-    assert len(cfg.providers) == 25
+    assert len(cfg.providers) == 26
     assert "lmstudio-30b" not in cfg.providers
     assert "github-o3mini" not in cfg.providers
     assert "openrouter-deepseek-r1" not in cfg.providers  # removed from config
@@ -237,14 +234,10 @@ def test_load_full_yaml(monkeypatch):
     ]
     assert cfg.call_sites["30_triage_calibration"].default_paid is True
     # lmstudio-30b filtered out; the Mistral family rungs remain (Large, then
-    # Medium directly below it — the in-family fallback added 2026-09-05), plus
-    # the paid last-resort tail appended 2026-09-21 to every chain that had no
-    # paid rung at all (before it, an all-free chain simply failed outright).
+    # Medium directly below it — the in-family fallback added 2026-09-05).
     assert cfg.call_sites["30_triage_calibration"].chain == [
         "mistral-large-free",
         "mistral-medium-free",
-        "openrouter-deepseek-flash",
-        "minimax",
     ]
     assert cfg.call_sites["31_outcome_classification"].chain == [
         "glm",
