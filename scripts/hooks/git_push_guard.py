@@ -6429,14 +6429,16 @@ def _check_codex_reviewed_head(
     non-pending Devin or CodeRabbit review whose ``commit_id`` is EXACTLY the
     current head then satisfies freshness, the head is returned so the merge stays
     bound to it by ``--match-head-commit``, and the substitute is recorded in
-    ``substitute_out`` so the caller can ask the owner. The ask is the CALLER'S
-    job, and it is not optional there: this function reports that a substitute
-    exists, it never authorises the merge by itself.
+    ``substitute_out`` so the caller can announce and log it. The owner's
+    approval is given IN CONVERSATION before the session adds the sigil (owner
+    ruling f7e8d2ed, 2026-09-24, which replaced a native permission prompt): the
+    sigil is the record of that yes. This function only reports that a
+    substitute exists; it never authorises the merge by itself.
 
     ``# stale-review-override`` wins over the substitute (owner ruling,
-    2026-09-24): the core's force arm returns before this is consulted, so no
-    ask fires. That is no looser than the stale override on its own, which is
-    already permitted and already needs no ask.
+    2026-09-24): the core's force arm returns before this is consulted, so the
+    substitute is never used. That is no looser than the stale override on its
+    own, which is already permitted.
 
     Unlike the stale override, the substitute does NOT waive the base-branch
     check and does NOT drop the head binding, and it asks for no fallback-evidence
@@ -6457,7 +6459,8 @@ def _check_codex_reviewed_head(
             + (
                 "\nIf Codex is unavailable: with the owner's approval, append "
                 "'# substitute-review' to accept a Devin or CodeRabbit review AT THIS "
-                "HEAD in Codex's place (the merge will ask the owner to confirm)."
+                "HEAD in Codex's place (ask the owner in conversation first; the sigil "
+                "records their yes)."
             ),
             None,
         )
@@ -10441,9 +10444,10 @@ def _run_merge_and_push_gates() -> int:
                 )
                 # The owner-approved Codex stand-in (standing order, 2026-09-24).
                 # Like every row here it records the sigil's PRESENCE, noted before
-                # any gate can return. The stand-in was actually USED only on a row
-                # whose outcome is `asked`; with Codex current, or with
-                # `# stale-review-override` beside it, nothing is asked.
+                # any gate can return. When the stand-in is actually USED, the merge
+                # arm amends the row's `waived` to `codex-freshness:used`; with Codex
+                # current, or with `# stale-review-override` beside it, the row keeps
+                # plain `codex-freshness`.
                 substitute_review = has_trailing_override(merge_seg.raw, "substitute-review")
                 # The FINDINGS waiver, read off the parsed segment rather than via
                 # has_trailing_override — which is why enumerating that helper's
@@ -10788,30 +10792,34 @@ def _run_merge_and_push_gates() -> int:
                     return 2
                 bind_source = "Codex-verified"
                 if substitute_used:
-                    # A stand-in satisfied freshness. The standing order says the
-                    # owner is ASKED each time, so the gate asks rather than trusting
-                    # a session to have asked: a native approval prompt, deferred to
-                    # the tail like every other ask so that no later hard block can
-                    # be pre-empted by it. With nobody present to answer (a
-                    # dispatched session) that is a refusal, never a hang.
+                    # A stand-in satisfied freshness. The owner approves each use IN
+                    # CONVERSATION before the session adds the sigil (ruling f7e8d2ed,
+                    # 2026-09-24, which replaced the native permission prompt this
+                    # arm used to raise): the sigil is the record of that yes, so the
+                    # gate announces the stand-in and marks the log row rather than
+                    # asking again. A dispatched session has nobody present who could
+                    # have approved it, so there the sigil cannot mean a yes: refused.
                     _who = " and ".join(substitute_used[0]["reviewers"])
                     bind_source = f"{_who}-verified"
                     if _is_dispatched():
                         print(
-                            f"BLOCKED: PR #{pr_num} — '# substitute-review' needs the "
-                            f"owner's approval each time, and a dispatched session has "
-                            f"nobody to ask. Codex has not reviewed head "
+                            f"BLOCKED: PR #{pr_num} — '# substitute-review' records the "
+                            f"owner's approval given in conversation, and a dispatched "
+                            f"session has nobody who could have given it. Codex has not "
+                            f"reviewed head "
                             f"{verified_head[:12]}; {_who} has.",
                             file=sys.stderr,
                         )
                         return 2
-                    _sub_reason = (
-                        f"Merge PR #{pr_num} on a SUBSTITUTE review? Codex has not reviewed "
-                        f"head {verified_head[:12]}; {_who} reviewed that exact head. "
-                        f"Standing order: with your approval, Devin or CodeRabbit may stand "
-                        f"in for Codex. Every other merge gate still applies."
+                    _amend_note("substitute-review", waived="codex-freshness:used")
+                    print(
+                        f"NOTE: PR #{pr_num} — Codex has not reviewed head "
+                        f"{verified_head[:12]}; {_who} reviewed that exact head and "
+                        f"stands in for Codex under '# substitute-review' (the owner's "
+                        f"approval, given in conversation). Every other merge gate still "
+                        f"applies.",
+                        file=sys.stderr,
                     )
-                    ask_reason = f"{ask_reason}\n\n{_sub_reason}" if ask_reason else _sub_reason
 
                 # Bind the MERGE to the verified head (TOCTOU — Codex P1): a push
                 # landing between the check above and the merge would otherwise
@@ -11390,7 +11398,8 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
             if _sub and _sub[0]:
                 label += (
                     f" — substitute available: {' and '.join(_sub[0])} reviewed this "
-                    f"head (merge with '# substitute-review'; the owner is asked)"
+                    f"head (with the owner's yes in conversation, merge with "
+                    f"'# substitute-review')"
                 )
     else:
         # Distinguish a genuinely-current review from a stale-but-trivial-delta

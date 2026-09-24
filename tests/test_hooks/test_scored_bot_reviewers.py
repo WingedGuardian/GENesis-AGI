@@ -1,5 +1,5 @@
 """Devin's inline findings are SCORED, and a Devin/CodeRabbit review at head can
-stand in for Codex behind an owner ask.
+stand in for Codex with the owner's approval, given in conversation.
 
 Owner rulings, 2026-09-24: Devin findings score on equal footing with Codex,
 severity-mapped (a severe bug or critical security finding is always-fix; a
@@ -7,8 +7,10 @@ non-severe bug or security warning weighs like a Codex P2; an informational
 analysis is surfaced, not scored). CodeRabbit scoring is UNCHANGED — Minor stays
 surface-only. A finding clears by a maintainer reply, or by the SAME bot that
 raised it replying `✅ **Resolved**` in its thread — never by another reviewer,
-never by free prose. With the owner asked and approving per PR, a Devin or
-CodeRabbit review at the exact head satisfies the Codex freshness check.
+never by free prose. With the owner approving per PR in conversation (the
+`# substitute-review` sigil records that yes; ruling f7e8d2ed replaced an
+earlier native prompt), a Devin or CodeRabbit review at the exact head
+satisfies the Codex freshness check.
 
 Why the comment shape below is trusted: MEASURED 2026-09-24 over every Devin
 comment on the 33 open non-draft PRs — 166 comments, every one opening with

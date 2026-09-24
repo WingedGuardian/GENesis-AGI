@@ -3731,16 +3731,19 @@ findings below, a gated `gh pr merge`:
 - **`# substitute-review` is the NARROW Codex stand-in** (owner standing order,
   2026-09-24). When Codex has not reviewed the head, a NON-dismissed,
   NON-pending Devin or CodeRabbit review whose `commit_id` is EXACTLY the head
-  satisfies the Codex freshness check — and the gate then ASKS the owner with a
-  native approval prompt, deferred to the end of the hook so no later hard block
-  can be pre-empted by it; a dispatched session is refused, since nobody is there
-  to answer. Unlike `# stale-review-override` it keeps the base-branch check and
+  satisfies the Codex freshness check. The owner approves each use IN
+  CONVERSATION before you add the sigil — the sigil is the record of that yes, so
+  never add it without asking (owner ruling 2026-09-24, which replaced a native
+  permission prompt the first version raised). The gate prints a NOTE naming the
+  stand-in and marks its override-log row `codex-freshness:used`; a dispatched
+  session is refused, since nobody there can have approved it. Every other gate
+  still applies. Unlike `# stale-review-override` it keeps the base-branch check and
   the `--match-head-commit` binding (labelled with the reviewer that verified the
   head), so no fallback-evidence file is needed on this path. Only a review
   record with a BODY counts: an empty-body record at head is the wrapper GitHub
   makes when the bot replies inside a thread, not a review of the head. With
-  both sigils present, `# stale-review-override` wins and nothing is asked — it is
-  already the broader, ask-free waiver. `--check-pr` says when a stand-in exists:
+  both sigils present, `# stale-review-override` wins and the stand-in is never
+  used — it is already the broader waiver. `--check-pr` says when a stand-in exists:
   `codex-at-head : BLOCK — … — substitute available: <reviewer> reviewed this
   head`. Codex remains the official reviewer; this exists for its outages.
 

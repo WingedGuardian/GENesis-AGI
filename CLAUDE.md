@@ -611,8 +611,8 @@ behind the writer, and 7 were a guard since removed.
   same way, in EVERY lane, before any score is consulted; a Devin non-severe
   finding weighs like a P2. Unless the configured documentation-path exclusion
   applies. When Codex is out, an owner-approved `# substitute-review` lets a Devin
-  or CodeRabbit review at the exact head stand in for Codex — the gate asks the
-  owner each time.
+  or CodeRabbit review at the exact head stand in for Codex — ask the owner in
+  conversation each time; the sigil records the yes.
   Maintainer-replied findings and findings on files outside the PR diff do not
   score; under the shipped `doc_findings: skip`, documentation findings do not
   score either. Until 2026-09-10 CodeRabbit was

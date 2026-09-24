@@ -1611,9 +1611,11 @@ def test_enforcement_surfaces_note_on_off_public_repo_no_op(monkeypatch, capsys)
 
 # ── the Codex stand-in: `# substitute-review` (owner standing order, 2026-09-24) ──
 # Driven through main() because the load-bearing properties live in the merge ARM,
-# not in the helper: the owner is ASKED (a native prompt, not a session promise),
-# a dispatched session is REFUSED, the ask cannot pre-empt a later hard block, the
-# merge stays bound to the substitute-verified head, and the override log records it.
+# not in the helper: the owner approves IN CONVERSATION and the sigil records it,
+# so the gate shows NO permission prompt (ruling f7e8d2ed, 2026-09-24); a
+# dispatched session is REFUSED; every later hard block still applies; the merge
+# stays bound to the substitute-verified head; and the override log marks a row
+# whose stand-in was actually used.
 
 _DEVIN = "devin-ai-integration[bot]"
 
@@ -1630,16 +1632,18 @@ def _asked(out: str) -> bool:
     return '"permissionDecision": "ask"' in out or '"permissionDecision":"ask"' in out
 
 
-def test_substitute_review_asks_the_owner(monkeypatch, capsys):
+def test_substitute_review_proceeds_with_a_note_and_no_prompt(monkeypatch, capsys):
+    """Owner ruling f7e8d2ed: approval is given in chat, the sigil records it."""
     rc = _run(
         monkeypatch,
         _merge_cmd(trailer="# substitute-review"),
         reviews=_devin_at(),
     )
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
     assert rc == 0
-    assert _asked(out), f"a substitute merge proceeded without asking the owner: {out!r}"
-    assert "devin-ai-integration[bot]" in out and HEAD[:12] in out
+    assert not _asked(captured.out), "the stand-in still raised a permission prompt"
+    assert "devin-ai-integration[bot]" in captured.err and HEAD[:12] in captured.err
+    assert "stands in for Codex" in captured.err
 
 
 def test_substitute_review_is_refused_in_a_dispatched_session(monkeypatch, capsys):
@@ -1652,7 +1656,7 @@ def test_substitute_review_is_refused_in_a_dispatched_session(monkeypatch, capsy
     captured = capsys.readouterr()
     assert rc == 2, "an unattended session merged on a substitute nobody approved"
     assert not _asked(captured.out)
-    assert "nobody to ask" in captured.err
+    assert "dispatched session" in captured.err
 
 
 def test_substitute_review_without_a_review_at_head_still_blocks(monkeypatch, capsys):
@@ -1704,10 +1708,11 @@ def test_the_sigil_is_inert_when_codex_reviewed_the_head(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert not _asked(out), "the owner was asked about a substitute Codex made unnecessary"
+    assert "stands in for Codex" not in capsys.readouterr().err
 
 
-def test_a_substitute_ask_never_preempts_a_later_hard_block(monkeypatch, capsys):
-    """The ask is deferred to the tail: an unresolved P1 must still BLOCK."""
+def test_a_substitute_never_waives_a_later_hard_block(monkeypatch, capsys):
+    """The stand-in answers the freshness check only: an unresolved P1 still BLOCKS."""
     rc = _run(
         monkeypatch,
         _merge_cmd(trailer="# substitute-review"),
@@ -1743,8 +1748,29 @@ def test_the_override_log_records_a_substitute_merge(monkeypatch, capsys):
     ]
     subs = [r for r in rows if r.get("sigil") == "substitute-review"]
     assert subs, f"no override row for the substitute merge: {rows}"
-    assert subs[0].get("outcome") == "asked"
-    assert subs[0].get("waived") == "codex-freshness", subs[0]
+    assert subs[0].get("outcome") == "allowed"
+    # A stand-in that was actually USED is marked, so the log separates it from
+    # a sigil that was merely present (Codex current, or stale-override beside it).
+    assert subs[0].get("waived") == "codex-freshness:used", subs[0]
+
+
+def test_an_unused_substitute_sigil_is_not_marked_used(monkeypatch, capsys):
+    import os as _os
+
+    log_dir = Path(_os.environ["GENESIS_MERGE_OVERRIDE_DIR"])
+    _run(
+        monkeypatch,
+        _merge_cmd(match=None, trailer="# stale-review-override substitute-review"),
+        reviews=_devin_at(),
+    )
+    rows = [
+        json.loads(line)
+        for f in sorted(log_dir.glob("*.jsonl"))
+        for line in f.read_text().splitlines()
+        if line.strip()
+    ]
+    subs = [r for r in rows if r.get("sigil") == "substitute-review"]
+    assert subs and subs[0].get("waived") == "codex-freshness", subs
 
 
 def test_every_logged_sigil_records_what_it_waived(monkeypatch, capsys):
