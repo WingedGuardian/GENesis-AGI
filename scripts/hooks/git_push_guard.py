@@ -1399,7 +1399,8 @@ _CR_BLOCKING_WEIGHT = 1.0
 # level must not silently start blocking every PR.
 _DEVIN_LOGINS = frozenset({"devin-ai-integration[bot]"})
 _DEVIN_META_PREFIX = "<!-- devin-review-comment "
-# Strength order used to pick which copy of a duplicated finding is classified.
+# Strength order among the copies of a duplicated finding. Compared only AFTER
+# each copy's scope is judged on its own anchor (see `_devin_disposition`).
 _DEVIN_SEVERITY_RANK: dict[str | None, int] = {"floor": 3, "minor": 2, "analysis": 1, None: 0}
 _DEVIN_MARKERS: dict[str, str] = {
     "🔴": "floor",  # severe bug
@@ -1411,8 +1412,10 @@ _DEVIN_MARKERS: dict[str, str] = {
 # Devin may WITHDRAW its own finding: a reply from the SAME bot login, in that
 # finding's thread, whose first line starts with this marker clears it (owner
 # ruling, 2026-09-24). Consulted for DEVIN findings only — Codex and CodeRabbit
-# findings still clear on a maintainer reply alone. MEASURED on the open queue: 50 of 167 Devin
-# findings carried Devin's own "resolved" reply and no maintainer reply. Only
+# findings still clear on a maintainer reply alone. MEASURED on the open queue in a
+# later snapshot than the 166-comment count above (so the denominators differ): 50
+# of 167 Devin finding groups carried Devin's own "resolved" reply and no
+# maintainer reply. Only
 # this exact lead counts — Devin also posts builder-style prose ("Fixed in …"),
 # which is a claim about work, not the reviewer's verdict — and no bot can clear
 # ANOTHER reviewer's finding.
@@ -3078,6 +3081,35 @@ def _check_inline_review_findings(
             _scope_cache.append(set(files) if files else None)
         changed = _scope_cache[0]
         return changed is not None and path not in changed
+
+    def _devin_disposition(copy: dict) -> tuple[str, str | None]:
+        """Where ONE copy of a Devin finding lands, judged on its OWN anchor.
+
+        ``("drift" | "analysis" | "off_diff" | "doc" | "scored", severity)``.
+        Severity and scope are decided per copy and only THEN compared, never
+        folded into one ranking key: a finding Devin posted twice can carry a
+        different marker AND a different anchor on each copy, and a single
+        (severity, in-diff) key let an off-diff red copy outrank an in-diff
+        yellow one and take the whole group out of scoring with it.
+        """
+        sev = _devin_finding(copy.get("body") or "")[1]
+        if sev is None:
+            return "drift", None
+        if sev == "analysis":
+            return "analysis", sev
+        path = copy.get("path")
+        if _off_diff(path):
+            return "off_diff", sev
+        # The doc-path lever, read the way each Codex branch reads it for the
+        # matching weight: a floor finding is excluded only under `skip`, a
+        # 0.5 finding under `skip` or `p1_only`. Same modes, same meaning, so
+        # one reviewer is never enforced where the other is not.
+        if _is_doc_path(path or ""):
+            mode = _doc_findings_mode()
+            if mode == "skip" or (sev == "minor" and mode == "p1_only"):
+                return "doc", sev
+        return "scored", sev
+
     for c in raw:
         login, utype = c.get("login") or "", c.get("type") or ""
         body = c.get("body") or ""
@@ -3121,51 +3153,63 @@ def _check_inline_review_findings(
             # once as Devin's own severity. Keyed on the login AND Bot type, so a
             # human pasting Devin's exact body is never believed (the authority
             # rule the unrecognised-author branch below exists to keep).
-            fid, sev = _devin_finding(body)
-            dv_path = c.get("path")
-            if fid is not None:
-                if fid in devin_seen:
-                    continue  # another post of a finding already classified
-                devin_seen.add(fid)
-                if fid in devin_cleared:
-                    continue  # answered: maintainer reply, or Devin withdrew it
-                # Classify the group by its STRONGEST copy, not whichever came
-                # first: the copies share an id but can differ in marker or anchor,
-                # and first-copy-wins let a gray or off-diff post hide a red one.
-                # Severity first, then an in-diff anchor over an off-diff one.
-                best = max(
-                    devin_copies.get(fid, [c]),
-                    key=lambda x: (
-                        _DEVIN_SEVERITY_RANK[_devin_finding(x.get("body") or "")[1]],
-                        not _off_diff(x.get("path")),
-                    ),
-                )
-                body = best.get("body") or ""
-                dv_path = best.get("path")
-                sev = _devin_finding(body)[1]
-            # An unidentifiable comment (fid None) is FORMAT DRIFT and is reported
-            # as such even when a maintainer answered it: the note is about this
-            # gate's parser, not the finding, and it never scored either way.
-            title = _inline_title(body)
-            if sev is None:
-                devin_unknown.append(title)
+            fid, _sev = _devin_finding(body)
+            if fid is None:
+                # An unidentifiable comment is FORMAT DRIFT and is reported as
+                # such even when a maintainer answered it: the note is about this
+                # gate's parser, not the finding, and it never scored either way.
+                devin_unknown.append(_inline_title(body))
                 continue
-            if sev == "analysis":
+            if fid in devin_seen:
+                continue  # another post of a finding already classified
+            devin_seen.add(fid)
+            copies = devin_copies.get(fid, [c])
+            # Drift is a fact about a COMMENT, so every unreadable copy is
+            # reported: before dedup can fold it into a readable sibling under
+            # the same id, and before clearing, for the reason given above.
+            # This is the parser alone. The per-copy SCOPE judgement below
+            # reads the PR's changed files, so it must stay AFTER the clearing
+            # check: an answered finding never pays for that read, exactly as
+            # the Codex and CodeRabbit branches check `replied_to` first.
+            has_readable = any(_devin_finding(cp.get("body") or "")[1] is not None for cp in copies)
+            for cp in copies:
+                if _devin_finding(cp.get("body") or "")[1] is None:
+                    drift_title = _inline_title(cp.get("body") or "")
+                    if has_readable:
+                        drift_title += " (a copy of a finding classified by its readable copy)"
+                    devin_unknown.append(drift_title)
+            if fid in devin_cleared:
+                continue  # answered: maintainer reply, or Devin withdrew it
+            judged = [(cp, *_devin_disposition(cp)) for cp in copies]
+            # The group SCORES on its strongest copy that is eligible to score.
+            # Only when no copy is eligible is it reported, once, through its
+            # strongest copy's reason. So neither a weaker copy nor an
+            # out-of-scope one can hide a scoring finding. `sorted` is stable,
+            # so equal severities keep their posting order.
+            readable = sorted(
+                (t for t in judged if t[1] != "drift"),
+                key=lambda t: _DEVIN_SEVERITY_RANK[t[2]],
+                reverse=True,
+            )
+            if not readable:
+                continue  # every copy was drift, reported above
+            eligible = [t for t in readable if t[1] == "scored"]
+            best, disp, sev = eligible[0] if eligible else readable[0]
+            title = _inline_title(best.get("body") or "")
+            dv_path = best.get("path")
+            # A stronger copy that could not score is not dropped silently: the
+            # reader sees that Devin marked the same finding more severely on an
+            # anchor outside this PR's scope. Surfaced on the title only, so no
+            # count changes.
+            if eligible and _DEVIN_SEVERITY_RANK[readable[0][2]] > _DEVIN_SEVERITY_RANK[sev]:
+                title += " (another copy was marked more severe outside this PR's scope)"
+            if disp == "analysis":
                 devin_analysis.append(title)
-                continue
-            if _off_diff(dv_path):
+            elif disp == "off_diff":
                 devin_off_diff.append((title, dv_path or ""))
-                continue
-            # The doc-path lever, read the way each Codex branch reads it for the
-            # matching weight: a floor finding is excluded only under `skip`, a
-            # 0.5 finding under `skip` or `p1_only`. Same modes, same meaning, so
-            # one reviewer is never enforced where the other is not.
-            if _is_doc_path(dv_path or ""):
-                mode = _doc_findings_mode()
-                if mode == "skip" or (sev == "minor" and mode == "p1_only"):
-                    devin_doc_skipped.append(title)
-                    continue
-            if sev == "floor":
+            elif disp == "doc":
+                devin_doc_skipped.append(title)
+            elif sev == "floor":
                 devin_block.append(title)
                 scored_at.append(("DV", dv_path or ""))
             else:
@@ -10396,8 +10440,10 @@ def _run_merge_and_push_gates() -> int:
                     merge_seg.raw, "scheduled-review-override"
                 )
                 # The owner-approved Codex stand-in (standing order, 2026-09-24).
-                # Recorded here with the others so the log shows every time the
-                # Codex check was satisfied by someone other than Codex.
+                # Like every row here it records the sigil's PRESENCE, noted before
+                # any gate can return. The stand-in was actually USED only on a row
+                # whose outcome is `asked`; with Codex current, or with
+                # `# stale-review-override` beside it, nothing is asked.
                 substitute_review = has_trailing_override(merge_seg.raw, "substitute-review")
                 # The FINDINGS waiver, read off the parsed segment rather than via
                 # has_trailing_override — which is why enumerating that helper's
@@ -10411,7 +10457,7 @@ def _run_merge_and_push_gates() -> int:
                     (
                         "substitute-review",
                         substitute_review,
-                        "codex-freshness (Devin/CodeRabbit review at head + owner ask)",
+                        "codex-freshness",
                     ),
                 ):
                     if _present:
@@ -10765,9 +10811,7 @@ def _run_merge_and_push_gates() -> int:
                         f"Standing order: with your approval, Devin or CodeRabbit may stand "
                         f"in for Codex. Every other merge gate still applies."
                     )
-                    ask_reason = (
-                        f"{ask_reason}\n\n{_sub_reason}" if ask_reason else _sub_reason
-                    )
+                    ask_reason = f"{ask_reason}\n\n{_sub_reason}" if ask_reason else _sub_reason
 
                 # Bind the MERGE to the verified head (TOCTOU — Codex P1): a push
                 # landing between the check above and the merge would otherwise

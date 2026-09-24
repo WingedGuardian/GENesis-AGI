@@ -378,11 +378,16 @@ class TestUncountedAccounting:
         assert out[0]["approx"]["unrecognised_format"] == 1
 
 
-# ── duplicated posts: classify the strongest copy ──────────────────
+# ── duplicated posts: score the strongest ELIGIBLE copy ──────────────────
 
 
 class TestDuplicateCopiesUseTheStrongest:
-    """Architect SF2: copies share an id but may differ; first-copy-wins hid a red one."""
+    """Copies share an id but may differ in marker AND anchor. Architect SF2:
+    first-copy-wins hid a red copy. Round 1 (Devin, CodeRabbit and GLM, each
+    independently): ranking severity before scope in ONE key let an
+    out-of-scope red copy discard an in-scope yellow one. Each copy's scope is
+    now judged on its own anchor, and the group scores on its strongest
+    ELIGIBLE copy."""
 
     def test_an_informational_first_copy_does_not_hide_a_severe_second(self, guard):
         fid = "BUG_pr-review-job-aaa_0009"
@@ -406,6 +411,132 @@ class TestDuplicateCopiesUseTheStrongest:
         ]
         block, _msg = _scan(guard, comments)
         assert block, "an off-diff first copy hid the in-diff copy"
+
+    def test_an_off_diff_severe_copy_does_not_hide_an_in_diff_non_severe_one(self, guard, capsys):
+        fid = "BUG_pr-review-job-aaa_0011"
+        comments = [
+            _c(
+                1,
+                _devin_body("🔴", "Red, anchored off-diff", fid=fid, path="src/other.py"),
+                path="src/other.py",
+            ),
+            _c(2, _devin_body("🟡", "Yellow, anchored in-diff", fid=fid)),
+        ]
+        block, msg = _scan(guard, comments)
+        assert not block, msg
+        err = capsys.readouterr().err
+        assert "review score 0.5" in err, f"the in-diff copy was not scored: {err}"
+
+    def test_a_doc_path_severe_copy_does_not_hide_a_code_path_non_severe_one(
+        self, guard, capsys, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            '{"filename": "docs/guide.md", "previous_filename": null}\n'
+            '{"filename": "src/benign.py", "previous_filename": null}',
+        )
+        fid = "BUG_pr-review-job-aaa_0012"
+        comments = [
+            _c(
+                1,
+                _devin_body("🔴", "Red, on a doc path", fid=fid, path="docs/guide.md"),
+                path="docs/guide.md",
+            ),
+            _c(2, _devin_body("🟡", "Yellow, on code", fid=fid)),
+        ]
+        block, msg = _scan(guard, comments)
+        assert not block, msg
+        assert "review score 0.5" in capsys.readouterr().err
+
+    def test_a_group_with_no_eligible_copy_is_reported_once(self, guard, capsys, offdiff_lock):
+        offdiff_lock.expected()
+        fid = "BUG_pr-review-job-aaa_0013"
+        comments = [
+            _c(
+                i,
+                _devin_body(m, f"Both off-diff {m}", fid=fid, path="src/other.py"),
+                path="src/other.py",
+            )
+            for i, m in ((1, "🟡"), (2, "🔴"))
+        ]
+        block, msg = _scan(guard, comments)
+        assert not block, msg
+        err = capsys.readouterr().err
+        assert err.count("[off-diff Devin") == 1, err
+        assert "Both off-diff 🔴" in err  # reported through its strongest copy
+
+    def test_an_unreadable_copy_beside_a_readable_one_is_reported_as_drift(self, guard, capsys):
+        fid = "BUG_pr-review-job-aaa_0014"
+        comments = [
+            _c(1, _devin_body("🟡", "Readable copy", fid=fid)),
+            _c(2, _devin_body("🟠", "New marker copy", fid=fid)),
+        ]
+        block, msg = _scan(guard, comments)
+        assert not block, msg
+        err = capsys.readouterr().err
+        assert "review score 0.5" in err, "the readable copy stopped scoring"
+        assert "[Devin unknown format]" in err and "New marker copy" in err, err
+
+    def test_drift_in_an_answered_group_is_still_reported(self, guard, capsys):
+        fid = "BUG_pr-review-job-aaa_0015"
+        comments = [
+            _c(1, _devin_body("🟡", "Answered copy", fid=fid)),
+            _c(2, _devin_body("🟠", "Unreadable sibling", fid=fid)),
+            _c(9, "Seen.", login="owner", utype="User", reply_to=1, assoc="OWNER"),
+        ]
+        block, msg = _scan(guard, comments)
+        assert not block, msg
+        err = capsys.readouterr().err
+        assert "Unreadable sibling" in err, err
+        assert "review score 0.5" not in err, "an answered finding still scored"
+
+    def test_a_severe_second_copy_beats_a_non_severe_first_when_both_score(self, guard):
+        """Both copies eligible: the stronger wins, whatever the posting order."""
+        fid = "BUG_pr-review-job-aaa_0017"
+        comments = [
+            _c(1, _devin_body("🟡", "Yellow first", fid=fid)),
+            _c(2, _devin_body("🔴", "Red second", fid=fid)),
+        ]
+        block, msg = _scan(guard, comments)
+        assert block, "a severe copy missed the floor behind a weaker first copy"
+        assert "always-fix floor" in msg and "Red second" in msg
+
+    def test_an_answered_group_never_reads_the_changed_files(self, guard, capsys, monkeypatch):
+        """The scope judgement reads the PR file list, so it runs only after the
+        clearing check. With that read failing, an answered-only PR must not claim
+        diff scoping was unavailable for a finding that never needed it."""
+        monkeypatch.setenv("_TEST_GH_PR_FILES", "__error__")
+        fid = "BUG_pr-review-job-aaa_0018"
+        comments = [
+            _c(1, _devin_body("🔴", "Answered red", fid=fid)),
+            _c(9, "Seen.", login="owner", utype="User", reply_to=1, assoc="OWNER"),
+        ]
+        block, msg = _scan(guard, comments)
+        assert not block, msg
+        assert "diff scoping unavailable" not in capsys.readouterr().err
+
+    def test_a_stronger_out_of_scope_copy_is_named_on_the_scored_title(self, guard, capsys):
+        fid = "BUG_pr-review-job-aaa_0019"
+        comments = [
+            _c(
+                1,
+                _devin_body("🔴", "Red elsewhere", fid=fid, path="src/other.py"),
+                path="src/other.py",
+            ),
+            _c(2, _devin_body("🟡", "Yellow here", fid=fid)),
+        ]
+        _scan(guard, comments)
+        assert "marked more severe outside this PR" in capsys.readouterr().err
+
+    def test_every_unreadable_copy_counts_toward_drift(self, guard):
+        fid = "BUG_pr-review-job-aaa_0016"
+        comments = [
+            _c(1, _devin_body("🟣", "First unreadable", fid=fid)),
+            _c(2, _devin_body("🟠", "Second unreadable", fid=fid)),
+        ]
+        out: list = []
+        _scan(guard, comments, uncounted_out=out)
+        assert out[0]["approx"]["unrecognised_format"] == 2, out[0]
 
 
 # ── the Codex stand-in: review at head by Devin or CodeRabbit ──────

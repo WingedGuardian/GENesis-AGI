@@ -1618,8 +1618,12 @@ def test_enforcement_surfaces_note_on_off_public_repo_no_op(monkeypatch, capsys)
 _DEVIN = "devin-ai-integration[bot]"
 
 
-def _devin_at(head: str = HEAD) -> str:
-    return json.dumps({"login": _DEVIN, "commit_id": head, "state": "COMMENTED"})
+def _devin_at(head: str = HEAD, *, has_body: bool = True) -> str:
+    # `has_body` is explicit: the reader defaults an ABSENT field to True, so a
+    # fixture that omitted it could never show the requirement is enforced.
+    return json.dumps(
+        {"login": _DEVIN, "commit_id": head, "state": "COMMENTED", "has_body": has_body}
+    )
 
 
 def _asked(out: str) -> bool:
@@ -1660,6 +1664,19 @@ def test_substitute_review_without_a_review_at_head_still_blocks(monkeypatch, ca
     err = capsys.readouterr().err
     assert rc == 2
     assert "no Devin or CodeRabbit review at head" in err
+
+
+def test_a_body_less_record_at_head_does_not_substitute(monkeypatch, capsys):
+    """An empty-body record is the wrapper GitHub creates for a thread reply."""
+    rc = _run(
+        monkeypatch,
+        _merge_cmd(trailer="# substitute-review"),
+        reviews=_devin_at(has_body=False),
+    )
+    captured = capsys.readouterr()
+    assert rc == 2, "a thread-reply wrapper stood in for a review of the head"
+    assert not _asked(captured.out)
+    assert "no Devin or CodeRabbit review at head" in captured.err
 
 
 def test_without_the_sigil_a_substitute_review_changes_nothing(monkeypatch, capsys):
@@ -1727,3 +1744,36 @@ def test_the_override_log_records_a_substitute_merge(monkeypatch, capsys):
     subs = [r for r in rows if r.get("sigil") == "substitute-review"]
     assert subs, f"no override row for the substitute merge: {rows}"
     assert subs[0].get("outcome") == "asked"
+    assert subs[0].get("waived") == "codex-freshness", subs[0]
+
+
+def test_every_logged_sigil_records_what_it_waived(monkeypatch, capsys):
+    """The whole sigil table, driven through main(). `waived` is stored only when
+    it fits the log's closed shape, so a label that does not fit is written as an
+    empty field on EVERY row, and no test that calls the writer directly can see
+    it. This one reads the rows the live table actually produced."""
+    import os as _os
+
+    log_dir = Path(_os.environ["GENESIS_MERGE_OVERRIDE_DIR"])
+    sigils = (
+        "ci-override",
+        "stale-review-override",
+        "review-override",
+        "scheduled-review-override",
+        "substitute-review",
+    )
+    _run(
+        monkeypatch,
+        _merge_cmd(match=None, trailer="# " + " ".join(sigils)),
+        reviews=_devin_at(),
+    )
+    rows = [
+        json.loads(line)
+        for f in sorted(log_dir.glob("*.jsonl"))
+        for line in f.read_text().splitlines()
+        if line.strip()
+    ]
+    by_sigil = {r.get("sigil"): r for r in rows}
+    assert set(by_sigil) == set(sigils), f"rows written: {sorted(by_sigil)}"
+    empty = sorted(s for s, r in by_sigil.items() if not r.get("waived"))
+    assert not empty, f"these sigils logged an empty waived field: {empty}"

@@ -3788,7 +3788,10 @@ The review-findings gate specifically:
    bot can clear another's, free prose such as "Fixed in …" clears nothing, and
    Codex and CodeRabbit findings still need a maintainer reply). A thread
    resolved in the GitHub UI does NOT clear a finding; reply instead. A finding
-   Devin posted more than once is classified on its strongest copy.
+   Devin posted more than once counts once: each copy's diff and documentation
+   scope is judged on its OWN anchor, the finding scores on its strongest copy
+   that is eligible to score, and every copy carrying an unrecognised marker is
+   reported as format drift, answered or not.
 
    | lane | blocks at | what lands there |
    |---|---|---|
