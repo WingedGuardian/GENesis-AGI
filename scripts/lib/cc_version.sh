@@ -702,7 +702,11 @@ for _attempt in range(ATTEMPTS):
 
         still += [k for k in missing_top
                   if k not in final or _canon(final[k]) != _canon(TOP_DEFAULTS[k])]
-    except (OSError, ValueError):
+    # RecursionError too, so the re-read can never escape as a traceback after a
+    # write. MEASURED 2026-09-23 through this function: intake accepts depth 995
+    # and verifies it; from 996 the intake refuses — no depth passes intake and
+    # then fails here, so this is a floor, not a live path.
+    except (OSError, ValueError, RecursionError):
         still = list(REQUIRED)
     if still:
         print("repair did not stick — %s missing again immediately, so something on "
