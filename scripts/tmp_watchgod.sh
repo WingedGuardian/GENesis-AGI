@@ -83,6 +83,23 @@ load_config() {
         # shellcheck source=/dev/null
         source "$CONF_FILE"
     fi
+    # Headroom can never exceed capacity, so a sacred ground at or above the
+    # volume's capacity makes `headroom < SACRED_GROUND_MB` true forever: the
+    # oxygen floor is pinned ON and the in-flight guard is bypassed on every
+    # RED run, silently and permanently. That is the same failure a capacity of
+    # 0 produces, from the other knob — cc_tmp_capacity_mb already rejects
+    # that one, and leaving this side open would be arbitrary. Clamp loudly
+    # rather than fail closed: a wrong sacred ground must not stop the daemon.
+    # Conditioned on the default being a SANE sacred ground for this capacity:
+    # on a volume genuinely smaller than 150MB every value is >= capacity, the
+    # floor being permanently on is the honest answer, and clamping would only
+    # trade a real signal for a warning on every poll.
+    local _cap
+    _cap="$(cc_tmp_capacity_mb)"
+    if [[ "${SACRED_GROUND_MB:-}" =~ ^[0-9]+$ ]] && (( _cap > 150 && SACRED_GROUND_MB >= _cap )); then
+        log WARN "watchgod.conf: SACRED_GROUND_MB=${SACRED_GROUND_MB} >= cc-tmp capacity ${_cap}MB — that pins the oxygen floor permanently ON and bypasses the in-flight guard on every RED run; clamping to 150"
+        SACRED_GROUND_MB=150
+    fi
 }
 
 # ── Logging ──────────────────────────────────────────────────
@@ -352,13 +369,62 @@ cc_tmp_capacity_mb() {
     fs_total="$(fs_total_mb "$CC_TMP_DIR")"
     conf="${CC_TMP_CAPACITY_MB:-2048}"
     # A hand-edited conf value like "2G" would kill the daemon at the
-    # arithmetic below under set -e; degrade to the default instead.
-    [[ "$conf" =~ ^[0-9]+$ ]] || conf=2048
+    # arithmetic below under set -e; degrade to the default instead. ZERO is
+    # rejected by the same test on purpose: a capacity of 0 makes every
+    # headroom negative, which pins the oxygen floor permanently ON and so
+    # bypasses the in-flight guard forever — the failure direction this whole
+    # helper exists to avoid.
+    [[ "$conf" =~ ^[1-9][0-9]*$ ]] || conf=2048
     if (( fs_total > 0 && fs_total < conf )); then
         echo "$fs_total"
     else
         echo "$conf"
     fi
+}
+
+cc_tmp_headroom_mb() {
+    # TRUE headroom in MB — how much more cc-tmp can grow before the write that
+    # kills Claude Code. Two independent ceilings bind it, and the real one is
+    # whichever is lower:
+    #   capacity - used   the volume's own cap (config on btrfs, statfs on LVM)
+    #   fs_free           what the filesystem will actually hand out. Lower than
+    #                     capacity-used whenever reserved blocks, filesystem
+    #                     metadata, or deleted-but-still-open files hold space
+    #                     the directory usage total cannot see.
+    # Taking the MINIMUM means a new blindness in either measure can only make
+    # the floor fire EARLIER, never later.
+    #
+    # …but fs_free counts ONLY when cc-tmp is its own mount point. That
+    # condition is the whole difference between two opposite meanings of the
+    # same number: on a dedicated volume it measures cc-tmp's own filesystem
+    # and belongs in the minimum; on an install where volume creation did not
+    # happen (an unsupported pool, a failed create or attach, a bare-metal
+    # bootstrap) cc-tmp is a plain directory on the SHARED filesystem, and
+    # folding that in makes "the host disk is full" indistinguishable from
+    # "cc-tmp is full". The floor's response — spare nothing, delete
+    # everything — is right for the second and is destructive AND futile for
+    # the first: it would wipe every in-flight write in a near-empty cc-tmp,
+    # on every 30s poll, without freeing anything that moves the host disk.
+    # `stat -c %m` is the discriminator (MEASURED with both oracle arms: the
+    # dedicated subvolume answers with its own path, a plain directory answers
+    # with its parent filesystem). A statfs-level host emergency keeps its own
+    # separate RED trigger in check_cc_tmp; it just does not license the
+    # bypass.
+    #
+    # $1 is the already-measured usage, because du of cc-tmp is not free and
+    # check_cc_tmp has measured it one line earlier; a direct call measures it.
+    local used="${1:-}" capacity headroom fs_free mnt
+    [[ "$used" =~ ^[0-9]+$ ]] || used="$(dir_usage_mb "$CC_TMP_DIR")"
+    capacity="$(cc_tmp_capacity_mb)"
+    headroom=$(( capacity - used ))
+    mnt="$(stat -c %m "$CC_TMP_DIR" 2>/dev/null)" || mnt=""
+    if [[ "$mnt" == "$CC_TMP_DIR" ]]; then
+        fs_free="$(fs_free_mb "$CC_TMP_DIR")"
+        if [[ "$fs_free" =~ ^[0-9]+$ ]] && (( fs_free < headroom )); then
+            headroom=$fs_free
+        fi
+    fi
+    echo "$headroom"
 }
 
 reap_dir_sparing_sockets() {
@@ -543,49 +609,101 @@ clean_cc_red() {
     # (not statfs) because on a btrfs backend df cannot see the volume quota —
     # the deployed sacred-ground check read 190GB free while the real ceiling
     # was 2GiB away, so it could never have fired before ENOSPC.
-    local capacity used_now headroom
-    capacity="$(cc_tmp_capacity_mb)"
-    used_now="$(dir_usage_mb "$CC_TMP_DIR")"
-    headroom=$(( capacity - used_now ))
+    # check_cc_tmp has already measured usage and headroom to decide this tier;
+    # it passes the number in so the du is not paid twice and the dispatcher and
+    # the cleaner can never disagree about which side of the floor we are on. A
+    # direct call (tests, a manual run) measures it here instead.
+    local headroom="${1:-}"
+    [[ "$headroom" =~ ^-?[0-9]+$ ]] || headroom="$(cc_tmp_headroom_mb)"
 
+    local floor=0
     local live_paths="" probe="" probe_snapshot=""
     local probe_fd   # assigned by `exec {probe_fd}>` below, never by hand
     if (( headroom < SACRED_GROUND_MB )); then
-        log WARN "Zone A RED — OXYGEN FLOOR: headroom ${headroom}MB < sacred ${SACRED_GROUND_MB}MB (capacity ${capacity}MB, used ${used_now}MB). In-flight guard BYPASSED — reclaiming everything."
+        floor=1
+        # Log the COMPONENTS, not just the minimum. headroom is a min() of two
+        # independent ceilings, so the number alone cannot tell an operator
+        # WHICH one bound it — and those have different remedies (reclaim
+        # cc-tmp vs free the volume's filesystem). The extra du costs one call
+        # on a path that fires only in an emergency.
+        local _cap _used _free
+        _cap="$(cc_tmp_capacity_mb)"
+        _used="$(dir_usage_mb "$CC_TMP_DIR")"
+        _free="$(fs_free_mb "$CC_TMP_DIR")"
+        log WARN "Zone A RED — OXYGEN FLOOR: true headroom ${headroom}MB < sacred ${SACRED_GROUND_MB}MB (capacity ${_cap}MB - used ${_used}MB; fs_free ${_free}MB, counted only when cc-tmp is its own mount). EVERY discretionary exclusion is bypassed — the in-flight guard, the 60-second freshness window, and the active session's own tree. Unix sockets are the ONLY thing that survives, anywhere in the tree (0 bytes: deleting them reclaims nothing and severs the control plane)."
     else
         probe="$(mktemp "$CC_TMP_DIR/.wg-probe.XXXXXX" 2>/dev/null)" || probe=""
         if [[ -n "$probe" ]]; then
-            # Guarded: a failing `exec {fd}>` EXITS a non-interactive shell
-            # under set -e even mid-function (MEASURED 2026-09-23) — an
-            # unguarded probe open would take the daemon down at the exact
-            # tier where fd pressure makes open() likeliest to fail. On
-            # failure, degrade to the same no-probe path mktemp failure takes.
-            if exec {probe_fd}>"$probe" 2>/dev/null; then
+            # Two hazards in one line, both MEASURED, both silent:
+            #   * a failing `exec {fd}>` EXITS a non-interactive shell under
+            #     set -e even mid-function — an unguarded open would take the
+            #     daemon down at the exact tier where fd pressure makes open()
+            #     likeliest to fail. Hence the `if`.
+            #   * an `exec` with NO COMMAND applies every redirection to the
+            #     shell PERMANENTLY, so a bare `exec {fd}>"$probe" 2>/dev/null`
+            #     sends the daemon's own stderr to /dev/null for the rest of
+            #     its life — the journal silently loses bash errors and set -e
+            #     aborts from then on. The brace group scopes the suppression
+            #     while probe_fd, opened in the current shell, outlives it.
+            # MEASURED 2026-09-24, 4 forms x 2 outcomes with a no-redirect
+            # oracle arm: this form keeps stderr AND still guards.
+            if { exec {probe_fd}>"$probe"; } 2>/dev/null; then
                 probe_snapshot="$(live_open_paths)"
                 exec {probe_fd}>&-
             fi
             rm -f "$probe"
         fi
-    fi
-    # Taken AFTER the probe is closed and unlinked: a snapshot still naming
-    # the probe would derive a unit from it and shrink the sweep for nothing.
-    # On the oxygen-floor path live_paths stays empty on purpose: an empty
-    # snapshot yields no exclusions and no spared directories anywhere below.
-    if (( headroom >= SACRED_GROUND_MB )); then
-        live_paths="$(live_open_paths)"
+        # ONE scan, and it is the scan the self-test validated. An earlier
+        # draft validated the probe snapshot and then took a SECOND snapshot to
+        # protect with — so the checked one was discarded and the one that
+        # actually guarded was unchecked. live_open_paths suppresses find
+        # failures, so a failed or partial second read returns empty, which is
+        # indistinguishable from "nothing is live" and reaps every active
+        # directory while the self-test reports healthy.
+        #
         # Positive self-test, not an emptiness test: a partial /proc read,
         # another uid's writer, or a CC_TMP_DIR spelling the kernel does not
         # use all yield a NON-empty snapshot with a structurally blind guard.
-        # The probe is a root-level loose file, so dir_has_live_writer (a
-        # prefix test, no unit derivation) is the right checker for it.
-        # Exact-path match, not a prefix test: dir_has_live_writer answers
-        # "is ANYTHING open under cc-tmp", which any other session's
-        # descriptor satisfies (6 measured live at review time) — masking a
-        # partial /proc read, the failure mode this self-test names first
-        # (round-3 finding, MEASURED: the old form passed with the probe
-        # wholly invisible).
-        if [[ -z "$probe" ]] || ! printf '%s\n' "$probe_snapshot" | grep -qxF -- "$probe"; then
-            log WARN "Zone A RED — in-flight guard UNAVAILABLE (self-test failed: this process's own open probe under $CC_TMP_DIR is not visible in the /proc snapshot); reaping without it, an active writer's directory may be deleted"
+        # Exact-path match, not a prefix test: a prefix test answers "is
+        # ANYTHING open under cc-tmp", which any other session's descriptor
+        # satisfies (6 measured live at review time) — masking exactly the
+        # partial read this names first (MEASURED: the prefix form passed with
+        # the probe wholly invisible).
+        # Whole-line containment in pure bash — NOT `printf | grep -qxF`.
+        # `grep -q` exits on its first match, which SIGPIPEs the printf still
+        # feeding it, and under `set -o pipefail` the pipeline then reports 141
+        # and the self-test reads as FAILED while the probe was in fact found.
+        # MEASURED 2026-09-24, sweeping snapshot size with the needle first:
+        # 33,901 B -> rc 0, 67,901 B -> rc 141. The boundary is the 64 KiB pipe
+        # buffer, and a live snapshot here is ~118 KB — so the piped form was
+        # failing its own self-test on EVERY real RED run while passing in
+        # small test fixtures. Same class as the awk early-exit above; the pipe
+        # is the hazard, so this form removes the pipe rather than working
+        # around it. Both operands are quoted, which makes the needle a LITERAL
+        # inside the pattern, and the \n fences make it an exact-line test.
+        if [[ -n "$probe" && $'\n'"$probe_snapshot"$'\n' == *$'\n'"$probe"$'\n'* ]]; then
+            # Drop the probe's own record — it is closed and unlinked by now,
+            # so a unit derived from it would exclude a path that cannot exist.
+            # grep -v has no early exit, so it drains its input and cannot
+            # SIGPIPE the printf the way the -q form above did.
+            live_paths="$(printf '%s\n' "$probe_snapshot" | grep -vxF -- "$probe")" || live_paths=""
+        else
+            # Degrade LOUD — but KEEP the snapshot. Discarding it here would
+            # be a policy change riding along with the single-snapshot fix,
+            # and a strictly worse one: a snapshot that failed a POSITIVE
+            # self-test is still better evidence than the empty string. Every
+            # failure mode this test catches (a partial /proc read, a
+            # CC_TMP_DIR spelling the kernel does not use, another uid's
+            # writer) makes the snapshot INCOMPLETE, never fictional — /proc
+            # fd links cannot name a path nobody has open — so using it can
+            # only under-protect, which is the same direction blanking goes,
+            # while blanking additionally throws away the real writers it DID
+            # see. The point is sharp here: the SIGPIPE defect fixed just above
+            # made this very branch fire on every real RED run, and under
+            # blanking that false negative would have deleted every live
+            # writer's tree rather than costing a log line.
+            log WARN "Zone A RED — in-flight guard DEGRADED (self-test failed: this process's own open probe under $CC_TMP_DIR is not visible in the /proc snapshot); proceeding with the unverified snapshot, which may be incomplete — an active writer's directory may be deleted"
+            live_paths="$probe_snapshot"
         fi
     fi
 
@@ -607,7 +725,10 @@ clean_cc_red() {
         # deliberately narrower -not -path "$newest_session/*". Promoting this
         # to the depth-1 parent would exclude every sibling project tree under
         # claude-<uid>/ from the sweep (MEASURED: 7 trees, 1 of them live).
-        if [[ -n "$newest_session" && "$newest_session" == "$dir/"* ]]; then
+        # Below the oxygen floor even this sparing goes: the active session's
+        # tree is as reclaimable as anything else when the alternative is
+        # ENOSPC for every session including that one.
+        if (( ! floor )) && [[ -n "$newest_session" && "$newest_session" == "$dir/"* ]]; then
             continue
         fi
         # The REAP unit is the whole directory: reaping only the quiet part of
@@ -620,13 +741,33 @@ clean_cc_red() {
         reap_dir_sparing_sockets "$dir"
     done < <(find "$CC_TMP_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null) || true
 
+    # The active session's own subtree, spared by both sweeps below — but ONLY
+    # when newest_session actually resolved. Spelled unconditionally, an empty
+    # newest_session makes the predicate `-not -path "/*"`, which matches every
+    # absolute path and so deletes NOTHING AT ALL: RED would run, log normally
+    # and reclaim zero bytes on any cc-tmp with no claude-<uid>/<project> dir
+    # at depth 2 (MEASURED: 0 of 2 files swept). Pre-existing on the default
+    # branch; it has to be right here because the floor path depends on these
+    # sweeps actually sweeping.
+    local -a session_excl=()
+    if (( ! floor )) && [[ -n "$newest_session" ]]; then
+        session_excl=(-not -path "$newest_session/*")
+    fi
+
     # Delete all reclaimable loose files except those modified in the last 60s.
     # This sweep has no -maxdepth, so it walks the WHOLE tree — including the
     # directories spared above. Without the exclusions it would delete the
     # quiet files inside a directory the reap loop deliberately kept, which is
     # the same partial-deletion failure by another route.
-    find "$CC_TMP_DIR" -type f -not -newermt '60 seconds ago' \
-        -not -path "$newest_session/*" ${live_excl[@]+"${live_excl[@]}"} \
+    #
+    # Below the floor the freshness window goes too. It is the one exclusion
+    # that survives an emptied live_paths, and a root-level file being written
+    # fast enough to cause the emergency is precisely the file whose mtime is
+    # always current — it would survive every sweep, all the way to ENOSPC.
+    local -a fresh_excl=()
+    (( floor )) || fresh_excl=(-not -newermt '60 seconds ago')
+    find "$CC_TMP_DIR" -type f ${fresh_excl[@]+"${fresh_excl[@]}"} \
+        ${session_excl[@]+"${session_excl[@]}"} ${live_excl[@]+"${live_excl[@]}"} \
         -delete 2>/dev/null || true
 
     # Delete caches — except where a live process is writing, and except
@@ -637,10 +778,26 @@ clean_cc_red() {
     # the live exclusions this sweep deleted a directory the reap loop had
     # just spared AND logged as spared, which is worse than not sparing it:
     # the operator is told a directory survived that did not.
-    find "$CC_TMP_DIR" -type d \( -name "claude-skills" -o -name "tsx-*" \) \
+    #
+    # Routed through reap_dir_sparing_sockets rather than `rm -rf`, for the
+    # SAME reason the depth-1 reap is: rm -rf has no socket predicate, so a
+    # socket living inside a cache directory was deleted here twenty lines
+    # after the reap loop deliberately kept its parent BECAUSE it holds a
+    # socket (MEASURED: of four sockets placed across the tree, the two inside
+    # cache directories were destroyed) — the exact spared-then-deleted
+    # failure the paragraph above says this sweep exists to avoid, and the
+    # reason the floor's log line could not honestly say sockets survive.
+    # Sockets are 0 bytes, so keeping them costs no reclaimed space; their
+    # ancestor directories stay non-empty and survive with them, which is the
+    # same outcome the depth-1 reap already produces.
+    local cache_dir
+    while IFS= read -r cache_dir; do
+        [[ -d "$cache_dir" ]] || continue   # an outer match may have taken it
+        reap_dir_sparing_sockets "$cache_dir"
+    done < <(find "$CC_TMP_DIR" -type d \( -name "claude-skills" -o -name "tsx-*" \) \
         ${live_excl[@]+"${live_excl[@]}"} \
-        -not -path "$newest_session/*" \
-        -exec rm -rf {} + 2>/dev/null || true
+        ${session_excl[@]+"${session_excl[@]}"} \
+        2>/dev/null) || true
 
     # Report the surviving control plane — counted AFTER every sweep above,
     # so the line is true by construction whatever any sweep did. Sockets
@@ -710,14 +867,25 @@ check_cc_tmp() {
 
     local tier="green"
 
+    # TRUE headroom against the volume's real ceiling, computed HERE rather
+    # than inside clean_cc_red alone. The budget thresholds above are a
+    # configured number and the statfs check below is blind on a btrfs backend,
+    # so a budget set larger than the volume lets both stay green while the
+    # volume runs out: with a 1 GiB volume and CC_TMP_BUDGET_MB=2000, budget-RED
+    # does not start until 1800 MB and df reports the shared pool, so nothing
+    # would ever call the only function that evaluates the real ceiling.
+    local headroom
+    headroom=$(cc_tmp_headroom_mb "$used_mb")
+
     # After the cc-tmp blast-radius split, free_mb measures the DEDICATED
     # volume, so this sacred-ground trigger guards that volume (not the rootfs).
     # On a 2 GiB volume it is a pure backstop behind the 450 MiB budget-red
     # above; rootfs free-space monitoring lives in Zone B (/tmp) below.
-    if (( used_mb > threshold_red )) || (( free_mb < SACRED_GROUND_MB )); then
+    if (( used_mb > threshold_red )) || (( free_mb < SACRED_GROUND_MB )) \
+        || (( headroom < SACRED_GROUND_MB )); then
         tier="red"
         _log_cc_pressure red "$used_mb" "$free_mb"   # capture BEFORE the nuclear cleanup erases it
-        clean_cc_red
+        clean_cc_red "$headroom"
     elif (( used_mb > threshold_orange )); then
         tier="orange"
         _log_cc_pressure orange "$used_mb" "$free_mb"
