@@ -159,10 +159,25 @@ checked is the environment that launches, because there is only one that both
 spawn paths build. A new allowlisted binary that can spawn a shell needs an
 entry there, and the allowlist alone should not be read as confining it.
 
-Still NOT confined, and worth knowing before granting a scoped shell:
-subcommands that write files to caller-chosen paths remain available (`gh run
-download`, `gh release download`), so "Write/Edit stay blocked" describes the
-TOOLS, not everything that can put bytes on disk.
+**Still NOT confined — and this is the sentence to read before granting any
+scoped shell.** The allowlist is enforced, which is a real improvement over a
+restriction nothing applied. It is not a sandbox. The permitted binary writes
+files to caller-chosen paths and makes authenticated API calls as the operator,
+so `Write`/`Edit` being blocked describes the TOOLS, not everything that can put
+bytes on disk or reach the network. Two consequences worth stating plainly
+rather than leaving to be discovered:
+
+- a scoped session can modify files on this host, INCLUDING files that take
+  effect on a later run, so "it can only comment on pull requests" is not a
+  property the allowlist gives you;
+- the profile that has this grant also ingests external, attacker-authored
+  content, so treat its capability as "acts with the operator's credentials",
+  not as "reads and replies".
+
+Bounding this properly needs a SUBCOMMAND-level allowlist rather than a
+first-token one. Until that exists, do not write a safety argument that rests
+on a scoped shell being unable to do something — `autonomy/audit.py` carried
+exactly such an argument and it was wrong.
 
 ### Install-local profiles (overlay)
 

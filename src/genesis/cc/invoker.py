@@ -356,7 +356,15 @@ def _sealed_gh_config_dir() -> str | None:
             target.mkdir(parents=True, exist_ok=True)
             target.chmod(0o700)
             for stale in target.iterdir():
-                if stale.is_file() and stale.name not in desired:
+                if stale.is_file() and stale.name in desired:
+                    continue
+                # DIRECTORIES TOO. The seal's whole job since the extension
+                # finding is that `<seal>/gh/extensions` does not exist — a
+                # sweep that only unlinks FILES leaves exactly the subtree the
+                # seal exists to prevent, and then locks it in at 0500.
+                if stale.is_dir() and not stale.is_symlink():
+                    shutil.rmtree(stale)
+                else:
                     stale.unlink()
             for name, body in desired.items():
                 path = target / name
@@ -379,6 +387,15 @@ def _seal_matches(target: Path, desired: dict[str, str]) -> bool:
     chmod-back leaves the right bytes at the wrong permissions, and a
     content-only check would call that good.
 
+    ANY DIRECTORY ENTRY MEANS NO. Enumerating only ``is_file()`` was blind to
+    the one thing the seal exists to prevent: ``XDG_DATA_HOME`` points here, so
+    a planted ``gh/extensions/gh-x`` re-opens the extension route while this
+    function reports the seal CLEAN and the stale sweep — also file-only —
+    leaves it in place, permanently, at 0500. MEASURED before the fix: a
+    planted extension survived a reseal and ``_seal_matches`` returned True.
+    The seal is a flat set of files by construction, so a directory is never
+    legitimate here and needs no name check.
+
     ANSWERS "NO" RATHER THAN RAISING when the directory moves under it. The
     first caller runs this OUTSIDE the rewrite lock, so a concurrent writer
     unlinking a stale file between the listing and the read is expected, not
@@ -391,7 +408,10 @@ def _seal_matches(target: Path, desired: dict[str, str]) -> bool:
     try:
         if not target.is_dir() or target.stat().st_mode & 0o777 != 0o500:
             return False
-        present = {p.name: p for p in target.iterdir() if p.is_file()}
+        entries = list(target.iterdir())
+        if any(p.is_dir() and not p.is_symlink() for p in entries):
+            return False
+        present = {p.name: p for p in entries if p.is_file()}
         if set(present) != set(desired):
             return False
         return all(
@@ -471,6 +491,32 @@ def _unconfinable_binary_message(binary: str) -> str:
         f"writable configuration, which is an escape from the allowlist rather "
         f"than a weaker form of it."
     )
+
+
+def _assert_hardening_present(env: dict[str, str], bash_allowlist: tuple[str, ...]) -> None:
+    """Raise unless every allowlisted binary's confinement is in ``env``.
+
+    Called on EVERY dict that is about to be launched, not once per build. The
+    builder was described as "the only thing every launch path shares" and that
+    was WRONG: both spawn paths merge ``_apply_login_fallback`` on top of the
+    built env and launch the merged result, so a check that ended at the
+    builder inspected a dict that was then added to. Same class as the
+    ``env_overrides`` hole this branch closed, one call later.
+
+    Recomputes the hardening rather than comparing against a remembered copy:
+    an enumeration of variable names goes stale the moment a hardening grows a
+    key, and a recompute also notices a seal that changed underneath us.
+    """
+    for binary in bash_allowlist:
+        hardening = _BINARY_HARDENING.get(binary)
+        if hardening is None:
+            continue
+        required = hardening()
+        if required is None:
+            raise RuntimeError(_unconfinable_binary_message(binary))
+        wrong = sorted(k for k, v in required.items() if env.get(k) != v)
+        if wrong:
+            raise RuntimeError(_unhardened_env_message(binary, wrong))
 
 
 def _unhardened_env_message(binary: str, wrong: list[str]) -> str:
@@ -1328,6 +1374,19 @@ class CCInvoker:
                 raise RuntimeError(_unhardened_env_message(binary, wrong))
         return env
 
+    @staticmethod
+    def _launch_env(env: dict[str, str], inv: CCInvocation) -> dict[str, str]:
+        """Last gate between a built env and the process that receives it.
+
+        Exists because ``_build_env`` is NOT the final word: both spawn paths
+        merge the login fallback on top of it. Anything that mutates the env
+        after the builder goes through here, so the dict that was checked is
+        the dict that launches.
+        """
+        if inv.bash_allowlist:
+            _assert_hardening_present(env, tuple(inv.bash_allowlist))
+        return env
+
     def _register_proc(self, key: str, proc: asyncio.subprocess.Process) -> None:
         """Register a live subprocess under a session key.
 
@@ -1605,6 +1664,7 @@ class CCInvoker:
         await self.verify_allowlist_enforceable(invocation)
         env = self._build_env(invocation)
         env = await self._apply_login_fallback(env, invocation)
+        env = self._launch_env(env, invocation)
         start = time.monotonic()
 
         # Extract dispatched effort from args — may differ from invocation.effort
@@ -1805,6 +1865,7 @@ class CCInvoker:
 
         env = self._build_env(invocation)
         env = await self._apply_login_fallback(env, invocation)
+        env = self._launch_env(env, invocation)
         start = time.monotonic()
 
         # Extract dispatched effort from args — may differ from invocation.effort

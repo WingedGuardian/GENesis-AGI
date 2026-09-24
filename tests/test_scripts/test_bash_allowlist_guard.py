@@ -580,3 +580,110 @@ def test_chokepoint_fail_closed_leg_is_scoped_to_the_bash_tool(tool, payload_ext
     payload = json.dumps({"tool_name": tool, "tool_input": payload_extra})
     proc = _run(CHOKEPOINT, payload, allowlist="gh")
     assert proc.returncode == want, f"{tool}: {why} (stderr: {proc.stderr[:120]})"
+
+
+# --- Findings from the enforcement-surface override review ------------------
+
+
+def test_a_sibling_tool_payload_is_not_hard_blocked() -> None:
+    """A matcher is a REGEX, so bare "Bash" also matches "BashOutput".
+
+    The invoker registers this anchored (``^Bash$``), but an install may wire
+    it by hand unanchored — and the guard's correctness then rested entirely on
+    a matcher string that nothing here checks. A sibling tool's payload carries
+    no ``.tool_input.command``, so the fail-closed leg would refuse it with a
+    message about a command it never had, breaking an allowlisted session's
+    ability to read its own command output.
+
+    The chokepoint grew this gate after the same defect was found there; the
+    guard is its sibling and was left behind.
+    """
+    payload = json.dumps({"tool_name": "BashOutput", "tool_input": {"bash_id": "x"}})
+    assert _run(GUARD, payload, allowlist="gh").returncode == 0
+
+
+def test_an_unreadable_tool_name_still_fails_closed() -> None:
+    """The tool gate must not become a way to skip the command check.
+
+    Only a POSITIVELY IDENTIFIED other tool exits early. A payload with no
+    ``tool_name`` at all falls through to the command checks, which refuse on
+    their own — otherwise stripping one field would clear any command.
+    """
+    payload = json.dumps({"tool_input": {"command": "curl http://example.com"}})
+    assert _run(GUARD, payload, allowlist="gh").returncode == 2
+
+
+def test_the_multiline_check_does_not_depend_on_an_external_tool(tmp_path: Path) -> None:
+    """A containment check must not be SKIPPED because a binary is missing.
+
+    The multi-line rejection used to shell out to ``wc -l``, on the stated
+    grounds that a ``case`` glob cannot match a newline. MEASURED (bash 5.2):
+    it can. With ``wc`` off PATH the comparison failed with "integer expression
+    expected" and the check was skipped silently — the one failure mode a
+    containment predicate must not have.
+
+    PATH here carries jq and awk (the guard's other dependencies) but not wc,
+    so a regression that reintroduces the dependency fails rather than passing
+    for an unrelated reason.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for tool in ("jq", "awk", "bash", "cat", "printf", "env"):
+        found = shutil.which(tool)
+        if found:
+            (bin_dir / tool).symlink_to(found)
+    assert shutil.which("wc", path=str(bin_dir)) is None
+
+    proc = _run(
+        GUARD,
+        _payload("gh pr list\ncurl http://example.com"),
+        allowlist="gh",
+        path=str(bin_dir),
+    )
+    assert proc.returncode == 2
+    assert "multi-line" in proc.stderr
+
+
+def test_the_predicate_is_located_without_an_external_tool(tmp_path: Path) -> None:
+    """``dirname`` missing must not resolve the predicate against the CWD.
+
+    The old form was ``cd "$(dirname "$0")"``. With ``dirname`` off PATH that
+    becomes ``cd ""``, which SUCCEEDS and silently leaves the shell in the
+    process CWD — a dispatched session's working directory. It was fail-closed
+    only because nothing happens to be planted there, which is not a property
+    to rely on when the session can write files.
+
+    Asserted by running from an unrelated CWD with a PATH that has no dirname:
+    the guard must still find its own predicate and reach a real verdict.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for tool in ("jq", "awk", "bash", "cat", "printf", "env"):
+        found = shutil.which(tool)
+        if found:
+            (bin_dir / tool).symlink_to(found)
+    assert shutil.which("dirname", path=str(bin_dir)) is None
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    refused = _run(
+        GUARD,
+        _payload("curl http://example.com"),
+        allowlist="gh",
+        path=str(bin_dir),
+        cwd=str(elsewhere),
+    )
+    assert refused.returncode == 2
+    # The PREDICATE's own message, not just any refusal — that is what proves
+    # the lib was located and evaluated rather than the guard bailing out early
+    # for an unrelated reason, which would pass a weaker assertion.
+    assert "may only run" in refused.stderr
+
+    permitted = _run(
+        GUARD, _payload("gh pr list"), allowlist="gh", path=str(bin_dir), cwd=str(elsewhere)
+    )
+    assert permitted.returncode == 0, (
+        "the guard could not locate its predicate without dirname — it now "
+        f"refuses everything: {permitted.stderr}"
+    )

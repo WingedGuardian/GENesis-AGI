@@ -344,10 +344,19 @@ PROFILES: dict[str, list[str]] = {
     # ── Steward profile ──────────────────────────────────────────
     # For the upstream-PR stewardship campaign. UNIQUE among profiles: it
     # grants Bash (so it can run `gh`) — every other profile blocks Bash.
-    # The shell is NOT open, though: scripts/bash_safety_hook.sh restricts it
-    # to the `gh` binary only (via GENESIS_BASH_ALLOWLIST). Write/Edit/browser
-    # stay blocked — the campaign comments/reopens/closes PRs and ESCALATES
-    # code fixes rather than editing/pushing itself.
+    # `GENESIS_BASH_ALLOWLIST` restricts the first token to `gh`, and that
+    # restriction is now actually ENFORCED — by the guard the invoker injects
+    # into the dispatch's settings, NOT by scripts/bash_safety_hook.sh, which
+    # this repository wires nowhere. Write/Edit/browser stay blocked.
+    #
+    # READ THIS BEFORE RELYING ON IT: a first-token allowlist bounds which
+    # BINARY runs, not what the session can do. The permitted binary writes
+    # files to caller-chosen paths and makes authenticated API calls, so this
+    # profile is NOT confined to commenting — the tool blocks describe the
+    # TOOLS, not the capability. Treat it as a session acting with the
+    # operator's credentials and filesystem access, which matters because it
+    # also ingests external, attacker-authored PR content. A subcommand-level
+    # allowlist is what would make "confined" true.
     "steward": (
         [t for t in _UNIVERSAL_DISALLOW if t != "Bash"]
         + _NO_BROWSER_INTERACTION

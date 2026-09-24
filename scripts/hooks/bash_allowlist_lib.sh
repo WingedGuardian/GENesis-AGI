@@ -45,15 +45,20 @@ genesis_bash_allowlist_verdict() {
     # it did before this guard existed.
     [ -n "$allow" ] || return 0
 
-    # Reject embedded newlines FIRST — a `case` glob does not reliably match
-    # $'\n', so use a line count. printf adds no trailing newline, so any count
-    # > 0 means an embedded newline, i.e. a second command on its own line.
-    local lines
-    lines=$(printf '%s' "$cmd" | wc -l)
-    if [ "$lines" -gt 0 ]; then
-        echo "BLOCKED: multi-line commands are not permitted in an allowlisted session ($allow)." >&2
-        return 2
-    fi
+    # Reject embedded newlines FIRST — a second command on its own line.
+    #
+    # This used to shell out to `wc -l`, on the stated grounds that a `case`
+    # glob "does not reliably match $'\n'". MEASURED (bash 5.2.21): it does.
+    # The reason was wrong and the dependency was load-bearing in the wrong
+    # direction — with `wc` off PATH the comparison failed with "integer
+    # expression expected" and the check was SKIPPED, which is the one thing a
+    # containment predicate must not do. A guard should not need an external
+    # tool to answer a question the shell can answer.
+    case "$cmd" in
+        *$'\n'*)
+            echo "BLOCKED: multi-line commands are not permitted in an allowlisted session ($allow)." >&2
+            return 2;;
+    esac
 
     # `&` is listed SEPARATELY from `&&` and is not redundant with it: a bare
     # `&` backgrounds the first command and runs the next one, so

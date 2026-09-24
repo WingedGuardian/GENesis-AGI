@@ -4348,6 +4348,113 @@ async def test_refuses_to_launch_when_the_gh_seal_cannot_be_prepared(
         await _verify(invoker, CCInvocation(prompt="hi", bash_allowlist=("gh",)))
 
 
+# --- The seal is a FLAT SET OF FILES, and a directory is never legitimate ---
+
+
+def test_a_directory_planted_in_the_seal_is_neither_reported_clean_nor_kept(tmp_path, monkeypatch):
+    """The extension closure rests on `<seal>/gh/extensions` not existing.
+
+    `XDG_DATA_HOME` points at the seal, so a planted `gh/extensions/gh-x` is a
+    live extension tree — the exact route the pin exists to close. Enumerating
+    only `is_file()` was blind to it twice over: `_seal_matches` reported the
+    contaminated seal CLEAN, and the stale sweep (also file-only) left it in
+    place and then locked it in at 0500, permanently, across every reseal.
+
+    MEASURED before the fix: planted extension survived a reseal and
+    `_seal_matches` returned True. Both halves are asserted here because
+    fixing either one alone still leaves the route open — a clean verdict with
+    the tree present, or a correct verdict that never removes it.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    seal = tmp_path / "gh-sealed"
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal)
+    assert inv_mod._sealed_gh_config_dir() == str(seal)
+
+    seal.chmod(0o700)
+    planted = seal / "gh" / "extensions" / "gh-evil"
+    planted.mkdir(parents=True)
+    (planted / "gh-evil").write_text("#!/bin/bash\necho pwned\n", encoding="utf-8")
+    seal.chmod(0o500)
+
+    desired = {"config.yml": inv_mod._SEALED_GH_CONFIG_YML}
+    hosts = Path.home() / ".config" / "gh" / "hosts.yml"
+    if hosts.is_file():
+        desired["hosts.yml"] = hosts.read_text(encoding="utf-8")
+
+    assert inv_mod._seal_matches(seal, desired) is False, (
+        "a seal containing a directory was reported CLEAN — XDG_DATA_HOME "
+        "points here, so that directory is a live gh extension tree."
+    )
+    assert inv_mod._sealed_gh_config_dir() == str(seal)
+    assert not planted.exists(), "the stale sweep left the planted extension tree"
+    assert not (seal / "gh").exists()
+    assert seal.stat().st_mode & 0o777 == 0o500
+
+
+# --- The env that was CHECKED must be the env that LAUNCHES ----------------
+
+
+def test_the_launch_gate_refuses_an_env_that_lost_its_hardening(invoker, monkeypatch):
+    """`_build_env` is not the last word, which is what this catches.
+
+    Both spawn paths merge `_apply_login_fallback` on top of the built env and
+    launch the merged result, so a check that ended at the builder inspected a
+    dict that was then added to. This is the same class as the `env_overrides`
+    hole, one call later, and it made the PR's own structural claim false.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda: "/seal")
+    inv = CCInvocation(prompt="hi", bash_allowlist=("gh",))
+    env = invoker._build_env(inv)
+
+    # survives untouched
+    assert invoker._launch_env(dict(env), inv)["GH_CONFIG_DIR"] == "/seal"
+
+    # a later merge strips the confinement — exactly what the fallback could do
+    tampered = {**env, "GH_CONFIG_DIR": "/tmp/attacker-writable"}
+    with pytest.raises(RuntimeError, match="not in the environment"):
+        invoker._launch_env(tampered, inv)
+
+
+def test_every_spawn_path_gates_the_env_it_actually_launches():
+    """Structural lock: nothing may mutate the env after the gate.
+
+    Asserted by AST rather than by reading, so a spawn path added later — or a
+    new post-build mutation slipped between the gate and the spawn — fails here
+    instead of launching an environment nobody checked. Allowlist polarity: the
+    callers are ENUMERATED and each must gate, so a new one is a failure by
+    construction.
+
+    The specific regression this locks: `_apply_login_fallback` was called
+    AFTER the builder's assertion in both paths, and returned a merged dict.
+    """
+    import ast
+    import inspect
+
+    from genesis.cc import invoker as inv_mod
+
+    tree = ast.parse(inspect.getsource(inv_mod))
+    callers: dict[str, bool] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef):
+            continue
+        dumped = ast.dump(node)
+        if "attr='_apply_login_fallback'" not in dumped:
+            continue
+        if node.name == "_apply_login_fallback":
+            continue
+        callers[node.name] = "attr='_launch_env'" in dumped
+
+    assert callers, "no caller of _apply_login_fallback found — the probe is inert"
+    missing = sorted(name for name, ok in callers.items() if not ok)
+    assert not missing, (
+        f"these mutate the env after _build_env without re-gating it: {missing}. "
+        f"The environment that was checked would not be the one launched."
+    )
+
+
 # --- The seal answers, rather than raising, when it moves under us ----------
 
 

@@ -53,7 +53,23 @@ set -u
 [ -n "${GENESIS_BASH_ALLOWLIST:-}" ] || exit 0
 
 _ALLOW=$GENESIS_BASH_ALLOWLIST
-_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Derive the directory with parameter expansion rather than `dirname`. With
+# `dirname` off PATH the old form became `cd ""`, which SUCCEEDS and silently
+# resolves the predicate against the process CWD — a dispatched session's
+# working directory, i.e. somewhere an allowlisted command can write. It is
+# fail-closed today only because nothing is planted there, which is not a
+# property to rely on. No external tool can now fail this open.
+_DIR=${BASH_SOURCE[0]%/*}
+if [ "$_DIR" = "${BASH_SOURCE[0]}" ]; then
+    # No slash to strip, so the directory cannot be derived from the
+    # invocation path and $PWD would be a guess. The invoker always registers
+    # an absolute path, so this shape is unexpected — refuse rather than guess.
+    echo "BLOCKED: this session restricts Bash to [$_ALLOW], but the guard's own" >&2
+    echo "directory could not be derived from its invocation path, so the" >&2
+    echo "allowlist predicate cannot be located." >&2
+    exit 2
+fi
 _LIB="$_DIR/bash_allowlist_lib.sh"
 
 if [ ! -r "$_LIB" ]; then
@@ -72,6 +88,22 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 _RAW=$(cat)
+
+# GATE ON tool_name, exactly as the chokepoint does. A matcher is a REGEX, and
+# an install may wire this unanchored — bare "Bash" also matches "BashOutput".
+# A sibling tool's payload carries no `.tool_input.command`, so without this
+# the fail-closed leg below would hard-block it with a message about a command
+# it never had. The chokepoint grew this gate after the same defect was found
+# there in round 1; this is its sibling and was left behind.
+#
+# An absent or unreadable tool_name deliberately FALLS THROUGH to the command
+# checks, which fail closed on their own — only a positively-identified other
+# tool exits early.
+_TOOL=$(printf '%s' "$_RAW" | jq -r '.tool_name // empty' 2>/dev/null)
+if [ -n "$_TOOL" ] && [ "$_TOOL" != "Bash" ]; then
+    exit 0
+fi
+
 _rc=0
 _CMD=$(printf '%s' "$_RAW" | jq -r '.tool_input.command // empty' 2>/dev/null) || _rc=$?
 if [ "$_rc" -ne 0 ] || [ -z "$_CMD" ]; then
