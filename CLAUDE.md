@@ -604,11 +604,15 @@ behind the writer, and 7 were a guard since removed.
   whether one was requested. It reads published reviews only, so "never triggered"
   and "triggered, still running" are the SAME output; if you have not just requested
   one, request one rather than reading that line as proof nobody did.
-  **Codex is not the only reviewer that can block you.** CodeRabbit reviews on its
-  own schedule, and an unresolved **Critical or Major** inline finding on a file in
-  the PR diff blocks a merge by itself — the always-fix floor, which stops a Codex
-  **P1** the same way, in EVERY lane, before any score is consulted. Unless the
-  configured documentation-path exclusion applies.
+  **Codex is not the only reviewer that can block you.** CodeRabbit and Devin
+  review on their own schedules. An unresolved CodeRabbit **Critical or Major**, or
+  a Devin **severe bug / critical security** finding, on a file in the PR diff
+  blocks a merge by itself — the always-fix floor, which stops a Codex **P1** the
+  same way, in EVERY lane, before any score is consulted; a Devin non-severe
+  finding weighs like a P2. Unless the configured documentation-path exclusion
+  applies. When Codex is out, an owner-approved `# substitute-review` lets a Devin
+  or CodeRabbit review at the exact head stand in for Codex — the gate asks the
+  owner each time.
   Maintainer-replied findings and findings on files outside the PR diff do not
   score; under the shipped `doc_findings: skip`, documentation findings do not
   score either. Until 2026-09-10 CodeRabbit was

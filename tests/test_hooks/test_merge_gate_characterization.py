@@ -1607,3 +1607,123 @@ def test_enforcement_surfaces_note_on_off_public_repo_no_op(monkeypatch, capsys)
     assert rc == 0
     assert "scheduled-review gate n/a" in err
     assert "owner/some-other-public-repo" in err  # names the canonical public repo
+
+
+# ── the Codex stand-in: `# substitute-review` (owner standing order, 2026-09-24) ──
+# Driven through main() because the load-bearing properties live in the merge ARM,
+# not in the helper: the owner is ASKED (a native prompt, not a session promise),
+# a dispatched session is REFUSED, the ask cannot pre-empt a later hard block, the
+# merge stays bound to the substitute-verified head, and the override log records it.
+
+_DEVIN = "devin-ai-integration[bot]"
+
+
+def _devin_at(head: str = HEAD) -> str:
+    return json.dumps({"login": _DEVIN, "commit_id": head, "state": "COMMENTED"})
+
+
+def _asked(out: str) -> bool:
+    return '"permissionDecision": "ask"' in out or '"permissionDecision":"ask"' in out
+
+
+def test_substitute_review_asks_the_owner(monkeypatch, capsys):
+    rc = _run(
+        monkeypatch,
+        _merge_cmd(trailer="# substitute-review"),
+        reviews=_devin_at(),
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert _asked(out), f"a substitute merge proceeded without asking the owner: {out!r}"
+    assert "devin-ai-integration[bot]" in out and HEAD[:12] in out
+
+
+def test_substitute_review_is_refused_in_a_dispatched_session(monkeypatch, capsys):
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    rc = _run(
+        monkeypatch,
+        _merge_cmd(trailer="# substitute-review"),
+        reviews=_devin_at(),
+    )
+    captured = capsys.readouterr()
+    assert rc == 2, "an unattended session merged on a substitute nobody approved"
+    assert not _asked(captured.out)
+    assert "nobody to ask" in captured.err
+
+
+def test_substitute_review_without_a_review_at_head_still_blocks(monkeypatch, capsys):
+    rc = _run(
+        monkeypatch,
+        _merge_cmd(trailer="# substitute-review"),
+        reviews=_devin_at(STALE),
+    )
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "no Devin or CodeRabbit review at head" in err
+
+
+def test_without_the_sigil_a_substitute_review_changes_nothing(monkeypatch, capsys):
+    rc = _run(monkeypatch, _merge_cmd(), reviews=_devin_at())
+    captured = capsys.readouterr()
+    assert rc == 2, "a Devin review at head satisfied freshness with no sigil and no ask"
+    assert "substitute-review" in captured.err  # the block names the route
+
+
+def test_stale_review_override_wins_over_substitute(monkeypatch, capsys):
+    """Owner ruling 2026-09-24: with both, the broader, ask-free waiver applies."""
+    rc = _run(
+        monkeypatch,
+        _merge_cmd(match=None, trailer="# stale-review-override substitute-review"),
+        reviews=_devin_at(),
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert not _asked(out)
+
+
+def test_the_sigil_is_inert_when_codex_reviewed_the_head(monkeypatch, capsys):
+    rows = "\n".join([_reviews_jsonl(HEAD), _devin_at()])
+    rc = _run(monkeypatch, _merge_cmd(trailer="# substitute-review"), reviews=rows)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert not _asked(out), "the owner was asked about a substitute Codex made unnecessary"
+
+
+def test_a_substitute_ask_never_preempts_a_later_hard_block(monkeypatch, capsys):
+    """The ask is deferred to the tail: an unresolved P1 must still BLOCK."""
+    rc = _run(
+        monkeypatch,
+        _merge_cmd(trailer="# substitute-review"),
+        reviews=_devin_at(),
+        router=_router(inline_lines=_INLINE_P1_LINE),
+    )
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert not _asked(captured.out)
+
+
+def test_a_substitute_merge_stays_bound_to_the_substitute_head(monkeypatch, capsys):
+    rc = _run(
+        monkeypatch,
+        _merge_cmd(match=None, trailer="# substitute-review"),
+        reviews=_devin_at(),
+    )
+    err = capsys.readouterr().err
+    assert rc == 2, "an unbound merge proceeded on a substitute review"
+    assert "devin-ai-integration[bot]-verified" in err
+
+
+def test_the_override_log_records_a_substitute_merge(monkeypatch, capsys):
+    import os as _os
+
+    log_dir = Path(_os.environ["GENESIS_MERGE_OVERRIDE_DIR"])
+    _run(monkeypatch, _merge_cmd(trailer="# substitute-review"), reviews=_devin_at())
+    rows = [
+        json.loads(line)
+        for f in sorted(log_dir.glob("*.jsonl"))
+        for line in f.read_text().splitlines()
+        if line.strip()
+    ]
+    subs = [r for r in rows if r.get("sigil") == "substitute-review"]
+    assert subs, f"no override row for the substitute merge: {rows}"
+    assert subs[0].get("outcome") == "asked"
