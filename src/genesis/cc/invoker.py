@@ -326,7 +326,17 @@ def _sealed_gh_config_dir() -> str | None:
     """
     target = _SEALED_GH_CONFIG_DIR
     try:
-        source = Path(os.environ.get("GH_CONFIG_DIR") or (Path.home() / ".config" / "gh"))
+        # gh's OWN precedence, from `gh help environment`: GH_CONFIG_DIR, then
+        # $XDG_CONFIG_HOME/gh, then ~/.config/gh. Implementing only the first
+        # and last builds a valid-LOOKING seal with no credential in it on any
+        # install that sets XDG_CONFIG_HOME — the session then launches
+        # unauthenticated and every gh call fails, which reads as a broken
+        # steward rather than as a missed config path.
+        _xdg = os.environ.get("XDG_CONFIG_HOME")
+        source = Path(
+            os.environ.get("GH_CONFIG_DIR")
+            or (Path(_xdg) / "gh" if _xdg else Path.home() / ".config" / "gh")
+        )
         hosts = source / "hosts.yml"
         desired = {
             "config.yml": _SEALED_GH_CONFIG_YML,

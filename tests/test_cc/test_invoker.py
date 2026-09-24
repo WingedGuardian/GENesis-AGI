@@ -4348,6 +4348,55 @@ async def test_refuses_to_launch_when_the_gh_seal_cannot_be_prepared(
         await _verify(invoker, CCInvocation(prompt="hi", bash_allowlist=("gh",)))
 
 
+def test_the_seal_finds_the_credential_where_gh_itself_would(tmp_path, monkeypatch):
+    """gh's source precedence is GH_CONFIG_DIR, XDG_CONFIG_HOME/gh, ~/.config/gh.
+
+    Implementing only the first and last builds a valid-LOOKING seal with no
+    credential in it on any install that sets XDG_CONFIG_HOME. The session then
+    launches unauthenticated and every call fails — which reads as a broken
+    profile rather than as a missed config path, and no check here would have
+    caught it because the seal itself is perfectly well-formed.
+
+    Precedence taken from `gh help environment`, not from memory.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    xdg = tmp_path / "xdgconf"
+    (xdg / "gh").mkdir(parents=True)
+    (xdg / "gh" / "hosts.yml").write_text("github.com:\n  oauth_token: t\n", encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+
+    seal = tmp_path / "seal"
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal)
+    assert inv_mod._sealed_gh_config_dir() == str(seal)
+    assert (seal / "hosts.yml").exists(), (
+        "the credential was not carried into the seal — gh resolves its config "
+        "from XDG_CONFIG_HOME/gh when that is set, so the session would launch "
+        "unauthenticated."
+    )
+    assert (seal / "hosts.yml").read_text(encoding="utf-8") == "github.com:\n  oauth_token: t\n"
+
+
+def test_gh_config_dir_still_wins_over_xdg(tmp_path, monkeypatch):
+    """The explicit override outranks XDG — the order matters, not just membership."""
+    import genesis.cc.invoker as inv_mod
+
+    explicit = tmp_path / "explicit"
+    explicit.mkdir()
+    (explicit / "hosts.yml").write_text("EXPLICIT\n", encoding="utf-8")
+    xdg = tmp_path / "xdgconf"
+    (xdg / "gh").mkdir(parents=True)
+    (xdg / "gh" / "hosts.yml").write_text("XDG\n", encoding="utf-8")
+
+    monkeypatch.setenv("GH_CONFIG_DIR", str(explicit))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    seal = tmp_path / "seal"
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal)
+    inv_mod._sealed_gh_config_dir()
+    assert (seal / "hosts.yml").read_text(encoding="utf-8") == "EXPLICIT\n"
+
+
 # --- The seal is a FLAT SET OF FILES, and a directory is never legitimate ---
 
 
