@@ -28,6 +28,13 @@ ExecStart=/bin/bash __REPO_DIR__/scripts/graph_project_runner.sh
 # time and kills nothing legitimate. It is deliberately not the project floor of
 # 2h: this unit repeats hourly, so a 2h cap would let two wedged ticks overlap
 # the lock it is supposed to release.
+# COHERENCE NOTE, because the number above is not the binding constraint and an
+# earlier version of this comment implied it was. The publication lease in the
+# store is taken with a 300s TTL and is never renewed, so a build that outlasts
+# five minutes loses its lease and fails with a clear error long before this
+# timeout is reached. The EFFECTIVE ceiling on a projection is therefore ~300s;
+# this value only bounds a projector wedged somewhere that never reaches the
+# publish step at all. Both are far above the MEASURED 13-21s run.
 TimeoutStartSec=1800
 # Only the venv interpreter, flock, mkdir and the shell. No node, no npm prefix
 # — this unit runs one Python module and takes no path through the CC tooling.
