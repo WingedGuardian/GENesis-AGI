@@ -13,8 +13,14 @@ absent ``data/`` and the ledger field reads ``—``::
                    "command": "python3 <repo>/scripts/genesis_statusline.py"}
 
 The status-line slot is SINGULAR. To keep another status line you already use,
-chain it with ``--then '<its command>'``: that command receives the same stdin
-and its output is printed below this line.
+compose them IN THE SETTINGS COMMAND, giving each the same stdin::
+
+    sh -c 'in=$(cat); printf %s "$in" | python3 <repo>/scripts/genesis_statusline.py;
+           printf %s "$in" | <your existing status-line command>'
+
+Composition deliberately lives there rather than in this script: running
+another program from here means owning its timeouts, its process group and its
+cancellation, and every one of those proved to be its own source of defects.
 
 Sources — each read through the module that owns it, never re-implemented here:
 
@@ -38,10 +44,8 @@ non-zero exit or empty output. Nothing enforces anything from it.
 
 from __future__ import annotations
 
-import argparse
 import contextlib
 import json
-import subprocess
 import sys
 from pathlib import Path
 
@@ -139,136 +143,17 @@ def render(data: dict) -> str:
     return _SEP.join((branch, ledger, streak, _pr_field(data)))
 
 
-#: Cap on the chained command. Failure mode it bounds: Claude Code cancels an
-#: in-flight status-line command only when the NEXT update arrives, and "slow
-#: scripts block the status line from updating until they complete" (CC
-#: statusline docs) — so a chained command that hangs in an idle session leaves
-#: the line stale indefinitely. MEASURED: the chained Node status line this was
-#: built beside runs in ~120ms, so 5s is >40x its normal cost and is reached only
-#: by a command that is actually stuck. Owner-chosen value (2026-09-23).
-_CHAINED_TIMEOUT_S = 5.0
-
-
-def _kill_group(proc) -> None:
-    """SIGKILL the chained command's whole process group (the shell AND what it
-    spawned).
-
-    The group id IS ``proc.pid`` — ``start_new_session`` makes the shell its
-    group leader — so no lookup. Two guards, both load-bearing:
-    - ``returncode is None``: once the shell has been REAPED its pid (and so its
-      group id) may be reused by an unrelated process; killing it then would hit
-      a stranger's group. An exited-but-unreaped shell still pins the id
-      (MEASURED: getpgid on the zombie returns its own pid), so this is the
-      exact line between safe and unsafe.
-    - ``pgid > 1``: killpg(1) signals every process this user owns.
-    """
-    import os
-    import signal
-
-    pgid = proc.pid
-    if proc.returncode is None and pgid > 1:
-        with contextlib.suppress(OSError):
-            os.killpg(pgid, signal.SIGKILL)
-
-
-def _disarm_sigterm() -> None:
-    """Restore the default SIGTERM once the chained command is finished, so a
-    late cancel cannot reach a group id that has since been released."""
-    import signal
-
-    with contextlib.suppress(ValueError, OSError):
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
-
-
-def _start_chained(cmd: str, raw: str):
-    """Start the chained command now so its latency overlaps our render.
-
-    It gets its OWN process group so a timeout can kill everything it spawned,
-    not just the shell. That also takes it out of OUR group, which Claude Code
-    signals to cancel us — so a SIGTERM handler forwards the kill. Residual: a
-    SIGKILL of this script cannot be caught, and would orphan a chained command
-    that is itself hung.
-    """
-    import signal
-
-    proc = subprocess.Popen(  # noqa: S602 — operator-configured command, same trust as statusLine itself
-        cmd,
-        shell=True,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-
-    def _on_term(_signum, _frame):
-        _kill_group(proc)
-        sys.exit(0)
-
-    with contextlib.suppress(ValueError, OSError):
-        signal.signal(signal.SIGTERM, _on_term)
-    return proc, raw.encode("utf-8", "surrogateescape")
-
-
-def _finish_chained(started) -> str:
-    """The chained command's stdout, or "" when it failed. Never raises.
-
-    Bytes in, bytes out, decoded with replacement: a chained command emitting
-    non-UTF-8 must cost its own rows, never blank ours. Past
-    ``_CHAINED_TIMEOUT_S`` its process group is killed and reaped, and it
-    contributes nothing.
-    """
-    try:
-        proc, payload = started
-        try:
-            out, _ = proc.communicate(payload, timeout=_CHAINED_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            _kill_group(proc)
-            # NO unbounded drain here. A descendant that left the group (setsid)
-            # survives the kill still holding the stdout pipe, so communicate()
-            # would wait for IT — MEASURED: a 1s cap held for 20s behind
-            # `setsid sleep 20 &`. Drop our end of the pipes and reap the shell
-            # with a bounded wait; an escaped descendant is outside anything a
-            # process-group kill can reach and is left to finish on its own.
-            for stream in (proc.stdin, proc.stdout):
-                if stream is not None:
-                    with contextlib.suppress(OSError):
-                        stream.close()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=1)
-            return ""
-        if proc.returncode != 0 or not out:
-            return ""
-        text = out.decode("utf-8", "replace")
-        return text if text.endswith("\n") else text + "\n"
-    except Exception:  # noqa: BLE001 — see docstring
-        return ""
-    finally:
-        _disarm_sigterm()
-
-
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument(
-        "--then",
-        metavar="CMD",
-        help="another statusLine command to run with the same stdin; its output "
-        "is printed below this line",
-    )
-    args = parser.parse_args(argv)
+    """Read CC's JSON payload from stdin, print one status line, exit 0.
 
+    ``argv`` is accepted for call-compatibility and ignored: the script takes
+    no options.
+    """
     with contextlib.suppress(AttributeError, ValueError):
         sys.stdout.reconfigure(errors="replace")
 
-    raw = sys.stdin.read()
-    started = None
-    if args.then:
-        try:
-            started = _start_chained(args.then, raw)
-        except Exception:  # noqa: BLE001 — a chained command that cannot start costs only its rows
-            started = None
-
     try:
-        data = json.loads(raw)
+        data = json.loads(sys.stdin.read())
     except (ValueError, RecursionError):
         data = {}
     if not isinstance(data, dict):
@@ -279,9 +164,6 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:  # noqa: BLE001 — last resort: an empty line blanks the whole status line
         line = _SEP.join((_ABSENT, f"ledger:{_ABSENT}", f"streak:{_ABSENT}", f"PR:{_ABSENT}"))
     print(line, flush=True)
-
-    if started is not None:
-        sys.stdout.write(_finish_chained(started))
     return 0
 
 

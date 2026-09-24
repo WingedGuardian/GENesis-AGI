@@ -146,146 +146,69 @@ def test_render_crash_still_prints_a_line(sl, monkeypatch, capsys):
     assert rc == 0 and out == "— · ledger:— · streak:— · PR:—\n"
 
 
-def _py(code: str) -> str:
-    return f'{sys.executable} -c "{code}"'
-
-
-def test_then_runs_the_chained_command_with_the_same_stdin(sl, monkeypatch, capsys):
-    cmd = _py("import sys,json; print('chained:'+json.load(sys.stdin)['marker'])")
-    rc, out = _run(sl, monkeypatch, capsys, {"cwd": "/x", "marker": "abc123"}, ["--then", cmd])
-    assert rc == 0
-    assert out.splitlines() == ["feat/x · ledger:— · streak:2/3 · PR:—", "chained:abc123"]
-
-
-@pytest.mark.parametrize(
-    "code",
-    [
-        "import sys; sys.stdout.buffer.write(b'\\xff ok\\n')",  # non-UTF-8 stdout
-        "import sys; sys.stderr.buffer.write(b'\\xff'); sys.exit(1)",  # non-UTF-8 stderr, fails
-        "import sys; sys.exit(3)",
-    ],
-)
-def test_misbehaving_chained_command_never_costs_our_line(sl, monkeypatch, capsys, code):
-    rc, out = _run(sl, monkeypatch, capsys, {"cwd": "/x"}, ["--then", _py(code)])
-    assert rc == 0
-    assert out.splitlines()[0] == "feat/x · ledger:— · streak:2/3 · PR:—"
-
-
-def test_non_utf8_chained_output_keeps_its_rows_with_replacement(sl, monkeypatch, capsys):
-    """Decoded with replacement, not dropped: the operator's other status line
-    must survive one bad byte, not vanish behind the catch-all."""
-    code = "import sys; sys.stdout.buffer.write(b'\\xff ok\\n')"
-    _, out = _run(sl, monkeypatch, capsys, {"cwd": "/x"}, ["--then", _py(code)])
-    assert out.splitlines()[1] == "� ok"
-
-
-def _pid_gone(pid: int, within: float = 5.0) -> bool:
-    import time
-
-    deadline = time.monotonic() + within
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return True
-        time.sleep(0.05)
-    return False
-
-
-def test_a_hung_chained_command_is_killed_with_its_children(sl, tmp_path, monkeypatch, capsys):
-    """Past the cap the chained command's WHOLE group dies — including a
-    grandchild the shell spawned, which killing the shell alone would orphan."""
-    import time
-
-    monkeypatch.setattr(sl, "_CHAINED_TIMEOUT_S", 0.5)
-    kid = tmp_path / "kid.pid"
-    cmd = f"sleep 30 & echo $! > {kid}; wait"
-    t0 = time.monotonic()
-    rc, out = _run(sl, monkeypatch, capsys, {"cwd": "/x"}, ["--then", cmd])
-    assert time.monotonic() - t0 < 10, "the cap did not bound the wait"
-    assert rc == 0
-    assert out.splitlines() == ["feat/x · ledger:— · streak:2/3 · PR:—"]
-    pid = int(kid.read_text())  # guard-the-guard: the grandchild really existed
-    assert _pid_gone(pid), f"grandchild {pid} survived the timeout"
-
-
-def test_a_descendant_that_escaped_the_group_cannot_hold_the_cap_open(sl, monkeypatch, capsys):
-    """`setsid` moves a descendant out of the group we kill while it keeps the
-    stdout pipe; draining that pipe after the kill would wait for IT (measured:
-    a 1s cap held 20s). The cap must hold anyway."""
-    import time
-
-    monkeypatch.setattr(sl, "_CHAINED_TIMEOUT_S", 0.5)
-    t0 = time.monotonic()
-    rc, out = _run(sl, monkeypatch, capsys, {"cwd": "/x"}, ["--then", "setsid sleep 20 &"])
-    assert time.monotonic() - t0 < 5, "an escaped descendant held the cap open"
-    assert rc == 0 and out.startswith("feat/x · ")
-
-
-def test_a_reaped_chained_command_is_never_group_killed(sl):
-    """Once reaped, the chained shell's pid — and so its group id — may belong to
-    someone else. _kill_group must refuse, so a late call cannot hit a stranger's
-    group. The 'stranger' is a real live group we own, with an explicit pid."""
-    from types import SimpleNamespace
-
-    stranger = subprocess.Popen(["sleep", "30"], start_new_session=True)
-    try:
-        assert stranger.pid > 1
-        reaped = SimpleNamespace(pid=stranger.pid, returncode=0)
-        sl._kill_group(reaped)
-        # Not poll(): a SIGKILL is delivered asynchronously, so an immediate
-        # poll() reads None even when the kill happened (measured: that made
-        # this assertion vacuous). Require it to SURVIVE a bounded wait instead.
-        with pytest.raises(subprocess.TimeoutExpired):
-            stranger.wait(timeout=0.5)
-        live = SimpleNamespace(pid=stranger.pid, returncode=None)
-        sl._kill_group(live)  # control arm: an unreaped proc IS killed
-        assert stranger.wait(timeout=5) is not None
-    finally:
-        if stranger.poll() is None:
-            stranger.kill()
-            stranger.wait()
-
-
-def test_sigterm_handler_is_disarmed_once_the_chained_command_is_done(sl, monkeypatch, capsys):
-    import signal
-
-    before = signal.getsignal(signal.SIGTERM)
-    try:
-        _run(sl, monkeypatch, capsys, {"cwd": "/x"}, ["--then", "true"])
-        assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
-    finally:
-        signal.signal(signal.SIGTERM, before)
-
-
-def test_sigterm_to_the_script_takes_the_chained_group_with_it(tmp_path):
-    """Claude Code cancels an in-flight status-line command by signalling it; the
-    chained command lives in its own group, so the script must forward the kill."""
-    import signal
-    import time
-
-    kid = tmp_path / "kid.pid"
-    proc = subprocess.Popen(
-        [sys.executable, str(_SCRIPT), "--then", f"sleep 30 & echo $! > {kid}; wait"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+def test_documented_composition_runs_both_status_lines_from_one_stdin(tmp_path):
+    """The script-header recipe for keeping another status line: the SETTINGS
+    command feeds the same stdin to both. Run it verbatim through real `sh`,
+    with a stand-in for the other status line that echoes a stdin field."""
+    other = tmp_path / "other.py"
+    other.write_text("import json, sys; print('other:' + json.load(sys.stdin)['marker'])\n")
+    recipe = 'in=$(cat); printf %s "$in" | "$PY" "$SL"; printf %s "$in" | "$PY" "$OTHER"'
+    proc = subprocess.run(
+        ["sh", "-c", recipe],
+        input=json.dumps({"cwd": str(tmp_path), "marker": "abc123"}),
+        capture_output=True,
+        text=True,
+        timeout=60,
         env={
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": str(tmp_path),
             "GENESIS_DB_PATH": str(tmp_path / "absent.db"),
+            "PY": sys.executable,
+            "SL": str(_SCRIPT),
+            "OTHER": str(other),
         },
     )
-    proc.stdin.write(b'{"cwd": "/"}')
-    proc.stdin.close()
-    deadline = time.monotonic() + 30
-    while not kid.exists() or not kid.read_text().strip():
-        assert time.monotonic() < deadline, "chained command never started"
-        time.sleep(0.05)
-    pid = int(kid.read_text())
-    proc.send_signal(signal.SIGTERM)
-    proc.wait(timeout=10)
-    assert _pid_gone(pid), f"grandchild {pid} survived SIGTERM to the script"
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.splitlines() == ["— · ledger:— · streak:— · PR:—", "other:abc123"]
+
+
+def test_a_failing_second_status_line_does_not_blank_ours(tmp_path):
+    """In the recipe the two commands are independent; ours still prints."""
+    recipe = 'in=$(cat); printf %s "$in" | "$PY" "$SL"; printf %s "$in" | false'
+    proc = subprocess.run(
+        ["sh", "-c", recipe],
+        input=json.dumps({"cwd": str(tmp_path)}),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(tmp_path),
+            "GENESIS_DB_PATH": str(tmp_path / "absent.db"),
+            "PY": sys.executable,
+            "SL": str(_SCRIPT),
+        },
+    )
+    assert proc.stdout.splitlines()[0].startswith("— · ledger:")
+
+
+def test_the_script_runs_no_other_program():
+    """Composition lives in the settings command by owner decision; the script
+    must not grow its own process management back."""
+    import ast
+
+    tree = ast.parse(_SCRIPT.read_text(encoding="utf-8"))
+    imported = {
+        alias.name.split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+    } | {
+        node.module.split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    assert not imported & {"subprocess", "signal", "pty", "multiprocessing"}, imported
 
 
 def _git_repo(path: Path, branch: str) -> Path:
