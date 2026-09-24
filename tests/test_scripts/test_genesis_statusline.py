@@ -146,49 +146,66 @@ def test_render_crash_still_prints_a_line(sl, monkeypatch, capsys):
     assert rc == 0 and out == "— · ledger:— · streak:— · PR:—\n"
 
 
-def test_documented_composition_runs_both_status_lines_from_one_stdin(tmp_path):
-    """The script-header recipe for keeping another status line: the SETTINGS
-    command feeds the same stdin to both. Run it verbatim through real `sh`,
-    with a stand-in for the other status line that echoes a stdin field."""
-    other = tmp_path / "other.py"
-    other.write_text("import json, sys; print('other:' + json.load(sys.stdin)['marker'])\n")
-    recipe = 'in=$(cat); printf %s "$in" | "$PY" "$SL"; printf %s "$in" | "$PY" "$OTHER"'
-    proc = subprocess.run(
-        ["sh", "-c", recipe],
-        input=json.dumps({"cwd": str(tmp_path), "marker": "abc123"}),
+def _documented_recipe(other_cmd: str) -> str:
+    """The composition recipe exactly as the script header documents it, with
+    the placeholders filled in. Extracted, not copied: a hand-copied recipe in
+    this file already drifted from the documented one once (it lost the
+    trailing `; true` that keeps the other command's exit status from blanking
+    the whole line)."""
+    import ast
+    import re
+
+    doc = ast.get_docstring(ast.parse(_SCRIPT.read_text(encoding="utf-8"))) or ""
+    m = re.search(r"sh -c '(.*?)'\n", doc, re.S)
+    assert m, "the composition recipe is gone from the script header"
+    recipe = " ".join(m.group(1).split())
+    assert "<repo>/scripts/genesis_statusline.py" in recipe
+    assert "<your existing status-line command>" in recipe
+    return recipe.replace("python3 <repo>/scripts/genesis_statusline.py", '"$PY" "$SL"').replace(
+        "<your existing status-line command>", other_cmd
+    )
+
+
+def _run_recipe(tmp_path: Path, other_cmd: str, stdin: dict, extra_env=None):
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(tmp_path),
+        "GENESIS_DB_PATH": str(tmp_path / "absent.db"),
+        "PY": sys.executable,
+        "SL": str(_SCRIPT),
+    }
+    env.update(extra_env or {})
+    return subprocess.run(
+        ["sh", "-c", _documented_recipe(other_cmd)],
+        input=json.dumps(stdin),
         capture_output=True,
         text=True,
         timeout=60,
-        env={
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            "HOME": str(tmp_path),
-            "GENESIS_DB_PATH": str(tmp_path / "absent.db"),
-            "PY": sys.executable,
-            "SL": str(_SCRIPT),
-            "OTHER": str(other),
-        },
+        env=env,
+    )
+
+
+def test_documented_composition_runs_both_status_lines_from_one_stdin(tmp_path):
+    """The header recipe feeds the same stdin to both status lines; run it
+    through real `sh` with a stand-in that echoes a stdin field."""
+    other = tmp_path / "other.py"
+    other.write_text("import json, sys; print('other:' + json.load(sys.stdin)['marker'])\n")
+    proc = _run_recipe(
+        tmp_path,
+        '"$PY" "$OTHER"',
+        {"cwd": str(tmp_path), "marker": "abc123"},
+        {"OTHER": str(other)},
     )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.splitlines() == ["— · ledger:— · streak:— · PR:—", "other:abc123"]
 
 
 def test_a_failing_second_status_line_does_not_blank_ours(tmp_path):
-    """In the recipe the two commands are independent; ours still prints."""
-    recipe = 'in=$(cat); printf %s "$in" | "$PY" "$SL"; printf %s "$in" | false'
-    proc = subprocess.run(
-        ["sh", "-c", recipe],
-        input=json.dumps({"cwd": str(tmp_path)}),
-        capture_output=True,
-        text=True,
-        timeout=60,
-        env={
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            "HOME": str(tmp_path),
-            "GENESIS_DB_PATH": str(tmp_path / "absent.db"),
-            "PY": sys.executable,
-            "SL": str(_SCRIPT),
-        },
-    )
+    """Claude Code blanks the WHOLE status line on a non-zero exit, so the
+    recipe must exit 0 even when the other command fails — output alone is not
+    enough, and asserting only output is how this was missed once."""
+    proc = _run_recipe(tmp_path, "false", {"cwd": str(tmp_path)})
+    assert proc.returncode == 0, "the other command's failure would blank our line too"
     assert proc.stdout.splitlines()[0].startswith("— · ledger:")
 
 

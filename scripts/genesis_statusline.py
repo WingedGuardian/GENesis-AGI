@@ -16,7 +16,11 @@ The status-line slot is SINGULAR. To keep another status line you already use,
 compose them IN THE SETTINGS COMMAND, giving each the same stdin::
 
     sh -c 'in=$(cat); printf %s "$in" | python3 <repo>/scripts/genesis_statusline.py;
-           printf %s "$in" | <your existing status-line command>'
+           printf %s "$in" | <your existing status-line command>; true'
+
+The trailing ``; true`` is load-bearing: Claude Code blanks the WHOLE status line
+when the command exits non-zero, and without it the other command's exit status
+becomes the recipe's — so its failure would hide this line too.
 
 Composition deliberately lives there rather than in this script: running
 another program from here means owning its timeouts, its process group and its
