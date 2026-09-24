@@ -279,6 +279,13 @@ check what the code does; nothing checks the sentences you wrote ABOUT what it
 does — and those are what the next session builds on, because permanent record
 has no tone of voice.
 
+**Scope, because this file opens by saying it is not for ordinary work.** This
+section is the exception: it fires whenever a session wrote a NUMBER or a DATED
+status claim into permanent record, on ordinary work too. That predicate is
+deliberately narrow — every wrap-up asserts SOMETHING, so a trigger on "status
+assertions" would fire always and therefore be ignored, while a number and a
+dated claim are both things you can look at a sentence and see.
+
 READ, and EXTERNAL to this repo — a sibling toolkit's methodology handed over
 2026-09-22, not a Genesis measurement: its author reports the pass finding
 defects a fully green suite had shipped past, each one a sentence that outran
