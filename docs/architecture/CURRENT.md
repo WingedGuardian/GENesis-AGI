@@ -1138,7 +1138,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: d0627c854 2026-09-11
+verified: 246808153 2026-09-24
 ```
 
 - **channels/**: adapter framework. Telegram (`bridge.py` =
@@ -1171,9 +1171,23 @@ verified: d0627c854 2026-09-11
   `cc_sessions.satellite_id` (added via `_migrate_add_columns`, not the base
   `CREATE TABLE` — mirrors `last_extracted_*`) persists the device for the optional
   `per_device` scope; default `global`.
-- **dashboard/**: Flask blueprint at `/genesis` (~45 route modules);
+- **dashboard/**: Flask blueprint at `/genesis` (~53 route modules);
   `_async_route` bridges sync Flask onto the runtime event loop; heartbeat
   thread detects degraded-but-alive Flask; web terminal.
+  **Auth posture — READS ARE OPEN, and this is the fact auditors keep
+  rediscovering.** Exactly two request hooks exist, and between them they leave
+  a gap: `auth._check_auth` is blueprint-level and gates HTML pages only,
+  returning None for any `/api/` or `/v1/` path; `auth.check_api_mutation_auth`
+  is app-level and returns None for GET/HEAD/OPTIONS. So a dashboard password
+  protects the HTML pages and the MUTATION routes — it does not gate reads, and
+  every GET under `/api/genesis/` answers an anonymous caller on every install,
+  configured or not. Per-handler predicates are the only read protection and
+  exist on a small minority of route modules; `is_authenticated()` returns True
+  when no password is set, so such a predicate is INERT on a passwordless
+  install by design (nothing is narrowed for an operator who chose not to
+  configure a credential). Network isolation is the primary control — see
+  `SECURITY.md`, which is authoritative for the threat model. Consult this
+  before concluding a route is protected because a password exists.
 - **mcp/**: 5 Genesis MCP servers (health, memory, outreach, recon,
   discord-bot) + external codebase-memory; profile→server allowlist lives in
   `cc/session_config._MCP_PROFILES`. `genesis-health` is the big one (~35 tool
